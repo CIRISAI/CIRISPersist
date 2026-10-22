@@ -709,13 +709,15 @@ class Engine:
         the engine will refuse the write.
         """
 
-    def cirisnode_cast_vote(self, envelope_json: str) -> None:
-        """(derived) deontic — v0.7.0 — Verify-and-insert a Vote envelope. [build-conditional: #[cfg(feature = "cirisnode")]]"""
+    def cirisnode_cast_vote(self, body_json: str) -> str:
+        """(derived) deontic — v60.0.0 — Cast a vote: body_json is a [VoteInput](crate::cirisnode::VoteInput) (contribution_id — a held Contribution row — score in [-1, 1], optio... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
-    def cirisnode_process_takedown_admission_json(self, contribution_json: str) -> str:
-        """v55.0.0 (CIRISPersist#1007; CC 4.5.3 step 2, CC 4.5.5) — execute a
-        takedown on the bytes plane from the SIGNED ``takedown_notice``
-        Contribution (the ``ContributionEnvelope`` JSON). The signature is
+    def cirisnode_process_takedown_admission_json(self, notice_attestation_id: str) -> str:
+        """v55.0.0 (CIRISPersist#1007; CC 4.5.3 step 2, CC 4.5.5) → v60.0.0
+        (CIRISPersist#803) — execute a takedown on the bytes plane from the
+        held ``takedown_notice:{basis}:v1`` ROW ``notice_attestation_id`` (filed
+        with ``cirisnode_put_contribution`` and the ``takedown_notice``
+        subject kind, or replicated from a peer). The row's hybrid signature is
         re-verified and CC 4.5.5 re-asked of this node's state; then ONE
         tombstone, ``blob:{content_sha256}``, is recorded on the steward
         purge's tombstone row and replicates as a purge bundle. An
@@ -724,37 +726,33 @@ class Engine:
         hard delete waits for ``purge_finalize_json`` after the window; the
         age-gate basis records nothing. No other device's claim is withdrawn.
 
-        Returns JSON ``{"notice_id", "content_sha256", "legal_basis",
-        "disposition", "signer", "tombstoned", "settles_at",
-        "claims_retracted", "bytes_destroyed"}``. Idempotent on the notice.
+        Returns JSON ``{"notice_id", "notice_attestation_id",
+        "content_sha256", "legal_basis", "disposition", "signer",
+        "tombstoned", "settles_at", "claims_retracted", "bytes_destroyed"}``.
+        Idempotent on the notice.
 
         Raises:
             ValueError: ``(token, body_json)`` with token
-                ``takedown_unauthorised`` (bad signature, basis outside the
-                closed set, outside its window, or a signer holding no
-                ``takedown`` duty over the content here).
+                ``takedown_unauthorised`` (no notice row by that id held here,
+                a bad signature, a basis outside the closed set, outside its
+                window, or a signer holding no ``takedown`` duty over the
+                content here).
         """
 
-    def cirisnode_put_key_grant_json(self, envelope_json: str) -> None:
-        """(derived) deontic — v16 (CIRISPersist#432, CC 5.1 CLM-epoch-keying) — the dedicated key_grant WRITER; the emission half of [cirisnode_list_key_grants_for_scope_epoch_j... [build-conditional: #[cfg(feature = "cirisnode")]]"""
-
-    def cirisnode_put_moderation_event(self, event_json: str) -> None:
-        """(derived) deontic — v0.7.0 — Verify-and-insert a ModerationEvent. [build-conditional: #[cfg(feature = "cirisnode")]]"""
+    def cirisnode_put_moderation_event(self, body_json: str) -> str:
+        """(derived) deontic — v60.0.0 — File a moderation event: body_json is a [ModerationInput](crate::cirisnode::ModerationInput) (target_contributor, allegation_type, commun... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def cirisnode_put_promotion_attestation(self, att_json: str) -> None:
-        """(derived) deontic — v0.7.2 (CIRISPersist#32) — Verify-and-insert a PromotionAttestation AND transactionally flip the named target rows' is_canonical to TRUE. Caller pa... [build-conditional: #[cfg(feature = "cirisnode")]]"""
+        """(derived) deontic — v0.7.2 (CIRISPersist#32) → v60.0.0 — record a [PromotionAttestation](crate::cirisnode::PromotionAttestation): its target_ids are the attestation_id... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
-    def cirisnode_put_reconsideration_attestation(self, att_json: str) -> None:
-        """(derived) deontic — v0.7.0 — Verify-and-insert a ReconsiderationAttestation. [build-conditional: #[cfg(feature = "cirisnode")]]"""
+    def cirisnode_put_reconsideration_attestation(self, body_json: str) -> str:
+        """(derived) deontic — v60.0.0 — Rule on a reconsideration: body_json is a [ReconsiderationRulingInput](crate::cirisnode::ReconsiderationRulingInput) (request_id, outcome... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
-    def cirisnode_put_reconsideration_request(self, req_json: str) -> None:
-        """(derived) deontic — v0.7.0 — Verify-and-insert a ReconsiderationRequest. [build-conditional: #[cfg(feature = "cirisnode")]]"""
+    def cirisnode_put_reconsideration_request(self, body_json: str) -> str:
+        """(derived) deontic — v60.0.0 — File a reconsideration: body_json is a [ReconsiderationRequestInput](crate::cirisnode::ReconsiderationRequestInput) (slashing_id, grounds... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
-    def cirisnode_put_slashing_attestation(self, att_json: str) -> None:
-        """(derived) deontic — v0.7.0 — Verify-and-insert a SlashingAttestation. [build-conditional: #[cfg(feature = "cirisnode")]]"""
-
-    def cirisnode_retire_key_grants_json(self, actor_key_id: str, now_iso: str) -> str:
-        """(derived) deontic — Retire prior key_grants issued by actor_key_id. Returns outcome-tagged JSON; "partial" = grants in failed are STILL LIVE and does NOT raise — branc... [build-conditional: #[cfg(feature = "cirisnode")]]"""
+    def cirisnode_put_slashing_attestation(self, body_json: str) -> str:
+        """(derived) deontic — v60.0.0 — Record a slashing: body_json is a [SlashingInput](crate::cirisnode::SlashingInput) (moderation_id, outcome, payload). Returns the slashin... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def clear_active_halt(self, family_key_id: str, active_halt_id: str) -> None:
         """(derived) deontic — #302 (H2) — clear the active halt iff it matches (a resume)."""
@@ -2638,44 +2636,32 @@ class Engine:
     def cirisgraph_upsert_node(self, node_json: str, expected_version: int, bulk_import: bool = False) -> None:
         """(derived) empirical — v0.8.0 — Upsert a graph node with AV-48 optimistic-concurrency gate. Pass expected_version = 0 for new rows; current version for updates. [build-conditional: #[cfg(feature = "cirisgraph")]]"""
 
+    def cirisnode_check_ledger_projection(self, projection: str) -> str:
+        """(derived) empirical — v60.0.0 — the ledger projection's from-rows rebuild check: projection is credits_ledger or expertise_ledger. Returns JSON {"live": n, "rebuilt": n}... [build-conditional: #[cfg(feature = "cirisnode")]]"""
+
     def cirisnode_count_delivery_attestations(self, announcement_id: str) -> int:
-        """(derived) empirical — v2.1 (CIRISPersist#101) — Count delivery attestations for a federation_announcement. [build-conditional: #[cfg(feature = "cirisnode")]]"""
+        """(derived) empirical — v2.1 (CIRISPersist#101) — Count delivery attestations for an announcement. [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def cirisnode_get_goal_json(self, goal_id: str) -> str | None:
         """(derived) empirical — Federation directory: fetch a Goal by goal_id."""
 
-    def cirisnode_list_contributions(self, filter_json: str, cursor_json: str | None, limit: int) -> str:
-        """(derived) empirical — v0.7.0 — Page through cirisnode.contributions. Returns JSON ContributionListPage (items + optional next_cursor). [build-conditional: #[cfg(feature = "cirisnode")]]"""
+    def cirisnode_list_contributions(self, author_id: str, filter_json: str | None = None, cursor_json: str | None = None, limit: int = 100) -> str:
+        """(derived) empirical — v60.0.0 — author_id's Contribution rows, newest first. filter_json is an optional [ContributionsFilter](crate::cirisnode::ContributionsFilter) (con... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def cirisnode_list_delivery_attestations(self, announcement_id: str) -> str:
-        """(derived) empirical — v2.1 (CIRISPersist#101) — List all delivery attestations for a federation_announcement, newest-first. Returns a JSON array of [DeliveryAttestation]... [build-conditional: #[cfg(feature = "cirisnode")]]"""
+        """(derived) empirical — v2.1 (CIRISPersist#101) — List all delivery attestations for an announcement, newest first. JSON array of DeliveryAttestation. [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def cirisnode_list_goals_json(self, goals_filter_json: str) -> str:
         """(derived) empirical — Federation directory: list goals matching goals_filter_json."""
 
-    def cirisnode_list_key_grants_for_content_json(self, content_sha256: str, recipient_key_id: str) -> str:
-        """(derived) empirical — List key_grant Contributions matching BOTH content_sha256 AND recipient_key_id. JSON array of [ContributionEnvelope](crate::cirisnode::Contribution... [build-conditional: #[cfg(feature = "cirisnode")]]"""
-
-    def cirisnode_list_key_grants_for_filtered_json(self, recipient_key_id: str, filter_json: str | None = None, cursor_json: str | None = None, limit: int = 100) -> str:
-        """(derived) empirical — v6.3.0 (CIRISPersist#135, Lane C) — key-grants to recipient_key_id, cursor-paged + filtered. JSON-encoded [KeyGrantListPage](crate::cirisnode::KeyG... [build-conditional: #[cfg(feature = "cirisnode")]]"""
-
-    def cirisnode_list_key_grants_for_json(self, recipient_key_id: str) -> str:
-        """(derived) empirical — List key_grant Contributions for recipient_key_id. JSON array of [ContributionEnvelope](crate::cirisnode::ContributionEnvelope). [build-conditional: #[cfg(feature = "cirisnode")]]"""
-
-    def cirisnode_list_key_grants_for_scope_epoch_json(self, scope_kind: str, scope_id: str, epoch: int) -> str:
-        """(derived) empirical — v4.x (CIRISPersist#142 Cut C3b, CEG §10.5.3) → v34.0.0 (CIRISPersist#704, CIRISEdge#492) — list every scope-epoch-addressed key_grant Contribution... [build-conditional: #[cfg(feature = "cirisnode")]]"""
-
     def cirisnode_list_takedowns_for_filtered_json(self, target_content_sha256: str, filter_json: str | None = None, cursor_json: str | None = None, limit: int = 100) -> str:
-        """(derived) empirical — v6.3.0 (CIRISPersist#135, Lane C) — takedowns against target_content_sha256, cursor-paged + filtered. JSON-encoded [TakedownListPage](crate::cirisn... [build-conditional: #[cfg(feature = "cirisnode")]]"""
+        """(derived) empirical — v6.3.0 (CIRISPersist#135) → v60.0.0 — takedown notice rows over target_content_sha256, newest first. filter_json MUST name claimant_key_id (rows ar... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
-    def cirisnode_list_takedowns_for_json(self, content_sha256: str) -> str:
-        """(derived) empirical — List takedown_notice Contributions for content_sha256. JSON array of [ContributionEnvelope](crate::cirisnode::ContributionEnvelope). [build-conditional: #[cfg(feature = "cirisnode")]]"""
+    def cirisnode_list_votes(self, contribution_id: str, voter_id: str | None = None, cursor_json: str | None = None, limit: int = 100) -> str:
+        """(derived) empirical — v60.0.0 — the votes on a held Contribution row (vote:{contribution_id}), newest first, optionally only voter_id's. Returns JSON {"items": [Attestat... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
-    def cirisnode_list_votes(self, filter_json: str, cursor_json: str | None, limit: int) -> str:
-        """(derived) empirical — v0.7.0 — Page through cirisnode.votes. Returns JSON VoteListPage. [build-conditional: #[cfg(feature = "cirisnode")]]"""
-
-    def cirisnode_put_contribution(self, envelope_json: str) -> None:
-        """(derived) empirical — v0.7.0 — Verify-and-insert a Contribution envelope. [build-conditional: #[cfg(feature = "cirisnode")]]"""
+    def cirisnode_put_contribution(self, body_json: str) -> str:
+        """(derived) empirical — v60.0.0 — Put a Contribution: body_json is a [ContributionInput](crate::cirisnode::ContributionInput) (contribution_type, subject, payload, optiona... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def cirisnode_put_goal_json(self, goal_json: str) -> None:
         """(derived) empirical — Federation directory: insert a typed Goal."""
@@ -3707,22 +3693,25 @@ class Engine:
         """(derived) axiotic — Scrub-stats aggregate for a window. Drives privacy dashboards. Returns JSON-encoded ScrubAggregate."""
 
     def cirisnode_get_credits_ledger(self, contributor_id: str, domain: str, language: str, subject: str) -> str | None:
-        """(derived) axiotic — v0.7.0 — Point-lookup one Credits ledger row. [build-conditional: #[cfg(feature = "cirisnode")]]"""
+        """(derived) axiotic — v0.7.0 — Point-lookup one credits-ledger row (the projection). JSON CreditsLedgerEntry or None. [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def cirisnode_get_expertise_ledger(self, contributor_id: str, domain: str, language: str) -> str | None:
-        """(derived) axiotic — v0.7.0 — Point-lookup one Expertise ledger row. [build-conditional: #[cfg(feature = "cirisnode")]]"""
+        """(derived) axiotic — v0.7.0 — Point-lookup one expertise-ledger row (the projection). JSON ExpertiseLedgerEntry or None. [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def cirisnode_read_vote_weight(self, contributor_id: str, domain: str, language: str, subject: str) -> str | None:
-        """(derived) axiotic — v0.7.0 — Compute Credits × expertise_multiplier × active_tier_multiplier for vote-weighting per SCHEMA.md §5.2. Returns JSON-encoded VoteWeight or... [build-conditional: #[cfg(feature = "cirisnode")]]"""
+        """(derived) axiotic — v0.7.0 — Credits × expertise_multiplier × active_tier_multiplier per SCHEMA.md §5.2, from the projections. JSON VoteWeight or None. [build-conditional: #[cfg(feature = "cirisnode")]]"""
+
+    def cirisnode_rehome_ledgers(self) -> int:
+        """(derived) axiotic — v60.0.0 — re-emit every pre-V203 ledger balance as this node's row (the rehome). Returns how many moved. [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def cirisnode_routable_contributors(self, domain: str, language: str) -> str:
-        """(derived) axiotic — v0.7.0 — List active routable contributors for (domain, language). Returns JSON array of RoutableContributor. [build-conditional: #[cfg(feature = "cirisnode")]]"""
+        """(derived) axiotic — v0.7.0 — List active routable contributors for (domain, language) (the expertise projection). JSON array of RoutableContributor. [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
-    def cirisnode_update_credits_ledger(self, update_json: str) -> None:
-        """(derived) axiotic — v0.7.0 — Upsert one row in credits_ledger. [build-conditional: #[cfg(feature = "cirisnode")]]"""
+    def cirisnode_update_credits_ledger(self, update_json: str) -> str:
+        """(derived) axiotic — v60.0.0 — Set a credits balance: update_json is a [CreditsUpdate](crate::cirisnode::CreditsUpdate). Emits this node's credits:{domain}:{language}:{... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
-    def cirisnode_update_expertise_ledger(self, update_json: str) -> None:
-        """(derived) axiotic — v0.7.0 — Upsert one row in expertise_ledger. [build-conditional: #[cfg(feature = "cirisnode")]]"""
+    def cirisnode_update_expertise_ledger(self, update_json: str) -> str:
+        """(derived) axiotic — v60.0.0 — Set an expertise balance: update_json is an [ExpertiseUpdate](crate::cirisnode::ExpertiseUpdate). Emits this node's expertise:{domain}:{l... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def conscience_override_rates(self, deployment_domain: str, window_json: str, caller_occurrence_key_id: str | None) -> str:
         """(derived) axiotic — Per-agent conscience-override rates within a deployment domain. Returns JSON array of OverrideRateRow."""

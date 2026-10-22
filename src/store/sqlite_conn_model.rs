@@ -743,6 +743,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("sqlite_record_hard_case_in_tx", ConnClass::HelperWrite),
     ("sqlite_project_hard_case", ConnClass::HelperWrite),
     ("sqlite_project_detection", ConnClass::HelperWrite),
+    // v60.0.0 (CIRISPersist#988 item 1) — the ledger projection's writer and
+    // its rebuild (into a scratch table, rolled back).
+    ("sqlite_project_ledger", ConnClass::HelperWrite),
+    ("sqlite_ledger_projection_rebuild", ConnClass::HelperWrite),
     // v58.0.0 (CIRISPersist#991) — the key plane's rows and projections.
     ("sqlite_key_plane_present", ConnClass::HelperRead),
     ("sqlite_plane_rows", ConnClass::HelperRead),

@@ -250,6 +250,8 @@ pub(crate) mod genesis_purge_door_invariants;
 /// holder (I591).
 #[cfg(test)]
 pub mod grant_scope_invariants;
+#[cfg(test)]
+mod ledger_projection_invariants;
 /// v56.0.0 (CIRISPersist#934 step 1) — the local write door's occupied-id
 /// divergence across backends, pinned (I951).
 #[cfg(test)]
@@ -675,6 +677,9 @@ pub mod shared_instance;
 // CIRISPersist#146 Ask 3 — the substrate hard_case:* emission surface
 // (consent-SLA watcher + general observability primitive; CEG §8.1.11.3).
 pub mod hard_case;
+// v60.0.0 (CIRISPersist#988 item 1) — the credits / expertise ledgers as
+// projections of this node's `credits:` / `expertise:` rows.
+pub mod ledger_projection;
 pub mod silo_projection;
 // CIRISPersist#183 — the "self at login" substrate vocabulary
 // (delegation/partnership envelope builders + scope tokens +
@@ -2573,35 +2578,20 @@ pub(crate) fn assert_change_envelope_matches(
 /// the feature matrix; unrelated to that work, and fixed rather than deferred
 /// because a leg that cannot compile is a leg that proves nothing.
 pub fn validate_subject_key_ids(subject_key_ids: &[String]) -> Result<(), Error> {
-    validate_subject_key_ids_at(subject_key_ids, SubjectGate::Emit)
-}
-
-/// CC 2.3.2.1 (PR #852 review) — which subject vectors a gate refuses.
-///
-/// `Emit` is the full rule, applied to rows THIS node produces. `Ingest` is
-/// applied to replicated rows and drops one clause — uppercase — because a
-/// live corpus predates the rule: `cirisnode`'s moderation and takedown
-/// contributions carry the subject's raw base64 Ed25519 pubkey (uppercase by
-/// construction) and reach the store through `put_contribution`, which never
-/// ran this validator. Refusing those at ingest would break a child-safety
-/// surface on a patch release, so the deferral is NAMED here rather than
-/// silently normalized, and every other vector — empty, whitespace, a
-/// malformed `canonical:` id — is refused on both paths. Closing the gap
-/// means giving cirisnode's subjects a canonical id; that is a data change,
-/// filed separately.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubjectGate {
-    /// Rows this node produces: the full CC 2.3.2.1 rule.
-    Emit,
-    /// Replicated rows: every vector except the pre-existing uppercase corpus.
-    Ingest,
-}
-
-/// CC 2.3.2.1 — the subject gate at `gate`. See [`SubjectGate`].
-pub fn validate_subject_key_ids_at(
-    subject_key_ids: &[String],
-    gate: SubjectGate,
-) -> Result<(), Error> {
+    // v60.0.0 (CIRISPersist#854) — ONE gate. Until v60 this ran in two shapes,
+    // `Emit` (the full rule) and `Ingest` (every clause but uppercase),
+    // because cirisnode's moderation and takedown Contributions carried the
+    // subject's raw base64 Ed25519 pubkey and reached the store through
+    // `put_contribution`, which never ran this validator. Those classes are
+    // rows now (V203), signed by federation keys and naming canonical subject
+    // ids; nothing still produces the uppercase corpus, so the split is gone
+    // and every door — the local producer and a peer's replicated row alike —
+    // asks the same rule.
+    //
+    // The canonical-spelling clauses run BEFORE the general uppercase clause
+    // so a malformed canonical id is refused naming WHICH part of its
+    // spelling is wrong (the prefix, the hash family, the digest), the
+    // diagnosis an operator staring at a rejected subject needs.
     for sid in subject_key_ids {
         let malformed = |why: &str| {
             Err(Error::InvalidArgument(format!(
@@ -2612,49 +2602,31 @@ pub fn validate_subject_key_ids_at(
         if sid.is_empty() {
             return malformed("empty");
         }
-        if gate == SubjectGate::Emit && sid.bytes().any(|b| b.is_ascii_uppercase()) {
-            return malformed("uppercase");
-        }
         if sid.chars().any(char::is_whitespace) {
             return malformed("whitespace");
         }
-        // PR #852 review round nine — `strip_prefix` is CASE-SENSITIVE, so
-        // `Canonical:sha256:<lowercase hex>` never entered the branch below at
-        // all: it fell through as an ordinary subject, and `SubjectGate::Ingest`
-        // skips the general uppercase clause, so a peer could persist it. That
-        // is the uppercase-digest defect again by another spelling — an id that
-        // LOOKS canonical, that exact-match canonical binding and withdrawal
-        // authority never recognize, leaving the subject unrevocable by its
-        // canonical identity. Anything whose first ten bytes are `canonical:`
-        // in ANY case must be exactly the canonical form or be refused; that
-        // also catches `canonical:SHA256:…`. Compared as BYTES so a multi-byte
-        // character cannot panic a slice, and the cirisnode legacy corpus is
-        // untouched because base64 subjects contain no `:`.
+        // PR #852 review round nine — `strip_prefix` is CASE-SENSITIVE, so an
+        // id whose first ten bytes are `canonical:` in ANY case must be exactly
+        // the canonical form. Compared as BYTES so a multi-byte character
+        // cannot panic a slice.
         let looks_canonical =
             sid.len() >= 10 && sid.as_bytes()[..10].eq_ignore_ascii_case(b"canonical:");
         if looks_canonical && !sid.starts_with("canonical:") {
             return malformed("canonical prefix is not lowercase");
         }
         if let Some(rest) = sid.strip_prefix("canonical:") {
-            // Round nine — the hash family is part of the canonical spelling:
-            // `canonical:SHA256:…` is the same alternate-spelling defect.
+            // Round nine — the hash family is part of the canonical spelling.
             let Some(digest) = rest.strip_prefix("sha256:") else {
                 if rest.len() >= 7 && rest.as_bytes()[..7].eq_ignore_ascii_case(b"sha256:") {
                     return malformed("canonical hash family is not lowercase");
                 }
                 return malformed("canonical id is not sha256");
             };
-            // PR #852 review round seven — `is_ascii_hexdigit()` accepts `A`-`F`,
-            // and `SubjectGate::Ingest` deliberately skips the general uppercase
-            // clause above (the cirisnode legacy corpus), so a peer could persist
-            // `canonical:sha256:<UPPERCASE>` while this branch's own message
-            // promised lowercase. Canonical binding and withdrawal authority
-            // compare by exact string equality, so the alternate spelling never
-            // matches the lowercase binding and the subject becomes unrevocable
-            // by its canonical identity — the precise harm CC 2.3.2.1 names.
-            // The digest is spelled out here rather than deferred to the general
-            // clause, so it holds on BOTH gates; the legacy exception covers
-            // non-canonical subjects only, and none of those carry this prefix.
+            // Round seven — `is_ascii_hexdigit()` accepts `A`-`F`; canonical
+            // binding and withdrawal authority compare by exact string
+            // equality, so an alternate spelling never matches the lowercase
+            // binding and the subject becomes unrevocable by its canonical
+            // identity — the precise harm CC 2.3.2.1 names.
             if digest.len() != 64
                 || !digest
                     .bytes()
@@ -2662,6 +2634,9 @@ pub fn validate_subject_key_ids_at(
             {
                 return malformed("canonical sha256 digest is not 64 lowercase hex");
             }
+        }
+        if sid.bytes().any(|b| b.is_ascii_uppercase()) {
+            return malformed("uppercase");
         }
     }
     Ok(())

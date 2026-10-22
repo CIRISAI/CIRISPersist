@@ -216,6 +216,14 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("project_hard_case_row", Class::Plumbing),
     ("project_detection_row", Class::Plumbing),
     ("project_detection_row_under", Class::Plumbing),
+    // v60.0.0 (CIRISPersist#988 item 1) — the ledger projection (this node's
+    // `credits:` / `expertise:` rows → the ledgers): a derivation and its
+    // writers; whether a row supersedes the held one is
+    // `ledger_projection::supersedes`, shared.
+    ("project_ledger_row", Class::Plumbing),
+    ("sqlite_project_ledger", Class::Plumbing),
+    ("pg_project_ledger", Class::Plumbing),
+    ("sqlite_ledger_projection_rebuild", Class::Plumbing),
     // v58.0.0 (CIRISPersist#1094 item 2) — the DSAR door's erasure of
     // row-backed detections under the producer's rule-1 `withdraws`: the hard-delete
     // of the cited rows, the tombstone header + tombstone it builds (pure) and
@@ -507,6 +515,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_consensus_protocol_form", Class::Gate),
     ("check_content_hash_hex", Class::Gate),
     ("check_delegated_duty_scores_admission", Class::Gate),
+    // v60.0.0 (CIRISPersist#803) — the `takedown_notice:{basis}:v1` row's
+    // shape and CC 4.5.5 duty-holder rule, in the shared plan.
+    ("check_takedown_notice_row_admission", Class::Gate),
     // v44.6.0 (#857) — a machine author may name only itself in for_key_id;
     // refuses on the caller's input.
     ("check_consent_for_key_admission", Class::Gate),
@@ -529,7 +540,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_family_charter_admission", Class::Gate),
     ("check_federation", Class::Gate),
     ("check_genesis_attestation_reserved", Class::Gate),
-    ("validate_subject_key_ids_at", Class::Gate),
+    ("validate_subject_key_ids", Class::Gate),
     ("check_genesis_rebake_purge_admission_under", Class::Gate),
     ("check_geographic_community_admission", Class::Gate),
     ("check_infra_attest_role_admission", Class::Gate),

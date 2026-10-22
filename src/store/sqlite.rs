@@ -21637,6 +21637,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
     ) -> Result<crate::federation::silo_projection::ProjectionRebuild, crate::federation::Error>
     {
         use crate::federation::silo_projection::SiloProjection;
+        let node = crate::federation::FederationDirectory::node_key_id(self);
         self.write(
             move |conn| -> Result<crate::federation::silo_projection::ProjectionRebuild, rusqlite::Error> {
                 let tx = conn.transaction()?;
@@ -21667,6 +21668,14 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                     }
                     SiloProjection::IdentityOccurrences => {
                         let rebuild = sqlite_occurrence_projection_rebuild(&tx)?;
+                        tx.rollback()?;
+                        return Ok(rebuild);
+                    }
+                    // v60.0.0 (CIRISPersist#988 item 1) — the ledgers: this
+                    // node's rows on the family, folded through the live
+                    // writer into a scratch table.
+                    SiloProjection::CreditsLedger | SiloProjection::ExpertiseLedger => {
+                        let rebuild = sqlite_ledger_projection_rebuild(&tx, projection, node.as_deref())?;
                         tx.rollback()?;
                         return Ok(rebuild);
                     }
@@ -21706,7 +21715,9 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                         }
                         SiloProjection::FederationKeys
                         | SiloProjection::FederationRevocations
-                        | SiloProjection::IdentityOccurrences => {}
+                        | SiloProjection::IdentityOccurrences
+                        | SiloProjection::CreditsLedger
+                        | SiloProjection::ExpertiseLedger => {}
                         SiloProjection::DetectionEvents => {
                             if let Some(event) =
                                 crate::derived::detection_row::project_detection_row_under(
@@ -21911,6 +21922,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             projected_trace,
             projected_detection,
             projected_hard_case,
+            projected_ledger,
             wire_index_key,
             ..
         } = planned;
@@ -21998,6 +22010,12 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                 // hard_case row, in the SAME transaction.
                 if let Some(event) = &projected_hard_case {
                     sqlite_project_hard_case(&tx, "hard_case_events", &row.attestation_id, event)?;
+                }
+                // v60.0.0 (CIRISPersist#988 item 1) — the ledger projection of
+                // this node's `credits:` / `expertise:` row, in the SAME
+                // transaction, when it supersedes the held one.
+                if let Some(ledger) = &projected_ledger {
+                    sqlite_project_ledger(&tx, None, ledger)?;
                 }
                 if let Some(depth) = withdraws_depth {
                     tx.execute(
@@ -23678,6 +23696,151 @@ fn sqlite_project_hard_case(
         ],
     )?;
     Ok(())
+}
+
+/// v60.0.0 (CIRISPersist#988 item 1) — the ledger table a projection writes,
+/// live (`None`) or a rebuild's scratch table.
+fn sqlite_ledger_table(
+    ledger: crate::federation::ledger_projection::Ledger,
+    scratch: Option<&str>,
+) -> String {
+    use crate::federation::ledger_projection::Ledger;
+    scratch.map(str::to_owned).unwrap_or_else(|| {
+        match ledger {
+            Ledger::Credits => "cirisnode_credits_ledger",
+            Ledger::Expertise => "cirisnode_expertise_ledger",
+        }
+        .to_owned()
+    })
+}
+
+/// v60.0.0 (CIRISPersist#988 item 1) — the ledger writer: read the row held
+/// on the projection's key, and replace it when the projection supersedes it
+/// ([`supersedes`](crate::federation::ledger_projection::supersedes)). The
+/// live put step and the rebuild both write through this.
+fn sqlite_project_ledger(
+    tx: &rusqlite::Transaction<'_>,
+    scratch: Option<&str>,
+    p: &crate::federation::ledger_projection::LedgerProjection,
+) -> Result<(), rusqlite::Error> {
+    use crate::federation::ledger_projection::{self as lp, LedgerBody};
+    let table = sqlite_ledger_table(p.ledger(), scratch);
+    let (c, d, l, subj) = p.key();
+    let (key_sql, key_params): (&str, Vec<String>) = match &p.body {
+        LedgerBody::Credits(_) => (
+            "contributor_id = ?1 AND domain = ?2 AND language = ?3 AND subject = ?4",
+            vec![c, d, l, subj],
+        ),
+        LedgerBody::Expertise(_) => (
+            "contributor_id = ?1 AND domain = ?2 AND language = ?3",
+            vec![c, d, l],
+        ),
+    };
+    let held: Option<(Option<String>, String)> = tx
+        .query_row(
+            &format!("SELECT attestation_id, last_updated_at FROM {table} WHERE {key_sql}"),
+            rusqlite::params_from_iter(key_params.iter()),
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let held_view = held
+        .as_ref()
+        .map(|(id, at)| (id.as_deref(), lp::parse_instant(at)));
+    if !lp::supersedes(held_view, p) {
+        return Ok(());
+    }
+    tx.execute(
+        &format!("DELETE FROM {table} WHERE {key_sql}"),
+        rusqlite::params_from_iter(key_params.iter()),
+    )?;
+    let at = lp::render_instant(p.asserted_at);
+    match &p.body {
+        LedgerBody::Credits(x) => tx.execute(
+            &format!(
+                "INSERT INTO {table} (contributor_id, domain, language, subject, balance, \
+                    last_update_contribution, last_updated_at, created_at, attestation_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)"
+            ),
+            rusqlite::params![
+                x.contributor_id,
+                x.domain,
+                x.language,
+                x.subject,
+                x.balance,
+                x.source_contribution,
+                at,
+                p.attestation_id,
+            ],
+        )?,
+        LedgerBody::Expertise(x) => tx.execute(
+            &format!(
+                "INSERT INTO {table} (contributor_id, domain, language, expertise, is_active, \
+                    last_updated_at, last_update_contribution, created_at, attestation_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?6, ?8)"
+            ),
+            rusqlite::params![
+                x.contributor_id,
+                x.domain,
+                x.language,
+                x.expertise,
+                i64::from(x.is_active),
+                at,
+                x.source_contribution,
+                p.attestation_id,
+            ],
+        )?,
+    };
+    Ok(())
+}
+
+/// v60.0.0 (CIRISPersist#988 item 1) — a ledger's from-rows rebuild: every
+/// row on the family, through [`project_ledger_row`](crate::federation::ledger_projection::project_ledger_row)
+/// and the live writer, into a scratch table of the live table's shape; both
+/// rendered with `quote()` of every column and sorted.
+fn sqlite_ledger_projection_rebuild(
+    tx: &rusqlite::Transaction<'_>,
+    projection: crate::federation::silo_projection::SiloProjection,
+    node_key_id: Option<&str>,
+) -> Result<crate::federation::silo_projection::ProjectionRebuild, rusqlite::Error> {
+    use crate::federation::ledger_projection::{self as lp, Ledger};
+    use crate::federation::silo_projection::SiloProjection;
+    let (ledger, family, scratch) = if projection == SiloProjection::CreditsLedger {
+        (
+            Ledger::Credits,
+            lp::CREDITS_PREFIX,
+            "_rebuild_credits_ledger",
+        )
+    } else {
+        (
+            Ledger::Expertise,
+            lp::EXPERTISE_PREFIX,
+            "_rebuild_expertise_ledger",
+        )
+    };
+    let live_table = sqlite_ledger_table(ledger, None);
+    tx.execute_batch(&format!(
+        "CREATE TEMP TABLE {scratch} AS SELECT * FROM {live_table} WHERE 0"
+    ))?;
+    let rows: Vec<crate::federation::Attestation> = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
+             WHERE substr(dimension, 1, length(?1)) = ?1 ORDER BY attestation_id"
+        ))?;
+        let rows = stmt.query_map([family], sqlite_row_to_attestation)?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for row in &rows {
+        if let Some(p) = lp::project_ledger_row(row, node_key_id) {
+            if p.ledger() == ledger {
+                sqlite_project_ledger(tx, Some(scratch), &p)?;
+            }
+        }
+    }
+    let mut live = sqlite_render_table(tx, &live_table, &live_table, "contributor_id")?;
+    let mut rebuilt = sqlite_render_table(tx, &live_table, scratch, "contributor_id")?;
+    live.sort();
+    rebuilt.sort();
+    Ok(crate::federation::silo_projection::ProjectionRebuild { live, rebuilt })
 }
 
 /// v58.0.0 (CIRISPersist#1094 item 2) — what V196 will delete on this store,

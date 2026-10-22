@@ -16885,6 +16885,42 @@
     "path#symbol": "src/federation/transport_rebind.rs#check_serve_rotation",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc9-1106"
+   },
+   {
+    "decimal_id": "3.1.1",
+    "claim_id": "CLM-takedown-notice-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/takedown_tombstone.rs#check_takedown_notice_row_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s1",
+    "witness": "I1170 (memory, sqlite, postgres; sqlite and postgres engines), I1107"
+   },
+   {
+    "decimal_id": "3.1.1",
+    "claim_id": "CLM-takedown-notice-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/takedown_tombstone.rs#takedown_terms",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s1",
+    "witness": "I786, I787, I789, I1171 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.1.1",
+    "claim_id": "CLM-takedown-notice-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/cirisnode/rows.rs#plan_takedown_notice_row",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s1",
+    "witness": "I1170 (sqlite and postgres engines)"
+   },
+   {
+    "decimal_id": "2.4.2",
+    "claim_id": "CLM-silo-projection-rebuildable",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/ledger_projection.rs#project_ledger_row",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s1",
+    "witness": "I1166 (memory, sqlite, postgres), I1169 (sqlite, postgres)"
    }
   ],
   "CIRISServer": [

@@ -216,6 +216,7 @@ Engine	cirisgraph_traverse_k_hop	empirical
 Engine	cirisgraph_upsert_edge	empirical	
 Engine	cirisgraph_upsert_node	empirical	
 Engine	cirisnode_cast_vote	deontic	
+Engine	cirisnode_check_ledger_projection	empirical	
 Engine	cirisnode_count_delivery_attestations	empirical	
 Engine	cirisnode_get_credits_ledger	axiotic	
 Engine	cirisnode_get_expertise_ledger	axiotic	
@@ -223,26 +224,20 @@ Engine	cirisnode_get_goal_json	empirical
 Engine	cirisnode_list_contributions	empirical	
 Engine	cirisnode_list_delivery_attestations	empirical	
 Engine	cirisnode_list_goals_json	empirical	
-Engine	cirisnode_list_key_grants_for_content_json	empirical	
-Engine	cirisnode_list_key_grants_for_filtered_json	empirical	
-Engine	cirisnode_list_key_grants_for_json	empirical	
-Engine	cirisnode_list_key_grants_for_scope_epoch_json	empirical
 Engine	cirisnode_list_takedowns_for_filtered_json	empirical	
-Engine	cirisnode_list_takedowns_for_json	empirical	
 Engine	cirisnode_list_votes	empirical	
 Engine	cirisnode_process_takedown_admission_json	deontic	
 Engine	cirisnode_put_contribution	empirical	
 Engine	cirisnode_put_delivery_attestation	testimonial	delivery_event
 Engine	cirisnode_put_goal_json	empirical	
-Engine	cirisnode_put_key_grant_json	deontic	
 Engine	cirisnode_put_moderation_event	deontic	
 Engine	cirisnode_put_promotion_attestation	deontic	
 Engine	cirisnode_put_reconsideration_attestation	deontic	
 Engine	cirisnode_put_reconsideration_request	deontic	
 Engine	cirisnode_put_slashing_attestation	deontic	
 Engine	cirisnode_read_vote_weight	axiotic	
+Engine	cirisnode_rehome_ledgers	axiotic	
 Engine	cirisnode_retire_goal_json	empirical	
-Engine	cirisnode_retire_key_grants_json	deontic	
 Engine	cirisnode_routable_contributors	axiotic	
 Engine	cirisnode_update_credits_ledger	axiotic	
 Engine	cirisnode_update_expertise_ledger	axiotic	

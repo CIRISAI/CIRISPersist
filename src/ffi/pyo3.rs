@@ -198,6 +198,23 @@ pub use persist_errors::{
     NotFound, Permanent, PersistError, Transient,
 };
 
+/// v60.0.0 (CIRISPersist#988 item 1) — call `$call` on the engine's
+/// [`NodeCoreService`](crate::cirisnode::NodeCoreService) backend, whichever
+/// it is.
+#[cfg(feature = "cirisnode")]
+macro_rules! dispatch_node_core {
+    ($engine:expr, $b:ident => $call:expr) => {{
+        #[allow(unused_imports)]
+        use crate::cirisnode::NodeCoreService as _;
+        match $engine.node_core_service() {
+            #[cfg(feature = "postgres")]
+            crate::engine::NodeCoreDispatch::Postgres($b) => $call,
+            #[cfg(feature = "sqlite")]
+            crate::engine::NodeCoreDispatch::Sqlite($b) => $call,
+        }
+    }};
+}
+
 /// v1.0.0-scaffold helper — map a stable substrate error `kind()` token
 /// (e.g. `"audit_not_found"`, `"cirisgraph_conflict"`, `"secrets_backend"`)
 /// onto the right typed Python exception class.
@@ -22255,358 +22272,180 @@ impl PyEngine {
         })
     }
 
-    // ── v0.7.0-α5: NodeCoreService PyO3 surface (CIRISPersist#30) ─────
+    // ── cirisnode PyO3 surface (v0.7.0-α5, CIRISPersist#30; rows in v60.0.0) ──
     //
-    // 8 typed-writes + 6 reads wrapping NodeCoreService. Inputs come
-    // across the FFI as JSON strings (typed envelope shapes from
-    // CIRISNodeCore/SCHEMA.md); outputs encode the same way. Errors
-    // route through cirisnode_err_to_py for stable kind() tokens.
+    // v60.0.0 (CIRISPersist#988 item 1, #803, #854) — every cirisnode class is
+    // a signed `scores` row. The method names stay; each WRITE is a thin
+    // wrapper that plans the row from its body (`cirisnode::rows`) and signs
+    // it with this engine's own composed hybrid signer, returning the row's
+    // `attestation_id`. A v59 typed envelope (it carries `signature` / its
+    // contributor id) is refused BY NAME, `cirisnode_typed_object_retired`;
+    // a `key_grant` Contribution is `cirisnode_key_grant_retired`. A plane
+    // refusal raises exactly as `put_attestation` raises it. Every signature
+    // change is listed in CHANGELOG `## [60.0.0]`.
 
-    /// v0.7.0 — Verify-and-insert a Contribution envelope.
+    /// v60.0.0 — Put a Contribution: `body_json` is a
+    /// [`ContributionInput`](crate::cirisnode::ContributionInput) (`contribution_type`,
+    /// `subject`, `payload`, optional `witness_set`; no id, author or
+    /// signature). A `takedown_notice` subject kind files the
+    /// `takedown_notice:{basis}:v1` row (its payload a
+    /// [`TakedownNoticePayload`](crate::cirisnode::TakedownNoticePayload)).
+    /// Returns the row's `attestation_id` (the Contribution's id).
     #[cfg(feature = "cirisnode")]
-    fn cirisnode_put_contribution(&self, py: Python<'_>, envelope_json: &str) -> PyResult<()> {
+    fn cirisnode_put_contribution(&self, py: Python<'_>, body_json: &str) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let env: crate::cirisnode::ContributionEnvelope = serde_json::from_str(envelope_json)
-                .map_err(|e| {
-                PyValueError::new_err(format!("ContributionEnvelope decode: {e}"))
-            })?;
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .put_contribution(env)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .put_contribution(env)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-            })
+        let body: crate::cirisnode::ContributionInput =
+            crate::cirisnode::rows::decode_input(body_json, "contribution")
+                .map_err(cirisnode_row_err_to_py)?;
+        self.cirisnode_call(py, move |engine| async move {
+            engine.cirisnode_put_contribution(&body).await
         })
     }
 
-    /// v0.7.0 — Verify-and-insert a Vote envelope.
+    /// v60.0.0 — Cast a vote: `body_json` is a
+    /// [`VoteInput`](crate::cirisnode::VoteInput) (`contribution_id` — a held
+    /// Contribution row — `score` in `[-1, 1]`, optional `detail` /
+    /// `rationale`). Returns the `vote:{contribution_id}` row's id.
     #[cfg(feature = "cirisnode")]
-    fn cirisnode_cast_vote(&self, py: Python<'_>, envelope_json: &str) -> PyResult<()> {
+    fn cirisnode_cast_vote(&self, py: Python<'_>, body_json: &str) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let env: crate::cirisnode::VoteEnvelope = serde_json::from_str(envelope_json)
-                .map_err(|e| PyValueError::new_err(format!("VoteEnvelope decode: {e}")))?;
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .cast_vote(env)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .cast_vote(env)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-            })
+        let body: crate::cirisnode::VoteInput =
+            crate::cirisnode::rows::decode_input(body_json, "vote")
+                .map_err(cirisnode_row_err_to_py)?;
+        self.cirisnode_call(py, move |engine| async move {
+            engine.cirisnode_cast_vote(&body).await
         })
     }
 
-    /// v0.7.0 — Upsert one row in credits_ledger.
+    /// v60.0.0 — Set a credits balance: `update_json` is a
+    /// [`CreditsUpdate`](crate::cirisnode::CreditsUpdate). Emits this node's
+    /// `credits:{domain}:{language}:{subject}` row, projected into the
+    /// credits ledger. Returns the row's id.
     #[cfg(feature = "cirisnode")]
-    fn cirisnode_update_credits_ledger(&self, py: Python<'_>, update_json: &str) -> PyResult<()> {
+    fn cirisnode_update_credits_ledger(
+        &self,
+        py: Python<'_>,
+        update_json: &str,
+    ) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let update: crate::cirisnode::CreditsUpdate = serde_json::from_str(update_json)
-                .map_err(|e| PyValueError::new_err(format!("CreditsUpdate decode: {e}")))?;
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .update_credits_ledger(update)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .update_credits_ledger(update)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-            })
+        let update: crate::cirisnode::CreditsUpdate =
+            crate::cirisnode::rows::decode_input(update_json, "credits update")
+                .map_err(cirisnode_row_err_to_py)?;
+        self.cirisnode_call(py, move |engine| async move {
+            engine.cirisnode_update_credits_ledger(&update).await
         })
     }
 
-    /// v0.7.0 — Upsert one row in expertise_ledger.
+    /// v60.0.0 — Set an expertise balance: `update_json` is an
+    /// [`ExpertiseUpdate`](crate::cirisnode::ExpertiseUpdate). Emits this
+    /// node's `expertise:{domain}:{language}` row. Returns the row's id.
     #[cfg(feature = "cirisnode")]
-    fn cirisnode_update_expertise_ledger(&self, py: Python<'_>, update_json: &str) -> PyResult<()> {
+    fn cirisnode_update_expertise_ledger(
+        &self,
+        py: Python<'_>,
+        update_json: &str,
+    ) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let update: crate::cirisnode::ExpertiseUpdate = serde_json::from_str(update_json)
-                .map_err(|e| PyValueError::new_err(format!("ExpertiseUpdate decode: {e}")))?;
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .update_expertise_ledger(update)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .update_expertise_ledger(update)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-            })
+        let update: crate::cirisnode::ExpertiseUpdate =
+            crate::cirisnode::rows::decode_input(update_json, "expertise update")
+                .map_err(cirisnode_row_err_to_py)?;
+        self.cirisnode_call(py, move |engine| async move {
+            engine.cirisnode_update_expertise_ledger(&update).await
         })
     }
 
-    /// v0.7.0 — Verify-and-insert a ModerationEvent.
+    /// v60.0.0 — File a moderation event: `body_json` is a
+    /// [`ModerationInput`](crate::cirisnode::ModerationInput)
+    /// (`target_contributor`, `allegation_type`, `community_id`, `payload`).
+    /// Returns the `moderation:{allegation_type}` row's id; the plane's
+    /// moderation gate decides who may file.
     #[cfg(feature = "cirisnode")]
-    fn cirisnode_put_moderation_event(&self, py: Python<'_>, event_json: &str) -> PyResult<()> {
+    fn cirisnode_put_moderation_event(&self, py: Python<'_>, body_json: &str) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let event: crate::cirisnode::ModerationEvent = serde_json::from_str(event_json)
-                .map_err(|e| PyValueError::new_err(format!("ModerationEvent decode: {e}")))?;
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .put_moderation_event(event)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .put_moderation_event(event)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-            })
+        let body: crate::cirisnode::ModerationInput =
+            crate::cirisnode::rows::decode_input(body_json, "moderation event")
+                .map_err(cirisnode_row_err_to_py)?;
+        self.cirisnode_call(py, move |engine| async move {
+            engine.cirisnode_put_moderation_event(&body).await
         })
     }
 
-    /// v0.7.0 — Verify-and-insert a SlashingAttestation.
+    /// v60.0.0 — Record a slashing: `body_json` is a
+    /// [`SlashingInput`](crate::cirisnode::SlashingInput) (`moderation_id`,
+    /// `outcome`, `payload`). Returns the `slashing:{outcome}` row's id.
     #[cfg(feature = "cirisnode")]
-    fn cirisnode_put_slashing_attestation(&self, py: Python<'_>, att_json: &str) -> PyResult<()> {
+    fn cirisnode_put_slashing_attestation(
+        &self,
+        py: Python<'_>,
+        body_json: &str,
+    ) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let att: crate::cirisnode::SlashingAttestation = serde_json::from_str(att_json)
-                .map_err(|e| PyValueError::new_err(format!("SlashingAttestation decode: {e}")))?;
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .put_slashing_attestation(att)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .put_slashing_attestation(att)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-            })
+        let body: crate::cirisnode::SlashingInput =
+            crate::cirisnode::rows::decode_input(body_json, "slashing")
+                .map_err(cirisnode_row_err_to_py)?;
+        self.cirisnode_call(py, move |engine| async move {
+            engine.cirisnode_put_slashing_attestation(&body).await
         })
     }
 
-    /// v0.7.0 — Verify-and-insert a ReconsiderationRequest.
+    /// v60.0.0 — File a reconsideration: `body_json` is a
+    /// [`ReconsiderationRequestInput`](crate::cirisnode::ReconsiderationRequestInput)
+    /// (`slashing_id`, `grounds`, `payload`). Returns the
+    /// `reconsideration:{grounds}` filing's id.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_reconsideration_request(
         &self,
         py: Python<'_>,
-        req_json: &str,
-    ) -> PyResult<()> {
+        body_json: &str,
+    ) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let req: crate::cirisnode::ReconsiderationRequest = serde_json::from_str(req_json)
-                .map_err(|e| {
-                    PyValueError::new_err(format!("ReconsiderationRequest decode: {e}"))
-                })?;
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .put_reconsideration_request(req)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .put_reconsideration_request(req)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-            })
+        let body: crate::cirisnode::ReconsiderationRequestInput =
+            crate::cirisnode::rows::decode_input(body_json, "reconsideration request")
+                .map_err(cirisnode_row_err_to_py)?;
+        self.cirisnode_call(py, move |engine| async move {
+            engine.cirisnode_put_reconsideration_request(&body).await
         })
     }
 
-    /// v0.7.0 — Verify-and-insert a ReconsiderationAttestation.
+    /// v60.0.0 — Rule on a reconsideration: `body_json` is a
+    /// [`ReconsiderationRulingInput`](crate::cirisnode::ReconsiderationRulingInput)
+    /// (`request_id`, `outcome` — `reversed` / `partial` / `upheld` —
+    /// `payload`). Returns the ruling row's id.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_reconsideration_attestation(
         &self,
         py: Python<'_>,
-        att_json: &str,
-    ) -> PyResult<()> {
+        body_json: &str,
+    ) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let att: crate::cirisnode::ReconsiderationAttestation = serde_json::from_str(att_json)
-                .map_err(|e| {
-                    PyValueError::new_err(format!("ReconsiderationAttestation decode: {e}"))
-                })?;
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .put_reconsideration_attestation(att)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .put_reconsideration_attestation(att)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-            })
+        let body: crate::cirisnode::ReconsiderationRulingInput =
+            crate::cirisnode::rows::decode_input(body_json, "reconsideration ruling")
+                .map_err(cirisnode_row_err_to_py)?;
+        self.cirisnode_call(py, move |engine| async move {
+            engine
+                .cirisnode_put_reconsideration_attestation(&body)
+                .await
         })
     }
 
-    /// v0.7.2 (CIRISPersist#32) — Verify-and-insert a
-    /// `PromotionAttestation` AND transactionally flip the named
-    /// target rows' `is_canonical` to TRUE. Caller passes the
-    /// envelope as JSON; on success, the named targets are
-    /// canonical-tier and the attestation row is written to
-    /// `cirisnode.promotion_attestations`.
+    /// v0.7.2 (CIRISPersist#32) → v60.0.0 — record a
+    /// [`PromotionAttestation`](crate::cirisnode::PromotionAttestation): its
+    /// `target_ids` are the `attestation_id`s of rows held here on the target
+    /// kind's family (all or none). Local bookkeeping.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_promotion_attestation(&self, py: Python<'_>, att_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let att: crate::cirisnode::PromotionAttestation = serde_json::from_str(att_json)
-                .map_err(|e| PyValueError::new_err(format!("PromotionAttestation decode: {e}")))?;
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .put_promotion_attestation(att)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .put_promotion_attestation(att)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-            })
+        let att: crate::cirisnode::PromotionAttestation = serde_json::from_str(att_json)
+            .map_err(|e| PyValueError::new_err(format!("PromotionAttestation decode: {e}")))?;
+        self.cirisnode_store_call(py, move |engine| async move {
+            dispatch_node_core!(engine, b => b.put_promotion_attestation(att).await)
         })
+        .map(|_| ())
     }
 
     /// v0.7.0 — List active routable contributors for `(domain,
-    /// language)`. Returns JSON array of `RoutableContributor`.
+    /// language)` (the expertise projection). JSON array of
+    /// `RoutableContributor`.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_routable_contributors(
         &self,
@@ -22615,47 +22454,14 @@ impl PyEngine {
         language: &str,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let domain = domain.to_owned();
-            let language = language.to_owned();
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let rows = backend
-                            .routable_contributors(&domain, &language)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&rows).map_err(|e| {
-                            PyRuntimeError::new_err(format!("RoutableContributor encode: {e}"))
-                        })
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let rows = backend
-                            .routable_contributors(&domain, &language)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&rows).map_err(|e| {
-                            PyRuntimeError::new_err(format!("RoutableContributor encode: {e}"))
-                        })
-                    })
-                }
-            })
+        let (domain, language) = (domain.to_owned(), language.to_owned());
+        self.cirisnode_store_call(py, move |engine| async move {
+            dispatch_node_core!(engine, b => b.routable_contributors(&domain, &language).await)
         })
     }
 
-    /// v0.7.0 — Compute `Credits × expertise_multiplier ×
-    /// active_tier_multiplier` for vote-weighting per SCHEMA.md §5.2.
-    /// Returns JSON-encoded `VoteWeight` or `None`.
+    /// v0.7.0 — `Credits × expertise_multiplier × active_tier_multiplier`
+    /// per SCHEMA.md §5.2, from the projections. JSON `VoteWeight` or None.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_read_vote_weight(
         &self,
@@ -22666,167 +22472,79 @@ impl PyEngine {
         subject: &str,
     ) -> PyResult<Option<String>> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let contributor_id = contributor_id.to_owned();
-            let domain = domain.to_owned();
-            let language = language.to_owned();
-            let subject = subject.to_owned();
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let opt = backend
-                            .read_vote_weight(&contributor_id, &domain, &language, &subject)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        match opt {
-                            None => Ok(None),
-                            Some(w) => Ok(Some(serde_json::to_string(&w).map_err(|e| {
-                                PyRuntimeError::new_err(format!("VoteWeight encode: {e}"))
-                            })?)),
-                        }
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let opt = backend
-                            .read_vote_weight(&contributor_id, &domain, &language, &subject)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        match opt {
-                            None => Ok(None),
-                            Some(w) => Ok(Some(serde_json::to_string(&w).map_err(|e| {
-                                PyRuntimeError::new_err(format!("VoteWeight encode: {e}"))
-                            })?)),
-                        }
-                    })
-                }
-            })
-        })
+        let k = (
+            contributor_id.to_owned(),
+            domain.to_owned(),
+            language.to_owned(),
+            subject.to_owned(),
+        );
+        let out = self.cirisnode_store_call(py, move |engine| async move {
+            dispatch_node_core!(engine, b => b.read_vote_weight(&k.0, &k.1, &k.2, &k.3).await)
+        })?;
+        Ok((out != "null").then_some(out))
     }
 
-    /// v0.7.0 — Page through `cirisnode.contributions`. Returns JSON
-    /// `ContributionListPage` (items + optional next_cursor).
+    /// v60.0.0 — `author_id`'s Contribution rows, newest first. `filter_json`
+    /// is an optional [`ContributionsFilter`](crate::cirisnode::ContributionsFilter)
+    /// (`contribution_type`, `subject_kind`, `domain`, `language`);
+    /// `cursor_json` the previous page's `next_cursor`. Returns JSON
+    /// `{"items": [Attestation…], "next_cursor": …}`.
     #[cfg(feature = "cirisnode")]
+    #[pyo3(signature = (author_id, filter_json=None, cursor_json=None, limit=100))]
     fn cirisnode_list_contributions(
         &self,
         py: Python<'_>,
-        filter_json: &str,
+        author_id: &str,
+        filter_json: Option<&str>,
         cursor_json: Option<&str>,
-        limit: i64,
+        limit: u32,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let filter: crate::cirisnode::ContributionsFilter = serde_json::from_str(filter_json)
-                .map_err(|e| {
-                PyValueError::new_err(format!("ContributionsFilter decode: {e}"))
-            })?;
-            let cursor: Option<crate::cirisnode::ListCursor> = match cursor_json {
-                None => None,
-                Some(s) => Some(
-                    serde_json::from_str(s)
-                        .map_err(|e| PyValueError::new_err(format!("ListCursor decode: {e}")))?,
-                ),
-            };
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let page = backend
-                            .list_contributions(filter, cursor, limit)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&page).map_err(|e| {
-                            PyRuntimeError::new_err(format!("ContributionListPage encode: {e}"))
-                        })
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let page = backend
-                            .list_contributions(filter, cursor, limit)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&page).map_err(|e| {
-                            PyRuntimeError::new_err(format!("ContributionListPage encode: {e}"))
-                        })
-                    })
-                }
-            })
+        let filter: crate::cirisnode::ContributionsFilter = match filter_json {
+            None => Default::default(),
+            Some(f) => crate::cirisnode::rows::decode_input(f, "contributions filter")
+                .map_err(cirisnode_row_err_to_py)?,
+        };
+        let cursor = cirisnode_cursor(cursor_json)?;
+        let author_id = author_id.to_owned();
+        self.cirisnode_call(py, move |engine| async move {
+            let dir = engine.federation_directory();
+            crate::cirisnode::rows::list_contributions(
+                dir.as_ref(),
+                &author_id,
+                &filter,
+                cursor,
+                limit,
+            )
+            .await
         })
     }
 
-    /// v0.7.0 — Page through `cirisnode.votes`. Returns JSON
-    /// `VoteListPage`.
+    /// v60.0.0 — the votes on a held Contribution row (`vote:{contribution_id}`),
+    /// newest first, optionally only `voter_id`'s. Returns JSON
+    /// `{"items": [Attestation…], "next_cursor": …}`.
     #[cfg(feature = "cirisnode")]
+    #[pyo3(signature = (contribution_id, voter_id=None, cursor_json=None, limit=100))]
     fn cirisnode_list_votes(
         &self,
         py: Python<'_>,
-        filter_json: &str,
+        contribution_id: &str,
+        voter_id: Option<&str>,
         cursor_json: Option<&str>,
-        limit: i64,
+        limit: u32,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let filter: crate::cirisnode::VotesFilter = serde_json::from_str(filter_json)
-                .map_err(|e| PyValueError::new_err(format!("VotesFilter decode: {e}")))?;
-            let cursor: Option<crate::cirisnode::ListCursor> = match cursor_json {
-                None => None,
-                Some(s) => Some(
-                    serde_json::from_str(s)
-                        .map_err(|e| PyValueError::new_err(format!("ListCursor decode: {e}")))?,
-                ),
-            };
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let page = backend
-                            .list_votes(filter, cursor, limit)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&page).map_err(|e| {
-                            PyRuntimeError::new_err(format!("VoteListPage encode: {e}"))
-                        })
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let page = backend
-                            .list_votes(filter, cursor, limit)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&page).map_err(|e| {
-                            PyRuntimeError::new_err(format!("VoteListPage encode: {e}"))
-                        })
-                    })
-                }
-            })
+        let cursor = cirisnode_cursor(cursor_json)?;
+        let (cid, voter) = (contribution_id.to_owned(), voter_id.map(str::to_owned));
+        self.cirisnode_call(py, move |engine| async move {
+            let dir = engine.federation_directory();
+            crate::cirisnode::rows::list_votes(dir.as_ref(), &cid, voter.as_deref(), cursor, limit)
+                .await
         })
     }
 
-    /// v0.7.0 — Point-lookup one Credits ledger row.
+    /// v0.7.0 — Point-lookup one credits-ledger row (the projection). JSON
+    /// `CreditsLedgerEntry` or None.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_get_credits_ledger(
         &self,
@@ -22837,53 +22555,20 @@ impl PyEngine {
         subject: &str,
     ) -> PyResult<Option<String>> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let contributor_id = contributor_id.to_owned();
-            let domain = domain.to_owned();
-            let language = language.to_owned();
-            let subject = subject.to_owned();
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let opt = backend
-                            .get_credits_ledger(&contributor_id, &domain, &language, &subject)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        match opt {
-                            None => Ok(None),
-                            Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
-                                PyRuntimeError::new_err(format!("CreditsLedgerEntry encode: {e}"))
-                            })?)),
-                        }
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let opt = backend
-                            .get_credits_ledger(&contributor_id, &domain, &language, &subject)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        match opt {
-                            None => Ok(None),
-                            Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
-                                PyRuntimeError::new_err(format!("CreditsLedgerEntry encode: {e}"))
-                            })?)),
-                        }
-                    })
-                }
-            })
-        })
+        let k = (
+            contributor_id.to_owned(),
+            domain.to_owned(),
+            language.to_owned(),
+            subject.to_owned(),
+        );
+        let out = self.cirisnode_store_call(py, move |engine| async move {
+            dispatch_node_core!(engine, b => b.get_credits_ledger(&k.0, &k.1, &k.2, &k.3).await)
+        })?;
+        Ok((out != "null").then_some(out))
     }
 
-    /// v0.7.0 — Point-lookup one Expertise ledger row.
+    /// v0.7.0 — Point-lookup one expertise-ledger row (the projection). JSON
+    /// `ExpertiseLedgerEntry` or None.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_get_expertise_ledger(
         &self,
@@ -22893,63 +22578,64 @@ impl PyEngine {
         language: &str,
     ) -> PyResult<Option<String>> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let contributor_id = contributor_id.to_owned();
-            let domain = domain.to_owned();
-            let language = language.to_owned();
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let opt = backend
-                            .get_expertise_ledger(&contributor_id, &domain, &language)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        match opt {
-                            None => Ok(None),
-                            Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
-                                PyRuntimeError::new_err(format!("ExpertiseLedgerEntry encode: {e}"))
-                            })?)),
-                        }
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let opt = backend
-                            .get_expertise_ledger(&contributor_id, &domain, &language)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        match opt {
-                            None => Ok(None),
-                            Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
-                                PyRuntimeError::new_err(format!("ExpertiseLedgerEntry encode: {e}"))
-                            })?)),
-                        }
-                    })
-                }
-            })
+        let k = (
+            contributor_id.to_owned(),
+            domain.to_owned(),
+            language.to_owned(),
+        );
+        let out = self.cirisnode_store_call(py, move |engine| async move {
+            dispatch_node_core!(engine, b => b.get_expertise_ledger(&k.0, &k.1, &k.2).await)
+        })?;
+        Ok((out != "null").then_some(out))
+    }
+
+    /// v60.0.0 — re-emit every pre-V203 ledger balance as this node's row
+    /// (the rehome). Returns how many moved.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_rehome_ledgers(&self, py: Python<'_>) -> PyResult<usize> {
+        self.ensure_usable()?;
+        let out = self.cirisnode_call(py, move |engine| async move {
+            engine.cirisnode_rehome_ledgers().await
+        })?;
+        out.parse::<usize>()
+            .map_err(|e| PyRuntimeError::new_err(format!("rehome count: {e}")))
+    }
+
+    /// v60.0.0 — the ledger projection's from-rows rebuild check:
+    /// `projection` is `credits_ledger` or `expertise_ledger`. Returns JSON
+    /// `{"live": n, "rebuilt": n}` when byte-equal; raises naming the first
+    /// row that differs (CLM-silo-projection-rebuildable).
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_check_ledger_projection(
+        &self,
+        py: Python<'_>,
+        projection: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        use crate::federation::silo_projection::SiloProjection;
+        let p = match projection {
+            "credits_ledger" => SiloProjection::CreditsLedger,
+            "expertise_ledger" => SiloProjection::ExpertiseLedger,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "projection {other:?} is not credits_ledger / expertise_ledger"
+                )))
+            }
+        };
+        self.purge_engine_call(py, move |engine| async move {
+            let r = engine.check_silo_projection(p).await?;
+            Ok(serde_json::json!({"live": r.live.len(), "rebuilt": r.rebuilt.len()}))
         })
     }
 
-    // ── v2.1 (CIRISPersist#101) — Federation Delivery Attestation
-    //    PyO3 surface. Three methods mirroring the NodeCoreService
-    //    additions for the FSD §3.2.1 ratified wire shape.
-    //    JSON-in / JSON-out, dispatching across Postgres + SQLite
-    //    via the same translate_error_kind taxonomy the other
-    //    cirisnode methods use.
+    // ── v2.1 (CIRISPersist#101) — Federation Delivery Attestation surface ──
 
     /// v2.1 (CIRISPersist#101) — Verify-and-insert a
     /// [`DeliveryAttestation`](crate::cirisnode::DeliveryAttestation).
-    /// Idempotent on `(announcement_id, peer_key_id)`. Hybrid
-    /// signature verified against `federation_keys[peer_key_id]`
-    /// before INSERT.
+    /// Idempotent on `(announcement_id, peer_key_id)`; hybrid signature
+    /// verified against `federation_keys[peer_key_id]` (Strict). v60.0.0 —
+    /// `announcement_id` names a held `contribution:federation_announcement`
+    /// row.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_delivery_attestation(
         &self,
@@ -22957,41 +22643,16 @@ impl PyEngine {
         attestation_json: &str,
     ) -> PyResult<()> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let att: crate::cirisnode::DeliveryAttestation = serde_json::from_str(attestation_json)
-                .map_err(|e| PyValueError::new_err(format!("DeliveryAttestation decode: {e}")))?;
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .put_delivery_attestation(att)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .put_delivery_attestation(att)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-            })
+        let att: crate::cirisnode::DeliveryAttestation = serde_json::from_str(attestation_json)
+            .map_err(|e| PyValueError::new_err(format!("DeliveryAttestation decode: {e}")))?;
+        self.cirisnode_store_call(py, move |engine| async move {
+            dispatch_node_core!(engine, b => b.put_delivery_attestation(att).await)
         })
+        .map(|_| ())
     }
 
-    /// v2.1 (CIRISPersist#101) — List all delivery attestations for
-    /// a federation_announcement, newest-first. Returns a JSON array
-    /// of [`DeliveryAttestation`](crate::cirisnode::DeliveryAttestation).
+    /// v2.1 (CIRISPersist#101) — List all delivery attestations for an
+    /// announcement, newest first. JSON array of `DeliveryAttestation`.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_list_delivery_attestations(
         &self,
@@ -22999,45 +22660,14 @@ impl PyEngine {
         announcement_id: &str,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let announcement_id = announcement_id.to_owned();
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let rows = backend
-                            .list_delivery_attestations(&announcement_id)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&rows).map_err(|e| {
-                            PyRuntimeError::new_err(format!("DeliveryAttestation list encode: {e}"))
-                        })
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let rows = backend
-                            .list_delivery_attestations(&announcement_id)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&rows).map_err(|e| {
-                            PyRuntimeError::new_err(format!("DeliveryAttestation list encode: {e}"))
-                        })
-                    })
-                }
-            })
+        let id = announcement_id.to_owned();
+        self.cirisnode_store_call(py, move |engine| async move {
+            dispatch_node_core!(engine, b => b.list_delivery_attestations(&id).await)
         })
     }
 
-    /// v2.1 (CIRISPersist#101) — Count delivery attestations for a
-    /// federation_announcement.
+    /// v2.1 (CIRISPersist#101) — Count delivery attestations for an
+    /// announcement.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_count_delivery_attestations(
         &self,
@@ -23045,94 +22675,20 @@ impl PyEngine {
         announcement_id: &str,
     ) -> PyResult<u64> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let announcement_id = announcement_id.to_owned();
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .count_delivery_attestations(&announcement_id)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .count_delivery_attestations(&announcement_id)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-            })
-        })
+        let id = announcement_id.to_owned();
+        let out = self.cirisnode_store_call(py, move |engine| async move {
+            dispatch_node_core!(engine, b => b.count_delivery_attestations(&id).await)
+        })?;
+        out.parse::<u64>()
+            .map_err(|e| PyRuntimeError::new_err(format!("count: {e}")))
     }
 
-    // ── v3.6.0 (CIRISPersist#134) — media-sharing reads ───────────────
-
-    /// List takedown_notice Contributions for `content_sha256`. JSON
-    /// array of [`ContributionEnvelope`](crate::cirisnode::ContributionEnvelope).
-    #[cfg(feature = "cirisnode")]
-    fn cirisnode_list_takedowns_for_json(
-        &self,
-        py: Python<'_>,
-        content_sha256: &str,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let sha = content_sha256.to_owned();
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let rows = backend
-                            .list_takedowns_for(&sha)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&rows)
-                            .map_err(|e| PyRuntimeError::new_err(format!("takedowns encode: {e}")))
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let rows = backend
-                            .list_takedowns_for(&sha)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&rows)
-                            .map_err(|e| PyRuntimeError::new_err(format!("takedowns encode: {e}")))
-                    })
-                }
-            })
-        })
-    }
-
-    /// v6.3.0 (CIRISPersist#135, Lane C) — takedowns against
-    /// `target_content_sha256`, cursor-paged + filtered. JSON-encoded
-    /// [`TakedownListPage`](crate::cirisnode::TakedownListPage).
-    ///
-    /// `filter_json` decodes to [`TakedownFilter`](crate::cirisnode::TakedownFilter)
-    /// (claimant secondary key + `[since, until)` window; `None` = empty
-    /// filter). `cursor_json` decodes to [`ListCursor`](crate::cirisnode::ListCursor)
-    /// (`None` = first page). Python sibling of
-    /// [`Engine::list_takedowns_for`](crate::Engine::list_takedowns_for)
-    /// — the cursor-paged superset of `cirisnode_list_takedowns_for_json`
-    /// for CIRISLensCore#29.4's takedown-abuse detector.
+    /// v6.3.0 (CIRISPersist#135) → v60.0.0 — takedown notice rows over
+    /// `target_content_sha256`, newest first. `filter_json` MUST name
+    /// `claimant_key_id` (rows are read by key) and may bound the signed
+    /// instant with `since` / `until` (`[since, until)`); `cursor_json` is
+    /// the previous page's `next_cursor`. Returns JSON
+    /// `{"items": [Attestation…], "next_cursor": …}`.
     #[cfg(feature = "cirisnode")]
     #[pyo3(signature = (target_content_sha256, filter_json=None, cursor_json=None, limit=100))]
     fn cirisnode_list_takedowns_for_filtered_json(
@@ -23141,519 +22697,64 @@ impl PyEngine {
         target_content_sha256: &str,
         filter_json: Option<&str>,
         cursor_json: Option<&str>,
-        limit: i64,
+        limit: u32,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let target = target_content_sha256.to_owned();
-            let filter: crate::cirisnode::TakedownFilter = match filter_json {
-                None => Default::default(),
-                Some(s) => serde_json::from_str(s).map_err(|e| {
-                    PyValueError::new_err(format!("TakedownFilter JSON decode: {e}"))
-                })?,
-            };
-            let cursor: Option<crate::cirisnode::ListCursor> =
-                match cursor_json {
-                    None => None,
-                    Some(s) => Some(serde_json::from_str(s).map_err(|e| {
-                        PyValueError::new_err(format!("ListCursor JSON decode: {e}"))
-                    })?),
-                };
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::cirisnode::NodeCoreService;
-                    crate::engine::media_validate_limit(limit)
-                        .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                    let rows = match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => pg.list_takedowns_for(&target).await,
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => {
-                            crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle())
-                                .list_takedowns_for(&target)
-                                .await
-                        }
-                    }
-                    .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                    let claimant = filter.claimant_key_id.as_deref();
-                    let kept = rows.into_iter().filter(|env| {
-                        if let Some(c) = claimant {
-                            if env.payload.get("claimant_key_id").and_then(|v| v.as_str())
-                                != Some(c)
-                            {
-                                return false;
-                            }
-                        }
-                        crate::engine::media_in_window(env.submitted_at, filter.since, filter.until)
-                    });
-                    let (items, next_cursor) =
-                        crate::engine::media_apply_cursor(kept, cursor, limit)
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                    let page = crate::cirisnode::TakedownListPage { items, next_cursor };
-                    serde_json::to_string(&page).map_err(|e| {
-                        PyRuntimeError::new_err(format!("TakedownListPage encode: {e}"))
-                    })
-                })
-            })
+        #[derive(serde::Deserialize, Default)]
+        #[serde(deny_unknown_fields)]
+        struct TakedownFilter {
+            #[serde(default)]
+            claimant_key_id: Option<String>,
+            #[serde(default)]
+            since: Option<chrono::DateTime<chrono::Utc>>,
+            #[serde(default)]
+            until: Option<chrono::DateTime<chrono::Utc>>,
+        }
+        let filter: TakedownFilter = match filter_json {
+            None => TakedownFilter::default(),
+            Some(f) => serde_json::from_str(f)
+                .map_err(|e| PyValueError::new_err(format!("takedown filter: {e}")))?,
+        };
+        let claimant = filter.claimant_key_id.ok_or_else(|| {
+            PyValueError::new_err(
+                "a takedown list names its claimant_key_id (v60.0.0: notices are rows, read by \
+                 their signer)",
+            )
+        })?;
+        let cursor = cirisnode_cursor(cursor_json)?;
+        let sha = target_content_sha256.to_owned();
+        let (since, until) = (filter.since, filter.until);
+        self.cirisnode_call(py, move |engine| async move {
+            let dir = engine.federation_directory();
+            crate::cirisnode::rows::list_takedowns(
+                dir.as_ref(),
+                &claimant,
+                Some(&sha),
+                since,
+                until,
+                cursor,
+                limit,
+            )
+            .await
         })
     }
 
-    /// v6.3.0 (CIRISPersist#135, Lane C) — key-grants to
-    /// `recipient_key_id`, cursor-paged + filtered. JSON-encoded
-    /// [`KeyGrantListPage`](crate::cirisnode::KeyGrantListPage).
-    ///
-    /// `filter_json` decodes to [`KeyGrantFilter`](crate::cirisnode::KeyGrantFilter)
-    /// (publisher secondary key + optional `content_sha256` scope +
-    /// `[since, until)` window). Python sibling of
-    /// [`Engine::list_key_grants_for`](crate::Engine::list_key_grants_for)
-    /// — the cursor-paged superset of `cirisnode_list_key_grants_for_json`
-    /// for CIRISLensCore#29.3's key_grant-abuse detector.
-    #[cfg(feature = "cirisnode")]
-    #[pyo3(signature = (recipient_key_id, filter_json=None, cursor_json=None, limit=100))]
-    fn cirisnode_list_key_grants_for_filtered_json(
-        &self,
-        py: Python<'_>,
-        recipient_key_id: &str,
-        filter_json: Option<&str>,
-        cursor_json: Option<&str>,
-        limit: i64,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let recipient = recipient_key_id.to_owned();
-            let filter: crate::cirisnode::KeyGrantFilter = match filter_json {
-                None => Default::default(),
-                Some(s) => serde_json::from_str(s).map_err(|e| {
-                    PyValueError::new_err(format!("KeyGrantFilter JSON decode: {e}"))
-                })?,
-            };
-            let cursor: Option<crate::cirisnode::ListCursor> =
-                match cursor_json {
-                    None => None,
-                    Some(s) => Some(serde_json::from_str(s).map_err(|e| {
-                        PyValueError::new_err(format!("ListCursor JSON decode: {e}"))
-                    })?),
-                };
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::cirisnode::NodeCoreService;
-                    crate::engine::media_validate_limit(limit)
-                        .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                    let content = filter.content_sha256.as_deref();
-                    let rows = match (&self.backend, content) {
-                        #[cfg(feature = "postgres")]
-                        (BackendDispatch::Postgres(pg), Some(sha)) => {
-                            pg.list_key_grants_for_content(sha, &recipient).await
-                        }
-                        #[cfg(feature = "postgres")]
-                        (BackendDispatch::Postgres(pg), None) => {
-                            pg.list_key_grants_for(&recipient).await
-                        }
-                        #[cfg(feature = "sqlite")]
-                        (BackendDispatch::Sqlite(sq), Some(sha)) => {
-                            crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle())
-                                .list_key_grants_for_content(sha, &recipient)
-                                .await
-                        }
-                        #[cfg(feature = "sqlite")]
-                        (BackendDispatch::Sqlite(sq), None) => {
-                            crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle())
-                                .list_key_grants_for(&recipient)
-                                .await
-                        }
-                    }
-                    .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                    let publisher = filter.publisher_key_id.as_deref();
-                    let kept = rows.into_iter().filter(|env| {
-                        if let Some(p) = publisher {
-                            if env.author_id != p {
-                                return false;
-                            }
-                        }
-                        crate::engine::media_in_window(env.submitted_at, filter.since, filter.until)
-                    });
-                    let (items, next_cursor) =
-                        crate::engine::media_apply_cursor(kept, cursor, limit)
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                    let page = crate::cirisnode::KeyGrantListPage { items, next_cursor };
-                    serde_json::to_string(&page).map_err(|e| {
-                        PyRuntimeError::new_err(format!("KeyGrantListPage encode: {e}"))
-                    })
-                })
-            })
-        })
-    }
-
-    /// List key_grant Contributions for `recipient_key_id`. JSON
-    /// array of [`ContributionEnvelope`](crate::cirisnode::ContributionEnvelope).
-    #[cfg(feature = "cirisnode")]
-    fn cirisnode_list_key_grants_for_json(
-        &self,
-        py: Python<'_>,
-        recipient_key_id: &str,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let recipient = recipient_key_id.to_owned();
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let rows = backend
-                            .list_key_grants_for(&recipient)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&rows)
-                            .map_err(|e| PyRuntimeError::new_err(format!("key_grants encode: {e}")))
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let rows = backend
-                            .list_key_grants_for(&recipient)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&rows)
-                            .map_err(|e| PyRuntimeError::new_err(format!("key_grants encode: {e}")))
-                    })
-                }
-            })
-        })
-    }
-
-    /// List key_grant Contributions matching BOTH `content_sha256` AND
-    /// `recipient_key_id`. JSON array of
-    /// [`ContributionEnvelope`](crate::cirisnode::ContributionEnvelope).
-    #[cfg(feature = "cirisnode")]
-    fn cirisnode_list_key_grants_for_content_json(
-        &self,
-        py: Python<'_>,
-        content_sha256: &str,
-        recipient_key_id: &str,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let sha = content_sha256.to_owned();
-            let recipient = recipient_key_id.to_owned();
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let rows = backend
-                            .list_key_grants_for_content(&sha, &recipient)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&rows)
-                            .map_err(|e| PyRuntimeError::new_err(format!("key_grants encode: {e}")))
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let rows = backend
-                            .list_key_grants_for_content(&sha, &recipient)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&rows)
-                            .map_err(|e| PyRuntimeError::new_err(format!("key_grants encode: {e}")))
-                    })
-                }
-            })
-        })
-    }
-
-    /// v4.x (CIRISPersist#142 Cut C3b, CEG §10.5.3) → v34.0.0
-    /// (CIRISPersist#704, CIRISEdge#492) — list every
-    /// **scope-epoch-addressed** `key_grant` Contribution for
-    /// `(scope_kind, scope_id, epoch)`, newest-first. JSON array of
-    /// [`ContributionEnvelope`](crate::cirisnode::ContributionEnvelope).
-    /// The consumer (LensCore) applies its own P4 catch-up depth cap.
-    ///
-    /// `scope_kind` is a
-    /// [`KeyGrantScope::as_str`](crate::cirisnode::KeyGrantScope::as_str)
-    /// token — the same string the write path projects onto
-    /// `key_grant_scope_kind`:
-    ///
-    ///   - `"stream_epoch"` — the streaming epoch-DEK cascade;
-    ///     `scope_id` is the `federation_streams` stream id.
-    ///   - `"transit_membership"` — the IFAC transit passphrase
-    ///     (CIRISEdge#492); `scope_id` is the IFAC `netname`.
-    ///
-    /// **Replaces `cirisnode_list_key_grants_for_stream_epoch_json`,
-    /// with no alias.** That method pinned `scope_kind` to
-    /// `StreamEpoch` at both backend arms, so the ONLY Python entry
-    /// point for epoch-addressed grants could not reach a
-    /// transit-membership grant at all — this cut's headline feature was
-    /// code-path-exists / no-host-can-call-it. A `#[deprecated]` shim
-    /// forwarding to the streaming half would have kept exactly that:
-    /// a caller asking for transit grants would get `[]` and read it as
-    /// "none issued". Removing the name gives a Python caller an
-    /// immediate `AttributeError` that says which method is gone.
-    ///
-    /// # `scope_kind` is REFUSED, not silently queried
-    ///
-    /// An unknown token, or a known-but-not-epoch-addressed one
-    /// (`single_content`, `group_member`, `subscription_tier`), raises
-    /// `ValueError`. `key_grant_scope_kind` is projected ONLY for
-    /// epoch-addressed grants, so such a query matches no row *by
-    /// construction* and returns `[]` — indistinguishable from "no
-    /// grants issued for this scope". A read whose empty result cannot
-    /// be told from a typo is a fail-open on key delivery: the caller
-    /// concludes it has no key material and moves on. The accepted
-    /// tokens are named in the error, derived from
-    /// [`KeyGrantScope::epoch_addressed_tokens`](crate::cirisnode::KeyGrantScope::epoch_addressed_tokens).
-    #[cfg(feature = "cirisnode")]
-    fn cirisnode_list_key_grants_for_scope_epoch_json(
-        &self,
-        py: Python<'_>,
-        scope_kind: &str,
-        scope_id: &str,
-        epoch: u64,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            // Refuse BEFORE any backend work: the token is validated against
-            // the enum's own vocabulary, never re-spelled here.
-            let kind =
-                crate::cirisnode::KeyGrantScope::from_wire_str(scope_kind).ok_or_else(|| {
-                    PyValueError::new_err(format!(
-                        "scope_kind {scope_kind:?} is not a key_grant scope; an \
-                         epoch-addressed read accepts: {}",
-                        crate::cirisnode::KeyGrantScope::epoch_addressed_tokens()
-                    ))
-                })?;
-            if !kind.is_epoch_addressed() {
-                return Err(PyValueError::new_err(format!(
-                    "scope_kind {:?} is not epoch-addressed — no grant is ever stored \
-                     under it in the (scope_kind, scope_id, epoch) index, so this read \
-                     could only ever return []; accepts: {}",
-                    kind.as_str(),
-                    crate::cirisnode::KeyGrantScope::epoch_addressed_tokens()
-                )));
-            }
-            let kind = kind.as_str();
-            let scope = scope_id.to_owned();
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let rows = backend
-                            .list_key_grants_for_scope_epoch(kind, &scope, epoch)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&rows)
-                            .map_err(|e| PyRuntimeError::new_err(format!("key_grants encode: {e}")))
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let rows = backend
-                            .list_key_grants_for_scope_epoch(kind, &scope, epoch)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&rows)
-                            .map_err(|e| PyRuntimeError::new_err(format!("key_grants encode: {e}")))
-                    })
-                }
-            })
-        })
-    }
-
-    /// v16 (CIRISPersist#432, CC 5.1 `CLM-epoch-keying`) — the
-    /// dedicated `key_grant` WRITER; the emission half of
-    /// [`cirisnode_list_key_grants_for_scope_epoch_json`](Self::cirisnode_list_key_grants_for_scope_epoch_json)
-    /// (and of the content-addressed grant readers).
-    ///
-    /// `envelope_json` is a full signed
-    /// [`ContributionEnvelope`](crate::cirisnode::ContributionEnvelope)
-    /// whose `contribution_type` is `proposal`, `subject.subject`
-    /// (subject_kind) is `key_grant`, and whose payload is a
-    /// [`KeyGrantPayload`](crate::cirisnode::KeyGrantPayload) in
-    /// exactly ONE addressing mode — scope-epoch-addressed
-    /// (v34.0.0/#704: `epoch` + `scope_id`, and an epoch-addressed
-    /// `scope` — `stream_epoch` or `transit_membership`) or
-    /// content-addressed (`content_sha256`).
-    /// The v33 wire keys `stream_id` / `stream_epoch` are REFUSED by
-    /// name, with the field that replaces each, rather than silently
-    /// dropped.
-    /// Anything else is rejected fail-closed BEFORE any admission
-    /// state is touched; a well-shaped grant then runs the full
-    /// `put_contribution` discipline (trust gate + hybrid signature
-    /// verification + V054/V064 column projection).
-    ///
-    /// Conflict semantics: the row PK is `contribution_id` — a
-    /// duplicate raises `Conflict`; re-granting the same
-    /// `(scope_id, epoch, recipient_key_id)` under a fresh
-    /// `contribution_id` appends (reads are newest-first; supersession
-    /// rides `rotation_chain` / retire, never row mutation).
-    #[cfg(feature = "cirisnode")]
-    fn cirisnode_put_key_grant_json(&self, py: Python<'_>, envelope_json: &str) -> PyResult<()> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let env: crate::cirisnode::ContributionEnvelope = serde_json::from_str(envelope_json)
-                .map_err(|e| {
-                PyValueError::new_err(format!("ContributionEnvelope decode: {e}"))
-            })?;
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .put_key_grant(env)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        backend
-                            .put_key_grant(env)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
-                    })
-                }
-            })
-        })
-    }
-
-    /// Retire prior key_grants issued by actor_key_id. Returns
-    /// outcome-tagged JSON; "partial" = grants in `failed` are STILL LIVE
-    /// and does NOT raise — branch on `outcome`, never on the non-raise.
-    ///
-    /// v3.6.0 (CIRISPersist#134) — emits a supersession `key_grant`
-    /// Contribution against every prior `key_grant` Contribution issued by
-    /// `actor_key_id`, using the engine's composed signer; the supersession
-    /// Contributions carry the prior contribution_ids in `rotation_chain`
-    /// per CEG 0.3 §5.6.8.4 (option b).
-    ///
-    /// Returns a JSON-encoded [`RetireKeyGrantsOutcome`](crate::cirisnode::RetireKeyGrantsOutcome),
-    /// tagged on `outcome` — v36.0.0 (#711), replacing the flat
-    /// `{grants_seen, supersedes_emitted, supersedes_failed}` report whose
-    /// failure count was skippable:
-    /// `{"outcome": "complete", "retired": u}` — every prior grant was
-    /// superseded — or `{"outcome": "partial", "retired": u, "failed":
-    /// [{"contribution_id": s, "stage": "prior_payload_decode" |
-    /// "supersession_emission", "error": s}, ...]}`. **`"partial"` means the
-    /// named grants are STILL LIVE** (on a transit grant: the IFAC passphrase
-    /// is NOT revoked); the call raises only for failures BEFORE the batch
-    /// (bad `now_iso`, listing query), so the caller MUST branch on
-    /// `outcome` and never treat a non-raise as retirement.
-    #[cfg(feature = "cirisnode")]
-    fn cirisnode_retire_key_grants_json(
-        &self,
-        py: Python<'_>,
-        actor_key_id: &str,
-        now_iso: &str,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let actor = actor_key_id.to_owned();
-            let now = chrono::DateTime::parse_from_rfc3339(now_iso)
-                .map_err(|e| {
-                    PyValueError::new_err(format!("retire_key_grants now_iso parse: {e}"))
-                })?
-                .with_timezone(&chrono::Utc);
-            // v3.6.8 (CIRISPersist#138) — local-signer fast-path. The
-            // actor_key_id IS the signing key for the supersedes
-            // emission; match it against the local alias.
-            let signer = self.select_signer(&actor);
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let outcome = backend
-                            .retire_key_grants(&actor, &*signer, now)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&outcome).map_err(|e| {
-                            PyRuntimeError::new_err(format!("retire_key_grants encode: {e}"))
-                        })
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend =
-                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
-                    runtime.block_on(async move {
-                        use crate::cirisnode::NodeCoreService;
-                        let outcome = backend
-                            .retire_key_grants(&actor, &*signer, now)
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serde_json::to_string(&outcome).map_err(|e| {
-                            PyRuntimeError::new_err(format!("retire_key_grants encode: {e}"))
-                        })
-                    })
-                }
-            })
-        })
-    }
-
-    /// v55.0.0 (CIRISPersist#1007; CC 4.5.3 step 2, CC 4.5.5) — **execute a
-    /// takedown on the bytes plane.** `contribution_json` is the signed
-    /// `takedown_notice` Contribution (the `ContributionEnvelope` JSON
-    /// `cirisnode_put_contribution` admitted). Its signature is re-verified and
-    /// CC 4.5.5 re-asked of this node's state, then ONE tombstone,
-    /// `blob:{content_sha256}`, is recorded on the steward purge's tombstone
-    /// row: the bytes are withheld at once and the tombstone replicates as a
-    /// purge bundle. An immediate-removal basis destroys this node's bytes on
-    /// receipt; a counter-notice basis retracts this node's own holding claim
-    /// and the hard delete waits for `purge_finalize_json` after the window;
-    /// the age-gate basis records nothing. No other device's claim is
-    /// withdrawn.
-    ///
-    /// Returns JSON `{"notice_id", "content_sha256", "legal_basis",
-    /// "disposition": {"kind": "destroy_on_receipt" | "withhold_then_delete"
-    /// (+ "window_days") | "age_gate"}, "signer", "tombstoned",
-    /// "settles_at" (RFC 3339 or null), "claims_retracted",
-    /// "bytes_destroyed"}`. A refusal raises `ValueError(token, body_json)`
-    /// with token `takedown_unauthorised`.
+    /// v55.0.0 (CIRISPersist#1007) → v60.0.0 — execute a takedown: the held
+    /// `takedown_notice:{basis}:v1` row `notice_attestation_id` through the
+    /// tombstone door. Returns JSON `{"notice_id", "content_sha256",
+    /// "legal_basis", "disposition", "signer", "tombstoned", "settles_at",
+    /// "claims_retracted", "bytes_destroyed"}`. A refusal raises
+    /// `ValueError(token, body_json)` with token `takedown_unauthorised`.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_process_takedown_admission_json(
         &self,
         py: Python<'_>,
-        contribution_json: &str,
+        notice_attestation_id: &str,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let env: crate::cirisnode::ContributionEnvelope =
-            serde_json::from_str(contribution_json)
-                .map_err(|e| PyValueError::new_err(format!("takedown contribution_json: {e}")))?;
-        let notice = crate::cirisnode::takedown_notice_from_contribution(&env)
-            .map_err(federation_err_to_py)?;
+        let id = notice_attestation_id.to_owned();
         self.purge_engine_call(py, move |engine| async move {
-            engine.takedown_tombstone(&notice).await
+            engine.cirisnode_process_takedown_admission(&id).await
         })
     }
 
@@ -33780,6 +32881,10 @@ fn cirisnode_err_to_py(e: crate::cirisnode::Error) -> PyErr {
         crate::cirisnode::Error::Backend(_)
         | crate::cirisnode::Error::NotImplemented(_)
         | crate::cirisnode::Error::Internal(_) => PyRuntimeError::new_err(kind),
+        // v60.0.0 (CIRISPersist#988 item 1) — a retired object is the
+        // caller's to stop sending; a plane error raises as the plane raises.
+        crate::cirisnode::Error::Retired { .. } => PyValueError::new_err(kind),
+        crate::cirisnode::Error::Federation(f) => federation_err_to_py(*f),
     }
 }
 
@@ -34413,10 +33518,83 @@ fn purge_cursor_instant(since_iso: &str) -> PyResult<chrono::DateTime<chrono::Ut
         .map_err(|e| PyValueError::new_err(format!("purge since_iso parse: {e}")))
 }
 
+/// v60.0.0 — a cirisnode door's error as Python sees it: a plane refusal
+/// raises exactly as `put_attestation` raises it; the cirisnode track's own
+/// errors keep their `kind()` taxonomy (a retirement raises `Permanent`
+/// carrying its token).
+#[cfg(feature = "cirisnode")]
+fn cirisnode_row_err_to_py(e: crate::cirisnode::Error) -> PyErr {
+    match e {
+        crate::cirisnode::Error::Federation(f) => federation_err_to_py(*f),
+        other => translate_error_kind(other.kind(), other.to_string()),
+    }
+}
+
+/// v60.0.0 — a list cursor from Python (`None` = the first page).
+#[cfg(feature = "cirisnode")]
+fn cirisnode_cursor(
+    cursor_json: Option<&str>,
+) -> PyResult<Option<crate::ceg::list::federation::AttestationCursor>> {
+    cursor_json
+        .map(|s| {
+            serde_json::from_str(s)
+                .map_err(|e| PyValueError::new_err(format!("cursor decode: {e}")))
+        })
+        .transpose()
+}
+
 impl PyEngine {
     /// v54.1.0 (CIRISPersist#1046) — run one steward-purge door on an
     /// `Engine` composed over this handle's backend and signers (the
     /// cohabitation pattern), and JSON-encode its result.
+    /// v60.0.0 (CIRISPersist#988 item 1) — run one cirisnode row door on an
+    /// `Engine` composed over this handle's backend and signers, and encode
+    /// its result: a `String` (a row id) is returned as-is, anything else
+    /// as JSON.
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_call<T, F, Fut>(&self, py: Python<'_>, call: F) -> PyResult<String>
+    where
+        T: serde::Serialize + 'static,
+        F: FnOnce(crate::Engine) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<T, crate::cirisnode::Error>> + Send,
+    {
+        catch_panic(|| {
+            let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    let out = call(engine).await.map_err(cirisnode_row_err_to_py)?;
+                    let v = serde_json::to_value(&out)
+                        .map_err(|e| PyRuntimeError::new_err(format!("cirisnode encode: {e}")))?;
+                    Ok(match v {
+                        serde_json::Value::String(s) => s,
+                        other => other.to_string(),
+                    })
+                })
+            })
+        })
+    }
+
+    /// v60.0.0 — [`Self::cirisnode_call`] for the cirisnode track's own
+    /// storage (ledger reads, promotion records, delivery attestations).
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_store_call<T, F, Fut>(&self, py: Python<'_>, call: F) -> PyResult<String>
+    where
+        T: serde::Serialize + 'static,
+        F: FnOnce(crate::Engine) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<T, crate::cirisnode::Error>> + Send,
+    {
+        self.cirisnode_call(py, call)
+    }
+
     fn purge_engine_call<T, F, Fut>(&self, py: Python<'_>, call: F) -> PyResult<String>
     where
         T: serde::Serialize,

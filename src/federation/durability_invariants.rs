@@ -448,7 +448,7 @@ pub(crate) mod bodies {
         establish(d, "i801-producer", &complainant.id, &hex::encode(taken)).await;
         let t = crate::federation::takedown_tombstone::takedown_tombstone(
             d,
-            &notice(&complainant, &hex::encode(taken), "dmca_512"),
+            &notice(&complainant, &hex::encode(taken), "dmca512"),
             "i801-node",
         )
         .await

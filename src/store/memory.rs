@@ -385,6 +385,13 @@ struct State {
     /// whose row left (the SQL backends' `ON DELETE CASCADE`).
     federation_hard_case_events:
         HashMap<String, (String, crate::federation::hard_case::HardCaseEvent)>,
+    /// v60.0.0 (CIRISPersist#988 item 1) — the `credits_ledger` /
+    /// `expertise_ledger` projections of this node's ledger rows, keyed by
+    /// [`LedgerProjection::map_key`](crate::federation::ledger_projection::LedgerProjection::map_key).
+    /// Memory held no ledger before v60; the row door gives it one, so the
+    /// projection witness runs here too.
+    cirisnode_ledgers:
+        std::collections::BTreeMap<String, crate::federation::ledger_projection::LedgerProjection>,
     /// v57.0.0 (CIRISPersist#988 item 3, V195 mirror) — the
     /// `detection_events` projection of the `detection:{detector}:v1` rows,
     /// keyed by `detection_id`, each entry carrying its row's
@@ -1009,6 +1016,7 @@ impl Default for MemoryBackend {
                 transport_destination_sigs: HashMap::new(),
                 freshness_floor: HashMap::new(),
                 federation_hard_case_events: HashMap::new(),
+                cirisnode_ledgers: std::collections::BTreeMap::new(),
                 derived_detection_events: HashMap::new(),
                 fountain_manifests: HashMap::new(),
                 fountain_symbols: HashMap::new(),
@@ -3427,6 +3435,31 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
                     live, &rows,
                 ));
             }
+            SiloProjection::CreditsLedger | SiloProjection::ExpertiseLedger => {
+                use crate::federation::ledger_projection::{project_ledger_row, Ledger};
+                let want = if projection == SiloProjection::CreditsLedger {
+                    Ledger::Credits
+                } else {
+                    Ledger::Expertise
+                };
+                let live: Vec<String> = state
+                    .cirisnode_ledgers
+                    .values()
+                    .filter(|p| p.ledger() == want)
+                    .map(|p| p.render())
+                    .collect();
+                let node = crate::federation::FederationDirectory::node_key_id(self);
+                let mut rebuilt = std::collections::BTreeMap::new();
+                for row in &state.federation_attestations {
+                    if let Some(p) = project_ledger_row(row, node.as_deref()) {
+                        if p.ledger() == want {
+                            memory_project_ledger(&mut rebuilt, p);
+                        }
+                    }
+                }
+                let rebuilt = rebuilt.values().map(|p| p.render()).collect();
+                return Ok(crate::federation::silo_projection::ProjectionRebuild { live, rebuilt });
+            }
             SiloProjection::HardCaseEvents => {
                 let live = state
                     .federation_hard_case_events
@@ -3495,6 +3528,7 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
             projected_trace,
             projected_detection,
             projected_hard_case,
+            projected_ledger,
             wire_index_key,
             ..
         } = planned;
@@ -3593,6 +3627,11 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
                 state
                     .federation_hard_case_events
                     .insert(event.event_id.clone(), (row.attestation_id.clone(), event));
+            }
+            // v60.0.0 (CIRISPersist#988 item 1) — the ledger projection, when
+            // the row supersedes the one held on its key.
+            if let Some(ledger) = projected_ledger {
+                memory_project_ledger(&mut state.cirisnode_ledgers, ledger);
             }
             // v36.0.0 (#668) — serve position (V130 mirror).
             let admitted_at = next_plane_position(
@@ -10699,6 +10738,28 @@ fn prune_row_projections(state: &mut State) {
     state
         .derived_detection_events
         .retain(|_, (attestation_id, _)| held.contains(attestation_id));
+    state
+        .cirisnode_ledgers
+        .retain(|_, p| held.contains(&p.attestation_id));
+}
+
+/// v60.0.0 (CIRISPersist#988 item 1) — the ledger writer: replace the held
+/// entry on the projection's key when the projection supersedes it
+/// ([`supersedes`](crate::federation::ledger_projection::supersedes)).
+fn memory_project_ledger(
+    ledgers: &mut std::collections::BTreeMap<
+        String,
+        crate::federation::ledger_projection::LedgerProjection,
+    >,
+    ledger: crate::federation::ledger_projection::LedgerProjection,
+) {
+    let key = ledger.map_key();
+    let held = ledgers
+        .get(&key)
+        .map(|h| (Some(h.attestation_id.as_str()), h.asserted_at));
+    if crate::federation::ledger_projection::supersedes(held, &ledger) {
+        ledgers.insert(key, ledger);
+    }
 }
 
 /// Shared validation for `TrustGrant`. Same rules as the PG CHECK

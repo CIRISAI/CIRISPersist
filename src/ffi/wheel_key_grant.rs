@@ -25,7 +25,8 @@
 //! public key, which the v1 signature `(recipient_x25519_pub, dek)`
 //! cannot express — and the v2 pair has been on this wheel since Cut
 //! C3b. A stale caller gets an `AttributeError` naming the method, the
-//! same disposition v34 gave `cirisnode_list_key_grants_for_stream_epoch_json`.
+//! same disposition v34 gave `cirisnode_list_key_grants_for_stream_epoch_json` (and v60
+//! gave the whole `key_grant` Contribution surface).
 //! Anyone draining pre-v34 v1-wrapped material does it against
 //! `ciris-crypto`'s still-exported v1 primitives (`unwrap_dek`,
 //! `KEY_GRANT_ALGORITHM_V1`) or CIRISVerify's own wheel sidecar, which
@@ -259,48 +260,23 @@ mod tests {
     }
 
     /// v35.0.0 (#715) — the mint-refused-by-your-own-gate witness. The token
-    /// the wheel mints must be the token `extract_key_grant_payload` — the
-    /// REAL admission door every `put_key_grant` passes through — admits as
-    /// `wrap_algorithm`. Wired through the minted ENVELOPE, not through the
-    /// constant both sides import: a wheel that drifted to any other spelling
-    /// (the hyphenated rc2 legacy is refused BY NAME at that door) reds this
-    /// test even though its own round-trip stays green.
+    /// the wheel mints must be the token the key-grant plane's admission
+    /// door accepts (`key_grant::check_wrap_algorithm`, the ONE constant
+    /// `at_rest_cascade::WRAP_ALGORITHM_V2`). v60.0.0 (CIRISPersist#988
+    /// item 1): the `key_grant` Contribution door this used to round-trip is
+    /// retired; the plane is the one door for a wrapped key.
     #[test]
-    #[cfg(feature = "cirisnode")]
-    fn wheel_minted_algorithm_round_trips_the_admission_door() {
+    fn wheel_minted_algorithm_is_the_planes_admitted_algorithm() {
         let (wrap_json, ..) = v2_wrap_fixture();
         let envelope: serde_json::Value = serde_json::from_str(&wrap_json).unwrap();
         let minted_algorithm = envelope
             .get("algorithm")
             .and_then(|v| v.as_str())
-            .expect("wheel envelope names its algorithm")
-            .to_owned();
-
-        let sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let payload = serde_json::json!({
-            "recipient_key_id": "recipient-1",
-            "content_sha256": sha,
-            "wrapped_dek_base64": B64.encode([0u8; 48]),
-            "wrap_algorithm": minted_algorithm,
-            "ratchet_version": 1,
-            "key_validity_window": {
-                "not_before": "2026-05-29T00:00:00Z",
-                "not_after": "2027-05-29T00:00:00Z",
-            },
-            "scope": "single_content",
-            "scope_id": sha,
-            "rotation_chain": [],
-        });
-        let admitted = crate::cirisnode::extract_key_grant_payload(
-            crate::cirisnode::KEY_GRANT_SUBJECT_KIND,
-            &payload,
-        )
-        .expect("a grant naming the wheel-minted algorithm is admitted")
-        .expect("subject_kind key_grant decodes to a grant");
+            .expect("wheel envelope names its algorithm");
         assert_eq!(
-            admitted.wrap_algorithm.as_str(),
             minted_algorithm,
-            "the admitted wrap_algorithm is the one the wheel minted"
+            crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2,
+            "the wheel mints the wrap the key-grant plane admits"
         );
     }
 

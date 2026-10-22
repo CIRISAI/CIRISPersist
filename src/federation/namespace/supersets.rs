@@ -1765,7 +1765,11 @@ mod tests {
         // record-unpurgeable at the steward purge's per-row question); the
         // CLM-hard-case-on-base row at the retired hold moved to the
         // replicated apply door (a move, not a new row).
-        const EXPECTED: usize = 314;
+        // v60.0.0 slice S1: +4 (CIRISPersist#988 item 1, #803):
+        // CLM-takedown-notice-row at the notice row's admission, the door's
+        // row reader and the planner (3); CLM-silo-projection-rebuildable at
+        // the ledger projection (1).
+        const EXPECTED: usize = 318;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

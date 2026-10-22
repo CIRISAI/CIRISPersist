@@ -125,6 +125,11 @@ pub(crate) struct PlannedAttestation {
     /// row's transaction: a peer's replicated row is in this node's table as
     /// its rebuild has it, the detection precedent.
     pub(crate) projected_hard_case: Option<super::hard_case::HardCaseEvent>,
+    /// v60.0.0 (CIRISPersist#988 item 1) — the `credits_ledger` /
+    /// `expertise_ledger` row a ledger row signed by this node projects to,
+    /// written in the row's transaction when it supersedes the held one
+    /// ([`super::ledger_projection::supersedes`]).
+    pub(crate) projected_ledger: Option<super::ledger_projection::LedgerProjection>,
     /// The signed-wire-index locator (#507b), federation tier only; the hash
     /// comes from the stored row (#646).
     pub(crate) wire_index_key: Option<String>,
@@ -571,10 +576,8 @@ where
     // not only the local producer: a remote signer can hybrid-sign a row
     // carrying a malformed subject, and replication would store the same
     // unmatchable revocation authority the emit path refuses.
-    crate::federation::validate_subject_key_ids_at(
-        &row.subject_key_ids,
-        crate::federation::SubjectGate::Ingest,
-    )?;
+    // v60.0.0 (CIRISPersist#854) — one gate, the emit gate's rule.
+    crate::federation::validate_subject_key_ids(&row.subject_key_ids)?;
     crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
     // v57.0.0 (CIRISPersist#988 item 3) — a `detection:*` row that carries a
     // detection body carries one the projection can read. Pure.
@@ -1044,6 +1047,11 @@ where
     // moderators) or is reached by an steward-bound duty-holder via a live
     // scoped delegates_to chain. Absence ⇒ REJECT.
     crate::federation::admission::check_delegated_duty_scores_admission(dir, &row).await?;
+    // v60.0.0 (CIRISPersist#803, CC 3.1.1 / CC 4.5.5) — a
+    // `takedown_notice:{basis}:v1` row: its CC 3.3.2 shape, then the one
+    // takedown authority decision for its signer over the content as this
+    // node holds it. A no-op for every other row.
+    crate::federation::takedown_tombstone::check_takedown_notice_row_admission(dir, &row).await?;
     // v44.6.0 (#857) — a machine author may name only itself in for_key_id.
     crate::federation::admission::check_consent_for_key_admission(dir, &row).await?;
 
@@ -1238,6 +1246,11 @@ where
     // v60.0.0 (CIRISConstitution#170 closed) — the hard_case projection, by
     // the one function the hard_case door and the rebuild call too.
     let projected_hard_case = super::hard_case::project_hard_case_row(&row);
+    // v60.0.0 (CIRISPersist#988 item 1) — the ledger projection, by the one
+    // function the rebuild calls too: this node's own `credits:` /
+    // `expertise:` rows only.
+    let projected_ledger =
+        super::ledger_projection::project_ledger_row(&row, dir.node_key_id().as_deref());
     row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
     // v21.1.0 (CIRISPersist#507b) — wire-index this row (federation tier
     // only, the E5 invariant). v31.0.0 (CIRISPersist#646) — only the
@@ -1259,6 +1272,7 @@ where
         projected_trace,
         projected_detection,
         projected_hard_case,
+        projected_ledger,
         wire_index_key,
         cycle_gated,
         received_at,

@@ -377,3 +377,5 @@ sqlite	201	self_roster_settled_index	15053344025319008484
 postgres	201	self_roster_settled_index	10153111305644630646
 sqlite	202	hard_case_event_emitter	6735624047132756008
 postgres	202	hard_case_event_emitter	11487871256818640586
+sqlite	203	cirisnode_silos_onto_scores	11439871028165941212
+postgres	203	cirisnode_silos_onto_scores	8784011894129432790

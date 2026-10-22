@@ -5,59 +5,35 @@
 // `cirisnode::federation_announcement`.
 #![allow(missing_docs)]
 
-//! Media-sharing substrate (CIRISPersist#134, v3.6.0).
+//! Media-sharing substrate (CIRISPersist#134, v3.6.0; v60.0.0).
 //!
-//! Two new `subject_kind` values on `cirisnode.contributions`:
+//! - [`TAKEDOWN_NOTICE_SUBJECT_KIND`] — a content-claimant's assertion that
+//!   bytes under the named SHA-256 must be taken down. v60.0.0
+//!   (CIRISPersist#803, CC 3.1.1 / CC 3.3.2): the notice is a
+//!   `takedown_notice:{basis}:v1` `scores` ROW, signed by its claimant
+//!   (`super::rows::plan_takedown_notice_row`); its admission is the
+//!   duty-holder gate (`takedown_tombstone::check_takedown_notice_row_admission`)
+//!   and its execution the CC 2.3 tombstone
+//!   ([`super::takedown_handler::process_takedown_admission`]).
 //!
-//!   - [`TAKEDOWN_NOTICE_SUBJECT_KIND`] — content-claimant assertion that
-//!     bytes under the named SHA-256 must be evicted from holders'
-//!     storage. The persist write path runs the typed
-//!     [`TakedownNoticePayload`] shape validator, projects the
-//!     `content_sha256` + `legal_basis` into dedicated indexed columns
-//!     (V054), and the takedown handler
-//!     ([`super::takedown_handler::process_takedown_admission`]) writes
-//!     ONE bytes-plane tombstone for the SHA (v55.0.0, CIRISPersist#1007;
-//!     CC 4.5.3 step 2), destroying the bytes on receipt for an
-//!     immediate-removal basis.
+//! - [`KEY_GRANT_SUBJECT_KIND`] — RETIRED in v60.0.0 (CIRISPersist#988
+//!   item 1). A `key_grant` Contribution duplicated the key-grant plane
+//!   (`key_grant:{axis}:v1`, `crate::federation::key_grant`) as a second,
+//!   unreplicated, classical-only door; a Contribution naming the subject
+//!   kind is refused by name (`super::rows::refusal::KEY_GRANT_RETIRED`).
 //!
-//!   - [`KEY_GRANT_SUBJECT_KIND`] — key-distribution envelope binding a
-//!     wrapped DEK to a recipient `key_id` over a `content_sha256` (or
-//!     scope tier). Persist projects `content_sha256` +
-//!     `recipient_key_id` into V054 columns; consumers index by either
-//!     axis. Bond-sale composition and registry-license issuance share
-//!     this row shape per the one-key primitive
-//!     ([[project_one_key_primitive]]).
-//!
-//! # Upstream contracts
-//!
-//! CEG 0.3 §5.6.8.4 + §11.4 + §11.5 (Registry commit a7d95cd) closed
-//! CIRISRegistry#38 (vocabulary + per-basis discipline + wrap-algorithm
-//! identity + retire emission shape) and CIRISRegistry#39 (hash-DB
-//! operator policy — self-hosted PDQ default, option a).
-//! CIRISNodeCore#24 (counter-notice carrier shape) remains open;
-//! TODO markers retained at the relevant call sites.
-//!
-//! The lock-in:
-//!
-//!   - [`LegalBasis`] vocabulary: 10 values, 5+4+1 discipline split.
-//!   - [`WrapAlgorithm`]: v34.0.0 (#704) leaves ONE variant, the PQC
-//!     hybrid `X25519MlKem768Aes256GcmHkdfSha256`. The classical-only v1
-//!     is GONE rather than superseded — there is no algorithm to choose,
-//!     so there is no wrong choice to make.
+//! [`LegalBasis`] is CC 3.3.2's closed vocabulary, in CC's wire spelling.
 
-use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::Error;
 
-/// Wire constant — `subject_kind` for content-claim takedown rows on
-/// `cirisnode.contributions`. Matches the V054 partial-CHECK
-/// vocabulary.
+/// Wire constant — the `subject_kind` of a takedown notice (CC 3.3.2).
 pub const TAKEDOWN_NOTICE_SUBJECT_KIND: &str = "takedown_notice";
 
-/// Wire constant — `subject_kind` for key-distribution rows on
-/// `cirisnode.contributions`.
+/// Wire constant — the RETIRED `key_grant` Contribution subject kind
+/// (v60.0.0): named so the refusal can name it.
 pub const KEY_GRANT_SUBJECT_KIND: &str = "key_grant";
 
 // ── LegalBasis ──────────────────────────────────────────────────────
@@ -100,9 +76,9 @@ pub const KEY_GRANT_SUBJECT_KIND: &str = "key_grant";
 /// additional bases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LegalBasis {
-    #[serde(rename = "dmca_512")]
+    #[serde(rename = "dmca512")]
     Dmca512,
-    #[serde(rename = "dsa_article_16")]
+    #[serde(rename = "dsa_article16")]
     DsaArticle16,
     #[serde(rename = "tvec_terrorist")]
     TvecTerrorist,
@@ -123,12 +99,15 @@ pub enum LegalBasis {
 }
 
 impl LegalBasis {
-    /// Wire-shaped string — matches the V054 CHECK constraint
-    /// vocabulary on `takedown_legal_basis`.
+    /// The CC 3.3.2 wire string — the `{basis}` of the notice row's
+    /// `takedown_notice:{basis}:v1` dimension. v60.0.0 (CIRISPersist#803):
+    /// `dmca512` / `dsa_article16`, CC's closed vocabulary; the pre-v60
+    /// `dmca_512` / `dsa_article_16` spellings are gone (V203 rewrote the
+    /// recorded headers).
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Dmca512 => "dmca_512",
-            Self::DsaArticle16 => "dsa_article_16",
+            Self::Dmca512 => "dmca512",
+            Self::DsaArticle16 => "dsa_article16",
             Self::TvecTerrorist => "tvec_terrorist",
             Self::NcmecCsam => "ncmec_csam",
             Self::GifctCip => "gifct_cip",
@@ -144,8 +123,8 @@ impl LegalBasis {
     /// mismatch.
     pub fn from_wire_str(s: &str) -> Option<Self> {
         Some(match s {
-            "dmca_512" => Self::Dmca512,
-            "dsa_article_16" => Self::DsaArticle16,
+            "dmca512" => Self::Dmca512,
+            "dsa_article16" => Self::DsaArticle16,
             "tvec_terrorist" => Self::TvecTerrorist,
             "ncmec_csam" => Self::NcmecCsam,
             "gifct_cip" => Self::GifctCip,
@@ -225,408 +204,53 @@ impl LegalBasis {
 
 // ── TakedownNoticePayload ───────────────────────────────────────────
 
-/// `takedown_notice` payload — JSONB on `cirisnode.contributions.payload`.
-///
-/// The `content_sha256` + `legal_basis` fields are additionally
-/// projected onto the dedicated `media_content_sha256` +
-/// `takedown_legal_basis` columns (V054) so reads don't dig into JSONB
-/// and the cross-column CHECK fires on direct-SQL bypass.
+/// The CC 3.3.2 `takedown_notice` body a claimant files: the members of the
+/// notice row (`super::rows::plan_takedown_notice_row`). v60.0.0 — the row
+/// is signed by its claimant, so `claimant_key_id` and `asserted_at` are the
+/// ROW's (the planner stamps them from the signer and the signed instant)
+/// and are not carried here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TakedownNoticePayload {
     /// SHA-256 of the content body, hex-encoded (64 lowercase hex).
     pub content_sha256: String,
 
     /// Optional perceptual / robust hash discriminator (PDQ, PhotoDNA,
-    /// Arachnid Shield digest, etc.). Vendor format is opaque to
-    /// persist — operators store and forward.
+    /// Arachnid Shield digest, etc.). Vendor format is opaque to persist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perceptual_hash: Option<String>,
 
     /// Federation `key_id`s of the holders the claimant identifies as
-    /// having the bytes. Persist uses [`super::super::federation::BlobStorage::list_holders`]
-    /// authoritatively, so this field is documentation /
-    /// claim-provenance only.
+    /// having the bytes. Claim-provenance only; persist reads holders from
+    /// the holding claims.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content_holder_key_ids: Vec<String>,
-
-    /// `key_id` of the entity filing the claim. Persist does not
-    /// verify ownership / standing — the [`AdmissionGate`](crate::federation::AdmissionGate)
-    /// is the trust-weighted admission surface.
-    pub claimant_key_id: String,
 
     /// Closed-set legal basis under which the notice is filed.
     pub legal_basis: LegalBasis,
 
-    /// ISO-3166-1 alpha-2 jurisdiction code. Free-form to admit
-    /// regional sub-codes; persist does not validate.
+    /// ISO-3166-1 alpha-2 jurisdiction code (free-form sub-codes admitted).
     pub jurisdiction: String,
 
-    /// "Good faith" statement required by some bases (DMCA §512(c)(3)(A)(v)
-    /// notably). Free-form text; persist stores verbatim.
+    /// "Good faith" statement required by some bases.
     pub good_faith_statement: String,
 
     /// Free-form claim narrative.
     pub claim_text: String,
 
-    /// Evidence references — URLs, IPFS CIDs, prior contribution IDs,
-    /// etc. Persist stores verbatim.
+    /// Evidence references — URLs, CIDs, row ids. Never makes the notice a
+    /// binding of the content (`takedown_tombstone::content_binding` skips
+    /// notice rows).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_refs: Vec<String>,
 
-    /// Counter-notice channel — operator-defined contact for the
-    /// counter-notice carrier shape that NodeCore#24 locks.
+    /// Counter-notice channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub counter_notice_channel: Option<String>,
 
-    /// When the notice was filed by the claimant.
-    pub asserted_at: DateTime<Utc>,
-
-    /// When the notice is no longer relevant. REQUIRED to bound replay
-    /// risk (mirroring `FederationAnnouncementPayload::expires_at`).
+    /// When the notice stops authorising. REQUIRED to bound replay risk; it
+    /// is the row's `expires_at`.
     pub expires_at: DateTime<Utc>,
-}
-
-// ── KeyGrantPayload ─────────────────────────────────────────────────
-
-/// `key_grant` payload — JSONB on `cirisnode.contributions.payload`.
-///
-/// The `content_sha256` + `recipient_key_id` fields are additionally
-/// projected onto the dedicated `media_content_sha256` +
-/// `key_grant_recipient_key_id` columns (V054) for indexed reads.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct KeyGrantPayload {
-    /// Federation `key_id` of the recipient — the entity authorized to
-    /// unwrap the DEK.
-    pub recipient_key_id: String,
-
-    /// SHA-256 of the content body the granted key encrypts, hex-encoded.
-    /// Present iff the grant is **content-addressed**; `None` for a
-    /// **scope-epoch-addressed** grant (see [`Self::epoch`]). Exactly one
-    /// addressing mode holds — enforced by [`extract_key_grant_payload`]
-    /// (mirrors the V129 `cirisnode.contributions` XOR CHECK; CEG 0.15
-    /// §10.5.3 RC1-1c).
-    ///
-    /// This is the ONLY `Option` addressing field on the content side, and
-    /// [`Self::epoch`] is the only one on the scope side. That is what makes
-    /// the XOR a two-field question — see [`Self::scope_id`] for why the id
-    /// itself cannot participate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_sha256: Option<String>,
-
-    /// v34.0.0 (CIRISPersist#704) — **was `stream_epoch` through v33.**
-    /// Key-rotation epoch within [`Self::scope_id`] the wrapped DEK covers.
-    /// Present iff scope-epoch-addressed. Projected onto `key_grant_epoch`
-    /// (V129).
-    ///
-    /// THE addressing discriminator for the scope-epoch branch: `epoch` is
-    /// `Some` exactly when [`Self::scope`] is
-    /// [`KeyGrantScope::is_epoch_addressed`], and `None` exactly when the
-    /// grant is content-addressed. [`extract_key_grant_payload`] enforces
-    /// that equivalence in both directions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub epoch: Option<u64>,
-
-    /// Base64-encoded wrapped DEK. The wrap algorithm is named below.
-    pub wrapped_dek_base64: String,
-
-    /// Wrap algorithm identifier. v34.0.0 (#704) removed the classical v1,
-    /// so EVERY grant — content-addressed included — carries the sole live
-    /// token, `x25519_mlkem768_aes256_gcm_hkdf_sha256` (PQC hybrid — see
-    /// [`WrapAlgorithm`] and CEG §10.5.3).
-    ///
-    /// v35.0.0 (#715) — retired spellings of this field are refused BY NAME
-    /// at the decode door, before the typed decode sees them: see
-    /// [`RETIRED_WRAP_ALGORITHM_WIRE_TOKENS`].
-    pub wrap_algorithm: WrapAlgorithm,
-
-    /// Symmetric-ratchet version the key was wrapped under.
-    pub ratchet_version: u32,
-
-    /// Validity window for the grant (start..end as RFC 3339 pair).
-    pub key_validity_window: KeyValidityWindow,
-
-    /// Scope of the grant. See [`KeyGrantScope`].
-    pub scope: KeyGrantScope,
-
-    /// Scope identifier — interpretation depends on [`Self::scope`].
-    /// For [`KeyGrantScope::SingleContent`] this is the
-    /// `content_sha256`; for [`KeyGrantScope::GroupMember`] /
-    /// [`KeyGrantScope::SubscriptionTier`] it's the group / tier id; for
-    /// [`KeyGrantScope::StreamEpoch`] it's the `federation_streams` stream
-    /// id, and for [`KeyGrantScope::TransitMembership`] the IFAC `netname`.
-    ///
-    /// v34.0.0 (CIRISPersist#704) — **THE SINGLE epoch-addressing id.** A
-    /// separate `scope_ref` (itself renamed from the v33 `stream_id`) carried
-    /// this value alongside `scope_id` for part of this unreleased cut. On
-    /// every epoch-addressed grant the two held the SAME string, only
-    /// `scope_ref` reached the queryable `key_grant_scope_id` column, and a
-    /// runtime check had to be written to force them to agree. Two fields
-    /// holding one fact diverge by hand at the first opportunity — the first
-    /// thing that check refused was a fixture in this file's own test module.
-    /// The check is deleted along with the second field: the values cannot
-    /// disagree because there is only one of them.
-    ///
-    /// NOT an `Option`, and therefore NOT part of the addressing XOR: it is
-    /// REQUIRED on every grant, content-addressed ones included. The XOR is
-    /// [`Self::content_sha256`] against [`Self::epoch`]. Projected onto
-    /// `key_grant_scope_id` (V129) iff [`Self::scope`] is epoch-addressed —
-    /// a content grant's `scope_id` is the sha it already stores in
-    /// `media_content_sha256`, so projecting it too would put one value in
-    /// two columns and re-create the divergence at the row level.
-    pub scope_id: String,
-
-    /// Rotation chain — prior `attestation_id`s in chronological
-    /// order; the head of the chain is the grant being rotated FROM.
-    /// Empty for the first grant in a chain.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rotation_chain: Vec<String>,
-
-    /// v34.0.0 (CIRISPersist#704, CIRISEdge#492) — the IFAC hash-truncation
-    /// size **in BITS**, for a [`KeyGrantScope::TransitMembership`] grant.
-    ///
-    /// **Required iff the scope is transit membership; refused otherwise, and
-    /// bounded to [`IFAC_SIZE_MIN_BITS`]..=[`IFAC_SIZE_MAX_BITS`]** — all three
-    /// halves ENFORCED by [`extract_key_grant_payload`], which is the door
-    /// every write path and both backends reach it through.
-    ///
-    /// This doc made that claim for the whole of this cut with nothing keeping
-    /// it: a transit grant with no `ifac_size`, a `stream_epoch` grant carrying
-    /// one, and `ifac_size: 0` were all admitted. The first of those is the
-    /// expensive one — the recipient unwraps a passphrase it cannot use,
-    /// because it cannot size the interface, and nothing in the delivery path
-    /// reports a problem.
-    ///
-    /// NOT WRAPPED, deliberately. It is not a secret — a recipient must size
-    /// the interface (`add_tcp_server_ifac(addr, netname, passphrase, size)`)
-    /// and it needs this BEFORE it can unwrap the passphrase, so folding it
-    /// into the ciphertext would make the grant unusable by the party it is
-    /// addressed to.
-    ///
-    /// A TYPED FIELD rather than a sub-field parsed out of `scope_id`: an
-    /// identifier carrying a second value inside it is a schema hiding in a
-    /// string, and nothing would validate it. `u16` because the IFAC size is a
-    /// bit-count that cannot exceed the hash width.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ifac_size: Option<u16>,
-}
-
-/// Closed-set wrap algorithm vocabulary.
-///
-/// # v1 — CEG 0.3 §5.6.8.4 — HPKE RFC 9180 base mode, KEM X25519, AEAD AES-128-GCM
-///
-/// Locked by CEG 0.3 (Registry commit a7d95cd, closes CIRISRegistry#38).
-/// Wire string: `"hpke_rfc9180_base_x25519_aes_gcm"`.
-///
-/// # v2 — CEG 0.15 §10.5.3 — X25519 + ML-KEM-768 hybrid (FIPS 203), PQC at rest
-///
-/// **MANDATORY for streaming epoch-DEK grants** (the §10.5.3 cascade);
-/// a content grant may stay v1, but a stream/epoch grant carrying v1 is
-/// rejected at ingest. Wraps with the `ciris-crypto::key_grant`
-/// `wrap_dek_for_recipient_v2` construction. The payload wire string
-/// `"x25519_mlkem768_aes256_gcm_hkdf_sha256"` names that construction.
-///
-/// **RATIFIED** at v25.1.0 (CIRISPersist#582): CC 5.1 (class rule CC 3.3.2,
-/// CIRISVerify#234) pins this snake_case spelling as *the single wire
-/// identifier*, closing the propose-then-ratify loop this doc block opened
-/// against CIRISRegistry#64. `ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2`
-/// now carries the same string; the hyphenated form verify shipped through
-/// v11.0.0 is a non-conformant alias that MUST be rejected and MUST NOT be
-/// normalized before comparison — which is why
-/// [`WrapAlgorithm::from_wire_str`] matches exactly and folds nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum WrapAlgorithm {
-    /// X25519 + ML-KEM-768 hybrid DEK wrap (FIPS 203), AES-256-GCM +
-    /// HKDF-SHA-256. CEG 0.15 §10.5.3; mandatory for streaming epoch
-    /// grants. Maps to `ciris-crypto`'s `KEY_GRANT_ALGORITHM_V2`.
-    #[serde(rename = "x25519_mlkem768_aes256_gcm_hkdf_sha256")]
-    X25519MlKem768Aes256GcmHkdfSha256,
-}
-
-impl WrapAlgorithm {
-    /// Wire-shaped string — matches the locked vocabulary.
-    ///
-    /// # Separator convention (v35.0.0, CIRISPersist#715)
-    ///
-    /// Wire tokens are **underscore-separated**. CC 5.1 (CIRISVerify#234)
-    /// ratified `x25519_mlkem768_aes256_gcm_hkdf_sha256` as the single wire
-    /// identifier for the v2 construction; the CC 1.0-rc2 hyphen spellings
-    /// are refused BY NAME at the decode door — see
-    /// [`RETIRED_WRAP_ALGORITHM_WIRE_TOKENS`] — never accepted, never
-    /// normalized, and never folded onto a live token. Any future variant
-    /// follows the underscore convention;
-    /// `wrap_algorithm_tokens_are_underscore_separated_715` pins the live
-    /// set (as literals) against a hyphen sneaking back in.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::X25519MlKem768Aes256GcmHkdfSha256 => "x25519_mlkem768_aes256_gcm_hkdf_sha256",
-        }
-    }
-
-    /// Parse from the wire-shaped string. Returns `None` on vocabulary
-    /// mismatch.
-    ///
-    /// v25.1.0 (CIRISPersist#582, CC 5.1 / CIRISVerify#234) — the v2 arm
-    /// defers to `ciris_crypto::key_grant::key_grant_algorithm_v2_accepts`,
-    /// the **only sanctioned comparison** for that identifier, instead of
-    /// re-spelling it here. Two validators for one artifact must share ONE
-    /// predicate, or the vocabulary drifts the moment one of them is edited.
-    ///
-    /// `accept_legacy_hyphenated = false`: the hyphenated form is
-    /// non-conformant and is refused at the parse door. The predicate
-    /// deliberately does **not** normalize — folding `-` → `_` would make two
-    /// distinct wire identifiers compare equal and defeat CC 5.1's
-    /// single-identifier rule. Already-stored hyphenated values are retired by
-    /// [`crate::maintenance::vocabulary`] (superseded, never rewritten), not
-    /// laundered here.
-    pub fn from_wire_str(s: &str) -> Option<Self> {
-        if ciris_crypto::key_grant::key_grant_algorithm_v2_accepts(s, false) {
-            return Some(Self::X25519MlKem768Aes256GcmHkdfSha256);
-        }
-        // v34.0.0 (#704) — v1 is GONE, not superseded. The fleet directive is
-        // that classical-only paths do not exist to be chosen; keeping a
-        // per-scope "reject v1" rule would imply v1 still lives somewhere.
-        //
-        // A stored v1 grant now fails HERE, and the caller renders the token it
-        // saw — so an operator sees the algorithm name and this release rather
-        // than a generic parse failure that looks like corruption.
-        //
-        // v35.0.0 (#715) — for the wire spellings with a KNOWN history (the
-        // removed v1 tokens and the CC 1.0-rc2 hyphenated v2), the decode door
-        // does better than rendering the token: it names the token AND its
-        // disposition — removed vs respelled, with the exact replacement — see
-        // `refuse_retired_wrap_algorithm_wire_tokens`.
-        None
-    }
-
-    // v34.0.0 (#704) — `is_streaming_pqc_v2()` REMOVED, not deprecated.
-    //
-    // It existed to answer "may this algorithm carry a streaming epoch-DEK
-    // grant?" (CEG §10.5.3) back when the enum had a classical v1 variant to
-    // say no to. v1 was removed earlier in this cut, so the predicate returned
-    // `true` for every value this type can hold: an instrument reporting the
-    // same thing whether or not the defect exists. Its guard branch in
-    // `extract_key_grant_payload` could never fire and the assertion in
-    // `extract_stream_epoch_grant_validates` could never fail.
-    //
-    // A `#[deprecated]` shim returning `true` would have preserved exactly the
-    // false assurance. Removing the method gives every downstream Rust caller a
-    // compile error naming it, which is the loud path: the rule it used to
-    // check is now the type system's, and "there is one algorithm" is the
-    // answer the caller needs to absorb.
-}
-
-/// `key_grant` scope. v1 supports three:
-///
-///   - [`Self::SingleContent`] — one grant per content blob.
-///   - [`Self::GroupMember`] — one grant per group, applies to every
-///     blob the group covers.
-///   - [`Self::SubscriptionTier`] — one grant per tier; the
-///     content the tier covers is operator-defined.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum KeyGrantScope {
-    SingleContent,
-    GroupMember,
-    SubscriptionTier,
-    /// One grant per `(stream id, epoch)` — the streaming epoch-DEK
-    /// cascade (CEG 0.15 §10.5.3). [`KeyGrantPayload::scope_id`] is the
-    /// `federation_streams` stream id.
-    StreamEpoch,
-    /// v34.0.0 (CIRISPersist#704, CIRISEdge#492) — one grant per
-    /// `(netname, epoch)`: the IFAC transit passphrase for scoped transit.
-    /// `scope_id` is the IFAC `netname`.
-    ///
-    /// Structurally IDENTICAL to [`Self::StreamEpoch`] — an `(id, epoch)` pair
-    /// with one grant set per epoch, rotated by superseding the set and
-    /// converged by reading it. That is why this is a second VALUE of the
-    /// epoch-addressed mechanism rather than a third addressing category: a
-    /// parallel copy would be N implementations of one invariant agreeing only
-    /// because someone diffed them (#663).
-    TransitMembership,
-}
-
-impl KeyGrantScope {
-    /// Does this scope address by `(scope_id, epoch)` rather than by content?
-    ///
-    /// The one definition of "epoch-addressed", so the XOR, the column
-    /// projection and the reads cannot disagree about which scopes are which.
-    #[must_use]
-    pub fn is_epoch_addressed(self) -> bool {
-        matches!(self, Self::StreamEpoch | Self::TransitMembership)
-    }
-
-    /// Every variant, in declaration order.
-    ///
-    /// THE list every derived vocabulary reads — [`Self::from_wire_str`] and
-    /// [`Self::epoch_addressed_tokens`] both walk it, so no caller (FFI door,
-    /// error message, test fixture) gets to spell a `scope_kind` token by hand
-    /// and agree with itself about a value the write path never stamps.
-    ///
-    /// Kept TOTAL by `key_grant_scope_all_is_the_whole_vocabulary`, which
-    /// checks it against serde's `unknown variant … expected one of …` text.
-    /// That text is generated by the derive macro FROM THE VARIANTS, so it is a
-    /// second enumeration nobody maintains: a variant added to the enum and not
-    /// to `ALL` appears there and fails the test.
-    pub const ALL: [Self; 5] = [
-        Self::SingleContent,
-        Self::GroupMember,
-        Self::SubscriptionTier,
-        Self::StreamEpoch,
-        Self::TransitMembership,
-    ];
-
-    /// Parse a wire token — the inverse of [`Self::as_str`], derived from it
-    /// over [`Self::ALL`] rather than being a second match with a second copy
-    /// of the spellings.
-    ///
-    /// `None` for any string outside the vocabulary. Callers at a boundary use
-    /// this to REFUSE an unknown `scope_kind` instead of querying on it: the
-    /// V129 column only ever holds an `as_str` token, so an unknown one
-    /// silently matches no row, and an empty result is indistinguishable from
-    /// "no grants issued".
-    #[must_use]
-    pub fn from_wire_str(token: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|s| s.as_str() == token)
-    }
-
-    /// The wire tokens an epoch-addressed read or write accepts, rendered
-    /// `a | b` for an error message.
-    ///
-    /// Derived twice over: membership comes from [`Self::is_epoch_addressed`]
-    /// (the one definition), the spelling from [`Self::as_str`]. A new
-    /// epoch-addressed scope therefore appears in every refusal message on its
-    /// first commit, with nothing to update.
-    #[must_use]
-    pub fn epoch_addressed_tokens() -> String {
-        Self::ALL
-            .into_iter()
-            .filter(|s| s.is_epoch_addressed())
-            .map(Self::as_str)
-            .collect::<Vec<_>>()
-            .join(" | ")
-    }
-}
-
-impl KeyGrantScope {
-    /// Wire-shaped string.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::SingleContent => "single_content",
-            Self::GroupMember => "group_member",
-            Self::SubscriptionTier => "subscription_tier",
-            Self::StreamEpoch => "stream_epoch",
-            Self::TransitMembership => "transit_membership",
-        }
-    }
-}
-
-/// Validity window for a [`KeyGrantPayload`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct KeyValidityWindow {
-    /// When the grant becomes valid.
-    pub not_before: DateTime<Utc>,
-    /// When the grant expires.
-    pub not_after: DateTime<Utc>,
 }
 
 // ── Extractors / validators ─────────────────────────────────────────
@@ -658,13 +282,6 @@ fn validate_non_empty(field: &str, value: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_base64(field: &str, value: &str) -> Result<(), Error> {
-    base64::engine::general_purpose::STANDARD
-        .decode(value.as_bytes())
-        .map(|_| ())
-        .map_err(|e| Error::InvalidArgument(format!("{field} not valid base64: {e}")))
-}
-
 /// Decode + validate a `takedown_notice` payload from the JSONB column.
 /// Returns `Ok(None)` for non-takedown rows (mirrors the
 /// [`super::federation_announcement::extract_announcement_payload`]
@@ -672,8 +289,10 @@ fn validate_base64(field: &str, value: &str) -> Result<(), Error> {
 ///
 /// Validation:
 ///   - `content_sha256` is hex-64 lowercase.
-///   - `claimant_key_id` / `jurisdiction` / `claim_text` /
-///     `good_faith_statement` non-empty.
+///   - `jurisdiction` / `claim_text` / `good_faith_statement` non-empty.
+///
+/// The notice's signer, `claimant_key_id` and `asserted_at` are the ROW's
+/// (v60.0.0): the planner stamps them, the payload does not carry them.
 ///   - `legal_basis` is a known [`LegalBasis`] variant (enforced by
 ///     serde — unknown vocabularies fail decode).
 pub fn extract_takedown_notice_payload(
@@ -686,440 +305,10 @@ pub fn extract_takedown_notice_payload(
     let typed: TakedownNoticePayload = serde_json::from_value(payload.clone())
         .map_err(|e| Error::InvalidArgument(format!("takedown_notice payload shape: {e}")))?;
     validate_hex_64("content_sha256", &typed.content_sha256)?;
-    validate_non_empty("claimant_key_id", &typed.claimant_key_id)?;
     validate_non_empty("jurisdiction", &typed.jurisdiction)?;
     validate_non_empty("claim_text", &typed.claim_text)?;
     validate_non_empty("good_faith_statement", &typed.good_faith_statement)?;
-    if typed.expires_at <= typed.asserted_at {
-        return Err(Error::InvalidArgument(
-            "takedown_notice: expires_at must be after asserted_at".into(),
-        ));
-    }
     Ok(Some(typed))
-}
-
-/// v34.0.0 (CIRISPersist#704, CIRISEdge#492) — smallest admissible
-/// [`KeyGrantPayload::ifac_size`], in BITS.
-///
-/// EVIDENCE, not a house preference. Reticulum — the protocol this grant
-/// delivers a passphrase for — pins `IFAC_MIN_SIZE = 1` byte and honours a
-/// configured `ifac_size` only when it is at least `IFAC_MIN_SIZE*8` bits,
-/// dropping a smaller value back to the interface default (`RNS/Reticulum.py`,
-/// config parse). leviculum, the Rust implementation CIRISEdge actually runs,
-/// mirrors that guard verbatim (`leviculum-std/src/ini_config.rs`: keep the
-/// value only `if bits >= 8`, then store `bits / 8`) — and notes why: a
-/// sub-8-bit value rounds DOWN to zero bytes and silently disables IFAC on an
-/// interface the operator asked to protect.
-///
-/// So the floor is not "0 is obviously wrong". It is the point below which the
-/// two peers stop agreeing about whether the interface is gated at all.
-pub const IFAC_SIZE_MIN_BITS: u16 = 8;
-
-/// v34.0.0 (CIRISPersist#704, CIRISEdge#492) — largest admissible
-/// [`KeyGrantPayload::ifac_size`], in BITS.
-///
-/// The access code is the TAIL of an Ed25519 signature over the frame —
-/// `ifac_identity.sign(raw)[-ifac_size:]` (`RNS/Transport.py::transmit`). An
-/// Ed25519 signature is 64 bytes, so 512 bits is the WHOLE width and there is
-/// nothing above it to truncate to: a larger value does not buy a longer code,
-/// it makes the sender's framing and the receiver's expectation disagree about
-/// how many bytes of the frame are the code. Reticulum's own interface
-/// documentation states the same range from the other side — "can be set to a
-/// custom size between 8 and 512 bits".
-///
-/// PROVENANCE: this bound is read off the Reticulum reference implementation
-/// and its docs, and off leviculum, NOT off anything in this repository —
-/// persist stores the value and never sizes an interface with it. It is
-/// recorded here because a delivery substrate that admits a value its consumer
-/// cannot use has not delivered anything.
-pub const IFAC_SIZE_MAX_BITS: u16 = 512;
-
-/// Enforce [`KeyGrantPayload::ifac_size`]'s doc'd contract — both halves.
-///
-/// The rule lives HERE, beside the addressing checks, rather than in each
-/// backend's write path: `extract_key_grant_payload` is the single door
-/// `put_key_grant` and both supersession emitters pass through, so a rule
-/// written once here cannot be enforced by sqlite and forgotten by postgres.
-///
-/// Ordering note — this runs AFTER the addressing match, on purpose. A
-/// content-addressed payload declaring `scope: transit_membership` is refused
-/// there, by the contradiction it actually contains; reporting a missing
-/// `ifac_size` first would answer a question the caller has not got to yet.
-fn validate_ifac_size(typed: &KeyGrantPayload) -> Result<(), Error> {
-    if typed.scope == KeyGrantScope::TransitMembership {
-        let Some(bits) = typed.ifac_size else {
-            return Err(Error::InvalidArgument(format!(
-                "key_grant: scope={} requires ifac_size (the IFAC hash-truncation \
-                 size, in bits, {IFAC_SIZE_MIN_BITS}..={IFAC_SIZE_MAX_BITS}). It is \
-                 NOT derivable from the grant: the recipient must size the interface \
-                 (add_tcp_server_ifac(addr, netname, passphrase, size)) BEFORE it can \
-                 unwrap the passphrase, so a transit grant without it delivers key \
-                 material its recipient cannot use",
-                KeyGrantScope::TransitMembership.as_str()
-            )));
-        };
-        if !(IFAC_SIZE_MIN_BITS..=IFAC_SIZE_MAX_BITS).contains(&bits) {
-            return Err(Error::InvalidArgument(format!(
-                "key_grant: ifac_size={bits} is outside the IFAC range \
-                 {IFAC_SIZE_MIN_BITS}..={IFAC_SIZE_MAX_BITS} bits. The access code is \
-                 the tail of an Ed25519 signature over the frame, so 512 bits is the \
-                 whole signature and below 8 bits the receiver drops the code to zero \
-                 bytes and stops gating the interface at all"
-            )));
-        }
-        return Ok(());
-    }
-    if let Some(bits) = typed.ifac_size {
-        return Err(Error::InvalidArgument(format!(
-            "key_grant: ifac_size={bits} was sent with scope={}, which addresses no \
-             IFAC interface — only scope={} carries one. Drop ifac_size, or send the \
-             grant with scope={}",
-            typed.scope.as_str(),
-            KeyGrantScope::TransitMembership.as_str(),
-            KeyGrantScope::TransitMembership.as_str()
-        )));
-    }
-    Ok(())
-}
-
-/// v34.0.0 (CIRISPersist#704) — `key_grant` wire keys this cut REMOVED, each
-/// paired with the field that replaces it.
-///
-/// WHY THIS TABLE EXISTS AT ALL. [`KeyGrantPayload`] carries no
-/// `#[serde(deny_unknown_fields)]`, and widening it to one would change how
-/// EVERY unknown key on the payload is treated — a separate decision with its
-/// own compatibility cost. Without it, `serde` silently DROPS a key it does not
-/// recognise. So a caller still emitting the released v33 `stream_id` would
-/// have its grant decode cleanly with `scope_id` absent (`missing field` — the
-/// one case that does error) or, worse for `stream_epoch` and `scope_ref`,
-/// decode into a payload the caller never described: no `epoch`, so the grant
-/// parses as CONTENT-addressed, and it is refused several checks later by a
-/// message about an addressing mode the caller did not choose. The key they
-/// actually sent is never mentioned, in any of it.
-///
-/// Naming the removed key and its replacement is the whole point: a downstream
-/// consumer reading the refusal learns what to change, in one line, without
-/// bisecting a release. These entries are permanent — a key removed once is
-/// removed forever, and a later reader of this list learns the rename history
-/// the wire actually went through.
-const REMOVED_KEY_GRANT_WIRE_KEYS: &[(&str, &str, &str)] = &[
-    (
-        "stream_id",
-        "scope_id",
-        "released through v33; generalized from streams to any epoch-addressed scope",
-    ),
-    (
-        "stream_epoch",
-        "epoch",
-        "released through v33; generalized from streams to any epoch-addressed scope",
-    ),
-    (
-        "scope_ref",
-        "scope_id",
-        "never released; it duplicated scope_id on every epoch-addressed grant and \
-         the two were collapsed into one field before this cut shipped",
-    ),
-];
-
-/// Refuse a `key_grant` payload still carrying a wire key this cut removed.
-///
-/// Runs BEFORE the typed decode so the caller is told about the key they SENT,
-/// rather than about a downstream consequence of it having been dropped.
-fn refuse_removed_key_grant_wire_keys(payload: &serde_json::Value) -> Result<(), Error> {
-    let Some(object) = payload.as_object() else {
-        // Not an object — the typed decode owns that diagnosis.
-        return Ok(());
-    };
-    for (removed, replacement, note) in REMOVED_KEY_GRANT_WIRE_KEYS {
-        if object.contains_key(*removed) {
-            return Err(Error::InvalidArgument(format!(
-                "key_grant: `{removed}` was REMOVED in v34.0.0 (CIRISPersist#704) — \
-                 use `{replacement}` instead ({note}). The payload is NOT read with \
-                 `deny_unknown_fields`, so this key would otherwise be silently \
-                 DROPPED and the grant admitted or refused on an addressing mode you \
-                 did not choose; rename `{removed}` to `{replacement}` and resubmit"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// v35.0.0 (CIRISPersist#715) — `wrap_algorithm` wire spellings with a KNOWN
-/// history, each refused BY NAME with its disposition and the exact token to
-/// send instead.
-///
-/// WHY A TABLE AND NOT THE GENERIC PATH. `WrapAlgorithm` is a closed serde
-/// enum, so an unknown token already fails the typed decode — but as `unknown
-/// variant`, which cannot say WHY the token is wrong. These three spellings
-/// are not typos: each was once a live identifier somewhere in the fleet, and
-/// the fix differs by token — the rc2 hyphenated v2 is RESPELLED (same
-/// construction, one conformant spelling), while the v1 tokens are REMOVED
-/// (the construction itself is gone; there is no respelling to switch to).
-/// A peer or a stored grant carrying one deserves the one-line answer, not a
-/// bisect through release notes.
-///
-/// Like [`REMOVED_KEY_GRANT_WIRE_KEYS`], entries are PERMANENT wire history,
-/// spelled as literals — they must outlive any constant that once named them.
-/// The tokens:
-///
-///   - `x25519-mlkem768-aes256-gcm-hkdf-sha256` — the CC 1.0-rc2 spelling of
-///     the live v2 token (verify's `KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED`);
-///     respelled with underscores at v25.1.0 (#582, CC 5.1 / CIRISVerify#234).
-///   - `hpke_rfc9180_base_x25519_aes_gcm` — THIS surface's v1 wire token
-///     (CEG 0.3 §5.6.8.4); removed in v34.0.0 (#704).
-///   - `x25519-aes256-gcm-hkdf-sha256` — the classical v1 wrap as the
-///     CC 1.0-rc2 floor spells it (verify's `KEY_GRANT_ALGORITHM_V1`); never a
-///     token of THIS enum, but the spelling a floor-pinned peer would send for
-///     a construction v34.0.0 removed.
-const RETIRED_WRAP_ALGORITHM_WIRE_TOKENS: &[(&str, &str)] = &[
-    (
-        "x25519-mlkem768-aes256-gcm-hkdf-sha256",
-        "is the CC 1.0-rc2 hyphen-separated spelling of the v2 hybrid wrap. CC 5.1 \
-         (CIRISVerify#234) ratified the underscore-separated token as the SINGLE \
-         wire identifier and nothing accepts both spellings: respell \
-         `x25519-mlkem768-aes256-gcm-hkdf-sha256` as \
-         `x25519_mlkem768_aes256_gcm_hkdf_sha256` and resubmit",
-    ),
-    (
-        "hpke_rfc9180_base_x25519_aes_gcm",
-        "names the classical v1 HPKE wrap (CEG 0.3 §5.6.8.4), REMOVED in v34.0.0 \
-         (CIRISPersist#704), not respelled — no spelling of v1 exists to switch \
-         to; re-wrap the DEK under `x25519_mlkem768_aes256_gcm_hkdf_sha256` and \
-         resubmit",
-    ),
-    (
-        "x25519-aes256-gcm-hkdf-sha256",
-        "names the classical v1 wrap as the CC 1.0-rc2 floor spells it, REMOVED in \
-         v34.0.0 (CIRISPersist#704), not respelled — no spelling of v1 exists to \
-         switch to; re-wrap the DEK under `x25519_mlkem768_aes256_gcm_hkdf_sha256` \
-         and resubmit",
-    ),
-];
-
-/// Refuse a `key_grant` payload whose `wrap_algorithm` carries a retired wire
-/// spelling — see [`RETIRED_WRAP_ALGORITHM_WIRE_TOKENS`].
-///
-/// Runs BEFORE the typed decode, mirroring
-/// [`refuse_removed_key_grant_wire_keys`]: the caller is told the token they
-/// SENT and its disposition, rather than serde's `unknown variant`, which can
-/// name the token but never the reason.
-fn refuse_retired_wrap_algorithm_wire_tokens(payload: &serde_json::Value) -> Result<(), Error> {
-    let Some(token) = payload.get("wrap_algorithm").and_then(|v| v.as_str()) else {
-        // Absent, non-string, or not an object — the typed decode owns that
-        // diagnosis.
-        return Ok(());
-    };
-    for (retired, disposition) in RETIRED_WRAP_ALGORITHM_WIRE_TOKENS {
-        if token == *retired {
-            return Err(Error::InvalidArgument(format!(
-                "key_grant: wrap_algorithm `{retired}` {disposition}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Decode + validate a `key_grant` payload from the JSONB column.
-/// Returns `Ok(None)` for non-grant rows.
-///
-/// Validation (common):
-///   - `recipient_key_id` / `scope_id` non-empty.
-///   - `wrapped_dek_base64` is valid base64.
-///   - `key_validity_window.not_after > not_before`.
-///   - `ifac_size` present iff `scope` is
-///     [`KeyGrantScope::TransitMembership`], and within
-///     [`IFAC_SIZE_MIN_BITS`]..=[`IFAC_SIZE_MAX_BITS`] when present — see
-///     [`validate_ifac_size`].
-///
-/// Addressing — **exactly one mode** (mirrors the V129
-/// `cirisnode.contributions` XOR CHECK; CEG 0.15 §10.5.3 RC1-1c):
-///   - **content-addressed**: `content_sha256` is `Some` hex-64
-///     lowercase; `epoch` is `None`, and `scope` must NOT satisfy
-///     [`KeyGrantScope::is_epoch_addressed`].
-///   - **scope-epoch-addressed**: `epoch` is `Some`; `content_sha256` is
-///     `None`, and `scope` must satisfy
-///     [`KeyGrantScope::is_epoch_addressed`]. The id is
-///     [`KeyGrantPayload::scope_id`], which every grant carries.
-///
-/// v34.0.0 (#704) — the XOR is `content_sha256` XOR `epoch`, two `Option`
-/// fields. `scope_id` is a REQUIRED `String` present on both branches, so it
-/// cannot discriminate between them and deliberately does not appear in the
-/// predicate; the branch it belongs to is decided by `epoch`, and the
-/// arms below force `scope` to agree with that decision in BOTH directions.
-/// The composite result — `epoch.is_some()` ⟺ `scope.is_epoch_addressed()` —
-/// is what lets the two backends project all three V129 scope columns
-/// together or not at all.
-///
-/// Removed wire keys are refused BEFORE decoding, by name — see
-/// [`REMOVED_KEY_GRANT_WIRE_KEYS`]. Likewise (v35.0.0, #715) the retired
-/// `wrap_algorithm` spellings — see [`RETIRED_WRAP_ALGORITHM_WIRE_TOKENS`].
-pub fn extract_key_grant_payload(
-    subject_kind: &str,
-    payload: &serde_json::Value,
-) -> Result<Option<KeyGrantPayload>, Error> {
-    if subject_kind != KEY_GRANT_SUBJECT_KIND {
-        return Ok(None);
-    }
-    refuse_removed_key_grant_wire_keys(payload)?;
-    refuse_retired_wrap_algorithm_wire_tokens(payload)?;
-    let typed: KeyGrantPayload = serde_json::from_value(payload.clone())
-        .map_err(|e| Error::InvalidArgument(format!("key_grant payload shape: {e}")))?;
-    validate_non_empty("recipient_key_id", &typed.recipient_key_id)?;
-    validate_non_empty("scope_id", &typed.scope_id)?;
-    validate_base64("wrapped_dek_base64", &typed.wrapped_dek_base64)?;
-    if typed.key_validity_window.not_after <= typed.key_validity_window.not_before {
-        return Err(Error::InvalidArgument(
-            "key_grant: key_validity_window.not_after must be after not_before".into(),
-        ));
-    }
-
-    // Exactly-one addressing mode (XOR), matching the V129 constraint.
-    //
-    // v34.0.0 (#704) — the scope side is `epoch` ALONE. It used to be
-    // `scope_ref.is_some() || epoch.is_some()`, an OR across two fields that
-    // then needed a follow-up check to refuse the half where only one was set.
-    // `scope_ref` is gone and `scope_id` cannot take its place in this
-    // predicate: `scope_id` is a required `String` carried by content grants
-    // too, so `scope_id.is_some()` would be a constant and the XOR would
-    // collapse to "always scope-addressed". The half-addressed shapes the OR
-    // used to catch are now UNREPRESENTABLE — there is no second scope field to
-    // set on its own — and the wire keys that could still express one are
-    // refused by name in `refuse_removed_key_grant_wire_keys` above.
-    let content_addressed = typed.content_sha256.is_some();
-    let scope_addressed = typed.epoch.is_some();
-    match (content_addressed, scope_addressed) {
-        (true, true) => {
-            return Err(Error::InvalidArgument(
-                "key_grant: content_sha256 and epoch are mutually exclusive \
-                 (exactly one addressing mode; CEG §10.5.3 RC1-1c)"
-                    .into(),
-            ));
-        }
-        (false, false) => {
-            return Err(Error::InvalidArgument(
-                "key_grant: must be addressed — set content_sha256 (content) OR \
-                 epoch, alongside an epoch-addressed scope + scope_id (scope-epoch)"
-                    .into(),
-            ));
-        }
-        (true, false) => {
-            // Content-addressed: hex-64 sha, no scope-epoch fields.
-            let sha = typed
-                .content_sha256
-                .as_deref()
-                .expect("content_addressed => Some");
-            validate_hex_64("content_sha256", sha)?;
-
-            // v34.0.0 (#704) — the ADDRESSING and the declared SCOPE must
-            // agree. A content-addressed payload declaring an epoch-addressed
-            // scope projects `scope_kind` NOT NULL beside a NULL `scope_id`,
-            // which the V129 CHECK (postgres) and trigger (sqlite) refuse.
-            //
-            // So it already failed closed — but as an opaque backend error,
-            // raised twice, once per dialect, describing a constraint name
-            // rather than the caller's mistake. The invariant belongs to the
-            // payload, so it is checked once, here, and says what is wrong.
-            if typed.scope.is_epoch_addressed() {
-                return Err(Error::InvalidArgument(format!(
-                    "key_grant: content-addressed grant declares scope={}, which is \
-                     epoch-addressed. A content grant carries no epoch, so the two \
-                     cannot both hold — set scope to a content scope, or address the \
-                     grant by epoch + an epoch-addressed scope",
-                    typed.scope.as_str()
-                )));
-            }
-        }
-        (false, true) => {
-            // Scope-epoch-addressed. `scope_id` is already validated non-empty
-            // for EVERY grant at the top of this function, so there is nothing
-            // id-shaped left to check on this branch.
-            //
-            // v34.0.0 (#704) — THREE checks were deleted here, each because the
-            // state it refused stopped being expressible:
-            //
-            //   * `validate_non_empty("scope_ref", …)` — the field is gone; the
-            //     one id is `scope_id`, checked above for both branches.
-            //   * `if typed.epoch.is_none()` — this arm IS `epoch.is_some()`
-            //     now that the XOR reads `epoch` alone, so the branch could
-            //     never be taken.
-            //   * the `scope_ref`/`scope_id` agreement check — two fields that
-            //     must agree became one field, which is the fix the check was
-            //     standing in for.
-            //
-            // Also deleted: the `wrap_algorithm` v2 guard. `WrapAlgorithm` is
-            // single-variant since v1 was removed earlier in this cut, so
-            // `is_streaming_pqc_v2()` was a constant `true` and its `!` a
-            // constant `false`. CEG §10.5.3's "reject a streaming epoch grant
-            // carrying wrap_algorithm: v1" is now enforced at the parse door
-            // (`WrapAlgorithm::from_wire_str` returns `None` for v1) and by the
-            // type — strictly stronger than a branch that could not run.
-
-            // v34.0.0 (#704) — was pinned to `StreamEpoch`, which would now
-            // reject every transit grant. The check is the same one the write
-            // path and the V129 rule use, so all three agree by construction
-            // rather than by three people writing the same `matches!`.
-            if !typed.scope.is_epoch_addressed() {
-                return Err(Error::InvalidArgument(format!(
-                    "key_grant: scope-epoch-addressed grant requires an epoch-addressed \
-                     scope ({}), got {}",
-                    KeyGrantScope::epoch_addressed_tokens(),
-                    typed.scope.as_str()
-                )));
-            }
-        }
-    }
-
-    // v34.0.0 (#704) — `ifac_size` is required iff the scope is transit
-    // membership, refused otherwise, and range-checked. Its doc comment
-    // asserted the first two for this whole cut with nothing keeping them.
-    validate_ifac_size(&typed)?;
-    Ok(Some(typed))
-}
-
-/// v16 (CIRISPersist#432, CC 5.1 `CLM-epoch-keying`) — assert an
-/// envelope IS a `key_grant` Contribution before the dedicated
-/// [`super::NodeCoreService::put_key_grant`] write runs.
-///
-/// Fail-closed admission for the first-class grant emission path:
-///
-///   - `contribution_type` MUST be `proposal` — grants ride the
-///     `proposal` discriminator sub-discriminated by `subject_kind`
-///     (the V011 CHECK pins the 7-value `contribution_type`
-///     vocabulary; there is deliberately NO `key_grant`
-///     contribution_type — see `retire_key_grants` + every existing
-///     grant row).
-///   - `subject.subject` (subject_kind) MUST be
-///     [`KEY_GRANT_SUBJECT_KIND`].
-///   - The payload MUST validate as a [`KeyGrantPayload`] in exactly
-///     one addressing mode (content-addressed XOR
-///     scope-epoch-addressed) via [`extract_key_grant_payload`] — which
-///     also refuses the wire keys v34.0.0 removed, by name.
-///
-/// Returns the validated payload so the caller can inspect the
-/// addressing mode without re-decoding. Signature/trust admission is
-/// NOT run here — `put_contribution` (which `put_key_grant`
-/// delegates to) owns that discipline.
-pub fn require_key_grant_envelope(
-    env: &super::types::ContributionEnvelope,
-) -> Result<KeyGrantPayload, Error> {
-    if env.contribution_type != super::types::ContributionType::Proposal {
-        return Err(Error::InvalidArgument(
-            "put_key_grant: key_grant Contributions ride contribution_type=proposal \
-             (sub-discriminated by subject_kind); no other contribution_type is admitted"
-                .into(),
-        ));
-    }
-    let subject_kind = env.subject.subject.as_deref().unwrap_or_default();
-    if subject_kind != KEY_GRANT_SUBJECT_KIND {
-        return Err(Error::InvalidArgument(format!(
-            "put_key_grant: subject_kind must be '{KEY_GRANT_SUBJECT_KIND}', got '{subject_kind}'"
-        )));
-    }
-    extract_key_grant_payload(subject_kind, &env.payload)?.ok_or_else(|| {
-        // Unreachable: subject_kind matched above, so the extractor
-        // either returns Some or errs. Fail closed regardless.
-        Error::Internal("put_key_grant: key_grant payload extraction returned None".into())
-    })
 }
 
 #[cfg(test)]
@@ -1135,69 +324,72 @@ mod tests {
             content_sha256: fixture_sha256(),
             perceptual_hash: None,
             content_holder_key_ids: vec!["holder-1".into()],
-            claimant_key_id: "claimant-1".into(),
             legal_basis: basis,
             jurisdiction: "US".into(),
             good_faith_statement: "I have a good-faith belief that the use is unauthorized.".into(),
             claim_text: "Copyright claim over content_sha256.".into(),
             evidence_refs: vec![],
             counter_notice_channel: None,
-            asserted_at: DateTime::parse_from_rfc3339("2026-05-29T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
             expires_at: DateTime::parse_from_rfc3339("2027-05-29T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
         }
     }
 
-    fn fixture_key_grant() -> KeyGrantPayload {
-        KeyGrantPayload {
-            recipient_key_id: "recipient-1".into(),
-            content_sha256: Some(fixture_sha256()),
-            epoch: None,
-            wrapped_dek_base64: base64::engine::general_purpose::STANDARD.encode([0u8; 48]),
-            wrap_algorithm: WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256,
-            ratchet_version: 1,
-            key_validity_window: KeyValidityWindow {
-                not_before: DateTime::parse_from_rfc3339("2026-05-29T00:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-                not_after: DateTime::parse_from_rfc3339("2027-05-29T00:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-            },
-            scope: KeyGrantScope::SingleContent,
-            scope_id: fixture_sha256(),
-            rotation_chain: vec![],
-            // v34.0.0 (#704) — transit-only; absent on every other scope.
-            ifac_size: None,
-        }
-    }
+    const ALL: [LegalBasis; 10] = [
+        LegalBasis::Dmca512,
+        LegalBasis::DsaArticle16,
+        LegalBasis::TvecTerrorist,
+        LegalBasis::NcmecCsam,
+        LegalBasis::GifctCip,
+        LegalBasis::CommunityStandards,
+        LegalBasis::PerceptualHashCsam,
+        LegalBasis::OsaIllegalContent,
+        LegalBasis::AvmsdAgeInappropriate,
+        LegalBasis::CourtOrder,
+    ];
 
     #[test]
     fn legal_basis_round_trips_wire_str() {
-        for b in [
-            LegalBasis::Dmca512,
-            LegalBasis::DsaArticle16,
-            LegalBasis::TvecTerrorist,
-            LegalBasis::NcmecCsam,
-            LegalBasis::GifctCip,
-            LegalBasis::CommunityStandards,
-            LegalBasis::PerceptualHashCsam,
-            LegalBasis::OsaIllegalContent,
-            LegalBasis::AvmsdAgeInappropriate,
-            LegalBasis::CourtOrder,
-        ] {
+        for b in ALL {
             assert_eq!(LegalBasis::from_wire_str(b.as_str()), Some(b));
+            assert_eq!(
+                serde_json::to_value(b).unwrap(),
+                serde_json::json!(b.as_str()),
+                "serde and as_str are one spelling"
+            );
         }
         assert!(LegalBasis::from_wire_str("nonsense").is_none());
+        // v60.0.0 (#803) — the pre-v60 spellings are not this type's.
+        assert!(LegalBasis::from_wire_str("dmca_512").is_none());
+        assert!(LegalBasis::from_wire_str("dsa_article_16").is_none());
+    }
+
+    /// v60.0.0 (#803, CC 3.3.2) — every `LegalBasis` wire string IS a
+    /// registry basis of `takedown_notice:{basis}:v1`, byte for byte, and the
+    /// registry's only other basis is the steward purge's.
+    #[test]
+    fn legal_basis_is_the_registrys_closed_vocabulary() {
+        let (values, open) = crate::federation::namespace::matcher::placeholder_values(
+            "takedown_notice:{basis}",
+            "{basis}",
+        )
+        .expect("rc8 registers takedown_notice:{basis}:v1 with a closed basis");
+        assert!(!open);
+        let ours: Vec<String> = ALL.iter().map(|b| b.as_str().to_owned()).collect();
+        for b in &ours {
+            assert!(values.contains(b), "{b:?} is not a registry basis");
+        }
+        let rest: Vec<&String> = values.iter().filter(|v| !ours.contains(v)).collect();
+        assert_eq!(
+            rest,
+            [&crate::federation::steward_purge::STEWARD_PURGE_BASIS.to_owned()],
+            "the registry's only basis outside LegalBasis is the steward purge's"
+        );
     }
 
     #[test]
     fn admits_counter_notice_matches_ceg_0_3_locked_set() {
-        // CEG 0.3 §5.6.8.4 + §11.4: four expeditious-with-counter-notice
-        // bases.
         for b in [
             LegalBasis::Dmca512,
             LegalBasis::DsaArticle16,
@@ -1219,164 +411,18 @@ mod tests {
     }
 
     #[test]
-    fn requires_immediate_eviction_matches_ceg_0_3_locked_set() {
-        // CEG 0.3 §5.6.8.4 + §11.4: five immediate-removal bases.
-        for b in [
-            LegalBasis::TvecTerrorist,
-            LegalBasis::NcmecCsam,
-            LegalBasis::GifctCip,
-            LegalBasis::PerceptualHashCsam,
-            LegalBasis::CourtOrder,
-        ] {
-            assert!(b.requires_immediate_eviction(), "{b:?}");
-        }
-        for b in [
-            LegalBasis::Dmca512,
-            LegalBasis::DsaArticle16,
-            LegalBasis::OsaIllegalContent,
-            LegalBasis::CommunityStandards,
-            LegalBasis::AvmsdAgeInappropriate,
-        ] {
-            assert!(!b.requires_immediate_eviction(), "{b:?}");
-        }
-    }
-
-    /// CEG 0.3 §11.4 regression: CourtOrder moves into the
-    /// immediate-removal set (was expeditious in the architect's draft).
-    #[test]
-    fn legal_basis_court_order_is_immediate_eviction() {
-        assert!(LegalBasis::CourtOrder.requires_immediate_eviction());
-        assert!(!LegalBasis::CourtOrder.admits_counter_notice());
-    }
-
-    /// CEG 0.3 §5.6.8.4: `AvmsdAgeInappropriate` belongs in the
-    /// new compose-with-age-gate discipline category — neither
-    /// immediate-eviction nor counter-noticed.
-    #[test]
-    fn legal_basis_avmsd_age_inappropriate_composes_with_age_gate() {
-        let basis = LegalBasis::AvmsdAgeInappropriate;
-        assert!(basis.composes_with_age_gate());
-        assert!(!basis.requires_immediate_eviction());
-        assert!(!basis.admits_counter_notice());
-        // All other bases do NOT compose with the age gate.
-        for b in [
-            LegalBasis::Dmca512,
-            LegalBasis::DsaArticle16,
-            LegalBasis::OsaIllegalContent,
-            LegalBasis::CommunityStandards,
-            LegalBasis::TvecTerrorist,
-            LegalBasis::NcmecCsam,
-            LegalBasis::GifctCip,
-            LegalBasis::PerceptualHashCsam,
-            LegalBasis::CourtOrder,
-        ] {
-            assert!(!b.composes_with_age_gate(), "{b:?}");
-        }
-    }
-
-    /// v58.0.0 (CC v1.0-rc8, CC 3.1.1 / 3.3.2) — **persist's `LegalBasis`
-    /// wire strings against the registry's closed `takedown_notice:{basis}:v1`
-    /// basis list.**
-    ///
-    /// rc8 registers the notice as a row family whose `{basis}` is CC 3.3.2's
-    /// normative wire string, closed. Persist's cirisnode notice predates that
-    /// table and spells two bases differently (`dmca_512` / `dsa_article_16`;
-    /// CC: `dmca512` / `dsa_article16`), and the V054 CHECK constraint pins
-    /// persist's spelling, so the rename is a migration, not a re-vendor.
-    /// Recorded here rather than left to be found: every other basis must be
-    /// the registry's byte for byte, the registry's eleventh basis must be the
-    /// steward purge's, and the divergence list must stay exactly what still
-    /// diverges (a fixed spelling reds until its line is deleted).
-    #[test]
-    fn legal_basis_wire_strings_against_the_rc8_takedown_family() {
-        const KNOWN_SPELLING_DIVERGENCES: &[(&str, &str)] =
-            &[("dmca_512", "dmca512"), ("dsa_article_16", "dsa_article16")];
-        let (values, open) = crate::federation::namespace::matcher::placeholder_values(
-            "takedown_notice:{basis}",
-            "{basis}",
-        )
-        .expect("rc8 registers takedown_notice:{basis}:v1 with a closed basis");
-        assert!(!open);
-        let all = [
-            LegalBasis::Dmca512,
-            LegalBasis::DsaArticle16,
-            LegalBasis::TvecTerrorist,
-            LegalBasis::NcmecCsam,
-            LegalBasis::GifctCip,
-            LegalBasis::CommunityStandards,
-            LegalBasis::PerceptualHashCsam,
-            LegalBasis::OsaIllegalContent,
-            LegalBasis::AvmsdAgeInappropriate,
-            LegalBasis::CourtOrder,
-        ];
-        let mut covered = std::collections::BTreeSet::new();
-        let mut diverging = Vec::new();
-        for b in all {
-            let ours = b.as_str();
-            if values.iter().any(|v| v == ours) {
-                covered.insert(ours.to_owned());
-                continue;
-            }
-            let (_, cc) = KNOWN_SPELLING_DIVERGENCES
-                .iter()
-                .find(|(p, _)| *p == ours)
-                .unwrap_or_else(|| {
-                    panic!("{ours:?} is neither a registry basis nor a known divergence")
-                });
-            assert!(
-                values.iter().any(|v| v == cc),
-                "{cc:?} is not a registry basis"
-            );
-            covered.insert((*cc).to_owned());
-            diverging.push(ours);
-        }
-        assert_eq!(
-            diverging,
-            KNOWN_SPELLING_DIVERGENCES
-                .iter()
-                .map(|(p, _)| *p)
-                .collect::<Vec<_>>(),
-            "a divergence was fixed (or a new one appeared): update the list"
-        );
-        let rest: Vec<&String> = values.iter().filter(|v| !covered.contains(*v)).collect();
-        assert_eq!(
-            rest,
-            [&crate::federation::steward_purge::STEWARD_PURGE_BASIS.to_owned()],
-            "the registry's only basis outside LegalBasis is the steward purge's"
-        );
-    }
-
-    /// CEG 0.3 closed set: the 10 LegalBasis variants split into
-    /// exactly 5 (immediate) + 4 (counter-noticed) + 1 (age-gate).
-    /// No variant ends up in two categories or in zero.
-    #[test]
     fn legal_basis_locked_set_matches_ceg_0_3() {
-        let all = [
-            LegalBasis::Dmca512,
-            LegalBasis::DsaArticle16,
-            LegalBasis::TvecTerrorist,
-            LegalBasis::NcmecCsam,
-            LegalBasis::GifctCip,
-            LegalBasis::CommunityStandards,
-            LegalBasis::PerceptualHashCsam,
-            LegalBasis::OsaIllegalContent,
-            LegalBasis::AvmsdAgeInappropriate,
-            LegalBasis::CourtOrder,
-        ];
-        let immediate = all
+        let immediate = ALL
             .iter()
             .filter(|b| b.requires_immediate_eviction())
             .count();
-        let counter = all.iter().filter(|b| b.admits_counter_notice()).count();
-        let age_gate = all.iter().filter(|b| b.composes_with_age_gate()).count();
-        assert_eq!(immediate, 5);
-        assert_eq!(counter, 4);
-        assert_eq!(age_gate, 1);
-        // Exhaustive: every basis falls in exactly one category.
-        for b in all {
-            let cats = (b.requires_immediate_eviction() as u8)
-                + (b.admits_counter_notice() as u8)
-                + (b.composes_with_age_gate() as u8);
+        let counter = ALL.iter().filter(|b| b.admits_counter_notice()).count();
+        let age_gate = ALL.iter().filter(|b| b.composes_with_age_gate()).count();
+        assert_eq!((immediate, counter, age_gate), (5, 4, 1));
+        for b in ALL {
+            let cats = u8::from(b.requires_immediate_eviction())
+                + u8::from(b.admits_counter_notice())
+                + u8::from(b.composes_with_age_gate());
             assert_eq!(cats, 1, "{b:?} must be in exactly one CEG 0.3 category");
         }
     }
@@ -1388,8 +434,6 @@ mod tests {
             LegalBasis::DsaArticle16.counter_notice_window_days(),
             Some(14)
         );
-        // CEG 0.3: OsaIllegalContent + CommunityStandards are now
-        // counter-noticed; persist defaults 14 days and 30 days.
         assert_eq!(
             LegalBasis::OsaIllegalContent.counter_notice_window_days(),
             Some(14)
@@ -1398,958 +442,66 @@ mod tests {
             LegalBasis::CommunityStandards.counter_notice_window_days(),
             Some(30)
         );
-        // Immediate-removal bases have no counter-notice window.
         assert_eq!(LegalBasis::NcmecCsam.counter_notice_window_days(), None);
-        assert_eq!(LegalBasis::CourtOrder.counter_notice_window_days(), None);
-        // Age-gate basis has no counter-notice window either (it
-        // composes with Policy J instead).
         assert_eq!(
             LegalBasis::AvmsdAgeInappropriate.counter_notice_window_days(),
             None
         );
     }
 
-    /// v34.0.0 (#704) — the surviving algorithm round-trips, and the RETIRED
-    /// v1 token is refused.
-    ///
-    /// Replaces `wrap_algorithm_hpke_rfc9180_wire_str_round_trip`, which pinned
-    /// the v1 wire string as the value `as_str()` returns. After the blanket
-    /// rename that test asserted the v2 variant renders the v1 token — a
-    /// contradiction that would have compiled and failed loudly, but for the
-    /// wrong reason.
-    ///
-    /// The v1 leg is kept as a NEGATIVE: `from_wire_str` must refuse
-    /// `hpke_rfc9180_base_x25519_aes_gcm`, so a stored classical grant is
-    /// rejected at parse rather than silently mapped onto the PQC variant.
+    /// The tombstone door's basis table and `LegalBasis` are one CC 4.5.3
+    /// table: every basis classifies the same way through both.
     #[test]
-    fn only_the_pqc_wrap_round_trips_and_v1_is_refused_704() {
-        let alg = WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256;
-        assert_eq!(alg.as_str(), "x25519_mlkem768_aes256_gcm_hkdf_sha256");
-        assert_eq!(
-            WrapAlgorithm::from_wire_str("x25519_mlkem768_aes256_gcm_hkdf_sha256"),
-            Some(alg)
-        );
-
-        // THE RETIREMENT, asserted rather than assumed: the classical token is
-        // no longer a value this type can hold.
-        assert!(
-            WrapAlgorithm::from_wire_str("hpke_rfc9180_base_x25519_aes_gcm").is_none(),
-            "v1 is GONE — a stored classical grant must fail at parse, not be \
-             folded onto the PQC variant"
-        );
-
-        let serialized = serde_json::to_string(&alg).unwrap();
-        let back: WrapAlgorithm = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(back, alg);
-    }
-
-    #[test]
-    fn extract_takedown_notice_payload_returns_none_for_non_matching_kind() {
-        let payload = serde_json::to_value(fixture_takedown(LegalBasis::Dmca512)).unwrap();
-        let out = extract_takedown_notice_payload("federation_announcement", &payload).unwrap();
-        assert!(out.is_none());
+    fn the_basis_table_is_one_table() {
+        use crate::federation::takedown_tombstone::{basis_disposition, TakedownDisposition};
+        for b in ALL {
+            let d = basis_disposition(b.as_str())
+                .unwrap_or_else(|| panic!("{} has no disposition", b.as_str()));
+            let expected = if b.requires_immediate_eviction() {
+                TakedownDisposition::DestroyOnReceipt
+            } else if b.composes_with_age_gate() {
+                TakedownDisposition::AgeGate
+            } else {
+                TakedownDisposition::WithholdThenDelete {
+                    window_days: i64::from(b.counter_notice_window_days().unwrap()),
+                }
+            };
+            assert_eq!(d, expected, "{}", b.as_str());
+        }
     }
 
     #[test]
     fn extract_takedown_notice_payload_validates_shape() {
-        let typed = fixture_takedown(LegalBasis::Dmca512);
-        let value = serde_json::to_value(&typed).unwrap();
-        let parsed = extract_takedown_notice_payload(TAKEDOWN_NOTICE_SUBJECT_KIND, &value)
-            .unwrap()
-            .unwrap();
-        assert_eq!(parsed, typed);
-    }
-
-    #[test]
-    fn extract_takedown_notice_payload_rejects_uppercase_sha() {
-        let mut typed = fixture_takedown(LegalBasis::Dmca512);
-        typed.content_sha256 = "A".repeat(64);
-        let value = serde_json::to_value(&typed).unwrap();
-        let err =
-            extract_takedown_notice_payload(TAKEDOWN_NOTICE_SUBJECT_KIND, &value).unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)));
-    }
-
-    #[test]
-    fn extract_takedown_notice_payload_rejects_short_sha() {
-        let mut typed = fixture_takedown(LegalBasis::Dmca512);
-        typed.content_sha256 = "abc".into();
-        let value = serde_json::to_value(&typed).unwrap();
-        let err =
-            extract_takedown_notice_payload(TAKEDOWN_NOTICE_SUBJECT_KIND, &value).unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)));
-    }
-
-    #[test]
-    fn extract_takedown_notice_payload_rejects_empty_claim_text() {
-        let mut typed = fixture_takedown(LegalBasis::Dmca512);
-        typed.claim_text = String::new();
-        let value = serde_json::to_value(&typed).unwrap();
-        let err =
-            extract_takedown_notice_payload(TAKEDOWN_NOTICE_SUBJECT_KIND, &value).unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)));
-    }
-
-    #[test]
-    fn extract_takedown_notice_payload_rejects_unknown_legal_basis() {
-        // Serialize an envelope whose `legal_basis` is a literal that
-        // does not map to any LegalBasis variant.
-        let typed = fixture_takedown(LegalBasis::Dmca512);
-        let mut value = serde_json::to_value(&typed).unwrap();
-        value["legal_basis"] = serde_json::Value::String("nonsense_basis".into());
-        let err =
-            extract_takedown_notice_payload(TAKEDOWN_NOTICE_SUBJECT_KIND, &value).unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)));
-    }
-
-    #[test]
-    fn extract_key_grant_payload_returns_none_for_non_matching_kind() {
-        let payload = serde_json::to_value(fixture_key_grant()).unwrap();
-        let out = extract_key_grant_payload("federation_announcement", &payload).unwrap();
-        assert!(out.is_none());
-    }
-
-    #[test]
-    fn extract_key_grant_payload_validates_shape() {
-        let typed = fixture_key_grant();
-        let value = serde_json::to_value(&typed).unwrap();
-        let parsed = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value)
-            .unwrap()
-            .unwrap();
-        assert_eq!(parsed, typed);
-    }
-
-    #[test]
-    fn extract_key_grant_payload_rejects_invalid_base64_dek() {
-        let mut typed = fixture_key_grant();
-        typed.wrapped_dek_base64 = "not!base64@@".into();
-        let value = serde_json::to_value(&typed).unwrap();
-        let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)));
-    }
-
-    #[test]
-    fn extract_key_grant_payload_rejects_inverted_validity_window() {
-        let mut typed = fixture_key_grant();
-        std::mem::swap(
-            &mut typed.key_validity_window.not_before,
-            &mut typed.key_validity_window.not_after,
-        );
-        let value = serde_json::to_value(&typed).unwrap();
-        let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)));
-    }
-
-    // ── Cut C3b: stream/epoch addressing (CEG §10.5.3) ──────────────
-
-    /// A valid stream/epoch-addressed grant: no content_sha256, `epoch` +
-    /// `scope_id` set, v2 wrap, StreamEpoch scope.
-    fn fixture_stream_grant() -> KeyGrantPayload {
-        KeyGrantPayload {
-            recipient_key_id: "recipient-1".into(),
-            content_sha256: None,
-            epoch: Some(7),
-            wrapped_dek_base64: base64::engine::general_purpose::STANDARD.encode([0u8; 48]),
-            wrap_algorithm: WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256,
-            ratchet_version: 1,
-            key_validity_window: KeyValidityWindow {
-                not_before: DateTime::parse_from_rfc3339("2026-05-29T00:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-                not_after: DateTime::parse_from_rfc3339("2027-05-29T00:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-            },
-            scope: KeyGrantScope::StreamEpoch,
-            scope_id: "stream-abc".into(),
-            rotation_chain: vec![],
-            // v34.0.0 (#704) — transit-only; absent on every other scope.
-            ifac_size: None,
-        }
-    }
-
-    #[test]
-    fn extract_stream_epoch_grant_validates() {
-        let typed = fixture_stream_grant();
-        let value = serde_json::to_value(&typed).unwrap();
-        let parsed = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value)
-            .unwrap()
-            .unwrap();
-        assert_eq!(parsed, typed);
-        // v34.0.0 (#704) — the `assert!(parsed.wrap_algorithm
-        // .is_streaming_pqc_v2())` that stood here is DELETED with the method.
-        // `WrapAlgorithm` is single-variant, so the assertion held for every
-        // value the field could take: it would have passed identically had the
-        // extractor returned a payload with the wrong algorithm, because there
-        // is no wrong algorithm left to return. `assert_eq!(parsed, typed)`
-        // above already pins the whole payload, algorithm included.
-    }
-
-    // v34.0.0 (#704) — `stream_grant_with_v1_wrap_is_rejected` DELETED, not
-    // flipped to v2.
-    //
-    // It asserted "a streaming epoch grant carrying wrap_algorithm v1 MUST be
-    // rejected". With v1 removed from the enum that state is UNCONSTRUCTIBLE,
-    // so the test could only have been rewritten into something that no longer
-    // checks what its name claims. The rule it enforced at runtime is now
-    // enforced by the type system, which is strictly stronger: not "we refuse
-    // it" but "it cannot be expressed".
-
-    #[test]
-    fn grant_with_both_addressing_modes_is_rejected() {
-        let mut typed = fixture_stream_grant();
-        typed.content_sha256 = Some("a".repeat(64)); // now BOTH set
-        let value = serde_json::to_value(&typed).unwrap();
-        let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(ref m) if m.contains("mutually exclusive")));
-    }
-
-    #[test]
-    fn grant_with_no_addressing_is_rejected() {
-        let mut typed = fixture_stream_grant();
-        typed.epoch = None; // neither content nor scope-epoch
-        let value = serde_json::to_value(&typed).unwrap();
-        let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(ref m) if m.contains("must be addressed")));
-    }
-
-    #[test]
-    fn stream_grant_requires_stream_epoch_scope() {
-        let mut typed = fixture_stream_grant();
-        typed.scope = KeyGrantScope::GroupMember; // wrong scope
-        let value = serde_json::to_value(&typed).unwrap();
-        let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
+        let payload = serde_json::to_value(fixture_takedown(LegalBasis::Dmca512)).unwrap();
         assert!(
-            matches!(err, Error::InvalidArgument(ref m) if m.contains("epoch-addressed scope")),
-            "got: {err:?}"
-        );
-    }
-
-    /// v34.0.0 (#704) — a content-addressed grant declaring an EPOCH-addressed
-    /// scope is refused HERE, with a typed error naming the contradiction.
-    ///
-    /// It already failed closed before this: the projection writes `scope_kind`
-    /// NOT NULL beside a NULL `scope_id`, which the V129 CHECK (postgres) and
-    /// trigger (sqlite) refuse. But that refusal arrives as an opaque backend
-    /// error naming a constraint, raised separately per dialect — two copies of
-    /// one rule, and neither tells the caller what they did wrong.
-    ///
-    /// The invariant belongs to the payload, so it is checked once.
-    #[test]
-    fn content_addressed_grant_may_not_declare_an_epoch_scope_704() {
-        for scope in [KeyGrantScope::StreamEpoch, KeyGrantScope::TransitMembership] {
-            let mut typed = fixture_key_grant(); // content-addressed
-            typed.scope = scope;
-            let value = serde_json::to_value(&typed).unwrap();
-            let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
-            assert!(
-                matches!(err, Error::InvalidArgument(ref m)
-                    if m.contains("epoch-addressed") && m.contains(scope.as_str())),
-                "the refusal must name the offending scope, not a constraint: {err:?}"
-            );
-        }
-    }
-
-    // v34.0.0 (#704) — `scope_ref_and_scope_id_must_agree_704` DELETED, not
-    // rewritten.
-    //
-    // It asserted that a payload carrying `scope_ref: "netname-a"` beside
-    // `scope_id: "netname-b"` is refused, because only `scope_ref` reached the
-    // queryable `key_grant_scope_id` column and the row would have been
-    // discoverable under one name while attested under the other. With
-    // `scope_ref` deleted there is one field, so the state the test constructed
-    // is UNCONSTRUCTIBLE and the test could only have been re-pointed at some
-    // other rule while keeping a name that promises this one — the exact
-    // mistake this cut already made once and caught.
-    //
-    // The rule is not lost; it is answered structurally. Two fields cannot
-    // disagree when there is one of them. What survives is the WIRE half:
-    // `scope_ref` arriving from an older caller is refused by name — see
-    // `removed_wire_key_scope_ref_is_refused_by_name_704` below.
-
-    /// A VALID transit grant: epoch-addressed, netname as `scope_id`, and an
-    /// in-range `ifac_size` — the shape `validate_ifac_size` admits.
-    ///
-    /// 128 bits = 16 bytes, which is leviculum's convention for a NETWORK
-    /// (TCP/UDP) interface — the medium a CIRIS relay port runs on. A fixture
-    /// value picked from the consumer's conventions rather than from thin air.
-    fn fixture_transit_grant() -> KeyGrantPayload {
-        KeyGrantPayload {
-            scope: KeyGrantScope::TransitMembership,
-            scope_id: "ciris-transit-net".to_owned(),
-            ifac_size: Some(128),
-            ..fixture_stream_grant()
-        }
-    }
-
-    /// The transit scope is accepted on the epoch-addressed path — the point of
-    /// the generalization. Without this leg the widened check above could be
-    /// refusing everything and the negative tests would not notice.
-    #[test]
-    fn a_transit_membership_grant_is_epoch_addressable_704() {
-        let typed = fixture_transit_grant();
-        let value = serde_json::to_value(&typed).unwrap();
-        assert!(
-            extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value)
+            extract_takedown_notice_payload("federation_announcement", &payload)
                 .unwrap()
-                .is_some(),
-            "transit membership must validate on the epoch-addressed path"
+                .is_none()
         );
-    }
-
-    // ── v34.0.0 (#704): `ifac_size` is required, refused, and bounded ──
-
-    /// REQUIRED half. A transit grant with no `ifac_size` is refused.
-    ///
-    /// This is the shape that cost the most if admitted: the recipient unwraps
-    /// a passphrase and cannot size the interface it belongs to, so the key
-    /// material is undeliverable while every layer reports success.
-    #[test]
-    fn transit_grant_without_ifac_size_is_refused_704() {
-        let mut typed = fixture_transit_grant();
-        typed.ifac_size = None;
-        let value = serde_json::to_value(&typed).unwrap();
-        let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
-        // ONE contiguous phrase binding the field to its requirement. Two
-        // independent `contains` on "transit_membership" and "ifac_size" would
-        // also pass on the WRONG-SCOPE refusal below, which names both.
         assert!(
-            matches!(&err, Error::InvalidArgument(m)
-                if m.contains("scope=transit_membership requires ifac_size")),
-            "the refusal must name the field and the scope that requires it: {err:?}"
-        );
-    }
-
-    /// REFUSED half, over EVERY non-transit scope — derived from
-    /// [`KeyGrantScope::ALL`], so a scope added later is covered on its first
-    /// commit rather than when someone remembers to extend a hand-written list.
-    ///
-    /// The fixture is chosen by `is_epoch_addressed` for the same reason: a
-    /// content-addressed base under an epoch scope would be refused by the
-    /// ADDRESSING check instead, and this test would pass while witnessing a
-    /// neighbouring gate.
-    #[test]
-    fn ifac_size_on_a_non_transit_scope_is_refused_704() {
-        for scope in KeyGrantScope::ALL {
-            if scope == KeyGrantScope::TransitMembership {
-                continue;
-            }
-            let mut typed = if scope.is_epoch_addressed() {
-                fixture_stream_grant()
-            } else {
-                fixture_key_grant()
-            };
-            typed.scope = scope;
-            // Admitted WITHOUT the field — so the refusal below has exactly one
-            // available explanation.
-            assert!(
-                extract_key_grant_payload(
-                    KEY_GRANT_SUBJECT_KIND,
-                    &serde_json::to_value(&typed).unwrap()
-                )
+            extract_takedown_notice_payload(TAKEDOWN_NOTICE_SUBJECT_KIND, &payload)
                 .unwrap()
-                .is_some(),
-                "the base fixture for {} must be VALID without ifac_size",
-                scope.as_str()
-            );
-
-            typed.ifac_size = Some(128);
-            let value = serde_json::to_value(&typed).unwrap();
-            let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
-            let named = format!("was sent with scope={}", scope.as_str());
-            assert!(
-                matches!(&err, Error::InvalidArgument(m) if m.contains(&named)),
-                "the refusal must name the scope it was sent with ({named:?}): {err:?}"
-            );
-        }
-    }
-
-    /// BOUNDS. `0` is refused, and so is every value outside
-    /// `IFAC_SIZE_MIN_BITS..=IFAC_SIZE_MAX_BITS`.
-    ///
-    /// The two boundary values themselves are asserted ADMITTED in the same
-    /// test. Without that leg a range check that refused everything — or one
-    /// off by one at either end — would look identical from here.
-    #[test]
-    fn transit_grant_ifac_size_out_of_range_is_refused_704() {
-        for bits in [
-            0,
-            1,
-            IFAC_SIZE_MIN_BITS - 1,
-            IFAC_SIZE_MAX_BITS + 1,
-            u16::MAX,
-        ] {
-            let mut typed = fixture_transit_grant();
-            typed.ifac_size = Some(bits);
-            let value = serde_json::to_value(&typed).unwrap();
-            let err = extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value).unwrap_err();
-            assert!(
-                matches!(&err, Error::InvalidArgument(m)
-                    if m.contains(&format!("ifac_size={bits} is outside the IFAC range"))),
-                "ifac_size={bits} must be refused BY VALUE, naming it: {err:?}"
-            );
-        }
-
-        // LITERALS, not the constants — a test that derives its boundary from
-        // the bound it is checking moves WITH a mistake in that bound. This
-        // leg was written against the constants first and MUTATION-TESTED:
-        // with `IFAC_SIZE_MAX_BITS` changed to 511 it stayed green, because
-        // both the admitted value and the refused one shifted underneath it.
-        // 8 and 512 are Reticulum's, and they are spelled here as such.
-        for bits in [8u16, 64, 128, 512] {
-            let mut typed = fixture_transit_grant();
-            typed.ifac_size = Some(bits);
-            let value = serde_json::to_value(&typed).unwrap();
-            assert!(
-                extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value)
-                    .unwrap()
-                    .is_some(),
-                "ifac_size={bits} is inside the range Reticulum accepts and must be \
-                 admitted — the bounds are inclusive at both ends"
-            );
-        }
-    }
-
-    /// The bound VALUES, pinned to their source.
-    ///
-    /// The range test above asserts the RELATION — refused outside, admitted
-    /// at the edges. It cannot see a bound that is simply the wrong number,
-    /// because the wrong number would be the one it tests against. These two
-    /// values are claims about Reticulum, so they are pinned as literals with
-    /// the evidence attached: moving one is then a deliberate act with a red
-    /// test naming what would have to have changed upstream.
-    #[test]
-    fn ifac_size_bounds_are_pinned_to_reticulum_704() {
-        assert_eq!(
-            IFAC_SIZE_MIN_BITS, 8,
-            "Reticulum pins IFAC_MIN_SIZE = 1 byte and honours a configured \
-             ifac_size only at or above IFAC_MIN_SIZE*8 bits; leviculum mirrors \
-             the same >= 8 guard before storing bits/8"
+                .is_some()
         );
-        assert_eq!(
-            IFAC_SIZE_MAX_BITS, 512,
-            "the access code is the tail of an Ed25519 signature over the frame \
-             (sign(raw)[-ifac_size:]), which is 64 bytes — 512 bits is the whole \
-             width, and Reticulum's interface documentation states the same range"
-        );
-    }
-
-    /// The gate the write path actually reaches: `put_key_grant` delegates to
-    /// `require_key_grant_envelope`, which delegates here. A rule enforced only
-    /// in the bare extractor would be a rule no writer meets.
-    #[test]
-    fn ifac_size_rule_is_enforced_through_the_put_gate_704() {
-        let mut typed = fixture_transit_grant();
-        typed.ifac_size = None;
-        let env = fixture_grant_envelope(&typed);
-        let err = require_key_grant_envelope(&env).unwrap_err();
+        let mut upper = fixture_takedown(LegalBasis::Dmca512);
+        upper.content_sha256 = "A".repeat(64);
+        let v = serde_json::to_value(upper).unwrap();
+        assert!(extract_takedown_notice_payload(TAKEDOWN_NOTICE_SUBJECT_KIND, &v).is_err());
+        let mut empty = fixture_takedown(LegalBasis::Dmca512);
+        empty.claim_text = String::new();
+        let v = serde_json::to_value(empty).unwrap();
+        assert!(extract_takedown_notice_payload(TAKEDOWN_NOTICE_SUBJECT_KIND, &v).is_err());
+        let mut v = serde_json::to_value(fixture_takedown(LegalBasis::Dmca512)).unwrap();
+        v["legal_basis"] = serde_json::json!("dmca_512");
         assert!(
-            matches!(&err, Error::InvalidArgument(m)
-                if m.contains("scope=transit_membership requires ifac_size")),
-            "got: {err:?}"
+            extract_takedown_notice_payload(TAKEDOWN_NOTICE_SUBJECT_KIND, &v).is_err(),
+            "the pre-v60 spelling is refused"
         );
-    }
-
-    /// v34.0.0 (#704) — `KeyGrantScope::ALL` is the WHOLE vocabulary.
-    ///
-    /// `ALL` is what `from_wire_str` and `epoch_addressed_tokens` walk, so a
-    /// variant missing from it is a `scope_kind` the write path stamps and no
-    /// boundary will accept — and the caller's read returns `[]`, which is
-    /// indistinguishable from "no grants issued".
-    ///
-    /// Checked against a SECOND enumeration nobody maintains: serde's
-    /// `unknown variant … expected one of …` error is generated by the derive
-    /// macro from the variants themselves. Neither side hand-spells a token —
-    /// `as_str` supplies them — so this also pins `as_str` against the
-    /// `rename_all = "snake_case"` the wire actually decodes with.
-    #[test]
-    fn key_grant_scope_all_is_the_whole_vocabulary() {
-        let err = serde_json::from_value::<KeyGrantScope>(serde_json::json!("__not_a_scope__"))
-            .expect_err("an unknown scope token must not decode")
-            .to_string();
-        let listed = err
-            .split_once("expected one of ")
-            .map(|(_, rest)| rest.matches('`').count() / 2)
-            .unwrap_or(0);
-        assert_eq!(
-            listed,
-            KeyGrantScope::ALL.len(),
-            "serde knows {listed} variants and KeyGrantScope::ALL lists {}; \
-             a variant is missing from ALL (or serde's error format changed): {err}",
-            KeyGrantScope::ALL.len()
-        );
-
-        for scope in KeyGrantScope::ALL {
-            assert!(
-                err.contains(&format!("`{}`", scope.as_str())),
-                "serde does not decode `{}` — as_str disagrees with the serde \
-                 rename, so a stamped scope_kind would not parse back: {err}",
-                scope.as_str()
-            );
-            assert_eq!(
-                KeyGrantScope::from_wire_str(scope.as_str()),
-                Some(scope),
-                "from_wire_str must invert as_str for {scope:?}"
-            );
-        }
-        assert_eq!(KeyGrantScope::from_wire_str("__not_a_scope__"), None);
-
-        // The epoch-addressed rendering is exactly the epoch-addressed subset,
-        // in ALL order — the token list every boundary refusal prints.
-        assert_eq!(
-            KeyGrantScope::epoch_addressed_tokens(),
-            "stream_epoch | transit_membership",
-            "the epoch-addressed vocabulary changed; every refusal message and \
-             the PyO3 scope-epoch read move with it"
-        );
-    }
-
-    // ── v34.0.0 (#704): removed wire keys refuse LOUDLY ─────────────
-
-    /// A scope-epoch grant that IS valid on the current wire, as raw JSON —
-    /// the base every removed-key case below mutates.
-    ///
-    /// Returned as `Value` rather than as a typed payload on purpose: the keys
-    /// under test do not exist as struct fields, so they can only be expressed
-    /// by editing the JSON. Each caller asserts this base is ADMITTED before
-    /// mutating it, so a refusal afterwards has exactly one available
-    /// explanation.
-    fn valid_grant_json() -> serde_json::Map<String, serde_json::Value> {
-        let value = serde_json::to_value(fixture_stream_grant()).unwrap();
+        let mut v = serde_json::to_value(fixture_takedown(LegalBasis::Dmca512)).unwrap();
+        v["claimant_key_id"] = serde_json::json!("someone");
         assert!(
-            extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value)
-                .unwrap()
-                .is_some(),
-            "the base payload must be VALID, or a refusal below proves nothing"
-        );
-        value.as_object().unwrap().clone()
-    }
-
-    /// Assert the refusal names the key the caller SENT and the key to send
-    /// instead — pinned as ONE contiguous directive phrase, not as two
-    /// independent `contains` checks.
-    ///
-    /// The two-`contains` form was written first and MUTATION-TESTED: with the
-    /// replacement removed from the message entirely, it still passed two of
-    /// the three cases. `"epoch"` is a substring of `"stream_epoch"`, so the
-    /// removed key satisfies the assertion about its own replacement; and the
-    /// `scope_ref` entry's explanatory note happens to mention `scope_id` in
-    /// prose, so that case passed on the note alone. Both would have reported
-    /// "the replacement is named" about a message that never named it.
-    ///
-    /// Pinning the whole phrase fixes it: it constrains each name's ROLE — what
-    /// to rename, and to what — and no substring relation or nearby prose can
-    /// assemble it by accident.
-    fn assert_names_removed_key_and_replacement(err: &Error, removed: &str, replacement: &str) {
-        let directive = format!("rename `{removed}` to `{replacement}` and resubmit");
-        assert!(
-            matches!(err, Error::InvalidArgument(m) if m.contains(&directive)),
-            "the refusal must tell the caller what to do, naming the removed key \
-             and its replacement in their roles ({directive:?}): {err:?}"
+            extract_takedown_notice_payload(TAKEDOWN_NOTICE_SUBJECT_KIND, &v).is_err(),
+            "the claimant is the row's signer, never a payload member"
         );
     }
-
-    /// `stream_id` — the RELEASED v33 name for the epoch-addressing id.
-    ///
-    /// The silent failure without this guard: v33 also had a `scope_id` field
-    /// meaning something else entirely, so a v33 payload decodes cleanly with
-    /// `stream_id` dropped and `scope_id` carrying whatever the OLD field meant.
-    /// The grant is admitted, and the column every epoch read addresses by
-    /// holds a value the caller never nominated as the stream id.
-    #[test]
-    fn removed_wire_key_stream_id_is_refused_by_name_704() {
-        let mut object = valid_grant_json();
-        object.insert("stream_id".into(), "stream-abc".into());
-        object.insert("scope_id".into(), "a-different-id".into());
-        let err =
-            extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &serde_json::Value::Object(object))
-                .unwrap_err();
-        assert_names_removed_key_and_replacement(&err, "stream_id", "scope_id");
-    }
-
-    /// `stream_epoch` — the RELEASED v33 name for the epoch.
-    ///
-    /// Modelled as the real old-caller shape: `stream_epoch` present, `epoch`
-    /// absent. Without the guard serde drops `stream_epoch`, the XOR sees no
-    /// `epoch`, and the grant is refused as "must be addressed" — a message
-    /// about an addressing mode the caller did not choose, which never mentions
-    /// the key they actually sent.
-    #[test]
-    fn removed_wire_key_stream_epoch_is_refused_by_name_704() {
-        let mut object = valid_grant_json();
-        object
-            .remove("epoch")
-            .expect("the base grant carries epoch");
-        object.insert("stream_epoch".into(), 7u64.into());
-        let err =
-            extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &serde_json::Value::Object(object))
-                .unwrap_err();
-        assert_names_removed_key_and_replacement(&err, "stream_epoch", "epoch");
-        // And it is refused for THIS reason, not for the addressing reason the
-        // dropped key would have produced downstream.
-        assert!(
-            matches!(&err, Error::InvalidArgument(m) if !m.contains("must be addressed")),
-            "the removed key must be named BEFORE the XOR sees its absence: {err:?}"
-        );
-    }
-
-    /// `scope_ref` — never released, collapsed into `scope_id` in this cut.
-    ///
-    /// Carries what the deleted `scope_ref_and_scope_id_must_agree_704` was
-    /// really protecting: a caller nominating an id under the old key while
-    /// `scope_id` says something else. That divergence is now impossible in the
-    /// struct, so the wire is where it is refused — by name, with the field to
-    /// use instead.
-    #[test]
-    fn removed_wire_key_scope_ref_is_refused_by_name_704() {
-        let mut object = valid_grant_json();
-        object.insert("scope_ref".into(), "netname-a".into());
-        object.insert("scope_id".into(), "netname-b".into());
-        let err =
-            extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &serde_json::Value::Object(object))
-                .unwrap_err();
-        assert_names_removed_key_and_replacement(&err, "scope_ref", "scope_id");
-    }
-
-    /// The removed-key door must not fire on a payload that carries none of
-    /// them — otherwise every test above would pass with the guard refusing
-    /// unconditionally.
-    #[test]
-    fn a_grant_without_removed_wire_keys_is_admitted_704() {
-        let object = valid_grant_json();
-        for (removed, _, _) in REMOVED_KEY_GRANT_WIRE_KEYS {
-            assert!(
-                !object.contains_key(*removed),
-                "the base fixture must not carry `{removed}`"
-            );
-        }
-        assert!(extract_key_grant_payload(
-            KEY_GRANT_SUBJECT_KIND,
-            &serde_json::Value::Object(object)
-        )
-        .unwrap()
-        .is_some());
-    }
-
-    /// The door is reached through `put_key_grant`'s gate too, not only the
-    /// bare extractor — `require_key_grant_envelope` delegates, so a writer
-    /// submitting an old-shaped envelope gets the same named refusal.
-    #[test]
-    fn removed_wire_keys_are_refused_through_the_put_gate_704() {
-        let mut object = valid_grant_json();
-        object.insert("scope_ref".into(), "netname-a".into());
-        let mut env = fixture_grant_envelope(&fixture_stream_grant());
-        env.payload = serde_json::Value::Object(object);
-        let err = require_key_grant_envelope(&env).unwrap_err();
-        assert_names_removed_key_and_replacement(&err, "scope_ref", "scope_id");
-    }
-
-    // ── v35.0.0 (#715): retired wrap_algorithm spellings refuse BY NAME ──
-
-    /// The separator convention, pinned: every live wire token is
-    /// underscore-separated.
-    ///
-    /// The expected tokens are restated as LITERALS — never derived from
-    /// `as_str()`, which is the thing under test. A witness derived from the
-    /// checked value can only see relations, never a wrong value: if `as_str`
-    /// were respelled with hyphens, `!as_str().contains('-')` would be the
-    /// only assertion to fire, and deriving the list from `as_str` would
-    /// silently bless the new spelling everywhere else.
-    #[test]
-    fn wrap_algorithm_tokens_are_underscore_separated_715() {
-        const EXPECTED_TOKENS: &[&str] = &["x25519_mlkem768_aes256_gcm_hkdf_sha256"];
-
-        // The convention, asserted on the LITERALS.
-        for token in EXPECTED_TOKENS {
-            assert!(
-                !token.contains('-'),
-                "wire tokens are underscore-separated; `{token}` carries a hyphen"
-            );
-            assert!(
-                token.contains('_'),
-                "wire tokens are underscore-separated; `{token}` has no separator \
-                 at all"
-            );
-        }
-
-        // The live vocabulary IS the literal list, element for element. The
-        // match arm forces a compile break when a variant is added, so a
-        // future token cannot dodge the convention by dodging this list.
-        let live = [WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256];
-        for alg in live {
-            match alg {
-                WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256 => {}
-            }
-        }
-        assert_eq!(live.len(), EXPECTED_TOKENS.len());
-        for (alg, expected) in live.iter().zip(EXPECTED_TOKENS) {
-            assert_eq!(alg.as_str(), *expected);
-        }
-    }
-
-    /// The CC 1.0-rc2 hyphenated spelling of v2 — the #715 headline. Refused
-    /// BY NAME as a RESPELLING: same construction, one conformant spelling,
-    /// stated exactly.
-    ///
-    /// The witness pins ONE contiguous directive phrase carrying BOTH
-    /// spellings in their roles. The substring trap this dodges: `x25519`
-    /// (and most other fragments) appear in BOTH spellings, and serde's
-    /// generic `unknown variant \`…\`, expected \`…\`` message ALSO renders
-    /// both tokens — so any pair of independent `contains` checks on
-    /// fragments can pass against the generic message the named door exists
-    /// to replace.
-    #[test]
-    fn rc2_hyphenated_v2_spelling_is_refused_by_name_715() {
-        let mut object = valid_grant_json();
-        object.insert(
-            "wrap_algorithm".into(),
-            "x25519-mlkem768-aes256-gcm-hkdf-sha256".into(),
-        );
-        let err =
-            extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &serde_json::Value::Object(object))
-                .unwrap_err();
-        let directive = "respell `x25519-mlkem768-aes256-gcm-hkdf-sha256` as \
-                         `x25519_mlkem768_aes256_gcm_hkdf_sha256` and resubmit";
-        assert!(
-            matches!(&err, Error::InvalidArgument(m) if m.contains(directive)),
-            "the refusal must state the exact replacement spelling as one \
-             contiguous directive ({directive:?}): {err:?}"
-        );
-        // Named at the DOOR, not diagnosed by the typed decode.
-        assert!(
-            matches!(&err, Error::InvalidArgument(m) if !m.contains("payload shape")),
-            "the retired token must be named BEFORE serde sees it: {err:?}"
-        );
-        // And named as a RESPELLING — the construction lives; claiming
-        // removal would send the caller re-wrapping a DEK that only needs
-        // its label fixed.
-        assert!(
-            matches!(&err, Error::InvalidArgument(m) if !m.contains("REMOVED")),
-            "the rc2 v2 spelling is respelled, not removed: {err:?}"
-        );
-    }
-
-    /// Both v1 spellings — this surface's `hpke_rfc9180_base_x25519_aes_gcm`
-    /// and the CC 1.0-rc2 floor's `x25519-aes256-gcm-hkdf-sha256` — are
-    /// refused BY NAME as REMOVED, not respelled: the construction is gone
-    /// (v34.0.0/#704), so the directive is to re-wrap under v2, never to
-    /// respell.
-    #[test]
-    fn removed_v1_wrap_tokens_are_refused_by_name_715() {
-        for v1_token in [
-            "hpke_rfc9180_base_x25519_aes_gcm",
-            "x25519-aes256-gcm-hkdf-sha256",
-        ] {
-            let mut object = valid_grant_json();
-            object.insert("wrap_algorithm".into(), v1_token.into());
-            let err = extract_key_grant_payload(
-                KEY_GRANT_SUBJECT_KIND,
-                &serde_json::Value::Object(object),
-            )
-            .unwrap_err();
-            // The token the caller sent, in its role — backtick-delimited so
-            // no other token can satisfy it by substring.
-            let named = format!("wrap_algorithm `{v1_token}` names the classical v1");
-            assert!(
-                matches!(&err, Error::InvalidArgument(m) if m.contains(&named)),
-                "the refusal must name the v1 token the caller sent \
-                 ({named:?}): {err:?}"
-            );
-            // Its disposition: REMOVED, not respelled — one contiguous phrase.
-            assert!(
-                matches!(&err, Error::InvalidArgument(m)
-                    if m.contains("REMOVED in v34.0.0 (CIRISPersist#704), not respelled")),
-                "v1's disposition is removal, stated as such: {err:?}"
-            );
-            // And the way forward, with the live token spelled exactly.
-            let forward =
-                "re-wrap the DEK under `x25519_mlkem768_aes256_gcm_hkdf_sha256` and resubmit";
-            assert!(
-                matches!(&err, Error::InvalidArgument(m) if m.contains(forward)),
-                "the refusal must state the exact live token ({forward:?}): {err:?}"
-            );
-        }
-    }
-
-    /// The retired table must never shadow the LIVE vocabulary — a live token
-    /// listed there would make the door refuse every valid grant — and its
-    /// rc2 entry must stay byte-equal to verify's constant for as long as
-    /// verify carries one.
-    #[test]
-    fn retired_wrap_tokens_never_shadow_the_live_vocabulary_715() {
-        for (retired, _) in RETIRED_WRAP_ALGORITHM_WIRE_TOKENS {
-            assert_eq!(
-                WrapAlgorithm::from_wire_str(retired),
-                None,
-                "`{retired}` is retired wire history and must not parse as a \
-                 live token"
-            );
-        }
-        assert!(
-            RETIRED_WRAP_ALGORITHM_WIRE_TOKENS
-                .iter()
-                .any(|(retired, _)| *retired
-                    == ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED),
-            "the rc2 hyphenated v2 entry must match verify's \
-             KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED byte-for-byte"
-        );
-        // The base fixture clears the door (valid_grant_json asserts
-        // admission), so the refusals above have exactly one explanation.
-    }
-
-    #[test]
-    fn content_grant_carries_the_pqc_wrap_704() {
-        // v34.0.0 (#704) — every grant is v2 now, content-addressed
-        // included. The old assertion here pinned the content default to
-        // v1, which was the live classical-only path this release removes.
-        let typed = fixture_key_grant();
-        assert_eq!(
-            typed.wrap_algorithm,
-            WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256
-        );
-        let value = serde_json::to_value(&typed).unwrap();
-        assert!(extract_key_grant_payload(KEY_GRANT_SUBJECT_KIND, &value)
-            .unwrap()
-            .is_some());
-    }
-
-    #[test]
-    fn wrap_algorithm_v2_wire_round_trip() {
-        assert_eq!(
-            WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256.as_str(),
-            "x25519_mlkem768_aes256_gcm_hkdf_sha256"
-        );
-        assert_eq!(
-            WrapAlgorithm::from_wire_str("x25519_mlkem768_aes256_gcm_hkdf_sha256"),
-            Some(WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256)
-        );
-        // serde rename matches the wire string.
-        assert_eq!(
-            serde_json::to_string(&WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256).unwrap(),
-            r#""x25519_mlkem768_aes256_gcm_hkdf_sha256""#
-        );
-    }
-
-    /// v25.1.0 (CIRISPersist#582, CC 5.1 / CIRISVerify#234) — persist's enum
-    /// and verify's constant name ONE construction, and a `#[serde(rename)]`
-    /// attribute cannot be a `const`. So the equality is asserted here: if
-    /// verify re-spells the identifier again, this fires instead of persist
-    /// silently serializing a form nothing else accepts.
-    #[test]
-    fn v2_wire_string_is_verifys_ratified_identifier() {
-        assert_eq!(
-            WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256.as_str(),
-            ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2,
-            "the serde rename + as_str spelling must equal verify's constant"
-        );
-        // The non-conformant hyphenated alias is REFUSED at the parse door,
-        // and is NOT normalized into the conformant form.
-        assert_eq!(
-            WrapAlgorithm::from_wire_str(
-                ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED
-            ),
-            None,
-            "CC 5.1: the hyphenated alias is non-conformant and MUST NOT be \
-             normalized before comparison"
-        );
-    }
-
-    #[test]
-    fn legal_basis_serde_matches_snake_case() {
-        assert_eq!(
-            serde_json::to_string(&LegalBasis::NcmecCsam).unwrap(),
-            r#""ncmec_csam""#
-        );
-        let parsed: LegalBasis = serde_json::from_str(r#""dmca_512""#).unwrap();
-        assert_eq!(parsed, LegalBasis::Dmca512);
-    }
-
-    // ── v16 (#432): require_key_grant_envelope (put_key_grant gate) ──
-
-    /// Wrap a payload in a proposal-typed key_grant envelope shell.
-    /// Signature is a dummy — the shape gate deliberately does NOT
-    /// verify signatures (put_contribution owns that).
-    fn fixture_grant_envelope(
-        payload: &KeyGrantPayload,
-    ) -> crate::cirisnode::types::ContributionEnvelope {
-        use crate::cirisnode::types::{Cell, ContributionEnvelope, ContributionType};
-        ContributionEnvelope {
-            contribution_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
-            contribution_type: ContributionType::Proposal,
-            author_id: "author-1".into(),
-            subject: Cell {
-                domain: "stream-dom".into(),
-                language: "en".into(),
-                subject: Some(KEY_GRANT_SUBJECT_KIND.into()),
-            },
-            payload: serde_json::to_value(payload).unwrap(),
-            witness_set: None,
-            signature: crate::cirisnode::types::HybridSignature {
-                ed25519: "sig".into(),
-                ml_dsa_65: None,
-                signed_at: Utc::now(),
-            },
-            submitted_at: Utc::now(),
-        }
-    }
-
-    #[test]
-    fn require_key_grant_envelope_admits_stream_epoch_grant() {
-        let payload = fixture_stream_grant();
-        let env = fixture_grant_envelope(&payload);
-        let parsed = require_key_grant_envelope(&env).unwrap();
-        assert_eq!(parsed, payload);
-        assert_eq!(parsed.scope_id, "stream-abc");
-        assert_eq!(parsed.epoch, Some(7));
-    }
-
-    #[test]
-    fn require_key_grant_envelope_admits_content_grant() {
-        let payload = fixture_key_grant();
-        let env = fixture_grant_envelope(&payload);
-        let parsed = require_key_grant_envelope(&env).unwrap();
-        assert_eq!(parsed, payload);
-    }
-
-    #[test]
-    fn require_key_grant_envelope_rejects_non_proposal_type() {
-        // Grants ride contribution_type=proposal — any other
-        // discriminator is rejected fail-closed even with a valid
-        // key_grant payload + subject_kind.
-        let mut env = fixture_grant_envelope(&fixture_stream_grant());
-        env.contribution_type = crate::cirisnode::types::ContributionType::ModerationEvent;
-        let err = require_key_grant_envelope(&env).unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidArgument(ref m) if m.contains("contribution_type=proposal")),
-            "got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn require_key_grant_envelope_rejects_wrong_subject_kind() {
-        let mut env = fixture_grant_envelope(&fixture_stream_grant());
-        env.subject.subject = Some("arc_question".into());
-        let err = require_key_grant_envelope(&env).unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidArgument(ref m) if m.contains("subject_kind")),
-            "got: {err:?}"
-        );
-        // Missing subject_kind entirely is equally rejected.
-        env.subject.subject = None;
-        let err = require_key_grant_envelope(&env).unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)), "got: {err:?}");
-    }
-
-    // v34.0.0 (#704) — `require_key_grant_envelope_rejects_malformed_payload`
-    // DELETED rather than flipped.
-    //
-    // It asserted that a v1 wrap on a stream/epoch grant fails the gate. With
-    // v1 removed from the enum that input is unconstructible, so there is no
-    // malformed payload of this shape left to reject — the gate's rule is now
-    // the type system's.
-    //
-    // Recorded because of HOW it nearly shipped: a blanket
-    // `s.replace(v1_variant, v2_variant)` rewrote it into a test that set v2,
-    // expected a refusal, and failed. A mechanical rename cannot tell a fixture
-    // from an assertion, and this one asserted the thing being deleted.
 }

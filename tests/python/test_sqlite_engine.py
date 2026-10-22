@@ -7,7 +7,7 @@ Validates the agent-facing exception classes are exported correctly so
 Full Engine construction (with signing-key + keyring setup) is
 exercised by the Rust-side substrate tests
 (`secrets::sqlite::tests::secrets_sqlite_round_trip_full_lifecycle`,
-`cirisnode::sqlite::tests::cirisnode_sqlite_round_trip_full_lifecycle`,
+the cirisnode witnesses (`cirisnode::rows_invariants`),
 etc.) which run against in-memory SQLite without any keyring
 dependency. This file just smoke-tests the wheel-level surface that
 the agent imports.

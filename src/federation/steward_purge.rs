@@ -411,6 +411,19 @@ pub const ATTESTATION_PROJECTIONS: &[(&str, &str, ProjectionRemoval)] = &[
         "attestation_id",
         ProjectionRemoval::ForeignKeyCascade,
     ),
+    // v60.0.0 (CIRISPersist#988 item 1; V203) — the credits and expertise
+    // ledgers are projections of this node's balance rows and leave with the
+    // row they project.
+    (
+        "cirisnode_credits_ledger",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeyCascade,
+    ),
+    (
+        "cirisnode_expertise_ledger",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeyCascade,
+    ),
 ];
 
 /// Tables with an `*attestation_id` column that are NOT projections of a

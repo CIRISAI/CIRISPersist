@@ -503,8 +503,9 @@ pub(crate) mod bodies {
             ("preserve_response:v1:v1", 1.0),
             ("archive_release:wa_approval:v1:v1", 1.0),
             ("lawful_order:release:v1:v1", 1.0),
-            ("takedown_notice:dmca512:v1", -1.0),
-            ("takedown_notice:dmca512:v1:v1", -1.0),
+            // v60.0.0 (#803): the legal-basis leaves have their door (the
+            // notice row, I1170); the steward purge's cosigned leaf does not.
+            ("takedown_notice:steward_purge:v1", -1.0),
             ("takedown_notice:steward_purge:v1:v1", -1.0),
         ] {
             let r = scores(

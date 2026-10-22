@@ -726,7 +726,7 @@ pub(crate) mod bodies {
         forged.cosignatures[1] = ts::threshold_sign(cc::FOUNDERS[1], b"other bytes");
         cases.push(("a forged cosignature", forged));
         let mut other_basis = dry.notice_template.clone();
-        other_basis["legal_basis"] = serde_json::json!("dmca_512");
+        other_basis["legal_basis"] = serde_json::json!("dmca512");
         cases.push((
             "another basis",
             notice_for(&other_basis, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t),
