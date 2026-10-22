@@ -1062,7 +1062,12 @@ where
                         ),
                     });
                 }
-                if sn.record.valid_from <= existing.valid_from {
+                // v60.0.0 — at substrate resolution on both sides, as the
+                // re-anchor plan compares: postgres holds `existing.valid_from`
+                // rounded, so a nanosecond bundle record read as newer than an
+                // equal held instant there (I1191).
+                use crate::federation::admission::truncate_to_substrate_resolution as at_resolution;
+                if at_resolution(sn.record.valid_from) <= at_resolution(existing.valid_from) {
                     return Err(Error::GenesisBundleInvalid {
                         detail: format!(
                             "serve node {kid}: bundle record valid_from {} is not newer \

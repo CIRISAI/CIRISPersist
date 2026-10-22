@@ -240,9 +240,6 @@ pub(crate) enum ConnClass {
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("add_peer_record", ConnClass::Write),
-    ("adopt_genesis_reanchor", ConnClass::Write),
-    ("adopt_scrub_upgrade", ConnClass::Write),
-    ("write_replaced_key_registration", ConnClass::Write),
     // #846 (§6.1) — the adopt floor: row + declared binding + holder claim in
     // one transaction.
     ("adopt_sealed_blob_at", ConnClass::Write),
@@ -251,9 +248,11 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("aggregate_scoring_factors_rollup_batch", ConnClass::Read),
     ("aggregate_scoring_factors_uncached", ConnClass::Read),
     ("aggregate_scrub_stats", ConnClass::Read),
-    ("attach_key_pqc_signature", ConnClass::Write),
     // v53.0.0 (#975) — the row-type census: one GROUP BY, read-only.
     ("attestation_type_census", ConnClass::Read),
+    // v60.0.0 (CIRISPersist#934 step 3) — the key-record executor: every
+    // key-record write door's one transaction.
+    ("store_planned_key_record", ConnClass::Write),
     ("attestations_binding_content", ConnClass::Read),
     ("backfill_trace_dedup_shard_keys", ConnClass::Write),
     ("backfill_revocation_subject_digests", ConnClass::Write),
@@ -583,7 +582,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("dag_link_backfill_cursor", ConnClass::Read),
     ("set_dag_link_backfill_cursor", ConnClass::Write),
     // v54.0.0 (#995 row 2) — the scrub re-hydration CAS and its test seam.
-    ("rehydrate_dropped_key_scrubs", ConnClass::Write),
     ("test_seam_drop_key_additional_scrubs", ConnClass::Write),
     // v54.0.0 (#995 row 4, V184) — the rooms of a shared plaintext blob.
     ("blob_associations", ConnClass::Read),
@@ -633,8 +631,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_org_membership", ConnClass::Write),
     ("put_organization", ConnClass::Write),
     ("put_partner_record", ConnClass::Write),
-    // v50.0.0 (review M5) — `put_public_key` delegates to this store step.
-    ("put_public_key_at_door", ConnClass::Write),
     // v50.0.0 (#928, V157) — the recorded admission depth of a `withdraws`.
     ("withdraws_admission_depth", ConnClass::Read),
     ("trust_direction_held_among", ConnClass::Read),
@@ -676,7 +672,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("sample_public_keys", ConnClass::Read),
     ("scoring_ingest_watermark_ms", ConnClass::Read),
     ("seal_stream", ConnClass::Write),
-    ("seed_genesis_accord_holders", ConnClass::Write),
     ("set_active_halt", ConnClass::Write),
     ("set_consent_role", ConnClass::Write),
     ("sqlite_load_stream_chunk_hashes", ConnClass::HelperRead),
@@ -791,7 +786,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("store_blob_local", ConnClass::Write),
     ("stream_consistency_proof", ConnClass::Read),
     ("stream_inclusion_proof", ConnClass::Read),
-    ("supersede_canonical_record", ConnClass::Write),
     ("supersede_group_row", ConnClass::Write),
     ("sweep_ack_timeouts", ConnClass::Write),
     ("sweep_candidates", ConnClass::Read),

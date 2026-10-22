@@ -16275,6 +16275,19 @@
     "witness": "I975, I978, I979, I980"
    },
    {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-planes-as-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/key_plane.rs#plan_key_record_write",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-934",
+    "tsv_comment_before": [
+     "# v60.0.0 (CIRISPersist#934 step 3) — every key-record write door decides in one",
+     "# plan; each backend's executor stores its verdict and the key:record:v1 row."
+    ],
+    "witness": "I1183, I1184, I1185, I1186, I1187, I1189, I1190 (memory, sqlite, postgres), I1191 (sqlite, postgres), I1188"
+   },
+   {
     "decimal_id": "2.6.1.3",
     "claim_id": "CLM-canonical",
     "repo": "CIRISPersist",

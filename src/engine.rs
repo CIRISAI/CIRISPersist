@@ -10061,9 +10061,15 @@ impl Engine {
         crate::federation::verify_key_registration(directory.as_ref(), &record.record).await?;
         match &self.backend {
             #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(b) => b.adopt_scrub_upgrade(record).await,
+            BackendDispatch::Postgres(b) => {
+                crate::federation::FederationDirectory::adopt_scrub_upgrade(b.as_ref(), record)
+                    .await
+            }
             #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(b) => b.adopt_scrub_upgrade(record).await,
+            BackendDispatch::Sqlite(b) => {
+                crate::federation::FederationDirectory::adopt_scrub_upgrade(b.as_ref(), record)
+                    .await
+            }
         }
     }
 

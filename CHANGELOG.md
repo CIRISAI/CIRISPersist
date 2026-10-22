@@ -267,6 +267,94 @@ builds one with `Goal::new`; both retire with the two message types.
   CLM-silo-projection-rebuildable (2.4.2) at `goal_projection::fold_goal`;
   `EXPECTED` 319.
 
+### Changed — the key-record write doors decide in one plan (CIRISPersist#934 step 3)
+
+Every door that writes `federation_keys` (and with it the key's
+`key:record:v1` row) used to run its own copy of its decision on each of the
+three backends. The decision now lives once, in
+`key_plane::plan_key_record_write`, one planner per door kind
+(`KeyRecordWrite`: `Put`, `SeedGenesis`, `ScrubUpgrade`,
+`SupersedeCanonical`, `Rebind`, `InvalidReplace`, `Reanchor`, `AttachPqc`,
+`RehydrateScrubs`); it calls the gates that were already shared
+(`admit_key_record`, the four conferral gates, `check_node_identity_*`,
+`prepare_rebind` / `prepare_invalid_replace`, `verify_canonical_supersede`,
+`verify_bundle_quorum`, `check_key_pqc_attachment`) in the order the copies
+ran them. Each backend keeps ONE executor,
+`KeyPlaneStore::store_planned_key_record(PlannedKeyRecord)`: the SQL, the row
+mapping and the transaction, the write's atomic re-assertion as its `WHERE`,
+and the key's row derived from the record as stored through the shared
+`key_record_row_step`. The replicated apply is one shared body too
+(`apply_replicated_key_record_planned`).
+
+The parity scan (`store::parity`) now reports `put_public_key`,
+`adopt_scrub_upgrade`, `store_rebound_key_record`,
+`store_invalid_replaced_key_record`, `adopt_genesis_reanchor`,
+`attach_key_pqc_signature` and `apply_replicated_key_record` as `shared`
+(they were `identical x3` or, for the two that delegated to inherent methods,
+invisible to it), and `SHARED_DOORS` holds them there.
+
+**Behaviour that changed (each was a backend divergence):**
+
+- The memory backend gains the scrub upgrade and the canonical supersede:
+  `adopt_scrub_upgrade` no longer answers "not supported", and the
+  replicated apply's `Upgrade` / `Supersede` arms run instead of reporting
+  `StoreConflict`.
+- The genesis seed stores the whole scrub set: both SQL backends' seed
+  INSERT left `additional_scrubs` out (the drop `RehydrateScrubs` repairs,
+  #995 row 2). The seeded row is also indexed, and on memory it gets its
+  `key:record:v1` row and admission position like the SQL backends'.
+- `consent_role` is normalized to its wire form before the hash on every
+  backend (memory already did): a record offered with the stored token
+  `'unregistered'` now hashes as the `None` it reads back as.
+- The memory insert door refuses a non-hybrid algorithm and a non-hex
+  content hash, as the SQL doors did.
+- A sqlite insert that loses a race to an identical row is settled, and to a
+  differing row is `Conflict` (it was a primary-key `Backend` error); a
+  rewrite whose guard matched nothing now rolls back on every backend (the
+  re-anchor committed its row step before refusing).
+- A memory rewrite keeps the held `consent_role`, as the SQL `SET` lists do.
+- **The genesis re-anchor's anti-rollback compares at the substrate's
+  resolution.** Postgres holds the anchored `valid_from` in microseconds, so
+  a bundle record with a nanosecond instant (the v2 ceremony's canonical is
+  `…22.147317128Z`) read as 128 ns newer than itself, and re-offering it to
+  `adopt_genesis_reanchor` re-wrote the row instead of refusing the
+  rollback. Both sides are now compared at the substrate's signed-instant
+  resolution (`truncate_to_substrate_resolution`; I1189). The bake door's
+  own pre-check (`bake_assembled_genesis`, serve nodes) had the same shape
+  and compares the same way: a held anchor carrying the bundle record's
+  nanosecond instant was read as older on postgres (I1191, sqlite and
+  postgres, red on postgres before the fix).
+- The canonical supersede settles a byte-identical re-offer before any
+  verify (the #672 rule), instead of after the policy check, where an
+  identical record could never arrive (`verify_canonical_supersede` refuses
+  it first).
+
+**Rust surface (clean break):** the inherent `SqliteBackend` /
+`PostgresBackend::{adopt_scrub_upgrade, supersede_canonical_record,
+apply_replicated_key_record}` and `MemoryBackend::apply_replicated_key_record`
+are gone; the `FederationDirectory` methods of the same names are the doors
+(bring the trait into scope). No `FederationDirectory` method changed, no
+Python signature changed, no migration.
+
+- Witnesses: **I1183** (the insert door), **I1184** (the genesis seed),
+  **I1185** (the scrub upgrade), **I1186** (the replicated apply), **I1187**
+  (each executor's atomic re-assertion, every write shape), all on memory,
+  sqlite and postgres; **I1189** (memory, sqlite, postgres) the re-anchor's
+  own refusals over the real v2 ceremony; **I1190** (memory, sqlite,
+  postgres) the supersede's settle, pubkey-change and policy refusals;
+  **I1191** (sqlite, postgres) the bake door's anti-rollback at resolution;
+  **I1188** (unit) the row step and the lost-race wording.
+- Mutation scope `scripts/mutants/scope-s3-key-plane.txt`: 129 mutants in
+  three shards, 101 caught, 28 unviable, 0 missed, nothing allow-listed (two
+  rounds: the first, 136 mutants, left twelve survivors; ten were witness
+  gaps, now I1187's anchored-version and rehydrate legs, I1189 (the
+  re-anchor's predicate and both SQL doors), I1190 (the supersede's three),
+  and the role-bearing leg of I1183; two were the row step's self-scrub guard on
+  sqlite and postgres, an equivalent branch, now removed on all three
+  backends). Weekly, three shards, in `mutants.yml`.
+- Evidence: CLM-planes-as-rows (3.1.3) at `key_plane::plan_key_record_write`;
+  `EXPECTED` 320.
+
 ### Changed — hard_case rows replicate (CIRISConstitution#170 closed)
 
 The steward ruled through CC (2026-10-21, CIRISConstitution#170 closed, rc9

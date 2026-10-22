@@ -383,6 +383,9 @@ pub(crate) mod key_plane_invariants;
 // v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — I1144–I1147:
 // the framed key plane is retired; a v57 store migrates onto the rows.
 mod key_plane_retired_invariants;
+// v60.0.0 (CIRISPersist#934 step 3) — I1183–I1191: the key-record write
+// doors on one plan, every backend storing its verdict.
+mod key_record_plan_invariants;
 // v59.0.0 (CIRISPersist#1103, CC 2.6.8) — I1153: a key id names its own key.
 #[cfg(test)]
 mod key_id_fingerprint_invariants;
@@ -2890,11 +2893,13 @@ pub trait FederationDirectory: Send + Sync {
     /// record for a `key_id` it already holds self-signed. That DO-NOTHING
     /// is exactly what #371 replaces over replication.
     ///
-    /// The real sqlite/postgres backends **override** this to run the
-    /// monotonic, verify-before-mutation upgrade path (the
+    /// The real backends (v60.0.0: memory, sqlite and postgres, through the
+    /// one shared body `key_plane::apply_replicated_key_record_planned`)
+    /// **override** this to run the monotonic, verify-before-mutation
+    /// upgrade path (the
     /// [`plan_replicated_key_apply`](register::plan_replicated_key_apply)
-    /// classification + `adopt_scrub_upgrade` on the Upgrade arm). The
-    /// default body here preserves the memory/mock backends: they have no
+    /// classification + the scrub upgrade on the Upgrade arm). The
+    /// default body here preserves mock directories: they have no
     /// scrub-upgrade plane, so an incoming record is a **first-seen
     /// insert** — `put_public_key` already leaves an existing differing row
     /// untouched, so a collision resolves to `Refused` (fail-closed,
