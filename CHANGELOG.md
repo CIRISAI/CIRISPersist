@@ -257,7 +257,11 @@ builds one with `Goal::new`; both retire with the two message types.
   over an upgrading store; **I1182** (memory, sqlite, postgres)
   `approach:{goal_id}` binds the goal's row id. Python:
   `tests/python/test_goal_rows_surface.py`.
-- Mutation scope `scripts/mutants/scope-s2-goals.txt`: MUTATION_RESULT.
+- Mutation scope `scripts/mutants/scope-s2-goals.txt`: 155 mutants in three
+  shards, 127 caught, 28 unviable, 0 missed, nothing allow-listed (two rounds:
+  the first left six survivors; four were witness gaps, now witnessed, and two
+  were equivalent forms of a redundant test, now removed). Weekly, three
+  shards, in `mutants.yml`.
 - Evidence: CLM-nsproc-meta-goal-alignment-goal-scale (3.1.9.7) moves from
   the retired `Goal::new` to `check_goal_row_admission`;
   CLM-silo-projection-rebuildable (2.4.2) at `goal_projection::fold_goal`;
