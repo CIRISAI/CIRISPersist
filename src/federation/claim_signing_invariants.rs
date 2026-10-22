@@ -635,101 +635,71 @@ mod tests {
         );
 
         // I84 (c), review round seven — the digest clause is spelled out, NOT
-        // borrowed from the general uppercase check, so it holds on the gate
-        // where that check is deliberately skipped. `is_ascii_hexdigit()`
-        // accepts `A`-`F`; an uppercase digest admitted at ingest never matches
-        // the lowercase canonical binding under withdraws rules 2/3, so the
-        // subject is unrevocable by its canonical identity.
-        use crate::federation::SubjectGate;
-        for gate in [SubjectGate::Emit, SubjectGate::Ingest] {
-            let upper = format!("canonical:sha256:{}", "A".repeat(64));
-            let err =
-                crate::federation::validate_subject_key_ids_at(std::slice::from_ref(&upper), gate)
-                    .expect_err("I84 (c): an UPPERCASE canonical digest is refused on BOTH gates");
-            assert!(
-                err.to_string().contains("CC 2.3.2.1"),
-                "I84 (c): the refusal cites the clause on {gate:?}: {err}"
-            );
-            // Mixed case is the same defect, and the likelier spelling.
-            let mixed = format!("canonical:sha256:{}{}", "A".repeat(32), "b".repeat(32));
-            crate::federation::validate_subject_key_ids_at(&[mixed], gate)
-                .expect_err("I84 (c): a MIXED-case canonical digest is refused on BOTH gates");
-            // The lowercase form still passes on both gates — the clause
-            // narrows the alphabet, it does not close the canonical door.
-            let lower = format!("canonical:sha256:{}", "9f".repeat(32));
-            crate::federation::validate_subject_key_ids_at(&[lower], gate).unwrap_or_else(|e| {
-                panic!("I84 (c): lowercase hex stays admissible on {gate:?}: {e}")
-            });
+        // borrowed from the general uppercase check. `is_ascii_hexdigit()`
+        // accepts `A`-`F`; an uppercase digest never matches the lowercase
+        // canonical binding under withdraws rules 2/3, so the subject would be
+        // unrevocable by its canonical identity. v60.0.0 (#854): there is ONE
+        // gate, and the canonical clauses run before the general uppercase
+        // one, so each refusal names its own defect.
+        let gate = |ids: &[String]| crate::federation::validate_subject_key_ids(ids);
+        let upper = format!("canonical:sha256:{}", "A".repeat(64));
+        let err = gate(std::slice::from_ref(&upper))
+            .expect_err("I84 (c): an UPPERCASE canonical digest is refused");
+        assert!(
+            err.to_string()
+                .contains("canonical sha256 digest is not 64 lowercase hex"),
+            "I84 (c): the refusal names the digest: {err}"
+        );
+        // Mixed case is the same defect, and the likelier spelling.
+        let mixed = format!("canonical:sha256:{}{}", "A".repeat(32), "b".repeat(32));
+        gate(&[mixed]).expect_err("I84 (c): a MIXED-case canonical digest is refused");
+        // The lowercase form still passes — the clause narrows the alphabet,
+        // it does not close the canonical door.
+        let lower = format!("canonical:sha256:{}", "9f".repeat(32));
+        gate(&[lower]).unwrap_or_else(|e| panic!("I84 (c): lowercase hex stays admissible: {e}"));
 
-            // I84 (d), review round nine — the PREFIX is part of the canonical
-            // spelling too. `strip_prefix` is case-sensitive, so a `Canonical:`
-            // id never entered the canonical branch at all: it fell through as
-            // an ordinary subject, and Ingest skips the general uppercase
-            // clause. Every alternate spelling of an id that LOOKS canonical is
-            // the same unrevocable-subject defect.
-            let hex = "9f".repeat(32);
-            // Each refusal must also name WHICH part of the spelling is wrong.
-            // Without that the hash-family clause is a survivable mutant: the
-            // generic "is not sha256" branch already refuses
-            // `canonical:SHA256:…`, so only the diagnosis distinguishes them,
-            // and an operator staring at a rejected subject needs it.
-            for (variant, why) in [
-                (
-                    format!("Canonical:sha256:{hex}"),
-                    "canonical prefix is not lowercase",
-                ),
-                (
-                    format!("CANONICAL:sha256:{hex}"),
-                    "canonical prefix is not lowercase",
-                ),
-                (
-                    format!("cAnOnIcAl:sha256:{hex}"),
-                    "canonical prefix is not lowercase",
-                ),
-                (
-                    format!("canonical:SHA256:{hex}"),
-                    "canonical hash family is not lowercase",
-                ),
-                (
-                    format!("canonical:Sha256:{hex}"),
-                    "canonical hash family is not lowercase",
-                ),
-            ] {
-                let err = crate::federation::validate_subject_key_ids_at(
-                    std::slice::from_ref(&variant),
-                    gate,
-                )
-                .expect_err(
-                    "I84 (d): an alternate canonical spelling must be refused on BOTH gates",
-                );
-                // On Emit the general uppercase clause legitimately fires
-                // first, so either reason is correct there. On Ingest that
-                // clause is deliberately absent, which makes the specific
-                // clause the ONLY thing refusing — so there the diagnosis is
-                // the assertion, and it is what keeps the clause load-bearing.
-                let msg = err.to_string();
-                if gate == SubjectGate::Ingest {
-                    assert!(
-                        msg.contains(why),
-                        "I84 (d): {variant:?} on Ingest must be refused AS {why:?}, got: {msg}"
-                    );
-                } else {
-                    assert!(
-                        msg.contains(why) || msg.contains("uppercase"),
-                        "I84 (d): {variant:?} on Emit must name the spelling defect: {msg}"
-                    );
-                }
-            }
-            // A subject that merely BEGINS with those letters is not canonical
-            // and stays admissible — the clause keys on the `:` at byte 9.
-            crate::federation::validate_subject_key_ids_at(
-                std::slice::from_ref(&"canonicalish-actor".to_owned()),
-                gate,
-            )
-            .unwrap_or_else(|e| {
-                panic!("I84 (d): a non-canonical lookalike stays admissible on {gate:?}: {e}")
-            });
+        // I84 (d), review round nine — the PREFIX and the HASH FAMILY are part
+        // of the canonical spelling too. Each refusal must name WHICH part is
+        // wrong: the general uppercase clause would refuse these too, so the
+        // diagnosis is what keeps the specific clauses load-bearing.
+        let hex = "9f".repeat(32);
+        for (variant, why) in [
+            (
+                format!("Canonical:sha256:{hex}"),
+                "canonical prefix is not lowercase",
+            ),
+            (
+                format!("CANONICAL:sha256:{hex}"),
+                "canonical prefix is not lowercase",
+            ),
+            (
+                format!("cAnOnIcAl:sha256:{hex}"),
+                "canonical prefix is not lowercase",
+            ),
+            (
+                format!("canonical:SHA256:{hex}"),
+                "canonical hash family is not lowercase",
+            ),
+            (
+                format!("canonical:Sha256:{hex}"),
+                "canonical hash family is not lowercase",
+            ),
+        ] {
+            let err = gate(std::slice::from_ref(&variant))
+                .expect_err("I84 (d): an alternate canonical spelling must be refused");
+            assert!(
+                err.to_string().contains(why),
+                "I84 (d): {variant:?} must be refused AS {why:?}, got: {err}"
+            );
         }
+        // A subject that merely BEGINS with those letters is not canonical and
+        // stays admissible — the clause keys on the `:` at byte 9.
+        gate(std::slice::from_ref(&"canonicalish-actor".to_owned()))
+            .unwrap_or_else(|e| panic!("I84 (d): a non-canonical lookalike stays admissible: {e}"));
+        // And an ordinary uppercase subject is refused AS uppercase.
+        let err = gate(std::slice::from_ref(&"Actor-X".to_owned()))
+            .expect_err("I84: an uppercase subject is refused");
+        assert!(err.to_string().contains("uppercase"), "I84: {err}");
     }
 
     /// **I85 (CC 3, the CC 2.3 audit) — a `withdraws` naming a `key_grant`
@@ -1065,17 +1035,32 @@ mod tests {
             err.to_string().contains("CC 2.3.2.1"),
             "I84 (b): the refusal cites the clause: {err}"
         );
-        // …and the ONE clause ingest does not carry, named rather than
-        // silent: a raw base64 pubkey subject (uppercase) still admits,
-        // because cirisnode's moderation corpus predates the rule. The emit
-        // gate refuses it, so no NEW row can carry one.
+        // v60.0.0 (#854) — I1172: ingest and emit are ONE gate. A raw base64
+        // pubkey subject (uppercase), the shape cirisnode's retired
+        // Contributions carried, is refused on a replicated row exactly as the
+        // emit path refuses it.
         let b64_subject = "vHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaU=".to_owned();
-        crate::federation::validate_subject_key_ids_at(
-            std::slice::from_ref(&b64_subject),
-            crate::federation::SubjectGate::Ingest,
-        )
-        .expect("I84 (b): ingest admits the pre-existing uppercase corpus");
         crate::federation::validate_subject_key_ids(std::slice::from_ref(&b64_subject))
-            .expect_err("I84 (b): emit refuses it, so no new row carries one");
+            .expect_err("I1172: the one gate refuses an uppercase subject");
+        let id2 = format!("i1172-{run}");
+        let mut row2 = ts::bare_attestation(
+            &id2,
+            &signer,
+            &signer,
+            &serde_json::json!({ "id": id2, "kind": "scores" }),
+        );
+        row2.attestation_type = crate::federation::types::attestation_type::SCORES.to_owned();
+        row2.subject_key_ids = vec![b64_subject];
+        let row2 = ts::seal_row(&signer, row2);
+        let err = backend
+            .apply_replicated_attestation(crate::federation::SignedAttestation {
+                attestation: row2,
+            })
+            .await
+            .expect_err("I1172: a replicated row with an uppercase subject is refused at ingest");
+        assert!(
+            err.to_string().contains("uppercase"),
+            "I1172: the ingest refusal names the clause: {err}"
+        );
     }
 }
