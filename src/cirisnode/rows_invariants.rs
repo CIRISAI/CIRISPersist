@@ -211,6 +211,20 @@ pub(crate) mod bodies {
         )
         .await
         .expect("I1167: the named moderator files");
+        // A vote names a Contribution row: a held row of another family is
+        // refused as such, not voted on.
+        let e = rows::plan_vote_row(
+            dir,
+            &VoteInput {
+                contribution_id: mid.clone(),
+                score: 0.5,
+                detail: None,
+                rationale: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.kind(), "cirisnode_invalid_argument", "I1167: {e}");
         let m = d.get_attestation(&mid).await.unwrap().unwrap();
         assert_eq!(
             m.attestation_envelope["dimension"],
@@ -327,6 +341,61 @@ pub(crate) mod bodies {
         rows::check_announcement_held(dir, &aid)
             .await
             .expect("I1167: a held announcement row");
+        // The author's Contributions, paged: both rows, newest first; a page of
+        // one holds one and names the next; a limit outside 1..=MAX_PAGE is
+        // refused.
+        let all = rows::list_contributions(dir, &author.id, &Default::default(), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(all.items.len(), 2, "I1167: both Contributions");
+        let one = rows::list_contributions(dir, &author.id, &Default::default(), None, 1)
+            .await
+            .unwrap();
+        assert_eq!(one.items.len(), 1);
+        assert!(
+            one.next_cursor.is_some(),
+            "I1167: a page of one names the next"
+        );
+        // The filter narrows: each field alone excludes what it does not name.
+        for f in [
+            rows::ContributionsFilter {
+                domain: Some("elsewhere".into()),
+                ..Default::default()
+            },
+            rows::ContributionsFilter {
+                language: Some("sw".into()),
+                ..Default::default()
+            },
+            rows::ContributionsFilter {
+                contribution_type: Some(ContributionType::DeferralRequest),
+                ..Default::default()
+            },
+            rows::ContributionsFilter {
+                subject_kind: Some("prompt_edit".into()),
+                ..Default::default()
+            },
+        ] {
+            let p = rows::list_contributions(dir, &author.id, &f, None, 10)
+                .await
+                .unwrap();
+            assert!(p.items.is_empty(), "I1167: {f:?} names neither row");
+        }
+        let kind = rows::ContributionsFilter {
+            subject_kind: Some("arc_question".into()),
+            domain: Some("health".into()),
+            language: Some("en".into()),
+            contribution_type: Some(ContributionType::Proposal),
+        };
+        let p = rows::list_contributions(dir, &author.id, &kind, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(p.items.len(), 1, "I1167: the arc_question alone");
+        for bad in [0, crate::federation::attestation_query::MAX_PAGE + 1] {
+            let e = rows::list_contributions(dir, &author.id, &Default::default(), None, bad)
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind(), "cirisnode_invalid_argument", "I1167 limit {bad}");
+        }
         let e = rows::plan_contribution_row(&contribution(
             crate::cirisnode::KEY_GRANT_SUBJECT_KIND,
             serde_json::json!({}),
@@ -348,7 +417,15 @@ pub(crate) mod engine_bodies {
     use crate::federation::types::identity_type::USER;
     use crate::Engine;
 
+    /// An engine whose own key is registered. The alias is padded to 32
+    /// bytes so the derived id seeds the same test key (a community founded
+    /// with the engine's key cosigns as it).
     pub(crate) async fn engine(dsn: &str, alias: &str) -> Engine {
+        let mut alias = alias.to_owned();
+        while alias.len() < 32 {
+            alias.push('0');
+        }
+        let alias = alias.as_str();
         let e = Engine::with_signer_pre_genesis(ts::local_signer(alias), dsn)
             .await
             .unwrap();
@@ -429,6 +506,28 @@ pub(crate) mod engine_bodies {
             "takedown_notice:ncmec_csam:v1"
         );
         assert_eq!(held.attestation_envelope["claimant_key_id"], me);
+        // The claimant's notice rows, narrowed by content and a half-open
+        // [since, until) window on the signed instant.
+        let at = held.asserted_at;
+        let sec = chrono::Duration::seconds(1);
+        for (content, since, until, want) in [
+            (Some(sha.as_str()), None, None, 1),
+            (Some("00"), None, None, 0),
+            (None, Some(at), None, 1),
+            (None, Some(at + sec), None, 0),
+            (None, None, Some(at), 0),
+            (None, None, Some(at + sec), 1),
+            (None, Some(at - sec), Some(at + sec), 1),
+        ] {
+            let page = rows::list_takedowns(dir.as_ref(), &me, content, since, until, None, 10)
+                .await
+                .unwrap();
+            assert_eq!(
+                page.items.len(),
+                want,
+                "I1170: content {content:?} since {since:?} until {until:?}"
+            );
+        }
         let report = e
             .cirisnode_process_takedown_admission(&nid)
             .await
@@ -506,7 +605,7 @@ pub(crate) mod engine_bodies {
             .expect_err("I1170: no such announcement");
         assert_eq!(err.kind(), "cirisnode_invalid_argument", "I1170: {err}");
         let mut on_held = att;
-        on_held.announcement_id = aid;
+        on_held.announcement_id = aid.clone();
         let err = put(on_held)
             .await
             .expect_err("I1170: the signature is still asked");
@@ -515,6 +614,112 @@ pub(crate) mod engine_bodies {
             "cirisnode_signature",
             "I1170: a held announcement passes the row rule; the forged signature does not"
         );
+        doors_return_their_rows(&e, &me, &alice.id, &aid, tag).await;
+    }
+
+    /// I1170 (doors) — every Engine row door returns the id of the row it
+    /// signed and put, signed by this engine, on its family.
+    async fn doors_return_their_rows(e: &Engine, me: &str, alice: &str, aid: &str, tag: &str) {
+        let dir = e.federation_directory();
+        let comm = format!("i1170-comm-{tag}");
+        crate::federation::doors_takedown_invariants::bodies::community_of(dir.as_ref(), &comm, me)
+            .await;
+        let held_on = |id: String, family: &'static str| {
+            let dir = dir.clone();
+            async move {
+                let row = dir
+                    .get_attestation(&id)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("I1170: {family} row {id:?} is held"));
+                assert_eq!(
+                    row.attesting_key_id, me,
+                    "I1170: {family} signed by the engine"
+                );
+                assert!(
+                    row.attestation_envelope["dimension"]
+                        .as_str()
+                        .is_some_and(|d| d.starts_with(family)),
+                    "I1170: {family}: {:?}",
+                    row.attestation_envelope["dimension"]
+                );
+                id
+            }
+        };
+        let vid = e
+            .cirisnode_cast_vote(&crate::cirisnode::VoteInput {
+                contribution_id: aid.to_owned(),
+                score: 1.0,
+                detail: None,
+                rationale: Some("yes".into()),
+            })
+            .await
+            .expect("I1170: a vote through the Engine");
+        held_on(vid, "vote:").await;
+        let mid = e
+            .cirisnode_put_moderation_event(&crate::cirisnode::ModerationInput {
+                target_contributor: alice.to_owned(),
+                allegation_type: "rogue_vote".into(),
+                community_id: comm.clone(),
+                payload: serde_json::json!({}),
+            })
+            .await
+            .expect("I1170: the room's moderator files");
+        let mid = held_on(mid, "moderation:").await;
+        let sid = e
+            .cirisnode_put_slashing_attestation(&crate::cirisnode::SlashingInput {
+                moderation_id: mid,
+                outcome: "proven_rogue".into(),
+                payload: serde_json::json!({}),
+            })
+            .await
+            .expect("I1170: a slashing through the Engine");
+        let sid = held_on(sid, "slashing:").await;
+        let rid = e
+            .cirisnode_put_reconsideration_request(&crate::cirisnode::ReconsiderationRequestInput {
+                slashing_id: sid,
+                grounds: "new_evidence".into(),
+                payload: serde_json::json!({}),
+            })
+            .await
+            .expect("I1170: the room's review-holder files");
+        let rid = held_on(rid, "reconsideration:").await;
+        let ruled = e
+            .cirisnode_put_reconsideration_attestation(
+                &crate::cirisnode::ReconsiderationRulingInput {
+                    request_id: rid,
+                    outcome: "upheld".into(),
+                    payload: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("I1170: the review-holder rules");
+        held_on(ruled, "reconsideration:").await;
+        let xid = e
+            .cirisnode_update_expertise_ledger(&crate::cirisnode::ExpertiseUpdate {
+                contributor_id: alice.to_owned(),
+                domain: "health".into(),
+                language: "en".into(),
+                new_expertise: 0.25,
+                new_active_tier: true,
+                source_contribution: aid.to_owned(),
+            })
+            .await
+            .expect("I1170: an expertise row");
+        let xid = held_on(xid, "expertise:").await;
+        let ledger = match e.node_core_service() {
+            #[cfg(feature = "postgres")]
+            crate::engine::NodeCoreDispatch::Postgres(b) => {
+                b.get_expertise_ledger(alice, "health", "en").await
+            }
+            #[cfg(feature = "sqlite")]
+            crate::engine::NodeCoreDispatch::Sqlite(b) => {
+                b.get_expertise_ledger(alice, "health", "en").await
+            }
+        }
+        .unwrap()
+        .expect("I1170: the expertise ledger holds it");
+        assert_eq!((ledger.expertise, ledger.attestation_id), (0.25, Some(xid)));
     }
 
     /// I1170 (rehome) — a pre-V203 balance is moved by the Engine's rehome.

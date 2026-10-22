@@ -195,6 +195,13 @@ pub(crate) mod bodies {
         let rows = live(b, SiloProjection::ExpertiseLedger).await;
         assert_eq!(rows.len(), 1, "I1166: {rows:?}");
         assert!(rows[0].contains("0.75"), "I1166: {rows:?}");
+        // Two ledgers, two keys: the expertise row never displaces the credits
+        // balance on the same contributor and cell.
+        let rows = live(b, SiloProjection::CreditsLedger).await;
+        assert!(
+            rows.len() == 1 && rows[0].contains("7.25"),
+            "I1166: the credits balance stands beside the expertise: {rows:?}"
+        );
         // A malformed body is held but never projected.
         emit(
             b,

@@ -1077,6 +1077,25 @@ mod tests {
         );
         assert_eq!(m.attested_key_id.as_deref(), Some("bad-actor"));
         assert_eq!(m.subject_key_ids, vec!["bad-actor".to_owned()]);
+        assert_eq!(
+            m.attestation_envelope.to_value()["score"],
+            serde_json::json!(-1.0),
+            "an accusation scores -1"
+        );
+        for (community, target) in [("", "bad-actor"), ("comm", "")] {
+            let e = plan_moderation_row(&ModerationInput {
+                target_contributor: target.into(),
+                allegation_type: "rogue_vote".into(),
+                community_id: community.into(),
+                payload: serde_json::json!({}),
+            })
+            .unwrap_err();
+            assert_eq!(
+                e.kind(),
+                "cirisnode_invalid_argument",
+                "{community:?}/{target:?}"
+            );
+        }
         let cr = plan_credits_row(&CreditsUpdate {
             contributor_id: "alice".into(),
             domain: "health".into(),
@@ -1112,6 +1131,26 @@ mod tests {
             (v["expertise"].clone(), v["is_active"].clone()),
             (0.25.into(), true.into())
         );
+        for (who, lang) in [("", "en"), ("alice", "")] {
+            let c = plan_credits_row(&CreditsUpdate {
+                contributor_id: who.into(),
+                domain: "health".into(),
+                language: lang.into(),
+                subject: "arc_question".into(),
+                new_balance: 1.0,
+                source_contribution: "c1".into(),
+            });
+            assert!(c.is_err(), "credits {who:?}/{lang:?}");
+            let x = plan_expertise_row(&ExpertiseUpdate {
+                contributor_id: who.into(),
+                domain: "health".into(),
+                language: lang.into(),
+                new_expertise: 0.5,
+                new_active_tier: true,
+                source_contribution: "c1".into(),
+            });
+            assert!(x.is_err(), "expertise {who:?}/{lang:?}");
+        }
         assert!(plan_expertise_row(&ExpertiseUpdate {
             new_expertise: 1.5,
             ..ExpertiseUpdate {
@@ -1153,6 +1192,51 @@ mod tests {
         decode_input::<ContributionInput>(&ok, "contribution").expect("a body decodes");
         let e = plan_contribution_row(&contribution("Arc")).unwrap_err();
         assert_eq!(e.kind(), "cirisnode_invalid_argument");
+    }
+
+    /// I1168 (unit) — the shape checks a planner runs before it reads a row:
+    /// a vocabulary segment is `[a-z0-9][a-z0-9_]*` (a bad first byte or a
+    /// bad later byte each refuse), and a row id carries no `:` or whitespace
+    /// and is not empty (it becomes a dimension segment), refused before any
+    /// read as `cirisnode_invalid_argument`, never `cirisnode_not_found`.
+    #[tokio::test]
+    async fn i1168_ids_and_vocabulary_are_shape_checked() {
+        for bad in ["arc-question", "_arc", "Arc", ""] {
+            let e = plan_contribution_row(&contribution(bad)).unwrap_err();
+            assert_eq!(e.kind(), "cirisnode_invalid_argument", "{bad:?}: {e}");
+        }
+        plan_contribution_row(&contribution("arc_q2")).expect("a vocabulary token");
+        let dir = crate::store::memory::MemoryBackend::new();
+        for bad in ["a:b", "", "a b", "x\t"] {
+            let e = plan_vote_row(
+                &dir,
+                &VoteInput {
+                    contribution_id: bad.to_owned(),
+                    score: 0.0,
+                    detail: None,
+                    rationale: None,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(e.kind(), "cirisnode_invalid_argument", "{bad:?}: {e}");
+        }
+        let e = plan_vote_row(
+            &dir,
+            &VoteInput {
+                contribution_id: "held-nowhere".into(),
+                score: 0.0,
+                detail: None,
+                rationale: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            e.kind(),
+            "cirisnode_not_found",
+            "a well-formed id is read: {e}"
+        );
     }
 
     /// I1170 (unit) — the notice row: CC 3.3.2's members at the top level,

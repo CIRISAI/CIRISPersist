@@ -692,6 +692,19 @@ mod tests {
                 "I84 (d): {variant:?} must be refused AS {why:?}, got: {err}"
             );
         }
+        // Another hash family is "not sha256", not a case error, whatever its
+        // length (the family clause compares only a 7-byte `sha256:`).
+        for other in [
+            format!("canonical:blake3:{hex}"),
+            "canonical:md5".to_owned(),
+        ] {
+            let err = gate(std::slice::from_ref(&other))
+                .expect_err("I84 (d): a non-sha256 canonical family is refused");
+            assert!(
+                err.to_string().contains("canonical id is not sha256"),
+                "I84 (d): {other:?} names the family, not its case: {err}"
+            );
+        }
         // A subject that merely BEGINS with those letters is not canonical and
         // stays admissible — the clause keys on the `:` at byte 9.
         gate(std::slice::from_ref(&"canonicalish-actor".to_owned()))

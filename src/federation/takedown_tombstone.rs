@@ -1022,3 +1022,158 @@ async fn record(
     }
     Ok(report)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notice_row(edit: impl FnOnce(&mut super::super::Attestation)) -> super::super::Attestation {
+        let now = chrono::Utc::now();
+        let mut row = super::super::Attestation {
+            attestation_id: "n1".into(),
+            attesting_key_id: "claimant".into(),
+            attested_key_id: "claimant".into(),
+            attestation_type: "scores".into(),
+            weight: None,
+            asserted_at: now,
+            expires_at: Some(now + chrono::Duration::days(1)),
+            attestation_envelope: serde_json::json!({
+                "dimension": "takedown_notice:dmca512:v1",
+                "score": -1.0,
+                "subject_kind": "takedown_notice",
+                "content_sha256": "ab".repeat(32),
+                "claimant_key_id": "claimant",
+                "legal_basis": "dmca512",
+                "jurisdiction": "US",
+                "good_faith_statement": "gf",
+                "claim_text": "claim",
+            }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "claimant".into(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".into(),
+            tier: "federation".into(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        edit(&mut row);
+        row
+    }
+
+    /// I1170 (unit) — the notice dimension's `{basis}` is one non-empty
+    /// segment between the stem and `:v1`.
+    #[test]
+    fn i1170_the_notice_dimension_names_one_basis() {
+        assert_eq!(
+            notice_basis_of_dimension("takedown_notice:dmca512:v1"),
+            Some("dmca512")
+        );
+        for d in [
+            "takedown_notice::v1",
+            "takedown_notice:a:b:v1",
+            "takedown_notice:dmca512",
+            "takedown_notice:dmca512:v2",
+            "moderation:dmca512:v1",
+        ] {
+            assert_eq!(notice_basis_of_dimension(d), None, "{d}");
+        }
+        assert_eq!(
+            notice_dimension("ncmec_csam"),
+            "takedown_notice:ncmec_csam:v1"
+        );
+        assert_eq!(cc_basis_spelling("dmca_512"), "dmca512");
+        assert_eq!(cc_basis_spelling("dsa_article_16"), "dsa_article16");
+        assert_eq!(cc_basis_spelling("ncmec_csam"), "ncmec_csam");
+    }
+
+    /// I1170 (unit) — the notice row's shape, member by member (CC 3.1.1 /
+    /// CC 3.3.2): each defect alone refuses, naming it.
+    #[test]
+    fn i1170_the_notice_row_shape_member_by_member() {
+        let ok = notice_shape_ok(notice_row(|_| {}));
+        assert_eq!(ok.legal_basis, "dmca512");
+        assert_eq!(
+            ok.disposition,
+            TakedownDisposition::WithholdThenDelete { window_days: 10 }
+        );
+        type Edit = Box<dyn FnOnce(&mut super::super::Attestation)>;
+        let cases: Vec<(&str, Edit)> = vec![
+            (
+                "subject_kind",
+                Box::new(|r| r.attestation_envelope["subject_kind"] = "x".into()),
+            ),
+            (
+                "dimension",
+                Box::new(|r| r.attestation_envelope["dimension"] = "takedown_notice:x".into()),
+            ),
+            (
+                "legal_basis",
+                Box::new(|r| r.attestation_envelope["legal_basis"] = "ncmec_csam".into()),
+            ),
+            (
+                "steward_purge",
+                Box::new(|r| {
+                    r.attestation_envelope["dimension"] = "takedown_notice:steward_purge:v1".into();
+                    r.attestation_envelope["legal_basis"] = "steward_purge".into();
+                }),
+            ),
+            (
+                "closed set",
+                Box::new(|r| {
+                    r.attestation_envelope["dimension"] = "takedown_notice:other:v1".into();
+                    r.attestation_envelope["legal_basis"] = "other".into();
+                }),
+            ),
+            (
+                "content_sha256",
+                Box::new(|r| r.attestation_envelope["content_sha256"] = "AB".repeat(32).into()),
+            ),
+            (
+                "claimant_key_id",
+                Box::new(|r| r.attestation_envelope["claimant_key_id"] = "someone".into()),
+            ),
+            (
+                "jurisdiction",
+                Box::new(|r| r.attestation_envelope["jurisdiction"] = "  ".into()),
+            ),
+            (
+                "good_faith_statement",
+                Box::new(|r| r.attestation_envelope["good_faith_statement"] = "".into()),
+            ),
+            (
+                "claim_text",
+                Box::new(|r| r.attestation_envelope["claim_text"] = " \t".into()),
+            ),
+            (
+                "score",
+                Box::new(|r| r.attestation_envelope["score"] = 1.0.into()),
+            ),
+            ("expires_at", Box::new(|r| r.expires_at = None)),
+            (
+                "after asserted_at",
+                Box::new(|r| r.expires_at = Some(r.asserted_at)),
+            ),
+        ];
+        for (what, edit) in cases {
+            let e = notice_row_shape(&notice_row(edit)).expect_err(what);
+            assert!(!e.is_empty(), "{what}");
+        }
+        assert!(is_notice_row(&notice_row(|_| {})));
+        assert!(!is_notice_row(&notice_row(
+            |r| r.attestation_type = "withdraws".into()
+        )));
+        assert!(!is_notice_row(&notice_row(|r| {
+            r.attestation_envelope["dimension"] = "moderation:x:v1".into();
+        })));
+    }
+
+    fn notice_shape_ok(row: super::super::Attestation) -> NoticeRowShape {
+        notice_row_shape(&row).expect("a well-formed notice row")
+    }
+}

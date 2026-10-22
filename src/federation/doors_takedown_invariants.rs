@@ -335,6 +335,14 @@ pub(crate) mod bodies {
             "I1171: named as retired: {e}"
         );
         let record = format!("blob:{sha}");
+        // A whitespace member is empty (the compat read keeps v59's rule).
+        let (mut blank, _) = legacy_contribution_notice(0x6b, &sha, "dmca_512");
+        blank.envelope["payload"]["claim_text"] = serde_json::json!("  ");
+        let e =
+            td::apply_replicated_takedown(dir, &blank, std::slice::from_ref(&record), "receiver")
+                .await
+                .expect_err("I1171: a blank claim_text");
+        assert_eq!(e.kind(), token::UNAUTHORISED, "I1171: {e}");
         let r = td::apply_replicated_takedown(dir, &n, &[record], "receiver")
             .await
             .expect("I1171: the v59 peer's replicated notice is applied (compat)");
