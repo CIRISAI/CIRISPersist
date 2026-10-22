@@ -67,6 +67,7 @@ pub(crate) mod bodies {
             subject_key_id: Some(format!("{id}-subject")),
             detail,
             emitted_at: chrono::Utc::now(),
+            emitter_key_id: String::new(),
         }
     }
 
@@ -422,6 +423,7 @@ pub(crate) mod bodies {
             .list_hard_case_events(hard_case::HardCaseFilter {
                 kind: Some(hard_case::kind::TRACE_ERASURE.to_owned()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();

@@ -728,6 +728,7 @@ pub(crate) mod bodies {
         dir.list_hard_case_events(crate::federation::hard_case::HardCaseFilter {
             kind: Some(crate::federation::hard_case::kind::FAST_PATH_TAKEDOWN.to_owned()),
             since: None,
+            emitter_key_id: None,
         })
         .await
         .unwrap()

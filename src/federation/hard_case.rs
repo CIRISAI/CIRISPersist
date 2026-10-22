@@ -194,6 +194,19 @@ pub struct HardCaseEvent {
     pub detail: serde_json::Value,
     /// When persist observed the condition.
     pub emitted_at: DateTime<Utc>,
+    /// v60.0.0 (CIRISConstitution#170 closed) — **which node emitted the
+    /// event**: the key id that SIGNED the stored `hard_case:*` row (its
+    /// `attesting_key_id`, the emitting node's `substrate_persist` identity).
+    /// Since the hold lifted, a listing holds peers' replicated events beside
+    /// this node's own, so every listed event names its emitter.
+    ///
+    /// Set by [`project_hard_case_row`] from the row and nowhere else: never
+    /// from `detail`, never from the signed body ([`hard_case_envelope`] drops
+    /// it, and a body's claim is overwritten), so it is the signer, not a
+    /// claim. Empty on an event an emitter is still building and on a pre-v57
+    /// silo row the rehome has not yet moved onto a signed row.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emitter_key_id: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -397,6 +410,7 @@ pub fn admin_action_event(
             admin_field::REASON: reason,
         }),
         emitted_at: at,
+        emitter_key_id: String::new(),
     }
 }
 
@@ -410,6 +424,11 @@ pub struct HardCaseFilter {
     /// Only events with `emitted_at >= since`. `None` = from the start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<DateTime<Utc>>,
+    /// v60.0.0 — only events whose row this key signed
+    /// ([`HardCaseEvent::emitter_key_id`]). `None` = every node's events,
+    /// replicated peers' included; this node's own key = the node-local view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emitter_key_id: Option<String>,
 }
 
 /// Effective consent stance of a subject over a target Contribution
@@ -583,6 +602,7 @@ pub fn membership_removed_event(
             "effective_at": effective_at.to_rfc3339(),
         }),
         emitted_at: effective_at,
+        emitter_key_id: String::new(),
     }
 }
 
@@ -641,6 +661,7 @@ pub fn trace_erasure_event(counts: &TraceErasureCounts, erased_at: DateTime<Utc>
         subject_key_id: None,
         detail: serde_json::to_value(counts).unwrap_or_default(),
         emitted_at: erased_at,
+        emitter_key_id: String::new(),
     }
 }
 
@@ -748,10 +769,19 @@ pub fn hard_case_attestation_id(event_id: &str) -> String {
 /// is written as: `{dimension, hard_case: <the event>}`. The event rides whole,
 /// as serde writes it, so the projection reads back exactly what the emitter
 /// observed.
+///
+/// v60.0.0 — the body never carries [`HardCaseEvent::emitter_key_id`]: the
+/// emitter is the row's signer, read off the row by the projection, so a
+/// caller-set value (a listed event re-recorded, say) is dropped here and
+/// the signed body keeps its v59 shape.
 pub fn hard_case_envelope(event: &HardCaseEvent) -> Result<serde_json::Value, serde_json::Error> {
+    let mut body = serde_json::to_value(event)?;
+    if let Some(members) = body.as_object_mut() {
+        members.remove("emitter_key_id");
+    }
     Ok(serde_json::json!({
         "dimension": hard_case_dimension(&event.kind),
-        BODY_MEMBER: serde_json::to_value(event)?,
+        BODY_MEMBER: body,
     }))
 }
 
@@ -777,12 +807,17 @@ pub fn project_hard_case_row(row: &super::types::Attestation) -> Option<HardCase
         return None;
     }
     let body = row.attestation_envelope.get(BODY_MEMBER)?;
-    let event: HardCaseEvent = serde_json::from_value(body.clone()).ok()?;
+    let mut event: HardCaseEvent = serde_json::from_value(body.clone()).ok()?;
     // The body must be the event the dimension and the id name: a row whose
     // three disagree is not one this door wrote.
-    (hard_case_dimension(&event.kind) == dimension
-        && hard_case_attestation_id(&event.event_id) == row.attestation_id)
-        .then_some(event)
+    if hard_case_dimension(&event.kind) != dimension
+        || hard_case_attestation_id(&event.event_id) != row.attestation_id
+    {
+        return None;
+    }
+    // v60.0.0 — the emitter is the row's SIGNER, whatever the body says.
+    event.emitter_key_id = row.attesting_key_id.clone();
+    Some(event)
 }
 
 /// v57.0.0 (CIRISPersist#988 item 2) — record an OBSERVATION riding on
@@ -926,6 +961,7 @@ mod tests {
             subject_key_id: None,
             detail: serde_json::json!({}),
             emitted_at: "2026-10-21T10:00:00Z".parse().unwrap(),
+            emitter_key_id: String::new(),
         };
         let row = |id: &str, envelope: serde_json::Value| {
             let mut r = ts::bare_attestation(id, "i1165-node", "", &envelope);
@@ -958,6 +994,48 @@ mod tests {
             project_hard_case_row(&row(&id, other_dimension)),
             None,
             "I1165: a dimension the body does not name"
+        );
+    }
+
+    /// I1165 (v60.0.0) — the emitter is the row's SIGNER, never a claim: the
+    /// projection sets it from `attesting_key_id` whatever the body says, and
+    /// the envelope never writes a caller-set value into the signed body.
+    #[test]
+    fn i1165_the_emitter_is_the_rows_signer_not_a_claim() {
+        use crate::federation::tier_ingest::test_support as ts;
+        let event = HardCaseEvent {
+            event_id: "i1165-emitter".to_owned(),
+            kind: kind::CONSENT_SLA_BREACH.to_owned(),
+            target_key_id: Some("i1165-target".to_owned()),
+            subject_key_id: Some("i1165-subject".to_owned()),
+            detail: serde_json::json!({"emitter_key_id": "i1165-detail-claim"}),
+            emitted_at: "2026-10-21T10:00:00Z".parse().unwrap(),
+            emitter_key_id: "i1165-caller-claim".to_owned(),
+        };
+        let envelope = hard_case_envelope(&event).unwrap();
+        assert!(
+            envelope[BODY_MEMBER].get("emitter_key_id").is_none(),
+            "I1165: the signed body carries no emitter: {envelope}"
+        );
+        let id = hard_case_attestation_id(&event.event_id);
+        let row = |envelope: &serde_json::Value| {
+            let mut r = ts::bare_attestation(&id, "i1165-signer", "", envelope);
+            r.attestation_type = super::super::types::attestation_type::SCORES.to_owned();
+            r
+        };
+        assert_eq!(
+            project_hard_case_row(&row(&envelope)).map(|e| e.emitter_key_id),
+            Some("i1165-signer".to_owned()),
+            "I1165: the emitter is the row's signer"
+        );
+        // A body that claims an emitter (a peer's hand-built row) is
+        // overruled by the row's signer.
+        let mut claimed = envelope.clone();
+        claimed[BODY_MEMBER]["emitter_key_id"] = serde_json::json!("i1165-body-claim");
+        assert_eq!(
+            project_hard_case_row(&row(&claimed)).map(|e| e.emitter_key_id),
+            Some("i1165-signer".to_owned()),
+            "I1165: a body's emitter claim is overwritten by the signer"
         );
     }
 
@@ -1032,6 +1110,7 @@ mod tests {
             subject_key_id: None,
             detail,
             emitted_at: "2026-08-02T10:00:00Z".parse().unwrap(),
+            emitter_key_id: String::new(),
         }
     }
 

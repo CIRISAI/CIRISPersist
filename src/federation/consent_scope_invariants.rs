@@ -370,6 +370,7 @@ pub(crate) mod bodies {
         let filter = || crate::federation::hard_case::HardCaseFilter {
             kind: Some(kind::RETAIN_WINDOW_BREACH.to_owned()),
             since: None,
+            emitter_key_id: None,
         };
         let events = d.list_hard_case_events(filter()).await.unwrap();
         assert!(

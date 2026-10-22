@@ -1104,6 +1104,7 @@ impl MemoryBackend {
                     subject_key_id: None,
                     detail: serde_json::json!({}),
                     emitted_at: chrono::Utc::now(),
+                    emitter_key_id: String::new(),
                 },
             ),
         );
@@ -7740,6 +7741,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .map(|(_, e)| e)
             .filter(|e| filter.kind.as_ref().is_none_or(|k| &e.kind == k))
             .filter(|e| filter.since.is_none_or(|s| e.emitted_at >= s))
+            .filter(|e| {
+                filter
+                    .emitter_key_id
+                    .as_ref()
+                    .is_none_or(|k| &e.emitter_key_id == k)
+            })
             .cloned()
             .collect();
         // Match the SQL backends: newest first, event_id as a stable tiebreak.
@@ -10306,6 +10313,7 @@ fn plan_peer_removal_event(
             "hard": hard,
         }),
         emitted_at: now,
+        emitter_key_id: String::new(),
     };
     crate::federation::attestation_admit::plan_hard_case_row(
         &event,
@@ -16121,6 +16129,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(hard_case::kind::TRACE_ERASURE.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -16143,6 +16152,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(hard_case::kind::TRACE_ERASURE.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -20296,6 +20306,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(hard_case::kind::FAMILY_MEMBERSHIP_CHANGE.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -20324,6 +20335,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(hard_case::kind::FAMILY_MEMBERSHIP_CHANGE.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -21541,6 +21553,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -21718,6 +21731,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();

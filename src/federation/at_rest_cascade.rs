@@ -1827,6 +1827,7 @@ pub mod orchestrate {
                         "excluded": granted_count.is_none(),
                     }),
                     emitted_at: observed_at,
+                    emitter_key_id: String::new(),
                 },
             )
             .await
@@ -1851,6 +1852,7 @@ pub mod orchestrate {
                         "reason": "no_valid_encryption_pubkeys",
                     }),
                     emitted_at: observed_at,
+                    emitter_key_id: String::new(),
                 },
             )
             .await
@@ -2738,6 +2740,7 @@ pub mod orchestrate {
                         "reason": "no_valid_encryption_pubkeys",
                     }),
                     emitted_at: as_of,
+                    emitter_key_id: String::new(),
                 },
             )
             .await?;

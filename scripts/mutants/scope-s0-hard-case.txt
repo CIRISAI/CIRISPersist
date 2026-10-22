@@ -17,8 +17,19 @@
 #   adds only mutants I1165 cannot speak to. The projection itself is the
 #   site here.
 #
+# - S0c (the release agent's condition on the widened listing): every listed
+#   event names its emitter, the row's SIGNER. The projection's emitter line
+#   (`project_hard_case_row`), the envelope that keeps the field out of the
+#   signed body (`hard_case_envelope`), and the three backends'
+#   `list_hard_case_events` filter arms are in scope. Witness I1165 (B lists
+#   A's event with A's key; B's key excludes it; A's key returns exactly it)
+#   and the unit witness i1165_the_emitter_is_the_rows_signer_not_a_claim.
+#
 # Grammar: docs/MUTATION_TESTING.md "Scope files".
 tests: test(/i1165|i960_|i962_/)
 features: postgres,sqlite,server
 
-src/federation/hard_case.rs project_hard_case_row
+src/federation/hard_case.rs project_hard_case_row hard_case_envelope
+src/store/memory.rs list_hard_case_events
+src/store/sqlite.rs list_hard_case_events
+src/store/postgres.rs list_hard_case_events
