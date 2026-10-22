@@ -500,6 +500,20 @@ mod tests {
         assert_eq!(t.meta.cc_section, "4.5.13");
         assert_eq!(t.base_law.expected_active(EXPECTED_ACTIVE_PROBE_N), 344);
         assert_eq!(t.base_law.expected_active(10), 10);
+        assert_eq!(
+            t.base_law.expected_active(12),
+            12,
+            "at k every member counts"
+        );
+        assert_eq!(t.base_law.expected_active(42), 13);
+        // At or below k the base is N even under a floor above k (the floor
+        // lifts only the tail).
+        let tiny = BaseLaw {
+            k: 2,
+            tail: 30,
+            min: 3,
+        };
+        assert_eq!((tiny.expected_active(2), tiny.expected_active(3)), (2, 3));
         let (mut two_path, mut other) = (Vec::new(), Vec::new());
         for row in &t.families {
             let door = DoorRule::SELF_ROSTER;
@@ -658,6 +672,14 @@ mod tests {
             let p = t.policy_of(row, DoorRule::SELF_ROSTER).unwrap();
             assert_eq!(t.check_corridor(row, &p).unwrap(), Err(want), "{fam}");
         }
+        // A forward-only row enacting on exactly half (strictly more than
+        // 1/2) is at the strict-majority floor, inside.
+        let t = with_row("community_remove", |r| {
+            r["enact"] = serde_json::json!({"num": 1, "den": 2});
+        });
+        let row = t.row("community_remove").unwrap();
+        let p = t.policy_of(row, DoorRule::SELF_ROSTER).unwrap();
+        assert_eq!(t.check_corridor(row, &p).unwrap(), Ok(()));
         // The forward-only row's window floor is checked too.
         let t = with_row("community_remove", |r| {
             r["window_class"] = "content_24h".into();

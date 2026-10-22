@@ -1383,6 +1383,26 @@ mod tests {
         for (p, want) in cases {
             assert_eq!(p.check_corridor(6, floor), Err(want), "{p:?}");
         }
+        // PolicyCorridor.lean `strict_in_corridor`: a community may tighten up
+        // to a floor AT enact (the reverse path switched off) and stay inside;
+        // `lax_outside`: a floor one voice reaches is outside.
+        let strict = with(&|p| p.floor = Some(least(2, 3)));
+        assert_eq!(
+            strict.floor.unwrap().votes(344),
+            strict.enact.votes(344),
+            "the floor sits exactly at enact"
+        );
+        assert_eq!(
+            strict.check_corridor(344, floor),
+            Ok(()),
+            "strict_in_corridor"
+        );
+        let lax = with(&|p| p.floor = Some(least(1, 344)));
+        assert_eq!(
+            lax.check_corridor(344, floor),
+            Err(CorridorRefusal::FloorBelowTwoVoters),
+            "lax_outside"
+        );
         // A floor of one key is the self roster's, declared, not a silent case.
         let mut one_key = community(AtWindow::Cancel);
         one_key.floor = Some(least(0, 1));
