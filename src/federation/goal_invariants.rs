@@ -839,6 +839,7 @@ mod run {
         b::i1182_an_approach_keys_on_the_goal_row(&p, &tag()).await;
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     /// The legacy goal both engines seed: `declarer`'s, scale `cohort`,
     /// retired.
     fn legacy_sql(table: &str, declarer: &str, retired: &str) -> String {
@@ -892,10 +893,12 @@ mod run {
 
     // ── I1181 — V204 over an upgrading node ───────────────────────────────
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     /// The declarer every V203 goal names: registered through the key door at
     /// the V203 schema (V204 touches only `goals`).
     const K1: &str = "i1181-k1";
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn v203_goal(table: &str, id: &str, scope: &str, cohort: &str) -> String {
         format!(
             "INSERT INTO {table} (goal_id, declared_by_key_id, declared_at, goal_text, \

@@ -316,7 +316,7 @@ did not fit its budget):
   planners, the shared replicated apply, the row step, and each backend's
   `store_planned_key_record` executor and doors, against I1183–I1188 and the
   doors' standing witnesses. 129 mutants in three shards, 101 caught, 28
-  unviable, 0 missed (two rounds: the first left ten survivors; eight were
+  unviable, 0 missed (two rounds: the first left twelve survivors; ten were
   witness gaps, now witnessed, two an equivalent branch, now removed), on
   the weekly run.
 - `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and

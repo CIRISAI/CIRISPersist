@@ -340,9 +340,10 @@ Python signature changed, no migration.
   **I1188** (unit) the row step and the lost-race wording.
 - Mutation scope `scripts/mutants/scope-s3-key-plane.txt`: 129 mutants in
   three shards, 101 caught, 28 unviable, 0 missed, nothing allow-listed (two
-  rounds: the first, 136 mutants, left ten survivors; eight were witness gaps,
-  now I1187's anchored-version and rehydrate legs, I1189 and I1190, and the
-  role-bearing leg of I1183; two were the row step's self-scrub guard on
+  rounds: the first, 136 mutants, left twelve survivors; ten were witness
+  gaps, now I1187's anchored-version and rehydrate legs, I1189 (the
+  re-anchor's predicate and both SQL doors), I1190 (the supersede's three),
+  and the role-bearing leg of I1183; two were the row step's self-scrub guard on
   sqlite and postgres, an equivalent branch, now removed on all three
   backends). Weekly, three shards, in `mutants.yml`.
 - Evidence: CLM-planes-as-rows (3.1.3) at `key_plane::plan_key_record_write`;

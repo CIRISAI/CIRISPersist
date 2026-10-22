@@ -1027,6 +1027,9 @@ pub(crate) enum OnHeld {
 /// What an in-place rewrite re-asserts about the held row, atomically, at
 /// write time (the `WHERE` of the SQL backends). The Ed25519 pubkey is
 /// re-asserted by every guard.
+// The supersede, replace and rehydrate shapes are written only by doors
+// the SQL backends compile (`cfg(any(postgres, sqlite))`).
+#[cfg_attr(not(any(feature = "postgres", feature = "sqlite")), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RewriteGuard {
     /// The held row is still self-signed (the scrub upgrade).
@@ -1043,6 +1046,9 @@ pub(crate) enum RewriteGuard {
 
 /// **The plan's verdict for one key-record write**: exactly what the
 /// executor stores. Every refusal has already been made.
+// The supersede, replace and rehydrate shapes are written only by doors
+// the SQL backends compile (`cfg(any(postgres, sqlite))`).
+#[cfg_attr(not(any(feature = "postgres", feature = "sqlite")), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) enum PlannedKeyRecord {
     /// A fresh row: `persist_row_hash` computed, `consent_role` in wire form.
