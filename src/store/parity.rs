@@ -224,7 +224,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("sqlite_project_ledger", Class::Plumbing),
     ("pg_project_ledger", Class::Plumbing),
     ("sqlite_ledger_projection_rebuild", Class::Plumbing),
-    ("pg_ledger_projection_rebuild", Class::Plumbing),
     // v58.0.0 (CIRISPersist#1094 item 2) — the DSAR door's erasure of
     // row-backed detections under the producer's rule-1 `withdraws`: the hard-delete
     // of the cited rows, the tombstone header + tombstone it builds (pure) and

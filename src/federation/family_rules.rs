@@ -538,6 +538,33 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
 /// declaration cannot outlive its truth.
 pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
     (
+        "contribution:",
+        "v60.0.0 (CIRISPersist#988 item 1) — `cirisnode::rows::CONTRIBUTION_PREFIX` \
+         BUILDS a Contribution row's dimension (`contribution:{subject_kind}:v1`) and \
+         reads it back (a vote names a held Contribution row; a promotion targets \
+         one). Persist states no emitter rule: the author signs its own row and the \
+         plane's door admits it like any open-vocabulary row.",
+    ),
+    (
+        "vote:",
+        "v60.0.0 (CIRISPersist#988 item 1) — `cirisnode::rows::VOTE_PREFIX` builds and \
+         reads `vote:{contribution_id}:v1` (CC 3.1.9.3, registered and unreserved): \
+         any voter signs it. No emitter rule of persist's.",
+    ),
+    (
+        "credits:",
+        "v60.0.0 (CIRISPersist#988 item 1) — `ledger_projection::CREDITS_PREFIX` names \
+         the family whose rows THIS node signed project into `credits_ledger` (a \
+         READ rule: which rows the projection folds), never an admission rule; CC \
+         3.1.9.6 registers the family unreserved and any signer's row is admitted.",
+    ),
+    (
+        "expertise:",
+        "v60.0.0 (CIRISPersist#988 item 1) — `ledger_projection::EXPERTISE_PREFIX`, as \
+         `credits:`: the projection's read rule over this node's rows, no admission \
+         rule.",
+    ),
+    (
         "settlement:",
         "v58.0.0 (CC rc8) — `settlement:*` is registered and UNRESERVED: any payer \
          signs it (CC 3.3.10). `admission::SETTLEMENT_DIMENSION_PREFIX` routes the \

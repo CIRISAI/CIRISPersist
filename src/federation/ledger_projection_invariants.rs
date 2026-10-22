@@ -126,13 +126,24 @@ pub(crate) mod bodies {
         let alice = format!("i1166-alice-{tag}");
         ts::register_hybrid_key(b, &alice).await;
 
-        credits(b, &node, &alice, 12.5, None).await;
+        // Explicit signed instants: two emits a microsecond apart may share
+        // a truncated instant, and the fold then orders by id (a coin flip
+        // this witness must not depend on).
+        let t0 = chrono::Utc::now() - chrono::Duration::minutes(10);
+        credits(b, &node, &alice, 12.5, Some(t0)).await;
         let rows = live(b, SiloProjection::CreditsLedger).await;
         assert_eq!(rows.len(), 1, "I1166: one key, one ledger row: {rows:?}");
         assert!(rows[0].contains("12.5"), "I1166: the balance: {rows:?}");
 
         // A newer row on the key replaces the balance.
-        let newer = credits(b, &node, &alice, 7.25, None).await;
+        let newer = credits(
+            b,
+            &node,
+            &alice,
+            7.25,
+            Some(t0 + chrono::Duration::minutes(1)),
+        )
+        .await;
         let rows = live(b, SiloProjection::CreditsLedger).await;
         assert_eq!(rows.len(), 1);
         assert!(

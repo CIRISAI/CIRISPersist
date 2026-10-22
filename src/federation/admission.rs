@@ -20021,6 +20021,11 @@ mod tests {
         // expresses. The gate is `membership_acceptance::check_membership_row_shape`
         // + `check_attestation_write_scope` (CIRISPersist#955).
         "membership:",
+        // v60.0.0 (CIRISPersist#803) — CC 3.1.1 reserves the notice to the
+        // content's duty-holders (CC 4.5.5), which no identity type expresses:
+        // the gate is `takedown_tombstone::check_takedown_notice_row_admission`
+        // (the `steward_purge` leaf stays held shut).
+        "takedown_notice:",
         // rc6 re-vendor (CIRISConstitution#137) — "legacy label on an owner's
         // own delegates_to row; claims no job, confers nothing; closed". It is
         // a label on a STRUCTURAL row, outside the `scores` dimension gate; the
