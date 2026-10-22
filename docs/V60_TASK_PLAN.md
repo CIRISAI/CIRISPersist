@@ -76,6 +76,21 @@ check (steward: after v60); #1113 takedown reversal (CC 4.5.3 at rc10, per-holde
 `build_manifest_hash` + `build_manifest_ref` (CC#183 N4). CC rc10 carries the text for all of
 them; their claims stay staged until built.
 
+Steward rulings 2026-10-22 (CC, cirisconstitution-b8), none in v60, tickets to be filed by the
+asking team: (1) RaptorQ is dropped as the durability mechanism; durability becomes per-item
+target-holder replication of encrypted chunks. The fountain store surfaces stay for the A/V
+codec path only; the `FountainHoldingClaim` "shelf length" role moves to a per-item holder
+count over chunk holdings; expect a durable-mark member on the publish row (shape from Server)
+and a real per-item holder listing where today only a symbol count is exposed. (2) New
+`mesh_config` keys, relieve-never-expand, Edge the consumer: `shaping.rho`,
+`shaping.window_secs`, `shaping.node_cap_bytes_per_s`, `onion.cap_factor`,
+`onion.mix_mean_delay_ms` (Edge files the shapes); the four redundancy keys keep their meaning
+over holders per item. (3) Role token `infra:relay` (steward-conferred, on owner-bound
+bundle-rooted identities, seat-like in the onion cap; Edge files the ask) and identity_type
+`rendezvous` (CC 3.1.4): no occurrence, no standing, key record travels inline, never admitted
+to the key plane as an identity. (4) Possession challenge (N6): weight rule is the interim;
+the challenger is staged for the durability tier's first release.
+
 ## 3. The mutation discipline (S0, then every slice)
 
 **Problem.** The repo has a centralized, gated mutation matrix (`scripts/mutants.sh`,
