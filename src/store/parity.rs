@@ -142,6 +142,42 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // compat listings' decoders.
     ("list_identity_occurrence_revocations_for", Class::Delegates),
     ("put_revocation_planned", Class::Plan),
+    // v60.0.0 (CIRISPersist#934 step 3) — the key-record write doors. Every
+    // door's decision is ONE shared plan (`key_record_write_planned`, the
+    // replicated apply `apply_replicated_key_record_planned`); the per-door
+    // planners are same-file helpers of `plan_key_record_write`.
+    ("key_record_write_planned", Class::Plan),
+    ("apply_replicated_key_record_planned", Class::Plan),
+    ("plan_key_record_write", Class::Delegates),
+    ("plan_key_put", Class::Delegates),
+    ("plan_key_seed", Class::Delegates),
+    ("plan_key_scrub_upgrade", Class::Delegates),
+    ("plan_key_supersede", Class::Delegates),
+    ("plan_key_replace", Class::Delegates),
+    ("plan_key_reanchor", Class::Delegates),
+    ("plan_key_attach_pqc", Class::Delegates),
+    // Gates: the stored-column shapes (hex content hash, hybrid algorithm),
+    // the consent-role token.
+    ("check_key_record_columns", Class::Gate),
+    ("admit_consent_role", Class::Gate),
+    // The replicated apply's classification and its first-sight PoP gate
+    // are refusals; the verify-error mapping re-raises anything that is not
+    // a verify refusal, unchanged (Plumbing).
+    ("plan_replicated_key_apply", Class::Gate),
+    ("verify_key_registration", Class::Gate),
+    ("key_refusal_of_verify_error", Class::Plumbing),
+    ("verify_canonical_supersede", Class::Gate),
+    // The executor (storage only; compared across backends as the
+    // `KeyPlaneStore` trait), its column encoders, and its two reports of a
+    // write whose atomic re-assertion matched nothing: Plumbing, because each
+    // fails only when the stored row changed between the plan and the write
+    // (a lost race, re-offerable) — every rule about the caller's record ran
+    // in the plan, and the wording is the plan's (`PlannedKeyRecord`).
+    ("store_planned_key_record", Class::Plumbing),
+    ("sqlite_key_columns", Class::Plumbing),
+    ("pg_key_columns", Class::Plumbing),
+    ("insert_held", Class::Plumbing),
+    ("raced", Class::Plumbing),
     ("revocations_for_subject", Class::Plumbing),
     ("check_revocation_bound_lowers", Class::Gate),
     ("revocation_row", Class::Plumbing),
@@ -494,10 +530,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_node_identity_exclusive", Class::Gate),
     // v50.0.0 (review H3) — Gate: a rewrite may not move `node` in or out.
     ("check_node_identity_unchanged", Class::Gate),
-    // v50.0.0 (review M5) — Delegates: `put_public_key` is the local-mint face
-    // of the one key-record store step; the replicated `Insert` arm reaches
-    // the same helper with the replicated door.
-    ("put_public_key_at_door", Class::Delegates),
     // v50.0.0 (PR #921 review) — Plumbing: the `cfg(test)` one-shot fault a
     // witness arms inside a backend door (`store::test_hooks`); never armed
     // outside a test, and it judges nothing about the caller's input.
@@ -944,13 +976,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // row fails verification, the incoming passes, same pubkeys and claim, a
     // permitted signer, neither side role-gated; refuses with `Conflict`.
     ("prepare_invalid_replace", Class::Gate),
-    // v54.1.0 (#1044) — the one guarded write the rebind and invalid-replace
-    // store steps share. Plumbing: every rule about the caller's record ran
-    // in `prepare_rebind` / `prepare_invalid_replace` before it; it fails only
-    // on the substrate's own terms — the stored row changed under the plan (a
-    // lost race, `Conflict`, re-offerable), or an encoding of the record it
-    // was handed.
-    ("write_replaced_key_registration", Class::Plumbing),
     ("prepare_sealed_manifest_row", Class::Plumbing),
     ("project_route", Class::Plumbing),
     // #846 — the chunk floor's one body; the write door and the adopt door
@@ -1324,7 +1349,13 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 17] = [
+    const SHARED_PLANS: [(&str, &str); 19] = [
+        // v60.0.0 (CIRISPersist#934 step 3) — the key-record write doors.
+        ("src/federation/key_plane.rs", "key_record_write_planned"),
+        (
+            "src/federation/key_plane.rs",
+            "apply_replicated_key_record_planned",
+        ),
         // v58.0.0 (CIRISPersist#1094 item 2).
         ("src/federation/subject_erasure.rs", "plan_store_erasure"),
         // v58.0.0 (CIRISPersist#991) — the key plane.
@@ -1388,7 +1419,43 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 15] = [
+    const SHARED_DOORS: [(&str, &str, &str); 22] = [
+        // v60.0.0 (CIRISPersist#934 step 3) — the key-record write doors.
+        (
+            "FederationDirectory",
+            "put_public_key",
+            "key_record_write_planned",
+        ),
+        (
+            "FederationDirectory",
+            "adopt_scrub_upgrade",
+            "key_record_write_planned",
+        ),
+        (
+            "FederationDirectory",
+            "store_rebound_key_record",
+            "key_record_write_planned",
+        ),
+        (
+            "FederationDirectory",
+            "store_invalid_replaced_key_record",
+            "key_record_write_planned",
+        ),
+        (
+            "FederationDirectory",
+            "adopt_genesis_reanchor",
+            "key_record_write_planned",
+        ),
+        (
+            "FederationDirectory",
+            "attach_key_pqc_signature",
+            "key_record_write_planned",
+        ),
+        (
+            "FederationDirectory",
+            "apply_replicated_key_record",
+            "apply_replicated_key_record_planned",
+        ),
         // v58.0.0 (CIRISPersist#991) — the revocation door.
         (
             "FederationDirectory",
@@ -2601,6 +2668,18 @@ mod tests {
     /// moves from one instant to the other (#1049) moves a row here, and the CC
     /// register can point at the row.
     const PLAN_INSTANTS: &[(&str, &str, Reads)] = &[
+        // v60.0.0 (CIRISPersist#934 step 3) — the key-record doors: the
+        // hardware gate's freshness is judged at receipt, as each backend's
+        // copy did with its own clock; the hybrid completion stamps the
+        // receipt instant into the record.
+        ("plan_key_put", "admit_key_record", Reads::ReceivedAt),
+        (
+            "plan_key_scrub_upgrade",
+            "admit_key_record",
+            Reads::ReceivedAt,
+        ),
+        ("plan_key_supersede", "admit_key_record", Reads::ReceivedAt),
+        ("plan_key_attach_pqc", "Some", Reads::ReceivedAt),
         // Receipt bounds (CC 2.6.7 W; the future-skew sanity bound).
         (
             "plan_put_attestation",
@@ -2768,7 +2847,13 @@ mod tests {
     ];
 
     /// The plan fns [`PLAN_INSTANTS`] covers: `(file, fn)`.
-    const INSTANT_PLANS: [(&str, &str); 12] = [
+    const INSTANT_PLANS: [(&str, &str); 16] = [
+        // v60.0.0 (CIRISPersist#934 step 3) — the key-record write planners
+        // that read an instant.
+        ("src/federation/key_plane.rs", "plan_key_put"),
+        ("src/federation/key_plane.rs", "plan_key_scrub_upgrade"),
+        ("src/federation/key_plane.rs", "plan_key_supersede"),
+        ("src/federation/key_plane.rs", "plan_key_attach_pqc"),
         // v57.0.0 (CIRISPersist#988 items 2, 3).
         ("src/federation/attestation_admit.rs", "plan_hard_case_row"),
         ("src/federation/attestation_admit.rs", "plan_detection_row"),

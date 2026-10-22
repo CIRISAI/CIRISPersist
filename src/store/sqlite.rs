@@ -3322,314 +3322,8 @@ impl SqliteBackend {
         &self,
         records: &[crate::federation::SignedKeyRecord],
     ) -> Result<(), crate::federation::Error> {
-        for sr in records {
-            let mut row = sr.record.clone();
-            crate::federation::register::validate_registration_pubkey(&row)?;
-            // v50.0.0 (CIRISPersist#925 ask 5, review H3) — CC 3.4.7.3 Clause A on
-            // every door that writes `identity_type`, not only the insert.
-            crate::federation::register::check_node_identity_exclusive(&row)?;
-            if row.algorithm != crate::federation::types::algorithm::HYBRID {
-                return Err(crate::federation::Error::InvalidArgument(format!(
-                    "genesis seed algorithm must be 'hybrid' (got '{}')",
-                    row.algorithm
-                )));
-            }
-            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-            // v13.0.0 (CIRISPersist#365) — same consent_role admission
-            // gate as put_public_key (backend-symmetric with PG's twin).
-            crate::federation::types::consent_role::check_admissible(row.consent_role.as_deref())?;
-            let envelope_text = serde_json::to_string(&row.registration_envelope)
-                .map_err(|e| crate::federation::Error::Backend(format!("envelope: {e}")))?;
-            let attestation_text: Option<String> =
-                match &row.attestation_evidence {
-                    Some(v) => Some(serde_json::to_string(v).map_err(|e| {
-                        crate::federation::Error::Backend(format!("attestation: {e}"))
-                    })?),
-                    None => None,
-                };
-            let roles_text: Option<String> = if row.capability_roles.is_empty() {
-                None
-            } else {
-                Some(
-                    serde_json::to_string(&row.capability_roles)
-                        .map_err(|e| crate::federation::Error::Backend(format!("roles: {e}")))?,
-                )
-            };
-            // v31.4.0 (CIRISPersist#682) — THIS node's admission position
-            // (V126), allocated per record because each is a separate row in
-            // this node's stream. Not the producer's `scrub_timestamp`: the
-            // pinned #268 ceremony bake is months old BY DESIGN, so keying the
-            // serve cursor on it would sort every genesis holder behind any
-            // consumer's cursor and it would never replicate. See
-            // [`SqliteBackend::next_key_admission_position`].
-            let admitted_at = self.next_key_admission_position().await?;
-            let kid = row.key_id.clone();
-            self.write(move |conn| -> Result<(), rusqlite::Error> {
-                // v58.0.0 (CIRISPersist#991) — the holder's record and its
-                // `key:record:v1` row, one transaction.
-                let tx = conn.transaction()?;
-                tx.execute(
-                    "INSERT INTO federation_keys (\
-                        key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
-                        identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
-                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                        attestation_evidence, consent_role, admitted_at\
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20) \
-                     ON CONFLICT (key_id) DO NOTHING",
-                    rusqlite::params![
-                        row.key_id,
-                        row.pubkey_ed25519_base64,
-                        row.pubkey_ml_dsa_65_base64,
-                        row.algorithm,
-                        row.identity_type,
-                        row.identity_ref,
-                        row.valid_from.to_rfc3339(),
-                        row.valid_until.map(|t| t.to_rfc3339()),
-                        envelope_text,
-                        hex::decode(&row.original_content_hash).map_err(|_| {
-                            rusqlite::Error::InvalidQuery
-                        })?,
-                        row.scrub_signature_classical,
-                        row.scrub_signature_pqc,
-                        row.scrub_key_id,
-                        row.scrub_timestamp.to_rfc3339(),
-                        row.pqc_completed_at.map(|t| t.to_rfc3339()),
-                        row.persist_row_hash,
-                        roles_text,
-                        attestation_text,
-                        // v13.0.0 (CIRISPersist#365) — wire None ⇔ the
-                        // stored V020 'unregistered' default (NOT NULL).
-                        crate::federation::types::consent_role::stored_from_wire(
-                            row.consent_role.as_deref(),
-                        ),
-                        admitted_at.to_rfc3339(),
-                    ],
-                )?;
-                sqlite_sync_key_record_row(&tx, &row.key_id)?;
-                tx.commit()
-            }).await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("genesis seed insert {kid}: {e}"))
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Gated self-signed → anchor-scrubbed **upgrade** of an existing own-key
-    /// row (CIRISPersist#351). Replaces a self-signed `federation_keys` row
-    /// with the granting-authority-scrubbed record for the SAME `key_id` +
-    /// SAME pubkey, so an in-place node's own row can be re-rooted to the
-    /// accord anchor (its self-signed boot row is otherwise sticky —
-    /// `put_public_key` is `DO NOTHING`). The scrub-signature is verified by
-    /// [`Engine::adopt_scrub_upgrade`](crate::engine::Engine::adopt_scrub_upgrade)
-    /// BEFORE this call (mirrors `register_federation_key` → `put_public_key`).
-    ///
-    /// Monotonic + identity-preserving guards:
-    /// - incoming MUST be granting-authority (`scrub_key_id != key_id`);
-    /// - the existing row MUST be self-signed (`scrub_key_id == key_id`) —
-    ///   a downgrade (anchored → self) or re-anchor is refused;
-    /// - the Ed25519 pubkey MUST be unchanged (a pubkey change is a different
-    ///   identity, refused);
-    /// - re-applying the exact same anchored record is idempotent
-    ///   ([`AdoptScrubOutcome::AlreadyAdopted`]).
-    pub async fn adopt_scrub_upgrade(
-        &self,
-        record: crate::federation::SignedKeyRecord,
-    ) -> Result<crate::federation::register::AdoptScrubOutcome, crate::federation::Error> {
-        use crate::federation::register::AdoptScrubOutcome;
-        let mut row = record.record;
-        // v19.0.0 (#486) — lift envelope-attested roles (upgrade path parity
-        // with put_public_key: the re-blessed canonical seed arrives HERE on
-        // an upgrading node; without the lift its conferred roles would stay
-        // invisible on exactly the nodes #480 cares about).
-        crate::federation::admission::lift_envelope_attested_roles(&mut row);
-
-        if row.scrub_key_id == row.key_id {
-            return Err(crate::federation::Error::InvalidArgument(
-                "adopt_scrub_upgrade requires a granting-authority record (scrub_key_id != key_id)"
-                    .into(),
-            ));
-        }
-        crate::federation::register::validate_registration_pubkey(&row)?;
-        // v50.0.0 (CIRISPersist#925 ask 5, review H3) — CC 3.4.7.3 Clause A on
-        // every door that writes `identity_type`, not only the insert.
-        crate::federation::register::check_node_identity_exclusive(&row)?;
-        if row.algorithm != crate::federation::types::algorithm::HYBRID {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "adopt_scrub_upgrade algorithm must be 'hybrid' (got '{}')",
-                row.algorithm
-            )));
-        }
-        // v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — adopt_scrub_upgrade is a
-        // self-signed → anchor-scrubbed UPDATE that CAN change identity_type,
-        // so it is a second path a `canonical` role could otherwise enter on.
-        // Re-run the accord-conferred gate: `canonical` is admitted here only
-        // if THIS incoming (anchor-scrubbed) record earned it via a real
-        // accord-holder scrubber. (The scrub_key_id != key_id guard above is
-        // necessary but not sufficient — the scrubber must be in the anchor.)
-        // v22.0.0 (CIRISPersist#543 H2) — the HARDWARE gate belongs here too.
-        // `adopt_scrub_upgrade` says in its own comment that it "CAN change
-        // identity_type", so it is a second path an `accord_holder` claim can
-        // enter on — and it ran every role gate EXCEPT the hardware-attestation
-        // check that `put_public_key` applies. A chokepoint that enforces three
-        // of four gates is not a chokepoint; #543's audit found this asymmetry
-        // and it is closed here so "every federation_keys write runs the same
-        // gates" is finally true.
-        // v47.3.0 (CIRISPersist#901) — one door predicate: an accord_holder
-        // runs structure + freshness; any other evidence-carrying row runs
-        // structure alone (a replicated body is checked where it lands).
-        self.hardware_attestation_policy()
-            .admit_key_record(&row, chrono::Utc::now())?;
-        crate::federation::admission::check_canonical_role_admission(self, &row).await?;
-        // #422 — `infra:attest` in `roles` is accord-conferred, same m-of-n
-        // co-scrub gate as `canonical`. Fail-closed before any write.
-        crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
-        // #440 — the CC 3.4.9 co-steward roles (`registry`/`verify`) are
-        // accord-conferred, same ceremony. Fail-closed before any write.
-        crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
-        // v22.0.0 (CIRISPersist#543 finding 3) — the CLOSED authority-claim
-        // gate: every remaining privileged `identity_type` is accord-conferred,
-        // never self-asserted. Same chokepoint, same fail-closed posture; the
-        // closed set lives in `identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES`
-        // and is proven to cover every reserved-prefix rule.
-        crate::federation::admission::check_privileged_identity_type_admission(self, &row).await?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-
-        // Resolve the existing row + classify the transition.
-        let existing = crate::federation::FederationDirectory::lookup_public_key(self, &row.key_id)
-            .await?
-            .ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "adopt_scrub_upgrade: no existing row for {} — use register_federation_key",
-                    row.key_id
-                ))
-            })?;
-        // v50.0.0 (CIRISPersist#925 review H3) — `node` never moves on a rewrite:
-        // the own-`identity_type` half of node-bearing is fixed at mint.
-        crate::federation::register::check_node_identity_unchanged(&existing, &row)?;
-        if existing.pubkey_ed25519_base64 != row.pubkey_ed25519_base64 {
-            return Err(crate::federation::Error::Conflict(format!(
-                "adopt_scrub_upgrade {}: pubkey change refused (different identity)",
-                row.key_id
-            )));
-        }
-        if existing.scrub_key_id != existing.key_id {
-            // Already anchored: idempotent iff byte-identical, else refuse.
-            return if existing.persist_row_hash == row.persist_row_hash {
-                Ok(AdoptScrubOutcome::AlreadyAdopted)
-            } else {
-                Err(crate::federation::Error::Conflict(format!(
-                    "adopt_scrub_upgrade {}: already anchored to a different record (downgrade/replace refused)",
-                    row.key_id
-                )))
-            };
-        }
-
-        let envelope_text = serde_json::to_string(&row.registration_envelope)
-            .map_err(|e| crate::federation::Error::Backend(format!("envelope: {e}")))?;
-        let attestation_text: Option<String> = match &row.attestation_evidence {
-            Some(v) => Some(
-                serde_json::to_string(v)
-                    .map_err(|e| crate::federation::Error::Backend(format!("attestation: {e}")))?,
-            ),
-            None => None,
-        };
-        let roles_text: Option<String> = if row.capability_roles.is_empty() {
-            None
-        } else {
-            Some(
-                serde_json::to_string(&row.capability_roles)
-                    .map_err(|e| crate::federation::Error::Backend(format!("roles: {e}")))?,
-            )
-        };
-        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
-        })?;
-        // v53.1.4 — the whole scrub set rides every rewrite of the scrub columns:
-        // a door that wrote scrub #1 alone stored a quorum-signed record as a
-        // one-holder row (the V096 JSON-array TEXT column; empty → "[]").
-        let additional_scrubs_text =
-            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
-                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
-            })?;
-        let kid = row.key_id.clone();
-        // v24.1.0 (CIRISPersist#547) — the Key-plane wire-index entry must
-        // follow this UPDATE. Without it a scrub-upgraded node advertises its
-        // new content hash while the index still carries the pre-adopt one,
-        // and the ref it just advertised point-reads to `None`.
-        // v31.0.0 (CIRISPersist#640) — the entry is no longer computed from
-        // `row` before the write; it is read BACK afterwards, below. See
-        // `SqliteBackend::index_stored_key_row`.
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                // v58.0.0 (CIRISPersist#991) — the write and its key-plane row, one transaction.
-                let tx = conn.transaction()?;
-                let conn: &rusqlite::Connection = &tx;
-                // v36.0.0 (CIRISPersist#707) — this door rewrites consumer-visible
-                // `KeyRecord` bytes, so it must MOVE the serve position or a
-                // consumer whose cursor has passed the row never learns it
-                // changed. `mutated_at`, through the same allocator as admission,
-                // inside the same lock acquisition as the write.
-                let mutated_at = sqlite_next_key_serve_position(conn)?;
-                // The WHERE re-asserts the guards atomically: self-signed + same
-                // pubkey. The Ed25519 pubkey is the guard, so it is NOT updated.
-                //
-                // v13.0.0 (CIRISPersist#365, CC 3.4.7.2): `consent_role` is
-                // deliberately NOT in the SET list — it is an operational role
-                // marker (its OQ-1 overwrite surface is `set_consent_role`),
-                // not registration content; an anchor-scrub upgrade must not
-                // clobber an assigned role.
-                let n = conn.execute(
-                    "UPDATE federation_keys SET \
-                    pubkey_ml_dsa_65_base64 = ?2, algorithm = ?3, identity_type = ?4, \
-                    identity_ref = ?5, valid_from = ?6, valid_until = ?7, \
-                    registration_envelope = ?8, original_content_hash = ?9, \
-                    scrub_signature_classical = ?10, scrub_signature_pqc = ?11, \
-                    scrub_key_id = ?12, scrub_timestamp = ?13, pqc_completed_at = ?14, \
-                    persist_row_hash = ?15, roles = ?16, attestation_evidence = ?17, \
-                    mutated_at = ?19, additional_scrubs = ?20 \
-                 WHERE key_id = ?1 AND scrub_key_id = key_id AND pubkey_ed25519_base64 = ?18",
-                    rusqlite::params![
-                        row.key_id,
-                        row.pubkey_ml_dsa_65_base64,
-                        row.algorithm,
-                        row.identity_type,
-                        row.identity_ref,
-                        row.valid_from.to_rfc3339(),
-                        row.valid_until.map(|t| t.to_rfc3339()),
-                        envelope_text,
-                        original_content_hash,
-                        row.scrub_signature_classical,
-                        row.scrub_signature_pqc,
-                        row.scrub_key_id,
-                        row.scrub_timestamp.to_rfc3339(),
-                        row.pqc_completed_at.map(|t| t.to_rfc3339()),
-                        row.persist_row_hash,
-                        roles_text,
-                        attestation_text,
-                        row.pubkey_ed25519_base64,
-                        mutated_at.to_rfc3339(),
-                        additional_scrubs_text,
-                    ],
-                )?;
-                sqlite_sync_key_record_row(conn, &row.key_id)?;
-                tx.commit()?;
-                Ok(n)
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("adopt_scrub_upgrade {kid}: {e}"))
-            })?;
-        if n == 0 {
-            // Guards passed the Rust checks but the atomic WHERE matched 0 —
-            // a concurrent mutation raced us. Fail-secure.
-            return Err(crate::federation::Error::Conflict(format!(
-                "adopt_scrub_upgrade {kid}: row changed concurrently"
-            )));
-        }
-        self.index_stored_key_row(&kid).await?;
-        Ok(AdoptScrubOutcome::Upgraded)
+        // v60.0.0 (CIRISPersist#934 step 3) — the shared plan, one insert per record.
+        crate::federation::key_plane::seed_genesis_accord_holders_planned(self, records).await
     }
 
     /// v54.1.0 (CIRISPersist#1040) — TEST SEAM: store `identity_type` on a
@@ -3778,514 +3472,6 @@ impl SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(e.to_string()))
     }
 
-    /// v54.0.0 (CIRISPersist#995 row 2) — write back the `additional_scrubs`
-    /// a pre-v53.1.4 UPDATE door dropped. The plan
-    /// (`ReplicatedKeyPlan::RehydrateScrubs`) has established that the held
-    /// row's `persist_row_hash` binds `record` exactly and that its column is
-    /// empty; the WHERE re-asserts both atomically, so nothing but the scrub
-    /// set moves (the hash already covers it). Moves the serve position and
-    /// re-indexes, like every door that rewrites consumer-visible bytes.
-    /// `Conflict` when the row changed between plan and act.
-    pub(crate) async fn rehydrate_dropped_key_scrubs(
-        &self,
-        record: &crate::federation::KeyRecord,
-    ) -> Result<(), crate::federation::Error> {
-        let kid = record.key_id.clone();
-        let hash = record.persist_row_hash.clone();
-        let text = serde_json::to_string(&record.additional_scrubs).map_err(|e| {
-            crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
-        })?;
-        let k = kid.clone();
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                // v58.0.0 (CIRISPersist#991) — the repair and its key-plane row,
-                // one transaction.
-                let tx = conn.transaction()?;
-                let mutated_at = sqlite_next_key_serve_position(&tx)?;
-                let n = tx.execute(
-                    "UPDATE federation_keys SET additional_scrubs = ?3, mutated_at = ?4 \
-                     WHERE key_id = ?1 AND persist_row_hash = ?2 AND additional_scrubs = '[]'",
-                    rusqlite::params![k, hash, text, mutated_at.to_rfc3339()],
-                )?;
-                sqlite_sync_key_record_row(&tx, &k)?;
-                tx.commit()?;
-                Ok(n)
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "rehydrate_dropped_key_scrubs {kid}: {e}"
-                ))
-            })?;
-        if n == 0 {
-            return Err(crate::federation::Error::Conflict(format!(
-                "rehydrate_dropped_key_scrubs {kid}: row changed concurrently"
-            )));
-        }
-        self.index_stored_key_row(&kid).await?;
-        Ok(())
-    }
-
-    /// v13.7.0 (CIRISPersist#405) — the CANONICAL SUPERSEDE store: replace an
-    /// existing **anchor-scrubbed canonical** row IN PLACE with a strictly-newer,
-    /// same-pubkey, m-of-n-re-verified re-scrubbed record (the CEG-native runtime
-    /// address move — no re-bake, no key rotation). Classification lives in
-    /// [`plan_replicated_key_apply`](crate::federation::register::plan_replicated_key_apply);
-    /// this mutation chokepoint RE-VERIFIES the full supersede policy
-    /// ([`verify_canonical_supersede`](crate::federation::register::verify_canonical_supersede)
-    /// — canonical-scope + signed-envelope monotonicity + m-of-n quorum, all
-    /// re-derived from persist's own state) and swaps atomically, optimistically
-    /// guarded on the planned-against version's `persist_row_hash` so a
-    /// concurrent supersede cannot be clobbered (0 rows ⇒ `Conflict` ⇒ `Refused`).
-    pub async fn supersede_canonical_record(
-        &self,
-        record: crate::federation::SignedKeyRecord,
-    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
-        use crate::federation::register::ReplicatedKeyOutcome;
-        let mut row = record.record;
-        crate::federation::register::validate_registration_pubkey(&row)?;
-        // v50.0.0 (CIRISPersist#925 ask 5, review H3) — CC 3.4.7.3 Clause A on
-        // every door that writes `identity_type`, not only the insert.
-        crate::federation::register::check_node_identity_exclusive(&row)?;
-        if row.algorithm != crate::federation::types::algorithm::HYBRID {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "supersede_canonical_record algorithm must be 'hybrid' (got '{}')",
-                row.algorithm
-            )));
-        }
-        if row.scrub_key_id == row.key_id {
-            return Err(crate::federation::Error::InvalidArgument(
-                "supersede_canonical_record requires an anchor-scrubbed record (scrub_key_id != key_id)"
-                    .into(),
-            ));
-        }
-
-        let existing = crate::federation::FederationDirectory::lookup_public_key(self, &row.key_id)
-            .await?
-            .ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "supersede_canonical_record: no existing row for {}",
-                    row.key_id
-                ))
-            })?;
-        // v50.0.0 (CIRISPersist#925 review H3) — `node` never moves on a rewrite:
-        // the own-`identity_type` half of node-bearing is fixed at mint.
-        crate::federation::register::check_node_identity_unchanged(&existing, &row)?;
-        if existing.pubkey_ed25519_base64 != row.pubkey_ed25519_base64
-            || existing.pubkey_ml_dsa_65_base64 != row.pubkey_ml_dsa_65_base64
-        {
-            return Err(crate::federation::Error::Conflict(format!(
-                "supersede_canonical_record {}: pubkey change refused (different identity)",
-                row.key_id
-            )));
-        }
-        if existing.scrub_key_id == existing.key_id {
-            // Existing is self-signed — that is the #375 UPGRADE case, not a
-            // supersede. Fail-closed (routed to Refused upstream).
-            return Err(crate::federation::Error::Conflict(format!(
-                "supersede_canonical_record {}: existing row is self-signed (use adopt_scrub_upgrade)",
-                row.key_id
-            )));
-        }
-
-        // Re-verify the full supersede policy at the mutation chokepoint
-        // (defense in depth — never trust the plan alone on the Trust Root).
-        // v22.0.0 (CIRISPersist#543 H2) — RUN THE ROLE GATES HERE TOO.
-        // `supersede_canonical_record` writes BOTH `identity_type` AND `roles`
-        // on the successor row, behind only `verify_canonical_supersede`. That
-        // verify proves the SUPERSEDE is authorized by the incumbent — it does
-        // NOT prove the successor earned the roles it carries, so an
-        // already-canonical key could rotate in a successor claiming
-        // `infra:attest` / co-steward / any privileged type without their own
-        // conferral. Rotation must not be a role-laundering path: a successor
-        // earns each privileged claim the same way a fresh registration does.
-        // v47.3.0 (CIRISPersist#901) — one door predicate: an accord_holder
-        // runs structure + freshness; any other evidence-carrying row runs
-        // structure alone (a replicated body is checked where it lands).
-        self.hardware_attestation_policy()
-            .admit_key_record(&row, chrono::Utc::now())?;
-        crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
-        crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
-        crate::federation::admission::check_privileged_identity_type_admission(self, &row).await?;
-
-        if !crate::federation::register::verify_canonical_supersede(self, &existing, &row).await? {
-            return Err(crate::federation::Error::Conflict(format!(
-                "supersede_canonical_record {}: supersede policy refused",
-                row.key_id
-            )));
-        }
-
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        // Byte-identical to what is already stored ⇒ idempotent no-op.
-        if existing.persist_row_hash == row.persist_row_hash {
-            return Ok(ReplicatedKeyOutcome::Unchanged);
-        }
-
-        let envelope_text = serde_json::to_string(&row.registration_envelope)
-            .map_err(|e| crate::federation::Error::Backend(format!("envelope: {e}")))?;
-        let attestation_text: Option<String> = match &row.attestation_evidence {
-            Some(v) => Some(
-                serde_json::to_string(v)
-                    .map_err(|e| crate::federation::Error::Backend(format!("attestation: {e}")))?,
-            ),
-            None => None,
-        };
-        let roles_text: Option<String> = if row.capability_roles.is_empty() {
-            None
-        } else {
-            Some(
-                serde_json::to_string(&row.capability_roles)
-                    .map_err(|e| crate::federation::Error::Backend(format!("roles: {e}")))?,
-            )
-        };
-        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
-        })?;
-        let expected_prior_hash = existing.persist_row_hash.clone();
-        // v53.1.4 — the whole scrub set rides every rewrite of the scrub columns:
-        // a door that wrote scrub #1 alone stored a quorum-signed record as a
-        // one-holder row (the V096 JSON-array TEXT column; empty → "[]").
-        let additional_scrubs_text =
-            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
-                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
-            })?;
-        let kid = row.key_id.clone();
-        // v24.1.0 (CIRISPersist#547) — the successor must be indexed; a
-        // canonical rotation that skipped this advertised the rotated record
-        // and could not serve it.
-        // v31.0.0 (CIRISPersist#640) — indexed from the stored row, after the
-        // swap; see `SqliteBackend::index_stored_key_row`.
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                // v58.0.0 (CIRISPersist#991) — the write and its key-plane row, one transaction.
-                let tx = conn.transaction()?;
-                let conn: &rusqlite::Connection = &tx;
-                // v36.0.0 (CIRISPersist#707) — a canonical rotation rewrites the
-                // whole consumer-visible record; the serve position must move or
-                // a consumer past the cursor keeps the rotated-away version
-                // forever.
-                let mutated_at = sqlite_next_key_serve_position(conn)?;
-                // Atomic swap: replace the EXACT version the policy was verified
-                // against (persist_row_hash guard) — a concurrent supersede to a
-                // different version matches 0 rows and fails closed. `consent_role`
-                // stays out of the SET (operational marker, not registration).
-                let n = conn.execute(
-                    "UPDATE federation_keys SET \
-                    pubkey_ml_dsa_65_base64 = ?2, algorithm = ?3, identity_type = ?4, \
-                    identity_ref = ?5, valid_from = ?6, valid_until = ?7, \
-                    registration_envelope = ?8, original_content_hash = ?9, \
-                    scrub_signature_classical = ?10, scrub_signature_pqc = ?11, \
-                    scrub_key_id = ?12, scrub_timestamp = ?13, pqc_completed_at = ?14, \
-                    persist_row_hash = ?15, roles = ?16, attestation_evidence = ?17, \
-                    mutated_at = ?20, additional_scrubs = ?21 \
-                 WHERE key_id = ?1 AND pubkey_ed25519_base64 = ?18 \
-                    AND scrub_key_id != key_id AND persist_row_hash = ?19",
-                    rusqlite::params![
-                        row.key_id,
-                        row.pubkey_ml_dsa_65_base64,
-                        row.algorithm,
-                        row.identity_type,
-                        row.identity_ref,
-                        row.valid_from.to_rfc3339(),
-                        row.valid_until.map(|t| t.to_rfc3339()),
-                        envelope_text,
-                        original_content_hash,
-                        row.scrub_signature_classical,
-                        row.scrub_signature_pqc,
-                        row.scrub_key_id,
-                        row.scrub_timestamp.to_rfc3339(),
-                        row.pqc_completed_at.map(|t| t.to_rfc3339()),
-                        row.persist_row_hash,
-                        roles_text,
-                        attestation_text,
-                        row.pubkey_ed25519_base64,
-                        expected_prior_hash,
-                        mutated_at.to_rfc3339(),
-                        additional_scrubs_text,
-                    ],
-                )?;
-                sqlite_sync_key_record_row(conn, &row.key_id)?;
-                tx.commit()?;
-                Ok(n)
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("supersede_canonical_record {kid}: {e}"))
-            })?;
-        if n == 0 {
-            return Err(crate::federation::Error::Conflict(format!(
-                "supersede_canonical_record {kid}: row changed concurrently"
-            )));
-        }
-        self.index_stored_key_row(&kid).await?;
-        Ok(ReplicatedKeyOutcome::Superseded)
-    }
-
-    /// v13.0.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
-    /// apply**. The anti-entropy apply the edge replication bridge routes
-    /// `apply_key` to, replacing its raw `put_public_key` call (which stays
-    /// unchanged for direct registration): a fresh `key_id` inserts as today,
-    /// and an anchor-scrubbed record arriving at a node that already holds
-    /// the SAME identity's **self-signed** row auto-upgrades it in place —
-    /// the [`adopt_scrub_upgrade`](Self::adopt_scrub_upgrade) path riding
-    /// replication instead of a per-node out-of-band endpoint call.
-    ///
-    /// All policy lives in the shared, backend-agnostic
-    /// [`plan_replicated_key_apply`](crate::federation::register::plan_replicated_key_apply)
-    /// (see its decision table): the `verify_key_registration` Strict scrub
-    /// gate and the v12.6.0 `owner_of` single-owner gate run INSIDE this
-    /// method (unlike #351's Engine-layer split), so no caller can reach the
-    /// upgrade transition unverified. Refusals are outcomes, not errors —
-    /// see [`ReplicatedKeyOutcome`](crate::federation::register::ReplicatedKeyOutcome).
-    /// A `Conflict` from the underlying store step (a row that changed
-    /// between plan and act) also resolves to `Refused`: on the replication
-    /// plane a lost race is fail-closed + re-offerable, never fatal.
-    pub async fn apply_replicated_key_record(
-        &self,
-        record: crate::federation::SignedKeyRecord,
-    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
-        use crate::federation::register::{
-            plan_replicated_key_apply, AdoptScrubOutcome, KeyRefusalReason, ReplicatedKeyOutcome,
-            ReplicatedKeyPlan,
-        };
-        /// v24.2.0 (CIRISPersist#565) — a `Conflict` from the store step: the
-        /// row present at WRITE time is not the row the plan was made against.
-        const RACED: ReplicatedKeyOutcome = ReplicatedKeyOutcome::Refused {
-            reason: KeyRefusalReason::StoreConflict,
-        };
-        match plan_replicated_key_apply(self, &record.record).await? {
-            ReplicatedKeyPlan::Unchanged => Ok(ReplicatedKeyOutcome::Unchanged),
-            // v54.0.0 (#995 row 2) — write back the scrubs a pre-v53.1.4 door dropped.
-            ReplicatedKeyPlan::RehydrateScrubs => {
-                let mut r = record.record;
-                r.persist_row_hash = crate::federation::types::compute_persist_row_hash(&r)?;
-                match self.rehydrate_dropped_key_scrubs(&r).await {
-                    Ok(()) => Ok(ReplicatedKeyOutcome::ScrubsRehydrated),
-                    Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
-                    Err(e) => Err(e),
-                }
-            }
-            // The plan produced the reason at the branch that fired; carry it
-            // through rather than re-deriving it here (#565).
-            ReplicatedKeyPlan::Refused { reason } => Ok(ReplicatedKeyOutcome::Refused { reason }),
-            ReplicatedKeyPlan::Insert => {
-                // v21.0.0 (CIRISPersist#502 E2) — the fresh-key insert path
-                // ran NO proof-of-possession: a replicated first-sight
-                // `SignedKeyRecord{identity_ref: victim, pubkey: attacker}`
-                // was admitted TOFU, and later attestations by that key then
-                // verified. The Strict hybrid PoP gate (`verify_key_
-                // registration` — the SAME gate `register_federation_key`
-                // runs, and the upgrade branch already runs) now guards the
-                // insert too. Fail-closed before any write.
-                if !crate::federation::register::record_is_role_gated(&record.record) {
-                    // v54.1.0 (CIRISPersist#1042, CIRISEdge#858) — a verify
-                    // failure is a TYPED refusal, never a bare `Err`: the
-                    // sender books `attester_key_unknown` (retryable: the
-                    // scrubber's Key row has not landed here yet) apart from
-                    // `unverifiable_signature` (terminal). Nothing is written.
-                    if let Err(e) =
-                        crate::federation::verify_key_registration(self, &record.record).await
-                    {
-                        return Ok(ReplicatedKeyOutcome::Refused {
-                            reason: crate::federation::register::key_refusal_of_verify_error(e)?,
-                        });
-                    }
-                }
-                match self
-                    .put_public_key_at_door(
-                        record,
-                        crate::federation::register::KeyDoor::ReplicatedInsert,
-                    )
-                    .await
-                {
-                    Ok(()) => Ok(ReplicatedKeyOutcome::Inserted),
-                    // A row appeared between plan and act with different
-                    // content — first-seen wins on the replication plane.
-                    Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
-                    Err(e) => Err(e),
-                }
-            }
-            ReplicatedKeyPlan::Upgrade => match self.adopt_scrub_upgrade(record).await {
-                Ok(AdoptScrubOutcome::Upgraded) => Ok(ReplicatedKeyOutcome::Upgraded),
-                Ok(AdoptScrubOutcome::AlreadyAdopted) => Ok(ReplicatedKeyOutcome::Unchanged),
-                // The atomic WHERE (or its Rust pre-checks) saw different
-                // state than the plan — a concurrent mutation. Fail-closed.
-                // v50.0.0 (CIRISPersist#925 review H3/M5) — a Clause A / `node`
-                // immutability refusal is TYPED here, so the replication cursor
-                // records it and moves on instead of re-polling an `Err`.
-                Err(crate::federation::Error::NodeIdentityNotExclusive { .. }) => {
-                    Ok(ReplicatedKeyOutcome::Refused {
-                        reason: crate::federation::register::KeyRefusalReason::NodeIdentityFused,
-                    })
-                }
-                Err(crate::federation::Error::NodeIdentityImmutable { .. }) => {
-                    Ok(ReplicatedKeyOutcome::Refused {
-                        reason: crate::federation::register::KeyRefusalReason::NodeIdentityChanged,
-                    })
-                }
-                Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
-                Err(e) => Err(e),
-            },
-            // v44.7.0 (#864) — existing self-signed UNBOUND → the holder's
-            // bound re-signing of the same claim. A lost race is fail-closed
-            // + re-offerable, like the arms above.
-            ReplicatedKeyPlan::Rebind => {
-                match crate::federation::FederationDirectory::store_rebound_key_record(self, record)
-                    .await
-                {
-                    Ok(outcome) => Ok(outcome),
-                    Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
-                    Err(e) => Err(e),
-                }
-            }
-            // v54.1.0 (#1044) — the stored record fails verification and the
-            // incoming one (same pubkeys, same claim) passes: replace it. A
-            // lost race, or a stored row that verifies after all, is
-            // fail-closed + re-offerable.
-            ReplicatedKeyPlan::ReplaceInvalid => {
-                match crate::federation::FederationDirectory::store_invalid_replaced_key_record(
-                    self, record,
-                )
-                .await
-                {
-                    Ok(outcome) => Ok(outcome),
-                    Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
-                    Err(e) => Err(e),
-                }
-            }
-            // #405 — existing canonical → strictly-newer, m-of-n-re-verified
-            // re-scrub (runtime address move). A lost race / policy-no-longer-
-            // holds Conflict is fail-closed + re-offerable.
-            ReplicatedKeyPlan::Supersede => match self.supersede_canonical_record(record).await {
-                Ok(outcome) => Ok(outcome),
-                // v50.0.0 (CIRISPersist#925 review H3/M5) — a Clause A / `node`
-                // immutability refusal is TYPED here, so the replication cursor
-                // records it and moves on instead of re-polling an `Err`.
-                Err(crate::federation::Error::NodeIdentityNotExclusive { .. }) => {
-                    Ok(ReplicatedKeyOutcome::Refused {
-                        reason: crate::federation::register::KeyRefusalReason::NodeIdentityFused,
-                    })
-                }
-                Err(crate::federation::Error::NodeIdentityImmutable { .. }) => {
-                    Ok(ReplicatedKeyOutcome::Refused {
-                        reason: crate::federation::register::KeyRefusalReason::NodeIdentityChanged,
-                    })
-                }
-                Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
-                Err(e) => Err(e),
-            },
-        }
-    }
-
-    /// v54.1.0 (CIRISPersist#1044) — the ONE in-place registration rewrite
-    /// both replacement doors share (the #864 rebind, the #1044 invalid
-    /// replace). One transaction: append the stored row's registration bytes
-    /// to `federation_key_registration_history` (V148) with the replaced
-    /// row's own `persist_row_hash` and `kind` (V186), then rewrite the
-    /// envelope, every scrub (V096 `additional_scrubs` included, v53.1.4),
-    /// `scrub_key_id`, `persist_row_hash` and `mutated_at` (#707: a cursor
-    /// that passed the row is served the new bytes). Both statements are
-    /// guarded on the planned-against hash and the Ed25519 pubkey; a rebind
-    /// additionally requires the stored row to be self-signed. 0 rows ⇒
-    /// `Conflict` (a concurrent mutation) and nothing is written.
-    async fn write_replaced_key_registration(
-        &self,
-        row: crate::federation::KeyRecord,
-        existing_hash: String,
-        kind: crate::federation::types::KeyReplacementKind,
-    ) -> Result<(), crate::federation::Error> {
-        let envelope_text = serde_json::to_string(&row.registration_envelope)
-            .map_err(|e| crate::federation::Error::Backend(format!("envelope: {e}")))?;
-        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
-        })?;
-        let additional_scrubs_text =
-            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
-                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
-            })?;
-        let require_self_signed = kind == crate::federation::types::KeyReplacementKind::Rebind;
-        let kind_token = kind.as_str();
-        let kid = row.key_id.clone();
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                let tx = conn.transaction()?;
-                let mutated_at = sqlite_next_key_serve_position(&tx)?;
-                // History first, FROM the row as stored and only if it is still
-                // the row the plan saw; the UPDATE below is guarded the same
-                // way, so a lost race leaves neither.
-                let replaced = tx.execute(
-                    "INSERT INTO federation_key_registration_history \
-                        (key_id, registration_envelope, original_content_hash, \
-                         scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                         scrub_timestamp, replaced_at, replaced_by_hash, \
-                         replaced_row_hash, replacement_kind) \
-                     SELECT key_id, registration_envelope, original_content_hash, \
-                         scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                         scrub_timestamp, ?3, ?4, persist_row_hash, ?5 \
-                     FROM federation_keys WHERE key_id = ?1 AND persist_row_hash = ?2 \
-                       AND (?6 = 0 OR scrub_key_id = key_id)",
-                    rusqlite::params![
-                        row.key_id,
-                        existing_hash,
-                        mutated_at.to_rfc3339(),
-                        row.persist_row_hash,
-                        kind_token,
-                        i64::from(require_self_signed),
-                    ],
-                )?;
-                if replaced == 0 {
-                    return Ok(0);
-                }
-                let n = tx.execute(
-                    "UPDATE federation_keys SET \
-                        registration_envelope = ?2, original_content_hash = ?3, \
-                        scrub_signature_classical = ?4, scrub_signature_pqc = ?5, \
-                        scrub_timestamp = ?6, pqc_completed_at = ?7, \
-                        persist_row_hash = ?8, mutated_at = ?9, additional_scrubs = ?12, \
-                        scrub_key_id = ?13 \
-                     WHERE key_id = ?1 AND (?14 = 0 OR scrub_key_id = key_id) \
-                       AND pubkey_ed25519_base64 = ?10 AND persist_row_hash = ?11",
-                    rusqlite::params![
-                        row.key_id,
-                        envelope_text,
-                        original_content_hash,
-                        row.scrub_signature_classical,
-                        row.scrub_signature_pqc,
-                        row.scrub_timestamp.to_rfc3339(),
-                        row.pqc_completed_at.map(|t| t.to_rfc3339()),
-                        row.persist_row_hash,
-                        mutated_at.to_rfc3339(),
-                        row.pubkey_ed25519_base64,
-                        existing_hash,
-                        additional_scrubs_text,
-                        row.scrub_key_id,
-                        i64::from(require_self_signed),
-                    ],
-                )?;
-                if n == 0 {
-                    return Ok(0);
-                }
-                // v58.0.0 (CIRISPersist#991) — the replaced claim leaves the
-                // plane (its bytes are in the history row above) and the new
-                // claim's row lands, in this transaction.
-                sqlite_sync_key_record_row(&tx, &row.key_id)?;
-                tx.commit()?;
-                Ok(n)
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "{kind_token} key registration {kid}: {e}"
-                ))
-            })?;
-        if n == 0 {
-            return Err(crate::federation::Error::Conflict(format!(
-                "{kind_token} key registration {kid}: row changed concurrently"
-            )));
-        }
-        self.index_stored_key_row(&kid).await
-    }
-
     /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
     /// founding bootstrap servers**: `federation_keys` rows whose
     /// `identity_type` **set** contains
@@ -4295,7 +3481,7 @@ impl SqliteBackend {
     /// necessarily anchor-scrub-conferred — the role cannot be self-claimed.
     /// Inherent on the backend (dispatched by `Engine::list_canonical_servers`)
     /// to avoid `FederationDirectory`/capsule bloat, mirroring
-    /// [`Self::adopt_scrub_upgrade`]. The SQL `LIKE` is a coarse prefilter; the
+    /// the key-record doors. The SQL `LIKE` is a coarse prefilter; the
     /// exact set-membership check is applied in Rust via `set_contains`.
     pub async fn list_canonical_servers(
         &self,
@@ -4879,16 +4065,35 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     // v13.0.1 (CIRISPersist#375) — expose the #371 upgrade-aware apply on
     // the trait so `Arc<dyn FederationDirectory>` holders (CIRISEdge's
     // anti-entropy bridge) reach the real path, not `put_public_key`'s
-    // DO-NOTHING. Delegates to the inherent method (the single source of
-    // truth for the plan + adopt_scrub_upgrade logic).
+    // DO-NOTHING. v60.0.0 (CIRISPersist#934 step 3): both doors are the
+    // shared plan's (`key_plane::key_record_write_planned`,
+    // `key_plane::apply_replicated_key_record_planned`).
     // v13.4.2 (CIRISPersist#394) — expose the self-signed→scrubbed upgrade on
-    // the trait (delegates to the inherent method) so the generic genesis seed
+    // the trait so the generic genesis seed
     // can upgrade the canonical node's own row instead of erroring on it.
     async fn adopt_scrub_upgrade(
         &self,
         record: crate::federation::SignedKeyRecord,
     ) -> Result<crate::federation::register::AdoptScrubOutcome, crate::federation::Error> {
-        SqliteBackend::adopt_scrub_upgrade(self, record).await
+        use crate::federation::register::AdoptScrubOutcome;
+        // v60.0.0 (CIRISPersist#934 step 3) — the decision is the shared plan's.
+        Ok(
+            match crate::federation::key_plane::key_record_write_planned(
+                self,
+                crate::federation::key_plane::KeyRecordWrite::ScrubUpgrade {
+                    record: record.record,
+                },
+            )
+            .await?
+            {
+                crate::federation::key_plane::KeyRecordWritten::Written => {
+                    AdoptScrubOutcome::Upgraded
+                }
+                crate::federation::key_plane::KeyRecordWritten::Settled => {
+                    AdoptScrubOutcome::AlreadyAdopted
+                }
+            },
+        )
     }
 
     /// v44.7.0 (CIRISPersist#864, `FSD/KEY_RECORD_REBIND.md` §3) — the REBIND
@@ -4906,19 +4111,25 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         record: crate::federation::SignedKeyRecord,
     ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
-        use crate::federation::register::{RebindPrepared, ReplicatedKeyOutcome};
-        let (row, existing_hash) =
-            match crate::federation::register::prepare_rebind(self, record).await? {
-                RebindPrepared::Unchanged => return Ok(ReplicatedKeyOutcome::Unchanged),
-                RebindPrepared::Replace { new, existing_hash } => (*new, existing_hash),
-            };
-        self.write_replaced_key_registration(
-            row,
-            existing_hash,
-            crate::federation::types::KeyReplacementKind::Rebind,
+        use crate::federation::register::ReplicatedKeyOutcome;
+        // v60.0.0 (CIRISPersist#934 step 3) — the decision is the shared plan's.
+        Ok(
+            match crate::federation::key_plane::key_record_write_planned(
+                self,
+                crate::federation::key_plane::KeyRecordWrite::Rebind {
+                    record: record.record,
+                },
+            )
+            .await?
+            {
+                crate::federation::key_plane::KeyRecordWritten::Written => {
+                    ReplicatedKeyOutcome::Rebound
+                }
+                crate::federation::key_plane::KeyRecordWritten::Settled => {
+                    ReplicatedKeyOutcome::Unchanged
+                }
+            },
         )
-        .await?;
-        Ok(ReplicatedKeyOutcome::Rebound)
     }
 
     /// v54.1.0 (CIRISPersist#1044) — the invalid-replace store step (see the
@@ -4929,19 +4140,25 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         record: crate::federation::SignedKeyRecord,
     ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
-        use crate::federation::register::{RebindPrepared, ReplicatedKeyOutcome};
-        let (row, existing_hash) =
-            match crate::federation::register::prepare_invalid_replace(self, record).await? {
-                RebindPrepared::Unchanged => return Ok(ReplicatedKeyOutcome::Unchanged),
-                RebindPrepared::Replace { new, existing_hash } => (*new, existing_hash),
-            };
-        self.write_replaced_key_registration(
-            row,
-            existing_hash,
-            crate::federation::types::KeyReplacementKind::InvalidReplaced,
+        use crate::federation::register::ReplicatedKeyOutcome;
+        // v60.0.0 (CIRISPersist#934 step 3) — the decision is the shared plan's.
+        Ok(
+            match crate::federation::key_plane::key_record_write_planned(
+                self,
+                crate::federation::key_plane::KeyRecordWrite::InvalidReplace {
+                    record: record.record,
+                },
+            )
+            .await?
+            {
+                crate::federation::key_plane::KeyRecordWritten::Written => {
+                    ReplicatedKeyOutcome::InvalidReplaced
+                }
+                crate::federation::key_plane::KeyRecordWritten::Settled => {
+                    ReplicatedKeyOutcome::Unchanged
+                }
+            },
         )
-        .await?;
-        Ok(ReplicatedKeyOutcome::InvalidReplaced)
     }
 
     async fn list_key_registration_history(
@@ -5083,146 +4300,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         record: crate::federation::SignedKeyRecord,
         bundle: &crate::federation::genesis::GenesisBundle,
     ) -> Result<(), crate::federation::Error> {
-        use crate::federation::Error;
-        crate::federation::genesis::verify_bundle_quorum(self, bundle).await?;
-        let mut row = record.record;
-        if !bundle.serve_nodes.iter().any(|sn| {
-            sn.record.persist_row_hash == row.persist_row_hash
-                && sn.record.key_id == row.key_id
-                && sn.record.registration_envelope == row.registration_envelope
-        }) {
-            return Err(Error::GenesisBundleInvalid {
-                detail: format!(
-                    "re-anchor record {} is not carried by the verified bundle",
-                    row.key_id
-                ),
-            });
-        }
-        // v19.0.0 (#486) — adopt-path parity: lift envelope-attested roles.
-        crate::federation::admission::lift_envelope_attested_roles(&mut row);
-        crate::federation::register::validate_registration_pubkey(&row)?;
-        // v50.0.0 (CIRISPersist#925 ask 5, review H3) — CC 3.4.7.3 Clause A on
-        // every door that writes `identity_type`, not only the insert.
-        crate::federation::register::check_node_identity_exclusive(&row)?;
-        // The accord-conferred role write gates, same as every adopt path.
-        crate::federation::admission::check_canonical_role_admission(self, &row).await?;
-        crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
-        crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
-        // v22.0.0 (CIRISPersist#543 finding 3) — the CLOSED authority-claim
-        // gate: every remaining privileged `identity_type` is accord-conferred,
-        // never self-asserted. Same chokepoint, same fail-closed posture; the
-        // closed set lives in `identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES`
-        // and is proven to cover every reserved-prefix rule.
-        crate::federation::admission::check_privileged_identity_type_admission(self, &row).await?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-
-        let existing = crate::federation::FederationDirectory::lookup_public_key(self, &row.key_id)
-            .await?
-            .ok_or_else(|| Error::GenesisBundleInvalid {
-                detail: format!("re-anchor target {} has no existing row", row.key_id),
-            })?;
-        // v50.0.0 (CIRISPersist#925 review H3) — `node` never moves on a rewrite:
-        // the own-`identity_type` half of node-bearing is fixed at mint.
-        crate::federation::register::check_node_identity_unchanged(&existing, &row)?;
-        if existing.pubkey_ed25519_base64 != row.pubkey_ed25519_base64 {
-            return Err(Error::GenesisBundleInvalid {
-                detail: format!("re-anchor {}: pubkey change refused", row.key_id),
-            });
-        }
-        if row.valid_from <= existing.valid_from {
-            return Err(Error::GenesisBundleInvalid {
-                detail: format!(
-                    "re-anchor {}: valid_from not newer than anchored — rollback refused",
-                    row.key_id
-                ),
-            });
-        }
-
-        let envelope_text = serde_json::to_string(&row.registration_envelope)
-            .map_err(|e| Error::Backend(format!("envelope: {e}")))?;
-        let attestation_text = match &row.attestation_evidence {
-            Some(v) => Some(
-                serde_json::to_string(v).map_err(|e| Error::Backend(format!("evidence: {e}")))?,
-            ),
-            None => None,
-        };
-        let roles_text: Option<String> = if row.capability_roles.is_empty() {
-            None
-        } else {
-            Some(
-                serde_json::to_string(&row.capability_roles)
-                    .map_err(|e| Error::Backend(format!("roles: {e}")))?,
-            )
-        };
-        let original_content_hash = hex::decode(&row.original_content_hash)
-            .map_err(|e| Error::InvalidArgument(format!("original_content_hash hex: {e}")))?;
-        // v53.1.4 — the whole scrub set rides every rewrite of the scrub columns:
-        // a door that wrote scrub #1 alone stored a quorum-signed record as a
-        // one-holder row (the V096 JSON-array TEXT column; empty → "[]").
-        let additional_scrubs_text = serde_json::to_string(&row.additional_scrubs)
-            .map_err(|e| Error::Backend(format!("additional_scrubs serialize: {e}")))?;
-        let kid = row.key_id.clone();
-        // v24.1.0 (CIRISPersist#547) — the re-anchored row must be indexed.
-        // v31.0.0 (CIRISPersist#640) — from the stored row, after the UPDATE;
-        // see `SqliteBackend::index_stored_key_row`.
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                // v58.0.0 (CIRISPersist#991) — the write and its key-plane row, one transaction.
-                let tx = conn.transaction()?;
-                let conn: &rusqlite::Connection = &tx;
-                // v36.0.0 (CIRISPersist#707) — a genesis re-anchor rewrites the
-                // whole consumer-visible record; the serve position must move or
-                // a consumer past the cursor keeps the pre-anchor row forever.
-                let mutated_at = sqlite_next_key_serve_position(conn)?;
-                // WHERE re-asserts the identity guard atomically. Unlike
-                // adopt_scrub_upgrade there is NO `scrub_key_id = key_id`
-                // condition — this path replaces an ANCHORED row, under the
-                // bundle-quorum authority verified above.
-                let n = conn.execute(
-                    "UPDATE federation_keys SET \
-                    pubkey_ml_dsa_65_base64 = ?2, algorithm = ?3, identity_type = ?4, \
-                    identity_ref = ?5, valid_from = ?6, valid_until = ?7, \
-                    registration_envelope = ?8, original_content_hash = ?9, \
-                    scrub_signature_classical = ?10, scrub_signature_pqc = ?11, \
-                    scrub_key_id = ?12, scrub_timestamp = ?13, pqc_completed_at = ?14, \
-                    persist_row_hash = ?15, roles = ?16, attestation_evidence = ?17, \
-                    mutated_at = ?19, additional_scrubs = ?20 \
-                 WHERE key_id = ?1 AND pubkey_ed25519_base64 = ?18",
-                    rusqlite::params![
-                        row.key_id,
-                        row.pubkey_ml_dsa_65_base64,
-                        row.algorithm,
-                        row.identity_type,
-                        row.identity_ref,
-                        row.valid_from.to_rfc3339(),
-                        row.valid_until.map(|t| t.to_rfc3339()),
-                        envelope_text,
-                        original_content_hash,
-                        row.scrub_signature_classical,
-                        row.scrub_signature_pqc,
-                        row.scrub_key_id,
-                        row.scrub_timestamp.to_rfc3339(),
-                        row.pqc_completed_at.map(|t| t.to_rfc3339()),
-                        row.persist_row_hash,
-                        roles_text,
-                        attestation_text,
-                        row.pubkey_ed25519_base64,
-                        mutated_at.to_rfc3339(),
-                        additional_scrubs_text,
-                    ],
-                )?;
-                sqlite_sync_key_record_row(conn, &row.key_id)?;
-                tx.commit()?;
-                Ok(n)
-            })
-            .await
-            .map_err(|e| Error::Backend(format!("reanchor {kid}: {e}")))?;
-        if n != 1 {
-            return Err(Error::Backend(format!(
-                "reanchor {kid}: expected 1 row updated, got {n}"
-            )));
-        }
-        self.index_stored_key_row(&kid).await?;
+        // v60.0.0 (CIRISPersist#934 step 3) — the decision is the shared plan's.
+        crate::federation::key_plane::key_record_write_planned(
+            self,
+            crate::federation::key_plane::KeyRecordWrite::Reanchor {
+                record: record.record,
+                bundle,
+            },
+        )
+        .await?;
         Ok(())
     }
 
@@ -5230,15 +4316,22 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         record: crate::federation::SignedKeyRecord,
     ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
-        SqliteBackend::apply_replicated_key_record(self, record).await
+        crate::federation::key_plane::apply_replicated_key_record_planned(self, record).await
     }
 
     async fn put_public_key(
         &self,
         record: crate::federation::SignedKeyRecord,
     ) -> Result<(), crate::federation::Error> {
-        self.put_public_key_at_door(record, crate::federation::register::KeyDoor::LocalMint)
-            .await?;
+        // v60.0.0 (CIRISPersist#934 step 3) — the decision is the shared plan's.
+        crate::federation::key_plane::key_record_write_planned(
+            self,
+            crate::federation::key_plane::KeyRecordWrite::Put {
+                record: record.record,
+                door: crate::federation::register::KeyDoor::LocalMint,
+            },
+        )
+        .await?;
         Ok(())
     }
 
@@ -11517,88 +10610,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         pubkey_ml_dsa_65_base64: &str,
         scrub_signature_pqc: &str,
     ) -> Result<(), crate::federation::Error> {
-        let mut row =
-            <Self as crate::federation::FederationDirectory>::lookup_public_key(self, key_id)
-                .await?
-                .ok_or_else(|| {
-                    crate::federation::Error::InvalidArgument(format!(
-                        "federation_keys row {key_id} does not exist"
-                    ))
-                })?;
-        if row.is_pqc_complete() {
-            return Err(crate::federation::Error::Conflict(format!(
-                "federation_keys row {key_id} is already PQC-complete"
-            )));
-        }
-        row.pubkey_ml_dsa_65_base64 = Some(pubkey_ml_dsa_65_base64.to_owned());
-        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
-        // v31.0.0 (CIRISPersist#657) — verify-before-mutation over the row AS IT
-        // WOULD BE STORED. Attaching a PQC leg installs a PUBLIC KEY; the shared
-        // gate proves the envelope the row's signer signed names THIS key (#659)
-        // and that the row verifies hybrid-Strict with it.
-        crate::federation::admission::check_key_pqc_attachment(self, &row).await?;
-        let now = chrono::Utc::now();
-        row.pqc_completed_at = Some(now);
-        let mut for_hash = row.clone();
-        for_hash.persist_row_hash = String::new();
-        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-        // v24.1.0 (CIRISPersist#547) — the hybrid-completion write changes FOUR
-        // serialized columns, so it moves the record's content hash exactly like
-        // the anchor mutators do; it is re-indexed after the UPDATE, below.
-        let key_id = key_id.to_owned();
-        let key_id_for_exec = key_id.clone();
-        let mldsa = pubkey_ml_dsa_65_base64.to_owned();
-        let pqc_sig = scrub_signature_pqc.to_owned();
-        let now_str = now.to_rfc3339();
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                // v58.0.0 (CIRISPersist#991) — a completed hybrid is when a
-                // record can first prove possession: its `key:record:v1` row
-                // lands in the completion's transaction.
-                let tx = conn.transaction()?;
-                // v36.0.0 (CIRISPersist#707) — the hybrid-completion write rewrites
-                // FOUR served columns; the serve position must move with them.
-                let mutated_at = sqlite_next_key_serve_position(&tx)?;
-                let n = tx.execute(
-                    "UPDATE federation_keys \
-                 SET pubkey_ml_dsa_65_base64 = ?1, scrub_signature_pqc = ?2, \
-                     pqc_completed_at = ?3, persist_row_hash = ?4, mutated_at = ?6 \
-                 WHERE key_id = ?5 AND pqc_completed_at IS NULL",
-                    rusqlite::params![
-                        mldsa,
-                        pqc_sig,
-                        now_str,
-                        new_hash,
-                        key_id_for_exec,
-                        mutated_at.to_rfc3339()
-                    ],
-                )?;
-                sqlite_sync_key_record_row(&tx, &key_id_for_exec)?;
-                tx.commit()?;
-                Ok(n)
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("attach_key_pqc_signature: {e}"))
-            })?;
-        if n == 0 {
-            return Err(crate::federation::Error::Conflict(
-                "federation_keys row was concurrently completed".to_string(),
-            ));
-        }
-        // v24.1.0 (CIRISPersist#547) — the hybrid-completion write moves FOUR
-        // serialized columns, so it moves the wire content hash exactly like the
-        // anchor mutators do. Indexed from the row AS STORED, by re-reading it:
-        // `pqc_completed_at` is generated HERE at nanosecond precision, and a
-        // backend that rounds it (postgres TIMESTAMPTZ keeps microseconds) would
-        // otherwise be handed the hash of a value its read surface never
-        // returns — the same advertise-vs-serve desync in the other direction.
-        // The postgres twin failed exactly that way before this re-read landed.
-        // Re-reading makes the index agree with the read surface by
-        // construction, on any backend, whatever it rounds.
-        // v31.0.0 (CIRISPersist#640) — through the shared helper; this site's
-        // remedy is now every site's remedy.
-        self.index_stored_key_row(&key_id).await?;
+        // v60.0.0 (CIRISPersist#934 step 3) — the decision is the shared plan's.
+        crate::federation::key_plane::key_record_write_planned(
+            self,
+            crate::federation::key_plane::KeyRecordWrite::AttachPqc {
+                key_id,
+                pubkey_ml_dsa_65_base64,
+                scrub_signature_pqc,
+            },
+        )
+        .await?;
         Ok(())
     }
 
@@ -23189,16 +22210,17 @@ fn sqlite_drop_key_record_rows(
 
 /// v58.0.0 (CIRISPersist#991, CC 3.1.3) — **the `key:record:v1` row follows
 /// its key**, in the caller's transaction: after any write to
-/// `federation_keys`, the key's row is the row its stored record plans to
-/// (`key_plane::key_record_row_if_verifiable`) — inserted when the record
-/// verifies (proof of possession, or a held base signer), the previous row (an older claim of the same key)
-/// deleted, the projection's `attestation_id` pointed at it; or no row at
-/// all when it does not verify (held without a row; the
-/// rebuild gate names it). A deleted key takes its row with it.
+/// `federation_keys`, the stored record (read back, so the row is over what
+/// this backend keeps), the projection's `attestation_id` and the base
+/// signer's held keys go to the shared step
+/// (v60.0.0: `key_plane::key_record_row_step`), and its verdict is applied:
+/// keep, or drop the key's rows and insert the planned one with the pointer
+/// moved to it. A deleted key takes its rows with it.
 fn sqlite_sync_key_record_row(
     tx: &rusqlite::Connection,
     key_id: &str,
 ) -> Result<(), rusqlite::Error> {
+    use crate::federation::key_plane::KeyRecordRowStep;
     if !sqlite_key_plane_present(tx)? {
         return Ok(());
     }
@@ -23214,30 +22236,27 @@ fn sqlite_sync_key_record_row(
             },
         )
         .optional()?;
-    let Some((record, current)) = stored else {
-        sqlite_drop_key_record_rows(tx, key_id)?;
-        return Ok(());
-    };
+    let (record, current) = stored.map_or((None, None), |(r, c)| (Some(r), c));
     // The base signer's held pubkeys, read in this transaction, when it is
     // not the key itself (the pre-rc8 conferral shape).
-    let held_signer: crate::federation::key_plane::HeldSigner =
-        if record.scrub_key_id == record.key_id {
-            None
-        } else {
-            tx.query_row(
+    let held_signer: crate::federation::key_plane::HeldSigner = match &record {
+        Some(r) if r.scrub_key_id != r.key_id => tx
+            .query_row(
                 "SELECT pubkey_ed25519_base64, pubkey_ml_dsa_65_base64 FROM federation_keys \
-              WHERE key_id = ?1",
-                [&record.scrub_key_id],
+                  WHERE key_id = ?1",
+                [&r.scrub_key_id],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
             )
-            .optional()?
-        };
-    let planned = crate::federation::key_plane::key_record_row_if_verifiable(&record, &held_signer);
-    if let (Some(cur), Some(p)) = (current.as_deref(), planned.as_ref()) {
-        if cur == p.attestation_id {
-            return Ok(());
-        }
-    }
+            .optional()?,
+        _ => None,
+    };
+    let KeyRecordRowStep::Replace(planned) = crate::federation::key_plane::key_record_row_step(
+        record.as_ref(),
+        current.as_deref(),
+        &held_signer,
+    ) else {
+        return Ok(());
+    };
     // The key's older claims leave the plane (their bytes are in the record's
     // history when a door replaced them); `ON DELETE SET NULL` clears the
     // projection's pointer.
@@ -23250,6 +22269,46 @@ fn sqlite_sync_key_record_row(
         )?;
     }
     Ok(())
+}
+
+/// v60.0.0 (CIRISPersist#934 step 3) — a key record's serialized columns,
+/// the JSON-on-SQLite convention: the envelope and evidence as TEXT, the
+/// roles as a JSON array (empty → NULL, the pre-V020 "no roles declared"),
+/// the V096 scrub set (empty → `"[]"`, the column DEFAULT), the content
+/// hash as bytes.
+struct SqliteKeyColumns {
+    envelope: String,
+    original_content_hash: Vec<u8>,
+    roles: Option<String>,
+    attestation_evidence: Option<String>,
+    additional_scrubs: String,
+}
+
+/// The encoded columns of `r`.
+fn sqlite_key_columns(
+    r: &crate::federation::KeyRecord,
+) -> Result<SqliteKeyColumns, crate::federation::Error> {
+    use crate::federation::Error;
+    fn json<T: serde::Serialize + ?Sized>(v: &T, what: &str) -> Result<String, Error> {
+        serde_json::to_string(v).map_err(|e| Error::Backend(format!("{what} serialize: {e}")))
+    }
+    Ok(SqliteKeyColumns {
+        envelope: json(&r.registration_envelope, "envelope")?,
+        original_content_hash: hex::decode(&r.original_content_hash).map_err(|e| {
+            Error::InvalidArgument(format!("original_content_hash hex decode: {e}"))
+        })?,
+        roles: if r.capability_roles.is_empty() {
+            None
+        } else {
+            Some(json(&r.capability_roles, "roles")?)
+        },
+        attestation_evidence: r
+            .attestation_evidence
+            .as_ref()
+            .map(|v| json(v, "attestation_evidence"))
+            .transpose()?,
+        additional_scrubs: json(&r.additional_scrubs, "additional_scrubs")?,
+    })
 }
 
 /// v58.0.0 (CIRISPersist#991, CC 3.3.6) — **the `identity:occurrence:v1` row
@@ -29024,226 +28083,6 @@ impl SqliteBackend {
         self.key_plane_rehomed.store(true, Ordering::Release);
         Ok(())
     }
-
-    pub(crate) async fn put_public_key_at_door(
-        &self,
-        record: crate::federation::SignedKeyRecord,
-        door: crate::federation::register::KeyDoor,
-    ) -> Result<(), crate::federation::Error> {
-        let mut row = record.record;
-        // v31.0.0 (CIRISPersist#647) — CANONICAL AT REST, first thing: the
-        // registration envelope is replaced by its JCS form, so the bytes
-        // bound into `federation_keys.registration_envelope` are the bytes
-        // `verify_key_registration` hashes and the producer signed.
-        // Idempotent, therefore signature-transparent; ahead of the role
-        // lift so every reader below sees one shape.
-        crate::federation::canonical_at_rest::canonicalize_in_place(
-            &mut row.registration_envelope,
-        )?;
-        // v19.0.0 (#486) — lift envelope-attested roles into the claim
-        // surface BEFORE the role write-gates (lift-then-gate).
-        crate::federation::admission::lift_envelope_attested_roles(&mut row);
-
-        // v10.1.0 (CIRISPersist#275 hardening) — universal write-path
-        // invariant: pubkey_ed25519_base64 MUST decode to a 32-byte Ed25519
-        // key. Rejects a wrong-curve / malformed key (e.g. a 65-byte P-256
-        // point) at admission for EVERY registration path — the backstop the
-        // #275 saga proved was missing. Runs first so a bad key leaves no trace.
-        crate::federation::register::validate_registration_pubkey(&row)?;
-        // v50.0.0 (CIRISPersist#925 ask 5, review M5) — CC 3.4.7.3 Clause A
-        // gates MINTING: a local mint of a fused key is refused. A key minted
-        // ELSEWHERE and arriving through the replicated `Insert` arm is
-        // admitted as gated data (Clause B and the steward gates apply to it
-        // wherever it acts): non-conformance is a reason to re-mint, and its
-        // signed history stays verifiable.
-        if door == crate::federation::register::KeyDoor::LocalMint {
-            crate::federation::register::check_node_identity_exclusive(&row)?;
-        }
-
-        // v2.5.0 (CIRISPersist#102 Ask 8) — hardware-attestation
-        // admission gate for accord_holder rows. Runs BEFORE
-        // persist_row_hash + INSERT so rejected rows leave no trace.
-        // #441: evaluated over identity_type ∪ roles (claims_role) — an
-        // `accord_holder` claim in the set form ("agent,accord_holder")
-        // or in the roles vector hits the same gate as the scalar.
-        // v47.3.0 (CIRISPersist#901) — one door predicate: an accord_holder
-        // runs structure + freshness; any other evidence-carrying row runs
-        // structure alone (a replicated body is checked where it lands).
-        self.hardware_attestation_policy()
-            .admit_key_record(&row, chrono::Utc::now())?;
-
-        // v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — the consent_role token is a
-        // PURE predicate over a closed vocabulary, so it leads the four
-        // accord-conferral gates below, every one of which is a directory walk.
-        // v31.2.0 (CIRISPersist#670): it used to run AFTER them, and after the
-        // conflict-check read — a row naming a token that does not exist paid
-        // for four authority resolutions before anything told it so, on the two
-        // backends production runs and not on memory. Backend-symmetric now.
-        // The wire ⇔ stored `'unregistered'` mapping stays at the bind site,
-        // where the column is written.
-        crate::federation::types::consent_role::check_admissible(row.consent_role.as_deref())?;
-
-        // v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — the `canonical` (founding
-        // bootstrap server) role is accord-CONFERRED, never self-claimed: a row
-        // may carry `canonical` only when anchor-scrub-signed (scrub_key_id !=
-        // key_id AND the scrubber's ed25519 ∈ the pinned HUMANITY_ACCORD
-        // anchor). This is the substrate write chokepoint every registration
-        // path (register_federation_key, register_self_federation_key, direct
-        // FFI, replication of a peer row) funnels through, so a self-signed /
-        // non-anchor-scrubbed `canonical` claim is refused here before any
-        // INSERT (verify-before-mutation). Backend-symmetric with Postgres +
-        // memory.
-        crate::federation::admission::check_canonical_role_admission(self, &row).await?;
-        // #422 — `infra:attest` in `roles` is accord-conferred, same m-of-n
-        // co-scrub gate as `canonical`. Fail-closed before any write.
-        crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
-        // #440 — the CC 3.4.9 co-steward roles (`registry`/`verify`) are
-        // accord-conferred, same ceremony. Fail-closed before any write.
-        crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
-        // v22.0.0 (CIRISPersist#543 finding 3) — the CLOSED authority-claim
-        // gate: every remaining privileged `identity_type` is accord-conferred,
-        // never self-asserted. Same chokepoint, same fail-closed posture; the
-        // closed set lives in `identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES`
-        // and is proven to cover every reserved-prefix rule.
-        crate::federation::admission::check_privileged_identity_type_admission(self, &row).await?;
-
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-
-        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!(
-                "original_content_hash hex decode: {e}"
-            ))
-        })?;
-        if row.algorithm != crate::federation::types::algorithm::HYBRID {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "algorithm must be 'hybrid' (got '{}')",
-                row.algorithm
-            )));
-        }
-
-        let registration_envelope_text = serde_json::to_string(&row.registration_envelope)
-            .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
-        // v2.5.0 (CIRISPersist#102 Ask 8) — attestation_evidence
-        // serialized to TEXT for the JSON-on-SQLite convention.
-        // Non-accord-holder rows + accord-holder rows with no
-        // evidence (rejected above) both serialize to None.
-        let attestation_evidence_text: Option<String> = match &row.attestation_evidence {
-            Some(v) => Some(serde_json::to_string(v).map_err(|e| {
-                crate::federation::Error::Backend(format!("attestation_evidence serialize: {e}"))
-            })?),
-            None => None,
-        };
-
-        let key_id = row.key_id.clone();
-        let row_hash = row.persist_row_hash.clone();
-        let conflict_check = self
-            .read(move |conn| -> Result<Option<String>, rusqlite::Error> {
-                conn.query_row(
-                    "SELECT persist_row_hash FROM federation_keys WHERE key_id = ?1",
-                    [&key_id],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()
-            })
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("conflict check: {e}")))?;
-
-        if let Some(existing_hash) = conflict_check {
-            if existing_hash == row_hash {
-                return Ok(()); // exact duplicate — idempotent no-op
-            }
-            return Err(crate::federation::Error::Conflict(format!(
-                "key_id {} already exists with different content",
-                row.key_id
-            )));
-        }
-
-        // v1.3.0 (CIRISPersist#46): serialize the roles list to a
-        // JSON-array TEXT for the column. Empty Vec → NULL so the
-        // column matches the pre-V020 "no roles declared" semantics.
-        let roles_text: Option<String> =
-            if row.capability_roles.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_string(&row.capability_roles).map_err(|e| {
-                    crate::federation::Error::Backend(format!("roles serialize: {e}"))
-                })?)
-            };
-        // v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — map wire None ⇔ the stored
-        // V020 'unregistered' default (NOT NULL column). The admission gate on
-        // the token itself (Rust-level; SQLite's V020 ALTER could not add the
-        // PG CHECK, so the check keeps the backends symmetric) ran at the top
-        // of this door, ahead of the conferral walks — CIRISPersist#670.
-        let consent_role_stored =
-            crate::federation::types::consent_role::stored_from_wire(row.consent_role.as_deref())
-                .to_owned();
-        // v13.2.0 (CIRISPersist#383) — the 2nd..Nth anchor scrubs serialize to
-        // the V096 `additional_scrubs` JSON-array TEXT column. Empty → "[]"
-        // (the column DEFAULT), so a single-scrub row is byte-stable.
-        let additional_scrubs_text =
-            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
-                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
-            })?;
-        // v21.1.0 (CIRISPersist#507b) — the row must land in the wire index.
-        // v24.1.0 (CIRISPersist#547) — through the SHARED derivation, so this
-        // path and the four mutators cannot compute the entry differently.
-        // v31.0.0 (CIRISPersist#640) — and that derivation reads the row
-        // BACK. Hashing `row` here indexed the CALLER's struct, which is not
-        // what `lookup_public_key` returns whenever the storage boundary
-        // normalizes anything — `consent_role` (wire `None` ⇔ stored
-        // `'unregistered'`) diverges on this very statement, three lines up.
-        let key_id_for_index = row.key_id.clone();
-        // v31.4.0 (CIRISPersist#682) — THIS node's admission position (V126),
-        // stamped here and never read from the wire. The serve cursor keys on
-        // it, so a record whose `scrub_timestamp` is old — the everyday
-        // delayed-replication case on the identity plane — still lands ahead of
-        // every consumer's cursor instead of behind it. See
-        // [`SqliteBackend::next_key_admission_position`].
-        let admitted_at = self.next_key_admission_position().await?;
-        self.rehome_legacy_key_plane().await?;
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            // v58.0.0 (CIRISPersist#991) — the record and its `key:record:v1`
-            // row, one transaction.
-            let tx = conn.transaction()?;
-            tx.execute(
-                "INSERT INTO federation_keys (\
-                    key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
-                    identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
-                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence, consent_role, additional_scrubs, admitted_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
-                rusqlite::params![
-                    row.key_id,
-                    row.pubkey_ed25519_base64,
-                    row.pubkey_ml_dsa_65_base64,
-                    row.algorithm,
-                    row.identity_type,
-                    row.identity_ref,
-                    row.valid_from.to_rfc3339(),
-                    row.valid_until.map(|t| t.to_rfc3339()),
-                    registration_envelope_text,
-                    original_content_hash,
-                    row.scrub_signature_classical,
-                    row.scrub_signature_pqc,
-                    row.scrub_key_id,
-                    row.scrub_timestamp.to_rfc3339(),
-                    row.pqc_completed_at.map(|t| t.to_rfc3339()),
-                    row.persist_row_hash,
-                    roles_text,
-                    attestation_evidence_text,
-                    consent_role_stored,
-                    additional_scrubs_text,
-                    admitted_at.to_rfc3339(),
-                ],
-            )?;
-            sqlite_sync_key_record_row(&tx, &row.key_id)?;
-            tx.commit()
-        }).await
-        .map_err(|e| crate::federation::Error::Backend(format!("insert federation_keys: {e}")))?;
-        self.index_stored_key_row(&key_id_for_index).await?;
-        Ok(())
-    }
 }
 
 /// v58.0.0 (CIRISPersist#991) — the key plane's executor on sqlite. Storage
@@ -29336,6 +28175,252 @@ impl crate::federation::key_plane::KeyPlaneStore for SqliteBackend {
         // retired).
         self.index_plane_row(Some(&plane_id)).await?;
         Ok(())
+    }
+
+    /// v60.0.0 (CIRISPersist#934 step 3) — the key-record executor: SQL,
+    /// row mapping and the transaction only; the decision is
+    /// [`plan_key_record_write`](crate::federation::key_plane::plan_key_record_write)'s.
+    /// The write's atomic re-assertion is the `WHERE`; a write that matched
+    /// nothing rolls back and reports the plan's wording
+    /// ([`PlannedKeyRecord::raced`](crate::federation::key_plane::PlannedKeyRecord::raced)).
+    /// The serve position (V126 `admitted_at` on an insert, #707
+    /// `mutated_at` on a rewrite) is allocated inside the same lock.
+    async fn store_planned_key_record(
+        &self,
+        planned: crate::federation::key_plane::PlannedKeyRecord,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::key_plane::{PlannedKeyRecord as P, RewriteGuard};
+        use crate::federation::Error;
+        let key_id = planned.key_id().to_owned();
+        // The serialized columns of a whole-record write.
+        let columns = match &planned {
+            P::Insert { record, .. }
+            | P::Rewrite { record, .. }
+            | P::Replace { record, .. }
+            | P::RehydrateScrubs { record } => Some(sqlite_key_columns(record)?),
+            P::CompletePqc { .. } => None,
+        };
+        self.rehome_legacy_key_plane().await?;
+        let kid = key_id.clone();
+        self.write(move |conn| -> Result<Result<(), Error>, rusqlite::Error> {
+            let tx = conn.transaction()?;
+            let position = sqlite_next_key_serve_position(&tx)?.to_rfc3339();
+            let rows: usize = match (&planned, &columns) {
+                (P::Insert { record: r, .. }, Some(c)) => {
+                    let n = tx.execute(
+                        "INSERT INTO federation_keys (\
+                            key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                            identity_type, identity_ref, valid_from, valid_until, \
+                            registration_envelope, original_content_hash, \
+                            scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                            scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                            attestation_evidence, consent_role, additional_scrubs, admitted_at\
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                            ?15, ?16, ?17, ?18, ?19, ?20, ?21) \
+                         ON CONFLICT (key_id) DO NOTHING",
+                        rusqlite::params![
+                            r.key_id,
+                            r.pubkey_ed25519_base64,
+                            r.pubkey_ml_dsa_65_base64,
+                            r.algorithm,
+                            r.identity_type,
+                            r.identity_ref,
+                            r.valid_from.to_rfc3339(),
+                            r.valid_until.map(|t| t.to_rfc3339()),
+                            c.envelope,
+                            c.original_content_hash,
+                            r.scrub_signature_classical,
+                            r.scrub_signature_pqc,
+                            r.scrub_key_id,
+                            r.scrub_timestamp.to_rfc3339(),
+                            r.pqc_completed_at.map(|t| t.to_rfc3339()),
+                            r.persist_row_hash,
+                            c.roles,
+                            c.attestation_evidence,
+                            crate::federation::types::consent_role::stored_from_wire(
+                                r.consent_role.as_deref()
+                            ),
+                            c.additional_scrubs,
+                            position,
+                        ],
+                    )?;
+                    if n == 0 {
+                        let held: Option<String> = tx
+                            .query_row(
+                                "SELECT persist_row_hash FROM federation_keys WHERE key_id = ?1",
+                                [&r.key_id],
+                                |row| row.get(0),
+                            )
+                            .optional()?;
+                        if let Err(e) = planned.insert_held(held.as_deref()) {
+                            return Ok(Err(e));
+                        }
+                    }
+                    1
+                }
+                (P::Rewrite { record: r, guard }, Some(c)) => {
+                    // The guard, as one statement: `self` = still self-signed
+                    // (the upgrade); `anchored` = still the anchored version
+                    // the policy was verified against (the supersede); `any`
+                    // = the pubkey alone (the bundle-authorised re-anchor).
+                    // `consent_role` is never in the SET list (CC 3.4.7.2).
+                    let (token, prior) = match guard {
+                        RewriteGuard::SelfSigned => ("self", None),
+                        RewriteGuard::Anchored { prior_hash } => {
+                            ("anchored", Some(prior_hash.as_str()))
+                        }
+                        RewriteGuard::SamePubkey => ("any", None),
+                    };
+                    tx.execute(
+                        "UPDATE federation_keys SET \
+                            pubkey_ml_dsa_65_base64 = ?2, algorithm = ?3, identity_type = ?4, \
+                            identity_ref = ?5, valid_from = ?6, valid_until = ?7, \
+                            registration_envelope = ?8, original_content_hash = ?9, \
+                            scrub_signature_classical = ?10, scrub_signature_pqc = ?11, \
+                            scrub_key_id = ?12, scrub_timestamp = ?13, pqc_completed_at = ?14, \
+                            persist_row_hash = ?15, roles = ?16, attestation_evidence = ?17, \
+                            mutated_at = ?19, additional_scrubs = ?20 \
+                         WHERE key_id = ?1 AND pubkey_ed25519_base64 = ?18 \
+                           AND CASE ?21 \
+                                 WHEN 'self' THEN scrub_key_id = key_id \
+                                 WHEN 'anchored' THEN scrub_key_id != key_id \
+                                                      AND persist_row_hash = ?22 \
+                                 ELSE 1 END",
+                        rusqlite::params![
+                            r.key_id,
+                            r.pubkey_ml_dsa_65_base64,
+                            r.algorithm,
+                            r.identity_type,
+                            r.identity_ref,
+                            r.valid_from.to_rfc3339(),
+                            r.valid_until.map(|t| t.to_rfc3339()),
+                            c.envelope,
+                            c.original_content_hash,
+                            r.scrub_signature_classical,
+                            r.scrub_signature_pqc,
+                            r.scrub_key_id,
+                            r.scrub_timestamp.to_rfc3339(),
+                            r.pqc_completed_at.map(|t| t.to_rfc3339()),
+                            r.persist_row_hash,
+                            c.roles,
+                            c.attestation_evidence,
+                            r.pubkey_ed25519_base64,
+                            position,
+                            c.additional_scrubs,
+                            token,
+                            prior,
+                        ],
+                    )?
+                }
+                (
+                    P::Replace {
+                        record: r,
+                        existing_hash,
+                        kind,
+                    },
+                    Some(c),
+                ) => {
+                    // V148 history first, FROM the row as stored and only while
+                    // it is the row the plan saw (V186: its own hash and the
+                    // kind); the UPDATE is guarded the same way, so a lost race
+                    // leaves neither. A rebind also requires a self-signed row.
+                    let self_signed =
+                        i64::from(*kind == crate::federation::types::KeyReplacementKind::Rebind);
+                    let replaced = tx.execute(
+                        "INSERT INTO federation_key_registration_history \
+                            (key_id, registration_envelope, original_content_hash, \
+                             scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                             scrub_timestamp, replaced_at, replaced_by_hash, \
+                             replaced_row_hash, replacement_kind) \
+                         SELECT key_id, registration_envelope, original_content_hash, \
+                             scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                             scrub_timestamp, ?3, ?4, persist_row_hash, ?5 \
+                         FROM federation_keys WHERE key_id = ?1 AND persist_row_hash = ?2 \
+                           AND (?6 = 0 OR scrub_key_id = key_id)",
+                        rusqlite::params![
+                            r.key_id,
+                            existing_hash,
+                            position,
+                            r.persist_row_hash,
+                            kind.as_str(),
+                            self_signed,
+                        ],
+                    )?;
+                    if replaced == 0 {
+                        0
+                    } else {
+                        tx.execute(
+                            "UPDATE federation_keys SET \
+                                registration_envelope = ?2, original_content_hash = ?3, \
+                                scrub_signature_classical = ?4, scrub_signature_pqc = ?5, \
+                                scrub_timestamp = ?6, pqc_completed_at = ?7, \
+                                persist_row_hash = ?8, mutated_at = ?9, additional_scrubs = ?12, \
+                                scrub_key_id = ?13 \
+                             WHERE key_id = ?1 AND (?14 = 0 OR scrub_key_id = key_id) \
+                               AND pubkey_ed25519_base64 = ?10 AND persist_row_hash = ?11",
+                            rusqlite::params![
+                                r.key_id,
+                                c.envelope,
+                                c.original_content_hash,
+                                r.scrub_signature_classical,
+                                r.scrub_signature_pqc,
+                                r.scrub_timestamp.to_rfc3339(),
+                                r.pqc_completed_at.map(|t| t.to_rfc3339()),
+                                r.persist_row_hash,
+                                position,
+                                r.pubkey_ed25519_base64,
+                                existing_hash,
+                                c.additional_scrubs,
+                                r.scrub_key_id,
+                                self_signed,
+                            ],
+                        )?
+                    }
+                }
+                (
+                    P::CompletePqc {
+                        key_id,
+                        pubkey_ml_dsa_65_base64,
+                        scrub_signature_pqc,
+                        completed_at,
+                        persist_row_hash,
+                    },
+                    _,
+                ) => tx.execute(
+                    "UPDATE federation_keys \
+                     SET pubkey_ml_dsa_65_base64 = ?1, scrub_signature_pqc = ?2, \
+                         pqc_completed_at = ?3, persist_row_hash = ?4, mutated_at = ?6 \
+                     WHERE key_id = ?5 AND pqc_completed_at IS NULL",
+                    rusqlite::params![
+                        pubkey_ml_dsa_65_base64,
+                        scrub_signature_pqc,
+                        completed_at.to_rfc3339(),
+                        persist_row_hash,
+                        key_id,
+                        position,
+                    ],
+                )?,
+                (P::RehydrateScrubs { record: r }, Some(c)) => tx.execute(
+                    "UPDATE federation_keys SET additional_scrubs = ?3, mutated_at = ?4 \
+                     WHERE key_id = ?1 AND persist_row_hash = ?2 AND additional_scrubs = '[]'",
+                    rusqlite::params![r.key_id, r.persist_row_hash, c.additional_scrubs, position],
+                )?,
+                (_, None) => unreachable!("every whole-record write carries its columns"),
+            };
+            if let Some(e) = planned.raced(rows as u64) {
+                return Ok(Err(e));
+            }
+            // v58.0.0 (CIRISPersist#991) — the key's `key:record:v1` row
+            // follows the record as stored, in this transaction.
+            sqlite_sync_key_record_row(&tx, planned.key_id())?;
+            tx.commit()?;
+            Ok(Ok(()))
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("key record write {kid}: {e}")))??;
+        // v24.1.0 (CIRISPersist#547) / v31.0.0 (#640) — the wire-index entry,
+        // from the row as stored.
+        self.index_stored_key_row(&key_id).await
     }
 }
 
@@ -55851,14 +54936,18 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
                 &backend, "sq656",
             )
             .await;
-        let a = backend
-            .supersede_canonical_record(crate::federation::SignedKeyRecord { record: laundering })
-            .await
-            .map(|_| ());
-        let b = backend
-            .supersede_canonical_record(crate::federation::SignedKeyRecord { record: clean })
-            .await
-            .map(|_| ());
+        let a = crate::federation::key_plane::supersede_canonical_planned(
+            &backend,
+            crate::federation::SignedKeyRecord { record: laundering },
+        )
+        .await
+        .map(|_| ());
+        let b = crate::federation::key_plane::supersede_canonical_planned(
+            &backend,
+            crate::federation::SignedKeyRecord { record: clean },
+        )
+        .await
+        .map(|_| ());
         crate::federation::admission::ungated_doors_test_support::assert_role_launder_refused(
             "sqlite", a, b,
         );

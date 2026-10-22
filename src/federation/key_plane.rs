@@ -801,6 +801,15 @@ pub(crate) trait KeyPlaneStore: super::attestation_admit::AttestationStore {
     /// its `key:revocation:v1` row, in one transaction, then its wire-index
     /// entry.
     async fn store_planned_revocation(&self, planned: PlannedRevocation) -> Result<(), Error>;
+
+    /// v60.0.0 (CIRISPersist#934 step 3) — store a planned key-record write:
+    /// the `federation_keys` write (its admission or serve position
+    /// allocated here; the atomic re-assertion [`PlannedKeyRecord`] names,
+    /// reported through [`PlannedKeyRecord::raced`] /
+    /// [`PlannedKeyRecord::insert_held`]), then the key's `key:record:v1`
+    /// row ([`key_record_row_step`] over the record as stored), in one
+    /// transaction; then its wire-index entry.
+    async fn store_planned_key_record(&self, planned: PlannedKeyRecord) -> Result<(), Error>;
 }
 
 /// **The `key:revocation:v1` door's decision** (CC 3.1.3, CC 2.4.1.1), once
@@ -926,6 +935,818 @@ where
     }
     let planned = plan_put_revocation(dir, revocation.revocation, chrono::Utc::now()).await?;
     dir.store_planned_revocation(planned).await
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  key:record:v1 — the write doors (v60.0.0, CIRISPersist#934 step 3)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// v60.0.0 (CIRISPersist#934 step 3) — **which door a key-record write comes
+/// through.** Every door that writes `federation_keys` (and with it the key's
+/// `key:record:v1` row) names itself here; [`plan_key_record_write`] holds
+/// each door's whole decision, once for every backend, and each backend's
+/// [`KeyPlaneStore::store_planned_key_record`] only stores what the plan
+/// decided.
+#[derive(Debug)]
+pub(crate) enum KeyRecordWrite<'a> {
+    /// `put_public_key` (a local mint) and the replicated `Insert` arm.
+    Put {
+        /// The record as offered.
+        record: KeyRecord,
+        /// Which of the two insert doors (CC 3.4.7.3 Clause A gates minting).
+        door: super::register::KeyDoor,
+    },
+    /// The genesis seed of one baked accord-holder record (CIRISPersist#347):
+    /// every insert invariant but the fresh-nonce hardware gate; a held
+    /// `key_id` is kept.
+    SeedGenesis {
+        /// The baked record.
+        record: KeyRecord,
+    },
+    /// The self-signed → anchor-scrubbed upgrade (CIRISPersist#351).
+    ScrubUpgrade {
+        /// The anchor-scrubbed record.
+        record: KeyRecord,
+    },
+    /// The canonical supersede (CIRISPersist#405): a strictly-newer,
+    /// quorum-re-verified re-scrub of an anchored canonical row.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    SupersedeCanonical {
+        /// The successor record.
+        record: KeyRecord,
+    },
+    /// The same-key rebind (CIRISPersist#864).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    Rebind {
+        /// The holder's bound re-signing.
+        record: KeyRecord,
+    },
+    /// The invalid-record replace (CIRISPersist#1044).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    InvalidReplace {
+        /// The record that verifies.
+        record: KeyRecord,
+    },
+    /// The authenticated genesis re-anchor (CIRISPersist#490).
+    Reanchor {
+        /// The record the bundle carries.
+        record: KeyRecord,
+        /// The bundle whose quorum authorises it.
+        bundle: &'a super::genesis::GenesisBundle,
+    },
+    /// The hybrid completion: an Ed25519-only record gains its ML-DSA-65 key
+    /// and signature (CIRISPersist#657).
+    AttachPqc {
+        /// The held key.
+        key_id: &'a str,
+        /// Its ML-DSA-65 public key.
+        pubkey_ml_dsa_65_base64: &'a str,
+        /// The PQC scrub signature.
+        scrub_signature_pqc: &'a str,
+    },
+    /// Write back the `additional_scrubs` a pre-v53.1.4 door dropped
+    /// (CIRISPersist#995 row 2).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    RehydrateScrubs {
+        /// The record whose hash the held row already binds.
+        record: KeyRecord,
+    },
+}
+
+/// When an [`PlannedKeyRecord::Insert`] finds its `key_id` held at write
+/// time (a row that landed between the plan and the write).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnHeld {
+    /// The held row must be byte-identical (same `persist_row_hash`); a
+    /// differing one is [`Error::Conflict`].
+    Conflict,
+    /// The held row stays as it is (the genesis seed's `DO NOTHING`).
+    Keep,
+}
+
+/// What an in-place rewrite re-asserts about the held row, atomically, at
+/// write time (the `WHERE` of the SQL backends). The Ed25519 pubkey is
+/// re-asserted by every guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RewriteGuard {
+    /// The held row is still self-signed (the scrub upgrade).
+    SelfSigned,
+    /// The held row is still the anchored version the policy was verified
+    /// against (the canonical supersede).
+    Anchored {
+        /// That version's `persist_row_hash`.
+        prior_hash: String,
+    },
+    /// The same pubkey, nothing else (the bundle-authorised re-anchor).
+    SamePubkey,
+}
+
+/// **The plan's verdict for one key-record write**: exactly what the
+/// executor stores. Every refusal has already been made.
+#[derive(Debug, Clone)]
+pub(crate) enum PlannedKeyRecord {
+    /// A fresh row: `persist_row_hash` computed, `consent_role` in wire form.
+    Insert {
+        /// The record to insert.
+        record: KeyRecord,
+        /// A `key_id` held at write time.
+        on_held: OnHeld,
+    },
+    /// Rewrite the whole registration of a held row in place (every column
+    /// but the Ed25519 pubkey, `consent_role` and the trust overlays).
+    Rewrite {
+        /// The record to store.
+        record: KeyRecord,
+        /// What the write re-asserts.
+        guard: RewriteGuard,
+    },
+    /// The rebind / invalid-replace: the held row's registration bytes go to
+    /// `federation_key_registration_history` with its own hash and the kind,
+    /// then the registration columns are rewritten — both only while the held
+    /// row is still `existing_hash` (and self-signed, for a rebind).
+    Replace {
+        /// The record to store.
+        record: KeyRecord,
+        /// The held version the plan was made against.
+        existing_hash: String,
+        /// Which replacement.
+        kind: super::types::KeyReplacementKind,
+    },
+    /// The hybrid completion of a held Ed25519-only row (only while its
+    /// `pqc_completed_at` is still unset).
+    CompletePqc {
+        /// The held key.
+        key_id: String,
+        /// Its ML-DSA-65 public key.
+        pubkey_ml_dsa_65_base64: String,
+        /// The PQC scrub signature.
+        scrub_signature_pqc: String,
+        /// The completion instant (the receipt clock).
+        completed_at: chrono::DateTime<chrono::Utc>,
+        /// The completed record's `persist_row_hash`.
+        persist_row_hash: String,
+    },
+    /// Write back `additional_scrubs` (only while the held row's hash is
+    /// `record.persist_row_hash` and its scrub set is empty).
+    RehydrateScrubs {
+        /// The record, `persist_row_hash` computed.
+        record: KeyRecord,
+    },
+}
+
+impl PlannedKeyRecord {
+    /// The key the write is about.
+    #[must_use]
+    pub(crate) fn key_id(&self) -> &str {
+        match self {
+            Self::Insert { record, .. }
+            | Self::Rewrite { record, .. }
+            | Self::Replace { record, .. }
+            | Self::RehydrateScrubs { record } => &record.key_id,
+            Self::CompletePqc { key_id, .. } => key_id,
+        }
+    }
+
+    /// The refusal an executor reports when its write's atomic re-assertion
+    /// matched `rows` rows instead of one (a concurrent mutation between the
+    /// plan and the write): `None` when the write landed. One wording for
+    /// every backend.
+    #[must_use]
+    pub(crate) fn raced(&self, rows: u64) -> Option<Error> {
+        let kid = self.key_id();
+        match self {
+            // An insert that matched nothing is settled by the held row
+            // ([`Self::insert_held`]), not here.
+            Self::Insert { .. } => None,
+            Self::Rewrite {
+                guard: RewriteGuard::SamePubkey,
+                ..
+            } => (rows != 1).then(|| {
+                Error::Backend(format!(
+                    "reanchor {kid}: expected 1 row updated, got {rows}"
+                ))
+            }),
+            _ if rows > 0 => None,
+            Self::Rewrite {
+                guard: RewriteGuard::SelfSigned,
+                ..
+            } => Some(Error::Conflict(format!(
+                "adopt_scrub_upgrade {kid}: row changed concurrently"
+            ))),
+            Self::Rewrite { .. } => Some(Error::Conflict(format!(
+                "supersede_canonical_record {kid}: row changed concurrently"
+            ))),
+            Self::Replace { kind, .. } => Some(Error::Conflict(format!(
+                "{} key registration {kid}: row changed concurrently",
+                kind.as_str()
+            ))),
+            Self::CompletePqc { .. } => Some(Error::Conflict(format!(
+                "federation_keys row {kid} was concurrently completed"
+            ))),
+            Self::RehydrateScrubs { .. } => Some(Error::Conflict(format!(
+                "rehydrate_dropped_key_scrubs {kid}: row changed concurrently"
+            ))),
+        }
+    }
+
+    /// An [`Self::Insert`] that found its `key_id` held at write time:
+    /// `Ok(())` when the held row may stand (byte-identical, or
+    /// [`OnHeld::Keep`]), else the conflict.
+    pub(crate) fn insert_held(&self, held_hash: Option<&str>) -> Result<(), Error> {
+        match self {
+            Self::Insert {
+                record,
+                on_held: OnHeld::Conflict,
+            } if held_hash.is_some_and(|h| h != record.persist_row_hash) => {
+                Err(Error::Conflict(format!(
+                    "key_id {} already exists with different content",
+                    record.key_id
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// What [`plan_key_record_write`] decided.
+#[derive(Debug, Clone)]
+pub(crate) enum KeyRecordPlan {
+    /// This node already holds exactly the record: nothing to write.
+    Settled,
+    /// Store this.
+    Write(Box<PlannedKeyRecord>),
+}
+
+/// What a key-record write door did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyRecordWritten {
+    /// The record (and its row) were written.
+    Written,
+    /// Already held exactly; nothing was written.
+    Settled,
+}
+
+/// The two stored-column shapes every door checks before it writes: the
+/// content hash is hex (the column is bytes) and the algorithm is hybrid.
+fn check_key_record_columns(row: &KeyRecord, door: &str) -> Result<(), Error> {
+    hex::decode(&row.original_content_hash)
+        .map_err(|e| Error::InvalidArgument(format!("original_content_hash hex decode: {e}")))?;
+    if row.algorithm != super::types::algorithm::HYBRID {
+        return Err(Error::InvalidArgument(format!(
+            "{door}algorithm must be 'hybrid' (got '{}')",
+            row.algorithm
+        )));
+    }
+    Ok(())
+}
+
+/// `consent_role`: the admissible-token gate (CC 3.4.7.2), then the wire
+/// form (`'unregistered'` ⇔ `None`), so the hash is over what the read
+/// surface returns.
+fn admit_consent_role(row: &mut KeyRecord) -> Result<(), Error> {
+    super::types::consent_role::check_admissible(row.consent_role.as_deref())?;
+    row.consent_role = row
+        .consent_role
+        .as_deref()
+        .and_then(super::types::consent_role::wire_from_stored)
+        .map(str::to_owned);
+    Ok(())
+}
+
+/// The insert doors' decision (`put_public_key`, the replicated `Insert`
+/// arm): canonical at rest (#647), the envelope-attested roles lifted before
+/// the role gates (#486), the 32-byte Ed25519 key (#275), CC 3.4.7.3 Clause A
+/// on a local mint (#925), the hardware gate at receipt (#102, #901), the
+/// consent-role token ahead of the four conferral walks (#365, #670), the
+/// conferral gates, the stored-column shapes; then a held `key_id` settles
+/// (byte-identical) or conflicts.
+async fn plan_key_put(
+    dir: &dyn super::FederationDirectory,
+    mut row: KeyRecord,
+    door: super::register::KeyDoor,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> Result<KeyRecordPlan, Error> {
+    super::canonical_at_rest::canonicalize_in_place(&mut row.registration_envelope)?;
+    super::admission::lift_envelope_attested_roles(&mut row);
+    super::register::validate_registration_pubkey(&row)?;
+    if door == super::register::KeyDoor::LocalMint {
+        super::register::check_node_identity_exclusive(&row)?;
+    }
+    dir.hardware_attestation_policy()
+        .admit_key_record(&row, received_at)?;
+    admit_consent_role(&mut row)?;
+    super::admission::check_canonical_role_admission(dir, &row).await?;
+    super::admission::check_infra_attest_role_admission(dir, &row).await?;
+    super::admission::check_co_steward_role_admission(dir, &row).await?;
+    super::admission::check_privileged_identity_type_admission(dir, &row).await?;
+    row.persist_row_hash = super::types::compute_persist_row_hash(&row)?;
+    check_key_record_columns(&row, "")?;
+    match dir.lookup_public_key(&row.key_id).await? {
+        Some(held) if held.persist_row_hash == row.persist_row_hash => Ok(KeyRecordPlan::Settled),
+        Some(_) => Err(Error::Conflict(format!(
+            "key_id {} already exists with different content",
+            row.key_id
+        ))),
+        None => Ok(KeyRecordPlan::Write(Box::new(PlannedKeyRecord::Insert {
+            record: row,
+            on_held: OnHeld::Conflict,
+        }))),
+    }
+}
+
+/// The genesis seed's decision (CIRISPersist#347): every insert invariant
+/// but the accord-holder fresh-nonce hardware gate — the pinned ceremony
+/// bake IS the trust root, stale by design — and a held `key_id` is kept.
+fn plan_key_seed(mut row: KeyRecord) -> Result<KeyRecordPlan, Error> {
+    super::register::validate_registration_pubkey(&row)?;
+    super::register::check_node_identity_exclusive(&row)?;
+    check_key_record_columns(&row, "genesis seed ")?;
+    admit_consent_role(&mut row)?;
+    row.persist_row_hash = super::types::compute_persist_row_hash(&row)?;
+    Ok(KeyRecordPlan::Write(Box::new(PlannedKeyRecord::Insert {
+        record: row,
+        on_held: OnHeld::Keep,
+    })))
+}
+
+/// The scrub upgrade's decision (CIRISPersist#351): the incoming record is
+/// granting-authority scrubbed; every gate the insert runs (the hardware
+/// gate included, #543 H2 — this door can change `identity_type`); the held
+/// row exists, keeps `node` (#925) and its Ed25519 pubkey, and is still
+/// self-signed — an anchored one settles when byte-identical, else the
+/// downgrade/replace is refused.
+async fn plan_key_scrub_upgrade(
+    dir: &dyn super::FederationDirectory,
+    mut row: KeyRecord,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> Result<KeyRecordPlan, Error> {
+    super::admission::lift_envelope_attested_roles(&mut row);
+    if row.scrub_key_id == row.key_id {
+        return Err(Error::InvalidArgument(
+            "adopt_scrub_upgrade requires a granting-authority record (scrub_key_id != key_id)"
+                .into(),
+        ));
+    }
+    super::register::validate_registration_pubkey(&row)?;
+    super::register::check_node_identity_exclusive(&row)?;
+    check_key_record_columns(&row, "adopt_scrub_upgrade ")?;
+    dir.hardware_attestation_policy()
+        .admit_key_record(&row, received_at)?;
+    super::admission::check_canonical_role_admission(dir, &row).await?;
+    super::admission::check_infra_attest_role_admission(dir, &row).await?;
+    super::admission::check_co_steward_role_admission(dir, &row).await?;
+    super::admission::check_privileged_identity_type_admission(dir, &row).await?;
+    row.persist_row_hash = super::types::compute_persist_row_hash(&row)?;
+    let existing = dir.lookup_public_key(&row.key_id).await?.ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "adopt_scrub_upgrade: no existing row for {} — use register_federation_key",
+            row.key_id
+        ))
+    })?;
+    super::register::check_node_identity_unchanged(&existing, &row)?;
+    if existing.pubkey_ed25519_base64 != row.pubkey_ed25519_base64 {
+        return Err(Error::Conflict(format!(
+            "adopt_scrub_upgrade {}: pubkey change refused (different identity)",
+            row.key_id
+        )));
+    }
+    if existing.scrub_key_id != existing.key_id {
+        return if existing.persist_row_hash == row.persist_row_hash {
+            Ok(KeyRecordPlan::Settled)
+        } else {
+            Err(Error::Conflict(format!(
+                "adopt_scrub_upgrade {}: already anchored to a different record \
+                 (downgrade/replace refused)",
+                row.key_id
+            )))
+        };
+    }
+    Ok(KeyRecordPlan::Write(Box::new(PlannedKeyRecord::Rewrite {
+        record: row,
+        guard: RewriteGuard::SelfSigned,
+    })))
+}
+
+/// The canonical supersede's decision (CIRISPersist#405): an anchored
+/// successor of an anchored row with the same pubkeys and `node` (#925),
+/// the role gates on the successor (#543 H2: rotation is not a
+/// role-laundering path), the supersede policy re-verified from this node's
+/// own state (canonical scope, signed-envelope monotonicity, m-of-n); a
+/// byte-identical successor settles.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+async fn plan_key_supersede(
+    dir: &dyn super::FederationDirectory,
+    mut row: KeyRecord,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> Result<KeyRecordPlan, Error> {
+    super::register::validate_registration_pubkey(&row)?;
+    super::register::check_node_identity_exclusive(&row)?;
+    check_key_record_columns(&row, "supersede_canonical_record ")?;
+    if row.scrub_key_id == row.key_id {
+        return Err(Error::InvalidArgument(
+            "supersede_canonical_record requires an anchor-scrubbed record \
+             (scrub_key_id != key_id)"
+                .into(),
+        ));
+    }
+    let existing = dir.lookup_public_key(&row.key_id).await?.ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "supersede_canonical_record: no existing row for {}",
+            row.key_id
+        ))
+    })?;
+    super::register::check_node_identity_unchanged(&existing, &row)?;
+    if existing.pubkey_ed25519_base64 != row.pubkey_ed25519_base64
+        || existing.pubkey_ml_dsa_65_base64 != row.pubkey_ml_dsa_65_base64
+    {
+        return Err(Error::Conflict(format!(
+            "supersede_canonical_record {}: pubkey change refused (different identity)",
+            row.key_id
+        )));
+    }
+    if existing.scrub_key_id == existing.key_id {
+        return Err(Error::Conflict(format!(
+            "supersede_canonical_record {}: existing row is self-signed (use adopt_scrub_upgrade)",
+            row.key_id
+        )));
+    }
+    dir.hardware_attestation_policy()
+        .admit_key_record(&row, received_at)?;
+    super::admission::check_infra_attest_role_admission(dir, &row).await?;
+    super::admission::check_co_steward_role_admission(dir, &row).await?;
+    super::admission::check_privileged_identity_type_admission(dir, &row).await?;
+    if !super::register::verify_canonical_supersede(dir, &existing, &row).await? {
+        return Err(Error::Conflict(format!(
+            "supersede_canonical_record {}: supersede policy refused",
+            row.key_id
+        )));
+    }
+    row.persist_row_hash = super::types::compute_persist_row_hash(&row)?;
+    if existing.persist_row_hash == row.persist_row_hash {
+        return Ok(KeyRecordPlan::Settled);
+    }
+    Ok(KeyRecordPlan::Write(Box::new(PlannedKeyRecord::Rewrite {
+        record: row,
+        guard: RewriteGuard::Anchored {
+            prior_hash: existing.persist_row_hash,
+        },
+    })))
+}
+
+/// The rebind / invalid-replace decision: the shared pre-check
+/// (`register::prepare_rebind` / `prepare_invalid_replace`) builds the row
+/// to write from the STORED row; a byte-identical one settles.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+async fn plan_key_replace(
+    dir: &dyn super::FederationDirectory,
+    row: KeyRecord,
+    kind: super::types::KeyReplacementKind,
+) -> Result<KeyRecordPlan, Error> {
+    use super::register::RebindPrepared;
+    use super::types::KeyReplacementKind;
+    let signed = super::SignedKeyRecord { record: row };
+    let prepared = match kind {
+        KeyReplacementKind::Rebind => super::register::prepare_rebind(dir, signed).await?,
+        _ => super::register::prepare_invalid_replace(dir, signed).await?,
+    };
+    match prepared {
+        RebindPrepared::Unchanged => Ok(KeyRecordPlan::Settled),
+        RebindPrepared::Replace { new, existing_hash } => {
+            check_key_record_columns(&new, "")?;
+            Ok(KeyRecordPlan::Write(Box::new(PlannedKeyRecord::Replace {
+                record: *new,
+                existing_hash,
+                kind,
+            })))
+        }
+    }
+}
+
+/// The genesis re-anchor's decision (CIRISPersist#490): the bundle quorum
+/// re-verified from this node's own roster and pins; the record one the
+/// bundle carries; the adopt-path gates; the held row exists, keeps `node`
+/// (#925) and its Ed25519 pubkey, and the record is strictly newer
+/// (`valid_from`, anti-rollback).
+async fn plan_key_reanchor(
+    dir: &dyn super::FederationDirectory,
+    mut row: KeyRecord,
+    bundle: &super::genesis::GenesisBundle,
+) -> Result<KeyRecordPlan, Error> {
+    super::genesis::verify_bundle_quorum(dir, bundle).await?;
+    if !bundle.serve_nodes.iter().any(|sn| {
+        sn.record.persist_row_hash == row.persist_row_hash
+            && sn.record.key_id == row.key_id
+            && sn.record.registration_envelope == row.registration_envelope
+    }) {
+        return Err(Error::GenesisBundleInvalid {
+            detail: format!(
+                "re-anchor record {} is not carried by the verified bundle",
+                row.key_id
+            ),
+        });
+    }
+    super::admission::lift_envelope_attested_roles(&mut row);
+    super::register::validate_registration_pubkey(&row)?;
+    super::register::check_node_identity_exclusive(&row)?;
+    super::admission::check_canonical_role_admission(dir, &row).await?;
+    super::admission::check_infra_attest_role_admission(dir, &row).await?;
+    super::admission::check_co_steward_role_admission(dir, &row).await?;
+    super::admission::check_privileged_identity_type_admission(dir, &row).await?;
+    row.persist_row_hash = super::types::compute_persist_row_hash(&row)?;
+    let existing =
+        dir.lookup_public_key(&row.key_id)
+            .await?
+            .ok_or_else(|| Error::GenesisBundleInvalid {
+                detail: format!("re-anchor target {} has no existing row", row.key_id),
+            })?;
+    super::register::check_node_identity_unchanged(&existing, &row)?;
+    if existing.pubkey_ed25519_base64 != row.pubkey_ed25519_base64 {
+        return Err(Error::GenesisBundleInvalid {
+            detail: format!("re-anchor {}: pubkey change refused", row.key_id),
+        });
+    }
+    if row.valid_from <= existing.valid_from {
+        return Err(Error::GenesisBundleInvalid {
+            detail: format!(
+                "re-anchor {}: valid_from not newer than anchored — rollback refused",
+                row.key_id
+            ),
+        });
+    }
+    hex::decode(&row.original_content_hash)
+        .map_err(|e| Error::InvalidArgument(format!("original_content_hash hex: {e}")))?;
+    Ok(KeyRecordPlan::Write(Box::new(PlannedKeyRecord::Rewrite {
+        record: row,
+        guard: RewriteGuard::SamePubkey,
+    })))
+}
+
+/// The hybrid completion's decision (CIRISPersist#657): the held row exists
+/// and is not yet complete; verify-before-mutation over the row AS IT WOULD
+/// BE STORED (the envelope names THIS ML-DSA key, #659, and the row
+/// verifies hybrid-Strict with it); the completion instant is the receipt
+/// clock, and the hash is the completed record's.
+async fn plan_key_attach_pqc(
+    dir: &dyn super::FederationDirectory,
+    key_id: &str,
+    pubkey_ml_dsa_65_base64: &str,
+    scrub_signature_pqc: &str,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> Result<KeyRecordPlan, Error> {
+    let mut row = dir.lookup_public_key(key_id).await?.ok_or_else(|| {
+        Error::InvalidArgument(format!("federation_keys row {key_id} does not exist"))
+    })?;
+    if row.is_pqc_complete() {
+        return Err(Error::Conflict(format!(
+            "federation_keys row {key_id} is already PQC-complete"
+        )));
+    }
+    row.pubkey_ml_dsa_65_base64 = Some(pubkey_ml_dsa_65_base64.to_owned());
+    row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+    super::admission::check_key_pqc_attachment(dir, &row).await?;
+    row.pqc_completed_at = Some(received_at);
+    row.persist_row_hash = String::new();
+    let persist_row_hash = super::types::compute_persist_row_hash(&row)?;
+    Ok(KeyRecordPlan::Write(Box::new(
+        PlannedKeyRecord::CompletePqc {
+            key_id: key_id.to_owned(),
+            pubkey_ml_dsa_65_base64: pubkey_ml_dsa_65_base64.to_owned(),
+            scrub_signature_pqc: scrub_signature_pqc.to_owned(),
+            completed_at: received_at,
+            persist_row_hash,
+        },
+    )))
+}
+
+/// v60.0.0 (CIRISPersist#934 step 3) — **the key-record write doors'
+/// decision**, once for every backend: each door's gates, in the order its
+/// three copies ran them, and the write they lead to. `received_at` is the
+/// receiving node's clock (the hardware gate's freshness, the hybrid
+/// completion's instant). The `key:record:v1` row is not planned here: it is
+/// a pure function of the record AS STORED ([`key_record_row_step`]), so the
+/// executor derives it after its write, in the same transaction.
+pub(crate) async fn plan_key_record_write(
+    dir: &dyn super::FederationDirectory,
+    write: KeyRecordWrite<'_>,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> Result<KeyRecordPlan, Error> {
+    // Each arm propagates, so the parity scan follows it (#934).
+    Ok(match write {
+        KeyRecordWrite::Put { record, door } => {
+            plan_key_put(dir, record, door, received_at).await?
+        }
+        KeyRecordWrite::SeedGenesis { record } => plan_key_seed(record)?,
+        KeyRecordWrite::ScrubUpgrade { record } => {
+            plan_key_scrub_upgrade(dir, record, received_at).await?
+        }
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        KeyRecordWrite::SupersedeCanonical { record } => {
+            plan_key_supersede(dir, record, received_at).await?
+        }
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        KeyRecordWrite::Rebind { record } => {
+            plan_key_replace(dir, record, super::types::KeyReplacementKind::Rebind).await?
+        }
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        KeyRecordWrite::InvalidReplace { record } => {
+            plan_key_replace(
+                dir,
+                record,
+                super::types::KeyReplacementKind::InvalidReplaced,
+            )
+            .await?
+        }
+        KeyRecordWrite::Reanchor { record, bundle } => {
+            plan_key_reanchor(dir, record, bundle).await?
+        }
+        KeyRecordWrite::AttachPqc {
+            key_id,
+            pubkey_ml_dsa_65_base64,
+            scrub_signature_pqc,
+        } => {
+            plan_key_attach_pqc(
+                dir,
+                key_id,
+                pubkey_ml_dsa_65_base64,
+                scrub_signature_pqc,
+                received_at,
+            )
+            .await?
+        }
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        KeyRecordWrite::RehydrateScrubs { mut record } => {
+            record.persist_row_hash = super::types::compute_persist_row_hash(&record)?;
+            KeyRecordPlan::Write(Box::new(PlannedKeyRecord::RehydrateScrubs { record }))
+        }
+    })
+}
+
+/// The door every backend's key-record write is: plan, then store.
+pub(crate) async fn key_record_write_planned<D>(
+    dir: &D,
+    write: KeyRecordWrite<'_>,
+) -> Result<KeyRecordWritten, Error>
+where
+    D: KeyPlaneStore,
+{
+    match plan_key_record_write(dir, write, chrono::Utc::now()).await? {
+        KeyRecordPlan::Settled => Ok(KeyRecordWritten::Settled),
+        KeyRecordPlan::Write(planned) => {
+            dir.store_planned_key_record(*planned).await?;
+            Ok(KeyRecordWritten::Written)
+        }
+    }
+}
+
+/// The genesis seed of the HUMANITY_ACCORD holder rows (CIRISPersist#347),
+/// one planned insert per baked record, each in its own write.
+pub(crate) async fn seed_genesis_accord_holders_planned<D>(
+    dir: &D,
+    records: &[super::SignedKeyRecord],
+) -> Result<(), Error>
+where
+    D: KeyPlaneStore,
+{
+    for sr in records {
+        key_record_write_planned(
+            dir,
+            KeyRecordWrite::SeedGenesis {
+                record: sr.record.clone(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// v60.0.0 (CIRISPersist#934 step 3; v13.0.0 CIRISPersist#371) — **the
+/// upgrade-aware replicated key apply**, once for every backend: the
+/// classification is
+/// [`plan_replicated_key_apply`](super::register::plan_replicated_key_apply)'s,
+/// and each arm is one of the key-record write doors above. Refusals are
+/// outcomes, not errors; a `Conflict` from the store step (the row changed
+/// between plan and write) is `StoreConflict`, fail-closed and re-offerable;
+/// a CC 3.4.7.3 Clause A / `node`-immutability refusal on a rewrite is typed
+/// (#925 review H3/M5), so the replication cursor records it and moves on.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn apply_replicated_key_record_planned<D>(
+    dir: &D,
+    record: super::SignedKeyRecord,
+) -> Result<super::register::ReplicatedKeyOutcome, Error>
+where
+    D: KeyPlaneStore,
+{
+    use super::register::{KeyRefusalReason, ReplicatedKeyOutcome as O, ReplicatedKeyPlan as P};
+    const RACED: O = O::Refused {
+        reason: KeyRefusalReason::StoreConflict,
+    };
+    let typed = |e: Error| -> Result<O, Error> {
+        match e {
+            Error::NodeIdentityNotExclusive { .. } => Ok(O::Refused {
+                reason: KeyRefusalReason::NodeIdentityFused,
+            }),
+            Error::NodeIdentityImmutable { .. } => Ok(O::Refused {
+                reason: KeyRefusalReason::NodeIdentityChanged,
+            }),
+            Error::Conflict(_) => Ok(RACED),
+            e => Err(e),
+        }
+    };
+    let record = record.record;
+    let (write, written) = match super::register::plan_replicated_key_apply(dir, &record).await? {
+        P::Unchanged => return Ok(O::Unchanged),
+        P::Refused { reason } => return Ok(O::Refused { reason }),
+        P::Insert => {
+            // v21.0.0 (CIRISPersist#502 E2) — the Strict hybrid PoP gate on
+            // a replicated first sight; v54.1.0 (#1042) — a verify failure
+            // is a TYPED refusal (retryable `attester_key_unknown` apart from
+            // terminal `unverifiable_signature`). Nothing is written.
+            if !super::register::record_is_role_gated(&record) {
+                if let Err(e) = super::verify_key_registration(dir, &record).await {
+                    return Ok(O::Refused {
+                        reason: super::register::key_refusal_of_verify_error(e)?,
+                    });
+                }
+            }
+            let write = KeyRecordWrite::Put {
+                record,
+                door: super::register::KeyDoor::ReplicatedInsert,
+            };
+            return match key_record_write_planned(dir, write).await {
+                Ok(_) => Ok(O::Inserted),
+                Err(Error::Conflict(_)) => Ok(RACED),
+                Err(e) => Err(e),
+            };
+        }
+        P::RehydrateScrubs => (
+            KeyRecordWrite::RehydrateScrubs { record },
+            O::ScrubsRehydrated,
+        ),
+        P::Upgrade => (KeyRecordWrite::ScrubUpgrade { record }, O::Upgraded),
+        P::Supersede => (KeyRecordWrite::SupersedeCanonical { record }, O::Superseded),
+        P::Rebind => (KeyRecordWrite::Rebind { record }, O::Rebound),
+        P::ReplaceInvalid => (
+            KeyRecordWrite::InvalidReplace { record },
+            O::InvalidReplaced,
+        ),
+    };
+    match key_record_write_planned(dir, write).await {
+        Ok(KeyRecordWritten::Written) => Ok(written),
+        Ok(KeyRecordWritten::Settled) => Ok(O::Unchanged),
+        Err(e) => typed(e),
+    }
+}
+
+/// Test support: the canonical supersede door alone (the replicated apply
+/// reaches it only through its classification), outcome as the apply reports
+/// it.
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub(crate) async fn supersede_canonical_planned<D>(
+    dir: &D,
+    record: super::SignedKeyRecord,
+) -> Result<super::register::ReplicatedKeyOutcome, Error>
+where
+    D: KeyPlaneStore,
+{
+    use super::register::ReplicatedKeyOutcome as O;
+    let write = KeyRecordWrite::SupersedeCanonical {
+        record: record.record,
+    };
+    Ok(match key_record_write_planned(dir, write).await? {
+        KeyRecordWritten::Written => O::Superseded,
+        KeyRecordWritten::Settled => O::Unchanged,
+    })
+}
+
+/// What a key's `key:record:v1` row becomes after a write to its record.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum KeyRecordRowStep {
+    /// The key's current row is already the row its record plans to.
+    Keep,
+    /// The key's rows leave the plane; `Some(row)` lands in their place (and
+    /// the projection points at it), `None` when the record does not verify
+    /// (held without a row; the rebuild gate names it) or the key is gone.
+    Replace(Option<Box<Attestation>>),
+}
+
+/// v60.0.0 (CIRISPersist#934 step 3; v58.0.0 CIRISPersist#991, CC 3.1.3) —
+/// **the `key:record:v1` row follows its record**: the row the record AS
+/// STORED plans to ([`key_record_row_if_verifiable`]: proof of possession,
+/// or `held_signer`, the base signer's held keys), given what the
+/// projection's `attestation_id` names today. Every backend's executor reads
+/// `stored` back inside its write's transaction (so the row is over the
+/// precision that backend keeps) and applies the step there.
+#[must_use]
+pub(crate) fn key_record_row_step(
+    stored: Option<&KeyRecord>,
+    current: Option<&str>,
+    held_signer: &HeldSigner,
+) -> KeyRecordRowStep {
+    let planned = stored.and_then(|record| key_record_row_if_verifiable(record, held_signer));
+    match (current, planned) {
+        (Some(cur), Some(row)) if cur == row.attestation_id => KeyRecordRowStep::Keep,
+        (_, planned) => KeyRecordRowStep::Replace(planned.map(Box::new)),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────

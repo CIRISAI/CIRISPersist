@@ -6416,10 +6416,12 @@ impl PyEngine {
                         )
                         .await
                         .map_err(federation_err_to_py)?;
-                        backend
-                            .adopt_scrub_upgrade(record)
-                            .await
-                            .map_err(federation_err_to_py)
+                        crate::federation::FederationDirectory::adopt_scrub_upgrade(
+                            backend.as_ref(),
+                            record,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
                     })
                 }
                 #[cfg(feature = "sqlite")]
@@ -6432,10 +6434,12 @@ impl PyEngine {
                         )
                         .await
                         .map_err(federation_err_to_py)?;
-                        backend
-                            .adopt_scrub_upgrade(record)
-                            .await
-                            .map_err(federation_err_to_py)
+                        crate::federation::FederationDirectory::adopt_scrub_upgrade(
+                            backend.as_ref(),
+                            record,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
                     })
                 }
             })?;

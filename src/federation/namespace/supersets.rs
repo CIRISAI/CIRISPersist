@@ -1773,7 +1773,9 @@ mod tests {
         // CLM-silo-projection-rebuildable at the goals projection's fold; the
         // M-1 row (CLM-nsproc-meta-goal-alignment-goal-scale) moved from the
         // retired constructor to the admission gate (a move, not a new row).
-        const EXPECTED: usize = 319;
+        // v60.0.0 slice S3: +1 (CIRISPersist#934 step 3): CLM-planes-as-rows
+        // at the key-record write plan.
+        const EXPECTED: usize = 320;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \
