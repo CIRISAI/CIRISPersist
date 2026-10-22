@@ -39,6 +39,16 @@ jobs:
           - {scope: scope-observe, shard: '0/2', id: observe-0-of-2, weekly: false}
           - {scope: scope-observe, shard: '1/2', id: observe-1-of-2, weekly: false}
           - {scope: scope-observe-sites, shard: '', id: observe-sites, weekly: true}
+          # v60.0.0: the slice scopes. S0's two are 19 mutants each; S1's 215
+          # ran 8 h as 4 shards on the dev box (2 h each, the whole budget),
+          # so it rides 5 shards on the weekly run.
+          - {scope: scope-s0-hard-case, shard: '', id: s0-hard-case, weekly: false}
+          - {scope: scope-s0-roster-seam, shard: '', id: s0-roster-seam, weekly: false}
+          - {scope: scope-s1-cirisnode, shard: '0/5', id: s1-cirisnode-0-of-5, weekly: true}
+          - {scope: scope-s1-cirisnode, shard: '1/5', id: s1-cirisnode-1-of-5, weekly: true}
+          - {scope: scope-s1-cirisnode, shard: '2/5', id: s1-cirisnode-2-of-5, weekly: true}
+          - {scope: scope-s1-cirisnode, shard: '3/5', id: s1-cirisnode-3-of-5, weekly: true}
+          - {scope: scope-s1-cirisnode, shard: '4/5', id: s1-cirisnode-4-of-5, weekly: true}
     services:
       postgres:
         image: ghcr.io/cirisai/postgres:16
