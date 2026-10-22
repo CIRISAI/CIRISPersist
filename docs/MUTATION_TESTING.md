@@ -315,8 +315,10 @@ did not fit its budget):
   on one plan (#934 step 3): `key_plane::plan_key_record_write`, its
   planners, the shared replicated apply, the row step, and each backend's
   `store_planned_key_record` executor and doors, against I1183–I1188 and the
-  doors' standing witnesses. 136 mutants, three shards (`MUTANTS_SHARD=0/3`
-  … `2/3`), on the weekly run.
+  doors' standing witnesses. 129 mutants in three shards, 101 caught, 28
+  unviable, 0 missed (two rounds: the first left ten survivors; eight were
+  witness gaps, now witnessed, two an equivalent branch, now removed), on
+  the weekly run.
 - `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and
   federation files that feed the counters. The issue's other starting modules
 (the `trust_root.rs` walks beyond `trust_root_valid`) are not yet scoped.

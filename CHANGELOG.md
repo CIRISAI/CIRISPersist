@@ -338,7 +338,13 @@ Python signature changed, no migration.
   own refusals over the real v2 ceremony; **I1190** (memory, sqlite,
   postgres) the supersede's settle, pubkey-change and policy refusals;
   **I1188** (unit) the row step and the lost-race wording.
-- Mutation scope `scripts/mutants/scope-s3-key-plane.txt`.
+- Mutation scope `scripts/mutants/scope-s3-key-plane.txt`: 129 mutants in
+  three shards, 101 caught, 28 unviable, 0 missed, nothing allow-listed (two
+  rounds: the first, 136 mutants, left ten survivors; eight were witness gaps,
+  now I1187's anchored-version and rehydrate legs, I1189 and I1190, and the
+  role-bearing leg of I1183; two were the row step's self-scrub guard on
+  sqlite and postgres, an equivalent branch, now removed on all three
+  backends). Weekly, three shards, in `mutants.yml`.
 - Evidence: CLM-planes-as-rows (3.1.3) at `key_plane::plan_key_record_write`;
   `EXPECTED` 320.
 
