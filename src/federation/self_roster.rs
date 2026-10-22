@@ -88,10 +88,37 @@ use super::{Error, FederationDirectory};
 /// `W_self` (CC 3.3.6.3): the lone path's window, 86 400 s.
 pub const W_SELF_SECS: i64 = 86_400;
 
-/// The self roster's conditions on the two paths (CC 3.3.6.3).
-#[must_use]
-pub fn policy() -> TwoPathPolicy {
-    TwoPathPolicy::self_roster(w_self_secs())
+/// The self roster's conditions on the two paths (CC 3.3.6.3): v60.0.0
+/// (S6v), the CC governance policy table's `self_roster_add` /
+/// `self_roster_evict` rows (CC 4.5.13, vendored at `v1.0-rc9`), admitted
+/// inside the self corridor
+/// ([`PolicyTable::self_roster`](super::governance_policy::PolicyTable::self_roster)),
+/// with the door's own rule (an eviction's target silent all window; one open
+/// proposal per proposer and per target). Only the window may move, and only
+/// in a live test-anchor harness ([`w_self_secs`]).
+///
+/// # Errors
+///
+/// [`Error::GovernancePolicyRefused`] when the table's rows are outside the
+/// self corridor, unreadable, or disagree: the door decides nothing.
+pub fn policy() -> Result<TwoPathPolicy, Error> {
+    let table = super::governance_policy::table()?.self_roster()?;
+    Ok(TwoPathPolicy {
+        window_secs: applied_window(table.window_secs),
+        ..table
+    })
+}
+
+/// The table's window, or the live test-anchor harness's (#1111): the same
+/// rule as [`w_self_secs`], over the table's value.
+fn applied_window(table_secs: i64) -> i64 {
+    #[cfg(feature = "test-anchor")]
+    if super::genesis::test_anchor_override_active() {
+        if let Some(secs) = test_window::env_secs() {
+            return secs;
+        }
+    }
+    table_secs
 }
 
 /// `W_self` as this node applies it: [`W_SELF_SECS`], on every production
@@ -166,9 +193,10 @@ pub mod test_window {
     }
 }
 
-/// The proposal row's dimension (CC 3.1.9.2 `objection:{state}`; minted here).
+/// The proposal row's dimension (CC 3.1.9.2 `objection:{state}`, whose open
+/// vocabulary CC rc9 lists as `proposal`, `assent`, `raised`; minted here).
 pub const DIMENSION_PROPOSAL: &str = "objection:proposal:v1";
-/// An assent row's dimension (minted here).
+/// An assent row's dimension (minted here; CC rc9 `objection:{state}`).
 pub const DIMENSION_ASSENT: &str = "objection:assent:v1";
 /// An objection row's dimension: the reverse quorum's own.
 pub const DIMENSION_OBJECTION: &str = super::reverse_quorum::DIMENSION_OBJECTION;
@@ -981,6 +1009,7 @@ async fn plan<D>(
     identity: &str,
     extra: Option<(&Carried, &str)>,
     now: DateTime<Utc>,
+    policy: &TwoPathPolicy,
 ) -> Result<Plan, Error>
 where
     D: FederationDirectory + ?Sized,
@@ -1036,11 +1065,10 @@ where
         with_answers.push((p, a, c));
     }
     let refs: Vec<(&Proposal, &Answers)> = with_answers.iter().map(|(p, a, _)| (p, a)).collect();
-    let decided: Vec<(String, TwoPathDecision)> =
-        two_path::decide_all(&roster, &refs, now, &policy())
-            .into_iter()
-            .map(|(p, d)| (p.id.clone(), d))
-            .collect();
+    let decided: Vec<(String, TwoPathDecision)> = two_path::decide_all(&roster, &refs, now, policy)
+        .into_iter()
+        .map(|(p, d)| (p.id.clone(), d))
+        .collect();
     let mut entries = Vec::with_capacity(decided.len());
     for (id, d) in decided {
         if let Some(pos) = with_answers.iter().position(|(p, _, _)| p.id == id) {
@@ -1072,8 +1100,9 @@ pub async fn standing<D>(dir: &D, identity: &str) -> Result<Vec<Standing>, Error
 where
     D: FederationDirectory + ?Sized,
 {
+    let policy = policy()?;
     let now = roster_clock();
-    let plan = plan(dir, identity, None, now).await?;
+    let plan = plan(dir, identity, None, now, &policy).await?;
     Ok(plan
         .entries
         .into_iter()
@@ -1153,10 +1182,13 @@ where
     if !is_roster_change(dir, &carried, &roster).await? {
         return Ok(());
     }
+    // v60.0.0 (S6v) — the corridor at admission: the policy is the CC table's
+    // row, refused before anything is held when it is outside its corridor.
+    let policy = policy()?;
     let row = proposal_row(&carried)?;
     let id = row.attestation_id.clone();
     let now = roster_clock();
-    let plan = plan(dir, &identity, Some((&carried, &id)), now).await?;
+    let plan = plan(dir, &identity, Some((&carried, &id)), now, &policy).await?;
     let decision = plan
         .entries
         .iter()
@@ -1276,11 +1308,12 @@ pub async fn execute_for<D>(dir: &D, identity: &str) -> Result<usize, Error>
 where
     D: FederationDirectory + ?Sized,
 {
+    let policy = policy()?;
     let mut landed = 0;
     let mut tried: BTreeSet<String> = BTreeSet::new();
     loop {
         let now = roster_clock();
-        let plan = plan(dir, identity, None, now).await?;
+        let plan = plan(dir, identity, None, now, &policy).await?;
         for id in &plan.withdrawn {
             dir.settle_self_roster_proposal(id, WITHDRAWN_OUTCOME, now)
                 .await?;

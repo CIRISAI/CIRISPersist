@@ -33638,6 +33638,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
             ref proposal_id,
             ..
         } => PyValueError::new_err(format!("{kind}: {decision}: {proposal_id}")),
+        // v60.0.0 (S6v) — the door's policy row is outside its corridor (or
+        // unreadable); the family and the reason token ride the kind.
+        crate::federation::Error::GovernancePolicyRefused { ref family, reason } => {
+            PyValueError::new_err(format!("{kind}: {family}: {reason}"))
+        }
         // v55.0.0 (CIRISPersist#1055) — typed out of `InvalidArgument`
         // (ValueError), so it keeps that type; the plane and the TERMINAL
         // reason token ride with the kind.

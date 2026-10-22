@@ -16943,6 +16943,37 @@
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v60-s2",
     "witness": "I1177 (unit), I1178 (memory, sqlite, postgres), I1180 (sqlite and postgres engines)"
+   },
+   {
+    "decimal_id": "4.5.13",
+    "claim_id": "CLM-governance-policy-table",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/governance_policy.rs#PolicyTable::admit",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s6v",
+    "tsv_comment_before": [
+     "# v60.0.0 (S6v, CC v1.0-rc9 at the tag) — the CC governance policy table is a runtime",
+     "# manifest; a two-path door reads its policy from it and runs the corridor at admission."
+    ],
+    "witness": "I1303, I1304, I1306 (unit), I1307 (memory, sqlite, postgres), two_path governance_policy_vectors_replay (732 CC vectors through the runtime reader)"
+   },
+   {
+    "decimal_id": "4.2.1.1",
+    "claim_id": "CLM-policy-corridor",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/governance_policy.rs#PolicyTable::check_corridor",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s6v",
+    "witness": "I1303, I1305 (unit), I1307 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "4.2.1.1",
+    "claim_id": "CLM-policy-corridor",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/two_path.rs#TwoPathPolicy::check_corridor",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s6v",
+    "witness": "two_path the_corridor_refuses_each_pole_by_its_token (PolicyCorridor.lean's examples), I1305"
    }
   ],
   "CIRISServer": [

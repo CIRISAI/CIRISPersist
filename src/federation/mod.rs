@@ -656,6 +656,9 @@ pub mod scores;
 pub mod scores_read_audit;
 pub mod steward_purge;
 pub mod two_path;
+// v60.0.0 (S6v; CC 4.5.13) — the two-path policy table as runtime data, and
+// the corridor at admission.
+pub mod governance_policy;
 // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the key roster of a self: the
 // two-path door its additions and evictions go through, and the steward
 // predicate (a live roster key signs as the fedID).
@@ -9772,6 +9775,31 @@ pub enum Error {
         needs: usize,
     },
 
+    /// v60.0.0 (S6v; CC 4.5.13 / 4.2.1.1 `CLM-policy-corridor`) — **the door
+    /// refuses to decide under its family's policy row.** A two-path door
+    /// reads its policy from the vendored CC governance policy table
+    /// ([`governance_policy`](crate::federation::governance_policy)); the row
+    /// must be a two-path row on a built base, readable, and inside its
+    /// corridor (`PolicyCorridor.lean`, as CC checks the table). `reason` is
+    /// a [`CorridorRefusal`](crate::federation::two_path::CorridorRefusal)
+    /// token or one of
+    /// [`governance_policy::refusal`](crate::federation::governance_policy::refusal)'s.
+    /// Nothing is held or written. With the vendored rc9 table it does not
+    /// arise (every row is in its corridor, I1303); it is the gate a table a
+    /// re-vendor moved out of the corridor meets. Stable `kind()` token
+    /// `federation_governance_policy_refused`; Python
+    /// `ValueError("federation_governance_policy_refused: {family}: {reason}")`.
+    #[error(
+        "governance policy {family:?} refused: {reason} — CC 4.5.13: a two-path door decides \
+         only under a readable row inside its corridor"
+    )]
+    GovernancePolicyRefused {
+        /// The table family the door asked for (`*` for the table itself).
+        family: String,
+        /// The corridor token or the table refusal.
+        reason: &'static str,
+    },
+
     /// v55.0.0 (CIRISPersist#1055, from CIRISEdge's adopt of v54.1) — **the
     /// signed row is malformed.** Its bytes cannot be read as the claim they
     /// carry: it names no signer, a member of its signed envelope is missing
@@ -12229,6 +12257,7 @@ impl Error {
             Error::AttesterKeyUnknown { .. } => "federation_attester_key_unknown",
             Error::SignerDoesNotActFor { .. } => "federation_signer_not_acting_for",
             Error::SelfRosterNotLanded { .. } => "federation_self_roster_not_landed",
+            Error::GovernancePolicyRefused { .. } => "federation_governance_policy_refused",
             Error::AssertedAtStale { .. } => "federation_invalid_argument",
             Error::EnvelopeKindRetired { .. } => replication_policy::ENVELOPE_KIND_RETIRED,
             Error::MalformedRow { .. } => "federation_malformed_row",

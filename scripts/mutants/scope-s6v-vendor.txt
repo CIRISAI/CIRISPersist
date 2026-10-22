@@ -1,0 +1,25 @@
+# Mutation scope: v60 slice S6v — vendor CC v1.0-rc9 at the tag
+# (docs/V60_TASK_PLAN.md §4 S6v).
+#
+# - The policy table as runtime data: `src/federation/governance_policy.rs`
+#   (the table reader, the row → `TwoPathPolicy` builder, the corridor as CC
+#   checks the table, `PolicyTable::admit` / `self_roster`, the expected-active
+#   base law). Witnesses I1303–I1306 (unit), the 732 CC governance vectors
+#   replayed through the runtime reader, I1307 (memory, sqlite, postgres).
+# - The corridor itself: `two_path.rs` `TwoPathPolicy::check_corridor`
+#   (PolicyCorridor.lean's examples, I1305).
+# - The admission site: `self_roster.rs` `policy` / `applied_window` (the door
+#   reads its policy from the table; I1307 at the door, I1132 the lone path
+#   over the table's window, the six CC self_roster traces).
+# - The registry loader the re-vendor moved: `registry.rs` `parse_manifest`,
+#   `registry`, `parse_polarity_classes` (the pins and the census witnesses in
+#   `registry::tests`, `scores_read_audit::tests`, the matcher's vector
+#   replay). `cc_manifests.rs` carries constants only (no mutant).
+#
+# Grammar: docs/MUTATION_TESTING.md "Scope files".
+tests: test(/governance_policy::|two_path::tests::|i1307|i1132|cc_manifests::|namespace::registry::tests::|namespace_match_vectors_replay|the_pinning_census_is_exactly|retaining_the_contradiction_count/)
+
+src/federation/governance_policy.rs
+src/federation/two_path.rs check_corridor
+src/federation/self_roster.rs policy applied_window
+src/federation/namespace/registry.rs parse_manifest registry parse_polarity_classes

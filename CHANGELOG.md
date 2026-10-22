@@ -355,6 +355,120 @@ Python signature changed, no migration.
 - Evidence: CLM-planes-as-rows (3.1.3) at `key_plane::plan_key_record_write`;
   `EXPECTED` 320.
 
+### Changed — CC v1.0-rc9 vendored at the tag; the policy table is runtime data; the corridor runs at admission (S6v)
+
+CIRISConstitution tagged `v1.0-rc9` on 2026-10-21 (tag object `a1c2bea5`,
+commit `5d50c6bb160ecbee99a66e1700597c029846e6b6`, CIRISConstitution#182).
+Persist vendors it at the tag: `scripts/check_vendored_cc.sh v1.0-rc9` passes
+for all twelve vendored files.
+
+**For Edge: the namespace registry diff** (`scripts/manifest_diff.py
+32512f52`, rc8.1 → rc9; registry `_meta.registry_sha256` `22b029cf…` →
+`feeb06a0…`, source `73aa281f…` → `afd1948e…`):
+
+| | |
+|---|---|
+| families | 174 → 176 (net +2) |
+| added | `identity:occurrence_revocation` (CC 3.1.3, `-1 only`, reserved: signed by the identity or a live occurrence of it), `transport:canonical_rebind` (CC 3.1.3, `positive-only`, reserved: `substrate-self-report`) |
+| removed | none |
+| changed | `objection:{state}`: the `{state}` segment is now an OPEN vocabulary with the listed values `proposal`, `assent`, `raised` (it named no values); description prose |
+| `_meta` | `cc_version` 1.0-rc8.1 → 1.0-rc9; `n_families` 174 → 176; `per_component.persist` 22 → 24 |
+
+Both added families are persist's own v59 mints (CIRISPersist#1104, the
+legacy occurrence revocation's carrier, and #1106, the holders' quorum
+re-bind), now registered under CC 3.1.7 R2(a); `objection:proposal:v1` /
+`objection:assent:v1` (the self-roster door's rows, #1099) are now in CC's
+listed vocabulary. No admission behaviour changed for a conformant row: the
+two carriers already carried the scores their polarity classes now state
+(`-1`, `+1`). The match vectors grow 1147 → 1159 (six per new family; the
+`objection` sample is `proposal`). The binds oracle is regenerated at the tag
+commit.
+
+| pin (`registry.rs`) | rc8.1 | rc9 |
+|---|---|---|
+| `VENDORED_CC_VERSION` | `1.0-rc8.1` | `1.0-rc9` |
+| `VENDORED_CC_COMMIT` | `157039d3…` | `5d50c6bb…` |
+| `VENDORED_SOURCE_SHA256` | `73aa281f…` | `afd1948e…` |
+| `VENDORED_REGISTRY_SHA256` | `22b029cf…` | `feeb06a0…` |
+| `VENDORED_N_FAMILIES` | 174 | 176 |
+| `VENDORED_REGISTRY_FILE_SHA256` | `44d4d480…` | `be0b1c86…` |
+| `VENDORED_VECTORS_FILE_SHA256` | `c1a989a7…` | `a1a6ce5f…` |
+| `namespace_match_binds.json` | (rc8.1 oracle) | `86a9980b…` (1159 vectors) |
+
+- **Four fixtures are runtime manifests now** (`src/federation/namespace/`,
+  beside the registry, pinned in the new `namespace::cc_manifests`):
+  `governance_policy.json` (CC 4.5.13, `policy_sha256 b7d2370d…`),
+  `governance_policy_vectors.json` (732 vectors), `csd4_chain.json`,
+  `topology_vocabulary.json`, each byte-identical to `git show
+  v1.0-rc9:manifests/<file>` (they were copied from the untagged `rc9` branch
+  in v59 / v60 S0; the bytes did not change). Readers repointed:
+  `scripts/csd4_coverage.py`, the `two_path` replay, the `reports` workflow.
+  CIRISServer's catalogue (`traces.json`, `requirements.yaml`, `PIN.md`,
+  `topology_vocabulary.pin`) stays under `tests/fixtures/csd4/`: no CC tag
+  carries it. The six `formal/self_roster` traces stay test fixtures, pinned
+  at the tag.
+- **The policy table is read at runtime** (`federation::governance_policy`):
+  `PolicyTable` parses the compiled-in table once; `policy_of` builds a row as
+  a `TwoPathPolicy` (ENACT strictly over its fraction; CANCEL / FLOOR at
+  least; the self rows' "strict majority of the others" and "one_voter";
+  `cancel_over`; `at_window`; the corridor's count minimum, checked against the
+  table's `min_count`; the window checked against its class), refusing any form
+  it does not read; `check_corridor` is CC's own table check
+  (`tools/build_governance_policy.py` at the tag) over
+  `TwoPathPolicy::check_corridor`: a reverse-path community row at bases 6, 7,
+  10 and the expected-active base 344, a forward-only row's enact and window
+  floors at 3, 6, 7, 10, 344, a self row in its own corridor at three keys.
+  `admit(family, door)` is a door's call: the row, built, on a built base
+  (`standing`), inside its corridor.
+- **The corridor runs at admission** (the piece v59 left for the tag): the
+  self-roster door's policy is the table's `self_roster_add` /
+  `self_roster_evict` rows (`self_roster::policy()` now returns `Result`), read
+  at every roster change (`gate`), every execute and every standing read. A row
+  outside its corridor, unreadable, or two self rows that disagree refuse the
+  change before anything is held: new `Error::GovernancePolicyRefused { family,
+  reason }`, `kind()` `federation_governance_policy_refused`, Python
+  `ValueError("federation_governance_policy_refused: {family}: {reason}")`,
+  `reason` a `CorridorRefusal` token or one of `policy_row_missing`,
+  `policy_not_two_path`, `policy_row_unreadable`, `policy_base_not_built`,
+  `policy_rows_disagree`. With the vendored table it does not arise (every
+  two-path row is in its corridor, I1303). `TwoPathPolicy::self_roster(window)`
+  is removed (clean break): the table is the one source; the test-anchor
+  `W_self` seam (#1111) still shortens the window of the table's policy.
+- **Re-run at the tag's pins**: the 732 CC governance vectors replay through
+  the RUNTIME reader (`PolicyTable::policy_of`, each family row also checked
+  in its corridor); the six self_roster traces replay under the table's
+  self-roster policy.
+- **Refusal tokens at the pin** (I1308): rc9 names `federation_set_semantics_unsorted`,
+  `federation_malformed_row` and the reasons `aggregate_source_duplicate`,
+  `envelope_member_missing`, `typed_diverges_from_envelope`, all spelled as
+  persist emits them, and `envelope_member_null` (CC 2.6.1.1.1 finding F4),
+  which persist does not emit: that is CIRISPersist#1098, kept out of v60 by
+  the task plan (§2). No CC text at rc9 (or on the rc10 branch at `9f6ff75`)
+  names `key_id_fingerprint_mismatch` or `carrier_without_roster_quorum`; the
+  witness latches both lists.
+- Witnesses: I1300 (every vendored CC file hashes to its pin: the registry, its
+  vectors, the four manifests, the six traces), I1301 (CIRISServer's catalogue
+  pin names the vendored vocabulary), I1302 (the pins are `git show
+  v1.0-rc9:` bytes and the tag is `VENDORED_CC_COMMIT`, when a
+  CIRISConstitution checkout is present: `$CIRIS_CC_REPO` or a sibling
+  directory; it skips, saying so, without one), I1303–I1306 (the table: every
+  two-path row in its corridor, the self-roster policy is the table's at every
+  roster size 1..=12, each corridor clause refused by its token, an unreadable
+  row refused not guessed), I1307 (memory, sqlite, postgres: under a table
+  whose self row is outside its corridor every roster change is refused and
+  nothing is held; under the vendored table the same changes land or are
+  held), I1308. `scripts/check_vendored_cc.sh` compares all twelve files.
+- Censuses moved by the re-vendor: `PINNING_FAMILIES` gains
+  `identity:occurrence_revocation` (`-1 only`, 16); the contradiction-count
+  contrast is 150 / 16 of 176.
+- Evidence: `CLM-governance-policy-table` (4.5.13) at
+  `governance_policy.rs#PolicyTable::admit`; `CLM-policy-corridor` (4.2.1.1)
+  at `governance_policy.rs#PolicyTable::check_corridor` and
+  `two_path.rs#TwoPathPolicy::check_corridor`; `EXPECTED` 323.
+- Mutation: `scripts/mutants/scope-s6v-vendor.txt`, 97 mutants, two weekly
+  shards in `mutants.yml`.
+- No migration. No store-trait method added or removed.
+
 ### Changed — hard_case rows replicate (CIRISConstitution#170 closed)
 
 The steward ruled through CC (2026-10-21, CIRISConstitution#170 closed, rc9

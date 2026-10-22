@@ -288,37 +288,6 @@ pub struct Counts {
 }
 
 impl TwoPathPolicy {
-    /// **The self roster's instance** (CC 3.3.6.3): ENACT a strict majority
-    /// of the live roster, proposer counted; CANCEL a strict majority of the
-    /// others; FLOOR one key (`0/1` lifted to [`FloorClass::SameIdentity`]'s
-    /// count minimum of one: every key is the same person's); reversible;
-    /// target silence for evictions; one open proposal per proposer and per
-    /// target; and, as `SelfRoster.tla` has it, a proposal the window does not
-    /// land stays open for the quorum path ([`AtWindow::StayOpen`]). At one key
-    /// ENACT is one vote: the add-device approval.
-    #[must_use]
-    pub fn self_roster(window_secs: i64) -> Self {
-        Self {
-            base: Base::StandingRoster,
-            enact: Threshold::StrictMajority,
-            cancel: Some(Threshold::StrictMajority),
-            cancel_over: CancelOver::Others,
-            floor: Some(Threshold::Fraction {
-                num: 0,
-                den: 1,
-                cmp: Cmp::AtLeast,
-            }),
-            floor_class: FloorClass::SameIdentity,
-            reverse_path: true,
-            at_window: AtWindow::StayOpen,
-            irreversible: false,
-            window_secs,
-            silence: SilenceRule::EvictOnly,
-            one_open_per_proposer: true,
-            one_open_per_target: true,
-        }
-    }
-
     /// The thresholds over `roster` for `proposer`'s proposal: ENACT by the
     /// table's own rule, CANCEL and FLOOR lifted to the count minimum
     /// (`max(min_count, …)`).
@@ -825,8 +794,15 @@ mod tests {
 
     const W: i64 = 86_400;
 
+    /// The self roster's policy: the CC table's rows (v60.0.0 S6v; the v59
+    /// constructor is gone), whose window is `W`.
     fn policy() -> TwoPathPolicy {
-        TwoPathPolicy::self_roster(W)
+        let p = crate::federation::governance_policy::table()
+            .expect("the vendored table")
+            .self_roster()
+            .expect("the self rows are in their corridor");
+        assert_eq!(p.window_secs, W);
+        p
     }
 
     fn keys(n: usize) -> Vec<String> {
@@ -1441,56 +1417,46 @@ mod tests {
         }
     }
 
-    /// CC's governance policy vectors (`tests/fixtures/governance_policy`,
-    /// rc9 `69fd22e`, pin `b7d2370d`): every family row is a [`TwoPathPolicy`], its
-    /// thresholds resolve to the vector's, and [`TwoPathPolicy::decide_counts`]
-    /// returns the vector's verdict, path and reason — all 732. A vector over
-    /// a non-standing base (the provisional expected-active law, not built)
-    /// names its base count, which the decision over counts takes as given;
-    /// those are counted.
+    /// CC's governance policy vectors (v60.0.0 S6v: the runtime manifests
+    /// `governance_policy.json` / `governance_policy_vectors.json` at the
+    /// `v1.0-rc9` tag, pin `b7d2370d`): every vector's family row is built
+    /// by the RUNTIME reader ([`PolicyTable::policy_of`](crate::federation::governance_policy::PolicyTable::policy_of)),
+    /// its thresholds resolve to the vector's, and
+    /// [`TwoPathPolicy::decide_counts`] returns the vector's verdict, path and
+    /// reason — all 732. A vector over a non-standing base (the provisional
+    /// expected-active law, not built) names its base count, which the
+    /// decision over counts takes as given; those are counted.
     #[test]
     fn governance_policy_vectors_replay() {
-        let table: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/governance_policy/governance_policy.json"
-        ))
-        .expect("table");
-        let vectors: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/governance_policy/governance_policy_vectors.json"
-        ))
-        .expect("vectors");
+        use crate::federation::governance_policy::{self as gp, DoorRule};
+        use crate::federation::namespace::cc_manifests;
+        let table = gp::table().expect("the vendored table");
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("namespace/governance_policy_vectors.json"))
+                .expect("vectors");
         assert_eq!(
-            table["_meta"]["policy_sha256"], vectors["_meta"]["policy_sha256"],
-            "the vectors are the table's"
+            vectors["_meta"]["policy_sha256"],
+            cc_manifests::VENDORED_GOVERNANCE_POLICY_SHA256,
+            "the vectors are the pinned table's"
         );
-        let frac = |v: &serde_json::Value, cmp: Cmp| -> Option<Threshold> {
-            Some(Threshold::Fraction {
-                num: u32::try_from(v.get("num")?.as_u64()?).ok()?,
-                den: u32::try_from(v.get("den")?.as_u64()?).ok()?,
-                cmp,
-            })
+        assert_eq!(
+            table.meta.policy_sha256,
+            cc_manifests::VENDORED_GOVERNANCE_POLICY_SHA256
+        );
+        let door = DoorRule {
+            silence: SilenceRule::Never,
+            one_open_per_proposer: true,
+            one_open_per_target: true,
         };
         let policy_of = |family: &str| -> TwoPathPolicy {
-            let row = table["families"]
-                .as_array()
-                .expect("families")
-                .iter()
-                .find(|r| r["family"] == family)
-                .unwrap_or_else(|| panic!("no family {family}"));
-            TwoPathPolicy {
-                base: Base::StandingRoster,
-                enact: frac(&row["enact"], Cmp::MoreThan).expect("a numeric enact"),
-                cancel: frac(&row["cancel"], Cmp::AtLeast),
-                cancel_over: CancelOver::Base,
-                floor: frac(&row["floor"], Cmp::AtLeast),
-                floor_class: FloorClass::Voters,
-                reverse_path: row["reverse_path"].as_bool().expect("reverse_path"),
-                at_window: AtWindow::Cancel,
-                irreversible: row["irreversible"].as_bool().expect("irreversible"),
-                window_secs: row["window_secs"].as_i64().expect("window"),
-                silence: SilenceRule::Never,
-                one_open_per_proposer: true,
-                one_open_per_target: true,
-            }
+            let row = table.row(family).expect("a vector names a table row");
+            let p = table.policy_of(row, door).expect("a two-path row");
+            assert_eq!(
+                table.check_corridor(row, &p).expect("readable"),
+                Ok(()),
+                "{family} is in its corridor"
+            );
+            p
         };
         let (mut replayed, mut skipped) = (0usize, 0usize);
         for v in vectors["vectors"].as_array().expect("vectors") {
