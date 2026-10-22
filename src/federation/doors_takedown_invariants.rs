@@ -213,6 +213,17 @@ pub(crate) mod bodies {
         sha_hex: &str,
         legacy_basis: &str,
     ) -> (TakedownNotice, String) {
+        legacy_contribution_notice_with(seed, sha_hex, legacy_basis, |_| {})
+    }
+
+    /// [`legacy_contribution_notice`] with `edit` applied to the payload
+    /// BEFORE the self-signature.
+    pub(crate) fn legacy_contribution_notice_with(
+        seed: u8,
+        sha_hex: &str,
+        legacy_basis: &str,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> (TakedownNotice, String) {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
         use ed25519_dalek::Signer as _;
@@ -239,6 +250,7 @@ pub(crate) mod bodies {
             "signature": {"ed25519": "", "ml_dsa_65": null, "signed_at": ts_of(t)},
             "submitted_at": ts_of(t),
         });
+        edit(&mut env["payload"]);
         let canonical = crate::verify::canonical::canonicalize_envelope_for_signing(&env).unwrap();
         env["signature"]["ed25519"] =
             serde_json::json!(B64.encode(key.sign(&canonical).to_bytes()));
@@ -335,9 +347,11 @@ pub(crate) mod bodies {
             "I1171: named as retired: {e}"
         );
         let record = format!("blob:{sha}");
-        // A whitespace member is empty (the compat read keeps v59's rule).
-        let (mut blank, _) = legacy_contribution_notice(0x6b, &sha, "dmca_512");
-        blank.envelope["payload"]["claim_text"] = serde_json::json!("  ");
+        // A whitespace member is empty (the compat read keeps v59's rule),
+        // even signed.
+        let (blank, _) = legacy_contribution_notice_with(0x6b, &sha, "dmca_512", |p| {
+            p["claimant_key_id"] = serde_json::json!("  ");
+        });
         let e =
             td::apply_replicated_takedown(dir, &blank, std::slice::from_ref(&record), "receiver")
                 .await
