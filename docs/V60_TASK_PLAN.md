@@ -88,7 +88,9 @@ and a real per-item holder listing where today only a symbol count is exposed. (
 over holders per item. (3) Role token `infra:relay` (steward-conferred, on owner-bound
 bundle-rooted identities, seat-like in the onion cap; Edge files the ask) and identity_type
 `rendezvous` (CC 3.1.4): no occurrence, no standing, key record travels inline, never admitted
-to the key plane as an identity. (4) Possession challenge (N6): weight rule is the interim;
+to the key plane as an identity; refusal token `federation_rendezvous_key_not_an_identity`
+(CC 3.1.4 `rendezvous:route:v1` row, rc10); a rendezvous node holding a mailbox MUST be a
+serve seat (CC 5.4.6 item 6), so the mailbox surface rides on #1101's predicate. (4) Possession challenge (N6): weight rule is the interim;
 the challenger is staged for the durability tier's first release.
 
 ## 3. The mutation discipline (S0, then every slice)
