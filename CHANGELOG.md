@@ -467,7 +467,7 @@ commit.
   `two_path.rs#TwoPathPolicy::check_corridor` (`EXPECTED` 323 at this
   commit; 326 with #1114 below).
 - Mutation: `scripts/mutants/scope-s6v-vendor.txt` (with #1114's three
-  functions), 112 mutants, three weekly shards in `mutants.yml`.
+  functions), 108 mutants, three weekly shards in `mutants.yml`.
 - No migration. No store-trait method added or removed.
 
 ### Changed — three signed-object refusals carry their own `malformed_row` reasons (CIRISPersist#1114, CC 2.6.1.7 rc10)

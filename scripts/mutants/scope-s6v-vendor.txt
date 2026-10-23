@@ -8,7 +8,7 @@
 #   replayed through the runtime reader, I1307 (memory, sqlite, postgres).
 # - The corridor itself: `two_path.rs` `TwoPathPolicy::check_corridor`
 #   (PolicyCorridor.lean's examples, I1305).
-# - The admission site: `self_roster.rs` `policy` / `applied_window` (the door
+# - The admission site: `self_roster.rs` `policy` (the door
 #   reads its policy from the table; I1307 at the door, I1132 the lone path
 #   over the table's window, the six CC self_roster traces).
 # - The registry loader the re-vendor moved: `registry.rs` `parse_manifest`,
@@ -25,7 +25,7 @@ tests: test(/governance_policy::|two_path::tests::|i1307|i1132|cc_manifests::|na
 
 src/federation/governance_policy.rs
 src/federation/two_path.rs check_corridor
-src/federation/self_roster.rs policy applied_window
+src/federation/self_roster.rs policy
 src/federation/namespace/registry.rs parse_manifest registry parse_polarity_classes
 src/federation/tier_ingest.rs check_content_hash
 src/federation/admission.rs check_row_mirror_members_closed

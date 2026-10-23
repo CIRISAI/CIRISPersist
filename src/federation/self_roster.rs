@@ -103,22 +103,26 @@ pub const W_SELF_SECS: i64 = 86_400;
 /// self corridor, unreadable, or disagree: the door decides nothing.
 pub fn policy() -> Result<TwoPathPolicy, Error> {
     let table = super::governance_policy::table()?.self_roster()?;
-    Ok(TwoPathPolicy {
-        window_secs: applied_window(table.window_secs),
-        ..table
-    })
+    Ok(harness_window(table))
 }
 
-/// The table's window, or the live test-anchor harness's (#1111): the same
-/// rule as [`w_self_secs`], over the table's value.
-fn applied_window(table_secs: i64) -> i64 {
-    #[cfg(feature = "test-anchor")]
+/// A `test-anchor` build only: the live harness's window (#1111) replaces
+/// the table's, the same rule as [`w_self_secs`]. Without the feature there
+/// is nothing to replace, so production carries no window override at all.
+#[cfg(feature = "test-anchor")]
+fn harness_window(mut policy: TwoPathPolicy) -> TwoPathPolicy {
     if super::genesis::test_anchor_override_active() {
         if let Some(secs) = test_window::env_secs() {
-            return secs;
+            policy.window_secs = secs;
         }
     }
-    table_secs
+    policy
+}
+
+/// See the `test-anchor` twin: a production build decides under the table.
+#[cfg(not(feature = "test-anchor"))]
+fn harness_window(policy: TwoPathPolicy) -> TwoPathPolicy {
+    policy
 }
 
 /// `W_self` as this node applies it: [`W_SELF_SECS`], on every production
