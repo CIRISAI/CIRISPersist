@@ -138,6 +138,12 @@ tokens census_return_recipient_not_seat / census_return_expired /
 census_composite_signer_not_seat / census_composite_below_k; "cells sum to mass" needs a
 signed mass_total member, a Merkle root cannot be summed; the objection tally stays an
 identified count and does not ride the anonymising carrier (one COUNT path, two instruments).
+SETTLED with Edge 10-23 (section 10 at CIRISEdge feat/onion-fsd 0f56b86): seven families
+(`census:share|partial|composite:{class}:v1`, `census:expected_active:v1`,
+`census:member:share|partial:v1`, `ballot:tally:{poll_id}:v1`), the `addressed` placement for
+every share row (member shares addressed to a tally MEMBER of the room, never room-held), sums
+mod the field prime, one composite per (class, period) by the share_index-0 seat, 19 tokens;
+final list sent to CC to register; persist's door work is #1121 (after v60, depends on #1101).
 
 ## 3. The mutation discipline (S0, then every slice)
 
