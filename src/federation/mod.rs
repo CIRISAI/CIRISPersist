@@ -60,6 +60,15 @@ pub mod attestation_emit;
 /// decided once: `plan_put_community`, the three roster plans, and the
 /// per-backend `CommunityStore` executor.
 pub(crate) mod community_admit;
+/// v60.0.0 (CIRISPersist#934 step 4) — the consent doors, decided once:
+/// the consent-role and trust-grant plans, the consent read folds, and the
+/// per-backend `ConsentStore` executor.
+pub(crate) mod consent_admit;
+/// v60.0.0 (CIRISPersist#934 step 4) — the sweeps' selections, decided once:
+/// the PQC sweep's page, the reaper's page, the known-hash eviction report and
+/// the room retention leg, with the per-backend `SweepStore` /
+/// `RoomEvictionStore` executors.
+pub(crate) mod sweep_plan;
 // v56.0.0 (CIRISPersist#1001) — the typed bounded attestation read.
 pub mod attestation_query;
 #[cfg(test)]
@@ -182,6 +191,9 @@ pub(crate) mod community_trust_consent_invariants;
 /// v48.0.0 (CIRISPersist#905) — the by-principals consent sweep witnesses.
 #[cfg(test)]
 pub mod consent_sweep_principals_invariants;
+// v60.0.0 (CIRISPersist#934 step 4, #1105) — I1192–I1201.
+#[cfg(test)]
+mod consent_sweep_plan_invariants;
 /// v53.1.0 (CIRISPersist#979) — I480–I487: a chunk of a withdrawn file is
 /// judged by its file.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -3972,6 +3984,41 @@ pub trait FederationDirectory: Send + Sync {
         let _ = (kind, after_content_hash, limit);
         Err(Error::Unsupported {
             method: "list_wire_hashes_since",
+        })
+    }
+
+    /// v60.0.0 (CIRISPersist#1105, Edge ask) — **the held hash set of ONE
+    /// key-plane family**: the `Attestation`-kind wire hashes
+    /// ([`Self::list_wire_hashes_since`]) of the `scores` rows whose
+    /// dimension is `family`, one of
+    /// [`key_plane::HOLDINGS_FAMILIES`](key_plane::HOLDINGS_FAMILIES)
+    /// (`key:record:v1`, `key:revocation:v1`, `identity:occurrence:v1`,
+    /// `identity:occurrence_revocation:v1`). Paged and cursored exactly like
+    /// [`Self::list_wire_hashes_since`]: the hash is the keyset, `None`
+    /// starts, the result is complete across pages.
+    ///
+    /// Edge computed each key-plane family's holdings by reading the whole
+    /// `Attestation` index and filtering, three extra index reads per peer
+    /// per round. This read seeks the family's rows and joins their index
+    /// entries, so the hashes are the index's own (what this node
+    /// advertises) and the union over the four families is a subset of the
+    /// `Attestation` set, never a different set.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] for a `family` that is not a key-plane
+    /// family (never an empty set: "no hashes" and "not a family" must not
+    /// read the same to a set difference). The default refuses as
+    /// [`Self::list_wire_hashes_since`]'s does.
+    async fn list_key_plane_wire_hashes_since(
+        &self,
+        family: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, Error> {
+        let _ = (family, after_content_hash, limit);
+        Err(Error::Unsupported {
+            method: "list_key_plane_wire_hashes_since",
         })
     }
 

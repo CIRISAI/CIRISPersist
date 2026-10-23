@@ -17,7 +17,7 @@ pub mod bodies {
 
     /// A federation-tier row signed by `signer` — the consent-by-humans
     /// fixture shape (sign → seal → reseal).
-    fn row(
+    pub(crate) fn row(
         id: &str,
         signer: &str,
         target: &str,
@@ -80,7 +80,7 @@ pub mod bodies {
 
     /// `author` withdraws its own row `target` — the structural composer the
     /// peer-set projection folds on (`revocation_fold_target`).
-    fn withdraws(id: &str, author: &str, target: &str) -> Attestation {
+    pub(crate) fn withdraws(id: &str, author: &str, target: &str) -> Attestation {
         let mut r = row(
             id,
             author,
@@ -94,7 +94,7 @@ pub mod bodies {
         r
     }
 
-    async fn put(d: &dyn FederationDirectory, a: Attestation) {
+    pub(crate) async fn put(d: &dyn FederationDirectory, a: Attestation) {
         d.put_attestation(SignedAttestation { attestation: a })
             .await
             .unwrap_or_else(|e| panic!("put {}: {e}", "attestation"));

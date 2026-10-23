@@ -319,6 +319,370 @@ impl PostgresBackend {
     }
 }
 
+/// v60.0.0 (CIRISPersist#934 step 4) — a shared plan's rendered binds as
+/// postgres parameters.
+fn pg_params(
+    binds: Vec<crate::federation::attestation_query::Bind>,
+) -> Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> {
+    use crate::federation::attestation_query::Bind;
+    binds
+        .into_iter()
+        .map(|b| -> Box<dyn tokio_postgres::types::ToSql + Sync + Send> {
+            match b {
+                Bind::Text(t) => Box::new(t),
+                Bind::Time(t) => Box::new(t),
+                Bind::Int(n) => Box::new(n),
+            }
+        })
+        .collect()
+}
+
+/// Run one rendered statement and return its rows.
+async fn pg_query_statement<C>(
+    client: &C,
+    stmt: crate::federation::attestation_query::Statement,
+) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    let params = pg_params(stmt.binds);
+    let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+        params.iter().map(|p| p.as_ref() as _).collect();
+    client.query(&stmt.sql, &params_ref[..]).await
+}
+
+/// v60.0.0 (CIRISPersist#934 step 4) — the sweeps' executor on postgres.
+/// Storage only: the selections are `federation::sweep_plan`'s.
+#[async_trait::async_trait]
+impl crate::federation::sweep_plan::SweepStore for PostgresBackend {
+    async fn read_hybrid_pending(
+        &self,
+        selection: crate::federation::sweep_plan::HybridPendingSelection,
+    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = pg_query_statement(
+            &**client,
+            selection.render(crate::federation::attestation_query::Dialect::Postgres),
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("read_hybrid_pending: {e}")))?;
+        rows.into_iter()
+            .map(|row| {
+                let mk_err = crate::federation::Error::Backend;
+                Ok(crate::federation::HybridPendingRow {
+                    id: row.safe_get_with("row_id", mk_err)?,
+                    // v31.0.0 (#644) — TEXT since V122.
+                    envelope: pg_envelope_value(
+                        &row.safe_get_with::<String, _, _, _>("envelope", mk_err)?,
+                        "envelope",
+                    )?,
+                    classical_sig_b64: row.safe_get_with("scrub_signature_classical", mk_err)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn read_expired_attestation_ids(
+        &self,
+        selection: crate::federation::sweep_plan::ExpiredSelection,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let client = self.pool().get().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("list_expired_attestation_ids pool: {e}"))
+        })?;
+        let rows = pg_query_statement(
+            &**client,
+            selection.render(crate::federation::attestation_query::Dialect::Postgres),
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_expired_attestation_ids: {e}"))
+        })?;
+        rows.iter()
+            .map(|r| r.safe_get_with("attestation_id", crate::federation::Error::Backend))
+            .collect()
+    }
+
+    async fn evict_known_wire_hashes_before(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(u64, u64), crate::federation::Error> {
+        let client = self.pool().get().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("evict_known_wire_hashes pool: {e}"))
+        })?;
+        let evicted = client
+            .execute(
+                "DELETE FROM cirislens.known_wire_hashes WHERE last_advertised_at < $1",
+                &[&cutoff],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("evict_known_wire_hashes: {e}"))
+            })?;
+        let row = client
+            .query_one("SELECT COUNT(*) FROM cirislens.known_wire_hashes", &[])
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("evict_known_wire_hashes count: {e}"))
+            })?;
+        let remaining: i64 =
+            row.safe_get_with::<i64, _, _, _>("count", crate::federation::Error::Backend)?;
+        Ok((evicted, u64::try_from(remaining).unwrap_or(0)))
+    }
+}
+
+/// v60.0.0 (CIRISPersist#934 step 4) — the room leg's executor on postgres:
+/// the read, the shared selection and the delete in one transaction.
+#[async_trait::async_trait]
+impl crate::federation::sweep_plan::RoomEvictionStore for PostgresBackend {
+    async fn evict_selected_room_epochs(
+        &self,
+        eviction: crate::federation::sweep_plan::RoomChunkEviction,
+    ) -> Result<u64, crate::federation::BlobError> {
+        use crate::federation::sweep_plan::RoomEpochRow;
+        let be = |e: tokio_postgres::Error| {
+            crate::federation::BlobError::Backend(format!("stream_dek_evict_room_chunks: {e}"))
+        };
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client.transaction().await.map_err(be)?;
+        // `FOR UPDATE OF d`: a concurrent sweep of the same minter waits here
+        // rather than reading the same epochs as not yet evicted.
+        let rows: Vec<RoomEpochRow> = tx
+            .query(
+                "SELECT d.stream_id, d.epoch, d.cohort_scope, d.room_epoch, \
+                        d.terminated_at IS NOT NULL AS terminated, \
+                        d.evicted_at IS NOT NULL AS evicted, \
+                        EXISTS (SELECT 1 FROM cirislens.federation_stream_chunks c2 \
+                                 JOIN cirislens.federation_dag_chunks dc \
+                                   ON dc.chunk_sha256 = c2.chunk_sha \
+                                 JOIN cirislens.federation_blobs m \
+                                   ON m.sha256 = dc.manifest_sha256 \
+                                WHERE c2.stream_id = d.stream_id AND c2.epoch = d.epoch) \
+                          AS manifest_held \
+                   FROM cirislens.federation_stream_deks d \
+                  WHERE d.group_key_id = $1 AND d.owner_key_id = $2 \
+                  FOR UPDATE OF d",
+                &[&eviction.community_key_id, &eviction.minter_key_id],
+            )
+            .await
+            .map_err(be)?
+            .into_iter()
+            .map(|r| {
+                Ok(RoomEpochRow {
+                    stream_id: r.try_get("stream_id")?,
+                    epoch: r.try_get("epoch")?,
+                    cohort_scope: r.try_get("cohort_scope")?,
+                    room_epoch: r.try_get("room_epoch")?,
+                    terminated: r.try_get("terminated")?,
+                    evicted: r.try_get("evicted")?,
+                    manifest_held: r.try_get("manifest_held")?,
+                })
+            })
+            .collect::<Result<_, tokio_postgres::Error>>()
+            .map_err(be)?;
+        let mut deleted = 0u64;
+        for row in rows.iter().filter(|r| eviction.selects(r)) {
+            deleted += tx
+                .execute(
+                    "DELETE FROM cirislens.federation_blobs WHERE sha256 IN ( \
+                        SELECT chunk_sha FROM cirislens.federation_stream_chunks \
+                         WHERE stream_id = $1 AND epoch = $2)",
+                    &[&row.stream_id, &row.epoch],
+                )
+                .await
+                .map_err(be)?;
+            tx.execute(
+                "UPDATE cirislens.federation_stream_deks SET evicted_at = $3 \
+                  WHERE stream_id = $1 AND epoch = $2",
+                &[&row.stream_id, &row.epoch, &eviction.now],
+            )
+            .await
+            .map_err(be)?;
+        }
+        tx.commit().await.map_err(be)?;
+        Ok(deleted)
+    }
+}
+
+/// v60.0.0 (CIRISPersist#934 step 4) — the consent plane's executor on
+/// postgres. Storage only: the decisions are `federation::consent_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::consent_admit::ConsentStore for PostgresBackend {
+    async fn store_planned_consent_role(
+        &self,
+        planned: crate::federation::consent_admit::PlannedConsentRole,
+    ) -> Result<bool, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // v36.0.0 (CIRISPersist#707) — `consent_role` IS in the served
+        // `KeyRecord` bytes, so this rewrite must move the serve position.
+        let mutated_at = self.next_key_serve_position(&client).await?;
+        let n = client
+            .execute(
+                "UPDATE cirislens.federation_keys SET consent_role = $2, mutated_at = $3 \
+                 WHERE key_id = $1",
+                &[&planned.key_id, &planned.stored(), &mutated_at],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "set_consent_role {}: {e}",
+                    planned.key_id
+                ))
+            })?;
+        drop(client);
+        if n == 0 {
+            return Ok(false);
+        }
+        // v31.0.0 (CIRISPersist#640) — index AFTER the write, from the row as
+        // stored.
+        self.index_stored_key_row(&planned.key_id).await?;
+        Ok(true)
+    }
+
+    async fn store_planned_trust_grant(
+        &self,
+        row: crate::federation::TrustRow,
+    ) -> Result<bool, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // PG TEXT[] binds from `&Vec<String>`; `None` stays NULL.
+        let n = client
+            .execute(
+                "UPDATE cirislens.federation_keys \
+                 SET trust_type = $2, trust_relationship = $3, trust_domains = $4, \
+                     trusted_by = $5, trusted_at = $6, expires_at = $7 \
+                 WHERE key_id = $1",
+                &[
+                    &row.key,
+                    &row.trust_type.as_str(),
+                    &row.trust_relationship.as_str(),
+                    &row.trust_domains,
+                    &row.trusted_by,
+                    &row.trusted_at,
+                    &row.expires_at,
+                ],
+            )
+            .await
+            // The V020 CHECKs (no self-trust, registry-requires-domains)
+            // cannot fire: the plan's shape validation refused both before
+            // the executor ran. A violation would be the plan's defect, and
+            // reads as the substrate error it then is.
+            .map_err(|e| crate::federation::Error::Backend(format!("grant_trust UPDATE: {e}")))?;
+        Ok(n > 0)
+    }
+
+    async fn read_consent_peer_rows(
+        &self,
+        read: crate::federation::consent_admit::ConsentRead<'_>,
+    ) -> Result<Vec<crate::federation::consent_admit::ConsentPeerRow>, crate::federation::Error>
+    {
+        use crate::federation::consent_admit::{ConsentPeerRow, ConsentRead};
+        let sql = match read {
+            ConsentRead::Node(_) => {
+                "SELECT node_key_id AS author_key_id, peer_key_id FROM cirislens.consent_peer_set \
+                 WHERE node_key_id = $1"
+            }
+            ConsentRead::For(_) => {
+                "SELECT author_key_id, peer_key_id FROM cirislens.consent_peer_set_for \
+                 WHERE for_key_id = $1"
+            }
+        };
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client.query(sql, &[&read.key()]).await.map_err(|e| {
+            crate::federation::Error::Backend(format!("read_consent_peer_rows: {e}"))
+        })?;
+        rows.into_iter()
+            .map(|r| {
+                let mk_err = crate::federation::Error::Backend;
+                Ok(ConsentPeerRow {
+                    author_key_id: r.safe_get_with("author_key_id", mk_err)?,
+                    peer_key_id: r.safe_get_with("peer_key_id", mk_err)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn read_live_consent_grant_candidates(
+        &self,
+        read: crate::federation::consent_admit::ConsentRead<'_>,
+    ) -> Result<crate::federation::attestation_query::QueryRows, crate::federation::Error> {
+        use crate::federation::consent_admit::ConsentRead;
+        let sql = match read {
+            ConsentRead::Node(_) => format!(
+                "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations fa \
+                 WHERE fa.attesting_key_id = $1 \
+                   AND EXISTS (SELECT 1 FROM cirislens.consent_peer_set cps \
+                               WHERE cps.source_attestation_id = fa.attestation_id::text)"
+            ),
+            ConsentRead::For(_) => format!(
+                "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations fa \
+                 WHERE EXISTS (SELECT 1 FROM cirislens.consent_peer_set_for cps \
+                               WHERE cps.source_attestation_id = fa.attestation_id::text \
+                                 AND cps.for_key_id = $1)"
+            ),
+        };
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client.query(&sql, &[&read.key()]).await.map_err(|e| {
+            crate::federation::Error::Backend(format!("read_live_consent_grant_candidates: {e}"))
+        })?;
+        let bytes = pg_envelope_bytes(&rows);
+        let rows = rows
+            .into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<_, _>>()?;
+        Ok(crate::federation::attestation_query::QueryRows {
+            rows,
+            bytes,
+            backend: crate::observe::StoreBackend::Postgres,
+        })
+    }
+
+    async fn read_consent_revocation_candidates(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // Not tier-filtered: the §10.1.3 promotion-overdue check needs the
+        // local-tier rows.
+        let base = format!(
+            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+             WHERE (attestation_type = 'withdraws' OR (dimension COLLATE \"C\") LIKE '{rev}%')",
+            rev = crate::federation::consent::consent_dimension::STATE_REVOKED_PREFIX,
+        );
+        let rows = match since {
+            Some(s) => {
+                client
+                    .query(&format!("{base} AND asserted_at >= $1"), &[&s])
+                    .await
+            }
+            None => client.query(&base, &[]).await,
+        }
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("read_consent_revocation_candidates: {e}"))
+        })?;
+        rows.into_iter().map(pg_row_to_attestation).collect()
+    }
+}
+
 /// v58.0.0 (CIRISPersist#991) — the key plane's executor on postgres.
 /// Storage only: the decisions are `federation::key_plane`'s plans.
 #[async_trait::async_trait]
@@ -426,6 +790,26 @@ impl crate::federation::key_plane::KeyPlaneStore for PostgresBackend {
     /// ([`PlannedKeyRecord::raced`](crate::federation::key_plane::PlannedKeyRecord::raced)).
     /// The serve position (V126 `admitted_at` on an insert, #707
     /// `mutated_at` on a rewrite) is allocated inside the transaction.
+    async fn read_key_plane_wire_hashes(
+        &self,
+        read: crate::federation::key_plane::KeyPlaneHoldingsRead,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let client = self.pool().get().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("list_key_plane_wire_hashes_since pool: {e}"))
+        })?;
+        let rows = pg_query_statement(
+            &**client,
+            read.render(crate::federation::attestation_query::Dialect::Postgres),
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_key_plane_wire_hashes_since: {e}"))
+        })?;
+        rows.iter()
+            .map(|r| r.safe_get_with("content_hash", crate::federation::Error::Backend))
+            .collect()
+    }
+
     async fn store_planned_key_record(
         &self,
         planned: crate::federation::key_plane::PlannedKeyRecord,
@@ -6739,39 +7123,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         key_id: &str,
         consent_role: Option<&str>,
     ) -> Result<(), crate::federation::Error> {
-        crate::federation::types::consent_role::check_admissible(consent_role)?;
-        let stored =
-            crate::federation::types::consent_role::stored_from_wire(consent_role).to_owned();
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // v36.0.0 (CIRISPersist#707) — `consent_role` IS in the served
-        // `KeyRecord` bytes, so this rewrite must move the serve position or a
-        // consumer past the cursor never learns the role changed.
-        let mutated_at = self.next_key_serve_position(&client).await?;
-        let n = client
-            .execute(
-                "UPDATE cirislens.federation_keys SET consent_role = $2, mutated_at = $3 \
-                 WHERE key_id = $1",
-                &[&key_id, &stored, &mutated_at],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("set_consent_role {key_id}: {e}"))
-            })?;
-        if n == 0 {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "set_consent_role: no federation_keys row for {key_id}"
-            )));
-        }
-        // v31.0.0 (CIRISPersist#640) — index AFTER the write, from the row as
-        // stored. This used to reload BEFORE the UPDATE and hand-patch
-        // `consent_role` onto the result — a model of what the write was about
-        // to produce, which is the same guess `key_entry(&row)` was making
-        // everywhere else. Reading it back removes the model.
-        drop(client);
-        self.index_stored_key_row(key_id).await?;
+        // v60.0.0 (CIRISPersist#934 step 4) — the decision is the shared plan's.
+        crate::federation::consent_admit::set_consent_role_planned(self, key_id, consent_role)
+            .await?;
         Ok(())
     }
 
@@ -7048,7 +7402,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         axis: &crate::federation::key_grant::KeyGrantAxis,
     ) -> Result<Option<String>, crate::federation::Error> {
-        crate::federation::key_grant::held_owner(self, axis).await
+        // v60.0.0 (CIRISPersist#934 step 4) — the one shared read.
+        let owner = crate::federation::key_grant::held_owner(self, axis).await?;
+        Ok(owner)
     }
 
     /// v55.0.0 (CIRISPersist#989) — a key-grant row admitted by a typed door
@@ -7057,7 +7413,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         row: &crate::federation::Attestation,
     ) -> Result<(), crate::federation::Error> {
-        crate::federation::key_grant::project_if_key_grant_row(self, row).await
+        // v60.0.0 (CIRISPersist#934 step 4) — the one shared projection plan.
+        crate::federation::key_grant::project_if_key_grant_row(self, row).await?;
+        Ok(())
     }
 
     /// v50.0.0 (CIRISPersist#916) — the receive doors' re-wrap: this node's
@@ -7395,56 +7753,21 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         for_key_id: &str,
     ) -> Result<Vec<(String, String)>, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let rows = client
-            .query(
-                "SELECT DISTINCT author_key_id, peer_key_id FROM cirislens.consent_peer_set_for \
-                 WHERE for_key_id = $1 ORDER BY author_key_id ASC, peer_key_id ASC",
-                &[&for_key_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_consent_peers_for: {e}"))
-            })?;
-        rows.into_iter()
-            .map(|r| {
-                Ok((
-                    r.try_get::<_, String>("author_key_id").map_err(|e| {
-                        crate::federation::Error::Backend(format!("author_key_id: {e}"))
-                    })?,
-                    r.try_get::<_, String>("peer_key_id").map_err(|e| {
-                        crate::federation::Error::Backend(format!("peer_key_id: {e}"))
-                    })?,
-                ))
-            })
-            .collect()
+        // v60.0.0 (CIRISPersist#934 step 4) — one fold over the typed read.
+        let pairs =
+            crate::federation::consent_admit::list_consent_peers_for_planned(self, for_key_id)
+                .await?;
+        Ok(pairs)
     }
 
     async fn list_consent_peers(
         &self,
         node_key_id: &str,
     ) -> Result<Vec<String>, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let rows = client
-            .query(
-                "SELECT DISTINCT peer_key_id FROM cirislens.consent_peer_set \
-                 WHERE node_key_id = $1 ORDER BY peer_key_id ASC",
-                &[&node_key_id],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("list_consent_peers: {e}")))?;
-        rows.into_iter()
-            .map(|r| {
-                r.try_get::<_, String>("peer_key_id")
-                    .map_err(|e| crate::federation::Error::Backend(format!("peer_key_id: {e}")))
-            })
-            .collect()
+        // v60.0.0 (CIRISPersist#934 step 4) — one fold over the typed read.
+        let peers =
+            crate::federation::consent_admit::list_consent_peers_planned(self, node_key_id).await?;
+        Ok(peers)
     }
 
     /// v21.2.0 (CIRISPersist#509 FLOOR) — `node_key_id`'s LIVE
@@ -7457,49 +7780,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         node_key_id: &str,
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let rows = client
-            .query(
-                "SELECT fa.attestation_id::text, fa.attesting_key_id, fa.attested_key_id, \
-                    fa.attestation_type, fa.weight::float8 AS weight, fa.asserted_at, \
-                    fa.expires_at, fa.attestation_envelope, fa.original_content_hash, \
-                    fa.scrub_signature_classical, fa.scrub_signature_pqc, fa.scrub_key_id, \
-                    fa.scrub_timestamp, fa.pqc_completed_at, fa.persist_row_hash, \
-                    fa.subject_key_ids, fa.withdraws_admission_rule, fa.cohort_scope, fa.tier, \
-                    fa.promoted_at, fa.additional_scrubs \
-                 FROM cirislens.federation_attestations fa \
-                 WHERE fa.attesting_key_id = $1 \
-                   AND EXISTS (SELECT 1 FROM cirislens.consent_peer_set cps \
-                               WHERE cps.source_attestation_id = fa.attestation_id::text) \
-                 ORDER BY fa.asserted_at DESC",
-                &[&node_key_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_live_consent_grants_by: {e}"))
-            })?;
-        let bytes = pg_envelope_bytes(&rows);
-        let candidates: Vec<crate::federation::Attestation> = rows
-            .into_iter()
-            .map(pg_row_to_attestation)
-            .collect::<Result<_, _>>()?;
-        let rows: Vec<crate::federation::Attestation> = candidates
-            .into_iter()
-            .filter(|a| {
-                crate::federation::admission::envelope_dimension(&a.attestation_envelope)
-                    == Some(crate::federation::consent_peer_set::DIMENSION)
-            })
-            .collect();
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Postgres,
-            crate::observe::Door::ListLiveConsentGrantsBy,
-            node_key_id,
-            &rows,
-            bytes,
-        );
+        // v60.0.0 (CIRISPersist#934 step 4) — one fold over the typed read.
+        let rows = crate::federation::consent_admit::live_consent_grants_planned(
+            self,
+            crate::federation::consent_admit::ConsentRead::Node(node_key_id),
+        )
+        .await?;
         Ok(rows)
     }
 
@@ -7509,50 +7795,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         for_key_id: &str,
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let rows = client
-            .query(
-                "SELECT fa.attestation_id::text, fa.attesting_key_id, fa.attested_key_id, \
-                    fa.attestation_type, fa.weight::float8 AS weight, fa.asserted_at, \
-                    fa.expires_at, fa.attestation_envelope, fa.original_content_hash, \
-                    fa.scrub_signature_classical, fa.scrub_signature_pqc, fa.scrub_key_id, \
-                    fa.scrub_timestamp, fa.pqc_completed_at, fa.persist_row_hash, \
-                    fa.subject_key_ids, fa.withdraws_admission_rule, fa.cohort_scope, fa.tier, \
-                    fa.promoted_at, fa.additional_scrubs \
-                 FROM cirislens.federation_attestations fa \
-                 WHERE 1 = 1 \
-                   AND EXISTS (SELECT 1 FROM cirislens.consent_peer_set_for cps \
-                               WHERE cps.source_attestation_id = fa.attestation_id::text \
-                                 AND cps.for_key_id = $1) \
-                 ORDER BY fa.asserted_at DESC",
-                &[&for_key_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_live_consent_grants_by: {e}"))
-            })?;
-        let bytes = pg_envelope_bytes(&rows);
-        let candidates: Vec<crate::federation::Attestation> = rows
-            .into_iter()
-            .map(pg_row_to_attestation)
-            .collect::<Result<_, _>>()?;
-        let rows: Vec<crate::federation::Attestation> = candidates
-            .into_iter()
-            .filter(|a| {
-                crate::federation::admission::envelope_dimension(&a.attestation_envelope)
-                    == Some(crate::federation::consent_peer_set::DIMENSION)
-            })
-            .collect();
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Postgres,
-            crate::observe::Door::ListLiveConsentGrantsFor,
-            for_key_id,
-            &rows,
-            bytes,
-        );
+        // v60.0.0 (CIRISPersist#934 step 4) — one fold over the typed read.
+        let rows = crate::federation::consent_admit::live_consent_grants_planned(
+            self,
+            crate::federation::consent_admit::ConsentRead::For(for_key_id),
+        )
+        .await?;
         Ok(rows)
     }
 
@@ -7753,6 +8001,23 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     /// `identity_canonical_binding.binding_attestation_id` via `ON DELETE SET
     /// NULL` (V121).
     /// v38.7.0 (CIRISPersist#780) — index-only hash page for one kind.
+    async fn list_key_plane_wire_hashes_since(
+        &self,
+        family: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        // v60.0.0 (CIRISPersist#1105) — one shared read plan.
+        let hashes = crate::federation::key_plane::list_key_plane_wire_hashes_planned(
+            self,
+            family,
+            after_content_hash,
+            limit,
+        )
+        .await?;
+        Ok(hashes)
+    }
+
     async fn list_wire_hashes_since(
         &self,
         kind: &str,
@@ -7910,39 +8175,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         cutoff: chrono::DateTime<chrono::Utc>,
         bound: u64,
     ) -> Result<crate::federation::KnownHashEviction, crate::federation::Error> {
-        let client = self.pool().get().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("evict_known_wire_hashes pool: {e}"))
-        })?;
-        // Only entries NOT advertised since the caller's cutoff. Persist never
-        // computes that instant — edge owns the wrap period and hands over the
-        // resulting timestamp, so there is exactly one owner of the number and
-        // nothing derived on this side of the boundary to go stale.
-        let evicted = client
-            .execute(
-                "DELETE FROM cirislens.known_wire_hashes WHERE last_advertised_at < $1",
-                &[&cutoff],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("evict_known_wire_hashes: {e}"))
-            })?;
-        let row = client
-            .query_one("SELECT COUNT(*) FROM cirislens.known_wire_hashes", &[])
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("evict_known_wire_hashes count: {e}"))
-            })?;
-        let remaining: i64 =
-            row.safe_get_with::<i64, _, _, _>("count", crate::federation::Error::Backend)?;
-        let remaining = u64::try_from(remaining).unwrap_or(0);
-        Ok(crate::federation::KnownHashEviction {
-            evicted,
-            remaining,
-            // Reported, never resolved by evicting further: everything left is
-            // younger than the floor, and forgetting one of those is invisible
-            // until edge's re-sweep wraps back to it.
-            over_bound_by: remaining.saturating_sub(bound),
-        })
+        // v60.0.0 (CIRISPersist#934 step 4) — the report is shared; the cutoff is
+        // the caller's (edge owns the wrap period), never derived here.
+        let report =
+            crate::federation::sweep_plan::evict_known_wire_hashes_planned(self, cutoff, bound)
+                .await?;
+        Ok(report)
     }
 
     /// v38.4.0 (CIRISPersist#768) — expired ids, oldest first, bounded.
@@ -7952,31 +8190,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<String>, crate::federation::Error> {
-        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
-        let off = i64::try_from(offset).unwrap_or(0);
-        let client = self.pool().get().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("list_expired_attestation_ids pool: {e}"))
-        })?;
-        let rows = client
-            .query(
-                "SELECT attestation_id FROM cirislens.federation_attestations \
-                 WHERE expires_at IS NOT NULL AND expires_at < $1 \
-                   AND attestation_type NOT IN \
-                       ('supersedes', 'withdraws', 'recants', 'delegates_to') \
-                 ORDER BY expires_at LIMIT $2 OFFSET $3",
-                &[&now, &lim, &off],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_expired_attestation_ids: {e}"))
-            })?;
-        rows.iter()
-            .map(|r| {
-                r.try_get::<_, String>("attestation_id").map_err(|e| {
-                    crate::federation::Error::Backend(format!("decode expired id: {e}"))
-                })
-            })
-            .collect()
+        // v60.0.0 (CIRISPersist#934 step 4) — the reaper's selection is shared.
+        let ids = crate::federation::sweep_plan::list_expired_attestation_ids_planned(
+            self, now, limit, offset,
+        )
+        .await?;
+        Ok(ids)
     }
 
     /// v38.4.0 (PR #769 review) — drop the projections the purged row owned.
@@ -11801,50 +12020,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         since: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // Subject-side revocations only: a `withdraws` admitted under rule
-        // 2/3/4 (rule 1 is the producer's own revoke), or a
-        // `consent:state:revoked` stance. NOT tier-filtered — the §10.1.3
-        // promotion-overdue check needs the local-tier rows too.
-        let cols = "attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
-            weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
-            original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-            scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, \
-            withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs";
-        // v20.0.0 (#495 C3) — dimension path + revoked prefix from the ONE
-        // constants (drift meant list_consent_revocations silently empty).
-        let pred = format!(
-            "((attestation_type = 'withdraws' AND withdraws_admission_rule IN (2, 3, 4)) \
-                    OR (attestation_envelope::jsonb->>'{dim}') LIKE '{rev}%')",
-            dim = crate::federation::envelope::paths::DIMENSION,
-            rev = crate::federation::consent::consent_dimension::STATE_REVOKED_PREFIX,
-        );
-        let rows = if let Some(s) = since {
-            client
-                .query(
-                    &format!(
-                        "SELECT {cols} FROM cirislens.federation_attestations \
-                         WHERE {pred} AND asserted_at >= $1 ORDER BY asserted_at DESC"
-                    ),
-                    &[&s],
-                )
-                .await
-        } else {
-            client
-                .query(
-                    &format!(
-                        "SELECT {cols} FROM cirislens.federation_attestations \
-                         WHERE {pred} ORDER BY asserted_at DESC"
-                    ),
-                    &[],
-                )
-                .await
-        }
-        .map_err(|e| crate::federation::Error::Backend(format!("list_consent_revocations: {e}")))?;
-        rows.into_iter().map(pg_row_to_attestation).collect()
+        // v60.0.0 (CIRISPersist#934 step 4) — one fold over the typed read.
+        let rows =
+            crate::federation::consent_admit::consent_revocations_planned(self, since).await?;
+        Ok(rows)
     }
 
     async fn communities_containing(
@@ -13676,75 +13855,28 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         limit: i64,
     ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let rows = client
-            .query(
-                "SELECT key_id, registration_envelope, scrub_signature_classical \
-                 FROM cirislens.federation_keys \
-                 WHERE pqc_completed_at IS NULL \
-                 ORDER BY valid_from ASC \
-                 LIMIT $1",
-                &[&limit],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_hybrid_pending_keys: {e}"))
-            })?;
-        rows.into_iter()
-            .map(|row| {
-                let mk_err = crate::federation::Error::Backend;
-                Ok(crate::federation::HybridPendingRow {
-                    id: row.safe_get_with("key_id", mk_err)?,
-                    // v31.0.0 (#644) — TEXT since V122.
-                    envelope: pg_envelope_value(
-                        &row.safe_get_with::<String, _, _, _>("registration_envelope", mk_err)?,
-                        "registration_envelope",
-                    )?,
-                    classical_sig_b64: row.safe_get_with("scrub_signature_classical", mk_err)?,
-                })
-            })
-            .collect()
+        // v60.0.0 (CIRISPersist#934 step 4) — the PQC sweep's selection is shared.
+        let rows = crate::federation::sweep_plan::list_hybrid_pending_planned(
+            self,
+            crate::federation::sweep_plan::HybridPlane::Keys,
+            limit,
+        )
+        .await?;
+        Ok(rows)
     }
 
     async fn list_hybrid_pending_attestations(
         &self,
         limit: i64,
     ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let rows = client
-            .query(
-                "SELECT attestation_id::text AS attestation_id, \
-                    attestation_envelope, scrub_signature_classical \
-                 FROM cirislens.federation_attestations \
-                 WHERE pqc_completed_at IS NULL \
-                 ORDER BY asserted_at ASC \
-                 LIMIT $1",
-                &[&limit],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_hybrid_pending_attestations: {e}"))
-            })?;
-        rows.into_iter()
-            .map(|row| {
-                let mk_err = crate::federation::Error::Backend;
-                Ok(crate::federation::HybridPendingRow {
-                    id: row.safe_get_with("attestation_id", mk_err)?,
-                    // v31.0.0 (#644) — TEXT since V122.
-                    envelope: pg_envelope_value(
-                        &row.safe_get_with::<String, _, _, _>("attestation_envelope", mk_err)?,
-                        "attestation_envelope",
-                    )?,
-                    classical_sig_b64: row.safe_get_with("scrub_signature_classical", mk_err)?,
-                })
-            })
-            .collect()
+        // v60.0.0 (CIRISPersist#934 step 4) — the PQC sweep's selection is shared.
+        let rows = crate::federation::sweep_plan::list_hybrid_pending_planned(
+            self,
+            crate::federation::sweep_plan::HybridPlane::Attestations,
+            limit,
+        )
+        .await?;
+        Ok(rows)
     }
 
     // ── Trust grants (v1.3.0, CIRISPersist#46 + #47) ───────────────
@@ -13753,73 +13885,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         signed: crate::federation::SignedTrustGrant,
     ) -> Result<(), crate::federation::Error> {
-        // v38.0.0 (#721) — the authority gate FIRST, inside the door (AV-9):
-        // the granter proves it is trusted_by against the directory-pinned
-        // keys, then the shape validation runs.
-        crate::federation::admission::check_trust_grant_authority(self, &signed).await?;
-        let grant = signed.grant;
-        crate::store::memory::validate_trust_grant(&grant)?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let trust_type_str = grant.trust_type.as_str();
-        let trust_relationship_str = grant.trust_relationship.as_str();
-        // PG TEXT[] binds from `&Vec<String>` via postgres-types' built-in.
-        let domains_owned: Vec<String> = grant.trust_domains.clone().unwrap_or_default();
-        let domains_param: Option<&Vec<String>> = if grant.trust_domains.is_some() {
-            Some(&domains_owned)
-        } else {
-            None
-        };
-        // UPSERT — overwrite trust columns, preserve everything else
-        // (pubkey, signature envelope, etc.). `trusted_at = NOW()` on
-        // the UPDATE branch so a re-grant refreshes the timestamp.
-        // `expires_at` re-set on UPDATE so a re-grant clears any prior
-        // soft-delete.
-        let n = client
-            .execute(
-                "UPDATE cirislens.federation_keys \
-                 SET trust_type = $2, \
-                     trust_relationship = $3, \
-                     trust_domains = $4, \
-                     trusted_by = $5, \
-                     trusted_at = NOW(), \
-                     expires_at = $6 \
-                 WHERE key_id = $1",
-                &[
-                    &grant.key,
-                    &trust_type_str,
-                    &trust_relationship_str,
-                    &domains_param,
-                    &grant.trusted_by,
-                    &grant.expires_at,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                // V020 CHECK constraints (no self-trust /
-                // registry-requires-domains) surface as `check_violation`
-                // here — translate to InvalidArgument for parity with
-                // the API-layer guards in `validate_trust_grant`.
-                if msg.contains("federation_keys_no_self_trust")
-                    || msg.contains("federation_keys_registry_requires_domains")
-                    || msg.contains("violates check constraint")
-                {
-                    crate::federation::Error::InvalidArgument(format!(
-                        "trust column CHECK violated: {msg}"
-                    ))
-                } else {
-                    crate::federation::Error::Backend(format!("grant_trust UPDATE: {msg}"))
-                }
-            })?;
-        if n == 0 {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "federation_keys row {} does not exist — call put_public_key first",
-                grant.key
-            )));
-        }
+        // v60.0.0 (CIRISPersist#934 step 4) — the decision is the shared plan's
+        // (the #721 authority gate first, then the shape).
+        crate::federation::consent_admit::grant_trust_planned(self, signed).await?;
         Ok(())
     }
 
@@ -16298,51 +16366,16 @@ impl crate::federation::BlobStorage for PostgresBackend {
         max_room_epoch: u64,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, crate::federation::BlobError> {
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let be = |e: tokio_postgres::Error| {
-            crate::federation::BlobError::Backend(format!("stream_dek_evict_room_chunks: {e}"))
-        };
-        let bound = i64::try_from(max_room_epoch).unwrap_or(i64::MAX);
-        // One transaction: the chunk rows go, the epoch rows stay, stamped.
-        // Scoped to epochs not yet evicted, so a re-run deletes nothing, and
-        // to TERMINATED epochs only (Codex r3 on #1065): an open epoch is
-        // swept once its terminator lands.
-        const EPOCHS: &str = "FROM cirislens.federation_stream_deks d \
-            WHERE d.group_key_id = $1 AND d.owner_key_id = $2 \
-              AND d.cohort_scope IN ('community', 'affiliations') \
-              AND d.room_epoch IS NOT NULL AND d.room_epoch <= $3 \
-              AND d.terminated_at IS NOT NULL \
-              AND d.evicted_at IS NULL \
-              AND NOT EXISTS (SELECT 1 FROM cirislens.federation_stream_chunks c2 \
-                               JOIN cirislens.federation_dag_chunks dc ON dc.chunk_sha256 = c2.chunk_sha \
-                               JOIN cirislens.federation_blobs m ON m.sha256 = dc.manifest_sha256 \
-                              WHERE c2.stream_id = d.stream_id AND c2.epoch = d.epoch)";
-        let tx = client.transaction().await.map_err(be)?;
-        let n = tx
-            .execute(
-                &format!(
-                    "DELETE FROM cirislens.federation_blobs WHERE sha256 IN ( \
-                        SELECT c.chunk_sha FROM cirislens.federation_stream_chunks c \
-                         WHERE EXISTS (SELECT 1 {EPOCHS} \
-                                         AND d.stream_id = c.stream_id AND d.epoch = c.epoch))"
-                ),
-                &[&community_key_id, &minter_key_id, &bound],
-            )
-            .await
-            .map_err(be)?;
-        tx.execute(
-            &format!(
-                "UPDATE cirislens.federation_stream_deks SET evicted_at = $4 \
-                  WHERE (stream_id, epoch) IN (SELECT d.stream_id, d.epoch {EPOCHS})"
-            ),
-            &[&community_key_id, &minter_key_id, &bound, &now],
+        // v60.0.0 (CIRISPersist#934 step 4) — the selection is shared; the
+        // executor runs it inside its delete transaction.
+        let n = crate::federation::sweep_plan::evict_room_chunks_planned(
+            self,
+            community_key_id,
+            minter_key_id,
+            max_room_epoch,
+            now,
         )
-        .await
-        .map_err(be)?;
-        tx.commit().await.map_err(be)?;
+        .await?;
         Ok(n)
     }
 
@@ -21634,24 +21667,14 @@ async fn pg_execute_attestation_query<C>(
 where
     C: tokio_postgres::GenericClient + Sync,
 {
-    use crate::federation::attestation_query::{render_sql, Bind, Dialect};
+    use crate::federation::attestation_query::{render_sql, Dialect};
     let stmt = render_sql(
         q,
         Dialect::Postgres,
         "cirislens.federation_attestations",
         PG_ATTESTATION_COLUMNS,
     );
-    let params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = stmt
-        .binds
-        .into_iter()
-        .map(|b| -> Box<dyn tokio_postgres::types::ToSql + Sync + Send> {
-            match b {
-                Bind::Text(t) => Box::new(t),
-                Bind::Time(t) => Box::new(t),
-                Bind::Int(n) => Box::new(n),
-            }
-        })
-        .collect();
+    let params = pg_params(stmt.binds);
     let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
         params.iter().map(|p| p.as_ref() as _).collect();
     let rows = client

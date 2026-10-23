@@ -1088,6 +1088,20 @@ pub enum DirectoryOp {
         /// The candidate rows' ids.
         attestation_ids: Vec<String>,
     },
+    /// [`FederationDirectory::list_key_plane_wire_hashes_since`] (v60.0.0,
+    /// CIRISPersist#1105) — the HELD hash set of one key-plane family,
+    /// routed so a capsule consumer (Edge) reaches the read the ask was for
+    /// rather than the trait default. Result rides
+    /// [`DirectoryOpResult::WireHashes`]. APPEND-ONLY (Growth): a new variant
+    /// at the end, so `DIRECTORY_ABI_VERSION` does not move.
+    ListKeyPlaneWireHashesSince {
+        /// One of `key_plane::HOLDINGS_FAMILIES`.
+        family: String,
+        /// Exclusive cursor; `None` starts at the first hash.
+        after_content_hash: Option<String>,
+        /// Page size.
+        limit: u32,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -2073,6 +2087,17 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
+        DirectoryOp::ListKeyPlaneWireHashesSince {
+            family,
+            after_content_hash,
+            limit,
+        } => match dir
+            .list_key_plane_wire_hashes_since(&family, after_content_hash.as_deref(), limit)
+            .await
+        {
+            Ok(v) => DirectoryOpResult::WireHashes(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
     }
 }
 
@@ -4025,6 +4050,30 @@ impl FederationDirectory for OpsDirectory {
     /// CIRISPersist#785 — #780's held-hash read, routed. It shipped in
     /// v38.7.0 with a default body and no op, so a capsule consumer reached
     /// the default and got `Unsupported`.
+    /// v60.0.0 (CIRISPersist#1105) — the family-scoped held-hash read,
+    /// routed.
+    async fn list_key_plane_wire_hashes_since(
+        &self,
+        family: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListKeyPlaneWireHashesSince {
+                family: family.to_owned(),
+                after_content_hash: after_content_hash.map(str::to_owned),
+                limit,
+            })
+            .await?
+        {
+            DirectoryOpResult::WireHashes(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
     async fn list_wire_hashes_since(
         &self,
         kind: &str,
@@ -5075,9 +5124,11 @@ mod tests {
         // v59.0.0 (sealed-transport floor) — a BREAK: the framed key-plane
         // ops are removed and `PutIdentityOccurrenceRevocation` retyped;
         // DIRECTORY_ABI_VERSION 8 → 9.
+        // v60.0.0 (CIRISPersist#1105) — GROWTH: `ListKeyPlaneWireHashesSince`
+        // APPENDED, nothing existing touched; DIRECTORY_ABI_VERSION stays.
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "784929785eec65791e29a7c00cc24914f9f1751ad4e098d3e04b550e86eec931",
+            "6420773215226d435dae76e5d96c9405929518cc66fa5af20f32a664ccab05fd",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -5152,6 +5203,57 @@ mod tests {
     /// (v38.7.0) with a default body and NO op, so a capsule consumer got
     /// `Unsupported` for the very read that release existed to provide, while
     /// its two neighbours routed fine.
+    /// v60.0.0 (CIRISPersist#1105, I1201 across the capsule) — the
+    /// family-scoped holdings read routes: the op answers exactly what the
+    /// directory answers, and a non-key-plane family is refused (as text,
+    /// like every op), never answered as an empty set.
+    #[test]
+    fn i1201_key_plane_holdings_route_through_the_capsule() {
+        let rt = test_runtime();
+        let (dir, directory) = memory_directory();
+        rt.block_on(async {
+            for k in ["i1201-cap-a", "i1201-cap-b"] {
+                crate::federation::tier_ingest::test_support::register_identity_key(
+                    &*dir,
+                    k,
+                    crate::federation::types::identity_type::NODE,
+                )
+                .await;
+            }
+        });
+        let direct = rt
+            .block_on(dir.list_key_plane_wire_hashes_since("key:record:v1", None, 100))
+            .expect("the direct read");
+        assert!(
+            direct.len() >= 2,
+            "I1201: the fixture's key rows: {direct:?}"
+        );
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::ListKeyPlaneWireHashesSince {
+                family: "key:record:v1".into(),
+                after_content_hash: None,
+                limit: 100,
+            },
+        ) {
+            DirectoryOpResult::WireHashes(v) => assert_eq!(v, direct, "I1201: routed as is"),
+            other => panic!("I1201: {other:?}"),
+        }
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::ListKeyPlaneWireHashesSince {
+                family: "consent:replication:v1".into(),
+                after_content_hash: None,
+                limit: 100,
+            },
+        ) {
+            DirectoryOpResult::Err(m) => assert!(m.contains("not a key-plane family"), "{m}"),
+            other => panic!("I1201: a non-key-plane family is refused: {other:?}"),
+        }
+    }
+
     #[test]
     fn known_hash_ops_round_trip_through_the_capsule_785() {
         let rt = test_runtime();

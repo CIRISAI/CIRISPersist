@@ -173,6 +173,68 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // fails only when the stored row changed between the plan and the write
     // (a lost race, re-offerable) — every rule about the caller's record ran
     // in the plan, and the wording is the plan's (`PlannedKeyRecord`).
+    // v60.0.0 (CIRISPersist#934 step 4) — the consent doors, the consent
+    // reads and the sweeps. Each door's decision is ONE shared function in
+    // `consent_admit` / `sweep_plan` / `key_plane` / `key_grant`; the writes
+    // and the gated reads are SHARED_PLANS, the read folds and sweep
+    // selections (which decide membership and never refuse) SHARED_SELECTIONS.
+    ("set_consent_role_planned", Class::Plan),
+    ("grant_trust_planned", Class::Plan),
+    ("list_consent_peers_planned", Class::Plan),
+    ("list_consent_peers_for_planned", Class::Plan),
+    ("live_consent_grants_planned", Class::Plan),
+    ("consent_revocations_planned", Class::Plan),
+    ("list_hybrid_pending_planned", Class::Plan),
+    ("list_expired_attestation_ids_planned", Class::Plan),
+    ("evict_known_wire_hashes_planned", Class::Plan),
+    ("evict_room_chunks_planned", Class::Plan),
+    ("list_key_plane_wire_hashes_planned", Class::Plan),
+    ("held_owner", Class::Plan),
+    // `held_owner`'s reads (Plumbing: a held-state lookup that fails only on
+    // the store's terms) and its axis decode (`sha_of`, Gate: a malformed
+    // hex digest on the caller's axis is refused).
+    ("blob_provenance", Class::Plumbing),
+    ("stream_key_state", Class::Plumbing),
+    ("sha_of", Class::Gate),
+    // The key-grant projection itself (same-file helper of
+    // `project_if_key_grant_row`).
+    ("project_key_grant_row", Class::Delegates),
+    // Inside it: the row's shape (`from_attestation`, Gate) and the content
+    // axis's author predicate (`may_issue_grant_for`, Gate: the signer must
+    // speak for the author of the bytes held; a "no" projects nothing). The
+    // grant-table writes and the #876 stranded-epoch repair are storage
+    // (Plumbing): every rule about the row ran before them. The pending
+    // projection is a same-file helper (Delegates).
+    ("from_attestation", Class::Gate),
+    ("may_issue_grant_for", Class::Gate),
+    ("community_dek_put_member_grants", Class::Plumbing),
+    ("rebind_stranded_blob_epochs", Class::Plumbing),
+    ("key_grant_pending_put", Class::Plumbing),
+    ("put_at_rest_grants", Class::Plumbing),
+    ("stream_dek_put_grants", Class::Plumbing),
+    ("project_pending_content_grants", Class::Delegates),
+    ("key_grant_pending_list", Class::Plumbing),
+    ("key_grant_pending_delete", Class::Plumbing),
+    ("project_if_key_grant_row", Class::Plan),
+    // Same-file helpers of those plans.
+    ("plan_set_consent_role", Class::Delegates),
+    ("plan_grant_trust", Class::Delegates),
+    ("consent_peers_planned", Class::Delegates),
+    ("plan_key_plane_holdings", Class::Delegates),
+    // The #1105 family gate: a dimension outside the key plane is refused,
+    // never answered as an empty holdings set.
+    ("check_key_plane_holdings_family", Class::Gate),
+    // The executors (storage only; compared across backends as the
+    // `ConsentStore` / `SweepStore` / `RoomEvictionStore` / `KeyPlaneStore`
+    // traits): each fails only on the substrate's own terms. A `false` from a
+    // consent write is "no key row", which the PLAN words as the refusal.
+    ("store_planned_consent_role", Class::Plumbing),
+    ("store_planned_trust_grant", Class::Plumbing),
+    ("read_consent_peer_rows", Class::Plumbing),
+    ("read_live_consent_grant_candidates", Class::Plumbing),
+    ("read_consent_revocation_candidates", Class::Plumbing),
+    ("evict_known_wire_hashes_before", Class::Plumbing),
+    ("pg_query_statement", Class::Plumbing),
     ("store_planned_key_record", Class::Plumbing),
     ("sqlite_key_columns", Class::Plumbing),
     ("pg_key_columns", Class::Plumbing),
@@ -1254,6 +1316,27 @@ pub(crate) struct DeclaredDivergence {
 /// across the three backends, gate for gate and order for order.
 #[cfg(test)]
 pub(crate) const DECLARED_DIVERGENCES: &[DeclaredDivergence] = &[
+    // v60.0.0 (CIRISPersist#934 step 4) — the key-grant doors.
+    DeclaredDivergence {
+        trait_name: "FederationDirectory",
+        method: "key_grant_held_owner",
+        backend: "memory",
+        expected: &[],
+        reason: "The memory backend has no blob plane: it holds no content under a key-grant \
+                 axis, so it runs the trait default (`None`, no gate). Sqlite and postgres run \
+                 the one shared read `key_grant::held_owner`. S5 (#1002) retires the memory \
+                 backend and this row.",
+    },
+    DeclaredDivergence {
+        trait_name: "FederationDirectory",
+        method: "project_key_grant_row",
+        backend: "memory",
+        expected: &[],
+        reason: "The memory backend has no grant tables to project a key-grant row into, so it \
+                 runs the trait default (a no-op, no gate). Sqlite and postgres run the one \
+                 shared plan `key_grant::project_if_key_grant_row`. S5 (#1002) retires the \
+                 memory backend and this row.",
+    },
     // v57.0.0 (CIRISPersist#988 item 2) — the legacy rehome.
     DeclaredDivergence {
         trait_name: "AttestationStore",
@@ -1331,7 +1414,7 @@ mod tests {
     /// The traits whose impls are compared, and where each trait's **default**
     /// bodies live. A backend that does not override a defaulted method runs
     /// the default, so the default's gate sequence is what it contributes.
-    const TRAITS: [(&str, &str); 6] = [
+    const TRAITS: [(&str, &str); 9] = [
         ("FederationDirectory", "src/federation/mod.rs"),
         ("BlobStorage", "src/federation/blobs.rs"),
         ("Backend", "src/store/backend.rs"),
@@ -1343,13 +1426,32 @@ mod tests {
         ("CommunityStore", "src/federation/community_admit.rs"),
         // v58.0.0 (CIRISPersist#991) — the key plane's executor.
         ("KeyPlaneStore", "src/federation/key_plane.rs"),
+        // v60.0.0 (CIRISPersist#934 step 4) — the consent plane's and the
+        // sweeps' executors.
+        ("ConsentStore", "src/federation/consent_admit.rs"),
+        ("SweepStore", "src/federation/sweep_plan.rs"),
+        ("RoomEvictionStore", "src/federation/sweep_plan.rs"),
     ];
 
     /// v56.0.0 (CIRISPersist#934) — the shared plans, read from their own
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 19] = [
+    const SHARED_PLANS: [(&str, &str); 24] = [
+        // v60.0.0 (CIRISPersist#934 step 4) — the consent writes, the #1105
+        // family-scoped holdings read (its family gate), and the key-grant
+        // projection (its row-shape gates).
+        (
+            "src/federation/consent_admit.rs",
+            "set_consent_role_planned",
+        ),
+        ("src/federation/consent_admit.rs", "grant_trust_planned"),
+        (
+            "src/federation/key_plane.rs",
+            "list_key_plane_wire_hashes_planned",
+        ),
+        ("src/federation/key_grant.rs", "project_if_key_grant_row"),
+        ("src/federation/key_grant.rs", "held_owner"),
         // v60.0.0 (CIRISPersist#934 step 3) — the key-record write doors.
         ("src/federation/key_plane.rs", "key_record_write_planned"),
         (
@@ -1412,6 +1514,47 @@ mod tests {
         ),
     ];
 
+    /// v60.0.0 (CIRISPersist#934 step 4) — **the shared selections**: the
+    /// read folds and sweep selections, `(file, fn)`. Like a [`SHARED_PLANS`]
+    /// body each is scanned once from its own file and held to the
+    /// [`CALL_CLASSES`] partition, and a door that only runs one reads
+    /// `shared`. Unlike a plan it decides WHICH rows (membership, order,
+    /// dedup, bound) and refuses nothing, so the rule is the opposite one:
+    /// a selection runs NO gate (a selection that starts refusing is a door
+    /// in disguise, and belongs in [`SHARED_PLANS`]), and every selection is
+    /// named by at least one door (a selection no door runs is dead code).
+    const SHARED_SELECTIONS: [(&str, &str); 8] = [
+        (
+            "src/federation/consent_admit.rs",
+            "list_consent_peers_planned",
+        ),
+        (
+            "src/federation/consent_admit.rs",
+            "list_consent_peers_for_planned",
+        ),
+        (
+            "src/federation/consent_admit.rs",
+            "live_consent_grants_planned",
+        ),
+        (
+            "src/federation/consent_admit.rs",
+            "consent_revocations_planned",
+        ),
+        (
+            "src/federation/sweep_plan.rs",
+            "list_hybrid_pending_planned",
+        ),
+        (
+            "src/federation/sweep_plan.rs",
+            "list_expired_attestation_ids_planned",
+        ),
+        (
+            "src/federation/sweep_plan.rs",
+            "evict_known_wire_hashes_planned",
+        ),
+        ("src/federation/sweep_plan.rs", "evict_room_chunks_planned"),
+    ];
+
     /// v56.0.0 (CIRISPersist#934) — **the doors that decide nothing in a
     /// backend**: `(trait, method, plan)`. On every backend that implements
     /// the trait, the door's whole sequence is exactly `plan:<plan>` — no gate
@@ -1419,7 +1562,79 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 22] = [
+    const SHARED_DOORS: [(&str, &str, &str); 37] = [
+        // v60.0.0 (CIRISPersist#934 step 4) — the consent writes.
+        (
+            "FederationDirectory",
+            "set_consent_role",
+            "set_consent_role_planned",
+        ),
+        ("FederationDirectory", "grant_trust", "grant_trust_planned"),
+        // The consent reads: one fold each over a typed read.
+        (
+            "FederationDirectory",
+            "list_consent_peers",
+            "list_consent_peers_planned",
+        ),
+        (
+            "FederationDirectory",
+            "list_consent_peers_for",
+            "list_consent_peers_for_planned",
+        ),
+        (
+            "FederationDirectory",
+            "list_live_consent_grants_by",
+            "live_consent_grants_planned",
+        ),
+        (
+            "FederationDirectory",
+            "list_live_consent_grants_for",
+            "live_consent_grants_planned",
+        ),
+        (
+            "FederationDirectory",
+            "list_consent_revocations",
+            "consent_revocations_planned",
+        ),
+        // The sweeps' selections.
+        (
+            "FederationDirectory",
+            "list_hybrid_pending_keys",
+            "list_hybrid_pending_planned",
+        ),
+        (
+            "FederationDirectory",
+            "list_hybrid_pending_attestations",
+            "list_hybrid_pending_planned",
+        ),
+        (
+            "FederationDirectory",
+            "list_expired_attestation_ids",
+            "list_expired_attestation_ids_planned",
+        ),
+        (
+            "FederationDirectory",
+            "evict_known_wire_hashes",
+            "evict_known_wire_hashes_planned",
+        ),
+        (
+            "BlobStorage",
+            "stream_dek_evict_room_chunks",
+            "evict_room_chunks_planned",
+        ),
+        // CIRISPersist#1105 — the family-scoped key-plane holdings read.
+        (
+            "FederationDirectory",
+            "list_key_plane_wire_hashes_since",
+            "list_key_plane_wire_hashes_planned",
+        ),
+        // The key-grant doors (sqlite / postgres; memory declared).
+        ("FederationDirectory", "key_grant_held_owner", "held_owner"),
+        (
+            "FederationDirectory",
+            "project_key_grant_row",
+            "project_if_key_grant_row",
+        ),
         // v60.0.0 (CIRISPersist#934 step 3) — the key-record write doors.
         (
             "FederationDirectory",
@@ -2159,7 +2374,7 @@ mod tests {
         }
 
         let mut plans: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (rel, name) in SHARED_PLANS {
+        for &(rel, name) in SHARED_PLANS.iter().chain(SHARED_SELECTIONS.iter()) {
             let stripped = strip_file(&read(rel));
             let index = index_functions(&stripped);
             let &(a, b) = index
@@ -2847,7 +3062,13 @@ mod tests {
     ];
 
     /// The plan fns [`PLAN_INSTANTS`] covers: `(file, fn)`.
-    const INSTANT_PLANS: [(&str, &str); 16] = [
+    const INSTANT_PLANS: [(&str, &str); 19] = [
+        // v60.0.0 (CIRISPersist#934 step 4) — the consent planners and the
+        // reaper's selection: none reads the clock (the trust grant's
+        // `trusted_at` is the door's one `received_at`).
+        ("src/federation/consent_admit.rs", "plan_set_consent_role"),
+        ("src/federation/consent_admit.rs", "plan_grant_trust"),
+        ("src/federation/sweep_plan.rs", "plan_expired"),
         // v60.0.0 (CIRISPersist#934 step 3) — the key-record write planners
         // that read an instant.
         ("src/federation/key_plane.rs", "plan_key_put"),
@@ -3015,6 +3236,14 @@ mod tests {
                 {
                     continue;
                 }
+                // v60.0.0 — a backend that runs the trait default by a
+                // DECLARED divergence (an empty one: the default decides
+                // nothing) has no impl to hold to the plan.
+                if !per_backend.contains_key(backend)
+                    && declared(trait_name, method, backend).is_some_and(|d| d.expected.is_empty())
+                {
+                    continue;
+                }
                 match per_backend.get(backend) {
                     Some((seq, line)) if *seq != want => failures.push(format!(
                         "{trait_name}::{method} on `{backend}` (line {line}) runs {seq:?}, not \
@@ -3027,7 +3256,13 @@ mod tests {
                 }
             }
         }
-        let planned: BTreeSet<&str> = SHARED_PLANS.iter().map(|(_, n)| *n).collect();
+        let planned: BTreeSet<&str> = SHARED_PLANS
+            .iter()
+            .chain(SHARED_SELECTIONS.iter())
+            .map(|(_, n)| *n)
+            .collect();
+        let selections: BTreeSet<&str> = SHARED_SELECTIONS.iter().map(|(_, n)| *n).collect();
+        let mut named: BTreeSet<String> = BTreeSet::new();
         for per_backend in scan.doors.values() {
             for (seq, _) in per_backend.values() {
                 for t in seq {
@@ -3035,12 +3270,24 @@ mod tests {
                         if !planned.contains(p) {
                             failures.push(format!("`{t}` names no SHARED_PLANS body"));
                         }
+                        named.insert(p.to_owned());
                     }
                 }
             }
         }
         for (name, seq) in &scan.plans {
-            if !seq.iter().any(|t| !t.starts_with(PLAN_TOKEN)) {
+            let gated = seq.iter().any(|t| !t.starts_with(PLAN_TOKEN));
+            if selections.contains(name.as_str()) {
+                if gated {
+                    failures.push(format!(
+                        "shared selection `{name}` runs {seq:?}: a selection refuses nothing; \
+                         a gated one belongs in SHARED_PLANS"
+                    ));
+                }
+                if !named.contains(name) {
+                    failures.push(format!("shared selection `{name}` is run by no door"));
+                }
+            } else if !gated {
                 failures.push(format!("shared plan `{name}` reads as running no gate"));
             }
         }

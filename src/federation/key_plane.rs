@@ -208,6 +208,142 @@ impl KeyPlaneFamily {
     }
 }
 
+/// v60.0.0 (CIRISPersist#1105) — the four families a key-plane HOLDINGS
+/// read may name: the three [`KeyPlaneFamily`] dimensions and the
+/// occurrence-revocation carrier
+/// ([`occurrence_revocation_carrier::CARRIER_DIMENSION`](super::occurrence_revocation_carrier::CARRIER_DIMENSION)).
+pub const HOLDINGS_FAMILIES: [&str; 4] = [
+    KEY_RECORD_DIMENSION,
+    KEY_REVOCATION_DIMENSION,
+    IDENTITY_OCCURRENCE_DIMENSION,
+    super::occurrence_revocation_carrier::CARRIER_DIMENSION,
+];
+
+/// v60.0.0 (CIRISPersist#1105) — refuse a holdings read for anything but a
+/// key-plane family: the read is scoped to one family by construction, so a
+/// dimension outside [`HOLDINGS_FAMILIES`] is a caller's error, not an empty
+/// set (an empty answer would read as "this node holds none of them" to an
+/// anti-entropy difference).
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] naming the four families.
+pub(crate) fn check_key_plane_holdings_family(family: &str) -> Result<&'static str, Error> {
+    HOLDINGS_FAMILIES
+        .into_iter()
+        .find(|f| *f == family)
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "list_key_plane_wire_hashes_since: '{family}' is not a key-plane family \
+                 (expected one of: {})",
+                HOLDINGS_FAMILIES.join(", ")
+            ))
+        })
+}
+
+/// v60.0.0 (CIRISPersist#1105) — **a planned key-plane holdings page**: the
+/// wire hashes (`signed_wire_index`, kind `Attestation`) of the `scores`
+/// rows whose dimension is `family`, ordered by hash, after `after`, at most
+/// `limit`. The hashes are the index's own, so they equal what this node
+/// advertises (the #780 invariant), and the page is the family's slice of
+/// [`FederationDirectory::list_wire_hashes_since`](super::FederationDirectory::list_wire_hashes_since)`("Attestation", ..)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeyPlaneHoldingsRead {
+    /// One of [`HOLDINGS_FAMILIES`].
+    pub(crate) family: &'static str,
+    /// Exclusive cursor; `""` starts at the first hash.
+    pub(crate) after: String,
+    /// Page size.
+    pub(crate) limit: u32,
+}
+
+/// The wire kind the key-plane rows are indexed under.
+pub(crate) const HOLDINGS_WIRE_KIND: &str = "Attestation";
+
+#[cfg_attr(not(any(feature = "postgres", feature = "sqlite")), allow(dead_code))]
+impl KeyPlaneHoldingsRead {
+    /// Is `row` (held under `content_hash` in the index) on this page?
+    #[must_use]
+    pub(crate) fn admits(&self, row: &Attestation, content_hash: &str) -> bool {
+        row.attestation_type == attestation_type::SCORES
+            && super::admission::envelope_dimension(&row.attestation_envelope) == Some(self.family)
+            && content_hash > self.after.as_str()
+    }
+
+    /// The one statement, for `dialect`: the family's rows seek the
+    /// `dimension`-leading index (V190), each joins its index entry on the
+    /// `(kind, record_key)` index (V183). Binds: family, kind, cursor, limit.
+    #[must_use]
+    pub(crate) fn render(
+        &self,
+        dialect: super::attestation_query::Dialect,
+    ) -> super::attestation_query::Statement {
+        use super::attestation_query::{Bind, Dialect, Statement};
+        let sql = match dialect {
+            Dialect::Sqlite => {
+                "SELECT w.content_hash FROM federation_attestations a \
+                 JOIN signed_wire_index w ON w.kind = ?2 \
+                  AND w.record_key = '{\"attestation_id\":\"' || a.attestation_id || '\"}' \
+                 WHERE a.dimension = ?1 AND a.attestation_type = 'scores' \
+                   AND w.content_hash > ?3 \
+                 ORDER BY w.content_hash LIMIT ?4"
+            }
+            Dialect::Postgres => {
+                "SELECT w.content_hash FROM cirislens.federation_attestations a \
+                 JOIN cirislens.signed_wire_index w ON w.kind = $2 \
+                  AND w.record_key = '{\"attestation_id\":\"' || a.attestation_id::text || '\"}' \
+                 WHERE (a.dimension COLLATE \"C\") = $1 AND a.attestation_type = 'scores' \
+                   AND w.content_hash > $3 \
+                 ORDER BY w.content_hash LIMIT $4"
+            }
+        };
+        Statement {
+            sql: sql.to_owned(),
+            binds: vec![
+                Bind::Text(self.family.to_owned()),
+                Bind::Text(HOLDINGS_WIRE_KIND.to_owned()),
+                Bind::Text(self.after.clone()),
+                Bind::Int(i64::from(self.limit)),
+            ],
+        }
+    }
+}
+
+/// v60.0.0 (CIRISPersist#1105) — plan a holdings page: the family gate,
+/// then the read.
+///
+/// # Errors
+///
+/// [`check_key_plane_holdings_family`]'s refusal.
+pub(crate) fn plan_key_plane_holdings(
+    family: &str,
+    after_content_hash: Option<&str>,
+    limit: u32,
+) -> Result<KeyPlaneHoldingsRead, Error> {
+    let family = check_key_plane_holdings_family(family)?;
+    Ok(KeyPlaneHoldingsRead {
+        family,
+        after: after_content_hash.unwrap_or("").to_owned(),
+        limit,
+    })
+}
+
+/// v60.0.0 (CIRISPersist#1105) — the door every backend runs for
+/// [`FederationDirectory::list_key_plane_wire_hashes_since`](super::FederationDirectory::list_key_plane_wire_hashes_since):
+/// the plan, then the executor.
+pub(crate) async fn list_key_plane_wire_hashes_planned<D>(
+    dir: &D,
+    family: &str,
+    after_content_hash: Option<&str>,
+    limit: u32,
+) -> Result<Vec<String>, Error>
+where
+    D: KeyPlaneStore,
+{
+    let read = plan_key_plane_holdings(family, after_content_hash, limit)?;
+    dir.read_key_plane_wire_hashes(read).await
+}
+
 /// Is this row one of the key plane's (by its signed dimension)?
 #[must_use]
 pub fn is_key_plane_row(row: &Attestation) -> bool {
@@ -810,6 +946,14 @@ pub(crate) trait KeyPlaneStore: super::attestation_admit::AttestationStore {
     /// row ([`key_record_row_step`] over the record as stored), in one
     /// transaction; then its wire-index entry.
     async fn store_planned_key_record(&self, planned: PlannedKeyRecord) -> Result<(), Error>;
+
+    /// v60.0.0 (CIRISPersist#1105) — run a key-plane holdings page:
+    /// [`KeyPlaneHoldingsRead::render`] on SQL, [`KeyPlaneHoldingsRead::admits`]
+    /// over the held index on memory; hashes in order, at most `limit`.
+    async fn read_key_plane_wire_hashes(
+        &self,
+        read: KeyPlaneHoldingsRead,
+    ) -> Result<Vec<String>, Error>;
 }
 
 /// **The `key:revocation:v1` door's decision** (CC 3.1.3, CC 2.4.1.1), once

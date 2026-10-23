@@ -6230,9 +6230,22 @@ pub const CONSENT_INSTANT_RESOLUTION_NANOS: u32 = 1_000;
 pub const SIGNED_INSTANT_RESOLUTION_NANOS: u32 = 1_000_000;
 
 /// v31.0.0 (CIRISPersist#598) — truncate an instant to the substrate's
-/// [`CONSENT_INSTANT_RESOLUTION_NANOS`] floor, i.e. to what postgres
-/// `TIMESTAMPTZ` can actually hold. Every persist-minted instant that will be
-/// bound to a signature goes through here.
+/// resolution: **milliseconds**, [`SIGNED_INSTANT_RESOLUTION_NANOS`] (v39.0.0).
+/// Every persist-minted instant that will be bound to a signature goes
+/// through here, and so does every comparison of an offered instant with a
+/// stored one (the S3 re-anchor and bake doors).
+///
+/// Why milliseconds and not the microseconds this function was written for
+/// in v31: it is the COARSEST precision any backend round-trips, and the
+/// precision persist mints at. Sqlite stores instants as RFC 3339 text
+/// written through `strftime('%f')` / CC 2.6.2's `.sssZ`, so it keeps
+/// milliseconds; postgres `TIMESTAMPTZ` keeps microseconds; persist mints at
+/// milliseconds (CC 2.6.2). An instant truncated here reads back
+/// byte-identical on every backend, so a value compared after a round trip
+/// compares as it did before one. The microsecond floor
+/// ([`CONSENT_INSTANT_RESOLUTION_NANOS`]) stays the ADMISSION check for
+/// offered rows (#598): raising it would refuse every already-signed
+/// microsecond row at ingest.
 #[must_use]
 pub fn truncate_to_substrate_resolution(
     t: chrono::DateTime<chrono::Utc>,

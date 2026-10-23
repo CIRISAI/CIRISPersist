@@ -194,6 +194,29 @@ fn i551_every_emitted_label_is_catalogued_and_every_catalogued_one_emitted() {
     }
 }
 
+/// v60.0.0 (CIRISPersist#934 step 4) — the doors recorded by ONE shared fold
+/// rather than by each backend: `(Door ident, the file whose fold records it)`.
+const SHARED_FOLD_DOORS: &[(&str, &str)] = &[
+    ("ListLiveConsentGrantsBy", "federation/consent_admit.rs"),
+    ("ListLiveConsentGrantsFor", "federation/consent_admit.rs"),
+];
+
+/// v60.0.0 — each shared-fold door is recorded in its fold's file.
+#[test]
+fn i551_shared_fold_doors_are_recorded_by_their_fold() {
+    let files = code_outside_observe();
+    for (door, file) in SHARED_FOLD_DOORS {
+        let (_, code) = files
+            .iter()
+            .find(|(p, _)| p.ends_with(file))
+            .expect("the fold's file");
+        assert!(
+            idents_after(code, "observe::Door::").contains(*door),
+            "I551 {file} records {door}"
+        );
+    }
+}
+
 /// Each backend file feeds the counters under its own backend label only.
 #[test]
 fn i551_each_backend_records_under_its_own_label() {
@@ -215,12 +238,20 @@ fn i551_each_backend_records_under_its_own_label() {
         );
         // Every door that file serves is recorded there — except the typed
         // bounded read (v56.0.0, CIRISPersist#1001), which no backend records:
-        // its one wrapper does.
+        // its one wrapper does; and (v60.0.0, CIRISPersist#934 step 4) the
+        // doors a shared fold records once, for every backend.
+        let doors = idents_after(code, "observe::Door::");
         assert!(
-            idents_after(code, "observe::Door::").len() >= Door::COUNT - 2,
+            doors.len() >= Door::COUNT - 2 - SHARED_FOLD_DOORS.len(),
             "I551 {file} records {} doors",
-            idents_after(code, "observe::Door::").len()
+            doors.len()
         );
+        for (door, _) in SHARED_FOLD_DOORS {
+            assert!(
+                !doors.contains(*door),
+                "I551 {file} records {door}, which its shared fold records"
+            );
+        }
         assert!(
             !idents_after(code, "observe::Door::").contains("AttestationQuery")
                 && !code.contains("record_query_read"),
