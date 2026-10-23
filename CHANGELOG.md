@@ -355,6 +355,100 @@ Python signature changed, no migration.
 - Evidence: CLM-planes-as-rows (3.1.3) at `key_plane::plan_key_record_write`;
   `EXPECTED` 320.
 
+### Changed — the consent and sweep planes decide in one function each (CIRISPersist#934 step 4, #1105)
+
+Fourteen doors were written once per backend: the two consent writes
+(`set_consent_role`, `grant_trust`), the five consent reads
+(`list_consent_peers`, `list_consent_peers_for`,
+`list_live_consent_grants_by` / `_for`, `list_consent_revocations`) and the
+sweeps' selections (the PQC sweep's `list_hybrid_pending_keys` /
+`_attestations`, the reaper's `list_expired_attestation_ids`,
+`evict_known_wire_hashes`, the room retention leg
+`stream_dek_evict_room_chunks`, and the two observation prunes). Each now
+decides in one place:
+
+- **Writes** — `consent_admit::plan_set_consent_role` (the CC 3.4.7.2 token
+  gate, the wire normal form) and `consent_admit::plan_grant_trust` (the #721
+  authority gate first, then the shape, then the row), run by
+  `set_consent_role_planned` / `grant_trust_planned`, which also word the
+  no-row refusal. `validate_trust_grant` moved from `store::memory` to
+  `consent_admit`.
+- **Reads** — one fold each over a typed read (`ConsentRead::{Node, For}`):
+  the fold sorts and deduplicates the peers, filters the live grants to
+  `consent:replication:v1` and orders them, applies the subject-side
+  revocation rule (`is_subject_side_revocation`); the executor returns the
+  projection rows or a candidate superset and decides nothing.
+- **Sweeps** — one selection each in `sweep_plan`
+  (`HybridPendingSelection`, `ExpiredSelection`, `known_hash_eviction`,
+  `RoomChunkEviction::selects`) and `retention::plan_observation_prune`;
+  each backend keeps the delete (or the read) as its executor. The room leg's
+  executor runs the shared predicate inside its delete transaction, so the
+  selection and the delete stay one atomic step.
+- The executors are three new crate traits, compared by the parity scan like
+  any door: `ConsentStore`, `SweepStore`, `RoomEvictionStore` (sqlite and
+  postgres only; memory has no blob plane). The key-grant doors
+  (`key_grant_held_owner`, `project_key_grant_row`) already ran one shared
+  body; they now read as `shared` too (memory runs the trait default, a
+  declared divergence).
+- The parity scan reports all of them `shared` (they were `identical x3` or
+  `gateless`) and `SHARED_DOORS` holds them; a new `SHARED_SELECTIONS` list
+  holds the read folds and sweep selections to the opposite rule from a plan:
+  a selection runs NO gate, and some door runs it.
+
+**#1105 — the family-scoped key-plane holdings read (Edge ask).**
+`FederationDirectory::list_key_plane_wire_hashes_since(family, after, limit)`:
+the `Attestation` wire hashes of the `scores` rows whose dimension is one of
+`key_plane::HOLDINGS_FAMILIES` (`key:record:v1`, `key:revocation:v1`,
+`identity:occurrence:v1`, `identity:occurrence_revocation:v1`), paged and
+cursored on the hash exactly like `list_wire_hashes_since`. One shared read
+plan (`key_plane::plan_key_plane_holdings`, the family gate refusing any
+other dimension as `InvalidArgument`, never an empty set) and one thin
+executor per backend (`KeyPlaneStore::read_key_plane_wire_hashes`). Routed
+through the directory capsule as `DirectoryOp::ListKeyPlaneWireHashesSince`
+(appended; `DIRECTORY_ABI_VERSION` unchanged; a refusal crosses the capsule
+as `Backend` text, like every op). Not on the Python surface.
+
+**Behaviour that changed (each was a backend divergence or an unordered
+tie):**
+
+- `list_hybrid_pending_keys` / `_attestations` with a zero or negative
+  `limit` return nothing on every backend; sqlite returned EVERY pending
+  row for `-1` (`LIMIT -1` is no limit) and postgres refused it. Ties on the
+  order instant come by id.
+- `list_expired_attestation_ids` orders ties on `expires_at` by id, so the
+  reaper's OFFSET paging is a total order (it could skip or repeat rows that
+  expired together); an offset past `i64::MAX` reads nothing (sqlite and
+  postgres paged from the start).
+- `list_live_consent_grants_by` / `_for` and `list_consent_revocations` order
+  ties on `asserted_at` by id, descending.
+- `grant_trust` stamps `trusted_at` with the door's one clock read on every
+  backend (postgres used the database's `NOW()`).
+- Postgres's room leg takes the minter's epoch rows `FOR UPDATE` in its
+  transaction, so two concurrent sweeps of one minter do not both read an
+  epoch as not yet evicted.
+
+**Rust surface:** `FederationDirectory::list_key_plane_wire_hashes_since`
+(new, default `Unsupported`); the directory capsule op above. No other
+`FederationDirectory` method changed, no Python signature changed, no
+migration.
+
+- Witnesses: **I1192** (the consent-role door), **I1193** (the trust-grant
+  door), **I1194** (the consent-peer and live-grant folds), **I1195** (the
+  consent-revocation fold), **I1196** (the PQC sweep's selection), **I1197**
+  (the reaper's selection), **I1198** (the known-hash eviction), **I1201**
+  (the #1105 holdings read), all on memory, sqlite and postgres; **I1199**
+  (unit) the room leg's predicate; **I1200** (unit, and postgres) the
+  observation prune plan and its executor; I1196 / I1197 also unit.
+- Mutation scope `scripts/mutants/scope-s4-consent-sweep.txt`: MUTATION_RESULT
+  Weekly, six shards, in `mutants.yml`.
+- Evidence: CLM-planes-as-rows (3.1.3) at
+  `key_plane::list_key_plane_wire_hashes_planned`; CLM-nsproc-tier-consent
+  (3.3.1) at `consent_admit::consent_revocations_planned`; `EXPECTED` 322.
+- Size: the backend files did not shrink (sqlite +31, postgres +34, memory
+  +48 lines): what each backend kept is the SQL and row mapping, which is
+  the executor's, and what left (the decisions) was small. The decisions
+  are now written once.
+
 ### Changed — hard_case rows replicate (CIRISConstitution#170 closed)
 
 The steward ruled through CC (2026-10-21, CIRISConstitution#170 closed, rc9

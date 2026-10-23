@@ -4139,36 +4139,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         key_id: &str,
         consent_role: Option<&str>,
     ) -> Result<(), crate::federation::Error> {
-        crate::federation::types::consent_role::check_admissible(consent_role)?;
-        let normalized: Option<String> = consent_role
-            .and_then(crate::federation::types::consent_role::wire_from_stored)
-            .map(str::to_owned);
-        {
-            let mut state = self.state.lock().expect("memory backend lock");
-            if !state.federation_keys.contains_key(key_id) {
-                return Err(crate::federation::Error::InvalidArgument(format!(
-                    "set_consent_role: no federation_keys row for {key_id}"
-                )));
-            }
-            // v36.0.0 (CIRISPersist#707) — `consent_role` IS in the served
-            // bytes, so this rewrite moves the serve position. Allocated
-            // BEFORE the row mutation so the new position sorts above every
-            // position the cursor could already have served.
-            let mutated_at = next_key_admission_position(&state);
-            state
-                .key_record_mutated_at
-                .insert(key_id.to_owned(), mutated_at);
-            let Some(row) = state.federation_keys.get_mut(key_id) else {
-                unreachable!("presence checked above under the same lock");
-            };
-            row.consent_role = normalized;
-            // v24.1.0 (CIRISPersist#547) — `consent_role` is excluded from
-            // `persist_row_hash` but IS in the bytes the read surface returns, so
-            // the WIRE content hash moves here. Re-index.
-            // v31.0.0 (CIRISPersist#640/#646) — through the shared stored-row
-            // helper, after the guard is released.
-        }
-        self.index_stored_key_row(key_id).await?;
+        // v60.0.0 (CIRISPersist#934 step 4) — the decision is the shared plan's.
+        crate::federation::consent_admit::set_consent_role_planned(self, key_id, consent_role)
+            .await?;
         Ok(())
     }
 
@@ -4823,31 +4796,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         for_key_id: &str,
     ) -> Result<Vec<(String, String)>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let mut out: Vec<(String, String)> = state
-            .consent_peer_set_for
-            .iter()
-            .filter(|r| r.for_key_id == for_key_id)
-            .map(|r| (r.author_key_id.clone(), r.peer_key_id.clone()))
-            .collect();
-        out.sort();
-        out.dedup();
-        Ok(out)
+        // v60.0.0 (CIRISPersist#934 step 4) — one fold over the typed read.
+        let pairs =
+            crate::federation::consent_admit::list_consent_peers_for_planned(self, for_key_id)
+                .await?;
+        Ok(pairs)
     }
 
     async fn list_consent_peers(
         &self,
         node_key_id: &str,
     ) -> Result<Vec<String>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let mut peers: Vec<String> = state
-            .consent_peer_set
-            .iter()
-            .filter(|r| r.node_key_id == node_key_id)
-            .map(|r| r.peer_key_id.clone())
-            .collect();
-        peers.sort();
-        peers.dedup();
+        // v60.0.0 (CIRISPersist#934 step 4) — one fold over the typed read.
+        let peers =
+            crate::federation::consent_admit::list_consent_peers_planned(self, node_key_id).await?;
         Ok(peers)
     }
 
@@ -4859,31 +4821,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         node_key_id: &str,
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let live_ids: std::collections::HashSet<&str> = state
-            .consent_peer_set
-            .iter()
-            .map(|r| r.source_attestation_id.as_str())
-            .collect();
-        let mut rows: Vec<_> = state
-            .federation_attestations
-            .iter()
-            .filter(|a| {
-                a.attesting_key_id == node_key_id
-                    && crate::federation::admission::envelope_dimension(&a.attestation_envelope)
-                        == Some(crate::federation::consent_peer_set::DIMENSION)
-                    && live_ids.contains(a.attestation_id.as_str())
-            })
-            .cloned()
-            .collect();
-        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Memory,
-            crate::observe::Door::ListLiveConsentGrantsBy,
-            node_key_id,
-            &rows,
-            0,
-        );
+        // v60.0.0 (CIRISPersist#934 step 4) — one fold over the typed read.
+        let rows = crate::federation::consent_admit::live_consent_grants_planned(
+            self,
+            crate::federation::consent_admit::ConsentRead::Node(node_key_id),
+        )
+        .await?;
         Ok(rows)
     }
 
@@ -4894,32 +4837,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         for_key_id: &str,
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        // v48.0.0 (#905) — the V147 projection's live sources for this machine.
-        let state = self.state.lock().expect("memory backend lock");
-        let live_ids: std::collections::HashSet<&str> = state
-            .consent_peer_set_for
-            .iter()
-            .filter(|r| r.for_key_id == for_key_id)
-            .map(|r| r.source_attestation_id.as_str())
-            .collect();
-        let mut rows: Vec<_> = state
-            .federation_attestations
-            .iter()
-            .filter(|a| {
-                crate::federation::admission::envelope_dimension(&a.attestation_envelope)
-                    == Some(crate::federation::consent_peer_set::DIMENSION)
-                    && live_ids.contains(a.attestation_id.as_str())
-            })
-            .cloned()
-            .collect();
-        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Memory,
-            crate::observe::Door::ListLiveConsentGrantsFor,
-            for_key_id,
-            &rows,
-            0,
-        );
+        // v60.0.0 (CIRISPersist#934 step 4) — one fold over the typed read.
+        let rows = crate::federation::consent_admit::live_consent_grants_planned(
+            self,
+            crate::federation::consent_admit::ConsentRead::For(for_key_id),
+        )
+        .await?;
         Ok(rows)
     }
 
@@ -5142,6 +5065,23 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     }
 
     /// v38.7.0 (CIRISPersist#780) — index-only hash page for one kind.
+    async fn list_key_plane_wire_hashes_since(
+        &self,
+        family: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        // v60.0.0 (CIRISPersist#1105) — one shared read plan.
+        let hashes = crate::federation::key_plane::list_key_plane_wire_hashes_planned(
+            self,
+            family,
+            after_content_hash,
+            limit,
+        )
+        .await?;
+        Ok(hashes)
+    }
+
     async fn list_wire_hashes_since(
         &self,
         kind: &str,
@@ -5245,15 +5185,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         cutoff: chrono::DateTime<chrono::Utc>,
         bound: u64,
     ) -> Result<crate::federation::KnownHashEviction, crate::federation::Error> {
-        let mut state = self.state.lock().expect("memory backend lock");
-        let before = state.known_wire_hashes.len() as u64;
-        state.known_wire_hashes.retain(|_, (ts, _)| *ts >= cutoff);
-        let remaining = state.known_wire_hashes.len() as u64;
-        Ok(crate::federation::KnownHashEviction {
-            evicted: before.saturating_sub(remaining),
-            remaining,
-            over_bound_by: remaining.saturating_sub(bound),
-        })
+        // v60.0.0 (CIRISPersist#934 step 4) — the report is shared; the cutoff is
+        // the caller's (edge owns the wrap period), never derived here.
+        let report =
+            crate::federation::sweep_plan::evict_known_wire_hashes_planned(self, cutoff, bound)
+                .await?;
+        Ok(report)
     }
 
     /// v38.4.0 (CIRISPersist#768) — expired ids, oldest first, bounded.
@@ -5263,30 +5200,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<String>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<(chrono::DateTime<chrono::Utc>, String)> = state
-            .federation_attestations
-            .iter()
-            // Never OFFER what the purge door refuses structurally — see the
-            // trait's accessor contract (PR #769 review round 2).
-            .filter(|a| {
-                !crate::federation::precedence::is_structural_composer(&a.attestation_type)
-                    && a.attestation_type
-                        != crate::federation::types::attestation_type::DELEGATES_TO
-            })
-            .filter_map(|a| {
-                a.expires_at
-                    .filter(|e| *e < now)
-                    .map(|e| (e, a.attestation_id.clone()))
-            })
-            .collect();
-        rows.sort();
-        Ok(rows
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|(_, id)| id)
-            .collect())
+        // v60.0.0 (CIRISPersist#934 step 4) — the reaper's selection is shared.
+        let ids = crate::federation::sweep_plan::list_expired_attestation_ids_planned(
+            self, now, limit, offset,
+        )
+        .await?;
+        Ok(ids)
     }
 
     /// v56.0.0 (CIRISPersist#934 step 1, door 5) — decided by
@@ -7641,33 +7560,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         since: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        use crate::federation::types::attestation_type;
-        let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<_> = state
-            .federation_attestations
-            .iter()
-            .filter(|a| {
-                // Subject-side revocations only: a `withdraws` admitted under
-                // rule 2/3/4 (rule 1 is the producer's own self-revoke, not a
-                // consent event), OR a `consent:state:revoked` stance.
-                let is_subject_withdraws = a.attestation_type == attestation_type::WITHDRAWS
-                    && matches!(a.withdraws_admission_rule, Some(2..=4));
-                let is_consent_revoked = a
-                    .attestation_envelope
-                    .get("dimension")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|d| {
-                        d.starts_with(
-                            crate::federation::consent::consent_dimension::STATE_REVOKED_PREFIX,
-                        )
-                    });
-                is_subject_withdraws || is_consent_revoked
-            })
-            .filter(|a| since.is_none_or(|s| a.asserted_at >= s))
-            .cloned()
-            .collect();
-        // Match the SQL backends: ORDER BY asserted_at DESC.
-        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        // v60.0.0 (CIRISPersist#934 step 4) — one fold over the typed read.
+        let rows =
+            crate::federation::consent_admit::consent_revocations_planned(self, since).await?;
         Ok(rows)
     }
 
@@ -9367,46 +9262,28 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         limit: i64,
     ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<_> = state
-            .federation_keys
-            .values()
-            .filter(|r| r.pqc_completed_at.is_none())
-            .cloned()
-            .collect();
-        rows.sort_by_key(|r| r.valid_from);
-        Ok(rows
-            .into_iter()
-            .take(limit.max(0) as usize)
-            .map(|r| crate::federation::HybridPendingRow {
-                id: r.key_id,
-                envelope: r.registration_envelope,
-                classical_sig_b64: r.scrub_signature_classical,
-            })
-            .collect())
+        // v60.0.0 (CIRISPersist#934 step 4) — the PQC sweep's selection is shared.
+        let rows = crate::federation::sweep_plan::list_hybrid_pending_planned(
+            self,
+            crate::federation::sweep_plan::HybridPlane::Keys,
+            limit,
+        )
+        .await?;
+        Ok(rows)
     }
 
     async fn list_hybrid_pending_attestations(
         &self,
         limit: i64,
     ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<_> = state
-            .federation_attestations
-            .iter()
-            .filter(|r| r.pqc_completed_at.is_none())
-            .cloned()
-            .collect();
-        rows.sort_by_key(|r| r.asserted_at);
-        Ok(rows
-            .into_iter()
-            .take(limit.max(0) as usize)
-            .map(|r| crate::federation::HybridPendingRow {
-                id: r.attestation_id,
-                envelope: r.attestation_envelope,
-                classical_sig_b64: r.scrub_signature_classical,
-            })
-            .collect())
+        // v60.0.0 (CIRISPersist#934 step 4) — the PQC sweep's selection is shared.
+        let rows = crate::federation::sweep_plan::list_hybrid_pending_planned(
+            self,
+            crate::federation::sweep_plan::HybridPlane::Attestations,
+            limit,
+        )
+        .await?;
+        Ok(rows)
     }
 
     // ── Trust grants (v1.3.0, CIRISPersist#46 + #47) ───────────────
@@ -9415,35 +9292,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         signed: crate::federation::SignedTrustGrant,
     ) -> Result<(), crate::federation::Error> {
-        // v38.0.0 (#721) — the authority gate FIRST, inside the door (AV-9):
-        // the granter proves it is trusted_by against the directory-pinned
-        // keys, then the shape validation runs.
-        crate::federation::admission::check_trust_grant_authority(self, &signed).await?;
-        let grant = signed.grant;
-        validate_trust_grant(&grant)?;
-        let mut state = self.state.lock().expect("memory backend lock");
-        // V020 adds the trust columns to the existing federation_keys
-        // table. On the memory backend we mirror that contract by
-        // requiring `grant.key` to already exist as a federation_keys
-        // row (matches the PG "UPSERT preserves pubkey + envelope"
-        // shape — there's nothing to preserve if the row doesn't
-        // exist yet).
-        if !state.federation_keys.contains_key(&grant.key) {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "federation_keys row {} does not exist — call put_public_key first",
-                grant.key
-            )));
-        }
-        let row = crate::federation::TrustRow {
-            key: grant.key.clone(),
-            trust_type: grant.trust_type,
-            trust_relationship: grant.trust_relationship,
-            trust_domains: grant.trust_domains,
-            trusted_by: grant.trusted_by,
-            trusted_at: chrono::Utc::now(),
-            expires_at: grant.expires_at,
-        };
-        state.federation_trust.insert(grant.key, row);
+        // v60.0.0 (CIRISPersist#934 step 4) — the decision is the shared plan's
+        // (the #721 authority gate first, then the shape).
+        crate::federation::consent_admit::grant_trust_planned(self, signed).await?;
         Ok(())
     }
 
@@ -10512,57 +10363,6 @@ fn memory_project_goal(
     }
 }
 
-/// Shared validation for `TrustGrant`. Same rules as the PG CHECK
-/// constraints (`federation_keys_no_self_trust` +
-/// `federation_keys_registry_requires_domains`) — surfaced as typed
-/// `Error::InvalidArgument` instead of an opaque backend SQL error.
-/// Used by every FederationDirectory impl so SQLite (which can't
-/// add CHECK via ALTER TABLE) gets the same enforcement.
-pub(crate) fn validate_trust_grant(
-    grant: &crate::federation::TrustGrant,
-) -> Result<(), crate::federation::Error> {
-    if grant.key.is_empty() {
-        return Err(crate::federation::Error::InvalidArgument(
-            "grant.key must be non-empty".into(),
-        ));
-    }
-    if grant.trusted_by.is_empty() {
-        return Err(crate::federation::Error::InvalidArgument(
-            "grant.trusted_by must be non-empty".into(),
-        ));
-    }
-    if grant.trusted_by == grant.key {
-        return Err(crate::federation::Error::InvalidArgument(format!(
-            "grant.trusted_by must differ from grant.key (no self-trust); got {}",
-            grant.key
-        )));
-    }
-    match grant.trust_relationship {
-        crate::federation::TrustRelationship::Registry => {
-            let n = grant.trust_domains.as_ref().map(|d| d.len()).unwrap_or(0);
-            if n == 0 {
-                return Err(crate::federation::Error::InvalidArgument(
-                    "Registry-relationship grants require a non-empty trust_domains list".into(),
-                ));
-            }
-        }
-        crate::federation::TrustRelationship::Direct => {
-            // Direct grants: trust_domains MUST be None per NodeCore's
-            // shape contract. The PG schema doesn't reject Some(vec)
-            // on Direct rows directly, but the resolver ignores
-            // domains there — surface as InvalidArgument at the API
-            // boundary so callers get a clean error instead of silent
-            // misuse of the field.
-            if grant.trust_domains.is_some() {
-                return Err(crate::federation::Error::InvalidArgument(
-                    "Direct-relationship grants must have trust_domains=None".into(),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 // ─── OutboundQueue impl (v0.4.0, CIRISPersist#16) ──────────────────
 //
 // In-process map mirroring the postgres edge_outbound_queue table.
@@ -11395,6 +11195,226 @@ impl crate::derived::DerivedSchema for MemoryBackend {
 /// minting only.
 impl MemoryBackend {}
 
+/// v60.0.0 (CIRISPersist#934 step 4) — the sweeps' executor on memory.
+/// Storage only: the selections are `federation::sweep_plan`'s, evaluated
+/// over the rows held here.
+#[async_trait::async_trait]
+impl crate::federation::sweep_plan::SweepStore for MemoryBackend {
+    async fn read_hybrid_pending(
+        &self,
+        selection: crate::federation::sweep_plan::HybridPendingSelection,
+    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
+        use crate::federation::sweep_plan::HybridPlane;
+        let state = self.state.lock().expect("memory backend lock");
+        let rows: Vec<_> = match selection.plane {
+            HybridPlane::Keys => state
+                .federation_keys
+                .values()
+                .map(|r| {
+                    (
+                        r.key_id.clone(),
+                        r.valid_from,
+                        r.pqc_completed_at.is_none(),
+                        (
+                            r.registration_envelope.clone(),
+                            r.scrub_signature_classical.clone(),
+                        ),
+                    )
+                })
+                .collect(),
+            HybridPlane::Attestations => state
+                .federation_attestations
+                .iter()
+                .map(|r| {
+                    (
+                        r.attestation_id.clone(),
+                        r.asserted_at,
+                        r.pqc_completed_at.is_none(),
+                        (
+                            r.attestation_envelope.clone(),
+                            r.scrub_signature_classical.clone(),
+                        ),
+                    )
+                })
+                .collect(),
+        };
+        Ok(selection
+            .cut(rows)
+            .into_iter()
+            .map(
+                |(id, (envelope, classical_sig_b64))| crate::federation::HybridPendingRow {
+                    id,
+                    envelope,
+                    classical_sig_b64,
+                },
+            )
+            .collect())
+    }
+
+    async fn read_expired_attestation_ids(
+        &self,
+        selection: crate::federation::sweep_plan::ExpiredSelection,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(selection.cut(
+            state
+                .federation_attestations
+                .iter()
+                .map(|a| {
+                    (
+                        a.attestation_id.clone(),
+                        a.attestation_type.clone(),
+                        a.expires_at,
+                    )
+                })
+                .collect(),
+        ))
+    }
+
+    async fn evict_known_wire_hashes_before(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(u64, u64), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let before = state.known_wire_hashes.len() as u64;
+        state.known_wire_hashes.retain(|_, (ts, _)| *ts >= cutoff);
+        let remaining = state.known_wire_hashes.len() as u64;
+        Ok((before.saturating_sub(remaining), remaining))
+    }
+}
+
+/// v60.0.0 (CIRISPersist#934 step 4) — the consent plane's executor on
+/// memory. Storage only: the decisions are `federation::consent_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::consent_admit::ConsentStore for MemoryBackend {
+    async fn store_planned_consent_role(
+        &self,
+        planned: crate::federation::consent_admit::PlannedConsentRole,
+    ) -> Result<bool, crate::federation::Error> {
+        {
+            let mut state = self.state.lock().expect("memory backend lock");
+            if !state.federation_keys.contains_key(&planned.key_id) {
+                return Ok(false);
+            }
+            // v36.0.0 (CIRISPersist#707) — `consent_role` IS in the served
+            // bytes, so this rewrite moves the serve position, allocated
+            // BEFORE the row mutation so it sorts above every served one.
+            let mutated_at = next_key_admission_position(&state);
+            state
+                .key_record_mutated_at
+                .insert(planned.key_id.clone(), mutated_at);
+            if let Some(row) = state.federation_keys.get_mut(&planned.key_id) {
+                row.consent_role = planned.role.clone();
+            }
+        }
+        // v31.0.0 (CIRISPersist#640/#646) — the WIRE content hash moves (the
+        // role is in the served bytes): re-index after the guard is released.
+        self.index_stored_key_row(&planned.key_id).await?;
+        Ok(true)
+    }
+
+    async fn store_planned_trust_grant(
+        &self,
+        row: crate::federation::TrustRow,
+    ) -> Result<bool, crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        // V020 puts the trust columns on the `federation_keys` row: a grant
+        // rides an existing key, as on the SQL backends.
+        if !state.federation_keys.contains_key(&row.key) {
+            return Ok(false);
+        }
+        state.federation_trust.insert(row.key.clone(), row);
+        Ok(true)
+    }
+
+    async fn read_consent_peer_rows(
+        &self,
+        read: crate::federation::consent_admit::ConsentRead<'_>,
+    ) -> Result<Vec<crate::federation::consent_admit::ConsentPeerRow>, crate::federation::Error>
+    {
+        use crate::federation::consent_admit::{ConsentPeerRow, ConsentRead};
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(match read {
+            ConsentRead::Node(node) => state
+                .consent_peer_set
+                .iter()
+                .filter(|r| r.node_key_id == node)
+                .map(|r| ConsentPeerRow {
+                    author_key_id: r.node_key_id.clone(),
+                    peer_key_id: r.peer_key_id.clone(),
+                })
+                .collect(),
+            ConsentRead::For(for_key) => state
+                .consent_peer_set_for
+                .iter()
+                .filter(|r| r.for_key_id == for_key)
+                .map(|r| ConsentPeerRow {
+                    author_key_id: r.author_key_id.clone(),
+                    peer_key_id: r.peer_key_id.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    async fn read_live_consent_grant_candidates(
+        &self,
+        read: crate::federation::consent_admit::ConsentRead<'_>,
+    ) -> Result<crate::federation::attestation_query::QueryRows, crate::federation::Error> {
+        use crate::federation::consent_admit::ConsentRead;
+        let state = self.state.lock().expect("memory backend lock");
+        let live: std::collections::HashSet<&str> = match read {
+            ConsentRead::Node(_) => state
+                .consent_peer_set
+                .iter()
+                .map(|r| r.source_attestation_id.as_str())
+                .collect(),
+            ConsentRead::For(for_key) => state
+                .consent_peer_set_for
+                .iter()
+                .filter(|r| r.for_key_id == for_key)
+                .map(|r| r.source_attestation_id.as_str())
+                .collect(),
+        };
+        let rows = state
+            .federation_attestations
+            .iter()
+            .filter(|a| match read {
+                ConsentRead::Node(node) => a.attesting_key_id == node,
+                ConsentRead::For(_) => true,
+            })
+            .filter(|a| live.contains(a.attestation_id.as_str()))
+            .cloned()
+            .collect();
+        Ok(crate::federation::attestation_query::QueryRows {
+            rows,
+            bytes: 0,
+            backend: crate::observe::StoreBackend::Memory,
+        })
+    }
+
+    async fn read_consent_revocation_candidates(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state
+            .federation_attestations
+            .iter()
+            .filter(|a| {
+                a.attestation_type == crate::federation::types::attestation_type::WITHDRAWS
+                    || crate::federation::admission::envelope_dimension(&a.attestation_envelope)
+                        .is_some_and(|d| {
+                            d.starts_with(
+                                crate::federation::consent::consent_dimension::STATE_REVOKED_PREFIX,
+                            )
+                        })
+            })
+            .filter(|a| since.is_none_or(|s| a.asserted_at >= s))
+            .cloned()
+            .collect())
+    }
+}
+
 /// v58.0.0 (CIRISPersist#991) — the key plane's executor on memory. Storage
 /// only: the decisions are `federation::key_plane`'s plans.
 #[async_trait::async_trait]
@@ -11455,6 +11475,34 @@ impl crate::federation::key_plane::KeyPlaneStore for MemoryBackend {
     /// position, and the key's `key:record:v1` row; a write that matched
     /// nothing reports the plan's wording
     /// ([`PlannedKeyRecord::raced`](crate::federation::key_plane::PlannedKeyRecord::raced)).
+    async fn read_key_plane_wire_hashes(
+        &self,
+        read: crate::federation::key_plane::KeyPlaneHoldingsRead,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let rows: std::collections::HashMap<&str, &crate::federation::Attestation> = state
+            .federation_attestations
+            .iter()
+            .map(|a| (a.attestation_id.as_str(), a))
+            .collect();
+        let mut hashes: Vec<String> = state
+            .signed_wire_index
+            .iter()
+            .filter(|((kind, hash), record_key)| {
+                kind == crate::federation::key_plane::HOLDINGS_WIRE_KIND
+                    && crate::federation::wire_index::record_key_field(record_key, "attestation_id")
+                        .ok()
+                        .and_then(|id| rows.get(id.as_str()).copied())
+                        .is_some_and(|row| read.admits(row, hash))
+            })
+            .map(|((_, hash), _)| hash.clone())
+            .collect();
+        // The SQL backends page over the index's hash order.
+        hashes.sort();
+        hashes.truncate(read.limit as usize);
+        Ok(hashes)
+    }
+
     async fn store_planned_key_record(
         &self,
         planned: crate::federation::key_plane::PlannedKeyRecord,

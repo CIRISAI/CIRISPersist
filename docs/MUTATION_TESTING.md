@@ -319,6 +319,13 @@ did not fit its budget):
   unviable, 0 missed (two rounds: the first left twelve survivors; ten were
   witness gaps, now witnessed, two an equivalent branch, now removed), on
   the weekly run.
+- `scope-s4-consent-sweep.txt` (v60.0.0, slice S4): the consent and sweep
+  planes on one plan (#934 step 4, #1105): `consent_admit` and `sweep_plan`
+  whole, the #1105 holdings read in `key_plane`, the key-grant doors' shared
+  bodies, the observation prune plan and its two executors, and each
+  backend's `ConsentStore` / `SweepStore` / `RoomEvictionStore` executors and
+  the doors that call the plans, against I1192–I1201 and the doors' standing
+  witnesses. 304 mutants in six shards, on the weekly run.
 - `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and
   federation files that feed the counters. The issue's other starting modules
 (the `trust_root.rs` walks beyond `trust_root_valid`) are not yet scoped.

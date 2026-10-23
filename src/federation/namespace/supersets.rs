@@ -1775,7 +1775,10 @@ mod tests {
         // retired constructor to the admission gate (a move, not a new row).
         // v60.0.0 slice S3: +1 (CIRISPersist#934 step 3): CLM-planes-as-rows
         // at the key-record write plan.
-        const EXPECTED: usize = 320;
+        // v60.0.0 slice S4: +2 (CIRISPersist#934 step 4, #1105):
+        // CLM-planes-as-rows at the family-scoped holdings read;
+        // CLM-nsproc-tier-consent at the consent-revocation fold.
+        const EXPECTED: usize = 322;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \
