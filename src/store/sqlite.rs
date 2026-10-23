@@ -1044,7 +1044,7 @@ impl SqliteBackend {
     /// Centralized so file-backed and in-memory share the same shape. Reader
     /// connections get their own, smaller block in
     /// [`crate::store::sqlite_conn_model::ReadPool::open`].
-    fn apply_connection_settings(conn: Connection) -> Result<Connection, Error> {
+    pub(crate) fn apply_connection_settings(conn: Connection) -> Result<Connection, Error> {
         (move || -> Result<Connection, rusqlite::Error> {
             // Foreign keys are off by default in SQLite for backwards
             // compat — turn them on so any future FK constraints we
