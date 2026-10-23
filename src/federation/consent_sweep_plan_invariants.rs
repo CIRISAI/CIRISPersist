@@ -370,6 +370,31 @@ pub(crate) mod bodies {
         .await;
         let w = format!("i1195-w-{s}");
         put(d, withdraws(&w, &subject, &own)).await;
+        // A SUBJECT's `withdraws` of a row naming it (rule 2) is one.
+        let about = format!("i1195-about-{s}");
+        put(
+            d,
+            row(
+                &about,
+                &target,
+                &target,
+                serde_json::json!({"dimension": "x:v1"}),
+                vec![target.clone(), subject.clone()],
+                now,
+            ),
+        )
+        .await;
+        let w2 = format!("i1195-w2-{s}");
+        put(d, withdraws(&w2, &subject, &about)).await;
+        assert_eq!(
+            d.get_attestation(&w2)
+                .await
+                .unwrap()
+                .unwrap()
+                .withdraws_admission_rule,
+            Some(2),
+            "I1195: the fixture is a rule-2 withdraws"
+        );
         let mine = |rows: Vec<Attestation>| -> Vec<String> {
             rows.into_iter()
                 .filter(|a| a.attestation_id.ends_with(s))
@@ -389,8 +414,8 @@ pub(crate) mod bodies {
         );
         assert_eq!(
             got,
-            vec![r_new.clone(), r_old.clone()],
-            "I1195: newest first"
+            vec![w2.clone(), r_new.clone(), r_old.clone()],
+            "I1195: the subject's withdraws and both stances, newest first"
         );
         assert_eq!(
             mine(
@@ -398,7 +423,7 @@ pub(crate) mod bodies {
                     .await
                     .unwrap()
             ),
-            vec![r_new.clone()],
+            vec![w2.clone(), r_new.clone()],
             "I1195: since bounds the scan"
         );
     }
@@ -457,6 +482,40 @@ pub(crate) mod bodies {
             full[..=pa].to_vec(),
             "I1196: the page is the order's prefix"
         );
+        // The attestation plane: a row is on the PQC sweep's page exactly
+        // when its hybrid half is still pending.
+        let k = format!("i1196-k-{s}");
+        ts::register_identity_key(d, &k, NODE).await;
+        let x = format!("i1196-x-{s}");
+        put(
+            d,
+            row(
+                &x,
+                &k,
+                &k,
+                serde_json::json!({"dimension": "x:v1"}),
+                vec![k.clone()],
+                Utc::now(),
+            ),
+        )
+        .await;
+        let pending: Vec<String> = d
+            .list_hybrid_pending_attestations(10_000)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        let stored = d.get_attestation(&x).await.unwrap().unwrap();
+        assert_eq!(
+            pending.contains(&x),
+            stored.pqc_completed_at.is_none(),
+            "I1196: on the page iff pending: {pending:?}"
+        );
+        assert!(
+            !pending.is_empty(),
+            "I1196: the fixture holds a hybrid-pending attestation"
+        );
     }
 
     /// I1197 — the reaper's selection.
@@ -491,6 +550,24 @@ pub(crate) mod bodies {
         let w_id = w.attestation_id.clone();
         put(d, w).await;
 
+        // Expiry is strict: a row expiring AT the judged instant has not
+        // expired yet.
+        let at_e =
+            crate::federation::admission::truncate_to_substrate_resolution(now + Duration::days(1));
+        assert!(
+            !d.list_expired_attestation_ids(at_e, 10_000, 0)
+                .await
+                .unwrap()
+                .contains(&early),
+            "I1197: expires_at == now is not expired"
+        );
+        assert!(
+            d.list_expired_attestation_ids(at_e + Duration::milliseconds(1), 10_000, 0)
+                .await
+                .unwrap()
+                .contains(&early),
+            "I1197: a millisecond later it is"
+        );
         let judged = now + Duration::days(3);
         let full = d
             .list_expired_attestation_ids(judged, 10_000, 0)
@@ -784,7 +861,14 @@ mod units {
             ("n".into(), "scores".into(), Some(now)),
             ("z".into(), "scores".into(), None),
         ];
-        assert_eq!(sel.cut(rows), vec!["b".to_owned(), "c".to_owned()]);
+        assert_eq!(sel.cut(rows.clone()), vec!["b".to_owned(), "c".to_owned()]);
+        // The boundary: a row expiring AT `now` is not offered, even with
+        // room on the page.
+        let wide = plan_expired(now, 10, 0).unwrap();
+        assert_eq!(
+            wide.cut(rows),
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        );
     }
 }
 

@@ -573,22 +573,11 @@ impl crate::federation::consent_admit::ConsentStore for PostgresBackend {
                 ],
             )
             .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                // The V020 CHECKs (no self-trust, registry-requires-domains)
-                // backstop the plan's shape validation; a violation reads as
-                // the plan's refusal would.
-                if msg.contains("federation_keys_no_self_trust")
-                    || msg.contains("federation_keys_registry_requires_domains")
-                    || msg.contains("violates check constraint")
-                {
-                    crate::federation::Error::InvalidArgument(format!(
-                        "trust column CHECK violated: {msg}"
-                    ))
-                } else {
-                    crate::federation::Error::Backend(format!("grant_trust UPDATE: {msg}"))
-                }
-            })?;
+            // The V020 CHECKs (no self-trust, registry-requires-domains)
+            // cannot fire: the plan's shape validation refused both before
+            // the executor ran. A violation would be the plan's defect, and
+            // reads as the substrate error it then is.
+            .map_err(|e| crate::federation::Error::Backend(format!("grant_trust UPDATE: {e}")))?;
         Ok(n > 0)
     }
 

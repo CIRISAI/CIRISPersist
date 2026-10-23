@@ -15,10 +15,12 @@
 #   the consent_role round trips, the #721 trust doors, the hybrid-pending
 #   listings, the #768 reaper, the #785 known-hash ageing, I757 (the room
 #   leg on sqlite and postgres), #767 / #776 (the observation prunes on
-#   sqlite).
+#   sqlite), and the key-grant doors' witnesses: the #1065 signer-is-author
+#   gate on the held-state leg (grant_scope_invariants, I591 / I596) and the
+#   projection end to end (I61, I800 on sqlite and postgres).
 #
 # Grammar: docs/MUTATION_TESTING.md "Scope files".
-tests: test(/consent_sweep_plan_invariants::|consent_sweep_principals_invariants::|consent_role_(round_trip|oq1)|trust_grant_rejects|trust_grant_then_lookup|trust_doors_refuse_the_unproven|trust_pg_grant_lookup|hybrid_pending|reaper_purges_expired|known_hash_ageing_and_eviction|stream_epoch_dek_invariants::.*i757|transport_prune_spares|observation_prunes_are_bounded/)
+tests: test(/consent_sweep_plan_invariants::|consent_sweep_principals_invariants::|consent_role_(round_trip|oq1)|trust_grant_rejects|trust_grant_then_lookup|trust_doors_refuse_the_unproven|trust_pg_grant_lookup|hybrid_pending|reaper_purges_expired|known_hash_ageing_and_eviction|stream_epoch_dek_invariants::.*i757|transport_prune_spares|observation_prunes_are_bounded|grant_scope_invariants::|key_grant_invariants::.*(i61_end_to_end|i800_the_blob_arrival_race)/)
 
 src/federation/consent_admit.rs
 src/federation/sweep_plan.rs
