@@ -325,7 +325,8 @@ did not fit its budget):
   bodies, the observation prune plan and its two executors, and each
   backend's `ConsentStore` / `SweepStore` / `RoomEvictionStore` executors and
   the doors that call the plans, against I1192–I1201 and the doors' standing
-  witnesses. 304 mutants in six shards, on the weekly run.
+  witnesses. 302 mutants in six shards, 256 caught, 46 unviable, 0
+  missed (three rounds), on the weekly run.
 - `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and
   federation files that feed the counters. The issue's other starting modules
 (the `trust_root.rs` walks beyond `trust_root_valid`) are not yet scoped.

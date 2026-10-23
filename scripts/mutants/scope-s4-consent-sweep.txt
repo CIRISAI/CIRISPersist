@@ -20,8 +20,13 @@
 #   projection end to end (I61, I800 on sqlite and postgres) and through the
 #   replicated door (I743, sqlite and postgres).
 #
+# Excluded: grant_scope_invariants' memory runs (I591 / I596 on memory_dyn):
+# the memory backend runs the trait default for key_grant_held_owner (no
+# blob plane), so they reach no site here; they killed no mutant in any shard
+# of the final round.
+#
 # Grammar: docs/MUTATION_TESTING.md "Scope files".
-tests: test(/consent_sweep_plan_invariants::|consent_sweep_principals_invariants::|consent_role_(round_trip|oq1)|trust_grant_rejects|trust_grant_then_lookup|trust_doors_refuse_the_unproven|trust_pg_grant_lookup|hybrid_pending|reaper_purges_expired|known_hash_ageing_and_eviction|stream_epoch_dek_invariants::.*i757|transport_prune_spares|observation_prunes_are_bounded|grant_scope_invariants::|key_grant_invariants::.*(i61_end_to_end|i800_the_blob_arrival_race)|key_grant_rows_invariants::.*i743/)
+tests: test(/consent_sweep_plan_invariants::|consent_sweep_principals_invariants::|consent_role_(round_trip|oq1)|trust_grant_rejects|trust_grant_then_lookup|trust_doors_refuse_the_unproven|trust_pg_grant_lookup|hybrid_pending|reaper_purges_expired|known_hash_ageing_and_eviction|stream_epoch_dek_invariants::.*i757|transport_prune_spares|observation_prunes_are_bounded|grant_scope_invariants::|key_grant_invariants::.*(i61_end_to_end|i800_the_blob_arrival_race)|key_grant_rows_invariants::.*i743/) - test(/grant_scope_invariants::run::memory_dyn::/)
 
 src/federation/consent_admit.rs
 src/federation/sweep_plan.rs

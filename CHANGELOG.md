@@ -426,6 +426,11 @@ tie):**
 - Postgres's room leg takes the minter's epoch rows `FOR UPDATE` in its
   transaction, so two concurrent sweeps of one minter do not both read an
   epoch as not yet evicted.
+- A postgres `grant_trust` whose row trips a V020 CHECK now reads as
+  `Backend` (it was re-worded `InvalidArgument`); the plan refuses both
+  shapes the CHECKs guard before the write, so no admitted grant reaches it.
+- The live-grant read counters are recorded by the shared fold, once per
+  read, under the executing backend's label (I551 learns the shape).
 
 **Rust surface:** `FederationDirectory::list_key_plane_wire_hashes_since`
 (new, default `Unsupported`); the directory capsule op above. No other
@@ -439,8 +444,16 @@ migration.
   (the #1105 holdings read), all on memory, sqlite and postgres; **I1199**
   (unit) the room leg's predicate; **I1200** (unit, and postgres) the
   observation prune plan and its executor; I1196 / I1197 also unit.
-- Mutation scope `scripts/mutants/scope-s4-consent-sweep.txt`: MUTATION_RESULT
-  Weekly, six shards, in `mutants.yml`.
+- Mutation scope `scripts/mutants/scope-s4-consent-sweep.txt`: 302 mutants in
+  six shards, 256 caught, 46 unviable, 0 missed, nothing allow-listed. Three
+  rounds: the first (304 mutants) left nineteen survivors. Fifteen were
+  witness gaps: a subject's rule-2 `withdraws` (I1195), the strict expiry
+  boundary (I1197), the attestation plane of the PQC sweep (I1196), and the
+  key-grant doors, whose witnesses the filter did not name (now I591 / I596,
+  I61, I800, I743). Two were the postgres trust executor's CHECK-name
+  mapping, unreachable behind the plan's shape validation, now removed. The
+  second round left the projection door (I743 added); the third, shard 1
+  again, was clean. Weekly, six shards, in `mutants.yml`.
 - Evidence: CLM-planes-as-rows (3.1.3) at
   `key_plane::list_key_plane_wire_hashes_planned`; CLM-nsproc-tier-consent
   (3.3.1) at `consent_admit::consent_revocations_planned`; `EXPECTED` 322.

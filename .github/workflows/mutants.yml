@@ -57,7 +57,7 @@ jobs:
           - {scope: scope-s3-key-plane, shard: '0/3', id: s3-key-plane-0-of-3, weekly: true}
           - {scope: scope-s3-key-plane, shard: '1/3', id: s3-key-plane-1-of-3, weekly: true}
           - {scope: scope-s3-key-plane, shard: '2/3', id: s3-key-plane-2-of-3, weekly: true}
-          # v60.0.0 S4 (CIRISPersist#934 step 4, #1105): 304 mutants, six
+          # v60.0.0 S4 (CIRISPersist#934 step 4, #1105): 302 mutants, six
           # shards (600 s + 120 s x 51 = 6720 s each), weekly.
           - {scope: scope-s4-consent-sweep, shard: '0/6', id: s4-consent-sweep-0-of-6, weekly: true}
           - {scope: scope-s4-consent-sweep, shard: '1/6', id: s4-consent-sweep-1-of-6, weekly: true}
