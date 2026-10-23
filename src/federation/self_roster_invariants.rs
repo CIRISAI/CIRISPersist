@@ -45,6 +45,10 @@
 //!   takes it out of the decision; it never lands; the slot is free.
 //! - **I1139 (two nodes)** — a proposal and its assent delivered through the
 //!   attestation plane land on the receiving node too.
+//! - **I1307 (the corridor at admission, v60.0.0 S6v)** — under a CC policy
+//!   table whose self-roster row is outside the self corridor every roster
+//!   change is refused `federation_governance_policy_refused` and nothing is
+//!   held; under the vendored table the same changes land or are held.
 
 #[cfg(test)]
 pub(crate) mod bodies {
@@ -1068,6 +1072,85 @@ pub(crate) mod bodies {
         );
     }
 
+    /// A copy of the vendored CC policy table whose `self_roster_add` row is
+    /// outside the self corridor (its window under the 24 h floor).
+    fn table_with_self_window_below_floor() -> crate::federation::governance_policy::PolicyTable {
+        let mut v: serde_json::Value = serde_json::from_str(
+            crate::federation::namespace::cc_manifests::GOVERNANCE_POLICY_JSON,
+        )
+        .unwrap();
+        for r in v["families"].as_array_mut().unwrap() {
+            if r["family"] == "self_roster_add" {
+                r["window_class"] = "none".into();
+                r["window_secs"] = 0.into();
+            }
+        }
+        crate::federation::governance_policy::PolicyTable::parse(&v.to_string()).unwrap()
+    }
+
+    fn policy_refused(r: Result<(), Error>, what: &str) {
+        let Err(e) = r else {
+            panic!("{what}: expected the corridor refusal, got Ok");
+        };
+        assert_eq!(e.kind(), "federation_governance_policy_refused", "{what}");
+        match e {
+            Error::GovernancePolicyRefused { family, reason } => assert_eq!(
+                (family.as_str(), reason),
+                ("self_roster_add", "window_below_floor"),
+                "{what}"
+            ),
+            other => panic!("{what}: expected the corridor refusal, got {other:?}"),
+        }
+    }
+
+    /// **I1307** (v60.0.0 S6v; CC 4.5.13, `CLM-policy-corridor`) — the
+    /// corridor runs at admission: under a policy table whose self-roster row
+    /// is outside the self corridor, the door refuses every roster change
+    /// `federation_governance_policy_refused` / `window_below_floor` — the
+    /// one-key addition that would land at once, and the two-key addition that
+    /// would be held — and nothing is written: no occurrence, no proposal row,
+    /// no receipt. The sweep and the standing read refuse alike. Under the
+    /// vendored table the same changes land and are held as before.
+    pub(crate) async fn i1307_the_corridor_runs_at_admission(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::governance_policy::test_table;
+        let (f, d1, d2) = (format!("f-{tag}"), format!("d1-{tag}"), format!("d2-{tag}"));
+        keys(d, &[&f, &d1, &d2]).await;
+        test_table::set(Some(table_with_self_window_below_floor()));
+        policy_refused(
+            add(d, &f, &f, &d1, ms_now()).await,
+            "I1307: one key, outside the corridor",
+        );
+        assert!(!active(d, &f, &d1).await, "I1307: nothing landed");
+        test_table::set(None);
+        add(d, &f, &f, &d1, ms_now())
+            .await
+            .expect("I1307: one key, the vendored table: lands at once");
+        test_table::set(Some(table_with_self_window_below_floor()));
+        policy_refused(
+            add(d, &d1, &f, &d2, ms_now()).await,
+            "I1307: two keys, outside the corridor",
+        );
+        assert!(
+            d.list_open_self_roster_proposals(Some(&f))
+                .await
+                .unwrap()
+                .is_empty(),
+            "I1307: no proposal is held"
+        );
+        assert!(!active(d, &f, &d2).await);
+        policy_refused(sr::execute_for(d, &f).await.map(|_| ()), "I1307: the sweep");
+        policy_refused(sr::standing(d, &f).await.map(|_| ()), "I1307: standing");
+        test_table::set(None);
+        let _ = pending(
+            add(d, &d1, &f, &d2, ms_now()).await,
+            "I1307: two keys, the vendored table: held",
+        );
+        assert_eq!(sr::standing(d, &f).await.unwrap().len(), 1);
+    }
+
     /// **I1138** — compat: pending is served neither framed nor as a row.
     pub(crate) async fn i1138_pending_is_not_served(d: &dyn FederationDirectory, tag: &str) {
         let (f, d1, d2) = (format!("f-{tag}"), format!("d1-{tag}"), format!("d2-{tag}"));
@@ -1288,6 +1371,7 @@ mod tests {
         bodies::i1161_nodes_owned_by_places_a_roster_keys_node
     );
     on_every_backend!(i1143, bodies::i1143_the_proposer_withdraws);
+    on_every_backend!(i1307, bodies::i1307_the_corridor_runs_at_admission);
     on_every_backend!(
         i1156,
         bodies::i1156_pending_is_retryable_refused_is_terminal

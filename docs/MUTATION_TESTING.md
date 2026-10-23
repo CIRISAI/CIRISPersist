@@ -319,6 +319,15 @@ did not fit its budget):
   unviable, 0 missed (two rounds: the first left twelve survivors; ten were
   witness gaps, now witnessed, two an equivalent branch, now removed), on
   the weekly run.
+- `scope-s6v-vendor.txt` (v60.0.0, slice S6v): the CC `v1.0-rc9` vendor.
+  The policy table read at runtime (`governance_policy.rs`), the corridor
+  (`TwoPathPolicy::check_corridor`), the self-roster door's admission site
+  (`self_roster::policy`), and the registry loader the re-vendor moved
+  (`parse_manifest`, `registry`, `parse_polarity_classes`), and #1114's
+  three refusals (`check_content_hash`, `check_row_mirror_members_closed`,
+  `validate_subject_key_ids`), against I1300–I1311, I84, the 732 CC
+  governance vectors, the six self_roster traces and the registry pins.
+  108 mutants in three shards, on the weekly run.
 - `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and
   federation files that feed the counters. The issue's other starting modules
 (the `trust_root.rs` walks beyond `trust_root_valid`) are not yet scoped.

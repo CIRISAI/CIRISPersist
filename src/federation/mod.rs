@@ -656,6 +656,13 @@ pub mod scores;
 pub mod scores_read_audit;
 pub mod steward_purge;
 pub mod two_path;
+// v60.0.0 (S6v; CC 4.5.13) — the two-path policy table as runtime data, and
+// the corridor at admission.
+pub mod governance_policy;
+// v60.0.0 (CIRISPersist#1114) — I1309–I1311: three signed-object refusals
+// get their own malformed_row reasons, on every backend.
+#[cfg(test)]
+mod malformed_reasons_1114_invariants;
 // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the key roster of a self: the
 // two-path door its additions and evictions go through, and the steward
 // predicate (a live roster key signs as the fedID).
@@ -2601,10 +2608,17 @@ pub fn validate_subject_key_ids(subject_key_ids: &[String]) -> Result<(), Error>
     // diagnosis an operator staring at a rejected subject needs.
     for sid in subject_key_ids {
         let malformed = |why: &str| {
-            Err(Error::InvalidArgument(format!(
-                "subject_key_ids element must be a canonical lowercase key_id \
-                 (CC 2.3.2.1 / CC 2.6.3 / §0.6): {why}; got {sid:?}"
-            )))
+            // v60.0.0 (CIRISPersist#1114, CC 2.6.1.7 rc10) — typed out of
+            // `InvalidArgument` (ValueError, the same Python type) under the
+            // closed reason `subject_key_id_malformed`.
+            Err(Error::malformed_row(
+                "attestation",
+                malformed_row::SUBJECT_KEY_ID_MALFORMED,
+                format!(
+                    "subject_key_ids element must be a canonical lowercase key_id \
+                     (CC 2.3.2.1 / CC 2.6.3 / §0.6): {why}; got {sid:?}"
+                ),
+            ))
         };
         if sid.is_empty() {
             return malformed("empty");
@@ -9772,6 +9786,31 @@ pub enum Error {
         needs: usize,
     },
 
+    /// v60.0.0 (S6v; CC 4.5.13 / 4.2.1.1 `CLM-policy-corridor`) — **the door
+    /// refuses to decide under its family's policy row.** A two-path door
+    /// reads its policy from the vendored CC governance policy table
+    /// ([`governance_policy`](crate::federation::governance_policy)); the row
+    /// must be a two-path row on a built base, readable, and inside its
+    /// corridor (`PolicyCorridor.lean`, as CC checks the table). `reason` is
+    /// a [`CorridorRefusal`](crate::federation::two_path::CorridorRefusal)
+    /// token or one of
+    /// [`governance_policy::refusal`](crate::federation::governance_policy::refusal)'s.
+    /// Nothing is held or written. With the vendored rc9 table it does not
+    /// arise (every row is in its corridor, I1303); it is the gate a table a
+    /// re-vendor moved out of the corridor meets. Stable `kind()` token
+    /// `federation_governance_policy_refused`; Python
+    /// `ValueError("federation_governance_policy_refused: {family}: {reason}")`.
+    #[error(
+        "governance policy {family:?} refused: {reason} — CC 4.5.13: a two-path door decides \
+         only under a readable row inside its corridor"
+    )]
+    GovernancePolicyRefused {
+        /// The table family the door asked for (`*` for the table itself).
+        family: String,
+        /// The corridor token or the table refusal.
+        reason: &'static str,
+    },
+
     /// v55.0.0 (CIRISPersist#1055, from CIRISEdge's adopt of v54.1) — **the
     /// signed row is malformed.** Its bytes cannot be read as the claim they
     /// carry: it names no signer, a member of its signed envelope is missing
@@ -12160,6 +12199,18 @@ pub mod malformed_row {
     /// `goal_id` / `declared_by_key_id` / `declared_at` / `scope` /
     /// `retired_at`) offered at a goal door that takes a body.
     pub const GOAL_TYPED_OBJECT_RETIRED: &str = "goal_typed_object_retired";
+    /// v60.0.0 (CIRISPersist#1114; CC 2.6.1.7, rc10 `99bf187`) — the row's
+    /// `original_content_hash` is not the SHA-256 of JCS(its envelope). Was a
+    /// `federation_tier_unverified` with a free-text reason.
+    pub const CONTENT_HASH_MISMATCH: &str = "content_hash_mismatch";
+    /// v60.0.0 (CIRISPersist#1114; CC 2.6.1.7 rc10) — the signed `row` mirror
+    /// carries a member outside its closed seven. Was
+    /// `envelope_member_invalid` (a serde refusal).
+    pub const ENVELOPE_ROW_MEMBER_UNKNOWN: &str = "envelope_row_member_unknown";
+    /// v60.0.0 (CIRISPersist#1114; CC 2.6.1.7 rc10) — a `subject_key_ids`
+    /// element is neither a canonical lowercase key_id nor the tagged
+    /// `canonical:sha256:<hex64>` form. Was a `federation_invalid_argument`.
+    pub const SUBJECT_KEY_ID_MALFORMED: &str = "subject_key_id_malformed";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -12179,6 +12230,9 @@ pub mod malformed_row {
         GOAL_META_ALIGNMENT,
         GOAL_BODY,
         GOAL_TYPED_OBJECT_RETIRED,
+        CONTENT_HASH_MISMATCH,
+        ENVELOPE_ROW_MEMBER_UNKNOWN,
+        SUBJECT_KEY_ID_MALFORMED,
     ];
 }
 
@@ -12229,6 +12283,7 @@ impl Error {
             Error::AttesterKeyUnknown { .. } => "federation_attester_key_unknown",
             Error::SignerDoesNotActFor { .. } => "federation_signer_not_acting_for",
             Error::SelfRosterNotLanded { .. } => "federation_self_roster_not_landed",
+            Error::GovernancePolicyRefused { .. } => "federation_governance_policy_refused",
             Error::AssertedAtStale { .. } => "federation_invalid_argument",
             Error::EnvelopeKindRetired { .. } => replication_policy::ENVELOPE_KIND_RETIRED,
             Error::MalformedRow { .. } => "federation_malformed_row",

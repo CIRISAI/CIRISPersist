@@ -500,6 +500,14 @@ pub fn range_for_polarity(label: &str) -> Option<DeclaredRange> {
 /// `signed` while persist read bounds off label text; rc8's `_aliases` folds it
 /// onto `+1.0 only` ("accord:* parent: every leaf is +1.0 only"), so the
 /// parent pins like its leaves.
+///
+/// # v60.0.0 (CC rc9) — one more
+///
+/// `identity:occurrence_revocation:v1` (`-1 only`), the carrier of a legacy
+/// occurrence revocation persist minted in v59 (CIRISPersist#1104) and CC rc9
+/// registers, pins `Refuted` like `key:revocation`: a revocation is asserted,
+/// never scored. Its sibling rc9 row, `transport:canonical_rebind:v1`, is
+/// `positive-only` and pins on neither side.
 pub const PINNING_FAMILIES: &[&str] = &[
     "accord:*",
     "accord:invoke:constitutional:{halt_id}",
@@ -509,6 +517,7 @@ pub const PINNING_FAMILIES: &[&str] = &[
     "accord:lifecycle:active",
     "accord:lifecycle:confirmed",
     "archive_release:{basis}",
+    "identity:occurrence_revocation",
     "key:revocation",
     "lawful_order:release",
     "preserve_request",
@@ -1655,7 +1664,7 @@ mod tests {
         );
         // The literal is not empty, so the census is a finding and not a
         // formality — and it is not everything, so it discriminates.
-        assert_eq!(PINNING_FAMILIES.len(), 15);
+        assert_eq!(PINNING_FAMILIES.len(), 16);
     }
 
     /// **CC 3.4.5's acceptance criterion, stated as it was written**: feasible
@@ -1695,8 +1704,12 @@ mod tests {
 
     /// **The measurement behind `RetainedCell::open_contradictions`'s doc.**
     ///
-    /// Retaining the contradiction count pins 149 of the registry's 174
-    /// families; withholding it pins 15. (143 of 168 / 10 until the v58.0.0
+    /// Retaining the contradiction count pins 150 of the registry's 176
+    /// families; withholding it pins 16. (149 of 174 / 15 until the v60.0.0
+    /// rc9 re-vendor: of its two new families the `-1 only`
+    /// `identity:occurrence_revocation` joins both sides and the
+    /// `positive-only` `transport:canonical_rebind` pins on neither. 143 of
+    /// 168 / 10 until the v58.0.0
     /// rc8 re-vendor: its six new families all join the retained side, the
     /// four single-point ones (three `+1.0 only` retirement rows,
     /// `takedown_notice`) join the withheld side too, and `accord:*` joins the
@@ -1729,11 +1742,11 @@ mod tests {
         let withheld = pinned_families(false).len();
         assert_eq!(
             (retained, withheld),
-            (149, 15),
+            (150, 16),
             "the contradiction-count contrast moved (retained={retained}, \
              withheld={withheld})"
         );
-        assert_eq!(vendored_family_polarities().len(), 174);
+        assert_eq!(vendored_family_polarities().len(), 176);
     }
 
     /// **The signed fold's escape hatch is a zero-confidence row — and that is

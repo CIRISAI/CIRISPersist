@@ -363,3 +363,13 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.1.1	CLM-takedown-notice-row	CIRISPersist	src/cirisnode/rows.rs#plan_takedown_notice_row	ciris-persist@59.1.0
 2.4.2	CLM-silo-projection-rebuildable	CIRISPersist	src/federation/ledger_projection.rs#project_ledger_row	ciris-persist@59.1.0
 2.4.2	CLM-silo-projection-rebuildable	CIRISPersist	src/federation/goal_projection.rs#fold_goal	ciris-persist@59.1.0
+# v60.0.0 (S6v, CC v1.0-rc9 at the tag) — the CC governance policy table is a runtime
+# manifest; a two-path door reads its policy from it and runs the corridor at admission.
+4.5.13	CLM-governance-policy-table	CIRISPersist	src/federation/governance_policy.rs#PolicyTable::admit	ciris-persist@59.1.0
+4.2.1.1	CLM-policy-corridor	CIRISPersist	src/federation/governance_policy.rs#PolicyTable::check_corridor	ciris-persist@59.1.0
+4.2.1.1	CLM-policy-corridor	CIRISPersist	src/federation/two_path.rs#TwoPathPolicy::check_corridor	ciris-persist@59.1.0
+# v60.0.0 (CIRISPersist#1114; CC 2.6.1.7, rc10 99bf187) — three signed-object refusals
+# carry their own federation_malformed_row reasons.
+2.6.1.7	CLM-signed-object	CIRISPersist	src/federation/tier_ingest.rs#check_content_hash	ciris-persist@59.1.0
+2.6.1.7	CLM-signed-object	CIRISPersist	src/federation/admission.rs#check_row_mirror_members_closed	ciris-persist@59.1.0
+2.6.1.7	CLM-signed-object	CIRISPersist	src/federation/mod.rs#validate_subject_key_ids	ciris-persist@59.1.0

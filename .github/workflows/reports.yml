@@ -15,7 +15,7 @@
 #                       cargo llvm-cov per certify feature set (scripts/coverage.sh);
 #                       the legs are DERIVED (ci_feature_matrix.py legs), not listed
 #   csd4       PR, weekly, dispatch
-#                       CC's CSD/4 chain (tests/fixtures/csd4/csd4_chain.json) joined to
+#                       CC's CSD/4 chain (src/federation/namespace/csd4_chain.json) joined to
 #                       evidence/cc_impl.tsv, the witnesses and the mutation scopes, with
 #                       the gap lists (scripts/csd4_coverage.py, v60.0.0)
 #   mutants-diff  PR labelled `run-mutants`, every `release-*` PR (v60.0.0), dispatch
@@ -199,7 +199,7 @@ jobs:
           retention-days: 30
 
   # v60.0.0 (docs/V60_TASK_PLAN.md §3b, S0-csd) — report-only. The join reads
-  # CC's chain (tests/fixtures/csd4/csd4_chain.json, vendored from rc9) and
+  # CC's chain (src/federation/namespace/csd4_chain.json, vendored at the rc9 tag) and
   # CEWPOS's catalogue at main.
   csd4:
     name: CSD/4 coverage (report)

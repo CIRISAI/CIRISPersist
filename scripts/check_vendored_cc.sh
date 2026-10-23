@@ -4,14 +4,22 @@
 #   scripts/check_vendored_cc.sh <cc-tag>          # e.g. v1.0-rc6
 #   CC_REPO=<url-or-path> scripts/check_vendored_cc.sh <cc-tag>
 #
-# Persist vendors two CIRISConstitution files byte-for-byte:
+# Persist vendors these CIRISConstitution files byte-for-byte:
 #
-#   manifests/namespace_registry.json      -> src/federation/namespace/namespace_registry.json
-#   manifests/namespace_match_vectors.json -> src/federation/namespace/namespace_match_vectors.json
+#   manifests/namespace_registry.json          -> src/federation/namespace/namespace_registry.json
+#   manifests/namespace_match_vectors.json     -> src/federation/namespace/namespace_match_vectors.json
+#   manifests/governance_policy.json           -> src/federation/namespace/governance_policy.json      (v60.0.0)
+#   manifests/governance_policy_vectors.json   -> src/federation/namespace/governance_policy_vectors.json
+#   manifests/csd4_chain.json                  -> src/federation/namespace/csd4_chain.json
+#   manifests/topology_vocabulary.json         -> src/federation/namespace/topology_vocabulary.json
+#   formal/self_roster/traces/*.json           -> tests/fixtures/self_roster/*.json (the six traces)
+#
+# (pins: registry.rs and cc_manifests.rs; the from-disk witness I1302 checks
+# the same property against a local CC checkout when one is present.)
 #
 # The vendor is taken BY COMMIT (`registry.rs#VENDORED_CC_COMMIT`), which can
 # precede the CC release tag. This script fetches CC at <cc-tag> and compares
-# both files to the vendored copies byte for byte; it exits non-zero on any
+# every file to its vendored copy byte for byte; it exits non-zero on any
 # difference, on a missing tag, or on a fetch failure — never "could not look,
 # so fine". Run it before cutting a persist release that names a CC version.
 # It needs the network, so it is a ship step and is NOT wired into CI.
@@ -34,18 +42,32 @@ echo "CC $tag = $sha"
 echo "vendored at $pinned"
 
 rc=0
-for f in namespace_registry.json namespace_match_vectors.json; do
-  if ! git -C "$tmp/cc" show "$sha:manifests/$f" > "$tmp/$f"; then
-    echo "FAIL: $tag carries no manifests/$f" >&2; rc=1; continue
+n=0
+compare() {  # <path in CC at the tag> <local path>
+  local cc_path="$1" local_path="$2" name
+  name="$(echo "$cc_path" | tr / _)"
+  n=$((n + 1))
+  if ! git -C "$tmp/cc" show "$sha:$cc_path" > "$tmp/$name"; then
+    echo "FAIL: $tag carries no $cc_path" >&2; rc=1; return
   fi
-  want="$(sha256sum "$tmp/$f" | cut -d' ' -f1)"
-  have="$(sha256sum "$dir/$f" | cut -d' ' -f1)"
-  if cmp -s "$tmp/$f" "$dir/$f"; then
-    echo "ok    $f  sha256 $have"
+  if [ ! -f "$local_path" ]; then
+    echo "FAIL: no vendored copy at ${local_path#"$root"/}" >&2; rc=1; return
+  fi
+  want="$(sha256sum "$tmp/$name" | cut -d' ' -f1)"
+  have="$(sha256sum "$local_path" | cut -d' ' -f1)"
+  if cmp -s "$tmp/$name" "$local_path"; then
+    echo "ok    $cc_path  sha256 $have"
   else
-    echo "DIFF  $f  vendored $have  !=  $tag $want" >&2
+    echo "DIFF  $cc_path  vendored $have  !=  $tag $want" >&2
     rc=1
   fi
+}
+for f in namespace_registry.json namespace_match_vectors.json governance_policy.json \
+         governance_policy_vectors.json csd4_chain.json topology_vocabulary.json; do
+  compare "manifests/$f" "$dir/$f"
+done
+for f in "$root"/tests/fixtures/self_roster/*.json; do
+  compare "formal/self_roster/traces/$(basename "$f")" "$f"
 done
 
 if [ "$rc" -ne 0 ]; then
@@ -56,4 +78,4 @@ if [ "$sha" != "$pinned" ]; then
   echo "note: the bytes match, but $tag is commit $sha and VENDORED_CC_COMMIT names $pinned —" \
        "re-pin the commit (and regenerate the binds with gen_namespace_match_binds.py) so the record names the tag's commit"
 fi
-echo "PASS: both vendored files are byte-identical to CIRISConstitution $tag"
+echo "PASS: all $n vendored files are byte-identical to CIRISConstitution $tag"
