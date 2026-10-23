@@ -114,6 +114,31 @@ refuse `identity_amendment_unauthorized` unless the cited response is admitted, 
 about this agent and signed by a key seated as a WA at the response's asserted_at.
 `wa_adjudication:{state}` closes to abandonment | seizure | successor.
 
+Steward ruling 10-22, the CENSUS (after v60; persist settles row names + tokens with Edge, files
+the ticket once settled): the holonomic view becomes the census; CC 6.2 removed; v1 is
+SECRET-SHARED: each node splits each bucketed count (and each member its vote cell) into two
+additive shares sent to two seats chosen by H(token‖period); each seat sums the shares it holds;
+composite and tally = the sum of the two partials, published with the mass commitment over
+per-period tokens; no seat sees a return or a vote; participation visible. Numbers: k = 10
+owners per cell; a census-derived base falls at most 10 % per period, floor above the
+small-community size = max(rooted-active roster, 50 % of the last stable composite); a
+one-period fall over a third freezes the base and all narrowing reliefs. Expected-active (CC
+4.5.13's base) = owners active in ≥1 of the last four periods, a member-only composite under the
+community's MLS epoch key. Dominance gate refuses a composite/tally where one owner holds over
+half the mass. Persist's door work: a share-sum store per seat per period (local, deleted after
+the period), the partial-sum row, the composite row on AggregationMetaV1 v3 (verify inputs as
+envelope members, dominance + multiplicity gates at federation admission), the expected-active
+reader with its floor feeding `two_path::Base` (today StandingRoster only; `Base::count` is the
+one site) and reverse_quorum, and the algorithm id + period a ballot binds to. Persist's
+answer (sent to CC + Edge 10-23 01:30 UTC): the share rows need ONE new placement class
+`addressed` (one recipient in for_key_id, audience {author, recipient}, never widened, expires
+at period end; may_receive's refers-to arm + expires_at/reap already exist, the Placement
+variant does not); recipient and aggregator must be serve seats (#1101 predicate); proposed
+tokens census_return_recipient_not_seat / census_return_expired /
+census_composite_signer_not_seat / census_composite_below_k; "cells sum to mass" needs a
+signed mass_total member, a Merkle root cannot be summed; the objection tally stays an
+identified count and does not ride the anonymising carrier (one COUNT path, two instruments).
+
 ## 3. The mutation discipline (S0, then every slice)
 
 **Problem.** The repo has a centralized, gated mutation matrix (`scripts/mutants.sh`,
