@@ -198,6 +198,9 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         Bound::Open("every key of one identity type: grows with the federation for the common types"),
     ),
     ("list_known_wire_hashes_since", Bound::Paged),
+    // v60.0.0 (CIRISPersist#1105) — one key-plane family's held hashes,
+    // cursored on the hash like `list_wire_hashes_since`.
+    ("list_key_plane_wire_hashes_since", Bound::Paged),
     (
         "list_key_registration_history",
         Bound::Schema("one key's replaced registrations: one per same-key rebind ceremony"),
