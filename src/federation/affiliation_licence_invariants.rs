@@ -1345,6 +1345,72 @@ pub mod bodies {
             obr::AFFILIATION_NOT_HELD,
             "I1219 a binding naming an unknown community",
         );
+        // Signed beyond W, cosigned by a quorum that still holds at receipt:
+        // admitted (W binds only a signer set that has lost standing). Kills:
+        // the W gate refusing every stale binding, or refusing a still-valid
+        // one.
+        ts::register_hybrid_key_as(d, &node("n6"), &node("n6"), identity_type::NODE).await;
+        let mut stale = binding(&k[0], &node("n6"), Some(&aff));
+        stale.asserted_at = base() - Duration::days(4);
+        stale.scrub_timestamp = stale.asserted_at;
+        ts::reseal(&mut stale);
+        must_put(
+            d,
+            &cosigned(stale, &[&k[1]]),
+            "I1219 a binding signed four days ago, its quorum still standing",
+        )
+        .await;
+        // A general delegation onto a node naming a community is not an
+        // owner-binding: the fold does not read it. Kills: the owner-binding
+        // filter weakened from AND to OR.
+        let mut general = crate::federation::admission::steward_liveness_test_support::signed_row(
+            &pk[0],
+            &node("n3"),
+            attestation_type::DELEGATES_TO,
+            serde_json::json!({ "scope": [ds::INFRA_SERVE], "community_id": plain }),
+        );
+        general.asserted_at = base() - Duration::minutes(4);
+        general.scrub_timestamp = general.asserted_at;
+        ts::reseal(&mut general);
+        must_put(d, &general, "I1219 a general delegation naming a community").await;
+        assert_eq!(
+            crate::federation::admission::affiliation_of_binding(d, &node("n3"))
+                .await
+                .unwrap(),
+            None,
+            "[{tag}] I1219: a general delegation names no affiliation on the bond"
+        );
+        // Two bindings in force by the same steward, naming two
+        // affiliations: the fold names the smaller id, whichever was read
+        // first (the larger one is the older row). Kills: the minimum
+        // inverted or dropped.
+        let (aff2, k2) = affiliation(
+            d,
+            &format!("{tag}-zz"),
+            consensus_protocol::MAJORITY,
+            &["a", "b", "c"],
+            1,
+            None,
+        )
+        .await;
+        assert!(aff < aff2, "the witness needs aff < aff2");
+        let mut older = binding(&k[0], &node("n2"), Some(&aff2));
+        older.asserted_at = base() - Duration::minutes(6);
+        older.scrub_timestamp = older.asserted_at;
+        ts::reseal(&mut older);
+        must_put(
+            d,
+            &cosigned(older, &[&k2[0], &k2[1]]),
+            "I1219 the steward's older binding naming the second affiliation",
+        )
+        .await;
+        assert_eq!(
+            crate::federation::admission::affiliation_of_binding(d, &node("n2"))
+                .await
+                .unwrap(),
+            Some(aff.clone()),
+            "[{tag}] I1219: two affiliations on the bond, the smaller id is named"
+        );
     }
 
     /// **I1220** — #1049: the consent `grant` chain at the signed instant.

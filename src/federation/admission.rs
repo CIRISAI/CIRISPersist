@@ -12094,15 +12094,15 @@ pub async fn affiliation_of_binding(
     key: &str,
 ) -> Result<Option<String>, Error> {
     let bindings = owner_bindings_in_force_at(directory, key, chrono::Utc::now()).await?;
-    let mut named: Option<String> = None;
+    // More than one binding in force (one steward's, naming two
+    // affiliations): the smallest id, so every node names the same one.
+    let mut named = Vec::new();
     for b in &bindings {
         if let Some(c) = envelope_cohort_target(&b.attestation_envelope)? {
-            if named.as_deref().is_none_or(|n| c < n) {
-                named = Some(c.to_owned());
-            }
+            named.push(c.to_owned());
         }
     }
-    Ok(named)
+    Ok(named.into_iter().min())
 }
 
 /// Verify-before-mutation (AV-9): wired into every backend's `put_attestation`
