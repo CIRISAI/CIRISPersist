@@ -1360,6 +1360,38 @@ pub mod bodies {
             "I1219 a binding signed four days ago, its quorum still standing",
         )
         .await;
+        // A bare retraction against the node ends the binding only when its
+        // GRANTER signs it. Kills: the bare-retraction match inverted.
+        let bare = |by: &str| {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut row =
+                ts::bare_attestation(&id, by, &node("n6"), &serde_json::json!({ "id": id }));
+            row.attestation_type = attestation_type::WITHDRAWS.to_owned();
+            ts::seal_row_in_place(by, &mut row);
+            row
+        };
+        let on_bond = || async {
+            crate::federation::admission::affiliation_of_binding(d, &node("n6"))
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            on_bond().await,
+            Some(aff.clone()),
+            "[{tag}] I1219: n6 on the bond"
+        );
+        must_put(d, &bare(&k[2]), "I1219 another key's bare retraction").await;
+        assert_eq!(
+            on_bond().await,
+            Some(aff.clone()),
+            "[{tag}] I1219: another key's bare retraction does not end the binding"
+        );
+        must_put(d, &bare(&k[0]), "I1219 the granter's bare retraction").await;
+        assert_eq!(
+            on_bond().await,
+            None,
+            "[{tag}] I1219: the granter's bare retraction ends it"
+        );
         // A general delegation onto a node naming a community is not an
         // owner-binding: the fold does not read it. Kills: the owner-binding
         // filter weakened from AND to OR.
