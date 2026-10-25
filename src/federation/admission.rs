@@ -5491,10 +5491,10 @@ pub fn check_encryption_pubkeys(
 /// 4. `signer_acts_for`: `attesting_key_id` is the occurrence's own
 ///    `identity_key_id` OR an already-active occurrence key of the same identity.
 ///
-/// NOT feature-gated: backend-agnostic (verify-core only), and the MemoryBackend
-/// (compiled without postgres/sqlite) calls it — a `cfg(any(postgres,sqlite))`
-/// gate here breaks reduced-feature builds (darwin no-postgres, the default-
-/// feature manifest bin) with E0425.
+/// NOT feature-gated: backend-agnostic (verify-core only); a
+/// `cfg(any(postgres,sqlite))` gate here broke reduced-feature builds (darwin
+/// no-postgres, the default-feature manifest bin) with E0425 while the retired
+/// memory backend called it.
 pub async fn verify_signed_identity_occurrence<D>(
     directory: &D,
     signed: &crate::federation::types::SignedIdentityOccurrence,
@@ -5950,8 +5950,7 @@ where
 ///    key bound as an occurrence of it ([`check_signer_acts_for`]) — a peer
 ///    cannot assert (or retire) a victim's route with its own unrelated key.
 ///
-/// NOT feature-gated: backend-agnostic, and the MemoryBackend calls it (the
-/// #418 cfg lesson).
+/// NOT feature-gated: backend-agnostic (the #418 cfg lesson).
 ///
 /// [`verify_threshold_signatures`]: ciris_verify_core::threshold::verify_threshold_signatures
 pub async fn verify_signed_transport_destination(
@@ -6977,8 +6976,7 @@ where
 /// [`ciris_verify_core::threshold::ThresholdSignature`] used as a LIST
 /// rather than a single value) and is a follow-up.
 ///
-/// NOT feature-gated: backend-agnostic, and the MemoryBackend calls it (the
-/// #418 cfg lesson).
+/// NOT feature-gated: backend-agnostic (the #418 cfg lesson).
 ///
 /// [`verify_threshold_signatures`]: ciris_verify_core::threshold::verify_threshold_signatures
 pub async fn verify_signed_touch_claim(
@@ -28920,7 +28918,8 @@ pub(crate) mod ungated_doors_test_support {
     /// survive the write→read round trip on the path a consumer advertises
     /// from?**
     ///
-    /// Edge reported it reading back EMPTY through `MemoryBackend`, which
+    /// Edge reported it reading back EMPTY through the (since retired) memory
+    /// backend, which
     /// matters now in a way it never did before: pre-v36 an unrecognized scope
     /// resolved `Cohort` for every family, so an empty string was harmless. In
     /// v36 the `Trace` family resolves an unrecognized scope to `SelfOwn`, so

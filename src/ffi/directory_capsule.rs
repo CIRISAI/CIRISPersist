@@ -4478,7 +4478,7 @@ mod tests {
 
     // ── shared helpers ─────────────────────────────────────────────
 
-    fn memory_directory() -> (Arc<dyn FederationDirectory>, Directory) {
+    fn test_directory() -> (Arc<dyn FederationDirectory>, Directory) {
         let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend;
         let directory = build_persist_directory(dir.clone());
@@ -4493,7 +4493,7 @@ mod tests {
     fn withdraws_admission_depth_op_forwards_the_recorded_depth() {
         use crate::federation::tier_ingest::test_support as ts;
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
         rt.block_on(ts::register_hybrid_key_as(
             dir.as_ref(),
             "capsule-issuer",
@@ -4559,7 +4559,7 @@ mod tests {
     fn apply_replicated_community_op_is_the_replicated_door() {
         use crate::federation::tier_ingest::test_support as ts;
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
         rt.block_on(ts::register_hybrid_key_as(
             dir.as_ref(),
             "capsule-human",
@@ -4705,7 +4705,7 @@ mod tests {
     #[test]
     fn scores_ops_round_trip_through_capsule() {
         let rt = test_runtime();
-        let (_dir, directory) = memory_directory();
+        let (_dir, directory) = test_directory();
         let filter = crate::read::AttestationFilter {
             subject_key_id: Some("subj".into()),
             ..Default::default()
@@ -4759,7 +4759,7 @@ mod tests {
     #[test]
     fn exclusion_planes_route_through_the_capsule_655_662() {
         let rt = test_runtime();
-        let (_dir, directory) = memory_directory();
+        let (_dir, directory) = test_directory();
 
         // `revocations_for` — routed, and an unknown subject is an empty
         // answer, not `Unsupported`. (An `Unsupported` here read as "this host
@@ -5210,7 +5210,7 @@ mod tests {
     #[test]
     fn i1201_key_plane_holdings_route_through_the_capsule() {
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
         rt.block_on(async {
             for k in ["i1201-cap-a", "i1201-cap-b"] {
                 crate::federation::tier_ingest::test_support::register_identity_key(
@@ -5257,7 +5257,7 @@ mod tests {
     #[test]
     fn known_hash_ops_round_trip_through_the_capsule_785() {
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
         let hash = crate::federation::wire_index::content_hash_of_bytes(b"capsule-785");
         let now = chrono::DateTime::parse_from_rfc3339("2027-05-06T07:08:09Z")
             .expect("literal is valid RFC-3339")
@@ -5370,7 +5370,7 @@ mod tests {
     #[test]
     fn i1153_capsule_put_public_key_refuses_a_mismatched_id() {
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
         let rec = sample_key_record("i1153-capsule-bad");
         match run_op(
             &rt,
@@ -5394,7 +5394,7 @@ mod tests {
     #[test]
     fn put_then_lookup_public_key_round_trips() {
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
         // v59.0.0 (CIRISPersist#1103) — the capsule's PutPublicKey is a door:
         // the id names its own key.
         let key_id = crate::federation::tier_ingest::test_support::fp_key_id("primitive-abc");
@@ -5636,11 +5636,11 @@ mod tests {
     #[test]
     fn put_then_list_transport_destinations_round_trips() {
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
 
-        // A transport destination needs its occurrence key on file (FK on
-        // real backends); MemoryBackend's put_transport_destination is
-        // permissive, so we assert the round-trip shape either way.
+        // A transport destination needs its occurrence key on file (an FK);
+        // the key is not registered here, so we assert the round-trip shape
+        // either way.
         let dest = self_at_login::TransportDestination {
             occurrence_key_id: "occ-1".into(),
             transport_kind: "reticulum".into(),
@@ -5666,7 +5666,7 @@ mod tests {
                 destination: dest.clone(),
             },
         );
-        // MemoryBackend may accept (Unit) or refuse (Err) — either is a
+        // The backend may accept (Unit) or refuse (Err) — either is a
         // valid ABI round-trip; the point is the bytes made it back.
         let direct_put = rt.block_on(dir.put_transport_destination(&dest));
         match (&put, &direct_put) {
@@ -5700,7 +5700,7 @@ mod tests {
     #[test]
     fn signed_transport_destination_ops_fail_closed_and_round_trip() {
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
 
         let signed = self_at_login::SignedTransportDestination {
             transport_destination: self_at_login::TransportDestination {
@@ -5764,7 +5764,7 @@ mod tests {
     #[test]
     fn reachable_under_scope_no_trust_roots() {
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
 
         let verdict = run_op(
             &rt,
@@ -5802,7 +5802,7 @@ mod tests {
         // (not collapse to the top-level Err), byte-identical to the direct
         // call — proving the verify ran entirely inside persist's `.so`.
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
 
         let op = DirectoryOp::VerifyHybridViaDirectory {
             canonical_bytes: b"canonical".to_vec(),
@@ -5846,7 +5846,7 @@ mod tests {
         // directory yields a root-only graph; the op result must equal the
         // direct call, serialized through the ABI.
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
 
         let res = run_op(
             &rt,
@@ -5890,7 +5890,7 @@ mod tests {
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::{attestation_type, identity_type as it};
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
         rt.block_on(async {
             register(dir.as_ref(), "zc-root", &[it::USER]).await;
             register(dir.as_ref(), "zc-next", &[it::PRIMITIVE]).await;
@@ -5942,11 +5942,17 @@ mod tests {
 
     #[test]
     fn backend_error_flattens_to_err_variant() {
-        // MemoryBackend has no `lookup_shared_instance_lease` impl (the
-        // default trait impl errors), so this proves the Err(String)
+        // A backend failure injected on `lookup_shared_instance_lease` (the
+        // fault double over the test backend) proves the Err(String)
         // flattening path across the ABI.
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let dir: Arc<dyn FederationDirectory> = Arc::new(
+            crate::federation::directory_double::FaultInjectingDirectory::new(Arc::new(
+                crate::store::test_backend::test_backend(),
+            ))
+            .erroring("lookup_shared_instance_lease"),
+        );
+        let directory = build_persist_directory(dir.clone());
 
         let res = run_op(
             &rt,
@@ -5957,7 +5963,7 @@ mod tests {
         );
         assert!(
             matches!(res, DirectoryOpResult::Err(_)),
-            "unimplemented backend method ⇒ Err(String), got {res:?}"
+            "a failing backend method ⇒ Err(String), got {res:?}"
         );
         // Direct call also errors — same class.
         assert!(rt
@@ -5973,7 +5979,7 @@ mod tests {
         // A parse failure must STILL fire the callback with a serialized
         // Err (uniform completion path), never leak the future.
         let rt = test_runtime();
-        let (_dir, directory) = memory_directory();
+        let (_dir, directory) = test_directory();
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let ctx: *mut c_void = Box::into_raw(Box::new(tx)) as *mut c_void;

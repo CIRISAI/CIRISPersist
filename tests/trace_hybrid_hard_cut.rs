@@ -4,7 +4,7 @@
 //! CEG 1.0-RC7 §10.1.5.1.1 + the hard cut on CIRISVerify#75: the
 //! producer's per-trace envelope signature must carry + verify
 //! ML-DSA-65 (HNDL forge-later against the durable, replicated,
-//! kept-for-posterity trace corpus). The MemoryBackend mirror of these
+//! kept-for-posterity trace corpus). The in-process mirror of these
 //! assertions lives in `src/ingest.rs` (the four lib proof tests); this
 //! file proves the same cut survives the V083 schema + the SQL
 //! round-trip on the two backends that actually persist.

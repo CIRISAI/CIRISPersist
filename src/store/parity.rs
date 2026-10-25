@@ -1,20 +1,21 @@
 //! **The backend-parity gate** (v31.2.0, CIRISPersist#670).
 //!
-//! `README.md` says persist behaves the same on postgres, sqlite and memory
-//! *"as an enforced invariant."* Until this module, it was not enforced — it
+//! `README.md` says persist behaves the same on postgres and sqlite *"as an
+//! enforced invariant."* Until this module, it was not enforced — it
 //! was convention plus per-case witnesses, and v31 alone found five
 //! divergences of one shape: **a gate, an order, or a type that one backend
 //! has and its siblings do not**. The recurring cost is always the same. The
-//! memory and sqlite arms are correct, so nobody can see it, and it surfaces
-//! on the one backend production runs.
+//! arm the tests reach for first is correct, so nobody can see it, and it
+//! surfaces on the one backend production runs. (Until v60.0.0 there was a
+//! third, in-process memory backend; CIRISPersist#1002 retired it.)
 //!
 //! # What this module does
 //!
-//! It reads `src/store/{memory,sqlite,postgres}.rs` **from disk as text** and,
-//! for every method of the three backend traits, extracts the **ordered
-//! sequence of gate calls** the method makes. All three backends must produce
-//! the same sequence. A gate present in two and absent in the third is a test
-//! failure naming the backend and the missing call; so is the same set of
+//! It reads `src/store/{sqlite,postgres}.rs` **from disk as text** and, for
+//! every method of the backend traits, extracts the **ordered sequence of gate
+//! calls** the method makes. Both backends must produce the same sequence. A
+//! gate present in one and absent in the other is a test failure naming the
+//! backend and the missing call; so is the same set of
 //! gates in a different order, because CIRISPersist#660 was an *ordering* bug
 //! with all the right gates present.
 //!
@@ -37,9 +38,9 @@
 //! reported "six divergences, none blocking" had been run by a detector that
 //! could not see any of them. A second attempt keyed on the call's *module
 //! path* instead, and immediately produced a false finding — `grant_trust`
-//! looked like a gate missing on two backends, when in fact all three call
-//! `validate_trust_grant` and two of them reach it through
-//! `crate::store::memory::`. **A path-prefix rule is exactly as much a guess
+//! looked like a gate missing on two backends, when in fact all three then
+//! called `validate_trust_grant` and two of them reached it through another
+//! backend's module path. **A path-prefix rule is exactly as much a guess
 //! as a name-prefix rule.**
 //!
 //! So the alphabet is a **partition, not a pattern**. The universe is derived:
@@ -117,9 +118,8 @@ pub(crate) enum Class {
 ///   refusal: it fails only on a non-finite weight, which
 ///   `check_row_column_binding` has already refused. Its *absence* would be a
 ///   real defect, but the row-hash witnesses catch that directly, and treating
-///   it as a gate would flag the memory backend's second call (it re-derives
-///   the stored row's hash for a conflict check where the SQL backends SELECT
-///   it) as a divergence it is not.
+///   it as a gate would flag a backend that re-derives the stored row's hash
+///   for a conflict check where another SELECTs it as a divergence it is not.
 /// - `check` is **Gate**, and is the receiver-qualified form —
 ///   `hardware_attestation_policy.check`, `DimensionAdmissionPolicy::default().check`.
 ///   A policy object refusing is a gate whatever the method is called.
@@ -262,7 +262,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("pg_sync_key_record_row", Class::Plumbing),
     ("pg_sync_occurrence_row", Class::Plumbing),
     ("pg_drop_key_record_rows", Class::Plumbing),
-    ("memory_signed_occurrence", Class::Plumbing),
     ("index_plane_row", Class::Plumbing),
     ("is_held_revocation", Class::Plumbing),
     ("sqlite_key_plane_present", Class::Plumbing),
@@ -284,8 +283,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_detection_body", Class::Gate),
     // The same-file emit helpers: each plans a row (the shared plan) and
     // stores it, so it carries the plan's sequence.
-    ("plan_peer_removal_event", Class::Delegates),
-    ("memory_record_hard_case_in_state", Class::Delegates),
     ("sqlite_record_hard_case_in_tx", Class::Delegates),
     ("pg_record_hard_case_in_tx", Class::Delegates),
     // An observation through the `record_hard_case` door (another door):
@@ -306,7 +303,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("pg_row_to_hard_case_event", Class::Plumbing),
     ("sqlite_render_table", Class::Plumbing),
     ("pg_render_table", Class::Plumbing),
-    ("render", Class::Plumbing),
     ("execute_batch", Class::Plumbing),
     ("batch_execute", Class::Plumbing),
     // The two projections (rows → table): a derivation that answers `None`
@@ -318,7 +314,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // `credits:` / `expertise:` rows → the ledgers): a derivation and its
     // writers; whether a row supersedes the held one is
     // `ledger_projection::supersedes`, shared.
-    ("project_ledger_row", Class::Plumbing),
     ("sqlite_project_ledger", Class::Plumbing),
     ("pg_project_ledger", Class::Plumbing),
     ("sqlite_ledger_projection_rebuild", Class::Plumbing),
@@ -354,7 +349,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("sqlite_store_erasure_withdraws", Class::Plumbing),
     ("pg_store_erasure_withdraws", Class::Plumbing),
     // The canonical subject of an agent / a detection's trace: derivations.
-    ("agent_subject", Class::Plumbing),
     ("detection_subject", Class::Plumbing),
     ("sqlite_erase_cited_rows", Class::Plumbing),
     ("pg_erase_cited_rows", Class::Plumbing),
@@ -363,7 +357,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // Each backend's erasure recorder plans the erasure row(s) (the shared
     // hard_case plan) and writes them with their tombstones: it carries the
     // plan's sequence.
-    ("memory_plan_erasure", Class::Delegates),
     ("sqlite_record_erasure", Class::Delegates),
     ("pg_record_erasure", Class::Delegates),
     // The pre-erasure move of attestable pre-v57 detections onto the plane:
@@ -637,8 +630,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_media_source", Class::Gate),
     // v45.0.0 (#871, FSD §5) — the placement rule: a rendition whose
     // original THIS node holds must name the original's `cohort_scope`.
-    // One name at the six write doors on all three backends (memory's
-    // `HeldBlobScope` answers "not held": it has no blob store).
+    // One name at the six write doors on every backend.
     ("check_rendition_placement", Class::Gate),
     ("check_delivery_mode_vocabulary", Class::Gate),
     ("check_device_class", Class::Gate),
@@ -679,8 +671,8 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
         "check_targeted_cohort_requires_federation_tier",
         Class::Gate,
     ),
-    // The tier vocabulary is a closed set; memory had no CHECK constraint,
-    // and an unknown tier is signature-exempt.
+    // The tier vocabulary is a closed set, and an unknown tier is
+    // signature-exempt.
     ("check_attestation_tier_vocabulary", Class::Gate),
     ("check_purge_admission", Class::Gate),
     ("check_reseal_admission", Class::Gate),
@@ -741,7 +733,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_user_target_steward_binding_admission", Class::Gate),
     ("check_withdraws_admission", Class::Gate),
     ("check_write", Class::Gate),
-    ("cloned", Class::Plumbing),
     ("commit", Class::Plumbing),
     ("compute_persist_row_hash", Class::Plumbing),
     ("connect", Class::Plumbing),
@@ -759,7 +750,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("execute", Class::Plumbing),
     ("filter", Class::Plumbing),
     ("filter_withheld_rows", Class::Gate),
-    ("find", Class::Plumbing),
     ("fountain_manifest_row", Class::Delegates),
     ("from_bytes", Class::Plumbing),
     ("from_manifest_bytes", Class::Plumbing),
@@ -775,7 +765,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("get_accord_proposal", Class::Delegates),
     ("get_attestation", Class::Delegates),
     ("get_client", Class::Delegates),
-    ("get_mut", Class::Plumbing),
     // v44.8.1 (#870) — the blob doors' post-write index hook for the holder
     // claim; same-file helper over `index_stored_record`, followed like it.
     ("index_holder_claim", Class::Delegates),
@@ -783,7 +772,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("index_stored_record", Class::Delegates),
     ("insert_trace_events_batch", Class::Delegates),
     ("insert_trace_llm_calls_batch", Class::Delegates),
-    ("iter", Class::Plumbing),
     ("list_org_memberships_for", Class::Delegates),
     ("list_partner_records_for", Class::Delegates),
     ("load_or_init_content_master", Class::Delegates),
@@ -870,7 +858,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("active_identity_for_occurrence", Class::Delegates),
     ("lookup_public_key", Class::Delegates),
     ("map_err", Class::Plumbing),
-    ("memory_idempotent_insert", Class::Delegates),
     // v36.0.0 (CIRISPersist#668) — visible because the cursor family's row
     // mappers are now direct calls (see the `pg_row_to_*` note): these are
     // the mappers' own decode helpers. Plumbing — they fail only on the
@@ -952,8 +939,8 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // refuses nothing; its ABSENCE from a door is what the re-serve/late-
     // admit witnesses red on.
     ("next_key_serve_position", Class::Plumbing),
-    // v36.0.0 (CIRISPersist#668) — the V130 per-plane allocator (postgres +
-    // memory spelling). Plumbing: reads a MAX and fails only on substrate
+    // v36.0.0 (CIRISPersist#668) — the V130 per-plane allocator (the postgres
+    // spelling). Plumbing: reads a MAX and fails only on substrate
     // error; the per-plane #668 witnesses catch a door that skips it.
     ("next_plane_position", Class::Plumbing),
     ("ok_or_else", Class::Plumbing),
@@ -1316,83 +1303,26 @@ pub(crate) struct DeclaredDivergence {
 /// across the three backends, gate for gate and order for order.
 #[cfg(test)]
 pub(crate) const DECLARED_DIVERGENCES: &[DeclaredDivergence] = &[
-    // v60.0.0 (CIRISPersist#934 step 4) — the key-grant doors.
-    DeclaredDivergence {
-        trait_name: "FederationDirectory",
-        method: "key_grant_held_owner",
-        backend: "memory",
-        expected: &[],
-        reason: "The memory backend has no blob plane: it holds no content under a key-grant \
-                 axis, so it runs the trait default (`None`, no gate). Sqlite and postgres run \
-                 the one shared read `key_grant::held_owner`. S5 (#1002) retires the memory \
-                 backend and this row.",
-    },
-    DeclaredDivergence {
-        trait_name: "FederationDirectory",
-        method: "project_key_grant_row",
-        backend: "memory",
-        expected: &[],
-        reason: "The memory backend has no grant tables to project a key-grant row into, so it \
-                 runs the trait default (a no-op, no gate). Sqlite and postgres run the one \
-                 shared plan `key_grant::project_if_key_grant_row`. S5 (#1002) retires the \
-                 memory backend and this row.",
-    },
-    // v57.0.0 (CIRISPersist#988 item 2) — the legacy rehome.
-    DeclaredDivergence {
-        trait_name: "AttestationStore",
-        method: "rehome_legacy_hard_case_events",
-        backend: "memory",
-        expected: &[],
-        reason: "The rehome moves pre-v57 `hard_case_events` rows (written before the table \
-                 became a projection) onto the plane. Only a durable store can hold such a row: \
-                 the memory backend starts empty every process and has written hard_case rows \
-                 through the plan since the first v57 build, so it has nothing to rehome and \
-                 its rehome plans nothing. Every row it does hold was planned by \
-                 `plan_hard_case_row` at its own door.",
-    },
     // v56.0.0 (CIRISPersist#934 door 4) — the `reseal_attestation_v31`
     // declaration that stood here is gone, and its reason was false. It said
     // the SQL backends "get that second answer from their transaction — they
     // read and update inside one". They did not: sqlite and postgres read the
     // row through `get_attestation` BEFORE their write transaction and asked
     // nothing inside it, so a change landing between the read and the write was
-    // overwritten (I953, red on both before the fix). Memory alone re-asked
-    // under its lock. The door is now shared on all three: the plan asks the
+    // overwritten (I953, red on both before the fix). The door is now shared:
+    // the plan asks the
     // shape and seal gates, and every executor re-asks the shape gate on the
     // row it holds inside its write step (`PlannedReseal::sealed_over`;
     // SHARED_DOORS below).
-    DeclaredDivergence {
-        trait_name: "FederationDirectory",
-        method: "list_signed_transport_destinations_since",
-        backend: "memory",
-        expected: &[],
-        reason: "v52.0.0 — `from_token` decodes the STORED `binding_provenance` TEXT column on \
-                 sqlite and postgres and refuses a token that is neither `rooted` nor `advisory`. \
-                 Memory stores the typed `BindingProvenance` enum and never holds a token, so \
-                 there is nothing to decode and nothing that can be malformed. The admission \
-                 door that refuses an unknown ENVELOPE token is shared by all three backends \
-                 (I279).",
-    },
-    DeclaredDivergence {
-        trait_name: "FederationDirectory",
-        method: "list_key_registration_history",
-        backend: "memory",
-        expected: &[],
-        reason: "v54.1.0 (#1044) — `from_token` decodes the STORED `replacement_kind` TEXT column \
-                 (V186) on sqlite and postgres and refuses a token that is neither `rebind` nor \
-                 `invalid_replaced`. Memory stores the typed `KeyReplacementKind` enum and never \
-                 holds a token, so there is nothing to decode and nothing that can be malformed. \
-                 The V186 CHECK constrains the column to the two tokens on both dialects.",
-    },
     DeclaredDivergence {
         trait_name: "FederationDirectory",
         method: "enter_mesh",
         backend: "postgres",
         expected: &["check_delegation_cycle_admission"],
         reason: "v54.0.0 (Codex on PR #1050) — the crossing's cycle check runs inside \
-                 `plan_enter_mesh` on every backend. Memory and sqlite take their in-process \
-                 delegation write lock BEFORE the plan, so the plan's check and the write are one \
-                 step: one process owns the store. Postgres shares its database with other \
+                 `plan_enter_mesh` on every backend. Sqlite takes its in-process delegation \
+                 write lock BEFORE the plan, so the plan's check and the write are one step: one \
+                 process owns the store. Postgres shares its database with other \
                  processes, so it also takes the delegation advisory lock in the UPDATE's \
                  transaction and asks the cycle gate AGAIN under it: a writer in another process \
                  may have committed the reverse edge between the plan and the lock (I597).",
@@ -1404,9 +1334,8 @@ mod tests {
     use super::{Class, DeclaredDivergence, CALL_CLASSES, DECLARED_DIVERGENCES};
     use std::collections::{BTreeMap, BTreeSet};
 
-    /// The three backend sources, by the name the failure message uses.
-    const BACKENDS: [(&str, &str); 3] = [
-        ("memory", "src/store/memory.rs"),
+    /// The backend sources, by the name the failure message uses.
+    const BACKENDS: [(&str, &str); 2] = [
         ("sqlite", "src/store/sqlite.rs"),
         ("postgres", "src/store/postgres.rs"),
     ];
@@ -1628,7 +1557,7 @@ mod tests {
             "list_key_plane_wire_hashes_since",
             "list_key_plane_wire_hashes_planned",
         ),
-        // The key-grant doors (sqlite / postgres; memory declared).
+        // The key-grant doors.
         ("FederationDirectory", "key_grant_held_owner", "held_owner"),
         (
             "FederationDirectory",
@@ -1763,7 +1692,7 @@ mod tests {
     /// Trailing substrate suffixes stripped before comparison.
     /// `check_revocation_anti_rollback_sqlite` and `..._postgres` are ONE
     /// logical gate whose "find the newest stored row" half is per-substrate.
-    const SUBSTRATE_SUFFIXES: [&str; 5] = ["_memory", "_sqlite", "_postgres", "_pg", "_mem"];
+    const SUBSTRATE_SUFFIXES: [&str; 3] = ["_sqlite", "_postgres", "_pg"];
 
     /// The prefix a [`Class::Plan`] call contributes to a door's sequence:
     /// the decision is the shared plan's, so the door's token NAMES the plan
@@ -2800,9 +2729,11 @@ mod tests {
     fn no_backend_file_hand_rolls_the_seal() {
         // Assembled so this test's own source is not a hit.
         let needle = ["sign", "envelope"].join("_");
-        // `(backend, containing fn, exact occurrences)`.
+        // `(backend, containing fn, exact occurrences)`. The tests the retired
+        // memory backend carried (CIRISPersist#1002) are scanned with the
+        // backend files: they are backend fixtures too.
         let sanctioned: [(&str, &str, usize); 1] = [(
-            "memory",
+            "backend_suite",
             // A forged REVOCATION: the envelope is signed by an attacker while
             // the row claims the revoker, so `put_revocation` must refuse it.
             // `seal_row_in_place` is Attestation-shaped and has no revocation
@@ -2813,7 +2744,8 @@ mod tests {
         )];
         let mut counted: BTreeMap<(&str, String), usize> = BTreeMap::new();
         let mut offenders = Vec::new();
-        for (backend, rel) in BACKENDS {
+        let suite = [("backend_suite", "src/store/backend_suite.rs")];
+        for (backend, rel) in BACKENDS.iter().chain(&suite).copied() {
             let stripped = strip_file(&read(rel));
             let index = index_functions(&stripped);
             for (i, line) in stripped.iter().enumerate() {

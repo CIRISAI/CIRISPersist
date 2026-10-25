@@ -541,7 +541,7 @@ mod from_disk {
             assert!(reason.len() > 40, "I235: an exemption carries its reason");
         }
         let root = env!("CARGO_MANIFEST_DIR");
-        for backend in ["memory", "sqlite", "postgres"] {
+        for backend in ["sqlite", "postgres"] {
             let src = std::fs::read_to_string(format!("{root}/src/store/{backend}.rs")).unwrap();
             for (kind, door) in DOORS {
                 let body = body_lines(&src, door);

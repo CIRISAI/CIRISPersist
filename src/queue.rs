@@ -505,7 +505,7 @@ mod tests {
     /// THREAT_MODEL.md AV-19 regression: graceful shutdown drain.
     /// Submit a few batches, drop the IngestHandle, await the
     /// PersisterHandle, confirm pending work didn't get lost. (The
-    /// MemoryBackend always succeeds; this proves the drain
+    /// in-memory test backend always succeeds; this proves the drain
     /// mechanism. Real backend-outage drain belongs in a Postgres
     /// integration test.)
     #[tokio::test]

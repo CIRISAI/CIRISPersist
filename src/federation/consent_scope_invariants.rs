@@ -802,7 +802,6 @@ mod run {
         const ADMISSION: &str = include_str!("admission.rs");
         const SQLITE: &str = include_str!("../store/sqlite.rs");
         const PG: &str = include_str!("../store/postgres.rs");
-        const MEM: &str = include_str!("../store/memory.rs");
         assert_eq!(
             SCOPE.matches("pub fn covers(").count(),
             1,
@@ -845,11 +844,7 @@ mod run {
             assert!(calls >= n, "I110: {name} calls the scope-token gate at its doors ({calls} < {n}: the shared ingest plan; local per backend; promotion)");
         }
         // Every backend's ingest and local doors are the shared doors.
-        for (name, text) in [
-            ("sqlite.rs", SQLITE),
-            ("postgres.rs", PG),
-            ("memory.rs", MEM),
-        ] {
+        for (name, text) in [("sqlite.rs", SQLITE), ("postgres.rs", PG)] {
             for door in [
                 "attestation_admit::put_attestation_planned(",
                 "attestation_admit::write_local_attestation_planned(",

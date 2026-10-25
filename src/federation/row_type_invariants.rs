@@ -454,7 +454,6 @@ mod pure {
             &rest[..end]
         }
         for (name, src) in [
-            ("memory", include_str!("../store/memory.rs")),
             ("sqlite", include_str!("../store/sqlite.rs")),
             ("postgres", include_str!("../store/postgres.rs")),
         ] {

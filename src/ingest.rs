@@ -3023,7 +3023,8 @@ mod tests {
     // ───────────────────────────────────────────────────────────────
     // v7.2.0 (CIRISPersist#225) — the trace-tier hybrid hard cut.
     // CEG 1.0-RC7 §10.1.5.1.1 + CIRISVerify#75. These four tests prove
-    // the cut against the MemoryBackend; the PG + SQLite mirror lives in
+    // the cut against the in-memory SQLite test backend; the PG + SQLite
+    // mirror lives in
     // tests/trace_hybrid_hard_cut.rs (both backends, V083 round-trip).
     // ───────────────────────────────────────────────────────────────
 

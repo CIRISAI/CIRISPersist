@@ -1,10 +1,10 @@
 //! v53.1.8 (CIRISPersist#1014) — the read-telemetry witnesses.
 //!
-//! - **I549** (memory, sqlite, postgres): over a seeded consent fold, the
+//! - **I549** (sqlite, postgres): over a seeded consent fold, the
 //!   trust-root walks, the audience resolver and one admission, every
 //!   `(backend, door)` counter delta equals the test probe's totals for the
 //!   same calls — reads and rows exactly, bytes per the module doc's
-//!   definition (sqlite / postgres: the probe's envelope bytes; memory: 0) —
+//!   definition (the probe's envelope bytes) —
 //!   and each fold's delta is its one entry plus every read the probe saw
 //!   while it ran.
 //! - **I550** (sqlite, postgres): the snapshot, the cache counters and the
@@ -223,7 +223,6 @@ fn i551_shared_fold_doors_are_recorded_by_their_fold() {
 fn i551_each_backend_records_under_its_own_label() {
     let files = code_outside_observe();
     for (file, own) in [
-        ("store/memory.rs", "Memory"),
         ("store/sqlite.rs", "Sqlite"),
         ("store/postgres.rs", "Postgres"),
     ] {
@@ -422,7 +421,7 @@ fn i552_the_weaver_registry_and_the_catalogue_agree() {
 // ── I553 ─────────────────────────────────────────────────────────────────
 
 /// Every `(backend, door)` read once (no rows, 1 byte), every fold entered
-/// once around one memory `get_attestation` read: then `emit_metrics` into a
+/// once around one sqlite `get_attestation` read: then `emit_metrics` into a
 /// debugging recorder must write every catalogued name with every catalogued
 /// label value and nothing else, each series at exactly the value the
 /// snapshot reads for it.
@@ -438,7 +437,7 @@ async fn i553_emit_metrics_writes_exactly_the_catalogue() {
     for f in Fold::ALL {
         super::fold(*f, async {
             super::record_read::<crate::federation::Attestation>(
-                StoreBackend::Memory,
+                StoreBackend::Sqlite,
                 Door::GetAttestation,
                 "i553",
                 &[],
@@ -557,10 +556,10 @@ async fn i553_emit_metrics_writes_exactly_the_catalogue() {
 
 // ── I690–I692 ────────────────────────────────────────────────────────────
 
-/// One memory read at `door` with no rows: one read, 0 rows, 1 byte.
+/// One sqlite read at `door` with no rows: one read, 0 rows, 1 byte.
 fn one_read(door: Door) {
     super::record_read::<crate::federation::Attestation>(
-        StoreBackend::Memory,
+        StoreBackend::Sqlite,
         door,
         "i69x",
         &[],
@@ -584,7 +583,7 @@ fn i690_the_snapshot_lists_only_doors_that_were_read() {
     assert_eq!(
         local.snapshot().reads,
         vec![DoorReads {
-            backend: StoreBackend::Memory.label(),
+            backend: StoreBackend::Sqlite.label(),
             door: Door::GetAttestation.label(),
             reads: 1,
             rows: 0,
@@ -790,13 +789,9 @@ fn assert_step(
     let probe = probe_totals(log);
     for door in Door::ALL {
         let (reads, rows, probe_bytes) = probe.get(door.label()).copied().unwrap_or_default();
-        let bytes = match backend {
-            StoreBackend::Memory => 0,
-            StoreBackend::Sqlite | StoreBackend::Postgres => probe_bytes,
-        };
         assert_eq!(
             delta3(before.door(backend, *door), after.door(backend, *door)),
-            (reads, rows, bytes),
+            (reads, rows, probe_bytes),
             "I549 {tag}: {} {} counters vs the probe (reads, rows, bytes)",
             backend.label(),
             door.label()
@@ -817,13 +812,9 @@ fn assert_step(
     let (c0, r0, w0, b0) = before.fold(fold);
     let (c1, r1, w1, b1) = after.fold(fold);
     assert!(c1 > c0, "I549 {tag}: {} was not entered", fold.label());
-    let bytes = match backend {
-        StoreBackend::Memory => 0,
-        _ => total.2,
-    };
     assert_eq!(
         (r1 - r0, w1 - w0, b1 - b0),
-        (total.0, total.1, bytes),
+        (total.0, total.1, total.2),
         "I549 {tag}: {} is credited every read made while it ran (reads, rows, bytes)",
         fold.label()
     );

@@ -826,7 +826,6 @@ mod run {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         for file in [
             "src/federation/mod.rs",
-            "src/store/memory.rs",
             "src/store/sqlite.rs",
             "src/store/postgres.rs",
             "src/ffi/directory_capsule.rs",

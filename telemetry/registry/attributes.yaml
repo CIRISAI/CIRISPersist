@@ -12,9 +12,6 @@ groups:
       - id: backend
         type:
           members:
-          - id: memory
-            value: "memory"
-            stability: development
           - id: sqlite
             value: "sqlite"
             stability: development

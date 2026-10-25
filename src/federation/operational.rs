@@ -1915,8 +1915,8 @@ pub mod test_support {
         // NON-BASE64 and the SQLite backend hex/base64-decodes both columns on
         // `put_public_key` — so the holder never landed on sqlite (blocker 1),
         // which then starved roster resolution to 0 valid co-scrubs (blocker 2).
-        // MemoryBackend tolerated the placeholders, which is why this crate's
-        // own helper test only ever ran on memory (the #518 "tested on one
+        // The (since retired) memory backend tolerated the placeholders, which
+        // is why this crate's own helper test only ever ran on memory (the #518 "tested on one
         // backend, used on the other" shape). A real self-scrub round-trips on
         // every backend.
         let bytes = crate::verify::canonical::ceg_produce_canonicalize(&registration_envelope)
@@ -2070,7 +2070,7 @@ pub mod test_support {
     /// private halves live in hardware.
     ///
     /// So this helper serves fixtures on a **bare** backend
-    /// (`SqliteBackend::open_in_memory` + `run_migrations`, `MemoryBackend::new`,
+    /// (`SqliteBackend::open_in_memory` + `run_migrations`, `test_backend()`,
     /// a fresh unseeded pg schema) — NOT `Engine::with_signer`, which seeds
     /// genesis, and NOT a shared pg test database that any engine test has
     /// touched. A fixture needing an accord-conferred `identity_type` against a
@@ -2457,7 +2457,7 @@ pub mod test_support {
     /// v21.15.0 (CIRISPersist#536) — a federation-tier [`Attestation`] REALLY
     /// signed by `attester`'s deterministic hybrid key (via `sign_envelope`),
     /// so it passes the federation-tier ingest hybrid-verify on sqlite/postgres
-    /// (not just MemoryBackend). The graph-shaped counterpart to
+    /// (not just on a backend that skips it). The graph-shaped counterpart to
     /// [`signed_canonical_record`] (which builds a `KeyRecord`); the trust-root
     /// legs are `delegates_to` / `scores` rows, not key records.
     pub(crate) fn signed_trust_attestation(
@@ -3496,7 +3496,7 @@ pub mod test_support {
     /// the other" gap (CIRISPersist#534, the #518 shape) cannot reopen: the
     /// holder registration + co-scrub now round-trip through whatever column
     /// encoding each backend applies (the `test-anchor` placeholder that only
-    /// MemoryBackend tolerated is gone). `tag` scopes the generated ids so a
+    /// the retired memory backend tolerated is gone). `tag` scopes the generated ids so a
     /// shared postgres DB does not collide across runs.
     pub async fn exercise_role_conferral(
         directory: &dyn crate::federation::FederationDirectory,
@@ -3519,9 +3519,9 @@ pub mod test_support {
         // DENY: same role CLAIM, but scrubbed only by an out-of-roster
         // identity → not conferred (the never-self-claimed monotonic property).
         // The scrubber is REGISTERED (so its `scrub_key_id` FK resolves — sqlite
-        // enforces that constraint, MemoryBackend does not; leaning on the FK-
-        // free backend is the same #518/#534 one-backend-tested trap this whole
-        // fix closes), but it is deliberately NOT in `roster`, so its scrub
+        // and postgres enforce that constraint; the retired memory backend did
+        // not, and leaning on it was the same #518/#534 one-backend-tested trap
+        // this whole fix closes), but it is deliberately NOT in `roster`, so its scrub
         // counts toward nothing.
         let self_id = format!("{tag}-canon-self");
         let self_scrubber = Identity::new(&format!("{tag}-selfscrub"));

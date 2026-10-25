@@ -354,6 +354,7 @@ mod run {
                     "\n    pub(crate) async fn ",
                     "\n    fn ",
                     "\nfn ",
+                    "\npub(crate) fn ",
                     "\nasync fn ",
                 ]
                 .iter()

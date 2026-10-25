@@ -57,7 +57,7 @@ pub mod secrets;
 /// shape on [`crate::Engine`].
 ///
 /// Callers that don't need the new route can use any `F` —
-/// `MemoryBackend` for tests is the conventional choice.
+/// `store::test_backend::test_backend()` for tests is the conventional choice.
 pub struct AppState<F>
 where
     F: FederationDirectory + Backend + 'static,

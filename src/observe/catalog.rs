@@ -83,7 +83,7 @@ pub const FOLD_ROWS: &str = "ciris.persist.fold.rows";
 pub const FOLD_BYTES: &str = "ciris.persist.fold.bytes";
 
 /// Every `backend` label value.
-pub const BACKEND_VALUES: &[&str] = &["memory", "sqlite", "postgres"];
+pub const BACKEND_VALUES: &[&str] = &["sqlite", "postgres"];
 
 /// Every `door` label value.
 pub const DOOR_VALUES: &[&str] = &[
@@ -156,7 +156,7 @@ pub const TELEMETRY_CATALOG: &[CatalogEntry] = &[
         unit: "By",
         labels: DOOR_LABELS,
         description: "Stored attestation_envelope bytes the door reads decoded, by backend and \
-                      door (sqlite/postgres: the TEXT column's length; memory: 0).",
+                      door (the TEXT column's length).",
     },
     CatalogEntry {
         name: FOLD_CALLS,

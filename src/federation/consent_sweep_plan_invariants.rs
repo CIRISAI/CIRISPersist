@@ -835,7 +835,7 @@ mod units {
     }
 
     /// I1196 / I1197 (unit) — the selections' bounds plan nothing for an
-    /// empty or unreachable page, and the memory cut is the SQL order.
+    /// empty or unreachable page.
     #[test]
     fn i1196_i1197_selection_bounds() {
         use crate::federation::sweep_plan::{plan_expired, plan_hybrid_pending, HybridPlane};
@@ -852,23 +852,6 @@ mod units {
         assert!(plan_expired(now, 1, usize::MAX).is_none());
         let sel = plan_expired(now, 2, 1).unwrap();
         assert_eq!((sel.limit, sel.offset), (2, 1));
-        let past = now - chrono::Duration::seconds(1);
-        let rows = vec![
-            ("c".into(), "scores".into(), Some(past)),
-            ("b".into(), "scores".into(), Some(past)),
-            ("a".into(), "scores".into(), Some(past)),
-            ("w".into(), "withdraws".into(), Some(past)),
-            ("n".into(), "scores".into(), Some(now)),
-            ("z".into(), "scores".into(), None),
-        ];
-        assert_eq!(sel.cut(rows.clone()), vec!["b".to_owned(), "c".to_owned()]);
-        // The boundary: a row expiring AT `now` is not offered, even with
-        // room on the page.
-        let wide = plan_expired(now, 10, 0).unwrap();
-        assert_eq!(
-            wide.cut(rows),
-            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
-        );
     }
 }
 

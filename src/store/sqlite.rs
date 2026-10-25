@@ -2181,7 +2181,7 @@ impl Backend for SqliteBackend {
             )
             .await
             .map_err(|e| Error::Backend(format!("read content_symbols: {e}")))?;
-        Ok(Some(super::memory::assemble_fountain_content(
+        Ok(Some(super::fountain_read::assemble_fountain_content(
             manifest, symbols,
         )?))
     }
@@ -19561,9 +19561,7 @@ const POS_ATTESTATION: &str = "COALESCE(admitted_at, promoted_at, asserted_at)";
 /// v0.3.5 (CIRISLens#8 ASK 3) — sqlite row → (event_id, TraceEventRow).
 /// Used by `Backend::fetch_trace_events_page`. Mirrors the postgres
 /// counterpart `pg_row_to_event_row` field set + ordering.
-pub(crate) fn sqlite_row_to_event_row(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<(i64, TraceEventRow)> {
+fn sqlite_row_to_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, TraceEventRow)> {
     use crate::schema::{ReasoningEventType, TraceLevel};
     let event_id: i64 = row.get("event_id")?;
     let event_type_str: String = row.get("event_type")?;
@@ -29301,7 +29299,7 @@ mod accord_tests {
     }
 
     /// v21.14.0 (CIRISPersist#534) — the accord-conferral test helpers must
-    /// work on SQLITE, not just MemoryBackend. Before #534 this failed at
+    /// work on SQLITE, not just the (since retired) memory backend. Before #534 this failed at
     /// `register_accord_holder`'s non-hex `test-anchor` (sqlite hex-decodes the
     /// column) and then starved roster resolution to 0 valid co-scrubs — the
     /// exact "tested on one backend, used on the other" gap #518 flagged. This
@@ -54752,9 +54750,9 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
     /// `list_signed_families_since` and feeds it to a SECOND directory's
     /// `put_family`, whose `verify_family_admission` is the same gate every
     /// real peer runs. Same discipline as
-    /// `promoted_row_crosses_to_a_peer_*_649`; the peer is a `MemoryBackend`
-    /// because the property is backend-independent and the point is that the
-    /// two corpora are genuinely separate.
+    /// `promoted_row_crosses_to_a_peer_*_649`; the peer is a second in-memory
+    /// SQLite (`test_backend`) because the property is backend-independent and
+    /// the point is that the two corpora are genuinely separate.
     #[tokio::test]
     async fn superseded_family_crosses_to_a_peer_sqlite_651() {
         use crate::federation::tier_ingest::test_support as ts;
@@ -54947,10 +54945,9 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
 
     /// v31.0.0 (CIRISPersist#656) — the SQLITE leg of the `put_blob` witness.
     ///
-    /// **Two backends, not three: `MemoryBackend` implements no
-    /// `BlobStorage`,** so there is no memory door to gate. Stated here rather
-    /// than left as a silently-absent leg, because "the third leg is missing"
-    /// and "the third door does not exist" look identical from a test list, and
+    /// **Two backends:** sqlite and postgres are the `BlobStorage` backends.
+    /// Stated here because "a leg is missing" and "the door does not exist"
+    /// look identical from a test list, and
     /// this release has twice been bitten by the first wearing the second's
     /// clothes.
     #[tokio::test]

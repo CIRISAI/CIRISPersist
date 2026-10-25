@@ -2,7 +2,7 @@
 #
 # - #1109: `admission::nodes_owned_by` seeks candidates among the bindings
 #   the person's own key AND every key bound as its occurrence signed; the
-#   verdict stays `owner_of`. Witness I1161 (memory, sqlite, postgres).
+#   verdict stays `owner_of`. Witness I1161 (sqlite, postgres).
 # - #1111: the test-anchor W_self seam. `w_self_secs` / `test_window::window`
 #   / `test_window::parse_secs` compile only with `test-anchor`, hence the
 #   features line. Witness I1162 (lib half: the override condition, the

@@ -1774,6 +1774,16 @@ mod tests {
     use super::*;
     use crate::federation::types::{attestation_tier, attestation_type};
 
+    /// v31.0.0 (CIRISPersist#650) — THE MUTATION. Pure: disable the fold
+    /// (replay the interim states) and the withdrawn grant flips from `Purge`
+    /// to `Restamp` — i.e. it is re-minted as a valid, freshly-signed,
+    /// peer-admissible v31 row.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[test]
+    fn the_v31_fold_is_load_bearing_650() {
+        super::test_support::assert_the_fold_is_load_bearing();
+    }
+
     fn env(dimension: &str, references: Option<&str>) -> serde_json::Value {
         let mut v = serde_json::json!({ "dimension": dimension });
         if let Some(r) = references {
@@ -2497,7 +2507,6 @@ pub(crate) mod test_support {
         }
     }
 
-    #[cfg(feature = "sqlite")]
     fn row_with(
         id: &str,
         attester: &str,
@@ -2543,7 +2552,6 @@ pub(crate) mod test_support {
     /// `weight: Some(1.0)` — and it is what makes the #647 at-rest assertions
     /// below able to fail. Without it, `sha256(column) == original_content_hash`
     /// holds by coincidence and the witness measures nothing.
-    #[cfg(feature = "sqlite")]
     fn scores_row(id: &str, attester: &str, dimension: &str) -> Attestation {
         let mut r = row_with(
             id,
@@ -3177,7 +3185,6 @@ pub(crate) mod test_support {
     /// only the fold mutated, and asserts the disposition flips from `Purge` to
     /// `Restamp`: i.e. the withdrawn grant would be re-minted as a valid,
     /// freshly-signed, peer-admissible v31 row.
-    #[cfg(feature = "sqlite")]
     pub(crate) fn assert_the_fold_is_load_bearing() {
         let dimension = crate::federation::consent_peer_set::DIMENSION;
         let grant = scores_row("g1", "alice", dimension);

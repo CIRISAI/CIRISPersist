@@ -1,12 +1,12 @@
 //! v60.0.0 (CIRISPersist#1002) — **the one backend constructor for tests.**
 //!
-//! `MemoryBackend` is retired. Every test that ran on it runs on
+//! The memory backend is retired. Every test that ran on it runs on
 //! [`SqliteBackend`] in memory with every migration applied: real SQL, a real
 //! schema and real transaction semantics, which is where the reds the memory
 //! backend could not produce come from.
 //!
-//! Measured on this box (#1002 step 1, `measure` below): `MemoryBackend::new()`
-//! took 90 µs and `SqliteBackend::open_in_memory()` + `run_migrations()` took
+//! Measured on this box (#1002 step 1, `measure` below): the memory backend's
+//! constructor took 81-90 µs and `SqliteBackend::open_in_memory()` + `run_migrations()` took
 //! 248 ms, so replay dominates. One migrated database per process is the
 //! TEMPLATE; each [`test_backend`] clones it with the SQLite backup API and then
 //! runs the real open path ([`Backend::run_migrations`]), which finds every
@@ -84,7 +84,7 @@ pub fn test_backend() -> SqliteBackend {
     backend
 }
 
-/// The fixture seams the retired `MemoryBackend` carried, on the backend the
+/// The fixture seams the retired memory backend carried, on the backend the
 /// tests now run on. **Each writes BELOW every door** (no admission gate, no
 /// signature check), exactly as the memory helpers did: a fixture that needs
 /// a row to exist, not a witness of the door that would write it. A witness
@@ -149,20 +149,16 @@ impl SqliteBackend {
         self.fixture_key_row(key_id, held.as_deref().unwrap_or(""), Some(pqc_pubkey_b64));
     }
 
-    /// Fixture read: every stored trace event row, oldest first.
+    /// Fixture read: every stored trace event row, in insertion order,
+    /// through the backend's own page read.
     #[doc(hidden)]
     pub fn snapshot_events(&self) -> Vec<crate::store::types::TraceEventRow> {
-        let conn = self.conn_handle();
-        let conn = conn.lock();
-        let mut stmt = conn
-            .prepare("SELECT * FROM trace_events ORDER BY ts, event_id")
-            .expect("snapshot_events: prepare");
-        let rows = stmt
-            .query_map([], crate::store::sqlite::sqlite_row_to_event_row)
-            .expect("snapshot_events: query")
-            .map(|r| r.expect("snapshot_events: row").1)
-            .collect();
-        rows
+        use crate::store::Backend as _;
+        on_own_runtime(|| block_on(self.fetch_trace_events_page(-1, i64::MAX, None)))
+            .expect("snapshot_events: fetch_trace_events_page")
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect()
     }
 }
 
@@ -360,20 +356,13 @@ mod measure {
     use crate::store::Backend as _;
     use std::time::Instant;
 
-    /// #1002 step 1 — `open_in_memory()` + every migration, against
-    /// `MemoryBackend::new()` and the template clone. Run with
-    /// `--run-ignored only --no-capture`.
+    /// #1002 step 1 — `open_in_memory()`, `open_in_memory()` + every
+    /// migration, and the template clone. Run with
+    /// `--run-ignored only --no-capture`. (The retired memory backend's
+    /// constructor measured 81-90 µs on this box, CIRISPersist#1002.)
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
-    async fn measure_open_in_memory_against_memory_backend() {
-        let n_mem = 500u32;
-        let t = Instant::now();
-        for _ in 0..n_mem {
-            let b = crate::store::memory::MemoryBackend::new();
-            std::hint::black_box(&b);
-        }
-        let mem = t.elapsed() / n_mem;
-
+    async fn measure_open_in_memory_against_the_clone() {
         let n = 30u32;
         let t = Instant::now();
         for _ in 0..n {
@@ -401,7 +390,7 @@ mod measure {
         }
         let cloned = t.elapsed() / n_t;
         println!(
-            "#1002 MEASURE MemoryBackend::new {mem:?} | open_in_memory {open:?} | \
+            "#1002 MEASURE open_in_memory {open:?} | \
              open_in_memory+run_migrations {migrated:?} | test_backend (template clone + open path) {cloned:?}"
         );
     }

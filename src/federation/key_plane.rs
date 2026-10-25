@@ -262,14 +262,6 @@ pub(crate) const HOLDINGS_WIRE_KIND: &str = "Attestation";
 
 #[cfg_attr(not(any(feature = "postgres", feature = "sqlite")), allow(dead_code))]
 impl KeyPlaneHoldingsRead {
-    /// Is `row` (held under `content_hash` in the index) on this page?
-    #[must_use]
-    pub(crate) fn admits(&self, row: &Attestation, content_hash: &str) -> bool {
-        row.attestation_type == attestation_type::SCORES
-            && super::admission::envelope_dimension(&row.attestation_envelope) == Some(self.family)
-            && content_hash > self.after.as_str()
-    }
-
     /// The one statement, for `dialect`: the family's rows seek the
     /// `dimension`-leading index (V190), each joins its index entry on the
     /// `(kind, record_key)` index (V183). Binds: family, kind, cursor, limit.

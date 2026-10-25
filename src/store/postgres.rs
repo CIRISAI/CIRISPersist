@@ -5036,7 +5036,7 @@ impl Backend for PostgresBackend {
                 symbol_bytes: bytes,
             });
         }
-        Ok(Some(super::memory::assemble_fountain_content(
+        Ok(Some(super::fountain_read::assemble_fountain_content(
             manifest, symbols,
         )?))
     }
@@ -29908,7 +29908,7 @@ fn row_to_calibration_bundle(r: tokio_postgres::Row) -> crate::derived::Calibrat
 // ─── Integration tests, gated on a real Postgres ───────────────────
 //
 // Mission category §4 "Backend parity": the same row sequence that
-// passes against `MemoryBackend` must produce the same observable
+// passes against SQLite must produce the same observable
 // results against Postgres. The conformance test harness lives in
 // `tests/postgres_conformance.rs` (gated behind
 // `CIRIS_PERSIST_TEST_PG_URL`).
@@ -32300,7 +32300,7 @@ mod tests {
     /// sqlite; the tag is unique per run because this database persists across
     /// tests.
     ///
-    /// **The peer is a `MemoryBackend`, deliberately.** Every postgres test in
+    /// **The peer is an in-memory SQLite (`test_backend`), deliberately.** Every postgres test in
     /// this crate connects to ONE shared database, so a second
     /// `PostgresBackend` would be a second handle on the SAME corpus and the
     /// peer put would hit the primary key rather than the gate stack — a
@@ -32520,7 +32520,7 @@ mod tests {
     }
 
     /// v31.0.0 (CIRISPersist#650) — the in-place v31 migration, postgres arm.
-    /// Shared exercise body with memory + sqlite; the peer is a `MemoryBackend`
+    /// Shared exercise body with sqlite; the peer is an in-memory SQLite
     /// (one postgres database per test process, so a second postgres corpus is
     /// not available — and the receiving stack is backend-symmetric by
     /// construction, with its own parity witnesses).
@@ -51696,9 +51696,8 @@ mod tests {
         .await;
     }
 
-    /// The POSTGRES leg of the `put_blob` witness. **Two backends, not three:**
-    /// `MemoryBackend` implements no `BlobStorage`, so there is no memory door
-    /// to gate — see the shared body.
+    /// The POSTGRES leg of the `put_blob` witness (the sqlite leg is its
+    /// twin) — see the shared body.
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn put_blob_admission_parity_postgres_656() {

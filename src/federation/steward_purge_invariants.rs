@@ -4678,7 +4678,7 @@ mod run {
                 "I661: the shared attestation plan carries {gate}"
             );
         }
-        for backend in ["memory", "sqlite", "postgres"] {
+        for backend in ["sqlite", "postgres"] {
             let src =
                 strip(&std::fs::read_to_string(format!("{root}/src/store/{backend}.rs")).unwrap());
             // v56.0.0 (CIRISPersist#934 step 1) — the attestation put is a call
@@ -4879,22 +4879,6 @@ mod run {
             if !columns.iter().any(|(t, c)| t == table && c == column) {
                 problems.push(format!(
                     "stale classification: {table}.{column} is not in the schema"
-                ));
-            }
-        }
-        // The memory backend mirrors the helper-removed tables by hand.
-        let root = env!("CARGO_MANIFEST_DIR");
-        let memory =
-            strip(&std::fs::read_to_string(format!("{root}/src/store/memory.rs")).unwrap());
-        let helper = body(&memory, "async fn purge_attestation_projections(");
-        for (table, _, removal) in ATTESTATION_PROJECTIONS {
-            if *removal != ProjectionRemoval::Helper {
-                continue;
-            }
-            let held = memory.contains(&format!("    {table}:"));
-            if held && !helper.contains(&format!(".{table}")) {
-                problems.push(format!(
-                    "memory holds {table} and its projection purge omits it"
                 ));
             }
         }

@@ -991,7 +991,6 @@ mod run {
     fn i119_every_door_and_the_vocabulary() {
         const SQLITE: &str = include_str!("../store/sqlite.rs");
         const PG: &str = include_str!("../store/postgres.rs");
-        const MEM: &str = include_str!("../store/memory.rs");
         const ADMISSION: &str = include_str!("admission.rs");
         const ENVELOPE: &str = include_str!("envelope.rs");
         // v56.0.0 (CIRISPersist#934 step 1) — the ingest door's gate lives in
@@ -1015,11 +1014,7 @@ mod run {
             );
         }
         // Every backend's ingest and local doors are the shared doors.
-        for (name, text) in [
-            ("sqlite.rs", SQLITE),
-            ("postgres.rs", PG),
-            ("memory.rs", MEM),
-        ] {
+        for (name, text) in [("sqlite.rs", SQLITE), ("postgres.rs", PG)] {
             for door in [
                 "attestation_admit::put_attestation_planned(",
                 "attestation_admit::write_local_attestation_planned(",

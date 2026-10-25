@@ -195,22 +195,6 @@ pub mod bodies {
     where
         B: crate::federation::FederationDirectory + crate::ceg::ReadEngine + Sync,
     {
-        // `list_attestations` is a relational CEG read: the memory backend has
-        // no substrate for it and says so. Its leg is `i142_mem`, which
-        // measures the same axis through the scores door memory DOES serve.
-        if let Err(crate::ceg::Error::Backend(msg)) = crate::ceg::ReadEngine::list_attestations(
-            b,
-            AttestationFilter::default(),
-            None,
-            1,
-            CallerScope::Unauthenticated,
-        )
-        .await
-        {
-            if msg.contains("no relational read substrate") {
-                return;
-            }
-        }
         let owner = format!("i142-owner-{s}");
         ts::register_identity_key(b, &owner, crate::federation::types::identity_type::USER).await;
         seed(b, &format!("i142-f1-{s}"), &owner, "self", None, "file:v1").await;
@@ -350,13 +334,11 @@ pub mod bodies {
         );
     }
 
-    /// **I142-mem — the axis on the scores plane, where the memory backend
-    /// lives.** `list_attestations` has no memory substrate, so the memory
-    /// twin of the cohort axis (`mem_scores_row_matches`) is measured through
-    /// `list_scores` — the other door `sqlite_cohort_axes` / `pg_cohort_axes`
-    /// are called from. Without this leg nothing would fail if the memory
-    /// twin ignored the axis.
-    pub async fn i142_mem_the_axis_on_the_scores_plane<B>(b: &B, s: &str)
+    /// **I142-scores — the axis on the scores plane.** The cohort axis is
+    /// measured through `list_scores` — the other door `sqlite_cohort_axes` /
+    /// `pg_cohort_axes` are called from — so a scores read that ignored the
+    /// axis fails here, not only one through `list_attestations`.
+    pub async fn i142_scores_the_axis_on_the_scores_plane<B>(b: &B, s: &str)
     where
         B: crate::federation::FederationDirectory + crate::ceg::ReadEngine + Sync,
     {
@@ -404,7 +386,7 @@ pub mod bodies {
         .await;
         assert!(
             all.contains(&format!("i142m-fed-{s}")),
-            "I142-mem: the federation row is on the scores plane to begin with: {all:?}"
+            "I142-scores: the federation row is on the scores plane to begin with: {all:?}"
         );
         assert_eq!(
             page(AttestationFilter {
@@ -414,7 +396,7 @@ pub mod bodies {
             })
             .await,
             vec![format!("i142m-self-{s}")],
-            "I142-mem: the cohort axis selects on the scores plane too — the memory twin of \
+            "I142-scores: the cohort axis selects on the scores plane too, through \
              sqlite_cohort_axes / pg_cohort_axes"
         );
     }
@@ -637,9 +619,9 @@ mod run {
                 }
 
                 #[tokio::test]
-                async fn i142_mem() {
+                async fn i142_scores() {
                     let Some(b) = $fresh.await else { return };
-                    super::super::bodies::i142_mem_the_axis_on_the_scores_plane(
+                    super::super::bodies::i142_scores_the_axis_on_the_scores_plane(
                         &b,
                         &super::suffix(),
                     )

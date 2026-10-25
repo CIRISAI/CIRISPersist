@@ -675,11 +675,7 @@ mod pure {
     /// commented-out call cannot pass.
     #[test]
     fn i448_every_backend_runs_the_prev_check_on_both_arms() {
-        for file in [
-            "src/store/memory.rs",
-            "src/store/sqlite.rs",
-            "src/store/postgres.rs",
-        ] {
+        for file in ["src/store/sqlite.rs", "src/store/postgres.rs"] {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
             let text = std::fs::read_to_string(&path).unwrap();
             let start = text
