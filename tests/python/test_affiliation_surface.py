@@ -9,6 +9,7 @@ given, refusing a term-bearing edge minted without one
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -74,7 +75,8 @@ def test_producer_doors_sign_the_term(tmp_path) -> None:
     b = _engine(tmp_path, "b", 0xB6)
     try:
         b.register_self_federation_key("user", "ref-aff-b", None, None, None)
-        b.put_public_key(record_a)
+        # lookup_public_key returns the record; the put door takes it signed.
+        b.put_public_key(json.dumps({"record": json.loads(record_a)}))
 
         # A term-bearing edge with no term is refused: CC supplies no default.
         with pytest.raises(ValueError, match="delegation_term_required"):
