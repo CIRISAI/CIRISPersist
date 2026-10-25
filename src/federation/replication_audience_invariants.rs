@@ -22,7 +22,7 @@
 //!   agree on a four-node fixture over every scope (one resolver, both sides).
 //! - **I399** several live lists intersect; withdrawing one leaves the other.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::replication_audience as ra;
     use crate::federation::tier_ingest::test_support as ts;
@@ -1445,7 +1445,7 @@ pub(crate) mod key_bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
@@ -1479,12 +1479,6 @@ mod runners {
             }
         };
     }
-
-    dyn_runners!(
-        memory,
-        async { Some(crate::store::memory::MemoryBackend::new()) },
-        []
-    );
 
     #[cfg(feature = "sqlite")]
     dyn_runners!(
@@ -1692,7 +1686,7 @@ mod consent_change_runners {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod codex_978_i505 {
     use crate::federation::accord_test_support as ops;
     use crate::federation::replication_audience as ra;
@@ -1773,13 +1767,6 @@ mod codex_978_i505 {
         );
     }
 
-    #[tokio::test]
-    async fn i505_memory() {
-        let d = crate::store::memory::MemoryBackend::new();
-        public_only_by_the_named_charter(&d, "memory").await;
-    }
-
-    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i505_sqlite() {
         use crate::store::Backend as _;

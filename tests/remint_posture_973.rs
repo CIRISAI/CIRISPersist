@@ -9,7 +9,6 @@
 use ciris_persist::federation::genesis::*;
 use ciris_persist::federation::FederationDirectory;
 use ciris_persist::store::backend::Backend as _;
-use ciris_persist::store::memory::MemoryBackend;
 use ciris_persist::store::sqlite::SqliteBackend;
 
 const SEEDS: [[u8; 32]; 3] = [[0x61; 32], [0x62; 32], [0x63; 32]];
@@ -57,11 +56,7 @@ async fn backends() -> Vec<(&'static str, Box<dyn FederationDirectory>)> {
     s.seed_genesis_accord_holders(&effective_accord_holder_records())
         .await
         .expect("seed holders");
-    let m = MemoryBackend::new();
-    m.seed_genesis_accord_holders(&effective_accord_holder_records())
-        .await
-        .expect("seed holders");
-    vec![("sqlite", Box::new(s)), ("memory", Box::new(m))]
+    vec![("sqlite", Box::new(s))]
 }
 
 async fn stored(d: &dyn FederationDirectory, id: &str) -> ciris_persist::federation::Attestation {

@@ -203,7 +203,7 @@
 //!   witness kills: re-added at the crossing or at the put door
 //!   (the replicated apply) it turns the crossing or B's apply red.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID as CANON;
     use crate::federation::canonical_community_invariants::bodies as cc;
@@ -337,7 +337,6 @@ pub(crate) mod bodies {
     #[cfg(feature = "postgres")]
     rollup_seams_for!(crate::store::postgres::PostgresBackend);
 
-    seams_for!(crate::store::memory::MemoryBackend);
     #[cfg(feature = "sqlite")]
     seams_for!(crate::store::sqlite::SqliteBackend);
     #[cfg(feature = "postgres")]
@@ -4372,7 +4371,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     macro_rules! runners {
         ($modname:ident, $fresh:expr) => {
@@ -4576,15 +4575,6 @@ mod run {
         };
     }
 
-    /// v57.0.0 (CIRISPersist#988 item 3) — memory holds detections now, so
-    /// I825 runs on all three backends (its rollup sibling I696 stays SQL).
-    #[tokio::test]
-    async fn i825_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
-        super::bodies::i825_a_purged_traces_detections_are_tombstoned(&b).await
-    }
-
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     macro_rules! rollup_runners {
         ($modname:ident, $fresh:expr) => {
@@ -4625,15 +4615,6 @@ mod run {
         b.run_migrations().await.unwrap();
         crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
         Some(b)
-    });
-
-    runners!(memory, async {
-        {
-            // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
-            let b = crate::store::memory::MemoryBackend::new();
-            crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
-            Some(b)
-        }
     });
 
     #[cfg(feature = "sqlite")]

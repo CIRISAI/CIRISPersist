@@ -16,7 +16,6 @@ use ciris_persist::federation::genesis::*;
 use ciris_persist::federation::types::compute_persist_row_hash;
 use ciris_persist::federation::{Error, FederationDirectory};
 use ciris_persist::store::backend::Backend as _;
-use ciris_persist::store::memory::MemoryBackend;
 use ciris_persist::store::sqlite::SqliteBackend;
 
 const SEEDS: [[u8; 32]; 3] = [[0x31; 32], [0x32; 32], [0x33; 32]];
@@ -63,14 +62,6 @@ fn vintages() -> (TestCeremonyOutputs, TestCeremonyOutputs) {
 async fn sqlite() -> SqliteBackend {
     let b = SqliteBackend::open_in_memory().await.unwrap();
     b.run_migrations().await.unwrap();
-    b.seed_genesis_accord_holders(&effective_accord_holder_records())
-        .await
-        .expect("seed holders");
-    b
-}
-
-async fn memory() -> MemoryBackend {
-    let b = MemoryBackend::new();
     b.seed_genesis_accord_holders(&effective_accord_holder_records())
         .await
         .expect("seed holders");
@@ -525,7 +516,6 @@ async fn replaced_only_once_the_bundle_charter_is_live(
 async fn i490_i491_import_a_later_ceremony() {
     let (v1, v2) = vintages();
     let _armed = Armed::with(&v1.block);
-    imports_a_later_ceremony(&memory().await, &v1, &v2, "memory").await;
     imports_a_later_ceremony(&sqlite().await, &v1, &v2, "sqlite").await;
 }
 
@@ -534,7 +524,6 @@ async fn i490_i491_import_a_later_ceremony() {
 async fn i492_tampered_bundle_installs_nothing() {
     let (v1, v2) = vintages();
     let _armed = Armed::with(&v1.block);
-    tampered_installs_nothing(&memory().await, &v1, &v2, "memory").await;
     tampered_installs_nothing(&sqlite().await, &v1, &v2, "sqlite").await;
 }
 
@@ -544,7 +533,6 @@ async fn i493_another_accord_is_refused() {
     let (v1, _) = vintages();
     let other = mint_test_ceremony(&OTHER_SEEDS, &NODE_SEED, at(-5)).expect("mint other");
     let _armed = Armed::with(&v1.block);
-    another_accord_is_refused(&memory().await, &v1, &other, "memory").await;
     another_accord_is_refused(&sqlite().await, &v1, &other, "sqlite").await;
 }
 
@@ -553,7 +541,6 @@ async fn i493_another_accord_is_refused() {
 async fn i494_reimport_is_a_noop() {
     let (v1, v2) = vintages();
     let _armed = Armed::with(&v1.block);
-    reimport_is_a_noop(&memory().await, &v1, &v2, "memory").await;
     reimport_is_a_noop(&sqlite().await, &v1, &v2, "sqlite").await;
 }
 
@@ -562,7 +549,6 @@ async fn i494_reimport_is_a_noop() {
 async fn i495_unrelated_held_row_survives() {
     let (v1, v2) = vintages();
     let _armed = Armed::with(&v1.block);
-    unrelated_held_row_survives(&memory().await, &v2, "memory").await;
     unrelated_held_row_survives(&sqlite().await, &v2, "sqlite").await;
 }
 
@@ -571,7 +557,6 @@ async fn i495_unrelated_held_row_survives() {
 async fn i496_chartless_row_takes_the_head() {
     let (v1, v2) = vintages();
     let _armed = Armed::with(&v1.block);
-    chartless_row_takes_the_head(&memory().await, &v2, "memory").await;
     chartless_row_takes_the_head(&sqlite().await, &v2, "sqlite").await;
 }
 
@@ -580,7 +565,6 @@ async fn i496_chartless_row_takes_the_head() {
 async fn i497_reboot_takes_the_later_genesis() {
     let (v1, v2) = vintages();
     let _armed = Armed::with(&v1.block);
-    reboot_takes_the_later_genesis(&memory().await, &v1, &v2, "memory").await;
     reboot_takes_the_later_genesis(&sqlite().await, &v1, &v2, "sqlite").await;
 }
 
@@ -852,7 +836,6 @@ async fn i502_older_bake_keeps_the_newer_birth() {
     let (_v1, v2) = vintages();
     let v3 = mint_test_ceremony(&SEEDS, &NODE_SEED, at(-1)).expect("mint v3");
     let _armed = Armed::with(&v2.block);
-    older_bake_keeps_the_newer_birth(&memory().await, &v2, &v3, "memory").await;
     older_bake_keeps_the_newer_birth(&sqlite().await, &v2, &v3, "sqlite").await;
 }
 
@@ -862,7 +845,6 @@ async fn i521_older_bake_leaves_the_imported_planes() {
     let (_v1, v2) = vintages();
     let v3 = mint_test_ceremony(&SEEDS, &NODE_SEED, at(-1)).expect("mint v3");
     let _armed = Armed::with(&v2.block);
-    older_bake_leaves_the_imported_planes(&memory().await, &v2, &v3, "memory").await;
     older_bake_leaves_the_imported_planes(&sqlite().await, &v2, &v3, "sqlite").await;
 }
 
@@ -871,7 +853,6 @@ async fn i521_older_bake_leaves_the_imported_planes() {
 async fn i503_a_forged_birth_never_replaces() {
     let (v1, v2) = vintages();
     let _armed = Armed::with(&v1.block);
-    a_forged_birth_never_replaces(&memory().await, &v1, &v2, "memory").await;
     a_forged_birth_never_replaces(&sqlite().await, &v1, &v2, "sqlite").await;
 }
 
@@ -881,7 +862,6 @@ async fn i501_bake_replaces_the_prior_birth() {
     let (v1, v2) = vintages();
     let v3 = mint_test_ceremony(&SEEDS, &NODE_SEED, at(-1)).expect("mint v3");
     let _armed = Armed::with(&v1.block);
-    bake_replaces_the_prior_birth(&memory().await, &v1, &v2, &v3, "memory").await;
     bake_replaces_the_prior_birth(&sqlite().await, &v1, &v2, &v3, "sqlite").await;
 }
 
@@ -890,7 +870,6 @@ async fn i501_bake_replaces_the_prior_birth() {
 async fn i498_older_ceremony_is_refused() {
     let (v1, v2) = vintages();
     let _armed = Armed::with(&v1.block);
-    older_ceremony_is_refused(&memory().await, &v1, &v2, "memory").await;
     older_ceremony_is_refused(&sqlite().await, &v1, &v2, "sqlite").await;
 }
 
@@ -899,7 +878,6 @@ async fn i498_older_ceremony_is_refused() {
 async fn i499_replaced_only_once_the_bundle_charter_is_live() {
     let (v1, v2) = vintages();
     let _armed = Armed::with(&v1.block);
-    replaced_only_once_the_bundle_charter_is_live(&memory().await, &v2, "memory").await;
     replaced_only_once_the_bundle_charter_is_live(&sqlite().await, &v2, "sqlite").await;
 }
 

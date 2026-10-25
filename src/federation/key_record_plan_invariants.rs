@@ -62,7 +62,7 @@
 //!   unverifiable or absent record; `PlannedKeyRecord::raced` /
 //!   `insert_held` word every lost race the way the three backends did.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::key_plane::{
         self, KeyPlaneStore, KeyRecordWrite, KeyRecordWritten, OnHeld, PlannedKeyRecord,
@@ -833,7 +833,7 @@ mod unit {
     use crate::federation::key_plane::{
         key_record_row_step, KeyRecordRowStep, OnHeld, PlannedKeyRecord, RewriteGuard,
     };
-    use crate::federation::key_plane_invariants::bodies::pop_record;
+    use crate::federation::key_plane_invariants::pure::pop_record;
     use crate::federation::types::{compute_persist_row_hash, KeyRecord, KeyReplacementKind};
     use crate::federation::Error;
 
@@ -958,7 +958,7 @@ mod unit {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod backends {
     use super::bodies;
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -966,41 +966,6 @@ mod backends {
 
     fn tag(n: &str) -> String {
         format!("{n}-{}", uuid::Uuid::new_v4().simple())
-    }
-
-    // ── memory ─────────────────────────────────────────────────────────
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i1183_put_memory() {
-        bodies::i1183_put(&crate::store::memory::MemoryBackend::new(), &tag("m")).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i1184_seed_memory() {
-        bodies::i1184_seed(&crate::store::memory::MemoryBackend::new(), &tag("m")).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i1185_scrub_upgrade_memory() {
-        bodies::i1185_scrub_upgrade(&crate::store::memory::MemoryBackend::new(), &tag("m")).await;
-    }
-
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i1186_replicated_apply_memory() {
-        bodies::i1186_replicated_apply(&crate::store::memory::MemoryBackend::new(), &tag("m"))
-            .await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i1187_executor_guards_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        bodies::i1187_executor_guards(&b, &tag("m")).await;
-        bodies::i1187_settled(&b, &tag("m")).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i1189_reanchor_refusals_memory() {
-        bodies::i1189_reanchor_refusals(&crate::store::memory::MemoryBackend::new()).await;
     }
 
     // ── sqlite ─────────────────────────────────────────────────────────
@@ -1112,12 +1077,6 @@ mod backends {
         let Some(b) = postgres().await else { return };
         bodies::i1189_reanchor_refusals(&b).await;
         eprintln!("i1189_reanchor_refusals_postgres: RAN");
-    }
-
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i1190_supersede_memory() {
-        bodies::i1190_supersede(&crate::store::memory::MemoryBackend::new(), &tag("m")).await;
     }
 
     #[cfg(feature = "sqlite")]

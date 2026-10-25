@@ -5,7 +5,7 @@
 //! postgres; the blob-door bodies run where a `BlobStorage` exists (sqlite,
 //! postgres).
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::USER;
@@ -973,6 +973,7 @@ pub(crate) mod bodies {
 
 #[cfg(test)]
 mod run {
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
     }
@@ -1062,6 +1063,7 @@ mod run {
         );
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     macro_rules! runners {
         ($modname:ident, $fresh:expr) => {
             mod $modname {
@@ -1125,9 +1127,6 @@ mod run {
             }
         };
     }
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

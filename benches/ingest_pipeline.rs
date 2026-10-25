@@ -1,4 +1,4 @@
-//! End-to-end ingest pipeline throughput against MemoryBackend.
+//! End-to-end ingest pipeline throughput against the in-memory SQLite test backend.
 //!
 //! The full path: bytes-in → schema parse → verify → scrub → sign →
 //! decompose → backend insert. SECURITY_AUDIT_v0.1.4.md §3.4 named
@@ -13,7 +13,6 @@ use base64::Engine as _;
 use ciris_keyring::HardwareSigner;
 use ciris_persist::ingest::IngestPipeline;
 use ciris_persist::scrub::NullScrubber;
-use ciris_persist::store::MemoryBackend;
 use ciris_persist::verify::PythonJsonDumpsCanonicalizer;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
@@ -61,9 +60,9 @@ fn ingest_pipeline_sweep(c: &mut Criterion) {
                 b.iter_with_setup(
                     || {
                         // Setup: fresh backend per iteration so dedup
-                        // doesn't short-circuit. The MemoryBackend
-                        // constructor is cheap (one Mutex per Vec).
-                        let backend = MemoryBackend::new();
+                        // doesn't short-circuit: a clone of the migrated
+                        // in-memory SQLite template (~7 ms, #1002).
+                        let backend = ciris_persist::store::test_backend::test_backend();
                         backend.add_public_key("agent-bench", sk.verifying_key());
                         // CIRISPersist#789 — admission resolves the producer's
                         // ML-DSA-65 pubkey from `federation_keys` by

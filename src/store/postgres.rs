@@ -32403,6 +32403,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(postgres)]
+    #[cfg(feature = "sqlite")]
     async fn promoted_row_crosses_to_a_peer_postgres_649() {
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -32410,7 +32411,7 @@ mod tests {
         };
         let origin = PostgresBackend::connect(&dsn).await.expect("connect");
         origin.run_migrations().await.expect("migrations run");
-        let peer = crate::store::memory::MemoryBackend::new();
+        let peer = crate::store::test_backend::test_backend();
         let tag = format!("pg649{}", uuid_like());
         crate::federation::bootstrap_admission::test_support::exercise_promoted_row_crosses_to_a_peer(
             &origin, &peer, &tag,
@@ -32453,6 +32454,7 @@ mod tests {
     /// v31.0.0 (CIRISPersist#650) — install a row in **v30 shape** by rewriting
     /// the STORED envelope. No production door can do this (both v31 gates
     /// refuse the shape), so the seam reaches the pool directly.
+    #[cfg(feature = "sqlite")]
     #[async_trait::async_trait]
     impl crate::federation::migration::test_support::LegacyRowInstaller for PostgresBackend {
         async fn downgrade_to_v30(&self, attestation_id: &str) {
@@ -32524,6 +32526,7 @@ mod tests {
     /// construction, with its own parity witnesses).
     #[tokio::test]
     #[serial_test::serial(postgres)]
+    #[cfg(feature = "sqlite")]
     async fn v31_migration_postgres_650() {
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -32531,7 +32534,7 @@ mod tests {
         };
         let origin = PostgresBackend::connect(&dsn).await.expect("connect");
         origin.run_migrations().await.expect("migrations run");
-        let peer = crate::store::memory::MemoryBackend::new();
+        let peer = crate::store::test_backend::test_backend();
         let tag = format!("pg650{}", uuid_like());
         crate::federation::migration::test_support::exercise_v31_migration(
             &origin, &origin, &peer, &tag,
@@ -32793,6 +32796,7 @@ mod tests {
     /// the SAME `reverse_quorum::test_support::exercise_reverse_quorum` body.
     #[tokio::test]
     #[serial_test::serial(postgres)]
+    #[cfg(feature = "sqlite")]
     async fn reverse_quorum_parity_postgres_574() {
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -32856,6 +32860,7 @@ mod tests {
     /// other direction.
     #[tokio::test]
     #[serial_test::serial(postgres)]
+    #[cfg(feature = "sqlite")]
     async fn escalation_on_silence_parity_postgres_591() {
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");

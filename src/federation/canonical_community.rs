@@ -3936,7 +3936,7 @@ where
 /// v53.1.7 — I547's oracle: [`live_charter_rows`] as v53.1.6 shipped it,
 /// VERBATIM (the family's whole about-slice), `super::` spelled from the crate
 /// root.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod v53_1_6_reference {
     use super::*;
 

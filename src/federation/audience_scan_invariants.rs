@@ -40,7 +40,7 @@
 //!   required methods (the double, inheriting the three reads' default
 //!   bodies) answers every I533 / I534 / I536 question as the backend does.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use std::collections::{BTreeSet, HashSet};
 
@@ -1647,7 +1647,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     use crate::federation::FederationDirectory;
 
@@ -1691,10 +1691,6 @@ mod runners {
         };
     }
 
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
-
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;
@@ -1728,11 +1724,6 @@ mod runners {
             s,
         )
         .await;
-    }
-
-    #[tokio::test]
-    async fn i539_memory() {
-        legacy_beside(crate::store::memory::MemoryBackend::new(), &suffix()).await
     }
 
     #[cfg(feature = "sqlite")]

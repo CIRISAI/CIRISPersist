@@ -31,6 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::catalog::{self, TELEMETRY_CATALOG};
 use super::{Door, DoorReads, Fold, FoldReads, LocalCounters, StoreBackend, TelemetrySnapshot};
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 use crate::federation::read_probe;
 
 // ── I551 ─────────────────────────────────────────────────────────────────
@@ -758,6 +759,7 @@ fn i1164_a_read_credits_each_active_fold_exactly_once() {
 // ── I549 ─────────────────────────────────────────────────────────────────
 
 /// The probe's totals per door: (reads, rows, bytes).
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn probe_totals(log: &[read_probe::Read]) -> BTreeMap<&'static str, (u64, u64, u64)> {
     let mut out: BTreeMap<&'static str, (u64, u64, u64)> = BTreeMap::new();
     for r in log {
@@ -769,12 +771,14 @@ fn probe_totals(log: &[read_probe::Read]) -> BTreeMap<&'static str, (u64, u64, u
     out
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn delta3(a: (u64, u64, u64), b: (u64, u64, u64)) -> (u64, u64, u64) {
     (b.0 - a.0, b.1 - a.1, b.2 - a.2)
 }
 
 /// One step of I549: `before` → `after` against the probe `log` the step
 /// produced. Returns the probe's (reads, rows) for the step.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn assert_step(
     tag: &str,
     backend: StoreBackend,
@@ -826,6 +830,7 @@ fn assert_step(
     (total.0, total.1)
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) async fn i549_counters_equal_the_probe(
     d: &dyn crate::federation::FederationDirectory,
     s: &str,
@@ -1003,18 +1008,9 @@ pub(crate) async fn i550_the_snapshot_is_reachable_through_engine(
 
 // ── runners ──────────────────────────────────────────────────────────────
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn suffix() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
-}
-
-mod memory {
-    use super::*;
-
-    #[tokio::test]
-    async fn i549() {
-        let d = crate::store::memory::MemoryBackend::new();
-        i549_counters_equal_the_probe(&d, &suffix(), StoreBackend::Memory).await;
-    }
 }
 
 #[cfg(feature = "sqlite")]

@@ -47,7 +47,7 @@
 //!   reconstructs it; a non-key-plane dimension is refused, never answered
 //!   empty.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::consent_sweep_principals_invariants::bodies::{
         grant, put, row, withdraws,
@@ -990,7 +990,7 @@ mod prune_postgres {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
@@ -1046,10 +1046,6 @@ mod run {
             }
         };
     }
-
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
 
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {

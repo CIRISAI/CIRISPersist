@@ -50,7 +50,7 @@
 //!   change is refused `federation_governance_policy_refused` and nothing is
 //!   held; under the vendored table the same changes land or are held.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::self_roster as sr;
     use crate::federation::tier_ingest::test_support as ts;
@@ -1218,7 +1218,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod tests {
     use super::bodies;
 
@@ -1230,13 +1230,6 @@ mod tests {
         ($name:ident, $body:path) => {
             mod $name {
                 use super::*;
-
-                #[tokio::test(flavor = "multi_thread")]
-                async fn memory() {
-                    let b = crate::store::memory::MemoryBackend::new();
-                    $body(&b, &tag("m")).await;
-                    bodies::reset_clock();
-                }
 
                 #[cfg(feature = "sqlite")]
                 #[tokio::test(flavor = "multi_thread")]
@@ -1386,15 +1379,6 @@ mod tests {
     mod i1149 {
         use super::*;
 
-        #[tokio::test(flavor = "multi_thread")]
-        async fn memory() {
-            let (a, b) = (
-                crate::store::memory::MemoryBackend::new(),
-                crate::store::memory::MemoryBackend::new(),
-            );
-            bodies::i1149_a_live_keys_old_rows_replicate(&a, &b, &tag("m")).await;
-        }
-
         #[cfg(feature = "sqlite")]
         #[tokio::test(flavor = "multi_thread")]
         async fn sqlite() {
@@ -1435,15 +1419,6 @@ mod tests {
 
     mod i1139 {
         use super::*;
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn memory() {
-            let (a, b) = (
-                crate::store::memory::MemoryBackend::new(),
-                crate::store::memory::MemoryBackend::new(),
-            );
-            bodies::i1139_two_nodes_land_alike(&a, &b, &tag("m")).await;
-        }
 
         #[cfg(feature = "sqlite")]
         #[tokio::test(flavor = "multi_thread")]

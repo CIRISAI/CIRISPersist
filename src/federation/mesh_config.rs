@@ -3291,11 +3291,13 @@ mod tests {
     // ══════════════════════════════════════════════════════════════════
 
     /// Register a key with its REAL deterministic hybrid pubkeys.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn register(dir: &dyn FederationDirectory, key_id: &str) {
         crate::federation::tier_ingest::test_support::register_hybrid_key(dir, key_id).await;
     }
 
     /// A really-hybrid-signed `delegates_to` carrying a `trust:*` job label.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn trust_edge(id: &str, from: &str, to: &str, job: &str) -> Attestation {
         trust_edge_with(id, from, to, job, &[])
     }
@@ -3309,6 +3311,7 @@ mod tests {
     /// afterwards: the envelope is what the row is signed over, and
     /// "construct the signed bytes, then mutate the row" is the class v31.0.0
     /// spent a cut removing from six sites.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn trust_edge_with(
         id: &str,
         from: &str,
@@ -3356,6 +3359,7 @@ mod tests {
 
     /// A really-hybrid-signed mesh-config row, ready for the real door.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn signed_config_row(
         author: &str,
         root: &str,
@@ -3418,6 +3422,7 @@ mod tests {
     ///
     /// The shape: one node, TWO trust roots it has live edges to, one key each
     /// root has conferred to, and one root the node has NOT subscribed to.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn mesh_config_door_body(dir: &dyn FederationDirectory, tag: &str) {
         use MeshConfigKey as K;
         let node = format!("mc-node-{tag}");
@@ -3898,12 +3903,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn mesh_config_door_and_fold_memory() {
-        let dir = crate::store::MemoryBackend::new();
-        mesh_config_door_body(&dir, "mem").await;
-    }
-
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn mesh_config_door_and_fold_sqlite() {
@@ -3960,6 +3959,7 @@ mod tests {
     /// already outside it. (The issue states persist "cannot even express
     /// refusing a node-authored value" — it can, twice, and these are the two
     /// branches.)
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn node_authored_load_ceiling_body(dir: &dyn FederationDirectory, tag: &str) {
         use MeshConfigKey as K;
         let node = format!("lc-node-{tag}");
@@ -4097,12 +4097,6 @@ mod tests {
             !fold.roots.contains(&node),
             "[{tag}] the node must not appear among its own trust roots"
         );
-    }
-
-    #[tokio::test]
-    async fn a_node_cannot_author_its_own_load_ceiling_memory() {
-        let dir = crate::store::MemoryBackend::new();
-        node_authored_load_ceiling_body(&dir, "mem").await;
     }
 
     #[cfg(feature = "sqlite")]

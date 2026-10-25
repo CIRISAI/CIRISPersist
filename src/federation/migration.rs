@@ -2442,6 +2442,7 @@ pub(crate) mod test_support {
     use super::*;
     use crate::federation::tier_ingest::test_support as seal;
     use crate::federation::types::attestation_type;
+    #[cfg(feature = "sqlite")]
     use crate::federation::SignedAttestation;
 
     /// Install a row in **v30 shape** — the one thing no production door can
@@ -2452,6 +2453,7 @@ pub(crate) mod test_support {
     /// access is private to those modules. The witness body below is shared, so
     /// the three backends are measured by ONE set of assertions.
     #[async_trait::async_trait]
+    #[cfg(feature = "sqlite")]
     pub(crate) trait LegacyRowInstaller: Send + Sync {
         /// Strip the #598 instants and the #643 mirror from the STORED
         /// envelope of `attestation_id`, leaving the row exactly as a v30
@@ -2460,6 +2462,7 @@ pub(crate) mod test_support {
     }
 
     /// Strip both v31 bindings from an envelope — the v30 shape, by removal.
+    #[cfg(feature = "sqlite")]
     pub(crate) fn v30_envelope(envelope: &serde_json::Value) -> serde_json::Value {
         use crate::federation::envelope::paths;
         let mut out = envelope.clone();
@@ -2494,6 +2497,7 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(feature = "sqlite")]
     fn row_with(
         id: &str,
         attester: &str,
@@ -2539,6 +2543,7 @@ pub(crate) mod test_support {
     /// `weight: Some(1.0)` — and it is what makes the #647 at-rest assertions
     /// below able to fail. Without it, `sha256(column) == original_content_hash`
     /// holds by coincidence and the witness measures nothing.
+    #[cfg(feature = "sqlite")]
     fn scores_row(id: &str, attester: &str, dimension: &str) -> Attestation {
         let mut r = row_with(
             id,
@@ -2556,6 +2561,7 @@ pub(crate) mod test_support {
     /// directory used to prove that a re-stamped row is accepted by somebody
     /// else's put door — the CIRISPersist#649 lesson that local success is not
     /// acceptance.
+    #[cfg(feature = "sqlite")]
     pub(crate) async fn exercise_v31_migration(
         dir: &dyn FederationDirectory,
         installer: &dyn LegacyRowInstaller,
@@ -3171,6 +3177,7 @@ pub(crate) mod test_support {
     /// only the fold mutated, and asserts the disposition flips from `Purge` to
     /// `Restamp`: i.e. the withdrawn grant would be re-minted as a valid,
     /// freshly-signed, peer-admissible v31 row.
+    #[cfg(feature = "sqlite")]
     pub(crate) fn assert_the_fold_is_load_bearing() {
         let dimension = crate::federation::consent_peer_set::DIMENSION;
         let grant = scores_row("g1", "alice", dimension);

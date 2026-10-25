@@ -5,7 +5,7 @@
 //! status, statuses with no row are absent, and every row is counted once
 //! (the counts sum to the rows enqueued).
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod bodies {
     use crate::outbound::{OutboundFilter, OutboundQueue, OutboundStatus};
     use std::collections::HashMap;
@@ -159,13 +159,9 @@ mod bodies {
 
 #[cfg(test)]
 mod run {
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn tag() -> String {
         uuid::Uuid::new_v4().simple().to_string()
-    }
-    #[tokio::test]
-    async fn i577_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        super::bodies::i577_the_counts_equal_the_rows(&b, &tag()).await;
     }
     #[cfg(feature = "sqlite")]
     #[tokio::test]

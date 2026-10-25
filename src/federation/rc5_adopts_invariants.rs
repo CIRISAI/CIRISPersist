@@ -2380,14 +2380,6 @@ mod runners {
         };
     }
 
-    dyn_runners!(memory_dyn, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
-
-    keyed_runners!(memory_keyed, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
-
     #[cfg(feature = "sqlite")]
     keyed_runners!(sqlite_keyed, async {
         use crate::store::Backend as _;

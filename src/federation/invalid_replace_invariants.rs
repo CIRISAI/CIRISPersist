@@ -389,9 +389,6 @@ mod run {
             }
         };
     }
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;
@@ -478,13 +475,14 @@ mod run {
     /// clause lives in `register`, which every backend calls (sqlite/postgres
     /// cannot hold the row without the production roster).
     #[tokio::test]
+    #[cfg(feature = "sqlite")]
     async fn i621_a_role_gated_row_is_not_replaced_memory() {
         use super::bodies::signed;
         use crate::federation::register::ReplicatedKeyOutcome;
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::identity_type::{CANONICAL, NODE};
         use crate::federation::FederationDirectory as _;
-        let d = crate::store::memory::MemoryBackend::new();
+        let d = crate::store::test_backend::test_backend();
         let s = suffix();
         let a = format!("i621-a-{s}");
         ts::register_identity_key(&d, &a, NODE).await;

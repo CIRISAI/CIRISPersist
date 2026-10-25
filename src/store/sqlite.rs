@@ -3299,7 +3299,7 @@ impl SqliteBackend {
     /// backend; callers must not already hold it (`parking_lot::Mutex` is not
     /// reentrant). Doors that already hold the lock call
     /// [`sqlite_next_key_serve_position`] directly inside their closure.
-    async fn next_key_admission_position(
+    pub(crate) async fn next_key_admission_position(
         &self,
     ) -> Result<chrono::DateTime<chrono::Utc>, crate::federation::Error> {
         self.read(sqlite_next_key_serve_position)
@@ -19561,7 +19561,9 @@ const POS_ATTESTATION: &str = "COALESCE(admitted_at, promoted_at, asserted_at)";
 /// v0.3.5 (CIRISLens#8 ASK 3) — sqlite row → (event_id, TraceEventRow).
 /// Used by `Backend::fetch_trace_events_page`. Mirrors the postgres
 /// counterpart `pg_row_to_event_row` field set + ordering.
-fn sqlite_row_to_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, TraceEventRow)> {
+pub(crate) fn sqlite_row_to_event_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(i64, TraceEventRow)> {
     use crate::schema::{ReasoningEventType, TraceLevel};
     let event_id: i64 = row.get("event_id")?;
     let event_type_str: String = row.get("event_type")?;
@@ -21833,7 +21835,7 @@ fn sqlite_row_to_hard_case_event(
 /// minted by `federation::key_plane` from the signed object it carries) in
 /// the caller's transaction, with its serve position. `INSERT OR IGNORE`: one
 /// signed object, one id, so a re-insert is a no-op.
-fn sqlite_insert_plane_row(
+pub(crate) fn sqlite_insert_plane_row(
     tx: &rusqlite::Connection,
     row: &crate::federation::Attestation,
 ) -> Result<usize, rusqlite::Error> {
@@ -23626,7 +23628,9 @@ fn sqlite_task_class_having(classes: &[crate::ceg::TaskClass]) -> String {
 /// Decode a `trace_llm_calls` row into a typed [`TraceLlmCallRow`].
 /// Mirrors `pg_row_to_llm_call_row`; the SELECT must alias every
 /// column read here.
-fn sqlite_row_to_llm_call_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TraceLlmCallRow> {
+pub(crate) fn sqlite_row_to_llm_call_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<TraceLlmCallRow> {
     use crate::schema::{LlmCallStatus, ReasoningEventType};
     let parent_event_type_str: String = row.get("parent_event_type")?;
     let parent_event_type = ReasoningEventType::from_wire_str(&parent_event_type_str)
@@ -54759,7 +54763,7 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
 
         let origin = SqliteBackend::open_in_memory().await.unwrap();
         origin.run_migrations().await.unwrap();
-        let peer = crate::store::memory::MemoryBackend::new();
+        let peer = crate::store::test_backend::test_backend();
 
         let authority = "fam651-authority";
         let fam_key = "fam651-key";

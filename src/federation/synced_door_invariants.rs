@@ -11,7 +11,7 @@
 //! same `Error::RateLimited` the wire door gives, and nothing is stored.
 
 /// The backend-agnostic witness bodies; `run` instantiates them per backend.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub mod bodies {
     use crate::federation::attestation_apply::{
         AttestationRefusalReason as Reason, ReplicatedAttestationOutcome as Outcome,
@@ -408,7 +408,7 @@ pub mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     fn tag(arm: &str) -> String {
         format!("i189-{arm}-{}", uuid::Uuid::new_v4().simple())
@@ -495,13 +495,6 @@ mod run {
             }
         };
     }
-
-    async fn memory(us: &str) -> Option<crate::store::memory::MemoryBackend> {
-        let b = crate::store::memory::MemoryBackend::new();
-        b.set_self_key_id(Some(us.to_owned()));
-        Some(b)
-    }
-    runners!(memory_backend, super::memory);
 
     #[cfg(feature = "sqlite")]
     async fn sqlite(us: &str) -> Option<crate::store::sqlite::SqliteBackend> {

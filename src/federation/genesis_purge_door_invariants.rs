@@ -22,7 +22,7 @@
 //! gate, nothing to delete, `Ok(false)` — so the refusal is the gate's, not
 //! the delete's.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::delegation_cycle_invariants::bodies::{agent, stage_local_edge};
     use crate::federation::genesis::bundle::GenesisPurgeAuthority;
@@ -76,15 +76,9 @@ pub(crate) mod bodies {
 
 #[cfg(test)]
 mod run {
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn tag() -> String {
         format!("i954-{}", uuid::Uuid::new_v4().simple())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i954_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        super::bodies::i954_the_genesis_door_refuses_an_id_the_bundle_does_not_carry(&b, &tag())
-            .await;
     }
 
     #[cfg(feature = "sqlite")]

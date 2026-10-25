@@ -44,7 +44,7 @@
 //! Each runner then TAMPERS with the live table (one column of one row) and
 //! asserts the gate goes red: a witness that cannot fail is a report.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::attestation_admit::AttestationStore;
     use crate::federation::hard_case::{self, HardCaseEvent};
@@ -707,7 +707,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     use super::bodies;
     use crate::federation::silo_projection::{check_projection_rebuild, SiloProjection};
@@ -716,107 +716,6 @@ mod run {
 
     fn tag(n: &str) -> String {
         format!("{n}-{}", uuid::Uuid::new_v4().simple())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i960_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        let t = tag("i960m");
-        let node = format!("{t}-node");
-        bodies::register_node(&b, &node).await;
-        b.set_node_key_id(&node);
-        bodies::i960_hard_case(&b, &node, &t).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i961_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        let t = tag("i961m");
-        let (a, c) = bodies::i961_detection(&b, &t).await;
-        let node = sub::signing_node(&b, &t).await;
-        b.set_node_key_id(&node.id);
-        let summary = b
-            .delete_traces_for_agent_id_hash(&format!("{t}-agent-h"))
-            .await
-            .unwrap();
-        assert_eq!(
-            summary.detection_events_tombstoned, 1,
-            "I961 memory: the row is erased"
-        );
-        bodies::i961_after_erasure(&b, &a, &c).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i962_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        let t = tag("i962m");
-        bodies::i962_refused_without_a_node_key(&b, &t).await;
-        let node = format!("{t}-node");
-        bodies::register_node(&b, &node).await;
-        b.set_node_key_id(&node);
-        bodies::i962_succeeds_with_the_node_key(&b, &node, &t).await;
-    }
-
-    /// Memory holds no pre-v57 rows: its rehome is a no-op (a declared
-    /// divergence in `store::parity`), and the gates hold.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i963_memory() {
-        use crate::federation::FederationDirectory as _;
-        let b = crate::store::memory::MemoryBackend::new();
-        let t = tag("i963m");
-        let node = format!("{t}-node");
-        bodies::register_node(&b, &node).await;
-        b.set_node_key_id(&node);
-        bodies::i960_hard_case(&b, &node, &t).await;
-        let before = b
-            .list_hard_case_events(crate::federation::hard_case::HardCaseFilter::default())
-            .await
-            .unwrap();
-        let attester = crate::federation::attestation_admit::HardCaseAttester {
-            key_id: node.clone(),
-            identity_type: crate::federation::types::identity_type::NODE.to_owned(),
-        };
-        use crate::federation::attestation_admit::AttestationStore as _;
-        b.rehome_legacy_hard_case_events(&attester, chrono::Utc::now())
-            .await
-            .unwrap();
-        assert_eq!(
-            b.list_hard_case_events(crate::federation::hard_case::HardCaseFilter::default())
-                .await
-                .unwrap(),
-            before
-        );
-        check_projection_rebuild(&b, SiloProjection::HardCaseEvents)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i964_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        let t = tag("i964m");
-        let node = sub::signing_node(&b, &t).await;
-        b.set_node_key_id(&node.id);
-        bodies::i964_the_dsar_erasure(&b, &t, None, 1).await;
-    }
-
-    /// Memory has no SQL to tamper with; its red is the rebuild of a map
-    /// entry that names no row.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i960_memory_red_on_an_orphan_projection_row() {
-        let b = crate::store::memory::MemoryBackend::new();
-        let t = tag("i960mr");
-        let node = format!("{t}-node");
-        bodies::register_node(&b, &node).await;
-        b.set_node_key_id(&node);
-        bodies::i960_hard_case(&b, &node, &t).await;
-        b.test_insert_orphan_hard_case_projection(&format!("{t}-orphan"));
-        assert!(
-            check_projection_rebuild(&b, SiloProjection::HardCaseEvents)
-                .await
-                .is_err(),
-            "I960 memory: an entry no row produces is red"
-        );
     }
 
     #[cfg(feature = "sqlite")]

@@ -523,7 +523,7 @@ where
     Ok(Some(new.to_owned()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod codex_978 {
     use super::*;
     use crate::federation::accord_test_support as ops;
@@ -579,13 +579,6 @@ mod codex_978 {
         assert_eq!(after.family_name, held.family_name, "{tag} I504: unchanged");
     }
 
-    #[tokio::test]
-    async fn i504_memory() {
-        let d = crate::store::memory::MemoryBackend::new();
-        non_accord_family_is_refused(&d, "memory").await;
-    }
-
-    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i504_sqlite() {
         use crate::store::Backend as _;

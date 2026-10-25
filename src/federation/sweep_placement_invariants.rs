@@ -363,7 +363,7 @@ pub mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
@@ -384,10 +384,6 @@ mod run {
                 }
             }
         };
-    }
-
-    async fn memory() -> Option<crate::store::memory::MemoryBackend> {
-        Some(crate::store::memory::MemoryBackend::new())
     }
 
     #[cfg(feature = "sqlite")]
@@ -461,46 +457,28 @@ mod run {
         }
     }
 
-    runners!(on_memory, super::memory());
     #[cfg(feature = "sqlite")]
     runners!(on_sqlite, super::sqlite());
     #[cfg(feature = "postgres")]
     runners!(on_postgres, super::postgres());
 
-    /// **I186 (e) — the three backends return the same candidate set for the
-    /// same fixture.** The SQL backends and memory each carry their own read;
-    /// this is what keeps them one rule.
+    /// **I186 (e) — the two backends return the same candidate set for the
+    /// same fixture.** Each SQL backend carries its own read; this is what
+    /// keeps them one rule. Both backends or nothing: one set agrees with
+    /// itself.
+    #[cfg(all(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
     async fn i186e_backends_agree_on_the_candidate_set() {
         use crate::federation::FederationDirectory;
         let s = suffix();
-        let mut sets: Vec<(&str, Vec<String>)> = Vec::new();
-        let m = memory().await.expect("memory");
-        sets.push((
-            "memory",
-            super::bodies::i186_candidate_set(&m as &dyn FederationDirectory, &s).await,
-        ));
-        #[cfg(feature = "sqlite")]
-        {
-            let q = sqlite().await.expect("sqlite");
-            sets.push((
-                "sqlite",
-                super::bodies::i186_candidate_set(&q as &dyn FederationDirectory, &s).await,
-            ));
-        }
-        #[cfg(feature = "postgres")]
-        if let Some(p) = postgres().await {
-            sets.push((
-                "postgres",
-                super::bodies::i186_candidate_set(&p as &dyn FederationDirectory, &s).await,
-            ));
-        }
-        for (name, set) in &sets[1..] {
-            assert_eq!(
-                set, &sets[0].1,
-                "I186 (e): {name} and memory disagree on the widening candidates"
-            );
-        }
+        let q = sqlite().await.expect("sqlite");
+        let lite = super::bodies::i186_candidate_set(&q as &dyn FederationDirectory, &s).await;
+        let Some(p) = postgres().await else { return };
+        let pg = super::bodies::i186_candidate_set(&p as &dyn FederationDirectory, &s).await;
+        assert_eq!(
+            pg, lite,
+            "I186 (e): postgres and sqlite disagree on the widening candidates"
+        );
     }
 
     /// **I186 (a)–(d) through the sweep itself** (`promote_consented_backlog`

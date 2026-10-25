@@ -31,7 +31,7 @@
 //!   check on both arms.
 //! - **I449** a key root (no lineage record) keeps its self-charter.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::canonical_community::{
         charter_in_force, charter_members_for, HeadCharter,
@@ -728,7 +728,7 @@ mod pure {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     use super::bodies;
 
@@ -793,7 +793,6 @@ mod run {
             }
         };
     }
-    runners!(memory, async { Some(crate::store::MemoryBackend::new()) });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

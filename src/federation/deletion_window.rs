@@ -694,35 +694,48 @@ mod tests {
 /// backend is a watch proven on one backend.
 #[cfg(test)]
 pub(crate) mod watch_witness {
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use super::*;
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::hard_case::{HardCaseEvent, HardCaseFilter};
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::tier_ingest::test_support as ts;
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::types::{attestation_tier, attestation_type};
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::SignedAttestation;
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     use crate::store::Backend as _;
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn t(s: &str) -> DateTime<Utc> {
         s.parse().expect("rfc3339 literal")
     }
 
     /// When the producer published. Fixed, not `now - k`: a clock-relative
     /// fixture rots on a date (the AV-77 expiry-horizon lesson).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     const PUBLISHED_AT: &str = "2026-01-01T00:00:00Z";
     /// A committed erasure deadline that has PASSED by [`SWEEP_AT`].
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     const PAST_WINDOW: &str = "2026-02-01T00:00:00Z";
     /// A committed erasure deadline still in the future at [`SWEEP_AT`].
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     const FUTURE_WINDOW: &str = "2099-01-01T00:00:00Z";
     /// When the retractions land — after publication, before the sweep.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     const RETRACTED_AT: &str = "2026-01-15T00:00:00Z";
     /// The instant the watch runs.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     const SWEEP_AT: &str = "2026-07-27T00:00:00Z";
     /// A much later tick of the same cron — the replay probe.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     const LATER_SWEEP_AT: &str = "2026-09-01T00:00:00Z";
 
     /// A deterministic, per-run attestation id. A UUIDv5 because postgres
     /// types the column as `uuid`; per-`tag` because the postgres arm runs
     /// against a SHARED database.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn row_id(tag: &str, label: &str) -> String {
         uuid::Uuid::new_v5(
             &uuid::Uuid::NAMESPACE_OID,
@@ -731,9 +744,11 @@ pub(crate) mod watch_witness {
         .to_string()
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn producer_key(tag: &str) -> String {
         format!("dw-producer-{tag}")
     }
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn subject_key(tag: &str) -> String {
         format!("dw-subject-{tag}")
     }
@@ -741,6 +756,7 @@ pub(crate) mod watch_witness {
     /// A published (federation-tier) row, optionally committing a
     /// `deletion_window`. Signed LAST, over the final envelope, so the
     /// mandatory federation-tier ingest gate admits it.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn published(tag: &str, label: &str, window: Option<&str>) -> Attestation {
         let mut envelope = serde_json::json!({
             "dimension": "identity_binding:v1",
@@ -766,6 +782,7 @@ pub(crate) mod watch_witness {
     /// A `withdraws` from `issuer` naming `target_id` — the structural
     /// retraction the sweep reads as (or, from a subject, does NOT read as)
     /// proof of deletion.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn withdraws(tag: &str, label: &str, issuer: &str, target_id: &str) -> Attestation {
         let envelope = serde_json::json!({
             "dimension": "identity_binding:v1",
@@ -783,6 +800,7 @@ pub(crate) mod watch_witness {
         )
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn row(
         tag: &str,
         label: &str,
@@ -823,6 +841,7 @@ pub(crate) mod watch_witness {
         sealed_row_
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn publish(dir: &dyn FederationDirectory, row: Attestation) {
         let id = row.attestation_id.clone();
         dir.put_attestation(SignedAttestation { attestation: row })
@@ -830,6 +849,7 @@ pub(crate) mod watch_witness {
             .unwrap_or_else(|e| panic!("put_attestation {id}: {e}"));
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn breach_events(dir: &dyn FederationDirectory, kind: &str) -> Vec<HardCaseEvent> {
         dir.list_hard_case_events(HardCaseFilter {
             kind: Some(kind.to_owned()),
@@ -843,6 +863,7 @@ pub(crate) mod watch_witness {
     /// Events of `kind` naming one of THIS run's rows. The postgres arm shares
     /// a database with every other test, so a global count proves nothing;
     /// tag-scoping is what makes the assertion honest there.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn mine(dir: &dyn FederationDirectory, kind: &str, tag: &str) -> Vec<HardCaseEvent> {
         let ids: Vec<String> = ["breached", "future", "deleted", "plain", "malformed"]
             .iter()
@@ -864,6 +885,7 @@ pub(crate) mod watch_witness {
     /// `fresh` = this backend's database is this test's alone (memory /
     /// sqlite), so the report's absolute counts can be pinned; postgres shares
     /// a database and only the tag-scoped facts are its to assert.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn exercise(dir: &dyn FederationDirectory, tag: &str, fresh: bool) {
         ts::register_hybrid_key(dir, &producer_key(tag)).await;
         ts::register_hybrid_key(dir, &subject_key(tag)).await;
@@ -1016,14 +1038,6 @@ pub(crate) mod watch_witness {
         ts::register_hybrid_key(dir, &subject_key(tag)).await;
         publish(dir, published(tag, "breached", Some(PAST_WINDOW))).await;
         (row_id(tag, "breached"), t(SWEEP_AT))
-    }
-
-    #[tokio::test]
-    async fn deletion_window_breach_witness_memory() {
-        let dir = crate::store::MemoryBackend::new();
-        // v57.0.0 (#988 item 2) — the breach row needs this node's key.
-        crate::federation::hard_case::test_support::declare_node(&dir, "dw-node-mem").await;
-        exercise(&dir, "mem", true).await;
     }
 
     #[cfg(feature = "sqlite")]

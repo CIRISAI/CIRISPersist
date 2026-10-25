@@ -5853,7 +5853,7 @@ mod put_blob_binding_tests {
         // the door it always bypassed, on a corpus that never saw it. This is
         // the assertion whose absence hid the defect: `put_blob` returned Ok
         // the whole time.
-        let peer = crate::store::MemoryBackend::new();
+        let peer = crate::store::test_backend::test_backend();
         crate::federation::tier_ingest::test_support::register_hybrid_key(&peer, holder).await;
         peer.put_attestation(crate::federation::SignedAttestation {
             attestation: stored.clone(),

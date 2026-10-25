@@ -14,7 +14,7 @@
 //! - the open's migration mints the admissible legacy carriers and NAMES the
 //!   user-self ones without a quorum (sqlite, postgres).
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::occurrence_revocation_carrier as orc;
     use crate::federation::self_roster_invariants::bodies as srb;
@@ -226,27 +226,12 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod tests {
     use super::bodies;
 
     fn tag(n: &str) -> String {
         format!("{n}{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i1155_node_memory() {
-        let (a, b) = (
-            crate::store::memory::MemoryBackend::new(),
-            crate::store::memory::MemoryBackend::new(),
-        );
-        bodies::i1155_a_node_carrier_reaches_a_stranger(&a, &b, &tag("m")).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i1155_user_memory() {
-        let d = crate::store::memory::MemoryBackend::new();
-        bodies::i1155_a_user_carrier_needs_the_quorum(&d, &tag("m")).await;
     }
 
     #[cfg(feature = "sqlite")]

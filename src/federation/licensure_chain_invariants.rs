@@ -1319,8 +1319,9 @@ mod run {
     macro_rules! on_every_backend {
         ($body:ident, $memory:ident, $sqlite:ident, $postgres:ident, $prefix:literal) => {
             #[tokio::test]
+            #[cfg(feature = "sqlite")]
             async fn $memory() {
-                let d = crate::store::memory::MemoryBackend::new();
+                let d = crate::store::test_backend::test_backend();
                 super::bodies::$body(&d, &format!("{}-{}", $prefix, suffix())).await;
             }
 

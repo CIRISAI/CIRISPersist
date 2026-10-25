@@ -760,7 +760,7 @@ pub const fn band_token(band: ConfidenceBand) -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     /// v38.0.0 (CIRISPersist#724) — **the two vendored manifests must agree
     /// on polarity where both declare a family**, modulo a written
@@ -1108,16 +1108,6 @@ mod tests {
 
     // ── the three-backend differential parity witnesses ──────────────
 
-    #[test]
-    fn scores_read_log_parity_memory() {
-        let tag = fresh_tag();
-        let (events, stamps) = capture(&tag, || {
-            let dir = crate::store::MemoryBackend::new();
-            block_on(exercise(&dir, &tag));
-        });
-        assert_backend_entries("mem", &tag, &events, &stamps);
-    }
-
     #[cfg(feature = "sqlite")]
     #[test]
     fn scores_read_log_parity_sqlite() {
@@ -1171,7 +1161,7 @@ mod tests {
     fn scores_read_log_is_identical_across_backends() {
         let tag = fresh_tag();
         let (mem, _) = capture(&tag, || {
-            let dir = crate::store::MemoryBackend::new();
+            let dir = crate::store::test_backend::test_backend();
             block_on(exercise(&dir, &tag));
         });
         let (sq, _) = capture(&tag, || {
@@ -1203,7 +1193,7 @@ mod tests {
     fn the_none_caller_path_is_logged_as_unauthenticated() {
         let tag = fresh_tag();
         let (events, _) = capture(&tag, || {
-            let dir = crate::store::MemoryBackend::new();
+            let dir = crate::store::test_backend::test_backend();
             block_on(async {
                 // The FFI wrapper's `caller_occurrence_key_id: Option<String>`
                 // reaches the door as `unwrap_or_default()` — the empty string.

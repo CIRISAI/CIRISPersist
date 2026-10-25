@@ -3856,7 +3856,9 @@ pub(crate) mod test_support {
     use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::federation::tier_ingest::test_support::{hybrid_pubkeys, sign_envelope};
     use crate::federation::types::{attestation_tier, attestation_type, CommunityMember};
-    use crate::federation::{Community, SignedAttestation};
+    use crate::federation::Community;
+    #[cfg(feature = "sqlite")]
+    use crate::federation::SignedAttestation;
 
     /// Register `key_id` as a **`user`**-role identity carrying its real
     /// deterministic hybrid pubkeys.
@@ -3956,6 +3958,7 @@ pub(crate) mod test_support {
 
     /// Seed a `reverse_quorum:2/3:3600` community over `members`, plus a
     /// commons action authored by `actor`. Returns the action row.
+    #[cfg(feature = "sqlite")]
     async fn seed<D: FederationDirectory + ?Sized>(
         dir: &D,
         community_key_id: &str,
@@ -4582,6 +4585,7 @@ pub(crate) mod test_support {
     /// side passes anyway (it did, in a mutation run). At five, `reverse_quorum
     /// :2/5` separates them — reversal 2, dismissal 3 — so the witness itself
     /// fails if reversal is ever floored at a strict majority.
+    #[cfg(feature = "sqlite")]
     pub(crate) async fn exercise_reverse_quorum(dir: &dyn FederationDirectory, suffix: &str) {
         use crate::federation::attestation_query::test_support::AllAttestations as _;
         let alice = format!("rq-alice-{suffix}");
@@ -4877,7 +4881,7 @@ pub(crate) mod test_support {
         // ── (6) THE MARKER TRAVELS. A peer that never saw any of this gets
         //    the same signed rows and folds to the SAME standing. An objection
         //    that only lived as an API call could not do this.
-        let peer = crate::store::memory::MemoryBackend::new();
+        let peer = crate::store::test_backend::test_backend();
         for k in [&alice, &bob, &carol, &dave, &erin, &actor, &community] {
             register_user_key(&peer, k).await;
         }
@@ -5102,6 +5106,7 @@ pub(crate) mod test_support {
     /// issue is actually about: the community that has exactly one person
     /// carrying the duty, and that person is asleep.
     #[allow(clippy::too_many_lines)]
+    #[cfg(feature = "sqlite")]
     pub(crate) async fn exercise_escalation_on_silence(
         dir: &dyn FederationDirectory,
         suffix: &str,
@@ -5528,7 +5533,7 @@ pub(crate) mod test_support {
         // ── (8) THE RECORD TRAVELS. A peer that never saw any of this receives
         //    the same signed rows and folds to the same escalation record. An
         //    escalation that lived in a control loop could not do this.
-        let peer = crate::store::memory::MemoryBackend::new();
+        let peer = crate::store::test_backend::test_backend();
         for k in roster.iter().chain([&stranger, &community]) {
             register_user_key(&peer, k).await;
         }

@@ -630,7 +630,7 @@ impl IngestError {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
     use crate::journal::Journal;
@@ -643,7 +643,7 @@ mod tests {
         TraceComponent, TraceLevel,
     };
     use crate::scrub::NullScrubber;
-    use crate::store::MemoryBackend;
+    use crate::store::sqlite::SqliteBackend;
     use crate::verify::ed25519::canonical_payload_value;
     use crate::verify::{Canonicalizer, PythonJsonDumpsCanonicalizer};
     use axum::body::Body;
@@ -705,9 +705,9 @@ mod tests {
         (dir, Arc::new(j))
     }
 
-    async fn build_app(queue_depth: usize) -> (Router, Arc<MemoryBackend>) {
+    async fn build_app(queue_depth: usize) -> (Router, Arc<SqliteBackend>) {
         use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, PqcSigner as _};
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(crate::store::test_backend::test_backend());
         // Register the edge fixture key + agent fixture key in the
         // directory so verify can resolve them.
         let edge_sk = SigningKey::from_bytes(&EDGE_SEED);

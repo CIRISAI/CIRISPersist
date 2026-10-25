@@ -21,7 +21,7 @@
 //! [`register_genesis_accord_roster`]: crate::federation::accord_test_support::register_genesis_accord_roster
 
 /// The backend-agnostic witness bodies; `run` instantiates them per backend.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::accord_test_support as ops;
     use crate::federation::canonical_community::{
@@ -3500,7 +3500,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
@@ -3915,10 +3915,6 @@ mod run {
         };
     }
 
-    dyn_runners!(memory_dyn, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
-
     #[cfg(feature = "sqlite")]
     dyn_runners!(sqlite_dyn, async {
         use crate::store::Backend as _;
@@ -4049,17 +4045,6 @@ mod run {
         super::bodies::f1_b_stand_up_without_the_family(d).await
     }
 
-    #[tokio::test]
-    async fn i190_f1_b_memory() {
-        let d = crate::store::memory::MemoryBackend::new();
-        let row = f1_b_setup(&d).await;
-        d.plant_community_below_the_door(row);
-        super::bodies::f1_b_a_failed_family_read_never_serves_a_cached_verdict(
-            std::sync::Arc::new(d),
-        )
-        .await;
-    }
-
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i190_f1_b_sqlite() {
@@ -4095,15 +4080,6 @@ mod run {
         .await;
     }
 
-    /// (f1), third phase, on every backend: a planted non-conformant squat.
-    #[tokio::test]
-    async fn i190_f1_c_memory() {
-        let d = crate::store::memory::MemoryBackend::new();
-        let squat = super::bodies::j_squat(&d).await;
-        d.plant_community_below_the_door(squat);
-        super::bodies::f1_c_a_failed_read_is_not_unsupported(std::sync::Arc::new(d)).await;
-    }
-
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i190_f1_c_sqlite() {
@@ -4131,17 +4107,6 @@ mod run {
         let squat = super::bodies::j_squat(&d).await;
         plant_postgres(&d, squat).await;
         super::bodies::f1_c_a_failed_read_is_not_unsupported(std::sync::Arc::new(d)).await;
-    }
-
-    #[tokio::test]
-    async fn i190_j_memory() {
-        for (setup, reason) in variants() {
-            let d = crate::store::memory::MemoryBackend::new();
-            let squat = setup(&d).await;
-            d.plant_community_below_the_door(squat);
-            super::bodies::j_a_squat_is_never_honoured(&d, &format!("j{}", &suffix()[..8]), reason)
-                .await;
-        }
     }
 
     #[cfg(feature = "sqlite")]

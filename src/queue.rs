@@ -371,11 +371,10 @@ where
     (IngestHandle { tx }, PersisterHandle { join })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
     use crate::scrub::NullScrubber;
-    use crate::store::MemoryBackend;
     use crate::verify::PythonJsonDumpsCanonicalizer;
 
     /// Test-only signer factory (Ed25519SoftwareSigner with a fixed
@@ -399,7 +398,7 @@ mod tests {
     /// QueueError::Full. The agent retries on 429.
     #[tokio::test]
     async fn full_queue_returns_429_typed() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(crate::store::test_backend::test_backend());
         let (_dir, journal) = temp_journal();
         let (signer, signer_key_id) = test_signer_arc();
         let (handle, _persister) = spawn_persister(
@@ -447,7 +446,7 @@ mod tests {
         journal.append(b"{not-json").unwrap();
         assert_eq!(journal.pending_count().unwrap(), 1);
 
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(crate::store::test_backend::test_backend());
         let (signer, signer_key_id) = test_signer_arc();
         let (handle, _persister) = spawn_persister(
             DEFAULT_QUEUE_DEPTH,
@@ -488,7 +487,7 @@ mod tests {
         // available; the surface to switch a failing backend to
         // journaling is in place. Real outage tests live in the
         // integration suite once Postgres is wired up.
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(crate::store::test_backend::test_backend());
         let (_dir, journal) = temp_journal();
         let (signer, signer_key_id) = test_signer_arc();
         let (handle, _persister) = spawn_persister(
@@ -511,7 +510,7 @@ mod tests {
     /// integration test.)
     #[tokio::test]
     async fn graceful_shutdown_drains_pending() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(crate::store::test_backend::test_backend());
         let (_dir, journal) = temp_journal();
         let (signer, signer_key_id) = test_signer_arc();
         let (handle, persister) = spawn_persister(

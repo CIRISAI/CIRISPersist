@@ -18,7 +18,7 @@
 //!   attestations keep their rows, free of the dropped foreign key; and the
 //!   executed takedowns' `legal_basis` takes CC 3.3.2's spelling.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::attestation_admit::AttestationStore;
     use crate::federation::envelope::EnvelopeCore;
@@ -246,18 +246,12 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     use super::bodies as b;
 
     fn tag() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..8].to_owned()
-    }
-
-    #[tokio::test]
-    async fn i1166_memory() {
-        let m = crate::store::memory::MemoryBackend::new();
-        b::i1166_the_ledgers_are_this_nodes_rows(&m, &tag()).await;
     }
 
     #[cfg(feature = "sqlite")]

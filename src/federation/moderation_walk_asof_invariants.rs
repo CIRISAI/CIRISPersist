@@ -509,12 +509,6 @@ mod run {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
     }
 
-    #[tokio::test]
-    async fn moderation_walk_as_of_memory() {
-        let d = crate::store::memory::MemoryBackend::new();
-        super::bodies::exercise_moderation_walk_as_of(&d, &format!("mao-{}", suffix())).await;
-    }
-
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn moderation_walk_as_of_sqlite() {
@@ -538,16 +532,6 @@ mod run {
             .unwrap();
         b.run_migrations().await.unwrap();
         super::bodies::exercise_moderation_walk_as_of(&b, &format!("mao-{}", suffix())).await;
-    }
-
-    #[tokio::test]
-    async fn moderator_change_belongs_to_its_instant_memory() {
-        let d = crate::store::memory::MemoryBackend::new();
-        super::bodies::exercise_moderator_change_belongs_to_its_instant(
-            &d,
-            &format!("i175-{}", suffix()),
-        )
-        .await;
     }
 
     #[cfg(feature = "sqlite")]
@@ -579,16 +563,6 @@ mod run {
         super::bodies::exercise_moderator_change_belongs_to_its_instant(
             &b,
             &format!("i175-{}", suffix()),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn an_appointment_belongs_to_its_epoch_memory() {
-        let d = crate::store::memory::MemoryBackend::new();
-        super::bodies::exercise_an_appointment_belongs_to_its_epoch(
-            &d,
-            &format!("i175b-{}", suffix()),
         )
         .await;
     }

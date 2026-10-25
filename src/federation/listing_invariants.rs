@@ -508,7 +508,7 @@ pub mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     /// A SHORT tag: the test signer seeds from a key id's first 32 bytes, so a
     /// 32-hex uuid tag in front of every member name would give the whole room
@@ -545,10 +545,6 @@ mod run {
             }
         };
     }
-
-    dyn_runners!(memory_dyn, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
 
     #[cfg(feature = "sqlite")]
     dyn_runners!(sqlite_dyn, async {

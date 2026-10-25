@@ -494,7 +494,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
     use crate::federation::types::{attestation_tier, attestation_type};
@@ -727,8 +727,8 @@ mod tests {
         env
     }
 
-    async fn memory_with_author(author: &str) -> crate::store::MemoryBackend {
-        let dir = crate::store::MemoryBackend::new();
+    async fn memory_with_author(author: &str) -> crate::store::sqlite::SqliteBackend {
+        let dir = crate::store::test_backend::test_backend();
         crate::federation::tier_ingest::test_support::register_hybrid_key(&dir, author).await;
         dir
     }

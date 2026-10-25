@@ -960,7 +960,7 @@ crate-type = ["cdylib", "rlib"]
 [[bench]]
 name = "ingest_pipeline"
 harness = false
-required-features = ["postgres"]
+required-features = ["sqlite"]
 
 # v2.12.0 (CIRISPersist#116) — calibration anchor for runner-noise
 # normalization. Pure-compute, no deps beyond criterion. The bench
@@ -988,7 +988,7 @@ harness = false
 [[bench]]
 name = "queue"
 harness = false
-required-features = ["postgres"]
+required-features = ["sqlite"]
 
 # v1.10.x bench-coverage cut — benches for the v1.7.x–v1.10.1 surface
 # that shipped with zero coverage. SQLite in-memory backed where a DB

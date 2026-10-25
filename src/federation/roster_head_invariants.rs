@@ -32,7 +32,7 @@
 //!   held accord head, with its window closed, lags the head; one anchored on
 //!   another head, an unauthorized one, or one whose window is open does not.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::canonical_community::root_witness_view;
     use crate::federation::lineage_witness::{
@@ -666,7 +666,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod backdated {
     use crate::federation::canonical_community::{
         self as cc, CIRIS_CANONICAL_COMMUNITY_KEY_ID as CANON,
@@ -864,7 +864,7 @@ mod pure {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     use super::bodies;
 
@@ -939,7 +939,6 @@ mod run {
             }
         };
     }
-    runners!(memory, async { Some(crate::store::MemoryBackend::new()) });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

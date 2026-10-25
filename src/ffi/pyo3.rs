@@ -5495,7 +5495,7 @@ impl PyEngine {
     /// `refused`. Raises `ValueError` (`federation_genesis_bundle_invalid`)
     /// on a bundle that does not verify; NOTHING is written in that case.
     /// This node's own genesis posture is not changed.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[cfg(feature = "sqlite")]
     fn install_genesis_bundle_roster_json(
         &self,
         py: Python<'_>,

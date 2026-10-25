@@ -143,25 +143,6 @@ trait Node: FederationDirectory {
     async fn apply_key(&self, r: SignedKeyRecord) -> ReplicatedKeyOutcome;
 }
 
-impl Node for ciris_persist::store::memory::MemoryBackend {
-    async fn seed_holders(&self) {
-        self.seed_genesis_accord_holders(&effective_accord_holder_records())
-            .await
-            .expect("seed holders");
-    }
-    fn be_the_node(&self) {
-        self.set_node_key_id(TEST_CEREMONY_NODE_KEY_ID);
-    }
-    async fn drop_scrubs(&self, key_id: &str) {
-        self.test_seam_drop_key_additional_scrubs(key_id)
-            .await
-            .unwrap();
-    }
-    async fn apply_key(&self, r: SignedKeyRecord) -> ReplicatedKeyOutcome {
-        self.apply_replicated_key_record(r).await.unwrap()
-    }
-}
-
 impl Node for SqliteBackend {
     async fn seed_holders(&self) {
         self.seed_genesis_accord_holders(&effective_accord_holder_records())
@@ -634,14 +615,6 @@ sqlite_case!(
     i572_a_stranded_row_is_rehydrated
 );
 
-#[serial_test::serial(test_anchor_env)]
-#[tokio::test]
-async fn i572_a_stranded_row_is_rehydrated_memory() {
-    let (block, bundle) = mint_final();
-    let _armed = Armed;
-    let b = ciris_persist::store::memory::MemoryBackend::new();
-    i572_a_stranded_row_is_rehydrated(&b, &block, &bundle, "memory").await;
-}
 sqlite_case!(
     i530_the_adopt_door_keeps_the_quorum_sqlite,
     i530_the_adopt_door_keeps_the_quorum

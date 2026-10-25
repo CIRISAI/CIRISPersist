@@ -23,6 +23,7 @@
 /// What one backend did, per scenario.
 #[cfg(test)]
 #[derive(Debug, PartialEq)]
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) struct Observed {
     /// (A) the weight held under the re-used id after the upsert.
     pub(crate) same_dimension_weight: Option<f64>,
@@ -39,7 +40,7 @@ pub(crate) struct Observed {
 }
 
 /// The backend-agnostic witness body.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use super::Observed;
     use crate::federation::tier_ingest::test_support as ts;
@@ -150,20 +151,13 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     use super::bodies;
     use crate::federation::FederationDirectory;
 
     fn tag() -> String {
         format!("i951-{}", uuid::Uuid::new_v4().simple())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i951_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        let seen = bodies::i951_observe(&b as &dyn FederationDirectory, &tag()).await;
-        assert_eq!(seen, bodies::ruled(), "I951 memory (see the module doc)");
     }
 
     #[cfg(feature = "sqlite")]

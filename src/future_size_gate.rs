@@ -13,10 +13,11 @@
 //! test covers the futures persist hands OUT, which the lint cannot see.
 
 /// `clippy::large_futures`' default `future-size-threshold`, the one Edge hit.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 pub(crate) const LARGE_FUTURE_BYTES: usize = 16 * 1024;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::LARGE_FUTURE_BYTES;
     use crate::federation::admission::ConsentGatedFamily;
@@ -44,7 +45,7 @@ mod tests {
     #[test]
     fn i578_free_doors_over_a_directory() {
         use crate::federation::{admission, consent_by_humans as cbh, trust_root};
-        let m = crate::store::memory::MemoryBackend::new();
+        let m = crate::store::test_backend::test_backend();
         let d: &dyn FederationDirectory = &m;
         let now = chrono::Utc::now();
         let row = crate::federation::tier_ingest::test_support::bare_attestation(
@@ -55,7 +56,7 @@ mod tests {
         );
         let sizes = [
             (
-                "trust_root::resolve_serve_tier<MemoryBackend>",
+                "trust_root::resolve_serve_tier<SqliteBackend>",
                 std::mem::size_of_val(&trust_root::resolve_serve_tier(&m, "k", "k")),
             ),
             (

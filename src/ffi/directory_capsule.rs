@@ -4470,16 +4470,16 @@ impl FederationDirectory for OpsDirectory {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
-    use crate::store::memory::MemoryBackend;
+    use crate::store::sqlite::SqliteBackend;
     use std::sync::mpsc;
 
     // ── shared helpers ─────────────────────────────────────────────
 
     fn memory_directory() -> (Arc<dyn FederationDirectory>, Directory) {
-        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend;
         let directory = build_persist_directory(dir.clone());
         (dir, directory)
@@ -4536,7 +4536,7 @@ mod tests {
     #[test]
     fn trust_direction_held_among_op_forwards_the_held_set() {
         let rt = test_runtime();
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(crate::store::test_backend::test_backend());
         backend.mark_trust_direction_held("held-row");
         let directory = build_persist_directory(backend as Arc<dyn FederationDirectory>);
         match run_op(
@@ -4926,7 +4926,7 @@ mod tests {
     #[test]
     fn accord_carrier_refusal_round_trips_the_capsule_674() {
         let rt = test_runtime();
-        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend;
         let directory = build_persist_directory(dir.clone());
         let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
@@ -5533,7 +5533,7 @@ mod tests {
         let rt = test_runtime();
         // v57.0.0 (#988 item 2) — the removal's hard_case row needs this
         // node's key.
-        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
         rt.block_on(crate::federation::hard_case::test_support::declare_node(
             &*backend,
             "capsule-node",
@@ -6047,7 +6047,7 @@ mod tests {
         // runtime that spawns the op-future (block_on on the caller
         // thread; the op-future runs on a worker; the oneshot bridges).
         let rt = test_runtime();
-        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend;
         let directory = build_persist_directory(dir.clone());
         let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
@@ -6094,7 +6094,7 @@ mod tests {
     #[test]
     fn ops_directory_known_hash_methods_route_785() {
         let rt = test_runtime();
-        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend;
         let directory = build_persist_directory(dir.clone());
         let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
@@ -6157,7 +6157,7 @@ mod tests {
         // resolves Some before revocation, None after (revocation-aware
         // through the ABI), and the raw revocations read round-trips too.
         let rt = test_runtime();
-        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend;
         let directory = build_persist_directory(dir.clone());
         let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
@@ -6245,7 +6245,7 @@ mod tests {
         // A REQUIRED method with no DirectoryOp must surface
         // `Error::Unsupported`, not route garbage.
         let rt = test_runtime();
-        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend;
         let directory = build_persist_directory(dir);
         let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
@@ -6276,7 +6276,7 @@ mod tests {
         // unrootable. It must now ROUTE: an unbound key resolves to
         // `Ok(None)` (the real backend answer), NOT the Unsupported error.
         let rt = test_runtime();
-        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend;
         let directory = build_persist_directory(dir.clone());
         let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(

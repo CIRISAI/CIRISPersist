@@ -30,7 +30,7 @@
 //!   but missing one chunk cannot file `here`, and the deficit lists it; with
 //!   every chunk held it can, and the deficit counts it.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::custody_ack::{CustodyState, CustodyVerdict};
     use crate::federation::custody_ack_invariants::bodies as cust;
@@ -740,7 +740,7 @@ mod from_disk {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
@@ -805,10 +805,6 @@ mod runners {
         )
         .await;
     }
-
-    dyn_runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
 
     #[cfg(feature = "sqlite")]
     dyn_runners!(sqlite, async {

@@ -37,7 +37,7 @@
 //! completion stores the caller's half and a completion instant.
 
 /// The backend-agnostic witness bodies.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::attestation_admit::{
         plan_put_attestation, AttestationPlan, AttestationStore, PlanInstants,
@@ -220,7 +220,7 @@ pub(crate) mod bodies {
 }
 
 /// I952's body, on any directory.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod pqc_bodies {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::{Error, FederationDirectory};
@@ -278,17 +278,9 @@ pub(crate) mod pqc_bodies {
 
 #[cfg(test)]
 mod run {
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i950_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        super::bodies::i950_the_plan_judges_at_its_input_instant(&b, &format!("i950-{}", suffix()))
-            .await;
-        super::pqc_bodies::i952_the_completion_is_decided_once(&b, &format!("i952-{}", suffix()))
-            .await;
     }
 
     #[cfg(feature = "sqlite")]

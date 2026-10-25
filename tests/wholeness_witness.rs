@@ -504,14 +504,6 @@ async fn hold_node_key<B: FederationDirectory>(backend: &B, node: &str) {
 }
 
 #[tokio::test]
-async fn memory_witness_projection() {
-    let backend = ciris_persist::store::MemoryBackend::default();
-    hold_node_key(&backend, "ww-node").await;
-    backend.set_node_key_id("ww-node");
-    run_projection_assertions(&backend, "memory", true).await;
-}
-
-#[tokio::test]
 async fn sqlite_witness_projection() {
     let backend = ciris_persist::store::SqliteBackend::open_in_memory()
         .await
@@ -547,10 +539,10 @@ async fn postgres_witness_projection() {
 }
 
 /// (d) compare_witnesses Equivocation → hard_case emitted, both witnesses
-/// retained (not reconciled). Memory backend (the verdict-routing path).
+/// retained (not reconciled), on the in-memory SQLite test backend.
 #[tokio::test]
 async fn equivocation_emits_hard_case_and_retains_both() {
-    let backend = ciris_persist::store::MemoryBackend::default();
+    let backend = ciris_persist::store::test_backend::test_backend();
     // v57.0.0 (CIRISPersist#988 item 2) — the equivocation proof is a
     // `hard_case:witness_equivocation:v1` row attested by THIS node's key, so
     // the node declares one it holds.

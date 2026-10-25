@@ -24,9 +24,14 @@
 /// The backend-agnostic bodies.
 #[cfg(test)]
 pub mod bodies {
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::cohort::Cohort;
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::{consensus_protocol, identity_type, Family, FamilyMember};
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    use crate::federation::types::identity_type;
+    use crate::federation::types::{consensus_protocol, Family, FamilyMember};
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::{Error, FederationDirectory, SignedFamily};
 
     fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
@@ -64,6 +69,7 @@ pub mod bodies {
         }
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn world(a: &dyn FederationDirectory, b: &dyn FederationDirectory, tag: &str) -> World {
         let keys: Vec<String> = ["alice", "bob", "carol"]
             .iter()
@@ -97,6 +103,7 @@ pub mod bodies {
 
     /// The change envelope for `members` (protocol unchanged), with an
     /// optional `dissolved_at`, signed by `signers`.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn change(
         a: &dyn FederationDirectory,
         w: &World,
@@ -131,6 +138,7 @@ pub mod bodies {
         (env, sigs)
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn served(d: &dyn FederationDirectory, id: &str) -> SignedFamily {
         d.list_signed_families_since(None, u32::MAX)
             .await
@@ -141,10 +149,12 @@ pub mod bodies {
             .family
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn held(d: &dyn FederationDirectory, id: &str) -> Family {
         d.lookup_family(id).await.unwrap().expect("family")
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn is_dissolved_refusal(e: &Error) -> bool {
         matches!(e, Error::GroupDissolved { .. }) && e.kind() == "federation_group_dissolved"
     }
@@ -152,6 +162,7 @@ pub mod bodies {
     const DISSOLVED: &str = "2026-09-30T12:00:00Z";
 
     /// Dissolve `w` on `a` with alice + bob (a majority of three).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn dissolve_on_a(a: &dyn FederationDirectory, w: &World, tag: &str) -> SignedFamily {
         let (alice, bob) = (&w.keys[0], &w.keys[1]);
         let all: Vec<&String> = w.keys.iter().collect();
@@ -166,6 +177,7 @@ pub mod bodies {
     }
 
     /// **I280** — a quorum dissolution replicates.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i280_a_quorum_dissolution_replicates(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
@@ -200,6 +212,7 @@ pub mod bodies {
     }
 
     /// **I281** — only a quorum-verified terminal amendment dissolves.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i281_only_a_quorum_terminal_amendment_dissolves(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
@@ -293,6 +306,7 @@ pub mod bodies {
     }
 
     /// **I282** — a dissolved family admits no further write.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i282_a_dissolved_family_admits_nothing(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
@@ -365,6 +379,7 @@ pub mod bodies {
     }
 
     /// Carol's own amendment removing only herself.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn carol_leaves(
         a: &dyn FederationDirectory,
         w: &World,
@@ -379,6 +394,7 @@ pub mod bodies {
     }
 
     /// **I283** — a self-leave is admitted on the leaver's signature alone.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i283_a_self_leave_needs_only_the_leaver(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
@@ -418,6 +434,7 @@ pub mod bodies {
     }
 
     /// **I284** — the self-leave arm admits nothing but a self-leave.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i284_the_leave_arm_admits_only_a_leave(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
@@ -521,7 +538,7 @@ pub mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
@@ -575,10 +592,6 @@ mod run {
             }
         };
     }
-
-    dyn_runners!(memory_dyn, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
 
     #[cfg(feature = "sqlite")]
     dyn_runners!(sqlite_dyn, async {

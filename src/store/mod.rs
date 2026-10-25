@@ -9,6 +9,9 @@
 //! contract.
 
 pub mod backend;
+/// v60.0.0 (CIRISPersist#1002) — the retired memory backend's own tests, on SQLite.
+#[cfg(all(test, feature = "sqlite"))]
+mod backend_suite;
 pub mod decompose;
 pub mod memory;
 // v3.12.x (CIRISPersist#156) — always-compiled migration-timing

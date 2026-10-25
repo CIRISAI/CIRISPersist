@@ -604,9 +604,6 @@ mod run {
             }
         };
     }
-    dir_runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
     #[cfg(feature = "sqlite")]
     dir_runners!(sqlite, async {
         use crate::store::Backend as _;

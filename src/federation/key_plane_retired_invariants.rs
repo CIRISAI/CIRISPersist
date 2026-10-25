@@ -39,7 +39,7 @@
 //!   or the framed revocation door (comments stripped); the v58 I1123 gate
 //!   (no hybrid-pending revocation path) rides along.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type;
@@ -653,7 +653,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     use super::bodies;
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -661,12 +661,6 @@ mod run {
 
     fn tag(n: &str) -> String {
         format!("{n}-{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i1150_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        bodies::i1150_replication_takes_no_framed_object(&b, &tag("i1150m")).await;
     }
 
     #[cfg(feature = "sqlite")]
@@ -691,12 +685,6 @@ mod run {
         b.run_migrations().await.unwrap();
         bodies::i1150_replication_takes_no_framed_object(&b, &tag("i1150p")).await;
         eprintln!("i1150_postgres: RAN");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i1145_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        bodies::i1145_framed_reads_are_retired(&b, &tag("i1145m")).await;
     }
 
     #[cfg(feature = "sqlite")]

@@ -17,7 +17,6 @@ use ciris_persist::federation::transport_rebind::{
 };
 use ciris_persist::federation::{Error, FederationDirectory, SignedAttestation};
 use ciris_persist::store::backend::Backend as _;
-use ciris_persist::store::memory::MemoryBackend;
 use ciris_persist::store::sqlite::SqliteBackend;
 
 const SEEDS: [[u8; 32]; 3] = [[0x31; 32], [0x32; 32], [0x33; 32]];
@@ -53,14 +52,6 @@ fn at(offset_secs: i64) -> chrono::DateTime<chrono::Utc> {
 async fn sqlite() -> SqliteBackend {
     let b = SqliteBackend::open_in_memory().await.unwrap();
     b.run_migrations().await.unwrap();
-    b.seed_genesis_accord_holders(&effective_accord_holder_records())
-        .await
-        .expect("seed holders");
-    b
-}
-
-async fn memory() -> MemoryBackend {
-    let b = MemoryBackend::new();
     b.seed_genesis_accord_holders(&effective_accord_holder_records())
         .await
         .expect("seed holders");
@@ -124,11 +115,10 @@ impl PgDrop {
     }
 }
 
-/// Run `$body(d, tag, $args...)` against a fresh memory, sqlite and (with a
-/// test database) postgres node.
+/// Run `$body(d, tag, $args...)` against a fresh sqlite and (with a test
+/// database) postgres node.
 macro_rules! on_each_backend {
     ($body:ident $(, $arg:expr)*) => {{
-        $body(&memory().await, "memory" $(, $arg)*).await;
         $body(&sqlite().await, "sqlite" $(, $arg)*).await;
         #[cfg(feature = "postgres")]
         if let Some((b, guard)) = postgres().await {
@@ -238,8 +228,8 @@ async fn i1157_the_bundle_rows_are_checked() {
     verify_ceremony_outputs(&v3_json)
         .await
         .expect("I1157: a v3 bundle verifies");
-    let d = memory().await;
-    boot(&d, &v3.bundle, "memory v3").await;
+    let d = sqlite().await;
+    boot(&d, &v3.bundle, "sqlite v3").await;
     assert!(
         transit_kex_pair_for(&d, TEST_CEREMONY_NODE_KEY_ID)
             .await
@@ -259,7 +249,7 @@ async fn i1157_the_v3_preimage_is_unchanged() {
     let v3 = parse_genesis_bundle(include_str!("fixtures/genesis/canonical_seed.v3.json"))
         .expect("the v3 fixture parses");
     assert_eq!(v3.version, 3);
-    let d = memory().await;
+    let d = sqlite().await;
     verify_bundle_quorum(&d, &v3)
         .await
         .expect("I1157: the v3 final genesis's authorizations still verify");
@@ -355,28 +345,18 @@ async fn i1159_amend_is_two_of_three_for_every_holder_pair() {
             .unwrap_or_else(|e| panic!("I1159 {pair:?}: the amend finishes: {e}"));
         assert_eq!(done.bundle.version, 4);
         assert_eq!(done.verified.quorum_verified, 2, "I1159 {pair:?}");
-        for (tag, d) in [
-            (
-                "memory",
-                Box::new(memory().await) as Box<dyn FederationDirectory>,
+        let (tag, d) = ("sqlite", sqlite().await);
+        boot(&d, &done.bundle, tag).await;
+        assert_eq!(
+            x_of(
+                &transit_kex_pair_for(&d, TEST_CEREMONY_NODE_KEY_ID)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{tag} I1159 {pair:?}: a Rooted pair"))
             ),
-            (
-                "sqlite",
-                Box::new(sqlite().await) as Box<dyn FederationDirectory>,
-            ),
-        ] {
-            boot(d.as_ref(), &done.bundle, tag).await;
-            assert_eq!(
-                x_of(
-                    &transit_kex_pair_for(d.as_ref(), TEST_CEREMONY_NODE_KEY_ID)
-                        .await
-                        .unwrap()
-                        .unwrap_or_else(|| panic!("{tag} I1159 {pair:?}: a Rooted pair"))
-                ),
-                0x71
-            );
-            clear_test_ceremony_outputs();
-        }
+            0x71
+        );
+        clear_test_ceremony_outputs();
     }
     // One holder, even twice: refused.
     let mut one = AmendState::plan(&v3_json, vec![row.clone()]).await.unwrap();
