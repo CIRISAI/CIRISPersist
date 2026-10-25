@@ -13458,7 +13458,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         limit: i64,
     ) -> Result<crate::read::ScoresPage, crate::federation::Error> {
         use crate::federation::Error;
-        use crate::read::LifecycleView;
         // #552 (CC 3.4.5) — the scores-plane read log. FIRST statement in the
         // door, ahead of every refusal, so a read rejected for a bad limit or
         // cursor is logged exactly like one that is served.
@@ -13481,30 +13480,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let (mut where_parts, mut params) = pg_scores_shared_predicates(&filter, &scope);
-        // lifecycle: exclude rows retracted by a still-hiding composer.
-        let hide: &[&str] = match filter.lifecycle {
-            LifecycleView::Live => &["supersedes", "withdraws", "recants"],
-            LifecycleView::IncludeSuperseded => &["withdraws", "recants"],
-            LifecycleView::IncludeWithdrawn => &["supersedes", "recants"],
-            LifecycleView::IncludeRecanted => &["supersedes", "withdraws"],
-            LifecycleView::All => &[],
-        };
-        if !hide.is_empty() {
-            let mut ph: Vec<String> = Vec::new();
-            for ty in hide {
-                params.push(Box::new((*ty).to_string()));
-                ph.push(format!("${}", params.len()));
+        // lifecycle: exclude rows retracted by a still-hiding composer (the
+        // one predicate, CIRISPersist#720).
+        if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
+            filter.lifecycle,
+            crate::federation::attestation_query::Dialect::Postgres,
+            "fa",
+            params.len() + 1,
+        ) {
+            for t in types {
+                params.push(Box::new(t));
             }
-            // v20.0.0 (#495 C2) — path from the ONE constant (see sqlite twin).
-            where_parts.push(format!(
-                "NOT EXISTS (SELECT 1 FROM cirislens.federation_attestations c \
-                   WHERE (c.attesting_key_id = fa.attesting_key_id \
-                          OR c.withdraws_admission_rule IS NOT NULL) \
-                     AND c.attestation_type IN ({}) \
-                     AND c.attestation_envelope::jsonb->>'{}' = fa.attestation_id::text)",
-                ph.join(","),
-                crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID
-            ));
+            where_parts.push(sql);
         }
         if let Some(c) = &cursor {
             if c.version != "v1" {
@@ -27511,32 +27498,16 @@ impl crate::read::ReadEngine for PostgresBackend {
         }
         // v49.0.0 (CIRISPersist#909) — the lifecycle view (see the sqlite
         // twin): `Live` hides rows retracted by a still-hiding composer.
-        {
-            use crate::read::LifecycleView;
-            let hide: &[&str] = match filter.lifecycle {
-                LifecycleView::Live => &["supersedes", "withdraws", "recants"],
-                LifecycleView::IncludeSuperseded => &["withdraws", "recants"],
-                LifecycleView::IncludeWithdrawn => &["supersedes", "recants"],
-                LifecycleView::IncludeRecanted => &["supersedes", "withdraws"],
-                LifecycleView::All => &[],
-            };
-            if !hide.is_empty() {
-                let mut ph: Vec<String> = Vec::new();
-                for ty in hide {
-                    params.push(Box::new((*ty).to_string()));
-                    ph.push(format!("${}", params.len()));
-                }
-                where_parts.push(format!(
-                    "NOT EXISTS (SELECT 1 FROM cirislens.federation_attestations c \
-                       WHERE (c.attesting_key_id = federation_attestations.attesting_key_id \
-                              OR c.withdraws_admission_rule IS NOT NULL) \
-                         AND c.attestation_type IN ({}) \
-                         AND c.attestation_envelope::jsonb->>'{}' = \
-                             federation_attestations.attestation_id::text)",
-                    ph.join(","),
-                    crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID
-                ));
+        if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
+            filter.lifecycle,
+            crate::federation::attestation_query::Dialect::Postgres,
+            "federation_attestations",
+            params.len() + 1,
+        ) {
+            for t in types {
+                params.push(Box::new(t));
             }
+            where_parts.push(sql);
         }
         if let Some(c) = &cursor {
             if c.version != "v1" {

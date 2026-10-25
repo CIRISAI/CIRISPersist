@@ -6303,3 +6303,140 @@ mod tests {
         assert!(via_proxy.is_none(), "unbound occurrence resolves to None");
     }
 }
+
+/// v60.0.0 (CIRISPersist#787) — the consumer side of every op.
+#[cfg(test)]
+mod proxy_gate {
+    /// The ops a consumer never reaches through an [`OpsDirectory`] trait
+    /// method, each with why. Every other op must be constructed by the proxy.
+    ///
+    /// [`OpsDirectory`]: super::OpsDirectory
+    const DISPATCH_ONLY: &[(&str, &str)] = &[
+        (
+            "ReachableUnderScope",
+            "a free fold (`reachable_under_scope_with_reasons`) persist runs over its own \
+             directory; no `FederationDirectory` method exists to proxy",
+        ),
+        (
+            "VerifyHybridViaDirectory",
+            "the verify runs inside persist's .so against its own vtable, by design: a \
+             consumer-side proxy would reintroduce the vtable skew the op exists to avoid",
+        ),
+        (
+            "BuildDelegationGraph",
+            "a free walk persist runs over its own directory; no trait method to proxy",
+        ),
+        (
+            "PutIdentityOccurrenceRevocation",
+            "retired at v59.0.0: kept so an old consumer's op is answered with the typed \
+             `federation_envelope_kind_retired` refusal, never issued by a current proxy",
+        ),
+        (
+            "TrustRootValid",
+            "`trust_root::trust_root_valid` is a free function over the directory, not a \
+             trait method",
+        ),
+        (
+            "CapabilityRootsToTrustedRoot",
+            "`trust_root::capability_roots_to_trusted_root` is a free function over the \
+             directory, not a trait method",
+        ),
+        (
+            "ResolveTransitEligibility",
+            "`trust_root::resolve_transit_eligibility` is a free, fail-closed function over \
+             the directory, not a trait method",
+        ),
+    ];
+
+    /// The body of the first `{ … }` block opening at or after `at`.
+    fn block(src: &str, at: usize) -> &str {
+        let open = at + src[at..].find('{').expect("a block");
+        let mut depth = 0usize;
+        for (k, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..open + k];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated block");
+    }
+
+    /// **I1322 (#787)** — every `DirectoryOp` the dispatch side answers has a
+    /// consumer-side proxy (a method of `impl FederationDirectory for
+    /// OpsDirectory` that builds it), or is named in [`DISPATCH_ONLY`] with
+    /// why. The dispatch `match` is exhaustive, so the compiler holds that
+    /// side; nothing held this one, and an op with no proxy answers
+    /// `Error::Unsupported` from the trait default in exactly the build a
+    /// consumer runs (#780). Read from the text this binary was compiled from
+    /// (`include_str!`), comments stripped, so neither a moved tree nor a
+    /// commented-out construction can read as a proxy.
+    #[test]
+    fn i1322_every_op_has_a_consumer_proxy_or_says_why() {
+        let src: String = include_str!("directory_capsule.rs")
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ops = block(
+            &src,
+            src.find("pub enum DirectoryOp {").expect("the op enum"),
+        );
+        let variants: Vec<&str> = ops
+            .lines()
+            .filter_map(|l| {
+                let name = l.strip_prefix("    ")?;
+                let end = name.find(|c: char| !c.is_ascii_alphanumeric())?;
+                let name = &name[..end];
+                name.starts_with(|c: char| c.is_ascii_uppercase())
+                    .then_some(name)
+            })
+            .collect();
+        assert!(
+            variants.len() >= 70,
+            "I1322: the op scan found {} variants — the extractor collapsed",
+            variants.len()
+        );
+        let proxy = block(
+            &src,
+            src.find("impl FederationDirectory for OpsDirectory {")
+                .expect("the consumer proxy"),
+        );
+        let built = |v: &str| {
+            proxy
+                .match_indices(&format!("DirectoryOp::{v}"))
+                .any(|(i, m)| {
+                    !proxy[i + m.len()..].starts_with(|c: char| c.is_ascii_alphanumeric())
+                })
+        };
+        let mut missing = Vec::new();
+        for v in &variants {
+            let exempt = DISPATCH_ONLY.iter().any(|(n, _)| n == v);
+            match (built(v), exempt) {
+                (true, true) => missing.push(format!(
+                    "{v}: the proxy builds it now — delete its DISPATCH_ONLY row"
+                )),
+                (false, false) => missing.push(format!(
+                    "{v}: no OpsDirectory method builds it (a consumer gets Unsupported)"
+                )),
+                _ => {}
+            }
+        }
+        for (n, why) in DISPATCH_ONLY {
+            assert!(
+                variants.contains(n),
+                "I1322: DISPATCH_ONLY names no op `{n}`"
+            );
+            assert!(
+                why.split_whitespace().count() >= 10,
+                "I1322: `{n}` needs a reason"
+            );
+        }
+        assert!(missing.is_empty(), "I1322 (#787):\n{}", missing.join("\n"));
+    }
+}

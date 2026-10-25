@@ -10615,7 +10615,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         limit: i64,
     ) -> Result<crate::read::ScoresPage, crate::federation::Error> {
         use crate::federation::Error;
-        use crate::read::LifecycleView;
         // #552 (CC 3.4.5) — the scores-plane read log. FIRST statement in the
         // door, ahead of every refusal, so a read rejected for a bad limit or
         // cursor is logged exactly like one that is served.
@@ -10633,34 +10632,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             .await
             .map_err(|e| Error::Backend(format!("list_scores admission: {e}")))?;
         let (mut parts, mut binds) = sqlite_scores_shared_predicates(&filter, &scope);
-        // lifecycle: exclude rows retracted by a still-hiding composer.
-        let hide: &[&str] = match filter.lifecycle {
-            LifecycleView::Live => &["supersedes", "withdraws", "recants"],
-            LifecycleView::IncludeSuperseded => &["withdraws", "recants"],
-            LifecycleView::IncludeWithdrawn => &["supersedes", "recants"],
-            LifecycleView::IncludeRecanted => &["supersedes", "withdraws"],
-            LifecycleView::All => &[],
-        };
-        if !hide.is_empty() {
-            let mut ph: Vec<String> = Vec::new();
-            for ty in hide {
-                binds.push(SqlValue::Text((*ty).to_string()));
-                ph.push(format!("?{}", binds.len()));
-            }
-            // v20.0.0 (#495 C2) — the composer-target path interpolates the
-            // ONE envelope-path constant (bound to EnvelopeCore's serde
-            // name by witness); a key rename can no longer silently leave
-            // a withdrawn attestation active.
-            // v51.2.0 (#945) — the retracting row is the target's own author's, OR the write door admitted it under a resolved rule (#945: a node owner's, a subject's, a delegate's withdrawal — every admitted retraction hides, as the consolidated fold already holds).
-            parts.push(format!(
-                "NOT EXISTS (SELECT 1 FROM federation_attestations c \
-                   WHERE (c.attesting_key_id = fa.attesting_key_id \
-                          OR c.withdraws_admission_rule IS NOT NULL) \
-                     AND c.attestation_type IN ({}) \
-                     AND json_extract(c.attestation_envelope, '$.{}') = fa.attestation_id)",
-                ph.join(","),
-                crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID
-            ));
+        // lifecycle: exclude rows retracted by a still-hiding composer (the
+        // one predicate, CIRISPersist#720; the composer-target path is the
+        // ONE envelope-path constant, #495 C2; an admitted retraction hides
+        // whoever authored it, #945).
+        if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
+            filter.lifecycle,
+            crate::federation::attestation_query::Dialect::Sqlite,
+            "fa",
+            binds.len() + 1,
+        ) {
+            binds.extend(types.into_iter().map(SqlValue::Text));
+            parts.push(sql);
         }
         if let Some(c) = &cursor {
             if c.version != "v1" {
@@ -25434,32 +25417,14 @@ impl crate::read::ReadEngine for SqliteBackend {
         // composer from the same attester; this read took the filter and
         // dropped the axis, so every drive listing showed withdrawn and
         // replaced files. The same fold `list_scores` applies.
-        {
-            use crate::read::LifecycleView;
-            let hide: &[&str] = match filter.lifecycle {
-                LifecycleView::Live => &["supersedes", "withdraws", "recants"],
-                LifecycleView::IncludeSuperseded => &["withdraws", "recants"],
-                LifecycleView::IncludeWithdrawn => &["supersedes", "recants"],
-                LifecycleView::IncludeRecanted => &["supersedes", "withdraws"],
-                LifecycleView::All => &[],
-            };
-            if !hide.is_empty() {
-                let mut ph: Vec<String> = Vec::new();
-                for ty in hide {
-                    binds.push(SqlValue::Text((*ty).to_string()));
-                    ph.push(format!("?{}", binds.len()));
-                }
-                parts.push(format!(
-                    "NOT EXISTS (SELECT 1 FROM federation_attestations c \
-                       WHERE (c.attesting_key_id = federation_attestations.attesting_key_id \
-                              OR c.withdraws_admission_rule IS NOT NULL) \
-                         AND c.attestation_type IN ({}) \
-                         AND json_extract(c.attestation_envelope, '$.{}') = \
-                             federation_attestations.attestation_id)",
-                    ph.join(","),
-                    crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID
-                ));
-            }
+        if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
+            filter.lifecycle,
+            crate::federation::attestation_query::Dialect::Sqlite,
+            "federation_attestations",
+            binds.len() + 1,
+        ) {
+            binds.extend(types.into_iter().map(SqlValue::Text));
+            parts.push(sql);
         }
         if let Some(c) = &cursor {
             if c.version != "v1" {

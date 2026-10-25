@@ -587,11 +587,13 @@ mod tests {
         files.sort();
         let mut tables: Tables = BTreeMap::new();
         for f in files {
-            let text = strip_sql(&std::fs::read_to_string(&f).expect("read migration"));
+            let text = strip_sql(&super::super::tree_read::read(&f));
             for st in statements(&text) {
                 apply_statement(&mut tables, &st);
             }
         }
+        // CIRISPersist#691 — the migrations read are still the text read.
+        super::super::tree_read::assert_unmoved();
         tables
     }
 
@@ -1069,7 +1071,17 @@ mod tests {
 
     /// `table -> the union of every column any INSERT in this file binds`.
     fn insert_columns(rel: &str) -> BTreeMap<String, BTreeSet<String>> {
-        let text = std::fs::read_to_string(manifest_dir().join(rel)).expect("read backend source");
+        // CIRISPersist#691 — the backend source this binary was compiled from.
+        let p = manifest_dir().join(rel);
+        let text = match rel {
+            "src/store/sqlite.rs" => {
+                super::super::tree_read::read_compiled(&p, include_str!("sqlite.rs"))
+            }
+            "src/store/postgres.rs" => {
+                super::super::tree_read::read_compiled(&p, include_str!("postgres.rs"))
+            }
+            _ => super::super::tree_read::read(&p),
+        };
         let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         // Assembled so this module's own doc text is not a match.
         let verb = ["INSERT"].join("");

@@ -69,6 +69,10 @@ pub mod test_backend;
 /// v50.0.0 (PR #921 review) — test-only hooks inside a backend's own door.
 #[cfg(test)]
 pub(crate) mod test_hooks;
+/// v60.0.0 (CIRISPersist#691) — the from-disk gates bind their verdict to the
+/// tree they read.
+#[cfg(test)]
+mod tree_read;
 pub mod types;
 
 pub use backend::{Backend, InsertReport, PublicKeySample};

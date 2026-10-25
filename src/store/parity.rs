@@ -303,6 +303,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("pg_row_to_hard_case_event", Class::Plumbing),
     ("sqlite_render_table", Class::Plumbing),
     ("pg_render_table", Class::Plumbing),
+    // v60.0.0 (CIRISPersist#720) — the lifecycle filter's one predicate: it
+    // renders a read's WHERE fragment and refuses nothing (`None` is "this
+    // view hides nothing", not a failure).
+    ("lifecycle_predicate", Class::Plumbing),
     ("execute_batch", Class::Plumbing),
     ("batch_execute", Class::Plumbing),
     // The two projections (rows → table): a derivation that answers `None`
@@ -1706,9 +1710,20 @@ mod tests {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     }
 
+    /// The text of `rel`, bound to the tree under test (CIRISPersist#691): a
+    /// backend source must be the text this binary was compiled from, and any
+    /// file must not change between two reads of the run.
     fn read(rel: &str) -> String {
         let p = manifest_dir().join(rel);
-        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+        match rel {
+            "src/store/sqlite.rs" => {
+                super::super::tree_read::read_compiled(&p, include_str!("sqlite.rs"))
+            }
+            "src/store/postgres.rs" => {
+                super::super::tree_read::read_compiled(&p, include_str!("postgres.rs"))
+            }
+            _ => super::super::tree_read::read(&p),
+        }
     }
 
     // ── lexing ──────────────────────────────────────────────────────
@@ -2321,6 +2336,9 @@ mod tests {
             plans.insert(name.to_owned(), seq);
         }
 
+        // CIRISPersist#691 — every file this scan read is still the text it
+        // read, or the verdict is about a tree that moved under it.
+        super::super::tree_read::assert_unmoved();
         Scan {
             doors,
             implements,
