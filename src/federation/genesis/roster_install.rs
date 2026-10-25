@@ -321,6 +321,10 @@ where
 ///
 /// [`Error::GenesisBundleInvalid`] on a refused bundle; the bake's errors;
 /// directory failures.
+///
+/// v60.0.0 (CIRISPersist#1002): step 1's throwaway directory is in-memory
+/// SQLite, so the import door needs `sqlite`.
+#[cfg(feature = "sqlite")]
 pub async fn install_genesis_bundle_roster<D>(
     dir: &D,
     bundle: &GenesisBundle,
@@ -354,7 +358,7 @@ where
     Ok(RosterInstall { bake, records })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
     use crate::federation::accord_test_support as ops;
@@ -429,7 +433,7 @@ mod tests {
     /// is then refused while X stands.
     #[tokio::test]
     async fn i499b_a_head_whose_charter_stands_is_never_replaced() {
-        let d = crate::store::memory::MemoryBackend::new();
+        let d = crate::store::test_backend::test_backend();
         ops::register_genesis_accord_roster(&d).await.unwrap();
         super::super::seed_accord_family(&d).await.unwrap();
         let x = put_charter(&d).await;

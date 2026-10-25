@@ -33,9 +33,10 @@ pub mod bundle;
 pub mod ceremony;
 /// CIRISPersist#973 — verify a ceremony's two outputs before they are baked.
 pub mod ceremony_verify;
+#[cfg(feature = "sqlite")]
+pub use ceremony_verify::verify_ceremony_outputs;
 pub use ceremony_verify::{
-    verify_ceremony_outputs, CeremonyOutputsRefusal, CeremonyOutputsRefused,
-    CeremonyOutputsVerified,
+    CeremonyOutputsRefusal, CeremonyOutputsRefused, CeremonyOutputsVerified,
 };
 /// v47.4.0 (CIRISPersist#805) — the `CIRIS_TEST_TRUST_ROOT*` block minter.
 #[cfg(feature = "test-anchor")]
@@ -62,10 +63,11 @@ pub use posture::{
     constitutional_seat, genesis_posture, require_constitutional_root, AbsentReason,
     BakeNotAdoptedReason, GenesisFault, GenesisLeg, GenesisPosture, ROOT_REQUIRING_GATES,
 };
+#[cfg(feature = "sqlite")]
+pub use roster_install::install_genesis_bundle_roster;
 pub use roster_install::{
     bundle_accord_genesis, install_accord_genesis_head, install_bundle_roster_records,
-    install_genesis_bundle_roster, RosterInstall, RosterRecordOutcome, RosterRecordReport,
-    RosterSource,
+    RosterInstall, RosterRecordOutcome, RosterRecordReport, RosterSource,
 };
 
 use super::SignedKeyRecord;
@@ -1621,7 +1623,7 @@ pub fn bundle_delegation_plane_v31_shaped(bundle: &GenesisBundle) -> Result<(), 
 /// bundle, the tier order decides which speaks first, and pinning one issue
 /// number made a witness that broke when the other gate widened — while the
 /// property it exists to prove never changed.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) fn is_v31_binding_refusal(msg: &str) -> bool {
     msg.contains("CIRISPersist#643") || msg.contains("CIRISPersist#598")
 }
@@ -2487,6 +2489,7 @@ pub(crate) async fn assert_below_quorum_row_cannot_confer(
 /// outcomes, and both are reachable by other routes. So this asserts the
 /// outcome is a re-anchor AND that the co-signature set is actually back.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 pub(crate) async fn assert_saved_ceremony_repairs_its_own_row(
     dir: &dyn super::FederationDirectory,
     tag: &str,
@@ -2561,6 +2564,7 @@ pub(crate) async fn assert_saved_ceremony_repairs_its_own_row(
 /// that id is different, and its `get_attestation` → `put_attestation` sequence
 /// collides for real, against the real backend.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 pub(crate) async fn assert_lost_bake_race_is_not_reported_as_success(
     dir: &dyn super::FederationDirectory,
     tag: &str,
@@ -2634,6 +2638,7 @@ pub(crate) async fn assert_lost_bake_race_is_not_reported_as_success(
 /// answering, not this fix. So the load-bearing assertion here is that the
 /// installed row is **still byte-identically present afterwards**.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 pub(crate) async fn assert_refused_replacement_keeps_the_row(
     dir: &dyn super::FederationDirectory,
     tag: &str,
@@ -2727,6 +2732,7 @@ pub(crate) async fn assert_refused_replacement_keeps_the_row(
 /// reached — going through the door would let the refusal mask whether the
 /// debit happened.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 pub(crate) fn assert_forged_genesis_claim_spares_the_reserve(tag: &str) {
     use crate::federation::replication::admission::{PeerWriteQuota, WriteAdmissionClass};
 
@@ -5191,6 +5197,7 @@ mod tests {
     /// the shape it got. The pre-v23 failure mode was the opposite of loud: a
     /// record list seeded an inert node that rooted and reported healthy.
     #[tokio::test]
+    #[cfg(feature = "sqlite")]
     async fn legacy_bare_record_list_seed_is_refused_loudly_551() {
         let legacy = r#"[{"record":{"key_id":"ciris-canonical-1-d7bdeu223k"}}]"#;
         let err = parse_genesis_bundle(legacy).expect_err("a bare record list is not a seed");
@@ -5209,7 +5216,7 @@ mod tests {
 
         // The same refusal through the operator-facing door — one parse door,
         // one message, so an artifact and the seed asset cannot disagree.
-        let backend = crate::store::memory::MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         let baked = super::bake_assembled_genesis(&backend, legacy)
             .await
             .expect_err("bake must refuse the legacy shape identically");

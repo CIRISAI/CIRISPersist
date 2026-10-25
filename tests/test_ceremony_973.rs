@@ -9,7 +9,6 @@ use ciris_persist::federation::canonical_community::resolve_community;
 use ciris_persist::federation::genesis::*;
 use ciris_persist::federation::FederationDirectory;
 use ciris_persist::store::backend::Backend as _;
-use ciris_persist::store::memory::MemoryBackend;
 use ciris_persist::store::sqlite::SqliteBackend;
 
 const SEEDS: [[u8; 32]; 3] = [[0x31; 32], [0x32; 32], [0x33; 32]];
@@ -86,14 +85,6 @@ fn mint(offset_secs: i64) -> TestCeremonyOutputs {
 async fn sqlite() -> SqliteBackend {
     let b = SqliteBackend::open_in_memory().await.unwrap();
     b.run_migrations().await.unwrap();
-    b.seed_genesis_accord_holders(&effective_accord_holder_records())
-        .await
-        .expect("seed holders");
-    b
-}
-
-async fn memory() -> MemoryBackend {
-    let b = MemoryBackend::new();
     b.seed_genesis_accord_holders(&effective_accord_holder_records())
         .await
         .expect("seed holders");
@@ -222,16 +213,6 @@ async fn i351_boot_from_ceremony_sqlite() {
     boots_fully_seeded(&b, &c, "sqlite").await;
 }
 
-/// I351 on the memory backend.
-#[serial_test::serial(test_anchor_env)]
-#[tokio::test]
-async fn i351_boot_from_ceremony_memory() {
-    let c = mint(-5);
-    let _armed = Armed::with(&c.block);
-    let b = memory().await;
-    boots_fully_seeded(&b, &c, "memory").await;
-}
-
 /// I351 on postgres, when a test database is provided
 /// (`scripts/pg_test_db.sh -- …`).
 #[cfg(feature = "postgres")]
@@ -294,60 +275,49 @@ async fn i351_boot_from_ceremony_postgres() {
 async fn i352_remint_supersedes_on_upgrade() {
     let old = mint(-3600);
     let _armed = Armed::with(&old.block);
-    for (tag, d) in [
-        (
-            "sqlite",
-            Box::new(sqlite().await) as Box<dyn FederationDirectory>,
-        ),
-        (
-            "memory",
-            Box::new(memory().await) as Box<dyn FederationDirectory>,
-        ),
-    ] {
-        let d = d.as_ref();
-        boots_fully_seeded(d, &old, tag).await;
-        let before = stored_instant(d, "genesis-charter").await;
-        let new = mint(-5);
-        install_test_ceremony_outputs(new.bundle.clone());
-        seed_family_and_canonical(d)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I352: boot against the re-mint: {e:?}"));
-        for (id, row) in test_ceremony_delegation_ids()
-            .iter()
-            .zip(&new.bundle.attestations)
-        {
-            assert_eq!(
-                stored_instant(d, id).await,
-                row.attestation.asserted_at,
-                "{tag} I352: {id} is the re-minted row"
-            );
-        }
-        assert!(stored_instant(d, "genesis-charter").await > before);
-        assert!(
-            matches!(genesis_posture(d).await, GenesisPosture::Entrenched),
-            "{tag} I352: seeded on the re-mint"
-        );
-        // v53.1.1 (operator ruling 2026-10-04, I501): the re-mint's bake
-        // REPLACED the held prior-genesis birth at the re-boot; a repeat is
-        // idempotent.
+    let (tag, d) = ("sqlite", &sqlite().await);
+    boots_fully_seeded(d, &old, tag).await;
+    let before = stored_instant(d, "genesis-charter").await;
+    let new = mint(-5);
+    install_test_ceremony_outputs(new.bundle.clone());
+    seed_family_and_canonical(d)
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I352: boot against the re-mint: {e:?}"));
+    for (id, row) in test_ceremony_delegation_ids()
+        .iter()
+        .zip(&new.bundle.attestations)
+    {
         assert_eq!(
-            d.lookup_community(CANON)
-                .await
-                .unwrap()
-                .unwrap()
-                .persist_row_hash,
-            ciris_persist::federation::types::compute_persist_row_hash(
-                &new.bundle.community_record(CANON).unwrap().community
-            )
-            .unwrap(),
-            "{tag} I352: the re-boot holds the re-mint's birth"
-        );
-        assert_eq!(
-            seed_canonical_community(d).await.unwrap(),
-            CommunityLegOutcome::AlreadyHeld,
-            "{tag} I352: idempotent"
+            stored_instant(d, id).await,
+            row.attestation.asserted_at,
+            "{tag} I352: {id} is the re-minted row"
         );
     }
+    assert!(stored_instant(d, "genesis-charter").await > before);
+    assert!(
+        matches!(genesis_posture(d).await, GenesisPosture::Entrenched),
+        "{tag} I352: seeded on the re-mint"
+    );
+    // v53.1.1 (operator ruling 2026-10-04, I501): the re-mint's bake
+    // REPLACED the held prior-genesis birth at the re-boot; a repeat is
+    // idempotent.
+    assert_eq!(
+        d.lookup_community(CANON)
+            .await
+            .unwrap()
+            .unwrap()
+            .persist_row_hash,
+        ciris_persist::federation::types::compute_persist_row_hash(
+            &new.bundle.community_record(CANON).unwrap().community
+        )
+        .unwrap(),
+        "{tag} I352: the re-boot holds the re-mint's birth"
+    );
+    assert_eq!(
+        seed_canonical_community(d).await.unwrap(),
+        CommunityLegOutcome::AlreadyHeld,
+        "{tag} I352: idempotent"
+    );
 }
 
 /// **I353 — a re-mint stamped more than 300 s ahead is refused and the node
@@ -823,7 +793,7 @@ fn i423_incomplete_names_what_is_owed() {
 }
 
 /// **I424 — `finish` ends in the ordinary doors and passes**; the outputs boot
-/// a node (I351 boots the same path on memory, sqlite and postgres).
+/// a node (I351 boots the same path on sqlite and postgres).
 #[serial_test::serial(test_anchor_env)]
 #[tokio::test]
 async fn i424_finish_runs_the_doors() {
@@ -1066,14 +1036,13 @@ async fn upgrades_from_v52(d: &dyn FederationDirectory, c: &TestCeremonyOutputs,
 
 /// **I428 — a node upgrading from v52 takes the bundle's accord genesis
 /// record** over the chartless row v52 seeded, and the accord root is valid
-/// with the bundle's charter in force (sqlite, memory).
+/// with the bundle's charter in force (sqlite).
 #[serial_test::serial(test_anchor_env)]
 #[tokio::test]
 async fn i428_v52_accord_row_takes_the_genesis_head() {
     let c = mint(-5);
     let _armed = Armed::with(&c.block);
     upgrades_from_v52(&sqlite().await, &c, "sqlite").await;
-    upgrades_from_v52(&memory().await, &c, "memory").await;
 }
 
 /// **I428b — a held accord row the successor rule does not cover is left
@@ -1117,7 +1086,7 @@ async fn i428b_other_accord_rows_are_left_standing() {
             },
         ),
     ] {
-        let d = memory().await;
+        let d = sqlite().await;
         d.put_family_local(row).await.unwrap();
         let before = d.lookup_family(accord).await.unwrap().unwrap();
         install_test_ceremony_outputs(c.bundle.clone());
@@ -1464,14 +1433,13 @@ async fn recovers(d: &dyn FederationDirectory, c: &TestCeremonyOutputs, tag: &st
 /// recovery key (CC 4.2.6)**: no quorum, one seat, a new version naming the
 /// held head; a squatted recovery id, a statement not signed by the recovery
 /// key and a record not signed by the new key are refused; a recovery key is
-/// spent after one rotation (sqlite, memory).
+/// spent after one rotation (sqlite).
 #[serial_test::serial(test_anchor_env)]
 #[tokio::test]
 async fn i429_recovery_rotates_one_seat_without_quorum() {
     let c = mint(-5);
     let _armed = Armed::with(&c.block);
     recovers(&sqlite().await, &c, "sqlite").await;
-    recovers(&memory().await, &c, "memory").await;
 }
 
 /// I429 on postgres, when a test database is provided.
@@ -1625,22 +1593,13 @@ async fn baked_sqlite() -> SqliteBackend {
     b
 }
 
-async fn baked_memory() -> MemoryBackend {
-    let b = MemoryBackend::new();
-    b.seed_genesis_accord_holders(accord_holder_genesis_records())
-        .await
-        .expect("seed holders");
-    b
-}
-
 /// **I428c — a node upgrading from v52 while the build still ships the
-/// version-2 bundle keeps a valid accord root** (sqlite, memory).
+/// version-2 bundle keeps a valid accord root** (sqlite).
 #[serial_test::serial(test_anchor_env)]
 #[tokio::test]
 async fn i428c_v2_bundle_upgrade_keeps_the_root() {
     disarmed();
     v2_bundle_keeps_the_root(&baked_sqlite().await, &baked_sqlite().await, "sqlite").await;
-    v2_bundle_keeps_the_root(&baked_memory().await, &baked_memory().await, "memory").await;
 }
 
 // ── v53.0.0 — a recovery replicated to a peer (two nodes), I429b ──
@@ -1838,7 +1797,7 @@ async fn recovery_replicates(
     assert_eq!(accord_head(b).await, held, "{tag}: nothing written on B");
     // A node holding no accord at all is offered a recovery-shaped version:
     // the reserved id refuses it at the door, by the recovery's own name.
-    let none = MemoryBackend::new();
+    let none = ciris_persist::store::test_backend::test_backend();
     none.seed_genesis_accord_holders(&effective_accord_holder_records())
         .await
         .unwrap();
@@ -1857,14 +1816,13 @@ async fn recovery_replicates(
 /// **I429b — a recovery replicates**: node A rotates a holder's seat, node B
 /// learns the version only through replication and admits it through the
 /// same accord door; B's head moves and the new holder counts in B's quorum;
-/// a squatted or spent recovery key offered to B is refused (sqlite, memory).
+/// a squatted or spent recovery key offered to B is refused (sqlite).
 #[serial_test::serial(test_anchor_env)]
 #[tokio::test]
 async fn i429b_recovery_replicates_to_a_peer() {
     let c = mint(-5);
     let _armed = Armed::with(&c.block);
     recovery_replicates(&sqlite().await, &sqlite().await, &c, "sqlite").await;
-    recovery_replicates(&memory().await, &memory().await, &c, "memory").await;
 }
 
 /// A fresh postgres database of this test's own (migrated), with the given

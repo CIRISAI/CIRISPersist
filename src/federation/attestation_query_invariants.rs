@@ -36,7 +36,7 @@
 //! [`AttestationQuery::admits`]: super::attestation_query::AttestationQuery::admits
 //! [`MAX_PAGE`]: super::attestation_query::MAX_PAGE
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use std::num::NonZeroU32;
 
@@ -738,7 +738,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
@@ -788,10 +788,6 @@ mod runners {
             }
         };
     }
-
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
 
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
@@ -955,6 +951,94 @@ mod runners {
             assert!(
                 plan.first().is_some_and(|l| l.starts_with("Limit")),
                 "I903 {tag}: the plan is limited: {plan:?}"
+            );
+        }
+    }
+}
+
+/// v60.0.0 (CIRISPersist#720, S5) — the lifecycle filter has one source.
+#[cfg(test)]
+mod lifecycle_predicate {
+    use crate::federation::attestation_query::{lifecycle_predicate, Dialect};
+    use crate::read::LifecycleView;
+
+    /// **I1320** — the one predicate: each view hides exactly its composer
+    /// classes, binds them in order from the caller's next placeholder, names
+    /// the outer row by the caller's alias, and `All` adds no predicate. The
+    /// four read sites (list_scores and the CEG list on each backend) call
+    /// this; none spells its own.
+    #[test]
+    fn i1320_one_lifecycle_predicate() {
+        assert_eq!(
+            lifecycle_predicate(LifecycleView::All, Dialect::Sqlite, "fa", 1),
+            None
+        );
+        for (view, want) in [
+            (
+                LifecycleView::Live,
+                vec!["supersedes", "withdraws", "recants"],
+            ),
+            (
+                LifecycleView::IncludeSuperseded,
+                vec!["withdraws", "recants"],
+            ),
+            (
+                LifecycleView::IncludeWithdrawn,
+                vec!["supersedes", "recants"],
+            ),
+            (
+                LifecycleView::IncludeRecanted,
+                vec!["supersedes", "withdraws"],
+            ),
+        ] {
+            let (sql, binds) = lifecycle_predicate(view, Dialect::Sqlite, "fa", 4).unwrap();
+            assert_eq!(binds, want, "I1320 {view:?}: the hidden classes");
+            let list: Vec<String> = (4..4 + want.len()).map(|n| format!("?{n}")).collect();
+            assert!(
+                sql.contains(&format!("IN ({})", list.join(","))),
+                "I1320 {view:?}: placeholders from the caller's next: {sql}"
+            );
+            assert!(
+                sql.contains("c.attesting_key_id = fa.attesting_key_id"),
+                "{sql}"
+            );
+            assert!(
+                sql.contains("OR c.withdraws_admission_rule IS NOT NULL"),
+                "{sql}"
+            );
+            assert!(sql.contains("= fa.attestation_id)"), "{sql}");
+            let (pg, pg_binds) =
+                lifecycle_predicate(view, Dialect::Postgres, "federation_attestations", 2).unwrap();
+            assert_eq!(pg_binds, want);
+            let list: Vec<String> = (2..2 + want.len()).map(|n| format!("${n}")).collect();
+            assert!(pg.contains(&format!("IN ({})", list.join(","))), "{pg}");
+            assert!(
+                pg.contains("FROM cirislens.federation_attestations c"),
+                "{pg}"
+            );
+            assert!(
+                pg.contains("= federation_attestations.attestation_id::text)"),
+                "{pg}"
+            );
+        }
+        // No read site spells the composer set itself any more.
+        for (name, text) in [
+            ("sqlite.rs", include_str!("../store/sqlite.rs")),
+            ("postgres.rs", include_str!("../store/postgres.rs")),
+        ] {
+            let live: String = text
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                live.matches("lifecycle_predicate(").count(),
+                2,
+                "I1320 {name}: list_scores and the CEG list call the one predicate"
+            );
+            assert!(
+                !live.contains("LifecycleView::IncludeSuperseded =>"),
+                "I1320 {name}: a read spells its own lifecycle classes again"
             );
         }
     }

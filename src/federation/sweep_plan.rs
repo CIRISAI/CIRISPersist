@@ -125,20 +125,6 @@ impl HybridPendingSelection {
             binds: vec![Bind::Int(self.limit)],
         }
     }
-
-    /// The selection over rows a backend holds in memory:
-    /// `(id, order instant, pending)` keys in, the page's ids out, in order.
-    #[must_use]
-    pub(crate) fn cut<T>(&self, rows: Vec<(String, DateTime<Utc>, bool, T)>) -> Vec<(String, T)> {
-        let mut pending: Vec<(String, DateTime<Utc>, T)> = rows
-            .into_iter()
-            .filter(|(_, _, pending, _)| *pending)
-            .map(|(id, at, _, t)| (id, at, t))
-            .collect();
-        pending.sort_by(|a, b| (a.1, a.0.as_str()).cmp(&(b.1, b.0.as_str())));
-        pending.truncate(usize::try_from(self.limit).unwrap_or(usize::MAX));
-        pending.into_iter().map(|(id, _, t)| (id, t)).collect()
-    }
 }
 
 /// The PQC sweep's page (`list_hybrid_pending_keys` /
@@ -203,13 +189,6 @@ pub(crate) fn plan_expired(
 
 #[cfg_attr(not(any(feature = "postgres", feature = "sqlite")), allow(dead_code))]
 impl ExpiredSelection {
-    /// Does the reaper offer this row?
-    #[must_use]
-    pub(crate) fn admits(&self, attestation_type: &str, expires_at: Option<DateTime<Utc>>) -> bool {
-        !NEVER_OFFERED_FOR_REAP.contains(&attestation_type)
-            && expires_at.is_some_and(|e| e < self.now)
-    }
-
     /// The one statement, for `dialect`.
     #[must_use]
     pub(crate) fn render(&self, dialect: Dialect) -> Statement {
@@ -250,24 +229,6 @@ impl ExpiredSelection {
             ),
             binds,
         }
-    }
-
-    /// The selection over rows a backend holds in memory:
-    /// `(id, type, expires_at)` in, the page's ids out, in order.
-    #[must_use]
-    pub(crate) fn cut(&self, rows: Vec<(String, String, Option<DateTime<Utc>>)>) -> Vec<String> {
-        let mut offered: Vec<(DateTime<Utc>, String)> = rows
-            .into_iter()
-            .filter(|(_, ty, exp)| self.admits(ty, *exp))
-            .filter_map(|(id, _, exp)| exp.map(|e| (e, id)))
-            .collect();
-        offered.sort();
-        offered
-            .into_iter()
-            .skip(usize::try_from(self.offset).unwrap_or(usize::MAX))
-            .take(usize::try_from(self.limit).unwrap_or(usize::MAX))
-            .map(|(_, id)| id)
-            .collect()
     }
 }
 

@@ -4470,16 +4470,16 @@ impl FederationDirectory for OpsDirectory {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
-    use crate::store::memory::MemoryBackend;
+    use crate::store::sqlite::SqliteBackend;
     use std::sync::mpsc;
 
     // ── shared helpers ─────────────────────────────────────────────
 
-    fn memory_directory() -> (Arc<dyn FederationDirectory>, Directory) {
-        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+    fn test_directory() -> (Arc<dyn FederationDirectory>, Directory) {
+        let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend;
         let directory = build_persist_directory(dir.clone());
         (dir, directory)
@@ -4493,7 +4493,7 @@ mod tests {
     fn withdraws_admission_depth_op_forwards_the_recorded_depth() {
         use crate::federation::tier_ingest::test_support as ts;
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
         rt.block_on(ts::register_hybrid_key_as(
             dir.as_ref(),
             "capsule-issuer",
@@ -4536,7 +4536,7 @@ mod tests {
     #[test]
     fn trust_direction_held_among_op_forwards_the_held_set() {
         let rt = test_runtime();
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(crate::store::test_backend::test_backend());
         backend.mark_trust_direction_held("held-row");
         let directory = build_persist_directory(backend as Arc<dyn FederationDirectory>);
         match run_op(
@@ -4559,7 +4559,7 @@ mod tests {
     fn apply_replicated_community_op_is_the_replicated_door() {
         use crate::federation::tier_ingest::test_support as ts;
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
         rt.block_on(ts::register_hybrid_key_as(
             dir.as_ref(),
             "capsule-human",
@@ -4705,7 +4705,7 @@ mod tests {
     #[test]
     fn scores_ops_round_trip_through_capsule() {
         let rt = test_runtime();
-        let (_dir, directory) = memory_directory();
+        let (_dir, directory) = test_directory();
         let filter = crate::read::AttestationFilter {
             subject_key_id: Some("subj".into()),
             ..Default::default()
@@ -4759,7 +4759,7 @@ mod tests {
     #[test]
     fn exclusion_planes_route_through_the_capsule_655_662() {
         let rt = test_runtime();
-        let (_dir, directory) = memory_directory();
+        let (_dir, directory) = test_directory();
 
         // `revocations_for` — routed, and an unknown subject is an empty
         // answer, not `Unsupported`. (An `Unsupported` here read as "this host
@@ -4926,7 +4926,7 @@ mod tests {
     #[test]
     fn accord_carrier_refusal_round_trips_the_capsule_674() {
         let rt = test_runtime();
-        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend;
         let directory = build_persist_directory(dir.clone());
         let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
@@ -5210,7 +5210,7 @@ mod tests {
     #[test]
     fn i1201_key_plane_holdings_route_through_the_capsule() {
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
         rt.block_on(async {
             for k in ["i1201-cap-a", "i1201-cap-b"] {
                 crate::federation::tier_ingest::test_support::register_identity_key(
@@ -5257,7 +5257,7 @@ mod tests {
     #[test]
     fn known_hash_ops_round_trip_through_the_capsule_785() {
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
         let hash = crate::federation::wire_index::content_hash_of_bytes(b"capsule-785");
         let now = chrono::DateTime::parse_from_rfc3339("2027-05-06T07:08:09Z")
             .expect("literal is valid RFC-3339")
@@ -5370,7 +5370,7 @@ mod tests {
     #[test]
     fn i1153_capsule_put_public_key_refuses_a_mismatched_id() {
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
         let rec = sample_key_record("i1153-capsule-bad");
         match run_op(
             &rt,
@@ -5394,7 +5394,7 @@ mod tests {
     #[test]
     fn put_then_lookup_public_key_round_trips() {
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
         // v59.0.0 (CIRISPersist#1103) — the capsule's PutPublicKey is a door:
         // the id names its own key.
         let key_id = crate::federation::tier_ingest::test_support::fp_key_id("primitive-abc");
@@ -5533,7 +5533,7 @@ mod tests {
         let rt = test_runtime();
         // v57.0.0 (#988 item 2) — the removal's hard_case row needs this
         // node's key.
-        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
         rt.block_on(crate::federation::hard_case::test_support::declare_node(
             &*backend,
             "capsule-node",
@@ -5636,11 +5636,11 @@ mod tests {
     #[test]
     fn put_then_list_transport_destinations_round_trips() {
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
 
-        // A transport destination needs its occurrence key on file (FK on
-        // real backends); MemoryBackend's put_transport_destination is
-        // permissive, so we assert the round-trip shape either way.
+        // A transport destination needs its occurrence key on file (an FK);
+        // the key is not registered here, so we assert the round-trip shape
+        // either way.
         let dest = self_at_login::TransportDestination {
             occurrence_key_id: "occ-1".into(),
             transport_kind: "reticulum".into(),
@@ -5666,7 +5666,7 @@ mod tests {
                 destination: dest.clone(),
             },
         );
-        // MemoryBackend may accept (Unit) or refuse (Err) — either is a
+        // The backend may accept (Unit) or refuse (Err) — either is a
         // valid ABI round-trip; the point is the bytes made it back.
         let direct_put = rt.block_on(dir.put_transport_destination(&dest));
         match (&put, &direct_put) {
@@ -5700,7 +5700,7 @@ mod tests {
     #[test]
     fn signed_transport_destination_ops_fail_closed_and_round_trip() {
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
 
         let signed = self_at_login::SignedTransportDestination {
             transport_destination: self_at_login::TransportDestination {
@@ -5764,7 +5764,7 @@ mod tests {
     #[test]
     fn reachable_under_scope_no_trust_roots() {
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
 
         let verdict = run_op(
             &rt,
@@ -5802,7 +5802,7 @@ mod tests {
         // (not collapse to the top-level Err), byte-identical to the direct
         // call — proving the verify ran entirely inside persist's `.so`.
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
 
         let op = DirectoryOp::VerifyHybridViaDirectory {
             canonical_bytes: b"canonical".to_vec(),
@@ -5846,7 +5846,7 @@ mod tests {
         // directory yields a root-only graph; the op result must equal the
         // direct call, serialized through the ABI.
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
 
         let res = run_op(
             &rt,
@@ -5890,7 +5890,7 @@ mod tests {
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::{attestation_type, identity_type as it};
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let (dir, directory) = test_directory();
         rt.block_on(async {
             register(dir.as_ref(), "zc-root", &[it::USER]).await;
             register(dir.as_ref(), "zc-next", &[it::PRIMITIVE]).await;
@@ -5942,11 +5942,17 @@ mod tests {
 
     #[test]
     fn backend_error_flattens_to_err_variant() {
-        // MemoryBackend has no `lookup_shared_instance_lease` impl (the
-        // default trait impl errors), so this proves the Err(String)
+        // A backend failure injected on `lookup_shared_instance_lease` (the
+        // fault double over the test backend) proves the Err(String)
         // flattening path across the ABI.
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        let dir: Arc<dyn FederationDirectory> = Arc::new(
+            crate::federation::directory_double::FaultInjectingDirectory::new(Arc::new(
+                crate::store::test_backend::test_backend(),
+            ))
+            .erroring("lookup_shared_instance_lease"),
+        );
+        let directory = build_persist_directory(dir.clone());
 
         let res = run_op(
             &rt,
@@ -5957,7 +5963,7 @@ mod tests {
         );
         assert!(
             matches!(res, DirectoryOpResult::Err(_)),
-            "unimplemented backend method ⇒ Err(String), got {res:?}"
+            "a failing backend method ⇒ Err(String), got {res:?}"
         );
         // Direct call also errors — same class.
         assert!(rt
@@ -5973,7 +5979,7 @@ mod tests {
         // A parse failure must STILL fire the callback with a serialized
         // Err (uniform completion path), never leak the future.
         let rt = test_runtime();
-        let (_dir, directory) = memory_directory();
+        let (_dir, directory) = test_directory();
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let ctx: *mut c_void = Box::into_raw(Box::new(tx)) as *mut c_void;
@@ -6047,7 +6053,7 @@ mod tests {
         // runtime that spawns the op-future (block_on on the caller
         // thread; the op-future runs on a worker; the oneshot bridges).
         let rt = test_runtime();
-        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend;
         let directory = build_persist_directory(dir.clone());
         let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
@@ -6094,7 +6100,7 @@ mod tests {
     #[test]
     fn ops_directory_known_hash_methods_route_785() {
         let rt = test_runtime();
-        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend;
         let directory = build_persist_directory(dir.clone());
         let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
@@ -6157,7 +6163,7 @@ mod tests {
         // resolves Some before revocation, None after (revocation-aware
         // through the ABI), and the raw revocations read round-trips too.
         let rt = test_runtime();
-        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend;
         let directory = build_persist_directory(dir.clone());
         let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
@@ -6245,7 +6251,7 @@ mod tests {
         // A REQUIRED method with no DirectoryOp must surface
         // `Error::Unsupported`, not route garbage.
         let rt = test_runtime();
-        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend;
         let directory = build_persist_directory(dir);
         let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
@@ -6276,7 +6282,7 @@ mod tests {
         // unrootable. It must now ROUTE: an unbound key resolves to
         // `Ok(None)` (the real backend answer), NOT the Unsupported error.
         let rt = test_runtime();
-        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let backend: Arc<SqliteBackend> = Arc::new(crate::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend;
         let directory = build_persist_directory(dir.clone());
         let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
@@ -6295,5 +6301,142 @@ mod tests {
             "proxy result must equal a direct backend call"
         );
         assert!(via_proxy.is_none(), "unbound occurrence resolves to None");
+    }
+}
+
+/// v60.0.0 (CIRISPersist#787) — the consumer side of every op.
+#[cfg(test)]
+mod proxy_gate {
+    /// The ops a consumer never reaches through an [`OpsDirectory`] trait
+    /// method, each with why. Every other op must be constructed by the proxy.
+    ///
+    /// [`OpsDirectory`]: super::OpsDirectory
+    const DISPATCH_ONLY: &[(&str, &str)] = &[
+        (
+            "ReachableUnderScope",
+            "a free fold (`reachable_under_scope_with_reasons`) persist runs over its own \
+             directory; no `FederationDirectory` method exists to proxy",
+        ),
+        (
+            "VerifyHybridViaDirectory",
+            "the verify runs inside persist's .so against its own vtable, by design: a \
+             consumer-side proxy would reintroduce the vtable skew the op exists to avoid",
+        ),
+        (
+            "BuildDelegationGraph",
+            "a free walk persist runs over its own directory; no trait method to proxy",
+        ),
+        (
+            "PutIdentityOccurrenceRevocation",
+            "retired at v59.0.0: kept so an old consumer's op is answered with the typed \
+             `federation_envelope_kind_retired` refusal, never issued by a current proxy",
+        ),
+        (
+            "TrustRootValid",
+            "`trust_root::trust_root_valid` is a free function over the directory, not a \
+             trait method",
+        ),
+        (
+            "CapabilityRootsToTrustedRoot",
+            "`trust_root::capability_roots_to_trusted_root` is a free function over the \
+             directory, not a trait method",
+        ),
+        (
+            "ResolveTransitEligibility",
+            "`trust_root::resolve_transit_eligibility` is a free, fail-closed function over \
+             the directory, not a trait method",
+        ),
+    ];
+
+    /// The body of the first `{ … }` block opening at or after `at`.
+    fn block(src: &str, at: usize) -> &str {
+        let open = at + src[at..].find('{').expect("a block");
+        let mut depth = 0usize;
+        for (k, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..open + k];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated block");
+    }
+
+    /// **I1322 (#787)** — every `DirectoryOp` the dispatch side answers has a
+    /// consumer-side proxy (a method of `impl FederationDirectory for
+    /// OpsDirectory` that builds it), or is named in [`DISPATCH_ONLY`] with
+    /// why. The dispatch `match` is exhaustive, so the compiler holds that
+    /// side; nothing held this one, and an op with no proxy answers
+    /// `Error::Unsupported` from the trait default in exactly the build a
+    /// consumer runs (#780). Read from the text this binary was compiled from
+    /// (`include_str!`), comments stripped, so neither a moved tree nor a
+    /// commented-out construction can read as a proxy.
+    #[test]
+    fn i1322_every_op_has_a_consumer_proxy_or_says_why() {
+        let src: String = include_str!("directory_capsule.rs")
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ops = block(
+            &src,
+            src.find("pub enum DirectoryOp {").expect("the op enum"),
+        );
+        let variants: Vec<&str> = ops
+            .lines()
+            .filter_map(|l| {
+                let name = l.strip_prefix("    ")?;
+                let end = name.find(|c: char| !c.is_ascii_alphanumeric())?;
+                let name = &name[..end];
+                name.starts_with(|c: char| c.is_ascii_uppercase())
+                    .then_some(name)
+            })
+            .collect();
+        assert!(
+            variants.len() >= 70,
+            "I1322: the op scan found {} variants — the extractor collapsed",
+            variants.len()
+        );
+        let proxy = block(
+            &src,
+            src.find("impl FederationDirectory for OpsDirectory {")
+                .expect("the consumer proxy"),
+        );
+        let built = |v: &str| {
+            proxy
+                .match_indices(&format!("DirectoryOp::{v}"))
+                .any(|(i, m)| {
+                    !proxy[i + m.len()..].starts_with(|c: char| c.is_ascii_alphanumeric())
+                })
+        };
+        let mut missing = Vec::new();
+        for v in &variants {
+            let exempt = DISPATCH_ONLY.iter().any(|(n, _)| n == v);
+            match (built(v), exempt) {
+                (true, true) => missing.push(format!(
+                    "{v}: the proxy builds it now — delete its DISPATCH_ONLY row"
+                )),
+                (false, false) => missing.push(format!(
+                    "{v}: no OpsDirectory method builds it (a consumer gets Unsupported)"
+                )),
+                _ => {}
+            }
+        }
+        for (n, why) in DISPATCH_ONLY {
+            assert!(
+                variants.contains(n),
+                "I1322: DISPATCH_ONLY names no op `{n}`"
+            );
+            assert!(
+                why.split_whitespace().count() >= 10,
+                "I1322: `{n}` needs a reason"
+            );
+        }
+        assert!(missing.is_empty(), "I1322 (#787):\n{}", missing.join("\n"));
     }
 }

@@ -444,6 +444,7 @@ pub(crate) mod test_table {
 
     /// Read `table` on this thread (`None`: the vendored one). The table is
     /// leaked: a test's lifetime.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) fn set(table: Option<PolicyTable>) {
         let leaked = table.map(|t| &*Box::leak(Box::new(t)));
         TABLE.with(|c| c.set(leaked));

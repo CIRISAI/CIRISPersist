@@ -5,11 +5,11 @@
 #   (contribution / vote / moderation / slashing / reconsideration / credits /
 #   expertise / takedown notice), refuses the retired objects by name, and
 #   decides the promotion record's and the delivery attestation's row rules.
-#   Witnesses I1167 (memory, sqlite, postgres), I1168 (unit), I1170 (sqlite
+#   Witnesses I1167 (sqlite, postgres), I1168 (unit), I1170 (sqlite
 #   and postgres engines).
 # - The ledger projection: `src/federation/ledger_projection.rs` (the rule,
-#   the fold's order) and the three backends' writers. Witnesses I1166
-#   (memory, sqlite, postgres), I1169 (sqlite, postgres).
+#   the fold's order) and the backends' writers. Witnesses I1166
+#   (sqlite, postgres), I1169 (sqlite, postgres).
 # - The takedown notice as a row: its admission at the plane's put door, the
 #   door's row reader, the one-release compat read of a v59 Contribution, the
 #   CC spelling, and the binding fold that skips notice rows. Witnesses I1170,
@@ -32,6 +32,5 @@ src/cirisnode/takedown_handler.rs
 src/federation/ledger_projection.rs
 src/federation/takedown_tombstone.rs cc_basis_spelling notice_basis_of_dimension is_notice_row notice_row_shape check_takedown_notice_row_admission takedown_terms legacy_contribution_terms hold_notice_row content_binding
 src/federation/mod.rs validate_subject_key_ids
-src/store/memory.rs memory_project_ledger
 src/store/sqlite.rs sqlite_project_ledger sqlite_ledger_projection_rebuild
 src/store/postgres.rs pg_project_ledger pg_ledger_projection_rebuild

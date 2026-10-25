@@ -17,7 +17,7 @@
 //! crossed row must not carry the re-seal's envelope. A control leg first
 //! re-seals a second staged row with no race, so the refusal is the race's.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::delegation_cycle_invariants::bodies::{agent, stage_local_edge};
     use crate::federation::tier_ingest::test_support as ts;
@@ -127,7 +127,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     fn tag() -> String {
         format!("i953-{}", uuid::Uuid::new_v4().simple())
@@ -143,11 +143,6 @@ mod run {
             let p = b.test_hooks().arm_pause("reseal_before_write");
             super::bodies::i953_race(d, p, &t).await;
         }};
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i953_memory() {
-        i953!(crate::store::memory::MemoryBackend::new());
     }
 
     #[cfg(feature = "sqlite")]

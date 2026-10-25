@@ -329,7 +329,7 @@ pub fn retired_ids(rows: &[&Attestation]) -> std::collections::HashSet<String> {
 ///   subject_key_ids)`, CC 4.5.2.2 GDPR Art. 20). All three backends implement
 ///   it; a backend that answered `Unsupported` would skip this arm and run the
 ///   rest, and any OTHER error fails loudly rather than skipping.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_support {
     use crate::federation::types::{attestation_tier, attestation_type, Attestation};
     use crate::federation::{FederationDirectory, SignedAttestation};

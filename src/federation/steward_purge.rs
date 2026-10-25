@@ -289,6 +289,7 @@ pub(crate) mod test_clock {
         static AT: Cell<Option<chrono::DateTime<chrono::Utc>>> = const { Cell::new(None) };
     }
     /// Pin the purge clock to `at` (`None`: the system clock).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) fn set(at: Option<chrono::DateTime<chrono::Utc>>) {
         AT.with(|c| c.set(at));
     }

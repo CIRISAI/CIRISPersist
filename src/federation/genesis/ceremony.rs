@@ -1034,6 +1034,7 @@ impl CeremonyState {
     ///
     /// [`CeremonyError::Incomplete`], or [`CeremonyError::Outputs`] naming the
     /// stage that refused.
+    #[cfg(feature = "sqlite")]
     pub async fn finish(&self) -> Result<CeremonyFinished, CeremonyError> {
         let bundle = self.assemble()?;
         let bundle_json = serde_json::to_string_pretty(&bundle)

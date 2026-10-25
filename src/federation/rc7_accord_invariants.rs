@@ -133,7 +133,7 @@ pub(crate) mod pure {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::accord_test_support as ops;
     use crate::federation::canonical_community_invariants::bodies::stand_up;
@@ -656,7 +656,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
@@ -701,10 +701,6 @@ mod runners {
             }
         };
     }
-
-    dyn_runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
 
     #[cfg(feature = "sqlite")]
     dyn_runners!(sqlite, async {

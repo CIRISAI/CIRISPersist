@@ -115,7 +115,7 @@
 //!   purge bundle over JSON, and B applies it, re-verified on B's state, and
 //!   destroys B's own copy on receipt.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::steward_purge::{self as sp, PurgePlane};
     use crate::federation::takedown_tombstone::{
@@ -1861,7 +1861,7 @@ pub(crate) mod engine_bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     macro_rules! runners {
         ($modname:ident, $fresh:expr) => {
@@ -1921,14 +1921,6 @@ mod run {
             }
         };
     }
-
-    // v57.0.0 (#988 item 2) — every runner's backend holds a node key: the
-    // fast-path takedown's hard_case row is attested by it (I799).
-    runners!(memory, async {
-        let b = crate::store::memory::MemoryBackend::new();
-        crate::federation::hard_case::test_support::declare_node(&b, "dt-node").await;
-        Some(b)
-    });
 
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {

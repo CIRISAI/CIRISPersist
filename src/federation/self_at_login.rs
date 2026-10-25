@@ -1042,13 +1042,16 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::{FederationDirectory, KeyRecord, SignedKeyRecord};
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn ts(s: &str) -> DateTime<Utc> {
         s.parse().expect("test timestamp")
     }
 
     /// A minimal live route row (local-put shape: no signature container).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) fn route(
         occ: &str,
         kind: &str,
@@ -1074,6 +1077,7 @@ pub(crate) mod test_support {
     /// signature gate can verify envelopes signed by the matching signer).
     /// `put_public_key` does not itself hybrid-verify the registration, so
     /// the scrub fields stay placeholders — only the PUBKEYS must be real.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn fixture_key(key_id: &str, ed_pk: String, mldsa_pk: Option<String>) -> KeyRecord {
         KeyRecord {
             key_id: key_id.into(),
@@ -1109,6 +1113,7 @@ pub(crate) mod test_support {
     /// refused even with a newer wall clock, and a higher epoch wins even
     /// with an older wall clock (epoch dominates — clock skew cannot roll a
     /// route back). Plus list ordering + the local remove.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn run_transport_route_guard_matrix(
         dir: &dyn FederationDirectory,
         suffix: &str,
@@ -1227,6 +1232,7 @@ pub(crate) mod test_support {
     ///   gossiping via the signed reads; older gossip cannot resurrect it;
     /// - a trusted-local put that supersedes a signed row drops the stored
     ///   signature container.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn run_signed_transport_route_matrix(
         dir: &dyn FederationDirectory,
         suffix: &str,
@@ -1682,6 +1688,7 @@ pub(crate) mod test_support {
     /// across memory + sqlite + postgres (the audit found the backends
     /// disagreeing). Also pins the fail-OPEN KEM gap (now closed) and the
     /// memory/sqlite double-revoke asymmetry.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn exercise_signed_row_survives_local_write(
         dir: &dyn FederationDirectory,
         suffix: &str,
@@ -1875,6 +1882,7 @@ pub(crate) mod test_support {
     /// double-carriage) — superseding on the occurrence's own asserted_at
     /// clock, retired by the occurrence's revocation, and revived by a newer
     /// occurrence.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn run_binding_projection_matrix(dir: &dyn FederationDirectory, suffix: &str) {
         use crate::federation::types::{
             device_class, IdentityOccurrence, IdentityOccurrenceRevocation,
@@ -2042,6 +2050,7 @@ pub(crate) mod test_support {
     ///   replay stays `Unchanged`.
     /// - **I1016** key separation: a transit x25519 equal to the row's own
     ///   Reticulum link x25519 refuses (`transit_kex_key_reuse`).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn run_transit_kex_matrix(dir: &dyn FederationDirectory, suffix: &str) {
         use crate::federation::malformed_row as mr;
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -2340,6 +2349,7 @@ pub(crate) mod test_support {
     /// - **I1021** a node with no binding resolves to `None`.
     /// - **I1022** two live Rooted bindings carrying different pairs resolve
     ///   to `None`; a retired binding's pair is never used.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn run_transit_kex_resolver_matrix(
         dir: &dyn FederationDirectory,
         suffix: &str,

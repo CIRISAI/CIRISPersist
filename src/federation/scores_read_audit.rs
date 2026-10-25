@@ -43,8 +43,8 @@
 //!
 //! Two things.
 //!
-//! **1. A read log at all six sites** — `list_scores` and `resolve_scores` on
-//! each of memory / sqlite / postgres. [`log_scores_read`] records the caller
+//! **1. A read log at all four sites** — `list_scores` and `resolve_scores` on
+//! each of sqlite / postgres. [`log_scores_read`] records the caller
 //! key id (or the literal [`UNAUTHENTICATED_CALLER`]), the subject filter, the
 //! dimension filter, whether a `confidence_floor` was supplied, and the
 //! timestamp. It is what makes trace audit *possible* at the substrate: the
@@ -760,7 +760,7 @@ pub const fn band_token(band: ConfidenceBand) -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     /// v38.0.0 (CIRISPersist#724) — **the two vendored manifests must agree
     /// on polarity where both declare a family**, modulo a written
@@ -1108,16 +1108,6 @@ mod tests {
 
     // ── the three-backend differential parity witnesses ──────────────
 
-    #[test]
-    fn scores_read_log_parity_memory() {
-        let tag = fresh_tag();
-        let (events, stamps) = capture(&tag, || {
-            let dir = crate::store::MemoryBackend::new();
-            block_on(exercise(&dir, &tag));
-        });
-        assert_backend_entries("mem", &tag, &events, &stamps);
-    }
-
     #[cfg(feature = "sqlite")]
     #[test]
     fn scores_read_log_parity_sqlite() {
@@ -1160,20 +1150,21 @@ mod tests {
     }
 
     /// **The differential itself**, in one process: the same two reads against
-    /// memory and sqlite must produce byte-identical log entries.
+    /// sqlite and postgres must produce byte-identical log entries.
     ///
-    /// The three per-backend witnesses above each compare against the same
-    /// literal, which already forces agreement; this one fails with a diff
-    /// naming the two backends rather than three separate mismatches against a
-    /// constant, which is the message an operator can act on.
-    #[cfg(feature = "sqlite")]
+    /// The per-backend witnesses above each compare against the same literal,
+    /// which already forces agreement; this one fails with a diff naming the
+    /// two backends rather than separate mismatches against a constant, which
+    /// is the message an operator can act on.
+    #[cfg(all(feature = "sqlite", feature = "postgres"))]
     #[test]
+    #[serial_test::serial(postgres)]
     fn scores_read_log_is_identical_across_backends() {
+        let Some(dsn) = crate::test_pg::dsn() else {
+            eprintln!("scores_read_log_is_identical_across_backends skipped: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
         let tag = fresh_tag();
-        let (mem, _) = capture(&tag, || {
-            let dir = crate::store::MemoryBackend::new();
-            block_on(exercise(&dir, &tag));
-        });
         let (sq, _) = capture(&tag, || {
             block_on(async {
                 use crate::store::Backend as _;
@@ -1184,10 +1175,20 @@ mod tests {
                 exercise(&dir, &tag).await;
             });
         });
-        assert_eq!(mem.len(), 2, "memory logged both reads: {mem:#?}");
+        let (pg, _) = capture(&tag, || {
+            block_on(async {
+                use crate::store::Backend as _;
+                let dir = crate::store::PostgresBackend::connect(&dsn)
+                    .await
+                    .expect("connect postgres");
+                dir.run_migrations().await.expect("migrations");
+                exercise(&dir, &tag).await;
+            });
+        });
+        assert_eq!(sq.len(), 2, "sqlite logged both reads: {sq:#?}");
         assert_eq!(
-            mem, sq,
-            "memory and sqlite disagree about what a scores-plane read logs"
+            sq, pg,
+            "sqlite and postgres disagree about what a scores-plane read logs"
         );
     }
 
@@ -1203,7 +1204,7 @@ mod tests {
     fn the_none_caller_path_is_logged_as_unauthenticated() {
         let tag = fresh_tag();
         let (events, _) = capture(&tag, || {
-            let dir = crate::store::MemoryBackend::new();
+            let dir = crate::store::test_backend::test_backend();
             block_on(async {
                 // The FFI wrapper's `caller_occurrence_key_id: Option<String>`
                 // reaches the door as `unwrap_or_default()` — the empty string.
@@ -1305,10 +1306,10 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    //  The six-site census, read FROM DISK
+    //  The four-site census, read FROM DISK
     //
     //  Mirrors `store::parity`, the `check_capacity_consent_admission`
-    //  discipline: read the three backend sources as text so the postgres
+    //  discipline: read the backend sources as text so the postgres
     //  arm is scanned under `--features sqlite` and under no features at
     //  all. The runtime witnesses above cannot do that — the postgres one
     //  needs a live database and the sqlite one a feature — so a site
@@ -1318,8 +1319,7 @@ mod tests {
     //  whatever is on disk WHILE IT RUNS and so fails toward a pass.
     // ─────────────────────────────────────────────────────────────────
 
-    const SITES: [(&str, &str); 3] = [
-        ("memory", "src/store/memory.rs"),
+    const SITES: [(&str, &str); 2] = [
         ("sqlite", "src/store/sqlite.rs"),
         ("postgres", "src/store/postgres.rs"),
     ];
@@ -1446,9 +1446,9 @@ mod tests {
         stripped[i..=j].to_owned()
     }
 
-    /// **Every one of the six sites emits the read log, before its gate.**
+    /// **Every one of the four sites emits the read log, before its gate.**
     #[test]
-    fn all_six_scores_read_sites_log() {
+    fn every_scores_read_site_logs() {
         let mut checked = 0usize;
         for (backend, rel) in SITES {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
@@ -1492,7 +1492,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 6, "the scan must cover all six sites");
+        assert_eq!(checked, 4, "the scan must cover all four sites");
     }
 
     #[test]

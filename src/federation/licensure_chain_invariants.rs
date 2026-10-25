@@ -1317,13 +1317,7 @@ mod run {
 
     /// One `#[tokio::test]` per backend for each body.
     macro_rules! on_every_backend {
-        ($body:ident, $memory:ident, $sqlite:ident, $postgres:ident, $prefix:literal) => {
-            #[tokio::test]
-            async fn $memory() {
-                let d = crate::store::memory::MemoryBackend::new();
-                super::bodies::$body(&d, &format!("{}-{}", $prefix, suffix())).await;
-            }
-
+        ($body:ident, $sqlite:ident, $postgres:ident, $prefix:literal) => {
             #[cfg(feature = "sqlite")]
             #[tokio::test]
             async fn $sqlite() {
@@ -1353,56 +1347,48 @@ mod run {
 
     on_every_backend!(
         exercise_term_bound_officer_lapses_for_licence,
-        term_bound_officer_lapses_for_licence_1032_memory,
         term_bound_officer_lapses_for_licence_1032_sqlite,
         term_bound_officer_lapses_for_licence_1032_postgres,
         "lic-term"
     );
     on_every_backend!(
         exercise_withdrawal_does_not_reclassify_issued_licence,
-        withdrawal_does_not_reclassify_issued_licence_1032_memory,
         withdrawal_does_not_reclassify_issued_licence_1032_sqlite,
         withdrawal_does_not_reclassify_issued_licence_1032_postgres,
         "lic-wd"
     );
     on_every_backend!(
         exercise_backdated_licence_is_refused_at_receipt,
-        backdated_licence_is_refused_at_receipt_1049_memory,
         backdated_licence_is_refused_at_receipt_1049_sqlite,
         backdated_licence_is_refused_at_receipt_1049_postgres,
         "lic-backdate"
     );
     on_every_backend!(
         exercise_grant_walk_honours_the_term,
-        grant_walk_honours_the_term_1032_memory,
         grant_walk_honours_the_term_1032_sqlite,
         grant_walk_honours_the_term_1032_postgres,
         "grant-term"
     );
     on_every_backend!(
         exercise_gate_and_fold_share_one_chain,
-        gate_and_fold_share_one_chain_1035_memory,
         gate_and_fold_share_one_chain_1035_sqlite,
         gate_and_fold_share_one_chain_1035_postgres,
         "lic-one"
     );
     on_every_backend!(
         exercise_community_authority_roots_the_chain,
-        community_authority_roots_the_chain_1035_memory,
         community_authority_roots_the_chain_1035_sqlite,
         community_authority_roots_the_chain_1035_postgres,
         "lic-aff"
     );
     on_every_backend!(
         exercise_superseded_founder_keeps_issued_licence,
-        i604_superseded_founder_keeps_issued_licence_memory,
         i604_superseded_founder_keeps_issued_licence_sqlite,
         i604_superseded_founder_keeps_issued_licence_postgres,
         "i604"
     );
     on_every_backend!(
         exercise_community_id_is_not_its_own_issuer,
-        i610_community_id_is_not_its_own_issuer_memory,
         i610_community_id_is_not_its_own_issuer_sqlite,
         i610_community_id_is_not_its_own_issuer_postgres,
         "i610"

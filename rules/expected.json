@@ -3,14 +3,12 @@
   "i110-check-consent-scope-tokens": {
     "src/federation/admission.rs": 1,
     "src/federation/attestation_admit.rs": 2,
-    "src/store/memory.rs": 0,
     "src/store/postgres.rs": 0,
     "src/store/sqlite.rs": 0
   },
   "i119-check-media-source": {
     "src/federation/admission.rs": 1,
     "src/federation/attestation_admit.rs": 2,
-    "src/store/memory.rs": 0,
     "src/store/postgres.rs": 0,
     "src/store/sqlite.rs": 0
   },
@@ -23,12 +21,10 @@
     "src/store/sqlite.rs": 0
   },
   "i448-prev-head-check": {
-    "src/store/memory.rs": 2,
     "src/store/postgres.rs": 2,
     "src/store/sqlite.rs": 2
   },
   "scores-read-log": {
-    "src/store/memory.rs": 2,
     "src/store/postgres.rs": 2,
     "src/store/sqlite.rs": 2
   },

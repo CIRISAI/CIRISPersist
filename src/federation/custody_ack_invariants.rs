@@ -35,7 +35,7 @@
 //! - **I514** (#984 row 9) — the custody door tells a shared backend its node
 //!   key before asking as that node; the stored report is the node's.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::custody_ack::{
         custody_ack_envelope, device_custody_of, CustodyState, CustodyVerdict,
@@ -1482,7 +1482,7 @@ mod engine_bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
@@ -1519,10 +1519,6 @@ mod runners {
             }
         };
     }
-
-    dyn_runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
 
     #[cfg(feature = "sqlite")]
     dyn_runners!(sqlite, async {

@@ -4690,10 +4690,9 @@ pub(crate) fn sealed_put_blob_attestation(
 /// v31.0.0 (CIRISPersist#656) — **the `put_blob` admission witness**, shared by
 /// the sqlite and postgres legs.
 ///
-/// **Two backends, not three: `MemoryBackend` implements no [`BlobStorage`],**
-/// so there is no memory door to gate. Recorded here rather than left as a
-/// silently-absent leg — "the third leg is missing" and "the third door does
-/// not exist" look identical from a test list.
+/// **Two backends:** sqlite and postgres are the backends that implement
+/// [`BlobStorage`] (the in-process memory backend that had no blob door was
+/// retired in v60.0.0, CIRISPersist#1002).
 ///
 /// #652 fixed the row SHAPE through one deterministic builder and wired no
 /// gates. Two things do not follow from construction, and both are asserted:
@@ -5853,7 +5852,7 @@ mod put_blob_binding_tests {
         // the door it always bypassed, on a corpus that never saw it. This is
         // the assertion whose absence hid the defect: `put_blob` returned Ok
         // the whole time.
-        let peer = crate::store::MemoryBackend::new();
+        let peer = crate::store::test_backend::test_backend();
         crate::federation::tier_ingest::test_support::register_hybrid_key(&peer, holder).await;
         peer.put_attestation(crate::federation::SignedAttestation {
             attestation: stored.clone(),

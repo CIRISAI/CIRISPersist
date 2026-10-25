@@ -5491,10 +5491,10 @@ pub fn check_encryption_pubkeys(
 /// 4. `signer_acts_for`: `attesting_key_id` is the occurrence's own
 ///    `identity_key_id` OR an already-active occurrence key of the same identity.
 ///
-/// NOT feature-gated: backend-agnostic (verify-core only), and the MemoryBackend
-/// (compiled without postgres/sqlite) calls it — a `cfg(any(postgres,sqlite))`
-/// gate here breaks reduced-feature builds (darwin no-postgres, the default-
-/// feature manifest bin) with E0425.
+/// NOT feature-gated: backend-agnostic (verify-core only); a
+/// `cfg(any(postgres,sqlite))` gate here broke reduced-feature builds (darwin
+/// no-postgres, the default-feature manifest bin) with E0425 while the retired
+/// memory backend called it.
 pub async fn verify_signed_identity_occurrence<D>(
     directory: &D,
     signed: &crate::federation::types::SignedIdentityOccurrence,
@@ -5950,8 +5950,7 @@ where
 ///    key bound as an occurrence of it ([`check_signer_acts_for`]) — a peer
 ///    cannot assert (or retire) a victim's route with its own unrelated key.
 ///
-/// NOT feature-gated: backend-agnostic, and the MemoryBackend calls it (the
-/// #418 cfg lesson).
+/// NOT feature-gated: backend-agnostic (the #418 cfg lesson).
 ///
 /// [`verify_threshold_signatures`]: ciris_verify_core::threshold::verify_threshold_signatures
 pub async fn verify_signed_transport_destination(
@@ -6977,8 +6976,7 @@ where
 /// [`ciris_verify_core::threshold::ThresholdSignature`] used as a LIST
 /// rather than a single value) and is a follow-up.
 ///
-/// NOT feature-gated: backend-agnostic, and the MemoryBackend calls it (the
-/// #418 cfg lesson).
+/// NOT feature-gated: backend-agnostic (the #418 cfg lesson).
 ///
 /// [`verify_threshold_signatures`]: ciris_verify_core::threshold::verify_threshold_signatures
 pub async fn verify_signed_touch_claim(
@@ -11448,7 +11446,7 @@ pub async fn check_canonical_role_admission_over_roster_with_custody_root(
 /// ([`check_canonical_role_admission_over_roster`]) is strict; its floor is
 /// exercised by the `*_513` witnesses and the run-the-real-artifact boot
 /// tests (the grandfathered genesis canonical through the real gate).
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) async fn check_canonical_role_admission_over_roster_legacy(
     directory: &dyn super::FederationDirectory,
     row: &super::KeyRecord,
@@ -17384,7 +17382,7 @@ pub async fn check_reserved_prefix_admission(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
 
     /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the per-segment case table.
@@ -17900,7 +17898,7 @@ mod tests {
             );
         }
         // Through the admission gate: the shape is judged before authority.
-        let dir = crate::store::memory::MemoryBackend::new();
+        let dir = crate::store::test_backend::test_backend();
         let mut row = rev_row_scores_784(env(serde_json::Value::from("not-a-digest")));
         let e = check_delegated_duty_scores_admission(&dir, &row)
             .await
@@ -19803,7 +19801,7 @@ mod tests {
         use crate::federation::{
             Attestation, FederationDirectory, SignedAttestation, SignedKeyRecord,
         };
-        let backend = crate::store::memory::MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         let author = "mem-ladder-author";
         let now = chrono::Utc::now();
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(author);
@@ -21545,13 +21543,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn config_self_or_owner_gate_memory_778() {
-        use crate::store::memory::MemoryBackend;
-        let backend = MemoryBackend::new();
-        run_config_self_or_owner_matrix(&backend, "mem").await;
-    }
-
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn config_self_or_owner_gate_sqlite_778() {
@@ -21711,8 +21702,9 @@ mod canonical_gate_tests {
     /// names both facts. This is the anti-Sybil property end-to-end at the
     /// strict over-roster gate.
     #[tokio::test]
+    #[cfg(feature = "sqlite")]
     async fn canonical_floor_refuses_unattested_roster_513() {
-        let backend = crate::store::memory::MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         let holders = [
             Identity::new("f513-0"),
             Identity::new("f513-1"),
@@ -21802,10 +21794,11 @@ mod canonical_gate_tests {
     /// expose yet — tracked verify-side; the real-artifact witnesses cover
     /// the full positive path.)
     #[tokio::test]
+    #[cfg(feature = "sqlite")]
     async fn mock_quorum_qualifies_the_floor_513() {
         use ciris_verify_core::accord_custody_attestation::test_support::MockYubicoCa;
 
-        let backend = crate::store::memory::MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         let ca = MockYubicoCa::new();
         let mut roster = Vec::new();
         for (i, kid) in ["mq0", "mq1", "mq2"].iter().enumerate() {
@@ -21850,11 +21843,12 @@ mod canonical_gate_tests {
     /// injected mock root. No hardware, no ceremony, inert against any
     /// real gate. The anti-Sybil floor's complete positive path.
     #[tokio::test]
+    #[cfg(feature = "sqlite")]
     async fn mock_full_quorum_mints_canonical_513() {
         use ciris_verify_core::accord_custody_attestation::test_support::MockYubicoCa;
         use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
 
-        let backend = crate::store::memory::MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         let ca = MockYubicoCa::new();
         // v31.0.0 (CIRISPersist#659) — the bytes the mock family signs are the
         // SUBJECT'S OWN bound envelope, taken from the record itself rather
@@ -21957,11 +21951,12 @@ mod canonical_gate_tests {
     /// the PQC-substitution attack of leg (d) walking back in through the hole
     /// the carve-out opened.
     #[tokio::test]
+    #[cfg(feature = "sqlite")]
     async fn coscrub_confers_only_on_the_key_it_names_659() {
         use ciris_verify_core::accord_custody_attestation::test_support::MockYubicoCa;
         use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
 
-        let backend = crate::store::memory::MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         let ca = MockYubicoCa::new();
         let subject = "canon-659-subject";
         // The three humans sign the SUBJECT'S OWN bound envelope — name,
@@ -22528,6 +22523,7 @@ mod canonical_gate_tests {
     /// pg), admit a 2-of-3 canonical via `put_public_key`, and confirm
     /// `is_canonical` / `list_canonical_servers` / round-trip
     /// `additional_scrubs` / accord-attested bootstrap-hint surfacing.
+    #[cfg(feature = "sqlite")]
     async fn run_endtoend(dir: &dyn FederationDirectory, tag: &str) {
         let accord: Vec<Identity> = accord_holder_roster_key_ids()
             .iter()
@@ -22647,13 +22643,6 @@ mod canonical_gate_tests {
         .await;
     }
 
-    #[tokio::test]
-    async fn canonical_gate_memory() {
-        use crate::store::memory::MemoryBackend;
-        let backend = MemoryBackend::new();
-        run_gate_matrix(&backend, "mem").await;
-    }
-
     /// v13.7.0 (CIRISPersist#405) — the CANONICAL SUPERSEDE policy end-to-end
     /// over a DISTINCT test roster, with REAL co-scrubs: proves the monotonic +
     /// m-of-n composition of
@@ -22664,10 +22653,10 @@ mod canonical_gate_tests {
     /// NON-canonical re-scrub does NOT (canonical-scope). All records share the
     /// fixed test pubkey, so the same-pubkey precondition holds.
     #[tokio::test]
+    #[cfg(feature = "sqlite")]
     async fn canonical_supersede_over_roster_matrix() {
         use super::super::register::verify_canonical_supersede_over_roster;
-        use crate::store::memory::MemoryBackend;
-        let dir = MemoryBackend::new();
+        let dir = crate::store::test_backend::test_backend();
         let founders = [
             Identity::new("scah0"),
             Identity::new("scah1"),
@@ -22886,13 +22875,6 @@ mod canonical_gate_tests {
         .await;
     }
 
-    #[tokio::test]
-    async fn i528_equal_instant_repair_memory() {
-        use crate::store::memory::MemoryBackend;
-        let backend = MemoryBackend::new();
-        run_equal_instant_repair_matrix(&backend, "mem").await;
-    }
-
     /// **I573** (#995 row 1) — **a lookup failure on the HELD row's quorum
     /// question is an error, never "the held row lacks the quorum".** The
     /// equal-instant repair reads `false` as licence to replace the held row;
@@ -22995,12 +22977,6 @@ mod canonical_gate_tests {
         );
     }
 
-    #[tokio::test]
-    async fn i573_held_row_lookup_failure_memory() {
-        let d = std::sync::Arc::new(crate::store::memory::MemoryBackend::new());
-        run_held_row_lookup_failure(d, "mem").await;
-    }
-
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i573_held_row_lookup_failure_sqlite() {
@@ -23061,14 +23037,6 @@ mod canonical_gate_tests {
             &canon[0].identity_type,
             identity_type::CANONICAL
         ));
-    }
-
-    /// End-to-end via the PRODUCTION gate on the ISOLATED memory backend.
-    #[tokio::test]
-    async fn canonical_endtoend_memory() {
-        use crate::store::memory::MemoryBackend;
-        let backend = MemoryBackend::new();
-        run_endtoend(&backend, "e2e-mem").await;
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -23335,14 +23303,6 @@ mod canonical_gate_tests {
         .await;
     }
 
-    #[tokio::test]
-    async fn infra_attest_gate_memory() {
-        use crate::store::memory::MemoryBackend;
-        let backend = MemoryBackend::new();
-        run_infra_gate_matrix(&backend, "mem").await;
-        run_infra_endtoend(&backend, "e2e-mem").await;
-    }
-
     // ─────────────────────────────────────────────────────────────────
     // CIRISPersist#441 — the `roles=[...]` set path runs the SAME
     // accord-conferral admission gates as the scalar `identity_type`
@@ -23456,13 +23416,6 @@ mod canonical_gate_tests {
         .await;
     }
 
-    #[tokio::test]
-    async fn set_path_parity_memory() {
-        use crate::store::memory::MemoryBackend;
-        let backend = MemoryBackend::new();
-        run_set_path_parity(&backend, "mem").await;
-    }
-
     // ─────────────────────────────────────────────────────────────────
     // CIRISPersist#469 — the seeder bridge: announced/advisory LAN-peer
     // bookmarks. Backend-parity harness over the #469 contract:
@@ -23571,13 +23524,6 @@ mod canonical_gate_tests {
             run_announced_peer_parity(&backend, "pg").await;
         })
         .await;
-    }
-
-    #[tokio::test]
-    async fn announced_peer_parity_memory() {
-        use crate::store::memory::MemoryBackend;
-        let backend = MemoryBackend::new();
-        run_announced_peer_parity(&backend, "mem").await;
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -23732,13 +23678,6 @@ mod canonical_gate_tests {
             run_costeward_gate_matrix(&backend, "pg").await;
         })
         .await;
-    }
-
-    #[tokio::test]
-    async fn costeward_gate_memory() {
-        use crate::store::memory::MemoryBackend;
-        let backend = MemoryBackend::new();
-        run_costeward_gate_matrix(&backend, "mem").await;
     }
 }
 
@@ -24281,105 +24220,6 @@ mod canonical_withdrawal_tests {
         .await;
     }
 
-    /// Memory-backend symmetry: the withdrawal store (record/lookup/list,
-    /// idempotency) + the revocation-wins gate consult
-    /// ([`check_canonical_role_admission_over_roster`](super::check_canonical_role_admission_over_roster))
-    /// behave identically to the SQL backends. Seeds the accord family (A1/B1/C1)
-    /// with test hybrid keys so the 2-of-3 ADD gate can be satisfied, then proves
-    /// the withdrawal consult runs BEFORE the quorum verify (a withdrawn key is
-    /// refused EVEN with a valid 2-of-3 scrub set), while a superseded-to-self
-    /// key is exempt.
-    #[tokio::test]
-    async fn canonical_withdrawal_memory() {
-        use crate::store::memory::MemoryBackend;
-
-        let backend = MemoryBackend::new();
-        let dir: &dyn FederationDirectory = &backend;
-
-        // Record a tombstone for a key + idempotency + conflict on differing.
-        dir.record_canonical_withdrawal("K", None, "digest-1")
-            .await
-            .expect("record");
-        dir.record_canonical_withdrawal("K", None, "digest-1")
-            .await
-            .expect("idempotent");
-        let err = dir
-            .record_canonical_withdrawal("K", Some("K2"), "digest-1")
-            .await
-            .expect_err("conflicting re-record");
-        assert!(matches!(err, super::Error::Conflict(_)));
-
-        let w = dir.lookup_canonical_withdrawal("K").await.unwrap().unwrap();
-        assert_eq!(w.key_id, "K");
-        assert_eq!(w.superseded_by, None);
-        assert_eq!(dir.list_canonical_withdrawals().await.unwrap().len(), 1);
-        assert!(dir
-            .lookup_canonical_withdrawal("nope")
-            .await
-            .unwrap()
-            .is_none());
-
-        // Seed the signable accord family (A1/B1/C1 with test hybrid keys) so a
-        // GENUINE 2-of-3 co-scrub can be produced + verified by the gate.
-        let accord: Vec<Identity> = accord_holder_roster_key_ids()
-            .iter()
-            .map(|k| Identity::new(k))
-            .collect();
-        for a in &accord {
-            register_holder(dir, a).await;
-        }
-        let roster = accord_holder_roster_key_ids();
-        let env = |kid: &str| serde_json::json!({ "key_id": kid });
-
-        // The gate consult rejects re-conferring canonical on the withdrawn key
-        // K EVEN with a valid 2-of-3 scrub set — the consult runs FIRST
-        // (revocation-wins), so the withdrawal (not a quorum shortfall) is the
-        // rejection cause.
-        let rec = signed_canonical_record(
-            "K",
-            "canonical,node",
-            PLACEHOLDER_SUBJECT_ED25519_BASE64,
-            None,
-            env("K"),
-            &[&accord[0], &accord[1]],
-        );
-        let err = super::check_canonical_role_admission_over_roster_legacy(dir, &rec, &roster)
-            .await
-            .expect_err("withdrawn key cannot be re-conferred canonical");
-        assert_eq!(err.kind(), "canonical_role_withdrawn");
-
-        // A NON-withdrawn key with a valid 2-of-3 scrub set passes the gate.
-        let ok = signed_canonical_record(
-            "J",
-            "canonical,node",
-            PLACEHOLDER_SUBJECT_ED25519_BASE64,
-            None,
-            env("J"),
-            &[&accord[0], &accord[1]],
-        );
-        super::check_canonical_role_admission_over_roster_legacy(dir, &ok, &roster)
-            .await
-            .expect("non-withdrawn 2-of-3 canonical passes the gate");
-
-        // Supersede exemption: a tombstone whose superseded_by names THIS key
-        // does NOT block re-confer (key-id-preserving rotation) — the valid
-        // 2-of-3 then confers.
-        dir.record_canonical_withdrawal("S", Some("S"), "digest-2")
-            .await
-            .expect("self-superseded tombstone");
-        let rec_s = signed_canonical_record(
-            "S",
-            "canonical,node",
-            PLACEHOLDER_SUBJECT_ED25519_BASE64,
-            None,
-            env("S"),
-            &[&accord[0], &accord[1]],
-        );
-        super::check_canonical_role_admission_over_roster_legacy(dir, &rec_s, &roster)
-            .await
-            .expect("a superseded-to-self key is exempt from the withdrawal block");
-    }
-
     // ─────────────────────────────────────────────────────────────────
     // CIRISPersist#424 — the `infra:attest` WITHDRAW decision table: the
     // #377 canonical machinery re-used for the roles-vector role (same
@@ -24569,13 +24409,6 @@ mod canonical_withdrawal_tests {
         })
         .await;
     }
-
-    #[tokio::test]
-    async fn infra_attest_withdrawal_memory() {
-        use crate::store::memory::MemoryBackend;
-        let backend = MemoryBackend::new();
-        run_infra_withdrawal_matrix(&backend, "mem").await;
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -24617,6 +24450,8 @@ mod envelope_size_tests {
     /// Backend-symmetric: the check is one line in each of the three local
     /// write funnels and the failure mode is someone deleting one of them, so
     /// asking one backend would not detect it.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[cfg(feature = "sqlite")]
     async fn exercise_stored_row_within_cap<D>(dir: &D)
     where
         D: crate::federation::FederationDirectory + Sync + ?Sized,
@@ -24708,11 +24543,6 @@ mod envelope_size_tests {
             .expect("the row landed");
         check_envelope_size_admission(&stored.attestation_envelope)
             .expect("every row this door stores must pass the cap it was admitted under");
-    }
-
-    #[tokio::test]
-    async fn stored_row_is_within_the_cap_on_memory() {
-        exercise_stored_row_within_cap(&crate::store::memory::MemoryBackend::new()).await;
     }
 
     #[cfg(feature = "sqlite")]
@@ -28216,14 +28046,28 @@ pub(crate) mod moderation_walk_liveness_test_support {
     /// not make before, and "≈2× reads, memoized per recipient" is a claim that
     /// has to be checked against a counter, not against an argument. This body
     /// pins four numbers on a `founder → deputy → leaf → tail` chain, using the
-    /// memory backend's [`attestation_read_counts`] — a count of what the
-    /// SUBSTRATE was asked for, external to the walk. The counts are properties
-    /// of the shared walk, not of the backend: all three backends run this exact
-    /// body and issue this exact sequence of calls.
-    ///
-    /// [`attestation_read_counts`]: crate::store::memory::MemoryBackend::attestation_read_counts
+    /// attestation read probe ([`crate::federation::read_probe`]): the bounded
+    /// queries the SUBSTRATE was asked for, external to the walk, split by axis
+    /// (`by` an attester, `to` a subject). The counts are properties of the
+    /// shared walk, not of the backend. v60.0.0 (#1002): the retired memory
+    /// backend's per-axis counters are the probe's tally now.
+    /// `(by-attester, to-subject)` bounded attestation queries this thread
+    /// made since the last [`crate::federation::read_probe::take`].
+    #[cfg(feature = "sqlite")]
+    fn attestation_read_counts() -> (u64, u64) {
+        let reads = crate::federation::read_probe::take();
+        let count = |pick: fn(&crate::federation::attestation_query::AttestationQuery) -> bool| {
+            reads
+                .iter()
+                .filter(|r| r.query.as_ref().is_some_and(pick))
+                .count() as u64
+        };
+        (count(|q| q.by.is_some()), count(|q| q.to.is_some()))
+    }
+
+    #[cfg(feature = "sqlite")]
     pub(crate) async fn exercise_moderation_walk_read_cost(
-        backend: &crate::store::memory::MemoryBackend,
+        backend: &crate::store::sqlite::SqliteBackend,
         suffix: &str,
     ) {
         let duty = DELEGATION_SCOPE_MODERATE;
@@ -28250,7 +28094,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
         //     this chain. Measured, it is 2 → 4: the predicate stops at the
         //     edge INTO the target and never dequeues the target itself, so the
         //     pre-#593 walk read one fewer node than the estimate assumed.
-        backend.reset_attestation_read_counts();
+        let _ = crate::federation::read_probe::take();
         assert!(
             reachable_under_scope(
                 backend,
@@ -28264,7 +28108,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
             "the live chain reaches the leaf"
         );
         assert_eq!(
-            backend.attestation_read_counts(),
+            attestation_read_counts(),
             (2, 2),
             "(list_attestations_by, list_attestations_for) for a founder -> deputy -> leaf probe. \
              `by` is unchanged from before CIRISPersist#593 (one per DEQUEUED node: founder, \
@@ -28275,7 +28119,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
         // (2) THE SHORT-CIRCUIT SURVIVED THE EXTRACTION. A depth-1 target ends
         //     the walk at the first hit: the founder's out-rows are read, the
         //     deputy's are NOT, and neither leaf nor tail is ever touched.
-        backend.reset_attestation_read_counts();
+        let _ = crate::federation::read_probe::take();
         assert!(
             reachable_under_scope(
                 backend,
@@ -28289,7 +28133,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
             "the founder reaches the deputy directly"
         );
         assert_eq!(
-            backend.attestation_read_counts(),
+            attestation_read_counts(),
             (1, 1),
             "the predicate must RETURN at the first edge into `targets` — one granter read, one \
              recipient read, and no traversal past the hit. CIRISPersist#584 had to give its \
@@ -28300,7 +28144,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
         // (3) …and the SAME body still enumerates exhaustively, because the
         //     enumerating caller passes an EMPTY `targets` that no edge can be
         //     in. Four granter reads (every node), three recipient reads.
-        backend.reset_attestation_read_counts();
+        let _ = crate::federation::read_probe::take();
         let reach = enumerate_scoped_delegation_reach(
             backend,
             &founder,
@@ -28322,7 +28166,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
             "empty targets ⇒ no short-circuit ⇒ full enumeration from the predicate's own body"
         );
         assert_eq!(
-            backend.attestation_read_counts(),
+            attestation_read_counts(),
             (4, 3),
             "the enumerating projection walks the whole chain — 4 dequeued nodes, 3 distinct \
              recipients. The contrast with (2) IS the short-circuit"
@@ -28341,7 +28185,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
                 .await
                 .expect("parallel edge admitted");
         }
-        backend.reset_attestation_read_counts();
+        let _ = crate::federation::read_probe::take();
         assert!(
             !reachable_under_scope(
                 backend,
@@ -28363,7 +28207,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
         // out-edges and the deputy's none.
         let pages = |n: u32| u64::from(n.div_ceil(FOLD_PAGE.get()).max(1));
         assert_eq!(
-            backend.attestation_read_counts(),
+            attestation_read_counts(),
             (pages(5) + pages(0), pages(5)),
             "5 edges, ONE distinct recipient, ONE incoming read of its five-row slice — memoized \
              per recipient for the whole walk. Key the memo on the granter instead and the \
@@ -28400,7 +28244,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
             .await
             .expect("proxy chain edge admitted");
         }
-        backend.reset_attestation_read_counts();
+        let _ = crate::federation::read_probe::take();
         let cr_targets: std::collections::HashSet<String> =
             std::iter::once(cr_sub.clone()).collect();
         assert!(
@@ -28415,7 +28259,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
             "the live proxy chain reaches the keyless subject"
         );
         assert_eq!(
-            backend.attestation_read_counts(),
+            attestation_read_counts(),
             (2, 2),
             "CIRISPersist#594's measured cost on the consent-revocation plane: a two-hop rule-(3) \
              probe reads 2 granters (unchanged — one per dequeued node) and 2 recipients (BOTH \
@@ -28881,6 +28725,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
     ///     `steward_bindings_of` clause (1) self-anchors only `user`-role keys.
     ///     `accord_holder` is HardwareAttested — strictly stronger than the
     ///     steward-bound heuristic, so the filter is a category error here.
+    #[cfg(feature = "sqlite")]
     pub(crate) async fn exercise_federation_duty_holders(
         dir: &dyn FederationDirectory,
         _suffix: &str,
@@ -29073,7 +28918,8 @@ pub(crate) mod ungated_doors_test_support {
     /// survive the write→read round trip on the path a consumer advertises
     /// from?**
     ///
-    /// Edge reported it reading back EMPTY through `MemoryBackend`, which
+    /// Edge reported it reading back EMPTY through the (since retired) memory
+    /// backend, which
     /// matters now in a way it never did before: pre-v36 an unrecognized scope
     /// resolved `Cohort` for every family, so an empty string was harmless. In
     /// v36 the `Trace` family resolves an unrecognized scope to `SelfOwn`, so
@@ -29231,6 +29077,7 @@ pub(crate) mod ungated_doors_test_support {
     /// AFTER planting `expected` (every id already sharing ONE `admitted_at`;
     /// `expected.len() > page`). The mirror of the key plane's
     /// `assert_one_admission_instant_pages_exactly_once`.
+    #[cfg(feature = "sqlite")]
     pub(crate) async fn assert_attestation_tie_pages_exactly_once(
         dir: &dyn FederationDirectory,
         suffix: &str,

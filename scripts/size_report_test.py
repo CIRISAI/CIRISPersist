@@ -87,7 +87,6 @@ FILES = {
     "src/lib.rs": "pub mod store;\n// c\n",
     "src/store/sqlite.rs": "fn s() {}\n\n",
     "src/store/postgres.rs": "fn p() {}\n",
-    "src/store/memory.rs": "fn m() {}\n",
     "src/ünïcode.rs": "fn u() {}\n",
     "src/data.json": "{}\n",
 }
@@ -111,8 +110,8 @@ class Table(unittest.TestCase):
         self.assertEqual(body[0], "path\tcode\tcomment\tblank\tlines")
         paths = [l.split("\t")[0] for l in body[1:]]
         self.assertEqual(paths, sorted(p for p in FILES if p.endswith(".rs")) + ["BACKENDS", "TOTAL"])
-        self.assertIn("BACKENDS\t3\t0\t1\t4", body)
-        self.assertIn("TOTAL\t5\t1\t1\t7", body)
+        self.assertIn("BACKENDS\t2\t0\t1\t3", body)
+        self.assertIn("TOTAL\t4\t1\t1\t6", body)
 
     def test_write_is_stable(self):
         run(["write"], self.root)
@@ -132,11 +131,11 @@ class Table(unittest.TestCase):
         rc, out, _ = run(["check"], self.root)
         self.assertEqual(rc, 0)
         self.assertRegex(out, r"src/store/sqlite\.rs\s+2\s+3\s+\+1")
-        self.assertRegex(out, r"BACKENDS\s+4\s+5\s+\+1")
+        self.assertRegex(out, r"BACKENDS\s+3\s+4\s+\+1")
 
     def test_fail_if_backends_grew_is_red_on_growth(self):
         run(["write"], self.root)
-        tree(self.root, {"src/store/memory.rs": "fn m() {}\nfn n() {}\n"})
+        tree(self.root, {"src/store/postgres.rs": "fn p() {}\nfn q() {}\n"})
         rc, out, _ = run(["check", "--fail-if-backends-grew"], self.root)
         self.assertEqual(rc, 1)
         self.assertIn("RED", out)
@@ -147,7 +146,7 @@ class Table(unittest.TestCase):
                          "src/store/sqlite.rs": "fn s() {}\n"})
         rc, out, _ = run(["check", "--fail-if-backends-grew"], self.root)
         self.assertEqual(rc, 0, out)
-        self.assertRegex(out, r"BACKENDS\s+4\s+3\s+-1")
+        self.assertRegex(out, r"BACKENDS\s+3\s+2\s+-1")
 
     def test_added_and_removed_files_are_named(self):
         run(["write"], self.root)

@@ -851,6 +851,7 @@ where
 /// Test support: hold `key_id` as a `lenscore_detector` key (a detection
 /// row's attester).
 #[cfg(test)]
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) async fn test_support_hold<D>(dir: &D, key_id: &str)
 where
     D: crate::federation::FederationDirectory + ?Sized,
@@ -873,18 +874,12 @@ where
 }
 
 /// Test support: give a bare backend the node identity a hard_case row needs.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_support {
     /// The inherent `set_node_key_id` of each backend, behind one name.
     pub(crate) trait DeclaresNode {
         /// Set this backend's node key id.
         fn declare_node_key_for_test(&self, key_id: &str);
-    }
-
-    impl DeclaresNode for crate::store::memory::MemoryBackend {
-        fn declare_node_key_for_test(&self, key_id: &str) {
-            self.set_node_key_id(key_id);
-        }
     }
 
     #[cfg(feature = "sqlite")]

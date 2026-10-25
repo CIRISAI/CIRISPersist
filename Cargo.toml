@@ -761,7 +761,11 @@ ndarray              = { version = "0.16", optional = true }
 # (CIRISVerify v1.6.4 hit + fixed this same trap). On iOS we link
 # against the system one instead. Both Cargo target tables below
 # resolve to the same dep entry; cargo unifies on the version pin.
-rusqlite = { version = "0.31", features = ["chrono", "serde_json", "functions"], optional = true }
+#
+# v60.0.0 (CIRISPersist#1002) — `backup` (the safe wrapper over
+# `sqlite3_backup_*`, present in every SQLite build) clones the migrated
+# template behind `store::test_backend::test_backend()`.
+rusqlite = { version = "0.31", features = ["backup", "chrono", "serde_json", "functions"], optional = true }
 
 # Phase 1 robustness — local journal for outage tolerance (FSD §3.4)
 redb = "4"
@@ -875,7 +879,7 @@ ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v20.2.0
 [target.'cfg(target_os = "android")'.dependencies]
 # v3.5.2 (#132) — rusqlite `bundled` for Android. See comment block
 # before the iOS entry (~line 628) for the rationale.
-rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json", "functions"], optional = true }
+rusqlite = { version = "0.31", features = ["backup", "bundled", "chrono", "serde_json", "functions"], optional = true }
 ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v20.2.0", version = "20", features = ["pqc-ml-dsa", "android"] }
 # v12.3.0 (CIRISPersist#355) — vendored openssl removed here too (dead leaf;
 # see the base-deps note). No Android openssl in any configuration now,
@@ -956,7 +960,7 @@ crate-type = ["cdylib", "rlib"]
 [[bench]]
 name = "ingest_pipeline"
 harness = false
-required-features = ["postgres"]
+required-features = ["sqlite"]
 
 # v2.12.0 (CIRISPersist#116) — calibration anchor for runner-noise
 # normalization. Pure-compute, no deps beyond criterion. The bench
@@ -984,7 +988,7 @@ harness = false
 [[bench]]
 name = "queue"
 harness = false
-required-features = ["postgres"]
+required-features = ["sqlite"]
 
 # v1.10.x bench-coverage cut — benches for the v1.7.x–v1.10.1 surface
 # that shipped with zero coverage. SQLite in-memory backed where a DB

@@ -300,7 +300,7 @@ mod pure {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod dyn_bodies {
     use crate::federation::membership_acceptance::test_support::{acceptance_row, proposal_row};
     use crate::federation::membership_acceptance::{
@@ -2091,7 +2091,7 @@ pub(crate) mod engine_bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
@@ -2124,10 +2124,6 @@ mod runners {
             }
         };
     }
-
-    dyn_runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
 
     #[cfg(feature = "sqlite")]
     dyn_runners!(sqlite, async {

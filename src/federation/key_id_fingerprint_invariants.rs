@@ -12,7 +12,7 @@
 //! a key already held under a non-matching id is grandfathered — it still
 //! resolves — but is refused when offered again under that id.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::register;
     use crate::federation::tier_ingest::test_support as ts;
@@ -135,18 +135,12 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod tests {
     use super::bodies;
 
     fn tag(n: &str) -> String {
         format!("{n}{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i1153_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        bodies::i1153_a_key_id_names_its_own_key(&b, &tag("m")).await;
     }
 
     #[cfg(feature = "sqlite")]

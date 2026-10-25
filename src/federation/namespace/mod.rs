@@ -3480,11 +3480,11 @@ mod subject_retainability_tests {
 /// expected verdict from [`resolve_projection_recipients`],
 /// [`projection_for`] or [`holdings_authority`]; a list computed from the code
 /// it checks asserts nothing about that code.
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod recipient_set_tests {
     use super::*;
     use crate::federation::FederationDirectory;
-    use crate::store::memory::MemoryBackend;
+    use crate::store::sqlite::SqliteBackend;
 
     /// Register `key_id` as a plain `node` with its deterministic hybrid
     /// pubkeys — the ordinary, unprivileged publisher/peer of these witnesses.
@@ -3528,8 +3528,8 @@ mod recipient_set_tests {
     /// The #744 fixture: a family whose roster seats exactly `PUBLISHER` and
     /// `SEATED`, plus a registered `STRANGER` who is on no roster. Returns the
     /// backend.
-    async fn holdings_fixture() -> MemoryBackend {
-        let backend = MemoryBackend::new();
+    async fn holdings_fixture() -> SqliteBackend {
+        let backend = crate::store::test_backend::test_backend();
         for who in [PUBLISHER, SEATED, STRANGER] {
             register_node(&backend, who).await;
         }
@@ -3876,17 +3876,17 @@ mod recipient_set_tests {
 /// v37.1.0 (CIRISPersist#744 item 2) — **the holdings seam's declared
 /// authority.** A trust-root corpus and a producer corpus must reach
 /// DIFFERENT projections, or the input is decorative.
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod holdings_authority_tests {
     use super::*;
     use crate::federation::FederationDirectory;
-    use crate::store::memory::MemoryBackend;
+    use crate::store::sqlite::SqliteBackend;
 
     /// The baked genesis canonical — an accord-co-scrubbed trust root that
     /// admits through the ordinary `check_canonical_role_admission` gate, so
     /// nothing here fabricates conferral.
-    async fn seeded_canonical() -> (MemoryBackend, String) {
-        let backend = MemoryBackend::new();
+    async fn seeded_canonical() -> (SqliteBackend, String) {
+        let backend = crate::store::test_backend::test_backend();
         backend
             .seed_genesis_accord_holders(crate::federation::genesis::accord_holder_genesis_records())
             .await

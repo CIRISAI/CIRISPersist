@@ -25,10 +25,10 @@ Each ported gate keeps its original Rust witness for one release (issue step 3).
 
 | rule | original gate | counts | expected |
 |---|---|---|---|
-| `i110-check-consent-scope-tokens` | `consent_scope_invariants.rs::i110_one_matcher_every_door` (≥ 2/2/2/1) | calls of `check_consent_scope_tokens` in sqlite, postgres, memory, admission | 2/2/2/1 exactly |
+| `i110-check-consent-scope-tokens` | `consent_scope_invariants.rs::i110_one_matcher_every_door` (≥ 2/2/2/1) | calls of `check_consent_scope_tokens` in sqlite, postgres, admission | 2/2/2/1 exactly |
 | `i119-check-media-source` | `media_source_invariants.rs::i119_every_door_and_the_vocabulary` (≥ 2/2/2/1) | calls of `check_media_source`, same four files | 2/2/2/1 exactly |
-| `i448-prev-head-check` | `lineage_head_invariants.rs::i448_every_backend_runs_the_prev_check_on_both_arms` (== 2 per backend) | calls of `check_prev_head_names_held` inside `fn supersede_group_row`, three backends | 2/2/2 |
-| `scores-read-log` | `scores_read_audit.rs::all_six_scores_read_sites_log` (1 per site, 6 sites) | calls of `log_scores_read` inside `fn list_scores` / `fn resolve_scores`, three backends | 2/2/2 |
+| `i448-prev-head-check` | `lineage_head_invariants.rs::i448_every_backend_runs_the_prev_check_on_both_arms` (== 2 per backend) | calls of `check_prev_head_names_held` inside `fn supersede_group_row`, both backends | 2/2 |
+| `scores-read-log` | `scores_read_audit.rs::every_scores_read_site_logs` (1 per site, 4 sites) | calls of `log_scores_read` inside `fn list_scores` / `fn resolve_scores`, both backends | 2/2 |
 | `i26-cached-content-master` | `blob_surface_gates.rs::i26_backends_resolve_the_content_master_through_the_cache` (cached ≥ 1) | calls of `resolve_persisted_content_master_cached`, sqlite + postgres | 1/1 |
 | `i26-uncached-content-master` | the same test (uncached == 0) | calls of `resolve_persisted_content_master`, sqlite + postgres | 0/0 |
 
@@ -133,7 +133,7 @@ Classes:
 | federation/replication/mod.rs | the_retired_depth_knob_stays_retired | #748 | all src | no `recursion_depth` | AST-COUNT (== 0) |
 | federation/roster_head_invariants.rs | i458_every_door_runs_its_consequence | I458 | 4 files | coverage check before `supersede_group_row(` | AST-STRUCT |
 | federation/row_type_invariants.rs | i378_the_gate_is_wired_at_every_door | I378 | backends, admission, emit, row_type | `admit_row_type` right after binding | AST-STRUCT (+ TEXTUAL) |
-| federation/scores_read_audit.rs | **all_six_scores_read_sites_log** | — | backends | one `log_scores_read(` per site, before the gate | AST-COUNT — **count ported**; order leg AST-STRUCT |
+| federation/scores_read_audit.rs | **every_scores_read_site_logs** | — | backends | one `log_scores_read(` per site, before the gate | AST-COUNT — **count ported**; order leg AST-STRUCT |
 | 〃 | the_redaction_token_is_reserved_and_unwired | CC 3.4.5 | all src | no other file names the token | AST-COUNT (== 0) |
 | federation/self_collective_invariants.rs | i140_the_doors_reach_python_and_no_claim_was_added | I140 | pyo3, types | 4 `fn …_json(` defined | AST-COUNT + TEXTUAL |
 | federation/types.rs | every_closed_vocabulary_const_is_in_its_all_686 | #686 | types.rs | consts == their `ALL` arrays | AST-STRUCT |

@@ -25,7 +25,7 @@
 //!   row: a withdrawn one is `accord_charter_not_held`.
 //! - **I511** (#984 row 6) a roster listing a seat twice is refused by name.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::accord_roster::{
         seat_change_digest, SeatAdd, SeatChange, ROSTER_CHANGE_KIND,
@@ -798,7 +798,7 @@ mod pure {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     use super::bodies;
 
@@ -854,7 +854,6 @@ mod run {
             }
         };
     }
-    runners!(memory, async { Some(crate::store::MemoryBackend::new()) });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

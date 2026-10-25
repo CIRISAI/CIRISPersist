@@ -1199,6 +1199,7 @@ mod tests {
     /// bad later byte each refuse), and a row id carries no `:` or whitespace
     /// and is not empty (it becomes a dimension segment), refused before any
     /// read as `cirisnode_invalid_argument`, never `cirisnode_not_found`.
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i1168_ids_and_vocabulary_are_shape_checked() {
         for bad in ["arc-question", "_arc", "Arc", ""] {
@@ -1206,7 +1207,7 @@ mod tests {
             assert_eq!(e.kind(), "cirisnode_invalid_argument", "{bad:?}: {e}");
         }
         plan_contribution_row(&contribution("arc_q2")).expect("a vocabulary token");
-        let dir = crate::store::memory::MemoryBackend::new();
+        let dir = crate::store::test_backend::test_backend();
         for bad in ["a:b", "", "a b", "x\t"] {
             let e = plan_vote_row(
                 &dir,

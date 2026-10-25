@@ -12,6 +12,9 @@
 //!
 //! Findings → v0.1.4 fixes.
 
+// v60.0.0 (CIRISPersist#1002) — runs on the in-memory SQLite test backend.
+#![cfg(feature = "sqlite")]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,7 +29,7 @@ use ciris_persist::schema::{
     CompleteTrace, ComponentType, ReasoningEventType, SchemaVersion, TraceComponent, TraceLevel,
 };
 use ciris_persist::scrub::NullScrubber;
-use ciris_persist::store::MemoryBackend;
+use ciris_persist::store::sqlite::SqliteBackend;
 use ciris_persist::verify::canonical::Canonicalizer;
 use ciris_persist::verify::{ed25519::canonical_payload_value, PythonJsonDumpsCanonicalizer};
 
@@ -40,7 +43,7 @@ fn test_signer() -> Box<dyn HardwareSigner> {
 
 /// Mint an agent keypair + register in the backend's accord_public_keys
 /// directory so verify_trace passes. Returns (signing_key, key_id).
-async fn agent_with_registered_key(backend: &MemoryBackend, key_id: &str, seed: u8) -> SigningKey {
+async fn agent_with_registered_key(backend: &SqliteBackend, key_id: &str, seed: u8) -> SigningKey {
     let sk = SigningKey::from_bytes(&[seed; 32]);
     backend.add_public_key(key_id, sk.verifying_key());
     // CIRISPersist#789 — the producer's ML-DSA-65 key must be IN THE
@@ -145,12 +148,13 @@ async fn build_signed_batch(
 /// distinct batches; assert no cross-agent dedup collisions and
 /// every persisted row carries a valid scrub envelope.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(feature = "sqlite")]
 async fn high_volume_concurrent_agents() {
     const N_AGENTS: usize = 8;
     const N_BATCHES_PER_AGENT: usize = 16;
     const COMPONENTS_PER_BATCH: usize = 6;
 
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     let signer = Arc::<dyn HardwareSigner>::from(test_signer());
     let signer_key_id = "qa-harness-signer".to_owned();
 
@@ -230,7 +234,7 @@ async fn high_volume_concurrent_agents() {
 #[tokio::test]
 async fn av5_schema_version_flood() {
     const N: usize = 10_000;
-    let backend = MemoryBackend::new();
+    let backend = ciris_persist::store::test_backend::test_backend();
     let signer = test_signer();
 
     let pipeline = IngestPipeline {
@@ -265,6 +269,7 @@ async fn av5_schema_version_flood() {
 /// THREAT_MODEL.md AV-6: 64-deep nested data blob → typed
 /// DataTooDeep rejection.
 #[tokio::test]
+#[cfg(feature = "sqlite")]
 async fn av6_json_bomb_depth() {
     let mut nested = serde_json::Value::Null;
     for _ in 0..64 {
@@ -292,7 +297,7 @@ async fn av6_json_bomb_depth() {
         "consent_timestamp": "2025-01-01T00:00:00Z",
         "trace_level": "generic", "trace_schema_version": "2.7.0",
     });
-    let backend = MemoryBackend::new();
+    let backend = ciris_persist::store::test_backend::test_backend();
     let signer = test_signer();
     let pipeline = IngestPipeline {
         backend: &backend,
@@ -320,7 +325,7 @@ async fn av6_json_bomb_depth() {
 /// as the dedup-key prefix. Both rows must persist.
 #[tokio::test]
 async fn av9_cross_agent_dedup() {
-    let backend = MemoryBackend::new();
+    let backend = ciris_persist::store::test_backend::test_backend();
     let signer = test_signer();
     let sk_a = agent_with_registered_key(&backend, "agent-A", 0xAA).await;
     let sk_b = agent_with_registered_key(&backend, "agent-B", 0xBB).await;
@@ -360,11 +365,12 @@ async fn av9_cross_agent_dedup() {
 /// Every persisted row's scrub_signature ed25519_verifies against
 /// the signer's public key + canonical(payload). Tests at scale.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(feature = "sqlite")]
 async fn av24_sign_verify_round_trip_all_rows() {
     const N_BATCHES: usize = 32;
     const COMPONENTS: usize = 8;
 
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     let signer = Arc::<dyn HardwareSigner>::from(test_signer());
     let signer_key_id = "qa-harness-signer".to_owned();
     let sk = agent_with_registered_key(&backend, "agent-qa", 0x42).await;
@@ -463,11 +469,12 @@ async fn av24_sign_verify_round_trip_all_rows() {
 /// producer mid-stream. PersisterHandle.shutdown() drains the queue
 /// without losing rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(feature = "sqlite")]
 async fn av19_graceful_shutdown_under_load() {
     use ciris_persist::{spawn_persister, Journal, DEFAULT_QUEUE_DEPTH};
     let dir = tempfile::tempdir().unwrap();
     let journal = Arc::new(Journal::open(dir.path().join("j.redb")).unwrap());
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     let sk = agent_with_registered_key(&backend, "agent-shutdown", 0xC0).await;
     let signer = Arc::<dyn HardwareSigner>::from(test_signer());
 
@@ -523,7 +530,7 @@ async fn av19_graceful_shutdown_under_load() {
 /// MAX_ATTEMPT_INDEX bound holds; values above the cap reject typed.
 #[tokio::test]
 async fn av17_attempt_index_out_of_range() {
-    let backend = MemoryBackend::new();
+    let backend = ciris_persist::store::test_backend::test_backend();
     let signer = test_signer();
     let sk = agent_with_registered_key(&backend, "agent-av17", 0x17).await;
 

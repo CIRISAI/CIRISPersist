@@ -6,7 +6,7 @@
 //! (memory, sqlite, postgres), so the three cannot diverge; the engine-level
 //! bodies (the promoter, the expiry sweep) run on sqlite.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::consent::ScopedStance;
     use crate::federation::hard_case::ConsentState;
@@ -663,7 +663,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
@@ -802,7 +802,6 @@ mod run {
         const ADMISSION: &str = include_str!("admission.rs");
         const SQLITE: &str = include_str!("../store/sqlite.rs");
         const PG: &str = include_str!("../store/postgres.rs");
-        const MEM: &str = include_str!("../store/memory.rs");
         assert_eq!(
             SCOPE.matches("pub fn covers(").count(),
             1,
@@ -845,11 +844,7 @@ mod run {
             assert!(calls >= n, "I110: {name} calls the scope-token gate at its doors ({calls} < {n}: the shared ingest plan; local per backend; promotion)");
         }
         // Every backend's ingest and local doors are the shared doors.
-        for (name, text) in [
-            ("sqlite.rs", SQLITE),
-            ("postgres.rs", PG),
-            ("memory.rs", MEM),
-        ] {
+        for (name, text) in [("sqlite.rs", SQLITE), ("postgres.rs", PG)] {
             for door in [
                 "attestation_admit::put_attestation_planned(",
                 "attestation_admit::write_local_attestation_planned(",
@@ -900,14 +895,6 @@ mod run {
             }
         };
     }
-    runners!(memory, async {
-        {
-            // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
-            let b = crate::store::memory::MemoryBackend::new();
-            crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
-            Some(b)
-        }
-    });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

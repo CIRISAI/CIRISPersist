@@ -1044,7 +1044,7 @@ impl SqliteBackend {
     /// Centralized so file-backed and in-memory share the same shape. Reader
     /// connections get their own, smaller block in
     /// [`crate::store::sqlite_conn_model::ReadPool::open`].
-    fn apply_connection_settings(conn: Connection) -> Result<Connection, Error> {
+    pub(crate) fn apply_connection_settings(conn: Connection) -> Result<Connection, Error> {
         (move || -> Result<Connection, rusqlite::Error> {
             // Foreign keys are off by default in SQLite for backwards
             // compat — turn them on so any future FK constraints we
@@ -2181,7 +2181,7 @@ impl Backend for SqliteBackend {
             )
             .await
             .map_err(|e| Error::Backend(format!("read content_symbols: {e}")))?;
-        Ok(Some(super::memory::assemble_fountain_content(
+        Ok(Some(super::fountain_read::assemble_fountain_content(
             manifest, symbols,
         )?))
     }
@@ -3299,7 +3299,7 @@ impl SqliteBackend {
     /// backend; callers must not already hold it (`parking_lot::Mutex` is not
     /// reentrant). Doors that already hold the lock call
     /// [`sqlite_next_key_serve_position`] directly inside their closure.
-    async fn next_key_admission_position(
+    pub(crate) async fn next_key_admission_position(
         &self,
     ) -> Result<chrono::DateTime<chrono::Utc>, crate::federation::Error> {
         self.read(sqlite_next_key_serve_position)
@@ -10615,7 +10615,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         limit: i64,
     ) -> Result<crate::read::ScoresPage, crate::federation::Error> {
         use crate::federation::Error;
-        use crate::read::LifecycleView;
         // #552 (CC 3.4.5) — the scores-plane read log. FIRST statement in the
         // door, ahead of every refusal, so a read rejected for a bad limit or
         // cursor is logged exactly like one that is served.
@@ -10633,34 +10632,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             .await
             .map_err(|e| Error::Backend(format!("list_scores admission: {e}")))?;
         let (mut parts, mut binds) = sqlite_scores_shared_predicates(&filter, &scope);
-        // lifecycle: exclude rows retracted by a still-hiding composer.
-        let hide: &[&str] = match filter.lifecycle {
-            LifecycleView::Live => &["supersedes", "withdraws", "recants"],
-            LifecycleView::IncludeSuperseded => &["withdraws", "recants"],
-            LifecycleView::IncludeWithdrawn => &["supersedes", "recants"],
-            LifecycleView::IncludeRecanted => &["supersedes", "withdraws"],
-            LifecycleView::All => &[],
-        };
-        if !hide.is_empty() {
-            let mut ph: Vec<String> = Vec::new();
-            for ty in hide {
-                binds.push(SqlValue::Text((*ty).to_string()));
-                ph.push(format!("?{}", binds.len()));
-            }
-            // v20.0.0 (#495 C2) — the composer-target path interpolates the
-            // ONE envelope-path constant (bound to EnvelopeCore's serde
-            // name by witness); a key rename can no longer silently leave
-            // a withdrawn attestation active.
-            // v51.2.0 (#945) — the retracting row is the target's own author's, OR the write door admitted it under a resolved rule (#945: a node owner's, a subject's, a delegate's withdrawal — every admitted retraction hides, as the consolidated fold already holds).
-            parts.push(format!(
-                "NOT EXISTS (SELECT 1 FROM federation_attestations c \
-                   WHERE (c.attesting_key_id = fa.attesting_key_id \
-                          OR c.withdraws_admission_rule IS NOT NULL) \
-                     AND c.attestation_type IN ({}) \
-                     AND json_extract(c.attestation_envelope, '$.{}') = fa.attestation_id)",
-                ph.join(","),
-                crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID
-            ));
+        // lifecycle: exclude rows retracted by a still-hiding composer (the
+        // one predicate, CIRISPersist#720; the composer-target path is the
+        // ONE envelope-path constant, #495 C2; an admitted retraction hides
+        // whoever authored it, #945).
+        if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
+            filter.lifecycle,
+            crate::federation::attestation_query::Dialect::Sqlite,
+            "fa",
+            binds.len() + 1,
+        ) {
+            binds.extend(types.into_iter().map(SqlValue::Text));
+            parts.push(sql);
         }
         if let Some(c) = &cursor {
             if c.version != "v1" {
@@ -21833,7 +21816,7 @@ fn sqlite_row_to_hard_case_event(
 /// minted by `federation::key_plane` from the signed object it carries) in
 /// the caller's transaction, with its serve position. `INSERT OR IGNORE`: one
 /// signed object, one id, so a re-insert is a no-op.
-fn sqlite_insert_plane_row(
+pub(crate) fn sqlite_insert_plane_row(
     tx: &rusqlite::Connection,
     row: &crate::federation::Attestation,
 ) -> Result<usize, rusqlite::Error> {
@@ -23626,7 +23609,9 @@ fn sqlite_task_class_having(classes: &[crate::ceg::TaskClass]) -> String {
 /// Decode a `trace_llm_calls` row into a typed [`TraceLlmCallRow`].
 /// Mirrors `pg_row_to_llm_call_row`; the SELECT must alias every
 /// column read here.
-fn sqlite_row_to_llm_call_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TraceLlmCallRow> {
+pub(crate) fn sqlite_row_to_llm_call_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<TraceLlmCallRow> {
     use crate::schema::{LlmCallStatus, ReasoningEventType};
     let parent_event_type_str: String = row.get("parent_event_type")?;
     let parent_event_type = ReasoningEventType::from_wire_str(&parent_event_type_str)
@@ -25432,32 +25417,14 @@ impl crate::read::ReadEngine for SqliteBackend {
         // composer from the same attester; this read took the filter and
         // dropped the axis, so every drive listing showed withdrawn and
         // replaced files. The same fold `list_scores` applies.
-        {
-            use crate::read::LifecycleView;
-            let hide: &[&str] = match filter.lifecycle {
-                LifecycleView::Live => &["supersedes", "withdraws", "recants"],
-                LifecycleView::IncludeSuperseded => &["withdraws", "recants"],
-                LifecycleView::IncludeWithdrawn => &["supersedes", "recants"],
-                LifecycleView::IncludeRecanted => &["supersedes", "withdraws"],
-                LifecycleView::All => &[],
-            };
-            if !hide.is_empty() {
-                let mut ph: Vec<String> = Vec::new();
-                for ty in hide {
-                    binds.push(SqlValue::Text((*ty).to_string()));
-                    ph.push(format!("?{}", binds.len()));
-                }
-                parts.push(format!(
-                    "NOT EXISTS (SELECT 1 FROM federation_attestations c \
-                       WHERE (c.attesting_key_id = federation_attestations.attesting_key_id \
-                              OR c.withdraws_admission_rule IS NOT NULL) \
-                         AND c.attestation_type IN ({}) \
-                         AND json_extract(c.attestation_envelope, '$.{}') = \
-                             federation_attestations.attestation_id)",
-                    ph.join(","),
-                    crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID
-                ));
-            }
+        if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
+            filter.lifecycle,
+            crate::federation::attestation_query::Dialect::Sqlite,
+            "federation_attestations",
+            binds.len() + 1,
+        ) {
+            binds.extend(types.into_iter().map(SqlValue::Text));
+            parts.push(sql);
         }
         if let Some(c) = &cursor {
             if c.version != "v1" {
@@ -29297,7 +29264,7 @@ mod accord_tests {
     }
 
     /// v21.14.0 (CIRISPersist#534) — the accord-conferral test helpers must
-    /// work on SQLITE, not just MemoryBackend. Before #534 this failed at
+    /// work on SQLITE, not just the (since retired) memory backend. Before #534 this failed at
     /// `register_accord_holder`'s non-hex `test-anchor` (sqlite hex-decodes the
     /// column) and then starved roster resolution to 0 valid co-scrubs — the
     /// exact "tested on one backend, used on the other" gap #518 flagged. This
@@ -54748,9 +54715,9 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
     /// `list_signed_families_since` and feeds it to a SECOND directory's
     /// `put_family`, whose `verify_family_admission` is the same gate every
     /// real peer runs. Same discipline as
-    /// `promoted_row_crosses_to_a_peer_*_649`; the peer is a `MemoryBackend`
-    /// because the property is backend-independent and the point is that the
-    /// two corpora are genuinely separate.
+    /// `promoted_row_crosses_to_a_peer_*_649`; the peer is a second in-memory
+    /// SQLite (`test_backend`) because the property is backend-independent and
+    /// the point is that the two corpora are genuinely separate.
     #[tokio::test]
     async fn superseded_family_crosses_to_a_peer_sqlite_651() {
         use crate::federation::tier_ingest::test_support as ts;
@@ -54759,7 +54726,7 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
 
         let origin = SqliteBackend::open_in_memory().await.unwrap();
         origin.run_migrations().await.unwrap();
-        let peer = crate::store::memory::MemoryBackend::new();
+        let peer = crate::store::test_backend::test_backend();
 
         let authority = "fam651-authority";
         let fam_key = "fam651-key";
@@ -54943,10 +54910,9 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
 
     /// v31.0.0 (CIRISPersist#656) — the SQLITE leg of the `put_blob` witness.
     ///
-    /// **Two backends, not three: `MemoryBackend` implements no
-    /// `BlobStorage`,** so there is no memory door to gate. Stated here rather
-    /// than left as a silently-absent leg, because "the third leg is missing"
-    /// and "the third door does not exist" look identical from a test list, and
+    /// **Two backends:** sqlite and postgres are the `BlobStorage` backends.
+    /// Stated here because "a leg is missing" and "the door does not exist"
+    /// look identical from a test list, and
     /// this release has twice been bitten by the first wearing the second's
     /// clothes.
     #[tokio::test]

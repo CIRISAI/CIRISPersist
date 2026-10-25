@@ -37,7 +37,7 @@
 //! - **I974** — the Engine door end to end (sqlite, postgres): the producer
 //!   route through the Engine the Python surface calls.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::attestation_admit::AttestationStore;
     use crate::federation::silo_projection::{check_projection_rebuild, SiloProjection};
@@ -1034,7 +1034,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     use super::bodies;
 
@@ -1047,13 +1047,6 @@ mod run {
             mod $name {
                 #[allow(unused_imports)]
                 use super::*;
-
-                #[tokio::test(flavor = "multi_thread")]
-                async fn memory() {
-                    let $b = crate::store::memory::MemoryBackend::new();
-                    let $t = tag(concat!(stringify!($name), "m"));
-                    $body
-                }
 
                 #[cfg(feature = "sqlite")]
                 #[tokio::test(flavor = "multi_thread")]
@@ -1111,19 +1104,6 @@ mod run {
         b.set_node_key_id(&node.id);
         bodies::i968_the_carve_out_stays(&b, &t).await;
     });
-
-    // I967 — the producer key's record expired (a per-backend seam).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i967_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        let t = tag("i967m");
-        let node = bodies::signing_node(&b, &t).await;
-        b.set_node_key_id(&node.id);
-        let agent = format!("{t}-agent");
-        let (row, producer) = bodies::i967_seed(&b, &t, &agent, false).await;
-        b.test_expire_key(&producer);
-        bodies::i967_refused_with_reason(&b, &agent, &row).await;
-    }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread")]
@@ -1183,17 +1163,6 @@ mod run {
     on_every_backend!(i973, |b, t| {
         bodies::i973_a_digest_named_subject(&b, &t).await;
     });
-
-    // I971 — two stores of one backend kind.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i971_memory() {
-        let a = crate::store::memory::MemoryBackend::new();
-        let b = crate::store::memory::MemoryBackend::new();
-        let t = tag("i971m");
-        let na = bodies::signing_node(&a, &format!("{t}a")).await;
-        a.set_node_key_id(&na.id);
-        bodies::i971_the_tombstone_delivered(&a, &b, &na, &t).await;
-    }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread")]

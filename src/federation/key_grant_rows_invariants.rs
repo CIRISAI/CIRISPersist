@@ -28,16 +28,17 @@
 
 #![cfg(test)]
 
-/// I746 (memory) — a held retired carrier (a v54 SET row, planted below the
+/// I746 (sqlite; v60 #1002 moved it off the retired memory backend) — a held retired carrier (a v54 SET row, planted below the
 /// door) is never served by the since-read, under `Report`; a row planted
 /// the same way of a registered type is (the control).
-mod memory_serve {
+#[cfg(feature = "sqlite")]
+mod sqlite_serve {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::FederationDirectory;
 
     #[tokio::test]
-    async fn i746_memory_never_serves_a_held_retired_carrier() {
-        let m = crate::store::memory::MemoryBackend::new();
+    async fn i746_never_serves_a_held_retired_carrier() {
+        let m = crate::store::test_backend::test_backend();
         let control = ts::owner_binding_attestation("i746-control", "i746-owner", "i746-node");
         let mut set = ts::owner_binding_attestation("i746-set", "i746-owner", "i746-node");
         set.attestation_type = crate::federation::key_grant::KEY_GRANT_EPOCH_DIMENSION.into();
@@ -324,7 +325,6 @@ pub(crate) mod directory {
             }
         };
     }
-    runners!(memory, async { Some(crate::store::MemoryBackend::new()) });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

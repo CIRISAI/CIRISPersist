@@ -530,11 +530,6 @@ pub(crate) mod live_fold {
             }
         };
     }
-    runners!(
-        memory,
-        async { Some(crate::store::memory::MemoryBackend::new()) },
-        false
-    );
     #[cfg(feature = "sqlite")]
     runners!(
         sqlite,
@@ -827,8 +822,9 @@ pub(crate) mod owner_withdraw {
     /// the read. The helper must still return a binding it saw live, and
     /// that binding must then lapse.
     #[tokio::test]
+    #[cfg(feature = "sqlite")]
     async fn i126_lapsing_binding_survives_a_put_slower_than_its_window() {
-        let d = crate::store::memory::MemoryBackend::new();
+        let d = crate::store::test_backend::test_backend();
         let d = &d as &dyn FederationDirectory;
         let s = suffix();
         let (owner, node) = (format!("ow-owner-{s}"), format!("ow-node-{s}"));
@@ -859,9 +855,6 @@ pub(crate) mod owner_withdraw {
             }
         };
     }
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

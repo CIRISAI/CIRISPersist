@@ -18,7 +18,7 @@
 //!
 //! [`FOLD_PAGE`]: crate::federation::attestation_query::FOLD_PAGE
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::attestation_query::FOLD_PAGE;
     use crate::federation::read_probe::{self, Read};
@@ -370,7 +370,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     macro_rules! runners {
         ($modname:ident, $fresh:expr) => {
@@ -410,18 +410,6 @@ mod runners {
                 }
             }
         };
-    }
-
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
-
-    /// I909 needs a directory that knows its node key.
-    #[tokio::test]
-    async fn i909_memory() {
-        let d = crate::store::memory::MemoryBackend::new();
-        d.set_node_key_id("i909-node");
-        super::bodies::i909_identity_fact_folds_read_bounded(&d).await;
     }
 
     #[cfg(feature = "sqlite")]

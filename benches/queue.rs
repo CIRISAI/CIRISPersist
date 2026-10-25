@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use ciris_keyring::HardwareSigner;
 use ciris_persist::scrub::NullScrubber;
-use ciris_persist::store::MemoryBackend;
 use ciris_persist::verify::PythonJsonDumpsCanonicalizer;
 use ciris_persist::{spawn_persister, Journal, DEFAULT_QUEUE_DEPTH};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -64,7 +63,7 @@ fn queue_submit_throughput(c: &mut Criterion) {
                         // journal — redb opens fast (~ms).
                         let dir = tempfile::tempdir().unwrap();
                         let journal = Arc::new(Journal::open(dir.path().join("j.redb")).unwrap());
-                        let backend = Arc::new(MemoryBackend::new());
+                        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
                         backend.add_public_key("agent-bench", sk.verifying_key());
                         let signer = Arc::<dyn HardwareSigner>::from(common::test_signer());
                         let (handle, persister) = spawn_persister(

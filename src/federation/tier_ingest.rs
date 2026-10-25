@@ -5056,15 +5056,6 @@ mod tests {
         );
     }
 
-    /// QualReview (LOW): the gate runs on the MEMORY backend in production
-    /// (`put_attestation` calls `verify_federation_tier_ingest`), so test the
-    /// matrix directly against it too — no engine DSN dispatches to memory.
-    #[tokio::test]
-    async fn tier_ingest_matrix_memory() {
-        let backend = crate::store::memory::MemoryBackend::new();
-        run_tier_ingest_matrix(&backend, "memory").await;
-    }
-
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn tier_ingest_matrix_sqlite() {

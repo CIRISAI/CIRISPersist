@@ -31,21 +31,31 @@
 //!   asserted at its own `scrub_timestamp`; one that cannot stays held
 //!   without a row and the gate names it.
 
+/// The pure fixtures `bodies` and the backend-free unit tests share.
 #[cfg(test)]
-pub(crate) mod bodies {
-    use crate::federation::attestation_admit::AttestationStore;
-    use crate::federation::key_plane::{self, KeyPlaneFamily};
+pub(crate) mod pure {
     use crate::federation::register::test_support::authority_signed_record;
-    use crate::federation::silo_projection::{check_projection_rebuild, SiloProjection};
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::{attestation_type, identity_type, Attestation, KeyRecord};
-    use crate::federation::{FederationDirectory, SignedAttestation, SignedKeyRecord};
+    use crate::federation::types::{identity_type, KeyRecord};
 
     /// A record of `key_id` that proves possession (signed by the key itself).
     pub(crate) fn pop_record(key_id: &str) -> KeyRecord {
         let (ed, mldsa) = ts::hybrid_pubkeys(key_id);
         authority_signed_record(key_id, identity_type::USER, &ed, mldsa.as_deref(), key_id)
     }
+}
+
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod bodies {
+    use crate::federation::attestation_admit::AttestationStore;
+    use crate::federation::key_plane::{self, KeyPlaneFamily};
+    use crate::federation::register::test_support::authority_signed_record;
+    use crate::federation::silo_projection::{check_projection_rebuild, SiloProjection};
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::types::{attestation_type, identity_type, Attestation};
+    use crate::federation::{FederationDirectory, SignedAttestation, SignedKeyRecord};
+
+    pub(crate) use super::pure::pop_record;
 
     /// Every row on the plane of `family`.
     pub(crate) async fn rows_of(
@@ -423,7 +433,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     use super::bodies;
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -435,44 +445,6 @@ mod run {
 
     fn tag(n: &str) -> String {
         format!("{n}-{}", uuid::Uuid::new_v4().simple())
-    }
-
-    // ── memory ─────────────────────────────────────────────────────────
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i975_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        bodies::i975_key_records_are_rows(&b, &tag("i975m")).await;
-        bodies::i975_red_on_a_key_without_a_row(&b, &tag("i975m")).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i976_memory() {
-        let (a, f) = (
-            crate::store::memory::MemoryBackend::new(),
-            crate::store::memory::MemoryBackend::new(),
-        );
-        bodies::i976_proof_of_possession(&a, &f, &tag("i976m")).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i977_memory() {
-        let (a, f) = (
-            crate::store::memory::MemoryBackend::new(),
-            crate::store::memory::MemoryBackend::new(),
-        );
-        bodies::i977_order_rule(&a, &f, &tag("i977m")).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i978_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        bodies::i978_revocations(&b, &tag("i978m")).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i979_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        bodies::i979_occurrences(&b, &tag("i979m")).await;
     }
 
     // ── sqlite ─────────────────────────────────────────────────────────

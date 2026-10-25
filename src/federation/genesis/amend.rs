@@ -103,6 +103,7 @@ impl AmendState {
     ///
     /// [`AMEND_INPUT_REFUSED`] when the pinned input does not verify or does
     /// not parse.
+    #[cfg(feature = "sqlite")]
     pub async fn plan(
         pinned_json: &str,
         serve_transport_destinations: Vec<SignedTransportDestination>,
@@ -240,6 +241,7 @@ impl AmendState {
     ///
     /// As [`Self::assemble`]; [`AMEND_INPUT_REFUSED`] when the amended bundle
     /// does not verify.
+    #[cfg(feature = "sqlite")]
     pub async fn finish(&self) -> Result<AmendFinished, AmendRefused> {
         let bundle = self.assemble()?;
         let bundle_json = serde_json::to_string_pretty(&bundle)

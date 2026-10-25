@@ -31,7 +31,7 @@
 //!   goal's `attestation_id`: the matcher binds it, and an approach row
 //!   naming a held goal is admitted.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::attestation_admit::AttestationStore;
     use crate::federation::envelope::EnvelopeCore;
@@ -753,7 +753,7 @@ pub(crate) mod engine_bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     use super::bodies as b;
 
@@ -782,12 +782,6 @@ mod run {
         Some(p)
     }
 
-    #[tokio::test]
-    async fn i1178_memory() {
-        let m = crate::store::memory::MemoryBackend::new();
-        b::i1178_goals_are_the_projection_of_goal_rows(&m, &tag()).await;
-    }
-
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i1178_sqlite() {
@@ -801,12 +795,6 @@ mod run {
         b::i1178_goals_are_the_projection_of_goal_rows(&p, &tag()).await;
     }
 
-    #[tokio::test]
-    async fn i1179_memory() {
-        let m = crate::store::memory::MemoryBackend::new();
-        b::i1179_m1_is_the_admission_gate(&m, &tag()).await;
-    }
-
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i1179_sqlite() {
@@ -818,12 +806,6 @@ mod run {
     async fn i1179_postgres() {
         let Some(p) = postgres().await else { return };
         b::i1179_m1_is_the_admission_gate(&p, &tag()).await;
-    }
-
-    #[tokio::test]
-    async fn i1182_memory() {
-        let m = crate::store::memory::MemoryBackend::new();
-        b::i1182_an_approach_keys_on_the_goal_row(&m, &tag()).await;
     }
 
     #[cfg(feature = "sqlite")]

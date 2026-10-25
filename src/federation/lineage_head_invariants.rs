@@ -31,7 +31,7 @@
 //!   check on both arms.
 //! - **I449** a key root (no lineage record) keeps its self-charter.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::canonical_community::{
         charter_in_force, charter_members_for, HeadCharter,
@@ -675,11 +675,7 @@ mod pure {
     /// commented-out call cannot pass.
     #[test]
     fn i448_every_backend_runs_the_prev_check_on_both_arms() {
-        for file in [
-            "src/store/memory.rs",
-            "src/store/sqlite.rs",
-            "src/store/postgres.rs",
-        ] {
+        for file in ["src/store/sqlite.rs", "src/store/postgres.rs"] {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
             let text = std::fs::read_to_string(&path).unwrap();
             let start = text
@@ -728,7 +724,7 @@ mod pure {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     use super::bodies;
 
@@ -793,7 +789,6 @@ mod run {
             }
         };
     }
-    runners!(memory, async { Some(crate::store::MemoryBackend::new()) });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

@@ -25,6 +25,13 @@
 // (`future_size_gate`) measures the futures persist hands OUT, which this
 // lint cannot see.
 #![warn(clippy::large_futures)]
+// v60.0.0 (CIRISPersist#1002) — a build with NO backend feature compiles the
+// shared plans and doors (attestation_admit, accord_quorum, key_plane, ...)
+// with nothing to run them: every caller is a backend, and the in-process
+// memory backend that used to call them in every build is retired. Dead code
+// there is the shape of the build, not a defect; every build WITH a backend
+// still denies it.
+#![cfg_attr(not(any(feature = "postgres", feature = "sqlite")), allow(dead_code))]
 
 //! ciris-persist — unified Rust persistence for the CIRIS federation.
 //!

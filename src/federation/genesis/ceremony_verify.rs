@@ -20,7 +20,9 @@
 //! against the family this build seeds and against every holder's signature.
 //! A refusal is reported by the stage it came from, with the door's own words.
 
+#[cfg(feature = "sqlite")]
 use super::{BakeItemOutcome, GenesisBundle};
+#[cfg(feature = "sqlite")]
 use crate::federation::FederationDirectory as _;
 
 /// Which stage refused. The wire token is [`Self::as_str`].
@@ -84,6 +86,7 @@ impl std::fmt::Display for CeremonyOutputsRefused {
 
 impl std::error::Error for CeremonyOutputsRefused {}
 
+#[cfg(feature = "sqlite")]
 fn refused(
     reason: CeremonyOutputsRefusal,
     detail: impl std::fmt::Display,
@@ -114,9 +117,13 @@ pub struct CeremonyOutputsVerified {
 /// roster, through the ordinary doors, on a throwaway in-memory directory.
 /// Nothing outside that directory is read or written.
 ///
+/// v60.0.0 (CIRISPersist#1002): the throwaway directory is an in-memory
+/// SQLite node (the memory backend is retired), so this needs `sqlite`.
+///
 /// # Errors
 ///
 /// [`CeremonyOutputsRefused`] naming the stage; see the module doc.
+#[cfg(feature = "sqlite")]
 pub async fn verify_ceremony_outputs(
     bundle_json: &str,
 ) -> Result<CeremonyOutputsVerified, CeremonyOutputsRefused> {
@@ -159,7 +166,25 @@ pub async fn verify_ceremony_outputs(
     check_family_record(&bundle, &roster).map_err(|d| refused(R::FamilyRecord, d))?;
 
     // A fresh node: the holders and the accord family, nothing else.
-    let dir = crate::store::memory::MemoryBackend::new();
+    // v60.0.0 (CIRISPersist#1002) — an in-memory SQLite node, migrated: the
+    // retired memory backend is no longer the scratch directory.
+    let dir = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .map_err(|e| {
+            refused(
+                R::HolderRosterMismatch,
+                format!("open the scratch directory: {e}"),
+            )
+        })?;
+    {
+        use crate::store::Backend as _;
+        dir.run_migrations().await.map_err(|e| {
+            refused(
+                R::HolderRosterMismatch,
+                format!("migrate the scratch directory: {e}"),
+            )
+        })?;
+    }
     dir.seed_genesis_accord_holders(&roster)
         .await
         .map_err(|e| refused(R::HolderRosterMismatch, format!("seed holders: {e}")))?;
@@ -225,6 +250,7 @@ pub async fn verify_ceremony_outputs(
 /// same founders, protocol, entrenchment and instant, naming the bundle's own
 /// charter), signed over its signing
 /// envelope by EVERY holder of this build's roster (the founding rule).
+#[cfg(feature = "sqlite")]
 fn check_family_record(
     bundle: &GenesisBundle,
     roster: &[crate::federation::SignedKeyRecord],

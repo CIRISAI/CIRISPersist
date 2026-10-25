@@ -494,7 +494,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
     use crate::federation::types::{attestation_tier, attestation_type};
@@ -727,8 +727,8 @@ mod tests {
         env
     }
 
-    async fn memory_with_author(author: &str) -> crate::store::MemoryBackend {
-        let dir = crate::store::MemoryBackend::new();
+    async fn test_backend_with_author(author: &str) -> crate::store::sqlite::SqliteBackend {
+        let dir = crate::store::test_backend::test_backend();
         crate::federation::tier_ingest::test_support::register_hybrid_key(&dir, author).await;
         dir
     }
@@ -738,7 +738,7 @@ mod tests {
     #[tokio::test]
     async fn apply_fresh_row_is_inserted() {
         let author = "att-apply-ins-author";
-        let dir = memory_with_author(author).await;
+        let dir = test_backend_with_author(author).await;
         let row = sealed_row(
             &uuid::Uuid::new_v4().to_string(),
             author,
@@ -762,7 +762,7 @@ mod tests {
     #[tokio::test]
     async fn apply_identical_reoffer_is_unchanged() {
         let author = "att-apply-unch-author";
-        let dir = memory_with_author(author).await;
+        let dir = test_backend_with_author(author).await;
         let row = sealed_row(
             &uuid::Uuid::new_v4().to_string(),
             author,
@@ -802,7 +802,7 @@ mod tests {
     #[tokio::test]
     async fn apply_conflicting_row_is_refused_pre_write() {
         let author = "att-apply-conf-author";
-        let dir = std::sync::Arc::new(memory_with_author(author).await);
+        let dir = std::sync::Arc::new(test_backend_with_author(author).await);
         let id = uuid::Uuid::new_v4().to_string();
         let first = sealed_row(
             &id,
@@ -868,7 +868,7 @@ mod tests {
     #[tokio::test]
     async fn apply_resigned_same_assertion_is_already_present() {
         let author = "att-apply-dup-author";
-        let dir = memory_with_author(author).await;
+        let dir = test_backend_with_author(author).await;
         let row = sealed_row(
             &uuid::Uuid::new_v4().to_string(),
             author,
@@ -915,7 +915,7 @@ mod tests {
     #[tokio::test]
     async fn apply_without_a_plan_maps_duplicate_key_to_store_conflict() {
         let author = "att-apply-race-author";
-        let dir = std::sync::Arc::new(memory_with_author(author).await);
+        let dir = std::sync::Arc::new(test_backend_with_author(author).await);
         let id = uuid::Uuid::new_v4().to_string();
         let first = sealed_row(
             &id,
@@ -1009,7 +1009,7 @@ mod tests {
     #[tokio::test]
     async fn a_generic_get_failure_propagates_and_does_not_degrade_624() {
         let author = "att-apply-geterr-author";
-        let dir = std::sync::Arc::new(memory_with_author(author).await);
+        let dir = std::sync::Arc::new(test_backend_with_author(author).await);
         let failing = crate::federation::directory_double::FaultInjectingDirectory::new(
             dir.clone() as std::sync::Arc<dyn FederationDirectory>,
         )
@@ -1041,7 +1041,7 @@ mod tests {
     #[tokio::test]
     async fn apply_composer_replay_is_deduplicated() {
         let author = "att-apply-dedup-author";
-        let dir = memory_with_author(author).await;
+        let dir = test_backend_with_author(author).await;
 
         // The target the withdraws retracts — the author's own row (rule 1:
         // the producer's own retraction).

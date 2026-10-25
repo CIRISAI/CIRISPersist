@@ -24,8 +24,6 @@
 //!   `SqliteBackend::read_measured`.
 //! - postgres: the octet length of the TEXT column (V122) as received, read
 //!   from the row buffer before decode (`pg_envelope_bytes`).
-//! - memory: `0`. The memory backend holds parsed envelopes, no serialized
-//!   form, and measuring one would mean re-serializing.
 //!
 //! A door that filters after decode (the live consent-grant reads drop rows
 //! whose envelope names another dimension) counts the bytes it decoded, which
@@ -83,8 +81,6 @@ macro_rules! label_set {
 label_set! {
     /// The storage backend a door read ran on.
     StoreBackend {
-        /// The in-process memory backend.
-        Memory => "memory",
         /// The SQLite backend.
         Sqlite => "sqlite",
         /// The PostgreSQL backend.

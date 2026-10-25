@@ -302,9 +302,6 @@ mod run {
             }
         };
     }
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;
@@ -621,7 +618,6 @@ mod run {
         const KEY_PLANE: &str = include_str!("key_plane.rs");
         const SQLITE: &str = include_str!("../store/sqlite.rs");
         const PG: &str = include_str!("../store/postgres.rs");
-        const MEM: &str = include_str!("../store/memory.rs");
         const PYO3: &str = include_str!("../ffi/pyo3.rs");
         const ENGINE: &str = include_str!("../engine.rs");
         assert_eq!(
@@ -630,11 +626,7 @@ mod run {
             1,
             "I103: the plan produces Rebind in exactly one place"
         );
-        for (name, text) in [
-            ("sqlite.rs", SQLITE),
-            ("postgres.rs", PG),
-            ("memory.rs", MEM),
-        ] {
+        for (name, text) in [("sqlite.rs", SQLITE), ("postgres.rs", PG)] {
             let body = text
                 .split("fn store_rebound_key_record(")
                 .nth(1)

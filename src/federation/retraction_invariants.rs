@@ -8,7 +8,7 @@
 //!   still does (rule 2, the control). One predicate decides both the door
 //!   and the fold (`precedence::retraction_entitled`).
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::precedence::retired_ids;
     use crate::federation::tier_ingest::test_support as ts;
@@ -284,7 +284,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
@@ -315,10 +315,6 @@ mod runners {
             }
         };
     }
-
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
 
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {

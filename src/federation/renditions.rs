@@ -234,7 +234,7 @@ pub async fn check_rendition_placement<B: HeldBlobScope + ?Sized>(
 /// and the retraction fold, run by memory, sqlite and postgres from
 /// [`runs`] and from each backend's projection-helper test (the helper is
 /// backend-specific; what it feeds is not).
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod witnesses {
     use super::{HolderClaim, Rendition};
     use crate::federation::media_source_invariants::bodies::{hex64, media_row, put, row};
@@ -559,7 +559,7 @@ pub(crate) mod witnesses {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runs {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
@@ -593,9 +593,6 @@ mod runs {
             }
         };
     }
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

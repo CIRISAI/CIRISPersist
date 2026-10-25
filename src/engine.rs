@@ -3895,7 +3895,7 @@ impl Engine {
     /// the `ciris-canonical` birth — through the same function the boot seed
     /// uses. This node's own genesis posture is not changed. See
     /// [`crate::federation::genesis::install_genesis_bundle_roster`].
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[cfg(feature = "sqlite")]
     pub async fn install_genesis_bundle_roster(
         &self,
         bundle: &crate::federation::genesis::GenesisBundle,
@@ -20766,6 +20766,7 @@ mod tests {
     /// all: verify refused any prior protocol that was not `quorum:M/N`), and
     /// the `unanimous` refusal was admitted on a majority. Each refusal leaves
     /// the live record untouched.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn quorum_supersede_protocol_decides_body(
         d: &dyn crate::federation::FederationDirectory,
         s: &str,
@@ -21122,12 +21123,6 @@ mod tests {
             d.lookup_family(&fam).await.unwrap().unwrap().members.len(),
             2
         );
-    }
-
-    #[tokio::test]
-    async fn quorum_supersede_protocol_decides_memory() {
-        let d = crate::store::memory::MemoryBackend::new();
-        quorum_supersede_protocol_decides_body(&d, "mem").await;
     }
 
     #[cfg(feature = "sqlite")]

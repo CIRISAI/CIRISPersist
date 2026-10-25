@@ -19,7 +19,7 @@
 //! tag persist vendors), pinned as "named by no CC text at the pin" in
 //! `namespace::cc_manifests` I1308 until the next CC re-pin.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::malformed_row;
     use crate::federation::tier_ingest::test_support as ts;
@@ -155,7 +155,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod tests {
     use super::bodies;
 
@@ -167,12 +167,6 @@ mod tests {
         ($name:ident, $body:path) => {
             mod $name {
                 use super::*;
-
-                #[tokio::test(flavor = "multi_thread")]
-                async fn memory() {
-                    let b = crate::store::memory::MemoryBackend::new();
-                    $body(&b, &tag("m")).await;
-                }
 
                 #[cfg(feature = "sqlite")]
                 #[tokio::test(flavor = "multi_thread")]

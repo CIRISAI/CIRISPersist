@@ -345,7 +345,7 @@ mod pure {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::USER;
@@ -668,7 +668,6 @@ pub(crate) mod bodies {
             }
         };
     }
-    runners!(memory, async { Some(crate::store::MemoryBackend::new()) });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

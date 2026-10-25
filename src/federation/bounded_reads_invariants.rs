@@ -39,7 +39,7 @@
 //!
 //! [`OwnerAudience`]: crate::federation::replication_audience::OwnerAudience
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use std::collections::{BTreeSet, HashSet};
 
@@ -1803,7 +1803,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
@@ -1835,12 +1835,6 @@ mod runners {
             }
         };
     }
-
-    runners!(
-        memory,
-        async { Some(crate::store::memory::MemoryBackend::new()) },
-        []
-    );
 
     #[cfg(feature = "sqlite")]
     runners!(

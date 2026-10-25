@@ -26,7 +26,7 @@
 //!   the delivery attestation lands on a held announcement row and is refused
 //!   for one not held.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::cirisnode::rows::{self, refusal};
     use crate::cirisnode::types::{Cell, ContributionType};
@@ -742,14 +742,9 @@ pub(crate) mod engine_bodies {
 
 #[cfg(test)]
 mod run {
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn tag() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..8].to_owned()
-    }
-
-    #[tokio::test]
-    async fn i1167_memory() {
-        let m = crate::store::memory::MemoryBackend::new();
-        super::bodies::i1167_each_class_is_an_admitted_row(&m, &tag()).await;
     }
 
     #[cfg(feature = "sqlite")]

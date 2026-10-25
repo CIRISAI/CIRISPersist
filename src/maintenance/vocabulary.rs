@@ -1313,13 +1313,6 @@ mod sweep_tests {
         )
     }
 
-    #[tokio::test]
-    async fn tightening_supersedes_and_is_idempotent_memory() {
-        let dir = crate::store::MemoryBackend::new();
-        let (mine, theirs) = signers("mem");
-        tighten_body(&dir, &mine, &theirs, "mem").await;
-    }
-
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn tightening_supersedes_and_is_idempotent_sqlite() {
