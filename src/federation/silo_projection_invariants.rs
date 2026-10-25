@@ -749,6 +749,36 @@ mod run {
         );
     }
 
+    /// The other red: a projection row no attestation produces (an orphan).
+    /// Until v60.0.0 only the retired memory backend witnessed it (#1002).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i960_sqlite_red_on_an_orphan_projection_row() {
+        let b = sqlite().await;
+        let t = tag("i960so");
+        let node = format!("{t}-node");
+        bodies::register_node(&b, &node).await;
+        b.set_node_key_id(&node);
+        bodies::i960_hard_case(&b, &node, &t).await;
+        // RED: a copy of a live row under ids no row produces, planted below
+        // the foreign key that keeps a door from writing one (the corruption
+        // this rebuild exists to see).
+        b.test_execute(&format!(
+            "PRAGMA foreign_keys = OFF; \
+             CREATE TEMP TABLE i960_orphan AS SELECT * FROM hard_case_events LIMIT 1; \
+             UPDATE i960_orphan SET event_id = '{t}-orphan', attestation_id = '{t}-orphan'; \
+             INSERT INTO hard_case_events SELECT * FROM i960_orphan; \
+             PRAGMA foreign_keys = ON;"
+        ))
+        .await;
+        assert!(
+            check_projection_rebuild(&b, SiloProjection::HardCaseEvents)
+                .await
+                .is_err(),
+            "I960 sqlite: an entry no row produces is red"
+        );
+    }
+
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread")]
     async fn i961_sqlite() {
