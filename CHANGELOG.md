@@ -750,7 +750,10 @@ payload's four sets before signing.
   chokepoint re-runs the payload gate; **I1230**, **I1234** (unit) the term
   lens and the grandfather ruling; **I1231** the term gate; **I1232** the
   walks read `role_term`; **I1233** (sqlite engine) the producer doors;
-  **I1235** the promotion chokepoint re-runs the term gate. Python:
+  **I1235** the promotion chokepoint re-runs the term gate; **I1225** (unit)
+  W's boundary. Extended: I972 (a licensee files), I313 (the stream read
+  keeps a wrap only from a sealer with standing at its row's instant), I798
+  (its duty edge carries a term). Python:
   `tests/python/test_affiliation_surface.py`.
 - Mutation scope `scripts/mutants/scope-s6-affiliations.txt`: 217 mutants,
   five weekly shards in `mutants.yml`.

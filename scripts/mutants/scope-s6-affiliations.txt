@@ -27,9 +27,13 @@
 #   `check_delegation_term_admission`, `licensure_role_term_at`,
 #   `affiliation_role_term_at`, `AffiliationConfig::role_term_seconds`, the
 #   producer doors) against I1230-I1235.
+# - Neighbouring witnesses the sites need (found by rounds 1-2): I972 (the
+#   reconsideration community check), I126 (`v51_invariants`, the in-force
+#   owner fold), I313 (the stream read through the owner's device), I1225
+#   (W's boundary).
 #
 # Grammar: docs/MUTATION_TESTING.md "Scope files".
-tests: test(/affiliation_licence_invariants::|delegation_term_invariants::|i1233_|licensure_chain_invariants::|grant_scope_invariants::|key_grant_invariants::|affiliation_config::|reconsideration|withdraws|self_roster::|owner_binding|stream_grant|i972|v51_invariants::/)
+tests: test(/affiliation_licence_invariants::|delegation_term_invariants::|i1233_|licensure_chain_invariants::|grant_scope_invariants::|key_grant_invariants::|affiliation_config::|reconsideration|withdraws|self_roster::|owner_binding|stream_grant|i972|v51_invariants::|i313/)
 
 src/federation/admission.rs community_quorum_cosigned_at quorum_licence_reach licence_roots_at licensure_issuance_at emitter_resolves_to_authority check_licensure_delegator_is_authority licence_authority_set check_partner_record_revision check_licence_audience resolve_withdraws_admission_rule_at check_reconsideration_admission check_owner_binding_affiliation_admission owner_bindings_in_force_at affiliation_of_binding delegation_term_live_at bound_breach is_term_bearing_edge delegation_term_adopted_at check_delegation_term_admission licensure_role_term_at affiliation_role_term_at grant_chain_instant check_consent_for_key_admission read stamp
 src/federation/operational.rs sets canonicalize_sets jcs_string_order check_partner_record_sets partner_record_of check_licence_payload

@@ -1080,10 +1080,15 @@ pub(crate) async fn stream_grant_row_instants(
             let Ok(parsed) = KeyGrantRow::from_attestation(&row) else {
                 continue;
             };
-            if parsed.recipient() == viewer_key_id
-                && matches!(&parsed.axis, KeyGrantAxis::Stream { stream_id: s, epoch: e, .. }
-                    if s == stream_id && *e == epoch)
-            {
+            let KeyGrantAxis::Stream {
+                stream_id: s,
+                epoch: e,
+                ..
+            } = &parsed.axis
+            else {
+                continue;
+            };
+            if (parsed.recipient(), s.as_str(), *e) == (viewer_key_id, stream_id, epoch) {
                 out.push(row.asserted_at);
             }
         }

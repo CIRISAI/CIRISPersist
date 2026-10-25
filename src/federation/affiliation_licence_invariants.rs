@@ -43,6 +43,7 @@
 //!   postgres nodes; see `grant_scope_invariants::key_grant_arms`).
 //! - **I1222** (pure) — the JCS order of a set is UTF-16, not byte order.
 //! - **I1223** — the promotion chokepoint re-runs the payload gate.
+//! - **I1225** (pure) — W is a closed window at its boundary.
 
 /// The backend-agnostic witness bodies; `run` instantiates them per backend.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -1580,6 +1581,34 @@ mod jcs_order {
         r.canonicalize_sets();
         assert_eq!(r.capabilities_granted, vec!["a", "b", astral, high_bmp]);
         assert!(check_partner_record_sets(&r).is_ok());
+        // The refusal says which defect it is. Kills: the repeat / order
+        // wording swapped.
+        let says = |v: &[&str]| check_partner_record_sets(&rec(v)).unwrap_err().to_string();
+        assert!(says(&["a", "a"]).contains("repeats"), "a repeat is named");
+        assert!(
+            says(&["b", "a"]).contains("is out of order after"),
+            "an inversion is named"
+        );
+    }
+
+    /// **I1225** (pure) — W's boundary: a row signed exactly W ago is inside
+    /// the window; one a nanosecond older is outside. Kills: the bound read
+    /// inclusively.
+    #[test]
+    fn i1225_w_is_a_closed_window() {
+        use crate::federation::self_roster::{
+            outside_past_freshness_window, PAST_FRESHNESS_W_SECS,
+        };
+        let now = chrono::Utc::now();
+        let w = chrono::Duration::seconds(PAST_FRESHNESS_W_SECS);
+        assert!(
+            !outside_past_freshness_window(now - w, now),
+            "exactly W ago"
+        );
+        assert!(
+            outside_past_freshness_window(now - w - chrono::Duration::nanoseconds(1), now),
+            "a nanosecond older"
+        );
     }
 }
 

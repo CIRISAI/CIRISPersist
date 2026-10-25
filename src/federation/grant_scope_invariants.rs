@@ -839,6 +839,19 @@ pub mod key_grant_arms {
                 .is_none(),
             "{tag} I1221: a refused row projects nothing"
         );
+        // A row whose attester is not its signer speaks for no one. Kills:
+        // the self-signed test weakened from OR to AND.
+        let mut not_self = sign_row_unstored_at(&delegate, &set_for(&r2), now)
+            .await
+            .attestation;
+        not_self.attesting_key_id = owner.clone();
+        let e = crate::federation::key_grant::check_key_grant_row_admission(dir, &not_self)
+            .await
+            .expect_err("a row attested for another key");
+        assert!(
+            matches!(&e, Error::KeyGrantRefused { reason, .. } if *reason == "signer_not_self"),
+            "{tag} I1221: signer_not_self: {e:?}"
+        );
     }
 
     /// **I591c** — the epoch axis, two nodes: B admits rows for A's counter.
