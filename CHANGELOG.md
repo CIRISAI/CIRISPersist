@@ -643,6 +643,53 @@ as the actor) and a peer admits it at the put door and the replicated apply.
   `CLM-accountability-record-unpurgeable` (2.4.1.1) gains
   `steward_purge.rs#accountability_record_of`.
 
+### Removed — the in-process memory backend (CIRISPersist#1002)
+
+Every test, bench and witness that ran on `MemoryBackend` runs on SQLite. The
+memory backend answered with its own in-process re-implementation of every
+door: real SQL, a real schema and real transactions are where the reds it
+could not produce come from, and each door it carried was a third copy to keep
+in parity.
+
+- **Removed (Rust, clean break):** `store::MemoryBackend` and `src/store/memory.rs`
+  (11,946 lines). No alias.
+- **Added (Rust):** `store::test_backend::test_backend()` (feature `sqlite`) —
+  a fresh, fully migrated in-memory `SqliteBackend`, cloned from one migrated
+  template per process with the SQLite backup API (7.1 ms a clone against
+  248 ms for `open_in_memory()` + every migration; `MemoryBackend::new` was
+  81 µs). Three doc-hidden fixtures stay public for the integration tests and
+  benches (`add_public_key`, `add_pqc_public_key`, `snapshot_events`); every
+  other below-the-door seam is `cfg(test)`, so no consumer build links a
+  writer that skips the doors.
+- **Feature gating:** the genesis doors whose scratch directory was a memory
+  node now open an in-memory SQLite one and need `sqlite`:
+  `Engine::install_genesis_bundle_roster`,
+  `federation::genesis::{install_genesis_bundle_roster, verify_ceremony_outputs}`,
+  `CeremonyState::finish`, `AmendState::{plan, finish}`. A `postgres`-only
+  build no longer has them.
+- **Python:** no Python surface named or constructed the memory backend, so
+  nothing is renamed. `PyEngine.install_genesis_bundle_roster_json` now needs
+  the `sqlite` feature, which the published wheel carries (`pyproject.toml`
+  features); the `pyo3` (postgres-only) shape loses it. No `.pyi` change.
+- **Telemetry:** the `backend` label set is `{sqlite, postgres}`
+  (`observe::StoreBackend::Memory` and the registry member are gone;
+  `telemetry/catalog.json` re-rendered). A dashboard keyed on
+  `backend="memory"` sees no series.
+- **Benches:** `ingest_pipeline` and `queue` run on the test backend and need
+  `sqlite` (they declared `postgres` and never used it). Their numbers now
+  include SQL writes; the baselines move.
+- **Tests:** the memory arm of every witness is gone (its duplicates of a
+  sqlite leg dropped; the tests only memory carried moved to
+  `src/store/backend_suite.rs`); `store::parity` compares two backends; the
+  from-disk gates and `rules/` read two backend files. A build with no backend
+  feature allows dead code crate-wide (every caller of the shared plans is a
+  backend). The server and server-pipeline unit tests need `sqlite`.
+- **Folded:** #720 — the lifecycle filter is one plan-emitted predicate
+  (`attestation_query::lifecycle_predicate`, I1320) instead of four SQL
+  copies and a memory fold; #691 — `store::tree_read` binds the parity and
+  schema-parity verdicts to the tree they read (I1321); #787 — every
+  `DirectoryOp` has an `OpsDirectory` proxy or a stated reason (I1322).
+
 ### Added — a test-anchor seam on `W_self` (CIRISPersist#1111, CIRISServer#794 T11)
 
 A `test-anchor` harness binary could not watch the self roster's lone path
