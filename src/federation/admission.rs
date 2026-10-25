@@ -10070,7 +10070,7 @@ pub async fn owner_granters_in_force_at(
 /// v60.0.0 (CIRISPersist#1062) — the owner-bindings over `node` IN FORCE at
 /// `t`, by the rule [`owner_granters_in_force_at`] documents (that fold is
 /// this one's granters).
-async fn owner_bindings_in_force_at(
+pub(crate) async fn owner_bindings_in_force_at(
     directory: &dyn super::FederationDirectory,
     node: &str,
     t: chrono::DateTime<chrono::Utc>,

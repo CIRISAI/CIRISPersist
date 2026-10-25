@@ -1386,7 +1386,32 @@ pub mod bodies {
             Some(aff.clone()),
             "[{tag}] I1219: another key's bare retraction does not end the binding"
         );
-        must_put(d, &bare(&k[0]), "I1219 the granter's bare retraction").await;
+        let retraction = must_put(d, &bare(&k[0]), "I1219 the granter's bare retraction").await;
+        // The STORED instant (postgres keeps microseconds).
+        let w_at = d
+            .get_attestation(&retraction.attestation_id)
+            .await
+            .unwrap()
+            .expect("stored")
+            .asserted_at;
+        // In force up to, not at, the retraction's instant (half-open).
+        // Kills: the end bound read inclusively.
+        let in_force = |t| async move {
+            crate::federation::admission::owner_bindings_in_force_at(d, &node("n6"), t)
+                .await
+                .unwrap()
+                .len()
+        };
+        assert_eq!(
+            in_force(w_at - Duration::milliseconds(1)).await,
+            1,
+            "[{tag}] I1219: in force just before its granter's retraction"
+        );
+        assert_eq!(
+            in_force(w_at).await,
+            0,
+            "[{tag}] I1219: not in force at the retraction's instant"
+        );
         assert_eq!(
             on_bond().await,
             None,
