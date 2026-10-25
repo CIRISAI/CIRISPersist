@@ -25,7 +25,7 @@ tests: test(/consent_sweep_plan_invariants::|consent_sweep_principals_invariants
 
 src/federation/consent_admit.rs
 src/federation/sweep_plan.rs
-src/federation/key_plane.rs check_key_plane_holdings_family admits render plan_key_plane_holdings list_key_plane_wire_hashes_planned
+src/federation/key_plane.rs check_key_plane_holdings_family render plan_key_plane_holdings list_key_plane_wire_hashes_planned
 src/federation/key_grant.rs held_owner project_if_key_grant_row
 src/retention/mod.rs plan_observation_prune keep_predicate name render
 src/retention/sqlite.rs prune_observation_table_sqlite prune_announced_peers_not_seen_since_sqlite prune_transport_destinations_not_seen_since_sqlite
