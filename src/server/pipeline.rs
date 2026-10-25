@@ -1341,22 +1341,33 @@ mod tests {
         let (app, _backend) = build_app(1).await;
         // Saturate the queue with rapid valid-envelope submissions.
         // The persister drains one at a time; with queue_depth=1 the
-        // second-in-flight submission lands 429.
-        let mut got_429 = false;
+        // second-in-flight submission lands 429. The envelopes are signed
+        // first and submitted together: one at a time, each handler's awaits
+        // (the SQLite test backend's reads yield, v60.0.0 #1002) let the
+        // persister drain every one, so the queue never filled.
+        let mut bodies = Vec::with_capacity(200);
         for _ in 0..200 {
             let batch = make_signed_batch(1);
             let env = make_signed_pipeline_envelope(batch).await;
-            let body = serde_json::to_vec(&env).unwrap();
-            let resp = app
-                .clone()
-                .oneshot(
+            bodies.push(serde_json::to_vec(&env).unwrap());
+        }
+        // Submitted concurrently: each handler runs to its first await, so
+        // many reach the queue while the persister holds the one slot.
+        let mut set = tokio::task::JoinSet::new();
+        for body in bodies {
+            set.spawn(
+                app.clone().oneshot(
                     Request::post("/api/v1/pipeline/ingest")
                         .header("Content-Type", "application/json")
                         .body(Body::from(body))
                         .unwrap(),
-                )
-                .await
-                .unwrap();
+                ),
+            );
+        }
+        let resps = set.join_all().await;
+        let mut got_429 = false;
+        for resp in resps {
+            let resp = resp.unwrap();
             if resp.status() == StatusCode::TOO_MANY_REQUESTS {
                 let retry = resp
                     .headers()
