@@ -572,7 +572,7 @@ class Engine:
     def add_community_member(self, community_key_id: str, member_json: str, admit_spec_json: str) -> bool:
         """(derived) deontic — #249 Cut B — incrementally add one member to a community roster (mirror of add_family_member). member_json is a [crate::federation::types::Communit..."""
 
-    def add_moderator(self, community_id: str, moderator_key_id: str, duty: str) -> str:
+    def add_moderator(self, community_id: str, moderator_key_id: str, duty: str, delegation_valid_from: str | None = None, delegation_valid_until: str | None = None) -> str:
         """(derived) deontic — v9.3.0 (#249, §11.10/§11.11) — appoint moderator_key_id a named moderator of community_id for duty (moderate/takedown/ review). Admissible IFF the..."""
 
     def add_peer_record_json(self, payload_json: str) -> None:
@@ -849,7 +849,7 @@ class Engine:
     def get_blob_for_viewer(self, at_rest_sha256_hex: str, viewer_key_id: str) -> str:
         """(derived) deontic — v43.0.0 (§10.1) — read a self/family-encrypted blob as viewer_key_id."""
 
-    def grant_delegation(self, delegate_key_id: str, scopes: list[str], sub_delegation: bool, delegation_purpose: str | None = None) -> str:
+    def grant_delegation(self, delegate_key_id: str, scopes: list[str], sub_delegation: bool, delegation_purpose: str | None = None, delegation_valid_from: str | None = None, delegation_valid_until: str | None = None) -> str:
         """(derived) deontic — v9.3.0 (#249) — emit a general delegates_to edge: authorize delegate_key_id within scopes (a list of scope tokens), with an explicit sub_delegation..."""
 
     def grant_trust(
@@ -1116,15 +1116,6 @@ class Engine:
 
     def put_lineage_head_cosign_json(self, payload_json: str) -> str:
         """(derived) deontic — v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6) — the lineage-head cosign door: payload_json is a ciris.lineage_head_cosign.v1 object (lineage_key_id, he..."""
-
-    def put_org_membership(self, signed_json: str) -> None:
-        """(derived) deontic — Federation directory: admit an org_membership envelope (role- gated; CEG 1.0-RC2 §5.6.8.13). Same arg shape as [put_organization](Self::put_organiz..."""
-
-    def put_organization(self, signed_json: str) -> None:
-        """(derived) deontic — Federation directory: admit an organization envelope (role-gated; CEG 1.0-RC2 §5.6.8.13). signed_json = SignedOrganization; key_directory_json = [T..."""
-
-    def put_partner_record(self, signed_json: str) -> None:
-        """(derived) deontic — Federation directory: admit a partner_record envelope (M-of-N steward quorum; CEG 1.0-RC2 §5.6.8.13). signed_json = SignedPartnerRecord (carries th..."""
 
     def put_plaintext_dag_chunk(self, chunk_sha256_hex: str, size: int, body: bytes, author_key_id: str) -> str:
         """(derived) deontic — v55.0.0 (CIRISPersist#952, CIRISEdge#734) — store ONE chunk of a plaintext chunk DAG ahead of its manifest (Engine::put_plaintext_dag_chunk). chunk..."""
@@ -2322,9 +2313,6 @@ class Engine:
     def list_signed_location_proofs_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedLocationProof wrappers since a cursor, as a JSON array. Same contract as [list_signed_f..."""
 
-    def list_signed_partner_records_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
-        """(derived) epistemic — v5.2.0 (CIRISPersist#194, CIRISEdge#65 v2 bridge) — bulk-list the full SignedPartnerRecord wrappers (row + the M-of-N steward signature set + thres..."""
-
     def list_signed_transport_destinations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v21.1.0 (CIRISPersist#507c) — bulk-list the full SignedTransportDestination wrappers since a cursor, as a JSON array. Signed rows only; RETIRED row..."""
 
@@ -3135,26 +3123,8 @@ class Engine:
     def list_local_holders_json(self, sha256_hex: str) -> str:
         """(derived) empirical — v3.5.2 (CIRISPersist#130) — Federation blob storage: local-truth holder query. Returns a JSON array of attesting_key_id strings for every holder wh..."""
 
-    def list_org_memberships_for(self, org_id: str) -> str:
-        """(derived) empirical — Federation directory: list all org_membership rows for one org_id. Returns a JSON array of OrgMembership."""
-
-    def list_org_memberships_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
-        """(derived) empirical — Federation directory: bulk-list org_membership rows since a cursor. Same contract as [list_organizations_since](Self::list_organizations_since)."""
-
-    def list_organizations_for(self, org_id: str) -> str:
-        """(derived) empirical — Federation directory: list all organization rows for org_id (full history; callers resolve current state). Returns a JSON array of Organization."""
-
-    def list_organizations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
-        """(derived) empirical — Federation directory: bulk-list organization rows since a cursor (CIRISEdge#65 v2 bridge). since_rfc3339 = None/empty for from- the-start, else an..."""
-
     def list_outbound(self, limit: int = 100, status: str | None = None, destination_key_id: str | None = None, sender_key_id: str | None = None, message_type: str | None = None, enqueued_after_rfc3339: str | None = None) -> list[Any]:
         """(derived) empirical — v0.4.0 — List outbound rows with optional filters. Returns a list of dicts. All filter parameters are optional; combine with AND."""
-
-    def list_partner_records_for(self, license_id: str) -> str:
-        """(derived) empirical — Federation directory: list all partner_record rows for license_id. Returns a JSON array of PartnerRecord."""
-
-    def list_partner_records_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
-        """(derived) empirical — Federation directory: bulk-list partner_record rows since a cursor. Same contract as [list_organizations_since](Self::list_organizations_since)."""
 
     def list_retention(self) -> str:
         """(derived) empirical — v6.0.1 (CIRISPersist#218) — All stored retention policies as a JSON-encoded array of RetentionPolicyRow ({table_name, policy})."""

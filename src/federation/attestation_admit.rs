@@ -729,6 +729,12 @@ where
     // Source struct is refused by member name (a holding claim without a
     // positive `size` is the custody parse\'s to refuse, v55) Pure; the same gate at every door.
     crate::federation::media_source::check_media_source(&row.attestation_envelope)?;
+    // v60.0.0 (CIRISPersist#1036 item 4, CC 3.3.9) — a `licensure:*` row
+    // carrying the typed licence payload (the `partner_record` field set)
+    // carries one that parses, with sorted-and-unique sets and no
+    // payment-processor identifier anywhere in its envelope. Pure; the same
+    // gate at every door.
+    crate::federation::operational::check_licence_payload(&row)?;
 
     // v31.0.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
     // `consent:state:*` row is refused unless its signed envelope carries
@@ -1087,6 +1093,11 @@ where
     // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
     // is refused: the recipient must not already reach the granter through live
     // `delegates_to` edges. Backend-symmetric with SQLite + Postgres; verify-before-mutation.
+    // v60.0.0 (CIRISPersist#1048, CC 2.4 / CC 4.4.3.2.8 C) — a term-bearing
+    // `delegates_to` (issuance, moderation, `sub_delegation`, or in an
+    // affiliation's hierarchy) carries a bounded term:
+    // `delegation_term_required`. Every backend, verify-before-mutation.
+    crate::federation::admission::check_delegation_term_admission(dir, &row).await?;
     crate::federation::admission::check_delegation_cycle_admission(dir, &row, received_at).await?;
 
     // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
@@ -1095,6 +1106,9 @@ where
     // is what makes the `self` cohort boundary well-defined. Backend-symmetric
     // with SQLite + Postgres; verify-before-mutation.
     crate::federation::admission::check_single_node_owner_admission(dir, &row).await?;
+    // v60.0.0 (CIRISPersist#1062) — an owner-binding that names an
+    // organisation is cosigned under that affiliation's protocol.
+    crate::federation::admission::check_owner_binding_affiliation_admission(dir, &row).await?;
 
     // v18.2.0 — trust-charter admission (the charter walk). AV-76: a
     // directory walk, so it stays in tier 4.
@@ -1205,6 +1219,12 @@ where
         fold_at,
     )
     .await?;
+    // v60.0.0 (CIRISPersist#1036 item 4) — the licence payload's `revision`
+    // never goes backwards for the authority's own licences.
+    crate::federation::admission::check_partner_record_revision(dir, &row).await?;
+    // v60.0.0 (CIRISPersist#1036 item 3) — a licence has no public default;
+    // a non-public licence reaches other readers by re-emission.
+    crate::federation::admission::check_licence_audience(dir, &row).await?;
 
     // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
     // this node has de-admitted gets its writes refused here. No-op when

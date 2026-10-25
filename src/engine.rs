@@ -4794,6 +4794,13 @@ impl Engine {
     /// general multi-parent `delegates_to` and is untouched by the gate. Any
     /// other purpose value is treated as a general delegation.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    ///
+    /// v60.0.0 (CIRISPersist#1048, CC 2.4, CIRISConstitution#163) — `term` is
+    /// signed onto the edge (`delegation_valid_from` / `delegation_valid_until`).
+    /// An edge carrying `license`, `grant`, `moderate`, `takedown`, `review` or
+    /// `slash`, or `sub_delegation`, MUST carry a `valid_until` at most one
+    /// year after its start; without one it is refused
+    /// `federation_delegation_term_required`. Renewal is a fresh grant.
     pub async fn grant_delegation(
         &self,
         signer: &crate::signing::LocalSigner,
@@ -4801,8 +4808,9 @@ impl Engine {
         scopes: Vec<String>,
         sub_delegation: bool,
         delegation_purpose: Option<&str>,
+        term: crate::federation::admission::DelegationTermBounds,
     ) -> Result<String, crate::federation::Error> {
-        let envelope = match delegation_purpose {
+        let mut envelope = match delegation_purpose {
             // The owner-binding sub-relation (CC 3.2): single-valued ownership,
             // gated by check_single_node_owner_admission. `sub_delegation` is
             // ignored (an owner-binding is a leaf, never a deputization).
@@ -4811,6 +4819,8 @@ impl Engine {
             }
             _ => crate::federation::delegates_to_envelope(delegate_key_id, &scopes, sub_delegation),
         };
+        // v60.0.0 (CIRISPersist#1048) — the term is signed onto the edge.
+        term.stamp(&mut envelope);
         let mut input = crate::federation::EmitAttestationInput::with_envelope(
             crate::federation::types::attestation_type::DELEGATES_TO,
             crate::federation::envelope::EnvelopeCore::from_value(envelope)
@@ -4864,6 +4874,7 @@ impl Engine {
             infra_scopes,
             false,
             delegation_purpose,
+            crate::federation::admission::DelegationTermBounds::default(),
         )
         .await
     }
@@ -4974,20 +4985,33 @@ impl Engine {
     /// may further-deputize within the duty (§11.10 deputization). Returns
     /// the `attestation_id`.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    ///
+    /// v60.0.0 (CIRISPersist#1048, CC 4.4.3.2.8 C) — an appointment decays:
+    /// `term` MUST carry a `valid_until` at most one year after its start (and
+    /// within an affiliation's `role_term`), or the edge is refused
+    /// `federation_delegation_term_required`. Renewal is a fresh appointment.
     pub async fn add_moderator(
         &self,
         signer: &crate::signing::LocalSigner,
         community_id: &str,
         moderator_key_id: &str,
         duty: &str,
+        term: crate::federation::admission::DelegationTermBounds,
     ) -> Result<String, crate::federation::Error> {
         // `community_id` is intentionally not stamped on the edge: the
         // §11.10 walk binds a moderator to a community by reaching it from
         // the community's authority roots, not by a field match. Bind it in
         // the debug log so the appointment is traceable.
         let _ = community_id;
-        self.grant_delegation(signer, moderator_key_id, vec![duty.to_owned()], true, None)
-            .await
+        self.grant_delegation(
+            signer,
+            moderator_key_id,
+            vec![duty.to_owned()],
+            true,
+            None,
+            term,
+        )
+        .await
     }
 
     /// v9.3.0 (CIRISPersist#249, CEG §3.2.3 / FSD-002 §2.2.3 withdraws) —
@@ -15040,6 +15064,89 @@ mod tests {
 
     // ─── v3.4.0 (CIRISPersist#123) — sweeper integration tests ─────
 
+    /// **I1233** (v60.0.0, CIRISPersist#1048) — the producer doors sign the
+    /// term they are given, and a term-bearing edge minted without one is
+    /// refused `federation_delegation_term_required` (CC refuses a perpetual
+    /// edge rather than supplying a default term). Kills: `grant_delegation`
+    /// dropping `term` (the termed grants would be refused `term_missing`).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i1233_producer_doors_sign_the_term_sqlite() {
+        use crate::federation::admission::{DelegationTermBounds, DELEGATION_VALID_UNTIL_FIELD};
+        use crate::federation::FederationDirectory;
+        let signer = crate::federation::tier_ingest::test_support::local_signer("i1233-granter");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "i1233-granter"))
+            .await
+            .expect("seed granter");
+        for k in ["i1233-a", "i1233-b", "i1233-m"] {
+            sq.put_public_key(sweeper_test_key(k)).await.expect("seed");
+        }
+        let term_missing = |r: Result<String, crate::federation::Error>, what: &str| match r {
+            Err(crate::federation::Error::DelegationTermRequired { rule, .. }) => {
+                assert_eq!(rule, "term_missing", "{what}");
+            }
+            other => panic!("{what}: expected delegation_term_required, got {other:?}"),
+        };
+        term_missing(
+            engine
+                .grant_delegation(
+                    &signer,
+                    "i1233-a",
+                    vec!["grant".into()],
+                    false,
+                    None,
+                    DelegationTermBounds::default(),
+                )
+                .await,
+            "I1233: grant_delegation(grant) with no term",
+        );
+        term_missing(
+            engine
+                .add_moderator(
+                    &signer,
+                    "c",
+                    "i1233-m",
+                    "moderate",
+                    DelegationTermBounds::default(),
+                )
+                .await,
+            "I1233: add_moderator with no term",
+        );
+        let until = chrono::Utc::now() + chrono::Duration::days(90);
+        let id = engine
+            .grant_delegation(
+                &signer,
+                "i1233-b",
+                vec!["grant".into()],
+                false,
+                None,
+                DelegationTermBounds::until(until),
+            )
+            .await
+            .expect("I1233: a termed grant admits");
+        let row = sq.get_attestation(&id).await.unwrap().expect("row");
+        assert_eq!(
+            row.attestation_envelope[DELEGATION_VALID_UNTIL_FIELD],
+            serde_json::json!(until.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+            "I1233: the term is signed onto the edge, canonical (CC 2.6.2)"
+        );
+        engine
+            .add_moderator(
+                &signer,
+                "c",
+                "i1233-m",
+                "moderate",
+                DelegationTermBounds::until(until),
+            )
+            .await
+            .expect("I1233: a termed appointment admits");
+    }
+
     /// Build a SignedKeyRecord whose key_id and scrub_key_id are
     /// self-referential so the FK constraints land cleanly.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -18860,6 +18967,9 @@ mod tests {
                 vec!["message_io".into(), "review".into()],
                 true,
                 None,
+                crate::federation::admission::DelegationTermBounds::until(
+                    chrono::Utc::now() + chrono::Duration::days(90),
+                ),
             )
             .await
             .expect("grant_delegation");
@@ -18940,6 +19050,7 @@ mod tests {
                 vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
                 false,
                 None,
+                crate::federation::admission::DelegationTermBounds::default(),
             )
             .await
             .unwrap_err();
@@ -19462,6 +19573,7 @@ mod tests {
                 vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
                 false,
                 None,
+                crate::federation::admission::DelegationTermBounds::default(),
             )
             .await
             .expect_err("an unproven granter cannot steward a minor");
@@ -19497,6 +19609,7 @@ mod tests {
                 vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
                 false,
                 None,
+                crate::federation::admission::DelegationTermBounds::default(),
             )
             .await
             .expect("adult-user → proven-minor guardianship is ADMITTED (CC 3.2)");
@@ -19541,6 +19654,7 @@ mod tests {
                 vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
                 false,
                 None,
+                crate::federation::admission::DelegationTermBounds::default(),
             )
             .await
             .expect("an unmarked delegation to an unverified user is a conferral");
@@ -19652,6 +19766,7 @@ mod tests {
                 vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
                 false,
                 None,
+                crate::federation::admission::DelegationTermBounds::default(),
             )
             .await
             .expect("guardianship admitted on postgres");
@@ -19950,7 +20065,15 @@ mod tests {
 
         // Appoint.
         let appt = engine
-            .add_moderator(&signer, "comm-1", "moderator", SCOPE_MODERATE)
+            .add_moderator(
+                &signer,
+                "comm-1",
+                "moderator",
+                SCOPE_MODERATE,
+                crate::federation::admission::DelegationTermBounds::until(
+                    chrono::Utc::now() + chrono::Duration::days(90),
+                ),
+            )
             .await
             .expect("add_moderator");
         assert!(
@@ -21670,7 +21793,15 @@ mod tests {
         seed_community_with_founder(&engine, &community, &derived, &label).await;
 
         let appt = engine
-            .add_moderator(&signer, &community, &moderator, SCOPE_MODERATE)
+            .add_moderator(
+                &signer,
+                &community,
+                &moderator,
+                SCOPE_MODERATE,
+                crate::federation::admission::DelegationTermBounds::until(
+                    chrono::Utc::now() + chrono::Duration::days(90),
+                ),
+            )
             .await
             .expect("add_moderator");
         assert!(

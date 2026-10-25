@@ -8064,7 +8064,22 @@ impl PyEngine {
     /// single-valued **owner-binding**, gated so a second DISTINCT owner is
     /// rejected (`federation_node_already_owned`) and resolvable via
     /// `owner_of_json`. `None` is the general (multi-parent) delegation.
-    #[pyo3(signature = (delegate_key_id, scopes, sub_delegation, delegation_purpose = None))]
+    ///
+    /// v60.0.0 (CIRISPersist#1048, CC 2.4) — `delegation_valid_from` /
+    /// `delegation_valid_until` (RFC 3339, optional) are signed onto the edge.
+    /// An edge carrying `license`, `grant`, `moderate`, `takedown`, `review` or
+    /// `slash`, or `sub_delegation=True`, MUST carry `delegation_valid_until`
+    /// at most one year after its start, or it is refused
+    /// `federation_delegation_term_required` (ValueError).
+    #[pyo3(signature = (
+        delegate_key_id,
+        scopes,
+        sub_delegation,
+        delegation_purpose = None,
+        delegation_valid_from = None,
+        delegation_valid_until = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn grant_delegation(
         &self,
         py: Python<'_>,
@@ -8072,8 +8087,11 @@ impl PyEngine {
         scopes: Vec<String>,
         sub_delegation: bool,
         delegation_purpose: Option<&str>,
+        delegation_valid_from: Option<&str>,
+        delegation_valid_until: Option<&str>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
+        let term = delegation_term_from_py(delegation_valid_from, delegation_valid_until)?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let (backend, signer, local_signer) = self.cut_c_emit_handles()?;
@@ -8093,6 +8111,7 @@ impl PyEngine {
                             scopes,
                             sub_delegation,
                             purpose.as_deref(),
+                            term,
                         )
                         .await
                         .map_err(federation_err_to_py)
@@ -8200,14 +8219,30 @@ impl PyEngine {
     /// moderator of `community_id` for `duty` (`moderate`/`takedown`/
     /// `review`). Admissible IFF the engine's signer is a community
     /// authority (founder/consensus signer) AND steward-bound.
+    ///
+    /// v60.0.0 (CIRISPersist#1048, CC 4.4.3.2.8 C) — an appointment decays:
+    /// `delegation_valid_until` (RFC 3339) is required, at most one year after
+    /// `delegation_valid_from` (or signing) and within an affiliation's
+    /// `role_term`, or the edge is refused `federation_delegation_term_required`
+    /// (ValueError). Renewal is a fresh appointment.
+    #[pyo3(signature = (
+        community_id,
+        moderator_key_id,
+        duty,
+        delegation_valid_from = None,
+        delegation_valid_until = None
+    ))]
     fn add_moderator(
         &self,
         py: Python<'_>,
         community_id: &str,
         moderator_key_id: &str,
         duty: &str,
+        delegation_valid_from: Option<&str>,
+        delegation_valid_until: Option<&str>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
+        let term = delegation_term_from_py(delegation_valid_from, delegation_valid_until)?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let (backend, signer, local_signer) = self.cut_c_emit_handles()?;
@@ -8222,7 +8257,7 @@ impl PyEngine {
                 );
                 runtime.block_on(async move {
                     engine
-                        .add_moderator(&local_signer, &community, &moderator, &duty)
+                        .add_moderator(&local_signer, &community, &moderator, &duty, term)
                         .await
                         .map_err(federation_err_to_py)
                 })
@@ -8542,218 +8577,6 @@ impl PyEngine {
         })
     }
 
-    // ── CEG 1.0-RC2 §5.6.8.13 operational data (v5.1.0, #65) ───────
-    //
-    // JSON-in/out. The role-gated admits (organization / org_membership)
-    // take `key_directory_json` (a JSON array of
-    // ciris_verify_core::threshold::ThresholdMember — pinned hybrid
-    // pubkeys from federation_keys) and `root_stewards_json` (a JSON
-    // array of String key_ids). The partner_record admit carries its own
-    // steward roster + signatures + threshold inside the
-    // SignedPartnerRecord; `steward_roster_json` supplies the pinned
-    // roster the M-of-N quorum verifies against.
-
-    /// Federation directory: admit an `organization` envelope (role-gated;
-    /// CEG 1.0-RC2 §5.6.8.13). `signed_json` = `SignedOrganization`;
-    /// `key_directory_json` = `[ThresholdMember]`; `root_stewards_json` =
-    /// `[String]`. Runs the four admission checks (skew-bound, no-payment-
-    /// processor, role authority, fail-closed).
-    fn put_organization(&self, py: Python<'_>, signed_json: &str) -> PyResult<()> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let signed: crate::federation::SignedOrganization = serde_json::from_str(signed_json)
-                .map_err(|e| {
-                PyValueError::new_err(format!("SignedOrganization JSON decode: {e}"))
-            })?;
-            let runtime = self.runtime.clone();
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .put_organization(signed)
-                            .await
-                            .map_err(federation_err_to_py)
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .put_organization(signed)
-                            .await
-                            .map_err(federation_err_to_py)
-                    })
-                }
-            })
-        })
-    }
-
-    /// Federation directory: admit an `org_membership` envelope (role-
-    /// gated; CEG 1.0-RC2 §5.6.8.13). Same arg shape as
-    /// [`put_organization`](Self::put_organization); `signed_json` =
-    /// `SignedOrgMembership`.
-    fn put_org_membership(&self, py: Python<'_>, signed_json: &str) -> PyResult<()> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let signed: crate::federation::SignedOrgMembership = serde_json::from_str(signed_json)
-                .map_err(|e| {
-                    PyValueError::new_err(format!("SignedOrgMembership JSON decode: {e}"))
-                })?;
-            let runtime = self.runtime.clone();
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .put_org_membership(signed)
-                            .await
-                            .map_err(federation_err_to_py)
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .put_org_membership(signed)
-                            .await
-                            .map_err(federation_err_to_py)
-                    })
-                }
-            })
-        })
-    }
-
-    /// Federation directory: admit a `partner_record` envelope (M-of-N
-    /// steward quorum; CEG 1.0-RC2 §5.6.8.13). `signed_json` =
-    /// `SignedPartnerRecord` (carries the steward signatures + threshold);
-    /// `steward_roster_json` = `[ThresholdMember]` (the pinned roster the
-    /// quorum verifies against). Runs skew-bound, no-payment-processor,
-    /// set-semantics-sorted, quorum, and revision anti-rollback.
-    fn put_partner_record(&self, py: Python<'_>, signed_json: &str) -> PyResult<()> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let signed: crate::federation::SignedPartnerRecord = serde_json::from_str(signed_json)
-                .map_err(|e| {
-                    PyValueError::new_err(format!("SignedPartnerRecord JSON decode: {e}"))
-                })?;
-            let runtime = self.runtime.clone();
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .put_partner_record(signed)
-                            .await
-                            .map_err(federation_err_to_py)
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .put_partner_record(signed)
-                            .await
-                            .map_err(federation_err_to_py)
-                    })
-                }
-            })
-        })
-    }
-
-    /// Federation directory: list all `organization` rows for `org_id`
-    /// (full history; callers resolve current state). Returns a JSON array
-    /// of `Organization`.
-    fn list_organizations_for(&self, py: Python<'_>, org_id: &str) -> PyResult<String> {
-        self.operational_list_for(py, org_id, OperationalKind::Organization)
-    }
-
-    /// Federation directory: list all `org_membership` rows for one
-    /// `org_id`. Returns a JSON array of `OrgMembership`.
-    fn list_org_memberships_for(&self, py: Python<'_>, org_id: &str) -> PyResult<String> {
-        self.operational_list_for(py, org_id, OperationalKind::OrgMembership)
-    }
-
-    /// Federation directory: list all `partner_record` rows for
-    /// `license_id`. Returns a JSON array of `PartnerRecord`.
-    fn list_partner_records_for(&self, py: Python<'_>, license_id: &str) -> PyResult<String> {
-        self.operational_list_for(py, license_id, OperationalKind::PartnerRecord)
-    }
-
-    /// Federation directory: bulk-list `organization` rows since a cursor
-    /// (CIRISEdge#65 v2 bridge). `since_rfc3339` = `None`/empty for from-
-    /// the-start, else an RFC-3339 timestamp (rows with `asserted_at >
-    /// since`). Returns a JSON array of `Organization` ordered by
-    /// `(asserted_at, attestation_id)`.
-    #[pyo3(signature = (since_rfc3339, since_id, limit))]
-    fn list_organizations_since(
-        &self,
-        py: Python<'_>,
-        since_rfc3339: Option<&str>,
-        since_id: Option<&str>,
-        limit: u32,
-    ) -> PyResult<String> {
-        self.operational_list_since(
-            py,
-            since_rfc3339,
-            since_id,
-            limit,
-            OperationalKind::Organization,
-        )
-    }
-
-    /// Federation directory: bulk-list `org_membership` rows since a
-    /// cursor. Same contract as
-    /// [`list_organizations_since`](Self::list_organizations_since).
-    #[pyo3(signature = (since_rfc3339, since_id, limit))]
-    fn list_org_memberships_since(
-        &self,
-        py: Python<'_>,
-        since_rfc3339: Option<&str>,
-        since_id: Option<&str>,
-        limit: u32,
-    ) -> PyResult<String> {
-        self.operational_list_since(
-            py,
-            since_rfc3339,
-            since_id,
-            limit,
-            OperationalKind::OrgMembership,
-        )
-    }
-
-    /// Federation directory: bulk-list `partner_record` rows since a
-    /// cursor. Same contract as
-    /// [`list_organizations_since`](Self::list_organizations_since).
-    #[pyo3(signature = (since_rfc3339, since_id, limit))]
-    fn list_partner_records_since(
-        &self,
-        py: Python<'_>,
-        since_rfc3339: Option<&str>,
-        since_id: Option<&str>,
-        limit: u32,
-    ) -> PyResult<String> {
-        self.operational_list_since(
-            py,
-            since_rfc3339,
-            since_id,
-            limit,
-            OperationalKind::PartnerRecord,
-        )
-    }
-
     /// v31.1.0 (CIRISPersist#662) — bulk-list the signed accord EVIDENCE
     /// bundles (proposal + its hybrid-signed participations) since a cursor,
     /// as a JSON array, ordered `(evidence_at ASC, proposal_digest ASC)`.
@@ -8891,54 +8714,6 @@ impl PyEngine {
                             serde_json::to_string(&pairs).map_err(|e| {
                                 PyRuntimeError::new_err(format!(
                                     "rematerialized withdrawals JSON encode: {e}"
-                                ))
-                            })
-                        }};
-                    }
-                    match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => dispatch!(pg),
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
-                    }
-                })
-            })
-        })
-    }
-
-    /// v5.2.0 (CIRISPersist#194, CIRISEdge#65 v2 bridge) — bulk-list the full
-    /// `SignedPartnerRecord` wrappers (row + the M-of-N steward signature set
-    /// + threshold) since a cursor, as a JSON array, with the same
-    /// `(asserted_at ASC, attestation_id ASC)` cursor contract as
-    /// `list_partner_records_since`. The Edge v2 Initiator hashes these to
-    /// advertise a byte-reproducible `envelope_hash` for anti-entropy
-    /// convergence (the unsigned `list_partner_records_since` can't
-    /// reconstruct the wire bytes).
-    fn list_signed_partner_records_since(
-        &self,
-        py: Python<'_>,
-        since_rfc3339: Option<&str>,
-        since_id: Option<&str>,
-        limit: u32,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        let since =
-            parse_pair_cursor("list_signed_partner_records_since", since_rfc3339, since_id)?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    macro_rules! dispatch {
-                        ($backend:expr) => {{
-                            let b = $backend.clone();
-                            let rows = b
-                                .list_signed_partner_records_since(since, limit)
-                                .await
-                                .map_err(federation_err_to_py)?;
-                            serde_json::to_string(&rows).map_err(|e| {
-                                PyRuntimeError::new_err(format!(
-                                    "signed partner_record list JSON encode: {e}"
                                 ))
                             })
                         }};
@@ -32269,24 +32044,30 @@ impl PyEngine {
     }
 }
 
-/// v5.1.0 (CIRISPersist#65) — which operational subject_kind a shared
-/// list dispatcher should query. Internal to the FFI layer.
-#[derive(Debug, Clone, Copy)]
-enum OperationalKind {
-    Organization,
-    OrgMembership,
-    PartnerRecord,
+/// v60.0.0 (CIRISPersist#1048) — a `delegates_to` term from two optional
+/// RFC 3339 strings; a present string that does not parse is a ValueError,
+/// never "no bound".
+fn delegation_term_from_py(
+    valid_from: Option<&str>,
+    valid_until: Option<&str>,
+) -> PyResult<crate::federation::admission::DelegationTermBounds> {
+    let parse = |field: &str, v: Option<&str>| -> PyResult<Option<chrono::DateTime<chrono::Utc>>> {
+        v.map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .map_err(|e| {
+                    PyValueError::new_err(format!("{field}: not an RFC 3339 instant: {e}"))
+                })
+        })
+        .transpose()
+    };
+    Ok(crate::federation::admission::DelegationTermBounds {
+        valid_from: parse("delegation_valid_from", valid_from)?,
+        valid_until: parse("delegation_valid_until", valid_until)?,
+    })
 }
 
-/// v5.1.0 (CIRISPersist#65) — decode the role-authority inputs shared by
-/// `put_organization` / `put_org_membership`: a JSON array of
-/// `ThresholdMember` (pinned hybrid pubkeys) + a JSON array of `String`
-/// root-steward key_ids.
-///
-/// v5.1.0 (CIRISPersist#65) — FFI-internal operational-data list
-/// dispatchers (not exposed to Python; the `#[pyo3]` wrappers above call
-/// them). Kept out of the `#[pymethods]` block because they take the
-/// non-Python `OperationalKind` discriminator.
+/// FFI-internal helpers kept out of the `#[pymethods]` block.
 impl PyEngine {
     /// v9.3.0 (#249 Cut C) — extract the (crate-level `BackendDispatch`,
     /// hardware signer, LocalSigner) triple the emit ceremonies share to
@@ -32314,122 +32095,6 @@ impl PyEngine {
             )
         })?;
         Ok((backend, self.signer.clone(), local_signer))
-    }
-
-    fn operational_list_for(
-        &self,
-        py: Python<'_>,
-        business_id: &str,
-        kind: OperationalKind,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let business_id = business_id.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    macro_rules! dispatch {
-                        ($backend:expr) => {{
-                            let b = $backend.clone();
-                            match kind {
-                                OperationalKind::Organization => {
-                                    let rows = b
-                                        .list_organizations_for(&business_id)
-                                        .await
-                                        .map_err(federation_err_to_py)?;
-                                    serde_json::to_string(&rows)
-                                }
-                                OperationalKind::OrgMembership => {
-                                    let rows = b
-                                        .list_org_memberships_for(&business_id)
-                                        .await
-                                        .map_err(federation_err_to_py)?;
-                                    serde_json::to_string(&rows)
-                                }
-                                OperationalKind::PartnerRecord => {
-                                    let rows = b
-                                        .list_partner_records_for(&business_id)
-                                        .await
-                                        .map_err(federation_err_to_py)?;
-                                    serde_json::to_string(&rows)
-                                }
-                            }
-                            .map_err(|e| {
-                                PyRuntimeError::new_err(format!(
-                                    "operational list JSON encode: {e}"
-                                ))
-                            })
-                        }};
-                    }
-                    match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => dispatch!(pg),
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
-                    }
-                })
-            })
-        })
-    }
-
-    fn operational_list_since(
-        &self,
-        py: Python<'_>,
-        since_rfc3339: Option<&str>,
-        since_id: Option<&str>,
-        limit: u32,
-        kind: OperationalKind,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        let since = parse_pair_cursor("operational_list_since", since_rfc3339, since_id)?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    macro_rules! dispatch {
-                        ($backend:expr) => {{
-                            let b = $backend.clone();
-                            match kind {
-                                OperationalKind::Organization => {
-                                    let rows = b
-                                        .list_organizations_since(since.clone(), limit)
-                                        .await
-                                        .map_err(federation_err_to_py)?;
-                                    serde_json::to_string(&rows)
-                                }
-                                OperationalKind::OrgMembership => {
-                                    let rows = b
-                                        .list_org_memberships_since(since.clone(), limit)
-                                        .await
-                                        .map_err(federation_err_to_py)?;
-                                    serde_json::to_string(&rows)
-                                }
-                                OperationalKind::PartnerRecord => {
-                                    let rows = b
-                                        .list_partner_records_since(since.clone(), limit)
-                                        .await
-                                        .map_err(federation_err_to_py)?;
-                                    serde_json::to_string(&rows)
-                                }
-                            }
-                            .map_err(|e| {
-                                PyRuntimeError::new_err(format!(
-                                    "operational list JSON encode: {e}"
-                                ))
-                            })
-                        }};
-                    }
-                    match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => dispatch!(pg),
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
-                    }
-                })
-            })
-        })
     }
 }
 
@@ -33615,6 +33280,13 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v59.0.0 (CIRISPersist#1049) — typed out of `InvalidArgument`: the
         // same kind and type.
         crate::federation::Error::AssertedAtStale { .. } => PyValueError::new_err(kind),
+        // v60.0.0 (CIRISPersist#1048, CC 4.4.3.2.8 C) — a term-bearing
+        // `delegates_to` with a missing, unreadable or over-bound term:
+        // caller-side, ValueError (4xx), with the rule so a caller can tell a
+        // missing term from an over-long one.
+        crate::federation::Error::DelegationTermRequired { rule, .. } => {
+            PyValueError::new_err(format!("{kind}: {rule}"))
+        }
         // v54.1.0 (CIRISPersist#1042) — the ordering gap keeps the Python
         // type of the arm it was split from (`SignatureInvalid` /
         // `FederationTierUnverified`, both ValueError); the KIND tells a
@@ -33969,15 +33641,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // unregistered attester) is caller-fault malformed-content /
         // authorization failure; ValueError (4xx).
         crate::federation::Error::FederationTierUnverified { .. } => PyValueError::new_err(kind),
-        // v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) —
-        // operational-data admission rejections are all caller-fault
-        // malformed-content / authorization failures; ValueError (4xx).
+        // v5.1.0 (CIRISPersist#65); v60.0.0 (CIRISPersist#1036 item 4) — the
+        // licence payload's admission rejections are caller-fault
+        // malformed-content; ValueError (4xx).
         crate::federation::Error::ClockSkewViolation { .. }
         | crate::federation::Error::PaymentProcessorIdentifier { .. }
-        | crate::federation::Error::OperationalAuthority(_)
-        // v31.0.0 (CIRISPersist#644) — a typed column diverging from the
-        // envelope its signature covers is caller-fault too.
-        | crate::federation::Error::OperationalEnvelopeUnbound { .. }
         | crate::federation::Error::PartnerRecordRollback { .. }
         | crate::federation::Error::SetSemanticsUnsorted(_) => PyValueError::new_err(kind),
         // v8.2.0 (CEG 1.0-RC11 §19.1) — a WholenessWitness admission
@@ -34058,8 +33726,7 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v31.0.0 (CIRISPersist#659) — a revocation whose typed columns are
         // not inside the bytes its scrub signature covers is caller-fault:
         // the remedy is to re-mint the envelope with the binding, which is
-        // exactly what the message says. Same class as
-        // `OperationalEnvelopeUnbound` → ValueError (4xx). The FIELD rides in
+        // exactly what the message says. ValueError (4xx). The FIELD rides in
         // the message rather than the bare `kind`, so a Python consumer can
         // tell "you forgot the binding" from "you rewrote the subject".
         crate::federation::Error::RevocationEnvelopeUnbound {

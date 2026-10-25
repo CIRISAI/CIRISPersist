@@ -500,6 +500,16 @@ pub const PAST_FRESHNESS_W_SECS: i64 = 259_200;
 /// The refusal token of [`check_roster_act_fresh`] (CIRISPersist#1049).
 pub const ASSERTED_AT_STALE: &str = "asserted_at_stale";
 
+/// v60.0.0 (CIRISPersist#1049, #1036 item 2) — is `asserted_at` more than
+/// [`PAST_FRESHNESS_W_SECS`] behind `now`? The one reading of W every door
+/// that judges a chain at a row's signed instant applies before it lets that
+/// instant stand alone (CC 2.6.7): the roster gate below, the licensure door,
+/// the key_grant sealer and the consent `grant` chain.
+#[must_use]
+pub fn outside_past_freshness_window(asserted_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    asserted_at < now - chrono::Duration::seconds(PAST_FRESHNESS_W_SECS)
+}
+
 /// **The bound on [`acts_as_steward_at`]'s instant, at admission**
 /// (CIRISPersist#1049; CC 2.6.7 W as ruled in 3.3.6.3, rc9 69fd22e): a row
 /// whose author stands for one of `stewards` as a roster key at the row's
@@ -528,19 +538,18 @@ where
     if stewards.iter().any(|s| s == author) {
         return Ok(());
     }
-    let oldest = roster_clock() - chrono::Duration::seconds(PAST_FRESHNESS_W_SECS);
-    // (`now` below is the same clock: the receipt instant.)
-    if asserted_at >= oldest {
+    let now = roster_clock();
+    if !outside_past_freshness_window(asserted_at, now) {
         return Ok(());
     }
-    let now = roster_clock();
     for s in stewards {
         if is_roster_key_at(dir, s, author, asserted_at).await?
             && !is_roster_key_at(dir, s, author, now).await?
         {
             return Err(Error::AssertedAtStale {
                 author: author.to_owned(),
-                steward: s.clone(),
+                standing_for: s.clone(),
+                plane: "roster",
                 asserted_at,
                 w_secs: PAST_FRESHNESS_W_SECS,
             });

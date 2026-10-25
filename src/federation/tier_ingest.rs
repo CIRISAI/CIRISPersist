@@ -4743,12 +4743,24 @@ pub mod test_support {
         grantee: &str,
     ) -> crate::federation::Attestation {
         let mut a = owner_binding_attestation(id, granter, grantee);
-        let envelope = serde_json::json!({
+        let mut envelope = serde_json::json!({
             "id": id,
             "kind": "delegates_to",
             "scope": [crate::federation::admission::DELEGATION_SCOPE_MODERATE],
             "sub_delegation": false,
         });
+        // v60.0.0 (CIRISPersist#1048, CC 2.4) — a `moderate` appointment
+        // carries a term, measured from its signed instant: signed now (not at
+        // the owner-binding fixture's fixed instant) for 180 days, so the
+        // fixture never decays on a calendar date.
+        let now =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        a.asserted_at = now;
+        a.scrub_timestamp = now;
+        crate::federation::admission::DelegationTermBounds::until(
+            now + chrono::Duration::days(180),
+        )
+        .stamp(&mut envelope);
         let (och, classical, pqc) = sign_envelope(granter, &envelope);
         a.attestation_envelope = envelope;
         a.original_content_hash = och;

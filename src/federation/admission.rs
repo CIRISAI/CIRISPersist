@@ -2926,6 +2926,10 @@ pub async fn check_promotion_admission(
     // chokepoint: a local row admitted before this cut does not cross with a
     // malformed struct. (A holding claim's size is the custody parse's, v55.)
     super::media_source::check_media_source(&row.attestation_envelope)?;
+    // v60.0.0 (CIRISPersist#1036 item 4) — the licence payload's pure gate at
+    // the promotion chokepoint too: a local-tier licence does not cross with a
+    // malformed payload, an unsorted or repeated set, or a processor id.
+    super::operational::check_licence_payload(row)?;
     check_capacity_consent_admission(directory, row, chrono::Utc::now()).await?;
 
     // v38.7.0 (CIRISPersist#778) — CC 3.4.5's OTHER emitter rule: `config:*`
@@ -2973,6 +2977,12 @@ pub async fn check_promotion_admission(
     // authority it names (v42.0.0, CIRISPersist#814).
     check_licensure_delegator_is_authority(directory, row, chrono::Utc::now(), row.asserted_at)
         .await?;
+    // v60.0.0 (CIRISPersist#1036 item 4) — the payload's `revision` against
+    // the authority's held licences, as at the put door.
+    check_partner_record_revision(directory, row).await?;
+    // v60.0.0 (CIRISPersist#1036 item 3) — the licence's audience, as at the
+    // put door.
+    check_licence_audience(directory, row).await?;
 
     // §11.10 moderation / reconsideration / quarantine duty.
     check_delegated_duty_scores_admission(directory, row).await?;
@@ -2983,10 +2993,19 @@ pub async fn check_promotion_admission(
     // CC 3.2 / CC 1.15.6 — a `delegates_to` onto a `user` target is admissible
     // only as minor-guardianship.
     check_user_target_steward_binding_admission(directory, row).await?;
+    // v60.0.0 (CIRISPersist#1062) — an owner-binding naming an affiliation
+    // is cosigned under its protocol; the roster is directory state that can
+    // have changed since the local write.
+    check_owner_binding_affiliation_admission(directory, row).await?;
 
     // CC 4.1.1 — the cycle-closing `delegates_to` is refused (v54.0.0,
     // CIRISPersist#1031). Re-run at promotion: the walks read the federation
     // tier only, so a local edge closes a cycle at the moment it is promoted.
+    // v60.0.0 (CIRISPersist#1048, CC 2.4 / CC 4.4.3.2.8 C) — a term-bearing
+    // `delegates_to` carries a bounded term. Re-run here: whether the
+    // community an edge names is an affiliation, and its `role_term`, are
+    // directory state that can have changed since the local write.
+    check_delegation_term_admission(directory, row).await?;
     check_delegation_cycle_admission(directory, row, chrono::Utc::now()).await?;
 
     // CC 5.4.6 / CC 3.4.13 Q5 — a minor's owner-binding is never announced
@@ -4075,16 +4094,63 @@ pub(crate) async fn community_in_force_at(
         .map_or_else(|| current.clone(), |(c, _)| c))
 }
 
-/// The authority set at `t`, or why there is none a single signer can stand
-/// for. `Err(protocol)`: the community's `consensus_protocol` admits only a
-/// collective act (a quorum), which a single-signed row or edge is not.
-async fn licensure_roots_at(
+/// v60.0.0 (CIRISPersist#1048 item 1, CC 4.4.3.2.8 C) — the `role_term`
+/// bound (seconds) a `license` walk rooted at `authority` reads at `t`: the
+/// charter of the record in force at `t` when the authority is an
+/// affiliation that declares one, else `None`. A key authority has no
+/// charter.
+async fn licensure_role_term_at(
     directory: &dyn super::FederationDirectory,
     authority: &LicensureAuthority,
     t: chrono::DateTime<chrono::Utc>,
-) -> Result<Result<std::collections::BTreeSet<String>, String>, Error> {
+) -> Result<Option<i64>, Error> {
     match authority {
-        LicensureAuthority::Key(k) => Ok(Ok(std::iter::once(k.clone()).collect())),
+        LicensureAuthority::Key(_) => Ok(None),
+        LicensureAuthority::Community(current) => super::affiliation_config::role_term_seconds(
+            &community_in_force_at(directory, current, t).await?,
+        ),
+    }
+}
+
+/// v60.0.0 (CIRISPersist#1048 item 1) — [`licensure_role_term_at`] for a walk
+/// scoped to `community_id` (the moderation walks): `None` when this node
+/// does not hold the record.
+async fn affiliation_role_term_at(
+    directory: &dyn super::FederationDirectory,
+    community_id: &str,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<i64>, Error> {
+    match directory.lookup_community(community_id).await? {
+        Some(c) => {
+            licensure_role_term_at(directory, &LicensureAuthority::Community(Box::new(c)), t).await
+        }
+        None => Ok(None),
+    }
+}
+
+/// v60.0.0 (CIRISPersist#1036 item 1) — **who stands for a licensing
+/// authority at an instant**: a set of single signers, or a quorum.
+enum LicenceRoots {
+    /// Keys each of which stands for the authority alone at `t`: the
+    /// authority key itself, or the founders active at `t` of a
+    /// `founder_only` community ("one founder suffices only where the
+    /// protocol says so").
+    Seats(std::collections::BTreeSet<String>),
+    /// A community whose `consensus_protocol` admits only a collective act:
+    /// the record in force at `t`. Its licence is a COSIGNED row, and its
+    /// `license` chain roots at an edge the quorum cosigned
+    /// ([`community_quorum_cosigned_at`]).
+    Quorum(Box<super::Community>),
+}
+
+/// The licensing authority's roots at `t` ([`LicenceRoots`]).
+async fn licence_roots_at(
+    directory: &dyn super::FederationDirectory,
+    authority: &LicensureAuthority,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<LicenceRoots, Error> {
+    match authority {
+        LicensureAuthority::Key(k) => Ok(LicenceRoots::Seats(std::iter::once(k.clone()).collect())),
         LicensureAuthority::Community(current) => {
             // v54.0.0 (Codex round 2 on PR #1050) — the RECORD in force at `t`,
             // not the one held now. A supersession replaces the roster the fold
@@ -4092,29 +4158,181 @@ async fn licensure_roots_at(
             // current record, a founder the supersession removed vanished from
             // the roots at every instant, and the folds dropped licences the
             // door had admitted while that founder stood.
-            let c = &community_in_force_at(directory, current, t).await?;
+            let c = community_in_force_at(directory, current, t).await?;
             // #1036 ruling item 1: "one founder suffices only where the
             // protocol says so" — and only `founder_only` says so. Any other
-            // protocol makes a licence an act of the affiliation's quorum, a
-            // cosigned row this plane does not carry yet (the #1036 plane
-            // move); until then no single key stands for it.
+            // protocol makes a licence an act of the affiliation's quorum
+            // (v60.0.0: a cosigned row, judged by the protocol itself).
             if c.consensus_protocol != crate::federation::types::consensus_protocol::FOUNDER_ONLY {
-                return Ok(Err(c.consensus_protocol.clone()));
+                return Ok(LicenceRoots::Quorum(Box::new(c)));
             }
             // The founders ACTIVE at `t` — the authorized roster fold, read at
             // the signed instant (a founder who left before `t` roots nothing
             // at `t`; one who joined after `t` had not yet).
             let roster = Box::pin(crate::federation::authorized_community_roster_at(
-                directory, c, t,
+                directory, &c, t,
             ))
             .await?;
-            Ok(Ok(roster
-                .into_iter()
-                .filter(|m| m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER))
-                .map(|m| m.key_id)
-                .collect()))
+            Ok(LicenceRoots::Seats(
+                roster
+                    .into_iter()
+                    .filter(|m| m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER))
+                    .map(|m| m.key_id)
+                    .collect(),
+            ))
         }
     }
+}
+
+/// v60.0.0 (CIRISPersist#1036 item 1, CC 2.4.1.2.1; CIRISConstitution#162) —
+/// **is `row` an act of `c`'s quorum at `t`?** A cosigned row whose protocol
+/// source is the community: its FULL scrub set (the base scrub and every
+/// `additional_scrubs` entry, all over the same envelope bytes) intersected
+/// with `c`'s roster at `t`, each survivor re-verified against this node's own
+/// key records ([`count_distinct_roster_scrubs`](super::reverse_quorum),
+/// the one shared count), evaluated under `c`'s own `consensus_protocol`
+/// ([`super::consensus::evaluate`], `Direction::Add`: an issuance confers).
+/// The question is asked about the SIGNERS, never about the row's subject.
+async fn community_quorum_cosigned_at(
+    directory: &dyn super::FederationDirectory,
+    c: &super::Community,
+    row: &super::Attestation,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error> {
+    let roster = Box::pin(crate::federation::authorized_community_roster_at(
+        directory, c, t,
+    ))
+    .await?;
+    let keys: Vec<String> = roster.iter().map(|m| m.key_id.clone()).collect();
+    let signers = super::reverse_quorum::count_distinct_roster_scrubs(
+        directory,
+        &row.attestation_envelope,
+        &row.scrubs(),
+        &keys,
+    )
+    .await;
+    if signers.is_empty() {
+        return Ok(false);
+    }
+    let mut seats = Vec::with_capacity(roster.len());
+    for m in roster {
+        seats.push(super::consensus::Seat {
+            node_bearing: super::is_node_bearing_key_at(directory, &m.key_id, t).await?,
+            key_id: m.key_id,
+            role: m.role,
+        });
+    }
+    Ok(super::consensus::evaluate(&super::consensus::Ballot {
+        protocol: &c.consensus_protocol,
+        subkind: super::community_subkind(c),
+        policy_blob: c.policy_blob.as_ref(),
+        roster: &seats,
+        signers: &signers,
+        direction: super::consensus::Direction::Add,
+    })
+    .admits())
+}
+
+/// v60.0.0 (CIRISPersist#1036 item 1) — **the `license` walk rooted at a
+/// community's quorum**, read through `lens` (its `as_of` is the instant).
+///
+/// A ROOT edge is a `delegates_to` carrying `license`, naming the community
+/// (`community_id`, any [`COHORT_TARGET_ENVELOPE_FIELDS`] alias), signed by a
+/// member of its roster at the instant and COSIGNED under its protocol at the
+/// instant ([`community_quorum_cosigned_at`]), live under the lens (asserted
+/// by then, unexpired, in its signed term), and not retracted by then — a
+/// cosigned row is withdrawn only by a cosigned `withdraws` naming it (CC
+/// 2.4.1.1 rule 0), so only such a retraction removes a root edge.
+///
+/// Each root edge is traversed; from the delegate of a root edge that grants
+/// `sub_delegation`, the ordinary attenuated walk continues one hop shorter
+/// than the cap. The walk's own first hop from that delegate is checked for
+/// the `license` token (the scope gate) but not for attenuation against the
+/// root edge's full scope set: for a licence verdict only `license` matters.
+async fn quorum_licence_reach(
+    directory: &dyn super::FederationDirectory,
+    c: &super::Community,
+    targets: &std::collections::HashSet<String>,
+    lens: DelegationWalkLens<'_>,
+) -> Result<ScopedReach, Error> {
+    let mut out = ScopedReach::default();
+    let Some(t) = lens.as_of else {
+        return Ok(out);
+    };
+    let roster = Box::pin(crate::federation::authorized_community_roster_at(
+        directory, c, t,
+    ))
+    .await?;
+    let mut rows = Vec::new();
+    for m in &roster {
+        let mut pages = AttestationQuery::by(&m.key_id, FOLD_PAGE)
+            .types(&[
+                attestation_type::DELEGATES_TO,
+                attestation_type::WITHDRAWS,
+                attestation_type::RECANTS,
+            ])
+            .pages();
+        while let Some(page) = pages.next(directory).await? {
+            rows.extend(page);
+        }
+    }
+    let mut retractions = Vec::new();
+    let mut candidates = Vec::new();
+    for r in rows {
+        if r.attestation_type == attestation_type::DELEGATES_TO {
+            if delegation_scope_grants(&r.attestation_envelope, DELEGATION_SCOPE_LICENSE)
+                && envelope_cohort_target(&r.attestation_envelope)
+                    .ok()
+                    .flatten()
+                    == Some(c.community_key_id.as_str())
+                && lens.admits_edge(&r)
+            {
+                candidates.push(r);
+            }
+        } else if lens.asserted_by(&r) {
+            retractions.push(r);
+        }
+    }
+    let mut roots = Vec::new();
+    for edge in candidates {
+        let mut retracted = false;
+        for w in &retractions {
+            if crate::federation::precedence::references_attestation_id_from_envelope(
+                &w.attestation_envelope,
+            ) == Some(edge.attestation_id.as_str())
+                && community_quorum_cosigned_at(directory, c, w, w.asserted_at).await?
+            {
+                retracted = true;
+                break;
+            }
+        }
+        if !retracted && community_quorum_cosigned_at(directory, c, &edge, t).await? {
+            roots.push(edge);
+        }
+    }
+    let onward_cap = MAX_MODERATION_DELEGATION_DEPTH.saturating_sub(1);
+    for root in roots {
+        out.traversed.insert(root.attestation_id.clone());
+        if targets.contains(&root.attested_key_id) {
+            out.hit_target = true;
+        }
+        if !delegation_grants_sub_delegation(&root.attestation_envelope) {
+            continue;
+        }
+        let reach = scoped_delegation_reach_at(
+            directory,
+            &root.attested_key_id,
+            targets,
+            DELEGATION_SCOPE_LICENSE,
+            onward_cap,
+            DelegationWalkPolicy::MODERATION_DUTY,
+            lens,
+        )
+        .await?;
+        out.hit_target |= reach.hit_target;
+        out.traversed.extend(reach.traversed);
+    }
+    Ok(out)
 }
 
 /// v54.0.0 (CIRISPersist#1035) — why a CLAIMED licensing delegation does not
@@ -4133,13 +4351,17 @@ pub enum LicensureChainBreak {
     /// expired, outside its term, retracted, unreachable, or past the cap).
     NotOnLiveChain,
     /// The authority is a community whose `consensus_protocol` admits only a
-    /// quorum act; no single-signed chain stands for it (#1036 item 1).
+    /// quorum act, and the named edge is on no `license` chain rooted at an
+    /// edge its quorum cosigned (#1036 item 1; v60.0.0: such a chain now
+    /// resolves, so this names a chain rooted at a lone member).
     AuthorityActsByQuorum,
 }
 
 /// v54.1.0 (CIRISPersist#1042 follow-up C) — the stable `reason` tokens of
 /// [`Error::LicensureDelegatorNotAuthority`]: one per
-/// [`LicensureChainBreak`], plus [`NOT_AUTHORITY_AT_RECEIPT`]. Append-only.
+/// [`LicensureChainBreak`]. v60.0.0 (CIRISPersist#1036 item 2) removed
+/// `not_authority_at_receipt`: a licence is judged at its signed instant, and
+/// a stale one is refused [`Error::AssertedAtStale`] instead.
 pub mod licensure_refusal {
     /// [`super::LicensureChainBreak::NamedEdgeAbsent`].
     pub const NAMED_EDGE_ABSENT: &str = "named_edge_absent";
@@ -4151,8 +4373,6 @@ pub mod licensure_refusal {
     pub const NOT_ON_LIVE_CHAIN: &str = "not_on_live_chain_at_asserted_at";
     /// [`super::LicensureChainBreak::AuthorityActsByQuorum`].
     pub const AUTHORITY_ACTS_BY_QUORUM: &str = "authority_acts_by_quorum";
-    /// [`super::LICENSURE_NOT_AUTHORITY_AT_RECEIPT`].
-    pub const NOT_AUTHORITY_AT_RECEIPT: &str = "not_authority_at_receipt";
 }
 
 impl LicensureChainBreak {
@@ -4172,13 +4392,6 @@ impl LicensureChainBreak {
         }
     }
 }
-
-/// v54.0.0 (CIRISPersist#1049) — the door's refusal reason when a row is the
-/// authority's own at its signed `asserted_at` but not at receipt: the
-/// emitter was a founder of a `founder_only` authority when the row was
-/// dated, and is not one now. Without a past-freshness window a signed
-/// instant cannot grant standing the emitter no longer has.
-pub const LICENSURE_NOT_AUTHORITY_AT_RECEIPT: &str = licensure_refusal::NOT_AUTHORITY_AT_RECEIPT;
 
 /// v54.0.0 (CIRISPersist#1035) — the verdict on ONE licensure row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4223,19 +4436,24 @@ impl LicensureIssuance {
 /// the door admitted — at any depth the walk follows.
 ///
 /// Judged at the instant `t` the caller names, never on the timeless graph.
-/// The fold passes the row's SIGNED `asserted_at` (a stamped instant belongs
-/// to the signer). The door passes BOTH receipt and the signed instant
-/// (v54.0.0, CIRISPersist#1049): see [`check_licensure_delegator_is_authority`].
+/// The fold and the door both pass the row's SIGNED `asserted_at` (a stamped
+/// instant belongs to the signer; v60.0.0, CIRISPersist#1036 item 2: the door
+/// no longer also judges at receipt — the past-freshness window W does that
+/// job, see [`check_licensure_delegator_is_authority`]).
 ///
-/// 1. the emitter is in the authority set at `t` ⇒ [`Authority`];
+/// 1. the emitter is in the authority set at `t` ⇒ [`Authority`]; for a
+///    community whose protocol admits only a collective act (v60.0.0,
+///    #1036 item 1) the row itself must be COSIGNED by its quorum at `t`
+///    ([`community_quorum_cosigned_at`]);
 /// 2. no `delegation_id` ⇒ [`Testimony`];
 /// 3. the named row must exist, be a `delegates_to` carrying `license`, and
 ///    delegate to the EMITTER;
-/// 4. it must be an edge the `license` walk from the authority set TRAVERSES
-///    under the lens at `t` — every link asserted by then, unexpired,
-///    in its signed term, unretracted by then, attenuated, `sub_delegation`
-///    granted past the first hop, within the depth cap. That is "lies on a
-///    live chain", read from the walk itself.
+/// 4. it must be an edge the `license` walk from the authority's roots
+///    TRAVERSES under the lens at `t` — every link asserted by then,
+///    unexpired, in its signed term, unretracted by then, attenuated,
+///    `sub_delegation` granted past the first hop, within the depth cap. For a
+///    quorum community the walk roots at the edges its quorum cosigned
+///    ([`quorum_licence_reach`]).
 ///
 /// [`Authority`]: LicensureIssuance::Authority
 /// [`Testimony`]: LicensureIssuance::Testimony
@@ -4256,20 +4474,24 @@ pub async fn licensure_issuance_at(
         .and_then(serde_json::Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    // A community's founder issuing directly (where the protocol lets one).
-    // Only a community needs the roster read for this; a key authority was
-    // settled above.
-    let roots = if matches!(authority, LicensureAuthority::Community(_)) {
-        let roots = licensure_roots_at(directory, authority, t).await?;
-        if roots
-            .as_ref()
-            .is_ok_and(|r| r.contains(&row.attesting_key_id))
-        {
-            return Ok(LicensureIssuance::Authority);
+    // A community's founder issuing directly (where the protocol lets one), or
+    // its quorum cosigning the row (where it does not). Only a community needs
+    // the roster read for this; a key authority was settled above.
+    let roots = match authority {
+        LicensureAuthority::Key(k) => LicenceRoots::Seats(std::iter::once(k.clone()).collect()),
+        LicensureAuthority::Community(_) => {
+            let roots = licence_roots_at(directory, authority, t).await?;
+            let stands = match &roots {
+                LicenceRoots::Seats(r) => r.contains(&row.attesting_key_id),
+                LicenceRoots::Quorum(c) => {
+                    community_quorum_cosigned_at(directory, c, row, t).await?
+                }
+            };
+            if stands {
+                return Ok(LicensureIssuance::Authority);
+            }
+            roots
         }
-        Some(roots)
-    } else {
-        None
     };
     let Some(delegation_id) = delegation_id else {
         return Ok(LicensureIssuance::Testimony);
@@ -4289,33 +4511,43 @@ pub async fn licensure_issuance_at(
     if edge.attested_key_id != row.attesting_key_id {
         return Ok(unresolved(LicensureChainBreak::NamedEdgeNotOntoEmitter));
     }
-    let roots = match roots {
-        Some(r) => r,
-        None => licensure_roots_at(directory, authority, t).await?,
-    };
-    let Ok(roots) = roots else {
-        return Ok(unresolved(LicensureChainBreak::AuthorityActsByQuorum));
-    };
     let lens = DelegationWalkLens {
         as_of: Some(t),
+        // v60.0.0 (CIRISPersist#1048 item 1) — an affiliation's charter term
+        // bounds every edge on its licence chain.
+        role_term_seconds: licensure_role_term_at(directory, authority, t).await?,
         ..DelegationWalkLens::default()
     };
-    for root in &roots {
-        let reach = scoped_delegation_reach_at(
-            directory,
-            root,
-            &std::collections::HashSet::new(),
-            DELEGATION_SCOPE_LICENSE,
-            MAX_MODERATION_DELEGATION_DEPTH,
-            DelegationWalkPolicy::MODERATION_DUTY,
-            lens,
-        )
-        .await?;
-        if reach.traversed.contains(&edge.attestation_id) {
-            return Ok(LicensureIssuance::Delegated { delegation_id });
+    match roots {
+        LicenceRoots::Seats(roots) => {
+            for root in &roots {
+                let reach = scoped_delegation_reach_at(
+                    directory,
+                    root,
+                    &std::collections::HashSet::new(),
+                    DELEGATION_SCOPE_LICENSE,
+                    MAX_MODERATION_DELEGATION_DEPTH,
+                    DelegationWalkPolicy::MODERATION_DUTY,
+                    lens,
+                )
+                .await?;
+                if reach.traversed.contains(&edge.attestation_id) {
+                    return Ok(LicensureIssuance::Delegated { delegation_id });
+                }
+            }
+            Ok(unresolved(LicensureChainBreak::NotOnLiveChain))
+        }
+        LicenceRoots::Quorum(c) => {
+            let reach =
+                quorum_licence_reach(directory, &c, &std::collections::HashSet::new(), lens)
+                    .await?;
+            if reach.traversed.contains(&edge.attestation_id) {
+                Ok(LicensureIssuance::Delegated { delegation_id })
+            } else {
+                Ok(unresolved(LicensureChainBreak::AuthorityActsByQuorum))
+            }
         }
     }
-    Ok(unresolved(LicensureChainBreak::NotOnLiveChain))
 }
 
 /// v42.0.0 (review, P1) — **was this ROW issued under `authority_id`'s
@@ -4333,12 +4565,11 @@ pub async fn licensure_issuance_at(
 /// claims no delegation is testimony permanently, and a claimed one is judged
 /// at the row's own signed instant.
 ///
-/// v54.0.0 (CIRISPersist#1049) — the fold keeps the signed instant while the
-/// door also judges at receipt. That is sound because the fold reads only
-/// STORED rows, and a stored row passed the door once: CC, "a grant admitted
-/// once is not re-admitted". The door's receipt check is what stops a
-/// withdrawn officer backdating a licence into an old term; the fold need not
-/// repeat it, and must not, or a later withdrawal would reclassify history.
+/// v54.0.0 (CIRISPersist#1049); v60.0.0 (CIRISPersist#1036 item 2) — the
+/// fold and the door judge at the same signed instant. The door adds only the
+/// past-freshness window W: a row older than W must also hold at receipt. The
+/// fold need not repeat that, and must not, or a later withdrawal would
+/// reclassify history ("a grant admitted once is not re-admitted").
 pub async fn row_was_issued_under_authority(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
@@ -4377,13 +4608,25 @@ pub async fn emitter_resolves_to_authority(
         return Ok(true);
     }
     let now = chrono::Utc::now();
-    let Ok(roots) = licensure_roots_at(directory, &authority, now).await? else {
-        return Ok(false);
+    let targets: std::collections::HashSet<String> = std::iter::once(attester.to_owned()).collect();
+    let lens = DelegationWalkLens {
+        as_of: Some(now),
+        role_term_seconds: licensure_role_term_at(directory, &authority, now).await?,
+        ..DelegationWalkLens::default()
+    };
+    let roots = match licence_roots_at(directory, &authority, now).await? {
+        LicenceRoots::Seats(roots) => roots,
+        // v60.0.0 (CIRISPersist#1036 item 1) — no single key IS a quorum
+        // authority; a key resolves to it through a chain its quorum rooted.
+        LicenceRoots::Quorum(c) => {
+            return Ok(quorum_licence_reach(directory, &c, &targets, lens)
+                .await?
+                .hit_target)
+        }
     };
     if roots.contains(attester) {
         return Ok(true);
     }
-    let targets: std::collections::HashSet<String> = std::iter::once(attester.to_owned()).collect();
     for root in &roots {
         if scoped_delegation_reach_at(
             directory,
@@ -4392,10 +4635,7 @@ pub async fn emitter_resolves_to_authority(
             DELEGATION_SCOPE_LICENSE,
             MAX_MODERATION_DELEGATION_DEPTH,
             DelegationWalkPolicy::MODERATION_DUTY,
-            DelegationWalkLens {
-                as_of: Some(now),
-                ..DelegationWalkLens::default()
-            },
+            lens,
         )
         .await?
         .hit_target
@@ -4533,29 +4773,29 @@ pub async fn licences_issued_under(
 /// `delegation_id` it required (any chain to the emitter passed, whichever
 /// edge the row named).
 ///
-/// v54.0.0 (CIRISPersist#1049) — **judged at receipt, and at the signed
-/// instant.** CC ruled a licence is judged at its signed `asserted_at`
-/// (#1036 item 2), but that rule is safe only with a past-freshness window on
-/// `asserted_at`, and none exists yet: judged at the signed instant alone, a
-/// withdrawn officer could date a licence inside their old term and the door
-/// would admit it. So in this cut the chain, its terms and the authority set
-/// must hold at RECEIPT (now). They must ALSO hold at the signed instant, so
-/// the door never admits a row the fold (which reads the signed instant)
-/// would exclude, and a row that is the authority's own at its signed instant
-/// must be the authority's own at receipt too
-/// ([`LICENSURE_NOT_AUTHORITY_AT_RECEIPT`]: a founder who has left cannot
-/// backdate a direct issuance). The signed-instant rule alone lands with the
-/// window (#1049).
+/// v60.0.0 (CIRISPersist#1036 item 2, CC 2.4.1.2.1, CIRISConstitution#162;
+/// the W bound CIRISPersist#1049, CC 2.6.7) — **judged at the signed
+/// `asserted_at`, never at receipt.** Authority is a shared verdict every node
+/// must compute identically, so the chain, its terms and the authority set
+/// are read at the row's signed instant (`fold_at`), the instant the fold
+/// reads — the door never admits a row the fold would exclude. A later
+/// withdrawal of a link stops future issuance and does not reclassify a
+/// licence already issued.
+///
+/// The signed instant stands alone only inside the past-freshness window W
+/// ([`super::self_roster::PAST_FRESHNESS_W_SECS`], 72 h): a row that IS the
+/// authority's at its signed instant, signed more than W before `received_at`,
+/// must also be the authority's at receipt, or it is refused
+/// [`Error::AssertedAtStale`] (plane `licensure`). Without the bound a
+/// withdrawn officer (or a departed founder, or a dissolved quorum) could date
+/// a licence inside its old term. A row whose standing still holds at receipt
+/// admits at any age, so an honest late arrival is not lost; testimony walks
+/// no chain and meets no bound.
 ///
 /// v56.0.0 (CIRISPersist#934 step 1) — `received_at` is the receiving node's
 /// clock at the door, an INPUT of the shared attestation plan
-/// (`attestation_admit::PlanInstants`) rather than a clock read inside the
-/// gate. This gate read the clock before the plan existed, so it judges at
-/// the receipt instant still: unchanged behaviour (#934). Where its judgement
-/// belongs at the row's signed instant instead, moving it is #1049's ruling.
-/// `fold_at` is the row's signed instant (the live door passes the row's own
-/// `asserted_at`, which is what this gate judged its second leg at before);
-/// a replay of `V(rows, t)` passes `t`.
+/// (`attestation_admit::PlanInstants`); `fold_at` is the row's signed instant
+/// (a replay of `V(rows, t)` passes `t`).
 pub async fn check_licensure_delegator_is_authority(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
@@ -4571,44 +4811,11 @@ pub async fn check_licensure_delegator_is_authority(
     // v54.0.0 (Codex round 3 on PR #1050) — resolved BEFORE any shortcut. A
     // community's id can also resolve to a key (an infrastructure community's
     // id IS its substrate key, `is_authorized_infrastructure_community`), and
-    // that key is not the community's authority set. Equality of the ids
-    // short-circuited here, so a delegated-issuance row that key signed was
-    // admitted without the founder / consensus set ever being read, and the
-    // fold then classified the stored row unresolved. Only a KEY authority is
+    // that key is not the community's authority set. Only a KEY authority is
     // its own issuer, and `licensure_issuance_at` says so with no read.
     let authority = resolve_licensure_authority(directory, authority_id).await?;
     if matches!(&authority, LicensureAuthority::Key(k) if *k == row.attesting_key_id) {
         return Ok(());
-    }
-    // v54.1.0 (CIRISPersist#1042 follow-up C) — typed, with `reason` as the
-    // stable token; the Display is the pre-v54.1 text.
-    let refuse = |reason: &'static str, delegation_id: Option<&str>, judged: &str| {
-        let message = format!(
-            "licensure_delegator_not_authority: {reason}: {:?} emitted {dimension:?} under \
-             delegation {delegation_id:?} signed at {asserted_at}, and it is not the \
-             authority's own issuance on a live `license` chain from {authority_id:?} at \
-             {judged} (CC 3.3.9 / CC 4.4.3.4.3; judged at receipt and at the signed \
-             asserted_at in this cut, CIRISPersist#1032, #1049). A `license` scope authorises \
-             emitting on behalf of a delegator that itself holds authority for THAT \
-             authority_id; lending authority one does not hold is the refusal. This says \
-             nothing about whether {authority_id:?} is known or trusted.",
-            row.attesting_key_id,
-            asserted_at = row.asserted_at,
-        );
-        Err(Error::LicensureDelegatorNotAuthority {
-            attesting_key_id: row.attesting_key_id.clone(),
-            authority_id: authority_id.to_owned(),
-            reason,
-            message,
-        })
-    };
-    let at_receipt = licensure_issuance_at(directory, &authority, row, received_at).await?;
-    if let LicensureIssuance::Unresolved {
-        delegation_id,
-        reason,
-    } = &at_receipt
-    {
-        return refuse(reason.as_str(), Some(delegation_id), "receipt");
     }
     let at_signed = licensure_issuance_at(directory, &authority, row, fold_at).await?;
     if let LicensureIssuance::Unresolved {
@@ -4616,16 +4823,311 @@ pub async fn check_licensure_delegator_is_authority(
         reason,
     } = &at_signed
     {
-        return refuse(
-            reason.as_str(),
-            Some(delegation_id),
-            "the signed asserted_at",
+        // v54.1.0 (CIRISPersist#1042 follow-up C) — typed, with `reason` as
+        // the stable token.
+        let message = format!(
+            "licensure_delegator_not_authority: {reason}: {:?} emitted {dimension:?} under \
+             delegation {delegation_id:?} signed at {asserted_at}, and it is not the \
+             authority's own issuance on a live `license` chain from {authority_id:?} at \
+             the signed asserted_at (CC 3.3.9 / CC 4.4.3.4.3 / CC 2.4.1.2.1; judged at the \
+             signed instant, CIRISPersist#1036). A `license` scope authorises emitting on \
+             behalf of a delegator that itself holds authority for THAT authority_id; lending \
+             authority one does not hold is the refusal. This says nothing about whether \
+             {authority_id:?} is known or trusted.",
+            row.attesting_key_id,
+            reason = reason.as_str(),
+            asserted_at = row.asserted_at,
         );
+        return Err(Error::LicensureDelegatorNotAuthority {
+            attesting_key_id: row.attesting_key_id.clone(),
+            authority_id: authority_id.to_owned(),
+            reason: reason.as_str(),
+            message,
+        });
     }
-    if at_signed.is_the_authoritys() && !at_receipt.is_the_authoritys() {
-        return refuse(LICENSURE_NOT_AUTHORITY_AT_RECEIPT, None, "receipt");
+    if at_signed.is_the_authoritys()
+        && super::self_roster::outside_past_freshness_window(row.asserted_at, received_at)
+        && !licensure_issuance_at(directory, &authority, row, received_at)
+            .await?
+            .is_the_authoritys()
+    {
+        return Err(Error::AssertedAtStale {
+            author: row.attesting_key_id.clone(),
+            standing_for: authority_id.to_owned(),
+            plane: "licensure",
+            asserted_at: row.asserted_at,
+            w_secs: super::self_roster::PAST_FRESHNESS_W_SECS,
+        });
     }
     Ok(())
+}
+
+/// v60.0.0 (CIRISPersist#1036 item 4, CC 3.3.9) — **the licence payload's
+/// `revision` anti-rollback**, ported from the retired `partner_record`
+/// plane: a `licensure:{A}` row carrying the typed payload
+/// ([`operational::PartnerRecord`](crate::federation::operational::PartnerRecord))
+/// whose `revision` is LOWER than one `A` already issued for the same
+/// `license_id` about the same subject is refused
+/// [`Error::PartnerRecordRollback`].
+///
+/// Only the AUTHORITY's own licences count, on both sides: the arriving row
+/// must be `A`'s issuance at its signed instant ([`licensure_issuance_at`],
+/// the one licensure verdict), and so must each held row it is compared
+/// against. Testimony about `A` carries no counter `A` answers for — were it
+/// counted, a stranger could publish `revision: u64::MAX` and freeze every
+/// later issuance of that licence — and testimony is never in the fold, so
+/// it needs no rollback guard either.
+///
+/// An EQUAL revision admits: a re-emission of one licence to named readers
+/// (CC 2.4.1.2.1, item 3) carries the revision it re-emits, and two
+/// same-revision rows compose in the status fold (`revoked` absorbs). The
+/// counter is grouped per `(authority, subject, license_id)`: the held
+/// licences read are the subject's (`attested_key_id`) rows under `A`.
+///
+/// # Errors
+///
+/// [`Error::PartnerRecordRollback`]; a malformed payload on the arriving row
+/// ([`Error::MalformedRow`]); directory reads.
+pub async fn check_partner_record_revision(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    let Some(rec) = crate::federation::operational::partner_record_of(row)? else {
+        return Ok(());
+    };
+    let Some(authority_id) = envelope_dimension(&row.attestation_envelope)
+        .and_then(crate::federation::licensure::authority_of)
+    else {
+        return Ok(());
+    };
+    let authority = resolve_licensure_authority(directory, authority_id).await?;
+    if !licensure_issuance_at(directory, &authority, row, row.asserted_at)
+        .await?
+        .is_the_authoritys()
+    {
+        return Ok(());
+    }
+    let prefix = format!(
+        "{}{authority_id}",
+        crate::federation::licensure::LICENSURE_DIMENSION_PREFIX
+    );
+    let mut held = Vec::new();
+    let mut pages = AttestationQuery::to(&row.attested_key_id, FOLD_PAGE)
+        .dimension_prefix(&prefix)
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        held.extend(page);
+    }
+    let mut existing: Option<u64> = None;
+    for h in &held {
+        if h.attestation_id == row.attestation_id
+            || envelope_dimension(&h.attestation_envelope)
+                .and_then(crate::federation::licensure::authority_of)
+                != Some(authority_id)
+        {
+            continue;
+        }
+        // A held row whose payload no longer parses carries no counter: it
+        // was admitted under the same parse, so this is unreachable short of
+        // a schema change, and skipping it fails toward admitting the
+        // authority's own new issuance rather than freezing it.
+        let Ok(Some(prior)) = crate::federation::operational::partner_record_of(h) else {
+            continue;
+        };
+        if prior.license_id != rec.license_id
+            || existing.is_some_and(|e| e >= prior.revision)
+            || prior.revision <= rec.revision
+        {
+            continue;
+        }
+        if licensure_issuance_at(directory, &authority, h, h.asserted_at)
+            .await?
+            .is_the_authoritys()
+        {
+            existing = Some(prior.revision);
+        }
+    }
+    match existing {
+        Some(existing) => Err(Error::PartnerRecordRollback {
+            license_id: rec.license_id,
+            submitted: rec.revision,
+            existing,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// v60.0.0 (CIRISPersist#1036 item 3) — the refusal prefix of
+/// [`check_licence_audience`]: `licence_audience_refused: {reason}: …`, an
+/// [`Error::InvalidArgument`] (Python `ValueError`). `reason` is a
+/// [`licence_audience_reason`] token.
+pub const LICENCE_AUDIENCE_REFUSED: &str = "licence_audience_refused";
+
+/// v60.0.0 (CIRISPersist#1036 item 3) — the stable reasons of
+/// [`LICENCE_AUDIENCE_REFUSED`]. Append-only.
+pub mod licence_audience_reason {
+    /// A licence at a commons scope (`species` / `biosphere` / `federation`)
+    /// whose class the affiliation's charter does not declare at that scope:
+    /// a licence has no public default.
+    pub const CLASS_NOT_DECLARED_PUBLIC: &str = "class_not_declared_public";
+    /// A licence at a scope other than the one the charter declares for its
+    /// class: the scope is the authority's declared choice.
+    pub const SCOPE_NOT_THE_DECLARED_CHOICE: &str = "scope_not_the_declared_choice";
+    /// A re-emission ([`super::LICENCE_RE_EMITS_MEMBER`]) naming no reader
+    /// beside the licensee in its `subject_key_ids`.
+    pub const RE_EMISSION_NAMES_NO_READER: &str = "re_emission_names_no_reader";
+    /// A re-emission of a licence this node does not hold under the same
+    /// authority and subject.
+    pub const RE_EMISSION_TARGET_UNKNOWN: &str = "re_emission_target_unknown";
+    /// A re-emission whose status or licence payload differs from the licence
+    /// it re-emits: a re-emission carries the same licence, never a new one.
+    pub const RE_EMISSION_DIVERGES: &str = "re_emission_diverges";
+}
+
+/// v60.0.0 (CIRISPersist#1036 item 3) — the envelope member of a licence row
+/// that RE-EMITS a held licence to named readers: the `attestation_id` of the
+/// licence it carries again. Persist's spelling (CC 2.4.1.2.1 describes the
+/// act, not the member); not `re_…`, which the payment-processor scan reads
+/// as a Stripe refund id.
+pub const LICENCE_RE_EMITS_MEMBER: &str = "reemission_of";
+
+/// v60.0.0 (CIRISPersist#1036 item 3, CC 2.4.1.2.1, CIRISConstitution#162;
+/// CLM-licence-audience) — **a licence has no public default; a non-public
+/// licence reaches other readers by re-emission.**
+///
+/// For a `licensure:{A}` row whose authority `A` is an AFFILIATION this node
+/// holds (`cohort_scope: affiliations`; the declaration lives in its charter,
+/// so only an affiliation can make one — a key authority and a plain
+/// community keep the producer's choice):
+///
+/// - its class is its licence payload's `license_type`
+///   ([`operational::PartnerRecord`](crate::federation::operational::PartnerRecord));
+/// - where the charter's `licence_audiences` declares a scope for the class,
+///   the row's signed `cohort_scope` must BE that scope
+///   ([`licence_audience_reason::SCOPE_NOT_THE_DECLARED_CHOICE`]);
+/// - where it declares none (or the row has no class), the row may take any
+///   scope but a commons one (`species`, `biosphere`, `federation`: no roster,
+///   any reader — the "public" CC rules out as a default)
+///   ([`licence_audience_reason::CLASS_NOT_DECLARED_PUBLIC`]).
+///
+/// A RE-EMISSION ([`LICENCE_RE_EMITS_MEMBER`] names a held licence) is a new
+/// row, signed (and for a quorum authority cosigned) again, carried at the
+/// SAME declared scope and naming its readers in `subject_key_ids` — never
+/// carried at the wrong scope (`cohort_scope` is in the signed bytes) and
+/// never by widening the roster. It must name at least one reader beside the
+/// licensee, re-emit a licence held under the same authority about the same
+/// subject, and carry its status and payload unchanged. Its authority is the
+/// licensure door's ([`check_licensure_delegator_is_authority`]), like any
+/// licence's. The authority head a verifier also needs (roster version,
+/// protocol, the `license` edges) rides its own planes.
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] prefixed [`LICENCE_AUDIENCE_REFUSED`]; the
+/// charter's own refusal when it does not parse; directory reads.
+pub async fn check_licence_audience(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    if row.attestation_type != attestation_type::SCORES {
+        return Ok(());
+    }
+    let Some(authority_id) = envelope_dimension(&row.attestation_envelope)
+        .and_then(crate::federation::licensure::authority_of)
+    else {
+        return Ok(());
+    };
+    let refuse = |reason: &'static str, detail: String| {
+        Err(Error::InvalidArgument(format!(
+            "{LICENCE_AUDIENCE_REFUSED}: {reason}: licence {} under {authority_id:?}: {detail} \
+             (CC 2.4.1.2.1, CIRISPersist#1036 item 3)",
+            row.attestation_id
+        )))
+    };
+    if let Some(original_id) = row
+        .attestation_envelope
+        .get(LICENCE_RE_EMITS_MEMBER)
+        .and_then(serde_json::Value::as_str)
+    {
+        if !row
+            .subject_key_ids
+            .iter()
+            .any(|k| k != &row.attested_key_id)
+        {
+            return refuse(
+                licence_audience_reason::RE_EMISSION_NAMES_NO_READER,
+                "a re-emission names its readers in subject_key_ids".to_owned(),
+            );
+        }
+        let Some(original) = directory.get_attestation(original_id).await? else {
+            return refuse(
+                licence_audience_reason::RE_EMISSION_TARGET_UNKNOWN,
+                format!("re-emits {original_id:?}, which this node does not hold"),
+            );
+        };
+        if envelope_dimension(&original.attestation_envelope)
+            .and_then(crate::federation::licensure::authority_of)
+            != Some(authority_id)
+            || original.attested_key_id != row.attested_key_id
+        {
+            return refuse(
+                licence_audience_reason::RE_EMISSION_TARGET_UNKNOWN,
+                format!(
+                    "re-emits {original_id:?}, which is not a licence under the same authority \
+                     about the same subject"
+                ),
+            );
+        }
+        let member = |r: &super::Attestation, k: &str| r.attestation_envelope.get(k).cloned();
+        if member(&original, "status") != member(row, "status")
+            || member(
+                &original,
+                crate::federation::operational::PARTNER_RECORD_MEMBER,
+            ) != member(row, crate::federation::operational::PARTNER_RECORD_MEMBER)
+        {
+            return refuse(
+                licence_audience_reason::RE_EMISSION_DIVERGES,
+                format!("re-emits {original_id:?} with a different status or payload"),
+            );
+        }
+    }
+    let Some(community) = directory.lookup_community(authority_id).await? else {
+        return Ok(());
+    };
+    if crate::federation::affiliation_config::declared_cohort(&community)?
+        != super::cohort::Cohort::Affiliations
+    {
+        return Ok(());
+    }
+    let class = crate::federation::operational::partner_record_of(row)?.map(|p| p.license_type);
+    let declared = crate::federation::affiliation_config::affiliation_config_of(&community)?
+        .and_then(|c| c.licence_audiences)
+        .and_then(|m| class.as_ref().and_then(|k| m.get(k).cloned()));
+    match declared {
+        Some(scope) if scope != row.cohort_scope => refuse(
+            licence_audience_reason::SCOPE_NOT_THE_DECLARED_CHOICE,
+            format!(
+                "class {class:?} is declared {scope:?} by the affiliation's charter, the row is \
+                 at {:?}",
+                row.cohort_scope
+            ),
+        ),
+        Some(_) => Ok(()),
+        None if crate::federation::types::cohort_scope::Scope::parse(&row.cohort_scope)
+            .map(crate::federation::types::cohort_scope::Scope::placement)
+            == Some(crate::federation::types::cohort_scope::Placement::Commons) =>
+        {
+            refuse(
+                licence_audience_reason::CLASS_NOT_DECLARED_PUBLIC,
+                format!(
+                    "class {class:?} has no declared audience in the affiliation's charter, and a \
+                 licence has no public default (the row is at the commons scope {:?})",
+                    row.cohort_scope
+                ),
+            )
+        }
+        None => Ok(()),
+    }
 }
 
 /// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — the **sensitive-leaf
@@ -8214,6 +8716,12 @@ struct DelegationWalkLens<'a> {
     /// appointed never conferred the duty. Deeper edges are judged by the
     /// ordinary gates. `None`: no epoch filter (every pre-existing caller).
     root_authority: Option<&'a [AuthorityInterval]>,
+    /// v60.0.0 (CIRISPersist#1048 item 1, CC 4.4.3.2.8 C) — `Some(s)`: the
+    /// walk roots at an affiliation whose charter declares a `role_term` of
+    /// `s` seconds, and a term-bearing edge whose term is longer is not live
+    /// (read only with `as_of`, beside the term). `None`: only the
+    /// constitutional one-year ceiling binds.
+    role_term_seconds: Option<i64>,
 }
 
 /// v54.0.0 (CIRISPersist#1032, CC 4.4.3.2.8 C) — the `delegates_to`
@@ -8229,8 +8737,198 @@ pub const DELEGATION_VALID_FROM_FIELD: &str = "delegation_valid_from";
 /// the canonical `valid_until`).
 pub const DELEGATION_VALID_UNTIL_FIELD: &str = "delegation_valid_until";
 
+/// v60.0.0 (CIRISPersist#1048) — **the instant the term rules took effect.**
+/// An edge signed before it keeps the term reading it was admitted under
+/// (CIRISPersist#1048 grandfather ruling, 2026-10-09: "stored edges keep
+/// conferring"): a one-ended term is not measured from its `asserted_at`, and
+/// an affiliation's `role_term` does not bound it. The admission gate
+/// ([`check_delegation_term_admission`]) is NOT gated on it — admission rules
+/// are not retroactive (they judge new admissions), and a backdated new
+/// edge must not dodge the gate by its own choice of instant.
+pub const DELEGATION_TERM_ADOPTED_AT: &str = "2026-10-23T00:00:00Z";
+
+fn delegation_term_adopted_at() -> chrono::DateTime<chrono::Utc> {
+    DELEGATION_TERM_ADOPTED_AT
+        .parse()
+        .expect("DELEGATION_TERM_ADOPTED_AT is an RFC 3339 instant")
+}
+
+/// v60.0.0 (CIRISPersist#1048) — the term a producer signs onto a
+/// `delegates_to` it mints ([`crate::Engine::grant_delegation`],
+/// [`crate::Engine::add_moderator`]). CC refuses a perpetual term-bearing
+/// edge rather than supplying a default term (CIRISConstitution#163), so a
+/// term-bearing edge minted with `valid_until: None` is refused at the door
+/// ([`check_delegation_term_admission`]). The default is no term, which is
+/// what a non-term-bearing edge (`act_on_behalf`, `infra:*`) may carry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DelegationTermBounds {
+    /// `delegation_valid_from`: the edge confers nothing before it. `None`:
+    /// the term opens when the edge is signed.
+    pub valid_from: Option<chrono::DateTime<chrono::Utc>>,
+    /// `delegation_valid_until`: the edge confers nothing at or after it.
+    pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl DelegationTermBounds {
+    /// A term open from signing until `valid_until`.
+    #[must_use]
+    pub fn until(valid_until: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            valid_from: None,
+            valid_until: Some(valid_until),
+        }
+    }
+
+    /// Write the present bounds into a `delegates_to` envelope, as CC 2.6.2
+    /// canonical instants (UTC `Z`, millisecond precision).
+    pub fn stamp(&self, envelope: &mut serde_json::Value) {
+        for (field, at) in [
+            (DELEGATION_VALID_FROM_FIELD, self.valid_from),
+            (DELEGATION_VALID_UNTIL_FIELD, self.valid_until),
+        ] {
+            if let Some(at) = at {
+                envelope[field] = serde_json::Value::String(
+                    at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                );
+            }
+        }
+    }
+}
+
+/// v60.0.0 (CIRISPersist#1048) — test fixtures: give a term-bearing
+/// `delegates_to` envelope that names no upper bound a 180-day term from its
+/// start, as CC requires of every producer. A fixture testing the term itself
+/// sets its own bounds, which this leaves alone.
+#[cfg(any(test, feature = "test-anchor"))]
+pub fn with_test_term(
+    envelope: &mut serde_json::Value,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+) {
+    if !is_term_bearing_edge(envelope) {
+        return;
+    }
+    let Ok(term) = DelegationTerm::read(envelope) else {
+        return;
+    };
+    if term.untils.is_empty() {
+        envelope[DELEGATION_VALID_UNTIL_FIELD] = serde_json::Value::String(
+            (term.from.unwrap_or(asserted_at) + chrono::Duration::days(180))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+    }
+}
+
+/// v60.0.0 (CIRISPersist#1048) — the refusal rules of
+/// [`Error::DelegationTermRequired`]. Stable tokens; append-only.
+pub mod delegation_term_rule {
+    /// A term-bearing edge names no upper bound (`delegation_valid_until` or
+    /// `valid_until`): a perpetual edge (CC 2.4, "a perpetual or
+    /// over-ceiling edge is refused").
+    pub const TERM_MISSING: &str = "term_missing";
+    /// A term member is present but is not an RFC 3339 instant.
+    pub const TERM_UNREADABLE: &str = "term_unreadable";
+    /// An upper bound lies more than one year
+    /// ([`ROLE_TERM_CEILING_SECONDS`](crate::federation::affiliation_config::ROLE_TERM_CEILING_SECONDS))
+    /// after the term's start.
+    pub const OVER_CEILING: &str = "over_ceiling";
+    /// An upper bound lies more than the named affiliation's `role_term`
+    /// after the term's start (CC 4.4.3.2.8 C: "the term itself is a charter
+    /// parameter").
+    pub const OVER_ROLE_TERM: &str = "over_role_term";
+}
+
+/// v60.0.0 (CIRISPersist#1048, CC 2.4, CIRISConstitution#163) — the scopes
+/// whose edge MUST carry a term: issuance (`license`, `grant`) and
+/// moderation (`moderate`, `takedown`, `review`, `slash`). An edge granting
+/// `sub_delegation` must too ([`is_term_bearing_edge`]).
+pub const TERM_BEARING_SCOPES: [&str; 6] = [
+    DELEGATION_SCOPE_LICENSE,
+    DELEGATION_SCOPE_GRANT,
+    DELEGATION_SCOPE_MODERATE,
+    DELEGATION_SCOPE_TAKEDOWN,
+    DELEGATION_SCOPE_REVIEW,
+    DELEGATION_SCOPE_SLASH,
+];
+
+/// v60.0.0 (CIRISPersist#1048) — does this `delegates_to` envelope confer
+/// something CC requires a term on: a [`TERM_BEARING_SCOPES`] token, or
+/// `sub_delegation`? An edge in an affiliation's hierarchy needs a term too;
+/// that is a fact about the community it names, read by
+/// [`check_delegation_term_admission`].
+#[must_use]
+pub fn is_term_bearing_edge(envelope: &serde_json::Value) -> bool {
+    delegation_grants_sub_delegation(envelope)
+        || TERM_BEARING_SCOPES
+            .iter()
+            .any(|s| delegation_scope_grants(envelope, s))
+}
+
+/// v60.0.0 (CIRISPersist#1048) — a `delegates_to` edge's signed term, read
+/// once for the walks' lens and the admission gate, so the two cannot read
+/// it differently.
+struct DelegationTerm {
+    /// `delegation_valid_from`, when present.
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    /// Every upper bound present: `delegation_valid_until` and the older
+    /// spelling `valid_until` (CC 2.1), which name the same bound.
+    untils: Vec<chrono::DateTime<chrono::Utc>>,
+}
+
+impl DelegationTerm {
+    /// Read the term. `Err(field)`: a member is present but is not an
+    /// RFC 3339 instant (null reads as absent).
+    fn read(envelope: &serde_json::Value) -> Result<Self, &'static str> {
+        let instant = |field: &'static str| match envelope.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(v) => v
+                .as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| Some(d.with_timezone(&chrono::Utc)))
+                .ok_or(field),
+        };
+        let from = instant(DELEGATION_VALID_FROM_FIELD)?;
+        let mut untils = Vec::new();
+        for field in [
+            DELEGATION_VALID_UNTIL_FIELD,
+            crate::federation::capacity::binding_field::VALID_UNTIL,
+        ] {
+            untils.extend(instant(field)?);
+        }
+        Ok(Self { from, untils })
+    }
+
+    /// The first upper bound that lies too far after the term's start, with
+    /// the rule it breaks. The start is `delegation_valid_from`, or, for a
+    /// term that names only its end, `start_if_absent` (the edge's signed
+    /// `asserted_at`: the edge confers nothing before it was signed — a
+    /// stamped instant belongs to the signer; `None` for a grandfathered edge,
+    /// which then has no span to measure). `role_term_seconds` is the
+    /// governing affiliation's charter bound, if any.
+    fn bound_breach(
+        &self,
+        start_if_absent: Option<chrono::DateTime<chrono::Utc>>,
+        role_term_seconds: Option<i64>,
+    ) -> Option<(&'static str, chrono::Duration)> {
+        let start = self.from.or(start_if_absent)?;
+        self.untils.iter().find_map(|until| {
+            let span = *until - start;
+            if span
+                > chrono::Duration::seconds(
+                    crate::federation::affiliation_config::ROLE_TERM_CEILING_SECONDS,
+                )
+            {
+                Some((delegation_term_rule::OVER_CEILING, span))
+            } else if role_term_seconds.is_some_and(|r| span > chrono::Duration::seconds(r)) {
+                Some((delegation_term_rule::OVER_ROLE_TERM, span))
+            } else {
+                None
+            }
+        })
+    }
+}
+
 /// v54.0.0 (CIRISPersist#1032, #1036 ruling item 2) — is a `delegates_to`
-/// envelope's signed TERM open at `t`?
+/// edge's signed TERM open at `t`?
 ///
 /// * `delegation_valid_from` (when present) must be `<= t`;
 /// * `delegation_valid_until` and `valid_until` (when present) must be `> t`
@@ -8238,53 +8936,168 @@ pub const DELEGATION_VALID_UNTIL_FIELD: &str = "delegation_valid_until";
 ///
 /// A member that is present but is not an RFC 3339 instant makes the edge
 /// NOT live: a term nobody can read cannot be judged open, and expiry must
-/// fail toward LESS authority (`namespace_supersets.json`, `valid_until`
-/// asymmetry note). An absent member bounds nothing.
+/// fail toward LESS authority. An absent member bounds nothing.
 ///
-/// The one-year ceiling (CC 4.4.3.2.8 C): when the term names both ends, an
-/// upper bound more than
+/// The bound (CC 4.4.3.2.8 C): an upper bound more than
 /// [`ROLE_TERM_CEILING_SECONDS`](crate::federation::affiliation_config::ROLE_TERM_CEILING_SECONDS)
-/// (`365 × 86400` s) after `delegation_valid_from` makes the edge NOT live at
-/// any instant: a term past the ceiling is not a term the constitution
-/// recognises, and it fails toward less authority like an unreadable one. A
-/// term that names only one end has no span to measure.
-fn delegation_term_live_at(envelope: &serde_json::Value, t: chrono::DateTime<chrono::Utc>) -> bool {
-    let instant = |field: &str| -> Option<Option<chrono::DateTime<chrono::Utc>>> {
-        match envelope.get(field) {
-            None | Some(serde_json::Value::Null) => Some(None),
-            Some(v) => v
-                .as_str()
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|d| Some(d.with_timezone(&chrono::Utc))),
-        }
-    };
-    let Some(from) = instant(DELEGATION_VALID_FROM_FIELD) else {
+/// (`365 × 86400` s) after the term's start makes the edge NOT live at any
+/// instant: a term past the ceiling is not a term the constitution
+/// recognises.
+///
+/// v60.0.0 (CIRISPersist#1048) — for an edge signed at or after
+/// [`DELEGATION_TERM_ADOPTED_AT`], the admission gate's reading through
+/// [`DelegationTerm`]: on a term-bearing edge ([`is_term_bearing_edge`]) a
+/// term naming only its end is measured from the signed `asserted_at`, and
+/// `role_term_seconds` (the charter bound of the affiliation the walk roots
+/// at) bounds it too. An edge signed before keeps the v54 reading (the
+/// grandfather ruling): the ceiling binds a term that names both ends, on
+/// any edge.
+fn delegation_term_live_at(
+    edge: &super::Attestation,
+    t: chrono::DateTime<chrono::Utc>,
+    role_term_seconds: Option<i64>,
+) -> bool {
+    let envelope = &edge.attestation_envelope;
+    let Ok(term) = DelegationTerm::read(envelope) else {
         return false;
     };
-    if from.is_some_and(|f| f > t) {
+    if term.from.is_some_and(|f| f > t) || term.untils.iter().any(|u| *u <= t) {
         return false;
     }
-    for field in [
-        DELEGATION_VALID_UNTIL_FIELD,
-        crate::federation::capacity::binding_field::VALID_UNTIL,
-    ] {
-        match instant(field) {
-            None => return false,
-            Some(Some(until)) if until <= t => return false,
-            Some(Some(until))
-                if from.is_some_and(|f| {
-                    until - f
-                        > chrono::Duration::seconds(
-                            crate::federation::affiliation_config::ROLE_TERM_CEILING_SECONDS,
-                        )
-                }) =>
+    if edge.asserted_at < delegation_term_adopted_at() {
+        return term.bound_breach(None, None).is_none();
+    }
+    !(is_term_bearing_edge(envelope)
+        && term
+            .bound_breach(Some(edge.asserted_at), role_term_seconds)
+            .is_some())
+}
+
+/// The lens ([`delegation_term_live_at`]) is private; the term witnesses read
+/// it through this.
+#[cfg(test)]
+pub(crate) fn delegation_term_live_at_for_test(
+    edge: &super::Attestation,
+    t: chrono::DateTime<chrono::Utc>,
+    role_term_seconds: Option<i64>,
+) -> bool {
+    delegation_term_live_at(edge, t, role_term_seconds)
+}
+
+/// v60.0.0 (CIRISPersist#1048, CC 2.4 / CC 4.4.3.2.8 C,
+/// CIRISConstitution#163; CLM-delegation-term) — **a term-bearing
+/// `delegates_to` carries a bounded term.** CC: "`delegation_valid_until` is
+/// REQUIRED, at most one year after `delegation_valid_from`, on any edge
+/// carrying `sub_delegation`, `license`, `grant`, `moderate`, `takedown`,
+/// `review` or `slash`, or sitting in an affiliation's `hierarchy`; a
+/// perpetual or over-ceiling edge is refused `delegation_term_required`."
+///
+/// The edge must, when it is term-bearing ([`is_term_bearing_edge`]) or
+/// names (`community_id`, any [`COHORT_TARGET_ENVELOPE_FIELDS`] alias — CC
+/// 2.1: a hierarchy edge names its community) a community this node holds
+/// that declares `cohort_scope: affiliations`:
+///
+/// * name an upper bound (`delegation_valid_until`, or the older `valid_until`)
+///   — else [`delegation_term_rule::TERM_MISSING`], with no implied ceiling;
+/// * carry readable term members — else
+///   [`delegation_term_rule::TERM_UNREADABLE`];
+/// * end each upper bound at most one year after the term's start — else
+///   [`delegation_term_rule::OVER_CEILING`] — and, in an affiliation that
+///   declares a `role_term`, at most that many days after it — else
+///   [`delegation_term_rule::OVER_ROLE_TERM`].
+///
+/// The term's start is `delegation_valid_from`, or the edge's signed
+/// `asserted_at` when it is absent (CC reading 2026-10-09: "`_from` absent =
+/// the edge's own signed `asserted_at`"). A term-bearing edge naming only its
+/// start is perpetual and refused. An edge that needs no term keeps it
+/// optional: `_until` absent there is open-ended.
+///
+/// Not gated: a trust-plane edge (an acceptance or a charter, not a
+/// delegation of capability) and an owner-binding (CC 3.2 governs its lapse,
+/// and CIRISConstitution#163 puts it out of scope).
+///
+/// The walks honour the same bounds through [`delegation_term_live_at`]: a
+/// licence or moderation walk rooted at an affiliation reads that
+/// affiliation's `role_term` (CIRISPersist#1048 item 1).
+///
+/// # Errors
+/// [`Error::DelegationTermRequired`] (`federation_delegation_term_required`);
+/// a named affiliation whose record does not parse refuses with
+/// [`Error::AffiliationConfigInvalid`], never "no bound".
+pub async fn check_delegation_term_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    if row.attestation_type != attestation_type::DELEGATES_TO
+        || is_trust_plane_edge(row)
+        || is_owner_binding_envelope(&row.attestation_envelope)
+    {
+        return Ok(());
+    }
+    let envelope = &row.attestation_envelope;
+    let mut role_term_seconds = None;
+    let mut in_hierarchy = None;
+    if let Some(named) = envelope_cohort_target(envelope)? {
+        if let Some(c) = directory.lookup_community(named).await? {
+            if crate::federation::affiliation_config::declared_cohort(&c)?
+                == super::cohort::Cohort::Affiliations
             {
-                return false
+                role_term_seconds = crate::federation::affiliation_config::role_term_seconds(&c)?;
+                in_hierarchy = Some(c.community_key_id);
             }
-            Some(_) => {}
         }
     }
-    true
+    if !is_term_bearing_edge(envelope) && in_hierarchy.is_none() {
+        return Ok(());
+    }
+    let refuse = |rule: &'static str, detail: String| {
+        Err(Error::DelegationTermRequired {
+            attesting_key_id: row.attesting_key_id.clone(),
+            attested_key_id: row.attested_key_id.clone(),
+            rule,
+            detail,
+        })
+    };
+    let why = in_hierarchy.as_ref().map_or_else(
+        || "a term-bearing edge".to_owned(),
+        |c| format!("an edge in affiliation {c}'s hierarchy"),
+    );
+    let term = match DelegationTerm::read(envelope) {
+        Ok(term) => term,
+        Err(field) => {
+            return refuse(
+                delegation_term_rule::TERM_UNREADABLE,
+                format!("{field} is not an RFC 3339 instant"),
+            )
+        }
+    };
+    if term.untils.is_empty() {
+        return refuse(
+            delegation_term_rule::TERM_MISSING,
+            format!(
+                "{why} names no {DELEGATION_VALID_UNTIL_FIELD}: a perpetual edge is refused \
+                 (CC 2.4, CC 4.4.3.2.8 C)"
+            ),
+        );
+    }
+    if let Some((rule, span)) = term.bound_breach(Some(row.asserted_at), role_term_seconds) {
+        let bound = role_term_seconds
+            .filter(|_| rule == delegation_term_rule::OVER_ROLE_TERM)
+            .unwrap_or(crate::federation::affiliation_config::ROLE_TERM_CEILING_SECONDS);
+        return refuse(
+            rule,
+            format!(
+                "{why}'s term runs {}s from its start ({}); the bound is {bound}s",
+                span.num_seconds(),
+                if term.from.is_some() {
+                    DELEGATION_VALID_FROM_FIELD
+                } else {
+                    "the signed asserted_at"
+                },
+            ),
+        );
+    }
+    Ok(())
 }
 
 /// v54.0.0 (CIRISPersist#1031 meeting #1032) — will a `delegates_to`
@@ -8321,7 +9134,7 @@ fn delegation_edge_live_at_or_after(
         },
     };
     let probe = from.map_or(now, |f| f.max(now));
-    edge.expires_at.is_none_or(|x| x > probe) && delegation_term_live_at(envelope, probe)
+    edge.expires_at.is_none_or(|x| x > probe) && delegation_term_live_at(edge, probe, None)
 }
 
 impl DelegationWalkLens<'_> {
@@ -8352,7 +9165,7 @@ impl DelegationWalkLens<'_> {
             // edge's own signed TERM, read at the same instant. Before this a
             // term-bound officer never lapsed under any lens that read only
             // the row's `expires_at` column.
-            if !delegation_term_live_at(&edge.attestation_envelope, t) {
+            if !delegation_term_live_at(edge, t, self.role_term_seconds) {
                 return false;
             }
         }
@@ -9123,8 +9936,16 @@ pub async fn resolve_withdraws_admission_rule_at(
     // `reconsideration:{grounds}` standing, this gate must be revisited in the
     // same change — otherwise it goes back to closing a door with nothing
     // behind it, which is what #587 actually objected to.
+    //
+    // v60.0.0 (CIRISPersist#1036 item 5, CIRISConstitution#164; CC 2.4.1.1 as
+    // ratified at rc8) — the carve-out names FOUR adverse classes: a subject
+    // may not withdraw a `licensure:*` or `revocation:*` row about itself
+    // either. A licensee's contest path is `reconsideration:{grounds}`, on
+    // which it holds standing ([`check_reconsideration_admission`]: the
+    // licence subject arm and the authority's duty-holders), never
+    // withdrawal. Same check, same refusal, widened in place.
     let target_denies_subject_revocation = envelope_dimension(&target.attestation_envelope)
-        .is_some_and(|d| d.starts_with("capacity:") || d.starts_with("detection:"));
+        .is_some_and(|d| SUBJECT_WITHDRAWS_CARVE_OUT.iter().any(|p| d.starts_with(p)));
     if target_denies_subject_revocation {
         return Err(Error::WithdrawsNotAdmitted {
             issuer: issuer.to_string(),
@@ -9234,6 +10055,21 @@ pub async fn owner_granters_in_force_at(
     node: &str,
     t: chrono::DateTime<chrono::Utc>,
 ) -> Result<std::collections::BTreeSet<String>, Error> {
+    Ok(owner_bindings_in_force_at(directory, node, t)
+        .await?
+        .into_iter()
+        .map(|b| b.attesting_key_id)
+        .collect())
+}
+
+/// v60.0.0 (CIRISPersist#1062) — the owner-bindings over `node` IN FORCE at
+/// `t`, by the rule [`owner_granters_in_force_at`] documents (that fold is
+/// this one's granters).
+async fn owner_bindings_in_force_at(
+    directory: &dyn super::FederationDirectory,
+    node: &str,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<super::Attestation>, Error> {
     // The bindings and the withdrawals that end them: the only two types the
     // fold below reads.
     let mut rows = Vec::new();
@@ -9280,15 +10116,27 @@ pub async fn owner_granters_in_force_at(
     };
     let in_force_at_t =
         |b: &super::Attestation| b.asserted_at <= t && ended_at(b).is_none_or(|e| e > t);
-    let owner_bindings = rows.iter().filter(|b| {
-        b.attestation_type == super::types::attestation_type::DELEGATES_TO
-            && is_owner_binding_envelope(&b.attestation_envelope)
-    });
-    Ok(owner_bindings
-        .filter(|b| in_force_at_t(b))
-        .map(|b| b.attesting_key_id.clone())
-        .collect())
+    let in_force: Vec<super::Attestation> = rows
+        .iter()
+        .filter(|b| {
+            b.attestation_type == super::types::attestation_type::DELEGATES_TO
+                && is_owner_binding_envelope(&b.attestation_envelope)
+                && in_force_at_t(b)
+        })
+        .cloned()
+        .collect();
+    Ok(in_force)
 }
+
+/// v60.0.0 (CIRISPersist#1036 item 5; CC 2.4.1.1, CIRISConstitution#164) —
+/// **the anti-Goodhart retraction dual's adverse classes**: a `withdraws`
+/// against a row on one of these families is admitted only under rule 1
+/// (the producer); the subject-side rules 2–4 are refused. `capacity:*` and
+/// `detection:*` since v21.11.0; `licensure:*` and `revocation:*` since
+/// v60.0.0. The subject's contest path for all four is
+/// `reconsideration:{grounds}`.
+pub const SUBJECT_WITHDRAWS_CARVE_OUT: [&str; 4] =
+    ["capacity:", "detection:", "licensure:", "revocation:"];
 
 /// v6.4.0 (CIRISPersist#146 Ask 2) — the `put_attestation` entry point
 /// for the broadened gate. A no-op (`Ok(None)`) for any
@@ -11126,6 +11974,130 @@ where
          federation_keys row, a constitutional family, nor a trust-root community \
          known to this node"
     )))
+}
+
+/// v60.0.0 (CIRISPersist#1062) — the refusal prefix of
+/// [`check_owner_binding_affiliation_admission`]:
+/// `owner_binding_affiliation_refused: {reason}: …`, an
+/// [`Error::InvalidArgument`] (Python `ValueError`). `reason` is one of
+/// [`owner_binding_affiliation_reason`]'s tokens.
+pub const OWNER_BINDING_AFFILIATION_REFUSED: &str = "owner_binding_affiliation_refused";
+
+/// v60.0.0 (CIRISPersist#1062) — the stable reasons of
+/// [`OWNER_BINDING_AFFILIATION_REFUSED`]. Append-only.
+pub mod owner_binding_affiliation_reason {
+    /// The binding names a community this node does not hold.
+    pub const AFFILIATION_NOT_HELD: &str = "affiliation_not_held";
+    /// The binding names a community that does not declare `cohort_scope:
+    /// affiliations`: only an organisation stands on a steward's bond.
+    pub const NOT_AN_AFFILIATION: &str = "not_an_affiliation";
+    /// The binding is not cosigned under the affiliation's
+    /// `consensus_protocol` at its signed instant.
+    pub const NOT_COSIGNED_UNDER_PROTOCOL: &str = "not_cosigned_under_protocol";
+}
+
+/// v60.0.0 (CIRISPersist#1062; CC 3.2 / CC 3.3.9, CIRISConstitution#168,
+/// CLM-org-on-the-bond) — **an owner-binding held on behalf of an
+/// organisation names the affiliation and is cosigned under its protocol.**
+///
+/// A `delegates_to(user → agent)` owner-binding
+/// ([`is_owner_binding_envelope`]) that names a community (`community_id`,
+/// any [`COHORT_TARGET_ENVELOPE_FIELDS`] alias, [`envelope_cohort_target`])
+/// is admitted only when that community is an affiliation this node holds and
+/// the row is cosigned by its quorum under its own `consensus_protocol` at the
+/// row's signed instant (the cosigned-row rule, the licence's shape:
+/// [`community_quorum_cosigned_at`]). Signed more than W ago, the quorum must
+/// also hold at receipt ([`Error::AssertedAtStale`], plane `owner_binding`).
+/// A binding naming no community is a personal steward's binding, as before.
+/// The affiliation then answers alongside the steward
+/// ([`affiliation_of_binding`]).
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] prefixed [`OWNER_BINDING_AFFILIATION_REFUSED`];
+/// [`Error::AssertedAtStale`]; a split-brain cohort target; directory reads.
+pub async fn check_owner_binding_affiliation_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    if row.attestation_type != attestation_type::DELEGATES_TO
+        || !is_owner_binding_envelope(&row.attestation_envelope)
+    {
+        return Ok(());
+    }
+    let Some(named) = envelope_cohort_target(&row.attestation_envelope)? else {
+        return Ok(());
+    };
+    let refuse = |reason: &'static str, detail: String| {
+        Err(Error::InvalidArgument(format!(
+            "{OWNER_BINDING_AFFILIATION_REFUSED}: {reason}: owner-binding {} by {} over {} names \
+             {named:?}: {detail} (CC 3.2 / CC 3.3.9, CIRISPersist#1062)",
+            row.attestation_id, row.attesting_key_id, row.attested_key_id
+        )))
+    };
+    let Some(c) = directory.lookup_community(named).await? else {
+        return refuse(
+            owner_binding_affiliation_reason::AFFILIATION_NOT_HELD,
+            "this node holds no such community".to_owned(),
+        );
+    };
+    if crate::federation::affiliation_config::declared_cohort(&c)?
+        != super::cohort::Cohort::Affiliations
+    {
+        return refuse(
+            owner_binding_affiliation_reason::NOT_AN_AFFILIATION,
+            "it does not declare cohort_scope: affiliations".to_owned(),
+        );
+    }
+    let at_signed = community_in_force_at(directory, &c, row.asserted_at).await?;
+    if !community_quorum_cosigned_at(directory, &at_signed, row, row.asserted_at).await? {
+        return refuse(
+            owner_binding_affiliation_reason::NOT_COSIGNED_UNDER_PROTOCOL,
+            format!(
+                "its cosigners do not meet {:?} at the signed instant",
+                at_signed.consensus_protocol
+            ),
+        );
+    }
+    let now = chrono::Utc::now();
+    if super::self_roster::outside_past_freshness_window(row.asserted_at, now)
+        && !community_quorum_cosigned_at(directory, &c, row, now).await?
+    {
+        return Err(Error::AssertedAtStale {
+            author: row.attesting_key_id.clone(),
+            standing_for: named.to_owned(),
+            plane: "owner_binding",
+            asserted_at: row.asserted_at,
+            w_secs: super::self_roster::PAST_FRESHNESS_W_SECS,
+        });
+    }
+    Ok(())
+}
+
+/// v60.0.0 (CIRISPersist#1062, CLM-org-on-the-bond) — **the affiliation named
+/// on `key`'s live owner-binding**, for slashing / quarantine propagation and
+/// for the record: the community the binding in force now names
+/// ([`envelope_cohort_target`]), or `None` for a personal steward's binding or
+/// no binding at all. [`steward_bindings_of`] and [`is_steward_bound`] are
+/// unchanged; this reads beside them.
+///
+/// # Errors
+///
+/// A split-brain cohort target on the binding; directory reads.
+pub async fn affiliation_of_binding(
+    directory: &dyn super::FederationDirectory,
+    key: &str,
+) -> Result<Option<String>, Error> {
+    let bindings = owner_bindings_in_force_at(directory, key, chrono::Utc::now()).await?;
+    let mut named: Option<String> = None;
+    for b in &bindings {
+        if let Some(c) = envelope_cohort_target(&b.attestation_envelope)? {
+            if named.as_deref().is_none_or(|n| c < n) {
+                named = Some(c.to_owned());
+            }
+        }
+    }
+    Ok(named)
 }
 
 /// Verify-before-mutation (AV-9): wired into every backend's `put_attestation`
@@ -15072,6 +16044,7 @@ pub(crate) async fn moderation_reach_of_at_within(
             as_of: Some(as_of),
             community_id: Some(community_id),
             root_authority: Some(root_authority),
+            role_term_seconds: affiliation_role_term_at(directory, community_id, as_of).await?,
         },
     )
     .await?
@@ -15124,6 +16097,7 @@ pub(crate) async fn moderation_reach_of_at(
             as_of: Some(as_of),
             community_id: Some(community_id),
             root_authority: None,
+            role_term_seconds: affiliation_role_term_at(directory, community_id, as_of).await?,
         },
     )
     .await?
@@ -15630,6 +16604,20 @@ pub async fn check_consent_for_key_admission(
         )
         .await?
     {
+        // v60.0.0 (CIRISPersist#1049, CC 2.6.7) — the chain stood at the
+        // row's signed instant; that instant stands alone only inside W.
+        let now = chrono::Utc::now();
+        if super::self_roster::outside_past_freshness_window(row.asserted_at, now)
+            && !holds_grant_delegation(directory, for_key, &row.attesting_key_id, now).await?
+        {
+            return Err(Error::AssertedAtStale {
+                author: row.attesting_key_id.clone(),
+                standing_for: for_key.to_owned(),
+                plane: "consent",
+                asserted_at: row.asserted_at,
+                w_secs: super::self_roster::PAST_FRESHNESS_W_SECS,
+            });
+        }
         return Ok(());
     }
     Err(Error::InvalidArgument(format!(
@@ -15823,12 +16811,14 @@ pub const RECONSIDERATION_COMMUNITY_MISMATCH: &str = "reconsideration_community_
 /// - **A ruling** (the envelope carries [`RECONSIDERATION_OUTCOME_MEMBER`]):
 ///   the review-holders of `C` only — `is_named_moderator(·, C, review)`, as
 ///   self or through a live `review`-scoped chain from a steward-bound root.
+///   v60.0.0 (CIRISPersist#1036 item 5): against a held `licensure:{A}`
+///   target, A's authority set ([`licence_authority_set`]) holds the duty
+///   too, as self or through a `review`-scoped chain from it.
 /// - **A filing**: the same holders ∪ [`reconsideration_target_subjects`] —
-///   the SIGNED subjects of the held target. Absence is never an admit
-///   condition: a target not held here, a licence target (its own arm,
-///   CIRISPersist#1036 item 5, out of this cut) and a target naming no
-///   subject each leave the subject arm empty, so only the review-holders
-///   remain.
+///   the SIGNED subjects of the held target (for a licence, the licensee
+///   too). Absence is never an admit condition: a target not held here and a
+///   target naming no subject leave the subject arm empty, so only the
+///   duty-holders remain.
 ///
 /// A subject admits as itself or, under CC 4.5.5 (b), through a live
 /// `review`-scoped chain it roots, when it is steward-bound.
@@ -15879,6 +16869,17 @@ pub async fn check_reconsideration_admission(
     };
     let mut holders =
         duty_holders_for_community(directory, &community_id, DELEGATION_SCOPE_REVIEW).await?;
+    // v60.0.0 (CIRISPersist#1036 item 5, CIRISConstitution#164; CC 2.4.1.1,
+    // CLM-licence-contest) — the duty-holders for a reconsideration against
+    // `licensure:{A}` are A's authority set, plus any `review`-scoped chain
+    // from it (the walk below, from a steward-bound root).
+    if let Some(t) = &target {
+        if let Some(authority_id) = envelope_dimension(&t.attestation_envelope)
+            .and_then(crate::federation::licensure::authority_of)
+        {
+            holders.extend(licence_authority_set(directory, authority_id).await?);
+        }
+    }
     let is_ruling = row
         .attestation_envelope
         .get(RECONSIDERATION_OUTCOME_MEMBER)
@@ -15900,14 +16901,46 @@ pub async fn check_reconsideration_admission(
     .await
 }
 
+/// v60.0.0 (CIRISPersist#1036 item 5; CC 2.4.1.1, CIRISConstitution#164) —
+/// **licensing authority `authority_id`'s authority set NOW**: the key
+/// itself; a `founder_only` community's active founders; or, for a community
+/// whose protocol acts by quorum, its active roster (each member is a party
+/// to the quorum that issues its licences). The duty-holder roots of a
+/// reconsideration against one of its licences.
+///
+/// # Errors
+///
+/// Directory reads.
+pub async fn licence_authority_set(
+    directory: &dyn super::FederationDirectory,
+    authority_id: &str,
+) -> Result<std::collections::HashSet<String>, Error> {
+    let authority = resolve_licensure_authority(directory, authority_id).await?;
+    let now = chrono::Utc::now();
+    Ok(match licence_roots_at(directory, &authority, now).await? {
+        LicenceRoots::Seats(keys) => keys.into_iter().collect(),
+        LicenceRoots::Quorum(c) => Box::pin(crate::federation::authorized_community_roster_at(
+            directory, &c, now,
+        ))
+        .await?
+        .into_iter()
+        .map(|m| m.key_id)
+        .collect(),
+    })
+}
+
 /// v58.0.0 (CIRISPersist#1094 item 3, CC 4.5.5) — **the subject of a
 /// reconsideration's target**, from the target row as held: its signed
 /// `subject_key_ids`, plus `filer` when the target names its subject by key
 /// digest ([`MODERATION_SUBJECT_DIGEST_ENVELOPE_FIELD`]) and the filer's
 /// registered key digests to it. Never the reconsideration's own
-/// `subject_key_ids`. Empty for a `licensure:*` target: a licensee's standing
-/// against a licence is CIRISPersist#1036 item 5's arm (A's authority set),
-/// not this one.
+/// `subject_key_ids`.
+///
+/// v60.0.0 (CIRISPersist#1036 item 5) — for a `licensure:*` target the
+/// licensee is the subject too: the row's `attested_key_id` (the key the
+/// licence is about) with its signed `subject_key_ids`. A licensee may not
+/// withdraw the licence ([`SUBJECT_WITHDRAWS_CARVE_OUT`]); this is its
+/// standing to contest it instead.
 ///
 /// # Errors
 ///
@@ -15921,7 +16954,7 @@ pub async fn reconsideration_target_subjects(
     if envelope_dimension(&target.attestation_envelope)
         .is_some_and(|d| d.starts_with(crate::federation::licensure::LICENSURE_DIMENSION_PREFIX))
     {
-        return Ok(subjects);
+        subjects.insert(target.attested_key_id.clone());
     }
     subjects.extend(target.subject_key_ids.iter().cloned());
     if let Some(digest) = moderation_subject_digest(&target.attestation_envelope)? {
@@ -16085,6 +17118,7 @@ pub async fn holds_grant_delegation(
             as_of: Some(now),
             community_id: None,
             root_authority: None,
+            role_term_seconds: None,
         },
     )
     .await?
@@ -16097,17 +17131,18 @@ pub async fn holds_grant_delegation(
 /// `key_grant::check_sealer`, and the pending projection) and a consent row's
 /// `for_key_id` chain.
 ///
-/// Today it is this node's clock, whatever the row: v54.0.0 kept "now"
-/// because judging at the signed `asserted_at` with no past bound lets a
-/// withdrawn delegate backdate a grant into its old window (#1049). The
-/// bound is W = 72 h, refusal `asserted_at_stale`, on CC rc8 (untagged), so
-/// it ships with the rc8 vendor. That cut changes this one function to the
-/// row's `asserted_at` and puts the freshness refusal in front of every
-/// caller; no caller passes its own instant.
+/// v60.0.0 (CIRISPersist#1049, CC 2.6.7) — the row's signed `asserted_at`,
+/// so every node computes the same verdict across a withdrawal of the chain
+/// (a stamped instant belongs to the signer). The admission doors put the
+/// past-freshness window W in front of it
+/// ([`crate::federation::self_roster::outside_past_freshness_window`]): a row
+/// signed more than W ago must also hold at receipt, else
+/// [`Error::AssertedAtStale`]. The projection and the read paths judge a
+/// STORED row at the same instant with no W, so a read never refuses what
+/// admission accepted.
 #[must_use]
 pub fn grant_chain_instant(row: &super::Attestation) -> chrono::DateTime<chrono::Utc> {
-    let _ = row;
-    chrono::Utc::now()
+    row.asserted_at
 }
 
 /// v54.0.0 (CIRISPersist#1031, CC 4.1.1) — **the cycle-closing `delegates_to`
@@ -25128,12 +26163,14 @@ pub(crate) mod r2_test_support {
                 serde_json::json!({"dimension": TRUST_CONFERS_DIMENSION, "scope": [scope]}),
             ),
         ];
-        for (id, from, to, _dim, envelope) in rows {
+        for (id, from, to, _dim, mut envelope) in rows {
             // Already placed by an earlier conferral in this test: re-offering
             // it would carry a fresh `asserted_at` under the same derived id.
             if dir.get_attestation(&id).await.ok().flatten().is_some() {
                 continue;
             }
+            // v60.0.0 (#1048) — a term-bearing edge carries a term (CC 2.4).
+            crate::federation::admission::with_test_term(&mut envelope, now);
             let (och, sc, sp) =
                 crate::federation::tier_ingest::test_support::sign_envelope(from, &envelope);
             let mut att = Attestation {
@@ -25841,103 +26878,6 @@ pub(crate) mod r2_test_support {
             err.kind(),
             "federation_revocation_scrub_skew",
             "({tag}) #659(d): {err}"
-        );
-    }
-
-    /// **v31.0.0 (CIRISPersist#659) — `threshold` HAS A FLOOR, AND IS SIGNED.**
-    ///
-    /// `SignedPartnerRecord::threshold` is the M of the M-of-N on the plane
-    /// that grants `capabilities_granted` and `max_autonomy_tier`. It arrived
-    /// caller-supplied, unfloored and outside the signature. Legs:
-    ///
-    /// - **(a)** the control: a strict-majority record admits;
-    /// - **(b)** `threshold: 1` over a three-steward roster is REFUSED — the
-    ///   1-of-N capability grant this repo's own accord-ops invariant forbids;
-    /// - **(c)** a `threshold` rewritten in transit (envelope says 2, wrapper
-    ///   says 3) is REFUSED — a floor applied to a relay's number is no floor.
-    pub(crate) async fn exercise_partner_threshold_floor(dir: &dyn FederationDirectory, tag: &str) {
-        use crate::federation::operational::test_support as op;
-
-        let stewards: Vec<op::Identity> = (0..3)
-            .map(|i| op::Identity::new(&format!("s{i}659p-{tag}")))
-            .collect();
-        for s in &stewards {
-            dir.put_public_key(SignedKeyRecord {
-                record: s.steward_key_record(),
-            })
-            .await
-            .ok();
-        }
-        let refs: Vec<&op::Identity> = stewards.iter().collect();
-        let now = truncate_to_substrate_resolution(Utc::now());
-
-        // (a) THE CONTROL — 2 of 3 is a strict majority.
-        let ok_id = uuid::Uuid::new_v4().to_string();
-        dir.put_partner_record(op::signed_partner_record(
-            &ok_id,
-            &format!("lic-ok-{tag}"),
-            1,
-            "active",
-            now,
-            &refs[..2],
-            2,
-            false,
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("({tag}) #659(a): a strict-majority licence must admit: {e}"));
-
-        // (b) ONE SIGNATURE FOR A LICENCE GRANT.
-        let solo = op::signed_partner_record(
-            &uuid::Uuid::new_v4().to_string(),
-            &format!("lic-solo-{tag}"),
-            1,
-            "active",
-            now,
-            &refs[..1],
-            1,
-            false,
-        );
-        let err = dir
-            .put_partner_record(solo)
-            .await
-            .err()
-            .unwrap_or_else(|| panic!("({tag}) #659(b): 1-of-3 must not grant a licence"));
-        assert_eq!(
-            err.kind(),
-            "federation_operational_authority",
-            "({tag}) #659(b): refused by the quorum policy: {err}"
-        );
-        assert!(
-            format!("{err}").contains("STRICT MAJORITY"),
-            "({tag}) #659(b): the refusal must say WHY one signature is not enough: {err}"
-        );
-
-        // (c) THE TRANSIT REWRITE — the stewards signed `threshold: 2`, the
-        //     wrapper claims 3. Bound, so the quorum never gets to count.
-        let mut rewritten = op::signed_partner_record(
-            &uuid::Uuid::new_v4().to_string(),
-            &format!("lic-rw-{tag}"),
-            1,
-            "active",
-            now,
-            &refs[..2],
-            2,
-            false,
-        );
-        rewritten.threshold = 3;
-        let err = dir
-            .put_partner_record(rewritten)
-            .await
-            .err()
-            .unwrap_or_else(|| panic!("({tag}) #659(c): an unsigned M is a relay's M"));
-        assert_eq!(
-            err.kind(),
-            "federation_operational_envelope_unbound",
-            "({tag}) #659(c): refused by the binding, before the floor: {err}"
-        );
-        assert!(
-            format!("{err}").contains("`threshold`"),
-            "({tag}) #659(c): the refusal must name the rewritten column: {err}"
         );
     }
 
@@ -27019,14 +27959,21 @@ pub(crate) mod steward_liveness_test_support {
     /// A federation-tier row of `kind`, hybrid-signed by `signer` over
     /// `envelope`. `attestation_id` is a real UUID — postgres types the column
     /// as `uuid` and refuses anything else at the driver.
+    ///
+    /// v60.0.0 (CIRISPersist#1048) — a term-bearing `delegates_to` that names
+    /// no upper bound gets a 180-day term ([`super::with_test_term`]), as CC
+    /// requires of a producer; a fixture that sets its own bounds keeps them.
     pub(crate) fn signed_row(
         signer: &str,
         attested: &str,
         kind: &str,
-        envelope: serde_json::Value,
+        mut envelope: serde_json::Value,
     ) -> Attestation {
-        let (och, classical, pqc) = sign_envelope(signer, &envelope);
         let ts = Utc::now();
+        if kind == attestation_type::DELEGATES_TO {
+            super::with_test_term(&mut envelope, ts);
+        }
+        let (och, classical, pqc) = sign_envelope(signer, &envelope);
         let mut sealed_row_ = Attestation {
             attestation_id: uuid::Uuid::new_v4().to_string(),
             attesting_key_id: signer.to_owned(),
@@ -28684,7 +29631,9 @@ pub(crate) mod moderation_walk_liveness_test_support {
                 }),
             ),
         ];
-        for (id, by, about, dim, env) in rows {
+        for (id, by, about, dim, mut env) in rows {
+            // v60.0.0 (#1048) — a term-bearing edge carries a term (CC 2.4).
+            crate::federation::admission::with_test_term(&mut env, now);
             let (och, sc, sp) =
                 crate::federation::tier_ingest::test_support::sign_envelope(by, &env);
             let mut att = Attestation {

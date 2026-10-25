@@ -210,6 +210,8 @@ pub fn consent_transferability(
         | K::FamilyMembershipWidening
         | K::CommunityMembershipListing
         | K::LocationProof
+        // v60.0.0 (CIRISPersist#1036): retired kinds; a licence rides the
+        // attestation kind, consented to as a row like any other.
         | K::Organization
         | K::OrgMembership
         | K::PartnerRecord

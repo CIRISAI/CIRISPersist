@@ -656,8 +656,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_no_moderator_federate_apply", Class::Gate),
     ("check_node_agency_admission", Class::Gate),
     ("check_observed_region", Class::Gate),
-    ("check_partner_revision_monotonic", Class::Gate),
-    ("check_partner_set_and_quorum", Class::Gate),
     ("check_peer_deadmission", Class::Gate),
     ("check_peer_record_admission", Class::Gate),
     ("check_privileged_identity_type_admission", Class::Gate),
@@ -691,7 +689,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_revocation_bound", Class::Gate),
     ("check_revocation_envelope_binding", Class::Gate),
     ("check_revocation_scrub_skew", Class::Gate),
-    ("check_role_authority", Class::Gate),
     ("check_row_column_binding", Class::Gate),
     // v38.5.0 (CIRISPersist#771) — refuses a DIFFERENT row under an occupied
     // `attestation_id`. A Gate, not Plumbing: identical bytes are an
@@ -709,6 +706,16 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — refuses the cycle-closing
     // `delegates_to` (`federation_delegation_cycle`).
     ("check_delegation_cycle_admission", Class::Gate),
+    // v60.0.0 (CIRISPersist#1048, CC 2.4 / CC 4.4.3.2.8 C) — refuses a
+    // term-bearing `delegates_to` without a bounded term
+    // (`federation_delegation_term_required`).
+    ("check_delegation_term_admission", Class::Gate),
+    // v60.0.0 (CIRISPersist#1036, #1062) — the licence payload, revision,
+    // audience and the owner-binding affiliation gates.
+    ("check_licence_payload", Class::Gate),
+    ("check_partner_record_revision", Class::Gate),
+    ("check_licence_audience", Class::Gate),
+    ("check_owner_binding_affiliation_admission", Class::Gate),
     // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — refuses a community record
     // whose declared cohort or affiliation config is malformed or invalid.
     ("check_community_record", Class::Gate),
@@ -735,7 +742,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // cleanup both trace-removal doors run in their transaction.
     ("sqlite_drop_orphaned_thought_signatures", Class::Plumbing),
     ("pg_drop_orphaned_thought_signatures", Class::Plumbing),
-    ("check_skew_and_payment", Class::Gate),
     ("check_trace_dimension_admission", Class::Gate),
     ("check_trust_charter_admission", Class::Gate),
     ("check_user_target_steward_binding_admission", Class::Gate),
@@ -784,8 +790,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("insert_trace_events_batch", Class::Delegates),
     ("insert_trace_llm_calls_batch", Class::Delegates),
     ("iter", Class::Plumbing),
-    ("list_org_memberships_for", Class::Delegates),
-    ("list_partner_records_for", Class::Delegates),
     ("load_or_init_content_master", Class::Delegates),
     // v50.0.0 (#920) — the content-master row load/init that
     // `load_or_init_content_master` now resolves; the same door, split.
@@ -870,7 +874,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("active_identity_for_occurrence", Class::Delegates),
     ("lookup_public_key", Class::Delegates),
     ("map_err", Class::Plumbing),
-    ("memory_idempotent_insert", Class::Delegates),
     // v36.0.0 (CIRISPersist#668) — visible because the cursor family's row
     // mappers are now direct calls (see the `pg_row_to_*` note): these are
     // the mappers' own decode helpers. Plumbing — they fail only on the
@@ -991,9 +994,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("pg_row_to_family_membership_revocation", Class::Delegates),
     ("pg_row_to_location_proof", Class::Delegates),
     ("pg_row_to_transport_destination", Class::Delegates),
-    ("pg_row_to_org_membership", Class::Delegates),
-    ("pg_row_to_organization", Class::Delegates),
-    ("pg_row_to_partner_record", Class::Delegates),
     ("pg_row_to_peer_metadata_for_hash", Class::Delegates),
     ("pg_row_to_signed_community", Class::Delegates),
     (
@@ -1023,7 +1023,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
         Class::Delegates,
     ),
     ("pg_row_to_signed_location_proof", Class::Delegates),
-    ("pg_row_to_signed_partner_record", Class::Delegates),
     ("pg_row_to_signed_transport_destination", Class::Delegates),
     ("pg_row_to_stored_proposal", Class::Delegates),
     ("pg_upsert_wire_index", Class::Delegates),
@@ -1090,7 +1089,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("repair_portable_defaults", Class::Plumbing),
     ("repair_v070_checksum", Class::Plumbing),
     ("resolve", Class::Plumbing),
-    ("resolve_steward_roster", Class::Gate),
     ("revocation_fold_target", Class::Plumbing),
     ("root_hash_from_bytes", Class::Plumbing),
     ("safe_get_with", Class::Plumbing),
@@ -1127,9 +1125,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ),
     ("sqlite_row_to_location_proof", Class::Delegates),
     ("sqlite_row_to_transport_destination", Class::Delegates),
-    ("sqlite_row_to_org_membership", Class::Delegates),
-    ("sqlite_row_to_organization", Class::Delegates),
-    ("sqlite_row_to_partner_record", Class::Delegates),
     ("sqlite_row_to_signed_community", Class::Delegates),
     (
         "sqlite_row_to_signed_community_membership_revocation",
@@ -1162,7 +1157,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
         Class::Delegates,
     ),
     ("sqlite_row_to_signed_location_proof", Class::Delegates),
-    ("sqlite_row_to_signed_partner_record", Class::Delegates),
     (
         "sqlite_row_to_signed_transport_destination",
         Class::Delegates,
@@ -1233,8 +1227,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("verify_for_admission", Class::Gate),
     ("verify_inline_hash", Class::Gate),
     ("verify_location_proof_admission", Class::Gate),
-    ("verify_org_membership_admission", Class::Gate),
-    ("verify_organization_admission", Class::Gate),
     ("verify_receipt_signature", Class::Gate),
     ("verify_revocation_admission", Class::Gate),
     ("verify_signed_identity_occurrence", Class::Gate),

@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 112 delegations, generated. Every one: fault first, then delegate.
+// 102 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -675,57 +675,6 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_open_self_roster_proposals(identity_key_id)
             .await
     }
-    async fn list_org_memberships_for(&self, org_id: &str) -> Result<Vec<OrgMembership>, Error> {
-        if let Some(e) = self.faulted("list_org_memberships_for") {
-            return Err(e);
-        }
-        self.inner.list_org_memberships_for(org_id).await
-    }
-    async fn list_org_memberships_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedOrgMembership>, Error> {
-        if let Some(e) = self.faulted("list_org_memberships_since") {
-            return Err(e);
-        }
-        self.inner.list_org_memberships_since(since, limit).await
-    }
-    async fn list_organizations_for(&self, org_id: &str) -> Result<Vec<Organization>, Error> {
-        if let Some(e) = self.faulted("list_organizations_for") {
-            return Err(e);
-        }
-        self.inner.list_organizations_for(org_id).await
-    }
-    async fn list_organizations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedOrganization>, Error> {
-        if let Some(e) = self.faulted("list_organizations_since") {
-            return Err(e);
-        }
-        self.inner.list_organizations_since(since, limit).await
-    }
-    async fn list_partner_records_for(
-        &self,
-        license_id: &str,
-    ) -> Result<Vec<PartnerRecord>, Error> {
-        if let Some(e) = self.faulted("list_partner_records_for") {
-            return Err(e);
-        }
-        self.inner.list_partner_records_for(license_id).await
-    }
-    async fn list_partner_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedPartnerRecord>, Error> {
-        if let Some(e) = self.faulted("list_partner_records_since") {
-            return Err(e);
-        }
-        self.inner.list_partner_records_since(since, limit).await
-    }
     async fn list_settled_self_roster_proposals(
         &self,
         identity_key_id: &str,
@@ -839,18 +788,6 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .list_signed_location_proofs_since(since, limit)
-            .await
-    }
-    async fn list_signed_partner_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedSignedPartnerRecord>, Error> {
-        if let Some(e) = self.faulted("list_signed_partner_records_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_partner_records_since(since, limit)
             .await
     }
     async fn list_signed_transport_destinations_since(
@@ -1086,24 +1023,6 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.put_location_proof(proof).await
-    }
-    async fn put_org_membership(&self, signed: SignedOrgMembership) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_org_membership") {
-            return Err(e);
-        }
-        self.inner.put_org_membership(signed).await
-    }
-    async fn put_organization(&self, signed: SignedOrganization) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_organization") {
-            return Err(e);
-        }
-        self.inner.put_organization(signed).await
-    }
-    async fn put_partner_record(&self, signed: SignedPartnerRecord) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_partner_record") {
-            return Err(e);
-        }
-        self.inner.put_partner_record(signed).await
     }
     async fn put_public_key(&self, record: SignedKeyRecord) -> Result<(), Error> {
         if let Some(e) = self.faulted("put_public_key") {

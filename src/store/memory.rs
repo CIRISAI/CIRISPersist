@@ -335,17 +335,6 @@ struct State {
     /// `(subject_key_id, asserted_at)` PK.
     federation_location_proofs:
         HashMap<(String, chrono::DateTime<chrono::Utc>), crate::federation::LocationProof>,
-    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13) — operational-data
-    /// rows keyed by `attestation_id`.
-    federation_organizations: HashMap<String, crate::federation::Organization>,
-    federation_org_memberships: HashMap<String, crate::federation::OrgMembership>,
-    federation_partner_records: HashMap<String, crate::federation::PartnerRecord>,
-    /// v5.2.0 (#194) — the M-of-N steward signature set + threshold per
-    /// partner_record `attestation_id`, so `list_signed_partner_records_since`
-    /// reconstructs the full wrapper (the row map above holds only the
-    /// unsigned [`PartnerRecord`]).
-    federation_partner_record_sigs:
-        HashMap<String, (Vec<ciris_verify_core::threshold::ThresholdSignature>, usize)>,
     /// v6.5.0 (CIRISPersist#183, CEG §5.6.8.8.1) — per-occurrence
     /// reachability rows. v17.0.0 (#443): keyed by the ROUTE-TABLE PK
     /// `(occurrence_key_id, transport_kind)` (`destination` is payload — one
@@ -643,9 +632,6 @@ fn next_key_admission_position(state: &State) -> chrono::DateTime<chrono::Utc> {
 //     twin. Plane tokens are the wire-index kind strings, so the side map
 //     reads like the shared index does.
 
-const PLANE_ORGANIZATION: &str = "Organization";
-const PLANE_ORG_MEMBERSHIP: &str = "OrgMembership";
-const PLANE_PARTNER_RECORD: &str = "PartnerRecord";
 const PLANE_FAMILY: &str = "Family";
 const PLANE_COMMUNITY: &str = "Community";
 const PLANE_LOCATION_PROOF: &str = "LocationProof";
@@ -723,29 +709,6 @@ fn allocate_and_stamp(
     at
 }
 
-/// The `(resume id, legacy fallback)` inventory per plane — what the
-/// allocator reads so it sees exactly what the cursor sees.
-fn organization_rows(state: &State) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
-    state
-        .federation_organizations
-        .values()
-        .map(|o| (o.attestation_id.clone(), o.asserted_at))
-        .collect()
-}
-fn org_membership_rows(state: &State) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
-    state
-        .federation_org_memberships
-        .values()
-        .map(|m| (m.attestation_id.clone(), m.asserted_at))
-        .collect()
-}
-fn partner_record_rows(state: &State) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
-    state
-        .federation_partner_records
-        .values()
-        .map(|p| (p.attestation_id.clone(), p.asserted_at))
-        .collect()
-}
 fn family_rows(state: &State) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
     state
         .federation_families
@@ -1007,10 +970,6 @@ impl Default for MemoryBackend {
                 federation_community_membership_widenings: HashMap::new(),
                 federation_community_dek_epoch: HashMap::new(),
                 federation_location_proofs: HashMap::new(),
-                federation_organizations: HashMap::new(),
-                federation_org_memberships: HashMap::new(),
-                federation_partner_records: HashMap::new(),
-                federation_partner_record_sigs: HashMap::new(),
                 blackhole_rules: HashMap::new(),
                 transport_destinations: HashMap::new(),
                 transport_destination_sigs: HashMap::new(),
@@ -7856,438 +7815,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
-    // ── CEG 1.0-RC2 §5.6.8.13 operational data (v5.1.0, #65) ───────
-
-    async fn put_organization(
-        &self,
-        signed: crate::federation::SignedOrganization,
-    ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::Organization,
-            &signed.organization,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        use crate::federation::operational;
-        let mut row = signed.organization;
-        let now = chrono::Utc::now();
-        operational::check_skew_and_payment(row.asserted_at, now, &row.signed_envelope)?;
-        // v31.0.0 (#644) — bind the projection + hybrid-Strict verify the
-        // row's OWN signature. Before the state lock: the verify resolves
-        // the attester's registered pubkeys, which locks the directory.
-        operational::verify_organization_admission(self, &row).await?;
-        // v21.0.0 (#502 E9) — resolve the steward roster from OUR directory
-        // BEFORE the state lock (the resolve locks the directory itself).
-        let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
-        let wire_index_key = {
-            let mut state = self.state.lock().expect("memory backend lock");
-            let current: Vec<_> = state
-                .federation_org_memberships
-                .values()
-                .filter(|m| m.org_id == row.org_id)
-                .cloned()
-                .collect();
-            operational::check_role_authority(
-                &row.attesting_key_id,
-                &row.org_id,
-                &current,
-                &__stw_dir,
-                &__stw_roots,
-            )?;
-            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-            // v21.1.0 (CIRISPersist#507b) — `Organization` carries its own
-            // single-signer signature fields inline — it IS the value
-            // `list_organizations_since` re-serializes, no separate wrapper.
-            // Computed before the insert below moves `row`.
-            let wire_index_key = crate::federation::wire_index::record_key(&[(
-                "attestation_id",
-                &row.attestation_id,
-            )]);
-            // v36.0.0 (#668) — THIS node's serve position (V130 mirror),
-            // allocated before the insert so the allocator reads only
-            // pre-existing rows, stamped after it lands.
-            let admitted_at = next_plane_position(
-                &state,
-                PLANE_ORGANIZATION,
-                organization_rows(&state).into_iter(),
-            );
-            let id_for_stamp = row.attestation_id.clone();
-            memory_idempotent_insert(
-                &mut state.federation_organizations,
-                row.attestation_id.clone(),
-                row,
-                "organization",
-            )?;
-            stamp_plane_position(&mut state, PLANE_ORGANIZATION, id_for_stamp, admitted_at);
-            wire_index_key
-        };
-        self.index_stored_record("Organization", &wire_index_key)
-            .await?;
-        Ok(())
-    }
-
-    async fn put_org_membership(
-        &self,
-        signed: crate::federation::SignedOrgMembership,
-    ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::OrgMembership,
-            &signed.org_membership,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        use crate::federation::operational;
-        let mut row = signed.org_membership;
-        let now = chrono::Utc::now();
-        operational::check_skew_and_payment(row.asserted_at, now, &row.signed_envelope)?;
-        // v31.0.0 (#644) — bind the projection + hybrid-Strict verify the
-        // row's OWN signature, before the lock (see `put_organization`).
-        operational::verify_org_membership_admission(self, &row).await?;
-        // v21.0.0 (#502 E9) — roster from OUR directory, before the lock.
-        let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
-        let wire_index_key = {
-            let mut state = self.state.lock().expect("memory backend lock");
-            let current: Vec<_> = state
-                .federation_org_memberships
-                .values()
-                .filter(|m| m.org_id == row.org_id)
-                .cloned()
-                .collect();
-            operational::check_role_authority(
-                &row.attesting_key_id,
-                &row.org_id,
-                &current,
-                &__stw_dir,
-                &__stw_roots,
-            )?;
-            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-            // v21.1.0 (CIRISPersist#507b) — `OrgMembership` carries its own
-            // single-signer signature fields inline; see `put_organization`'s
-            // wire-index comment.
-            let wire_index_key = crate::federation::wire_index::record_key(&[(
-                "attestation_id",
-                &row.attestation_id,
-            )]);
-            // v36.0.0 (#668) — serve position (V130 mirror).
-            let admitted_at = next_plane_position(
-                &state,
-                PLANE_ORG_MEMBERSHIP,
-                org_membership_rows(&state).into_iter(),
-            );
-            let id_for_stamp = row.attestation_id.clone();
-            memory_idempotent_insert(
-                &mut state.federation_org_memberships,
-                row.attestation_id.clone(),
-                row,
-                "org_membership",
-            )?;
-            stamp_plane_position(&mut state, PLANE_ORG_MEMBERSHIP, id_for_stamp, admitted_at);
-            wire_index_key
-        };
-        self.index_stored_record("OrgMembership", &wire_index_key)
-            .await?;
-        Ok(())
-    }
-
-    async fn put_partner_record(
-        &self,
-        signed: crate::federation::SignedPartnerRecord,
-    ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::PartnerRecord,
-            &signed,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        use crate::federation::operational;
-        let now = chrono::Utc::now();
-        operational::check_skew_and_payment(
-            signed.partner_record.asserted_at,
-            now,
-            &signed.partner_record.signed_envelope,
-        )?;
-        // v21.0.0 (#502 E9) — steward roster from OUR directory.
-        let (__stw_dir, _) = operational::resolve_steward_roster(self).await?;
-        operational::check_partner_set_and_quorum(&signed, &__stw_dir)?;
-        let wire_index_key = {
-            let mut state = self.state.lock().expect("memory backend lock");
-            let existing_max = state
-                .federation_partner_records
-                .values()
-                .filter(|p| p.license_id == signed.partner_record.license_id)
-                .map(|p| p.revision)
-                .max();
-            operational::check_partner_revision_monotonic(
-                &signed.partner_record.license_id,
-                signed.partner_record.revision,
-                existing_max,
-            )?;
-            // v5.2.0 (#194) — keep the M-of-N steward signature set + threshold so
-            // list_signed_partner_records_since reconstructs the full wrapper.
-            let steward_signatures = signed.steward_signatures;
-            let threshold = signed.threshold;
-            let mut row = signed.partner_record;
-            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-            let attestation_id = row.attestation_id.clone();
-            // v21.1.0 (CIRISPersist#507b) — `PartnerRecord`'s M-of-N steward
-            // quorum is EXTERNAL to the row, so the read surface
-            // (`list_signed_partner_records_since`) returns the
-            // `SignedPartnerRecord` wrapper — hash that shape, not the bare row.
-            // Computed before the moves below.
-            let wire_index_key =
-                crate::federation::wire_index::record_key(&[("attestation_id", &attestation_id)]);
-            // v36.0.0 (#668) — serve position (V130 mirror).
-            let admitted_at = next_plane_position(
-                &state,
-                PLANE_PARTNER_RECORD,
-                partner_record_rows(&state).into_iter(),
-            );
-            memory_idempotent_insert(
-                &mut state.federation_partner_records,
-                attestation_id.clone(),
-                row,
-                "partner_record",
-            )?;
-            stamp_plane_position(
-                &mut state,
-                PLANE_PARTNER_RECORD,
-                attestation_id.clone(),
-                admitted_at,
-            );
-            state
-                .federation_partner_record_sigs
-                .insert(attestation_id, (steward_signatures, threshold));
-            wire_index_key
-        };
-        self.index_stored_record("PartnerRecord", &wire_index_key)
-            .await?;
-        Ok(())
-    }
-
-    async fn list_organizations_for(
-        &self,
-        org_id: &str,
-    ) -> Result<Vec<crate::federation::Organization>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<_> = state
-            .federation_organizations
-            .values()
-            .filter(|o| o.org_id == org_id)
-            .cloned()
-            .collect();
-        rows.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
-        Ok(rows)
-    }
-
-    async fn list_org_memberships_for(
-        &self,
-        org_id: &str,
-    ) -> Result<Vec<crate::federation::OrgMembership>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<_> = state
-            .federation_org_memberships
-            .values()
-            .filter(|m| m.org_id == org_id)
-            .cloned()
-            .collect();
-        rows.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
-        Ok(rows)
-    }
-
-    async fn list_partner_records_for(
-        &self,
-        license_id: &str,
-    ) -> Result<Vec<crate::federation::PartnerRecord>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<_> = state
-            .federation_partner_records
-            .values()
-            .filter(|p| p.license_id == license_id)
-            .cloned()
-            .collect();
-        rows.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
-        Ok(rows)
-    }
-
-    // v36.0.0 (CIRISPersist#668) — every cursor below reads THIS node's
-    // serve position (the `serve_positions` side map, falling back to the
-    // plane's legacy producer instant exactly as the sqlite COALESCE does)
-    // and resumes on the `(position, id)` PAIR.
-
-    async fn list_organizations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedOrganization>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let position = |o: &crate::federation::operational::Organization| {
-            plane_position(&state, PLANE_ORGANIZATION, &o.attestation_id, o.asserted_at)
-        };
-        let mut rows: Vec<_> = state
-            .federation_organizations
-            .values()
-            .filter(|o| {
-                since.as_ref().is_none_or(|(s_at, s_id)| {
-                    (position(o), o.attestation_id.as_str()) > (*s_at, s_id.as_str())
-                })
-            })
-            .map(|o| crate::federation::ServedOrganization {
-                admitted_at: position(o),
-                organization: o.clone(),
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            a.admitted_at.cmp(&b.admitted_at).then_with(|| {
-                a.organization
-                    .attestation_id
-                    .cmp(&b.organization.attestation_id)
-            })
-        });
-        rows.truncate(limit as usize);
-        Ok(rows)
-    }
-
-    async fn list_org_memberships_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedOrgMembership>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let position = |m: &crate::federation::operational::OrgMembership| {
-            plane_position(
-                &state,
-                PLANE_ORG_MEMBERSHIP,
-                &m.attestation_id,
-                m.asserted_at,
-            )
-        };
-        let mut rows: Vec<_> = state
-            .federation_org_memberships
-            .values()
-            .filter(|m| {
-                since.as_ref().is_none_or(|(s_at, s_id)| {
-                    (position(m), m.attestation_id.as_str()) > (*s_at, s_id.as_str())
-                })
-            })
-            .map(|m| crate::federation::ServedOrgMembership {
-                admitted_at: position(m),
-                org_membership: m.clone(),
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            a.admitted_at.cmp(&b.admitted_at).then_with(|| {
-                a.org_membership
-                    .attestation_id
-                    .cmp(&b.org_membership.attestation_id)
-            })
-        });
-        rows.truncate(limit as usize);
-        Ok(rows)
-    }
-
-    async fn list_partner_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedPartnerRecord>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let position = |p: &crate::federation::operational::PartnerRecord| {
-            plane_position(
-                &state,
-                PLANE_PARTNER_RECORD,
-                &p.attestation_id,
-                p.asserted_at,
-            )
-        };
-        let mut rows: Vec<_> = state
-            .federation_partner_records
-            .values()
-            .filter(|p| {
-                since.as_ref().is_none_or(|(s_at, s_id)| {
-                    (position(p), p.attestation_id.as_str()) > (*s_at, s_id.as_str())
-                })
-            })
-            .map(|p| crate::federation::ServedPartnerRecord {
-                admitted_at: position(p),
-                partner_record: p.clone(),
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            a.admitted_at.cmp(&b.admitted_at).then_with(|| {
-                a.partner_record
-                    .attestation_id
-                    .cmp(&b.partner_record.attestation_id)
-            })
-        });
-        rows.truncate(limit as usize);
-        Ok(rows)
-    }
-
-    async fn list_signed_partner_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedSignedPartnerRecord>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let position = |p: &crate::federation::operational::PartnerRecord| {
-            plane_position(
-                &state,
-                PLANE_PARTNER_RECORD,
-                &p.attestation_id,
-                p.asserted_at,
-            )
-        };
-        let mut rows: Vec<_> = state
-            .federation_partner_records
-            .values()
-            .filter(|p| {
-                since.as_ref().is_none_or(|(s_at, s_id)| {
-                    (position(p), p.attestation_id.as_str()) > (*s_at, s_id.as_str())
-                })
-            })
-            .cloned()
-            .collect();
-        rows.sort_by(|a, b| {
-            position(a)
-                .cmp(&position(b))
-                .then_with(|| a.attestation_id.cmp(&b.attestation_id))
-        });
-        rows.truncate(limit as usize);
-        Ok(rows
-            .into_iter()
-            .map(|partner_record| {
-                let (steward_signatures, threshold) = state
-                    .federation_partner_record_sigs
-                    .get(&partner_record.attestation_id)
-                    .cloned()
-                    .unwrap_or_default();
-                crate::federation::ServedSignedPartnerRecord {
-                    admitted_at: position(&partner_record),
-                    record: crate::federation::SignedPartnerRecord {
-                        partner_record,
-                        steward_signatures,
-                        threshold,
-                    },
-                }
-            })
-            .collect())
-    }
-
     // ─── v21.0.0 (CIRISPersist#504 FLOOR) — bulk signed-since reads for the
     //     5 E4 keyless-declaration planes (edge advertise/serve bridge).
     //     Signed-only: a record is included only if its key is present in
@@ -10807,29 +10334,6 @@ fn uuid_like_counter() -> u64 {
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Append-only idempotent insert keyed by `attestation_id` (the V071
-/// operational tables): a re-submit of byte-identical content is a no-op
-/// `Ok(())`; a collision with differing content is an
-/// [`Error::Conflict`](crate::federation::Error::Conflict). Mirrors the
-/// `put_public_key` idempotent contract on the in-memory backend.
-fn memory_idempotent_insert<V: PartialEq>(
-    map: &mut std::collections::HashMap<String, V>,
-    key: String,
-    value: V,
-    kind: &str,
-) -> Result<(), crate::federation::Error> {
-    match map.get(&key) {
-        Some(existing) if *existing == value => Ok(()),
-        Some(_) => Err(crate::federation::Error::Conflict(format!(
-            "{kind} attestation_id {key} already exists with differing content"
-        ))),
-        None => {
-            map.insert(key, value);
-            Ok(())
-        }
-    }
-}
-
 /// Helper trait for None-or-zero check used by the memory backend's
 /// invariant gate.
 trait IsNoneOrZero {
@@ -12024,50 +11528,6 @@ mod accord_tests {
         .await;
     }
 
-    /// #644-a — an org row whose own signature does not verify is REFUSED,
-    /// on the memory backend.
-    #[tokio::test]
-    async fn org_bogus_signature_refused_memory_644() {
-        let backend = MemoryBackend::new();
-        crate::federation::operational::test_support::exercise_org_bogus_signature_refused(
-            &backend, "mem644a",
-        )
-        .await;
-    }
-
-    /// #644-b — a `withdrawn_at` tombstone (and a `status` / `role` flip)
-    /// that the signature does not cover is REFUSED, on the memory backend.
-    #[tokio::test]
-    async fn unsigned_tombstone_refused_memory_644() {
-        let backend = MemoryBackend::new();
-        crate::federation::operational::test_support::exercise_unsigned_tombstone_refused(
-            &backend, "mem644b",
-        )
-        .await;
-    }
-
-    /// #644-c — an inflated `PartnerRecord::revision` is REFUSED and a
-    /// legitimate later revision still admits, on the memory backend.
-    #[tokio::test]
-    async fn revision_inflation_refused_memory_644() {
-        let backend = MemoryBackend::new();
-        crate::federation::operational::test_support::exercise_revision_inflation_refused(
-            &backend, "mem644c",
-        )
-        .await;
-    }
-
-    /// #658 — one signed operational envelope may not be installed at a
-    /// second primary key, on the memory backend.
-    #[tokio::test]
-    async fn operational_id_replay_refused_memory_658() {
-        let backend = MemoryBackend::new();
-        crate::federation::operational::test_support::exercise_operational_id_replay_refused(
-            &backend, "mem658",
-        )
-        .await;
-    }
-
     /// #598 B10-b — two directories fed the SAME signed envelopes with the two
     /// `asserted_at` columns swapped fold to the SAME verdict, on the memory backend.
     #[tokio::test]
@@ -12960,6 +12420,13 @@ mod tests {
     /// keeping both in one helper is what stops a fixture from re-signing half
     /// the change.
     fn resign_fix(row: &mut Attestation) {
+        // v60.0.0 (#1048) — a term-bearing `delegates_to` carries a term.
+        if row.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO {
+            crate::federation::admission::with_test_term(
+                &mut row.attestation_envelope,
+                row.asserted_at,
+            );
+        }
         crate::federation::tier_ingest::test_support::reseal(row);
     }
 
@@ -14019,104 +13486,6 @@ mod tests {
             .revoke_trust(ts::signed_trust_revocation("subject-721", "granter-721"))
             .await
             .expect("revoking an expired grant is a no-op");
-    }
-
-    /// v38.0.0 (CIRISPersist#709) — **a bystander's registration is not a
-    /// vote.** The partner-licence quorum denominator was `count(identity_type
-    /// = steward)` over the whole directory — no validity window, no
-    /// revocation fold — while M is signed and frozen at mint. So the SAME
-    /// signed bytes admitted on a fresh node and refused on a synced one
-    /// ("quorum policy 2/33 refused"), non-convergent and remotely inflatable
-    /// (steward-shaped rows arrive over replication and never leave). The
-    /// denominator now folds the two liveness facts persist itself holds:
-    /// expiry and revocation.
-    #[tokio::test]
-    async fn partner_quorum_denominator_folds_liveness_709() {
-        use crate::federation::operational::test_support as op;
-        use crate::federation::FederationDirectory as _;
-        let backend = MemoryBackend::new();
-
-        let stewards: Vec<op::Identity> = (0..3)
-            .map(|i| op::Identity::new(&format!("s709-{i}")))
-            .collect();
-        for s in &stewards {
-            backend
-                .put_public_key(SignedKeyRecord {
-                    record: s.steward_key_record(),
-                })
-                .await
-                .unwrap();
-        }
-        let refs: Vec<&op::Identity> = stewards.iter().collect();
-        let now =
-            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
-
-        // THE CONTROL — 2 of 3 seated stewards is a strict majority.
-        backend
-            .put_partner_record(op::signed_partner_record(
-                &uuid::Uuid::new_v4().to_string(),
-                "lic-709-control",
-                1,
-                "active",
-                now,
-                &refs[..2],
-                2,
-                false,
-            ))
-            .await
-            .expect("2-of-3 must admit before the accumulation");
-
-        // THE ACCUMULATION — thirty EXPIRED steward-shaped rows, planted as
-        // state (what a directory looks like after months of replication;
-        // the door's own gates are not the subject here, the DENOMINATOR is).
-        {
-            let mut st = backend.state.lock().expect("memory backend lock");
-            for i in 0..30 {
-                let mut rec = op::Identity::new(&format!("expired709-{i}")).steward_key_record();
-                rec.valid_until = Some("2021-01-01T00:00:00Z".parse().unwrap());
-                st.federation_keys.insert(rec.key_id.clone(), rec);
-            }
-        }
-        // …and one REVOKED live steward, through the real doors.
-        backend
-            .put_public_key(SignedKeyRecord {
-                record: fix_key("revoked709", "revoked709", "revoked709"),
-            })
-            .await
-            .ok();
-        {
-            // identity_type must be steward for the row to enter the scan.
-            let mut st = backend.state.lock().expect("memory backend lock");
-            if let Some(rec) = st.federation_keys.get_mut("revoked709") {
-                rec.identity_type = crate::federation::types::identity_type::STEWARD.to_owned();
-            }
-        }
-        backend
-            .put_revocation(SignedRevocation {
-                revocation: fix_revocation("rev709", "revoked709", "revoked709", "revoked709"),
-            })
-            .await
-            .expect("revocation admits");
-
-        // THE SAME two signers, a NEW licence: the denominator must still be
-        // the 3 seated stewards — an expired row is not seated, a revoked row
-        // is not seated, and a bystander's registration is not a vote.
-        backend
-            .put_partner_record(op::signed_partner_record(
-                &uuid::Uuid::new_v4().to_string(),
-                "lic-709-after",
-                1,
-                "active",
-                now,
-                &refs[..2],
-                2,
-                false,
-            ))
-            .await
-            .expect(
-                "2-of-3 SEATED must still admit — 30 expired rows and a revoked one \
-                 inflated the denominator (#709)",
-            );
     }
 
     // ─── v31.4.0 (CIRISPersist#682 / #668) — the identity plane's serve
@@ -17151,74 +16520,6 @@ mod tests {
         assert_eq!(err.kind(), "federation_genesis_bundle_invalid");
     }
 
-    /// v21.0.0 (CIRISPersist#502 E9) — the operational role authority
-    /// resolves the steward roster from OUR OWN registered directory, not a
-    /// caller-passed slice. A grant rooted at a key that is NOT a registered
-    /// steward is REFUSED — a caller can no longer bless itself by handing
-    /// in a roster.
-    #[tokio::test]
-    async fn operational_roster_resolves_from_own_directory_502e9() {
-        use crate::federation::operational::test_support as op;
-        let backend = MemoryBackend::new();
-        let steward = op::Identity::new("e9-steward");
-        let admin = op::Identity::new("e9-admin");
-
-        // v31.0.0 (CIRISPersist#644) — the outsider is now REGISTERED (as a
-        // plain agent), which sharpens this test rather than weakening it.
-        // Before #644 the first leg refused a key the directory had never
-        // heard of, so "not a steward" and "not registered at all" were
-        // indistinguishable — and the row's own signature was never checked,
-        // so the leg could not have told them apart. Now the outsider's
-        // signature VERIFIES and the ONLY thing it lacks is steward status,
-        // which is precisely the E9 property under test.
-        let outsider = op::Identity::new("e9-outsider");
-        crate::federation::tier_ingest::test_support::register_hybrid_key(&backend, "e9-outsider")
-            .await;
-
-        // Grant rooted at a registered NON-steward → the resolved roster
-        // does not contain it → NoQualifyingGrant, refused.
-        let grant = op::signed_membership(
-            "e9-m1",
-            &outsider,
-            "e9-admin",
-            "e9-org",
-            "org_admin",
-            "active",
-            chrono::Utc::now(),
-        );
-        let err = backend
-            .put_org_membership(grant)
-            .await
-            .expect_err("(E9) grant rooted at a non-steward is refused");
-        assert!(
-            err.kind().contains("operational_authority"),
-            "kind {}",
-            err.kind()
-        );
-
-        // Register the steward IN OUR DIRECTORY → now the same grant admits.
-        backend
-            .put_public_key(SignedKeyRecord {
-                record: steward.steward_key_record(),
-            })
-            .await
-            .expect("register steward");
-        let grant2 = op::signed_membership(
-            "e9-m2",
-            &steward,
-            "e9-admin",
-            "e9-org",
-            "org_admin",
-            "active",
-            chrono::Utc::now(),
-        );
-        backend
-            .put_org_membership(grant2)
-            .await
-            .expect("(E9) grant rooted at a REGISTERED steward admits");
-        let _ = &admin;
-    }
-
     // v30.8.0 (CIRISPersist#596 item 1) — gated with `grant_slash`, which needs
     // the conferral builder in `r2_test_support` (itself cfg(any(sqlite,
     // postgres)) because it requires a real signing path). A cfg on the helper
@@ -18016,18 +17317,6 @@ mod tests {
         let backend = MemoryBackend::new();
         crate::federation::admission::r2_test_support::exercise_revocation_rollback_and_region(
             &backend, "mem659g",
-        )
-        .await;
-    }
-
-    /// v31.0.0 (CIRISPersist#659) — a licence grant takes a strict majority,
-    /// and the M is signed. On memory.
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    #[tokio::test]
-    async fn partner_threshold_floor_memory_659() {
-        let backend = MemoryBackend::new();
-        crate::federation::admission::r2_test_support::exercise_partner_threshold_floor(
-            &backend, "mem659p",
         )
         .await;
     }

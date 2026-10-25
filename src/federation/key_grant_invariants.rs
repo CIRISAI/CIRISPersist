@@ -355,12 +355,22 @@ pub mod two_node {
         signer: &crate::signing::LocalSigner,
         row: &KeyGrantRow,
     ) -> SignedKeyGrantRow {
+        sign_row_unstored_at(signer, row, chrono::Utc::now()).await
+    }
+
+    /// v60.0.0 (#1049) — [`sign_row_unstored`] signed at `at` (a stamped
+    /// instant belongs to the signer, so a witness may backdate one).
+    pub async fn sign_row_unstored_at(
+        signer: &crate::signing::LocalSigner,
+        row: &KeyGrantRow,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> SignedKeyGrantRow {
         let key = signer.derived_key_id();
         let mut input = row.emit_input().expect("emit input");
         let canonical = crate::federation::attestation_emit::stamp_and_canonicalize(
             &mut input,
             &key,
-            chrono::Utc::now(),
+            crate::federation::admission::truncate_to_substrate_resolution(at),
         )
         .expect("canonicalize");
         let sig = signer.sign_hybrid(&canonical).await.expect("hybrid sign");

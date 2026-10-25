@@ -57,10 +57,14 @@ pub mod bodies {
         seed: &str,
         target: &str,
         verb: &str,
-        envelope: serde_json::Value,
+        mut envelope: serde_json::Value,
         subject_key_ids: Vec<String>,
         at: chrono::DateTime<chrono::Utc>,
     ) -> Attestation {
+        // v60.0.0 (#1048) — a term-bearing edge carries a term (CC 2.4).
+        if verb == attestation_type::DELEGATES_TO {
+            admission::with_test_term(&mut envelope, at);
+        }
         let mut r = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: signer.to_owned(),
@@ -130,6 +134,22 @@ pub mod bodies {
         from: chrono::DateTime<chrono::Utc>,
         until: chrono::DateTime<chrono::Utc>,
     ) -> String {
+        try_put_grant_with_term(d, granter, grantee, at, from, until)
+            .await
+            .unwrap_or_else(|e| panic!("delegates_to({granter} → {grantee}, grant, term): {e}"))
+    }
+
+    /// v60.0.0 (#1048) — [`put_grant_with_term`] returning the door's verdict:
+    /// a term past the one-year ceiling is now refused at admission
+    /// (`delegation_term_required`), not only dead in the walk's lens.
+    pub async fn try_put_grant_with_term(
+        d: &dyn FederationDirectory,
+        granter: &str,
+        grantee: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        from: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<String, Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let r = row(
             &id,
@@ -150,8 +170,7 @@ pub mod bodies {
         );
         d.put_attestation(SignedAttestation { attestation: r })
             .await
-            .unwrap_or_else(|e| panic!("delegates_to({granter} → {grantee}, grant, term): {e}"));
-        id
+            .map(|_| id)
     }
 
     /// The granter withdraws the edge `target` by name.
@@ -356,7 +375,19 @@ pub mod bodies {
         for (i, (what, from, until, admits)) in arms.into_iter().enumerate() {
             let m = k(&format!("m{i}"));
             ts::register_identity_key(d, &m, AGENT).await;
-            put_grant_with_term(d, &alice, &m, at, from, until).await;
+            // v60.0.0 (#1048) — a term past the ceiling is refused at the door.
+            match try_put_grant_with_term(d, &alice, &m, at, from, until).await {
+                Err(Error::DelegationTermRequired { rule, .. }) if i == 2 => {
+                    assert_eq!(
+                        rule,
+                        admission::delegation_term_rule::OVER_CEILING,
+                        "I596 {what}"
+                    );
+                    continue;
+                }
+                Err(e) => panic!("I596 {what}: the edge: {e}"),
+                Ok(_) => assert!(i != 2, "I596 {what}: an over-ceiling edge must be refused"),
+            }
             let r = put(d, replication_grant(&k(&format!("g{i}")), &m, &alice)).await;
             if admits {
                 r.unwrap_or_else(|e| {
@@ -568,7 +599,6 @@ pub mod key_grant_arms {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
-        use super::bodies::put_grant_with_term;
         use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
         let run = uuid::Uuid::new_v4().simple().to_string();
         let owner = format!("{tag}-i596-owner-{run}");
@@ -645,7 +675,23 @@ pub mod key_grant_arms {
         for (i, (what, from, until, admits)) in arms.into_iter().enumerate() {
             let delegate = node_signer(a.backend, &format!("{tag}-i596-d{i}-{run}")).await;
             let d_key = delegate.derived_key_id();
-            put_grant_with_term(dir, &owner, &d_key, at, from, until).await;
+            // v60.0.0 (#1048) — a term past the ceiling is refused at the door.
+            match super::bodies::try_put_grant_with_term(dir, &owner, &d_key, at, from, until).await
+            {
+                Err(Error::DelegationTermRequired { rule, .. }) if i == 2 => {
+                    assert_eq!(
+                        rule,
+                        crate::federation::admission::delegation_term_rule::OVER_CEILING,
+                        "{tag} I596b {what}"
+                    );
+                    continue;
+                }
+                Err(e) => panic!("{tag} I596b {what}: the edge: {e}"),
+                Ok(_) => assert!(
+                    i != 2,
+                    "{tag} I596b {what}: an over-ceiling edge must be refused"
+                ),
+            }
             let recipient = format!("{tag}-i596-r{i}-{run}");
             recipient_of(a, &owner, &recipient).await;
             let r = admit_replicated_key_grant(
@@ -674,6 +720,125 @@ pub mod key_grant_arms {
                 );
             }
         }
+    }
+
+    /// **I1221** (v60.0.0, CIRISPersist#1049) — a `key_grant` row's sealer
+    /// chain is judged at its signed `asserted_at`, with W in front. A `grant`
+    /// delegate appointed five days ago:
+    ///
+    /// - a row it signed four days ago, its chain still standing: admits;
+    /// - (the owner withdraws the delegation now)
+    /// - a row signed an hour ago, inside W, when the chain stood: admits and
+    ///   PROJECTS (the projection judges at the same instant);
+    /// - a row signed four days ago, beyond W: `asserted_at_stale`, plane
+    ///   `key_grant`.
+    ///
+    /// Kills: the chain judged at receipt (the hour-old row refuses), and the
+    /// W gate dropped (the four-day-old row admits).
+    pub async fn exercise_i1221_key_grant_judged_at_issuance<B>(a: &Node<'_, B>, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+        use crate::federation::key_grant_invariants::two_node::sign_row_unstored_at;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let owner = format!("{tag}-i1221-owner-{run}");
+        ts::register_hybrid_key_as(a.backend, &owner, &owner, USER).await;
+        a.backend
+            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: owner.clone(),
+                occurrence_key_id: a.key.clone(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now() - chrono::Duration::days(6),
+                valid_until: None,
+                encryption_pubkeys: Some(a.kem.clone()),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap();
+        let sealed = encrypt_and_cascade(
+            a.backend,
+            SELF,
+            &owner,
+            b"the ledger",
+            None,
+            None,
+            Some(&a.key),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I1221: A seals self: {e}"));
+        let sha = sealed.at_rest_sha256;
+        let set_for = |recipient: &str| KeyGrantRow {
+            axis: KeyGrantAxis::Content {
+                at_rest_sha256: hex::encode(sha),
+                cohort_scope: SELF.into(),
+                owner_key_id: owner.clone(),
+            },
+            wrap: wrap(recipient),
+        };
+        let dir = a.backend.as_dyn_directory();
+        let now = chrono::Utc::now();
+        let delegate = node_signer(a.backend, &format!("{tag}-i1221-d-{run}")).await;
+        let d_key = delegate.derived_key_id();
+        let appointed = now - chrono::Duration::days(5);
+        let edge = super::bodies::put_grant_with_term(
+            dir,
+            &owner,
+            &d_key,
+            appointed,
+            appointed,
+            now + chrono::Duration::days(30),
+        )
+        .await;
+        let r0 = format!("{tag}-i1221-r0-{run}");
+        recipient_of(a, &owner, &r0).await;
+        admit_replicated_key_grant(
+            a.backend,
+            sign_row_unstored_at(&delegate, &set_for(&r0), now - chrono::Duration::days(4)).await,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I1221: an old row whose chain stands: {e}"));
+        withdraw(dir, &owner, &owner, &d_key, &edge).await;
+        let r1 = format!("{tag}-i1221-r1-{run}");
+        recipient_of(a, &owner, &r1).await;
+        let admitted = admit_replicated_key_grant(
+            a.backend,
+            sign_row_unstored_at(&delegate, &set_for(&r1), now - chrono::Duration::hours(1)).await,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I1221: a row signed inside W: {e}"));
+        assert!(
+            admitted.projected
+                && a.backend
+                    .get_at_rest_grant(&sha, &r1)
+                    .await
+                    .unwrap()
+                    .is_some(),
+            "{tag} I1221: the projection judges at the signed instant too: {admitted:?}"
+        );
+        let r2 = format!("{tag}-i1221-r2-{run}");
+        recipient_of(a, &owner, &r2).await;
+        let e = admit_replicated_key_grant(
+            a.backend,
+            sign_row_unstored_at(&delegate, &set_for(&r2), now - chrono::Duration::days(4)).await,
+        )
+        .await
+        .expect_err("a backdated row from a withdrawn delegate");
+        assert!(
+            matches!(&e, Error::AssertedAtStale { plane, .. }
+                if *plane == crate::federation::key_grant::KEY_GRANT_PLANE),
+            "{tag} I1221: asserted_at_stale on the key_grant plane: {e:?}"
+        );
+        assert!(
+            a.backend
+                .get_at_rest_grant(&sha, &r2)
+                .await
+                .unwrap()
+                .is_none(),
+            "{tag} I1221: a refused row projects nothing"
+        );
     }
 
     /// **I591c** — the epoch axis, two nodes: B admits rows for A's counter.
@@ -861,6 +1026,13 @@ mod run {
         }
 
         #[tokio::test(flavor = "multi_thread")]
+        async fn i1221() {
+            let ba = fresh().await;
+            let a = node(&ba, "i1221-a").await;
+            exercise_i1221_key_grant_judged_at_issuance(&a, "sqlite").await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
         async fn i591c() {
             let (ba, bb) = (fresh().await, fresh().await);
             let a = node(&ba, "i591c-a").await;
@@ -896,6 +1068,13 @@ mod run {
             let Some(ba) = fresh().await else { return };
             let a = node(&ba, "i596b-a").await;
             exercise_i596b_content_axis_term(&a, "postgres").await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn i1221() {
+            let Some(ba) = fresh().await else { return };
+            let a = node(&ba, "i1221-a").await;
+            exercise_i1221_key_grant_judged_at_issuance(&a, "postgres").await;
         }
 
         #[tokio::test(flavor = "multi_thread")]

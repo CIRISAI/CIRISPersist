@@ -308,7 +308,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 4.4.3.4.1	CLM-cascade	CIRISPersist	src/federation/at_rest_cascade.rs#encrypt_and_cascade	ciris-persist@59.1.0
 4.5.12.2	CLM-envelope-multi	CIRISPersist	src/federation/admission.rs#DimensionAdmissionPolicy::check_write_cohort_scope	ciris-persist@59.1.0
 4.5.3	CLM-takedown	CIRISPersist	src/cirisnode/takedown_handler.rs#process_takedown_admission	ciris-persist@59.1.0
-5.3.2.3	CLM-merge	CIRISPersist	src/federation/operational.rs#SubjectKind::merge_intent	ciris-persist@59.1.0
+5.3.2.3	CLM-merge	CIRISPersist	src/federation/admission.rs#check_partner_record_revision	ciris-persist@59.1.0
 5.3.2.4	CLM-attestation-tier	CIRISPersist	src/federation/admission.rs#check_local_tier_eligibility	ciris-persist@59.1.0
 5.3.2.4.2	CLM-local	CIRISPersist	src/engine.rs#Engine::enter_mesh	ciris-persist@59.1.0
 5.3.3.1	CLM-stream	CIRISPersist	src/federation/stream_seal.rs#seal_stream_chunk	ciris-persist@59.1.0
@@ -379,3 +379,19 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 2.6.1.7	CLM-signed-object	CIRISPersist	src/federation/tier_ingest.rs#check_content_hash	ciris-persist@59.1.0
 2.6.1.7	CLM-signed-object	CIRISPersist	src/federation/admission.rs#check_row_mirror_members_closed	ciris-persist@59.1.0
 2.6.1.7	CLM-signed-object	CIRISPersist	src/federation/mod.rs#validate_subject_key_ids	ciris-persist@59.1.0
+# v60.0.0 S6 (CIRISPersist#1036 items 1-5, #1049, #1062, #1048; CC rc9) — an organisation
+# is an affiliation; organization / org_membership / partner_record retire onto its rows (V205).
+3.3.9	CLM-authority-id-is-org-id	CIRISPersist	src/federation/admission.rs#licence_authority_set	ciris-persist@59.1.0
+2.4.1.2.1	CLM-licence-authority-quorum	CIRISPersist	src/federation/admission.rs#check_licensure_delegator_is_authority	ciris-persist@59.1.0
+2.4.1.2.1	CLM-licence-authority-quorum	CIRISPersist	src/federation/admission.rs#community_quorum_cosigned_at	ciris-persist@59.1.0
+2.4.1.2.1	CLM-licence-judged-at-issuance	CIRISPersist	src/federation/admission.rs#licence_roots_at	ciris-persist@59.1.0
+2.4.1.2.1	CLM-licence-audience	CIRISPersist	src/federation/admission.rs#check_licence_audience	ciris-persist@59.1.0
+2.4.1.1	CLM-licence-contest	CIRISPersist	src/federation/admission.rs#resolve_withdraws_admission_rule_at	ciris-persist@59.1.0
+2.4.1.1	CLM-licence-contest	CIRISPersist	src/federation/admission.rs#check_reconsideration_admission	ciris-persist@59.1.0
+3.2	CLM-org-on-the-bond	CIRISPersist	src/federation/admission.rs#check_owner_binding_affiliation_admission	ciris-persist@59.1.0
+3.2	CLM-org-on-the-bond	CIRISPersist	src/federation/admission.rs#affiliation_of_binding	ciris-persist@59.1.0
+4.4.3.2.8	CLM-delegation-term	CIRISPersist	src/federation/admission.rs#check_delegation_term_admission	ciris-persist@59.1.0
+2.6.7	CLM-admission-freshness-window	CIRISPersist	src/federation/key_grant.rs#check_key_grant_row_admission	ciris-persist@59.1.0
+2.6.7	CLM-admission-freshness-window	CIRISPersist	src/federation/admission.rs#check_consent_for_key_admission	ciris-persist@59.1.0
+2.6.7	CLM-admission-freshness-window	CIRISPersist	src/federation/admission.rs#check_licensure_delegator_is_authority	ciris-persist@59.1.0
+2.6.1.1.1	CLM-canonicalization-array	CIRISPersist	src/federation/operational.rs#check_partner_record_sets	ciris-persist@59.1.0

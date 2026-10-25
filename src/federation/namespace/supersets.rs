@@ -1779,7 +1779,14 @@ mod tests {
         // CLM-planes-as-rows at the family-scoped holdings read;
         // CLM-nsproc-tier-consent at the consent-revocation fold.
         // Merged with S6v (+6): 320 + 6 + 2.
-        const EXPECTED: usize = 328;
+        // v60.0.0 slice S6: +14 (CIRISPersist#1036, #1049, #1062, #1048):
+        // CLM-authority-id-is-org-id (1), CLM-licence-authority-quorum (2),
+        // CLM-licence-judged-at-issuance (1), CLM-licence-audience (1),
+        // CLM-licence-contest (2), CLM-org-on-the-bond (2),
+        // CLM-delegation-term (1), CLM-admission-freshness-window (3),
+        // CLM-canonicalization-array (1); CLM-merge moved off the retired
+        // SubjectKind onto the licence revision gate (a move, not a new row).
+        const EXPECTED: usize = 342;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

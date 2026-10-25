@@ -1054,6 +1054,43 @@ pub async fn check_sealer(
 /// The `plane` a key-grant `SignerDoesNotActFor` refusal names.
 pub const KEY_GRANT_PLANE: &str = "key_grant";
 
+/// v60.0.0 (CIRISPersist#1049) — **the signed instants of the stream-axis
+/// grant rows `sealer` holds for `(stream_id, epoch, viewer_key_id)`**, read
+/// from the stored `key_grant:stream:v1` rows (no projection column carries
+/// them, and none is added). The read path judges a sealer's `grant` chain at
+/// these instants, the instants admission judged it at
+/// ([`crate::federation::admission::grant_chain_instant`]), so a read never
+/// refuses a grant admission accepted.
+pub(crate) async fn stream_grant_row_instants(
+    dir: &dyn FederationDirectory,
+    sealer: &str,
+    stream_id: &str,
+    epoch: u64,
+    viewer_key_id: &str,
+) -> Result<Vec<chrono::DateTime<chrono::Utc>>, Error> {
+    let mut out = Vec::new();
+    let mut pages = crate::federation::attestation_query::AttestationQuery::by(
+        sealer,
+        crate::federation::attestation_query::FOLD_PAGE,
+    )
+    .dimension(KEY_GRANT_STREAM_DIMENSION)
+    .pages();
+    while let Some(page) = pages.next(dir).await? {
+        for row in page {
+            let Ok(parsed) = KeyGrantRow::from_attestation(&row) else {
+                continue;
+            };
+            if parsed.recipient() == viewer_key_id
+                && matches!(&parsed.axis, KeyGrantAxis::Stream { stream_id: s, epoch: e, .. }
+                    if s == stream_id && *e == epoch)
+            {
+                out.push(row.asserted_at);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// v55.0.0 (CIRISPersist#989, CC 3.3.2 rc7) — **the key-grant admission
 /// rule**, asked of every federation-tier row by
 /// `check_reserved_prefix_admission` on every backend:
@@ -1064,7 +1101,9 @@ pub const KEY_GRANT_PLANE: &str = "key_grant";
 /// - a `scores` row on `key_grant:` must parse ([`KeyGrantRow::from_attestation`]),
 ///   carry a v2 wrap, be self-signed (`attesting_key_id == scrub_key_id`),
 ///   meet the sealer rule ([`check_sealer`], at the row's `asserted_at`, its
-///   delegation chain at [`grant_chain_instant`](crate::federation::admission::grant_chain_instant)),
+///   delegation chain at [`grant_chain_instant`](crate::federation::admission::grant_chain_instant);
+///   v60.0.0, #1049: a row signed more than W ago must also meet it at
+///   receipt, else `asserted_at_stale`),
 ///   and name a recipient [`recipient_may_hold_key`] admits
 ///   (`recipient_not_in_audience`).
 ///
@@ -1104,6 +1143,26 @@ pub async fn check_key_grant_row_admission(
         crate::federation::admission::grant_chain_instant(row),
     )
     .await?;
+    // v60.0.0 (CIRISPersist#1049, CC 2.6.7 W) — the sealer rule (its `grant`
+    // chain and the epoch axis's membership) is judged at the row's signed
+    // `asserted_at`; that instant stands alone only inside W. Older, the
+    // signer must ALSO be a sealer at receipt, or the row is
+    // `asserted_at_stale`: a withdrawn delegate cannot backdate a grant into
+    // its old window.
+    let now = chrono::Utc::now();
+    if crate::federation::self_roster::outside_past_freshness_window(row.asserted_at, now)
+        && check_sealer(dir, signer, &parsed.axis, now, now)
+            .await
+            .is_err()
+    {
+        return Err(Error::AssertedAtStale {
+            author: signer.to_owned(),
+            standing_for: parsed.axis.group_key_id().to_owned(),
+            plane: KEY_GRANT_PLANE,
+            asserted_at: row.asserted_at,
+            w_secs: crate::federation::self_roster::PAST_FRESHNESS_W_SECS,
+        });
+    }
     if !recipient_may_hold_key(
         dir,
         parsed.axis.emission_cohort_scope(),
