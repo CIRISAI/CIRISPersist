@@ -336,6 +336,13 @@ did not fit its budget):
   the doors that call the plans, against I1192–I1201 and the doors' standing
   witnesses. 302 mutants in six shards, 256 caught, 46 unviable, 0
   missed (three rounds), on the weekly run.
+- `scope-s5-memory-retire.txt` (v60.0.0, slice S5): what the memory
+  backend's retirement added (#1002): the one lifecycle predicate (#720,
+  `lifecycle_predicate`, `hiding_composers`), the from-disk tree binding
+  (#691, `store::tree_read`), the fountain assembler moved out of memory.rs,
+  and `test_backend`, against I1320, I1321 and the lifecycle / fountain
+  reads on both backends. 16 mutants in one shard, nightly. Every other
+  scope dropped its `src/store/memory.rs` sites and memory legs.
 - `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and
   federation files that feed the counters. The issue's other starting modules
 (the `trust_root.rs` walks beyond `trust_root_valid`) are not yet scoped.

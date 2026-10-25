@@ -69,9 +69,15 @@ pub fn test_backend() -> SqliteBackend {
         let src = template().lock();
         let backup =
             rusqlite::backup::Backup::new(&src, &mut dst).expect("test_backend: backup handle");
-        backup
-            .step(-1)
-            .expect("test_backend: copy the migrated template");
+        // The whole template in one step, or the clone is a partial copy the
+        // open path would silently re-migrate from scratch.
+        assert_eq!(
+            backup
+                .step(-1)
+                .expect("test_backend: copy the migrated template"),
+            rusqlite::backup::StepResult::Done,
+            "test_backend: the template copied in full"
+        );
     }
     let dst = SqliteBackend::apply_connection_settings(dst).expect("test_backend: pragmas");
     let backend = SqliteBackend::from_handles(

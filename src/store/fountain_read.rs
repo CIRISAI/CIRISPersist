@@ -46,3 +46,49 @@ pub(crate) fn assemble_fountain_content(
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::fountain::{FountainContent, FountainManifestV1, FountainSymbolV1};
+
+    fn symbol(id: u32, bytes: &[u8]) -> FountainSymbolV1 {
+        FountainSymbolV1 {
+            content_id: "c".into(),
+            symbol_id: id,
+            retention_priority: 0,
+            symbol_bytes: bytes.to_vec(),
+        }
+    }
+
+    /// **I1323** — the read re-authenticates every present symbol against
+    /// the signed hash at its index: a symbol whose bytes changed is
+    /// `FountainIntegrity`, never served; the signed bytes are `Full`.
+    #[test]
+    fn i1323_a_symbol_that_is_not_its_signed_hash_is_refused() {
+        let manifest = FountainManifestV1 {
+            content_id: "c".into(),
+            corpus_kind: "blob".into(),
+            manifest_version: 1,
+            n_source: 1,
+            k_repair: 0,
+            symbol_size: 4,
+            original_content_length: 4,
+            min_viable_symbols: 1,
+            symbol_hashes: vec![crate::fountain::symbol_sha256_hex(b"abcd")],
+            envelope: serde_json::json!({}),
+            signature: String::new(),
+            signature_ml_dsa_65: String::new(),
+            pqc_key_id: String::new(),
+        };
+        assert!(matches!(
+            super::assemble_fountain_content(manifest.clone(), vec![symbol(0, b"abcd")]),
+            Ok(FountainContent::Full { .. })
+        ));
+        let err = super::assemble_fountain_content(manifest.clone(), vec![symbol(0, b"abce")])
+            .expect_err("I1323: a tampered symbol is refused");
+        assert!(matches!(err, super::Error::FountainIntegrity(_)), "{err:?}");
+        let err = super::assemble_fountain_content(manifest, vec![symbol(1, b"abcd")])
+            .expect_err("I1323: a symbol with no signed hash is refused");
+        assert!(matches!(err, super::Error::FountainIntegrity(_)), "{err:?}");
+    }
+}
