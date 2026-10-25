@@ -341,7 +341,8 @@ did not fit its budget):
   `lifecycle_predicate`, `hiding_composers`), the from-disk tree binding
   (#691, `store::tree_read`), the fountain assembler moved out of memory.rs,
   and `test_backend`, against I1320, I1321 and the lifecycle / fountain
-  reads on both backends. 16 mutants in one shard, nightly. Every other
+  reads on both backends. 15 mutants in one shard, 13 caught, 2 unviable,
+  0 missed (round 2), nightly. Every other
   scope dropped its `src/store/memory.rs` sites and memory legs.
 - `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and
   federation files that feed the counters. The issue's other starting modules
