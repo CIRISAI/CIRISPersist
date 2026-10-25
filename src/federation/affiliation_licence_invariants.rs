@@ -42,6 +42,7 @@
 //! - **I1221** — #1049: a `key_grant` row's sealer chain likewise (sqlite /
 //!   postgres nodes; see `grant_scope_invariants::key_grant_arms`).
 //! - **I1222** (pure) — the JCS order of a set is UTF-16, not byte order.
+//! - **I1223** — the promotion chokepoint re-runs the payload gate.
 
 /// The backend-agnostic witness bodies; `run` instantiates them per backend.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -261,6 +262,42 @@ pub mod bodies {
             &format!("[{tag}] I1210: a licence without the payload is not scanned"),
         )
         .await;
+    }
+
+    /// **I1223** — the promotion chokepoint re-runs the payload gate: a
+    /// licence whose payload repeats a set member does not cross to the
+    /// federation tier, and the well-formed one does. Kills: dropping
+    /// `check_licence_payload` from `check_promotion_admission` (no mutant
+    /// deletes a call; this is the reachability witness).
+    pub async fn i1223_promotion_re_runs_the_payload_gate(d: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::admission::check_promotion_admission;
+        let (board, holder) = keys(d, tag).await;
+        let at = base() - Duration::minutes(5);
+        let lic = |id: &str, caps: &[&str]| {
+            with(
+                licence(&board, &holder, &board, "issued", None, at),
+                "partner_record",
+                payload(id, "professional_full", 1, caps),
+            )
+        };
+        let dup = lic("lic-p1", &["a.read", "a.read"]);
+        assert_eq!(
+            kind_of(
+                check_promotion_admission(d, &dup, None)
+                    .await
+                    .map(|()| dup.clone()),
+                "I1223 repeat"
+            ),
+            "federation_set_semantics_unsorted",
+            "[{tag}] I1223: a repeated set member does not cross"
+        );
+        let ok = lic("lic-p2", &["a.read", "b.write"]);
+        if let Err(e) = check_promotion_admission(d, &ok, None).await {
+            panic!(
+                "[{tag}] I1223 control: a well-formed licence crosses, got {} ({e})",
+                e.kind()
+            );
+        }
     }
 
     /// **I1211** — the `revision` anti-rollback.
@@ -1336,6 +1373,12 @@ mod run {
         i1210_sqlite,
         i1210_postgres,
         "i1210"
+    );
+    on_both_backends!(
+        i1223_promotion_re_runs_the_payload_gate,
+        i1223_sqlite,
+        i1223_postgres,
+        "i1223"
     );
     on_both_backends!(
         i1211_revision_never_goes_backwards,

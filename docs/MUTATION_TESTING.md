@@ -336,6 +336,15 @@ did not fit its budget):
   the doors that call the plans, against I1192–I1201 and the doors' standing
   witnesses. 302 mutants in six shards, 256 caught, 46 unviable, 0
   missed (three rounds), on the weekly run.
+- `scope-s6-affiliations.txt` (v60.0.0, slice S6): organisations as
+  affiliations (#1036 items 1-5, #1049, #1062, #1048): the licence authority
+  quorum and its `license` walk, the signed-instant verdicts with W in front
+  (licence, consent grant chain, key_grant sealer and the stream read), the
+  licence audience, the typed licence payload (`operational.rs`) and its
+  `revision` gate, the subject-withdraws carve-out and the contest, the
+  affiliation owner-binding, and the delegation term gate and lens, against
+  I1210–I1235 and the licensure-chain, grant-scope and key-grant witnesses.
+  217 mutants in five shards, on the weekly run.
 - `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and
   federation files that feed the counters. The issue's other starting modules
 (the `trust_root.rs` walks beyond `trust_root_valid`) are not yet scoped.

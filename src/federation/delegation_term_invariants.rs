@@ -34,6 +34,8 @@
 //!   `not_on_live_chain_at_asserted_at`, one inside it admits, and the same
 //!   long edge under a plain community admits. The moderation walk scoped to
 //!   an affiliation drops an appointment longer than its `role_term`.
+//! - **I1235** (sqlite, postgres) — the promotion chokepoint re-runs the
+//!   gate: an untermed term-bearing edge does not cross; a termed one does.
 //! - **I1233** (sqlite) — the producer doors: `Engine::add_moderator` and
 //!   `Engine::grant_delegation` without a term are refused
 //!   `federation_delegation_term_required`, and with one they admit.
@@ -67,16 +69,67 @@ pub mod bodies {
         d: &dyn FederationDirectory,
         granter: &str,
         recipient: &str,
-        mut envelope: serde_json::Value,
+        envelope: serde_json::Value,
     ) -> Result<String, Error> {
+        let row = raw_edge(granter, recipient, envelope);
+        let id = row.attestation_id.clone();
+        d.put_attestation(crate::federation::SignedAttestation { attestation: row })
+            .await?;
+        Ok(id)
+    }
+
+    /// The sealed `delegates_to(granter → recipient)` [`put_raw`] offers.
+    fn raw_edge(
+        granter: &str,
+        recipient: &str,
+        mut envelope: serde_json::Value,
+    ) -> crate::federation::Attestation {
         let id = uuid::Uuid::new_v4().to_string();
         envelope["references_attestation_id"] = serde_json::Value::String(id.clone());
         let mut row = ts::bare_attestation(&id, granter, recipient, &envelope);
         row.attestation_type = attestation_type::DELEGATES_TO.to_owned();
         ts::seal_row_in_place(granter, &mut row);
-        d.put_attestation(crate::federation::SignedAttestation { attestation: row })
-            .await?;
-        Ok(id)
+        row
+    }
+
+    /// **I1235** — the promotion chokepoint re-runs the term gate: a
+    /// term-bearing edge with no term does not cross to the federation tier
+    /// (whether an edge sits in an affiliation's hierarchy is directory state
+    /// that can change after the local write), and the same edge with a term
+    /// does. Kills: dropping `check_delegation_term_admission` from
+    /// `check_promotion_admission` (no mutant deletes a call; this is the
+    /// reachability witness).
+    pub async fn i1235_promotion_re_runs_the_term_gate(d: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::admission::check_promotion_admission;
+        let granter = format!("{tag}-granter");
+        let r = format!("{tag}-r");
+        ts::register_hybrid_key_as(d, &granter, &granter, identity_type::USER).await;
+        ts::register_hybrid_key_as(d, &r, &r, identity_type::PRIMITIVE).await;
+        let untermed = raw_edge(
+            &granter,
+            &r,
+            serde_json::json!({ "scope": [DELEGATION_SCOPE_GRANT] }),
+        );
+        match check_promotion_admission(d, &untermed, None).await {
+            Err(Error::DelegationTermRequired { rule: got, .. }) => {
+                assert_eq!(got, rule::TERM_MISSING, "[{tag}] I1235: the rule");
+            }
+            other => panic!("[{tag}] I1235: an untermed grant edge crossed: {other:?}"),
+        }
+        let termed = raw_edge(
+            &granter,
+            &r,
+            serde_json::json!({
+                "scope": [DELEGATION_SCOPE_GRANT],
+                DELEGATION_VALID_UNTIL_FIELD: instant(Utc::now() + Duration::days(30)),
+            }),
+        );
+        if let Err(e) = check_promotion_admission(d, &termed, None).await {
+            panic!(
+                "[{tag}] I1235 control: a termed edge must cross, got {} ({e})",
+                e.kind()
+            );
+        }
     }
 
     /// Unwrap a `DelegationTermRequired` with `want`, or panic naming what came
@@ -775,6 +828,12 @@ mod run {
         i1231_sqlite,
         i1231_postgres,
         "i1231"
+    );
+    on_every_backend!(
+        i1235_promotion_re_runs_the_term_gate,
+        i1235_sqlite,
+        i1235_postgres,
+        "i1235"
     );
     on_every_backend!(
         i1232_walks_read_the_affiliations_role_term,
