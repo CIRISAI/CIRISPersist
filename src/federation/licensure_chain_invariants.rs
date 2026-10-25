@@ -835,6 +835,30 @@ pub mod bodies {
             &format!("[{tag}] #1035: a row naming a licence instead of an edge"),
         )
         .await;
+        // A `delegates_to` onto the emitter that does not carry `license` is
+        // not a licence delegation either. Kills: the type OR scope test
+        // weakened to AND (the edge would fall through to the walk and be
+        // refused under another reason).
+        let not_license = must_put(
+            dir,
+            &edge(&manager, &clerk, &["consent_revocation"], now, &[]),
+            "#1035 an edge onto the clerk without `license`",
+        )
+        .await;
+        must_refuse_as(
+            dir,
+            &licence(
+                &clerk,
+                &holder,
+                &board,
+                "probation",
+                Some(&not_license.attestation_id),
+                now,
+            ),
+            LicensureChainBreak::NamedEdgeNotLicense,
+            &format!("[{tag}] #1035: a row naming an edge without `license`"),
+        )
+        .await;
 
         // The named row must exist.
         must_refuse_as(

@@ -9993,7 +9993,12 @@ pub async fn resolve_withdraws_admission_rule_at(
         if reach.hit_target {
             return Ok(3);
         }
-        beyond_cap |= reach.beyond_cap;
+        // v60.0.0 — no `beyond_cap` from this walk: rule 4 walks the same
+        // graph from the same issuer at the same depth over a superset of
+        // these targets, and a walk that misses its targets explores the
+        // whole capped graph either way, so its cut is the same cut
+        // (mutation round 1 on scope-s6-affiliations: the accumulation here
+        // was equivalent).
     }
     // Rule 4 — `issuer` holds a valid consent_revocation-scoped
     // `delegates_to` reaching a key that itself satisfies rule 1

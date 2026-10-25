@@ -15145,6 +15145,30 @@ mod tests {
             )
             .await
             .expect("I1233: a termed appointment admits");
+        // A purpose other than the owner-binding's is a general delegation:
+        // it keeps its `sub_delegation`. Kills: the owner-binding arm's
+        // guard matching every purpose (an owner-binding drops it).
+        let general = engine
+            .grant_delegation(
+                &signer,
+                "i1233-a",
+                vec!["grant".into()],
+                true,
+                Some("not_an_owner_binding"),
+                DelegationTermBounds::until(until),
+            )
+            .await
+            .expect("I1233: a general delegation with an unknown purpose admits");
+        let row = sq
+            .get_attestation(&general)
+            .await
+            .expect("read")
+            .expect("stored");
+        assert_eq!(
+            row.attestation_envelope["sub_delegation"],
+            serde_json::Value::Bool(true),
+            "I1233: an unknown purpose is a general delegation"
+        );
     }
 
     /// Build a SignedKeyRecord whose key_id and scrub_key_id are

@@ -417,6 +417,17 @@ pub mod bodies {
                 None => expect_admitted(got, &what),
             }
         }
+        // The refusal names the bound it broke: the charter's 90 days, not
+        // the ceiling. Kills: the bound chosen for the wrong rule.
+        let r = recipient();
+        ts::register_hybrid_key_as(d, &r, &r, identity_type::PRIMITIVE).await;
+        match put_raw(d, &aff_keys[0], &r, in_group(&aff, Some(now + day * 100))).await {
+            Err(Error::DelegationTermRequired { detail, .. }) => assert!(
+                detail.contains(&format!("the bound is {}s", 90 * 86_400)),
+                "[{tag}] I1231(7): the refusal names the role_term bound: {detail}"
+            ),
+            other => panic!("[{tag}] I1231(7): expected an over-role-term refusal, got {other:?}"),
+        }
         // A plain community has no hierarchy and no charter term.
         let r = recipient();
         ts::register_hybrid_key_as(d, &r, &r, identity_type::PRIMITIVE).await;
@@ -597,6 +608,23 @@ pub mod bodies {
             &format!("[{tag}] I1232: a plain community's 200-day officer issues"),
         )
         .await;
+        // The key-at-now reading reads the same charter term. Kills: the
+        // `role_term` dropped from `emitter_resolves_to_authority`'s lens.
+        {
+            use crate::federation::admission::emitter_resolves_to_authority as resolves;
+            assert!(
+                !resolves(d, &long, &aff).await.expect("resolves"),
+                "[{tag}] I1232: the 200-day officer does not resolve to the affiliation now"
+            );
+            assert!(
+                resolves(d, &short, &aff).await.expect("resolves"),
+                "[{tag}] I1232: the 80-day officer does"
+            );
+            assert!(
+                resolves(d, &plain_long, &plain).await.expect("resolves"),
+                "[{tag}] I1232: the plain community's 200-day officer does"
+            );
+        }
 
         // The moderation walk scoped to the affiliation: an appointment that
         // names no room (absent-as-unscoped) with a 200-day term is dropped,
@@ -704,6 +732,23 @@ mod lens {
             live(&until_only(80), signed + day, Some(90 * 86_400)),
             "80 days under a 90-day role_term"
         );
+        // Exactly the role_term is inside it. Kills: `>` → `>=` on the
+        // role_term bound.
+        assert!(
+            live(&until_only(90), signed + day, Some(90 * 86_400)),
+            "exactly 90 days under a 90-day role_term"
+        );
+        // A term opens AT its `delegation_valid_from` (half-open from the
+        // start). Kills: `>` → `>=` on the start.
+        let opens = e(serde_json::json!({
+            DELEGATION_VALID_FROM_FIELD: at(signed + day),
+            DELEGATION_VALID_UNTIL_FIELD: at(signed + day * 30),
+        }));
+        assert!(live(&opens, signed + day, None), "live at its own start");
+        assert!(
+            !live(&opens, signed + day - Duration::seconds(1), None),
+            "not live a second before its start"
+        );
         // Unreadable: never live.
         let odd = e(serde_json::json!({ DELEGATION_VALID_FROM_FIELD: "soon" }));
         assert!(!live(&odd, signed + day, None), "an unreadable term");
@@ -783,6 +828,14 @@ mod lens {
         assert!(
             !live(&fresh, adopted + day * 2, None),
             "I1234 control: post-adoption, 400 days from signing is past the ceiling"
+        );
+        // Signed AT the adoption instant is post-adoption. Kills: `<` → `<=`
+        // on the grandfather boundary.
+        let mut at_adoption = until_only.clone();
+        at_adoption.asserted_at = adopted;
+        assert!(
+            !live(&at_adoption, adopted + day, None),
+            "I1234: an edge signed at the adoption instant is measured"
         );
     }
 }

@@ -379,6 +379,50 @@ pub mod bodies {
             "I1211 another licence",
         )
         .await;
+        // A rollback names the HIGHEST held revision (3 over 2, 2), not the
+        // first one read. Kills: the running-maximum test inverted.
+        let e = put(d, &lic(&board, 1, "issued", 0))
+            .await
+            .expect_err("I1211 rollback below 3");
+        assert!(
+            matches!(&e, Error::PartnerRecordRollback { existing: 3, .. }),
+            "[{tag}] I1211: the rollback names the highest held revision: {e:?}"
+        );
+        // Another authority whose id the board's is a prefix of: the prefix
+        // read reaches its rows, and the board's own testimony there at
+        // revision 50 is not the board's counter. Kills: the
+        // foreign-authority skip weakened (the board's row under
+        // `licensure:{board}2` would count as the board's own).
+        let board2 = format!("{board}2");
+        crate::federation::admission::steward_liveness_test_support::register(
+            d,
+            &board2,
+            &[identity_type::USER],
+        )
+        .await;
+        must_put(
+            d,
+            &with(
+                licence(
+                    &board,
+                    &holder,
+                    &board2,
+                    "issued",
+                    None,
+                    now - Duration::minutes(2),
+                ),
+                "partner_record",
+                payload("lic-r", "professional_full", 50, &[]),
+            ),
+            "I1211 the board's testimony under another authority at 50",
+        )
+        .await;
+        must_put(
+            d,
+            &lic(&board, 4, "issued", 1),
+            "I1211 the board's revision 4 under its own authority",
+        )
+        .await;
     }
 
     /// **I1212** — the skew bound, ported.
@@ -711,6 +755,18 @@ pub mod bodies {
             &format!("[{tag}] I1215(4): two hops from the quorum, under sub_delegation"),
         )
         .await;
+        // The key-at-now reading agrees: o6 resolves to the affiliation
+        // through the quorum's deputising root; o4 (under a root without
+        // sub_delegation) does not. Kills: the onward reach not reported.
+        use crate::federation::admission::emitter_resolves_to_authority as resolves;
+        assert!(
+            resolves(d, &o6, &aff).await.expect("resolves"),
+            "[{tag}] I1215(4): o6 resolves through the quorum's onward chain"
+        );
+        assert!(
+            !resolves(d, &o4, &aff).await.expect("resolves"),
+            "[{tag}] I1215(4): o4 does not"
+        );
         // (5) A lone member's withdraws does not retract a cosigned root
         // (rule 0). Kills: honouring any retraction of the root. (Its own
         // root: the cosigned retraction below would otherwise be the same
@@ -966,6 +1022,78 @@ pub mod bodies {
             put(d, &re(4, "self", &[&holder, &reader], "no-such-licence")).await,
             aud::RE_EMISSION_TARGET_UNKNOWN,
             "I1217 a re-emission of nothing",
+        );
+        // Re-emitting a held licence about ANOTHER subject, or under ANOTHER
+        // authority: each alone is not this licence. Kills: the authority OR
+        // subject test weakened to AND.
+        let about_reader = must_put(
+            d,
+            &placed(
+                with(
+                    licence(&k[0], &reader, &aff, "issued", None, at),
+                    "partner_record",
+                    payload("lic-reader", "community_plus", 1, &[]),
+                ),
+                "self",
+                &[],
+            ),
+            "I1217 a licence about the reader",
+        )
+        .await;
+        refused(
+            put(
+                d,
+                &re(4, "self", &[&holder, &reader], &about_reader.attestation_id),
+            )
+            .await,
+            aud::RE_EMISSION_TARGET_UNKNOWN,
+            "I1217 a re-emission of a licence about another subject",
+        );
+        let under_key = must_put(
+            d,
+            &with(
+                licence(&k[1], &holder, &k[1], "issued", None, at),
+                "partner_record",
+                payload("lic-key", "community_plus", 1, &[]),
+            ),
+            "I1217 a licence under another (key) authority",
+        )
+        .await;
+        refused(
+            put(
+                d,
+                &re(4, "self", &[&holder, &reader], &under_key.attestation_id),
+            )
+            .await,
+            aud::RE_EMISSION_TARGET_UNKNOWN,
+            "I1217 a re-emission of a licence under another authority",
+        );
+        // Another status, same payload. Kills: the status OR payload test
+        // weakened to AND.
+        let suspended = placed(
+            with(
+                with(
+                    licence(
+                        &k[0],
+                        &holder,
+                        &aff,
+                        "suspended",
+                        None,
+                        at + Duration::minutes(2),
+                    ),
+                    "partner_record",
+                    payload("lic-re", "community_plus", 4, &[]),
+                ),
+                LICENCE_RE_EMITS_MEMBER,
+                serde_json::json!(original.attestation_id),
+            ),
+            "self",
+            &[&holder, &reader],
+        );
+        refused(
+            put(d, &suspended).await,
+            aud::RE_EMISSION_DIVERGES,
+            "I1217 a re-emission carrying another status",
         );
         // At the wrong scope: never carried at a scope the class does not
         // declare. Kills: exempting re-emissions from the scope rule.
