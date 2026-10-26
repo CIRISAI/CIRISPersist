@@ -32,6 +32,12 @@
 //!   malformed, one that matches is accepted, `None` resolves to the row's.
 //! - **I513** (#984 row 8) — a `stream_id` folds receipts only when the blob
 //!   is of that stream; any other stream is refused.
+//! - **I1407** (sqlite, postgres; v60.1.0, CIRISPersist#1006) — `received` is
+//!   ordered by the instant the subscriber SIGNED on its
+//!   `delivery_receipt:{stream}` row: a v1 receipt stored after the device's
+//!   later `none` no longer outranks it; a signed receipt row before the
+//!   `none` keeps `none`, one after reads `received` at its instant, and a
+//!   withdrawn or expired row does not count.
 //! - **I514** (#984 row 9) — the custody door tells a shared backend its node
 //!   key before asking as that node; the stored report is the node's.
 
@@ -847,6 +853,234 @@ mod engine_bodies {
         sid
     }
 
+    /// Node B (the ladder's subscriber) signs `env` as a `scores` row at
+    /// `federation`, stamped `at`, into A's directory. Returns the row id.
+    async fn signed_by_b<B>(
+        l: &Ladder<B>,
+        run: &str,
+        mut env: serde_json::Value,
+        at: chrono::DateTime<chrono::Utc>,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> String
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        env["asserted_at"] =
+            serde_json::json!(crate::federation::admission::render_signed_instant(at));
+        let core: crate::federation::envelope::EnvelopeCore =
+            serde_json::from_value(env).expect("envelope");
+        let mut input = crate::federation::EmitAttestationInput::with_envelope(
+            crate::federation::types::attestation_type::SCORES,
+            core,
+            crate::federation::types::cohort_scope::FEDERATION,
+        );
+        input.expires_at = expires_at;
+        let signer =
+            crate::federation::tier_ingest::test_support::local_signer(&format!("em-b-{run}"));
+        crate::federation::attestation_emit::emit_with_local_signer(
+            l.ba.as_dyn_directory(),
+            &signer,
+            input,
+        )
+        .await
+        .expect("B's row is admitted on A")
+        .attestation_id
+    }
+
+    /// B's signed `delivery_receipt:{stream}` row (CC 3.4.6) about `sha`.
+    async fn signed_receipt_row<B>(
+        l: &Ladder<B>,
+        run: &str,
+        stream: &str,
+        sha: &[u8; 32],
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> String
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        signed_receipt_row_until(l, run, stream, sha, at, None).await
+    }
+
+    async fn signed_receipt_row_until<B>(
+        l: &Ladder<B>,
+        run: &str,
+        stream: &str,
+        sha: &[u8; 32],
+        at: chrono::DateTime<chrono::Utc>,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> String
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        signed_by_b(
+            l,
+            run,
+            serde_json::json!({
+                "dimension": crate::federation::custody_ack::delivery_receipt_dimension(stream),
+                "score": 1.0,
+                "confidence": 1.0,
+                "evidence_refs": [hex::encode(sha)],
+            }),
+            at,
+            expires_at,
+        )
+        .await
+    }
+
+    /// **I1407** (v60.1.0, CIRISPersist#1006; CC 3.1.3.3, CC 3.4.6) — **`received`
+    /// is ordered by the instant the SUBSCRIBER signed**, never by this node's
+    /// storage stamp. A `ciris-delivery-receipt/v1` receipt stored after the
+    /// device's later signed `none` (the receiver's clock ahead) no longer
+    /// outranks it: the device reads `none`, and a stored receipt with no
+    /// signed instant is not custody evidence. The device's own
+    /// `delivery_receipt:{stream}` row orders: one signed before the `none`
+    /// keeps `none`; one signed after reads `received` at its signed instant;
+    /// withdrawn by the device it no longer counts, nor once it has expired.
+    pub(crate) async fn i1407_received_is_ordered_by_the_signed_instant<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::custody_ack::{custody_ack_envelope, signed_receipt_at};
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let e = &l.engine_a;
+        let author = format!("i1407-author-{run}");
+        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+            l.ba.as_ref(),
+            &author,
+            &author,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+        let bytes = format!("i1407 {run}").into_bytes();
+        let x: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&bytes).into();
+        e.put_blob_signing(
+            &x,
+            crate::federation::BlobBody::Inline(bytes),
+            None,
+            &author,
+            chrono::Utc::now(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        let ms = |t: chrono::DateTime<chrono::Utc>| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis()).unwrap()
+        };
+        let t_none = ms(chrono::Utc::now() - chrono::Duration::seconds(60));
+        signed_by_b(
+            &l,
+            run,
+            custody_ack_envelope(
+                &x,
+                CustodyState::None,
+                None,
+                crate::federation::types::cohort_scope::FEDERATION,
+                None,
+            )
+            .unwrap(),
+            t_none,
+            None,
+        )
+        .await;
+        // The v1 receipt is stored NOW, a minute after B's signed `none`.
+        let sid = receipted_stream(&l, run, &x).await;
+        let b_state = |v: &crate::federation::custody_ack::CustodyView| {
+            v.devices
+                .iter()
+                .find(|d| d.device_key_id == l.node_b)
+                .unwrap_or_else(|| panic!("I1407 the subscriber is listed: {v:?}"))
+                .clone()
+        };
+        let v = e.custody_view(&x, &l.node_a, Some(&sid)).await.unwrap();
+        let b = b_state(&v);
+        assert_eq!(
+            b.state,
+            CustodyVerdict::None,
+            "I1407 a stored receipt never outranks the device's later signed `none`: {b:?}"
+        );
+        assert_eq!(b.received_at, None, "I1407 no signed receipt instant");
+
+        // Signed before the `none`: still `none`.
+        signed_receipt_row(&l, run, &sid, &x, t_none - chrono::Duration::seconds(30)).await;
+        let b = b_state(&e.custody_view(&x, &l.node_a, Some(&sid)).await.unwrap());
+        assert_eq!(
+            b.state,
+            CustodyVerdict::None,
+            "I1407 an earlier receipt: {b:?}"
+        );
+
+        // Signed after the `none`: `received`, at the signed instant.
+        let t_after = t_none + chrono::Duration::seconds(30);
+        let later = signed_receipt_row(&l, run, &sid, &x, t_after).await;
+        let b = b_state(&e.custody_view(&x, &l.node_a, Some(&sid)).await.unwrap());
+        assert_eq!(
+            b.state,
+            CustodyVerdict::Received,
+            "I1407 a later receipt: {b:?}"
+        );
+        assert_eq!(b.received_at, Some(t_after), "I1407 the signed instant");
+
+        // An expired receipt row does not count at a reader's later clock.
+        let t_exp = t_none + chrono::Duration::seconds(45);
+        signed_receipt_row_until(
+            &l,
+            run,
+            &sid,
+            &x,
+            t_exp,
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        )
+        .await;
+        let dir = l.ba.as_dyn_directory();
+        assert_eq!(
+            signed_receipt_at(dir, &l.node_b, &sid, chrono::Utc::now())
+                .await
+                .unwrap(),
+            Some(ms(t_exp)),
+            "I1407 a live row counts"
+        );
+        assert_eq!(
+            signed_receipt_at(
+                dir,
+                &l.node_b,
+                &sid,
+                chrono::Utc::now() + chrono::Duration::days(1)
+            )
+            .await
+            .unwrap(),
+            Some(t_after),
+            "I1407 an expired row does not"
+        );
+
+        // Withdrawn by the device: no longer counts.
+        let prior = dir.get_attestation(&later).await.unwrap().unwrap();
+        crate::federation::blobs::emit_withdraws_attestation_helper(
+            &prior,
+            "",
+            &crate::federation::tier_ingest::test_support::local_signer(&format!("em-b-{run}")),
+            dir,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("B withdraws its receipt row");
+        assert_eq!(
+            signed_receipt_at(
+                dir,
+                &l.node_b,
+                &sid,
+                chrono::Utc::now() + chrono::Duration::days(1)
+            )
+            .await
+            .unwrap(),
+            Some(ms(t_none - chrono::Duration::seconds(30))),
+            "I1407 a withdrawn row does not count"
+        );
+    }
+
     /// **I513** (v53.1.2, CIRISPersist#984 row 8) — **a `stream_id` folds
     /// receipts into a blob's view only when the blob is of that stream**: its
     /// own one-leaf log, a stream it sits at as a chunk (V175), or the stream
@@ -879,8 +1113,17 @@ mod engine_bodies {
             matches!(&r, Err(BlobError::InvalidArgument(m)) if m.contains("not the blob's stream")),
             "I513 an unrelated stream is refused: {r:?}"
         );
-        // Control: X's own log, receipted, folds node B as `received`.
+        // Control: X's own log, receipted, folds node B as `received` (v60.1.0,
+        // CIRISPersist#1006: by the instant B SIGNED on its receipt row).
         let s_x = receipted_stream(&l, run, &x).await;
+        signed_receipt_row(
+            &l,
+            run,
+            &s_x,
+            &x,
+            chrono::Utc::now() - chrono::Duration::seconds(5),
+        )
+        .await;
         let v = e.custody_view(&x, &l.node_a, Some(&s_x)).await.unwrap();
         let b = v
             .devices
@@ -1564,6 +1807,11 @@ mod runners {
     #[cfg(feature = "sqlite")]
     sqlite_engine_case!(i513_sqlite, i513_receipts_fold_only_for_the_blobs_stream);
     #[cfg(feature = "sqlite")]
+    sqlite_engine_case!(
+        i1407_sqlite,
+        i1407_received_is_ordered_by_the_signed_instant
+    );
+    #[cfg(feature = "sqlite")]
     sqlite_engine_case!(i525_sqlite, i525_the_target_arm_reads_every_room_shape);
     #[cfg(feature = "sqlite")]
     sqlite_engine_case!(i526_sqlite, i526_a_plaintext_room_write_carries_the_group);
@@ -1634,6 +1882,11 @@ mod runners {
     postgres_engine_case!(i512_postgres, i512_the_target_is_the_rows);
     #[cfg(feature = "postgres")]
     postgres_engine_case!(i513_postgres, i513_receipts_fold_only_for_the_blobs_stream);
+    #[cfg(feature = "postgres")]
+    postgres_engine_case!(
+        i1407_postgres,
+        i1407_received_is_ordered_by_the_signed_instant
+    );
     #[cfg(feature = "postgres")]
     postgres_engine_case!(i525_postgres, i525_the_target_arm_reads_every_room_shape);
     #[cfg(feature = "postgres")]

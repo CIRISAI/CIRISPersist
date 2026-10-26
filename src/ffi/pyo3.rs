@@ -14160,7 +14160,9 @@ impl PyEngine {
     /// one blob as JSON: `{sha256_hex, devices: [{device_key_id, state,
     /// reported_at?, received_at?, size?, challengeable}], copies_here,
     /// receipts_consulted}`, `state` ∈ `here` | `received` | `none` |
-    /// `unknown`. `stream_id` adds that stream's delivery receipts. Authorized
+    /// `unknown`. `stream_id` adds that stream's delivery receipts, ordered by
+    /// the subscriber's signed `delivery_receipt:{stream_id}:v1` row (v60.1.0,
+    /// CIRISPersist#1006). Authorized
     /// like `read_blob_as` (`blob_not_granted` for a stranger). Never render
     /// `unknown` as `none`, nor a lapsed `here` as a copy.
     #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, stream_id=None))]

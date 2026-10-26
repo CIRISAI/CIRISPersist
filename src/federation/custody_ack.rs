@@ -465,7 +465,10 @@ pub struct DeviceCustody {
     /// The latest report's signed instant, live or not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported_at: Option<DateTime<Utc>>,
-    /// The latest delivery receipt's stored instant, when one was consulted.
+    /// The latest delivery receipt's instant, when one was consulted: since
+    /// v60.1.0 (CIRISPersist#1006) the instant the SUBSCRIBER signed on its
+    /// `delivery_receipt:{stream_id}` row ([`signed_receipt_at`]), never this
+    /// node's storage stamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub received_at: Option<DateTime<Utc>>,
     /// The size a live `here` report names.
@@ -576,6 +579,66 @@ where
 {
     let acks = custody_acks_of(directory, device_key_id, blob_sha256_hex).await?;
     Ok(fold_device_custody(device_key_id, &acks, receipt_at, now))
+}
+
+/// v60.1.0 (CIRISPersist#1006, CC 3.4.6) — the dimension of a subscriber's
+/// signed delivery receipt row for `stream_id`: CC's
+/// `delivery_receipt:{stream_id}` family with the version segment the
+/// namespace grammar requires, `delivery_receipt:{stream_id}:v1` — the
+/// spelling CIRISEdge's receiver already emits (`receipts.rs`,
+/// `RECEIPT_DIMENSION_VERSION`), signed by the receiving node.
+#[must_use]
+pub fn delivery_receipt_dimension(stream_id: &str) -> String {
+    format!("delivery_receipt:{stream_id}:v1")
+}
+
+/// v60.1.0 (CIRISPersist#1006, CC 3.1.3.3 / CC 3.4.6) — **`device`'s latest
+/// SIGNED delivery instant for `stream_id`**: the greatest `asserted_at` of the
+/// rows the device signed under exactly [`delivery_receipt_dimension`] (the
+/// query pins both) that no composer of the device retired and that have not
+/// expired at `now`.
+///
+/// A stamped instant belongs to its signer: CC 3.1.3.3's "a receipt with no
+/// LATER live report" compares the receipt's instant with the device's signed
+/// report instant, so both must be the device's. A stored
+/// `ciris-delivery-receipt/v1` receipt
+/// ([`StoredDeliveryReceipt`](super::stream_receipt::StoredDeliveryReceipt))
+/// carries no signed instant (its signing bytes are `(stream, epoch, k, root)`),
+/// only this node's `received_at` storage stamp, so it is not custody
+/// evidence: it still joins the STH and names the subscriber as a device to
+/// fold, and nothing more.
+pub async fn signed_receipt_at<D>(
+    directory: &D,
+    device_key_id: &str,
+    stream_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    use super::attestation_query::{AttestationQuery, FOLD_PAGE};
+    let dimension = delivery_receipt_dimension(stream_id);
+    let mut rows: Vec<Attestation> = Vec::new();
+    let mut pages = AttestationQuery::by(device_key_id, FOLD_PAGE)
+        .dimension(&dimension)
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        rows.extend(page);
+    }
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let ids: Vec<String> = rows.iter().map(|r| r.attestation_id.clone()).collect();
+    let composers = directory
+        .list_composers_referencing_any(&ids, None, Some(device_key_id))
+        .await?;
+    let refs: Vec<&Attestation> = rows.iter().chain(composers.iter()).collect();
+    let retired = super::precedence::retired_ids(&refs);
+    Ok(rows
+        .iter()
+        .filter(|r| !retired.contains(&r.attestation_id) && r.expires_at.is_none_or(|e| e > now))
+        .map(|r| r.asserted_at)
+        .max())
 }
 
 /// The custody of one blob across the devices this node can name.
@@ -691,18 +754,25 @@ where
     let mut devices = candidate_devices(backend, at_rest_sha256, head.crypto_tier).await?;
     let mut receipts: BTreeMap<String, DateTime<Utc>> = BTreeMap::new();
     if let Some(stream) = stream_id {
-        for r in backend
-            .list_stored_delivery_receipts_for(stream, 1_000_000)
-            .await?
-        {
-            let at = receipts
-                .entry(r.receipt.subscriber_key_id.clone())
-                .or_insert(r.received_at);
-            if r.received_at > *at {
-                *at = r.received_at;
+        // The stream's subscribers are devices to fold (a stored receipt
+        // names one); v60.1.0 (CIRISPersist#1006) — but `received` is ordered
+        // only by an instant each device SIGNED, its `delivery_receipt:` row,
+        // never by this node's storage stamp on the stored receipt.
+        devices.extend(
+            backend
+                .list_stored_delivery_receipts_for(stream, 1_000_000)
+                .await?
+                .into_iter()
+                .map(|r| r.receipt.subscriber_key_id),
+        );
+        for d in &devices {
+            if let Some(at) = signed_receipt_at(backend, d, stream, now)
+                .await
+                .map_err(|e| BlobError::Backend(format!("delivery receipts of {d}: {e}")))?
+            {
+                receipts.insert(d.clone(), at);
             }
         }
-        devices.extend(receipts.keys().cloned());
     }
     let hex_sha = hex::encode(at_rest_sha256);
     let mut out = Vec::with_capacity(devices.len());

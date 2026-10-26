@@ -57,6 +57,19 @@ threat-model citations because this crate's audit story is the point.
   4. decided: a plaintext chunk shared with a live DAG stays (not withheld,
      not evicted) when another DAG that uses it is taken down; the existing
      purge walk already does this. Witness I1405.
+- **CIRISPersist#1006** — `custody_view`'s `received` was ordered by this
+  node's storage stamp on a stored `ciris-delivery-receipt/v1` receipt (whose
+  signed bytes carry no instant), so a receipt stored late outranked the
+  device's later signed `none`. `received` is now ordered only by the instant
+  the subscriber SIGNED on its `delivery_receipt:{stream_id}:v1` scores row
+  (CC 3.4.6; the spelling CIRISEdge's receiver already emits), its latest
+  live, unretired, unexpired one (`custody_ack::signed_receipt_at`). A stored
+  v1 receipt still joins the STH and names the subscriber as a device, and is
+  no longer custody evidence on its own. No wire change: the v1 receipt bytes
+  are unchanged. Not in this cut: the issue's membership check at
+  `put_delivery_receipt` (it reverses `stream_receipt.rs`'s documented
+  consumer-policy posture and awaits a ruling). Witness I1407 (sqlite,
+  postgres); I513's control now signs its receipt row.
 
 ## [60.0.0] - 2026-10-26
 

@@ -7462,7 +7462,10 @@ impl Engine {
     /// one blob for `viewer_key_id`: per device, `here` | `received` | `none`
     /// | `unknown`, folded at this node's clock. `stream_id`, when the caller
     /// knows the blob's stream, adds its delivery receipts (a receipt with no
-    /// later live report reads `received`). Authorized like
+    /// later live report reads `received`; v60.1.0, CIRISPersist#1006: ordered
+    /// by the instant the subscriber signed on its
+    /// `delivery_receipt:{stream_id}:v1` row, never by this node's storage
+    /// stamp on a stored v1 receipt). Authorized like
     /// [`blob_custody`](Self::blob_custody): a stranger is `NotGranted`.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn custody_view(
