@@ -600,6 +600,175 @@ migration.
   the executor's, and what left (the decisions) was small. The decisions
   are now written once.
 
+### Changed — an organisation is an affiliation; the three operational planes retire (CIRISPersist#1036 items 1–5, #1049, #1062, #1048; CC rc9)
+
+CC 3.3.9 moves `organization`, `org_membership` and `partner_record` onto the
+rows every community already uses (CIRISConstitution#161, #162, #164, #167,
+#168, #163). An organisation is a community record at
+`cohort_scope: affiliations`, named as an authority by its
+`community_key_id`; a member is a `membership:{stage}` seat plus a hierarchy
+`delegates_to`; a partner is a `licensure:{community_key_id}:v1` row carrying
+the typed licence payload. No Portal data existed to migrate (operator
+ruling).
+
+- **Item 1, the authority quorum** (CLM-licence-authority-quorum,
+  CLM-authority-id-is-org-id). Under a quorum `consensus_protocol` a licence
+  is a COSIGNED row: its full scrub set (base scrub + `additional_scrubs[]`)
+  intersected with the authority community's roster at the instant, each
+  survivor re-verified by `reverse_quorum::count_distinct_roster_scrubs`, is
+  evaluated under the community's own protocol. One member's signature is
+  testimony; a stranger's cosignature counts for nothing. The `license`
+  chain roots at an edge the quorum cosigned that names the affiliation
+  (`community_id`); a lone member's appointment roots nothing; onward hops
+  need `sub_delegation`; a root edge is retracted only by a cosigned
+  `withdraws` (rule 0). `licensure_delegator_not_authority` admits this case.
+  `admission::licence_authority_set` reads the set.
+- **Item 2 and #1049, judged at the signed instant with W in front**
+  (CLM-licence-judged-at-issuance, CLM-admission-freshness-window). A
+  licence, a consent row's `grant` chain and a `key_grant` row's sealer chain
+  (and the epoch-axis membership) are judged at the row's signed
+  `asserted_at` (`grant_chain_instant` is now the row's instant, not receipt).
+  Signed more than W = 72 h ago (`self_roster::outside_past_freshness_window`,
+  one reading of W for every door), the standing must ALSO hold at receipt,
+  else **`asserted_at_stale`** (`Error::AssertedAtStale`, plane `licensure` /
+  `consent` / `key_grant` / `owner_binding`). This is the CC 3.3.6.3
+  2026-10-19 reading (#1099: W binds a signer that has lost standing), so a
+  new node syncing history admits its legitimate old rows. The stream read
+  path judges a sealer's chain at the stored grant rows' instants
+  (`key_grant::stream_grant_row_instants`; no migration), so a read never
+  refuses a grant admission accepted. A withdrawal stops future issuance and
+  does not reclassify a licence already issued.
+- **Item 3, the audience** (CLM-licence-audience). A licence has no public
+  default: for a licence under an affiliation, the charter's new
+  `affiliation_config.licence_audiences` (`{license_type: cohort_scope}`,
+  validated at the community door, `licence_audience_invalid`) is the
+  declared scope per class; a class with no declaration may take any scope
+  but a commons one. A non-public licence reaches other readers by
+  RE-EMISSION: a new row (member `reemission_of` = the held licence's id),
+  signed and cosigned again at the same scope, naming its readers in
+  `subject_key_ids`, payload and status unchanged. Refusal
+  `federation_invalid_argument` prefixed `licence_audience_refused:` with
+  reasons `class_not_declared_public`, `scope_not_the_declared_choice`,
+  `re_emission_names_no_reader`, `re_emission_target_unknown`,
+  `re_emission_diverges`. The authority head a verifier needs (roster,
+  protocol, `license` edges) travels on its own planes.
+- **Item 4, the kinds' move.** `operational::PartnerRecord` is the typed
+  licence payload (envelope member `partner_record` on a `licensure:` scores
+  row). Ported: the field set (malformed → `federation_malformed_row`
+  `envelope_member_invalid`); the `revision` anti-rollback against the
+  AUTHORITY's own held licences only (`federation_partner_record_rollback`;
+  a stranger's testimony neither counts nor is counted); the ±5 min skew
+  bound; payment-processor rejection over the whole envelope. The four
+  set-semantics arrays must be sorted by JCS string order (UTF-16 code
+  units) AND unique: a repeat, which v59 let through, is
+  **`federation_set_semantics_unsorted`**; producers call
+  `PartnerRecord::canonicalize_sets` before signing. The promotion
+  chokepoint re-runs the payload, revision, audience, owner-binding and
+  term gates. **V205** (both dialects) drops `federation_organizations`,
+  `federation_org_memberships`, `federation_partner_records` and their
+  `signed_wire_index` / `known_wire_hashes` rows. The replication kinds
+  `Organization`, `OrgMembership`, `PartnerRecord` join `RETIRED_FRAMED` at
+  their hashed positions in `EnvelopeKind::ALL` (nothing renumbered; the
+  manifest hash Edge and Server pin does not move): an inbound object is
+  refused `federation_envelope_kind_retired`. CLM-merge (5.3.2.3) moves from
+  the retired `SubjectKind::merge_intent` to the licence's revision gate.
+- **Item 5, contest** (CLM-licence-contest). A subject's `withdraws` against
+  a `licensure:*` or `revocation:*` row about itself is refused
+  (`SUBJECT_WITHDRAWS_CARVE_OUT` = `capacity:`, `detection:`, `licensure:`,
+  `revocation:`; the v59-deferred widening in
+  `resolve_withdraws_admission_rule_at`). The contest is
+  `reconsideration:{grounds}`: the licensee files; for a `licensure:{A}`
+  target A's authority set (plus any `review`-scoped chain from it) rules.
+- **#1062, the organisation on the bond** (CLM-org-on-the-bond). An
+  owner-binding that names a community is admitted only when that community
+  is an affiliation this node holds and the row is cosigned under its
+  protocol at its signed instant; refusal `federation_invalid_argument`
+  prefixed `owner_binding_affiliation_refused:` (`affiliation_not_held`,
+  `not_an_affiliation`, `not_cosigned_under_protocol`). New fold
+  `admission::affiliation_of_binding(key)`. A binding naming no community is
+  a personal steward's binding, unchanged.
+- **#1048, delegation terms** (CLM-delegation-term). A `delegates_to`
+  carrying `license`, `grant`, `moderate`, `takedown`, `review` or `slash`,
+  or `sub_delegation`, or naming an affiliation (its hierarchy), MUST carry
+  `delegation_valid_until` at most 365 days after `delegation_valid_from`
+  (absent = the edge's `asserted_at`), and within the affiliation's
+  `role_term`; otherwise **`federation_delegation_term_required`**
+  (`Error::DelegationTermRequired`, rules `term_missing`, `term_unreadable`,
+  `over_ceiling`, `over_role_term`). Owner-bindings and the trust plane are
+  not gated; an edge that needs no term stays open-ended. The licence and
+  moderation walks read the affiliation's `role_term`. Grandfathered: an edge
+  signed before `DELEGATION_TERM_ADOPTED_AT` (2026-10-23) keeps the v54
+  reading. From the parked `v54.1-rc8-term-gate`, rebuilt on the v60 doors.
+
+**Python surface (clean break):**
+
+| method | v59 | v60 |
+|---|---|---|
+| `put_organization`, `put_org_membership`, `put_partner_record` | `(signed_json) -> None` | REMOVED |
+| `list_organizations_for`, `list_org_memberships_for`, `list_partner_records_for` | `(id) -> str` | REMOVED |
+| `list_organizations_since`, `list_org_memberships_since`, `list_partner_records_since`, `list_signed_partner_records_since` | `(since_rfc3339, since_id, limit) -> str` | REMOVED |
+| `grant_delegation` | `(delegate_key_id, scopes, sub_delegation, delegation_purpose=None)` | `+ delegation_valid_from=None, delegation_valid_until=None` (RFC 3339); a term-bearing edge without a bounded `_until` raises `ValueError` (`delegation_term_required`) |
+| `add_moderator` | `(community_id, moderator_key_id, duty)` | `+ delegation_valid_from=None, delegation_valid_until=None`; an appointment without a term raises `ValueError` |
+
+Error kinds gone with the planes: `federation_operational_authority`,
+`federation_operational_envelope_unbound`.
+
+**Rust surface (clean break):** `FederationDirectory::{put_organization,
+put_org_membership, put_partner_record, list_organizations_for,
+list_org_memberships_for, list_partner_records_for, list_organizations_since,
+list_org_memberships_since, list_partner_records_since,
+list_signed_partner_records_since}` removed (102 trait methods delegate in
+the directory double, from 112). Gone from `operational`: `SubjectKind`,
+`MergeIntent`, `Organization`, `OrgMembership`, the signed and `Served*`
+wrappers, the role-authority / steward-quorum / LWW / monotonic-quorum
+helpers; `Error::{OperationalAuthority, OperationalEnvelopeUnbound}`. New:
+`operational::{PartnerRecord (the payload), check_partner_record_sets,
+partner_record_of, check_licence_payload}`;
+`admission::{check_partner_record_revision, check_licence_audience,
+check_owner_binding_affiliation_admission, affiliation_of_binding,
+licence_authority_set, check_delegation_term_admission, DelegationTermBounds,
+is_term_bearing_edge, TERM_BEARING_SCOPES, SUBJECT_WITHDRAWS_CARVE_OUT}`;
+`affiliation_config::role_term_seconds`; `Error::DelegationTermRequired`;
+`Engine::grant_delegation` / `add_moderator` take a `DelegationTermBounds`.
+**`DIRECTORY_ABI_VERSION` 10 → 11**: `DirectoryOp::{ListOrganizationsSince,
+ListOrgMembershipsSince}` and `DirectoryOpResult::{Organizations,
+OrgMemberships}` removed.
+
+**Edge adapts** (S7): drop the `Organization`, `OrgMembership` and
+`PartnerRecord` replication kinds (send nothing on them; persist refuses them
+`federation_envelope_kind_retired`) and every use of the removed directory
+methods, types and capsule ops; carry a licence as the `licensure:` row it
+is, cosigned in `additional_scrubs[]`; pass a term to `grant_delegation` /
+`add_moderator` for term-bearing scopes; sort AND dedupe the licence
+payload's four sets before signing.
+
+- Witnesses (sqlite, postgres unless noted): **I1210** the payload gate;
+  **I1211** the revision anti-rollback; **I1212** the skew bound; **I1213**
+  the retired kinds and V205; **I1214–I1215** item 1; **I1216–I1217** item
+  3; **I1218** item 5; **I1219** #1062; **I1220–I1221** #1049 (consent,
+  key_grant); **I1222** (unit) UTF-16 set order; **I1223** the promotion
+  chokepoint re-runs the payload gate; **I1230**, **I1234** (unit) the term
+  lens and the grandfather ruling; **I1231** the term gate; **I1232** the
+  walks read `role_term`; **I1233** (sqlite engine) the producer doors;
+  **I1235** the promotion chokepoint re-runs the term gate; **I1225** (unit)
+  W's boundary. Extended: I972 (a licensee files), I313 (the stream read
+  keeps a wrap only from a sealer with standing at its row's instant), I798
+  (its duty edge carries a term). Python:
+  `tests/python/test_affiliation_surface.py`.
+- Mutation scope `scripts/mutants/scope-s6-affiliations.txt`: 212 mutants in
+  five shards, 186 caught, 26 unviable, 0 missed, nothing allow-listed (three
+  rounds: 28, then 9 survivors, all witnessed or removed as equivalent).
+  Weekly, five shards, in `mutants.yml`.
+- `resolve_withdraws_admission_rule_at`: rule 3 no longer accumulates
+  `beyond_delegation_depth_cap` (rule 4 walks the same graph over a superset
+  of targets; the refusal reports the same cut).
+- Evidence (manifest round `v60-s6`): CLM-authority-id-is-org-id (3.3.9),
+  CLM-licence-authority-quorum ×2, CLM-licence-judged-at-issuance,
+  CLM-licence-audience (2.4.1.2.1), CLM-licence-contest ×2 (2.4.1.1),
+  CLM-org-on-the-bond ×2 (3.2), CLM-delegation-term (4.4.3.2.8),
+  CLM-admission-freshness-window ×3 (2.6.7), CLM-canonicalization-array
+  (2.6.1.1.1); CLM-merge repointed; `EXPECTED` 342.
+
 ### Changed — hard_case rows replicate (CIRISConstitution#170 closed)
 
 The steward ruled through CC (2026-10-21, CIRISConstitution#170 closed, rc9

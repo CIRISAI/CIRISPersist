@@ -74,11 +74,17 @@ pub enum EnvelopeKind {
     CommunityMembershipRevocation,
     /// `federation_location_proofs` (E4).
     LocationProof,
-    /// `organizations` — role-authority quorum (E9).
+    /// `organizations` — role-authority quorum (E9). v60.0.0
+    /// (CIRISPersist#1036, CC 3.3.9): RETIRED ([`RETIRED_FRAMED`]); an
+    /// organisation is an affiliation's community record. Kept at its hashed
+    /// position.
     Organization,
-    /// `org_memberships` — role-authority quorum (E9).
+    /// `org_memberships` — role-authority quorum (E9). v60.0.0: RETIRED; a
+    /// member is a `membership:{stage}` seat plus a hierarchy edge.
     OrgMembership,
-    /// `partner_records` — M-of-N steward quorum (E9).
+    /// `partner_records` — M-of-N steward quorum (E9). v60.0.0: RETIRED; a
+    /// partner is a `licensure:{community_key_id}:v1` row carrying the typed
+    /// licence payload, which rides the [`Self::Attestation`] kind.
     PartnerRecord,
     /// `federation_transport_destinations`.
     TransportDestination,
@@ -174,11 +180,21 @@ pub const ENVELOPE_KIND_RETIRED: &str = "federation_envelope_kind_retired";
 /// v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — the kinds
 /// whose FRAMED carriage is retired: a key-plane object travels only as its
 /// row (an `Attestation`). They stay in the hashed vocabulary.
-pub const RETIRED_FRAMED: [EnvelopeKind; 4] = [
+///
+/// v60.0.0 (CIRISPersist#1036 item 4, CC 3.3.9) — the three operational
+/// kinds join them: an organisation is an affiliation's community record, a
+/// membership a seat plus a hierarchy edge, a partner a `licensure:*` row
+/// with the typed licence payload. Their tables went at V205; an inbound
+/// object of either kind is refused [`ENVELOPE_KIND_RETIRED`]. Appended here,
+/// never renumbered in [`EnvelopeKind::ALL`] (its order is hashed).
+pub const RETIRED_FRAMED: [EnvelopeKind; 7] = [
     EnvelopeKind::Key,
     EnvelopeKind::Revocation,
     EnvelopeKind::IdentityOccurrence,
     EnvelopeKind::IdentityOccurrenceRevocation,
+    EnvelopeKind::Organization,
+    EnvelopeKind::OrgMembership,
+    EnvelopeKind::PartnerRecord,
 ];
 
 /// v59.0.0 — refuse a wire-kind token (`EnvelopeKind::as_str()`) naming a
@@ -453,6 +469,8 @@ pub fn policy_for(kind: EnvelopeKind) -> KindPolicy {
             &[],
         ),
         // E9: operational planes — quorum roster from OUR directory.
+        // v60.0.0 (#1036): retired (`RETIRED_FRAMED`); the tuple is kept so
+        // the hashed manifest, which Edge and Server pin, does not move.
         K::Organization | K::OrgMembership | K::PartnerRecord => (
             S::QuorumFromOwnDirectory,
             B::StewardRosterFromDirectory,
@@ -678,6 +696,21 @@ pub const SETTLE_EXEMPT: &[(EnvelopeKind, &str)] = &[
         "v59.0.0 (sealed-transport floor, operator ruling 2026-10-19): the framed carriage is \
          retired and has no door; an occurrence is revoked by a withdraws on its \
          identity:occurrence:v1 row, which the attestation door settles",
+    ),
+    (
+        EnvelopeKind::Organization,
+        "v60.0.0 (CIRISPersist#1036, CC 3.3.9): retired with its table (V205); an organisation \
+         is an affiliation's community record, settled by the community door",
+    ),
+    (
+        EnvelopeKind::OrgMembership,
+        "v60.0.0 (CIRISPersist#1036, CC 3.3.9): retired with its table (V205); a membership is \
+         a seat plus a hierarchy edge, settled by their own doors",
+    ),
+    (
+        EnvelopeKind::PartnerRecord,
+        "v60.0.0 (CIRISPersist#1036, CC 3.3.9): retired with its table (V205); a partner is a \
+         licensure row with the typed licence payload, which the attestation door settles",
     ),
 ];
 

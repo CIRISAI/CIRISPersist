@@ -188,13 +188,12 @@ pub fn locator_instant(t: &chrono::DateTime<chrono::Utc>) -> String {
 ///
 /// Five kinds reload targeted — `Key`/`Attestation` by single-row getter,
 /// `IdentityOccurrence`/`IdentityOccurrenceRevocation`/`TransportDestination`
-/// scoped to their parent — so those puts take one extra point read. The other
-/// eight (`Family`, `Community`, `LocationProof`, both membership revocations,
-/// `Organization`, `OrgMembership`, `PartnerRecord`) have no subject-scoped
+/// scoped to their parent — so those puts take one extra point read. The
+/// others (`Family`, `Community`, `LocationProof`, the membership revocations,
+/// widenings and listings) have no subject-scoped
 /// signed read on the trait, so [`reload_record_bytes`] filters them from a
 /// `_since(None, u32::MAX)` scan and the put inherits that O(table) cost.
-/// Those are governance and operational writes (a family formed, a partner
-/// admitted), not per-request work, and their point-read was ALREADY that
+/// Those are governance writes (a family formed, a member removed), not per-request work, and their point-read was ALREADY that
 /// scan. The trade is deliberate: the scan is now the only thing left to make
 /// cheaper, and making it cheaper in `reload_record_bytes` fixes both paths at
 /// once — which was never true while the write path had its own derivation.
@@ -225,18 +224,13 @@ pub(crate) async fn entry_as_stored(
 /// longer matches the filter the read method applies) rather than erroring;
 /// the caller (the point-read) treats that identically to a hash mismatch.
 ///
-/// `Organization`/`OrgMembership` carry their own single-signer signature
-/// fields inline (same shape as `KeyRecord`/`Attestation`) — no bulk
-/// signed-since surface exists (or is needed) for them, so this reloads via
-/// the plain `list_organizations_since`/`list_org_memberships_since` (which
-/// already return the fully-signed row) and searches by `attestation_id`.
-/// `PartnerRecord`'s M-of-N steward quorum is external to the row
-/// (`SignedPartnerRecord`), so that arm uses
-/// `list_signed_partner_records_since` instead.
+/// v60.0.0 (CIRISPersist#1036 item 4) — the three operational kinds
+/// (`Organization` / `OrgMembership` / `PartnerRecord`) retired with their
+/// tables (V205): their index rows were dropped with them, and a kind this
+/// function does not name is refused below.
 ///
 /// The `_since(None, u32::MAX)` full-scan arms (`Family`/`Community`/
-/// `LocationProof`/`*MembershipRevocation`/`Organization`/`OrgMembership`/
-/// `PartnerRecord`) are O(n) in table size — acceptable for a point-read
+/// `LocationProof`/`*MembershipRevocation`) are O(n) in table size — acceptable for a point-read
 /// fallback/backfill path (not a per-request hot path); the 3 primary
 /// planes with a natural per-parent grouping (`IdentityOccurrence`,
 /// `IdentityOccurrenceRevocation`, `TransportDestination`) and the 2 with a
@@ -451,48 +445,6 @@ pub async fn reload_record_bytes(
                     serde_json::to_vec(&l.listing)
                         .map_err(|e| to_bytes(e, "CommunityMembershipListing"))?,
                 ),
-                None => None,
-            }
-        }
-        "Organization" => {
-            let attestation_id = record_key_field(record_key_json, "attestation_id")?;
-            let rows = dir.list_organizations_since(None, u32::MAX).await?;
-            match rows
-                .into_iter()
-                .find(|r| r.organization.attestation_id == attestation_id)
-            {
-                Some(r) => Some(
-                    serde_json::to_vec(&r.organization).map_err(|e| to_bytes(e, "Organization"))?,
-                ),
-                None => None,
-            }
-        }
-        "OrgMembership" => {
-            let attestation_id = record_key_field(record_key_json, "attestation_id")?;
-            let rows = dir.list_org_memberships_since(None, u32::MAX).await?;
-            match rows
-                .into_iter()
-                .find(|r| r.org_membership.attestation_id == attestation_id)
-            {
-                Some(r) => Some(
-                    serde_json::to_vec(&r.org_membership)
-                        .map_err(|e| to_bytes(e, "OrgMembership"))?,
-                ),
-                None => None,
-            }
-        }
-        "PartnerRecord" => {
-            let attestation_id = record_key_field(record_key_json, "attestation_id")?;
-            let rows = dir
-                .list_signed_partner_records_since(None, u32::MAX)
-                .await?;
-            match rows
-                .into_iter()
-                .find(|r| r.record.partner_record.attestation_id == attestation_id)
-            {
-                Some(r) => {
-                    Some(serde_json::to_vec(&r.record).map_err(|e| to_bytes(e, "PartnerRecord"))?)
-                }
                 None => None,
             }
         }
@@ -753,21 +705,6 @@ pub async fn all_kind_hash_keys(
             ("effective_at", &effective_at),
         ]);
         out.push(("CommunityMembershipListing", content_hash_of(v)?, rk));
-    }
-    for r in dir.list_organizations_since(None, u32::MAX).await? {
-        let rk = record_key(&[("attestation_id", &r.organization.attestation_id)]);
-        out.push(("Organization", content_hash_of(&r.organization)?, rk));
-    }
-    for r in dir.list_org_memberships_since(None, u32::MAX).await? {
-        let rk = record_key(&[("attestation_id", &r.org_membership.attestation_id)]);
-        out.push(("OrgMembership", content_hash_of(&r.org_membership)?, rk));
-    }
-    for r in dir
-        .list_signed_partner_records_since(None, u32::MAX)
-        .await?
-    {
-        let rk = record_key(&[("attestation_id", &r.record.partner_record.attestation_id)]);
-        out.push(("PartnerRecord", content_hash_of(&r.record)?, rk));
     }
     Ok(out)
 }

@@ -107,10 +107,6 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::federation::admission::{reachable_under_scope_with_reasons, ReachabilityVerdict};
-use crate::federation::operational::{
-    OrgMembership, Organization, PartnerRecord, SignedOrgMembership, SignedOrganization,
-    SignedPartnerRecord,
-};
 use crate::federation::types::{
     Attestation, Community, CommunityMembershipRevocation, Family, FamilyMembershipRevocation,
     HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord, LocationProof,
@@ -280,6 +276,12 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// `KeyPlaneRefused` (terminal). A consumer built against 9 fails to decode it
 /// on the hot path (the v6 / v8 payload-type form).
 ///
+/// v11 (v60.0.0, CIRISPersist#1036 item 4, CC 3.3.9) — a BREAK: the
+/// operational kinds retired onto affiliation rows, so the ops
+/// `ListOrgMembershipsSince` / `ListOrganizationsSince` and their results
+/// `OrgMemberships` / `Organizations` are REMOVED (their tables went at
+/// V205). A consumer built against 10 sends ops this host no longer decodes.
+///
 /// Consumers MUST check the field at capsule-receive time:
 ///
 /// ```ignore
@@ -292,7 +294,7 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 ///     "persist directory_capsule ABI version mismatch — pin floor too low"
 /// );
 /// ```
-pub const DIRECTORY_ABI_VERSION: u32 = 10;
+pub const DIRECTORY_ABI_VERSION: u32 = 11;
 
 /// A `FederationDirectory` operation, serialized by the consumer and
 /// dispatched inside persist's `.so`.
@@ -400,20 +402,6 @@ pub enum DirectoryOp {
     PeerMetadataFor {
         /// The peer `key_id` whose metadata row to read.
         key_id: String,
-    },
-    /// [`FederationDirectory::list_org_memberships_since`].
-    ListOrgMembershipsSince {
-        /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
-    /// [`FederationDirectory::list_organizations_since`].
-    ListOrganizationsSince {
-        /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
     },
     /// [`FederationDirectory::list_held_fountain_content`].
     ListHeldFountainContent {
@@ -1149,10 +1137,6 @@ pub enum DirectoryOpResult {
     SharedLease(Option<shared_instance::SharedInstanceLease>),
     /// `peer_metadata_for`.
     PeerMetadata(Option<PeerMetadataRow>),
-    /// `list_org_memberships_since`.
-    OrgMemberships(Vec<crate::federation::ServedOrgMembership>),
-    /// `list_organizations_since`.
-    Organizations(Vec<crate::federation::ServedOrganization>),
     /// `list_held_fountain_content`.
     FountainHeld(Vec<FountainHeldMeta>),
     /// `evict_fountain_content_to_tier`,
@@ -1731,18 +1715,6 @@ pub async fn dispatch_directory_op(
             Ok(v) => DirectoryOpResult::PeerMetadata(v),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
-        DirectoryOp::ListOrgMembershipsSince { since, limit } => {
-            match dir.list_org_memberships_since(since, limit).await {
-                Ok(v) => DirectoryOpResult::OrgMemberships(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
-        DirectoryOp::ListOrganizationsSince { since, limit } => {
-            match dir.list_organizations_since(since, limit).await {
-                Ok(v) => DirectoryOpResult::Organizations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
         DirectoryOp::ListHeldFountainContent { publisher_key_id } => {
             match dir.list_held_fountain_content(&publisher_key_id).await {
                 Ok(v) => DirectoryOpResult::FountainHeld(v),
@@ -2784,40 +2756,6 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::Unit => Ok(()),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    async fn list_organizations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedOrganization>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListOrganizationsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::Organizations(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    async fn list_org_memberships_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedOrgMembership>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListOrgMembershipsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::OrgMemberships(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -4255,57 +4193,6 @@ impl FederationDirectory for OpsDirectory {
             method: "communities_containing",
         })
     }
-    async fn put_organization(&self, signed: SignedOrganization) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "put_organization",
-        })
-    }
-    async fn put_org_membership(&self, signed: SignedOrgMembership) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "put_org_membership",
-        })
-    }
-    async fn put_partner_record(&self, signed: SignedPartnerRecord) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "put_partner_record",
-        })
-    }
-    async fn list_organizations_for(&self, org_id: &str) -> Result<Vec<Organization>, Error> {
-        Err(Error::Unsupported {
-            method: "list_organizations_for",
-        })
-    }
-    async fn list_org_memberships_for(&self, org_id: &str) -> Result<Vec<OrgMembership>, Error> {
-        Err(Error::Unsupported {
-            method: "list_org_memberships_for",
-        })
-    }
-    async fn list_partner_records_for(
-        &self,
-        license_id: &str,
-    ) -> Result<Vec<PartnerRecord>, Error> {
-        Err(Error::Unsupported {
-            method: "list_partner_records_for",
-        })
-    }
-    async fn list_partner_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedPartnerRecord>, Error> {
-        Err(Error::Unsupported {
-            method: "list_partner_records_since",
-        })
-    }
-    async fn list_signed_partner_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedSignedPartnerRecord>, Error> {
-        Err(Error::Unsupported {
-            method: "list_signed_partner_records_since",
-        })
-    }
     async fn add_community_member(
         &self,
         community_key_id: &str,
@@ -5020,10 +4907,13 @@ mod tests {
     /// puts in the vtable a consumer reads at runtime. A single assertion
     /// comparing them to each other would hold trivially while both drifted.
     #[test]
-    fn abi_version_pinned_at_10() {
+    fn abi_version_pinned_at_11() {
         assert_eq!(
-            DIRECTORY_ABI_VERSION, 10,
-            "v59.0.0 (CIRISPersist#1064): AttestationRefusalReason gained SelfRosterPending \
+            DIRECTORY_ABI_VERSION, 11,
+            "v60.0.0 (CIRISPersist#1036): the operational kinds retired — ListOrgMembershipsSince \
+             / ListOrganizationsSince and their results are removed from the op and result \
+             wire, so a consumer built against 10 sends ops this host no longer decodes. \
+             Previous move: v59.0.0 (CIRISPersist#1064): AttestationRefusalReason gained SelfRosterPending \
              inside ReplicatedAttestationOutcome — a consumer built against 9 fails to decode \
              it. Previous move: v59.0.0 (sealed-transport floor, operator ruling 2026-10-19): the framed \
              key-plane listings are removed from the op and result wire and \
@@ -5054,7 +4944,7 @@ mod tests {
              built for"
         );
         assert_eq!(
-            PERSIST_DIRECTORY_VTABLE.abi_version, 10,
+            PERSIST_DIRECTORY_VTABLE.abi_version, 11,
             "the shipped vtable must advertise what consumers pin against"
         );
     }
@@ -5126,9 +5016,11 @@ mod tests {
         // DIRECTORY_ABI_VERSION 8 → 9.
         // v60.0.0 (CIRISPersist#1105) — GROWTH: `ListKeyPlaneWireHashesSince`
         // APPENDED, nothing existing touched; DIRECTORY_ABI_VERSION stays.
+        // v60.0.0 (CIRISPersist#1036) — a BREAK: `ListOrgMembershipsSince` and
+        // `ListOrganizationsSince` removed; DIRECTORY_ABI_VERSION 10 → 11.
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "6420773215226d435dae76e5d96c9405929518cc66fa5af20f32a664ccab05fd",
+            "b8c73d71ef70c97a2ede3c0b3aed9c387ec1b1ce6f99391e12d4af82e9703c57",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -5172,9 +5064,11 @@ mod tests {
     fn directory_op_result_wire_contract_is_pinned_682() {
         // v59.0.0 (sealed-transport floor) — the four framed key-plane
         // results removed (a BREAK, with the op gate's bump to 9).
+        // v60.0.0 (CIRISPersist#1036) — `OrgMemberships` / `Organizations`
+        // removed (a BREAK, with the op gate's bump to 11).
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "2295b94a42f9da5c7d758c6a0764da0fca8953aaf408dcfd6d672f13a9eff827",
+            "0043d184699c08d81551475dc116633616df366abbae8b5dc021c0ae2d79f5bf",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );

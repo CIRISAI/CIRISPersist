@@ -12,13 +12,11 @@
 //!    already issued. The instant-less `license` / `grant` reachability read
 //!    judges NOW, never the timeless graph.
 //!
-//!    **#1049 — in this cut the DOOR also judges at receipt.** With no
-//!    past-freshness window on `asserted_at`, the signed instant alone lets
-//!    a withdrawn officer date a licence inside their old term. So the door
-//!    requires the chain at receipt AND at the signed instant: a licence
-//!    signed in term but received after it is REFUSED here, and a backdated
-//!    licence from a withdrawn officer or a departed founder is refused. The
-//!    FOLD keeps the signed instant: it reads only rows the door admitted.
+//!    **v60.0.0 (#1036 item 2, #1049) — the door judges at the signed
+//!    instant too, bounded by W.** A licence signed inside an open term and
+//!    received after it closed admits; a row signed more than W (72 h) before
+//!    receipt must also hold at receipt, or it is `asserted_at_stale`. Before
+//!    v60 the door judged at receipt as well (no window existed yet).
 //! 2. **#1035 — the gate and the fold use ONE chain function.** The door
 //!    refuses what the fold would exclude and the fold finds what the door
 //!    admitted: a two-hop delegate's issuance is FOUND, and the named edge
@@ -196,11 +194,11 @@ pub mod bodies {
         )
         .await;
 
-        // (a) Issued INSIDE the term, received now (after the term). The
-        // CC-ruled signed-instant rule admits it, but in this cut the door
-        // also judges at receipt (#1049: no past-freshness window yet), so it
-        // is REFUSED, and the fold has nothing to count.
-        // Kills: the door judging at the signed instant alone.
+        // (a) Issued INSIDE the term, received now (after the term). v60.0.0
+        // (#1036 item 2): judged at the signed instant, inside W, it ADMITS
+        // and is the board's licensure — a later lapse does not reclassify a
+        // licence already issued.
+        // Kills: the door also judging at receipt (the v54 rule).
         let in_term = licence(
             &clerk,
             &holder,
@@ -209,12 +207,12 @@ pub mod bodies {
             Some(&term.attestation_id),
             now - Duration::hours(2),
         );
-        must_refuse(
+        must_put(
             dir,
             &in_term,
             &format!(
-                "[{tag}] #1049: a licence signed while the officer's term was open but \
-                 received after it closed is refused at receipt in this cut"
+                "[{tag}] #1036.2: a licence signed while the officer's term was open, received \
+                 after it closed, inside W"
             ),
         )
         .await;
@@ -222,8 +220,8 @@ pub mod bodies {
             status_set_for(dir, &holder, &board, Utc::now())
                 .await
                 .expect("fold"),
-            BTreeSet::new(),
-            "[{tag}] #1049: a refused licence is not in the board's licensure"
+            BTreeSet::from([LicensureStatus::Issued]),
+            "[{tag}] #1036.2: the in-term licence is the board's licensure"
         );
 
         // (b) Issued AFTER the term closed: REFUSED.
@@ -320,36 +318,28 @@ pub mod bodies {
         .await;
 
         // (f) A term nobody can read is not an open term (fail toward LESS
-        // authority). Kills: treating a malformed term as absent.
+        // authority). v60.0.0 (#1048): the door refuses such an edge outright
+        // (`term_unreadable`); the lens's own reading is witnessed pure (I1230).
+        // Kills: treating a malformed term as absent at the door.
         let odd = officer(dir, tag, "odd").await;
-        let malformed = must_put(
-            dir,
-            &edge(
-                &board,
-                &odd,
-                &[DELEGATION_SCOPE_LICENSE],
-                t_edge,
-                &[(
-                    DELEGATION_VALID_UNTIL_FIELD,
-                    serde_json::json!("next tuesday"),
-                )],
+        let unreadable = edge(
+            &board,
+            &odd,
+            &[DELEGATION_SCOPE_LICENSE],
+            t_edge,
+            &[(
+                DELEGATION_VALID_UNTIL_FIELD,
+                serde_json::json!("next tuesday"),
+            )],
+        );
+        match put(dir, &unreadable).await {
+            Err(Error::DelegationTermRequired { rule, .. }) => assert_eq!(
+                rule,
+                crate::federation::admission::delegation_term_rule::TERM_UNREADABLE,
+                "[{tag}] #1048: an unreadable term"
             ),
-            "the door stores an edge whose term is unreadable (the lens judges it)",
-        )
-        .await;
-        must_refuse(
-            dir,
-            &licence(
-                &odd,
-                &holder,
-                &board,
-                "issued",
-                Some(&malformed.attestation_id),
-                now,
-            ),
-            &format!("[{tag}] #1032: an officer whose term is unreadable"),
-        )
-        .await;
+            other => panic!("[{tag}] #1048: an unreadable term must be refused: {other:?}"),
+        }
     }
 
     /// #1032 — **a later withdrawal stops future issuance and does not
@@ -422,23 +412,25 @@ pub mod bodies {
         .await;
     }
 
-    /// #1049 — **a backdated licence is refused at receipt.** Without a
-    /// past-freshness window, the signed `asserted_at` is the signer's to
-    /// choose. Both bypasses are closed by the door's receipt check:
+    /// #1049 / #1036 item 2 — **the signed instant stands inside W; beyond it
+    /// the standing must hold at receipt.**
     ///
     /// - (a) an officer the board has WITHDRAWN dates a licence inside the
-    ///   appointment's old live window;
+    ///   appointment's old live window, two hours ago: inside W the signed
+    ///   instant stands and it ADMITS (the exposure CC accepted with W);
+    /// - (a') the same officer dates one four days ago (beyond W), inside an
+    ///   appointment made five days ago: REFUSED `asserted_at_stale`, plane
+    ///   `licensure`;
     /// - (b) a founder who has LEFT a `founder_only` affiliation dates a direct
-    ///   issuance inside their tenure (refused `not_authority_at_receipt`).
+    ///   issuance inside their tenure, inside W: ADMITS;
+    /// - (c) the door judges at the signed instant: a licence dated before an
+    ///   open-ended appointment existed is refused, so the door never admits a
+    ///   row the fold would exclude.
     ///
-    /// - (c) the door still judges at the signed instant too: a licence dated
-    ///   before an open-ended appointment existed is refused, so the door
-    ///   never admits a row the fold would exclude.
-    ///
-    /// Kills: the door judging at the signed `asserted_at` alone (arms (a)
-    /// and (b) admit), dropping the authority-at-receipt clause (arm (b)
-    /// admits), and dropping the signed-instant verdict (arm (c) admits).
-    pub async fn exercise_backdated_licence_is_refused_at_receipt(
+    /// Kills: the door judging at receipt (arms (a), (b) refuse), dropping the
+    /// W gate (arm (a') admits), and dropping the signed-instant verdict (arm
+    /// (c) admits).
+    pub async fn exercise_backdated_licence_is_bounded_by_w(
         dir: &dyn FederationDirectory,
         tag: &str,
     ) {
@@ -448,7 +440,7 @@ pub mod bodies {
         let (board, holder) = keys(dir, tag).await;
         let now = base();
 
-        // (a) The withdrawn officer.
+        // (a) / (a') The withdrawn officer.
         let clerk = officer(dir, tag, "clerk").await;
         let appointment = must_put(
             dir,
@@ -456,10 +448,10 @@ pub mod bodies {
                 &board,
                 &clerk,
                 &[DELEGATION_SCOPE_LICENSE],
-                now - Duration::hours(3),
+                now - Duration::days(5),
                 &[],
             ),
-            "the board appoints a licensing officer",
+            "the board appoints a licensing officer five days ago",
         )
         .await;
         must_put(
@@ -468,7 +460,7 @@ pub mod bodies {
             "the board withdraws the officer",
         )
         .await;
-        must_refuse(
+        must_put(
             dir,
             &licence(
                 &clerk,
@@ -479,15 +471,41 @@ pub mod bodies {
                 now - Duration::hours(2),
             ),
             &format!(
-                "[{tag}] #1049: a withdrawn officer dating a licence inside the old \
-                 appointment"
+                "[{tag}] #1036.2: a withdrawn officer's licence dated inside the old \
+                 appointment and inside W"
             ),
         )
         .await;
+        let stale = licence(
+            &clerk,
+            &holder,
+            &board,
+            "probation",
+            Some(&appointment.attestation_id),
+            now - Duration::days(4),
+        );
+        let err = put(dir, &stale)
+            .await
+            .expect_err("a withdrawn officer's licence dated beyond W must be refused");
+        assert!(
+            matches!(&err, Error::AssertedAtStale { plane, standing_for, .. }
+                if *plane == "licensure" && *standing_for == board),
+            "[{tag}] #1049: refused `asserted_at_stale` on the licensure plane: {err:?}"
+        );
+        assert!(
+            format!("{err}").starts_with("asserted_at_stale:"),
+            "[{tag}] #1049: the Display leads with the token: {err}"
+        );
+        assert!(
+            dir.get_attestation(&stale.attestation_id)
+                .await
+                .expect("read")
+                .is_none(),
+            "[{tag}] #1049: the refused row is not stored"
+        );
 
-        // (c) The door ALSO judges at the signed instant, so it never admits
-        // a row the fold would exclude: a licence dated before an open-ended
-        // appointment existed is live at receipt and refused.
+        // (c) The door judges at the signed instant: a licence dated before
+        // an open-ended appointment existed is live at receipt and refused.
         // Kills: the door dropping its signed-instant verdict.
         let registrar = officer(dir, tag, "registrar").await;
         let open_ended = must_put(
@@ -512,13 +530,13 @@ pub mod bodies {
                 Some(&open_ended.attestation_id),
                 now - Duration::hours(2),
             ),
-            &format!("[{tag}] #1049: a licence dated before the appointment existed"),
+            &format!("[{tag}] #1032: a licence dated before the appointment existed"),
         )
         .await;
 
         // (b) The departed founder. alice and carol found a founder_only
         // affiliation; alice leaves an hour ago, then dates a direct issuance
-        // two hours ago, when she was still a founder.
+        // two hours ago, when she was still a founder: inside W it stands.
         let (aff, k) = make_group(
             dir,
             &format!("{tag}-fo"),
@@ -545,49 +563,25 @@ pub mod bodies {
         ))
         .await
         .unwrap_or_else(|e| panic!("[{tag}] alice leaves (carol remains a founder): {e}"));
-        let backdated = licence(
-            &alice,
-            &holder,
-            &aff,
-            "issued",
-            None,
-            now - Duration::hours(2),
-        );
-        let err = put(dir, &backdated)
-            .await
-            .expect_err("a departed founder's backdated issuance must be refused");
-        assert!(
-            format!("{err}").contains(REFUSAL)
-                && format!("{err}")
-                    .contains(crate::federation::admission::LICENSURE_NOT_AUTHORITY_AT_RECEIPT),
-            "[{tag}] #1049: refused as not the authority at receipt: {err}"
-        );
-        assert!(
-            matches!(&err, Error::LicensureDelegatorNotAuthority { reason, .. }
-                if *reason == crate::federation::admission::licensure_refusal::NOT_AUTHORITY_AT_RECEIPT),
-            "[{tag}] #1042 C: typed `not_authority_at_receipt`: {err:?}"
-        );
-        assert!(
-            dir.get_attestation(&backdated.attestation_id)
-                .await
-                .expect("read")
-                .is_none(),
-            "[{tag}] #1049: the refused row is not stored"
-        );
-        // Over-refusal control: a current founder's direct issuance admits.
-        must_put(
+        let backdated = must_put(
             dir,
             &licence(
-                &k[1],
+                &alice,
                 &holder,
                 &aff,
                 "issued",
                 None,
-                now - Duration::minutes(30),
+                now - Duration::minutes(110),
             ),
-            "a current founder issues directly",
+            &format!("[{tag}] #1036.2: a departed founder's issuance dated inside her tenure"),
         )
         .await;
+        assert!(
+            crate::federation::admission::row_was_issued_under_authority(dir, &backdated, &aff)
+                .await
+                .expect("verdict"),
+            "[{tag}] #1036.2: judged at its signed instant, it is the affiliation's"
+        );
     }
 
     /// #1032 — **the `grant` walk honours the term too.** The instant-less
@@ -839,6 +833,30 @@ pub mod bodies {
             ),
             LicensureChainBreak::NamedEdgeNotLicense,
             &format!("[{tag}] #1035: a row naming a licence instead of an edge"),
+        )
+        .await;
+        // A `delegates_to` onto the emitter that does not carry `license` is
+        // not a licence delegation either. Kills: the type OR scope test
+        // weakened to AND (the edge would fall through to the walk and be
+        // refused under another reason).
+        let not_license = must_put(
+            dir,
+            &edge(&manager, &clerk, &["consent_revocation"], now, &[]),
+            "#1035 an edge onto the clerk without `license`",
+        )
+        .await;
+        must_refuse_as(
+            dir,
+            &licence(
+                &clerk,
+                &holder,
+                &board,
+                "probation",
+                Some(&not_license.attestation_id),
+                now,
+            ),
+            LicensureChainBreak::NamedEdgeNotLicense,
+            &format!("[{tag}] #1035: a row naming an edge without `license`"),
         )
         .await;
 
@@ -1358,9 +1376,9 @@ mod run {
         "lic-wd"
     );
     on_every_backend!(
-        exercise_backdated_licence_is_refused_at_receipt,
-        backdated_licence_is_refused_at_receipt_1049_sqlite,
-        backdated_licence_is_refused_at_receipt_1049_postgres,
+        exercise_backdated_licence_is_bounded_by_w,
+        backdated_licence_is_bounded_by_w_1049_sqlite,
+        backdated_licence_is_bounded_by_w_1049_postgres,
         "lic-backdate"
     );
     on_every_backend!(

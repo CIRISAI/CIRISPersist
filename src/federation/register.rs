@@ -1730,7 +1730,7 @@ pub enum RevocationBoundRefusal {
     /// precision, which postgres `TIMESTAMPTZ` cannot store.
     ///
     /// The same class as [`crate::federation::admission::check_instant_binding`]'s
-    /// resolution clause and `operational::bind_instant_value`'s, on the field
+    /// resolution clause (and the retired operational planes' instant binding), on the field
     /// this gate owns. Two consequences, both backend-dependent and both
     /// silent before this variant: the bound orders
     /// [`Revocation::suspects_statement_at`](super::types::Revocation::suspects_statement_at),

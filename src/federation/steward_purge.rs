@@ -440,18 +440,6 @@ pub const ATTESTATION_PROJECTIONS: &[(&str, &str, ProjectionRemoval)] = &[
 pub const INDEPENDENT_ATTESTATION_ID_TABLES: &[(&str, &str)] = &[
     ("federation_attestations", "the row itself"),
     (
-        "federation_organizations",
-        "its own signed organization record; the id is that record's",
-    ),
-    (
-        "federation_org_memberships",
-        "its own signed membership record; the id is that record's",
-    ),
-    (
-        "federation_partner_records",
-        "its own signed partner record; the id is that record's",
-    ),
-    (
         "cirisnode_promotion_attestations",
         "the cirisnode plane's own promotion records, written by src/cirisnode",
     ),

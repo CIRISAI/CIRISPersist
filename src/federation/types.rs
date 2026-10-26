@@ -1256,6 +1256,12 @@ pub mod delegation_scope {
             "holding_claim::CUSTODY_ACK_SCOPE_MISMATCH",
             "v55.0.0 (CIRISPersist#989) — a REFUSAL TOKEN (a holding claim placed at another              cohort scope than its content's, CC 3.1.3.3 rule 1), not a delegates_to scope value",
         ),
+        (
+            "admission::SCOPE_NOT_THE_DECLARED_CHOICE",
+            "v60.0.0 (CIRISPersist#1036 item 3) — a REFUSAL REASON of \
+             `licence_audience_refused` (a licence placed at another cohort scope than the one \
+             its class is declared at), not a delegates_to scope value",
+        ),
     ];
 
     /// CC 3.4.7.3 — the legacy **unprefixed** agency kinds (the pre-split
@@ -3985,80 +3991,6 @@ pub fn split_resume_id<const N: usize>(token: &str) -> [&str; N] {
         }
     }
     out
-}
-
-/// One `organization` row as the serve cursor returns it (#668). See the
-/// family note above and [`ServedKeyRecord`] for the full reasoning.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ServedOrganization {
-    /// The organization row itself, unchanged.
-    pub organization: crate::federation::operational::Organization,
-    /// THIS node's serve position on the row (node-local, never hashed).
-    pub admitted_at: chrono::DateTime<chrono::Utc>,
-}
-
-impl ServedOrganization {
-    /// The `(admitted_at, attestation_id)` pair a caller resumes from.
-    #[must_use]
-    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
-        (self.admitted_at, self.organization.attestation_id.clone())
-    }
-}
-
-/// One `org_membership` row as the serve cursor returns it (#668).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ServedOrgMembership {
-    /// The membership row itself, unchanged.
-    pub org_membership: crate::federation::operational::OrgMembership,
-    /// THIS node's serve position on the row (node-local, never hashed).
-    pub admitted_at: chrono::DateTime<chrono::Utc>,
-}
-
-impl ServedOrgMembership {
-    /// The `(admitted_at, attestation_id)` pair a caller resumes from.
-    #[must_use]
-    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
-        (self.admitted_at, self.org_membership.attestation_id.clone())
-    }
-}
-
-/// One `partner_record` row as the projection-read serve cursor returns it
-/// (#668).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ServedPartnerRecord {
-    /// The partner record itself, unchanged.
-    pub partner_record: crate::federation::operational::PartnerRecord,
-    /// THIS node's serve position on the row (node-local, never hashed).
-    pub admitted_at: chrono::DateTime<chrono::Utc>,
-}
-
-impl ServedPartnerRecord {
-    /// The `(admitted_at, attestation_id)` pair a caller resumes from.
-    #[must_use]
-    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
-        (self.admitted_at, self.partner_record.attestation_id.clone())
-    }
-}
-
-/// One `partner_record` row with its steward quorum signatures, as the
-/// signed serve cursor returns it (#668).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ServedSignedPartnerRecord {
-    /// The signed partner record itself, unchanged.
-    pub record: crate::federation::operational::SignedPartnerRecord,
-    /// THIS node's serve position on the row (node-local, never hashed).
-    pub admitted_at: chrono::DateTime<chrono::Utc>,
-}
-
-impl ServedSignedPartnerRecord {
-    /// The `(admitted_at, attestation_id)` pair a caller resumes from.
-    #[must_use]
-    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
-        (
-            self.admitted_at,
-            self.record.partner_record.attestation_id.clone(),
-        )
-    }
 }
 
 /// One `federation_families` row as the serve cursor returns it (#668).

@@ -469,6 +469,48 @@ pub(crate) mod bodies {
             plain[50..=140].to_vec(),
             "I313: and by range"
         );
+        // v60.0.0 (CIRISPersist#1049) — the read keeps a wrap only from a
+        // sealer that speaks for the owner at its own grant row's instant: a
+        // wrap held under a sealer with no grant row and no standing reaches
+        // nobody. Kills: the owner shortcut taken for every sealer.
+        {
+            use crate::federation::chunk_dag_cascade::orchestrate::stream_grant_sealer;
+            let lone = format!("i313-lone-{run}");
+            let template =
+                p.sa.stream_dek_grants(&stream, 0, &p.key_a)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .expect("a wrap");
+            p.sb.stream_dek_put_grants(
+                &stream,
+                0,
+                &format!("i313-nobody-{run}"),
+                cohort_scope::SELF,
+                &[crate::federation::GrantWrap {
+                    recipient_key_id: lone.clone(),
+                    ..template
+                }],
+            )
+            .await
+            .expect("a wrap held under a sealer with no standing");
+            assert!(
+                stream_grant_sealer(p.sb.as_ref(), &stream, 0, &lone)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "I313: a wrap from a sealer with no standing is not the viewer's"
+            );
+            assert_eq!(
+                stream_grant_sealer(p.sb.as_ref(), &stream, 0, &p.key_b)
+                    .await
+                    .unwrap()
+                    .map(|(sealer, _)| sealer),
+                Some(p.key_a.clone()),
+                "I313: B's wrap is A's, the owner's device, judged at its row's instant"
+            );
+        }
         // The stream's single sender grants its keys. B is the same person's
         // other node and speaks for A (#884); a party that shares no
         // principal with the stream's owner does not, and its set is refused

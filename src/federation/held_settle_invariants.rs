@@ -447,9 +447,6 @@ mod from_disk {
             "put_community_membership_revocation",
         ),
         (EnvelopeKind::LocationProof, "put_location_proof"),
-        (EnvelopeKind::Organization, "put_organization"),
-        (EnvelopeKind::OrgMembership, "put_org_membership"),
-        (EnvelopeKind::PartnerRecord, "put_partner_record"),
         (
             EnvelopeKind::TransportDestination,
             "put_signed_transport_destination",

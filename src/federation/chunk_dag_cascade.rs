@@ -3697,22 +3697,31 @@ pub mod orchestrate {
             .stream_dek_grants_for_recipient(stream_id, epoch, viewer_key_id)
             .await?
         {
-            if sealer == owner
-                // v54.0.0 (#1033) — the admission predicate, so a row
-                // admitted under the `grant`-delegate arm is not then refused
-                // here. Judged now, as admission's chain is
-                // (`admission::grant_chain_instant`); CIRISPersist#1049 moves
-                // both to the row's signed instant together.
-                || crate::federation::key_grant::may_issue_grant_for(
-                    backend,
-                    &sealer,
-                    &owner,
-                    chrono::Utc::now(),
-                )
-                .await
-                    .map_err(|e| BlobError::Backend(format!("stream grant sealer: {e}")))?
-            {
+            if sealer == owner {
                 return Ok(Some((sealer, wrap)));
+            }
+            // v54.0.0 (#1033) — the admission predicate, so a row admitted
+            // under the `grant`-delegate arm is not then refused here.
+            // v60.0.0 (CIRISPersist#1049) — judged at the stored grant row's
+            // signed instant, the instant admission judged it at
+            // (`admission::grant_chain_instant`): a delegate whose chain was
+            // withdrawn after it sealed keeps the wrap it lawfully issued.
+            let instants = crate::federation::key_grant::stream_grant_row_instants(
+                backend,
+                &sealer,
+                stream_id,
+                epoch,
+                viewer_key_id,
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("stream grant sealer: {e}")))?;
+            for at in instants {
+                if crate::federation::key_grant::may_issue_grant_for(backend, &sealer, &owner, at)
+                    .await
+                    .map_err(|e| BlobError::Backend(format!("stream grant sealer: {e}")))?
+                {
+                    return Ok(Some((sealer, wrap)));
+                }
             }
         }
         Ok(None)

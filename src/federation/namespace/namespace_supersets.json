@@ -16478,9 +16478,10 @@
     "decimal_id": "5.3.2.3",
     "claim_id": "CLM-merge",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/operational.rs#SubjectKind::merge_intent",
+    "path#symbol": "src/federation/admission.rs#check_partner_record_revision",
     "tsv_target": "evidence/cc_impl.tsv",
-    "manifest_round": "cc-rc8-1091"
+    "manifest_round": "v60-s6",
+    "witness": "I1211 (sqlite, postgres): the monotonic_quorum intent of a licence is revision anti-rollback against the authority"
    },
    {
     "decimal_id": "5.3.2.4",
@@ -17031,6 +17032,136 @@
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v60-1114",
     "witness": "I1311 (memory, sqlite, postgres), I84: subject_key_id_malformed"
+   },
+   {
+    "decimal_id": "3.3.9",
+    "claim_id": "CLM-authority-id-is-org-id",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#licence_authority_set",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s6",
+    "tsv_comment_before": [
+     "# v60.0.0 S6 (CIRISPersist#1036 items 1-5, #1049, #1062, #1048; CC rc9) — an organisation",
+     "# is an affiliation; organization / org_membership / partner_record retire onto its rows (V205)."
+    ],
+    "witness": "I1214, I1215 (sqlite, postgres): the authority named by community_key_id resolves its keys under its consensus_protocol"
+   },
+   {
+    "decimal_id": "2.4.1.2.1",
+    "claim_id": "CLM-licence-authority-quorum",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_licensure_delegator_is_authority",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s6",
+    "witness": "I1214, I1215 (sqlite, postgres): a licence under a quorum protocol is a cosigned row; a lone member's appointment roots nothing"
+   },
+   {
+    "decimal_id": "2.4.1.2.1",
+    "claim_id": "CLM-licence-authority-quorum",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#community_quorum_cosigned_at",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s6",
+    "witness": "I1215 (sqlite, postgres): the license chain roots at an edge the quorum cosigned"
+   },
+   {
+    "decimal_id": "2.4.1.2.1",
+    "claim_id": "CLM-licence-judged-at-issuance",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#licence_roots_at",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s6",
+    "witness": "I1215 (sqlite, postgres), backdated_licence_is_bounded_by_w_1049 (sqlite, postgres): judged at the signed asserted_at; a withdrawal stops future issuance only"
+   },
+   {
+    "decimal_id": "2.4.1.2.1",
+    "claim_id": "CLM-licence-audience",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_licence_audience",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s6",
+    "witness": "I1216, I1217 (sqlite, postgres): no public default; re-emission to named readers"
+   },
+   {
+    "decimal_id": "2.4.1.1",
+    "claim_id": "CLM-licence-contest",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#resolve_withdraws_admission_rule_at",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s6",
+    "witness": "I1218 (sqlite, postgres): a subject's withdraws against licensure:* / revocation:* is refused"
+   },
+   {
+    "decimal_id": "2.4.1.1",
+    "claim_id": "CLM-licence-contest",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_reconsideration_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s6",
+    "witness": "I1218 (sqlite, postgres): the contest is reconsideration:{grounds}, ruled by the authority's set"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-org-on-the-bond",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_owner_binding_affiliation_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s6",
+    "witness": "I1219 (sqlite, postgres): an owner-binding naming an affiliation is cosigned under its protocol"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-org-on-the-bond",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#affiliation_of_binding",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s6",
+    "witness": "I1219 (sqlite, postgres)"
+   },
+   {
+    "decimal_id": "4.4.3.2.8",
+    "claim_id": "CLM-delegation-term",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_delegation_term_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s6",
+    "witness": "I1230, I1234 (unit), I1231, I1232 (sqlite, postgres), I1233 (sqlite engine): delegation_term_required"
+   },
+   {
+    "decimal_id": "2.6.7",
+    "claim_id": "CLM-admission-freshness-window",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/key_grant.rs#check_key_grant_row_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s6",
+    "witness": "I1221 (sqlite, postgres): asserted_at_stale on the key_grant sealer chain"
+   },
+   {
+    "decimal_id": "2.6.7",
+    "claim_id": "CLM-admission-freshness-window",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_consent_for_key_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s6",
+    "witness": "I1220 (sqlite, postgres): asserted_at_stale on the consent grant chain"
+   },
+   {
+    "decimal_id": "2.6.7",
+    "claim_id": "CLM-admission-freshness-window",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_licensure_delegator_is_authority",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s6",
+    "witness": "backdated_licence_is_bounded_by_w_1049 (sqlite, postgres): asserted_at_stale on the licence chain"
+   },
+   {
+    "decimal_id": "2.6.1.1.1",
+    "claim_id": "CLM-canonicalization-array",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/operational.rs#check_partner_record_sets",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s6",
+    "witness": "I1210 (sqlite, postgres), I1222 (unit): the licence payload's sets sorted AND unique in UTF-16 order"
    }
   ],
   "CIRISServer": [

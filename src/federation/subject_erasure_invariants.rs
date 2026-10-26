@@ -948,21 +948,22 @@ pub(crate) mod bodies {
             "federation_delegated_scope_unauthorized",
             "I972: {e}"
         );
-        // (7) a licence target: not this arm (CIRISPersist#1036 item 5).
+        // (7) a licence target (v60.0.0, CIRISPersist#1036 item 5): the
+        // licensee is the subject that files — its own `withdraws` against
+        // the licence is refused, so `reconsideration:{grounds}` is its
+        // contest path (CC 2.4.1.1; I1218 drives it end to end).
         let licence = ts::bare_attestation(
             "i972-licence",
             &moderator,
             &subject,
             &serde_json::json!({"dimension": "licensure:board:v1"}),
         );
-        let mut licence = licence;
-        licence.subject_key_ids = vec![subject.clone()];
-        assert!(
-            crate::federation::admission::reconsideration_target_subjects(dir, &subject, &licence)
+        assert_eq!(
+            crate::federation::admission::reconsideration_target_subjects(dir, &stranger, &licence)
                 .await
-                .unwrap()
-                .is_empty(),
-            "I972: a licence's subject files under its own arm"
+                .unwrap(),
+            std::iter::once(subject.clone()).collect(),
+            "I972: a licence's licensee has standing to file"
         );
     }
 

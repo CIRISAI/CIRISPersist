@@ -222,21 +222,6 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         "list_location_proofs_for",
         Bound::Open("one subject's full location-proof history"),
     ),
-    (
-        "list_org_memberships_for",
-        Bound::Open("one org's memberships, every user, full history"),
-    ),
-    ("list_org_memberships_since", Bound::Paged),
-    (
-        "list_organizations_for",
-        Bound::Open("one org's full record history"),
-    ),
-    ("list_organizations_since", Bound::Paged),
-    (
-        "list_partner_records_for",
-        Bound::Open("one licence's full partner-record history"),
-    ),
-    ("list_partner_records_since", Bound::Paged),
     ("list_purge_executions_since", Bound::Paged),
     ("list_scores", Bound::Paged),
     ("list_signed_accord_quorum_evidence_since", Bound::Paged),
@@ -252,7 +237,6 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         Bound::Schema("the signed twin of list_identity_occurrences_for: one per device"),
     ),
     ("list_signed_location_proofs_since", Bound::Paged),
-    ("list_signed_partner_records_since", Bound::Paged),
     (
         "list_signed_records",
         Bound::Open("every replicated record of one kind for one subject; the history-bearing kinds grow"),

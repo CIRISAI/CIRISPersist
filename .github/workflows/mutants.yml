@@ -78,6 +78,13 @@ jobs:
           # scratch on both backends with its reaper. 44 mutants, one shard
           # (600 s + 120 s x 44 = 5880 s), nightly.
           - {scope: scope-s5-memory-retire, shard: '', id: s5-memory-retire, weekly: false}
+          # v60.0.0 S6 (CIRISPersist#1036, #1049, #1062, #1048): 212 mutants,
+          # five shards (600 s + 120 s x 43 = 5760 s each), weekly.
+          - {scope: scope-s6-affiliations, shard: '0/5', id: s6-affiliations-0-of-5, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '1/5', id: s6-affiliations-1-of-5, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '2/5', id: s6-affiliations-2-of-5, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '3/5', id: s6-affiliations-3-of-5, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '4/5', id: s6-affiliations-4-of-5, weekly: true}
     services:
       postgres:
         image: ghcr.io/cirisai/postgres:16
