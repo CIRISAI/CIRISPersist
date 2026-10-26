@@ -53,6 +53,8 @@ pub(crate) mod attestation_admit;
 /// ATTESTATION-plane apply (`AttestationRefusalReason` /
 /// `ReplicatedAttestationOutcome`): the Key plane's #565 twin.
 pub mod attestation_apply;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod attestation_apply_invariants;
 /// v25.1.0 (CIRISPersist#582) — the backend-generic signed-ATTESTATION emit
 /// recipe (distinct from [`emit`], the trust-grant/audit-entry API).
 pub mod attestation_emit;
@@ -60,6 +62,15 @@ pub mod attestation_emit;
 /// decided once: `plan_put_community`, the three roster plans, and the
 /// per-backend `CommunityStore` executor.
 pub(crate) mod community_admit;
+/// v60.0.0 (CIRISPersist#934 step 4) — the consent doors, decided once:
+/// the consent-role and trust-grant plans, the consent read folds, and the
+/// per-backend `ConsentStore` executor.
+pub(crate) mod consent_admit;
+/// v60.0.0 (CIRISPersist#934 step 4) — the sweeps' selections, decided once:
+/// the PQC sweep's page, the reaper's page, the known-hash eviction report and
+/// the room retention leg, with the per-backend `SweepStore` /
+/// `RoomEvictionStore` executors.
+pub(crate) mod sweep_plan;
 // v56.0.0 (CIRISPersist#1001) — the typed bounded attestation read.
 pub mod attestation_query;
 #[cfg(test)]
@@ -182,6 +193,9 @@ pub(crate) mod community_trust_consent_invariants;
 /// v48.0.0 (CIRISPersist#905) — the by-principals consent sweep witnesses.
 #[cfg(test)]
 pub mod consent_sweep_principals_invariants;
+// v60.0.0 (CIRISPersist#934 step 4, #1105) — I1192–I1201.
+#[cfg(test)]
+mod consent_sweep_plan_invariants;
 /// v53.1.0 (CIRISPersist#979) — I480–I487: a chunk of a withdrawn file is
 /// judged by its file.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -234,6 +248,12 @@ mod retraction_invariants;
 /// cohort and the typed config record (I592–I594).
 #[cfg(test)]
 pub mod affiliation_invariants;
+/// v60.0.0 (CIRISPersist#1036, #1049, #1062) — I1210–I1229: organisations as
+/// affiliations (the licence payload, the quorum authority, judged at
+/// issuance under W, the audience, the contest path, the owner on the bond,
+/// the retired kinds).
+#[cfg(test)]
+mod affiliation_licence_invariants;
 /// v56.0.0 (CIRISPersist#934 step 1) — the shared attestation plan judges at
 /// the instant it is given (I950).
 #[cfg(test)]
@@ -242,14 +262,23 @@ pub(crate) mod attestation_admit_invariants;
 /// is refused at admission (I590).
 #[cfg(test)]
 pub mod delegation_cycle_invariants;
+/// v60.0.0 (CIRISPersist#1048) — I1230–I1234: a term-bearing `delegates_to`
+/// carries a bounded term; an affiliation's `role_term` bounds its walks.
+#[cfg(test)]
+mod delegation_term_invariants;
 /// v56.0.0 (CIRISPersist#934 step 1, door 6) — the genesis re-bake purge
 /// door refuses, at the store, an id the bundle does not carry (I954).
 #[cfg(test)]
 pub(crate) mod genesis_purge_door_invariants;
+/// v60.0.0 (CIRISPersist#988 item 4) — I1178–I1182, goals as rows.
+#[cfg(test)]
+mod goal_invariants;
 /// v54.0.0 (CIRISPersist#1033, CC 2.4.1.2.1) — the `grant` scope admits its
 /// holder (I591).
 #[cfg(test)]
 pub mod grant_scope_invariants;
+#[cfg(test)]
+mod ledger_projection_invariants;
 /// v56.0.0 (CIRISPersist#934 step 1) — the local write door's occupied-id
 /// divergence across backends, pinned (I951).
 #[cfg(test)]
@@ -354,6 +383,7 @@ pub mod emit;
 pub mod family_rules;
 pub mod genesis;
 pub mod goal;
+pub mod goal_projection;
 pub(crate) mod group_amendment;
 pub mod hardware_attestation;
 pub mod identity_aggregate;
@@ -377,6 +407,9 @@ pub(crate) mod key_plane_invariants;
 // v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — I1144–I1147:
 // the framed key plane is retired; a v57 store migrates onto the rows.
 mod key_plane_retired_invariants;
+// v60.0.0 (CIRISPersist#934 step 3) — I1183–I1191: the key-record write
+// doors on one plan, every backend storing its verdict.
+mod key_record_plan_invariants;
 // v59.0.0 (CIRISPersist#1103, CC 2.6.8) — I1153: a key id names its own key.
 #[cfg(test)]
 mod key_id_fingerprint_invariants;
@@ -434,10 +467,10 @@ pub mod location;
 pub mod migration;
 pub mod namespace;
 pub mod session_claim;
-// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — operational-
-// data admit + merge surface (organization / org_membership /
-// partner_record). Row shapes, the four admission checks, and the two
-// CEG-declared merge dispatchers; the backends do the storage I/O.
+// v60.0.0 (CIRISPersist#1036 item 4, CC 3.3.9) — the three operational
+// planes retired onto affiliation rows; what remains is the `partner_record`
+// field set as the typed licence payload on a `licensure:*` row, plus the
+// skew and payment-processor checks it ports.
 pub mod operational;
 
 /// v18.3.0 (CIRISPersist#484) — the exported accord co-scrub test-minting
@@ -647,6 +680,13 @@ pub mod scores;
 pub mod scores_read_audit;
 pub mod steward_purge;
 pub mod two_path;
+// v60.0.0 (S6v; CC 4.5.13) — the two-path policy table as runtime data, and
+// the corridor at admission.
+pub mod governance_policy;
+// v60.0.0 (CIRISPersist#1114) — I1309–I1311: three signed-object refusals
+// get their own malformed_row reasons, on every backend.
+#[cfg(test)]
+mod malformed_reasons_1114_invariants;
 // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the key roster of a self: the
 // two-path door its additions and evictions go through, and the steward
 // predicate (a live roster key signs as the fedID).
@@ -675,6 +715,9 @@ pub mod shared_instance;
 // CIRISPersist#146 Ask 3 — the substrate hard_case:* emission surface
 // (consent-SLA watcher + general observability primitive; CEG §8.1.11.3).
 pub mod hard_case;
+// v60.0.0 (CIRISPersist#988 item 1) — the credits / expertise ledgers as
+// projections of this node's `credits:` / `expertise:` rows.
+pub mod ledger_projection;
 pub mod silo_projection;
 // CIRISPersist#183 — the "self at login" substrate vocabulary
 // (delegation/partnership envelope builders + scope tokens +
@@ -780,8 +823,8 @@ pub use crossing::{
 };
 pub use freshness::{coalesce_touch_ts, TouchApplyOutcome};
 pub use goal::{
-    canonicalize_goal_text, DeliberationRef, Goal, GoalScope, GoalsFilter, M1Dimension,
-    MetaGoalAlignment,
+    canonicalize_goal_text, DeliberationRef, Goal, GoalInput, GoalRehome, GoalScope, GoalsFilter,
+    LegacyGoal, M1Dimension, MetaGoalAlignment,
 };
 pub use hard_case::{
     check_admin_action_attribution, AdminActionRefusal, ConsentPromotionOverdueRow, ConsentState,
@@ -808,10 +851,7 @@ pub use hardware_attestation::{HardwareAttestationPolicy, DEFAULT_MAX_NONCE_AGE}
 pub use identity_aggregate::{
     ContentKemIdentity, LocalIdentityAggregate, LOCAL_IDENTITY_AGGREGATE_VERSION,
 };
-pub use operational::{
-    MergeIntent, OrgMembership, Organization, PartnerRecord, SignedOrgMembership,
-    SignedOrganization, SignedPartnerRecord, SubjectKind,
-};
+pub use operational::{PartnerRecord, PARTNER_RECORD_MEMBER};
 pub use ownership_reclaim::{
     check_ownership_reclaim_admission, check_post_reclaim_rebinding_admission, ReclaimPolicy,
     ReclaimRefusal, ReclaimVerdict, WaFinding, WaQuorum, OWNERSHIP_FRESHNESS_TARGET_KIND,
@@ -898,8 +938,7 @@ pub use types::{
     PeerMetadataRow, PeerPolicyBlob, Revocation, ServedAttestation, ServedCommunity,
     ServedCommunityMembershipRevocation, ServedCommunityMembershipWidening, ServedFamily,
     ServedFamilyMembershipRevocation, ServedIdentityOccurrence, ServedKeyRecord,
-    ServedLocationProof, ServedOrgMembership, ServedOrganization, ServedPartnerRecord,
-    ServedRevocation, ServedSignedPartnerRecord, ServedTransportDestination, SignedAttestation,
+    ServedLocationProof, ServedRevocation, ServedTransportDestination, SignedAttestation,
     SignedCommunity, SignedCommunityMembershipRevocation, SignedCommunityMembershipWidening,
     SignedFamily, SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedKeyRecord,
     SignedLocationProof, SignedRevocation, SignedTouchClaim, SignedTrustGrant,
@@ -2573,88 +2612,62 @@ pub(crate) fn assert_change_envelope_matches(
 /// the feature matrix; unrelated to that work, and fixed rather than deferred
 /// because a leg that cannot compile is a leg that proves nothing.
 pub fn validate_subject_key_ids(subject_key_ids: &[String]) -> Result<(), Error> {
-    validate_subject_key_ids_at(subject_key_ids, SubjectGate::Emit)
-}
-
-/// CC 2.3.2.1 (PR #852 review) — which subject vectors a gate refuses.
-///
-/// `Emit` is the full rule, applied to rows THIS node produces. `Ingest` is
-/// applied to replicated rows and drops one clause — uppercase — because a
-/// live corpus predates the rule: `cirisnode`'s moderation and takedown
-/// contributions carry the subject's raw base64 Ed25519 pubkey (uppercase by
-/// construction) and reach the store through `put_contribution`, which never
-/// ran this validator. Refusing those at ingest would break a child-safety
-/// surface on a patch release, so the deferral is NAMED here rather than
-/// silently normalized, and every other vector — empty, whitespace, a
-/// malformed `canonical:` id — is refused on both paths. Closing the gap
-/// means giving cirisnode's subjects a canonical id; that is a data change,
-/// filed separately.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubjectGate {
-    /// Rows this node produces: the full CC 2.3.2.1 rule.
-    Emit,
-    /// Replicated rows: every vector except the pre-existing uppercase corpus.
-    Ingest,
-}
-
-/// CC 2.3.2.1 — the subject gate at `gate`. See [`SubjectGate`].
-pub fn validate_subject_key_ids_at(
-    subject_key_ids: &[String],
-    gate: SubjectGate,
-) -> Result<(), Error> {
+    // v60.0.0 (CIRISPersist#854) — ONE gate. Until v60 this ran in two shapes,
+    // `Emit` (the full rule) and `Ingest` (every clause but uppercase),
+    // because cirisnode's moderation and takedown Contributions carried the
+    // subject's raw base64 Ed25519 pubkey and reached the store through
+    // `put_contribution`, which never ran this validator. Those classes are
+    // rows now (V203), signed by federation keys and naming canonical subject
+    // ids; nothing still produces the uppercase corpus, so the split is gone
+    // and every door — the local producer and a peer's replicated row alike —
+    // asks the same rule.
+    //
+    // The canonical-spelling clauses run BEFORE the general uppercase clause
+    // so a malformed canonical id is refused naming WHICH part of its
+    // spelling is wrong (the prefix, the hash family, the digest), the
+    // diagnosis an operator staring at a rejected subject needs.
     for sid in subject_key_ids {
         let malformed = |why: &str| {
-            Err(Error::InvalidArgument(format!(
-                "subject_key_ids element must be a canonical lowercase key_id \
-                 (CC 2.3.2.1 / CC 2.6.3 / §0.6): {why}; got {sid:?}"
-            )))
+            // v60.0.0 (CIRISPersist#1114, CC 2.6.1.7 rc10) — typed out of
+            // `InvalidArgument` (ValueError, the same Python type) under the
+            // closed reason `subject_key_id_malformed`.
+            Err(Error::malformed_row(
+                "attestation",
+                malformed_row::SUBJECT_KEY_ID_MALFORMED,
+                format!(
+                    "subject_key_ids element must be a canonical lowercase key_id \
+                     (CC 2.3.2.1 / CC 2.6.3 / §0.6): {why}; got {sid:?}"
+                ),
+            ))
         };
         if sid.is_empty() {
             return malformed("empty");
         }
-        if gate == SubjectGate::Emit && sid.bytes().any(|b| b.is_ascii_uppercase()) {
-            return malformed("uppercase");
-        }
         if sid.chars().any(char::is_whitespace) {
             return malformed("whitespace");
         }
-        // PR #852 review round nine — `strip_prefix` is CASE-SENSITIVE, so
-        // `Canonical:sha256:<lowercase hex>` never entered the branch below at
-        // all: it fell through as an ordinary subject, and `SubjectGate::Ingest`
-        // skips the general uppercase clause, so a peer could persist it. That
-        // is the uppercase-digest defect again by another spelling — an id that
-        // LOOKS canonical, that exact-match canonical binding and withdrawal
-        // authority never recognize, leaving the subject unrevocable by its
-        // canonical identity. Anything whose first ten bytes are `canonical:`
-        // in ANY case must be exactly the canonical form or be refused; that
-        // also catches `canonical:SHA256:…`. Compared as BYTES so a multi-byte
-        // character cannot panic a slice, and the cirisnode legacy corpus is
-        // untouched because base64 subjects contain no `:`.
+        // PR #852 review round nine — `strip_prefix` is CASE-SENSITIVE, so an
+        // id whose first ten bytes are `canonical:` in ANY case must be exactly
+        // the canonical form. Compared as BYTES so a multi-byte character
+        // cannot panic a slice.
         let looks_canonical =
             sid.len() >= 10 && sid.as_bytes()[..10].eq_ignore_ascii_case(b"canonical:");
         if looks_canonical && !sid.starts_with("canonical:") {
             return malformed("canonical prefix is not lowercase");
         }
         if let Some(rest) = sid.strip_prefix("canonical:") {
-            // Round nine — the hash family is part of the canonical spelling:
-            // `canonical:SHA256:…` is the same alternate-spelling defect.
+            // Round nine — the hash family is part of the canonical spelling.
             let Some(digest) = rest.strip_prefix("sha256:") else {
                 if rest.len() >= 7 && rest.as_bytes()[..7].eq_ignore_ascii_case(b"sha256:") {
                     return malformed("canonical hash family is not lowercase");
                 }
                 return malformed("canonical id is not sha256");
             };
-            // PR #852 review round seven — `is_ascii_hexdigit()` accepts `A`-`F`,
-            // and `SubjectGate::Ingest` deliberately skips the general uppercase
-            // clause above (the cirisnode legacy corpus), so a peer could persist
-            // `canonical:sha256:<UPPERCASE>` while this branch's own message
-            // promised lowercase. Canonical binding and withdrawal authority
-            // compare by exact string equality, so the alternate spelling never
-            // matches the lowercase binding and the subject becomes unrevocable
-            // by its canonical identity — the precise harm CC 2.3.2.1 names.
-            // The digest is spelled out here rather than deferred to the general
-            // clause, so it holds on BOTH gates; the legacy exception covers
-            // non-canonical subjects only, and none of those carry this prefix.
+            // Round seven — `is_ascii_hexdigit()` accepts `A`-`F`; canonical
+            // binding and withdrawal authority compare by exact string
+            // equality, so an alternate spelling never matches the lowercase
+            // binding and the subject becomes unrevocable by its canonical
+            // identity — the precise harm CC 2.3.2.1 names.
             if digest.len() != 64
                 || !digest
                     .bytes()
@@ -2662,6 +2675,9 @@ pub fn validate_subject_key_ids_at(
             {
                 return malformed("canonical sha256 digest is not 64 lowercase hex");
             }
+        }
+        if sid.bytes().any(|b| b.is_ascii_uppercase()) {
+            return malformed("uppercase");
         }
     }
     Ok(())
@@ -2911,11 +2927,13 @@ pub trait FederationDirectory: Send + Sync {
     /// record for a `key_id` it already holds self-signed. That DO-NOTHING
     /// is exactly what #371 replaces over replication.
     ///
-    /// The real sqlite/postgres backends **override** this to run the
-    /// monotonic, verify-before-mutation upgrade path (the
+    /// The real backends (v60.0.0: memory, sqlite and postgres, through the
+    /// one shared body `key_plane::apply_replicated_key_record_planned`)
+    /// **override** this to run the monotonic, verify-before-mutation
+    /// upgrade path (the
     /// [`plan_replicated_key_apply`](register::plan_replicated_key_apply)
-    /// classification + `adopt_scrub_upgrade` on the Upgrade arm). The
-    /// default body here preserves the memory/mock backends: they have no
+    /// classification + the scrub upgrade on the Upgrade arm). The
+    /// default body here preserves mock directories: they have no
     /// scrub-upgrade plane, so an incoming record is a **first-seen
     /// insert** — `put_public_key` already leaves an existing differing row
     /// untouched, so a collision resolves to `Refused` (fail-closed,
@@ -3974,6 +3992,41 @@ pub trait FederationDirectory: Send + Sync {
         let _ = (kind, after_content_hash, limit);
         Err(Error::Unsupported {
             method: "list_wire_hashes_since",
+        })
+    }
+
+    /// v60.0.0 (CIRISPersist#1105, Edge ask) — **the held hash set of ONE
+    /// key-plane family**: the `Attestation`-kind wire hashes
+    /// ([`Self::list_wire_hashes_since`]) of the `scores` rows whose
+    /// dimension is `family`, one of
+    /// [`key_plane::HOLDINGS_FAMILIES`](key_plane::HOLDINGS_FAMILIES)
+    /// (`key:record:v1`, `key:revocation:v1`, `identity:occurrence:v1`,
+    /// `identity:occurrence_revocation:v1`). Paged and cursored exactly like
+    /// [`Self::list_wire_hashes_since`]: the hash is the keyset, `None`
+    /// starts, the result is complete across pages.
+    ///
+    /// Edge computed each key-plane family's holdings by reading the whole
+    /// `Attestation` index and filtering, three extra index reads per peer
+    /// per round. This read seeks the family's rows and joins their index
+    /// entries, so the hashes are the index's own (what this node
+    /// advertises) and the union over the four families is a subset of the
+    /// `Attestation` set, never a different set.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] for a `family` that is not a key-plane
+    /// family (never an empty set: "no hashes" and "not a family" must not
+    /// read the same to a set difference). The default refuses as
+    /// [`Self::list_wire_hashes_since`]'s does.
+    async fn list_key_plane_wire_hashes_since(
+        &self,
+        family: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, Error> {
+        let _ = (family, after_content_hash, limit);
+        Err(Error::Unsupported {
+            method: "list_key_plane_wire_hashes_since",
         })
     }
 
@@ -5500,152 +5553,22 @@ pub trait FederationDirectory: Send + Sync {
     /// Non-geographic communities are never returned.
     async fn communities_containing(&self, cell_id: &str) -> Result<Vec<Community>, Error>;
 
-    // ── CEG 1.0-RC2 §5.6.8.13 operational data (v5.1.0, #65) ───────
-
-    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — admit
-    /// an `organization` envelope. Role-gated (`lww_skew_bounded`).
-    ///
-    /// Runs the four admission checks in order:
-    /// 1. **Skew-bound** ([`operational::check_skew_bound`]) — reject
-    ///    `asserted_at > now + §0.7 tolerance`.
-    /// 2. **No payment-processor identifier**
-    ///    ([`operational::reject_payment_processor_identifiers`]) over the
-    ///    signed envelope.
-    /// 3. **Authority** — the backend resolves the **current
-    ///    `org_membership` set** for `organization.org_id` from storage,
-    ///    then calls
-    ///    [`ciris_verify_core::operational_admit::resolve_role_authority`]
-    ///    with the caller-supplied `key_directory` + `root_stewards`,
-    ///    requiring [`OrgRole::OrgAdmin`](ciris_verify_core::operational_admit::OrgRole::OrgAdmin).
-    ///    **Fail-closed** — anything but a positive verdict is rejection.
-    ///
-    /// Append-only on `attestation_id`; idempotent re-submit of identical
-    /// content is `Ok(())`. Current-state is resolved at read time by
-    /// [`operational::resolve_lww`] (stable-id grouping on `org_id`).
-    async fn put_organization(&self, signed: SignedOrganization) -> Result<(), Error>;
-
-    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — admit
-    /// an `org_membership` envelope. Role-gated (`lww_skew_bounded`).
-    ///
-    /// Same four-check pipeline as [`Self::put_organization`]; the
-    /// authority check requires the granter (the operation's
-    /// `attesting_key_id`) hold a role permitting the grant — resolved by
-    /// [`ciris_verify_core::operational_admit::resolve_role_authority`]
-    /// against the current membership set for `org_membership.org_id`
-    /// (requiring `OrgAdmin`), the caller-supplied `key_directory`, and
-    /// `root_stewards`. Fail-closed.
-    ///
-    /// Current-state is resolved at read time by
-    /// [`operational::resolve_lww`] (stable-id grouping on
-    /// `(user_id, org_id)`).
-    async fn put_org_membership(&self, signed: SignedOrgMembership) -> Result<(), Error>;
-
-    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — admit
-    /// a `partner_record` envelope. M-of-N steward quorum
-    /// (`monotonic_quorum`).
-    ///
-    /// Runs:
-    /// 1. **Skew-bound** ([`operational::check_skew_bound`]).
-    /// 2. **No payment-processor identifier** over the signed envelope.
-    /// 3. **Set-semantics** — capability/restriction arrays sorted
-    ///    ([`ciris_verify_core::operational_admit::check_set_semantics_sorted`]
-    ///    over [`operational::PARTNER_RECORD_SET_FIELDS`]).
-    /// 4. **Quorum** —
-    ///    [`ciris_verify_core::operational_admit::verify_partner_record_quorum`]
-    ///    over `JCS(signed_envelope)` against `steward_roster` at
-    ///    `signed.threshold`. Fail-closed.
-    /// 5. **Anti-rollback** — the `revision` MUST strictly exceed the
-    ///    most-recent admitted `revision` for the same `license_id`
-    ///    (queried from storage), else [`Error::PartnerRecordRollback`].
-    ///    Enforced **at admission**, before the §10.1.6 merge.
-    ///
-    /// Current-state is resolved at read time by
-    /// [`operational::resolve_monotonic_quorum`] (stable-id grouping on
-    /// `license_id`).
-    async fn put_partner_record(&self, signed: SignedPartnerRecord) -> Result<(), Error>;
-
-    /// v5.1.0 (CIRISPersist#65) — all stored `organization` rows for
-    /// `org_id` (in-force and withdrawn — full history). Callers resolve
-    /// current state via [`operational::resolve_lww`].
-    async fn list_organizations_for(&self, org_id: &str) -> Result<Vec<Organization>, Error>;
-
-    /// v5.1.0 (CIRISPersist#65) — all stored `org_membership` rows for one
-    /// `org_id` (every user; full history). This is the set the role-
-    /// authority resolver groups by `(user_id, org_id)`.
-    async fn list_org_memberships_for(&self, org_id: &str) -> Result<Vec<OrgMembership>, Error>;
-
-    /// v5.1.0 (CIRISPersist#65) — all stored `partner_record` rows for
-    /// `license_id` (full history). Callers resolve current state via
-    /// [`operational::resolve_monotonic_quorum`].
-    async fn list_partner_records_for(&self, license_id: &str)
-        -> Result<Vec<PartnerRecord>, Error>;
-
-    /// v5.1.0 (CIRISPersist#65, CIRISEdge#65 v2 bridge) — bulk-list
-    /// `organization` rows since a cursor, for the anti-entropy carrier.
-    ///
-    /// v36.0.0 (CIRISPersist#668) — **BREAKING: resumes on THIS node's serve
-    /// position, as a PAIR.** `since` is the `(admitted_at, attestation_id)`
-    /// pair the last-returned row's
-    /// [`ServedOrganization::resume_pair`](crate::federation::ServedOrganization::resume_pair)
-    /// yields (`None` = from the start); the page is ordered by that pair and
-    /// the filter is strictly greater than it, so a tie larger than one page
-    /// resumes correctly instead of skipping its remainder, and a row
-    /// replicated late is stamped ahead of every existing cursor instead of
-    /// sorting under the producer's `asserted_at`, permanently behind it.
-    /// Every remaining `list_*_since` cursor on this trait carries the same
-    /// contract — learn this one, know them all.
-    async fn list_organizations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedOrganization>, Error>;
-
-    /// v5.1.0 (CIRISPersist#65, CIRISEdge#65 v2 bridge) — bulk-list
-    /// `org_membership` rows since a cursor. Same ordering + pair-cursor
-    /// contract as [`Self::list_organizations_since`] (#668).
-    async fn list_org_memberships_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedOrgMembership>, Error>;
-
-    /// v5.1.0 (CIRISPersist#65, CIRISEdge#65 v2 bridge) — bulk-list
-    /// `partner_record` rows since a cursor. Same ordering + pair-cursor
-    /// contract as [`Self::list_organizations_since`] (#668).
-    async fn list_partner_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedPartnerRecord>, Error>;
-
-    /// v5.2.0 (CIRISPersist#194, CIRISEdge#65 v2 bridge) — bulk-list the
-    /// **full [`SignedPartnerRecord`] wrappers** (row + the M-of-N steward
-    /// signature set + threshold) since a cursor, with the same ordering +
-    /// cursor contract as [`Self::list_partner_records_since`]
-    /// (`asserted_at ASC, attestation_id ASC`).
-    ///
-    /// Unlike [`Self::list_partner_records_since`] (which returns rows
-    /// *without* signatures), this re-emits the wrapper the producer signed,
-    /// so the Edge v2 Initiator can recompute a **byte-reproducible**
-    /// `envelope_hash` from JCS bytes identical to the sender's — the
-    /// property anti-entropy convergence depends on. Records admitted before
-    /// v5.2.0 (admit-only era) carry an empty signature set + `threshold: 0`.
-    /// Pair-cursor contract per [`Self::list_organizations_since`] (#668);
-    /// `admitted_at` rides on [`ServedSignedPartnerRecord`], never inside
-    /// the signed wrapper.
-    async fn list_signed_partner_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedSignedPartnerRecord>, Error>;
-
     /// v21.0.0 (CIRISPersist#504 FLOOR, CIRISEdge advertise/serve bridge) —
     /// bulk-list the full [`SignedFamily`] wrappers (row + the V110 authority
     /// signature the CIRISPersist#502 E4 gate verified at admission) since a
-    /// cursor. Pair-cursor contract per [`Self::list_organizations_since`]
-    /// (#668): `since` is the `(admitted_at, family_key_id)` pair from
+    /// cursor. `since` is the `(admitted_at, family_key_id)` pair from
     /// [`ServedFamily::resume_pair`](crate::federation::ServedFamily::resume_pair).
     /// `limit` caps the page.
+    ///
+    /// v36.0.0 (CIRISPersist#668) — **resumes on THIS node's serve position,
+    /// as a PAIR** (`None` = from the start): the page is ordered by that pair
+    /// and the filter is strictly greater than it, so a tie larger than one
+    /// page resumes correctly instead of skipping its remainder, and a row
+    /// replicated late is stamped ahead of every existing cursor instead of
+    /// sorting under the producer's instant, permanently behind it. Every
+    /// remaining `list_*_since` cursor on this trait carries the same contract
+    /// — learn this one, know them all. (v60.0.0: this contract was spelled on
+    /// the retired `list_organizations_since`, CIRISPersist#1036.)
     ///
     /// **Signed rows only.** A `put_family_local` genesis-bake row is
     /// legitimately unsigned (`authority_key_id` NULL) and is never emitted
@@ -5753,7 +5676,7 @@ pub trait FederationDirectory: Send + Sync {
     /// [`self_at_login::SignedTransportDestination`] wrappers since a
     /// cursor — the bulk-read mirror of
     /// [`Self::list_signed_transport_destinations_for`]. Pair-cursor
-    /// contract per [`Self::list_organizations_since`] (#668); the resume id
+    /// contract per [`Self::list_signed_families_since`] (#668); the resume id
     /// is the compound of `(occurrence_key_id, transport_kind)`. `limit`
     /// caps the page.
     ///
@@ -5782,7 +5705,7 @@ pub trait FederationDirectory: Send + Sync {
     /// the V130 `admitted_at` serve position (stamped at admission,
     /// RE-stamped by the promote sweep and every other consumer-visible
     /// rewrite), and the resume is the `(admitted_at, attestation_id)` PAIR
-    /// per [`Self::list_organizations_since`]. `limit` caps the page.
+    /// per [`Self::list_signed_families_since`]. `limit` caps the page.
     ///
     /// The `Attestation` row carries its own hybrid scrub-signature fields
     /// inline (same shape as [`KeyRecord`]) — it IS the signed wrapper;
@@ -6854,6 +6777,7 @@ pub trait FederationDirectory: Send + Sync {
                         "cohort_key_id": group_key_id,
                     }),
                     emitted_at: now,
+                    emitter_key_id: String::new(),
                 },
             )
             .await?;
@@ -8255,51 +8179,30 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
-    // ── Goals (v2.10.0, CIRISPersist#114) ──────────────────────────
+    // v60.0.0 (CIRISPersist#988 item 4) — a Goal is a signed
+    // `goal:{scale}:v1` row (see [`goal`]); the `goals` table is the
+    // projection of the goal rows this node holds ([`goal_projection`]),
+    // written by the attestation plane's executor in the row's transaction.
+    // There is no write door here: a goal is declared, amended, retired and
+    // disowned by rows (`Engine::put_goal` / `amend_goal` / `retire_goal` /
+    // `recant_goal`). These are the projection's reads.
     //
-    // The typed `Goal` primitive (see [`goal`]) carries M-1 alignment
-    // as a structural construction-time invariant — a Goal cannot be
-    // constructed without [`MetaGoalAlignment`]. The persistence
-    // surface mirrors that discipline: every write goes through a
-    // typed `Goal`, never a free-form JSON envelope.
-    //
-    // F-3 detector consumers (CIRISLensCore#23 / #24 / #26) walk
-    // these rows to aggregate goals by `declared_by_key_id` + scope +
-    // `m1_dimension`. The hot path skips retired goals (the
-    // `(retired_at IS NULL)` partial index), so `list_goals` defaults
-    // to live-only via `GoalsFilter::include_retired = false`.
-    //
-    // Defaults route to `Error::Backend(...)` so the memory shim and
-    // any future test-only backend compile cleanly; the real backends
-    // (postgres, sqlite) override every method.
+    // F-3 detector consumers (CIRISLensCore#23 / #24 / #26) walk these rows
+    // to aggregate goals by declarer, scale and M-1 dimension. The hot path
+    // skips retired goals (the `(retired_at IS NULL)` partial index), so
+    // `list_goals` defaults to live-only.
 
-    /// Insert a [`Goal`]. The row is persisted with a server-computed
-    /// `persist_row_hash` over the canonical bytes (same shape as
-    /// `KeyRecord` et al.). Errors:
-    /// - [`Error::InvalidArgument`] when `declared_by_key_id` is not
-    ///   present in `federation_keys` (FK enforcement).
-    /// - [`Error::Conflict`] when `goal_id` is already in the table
-    ///   with content that differs from the submitted row.
-    async fn put_goal(&self, goal: Goal) -> Result<(), Error> {
-        let _ = goal;
-        Err(Error::Backend(
-            "put_goal not implemented for this backend".into(),
-        ))
-    }
-
-    /// Fetch a single [`Goal`] by `goal_id`. Returns `None` when
-    /// absent.
-    async fn get_goal(&self, goal_id: uuid::Uuid) -> Result<Option<Goal>, Error> {
+    /// The projected [`Goal`] whose declaration is `goal_id`, or `None`.
+    async fn get_goal(&self, goal_id: &str) -> Result<Option<Goal>, Error> {
         let _ = goal_id;
         Err(Error::Backend(
             "get_goal not implemented for this backend".into(),
         ))
     }
 
-    /// Enumerate [`Goal`] rows matching `filter`. Fields AND-composed
-    /// (see [`GoalsFilter`]); retired rows are filtered out by
-    /// default. Returned in stable lex order by `(declared_at,
-    /// goal_id)` so callers can deterministically paginate.
+    /// The projected [`Goal`]s matching `filter` (AND-composed; retired
+    /// goals only with `include_retired`), in `(declared_at, goal_id)`
+    /// order.
     async fn list_goals(&self, filter: GoalsFilter) -> Result<Vec<Goal>, Error> {
         let _ = filter;
         Err(Error::Backend(
@@ -8307,26 +8210,18 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
-    /// Mark a [`Goal`] retired at `retired_at`. **Idempotent.** A
-    /// second call against an already-retired goal returns `Ok(())`
-    /// without changing the stored `retired_at` — the chosen
-    /// discipline matches [`revoke_trust`](Self::revoke_trust)'s
-    /// "soft-delete, idempotent" shape so consumers driving
-    /// retirement from a queue don't need to special-case the
-    /// race-replay window. Callers wanting strict-once semantics
-    /// MUST guard at their layer (the
-    /// [`Engine::receive_and_persist`](crate::Engine::receive_and_persist)
-    /// pattern uses content-hash dedup for that). When the row does
-    /// not exist, [`Error::InvalidArgument`] is returned.
-    async fn retire_goal(
-        &self,
-        goal_id: uuid::Uuid,
-        retired_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), Error> {
-        let _ = (goal_id, retired_at);
-        Err(Error::Backend(
-            "retire_goal not implemented for this backend".into(),
-        ))
+    /// v60.0.0 — the pre-V204 `goals` rows no row backs (`attestation_id`
+    /// NULL), for [`Engine::rehome_legacy_goals`](crate::Engine::rehome_legacy_goals).
+    /// A store that never held a typed goal has none.
+    async fn legacy_goals(&self) -> Result<Vec<LegacyGoal>, Error> {
+        Ok(Vec::new())
+    }
+
+    /// v60.0.0 — remove the pre-V204 `goals` row `goal_id` (only a row with no
+    /// `attestation_id`; a projection row is never touched).
+    async fn delete_legacy_goal(&self, goal_id: &str) -> Result<(), Error> {
+        let _ = goal_id;
+        Ok(())
     }
 
     // ── Peer-mutation surface (v3.1.0, CIRISPersist#117) ───────────
@@ -8901,9 +8796,8 @@ pub trait FederationDirectory: Send + Sync {
     ///   [`WitnessReconcileAction::TriggerQuorumMerge`]. The witness is a
     ///   divergence DETECTOR: the caller fulfils the directive by
     ///   re-running the EXISTING §10.1.6 quorum-merge resolver
-    ///   ([`operational::resolve_monotonic_quorum`] for `partner_record`,
-    ///   the `revision` anti-rollback for `revocation`/`org_membership`)
-    ///   over the stored rows. The witness root NEVER enters that
+    ///   (the `revision` anti-rollback for `revocation`; a licence's
+    ///   status is the `licensure` fold's) over the stored rows. The witness root NEVER enters that
     ///   resolution — there is no "reconstitute from any fragment" path,
     ///   so a revoked key cannot be resurrected.
     /// - **Consistent** → [`WitnessReconcileAction::NoAction`].
@@ -8990,6 +8884,7 @@ pub trait FederationDirectory: Send + Sync {
             .list_hard_case_events(hard_case::HardCaseFilter {
                 kind: Some(crate::witness::WITNESS_EQUIVOCATION.to_owned()),
                 since: None,
+                emitter_key_id: None,
             })
             .await?;
         let mut records = Vec::with_capacity(proofs.len());
@@ -9287,6 +9182,7 @@ pub trait FederationDirectory: Send + Sync {
                             "deadline": deadline.to_rfc3339(),
                         }),
                         emitted_at: now,
+                        emitter_key_id: String::new(),
                     })
                     .await?;
                     report.sla_breaches += 1;
@@ -9329,6 +9225,7 @@ pub trait FederationDirectory: Send + Sync {
                         "promotion_window_secs": promotion_window.as_secs(),
                     }),
                     emitted_at: now,
+                    emitter_key_id: String::new(),
                 })
                 .await?;
                 report.promotion_overdue += 1;
@@ -9387,6 +9284,7 @@ pub trait FederationDirectory: Send + Sync {
                     "promotion_window_secs": sla.as_secs(),
                 }),
                 emitted_at: now,
+                emitter_key_id: String::new(),
             })
             .await?;
             overdue.push(overdue_row(rev, now));
@@ -9729,24 +9627,36 @@ pub enum Error {
         reason: SignerNotActingReason,
     },
 
-    /// v59.0.0 (CIRISPersist#1049 / #1099, CIRISEdge) — **a roster act outside
-    /// the past-freshness window W** ([`self_roster::check_roster_act_fresh`]):
-    /// `author` stood for `steward` only as a roster key at the row's signed
-    /// `asserted_at`, is no longer a live roster key of that self, and the
-    /// instant is more than W behind this node's clock. Typed out of
+    /// v59.0.0 (CIRISPersist#1049 / #1099, CIRISEdge) — **an act whose
+    /// standing was judged at its signed `asserted_at`, outside the
+    /// past-freshness window W.** The author stood for `standing_for` on
+    /// `plane` at the row's signed instant, does not stand for it at receipt,
+    /// and the instant is more than W behind this node's clock: a withdrawn
+    /// standing cannot sign into the window in which it was still live.
+    ///
+    /// Planes (v60.0.0 widened it from the roster gate,
+    /// [`self_roster::check_roster_act_fresh`]): `roster` (a roster key of a
+    /// self), `licensure` (a licence's authority, CIRISPersist#1036 item 2),
+    /// `key_grant` (a grant row's sealer chain, CIRISPersist#1049) and
+    /// `consent` (a consent row's `grant`-scoped chain, #1049). Typed out of
     /// [`Error::InvalidArgument`], so it keeps that arm's `kind()` token
     /// (`federation_invalid_argument`) and Python type (`ValueError`); the
-    /// Display still leads with [`self_roster::ASSERTED_AT_STALE`].
+    /// Display leads with [`self_roster::ASSERTED_AT_STALE`].
     #[error(
-        "asserted_at_stale: {author} signs as {steward}'s roster key at {asserted_at}, more than \
-         W = {w_secs} s before this node's clock — a roster act is admitted only inside the \
-         past-freshness window (CIRISPersist#1049, CC 2.6.7)"
+        "asserted_at_stale: {author} stood for {standing_for} on the {plane} plane at \
+         {asserted_at}, does not at receipt, and that instant is more than W = {w_secs} s \
+         before this node's clock — an act judged at its signed instant is admitted only \
+         inside the past-freshness window (CIRISPersist#1049, CC 2.6.7)"
     )]
     AssertedAtStale {
         /// The row's signer.
         author: String,
-        /// The self it signed for as a roster key.
-        steward: String,
+        /// Whom it stood for at the signed instant: the self (roster), the
+        /// licensing authority (licensure), the owner or minter (key_grant),
+        /// the named person (consent).
+        standing_for: String,
+        /// `roster` | `licensure` | `key_grant` | `consent`.
+        plane: &'static str,
         /// The row's signed instant.
         asserted_at: chrono::DateTime<chrono::Utc>,
         /// W, in seconds.
@@ -9812,6 +9722,31 @@ pub enum Error {
         needs: usize,
     },
 
+    /// v60.0.0 (S6v; CC 4.5.13 / 4.2.1.1 `CLM-policy-corridor`) — **the door
+    /// refuses to decide under its family's policy row.** A two-path door
+    /// reads its policy from the vendored CC governance policy table
+    /// ([`governance_policy`](crate::federation::governance_policy)); the row
+    /// must be a two-path row on a built base, readable, and inside its
+    /// corridor (`PolicyCorridor.lean`, as CC checks the table). `reason` is
+    /// a [`CorridorRefusal`](crate::federation::two_path::CorridorRefusal)
+    /// token or one of
+    /// [`governance_policy::refusal`](crate::federation::governance_policy::refusal)'s.
+    /// Nothing is held or written. With the vendored rc9 table it does not
+    /// arise (every row is in its corridor, I1303); it is the gate a table a
+    /// re-vendor moved out of the corridor meets. Stable `kind()` token
+    /// `federation_governance_policy_refused`; Python
+    /// `ValueError("federation_governance_policy_refused: {family}: {reason}")`.
+    #[error(
+        "governance policy {family:?} refused: {reason} — CC 4.5.13: a two-path door decides \
+         only under a readable row inside its corridor"
+    )]
+    GovernancePolicyRefused {
+        /// The table family the door asked for (`*` for the table itself).
+        family: String,
+        /// The corridor token or the table refusal.
+        reason: &'static str,
+    },
+
     /// v55.0.0 (CIRISPersist#1055, from CIRISEdge's adopt of v54.1) — **the
     /// signed row is malformed.** Its bytes cannot be read as the claim they
     /// carry: it names no signer, a member of its signed envelope is missing
@@ -9847,8 +9782,9 @@ pub enum Error {
     /// v54.1.0 this was an [`Error::InvalidArgument`] whose prose an adopter had
     /// to prefix-match; `reason` is now the stable token, one of
     /// [`admission::licensure_refusal`]'s constants (the
-    /// [`admission::LicensureChainBreak`] tokens and
-    /// `not_authority_at_receipt`). Stable `kind()` token
+    /// [`admission::LicensureChainBreak`] tokens; v60.0.0 removed
+    /// `not_authority_at_receipt`, CIRISPersist#1036 item 2 — a stale licence
+    /// is [`Error::AssertedAtStale`]). Stable `kind()` token
     /// `federation_licensure_delegator_not_authority`; Python `ValueError`, the
     /// type of the `InvalidArgument` arm it replaces.
     ///
@@ -9996,26 +9932,6 @@ pub enum Error {
         reason: AdminActionRefusal,
     },
 
-    /// v57.0.0 (CIRISPersist#988 item 2) — a `hard_case:*` row offered to the
-    /// federation tier (the crossing, the put door or the replicated apply)
-    /// while its replication is held: a peer on an earlier release could purge
-    /// the node's accountability record, and persist cannot yet tell which
-    /// peers carry the refusal (CIRISConstitution#170). The row stays at the
-    /// local tier. Not a caller fault: the call is correct and the door is
-    /// held, so Python sees `RuntimeError` (the posture of `NoActorSignature`).
-    /// See [`hard_case::check_hard_case_replication_held`] for what unblocks it.
-    #[error(
-        "hard_case row {attestation_id} ({dimension}) does not enter the federation tier: \
-         hard_case replication is held until peers carry its unpurgeable refusal \
-         (CIRISConstitution#170)"
-    )]
-    HardCaseReplicationHeld {
-        /// The row offered.
-        attestation_id: String,
-        /// Its `hard_case:{kind}:v1` dimension.
-        dimension: String,
-    },
-
     /// v57.0.0 (CIRISPersist#988 item 2) — this node cannot attest a
     /// `hard_case:*` row (CC 3.1.9.4: the attester is the node key): it has
     /// no declared node key (`reason` [`hard_case::refusal::NODE_KEY_UNSET`])
@@ -10057,8 +9973,7 @@ pub enum Error {
     /// `revocation_envelope` it claims to project.
     ///
     /// The de-conferral plane is **producer envelope + typed projection**, the
-    /// same shape as the three operational planes
-    /// ([`Error::OperationalEnvelopeUnbound`]): the hybrid signature covers
+    /// shape the three retired operational planes had: the hybrid signature covers
     /// `revocation_envelope` and nothing else, while WHICH KEY IS REVOKED,
     /// WHO revoked it, WHICH ROW this is and WHEN it takes effect were all
     /// plain caller-supplied columns. One validly-signed revocation could
@@ -11058,14 +10973,11 @@ pub enum Error {
     #[error("write-path cohort_scope refused: {0}")]
     WriteScopeRefused(#[from] crate::scope::ScopeRefusalReason),
 
-    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §10.1.6 / §0.7) — an
-    /// operational-data envelope merging under `lww_skew_bounded`
-    /// (`organization` / `org_membership`) carried an `asserted_at` more
-    /// than the §0.7 clock-skew tolerance (±5 min) in the future.
-    /// Rejected at admission by
-    /// [`operational::check_skew_bound`]; the row is not stored. The LWW
-    /// front-running fix — unbounded LWW on `org_membership.role` is a
-    /// role-escalation surface.
+    /// v5.1.0 (CIRISPersist#65, CC 2.6.7) — a signed instant more than the
+    /// clock-skew tolerance (±5 min) in the future
+    /// ([`operational::check_skew_bound`]); the row is not stored. The
+    /// last-writer front-running fix: a forward-dated instant out-ranks every
+    /// honest later row.
     #[error(
         "clock-skew violation: asserted_at {asserted_at} is more than 5 minutes \
          past now {now} (§0.7)"
@@ -11077,13 +10989,13 @@ pub enum Error {
         now: String,
     },
 
-    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13, fail-secure) — an
-    /// operational-data envelope carried a recognizable payment-processor
-    /// (Stripe-shaped) identifier anywhere, including an open-vocabulary
-    /// field or object key. Rejected at admission by
-    /// [`operational::reject_payment_processor_identifiers`]; the row is
-    /// not stored. Defense-in-depth behind the Registry's emit-side
-    /// minimization — billing stays entirely Portal+Stripe, off-wire.
+    /// v5.1.0 (CIRISPersist#65, CC 3.3.9, fail-secure) — an envelope that
+    /// carries the licence payload (v60.0.0: a `licensure:*` row with
+    /// [`operational::PARTNER_RECORD_MEMBER`]) or a `settlement:*` row carried
+    /// a recognizable payment-processor (Stripe-shaped) identifier anywhere,
+    /// including an open-vocabulary field or object key
+    /// ([`operational::reject_payment_processor_identifiers`]); the row is not
+    /// stored. Billing stays entirely Portal+Stripe, off-wire.
     #[error(
         "operational envelope carries a payment-processor identifier \
          (matched prefix {matched_prefix:?}); billing data MUST NOT federate"
@@ -11093,86 +11005,35 @@ pub enum Error {
         matched_prefix: &'static str,
     },
 
-    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13) — an
-    /// operational-data admit failed its authority check: the
-    /// `organization` / `org_membership` actor did not hold the required
-    /// role via a root-anchored grant
-    /// ([`ciris_verify_core::operational_admit::resolve_role_authority`]
-    /// returned `authorized: false`), or the `partner_record` M-of-N
-    /// steward quorum was not met
-    /// ([`ciris_verify_core::operational_admit::verify_partner_record_quorum`]).
-    /// Fail-closed: the absence of a positive verdict is rejection. The
-    /// row is not stored.
-    #[error("operational-data authority not established: {0}")]
-    OperationalAuthority(String),
-
-    /// v31.0.0 (CIRISPersist#644, CEG 1.0-RC2 §5.6.8.13) — an
-    /// `organization` / `org_membership` / `partner_record` row carried a
-    /// typed column that its signature does not cover and that disagrees
-    /// with the signed envelope it claims to project.
-    ///
-    /// The three operational planes are **producer envelope + typed
-    /// projection**: the signature (or the M-of-N steward quorum) covers
-    /// `signed_envelope` and nothing else, while `resolve_lww` /
-    /// `resolve_monotonic_quorum` / the read surface all decide on the
-    /// COLUMNS beside it. Before this gate those columns — including the
-    /// `withdrawn_at` tombstone, `status`, `role`, the `asserted_at` LWW
-    /// key and the `partner_record` `revision` anti-rollback counter —
-    /// were authored by whoever wrote the row rather than by whoever
-    /// signed it, so replaying a still-validly-signed envelope with edited
-    /// columns needed no forgery at all.
-    ///
-    /// Fail-closed, and no legacy regime: an unbound row is REFUSED, not
-    /// downgraded. See
-    /// [`operational::check_organization_binding`] /
-    /// [`operational::check_org_membership_binding`] /
-    /// [`operational::check_partner_record_binding`].
-    #[error(
-        "{plane} row {attestation_id:?}: typed column `{field}` is not bound to the \
-         signed envelope — {detail}. The signature covers `signed_envelope` only, so an \
-         unbound column is authored by whoever wrote the row, not by whoever signed it \
-         (CIRISPersist#644)"
-    )]
-    OperationalEnvelopeUnbound {
-        /// `organization` | `org_membership` | `partner_record`.
-        plane: &'static str,
-        /// The rejected row's `attestation_id`.
-        attestation_id: String,
-        /// The typed column that diverged.
-        field: &'static str,
-        /// How it diverged (column value vs signed value, or absence).
-        detail: String,
-    },
-
-    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13, F-AV-ROLLBACK) — a
-    /// `partner_record` write whose `revision` does not strictly exceed
-    /// the most-recent admitted `revision` for the same `license_id`. The
-    /// monotonic anti-rollback is enforced **at admission**, before the
-    /// §10.1.6 quorum merge — a stale `active` can never overwrite a
-    /// later `revoked`. Equal revisions reject too. The row is not stored.
+    /// v5.1.0 (CIRISPersist#65, F-AV-ROLLBACK); v60.0.0 (CIRISPersist#1036
+    /// item 4, CC 3.3.9) — a licence payload ([`operational::PartnerRecord`])
+    /// whose `revision` is LOWER than one the same authority already issued for
+    /// the same `license_id` about the same subject
+    /// (`admission::check_partner_record_revision`). Refused at admission, so a
+    /// stale `issued` can never be re-served over a later `revoked`. An EQUAL
+    /// revision admits: a re-emission of one licence to named readers (CC
+    /// 2.4.1.2.1) carries the revision it re-emits. The row is not stored.
     #[error(
         "partner_record revision rollback for license_id {license_id:?}: \
-         submitted revision {submitted} does not exceed existing {existing}"
+         submitted revision {submitted} is below existing {existing}"
     )]
     PartnerRecordRollback {
         /// The `license_id` whose monotonic counter was violated.
         license_id: String,
         /// The rejected row's `revision`.
         submitted: u64,
-        /// The latest already-admitted `revision` for this `license_id`.
+        /// The highest already-admitted `revision` for this `license_id`.
         existing: u64,
     },
 
-    /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §0.9.2.1 rule 1)
-    /// — a `partner_record` set-semantics array
+    /// v5.1.0 (CIRISPersist#65, CC 2.6.1.1.1 rule 1); v60.0.0
+    /// (CIRISPersist#1036 item 4) — a licence payload's set-semantics array
     /// (`capabilities_granted` / `capabilities_denied` /
-    /// `geographic_restrictions` / `allowed_identity_templates`) was not
-    /// lexicographically sorted. Caught by
-    /// [`ciris_verify_core::operational_admit::check_set_semantics_sorted`]
-    /// at the producer *before* M stewards sign divergent JCS bytes —
-    /// far better than a silent quorum collapse at admission. The row is
-    /// not stored.
-    #[error("partner_record set-semantics array not sorted: {0}")]
+    /// `geographic_restrictions` / `allowed_identity_templates`) is not
+    /// sorted AND unique by JCS string form
+    /// ([`operational::check_partner_record_sets`]); a repeat is refused as
+    /// well as a misordering. The row is not stored.
+    #[error("partner_record set-semantics array not sorted and unique: {0}")]
     SetSemanticsUnsorted(String),
 
     /// v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3). A `withdraws`
@@ -11329,6 +11190,34 @@ pub enum Error {
         /// Length of the existing path `attested → … → attesting` that this
         /// edge would close (at least 1).
         hops: usize,
+    },
+
+    /// v60.0.0 (CIRISPersist#1048, CC 2.4 / CC 4.4.3.2.8 C, CIRISConstitution#163)
+    /// — a term-bearing `delegates_to` was REFUSED because its signed term is
+    /// missing, unreadable, or longer than the bound that governs it. A
+    /// `delegates_to` carrying `license`, `grant`, `moderate`, `takedown`,
+    /// `review`, `slash` or `sub_delegation`, or naming an affiliation (its
+    /// hierarchy), MUST carry `delegation_valid_until` at most one year after
+    /// `delegation_valid_from` (absent: its signed `asserted_at`), and at most
+    /// the affiliation's `role_term`. `rule` is one of
+    /// [`admission::delegation_term_rule`]'s tokens. The row is not stored
+    /// (verify-before-mutation, AV-9). Stable `kind()` token
+    /// `federation_delegation_term_required` (CC's refusal name,
+    /// `delegation_term_required`). See
+    /// [`admission::check_delegation_term_admission`].
+    #[error(
+        "delegates_to {attesting_key_id:?} -> {attested_key_id:?} refused \
+         delegation_term_required ({rule}): {detail}"
+    )]
+    DelegationTermRequired {
+        /// The refused edge's granter (`attesting_key_id`).
+        attesting_key_id: String,
+        /// The refused edge's recipient (`attested_key_id`).
+        attested_key_id: String,
+        /// Which bound failed: an [`admission::delegation_term_rule`] token.
+        rule: &'static str,
+        /// What the edge carried, for an operator.
+        detail: String,
     },
 
     /// v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — a **second,
@@ -12206,6 +12095,32 @@ pub mod malformed_row {
     /// occurrence, not cosigned by a strict majority of the self's current
     /// live roster: a legacy revocation does not bypass the two-path door.
     pub const CARRIER_WITHOUT_ROSTER_QUORUM: &str = "carrier_without_roster_quorum";
+    /// v60.0.0 (CIRISPersist#988 item 4, CC 3.1.9.7) — a `goal:*` row (a
+    /// declaration or an amendment) whose `meta_goal_alignment` is missing or
+    /// ill-formed: a dimension outside the seven M-1 dimensions, an empty
+    /// rationale, an unknown member, an empty deliberation pointer.
+    pub const GOAL_META_ALIGNMENT: &str = "goal_meta_alignment_malformed";
+    /// v60.0.0 (CIRISPersist#988 item 4) — any other ill-formed goal body: a
+    /// dimension that is not a clean `goal:{scale}:v1` leaf, an empty
+    /// `goal_text`, a `cohort` scale without its `cohort_id` (or a `cohort_id`
+    /// on another scale), a score outside `[-1, 1]`.
+    pub const GOAL_BODY: &str = "goal_body_malformed";
+    /// v60.0.0 (CIRISPersist#988 item 4) — a v59 typed `Goal` (it carries
+    /// `goal_id` / `declared_by_key_id` / `declared_at` / `scope` /
+    /// `retired_at`) offered at a goal door that takes a body.
+    pub const GOAL_TYPED_OBJECT_RETIRED: &str = "goal_typed_object_retired";
+    /// v60.0.0 (CIRISPersist#1114; CC 2.6.1.7, rc10 `99bf187`) — the row's
+    /// `original_content_hash` is not the SHA-256 of JCS(its envelope). Was a
+    /// `federation_tier_unverified` with a free-text reason.
+    pub const CONTENT_HASH_MISMATCH: &str = "content_hash_mismatch";
+    /// v60.0.0 (CIRISPersist#1114; CC 2.6.1.7 rc10) — the signed `row` mirror
+    /// carries a member outside its closed seven. Was
+    /// `envelope_member_invalid` (a serde refusal).
+    pub const ENVELOPE_ROW_MEMBER_UNKNOWN: &str = "envelope_row_member_unknown";
+    /// v60.0.0 (CIRISPersist#1114; CC 2.6.1.7 rc10) — a `subject_key_ids`
+    /// element is neither a canonical lowercase key_id nor the tagged
+    /// `canonical:sha256:<hex64>` form. Was a `federation_invalid_argument`.
+    pub const SUBJECT_KEY_ID_MALFORMED: &str = "subject_key_id_malformed";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -12222,6 +12137,12 @@ pub mod malformed_row {
         AGGREGATE_SOURCE_DUPLICATE,
         KEY_ID_FINGERPRINT_MISMATCH,
         CARRIER_WITHOUT_ROSTER_QUORUM,
+        GOAL_META_ALIGNMENT,
+        GOAL_BODY,
+        GOAL_TYPED_OBJECT_RETIRED,
+        CONTENT_HASH_MISMATCH,
+        ENVELOPE_ROW_MEMBER_UNKNOWN,
+        SUBJECT_KEY_ID_MALFORMED,
     ];
 }
 
@@ -12272,6 +12193,7 @@ impl Error {
             Error::AttesterKeyUnknown { .. } => "federation_attester_key_unknown",
             Error::SignerDoesNotActFor { .. } => "federation_signer_not_acting_for",
             Error::SelfRosterNotLanded { .. } => "federation_self_roster_not_landed",
+            Error::GovernancePolicyRefused { .. } => "federation_governance_policy_refused",
             Error::AssertedAtStale { .. } => "federation_invalid_argument",
             Error::EnvelopeKindRetired { .. } => replication_policy::ENVELOPE_KIND_RETIRED,
             Error::MalformedRow { .. } => "federation_malformed_row",
@@ -12286,7 +12208,6 @@ impl Error {
             Error::LocalAttestationIdOccupied { .. } => "federation_local_attestation_id_occupied",
             Error::Conflict(_) => "federation_conflict",
             Error::AdminActionUnattributed { .. } => "federation_admin_action_unattributed",
-            Error::HardCaseReplicationHeld { .. } => hard_case::refusal::REPLICATION_HELD,
             Error::HardCaseAttesterUnavailable { .. } => hard_case::refusal::ATTESTER_UNAVAILABLE,
             Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",
             Error::RevocationEnvelopeUnbound { .. } => "federation_revocation_envelope_unbound",
@@ -12357,8 +12278,6 @@ impl Error {
             Error::WriteScopeRefused(_) => "federation_write_scope_refused",
             Error::ClockSkewViolation { .. } => "federation_clock_skew_violation",
             Error::PaymentProcessorIdentifier { .. } => "federation_payment_processor_identifier",
-            Error::OperationalAuthority(_) => "federation_operational_authority",
-            Error::OperationalEnvelopeUnbound { .. } => "federation_operational_envelope_unbound",
             Error::PartnerRecordRollback { .. } => "federation_partner_record_rollback",
             Error::SetSemanticsUnsorted(_) => "federation_set_semantics_unsorted",
             Error::WithdrawsNotAdmitted { .. } => "federation_withdraws_not_admitted",
@@ -12366,6 +12285,7 @@ impl Error {
             Error::NodeAgencyForbidden { .. } => "federation_node_agency_forbidden",
             Error::NodeAlreadyOwned { .. } => "federation_node_already_owned",
             Error::DelegationCycle { .. } => "federation_delegation_cycle",
+            Error::DelegationTermRequired { .. } => "federation_delegation_term_required",
             Error::AffiliationCohortMismatch { .. } => "federation_affiliation_cohort_mismatch",
             Error::AffiliationConfigInvalid { .. } => "federation_affiliation_config_invalid",
             Error::AmbiguousNodeOwner { .. } => "federation_ambiguous_node_owner",

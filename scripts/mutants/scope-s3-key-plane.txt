@@ -1,0 +1,34 @@
+# Mutation scope: v60 slice S3 — the key-record write doors on one plan
+# (CIRISPersist#934 step 3; docs/V60_TASK_PLAN.md §4 S3).
+#
+# - The plan: `src/federation/key_plane.rs` — `plan_key_record_write` and its
+#   per-door planners (insert, genesis seed, scrub upgrade, canonical
+#   supersede, rebind / invalid-replace, re-anchor, hybrid completion), the
+#   door it runs as (`key_record_write_planned`), the seed loop, the shared
+#   replicated apply, the row step, and the lost-race wording the executors
+#   report (`PlannedKeyRecord::raced` / `insert_held`). Witnesses I1183–I1187,
+#   I1189, I1190 (sqlite, postgres), I1188 (unit), and the doors' standing
+#   witnesses: I975–I980 (the key plane), the #864 rebind and #1044
+#   invalid-replace invariants, the #925 Clause A rewrite doors, the #656
+#   supersede role gates, the #657 PQC completion, and the #622 / #665
+#   genesis seed and ceremony re-anchor witnesses (sqlite, postgres).
+#   The integration binary `tests/reanchor_5314.rs` drives the same doors
+#   but the tool builds `--lib` only, so it is not a witness here.
+# - The executors: each backend's `store_planned_key_record`, its row step
+#   (`*_sync_key_record_row`) and its column encoder, and the doors that
+#   call the plan.
+# - Not in scope: `remove_peer_record` (its key-row drop is one statement in
+#   the peer removal's own transaction; I975's RED leg and the #721 removal
+#   witnesses cover it), and the rehome at open (I980).
+#
+# Two witnesses of the modules named are excluded: `i621_admissibility_predicate`
+# (the #1044 admissibility predicate in register.rs, not a site here) and
+# `i103_one_rule_every_door` (a from-disk text check no operator mutant can
+# reach); both killed no mutant in any shard of round 2.
+#
+# Grammar: docs/MUTATION_TESTING.md "Scope files".
+tests: test(/i118[3-9]|i1190|key_plane_invariants::|key_rebind_invariants::|invalid_replace_invariants::|clause_a_on_the_rewrite_doors|canonical_supersede_role_gate_parity|attach_key_pqc_is_gated|adopt_scrub_upgrade|apply_replicated_key_record|genesis_seed_installs_parity|ceremony_supersedes_boot_seeded_plane|bake_real_genesis/) - test(/i621_admissibility_predicate|i103_one_rule_every_door/)
+
+src/federation/key_plane.rs plan_key_put plan_key_seed plan_key_scrub_upgrade plan_key_supersede plan_key_replace plan_key_reanchor plan_key_attach_pqc plan_key_record_write key_record_write_planned seed_genesis_accord_holders_planned apply_replicated_key_record_planned key_record_row_step check_key_record_columns admit_consent_role key_id raced insert_held
+src/store/sqlite.rs store_planned_key_record sqlite_sync_key_record_row sqlite_key_columns put_public_key adopt_scrub_upgrade store_rebound_key_record store_invalid_replaced_key_record adopt_genesis_reanchor attach_key_pqc_signature seed_genesis_accord_holders
+src/store/postgres.rs store_planned_key_record pg_sync_key_record_row pg_key_columns put_public_key adopt_scrub_upgrade store_rebound_key_record store_invalid_replaced_key_record adopt_genesis_reanchor attach_key_pqc_signature seed_genesis_accord_holders

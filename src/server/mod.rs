@@ -57,7 +57,7 @@ pub mod secrets;
 /// shape on [`crate::Engine`].
 ///
 /// Callers that don't need the new route can use any `F` —
-/// `MemoryBackend` for tests is the conventional choice.
+/// `store::test_backend::test_backend()` for tests is the conventional choice.
 pub struct AppState<F>
 where
     F: FederationDirectory + Backend + 'static,
@@ -302,12 +302,12 @@ struct ErrorResponse {
     retry_after_seconds: Option<u32>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
     use crate::queue::{spawn_persister, DEFAULT_QUEUE_DEPTH};
     use crate::scrub::NullScrubber;
-    use crate::store::MemoryBackend;
+    use crate::store::sqlite::SqliteBackend;
     use crate::verify::PythonJsonDumpsCanonicalizer;
     use axum::body::Body;
     use axum::http::Request;
@@ -321,9 +321,9 @@ mod tests {
         (dir, Arc::new(j))
     }
 
-    fn build_app(queue_depth: usize) -> (Router, Arc<MemoryBackend>) {
+    fn build_app(queue_depth: usize) -> (Router, Arc<SqliteBackend>) {
         use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner};
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(crate::store::test_backend::test_backend());
         let (_dir, journal) = temp_journal();
         std::mem::forget(_dir); // keep tempdir alive for test duration
         let mut signer = Ed25519SoftwareSigner::new("server-test-signer");

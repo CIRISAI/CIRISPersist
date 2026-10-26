@@ -1096,12 +1096,6 @@ async fn i1152_member_commitment_unique<B: Backend>(backend: &B, suffix: &str) {
 }
 
 #[tokio::test]
-async fn i1152_member_commitment_unique_memory() {
-    let backend = ciris_persist::store::MemoryBackend::new();
-    i1152_member_commitment_unique(&backend, "memory").await;
-}
-
-#[tokio::test]
 async fn i1152_member_commitment_unique_sqlite() {
     let backend = ciris_persist::store::SqliteBackend::open_in_memory()
         .await

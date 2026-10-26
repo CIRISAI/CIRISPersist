@@ -12,6 +12,10 @@
 #   gil_teardown           drops a runtime while holding/handing back the GIL (#572).
 #   runtime_teardown_gauge reads the process-wide runtime-teardown gauge.
 #   env_ciris_data_dir     sets CIRIS_DATA_DIR (process environment).
+#   genesis_scratch        counts or reaps the cluster's genesis-scratch databases
+#                          named for THIS process id (v60.0.0, #1002); under
+#                          `cargo test` (one process) a sibling test's live
+#                          scratch carries the same pid. Inert under nextest.
 #
 # A bare `#[serial]`, or a key not listed here, is refused: new tests name what
 # they share, and a new key comes with its reason above. Expected 0.
@@ -23,7 +27,7 @@ rule:
   kind: attribute_item
   regex: '^#\[\s*(serial_test::)?(serial|parallel|file_serial)\b'
   not:
-    regex: '^#\[\s*serial_test::serial\s*\(\s*(postgres|test_anchor_env|engine_singleton|gil_teardown|runtime_teardown_gauge|env_ciris_data_dir)(\s*,\s*(postgres|test_anchor_env|engine_singleton|gil_teardown|runtime_teardown_gauge|env_ciris_data_dir))*\s*\)\s*\]$'
+    regex: '^#\[\s*serial_test::serial\s*\(\s*(postgres|test_anchor_env|engine_singleton|gil_teardown|runtime_teardown_gauge|env_ciris_data_dir|genesis_scratch)(\s*,\s*(postgres|test_anchor_env|engine_singleton|gil_teardown|runtime_teardown_gauge|env_ciris_data_dir|genesis_scratch))*\s*\)\s*\]$'
 files:
   - src/**/*.rs
   - tests/**/*.rs

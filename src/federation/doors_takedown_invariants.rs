@@ -99,12 +99,23 @@
 //!   no `evict_actor`; both backends' `evict_actor` delegate to
 //!   `holding_claim::evict_actor_of` (which retracts only the evicting
 //!   signer's claims); the withdraws door asks `check_custody_withdraws_signer`.
+//! - **I1170** (memory, sqlite, postgres; v60.0.0, CIRISPersist#803) — a
+//!   takedown notice ROW never binds its content: a named moderator's admitted
+//!   notice row, its `evidence_refs` naming the digest, adds no subject to the
+//!   content's binding. (The notice row's admission and its execution through
+//!   the Engine are `cirisnode::rows_invariants`' I1170.) Every takedown
+//!   witness here builds its notice as a signed `takedown_notice:{basis}:v1`
+//!   row.
+//! - **I1171** (memory, sqlite, postgres; v60.x compat) — a v59 peer's
+//!   replicated takedown, its notice the retired Contribution in the old
+//!   spelling, is still applied (re-verified, re-asked, recorded in CC's
+//!   spelling); the local door refuses it as retired.
 //! - **I795** (two nodes, sqlite and postgres) — the takedown delivered
 //!   through the planes: A takes content down, serves the tombstone as a
 //!   purge bundle over JSON, and B applies it, re-verified on B's state, and
 //!   destroys B's own copy on receipt.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::steward_purge::{self as sp, PurgePlane};
     use crate::federation::takedown_tombstone::{
@@ -113,26 +124,25 @@ pub(crate) mod bodies {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{attestation_type, Attestation, SignedAttestation};
     use crate::federation::FederationDirectory;
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine as _;
-    use ed25519_dalek::Signer as _;
 
-    /// A takedown claimant: its Ed25519 key, and its contributor id (the
-    /// base64 pubkey, which IS its `author_id` on the cirisnode track).
+    /// A takedown claimant: a federation key id (lowercase, CC 2.3.2.1), whose
+    /// deterministic hybrid key the test signer derives from the id.
+    /// v60.0.0 (CIRISPersist#803, #854) — the notice is a row the claimant
+    /// signs, so the claimant is a federation key, not a raw base64 pubkey.
     pub(crate) struct Claimant {
-        key: ed25519_dalek::SigningKey,
         pub(crate) id: String,
     }
 
     pub(crate) fn claimant(seed: u8) -> Claimant {
-        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
-        let id = B64.encode(key.verifying_key().to_bytes());
-        Claimant { key, id }
+        Claimant {
+            id: format!("td-claimant-{seed:02x}"),
+        }
     }
 
-    /// A `takedown_notice` Contribution, shaped as `ContributionEnvelope`
-    /// serializes (the adopter's real row), signed as `put_contribution`
-    /// verifies it.
+    /// A `takedown_notice:{basis}:v1` ROW (CC 3.1.1 / CC 3.3.2), signed by
+    /// the claimant: the CC 3.3.2 members at the envelope's top level,
+    /// score `-1`, `claimant_key_id` = the signer, the notice's `expires_at`
+    /// the row's. v60.0.0 (CIRISPersist#803).
     pub(crate) fn notice_at(
         c: &Claimant,
         sha_hex: &str,
@@ -140,30 +150,39 @@ pub(crate) mod bodies {
         asserted_at: chrono::DateTime<chrono::Utc>,
         expires_at: chrono::DateTime<chrono::Utc>,
     ) -> TakedownNotice {
-        let ts_of = |t: chrono::DateTime<chrono::Utc>| serde_json::to_value(t).unwrap();
+        notice_row_with(c, sha_hex, basis, asserted_at, expires_at, |_| {})
+    }
+
+    /// [`notice_at`] with `edit` applied to the envelope BEFORE the seal.
+    pub(crate) fn notice_row_with(
+        c: &Claimant,
+        sha_hex: &str,
+        basis: &str,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+        expires_at: chrono::DateTime<chrono::Utc>,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> TakedownNotice {
         let mut env = serde_json::json!({
-            "contribution_id": uuid::Uuid::new_v4().to_string(),
-            "contribution_type": "proposal",
-            "author_id": c.id,
-            "subject": {"domain": "media", "language": "en", "subject": "takedown_notice"},
-            "payload": {
-                "content_sha256": sha_hex,
-                "claimant_key_id": c.id,
-                "legal_basis": basis,
-                "jurisdiction": "US",
-                "good_faith_statement": "good faith",
-                "claim_text": "claim",
-                "asserted_at": ts_of(asserted_at),
-                "expires_at": ts_of(expires_at),
-            },
-            "witness_set": null,
-            "signature": {"ed25519": "", "ml_dsa_65": null, "signed_at": ts_of(asserted_at)},
-            "submitted_at": ts_of(asserted_at),
+            "dimension": td::notice_dimension(basis),
+            "score": -1.0,
+            "confidence": 1.0,
+            "subject_kind": "takedown_notice",
+            "content_sha256": sha_hex,
+            "claimant_key_id": c.id,
+            "legal_basis": basis,
+            "jurisdiction": "US",
+            "good_faith_statement": "good faith",
+            "claim_text": "claim",
         });
-        let canonical = crate::verify::canonical::canonicalize_envelope_for_signing(&env).unwrap();
-        env["signature"]["ed25519"] =
-            serde_json::json!(B64.encode(c.key.sign(&canonical).to_bytes()));
-        TakedownNotice { envelope: env }
+        edit(&mut env);
+        let mut row = ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), &c.id, &c.id, &env);
+        row.attestation_type = attestation_type::SCORES.into();
+        row.weight = None;
+        row.asserted_at = asserted_at;
+        row.scrub_timestamp = asserted_at;
+        row.expires_at = Some(expires_at);
+        let row = ts::seal_row(&c.id, row);
+        TakedownNotice::of_row(&row).expect("a notice row serializes")
     }
 
     pub(crate) fn notice(c: &Claimant, sha_hex: &str, basis: &str) -> TakedownNotice {
@@ -171,21 +190,184 @@ pub(crate) mod bodies {
         notice_at(c, sha_hex, basis, t, t + chrono::Duration::days(30))
     }
 
-    /// [`notice`] whose payload NAMES `community` (a claim the door never
-    /// reads), re-signed.
+    /// [`notice`] whose envelope NAMES `community` (a claim the door never
+    /// reads), sealed with it.
     pub(crate) fn notice_naming(
         c: &Claimant,
         sha_hex: &str,
         basis: &str,
         community: &str,
     ) -> TakedownNotice {
-        let mut n = notice(c, sha_hex, basis);
-        n.envelope["payload"]["community_id"] = serde_json::json!(community);
-        let canonical =
-            crate::verify::canonical::canonicalize_envelope_for_signing(&n.envelope).unwrap();
-        n.envelope["signature"]["ed25519"] =
-            serde_json::json!(B64.encode(c.key.sign(&canonical).to_bytes()));
-        n
+        let t = chrono::Utc::now();
+        notice_row_with(c, sha_hex, basis, t, t + chrono::Duration::days(30), |e| {
+            e["community_id"] = serde_json::json!(community);
+        })
+    }
+
+    /// v60.x COMPAT fixture — a v59 peer's `takedown_notice` CONTRIBUTION,
+    /// shaped as `ContributionEnvelope` serialized and self-signed Ed25519 by
+    /// the raw key whose base64 pubkey is `author_id`, in the pre-v60 basis
+    /// spelling. Returns `(notice, author_id)`.
+    pub(crate) fn legacy_contribution_notice(
+        seed: u8,
+        sha_hex: &str,
+        legacy_basis: &str,
+    ) -> (TakedownNotice, String) {
+        legacy_contribution_notice_with(seed, sha_hex, legacy_basis, |_| {})
+    }
+
+    /// [`legacy_contribution_notice`] with `edit` applied to the payload
+    /// BEFORE the self-signature.
+    pub(crate) fn legacy_contribution_notice_with(
+        seed: u8,
+        sha_hex: &str,
+        legacy_basis: &str,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> (TakedownNotice, String) {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let author = B64.encode(key.verifying_key().to_bytes());
+        let t = chrono::Utc::now();
+        let ts_of = |t: chrono::DateTime<chrono::Utc>| serde_json::to_value(t).unwrap();
+        let mut env = serde_json::json!({
+            "contribution_id": uuid::Uuid::new_v4().to_string(),
+            "contribution_type": "proposal",
+            "author_id": author,
+            "subject": {"domain": "media", "language": "en", "subject": "takedown_notice"},
+            "payload": {
+                "content_sha256": sha_hex,
+                "claimant_key_id": author,
+                "legal_basis": legacy_basis,
+                "jurisdiction": "US",
+                "good_faith_statement": "good faith",
+                "claim_text": "claim",
+                "asserted_at": ts_of(t),
+                "expires_at": ts_of(t + chrono::Duration::days(30)),
+            },
+            "witness_set": null,
+            "signature": {"ed25519": "", "ml_dsa_65": null, "signed_at": ts_of(t)},
+            "submitted_at": ts_of(t),
+        });
+        edit(&mut env["payload"]);
+        let canonical = crate::verify::canonical::canonicalize_envelope_for_signing(&env).unwrap();
+        env["signature"]["ed25519"] =
+            serde_json::json!(B64.encode(key.sign(&canonical).to_bytes()));
+        (TakedownNotice { envelope: env }, author)
+    }
+
+    // ── I1170 (binding) ───────────────────────────────────────────────────
+    /// v60.0.0 (#803) — a takedown notice ROW is about the content, never a
+    /// binding of it: a named moderator's admitted notice row, whose
+    /// `evidence_refs` name the digest and whose attested key is its signer,
+    /// adds no subject to the content's binding (`content_binding` skips the
+    /// `takedown_notice:` family).
+    pub(crate) async fn i1170_a_notice_row_never_binds_its_content<D>(d: &D)
+    where
+        D: FederationDirectory + Sync,
+    {
+        let dir = d.as_dyn_directory();
+        let sha = sha_of("i1170b");
+        let moderator = claimant(0x6d);
+        let comm = "i1170b-comm";
+        let binder = claimant(0x6e);
+        // Two members: the binder writes the room's binding row, the
+        // moderator files the notice.
+        group_of(dir, comm, &[&moderator.id, &binder.id], None).await;
+        bind_row(
+            dir,
+            &binder.id,
+            &binder.id,
+            &[],
+            &sha,
+            crate::federation::types::cohort_scope::COMMUNITY,
+            Some(comm),
+            None,
+        )
+        .await
+        .expect("I1170: the binding row");
+        let t = chrono::Utc::now();
+        let n = notice_row_with(
+            &moderator,
+            &sha,
+            "dmca512",
+            t,
+            t + chrono::Duration::days(1),
+            |e| {
+                e["evidence_refs"] = serde_json::json!([sha.clone()]);
+            },
+        );
+        let row: Attestation = serde_json::from_value(n.envelope.clone()).unwrap();
+        dir.put_attestation(SignedAttestation { attestation: row })
+            .await
+            .expect("I1170: the named moderator's notice row is admitted");
+        let binding = td::content_binding(dir, &sha).await.unwrap().unwrap();
+        assert!(
+            !binding.subjects.contains(&moderator.id),
+            "I1170: the notice row is not a binding: {binding:?}"
+        );
+    }
+
+    // ── I1171 ─────────────────────────────────────────────────────────────
+    /// v60.x compat (one release): a v59 peer's replicated takedown, its
+    /// notice the retired Contribution in the old spelling, is still applied
+    /// — re-verified (Ed25519, as v59 did) and re-asked under CC 4.5.5 here,
+    /// recorded under CC 3.3.2's spelling. The LOCAL door refuses the same
+    /// Contribution: a notice filed here is a row.
+    pub(crate) async fn i1171_a_v59_peers_contribution_notice_still_applies<D>(d: &D)
+    where
+        D: FederationDirectory + Sync,
+    {
+        let dir = d.as_dyn_directory();
+        let sha = sha_of("i1171");
+        let (n, author) = legacy_contribution_notice(0x6b, &sha, "dmca_512");
+        // The legacy author moderates the room the content is bound into.
+        let comm = "i1171-comm";
+        let binder = claimant(0x6c);
+        group_of(dir, comm, &[&author, &binder.id], None).await;
+        bind_row(
+            dir,
+            &binder.id,
+            &binder.id,
+            &[],
+            &sha,
+            crate::federation::types::cohort_scope::COMMUNITY,
+            Some(comm),
+            None,
+        )
+        .await
+        .expect("I1171: the binding row");
+        let e = td::takedown_tombstone(dir, &n, NODE)
+            .await
+            .expect_err("I1171: the local door takes a notice row only");
+        assert_eq!(e.kind(), token::UNAUTHORISED, "I1171: {e}");
+        assert!(
+            e.to_string().contains("retired"),
+            "I1171: named as retired: {e}"
+        );
+        let record = format!("blob:{sha}");
+        // A whitespace member is empty (the compat read keeps v59's rule),
+        // even signed.
+        let (blank, _) = legacy_contribution_notice_with(0x6b, &sha, "dmca_512", |p| {
+            p["claimant_key_id"] = serde_json::json!("  ");
+        });
+        let e =
+            td::apply_replicated_takedown(dir, &blank, std::slice::from_ref(&record), "receiver")
+                .await
+                .expect_err("I1171: a blank claim_text");
+        assert_eq!(e.kind(), token::UNAUTHORISED, "I1171: {e}");
+        let r = td::apply_replicated_takedown(dir, &n, &[record], "receiver")
+            .await
+            .expect("I1171: the v59 peer's replicated notice is applied (compat)");
+        assert_eq!(r.legal_basis, "dmca512", "I1171: recorded in CC's spelling");
+        assert_eq!(
+            r.notice_attestation_id, None,
+            "I1171: a Contribution has no row"
+        );
+        let e = dir.purge_execution(&r.notice_id).await.unwrap().unwrap();
+        assert_eq!(e.legal_basis, "dmca512");
+        assert_eq!(e.origin, sp::origin::REPLICATED);
     }
 
     /// A community whose only member is `member` (a person, so a
@@ -252,7 +434,7 @@ pub(crate) mod bodies {
         let sha = sha_of("i796");
 
         // Not bound here yet: retryable, nothing written.
-        let e = td::takedown_tombstone(dir, &notice_naming(&mod_y, &sha, "dmca_512", comm_y), NODE)
+        let e = td::takedown_tombstone(dir, &notice_naming(&mod_y, &sha, "dmca512", comm_y), NODE)
             .await
             .expect_err("I796: no binding row held");
         assert_eq!(e.kind(), token::CONTENT_UNBOUND, "I796: {e}");
@@ -293,16 +475,15 @@ pub(crate) mod bodies {
         .expect("I796: the binding row under Y");
 
         // X's moderator names X: judged under Y, refused.
-        let e = td::takedown_tombstone(dir, &notice_naming(&mod_x, &sha, "dmca_512", comm_x), NODE)
+        let e = td::takedown_tombstone(dir, &notice_naming(&mod_x, &sha, "dmca512", comm_x), NODE)
             .await
             .expect_err("I796: X's moderator over Y's content");
         assert_eq!(e.kind(), token::UNAUTHORISED, "I796: {e}");
         assert_eq!(dir.purge_tombstoned("blob", &sha).await.unwrap(), None);
         // Y's moderator, whatever community the notice names, is Y's.
-        let ok =
-            td::takedown_tombstone(dir, &notice_naming(&mod_y, &sha, "dmca_512", comm_x), NODE)
-                .await
-                .expect("I796: Y's named moderator over Y's content");
+        let ok = td::takedown_tombstone(dir, &notice_naming(&mod_y, &sha, "dmca512", comm_x), NODE)
+            .await
+            .expect("I796: Y's named moderator over Y's content");
         assert!(ok.tombstoned);
     }
 
@@ -421,7 +602,7 @@ pub(crate) mod bodies {
         let dir = d.as_dyn_directory();
         let producer = "i772-producer";
         let auth = |signer: String, sha: String| async move {
-            td::takedown_authority(dir, &signer, &sha, "dmca_512").await
+            td::takedown_authority(dir, &signer, &sha, "dmca512").await
         };
         let unauthorised = |r: Result<(), crate::federation::Error>| matches!(&r, Err(e) if e.kind() == token::UNAUTHORISED);
 
@@ -579,6 +760,8 @@ pub(crate) mod bodies {
         let dir = d.as_dyn_directory();
         let owner = claimant(0x71);
         let stranger = claimant(0x72);
+        // A keyed stranger: its notice row verifies, and it holds no duty.
+        ts::register_hybrid_key(dir, &stranger.id).await;
         let sha = sha_of("i786");
         establish(dir, "i786-producer", &owner.id, &sha).await;
         let unauth = |r: Result<td::TakedownReport, crate::federation::Error>, why: &str| {
@@ -587,11 +770,12 @@ pub(crate) mod bodies {
         };
 
         unauth(
-            td::takedown_tombstone(dir, &notice(&stranger, &sha, "dmca_512"), NODE).await,
+            td::takedown_tombstone(dir, &notice(&stranger, &sha, "dmca512"), NODE).await,
             "a signer with no duty over the content",
         );
-        let mut edited = notice(&owner, &sha, "dmca_512");
-        edited.envelope["payload"]["claim_text"] = serde_json::json!("edited after signing");
+        let mut edited = notice(&owner, &sha, "dmca512");
+        edited.envelope["attestation_envelope"]["claim_text"] =
+            serde_json::json!("edited after signing");
         unauth(
             td::takedown_tombstone(dir, &edited, NODE).await,
             "a notice edited after signing",
@@ -603,7 +787,7 @@ pub(crate) mod bodies {
                 &notice_at(
                     &owner,
                     &sha,
-                    "dmca_512",
+                    "dmca512",
                     t - chrono::Duration::days(40),
                     t - chrono::Duration::days(10),
                 ),
@@ -626,7 +810,7 @@ pub(crate) mod bodies {
             "I786: no refused notice wrote a tombstone"
         );
 
-        let ok = td::takedown_tombstone(dir, &notice(&owner, &sha, "dmca_512"), NODE)
+        let ok = td::takedown_tombstone(dir, &notice(&owner, &sha, "dmca512"), NODE)
             .await
             .expect("I786: a signed subject of the content takes it down");
         assert!(ok.tombstoned);
@@ -672,6 +856,18 @@ pub(crate) mod bodies {
             hex::encode(sha2::Sha256::digest(e.notice_jcs.as_bytes())),
             r.notice_id,
             "I787: the notice id is the hash of the stored notice"
+        );
+        // v60.0.0 (#803, CC 3.3.2) — the stored notice IS the notice row: the
+        // tombstone cites its `attestation_id`, and the row is held.
+        let row_id = n.envelope["attestation_id"].as_str().unwrap().to_owned();
+        assert_eq!(r.notice_attestation_id.as_deref(), Some(row_id.as_str()));
+        assert!(
+            e.notice_jcs.contains(&row_id),
+            "I787: the header carries the notice row"
+        );
+        assert!(
+            dir.get_attestation(&row_id).await.unwrap().is_some(),
+            "I787: the notice row the tombstone cites is held"
         );
         assert!(
             !e.notice_jcs.contains("\"bytes\""),
@@ -728,6 +924,7 @@ pub(crate) mod bodies {
         dir.list_hard_case_events(crate::federation::hard_case::HardCaseFilter {
             kind: Some(crate::federation::hard_case::kind::FAST_PATH_TAKEDOWN.to_owned()),
             since: None,
+            emitter_key_id: None,
         })
         .await
         .unwrap()
@@ -736,7 +933,9 @@ pub(crate) mod bodies {
     /// A `delegates_to(granter → grantee)` bearing `scope`, really signed.
     async fn delegate(dir: &dyn FederationDirectory, granter: &str, grantee: &str, scope: &[&str]) {
         let id = uuid::Uuid::new_v4().to_string();
-        let envelope = serde_json::json!({"references_attestation_id": id, "scope": scope});
+        let mut envelope = serde_json::json!({"references_attestation_id": id, "scope": scope});
+        // v60.0.0 (#1048) — a duty edge carries a term (CC 2.4).
+        crate::federation::admission::with_test_term(&mut envelope, chrono::Utc::now());
         let mut row = ts::bare_attestation(&id, granter, grantee, &envelope);
         row.attestation_type = attestation_type::DELEGATES_TO.to_owned();
         ts::seal_row_in_place(granter, &mut row);
@@ -901,6 +1100,18 @@ pub(crate) mod bodies {
         let n = TakedownNotice {
             envelope: bundle.notice.envelope.clone(),
         };
+        // v60.0.0 (#803) — the notice is a row: on a receiver that does not
+        // hold its signer's key yet the refusal is that ordering gap,
+        // retryable, never a verdict on the notice.
+        let e = td::apply_replicated_takedown(b, &n, &bundle.record_ids, "receiver")
+            .await
+            .expect_err("I789: the receiver does not hold the signer's key yet");
+        assert_eq!(
+            e.kind(),
+            "federation_attester_key_unknown",
+            "I789: retryable: {e}"
+        );
+        ts::register_hybrid_key(b, &owner.id).await;
         let e = td::apply_replicated_takedown(b, &n, &bundle.record_ids, "receiver")
             .await
             .expect_err("I789: the receiver holds no row binding the content");
@@ -938,7 +1149,7 @@ pub(crate) mod bodies {
         let owner = claimant(0x76);
         let sha = sha_of("i792");
         let score = establish(dir, "i792-producer", &owner.id, &sha).await;
-        let r = td::takedown_tombstone(dir, &notice(&owner, &sha, "dsa_article_16"), NODE)
+        let r = td::takedown_tombstone(dir, &notice(&owner, &sha, "dsa_article16"), NODE)
             .await
             .unwrap();
         assert!(
@@ -1462,7 +1673,7 @@ pub(crate) mod engine_bodies {
         establish(dir, &author, &owner.id, &hex::encode(dmca)).await;
         let r = l
             .engine_a
-            .takedown_tombstone(&notice(&owner, &hex::encode(dmca), "dmca_512"))
+            .takedown_tombstone(&notice(&owner, &hex::encode(dmca), "dmca512"))
             .await
             .expect("I790: a counter-notice takedown");
         assert_eq!(
@@ -1652,7 +1863,7 @@ pub(crate) mod engine_bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     macro_rules! runners {
         ($modname:ident, $fresh:expr) => {
@@ -1699,17 +1910,19 @@ mod run {
                     let Some(d) = $fresh.await else { return };
                     b::i792_a_score_over_taken_down_content_stands(&d).await
                 }
+                #[tokio::test]
+                async fn i1170_binding() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i1170_a_notice_row_never_binds_its_content(&d).await
+                }
+                #[tokio::test]
+                async fn i1171() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i1171_a_v59_peers_contribution_notice_still_applies(&d).await
+                }
             }
         };
     }
-
-    // v57.0.0 (#988 item 2) — every runner's backend holds a node key: the
-    // fast-path takedown's hard_case row is attested by it (I799).
-    runners!(memory, async {
-        let b = crate::store::memory::MemoryBackend::new();
-        crate::federation::hard_case::test_support::declare_node(&b, "dt-node").await;
-        Some(b)
-    });
 
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {

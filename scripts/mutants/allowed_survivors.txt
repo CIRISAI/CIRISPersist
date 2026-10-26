@@ -17,3 +17,10 @@
 #
 # Empty since v54.1.0: the six survivors and three timeouts of the first
 # nightly run (#1037, #1038, #1051) are killed by witnesses or left the scope.
+#
+# v60.0.0 (S0) — equivalent under admission. The prefilter in
+# nodes_owned_by only narrows the candidates `owner_of` then decides; `||`
+# adds every other delegates_to target (each rejected by owner_of, the one
+# verdict) and an owner-binding with an empty attested key, which the
+# delegates_to admission never stores. No reachable state tells them apart.
+src/federation/admission.rs:10972 replace && with || in nodes_owned_by #1109 equivalent: owner_of is the verdict; an empty attested key is refused at admission

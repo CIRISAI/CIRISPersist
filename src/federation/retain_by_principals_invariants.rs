@@ -9,7 +9,7 @@
 //! content past a human's window. One body per invariant, generic over the
 //! directory, run on memory, sqlite and postgres.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::consent_by_humans as cbh;
     use crate::federation::consent_scope_invariants::bodies::{at, put, row, stance};
@@ -295,6 +295,7 @@ pub(crate) mod bodies {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::RETAIN_WINDOW_BREACH.to_owned()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -310,7 +311,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
@@ -334,14 +335,6 @@ mod run {
             }
         };
     }
-    runners!(memory, async {
-        {
-            // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
-            let b = crate::store::memory::MemoryBackend::new();
-            crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
-            Some(b)
-        }
-    });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

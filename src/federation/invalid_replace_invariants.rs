@@ -389,9 +389,6 @@ mod run {
             }
         };
     }
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;
@@ -474,17 +471,19 @@ mod run {
     /// fails `verify_key_registration` (seeded past `put_public_key`'s
     /// production-roster gate, which is the only way a test can hold one) is
     /// NOT replaced by the holder's self-signed passing record: the plan's own
-    /// refusal stands and the store step is `Conflict`. Memory only — the
-    /// clause lives in `register`, which every backend calls (sqlite/postgres
-    /// cannot hold the row without the production roster).
+    /// refusal stands and the store step is `Conflict`. On sqlite only, through
+    /// the below-the-door seed fixture: the clause lives in `register`, which
+    /// every backend calls, and no door can hold the row without the
+    /// production roster.
     #[tokio::test]
-    async fn i621_a_role_gated_row_is_not_replaced_memory() {
+    #[cfg(feature = "sqlite")]
+    async fn i621_a_role_gated_row_is_not_replaced() {
         use super::bodies::signed;
         use crate::federation::register::ReplicatedKeyOutcome;
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::identity_type::{CANONICAL, NODE};
         use crate::federation::FederationDirectory as _;
-        let d = crate::store::memory::MemoryBackend::new();
+        let d = crate::store::test_backend::test_backend();
         let s = suffix();
         let a = format!("i621-a-{s}");
         ts::register_identity_key(&d, &a, NODE).await;

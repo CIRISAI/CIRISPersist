@@ -14,9 +14,13 @@
 #   coverage   weekly, dispatch
 #                       cargo llvm-cov per certify feature set (scripts/coverage.sh);
 #                       the legs are DERIVED (ci_feature_matrix.py legs), not listed
-#   mutants-diff  PR labelled `run-mutants`, dispatch
-#                       cargo-mutants on the changed lines only (scripts/mutants_diff.sh);
-#                       never runs by default
+#   csd4       PR, weekly, dispatch
+#                       CC's CSD/4 chain (src/federation/namespace/csd4_chain.json) joined to
+#                       evidence/cc_impl.tsv, the witnesses and the mutation scopes, with
+#                       the gap lists (scripts/csd4_coverage.py, v60.0.0)
+#   mutants-diff  PR labelled `run-mutants`, every `release-*` PR (v60.0.0), dispatch
+#                       cargo-mutants on the changed lines only (scripts/mutants_diff.sh),
+#                       capped at MUTANTS_DIFF_BUDGET_SECS
 #
 # On a PR, `size` shows this PR's own delta (vs the base), while `semver`
 # shows every break since the last release — main's and this PR's together,
@@ -39,7 +43,7 @@ on:
         required: false
         default: origin/main
       run:
-        description: 'which report(s): all | semver | coverage | mutants-diff'
+        description: 'which report(s): all | semver | coverage | csd4 | mutants-diff'
         required: false
         default: all
 
@@ -194,11 +198,48 @@ jobs:
             target/coverage/${{ matrix.leg }}/html/
           retention-days: 30
 
+  # v60.0.0 (docs/V60_TASK_PLAN.md §3b, S0-csd) — report-only. The join reads
+  # CC's chain (src/federation/namespace/csd4_chain.json, vendored at the rc9 tag) and
+  # CEWPOS's catalogue at main.
+  csd4:
+    name: CSD/4 coverage (report)
+    if: >-
+      (github.event_name == 'pull_request' && github.event.action != 'labeled')
+      || github.event_name == 'schedule'
+      || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all","csd4"]'), inputs.run))
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: CIRISAI/CEWPOS
+          path: _ext/CEWPOS
+      - name: CSD/4 coverage (report)
+        run: |
+          mkdir -p target/csd4
+          python3 scripts/csd4_coverage.py --cewpos-dir _ext/CEWPOS --out target/csd4/coverage.md
+          sed -n '/^## Gap counts/,/^### (a)/p' target/csd4/coverage.md | sed '$d' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: csd4-coverage
+          path: target/csd4/coverage.md
+          retention-days: 30
+
+  # v60.0.0 (docs/V60_TASK_PLAN.md §3 item 4) — also on every `release-*` PR
+  # (opened / synchronize / reopened, not on a label event), unlabelled: the
+  # cut's whole diff gets "which changed line survives?" answered. Capped by
+  # MUTANTS_DIFF_BUDGET_SECS (the script interrupts the tool at the cap and
+  # its summary says INCOMPLETE with what finished) inside the job's 150 min.
   mutants-diff:
     name: mutants on the diff (report)
     if: >-
       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-mutants')
         && (github.event.action != 'labeled' || github.event.label.name == 'run-mutants'))
+      || (github.event_name == 'pull_request' && github.event.action != 'labeled'
+        && startsWith(github.head_ref, 'release-'))
       || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all","mutants-diff"]'), inputs.run))
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -219,6 +260,13 @@ jobs:
           BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || inputs.mutants_base }}
           MUTANTS_DIFF_BUDGET_SECS: '7200'
         run: scripts/mutants_diff.sh "$BASE"
+      # The script appends summary.txt to the step summary itself when it
+      # finishes; when it stops early (exit 1: tool, baseline or build), this
+      # puts what it wrote there instead.
+      - name: diff-scoped mutants summary (the script stopped early)
+        if: failure()
+        run: |
+          { echo "### mutants on the diff (report)"; echo '```'; cat target/mutants-diff/summary.txt 2>/dev/null || echo "no summary — see the log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         if: always()
         with:

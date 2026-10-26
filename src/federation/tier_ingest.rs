@@ -129,6 +129,26 @@ where
     verify_row_hybrid_signature(directory, row).await
 }
 
+/// v60.0.0 (CIRISPersist#1114; CC 2.6.1.7, rc10 `99bf187`) — the row's
+/// declared `original_content_hash` must be the SHA-256 of JCS(its envelope)
+/// (canonicalizer agreement, fail-secure). Terminal for these bytes:
+/// `federation_malformed_row` / `content_hash_mismatch`, the Python type
+/// (ValueError) of the `FederationTierUnverified` arm it replaces.
+pub(crate) fn check_content_hash(row: &Attestation, computed_hash: &str) -> Result<(), Error> {
+    if computed_hash == row.original_content_hash {
+        return Ok(());
+    }
+    Err(Error::malformed_row(
+        "attestation",
+        super::malformed_row::CONTENT_HASH_MISMATCH,
+        format!(
+            "attestation {}: original_content_hash mismatch: envelope canonicalizes to \
+             {computed_hash}, row declares {}",
+            row.attestation_id, row.original_content_hash
+        ),
+    ))
+}
+
 /// v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — verify an
 /// [`Attestation`] row's envelope bound-hybrid signature **regardless of
 /// tier**. This is the tier-agnostic core [`verify_federation_tier_ingest`]
@@ -203,13 +223,7 @@ where
 
     // Cross-check the declared original_content_hash matches the envelope's
     // canonical SHA-256 (canonicalizer agreement, fail-secure).
-    if computed_hash != row.original_content_hash {
-        return Err(reject(format!(
-            "original_content_hash mismatch: envelope canonicalizes to {computed_hash}, \
-             row declares {}",
-            row.original_content_hash
-        )));
-    }
+    check_content_hash(row, &computed_hash)?;
 
     // v24.0.0 (CIRISPersist#556) — EVERY scrub, not just the first.
     //
@@ -4729,12 +4743,24 @@ pub mod test_support {
         grantee: &str,
     ) -> crate::federation::Attestation {
         let mut a = owner_binding_attestation(id, granter, grantee);
-        let envelope = serde_json::json!({
+        let mut envelope = serde_json::json!({
             "id": id,
             "kind": "delegates_to",
             "scope": [crate::federation::admission::DELEGATION_SCOPE_MODERATE],
             "sub_delegation": false,
         });
+        // v60.0.0 (CIRISPersist#1048, CC 2.4) — a `moderate` appointment
+        // carries a term, measured from its signed instant: signed now (not at
+        // the owner-binding fixture's fixed instant) for 180 days, so the
+        // fixture never decays on a calendar date.
+        let now =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        a.asserted_at = now;
+        a.scrub_timestamp = now;
+        crate::federation::admission::DelegationTermBounds::until(
+            now + chrono::Duration::days(180),
+        )
+        .stamp(&mut envelope);
         let (och, classical, pqc) = sign_envelope(granter, &envelope);
         a.attestation_envelope = envelope;
         a.original_content_hash = och;
@@ -5040,15 +5066,6 @@ mod tests {
             dir.get_attestation(&e_id).await.expect("get").is_some(),
             "(e) admitted local-tier row must be stored"
         );
-    }
-
-    /// QualReview (LOW): the gate runs on the MEMORY backend in production
-    /// (`put_attestation` calls `verify_federation_tier_ingest`), so test the
-    /// matrix directly against it too — no engine DSN dispatches to memory.
-    #[tokio::test]
-    async fn tier_ingest_matrix_memory() {
-        let backend = crate::store::memory::MemoryBackend::new();
-        run_tier_ingest_matrix(&backend, "memory").await;
     }
 
     #[cfg(feature = "sqlite")]

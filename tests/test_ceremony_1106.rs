@@ -17,8 +17,14 @@ use ciris_persist::federation::transport_rebind::{
 };
 use ciris_persist::federation::{Error, FederationDirectory, SignedAttestation};
 use ciris_persist::store::backend::Backend as _;
-use ciris_persist::store::memory::MemoryBackend;
 use ciris_persist::store::sqlite::SqliteBackend;
+
+/// The genesis scratch the doors replay on: an in-memory SQLite clone
+/// (CIRISPersist#1002; the postgres scratch is witnessed in
+/// `genesis_scratch_parity.rs`).
+fn scratch() -> ciris_persist::store::sqlite::SqliteBackend {
+    ciris_persist::store::test_backend::test_backend()
+}
 
 const SEEDS: [[u8; 32]; 3] = [[0x31; 32], [0x32; 32], [0x33; 32]];
 const NODE_SEED: [u8; 32] = [0x4E; 32];
@@ -53,14 +59,6 @@ fn at(offset_secs: i64) -> chrono::DateTime<chrono::Utc> {
 async fn sqlite() -> SqliteBackend {
     let b = SqliteBackend::open_in_memory().await.unwrap();
     b.run_migrations().await.unwrap();
-    b.seed_genesis_accord_holders(&effective_accord_holder_records())
-        .await
-        .expect("seed holders");
-    b
-}
-
-async fn memory() -> MemoryBackend {
-    let b = MemoryBackend::new();
     b.seed_genesis_accord_holders(&effective_accord_holder_records())
         .await
         .expect("seed holders");
@@ -124,11 +122,10 @@ impl PgDrop {
     }
 }
 
-/// Run `$body(d, tag, $args...)` against a fresh memory, sqlite and (with a
-/// test database) postgres node.
+/// Run `$body(d, tag, $args...)` against a fresh sqlite and (with a test
+/// database) postgres node.
 macro_rules! on_each_backend {
     ($body:ident $(, $arg:expr)*) => {{
-        $body(&memory().await, "memory" $(, $arg)*).await;
         $body(&sqlite().await, "sqlite" $(, $arg)*).await;
         #[cfg(feature = "postgres")]
         if let Some((b, guard)) = postgres().await {
@@ -164,7 +161,7 @@ async fn i1157_a_fresh_node_resolves_the_serve_pairs_offline() {
     assert_eq!(c.bundle.version, 4);
     assert_eq!(c.bundle.serve_transport_destinations.len(), 1);
     let _armed = Armed::with(&c.block);
-    verify_ceremony_outputs(&c.bundle_json().unwrap())
+    verify_ceremony_outputs(&c.bundle_json().unwrap(), &scratch())
         .await
         .expect("I1157: the v4 outputs verify");
     on_each_backend!(resolves_offline, &c.bundle);
@@ -198,7 +195,7 @@ async fn i1157_the_bundle_rows_are_checked() {
         c.bundle.holders[0].record.key_id.clone();
     refused(&by_holder, "a row by a non-serve key");
     assert!(
-        verify_ceremony_outputs(&serde_json::to_string(&by_holder).unwrap())
+        verify_ceremony_outputs(&serde_json::to_string(&by_holder).unwrap(), &scratch())
             .await
             .is_err()
     );
@@ -221,7 +218,7 @@ async fn i1157_the_bundle_rows_are_checked() {
         "I1157: the v4 digest binds the transport rows"
     );
     assert!(
-        verify_ceremony_outputs(&serde_json::to_string(&swapped).unwrap())
+        verify_ceremony_outputs(&serde_json::to_string(&swapped).unwrap(), &scratch())
             .await
             .is_err(),
         "I1157: a row swapped after authorization fails the quorum"
@@ -235,11 +232,11 @@ async fn i1157_the_bundle_rows_are_checked() {
         !v3_json.contains("serve_transport_destinations"),
         "I1157: a v3 bundle's wire is unchanged"
     );
-    verify_ceremony_outputs(&v3_json)
+    verify_ceremony_outputs(&v3_json, &scratch())
         .await
         .expect("I1157: a v3 bundle verifies");
-    let d = memory().await;
-    boot(&d, &v3.bundle, "memory v3").await;
+    let d = sqlite().await;
+    boot(&d, &v3.bundle, "sqlite v3").await;
     assert!(
         transit_kex_pair_for(&d, TEST_CEREMONY_NODE_KEY_ID)
             .await
@@ -259,7 +256,7 @@ async fn i1157_the_v3_preimage_is_unchanged() {
     let v3 = parse_genesis_bundle(include_str!("fixtures/genesis/canonical_seed.v3.json"))
         .expect("the v3 fixture parses");
     assert_eq!(v3.version, 3);
-    let d = memory().await;
+    let d = sqlite().await;
     verify_bundle_quorum(&d, &v3)
         .await
         .expect("I1157: the v3 final genesis's authorizations still verify");
@@ -340,7 +337,7 @@ async fn i1159_amend_is_two_of_three_for_every_holder_pair() {
     let holders = test_ceremony_holders(&SEEDS).unwrap();
     let row = test_serve_transport_destination(&NODE_SEED, at(-30), 0x71, 0x72).unwrap();
     for pair in [[0usize, 1], [1, 2], [0, 2]] {
-        let mut amend = AmendState::plan(&v3_json, vec![row.clone()])
+        let mut amend = AmendState::plan(&v3_json, vec![row.clone()], &scratch())
             .await
             .expect("the pinned v3 verifies");
         let bytes = amend.authz_bytes().unwrap();
@@ -350,36 +347,28 @@ async fn i1159_amend_is_two_of_three_for_every_holder_pair() {
                 .unwrap();
         }
         let done = amend
-            .finish()
+            .finish(&scratch())
             .await
             .unwrap_or_else(|e| panic!("I1159 {pair:?}: the amend finishes: {e}"));
         assert_eq!(done.bundle.version, 4);
         assert_eq!(done.verified.quorum_verified, 2, "I1159 {pair:?}");
-        for (tag, d) in [
-            (
-                "memory",
-                Box::new(memory().await) as Box<dyn FederationDirectory>,
+        let (tag, d) = ("sqlite", sqlite().await);
+        boot(&d, &done.bundle, tag).await;
+        assert_eq!(
+            x_of(
+                &transit_kex_pair_for(&d, TEST_CEREMONY_NODE_KEY_ID)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{tag} I1159 {pair:?}: a Rooted pair"))
             ),
-            (
-                "sqlite",
-                Box::new(sqlite().await) as Box<dyn FederationDirectory>,
-            ),
-        ] {
-            boot(d.as_ref(), &done.bundle, tag).await;
-            assert_eq!(
-                x_of(
-                    &transit_kex_pair_for(d.as_ref(), TEST_CEREMONY_NODE_KEY_ID)
-                        .await
-                        .unwrap()
-                        .unwrap_or_else(|| panic!("{tag} I1159 {pair:?}: a Rooted pair"))
-                ),
-                0x71
-            );
-            clear_test_ceremony_outputs();
-        }
+            0x71
+        );
+        clear_test_ceremony_outputs();
     }
     // One holder, even twice: refused.
-    let mut one = AmendState::plan(&v3_json, vec![row.clone()]).await.unwrap();
+    let mut one = AmendState::plan(&v3_json, vec![row.clone()], &scratch())
+        .await
+        .unwrap();
     let bytes = one.authz_bytes().unwrap();
     for _ in 0..2 {
         one.add_authorization(test_amend_authorization(&holders[0], &bytes))
@@ -390,7 +379,9 @@ async fn i1159_amend_is_two_of_three_for_every_holder_pair() {
         other => panic!("I1159: one holder amended: {other:?}"),
     }
     // A carried byte altered: refused.
-    let mut altered = AmendState::plan(&v3_json, vec![row]).await.unwrap();
+    let mut altered = AmendState::plan(&v3_json, vec![row], &scratch())
+        .await
+        .unwrap();
     altered.base.produced_at = at(0).to_rfc3339();
     let bytes = altered.authz_bytes().unwrap();
     for i in [0, 1] {

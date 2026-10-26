@@ -226,8 +226,7 @@ impl SchemaResolver for NoOpSchemaResolver {
 ///   SHA) and overwhelmingly outnumbered by reads, BUT the critical
 ///   sections are tiny (one `HashMap::get` clone, or one `insert`).
 ///   `Mutex` is faster on the uncontended hot path than `RwLock` and
-///   matches the rest of persist's in-memory shape (see
-///   `MemoryBackend`).
+///   matches the rest of persist's in-process caches.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub struct BlobBackedSchemaResolver<B: BlobStorage + 'static> {
     /// Deployer-supplied mapping `axis_name → schema SHA-256`. In

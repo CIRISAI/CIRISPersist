@@ -1602,12 +1602,12 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
     use crate::schema::SchemaVersion;
     use crate::scrub::NullScrubber;
-    use crate::store::{decompose, MemoryBackend};
+    use crate::store::{decompose, SqliteBackend};
     use crate::verify::PythonJsonDumpsCanonicalizer;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -1672,7 +1672,7 @@ mod tests {
     /// world that does not exist.
     ///
     /// Deterministic seed, matching the signer the trace fixtures use.
-    async fn seed_test_pqc_key(backend: &MemoryBackend) {
+    async fn seed_test_pqc_key(backend: &SqliteBackend) {
         use ciris_keyring::PqcSigner;
         let mldsa =
             ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&[0x77; 32], "test-mldsa")
@@ -1834,7 +1834,7 @@ mod tests {
         let (bytes, key_id, vkey) =
             make_signed_batch_bytes_with_cohort("community", Some("community-key:lens-alpha"))
                 .await;
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         backend.add_public_key(&key_id, vkey);
         seed_test_pqc_key(&backend).await;
 
@@ -1875,7 +1875,7 @@ mod tests {
     async fn write_gate_refuses_non_member_community_zero_writes() {
         let (bytes, key_id, vkey) =
             make_signed_batch_bytes_with_cohort("community", Some("community-key:not-mine")).await;
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         backend.add_public_key(&key_id, vkey);
         seed_test_pqc_key(&backend).await;
 
@@ -1921,7 +1921,7 @@ mod tests {
     async fn write_gate_unresolved_roster_is_retryable_797() {
         let (bytes, key_id, vkey) =
             make_signed_batch_bytes_with_cohort("community", Some("community-key:unseen")).await;
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         backend.add_public_key(&key_id, vkey);
         seed_test_pqc_key(&backend).await;
         let (signer, signer_key_id) = make_test_signer().await;
@@ -1956,7 +1956,7 @@ mod tests {
     async fn write_gate_admits_member_community_persists() {
         let (bytes, key_id, vkey) =
             make_signed_batch_bytes_with_cohort("community", Some("community-key:mine")).await;
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         backend.add_public_key(&key_id, vkey);
         seed_test_pqc_key(&backend).await;
 
@@ -1995,7 +1995,7 @@ mod tests {
         // target — the substrate must ignore it and stamp the signer.
         let (bytes, key_id, vkey) =
             make_signed_batch_bytes_with_cohort("self", Some("victim-identity-forged")).await;
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         backend.add_public_key(&key_id, vkey);
         seed_test_pqc_key(&backend).await;
 
@@ -2048,7 +2048,7 @@ mod tests {
             "fixture must omit cohort fields on the wire"
         );
 
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         backend.add_public_key(&key_id, vkey);
         seed_test_pqc_key(&backend).await;
         let (signer, signer_key_id) = make_test_signer().await;
@@ -2082,7 +2082,7 @@ mod tests {
         // scrub (null) + decompose + backend (memory). Every layer
         // must succeed with mission-aligned outcome counts.
         let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         backend.add_public_key(&key_id, vkey);
         seed_test_pqc_key(&backend).await;
 
@@ -2296,7 +2296,7 @@ mod tests {
         }
 
         let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         backend.add_public_key(&key_id, vkey);
         seed_test_pqc_key(&backend).await;
         let (signer, signer_key_id) = make_test_signer().await;
@@ -2351,7 +2351,7 @@ mod tests {
         // Mission category §4 "Idempotency": replaying the same batch
         // bytes results in 0 inserts + N conflicts the second time.
         let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         backend.add_public_key(&key_id, vkey);
         seed_test_pqc_key(&backend).await;
 
@@ -2379,7 +2379,7 @@ mod tests {
     async fn envelope_native_trace_mints_scores_attestation_and_replays_idempotently() {
         use crate::federation::FederationDirectory as _;
         let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         backend.add_public_key(&key_id, vkey);
         seed_test_pqc_key(&backend).await;
 
@@ -2463,7 +2463,7 @@ mod tests {
 
         // ── Node A: real ingest (the same fixture as the mint witness). ──
         let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
-        let node_a = MemoryBackend::new();
+        let node_a = crate::store::test_backend::test_backend();
         node_a.add_public_key(&key_id, vkey);
         seed_test_pqc_key(&node_a).await;
         let (signer, signer_key_id) = make_test_signer().await;
@@ -2586,7 +2586,7 @@ mod tests {
     #[tokio::test]
     async fn envelope_native_mint_skips_honestly_when_producer_unregistered() {
         let (bytes, _key_id, _vkey) = make_signed_batch_bytes().await;
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         // NO key registered anywhere — the true relay shape: authenticity was
         // established upstream (TrustPreVerified skips the lookup), and the
         // producer has not yet federated to THIS node's directory.
@@ -2610,7 +2610,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_json_is_typed_error() {
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         let (signer, signer_key_id) = make_test_signer().await;
         let pipeline = IngestPipeline {
             backend: &backend,
@@ -2636,7 +2636,7 @@ mod tests {
             "trace_level": "generic",
             "trace_schema_version": "9.9.9"
         });
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         let (signer, signer_key_id) = make_test_signer().await;
         let pipeline = IngestPipeline {
             backend: &backend,
@@ -2660,7 +2660,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_signing_key_rejected() {
         let (bytes, key_id, _vkey) = make_signed_batch_bytes().await;
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         // No key registered → verify must reject with UnknownKey.
         let (signer, signer_key_id) = make_test_signer().await;
         let pipeline = IngestPipeline {
@@ -2686,7 +2686,7 @@ mod tests {
         let (bytes, key_id, _vkey) = make_signed_batch_bytes().await;
         // Wire a *different* key for the same key_id.
         let other_sk = SigningKey::from_bytes(&[0x99; 32]);
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         backend.add_public_key(&key_id, other_sk.verifying_key());
         seed_test_pqc_key(&backend).await;
 
@@ -2723,7 +2723,7 @@ mod tests {
     #[tokio::test]
     async fn skip_verify_persists_without_directory_lookup() {
         let (bytes, key_id, _vkey) = make_signed_batch_bytes().await;
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         // Intentionally register NO public key: a `Full`-mode ingest
         // would fail at step 2 with `UnknownKey`.
 
@@ -2794,7 +2794,7 @@ mod tests {
         let (bytes, key_id, _vkey) = make_signed_batch_bytes().await;
         // Register a *different* key for the same key_id → mismatch.
         let other_sk = SigningKey::from_bytes(&[0x99; 32]);
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         backend.add_public_key(&key_id, other_sk.verifying_key());
         seed_test_pqc_key(&backend).await;
 
@@ -2908,7 +2908,7 @@ mod tests {
             "trace_schema_version": "2.7.9",
         });
 
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         backend.add_public_key(key_id, sk.verifying_key());
         seed_test_pqc_key(&backend).await;
         let (signer, signer_key_id) = make_test_signer().await;
@@ -2972,7 +2972,7 @@ mod tests {
             "trace_level": "generic",
             "trace_schema_version": "2.7.0"
         });
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         let (signer, signer_key_id) = make_test_signer().await;
         let pipeline = IngestPipeline {
             backend: &backend,
@@ -3023,7 +3023,8 @@ mod tests {
     // ───────────────────────────────────────────────────────────────
     // v7.2.0 (CIRISPersist#225) — the trace-tier hybrid hard cut.
     // CEG 1.0-RC7 §10.1.5.1.1 + CIRISVerify#75. These four tests prove
-    // the cut against the MemoryBackend; the PG + SQLite mirror lives in
+    // the cut against the in-memory SQLite test backend; the PG + SQLite
+    // mirror lives in
     // tests/trace_hybrid_hard_cut.rs (both backends, V083 round-trip).
     // ───────────────────────────────────────────────────────────────
 
@@ -3032,7 +3033,7 @@ mod tests {
     #[tokio::test]
     async fn full_mode_hybrid_trace_admitted_and_both_halves_stored() {
         let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         backend.add_public_key(&key_id, vkey);
         seed_test_pqc_key(&backend).await;
 
@@ -3129,7 +3130,7 @@ mod tests {
             "trace_schema_version": "2.7.0",
         });
 
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         backend.add_public_key(key_id, sk.verifying_key());
         seed_test_pqc_key(&backend).await;
         let (signer, signer_key_id) = make_test_signer().await;
@@ -3218,7 +3219,7 @@ mod tests {
             "trace_schema_version": "2.7.legacy",
         });
 
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         // Intentionally register NO key — TrustPreVerified skips lookup
         // AND the hybrid gate; a clean persist proves the carve-out.
         let (signer, signer_key_id) = make_test_signer().await;
@@ -3255,7 +3256,7 @@ mod tests {
     #[tokio::test]
     async fn stored_hybrid_signature_verifies_both_halves_on_read() {
         let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         backend.add_public_key(&key_id, vkey);
         seed_test_pqc_key(&backend).await;
         let (signer, signer_key_id) = make_test_signer().await;

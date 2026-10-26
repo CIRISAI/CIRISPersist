@@ -1,0 +1,34 @@
+# Mutation scope: v60 slice S4 — the consent and sweep planes on one plan
+# (CIRISPersist#934 step 4, CIRISPersist#1105; docs/V60_TASK_PLAN.md §4 S4).
+#
+# - The plans: `consent_admit` (the consent-role and trust-grant plans and
+#   the consent read folds) and `sweep_plan` (the PQC sweep's selection, the
+#   reaper's selection, the known-hash eviction report, the room leg's
+#   predicate), whole files; the #1105 holdings read in `key_plane`; the
+#   key-grant doors' shared bodies in `key_grant`; the observation prune
+#   plan in `retention`.
+# - The executors: each backend's `ConsentStore`, `SweepStore`,
+#   `RoomEvictionStore` and #1105 `KeyPlaneStore` read, the retention
+#   executors, and the doors that call the plans.
+# - Witnesses: I1192–I1201 (sqlite, postgres; I1199 / I1200 also
+#   unit), and the doors' standing witnesses: I169 (consent by principals),
+#   the consent_role round trips, the #721 trust doors, the hybrid-pending
+#   listings, the #768 reaper, the #785 known-hash ageing, I757 (the room
+#   leg on sqlite and postgres), #767 / #776 (the observation prunes on
+#   sqlite), and the key-grant doors' witnesses: the #1065 signer-is-author
+#   gate on the held-state leg (grant_scope_invariants, I591 / I596) and the
+#   projection end to end (I61, I800 on sqlite and postgres) and through the
+#   replicated door (I743, sqlite and postgres).
+#
+# Grammar: docs/MUTATION_TESTING.md "Scope files".
+tests: test(/consent_sweep_plan_invariants::|consent_sweep_principals_invariants::|consent_role_(round_trip|oq1)|trust_grant_rejects|trust_grant_then_lookup|trust_doors_refuse_the_unproven|trust_pg_grant_lookup|hybrid_pending|reaper_purges_expired|known_hash_ageing_and_eviction|stream_epoch_dek_invariants::.*i757|transport_prune_spares|observation_prunes_are_bounded|grant_scope_invariants::|key_grant_invariants::.*(i61_end_to_end|i800_the_blob_arrival_race)|key_grant_rows_invariants::.*i743/)
+
+src/federation/consent_admit.rs
+src/federation/sweep_plan.rs
+src/federation/key_plane.rs check_key_plane_holdings_family render plan_key_plane_holdings list_key_plane_wire_hashes_planned
+src/federation/key_grant.rs held_owner project_if_key_grant_row
+src/retention/mod.rs plan_observation_prune keep_predicate name render
+src/retention/sqlite.rs prune_observation_table_sqlite prune_announced_peers_not_seen_since_sqlite prune_transport_destinations_not_seen_since_sqlite
+src/retention/postgres.rs prune_observation_table_pg prune_announced_peers_not_seen_since_pg prune_transport_destinations_not_seen_since_pg
+src/store/sqlite.rs store_planned_consent_role store_planned_trust_grant read_consent_peer_rows read_live_consent_grant_candidates read_consent_revocation_candidates read_hybrid_pending read_expired_attestation_ids evict_known_wire_hashes_before evict_selected_room_epochs read_key_plane_wire_hashes sqlite_binds set_consent_role grant_trust list_consent_peers list_consent_peers_for list_live_consent_grants_by list_live_consent_grants_for list_consent_revocations list_hybrid_pending_keys list_hybrid_pending_attestations list_expired_attestation_ids evict_known_wire_hashes stream_dek_evict_room_chunks key_grant_held_owner project_key_grant_row list_key_plane_wire_hashes_since
+src/store/postgres.rs store_planned_consent_role store_planned_trust_grant read_consent_peer_rows read_live_consent_grant_candidates read_consent_revocation_candidates read_hybrid_pending read_expired_attestation_ids evict_known_wire_hashes_before evict_selected_room_epochs read_key_plane_wire_hashes pg_params pg_query_statement set_consent_role grant_trust list_consent_peers list_consent_peers_for list_live_consent_grants_by list_live_consent_grants_for list_consent_revocations list_hybrid_pending_keys list_hybrid_pending_attestations list_expired_attestation_ids evict_known_wire_hashes stream_dek_evict_room_chunks key_grant_held_owner project_key_grant_row list_key_plane_wire_hashes_since

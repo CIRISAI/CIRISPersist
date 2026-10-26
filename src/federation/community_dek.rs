@@ -1566,6 +1566,7 @@ pub mod orchestrate {
                         "reason": "no_valid_encryption_pubkeys",
                     }),
                     emitted_at: observed_at,
+                    emitter_key_id: String::new(),
                 },
             )
             .await

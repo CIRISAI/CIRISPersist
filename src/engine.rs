@@ -3903,11 +3903,11 @@ impl Engine {
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(b) => {
-                crate::federation::genesis::install_genesis_bundle_roster(&**b, bundle).await
+                crate::federation::genesis::install_genesis_bundle_roster(&**b, &**b, bundle).await
             }
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => {
-                crate::federation::genesis::install_genesis_bundle_roster(&**b, bundle).await
+                crate::federation::genesis::install_genesis_bundle_roster(&**b, &**b, bundle).await
             }
         }
     }
@@ -4794,6 +4794,13 @@ impl Engine {
     /// general multi-parent `delegates_to` and is untouched by the gate. Any
     /// other purpose value is treated as a general delegation.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    ///
+    /// v60.0.0 (CIRISPersist#1048, CC 2.4, CIRISConstitution#163) — `term` is
+    /// signed onto the edge (`delegation_valid_from` / `delegation_valid_until`).
+    /// An edge carrying `license`, `grant`, `moderate`, `takedown`, `review` or
+    /// `slash`, or `sub_delegation`, MUST carry a `valid_until` at most one
+    /// year after its start; without one it is refused
+    /// `federation_delegation_term_required`. Renewal is a fresh grant.
     pub async fn grant_delegation(
         &self,
         signer: &crate::signing::LocalSigner,
@@ -4801,8 +4808,9 @@ impl Engine {
         scopes: Vec<String>,
         sub_delegation: bool,
         delegation_purpose: Option<&str>,
+        term: crate::federation::admission::DelegationTermBounds,
     ) -> Result<String, crate::federation::Error> {
-        let envelope = match delegation_purpose {
+        let mut envelope = match delegation_purpose {
             // The owner-binding sub-relation (CC 3.2): single-valued ownership,
             // gated by check_single_node_owner_admission. `sub_delegation` is
             // ignored (an owner-binding is a leaf, never a deputization).
@@ -4811,6 +4819,8 @@ impl Engine {
             }
             _ => crate::federation::delegates_to_envelope(delegate_key_id, &scopes, sub_delegation),
         };
+        // v60.0.0 (CIRISPersist#1048) — the term is signed onto the edge.
+        term.stamp(&mut envelope);
         let mut input = crate::federation::EmitAttestationInput::with_envelope(
             crate::federation::types::attestation_type::DELEGATES_TO,
             crate::federation::envelope::EnvelopeCore::from_value(envelope)
@@ -4864,6 +4874,7 @@ impl Engine {
             infra_scopes,
             false,
             delegation_purpose,
+            crate::federation::admission::DelegationTermBounds::default(),
         )
         .await
     }
@@ -4974,20 +4985,33 @@ impl Engine {
     /// may further-deputize within the duty (§11.10 deputization). Returns
     /// the `attestation_id`.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    ///
+    /// v60.0.0 (CIRISPersist#1048, CC 4.4.3.2.8 C) — an appointment decays:
+    /// `term` MUST carry a `valid_until` at most one year after its start (and
+    /// within an affiliation's `role_term`), or the edge is refused
+    /// `federation_delegation_term_required`. Renewal is a fresh appointment.
     pub async fn add_moderator(
         &self,
         signer: &crate::signing::LocalSigner,
         community_id: &str,
         moderator_key_id: &str,
         duty: &str,
+        term: crate::federation::admission::DelegationTermBounds,
     ) -> Result<String, crate::federation::Error> {
         // `community_id` is intentionally not stamped on the edge: the
         // §11.10 walk binds a moderator to a community by reaching it from
         // the community's authority roots, not by a field match. Bind it in
         // the debug log so the appointment is traceable.
         let _ = community_id;
-        self.grant_delegation(signer, moderator_key_id, vec![duty.to_owned()], true, None)
-            .await
+        self.grant_delegation(
+            signer,
+            moderator_key_id,
+            vec![duty.to_owned()],
+            true,
+            None,
+            term,
+        )
+        .await
     }
 
     /// v9.3.0 (CIRISPersist#249, CEG §3.2.3 / FSD-002 §2.2.3 withdraws) —
@@ -9303,8 +9327,10 @@ impl Engine {
     }
 
     /// v55.0.0 (CIRISPersist#1007; CC 4.5.3 step 2, CC 4.5.5, CC 2.3) — **take
-    /// content down on the bytes plane** under a signed `takedown_notice`
-    /// Contribution. The notice's signature is verified and CC 4.5.5 is asked
+    /// content down on the bytes plane** under a signed
+    /// `takedown_notice:{basis}:v1` row (v60.0.0, CIRISPersist#803;
+    /// [`TakedownNotice::of_row`](crate::federation::takedown_tombstone::TakedownNotice::of_row)).
+    /// The row's signature is verified and CC 4.5.5 is asked
     /// of this node's own state (the signer holds the `takedown` duty over the
     /// content); then ONE tombstone, `blob:{content_sha256}`, is recorded on
     /// the steward purge's tombstone row, which withholds the bytes from every
@@ -10059,9 +10085,15 @@ impl Engine {
         crate::federation::verify_key_registration(directory.as_ref(), &record.record).await?;
         match &self.backend {
             #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(b) => b.adopt_scrub_upgrade(record).await,
+            BackendDispatch::Postgres(b) => {
+                crate::federation::FederationDirectory::adopt_scrub_upgrade(b.as_ref(), record)
+                    .await
+            }
             #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(b) => b.adopt_scrub_upgrade(record).await,
+            BackendDispatch::Sqlite(b) => {
+                crate::federation::FederationDirectory::adopt_scrub_upgrade(b.as_ref(), record)
+                    .await
+            }
         }
     }
 
@@ -11034,121 +11066,6 @@ impl Engine {
         }
     }
 
-    /// v6.3.0 (CIRISPersist#135, Lane C) — takedowns claimed against a
-    /// given `target_content_sha256` (the target of the moderation
-    /// claim), cursor-paged + filterable.
-    ///
-    /// CIRISLensCore#29.4's takedown-abuse detector reads per-target to
-    /// catch "single claimant emitting many takedowns against one
-    /// target" — set [`TakedownFilter::claimant_key_id`](crate::cirisnode::TakedownFilter)
-    /// for the per-target × per-claimant slice. Composes over
-    /// [`NodeCoreService::list_takedowns_for`](crate::cirisnode::NodeCoreService::list_takedowns_for)
-    /// (the V054-indexed `media_content_sha256` read, already
-    /// newest-first by `submitted_at DESC, contribution_id DESC`) then
-    /// AND-applies the claimant + `[since, until)` window and advances a
-    /// [`ListCursor`](crate::cirisnode::ListCursor) on the same
-    /// `(submitted_at, contribution_id)` tuple — the deterministic
-    /// ordering that storage query already emits, identical to
-    /// `list_contributions`'s cursor shape.
-    ///
-    /// The claimant secondary key lives in the Contribution `payload`
-    /// JSONB (`payload.claimant_key_id`), not an indexed column, so it is
-    /// applied in the facade over the already-bounded per-target row set
-    /// — avoiding a backend-divergent JSON-path predicate while keeping
-    /// both backends behaviourally identical (parity is structural: the
-    /// only SQL is the parametrized storage query).
-    #[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
-    pub async fn list_takedowns_for(
-        &self,
-        target_content_sha256: &str,
-        filter: crate::cirisnode::TakedownFilter,
-        cursor: Option<crate::cirisnode::ListCursor>,
-        limit: i64,
-    ) -> Result<crate::cirisnode::TakedownListPage, crate::cirisnode::Error> {
-        use crate::cirisnode::NodeCoreService;
-        media_validate_limit(limit)?;
-        let svc = self.node_core_service();
-        let rows = match &svc {
-            #[cfg(feature = "postgres")]
-            NodeCoreDispatch::Postgres(b) => b.list_takedowns_for(target_content_sha256).await?,
-            #[cfg(feature = "sqlite")]
-            NodeCoreDispatch::Sqlite(b) => b.list_takedowns_for(target_content_sha256).await?,
-        };
-        let claimant = filter.claimant_key_id.as_deref();
-        let kept = rows.into_iter().filter(|env| {
-            if let Some(c) = claimant {
-                if env.payload.get("claimant_key_id").and_then(|v| v.as_str()) != Some(c) {
-                    return false;
-                }
-            }
-            media_in_window(env.submitted_at, filter.since, filter.until)
-        });
-        let (items, next_cursor) = media_apply_cursor(kept, cursor, limit)?;
-        Ok(crate::cirisnode::TakedownListPage { items, next_cursor })
-    }
-
-    /// v6.3.0 (CIRISPersist#135, Lane C) — key-grants delivered to a
-    /// given `recipient_key_id`, cursor-paged + filterable.
-    ///
-    /// CIRISLensCore#29.3's key_grant-abuse detector reads per-recipient
-    /// to catch "single recipient receiving key_grants from many
-    /// unrelated publishers in a short window" (sybil sample pattern) —
-    /// set [`KeyGrantFilter::publisher_key_id`](crate::cirisnode::KeyGrantFilter)
-    /// for the per-recipient × per-publisher slice. Composes over
-    /// [`NodeCoreService::list_key_grants_for`](crate::cirisnode::NodeCoreService::list_key_grants_for)
-    /// — or the two-axis
-    /// [`list_key_grants_for_content`](crate::cirisnode::NodeCoreService::list_key_grants_for_content)
-    /// V054 index path when [`KeyGrantFilter::content_sha256`](crate::cirisnode::KeyGrantFilter)
-    /// pins a content hash — then AND-applies the publisher
-    /// (`author_id`) + `[since, until)` window and advances a
-    /// [`ListCursor`](crate::cirisnode::ListCursor) on the same
-    /// `(submitted_at, contribution_id)` tuple the storage query emits.
-    ///
-    /// The publisher secondary key is the top-level Contribution
-    /// `author_id`; the window filters `submitted_at` — both applied in
-    /// the facade over the already-bounded per-recipient row set, so the
-    /// only SQL is the parametrized storage query and both backends are
-    /// behaviourally identical.
-    #[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
-    pub async fn list_key_grants_for(
-        &self,
-        recipient_key_id: &str,
-        filter: crate::cirisnode::KeyGrantFilter,
-        cursor: Option<crate::cirisnode::ListCursor>,
-        limit: i64,
-    ) -> Result<crate::cirisnode::KeyGrantListPage, crate::cirisnode::Error> {
-        use crate::cirisnode::NodeCoreService;
-        media_validate_limit(limit)?;
-        let svc = self.node_core_service();
-        let rows = match (&svc, filter.content_sha256.as_deref()) {
-            #[cfg(feature = "postgres")]
-            (NodeCoreDispatch::Postgres(b), Some(sha)) => {
-                b.list_key_grants_for_content(sha, recipient_key_id).await?
-            }
-            #[cfg(feature = "postgres")]
-            (NodeCoreDispatch::Postgres(b), None) => {
-                b.list_key_grants_for(recipient_key_id).await?
-            }
-            #[cfg(feature = "sqlite")]
-            (NodeCoreDispatch::Sqlite(b), Some(sha)) => {
-                b.list_key_grants_for_content(sha, recipient_key_id).await?
-            }
-            #[cfg(feature = "sqlite")]
-            (NodeCoreDispatch::Sqlite(b), None) => b.list_key_grants_for(recipient_key_id).await?,
-        };
-        let publisher = filter.publisher_key_id.as_deref();
-        let kept = rows.into_iter().filter(|env| {
-            if let Some(p) = publisher {
-                if env.author_id != p {
-                    return false;
-                }
-            }
-            media_in_window(env.submitted_at, filter.since, filter.until)
-        });
-        let (items, next_cursor) = media_apply_cursor(kept, cursor, limit)?;
-        Ok(crate::cirisnode::KeyGrantListPage { items, next_cursor })
-    }
-
     /// v31.0.0 (CIRISPersist#658) — the `subscribe_detection_events` polling
     /// cadence, hoisted out of that function's body.
     ///
@@ -11278,110 +11195,6 @@ impl Engine {
 
         tokio_stream::wrappers::ReceiverStream::new(rx)
     }
-}
-
-// ─── Media-detector read-facade helpers (v6.3.0, CIRISPersist#135) ──
-//
-// Shared by [`Engine::list_takedowns_for`] / [`Engine::list_key_grants_for`].
-// Both compose over the existing unpaged `NodeCoreService` listers
-// (V054-indexed, newest-first `submitted_at DESC, contribution_id DESC`)
-// and apply the filter + cursor in-facade. The cursor scheme mirrors
-// `list_contributions` exactly: a `(submitted_at, contribution_id)`
-// tuple, DESC, with `contribution_id` as the unique tiebreaker — so a
-// page boundary is deterministic even when many rows share a
-// `submitted_at`.
-
-/// Bound the page `limit` to the same `[1, 10000]` range the
-/// `list_contributions` / `list_votes` storage paths enforce.
-#[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
-pub(crate) fn media_validate_limit(limit: i64) -> Result<(), crate::cirisnode::Error> {
-    if !(1..=10_000).contains(&limit) {
-        return Err(crate::cirisnode::Error::InvalidArgument(format!(
-            "limit must be in [1, 10000], got {limit}"
-        )));
-    }
-    Ok(())
-}
-
-/// Half-open `[since, until)` window test on a row `submitted_at`.
-#[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
-pub(crate) fn media_in_window(
-    ts: chrono::DateTime<chrono::Utc>,
-    since: Option<chrono::DateTime<chrono::Utc>>,
-    until: Option<chrono::DateTime<chrono::Utc>>,
-) -> bool {
-    if let Some(s) = since {
-        if ts < s {
-            return false;
-        }
-    }
-    if let Some(u) = until {
-        if ts >= u {
-            return false;
-        }
-    }
-    true
-}
-
-/// Advance the `(submitted_at, contribution_id)`-DESC cursor over an
-/// already newest-first iterator, returning one capped page + the
-/// `next_cursor` (`Some` iff the page filled to `limit`, mirroring
-/// `list_contributions`). Validates the cursor version (`v1` only).
-#[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
-pub(crate) fn media_apply_cursor(
-    rows: impl Iterator<Item = crate::cirisnode::ContributionEnvelope>,
-    cursor: Option<crate::cirisnode::ListCursor>,
-    limit: i64,
-) -> Result<
-    (
-        Vec<crate::cirisnode::ContributionEnvelope>,
-        Option<crate::cirisnode::ListCursor>,
-    ),
-    crate::cirisnode::Error,
-> {
-    // Cursor predicate: in DESC `(submitted_at, contribution_id)` order,
-    // keep rows STRICTLY past the trailing row — i.e.
-    // `submitted_at < last_ts OR (submitted_at == last_ts AND
-    // contribution_id < last_id)`. Identical tuple-compare to the
-    // `list_contributions` SQL `WHERE` clause.
-    let after = match cursor {
-        None => None,
-        Some(c) => {
-            if c.version != "v1" {
-                return Err(crate::cirisnode::Error::InvalidArgument(format!(
-                    "ListCursor version {} unsupported (expected v1)",
-                    c.version
-                )));
-            }
-            Some((c.last_ts, c.last_id))
-        }
-    };
-    let mut items: Vec<crate::cirisnode::ContributionEnvelope> = Vec::new();
-    let cap = limit as usize;
-    for env in rows {
-        if let Some((last_ts, last_id)) = &after {
-            let past = env.submitted_at < *last_ts
-                || (env.submitted_at == *last_ts && env.contribution_id < *last_id);
-            if !past {
-                continue;
-            }
-        }
-        items.push(env);
-        if items.len() == cap {
-            break;
-        }
-    }
-    let next_cursor = if items.len() == cap {
-        items.last().map(|last| {
-            crate::cirisnode::ListCursor::from_trailing(
-                last.submitted_at,
-                last.contribution_id.clone(),
-            )
-        })
-    } else {
-        None
-    };
-    Ok((items, next_cursor))
 }
 
 /// v2.0 (CIRISPersist#93) — per-backend
@@ -12919,93 +12732,29 @@ mod tests {
         assert!(matches!(err, IngestError::Verify(_)), "got: {err:?}");
     }
 
-    /// v1.11.0 (CIRISPersist#90) — `Engine::node_core_service` returns
-    /// the SQLite dispatch variant and a `put_contribution` /
-    /// `list_contributions` round-trips through it.
-    // v31.3.0 (CIRISPersist#678) — the name is not decoration: this asserts the
-    // SQLITE dispatch variant, so it needs sqlite, not "some backend". Gated on
-    // the union it compiled only because every leg carries both.
+    /// v1.11.0 (CIRISPersist#90) — `Engine::node_core_service` returns the
+    /// SQLite dispatch variant, and a ledger read round-trips through it.
+    /// v60.0.0 — the typed `put_contribution` is gone (a Contribution is a
+    /// row); the dispatch serves the ledger projections.
     #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
     #[tokio::test]
     async fn node_core_service_sqlite_round_trip() {
-        use crate::cirisnode::{
-            Cell, ContributionEnvelope, ContributionType, ContributionsFilter, HybridSignature,
-            NodeCoreService,
-        };
-        use base64::engine::general_purpose::STANDARD as B64;
-        use base64::Engine as _;
-        use chrono::Utc;
-        use ed25519_dalek::{Signer as _, SigningKey};
-        use uuid::Uuid;
-
+        use crate::cirisnode::NodeCoreService;
         let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
             .await
             .expect("construct engine");
-
-        let dispatch = engine.node_core_service();
-        // v31.3.0 (CIRISPersist#678) — the POSTGRES arm was gated and the
-        // SQLITE arm was not, so `--features cirisnode,postgres` referenced a
-        // variant that does not exist there. Asymmetric gating on the two arms
-        // of one match is invisible to any build that has both.
-        //
-        // v34.0.0 — and the SYMMETRIC form had the mirror-image blindness: as a
-        // `match`, the postgres arm disappears under `sqlite,cirisnode` and the
-        // remaining single arm is `clippy::infallible_destructuring_match`, a
-        // DENY-level error that no build carrying both features can see. The
-        // arm count here is feature-dependent, so the construct must be one
-        // that reads the same at every arity. `let`-else is: irrefutable when
-        // sqlite is the only backend, refutable and panicking when it is not.
+        // v34.0.0 — `let`-else reads the same at every arity of the
+        // feature-dependent match (CIRISPersist#678).
         #[allow(irrefutable_let_patterns)]
-        let NodeCoreDispatch::Sqlite(backend) = dispatch
-        else {
+        let NodeCoreDispatch::Sqlite(backend) = engine.node_core_service() else {
             panic!("expected sqlite NodeCore variant")
         };
-
-        // Build + sign a Contribution envelope (the contributor's
-        // pubkey IS the author_id, per SCHEMA.md §2.2).
-        let author_key = SigningKey::from_bytes(&[0xA1; 32]);
-        let author = B64.encode(author_key.verifying_key().to_bytes());
-        let domain = format!("engine90-dom-{}", Uuid::new_v4());
-        let mut env = ContributionEnvelope {
-            contribution_id: Uuid::new_v4().to_string(),
-            contribution_type: ContributionType::Proposal,
-            author_id: author.clone(),
-            subject: Cell {
-                domain: domain.clone(),
-                language: "en".into(),
-                subject: Some("arc_question".into()),
-            },
-            payload: serde_json::json!({"question_id": "engine90_q01"}),
-            witness_set: None,
-            signature: HybridSignature {
-                ed25519: String::new(),
-                ml_dsa_65: None,
-                signed_at: Utc::now(),
-            },
-            submitted_at: Utc::now(),
-        };
-        let canonical =
-            crate::cirisnode::verify::canonical_bytes_for_envelope(&env).expect("canonical bytes");
-        env.signature.ed25519 = B64.encode(author_key.sign(&canonical).to_bytes());
-
-        backend
-            .put_contribution(env.clone())
+        let got = backend
+            .get_credits_ledger("nobody", "health", "en", "arc_question")
             .await
-            .expect("put_contribution through NodeCoreDispatch");
-
-        let page = backend
-            .list_contributions(
-                ContributionsFilter {
-                    domain: Some(domain.clone()),
-                    ..Default::default()
-                },
-                None,
-                10,
-            )
-            .await
-            .expect("list_contributions through NodeCoreDispatch");
-        assert_eq!(page.items.len(), 1, "the contribution we inserted");
-        assert_eq!(page.items[0].contribution_id, env.contribution_id);
+            .expect("a ledger read through NodeCoreDispatch");
+        assert!(got.is_none());
+        assert!(backend.legacy_ledger_rows().await.unwrap().is_empty());
     }
 
     /// v2.0 (CIRISPersist#93) — `Engine::audit_service` returns the
@@ -15314,6 +15063,113 @@ mod tests {
     }
 
     // ─── v3.4.0 (CIRISPersist#123) — sweeper integration tests ─────
+
+    /// **I1233** (v60.0.0, CIRISPersist#1048) — the producer doors sign the
+    /// term they are given, and a term-bearing edge minted without one is
+    /// refused `federation_delegation_term_required` (CC refuses a perpetual
+    /// edge rather than supplying a default term). Kills: `grant_delegation`
+    /// dropping `term` (the termed grants would be refused `term_missing`).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i1233_producer_doors_sign_the_term_sqlite() {
+        use crate::federation::admission::{DelegationTermBounds, DELEGATION_VALID_UNTIL_FIELD};
+        use crate::federation::FederationDirectory;
+        let signer = crate::federation::tier_ingest::test_support::local_signer("i1233-granter");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "i1233-granter"))
+            .await
+            .expect("seed granter");
+        for k in ["i1233-a", "i1233-b", "i1233-m"] {
+            sq.put_public_key(sweeper_test_key(k)).await.expect("seed");
+        }
+        let term_missing = |r: Result<String, crate::federation::Error>, what: &str| match r {
+            Err(crate::federation::Error::DelegationTermRequired { rule, .. }) => {
+                assert_eq!(rule, "term_missing", "{what}");
+            }
+            other => panic!("{what}: expected delegation_term_required, got {other:?}"),
+        };
+        term_missing(
+            engine
+                .grant_delegation(
+                    &signer,
+                    "i1233-a",
+                    vec!["grant".into()],
+                    false,
+                    None,
+                    DelegationTermBounds::default(),
+                )
+                .await,
+            "I1233: grant_delegation(grant) with no term",
+        );
+        term_missing(
+            engine
+                .add_moderator(
+                    &signer,
+                    "c",
+                    "i1233-m",
+                    "moderate",
+                    DelegationTermBounds::default(),
+                )
+                .await,
+            "I1233: add_moderator with no term",
+        );
+        let until = chrono::Utc::now() + chrono::Duration::days(90);
+        let id = engine
+            .grant_delegation(
+                &signer,
+                "i1233-b",
+                vec!["grant".into()],
+                false,
+                None,
+                DelegationTermBounds::until(until),
+            )
+            .await
+            .expect("I1233: a termed grant admits");
+        let row = sq.get_attestation(&id).await.unwrap().expect("row");
+        assert_eq!(
+            row.attestation_envelope[DELEGATION_VALID_UNTIL_FIELD],
+            serde_json::json!(until.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+            "I1233: the term is signed onto the edge, canonical (CC 2.6.2)"
+        );
+        engine
+            .add_moderator(
+                &signer,
+                "c",
+                "i1233-m",
+                "moderate",
+                DelegationTermBounds::until(until),
+            )
+            .await
+            .expect("I1233: a termed appointment admits");
+        // A purpose other than the owner-binding's is a general delegation:
+        // it keeps its `sub_delegation`. Kills: the owner-binding arm's
+        // guard matching every purpose (an owner-binding drops it).
+        let general = engine
+            .grant_delegation(
+                &signer,
+                "i1233-a",
+                vec!["grant".into()],
+                true,
+                Some("not_an_owner_binding"),
+                DelegationTermBounds::until(until),
+            )
+            .await
+            .expect("I1233: a general delegation with an unknown purpose admits");
+        let row = sq
+            .get_attestation(&general)
+            .await
+            .expect("read")
+            .expect("stored");
+        assert_eq!(
+            row.attestation_envelope["sub_delegation"],
+            serde_json::Value::Bool(true),
+            "I1233: an unknown purpose is a general delegation"
+        );
+    }
 
     /// Build a SignedKeyRecord whose key_id and scrub_key_id are
     /// self-referential so the FK constraints land cleanly.
@@ -18624,9 +18480,17 @@ mod tests {
             .emit_attestation_self(bad)
             .await
             .expect_err("uppercase subject_key_id must be refused (#293)");
+        // v60.0.0 (CIRISPersist#1114) — typed out of `InvalidArgument` (the
+        // same Python ValueError) under its own reason.
         assert!(
-            matches!(err, crate::federation::Error::InvalidArgument(_)),
-            "expected InvalidArgument, got {err:?}"
+            matches!(
+                err,
+                crate::federation::Error::MalformedRow {
+                    reason: crate::federation::malformed_row::SUBJECT_KEY_ID_MALFORMED,
+                    ..
+                }
+            ),
+            "expected subject_key_id_malformed, got {err:?}"
         );
 
         // The canonical lowercase form of the SAME id is admitted — the rule
@@ -19127,6 +18991,9 @@ mod tests {
                 vec!["message_io".into(), "review".into()],
                 true,
                 None,
+                crate::federation::admission::DelegationTermBounds::until(
+                    chrono::Utc::now() + chrono::Duration::days(90),
+                ),
             )
             .await
             .expect("grant_delegation");
@@ -19207,6 +19074,7 @@ mod tests {
                 vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
                 false,
                 None,
+                crate::federation::admission::DelegationTermBounds::default(),
             )
             .await
             .unwrap_err();
@@ -19729,6 +19597,7 @@ mod tests {
                 vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
                 false,
                 None,
+                crate::federation::admission::DelegationTermBounds::default(),
             )
             .await
             .expect_err("an unproven granter cannot steward a minor");
@@ -19764,6 +19633,7 @@ mod tests {
                 vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
                 false,
                 None,
+                crate::federation::admission::DelegationTermBounds::default(),
             )
             .await
             .expect("adult-user → proven-minor guardianship is ADMITTED (CC 3.2)");
@@ -19808,6 +19678,7 @@ mod tests {
                 vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
                 false,
                 None,
+                crate::federation::admission::DelegationTermBounds::default(),
             )
             .await
             .expect("an unmarked delegation to an unverified user is a conferral");
@@ -19919,6 +19790,7 @@ mod tests {
                 vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
                 false,
                 None,
+                crate::federation::admission::DelegationTermBounds::default(),
             )
             .await
             .expect("guardianship admitted on postgres");
@@ -20217,7 +20089,15 @@ mod tests {
 
         // Appoint.
         let appt = engine
-            .add_moderator(&signer, "comm-1", "moderator", SCOPE_MODERATE)
+            .add_moderator(
+                &signer,
+                "comm-1",
+                "moderator",
+                SCOPE_MODERATE,
+                crate::federation::admission::DelegationTermBounds::until(
+                    chrono::Utc::now() + chrono::Duration::days(90),
+                ),
+            )
             .await
             .expect("add_moderator");
         assert!(
@@ -21033,6 +20913,7 @@ mod tests {
     /// all: verify refused any prior protocol that was not `quorum:M/N`), and
     /// the `unanimous` refusal was admitted on a majority. Each refusal leaves
     /// the live record untouched.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn quorum_supersede_protocol_decides_body(
         d: &dyn crate::federation::FederationDirectory,
         s: &str,
@@ -21391,12 +21272,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn quorum_supersede_protocol_decides_memory() {
-        let d = crate::store::memory::MemoryBackend::new();
-        quorum_supersede_protocol_decides_body(&d, "mem").await;
-    }
-
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn quorum_supersede_protocol_decides_sqlite() {
@@ -21537,6 +21412,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::COMMUNITY_MEMBERSHIP_CHANGE.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .expect("list events");
@@ -21622,6 +21498,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::FAMILY_MEMBERSHIP_CHANGE.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .expect("list family events");
@@ -21721,6 +21598,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::DELETION_WINDOW_BREACH.to_string()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .expect("list_hard_case_events");
@@ -21934,7 +21812,15 @@ mod tests {
         seed_community_with_founder(&engine, &community, &derived, &label).await;
 
         let appt = engine
-            .add_moderator(&signer, &community, &moderator, SCOPE_MODERATE)
+            .add_moderator(
+                &signer,
+                &community,
+                &moderator,
+                SCOPE_MODERATE,
+                crate::federation::admission::DelegationTermBounds::until(
+                    chrono::Utc::now() + chrono::Duration::days(90),
+                ),
+            )
             .await
             .expect("add_moderator");
         assert!(
@@ -22177,484 +22063,9 @@ mod tests {
         assert_local_identity_aggregate_conformance(&engine).await;
     }
 
-    // ── v6.3.0 (CIRISPersist#135, Lane C) — media-detector read facades ──
-    //
-    // Engine-level `list_takedowns_for` / `list_key_grants_for` +
-    // `list_attestations`. These exercise the public Rust facade
-    // end-to-end on SQLite (the lib-test backend); the PG twins are
-    // env-gated (compile-checked here, runtime-verified by the lead's
-    // localhost:5433 docker PG). The fixtures sign over the canonical
-    // envelope so `put_contribution` admits them with no trust gate and
-    // no registered author key (author_id == the signing pubkey).
-
-    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
-    fn media_pubkey_b64(key: &SigningKey) -> String {
-        use base64::engine::general_purpose::STANDARD as B64;
-        use base64::Engine as _;
-        use ed25519_dalek::VerifyingKey;
-        let vk: VerifyingKey = key.verifying_key();
-        B64.encode(vk.to_bytes())
-    }
-
-    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
-    fn media_sign(
-        env: &crate::cirisnode::ContributionEnvelope,
-        key: &SigningKey,
-    ) -> crate::cirisnode::HybridSignature {
-        use base64::engine::general_purpose::STANDARD as B64;
-        use base64::Engine as _;
-        use ed25519_dalek::Signer as _;
-        let canonical =
-            crate::cirisnode::verify::canonical_bytes_for_envelope(env).expect("canonical bytes");
-        crate::cirisnode::HybridSignature {
-            ed25519: B64.encode(key.sign(&canonical).to_bytes()),
-            ml_dsa_65: None,
-            signed_at: chrono::Utc::now(),
-        }
-    }
-
-    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
-    fn media_sha_hex(seed: u8) -> String {
-        let mut bytes = [0u8; 32];
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = seed.wrapping_add(i as u8);
-        }
-        hex::encode(bytes)
-    }
-
-    /// Build a signed `takedown_notice` Contribution with a chosen
-    /// claimant + `submitted_at` (so the secondary-key / window / cursor
-    /// axes are controllable).
-    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
-    fn media_build_takedown(
-        author_key: &SigningKey,
-        sha_hex: &str,
-        claimant_key_id: &str,
-        submitted_at: chrono::DateTime<chrono::Utc>,
-    ) -> crate::cirisnode::ContributionEnvelope {
-        use crate::cirisnode::{Cell, ContributionEnvelope, ContributionType, HybridSignature};
-        let author = media_pubkey_b64(author_key);
-        let payload = crate::cirisnode::TakedownNoticePayload {
-            content_sha256: sha_hex.to_owned(),
-            perceptual_hash: None,
-            content_holder_key_ids: vec![],
-            claimant_key_id: claimant_key_id.to_owned(),
-            legal_basis: crate::cirisnode::LegalBasis::Dmca512,
-            jurisdiction: "US".into(),
-            good_faith_statement: "good faith".into(),
-            claim_text: "claim".into(),
-            evidence_refs: vec![],
-            counter_notice_channel: None,
-            asserted_at: submitted_at,
-            expires_at: submitted_at + chrono::Duration::days(30),
-        };
-        // v8.7.1 (#233): the §11.10 gate requires the author to be a
-        // duty-holder over the target. These tests exercise takedown
-        // listing/filtering mechanics, not the moderation gate, so the
-        // author self-declares as a subject of the target (as-self path).
-        let mut payload_json = serde_json::to_value(&payload).unwrap();
-        payload_json["subject_key_ids"] = serde_json::json!([author.clone()]);
-        let mut env = ContributionEnvelope {
-            contribution_id: uuid::Uuid::new_v4().to_string(),
-            contribution_type: ContributionType::Proposal,
-            author_id: author,
-            subject: Cell {
-                domain: format!("media-{}", uuid::Uuid::new_v4()),
-                language: "en".into(),
-                subject: Some(crate::cirisnode::TAKEDOWN_NOTICE_SUBJECT_KIND.into()),
-            },
-            payload: payload_json,
-            witness_set: None,
-            signature: HybridSignature {
-                ed25519: String::new(),
-                ml_dsa_65: None,
-                signed_at: submitted_at,
-            },
-            submitted_at,
-        };
-        env.signature = media_sign(&env, author_key);
-        env
-    }
-
-    /// Build a signed `key_grant` Contribution with a chosen recipient +
-    /// content + `submitted_at`. The grant publisher is `author_key`.
-    #[cfg(all(feature = "cirisnode", feature = "sqlite"))]
-    fn media_build_key_grant(
-        author_key: &SigningKey,
-        sha_hex: &str,
-        recipient_key_id: &str,
-        submitted_at: chrono::DateTime<chrono::Utc>,
-    ) -> crate::cirisnode::ContributionEnvelope {
-        use crate::cirisnode::{Cell, ContributionEnvelope, ContributionType, HybridSignature};
-        let author = media_pubkey_b64(author_key);
-        let payload = crate::cirisnode::KeyGrantPayload {
-            recipient_key_id: recipient_key_id.to_owned(),
-            content_sha256: Some(sha_hex.to_owned()),
-            epoch: None,
-            wrapped_dek_base64: {
-                use base64::Engine as _;
-                base64::engine::general_purpose::STANDARD.encode([0u8; 48])
-            },
-            wrap_algorithm: crate::cirisnode::WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256,
-            ratchet_version: 1,
-            key_validity_window: crate::cirisnode::KeyValidityWindow {
-                not_before: submitted_at,
-                not_after: submitted_at + chrono::Duration::days(30),
-            },
-            scope: crate::cirisnode::KeyGrantScope::SingleContent,
-            scope_id: sha_hex.to_owned(),
-            rotation_chain: vec![],
-            // v34.0.0 (#704) — transit-only; absent on every other scope.
-            ifac_size: None,
-        };
-        let mut env = ContributionEnvelope {
-            contribution_id: uuid::Uuid::new_v4().to_string(),
-            contribution_type: ContributionType::Proposal,
-            author_id: author,
-            subject: Cell {
-                domain: format!("media-{}", uuid::Uuid::new_v4()),
-                language: "en".into(),
-                subject: Some(crate::cirisnode::KEY_GRANT_SUBJECT_KIND.into()),
-            },
-            payload: serde_json::to_value(&payload).unwrap(),
-            witness_set: None,
-            signature: HybridSignature {
-                ed25519: String::new(),
-                ml_dsa_65: None,
-                signed_at: submitted_at,
-            },
-            submitted_at,
-        };
-        env.signature = media_sign(&env, author_key);
-        env
-    }
-
-    /// Seed a contribution through the SQLite NodeCore dispatch the
-    /// Engine facade composes over.
-    #[cfg(all(feature = "sqlite", feature = "cirisnode"))]
-    async fn media_seed(engine: &Engine, env: crate::cirisnode::ContributionEnvelope) {
-        use crate::cirisnode::NodeCoreService;
-        match engine.node_core_service() {
-            NodeCoreDispatch::Sqlite(b) => {
-                b.put_contribution(env).await.expect("seed contribution")
-            }
-            #[cfg(feature = "postgres")]
-            NodeCoreDispatch::Postgres(b) => {
-                b.put_contribution(env).await.expect("seed contribution")
-            }
-        }
-    }
-
-    /// v8.7.2 (#233 follow-on, CEG RC27 §11.10) — seed `producer`'s
-    /// federation key + a content-ESTABLISHING `scores` attestation binding
-    /// `sha_hex` with SIGNED subjects=[producer], through the Engine's
-    /// federation directory. The §11.10 takedown gate resolves subject-self
-    /// authority over THIS, so listing/filtering tests must establish the
-    /// content before filing takedowns (the payload's `subject_key_ids` is
-    /// advisory only).
-    #[cfg(all(feature = "sqlite", feature = "cirisnode"))]
-    async fn media_seed_establishing(engine: &Engine, producer_key: &SigningKey, sha_hex: &str) {
-        let producer = media_pubkey_b64(producer_key);
-        let dir = engine.federation_directory();
-        // v9.0.0 (CC 5.3.2.4.3.1) — register REAL deterministic hybrid
-        // pubkeys + hybrid-sign the establishing content so the ingest
-        // gate admits it. Takedown payloads verify self-contained against
-        // their `author_id` pubkey, not this registered row.
-        let (ed_pk, mldsa_pk) =
-            crate::federation::tier_ingest::test_support::hybrid_pubkeys(&producer);
-        dir.put_public_key(crate::federation::types::SignedKeyRecord {
-            record: crate::federation::types::KeyRecord {
-                key_id: producer.clone(),
-                pubkey_ed25519_base64: ed_pk,
-                pubkey_ml_dsa_65_base64: mldsa_pk,
-                algorithm: crate::federation::types::algorithm::HYBRID.into(),
-                identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
-                identity_ref: producer.clone(),
-                valid_from: "2026-01-01T00:00:00Z".parse().unwrap(),
-                valid_until: None,
-                registration_envelope: serde_json::json!({ "id": producer }),
-                original_content_hash: "deadbeef".into(),
-                scrub_signature_classical: "c2lnbmF0dXJl".into(),
-                scrub_signature_pqc: None,
-                scrub_key_id: producer.clone(),
-                scrub_timestamp: "2026-01-01T00:00:00Z".parse().unwrap(),
-                pqc_completed_at: None,
-                persist_row_hash: String::new(),
-                capability_roles: Vec::new(),
-                // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
-                attestation_evidence: Some(crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence()),
-                consent_role: None,
-                additional_scrubs: Vec::new(),
-            },
-        })
-        .await
-        .map_or_else(
-            |e| match e {
-                // Tolerate an idempotent re-seed on a reused PG (the
-                // PG-twin tests share the lead's docker DB across runs).
-                crate::federation::Error::Conflict(_) => {}
-                other => panic!("seed producer key: {other}"),
-            },
-            |()| {},
-        );
-        let establishing_envelope = serde_json::json!({
-            "dimension": "content:established:v1",
-            "evidence_refs": [sha_hex],
-        });
-        let (och, classical, pqc) = crate::federation::tier_ingest::test_support::sign_envelope(
-            &producer,
-            &establishing_envelope,
-        );
-        // v31.0.0 (CIRISPersist#598/#643) — SEAL, don't hand-sign. Bound first so
-        // the mirror and the signed instants are stamped BEFORE the signature,
-        // which is the rule every producer on this substrate follows.
-        let establishing = crate::federation::types::Attestation {
-            attestation_id: uuid::Uuid::new_v4().to_string(),
-            attesting_key_id: producer.clone(),
-            attested_key_id: producer.clone(),
-            attestation_type: crate::federation::types::attestation_type::SCORES.into(),
-            weight: None,
-            asserted_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-            expires_at: None,
-            attestation_envelope: establishing_envelope,
-            original_content_hash: och,
-            scrub_signature_classical: classical,
-            scrub_signature_pqc: pqc,
-            scrub_key_id: producer.clone(),
-            scrub_timestamp: "2026-01-01T00:00:00Z".parse().unwrap(),
-            pqc_completed_at: Some("2026-01-01T00:00:00Z".parse().unwrap()),
-            persist_row_hash: String::new(),
-            subject_key_ids: vec![producer.clone()],
-            withdraws_admission_rule: None,
-            cohort_scope: "federation".to_string(),
-            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
-            promoted_at: None,
-            additional_scrubs: Vec::new(),
-        };
-        dir.put_attestation(crate::federation::types::SignedAttestation {
-            attestation: crate::federation::tier_ingest::test_support::seal_row(
-                &producer,
-                establishing,
-            ),
-        })
-        .await
-        .expect("seed establishing content");
-    }
-
-    /// `list_takedowns_for` returns only the target's takedowns, honours
-    /// the `claimant_key_id` secondary filter, and respects the
-    /// `[since, until)` window.
-    #[cfg(all(feature = "sqlite", feature = "cirisnode"))]
-    #[tokio::test]
-    async fn list_takedowns_for_filters_target_claimant_and_window() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-            .await
-            .expect("engine");
-        let k1 = SigningKey::from_bytes(&[0x11; 32]);
-        let k2 = SigningKey::from_bytes(&[0x22; 32]);
-        let claimant_a = media_pubkey_b64(&k1);
-        let claimant_b = media_pubkey_b64(&k2);
-        let target = media_sha_hex(0x40);
-        let other = media_sha_hex(0x41);
-        let t0 = "2026-01-01T00:00:00Z".parse().unwrap();
-        let t1 = "2026-02-01T00:00:00Z".parse().unwrap();
-        // v8.7.2: establish content provenance so each filer (author) is a
-        // SIGNED subject of the content it takes down (subject-self path).
-        media_seed_establishing(&engine, &k1, &target).await;
-        media_seed_establishing(&engine, &k2, &target).await;
-        media_seed_establishing(&engine, &k1, &other).await;
-        // target × claimant_a @ t0, target × claimant_b @ t1, other-target.
-        media_seed(&engine, media_build_takedown(&k1, &target, &claimant_a, t0)).await;
-        media_seed(&engine, media_build_takedown(&k2, &target, &claimant_b, t1)).await;
-        media_seed(&engine, media_build_takedown(&k1, &other, &claimant_a, t1)).await;
-
-        // Per-target: two rows, neither from `other`.
-        let page = engine
-            .list_takedowns_for(&target, Default::default(), None, 100)
-            .await
-            .expect("per-target");
-        assert_eq!(page.items.len(), 2, "both target takedowns");
-        assert!(page.next_cursor.is_none());
-
-        // Per-target × per-claimant: just claimant_a's.
-        let page = engine
-            .list_takedowns_for(
-                &target,
-                crate::cirisnode::TakedownFilter {
-                    claimant_key_id: Some(claimant_a.clone()),
-                    ..Default::default()
-                },
-                None,
-                100,
-            )
-            .await
-            .expect("per-claimant");
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(
-            page.items[0]
-                .payload
-                .get("claimant_key_id")
-                .and_then(|v| v.as_str()),
-            Some(claimant_a.as_str())
-        );
-
-        // Window `[t1, +inf)` excludes the t0 row.
-        let page = engine
-            .list_takedowns_for(
-                &target,
-                crate::cirisnode::TakedownFilter {
-                    since: Some(t1),
-                    ..Default::default()
-                },
-                None,
-                100,
-            )
-            .await
-            .expect("window");
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(page.items[0].submitted_at, t1);
-    }
-
-    /// `list_takedowns_for` pages deterministically: a `limit`-1 walk
-    /// yields every row exactly once, newest-first, no duplicates across
-    /// the cursor boundary (even with a shared `submitted_at`).
-    #[cfg(all(feature = "sqlite", feature = "cirisnode"))]
-    #[tokio::test]
-    async fn list_takedowns_for_cursor_pages_without_gaps_or_dupes() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-            .await
-            .expect("engine");
-        let k = SigningKey::from_bytes(&[0x33; 32]);
-        let claimant = media_pubkey_b64(&k);
-        let target = media_sha_hex(0x50);
-        // Five rows; two share a timestamp to exercise the
-        // contribution_id tiebreaker.
-        let shared = "2026-03-01T00:00:00Z".parse().unwrap();
-        let stamps: [chrono::DateTime<chrono::Utc>; 5] = [
-            "2026-03-05T00:00:00Z".parse().unwrap(),
-            "2026-03-04T00:00:00Z".parse().unwrap(),
-            shared,
-            shared,
-            "2026-03-02T00:00:00Z".parse().unwrap(),
-        ];
-        // v8.7.2: establish content so the filer is a signed subject.
-        media_seed_establishing(&engine, &k, &target).await;
-        for ts in stamps {
-            media_seed(&engine, media_build_takedown(&k, &target, &claimant, ts)).await;
-        }
-
-        let mut seen: Vec<String> = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = engine
-                .list_takedowns_for(&target, Default::default(), cursor.clone(), 2)
-                .await
-                .expect("page");
-            for it in &page.items {
-                seen.push(it.contribution_id.clone());
-            }
-            match page.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
-        }
-        assert_eq!(seen.len(), 5, "every row once");
-        let mut deduped = seen.clone();
-        deduped.sort();
-        deduped.dedup();
-        assert_eq!(deduped.len(), 5, "no duplicate across cursor boundary");
-    }
-
-    /// `list_key_grants_for` returns only the recipient's grants, honours
-    /// the `publisher_key_id` secondary filter, and the `content_sha256`
-    /// scope routes through the two-axis index path.
-    #[cfg(all(feature = "sqlite", feature = "cirisnode"))]
-    #[tokio::test]
-    async fn list_key_grants_for_filters_recipient_publisher_and_content() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-            .await
-            .expect("engine");
-        let pub_a = SigningKey::from_bytes(&[0x44; 32]);
-        let pub_b = SigningKey::from_bytes(&[0x55; 32]);
-        let publisher_a = media_pubkey_b64(&pub_a);
-        let recipient = "recipient-key-1";
-        let other_recipient = "recipient-key-2";
-        let sha_x = media_sha_hex(0x60);
-        let sha_y = media_sha_hex(0x61);
-        let t = "2026-04-01T00:00:00Z".parse().unwrap();
-        media_seed(&engine, media_build_key_grant(&pub_a, &sha_x, recipient, t)).await;
-        media_seed(&engine, media_build_key_grant(&pub_b, &sha_y, recipient, t)).await;
-        media_seed(
-            &engine,
-            media_build_key_grant(&pub_a, &sha_x, other_recipient, t),
-        )
-        .await;
-
-        // Per-recipient: two grants (both publishers), none for `other`.
-        let page = engine
-            .list_key_grants_for(recipient, Default::default(), None, 100)
-            .await
-            .expect("per-recipient");
-        assert_eq!(page.items.len(), 2);
-
-        // Per-recipient × per-publisher: just publisher_a's.
-        let page = engine
-            .list_key_grants_for(
-                recipient,
-                crate::cirisnode::KeyGrantFilter {
-                    publisher_key_id: Some(publisher_a.clone()),
-                    ..Default::default()
-                },
-                None,
-                100,
-            )
-            .await
-            .expect("per-publisher");
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(page.items[0].author_id, publisher_a);
-
-        // content_sha256 scope (two-axis index path): only the sha_x grant.
-        let page = engine
-            .list_key_grants_for(
-                recipient,
-                crate::cirisnode::KeyGrantFilter {
-                    content_sha256: Some(sha_x.clone()),
-                    ..Default::default()
-                },
-                None,
-                100,
-            )
-            .await
-            .expect("content-scope");
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(
-            page.items[0]
-                .payload
-                .get("content_sha256")
-                .and_then(|v| v.as_str()),
-            Some(sha_x.as_str())
-        );
-    }
-
-    /// `list_takedowns_for` / `list_key_grants_for` reject an
-    /// out-of-range `limit` (parity with the storage cap).
-    #[cfg(all(feature = "sqlite", feature = "cirisnode"))]
-    #[tokio::test]
-    async fn media_facades_reject_bad_limit() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-            .await
-            .expect("engine");
-        let err = engine
-            .list_takedowns_for("deadbeef", Default::default(), None, 0)
-            .await
-            .expect_err("limit 0 rejected");
-        assert!(matches!(err, crate::cirisnode::Error::InvalidArgument(_)));
-        let err = engine
-            .list_key_grants_for("r", Default::default(), None, 99_999)
-            .await
-            .expect_err("limit too large");
-        assert!(matches!(err, crate::cirisnode::Error::InvalidArgument(_)));
-    }
+    // v60.0.0 (CIRISPersist#988 item 1) — the v6.3.0 media-detector read
+    // facades over the dropped `cirisnode.contributions` table are gone with
+    // it; takedown notices are rows (`cirisnode::rows::list_takedowns`).
 
     /// `list_attestations` facade dispatches to the backend
     /// `ReadEngine::list_attestations` — an empty store returns an empty
@@ -22707,100 +22118,6 @@ mod tests {
             "the facade returns exactly the baked delegation plane"
         );
         assert!(page.next_cursor.is_none());
-    }
-
-    /// PG twin of `list_takedowns_for_filters_target_claimant_and_window`
-    /// — env-gated; runtime-verified against the lead's docker PG.
-    // v31.3.0 (CIRISPersist#678) — this PG twin seeds through `media_seed*`,
-    // whose bodies match `NodeCoreDispatch::Sqlite`, so it needs sqlite too.
-    #[cfg(all(feature = "postgres", feature = "sqlite", feature = "cirisnode"))]
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn list_takedowns_for_filters_postgres() {
-        let Some(dsn) = crate::test_pg::dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let alias = format!("media-td-{}", uuid::Uuid::new_v4().simple());
-        let engine = Engine::with_signer(pqc_signer(&alias), &dsn)
-            .await
-            .expect("PG engine");
-        let k1 = SigningKey::from_bytes(&[0x11; 32]);
-        let k2 = SigningKey::from_bytes(&[0x22; 32]);
-        let claimant_a = media_pubkey_b64(&k1);
-        let claimant_b = media_pubkey_b64(&k2);
-        // Unique-per-run target (64-hex, sha256-shaped) so the test is
-        // self-isolating against a reused PG — mirrors the key_grants twin's
-        // per-run `recipient`. A fixed target accumulates rows across runs on
-        // a persistent DB (CI's PG is ephemeral, but local verification reuses
-        // one) and breaks the exact-count assertion.
-        let target = format!(
-            "{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
-        );
-        let t0 = "2026-01-01T00:00:00Z".parse().unwrap();
-        let t1 = "2026-02-01T00:00:00Z".parse().unwrap();
-        // v8.7.2: establish content provenance so each filer is a signed
-        // subject of the content it takes down (per-run target ⇒ isolated).
-        media_seed_establishing(&engine, &k1, &target).await;
-        media_seed_establishing(&engine, &k2, &target).await;
-        media_seed(&engine, media_build_takedown(&k1, &target, &claimant_a, t0)).await;
-        media_seed(&engine, media_build_takedown(&k2, &target, &claimant_b, t1)).await;
-        let page = engine
-            .list_takedowns_for(
-                &target,
-                crate::cirisnode::TakedownFilter {
-                    claimant_key_id: Some(claimant_a.clone()),
-                    ..Default::default()
-                },
-                None,
-                100,
-            )
-            .await
-            .expect("per-claimant");
-        assert_eq!(page.items.len(), 1);
-    }
-
-    /// PG twin of the key_grant facade test — env-gated.
-    // v31.3.0 (CIRISPersist#678) — this PG twin seeds through `media_seed*`,
-    // whose bodies match `NodeCoreDispatch::Sqlite`, so it needs sqlite too.
-    #[cfg(all(feature = "postgres", feature = "sqlite", feature = "cirisnode"))]
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn list_key_grants_for_filters_postgres() {
-        let Some(dsn) = crate::test_pg::dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let alias = format!("media-kg-{}", uuid::Uuid::new_v4().simple());
-        let engine = Engine::with_signer(pqc_signer(&alias), &dsn)
-            .await
-            .expect("PG engine");
-        let pub_a = SigningKey::from_bytes(&[0x44; 32]);
-        let publisher_a = media_pubkey_b64(&pub_a);
-        let recipient = format!("rec-{}", uuid::Uuid::new_v4());
-        let sha_x = media_sha_hex(0x60);
-        let t = "2026-04-01T00:00:00Z".parse().unwrap();
-        media_seed(
-            &engine,
-            media_build_key_grant(&pub_a, &sha_x, &recipient, t),
-        )
-        .await;
-        let page = engine
-            .list_key_grants_for(
-                &recipient,
-                crate::cirisnode::KeyGrantFilter {
-                    content_sha256: Some(sha_x.clone()),
-                    ..Default::default()
-                },
-                None,
-                100,
-            )
-            .await
-            .expect("content-scope");
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(page.items[0].author_id, publisher_a);
     }
 
     // ── v6.5.0 (CIRISPersist#183, CEG §8.1.12.7) self-at-login ─────

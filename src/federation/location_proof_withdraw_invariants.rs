@@ -14,7 +14,7 @@
 //!   a re-offer that is not a withdrawal is refused; a second withdrawal is a
 //!   no-op that keeps the first instant.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::location::member_in_geographic_constraint;
     use crate::federation::tier_ingest::test_support as ts;
@@ -139,7 +139,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod reindex_bodies {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::LocationProof;
@@ -432,7 +432,7 @@ pub(crate) mod reindex_bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod peer_bodies {
     use crate::federation::location::member_in_geographic_constraint;
     use crate::federation::tier_ingest::test_support as ts;
@@ -556,7 +556,7 @@ pub(crate) mod peer_bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
@@ -599,10 +599,6 @@ mod runners {
         };
     }
 
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
-
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;
@@ -624,7 +620,8 @@ mod runners {
         Some(b)
     });
 
-    /// I599 on one backend (memory, sqlite): both writers share it.
+    /// I599 on one backend: both writers share it.
+    #[cfg(feature = "sqlite")]
     macro_rules! i599_single {
         ($b:expr) => {{
             let b = $b;
@@ -639,11 +636,6 @@ mod runners {
             )
             .await;
         }};
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i599_memory() {
-        i599_single!(crate::store::memory::MemoryBackend::new());
     }
 
     #[cfg(feature = "sqlite")]

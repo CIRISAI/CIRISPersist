@@ -249,12 +249,12 @@ pub fn enforce_admission_invariants(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
     use crate::federation::types::{attestation_tier, identity_type};
     use crate::federation::{Attestation, FederationDirectory, KeyRecord, SignedKeyRecord};
-    use crate::store::memory::MemoryBackend;
+    use crate::store::sqlite::SqliteBackend;
 
     // ── shared test fixtures ────────────────────────────────────────────
 
@@ -344,7 +344,7 @@ mod tests {
     /// roster standing in the test directory co-scrubs the record to the family
     /// m-of-n. Every other type still registers self-scrubbed, which is what
     /// the gate permits.
-    async fn register(backend: &MemoryBackend, key_id: &str, identity_type_value: &str) {
+    async fn register(backend: &SqliteBackend, key_id: &str, identity_type_value: &str) {
         let record = fix_key(key_id, identity_type_value);
         let accord_conferred = identity_type::parse_set(identity_type_value)
             .iter()
@@ -552,7 +552,7 @@ mod tests {
     async fn manifest_reserved_invariants_match_persist_admission() {
         use crate::federation::admission::check_reserved_prefix_admission;
 
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         register(&backend, "wia-wrong-agent", identity_type::AGENT).await;
         register(&backend, "wia-target", identity_type::AGENT).await;
         for it in [
@@ -700,7 +700,7 @@ mod tests {
             "manifest text for transparency_log:inclusion changed — re-verify this witness"
         );
 
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         register(&backend, "tli-agent", identity_type::AGENT).await;
         register(&backend, "tli-target", identity_type::AGENT).await;
         let row = fix_attestation(
@@ -729,7 +729,7 @@ mod tests {
     #[tokio::test]
     async fn health_liveness_self_emission_rejected() {
         use crate::federation::admission::check_reserved_prefix_admission;
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         register(&backend, "hl-self", identity_type::AGENT).await;
         let row = fix_attestation("hl-att", "health:liveness:v1", "hl-self", "hl-self");
         let err = check_reserved_prefix_admission(&backend, &row)
@@ -748,7 +748,7 @@ mod tests {
     #[tokio::test]
     async fn health_liveness_cross_subject_still_admitted() {
         use crate::federation::admission::check_reserved_prefix_admission;
-        let backend = MemoryBackend::new();
+        let backend = crate::store::test_backend::test_backend();
         register(&backend, "hl-monitor", identity_type::AGENT).await;
         register(&backend, "hl-observed", identity_type::AGENT).await;
         let row = fix_attestation("hl-att", "health:liveness:v1", "hl-monitor", "hl-observed");

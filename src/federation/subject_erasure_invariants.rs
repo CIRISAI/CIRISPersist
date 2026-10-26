@@ -37,7 +37,7 @@
 //! - **I974** — the Engine door end to end (sqlite, postgres): the producer
 //!   route through the Engine the Python surface calls.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::attestation_admit::AttestationStore;
     use crate::federation::silo_projection::{check_projection_rebuild, SiloProjection};
@@ -128,6 +128,7 @@ pub(crate) mod bodies {
         b.list_hard_case_events(crate::federation::hard_case::HardCaseFilter {
             kind: Some(crate::federation::hard_case::kind::TRACE_ERASURE.to_owned()),
             since: None,
+            emitter_key_id: None,
         })
         .await
         .unwrap()
@@ -504,6 +505,7 @@ pub(crate) mod bodies {
                 "detection_events_tombstoned": 1,
             }),
             emitted_at: chrono::Utc::now(),
+            emitter_key_id: String::new(),
         }
     }
 
@@ -584,6 +586,28 @@ pub(crate) mod bodies {
         );
         b.record_hard_case(v58.clone()).await.unwrap();
         (v57.event_id, notice_id, v58.event_id)
+    }
+
+    /// V202 over a row projected before the column existed: the event lists
+    /// with its row's signer as its emitter, and the emitter filter finds it.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) async fn i969_v202_backfills_the_signer<B>(b: &B, event_id: &str, node: &str)
+    where
+        B: FederationDirectory,
+    {
+        let listed = b
+            .list_hard_case_events(crate::federation::hard_case::HardCaseFilter {
+                emitter_key_id: Some(node.to_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|e| e.event_id == event_id && e.emitter_key_id == node),
+            "I969: V202 backfills the emitter from the row's signer: {listed:?}"
+        );
     }
 
     /// After V196 ran over the seeded rows: the v57 row and its header are
@@ -924,21 +948,22 @@ pub(crate) mod bodies {
             "federation_delegated_scope_unauthorized",
             "I972: {e}"
         );
-        // (7) a licence target: not this arm (CIRISPersist#1036 item 5).
+        // (7) a licence target (v60.0.0, CIRISPersist#1036 item 5): the
+        // licensee is the subject that files — its own `withdraws` against
+        // the licence is refused, so `reconsideration:{grounds}` is its
+        // contest path (CC 2.4.1.1; I1218 drives it end to end).
         let licence = ts::bare_attestation(
             "i972-licence",
             &moderator,
             &subject,
             &serde_json::json!({"dimension": "licensure:board:v1"}),
         );
-        let mut licence = licence;
-        licence.subject_key_ids = vec![subject.clone()];
-        assert!(
-            crate::federation::admission::reconsideration_target_subjects(dir, &subject, &licence)
+        assert_eq!(
+            crate::federation::admission::reconsideration_target_subjects(dir, &stranger, &licence)
                 .await
-                .unwrap()
-                .is_empty(),
-            "I972: a licence's subject files under its own arm"
+                .unwrap(),
+            std::iter::once(subject.clone()).collect(),
+            "I972: a licence's licensee has standing to file"
         );
     }
 
@@ -1010,7 +1035,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     use super::bodies;
 
@@ -1023,13 +1048,6 @@ mod run {
             mod $name {
                 #[allow(unused_imports)]
                 use super::*;
-
-                #[tokio::test(flavor = "multi_thread")]
-                async fn memory() {
-                    let $b = crate::store::memory::MemoryBackend::new();
-                    let $t = tag(concat!(stringify!($name), "m"));
-                    $body
-                }
 
                 #[cfg(feature = "sqlite")]
                 #[tokio::test(flavor = "multi_thread")]
@@ -1087,19 +1105,6 @@ mod run {
         b.set_node_key_id(&node.id);
         bodies::i968_the_carve_out_stays(&b, &t).await;
     });
-
-    // I967 — the producer key's record expired (a per-backend seam).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i967_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        let t = tag("i967m");
-        let node = bodies::signing_node(&b, &t).await;
-        b.set_node_key_id(&node.id);
-        let agent = format!("{t}-agent");
-        let (row, producer) = bodies::i967_seed(&b, &t, &agent, false).await;
-        b.test_expire_key(&producer);
-        bodies::i967_refused_with_reason(&b, &agent, &row).await;
-    }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread")]
@@ -1160,17 +1165,6 @@ mod run {
         bodies::i973_a_digest_named_subject(&b, &t).await;
     });
 
-    // I971 — two stores of one backend kind.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i971_memory() {
-        let a = crate::store::memory::MemoryBackend::new();
-        let b = crate::store::memory::MemoryBackend::new();
-        let t = tag("i971m");
-        let na = bodies::signing_node(&a, &format!("{t}a")).await;
-        a.set_node_key_id(&na.id);
-        bodies::i971_the_tombstone_delivered(&a, &b, &na, &t).await;
-    }
-
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread")]
     async fn i971_sqlite() {
@@ -1223,11 +1217,18 @@ mod run {
             .await
             .unwrap();
         b.run_migrations_through(195).await.unwrap();
+        // Today's writers project `emitter_key_id` (V202): the column exists
+        // while they seed and is dropped before the rest of the migrations,
+        // so V196 and V202 run over the schema an upgrading node holds.
+        b.test_execute("ALTER TABLE hard_case_events ADD COLUMN emitter_key_id TEXT")
+            .await;
         let t = tag("i969s");
         let node = bodies::signing_node(&b, &t).await;
         b.set_node_key_id(&node.id);
         let agent = format!("{t}-agent");
         let (v57, notice, v58) = bodies::i969_seed(&b, &node.id, &agent).await;
+        b.test_execute("ALTER TABLE hard_case_events DROP COLUMN emitter_key_id")
+            .await;
         // A pre-v57 silo row naming its agent (written after the emitter
         // above, so the rehome has not moved it).
         b.test_execute(&format!(
@@ -1239,6 +1240,7 @@ mod run {
         .await;
         b.run_migrations().await.unwrap();
         bodies::i969_after_v196(&b, &v57, &notice, &v58, &agent).await;
+        bodies::i969_v202_backfills_the_signer(&b, &v58, &node.id).await;
         use crate::federation::FederationDirectory as _;
         assert!(
             b.list_hard_case_events(crate::federation::hard_case::HardCaseFilter::default())
@@ -1262,11 +1264,16 @@ mod run {
             .await
             .unwrap();
         b.run_migrations_through(195).await.unwrap();
+        // As i969_sqlite: the V202 column only while today's writers seed.
+        b.test_execute("ALTER TABLE cirislens.hard_case_events ADD COLUMN emitter_key_id TEXT")
+            .await;
         let t = tag("i969p");
         let node = bodies::signing_node(&b, &t).await;
         b.set_node_key_id(&node.id);
         let agent = format!("{t}-agent");
         let (v57, notice, v58) = bodies::i969_seed(&b, &node.id, &agent).await;
+        b.test_execute("ALTER TABLE cirislens.hard_case_events DROP COLUMN emitter_key_id")
+            .await;
         b.test_execute(&format!(
             "INSERT INTO cirislens.hard_case_events \
                 (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
@@ -1276,6 +1283,7 @@ mod run {
         .await;
         b.run_migrations().await.unwrap();
         bodies::i969_after_v196(&b, &v57, &notice, &v58, &agent).await;
+        bodies::i969_v202_backfills_the_signer(&b, &v58, &node.id).await;
         use crate::federation::FederationDirectory as _;
         assert!(
             b.list_hard_case_events(crate::federation::hard_case::HardCaseFilter::default())

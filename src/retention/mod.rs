@@ -288,6 +288,200 @@ pub enum RetentionError {
     Backend(String),
 }
 
+/// v60.0.0 (CIRISPersist#934 step 4) — the two OBSERVATION tables a prune may
+/// age out (v38.4.0, CIRISPersist#767 Ask 2). Not evidence: this node's
+/// running notes about who it has heard from and where.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservationTable {
+    /// `announced_peers`.
+    AnnouncedPeers,
+    /// `transport_destinations`.
+    TransportDestinations,
+}
+
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+impl ObservationTable {
+    /// The unqualified table name.
+    #[must_use]
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::AnnouncedPeers => "announced_peers",
+            Self::TransportDestinations => "transport_destinations",
+        }
+    }
+
+    /// The rows the prune may NOT take, as the SQL conjunct every one of
+    /// its rows must satisfy (`None`: every aged row is a note).
+    ///
+    /// `transport_destinations` (v38.7.0, CIRISPersist#776/#770) — age on
+    /// `last_seen_at` ALONE, and only where it EXISTS: **only rows that were
+    /// ever OBSERVED.**
+    ///
+    /// v38.7.0 (CIRISPersist#776) — **only rows that were ever OBSERVED.**
+    ///
+    /// The v38.4.0 form aged rows on `COALESCE(last_seen_at, asserted_at)`,
+    /// so a row that was never a sighting still ran on a sighting's clock.
+    /// Measured downstream: ALL 11,034 rows on their canonical have
+    /// `last_seen_at IS NULL`, and a 30-day pass would have deleted 5,408
+    /// of them. They withdrew the prune before shipping rather than lose
+    /// authoritative routes.
+    ///
+    /// The rows it would have taken are the expensive ones. A
+    /// quorum-authorized canonical address is written with
+    /// `BindingProvenance::Rooted`, `last_seen_at: None` — an ASSERTION,
+    /// not an observation. It is recreated only by another quorum, and an
+    /// explicit-hash canonical cannot announce itself, so once the row is
+    /// gone the node falls back to an obsolete bootstrap address or loses
+    /// the route outright.
+    ///
+    /// The v38.4.0 signature exclusion did not save them either:
+    /// `TransportDestination` has NO `signature` field, so
+    /// `put_transport_destination` writes NULL for every locally asserted
+    /// row and the exclusion protects replicated routes and nothing else.
+    ///
+    /// An asserted route is current until SUPERSEDED. It has no staleness
+    /// clock, and this function is therefore not the tool for bounding
+    /// asserted rows — that growth is an intake question
+    /// (CIRISPersist#672), not a retention one. Requiring
+    /// `last_seen_at IS NOT NULL` makes the function do exactly what its
+    /// name says and makes it structurally incapable of aging an
+    /// assertion.
+    ///
+    /// ## A contract this substrate CANNOT check, stated where it is read
+    ///
+    /// Even for observed rows, the caller must ensure `last_seen_at`
+    /// advances on every CONFIRMING sighting. CIRISEdge#770 measured the
+    /// opposite: `record_announced_peer` reaches its durable writes only
+    /// when `newly_rooted_key` is `Some`, so a peer announcing every few
+    /// seconds for a month without rotating its epoch has `last_seen_at`
+    /// frozen at that rotation. Aging on a column that does not advance
+    /// deletes the HEALTHIEST peers first, because a peer that never
+    /// rotates is a peer that never refreshes. If your writer does not
+    /// refresh on confirmation, this prune is not safe for you to call at
+    /// any cutoff.
+    ///
+    /// v38.4.0 (PR #769 review) — **and only UNSIGNED, unretired rows.**
+    ///
+    /// Two different records share this table, and only one of them is
+    /// an observation:
+    ///
+    /// - `signature IS NULL` — a trusted-LOCAL row. This node's running
+    ///   note about where it last saw a peer. Prunable.
+    /// - `signature IS NOT NULL` — a SIGNED, replicated route carrying
+    ///   V105's `epoch`, the durable monotonic supersession counter.
+    ///   Its epoch is what REFUSES older gossip: the upsert admits an
+    ///   incoming route only when `excluded.epoch > stored.epoch`.
+    ///   Deleting a live signed row deletes the number that does the
+    ///   refusing, so a peer could then re-insert a stale LOWER-epoch
+    ///   route into an empty slot and win. Never prunable.
+    /// - `retired_at IS NOT NULL` — the replicated TOMBSTONE, kept for
+    ///   the same reason: a route retired by a signed put stays retired
+    ///   against older gossip.
+    ///
+    /// Both exclusions are the same principle: an epoch-versioned
+    /// replicated record is not an observation, and ageing it out on an
+    /// observation's clock destroys a convergence guarantee. Signed
+    /// routes do not grow unboundedly anyway — V105 made the table one
+    /// route per (peer, kind), superseded in place — so the unbounded
+    /// growth this prune exists to bound is entirely in the unsigned
+    /// rows it still removes.
+    /// V105 (#443) makes `retired_at` a REPLICATED tombstone: a route
+    /// retired by a signed act, kept so older signed route gossip cannot
+    /// become authoritative again. Ageing it out on the same clock as an
+    /// ordinary observation would delete the very record that refuses the
+    /// stale route, and a peer could then reintroduce the pre-retirement
+    /// destination. The tombstone outlives the observation by design, so
+    /// this prune only ever removes rows that are still just notes.
+    #[must_use]
+    pub(crate) const fn keep_predicate(self) -> Option<&'static str> {
+        match self {
+            Self::AnnouncedPeers => None,
+            Self::TransportDestinations => {
+                Some("signature IS NULL AND retired_at IS NULL AND last_seen_at IS NOT NULL")
+            }
+        }
+    }
+}
+
+/// v60.0.0 (CIRISPersist#934 step 4) — **a planned observation prune**:
+/// the rows of [`ObservationTable`] not seen since `cutoff` that its
+/// [`ObservationTable::keep_predicate`] admits, oldest `last_seen_at`
+/// first, at most `limit`. One plan for both backends; each renders it
+/// ([`Self::render`]) and executes the statement.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObservationPrune {
+    /// The table.
+    pub(crate) table: ObservationTable,
+    /// Rows whose `last_seen_at` is before this go.
+    pub(crate) cutoff: DateTime<Utc>,
+    /// The batch bound, at least 1.
+    pub(crate) limit: i64,
+}
+
+/// Plan one bounded prune pass: `None` for an empty batch (`max_rows` 0),
+/// refused when the batch does not fit the statement's `LIMIT`.
+///
+/// # Errors
+///
+/// [`RetentionError::InvalidArgument`] when `max_rows` exceeds `i64::MAX`.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn plan_observation_prune(
+    table: ObservationTable,
+    cutoff: DateTime<Utc>,
+    max_rows: usize,
+) -> Result<Option<ObservationPrune>, RetentionError> {
+    if max_rows == 0 {
+        return Ok(None);
+    }
+    let limit = i64::try_from(max_rows)
+        .map_err(|_| RetentionError::InvalidArgument(format!("max_rows {max_rows} > i64::MAX")))?;
+    Ok(Some(ObservationPrune {
+        table,
+        cutoff,
+        limit,
+    }))
+}
+
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+impl ObservationPrune {
+    /// The one statement, for `dialect`: binds `(cutoff, limit)` as
+    /// `?1`/`$1`, `?2`/`$2`.
+    ///
+    /// Postgres bounds by `ctid` (one physical row identifier, the same SQL
+    /// for both tables whatever their key shape; the first v38.4.0 shape
+    /// reused a parenthesised composite key and postgres rejected it on
+    /// every call) and RE-CHECKS the age and the keep predicate in the
+    /// outer DELETE: between the sub-select's snapshot and the delete an
+    /// announce can refresh `last_seen_at`, and without the re-check the
+    /// delete would take a row that is no longer stale. Sqlite's statement
+    /// runs under its one writer, so the sub-select is the whole check.
+    #[must_use]
+    pub(crate) fn render(&self, dialect: crate::federation::attestation_query::Dialect) -> String {
+        use crate::federation::attestation_query::Dialect;
+        let keep = self
+            .table
+            .keep_predicate()
+            .map(|p| format!(" AND {p}"))
+            .unwrap_or_default();
+        let name = self.table.name();
+        match dialect {
+            Dialect::Sqlite => format!(
+                "DELETE FROM {name} WHERE rowid IN ( \
+                    SELECT rowid FROM {name} WHERE last_seen_at < ?1{keep} \
+                     ORDER BY last_seen_at LIMIT ?2)"
+            ),
+            Dialect::Postgres => format!(
+                "DELETE FROM cirislens.{name} WHERE ctid IN ( \
+                    SELECT ctid FROM cirislens.{name} WHERE last_seen_at < $1{keep} \
+                     ORDER BY last_seen_at LIMIT $2) \
+                 AND last_seen_at < $1{keep}"
+            ),
+        }
+    }
+}
+
 impl RetentionError {
     /// Stable string-token for telemetry / structured logging.
     pub fn kind(&self) -> &'static str {

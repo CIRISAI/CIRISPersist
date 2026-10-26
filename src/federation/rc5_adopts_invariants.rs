@@ -2380,14 +2380,6 @@ mod runners {
         };
     }
 
-    dyn_runners!(memory_dyn, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
-
-    keyed_runners!(memory_keyed, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
-
     #[cfg(feature = "sqlite")]
     keyed_runners!(sqlite_keyed, async {
         use crate::store::Backend as _;
@@ -2523,8 +2515,8 @@ mod runners {
         super::bodies::clause_a_on_the_rewrite_doors(
             &b as &dyn crate::federation::FederationDirectory,
             &format!("clause-a-rw-{}", suffix()),
-            |r| b.adopt_scrub_upgrade(r),
-            |r| b.supersede_canonical_record(r),
+            |r| crate::federation::FederationDirectory::adopt_scrub_upgrade(&b, r),
+            |r| crate::federation::key_plane::supersede_canonical_planned(&b, r),
         )
         .await;
     }
@@ -2544,8 +2536,8 @@ mod runners {
         super::bodies::clause_a_on_the_rewrite_doors(
             &b as &dyn crate::federation::FederationDirectory,
             &format!("clause-a-rw-{}", suffix()),
-            |r| b.adopt_scrub_upgrade(r),
-            |r| b.supersede_canonical_record(r),
+            |r| crate::federation::FederationDirectory::adopt_scrub_upgrade(&b, r),
+            |r| crate::federation::key_plane::supersede_canonical_planned(&b, r),
         )
         .await;
     }

@@ -18,7 +18,7 @@
 //!   engine occurrence, run `self_at_login` with `app` = the engine key, and
 //!   the owner is still the node's principal.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type as it;
@@ -253,7 +253,7 @@ pub(crate) mod engine_bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
@@ -282,10 +282,6 @@ mod runners {
             }
         };
     }
-
-    dyn_runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
 
     #[cfg(feature = "sqlite")]
     dyn_runners!(sqlite, async {

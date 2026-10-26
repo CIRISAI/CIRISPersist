@@ -50,6 +50,13 @@ statement) was tested and then dropped unjudged.
 three 20 s periods and reads as its FAIL, instead of a 300 s tool timeout
 credited to no witness (`record_read`'s three loop mutants cost 1049 s of the
 first run). I692 additionally bounds the fold-mask loop in a 5 s deadline.
+That was not enough (CIRISPersist#1112, red nightly 2026-10-14 to 10-21):
+seventeen witnesses read inside a fold, each hung to the 60 s leash under
+the same mutant, four at a time, and the whole run still outlived
+cargo-mutants' 300 s floor: three TIMEOUTs credited to no witness. A witness
+cannot end an infinite loop, so v60.0.0 bounds the loop itself (by the mask's
+popcount); the mutants now return at once with the wrong fold credited, and
+I1164 counts every fold.
 
 ## Verdict: cargo-mutants
 
@@ -266,6 +273,9 @@ Schema `ciris-persist/mutants-matrix/v1`, one format for both tools
 ```
 # comment to end of line
 tests: <nextest filterset>      the witnesses measured; required
+features: <feature>[,<feature>] the cargo features the sites compile under
+                                (v60.0.0; default postgres,sqlite,server;
+                                MUTANTS_FEATURES still wins)
 witnesses: <path> ...           extra witness files for the unvalidated report
                                 (every *_invariants.rs counts without listing)
 <path>                          every mutant in the file
@@ -285,17 +295,156 @@ To add one:
 4. Run it: `MUTANTS_BUDGET_SECS=7200 scripts/mutants.sh cargo-mutants <scope>`.
    If it exits 3, shard it.
 
-Three scopes exist (v54.1.0; `scope-consent.txt` held the first two
-together and did not fit its budget):
+The scopes (v54.1.0; `scope-consent.txt` held the first two together and
+did not fit its budget):
 
 - `scope-consent-gate.txt`: the consent gate, against the I548 and I570
   witnesses. 19 mutants. v54.0.0 had moved the gate's universe predicate into
   `per_principal_stances`, which the scope did not name: it is named now.
-- `scope-observe.txt`: `src/observe/`, against I549–I553 and I690–I692.
-  71 mutants, run as two shards (`MUTANTS_SHARD=0/2`, `1/2`).
+- `scope-observe.txt`: `src/observe/`, against I549–I553, I690–I699 and
+  (v60.0.0, #1112) I1163–I1164. 71 mutants, run as two shards
+  (`MUTANTS_SHARD=0/2`, `1/2`).
+- `scope-s0-roster-seam.txt` (v60.0.0, slice S0): `nodes_owned_by` (#1109,
+  I1161, and I1342 for the seek's owner-binding filter, which changes only
+  what is read) and the test-anchor `W_self` seam (#1111, I1162); the first
+  scope with a `features:` line (`test-anchor`).
+- `scope-s2-goals.txt` (v60.0.0, slice S2): goals as `goal:{scale}:v1`
+  rows (#988 item 4): `goal.rs`, `goal_projection.rs` and the three
+  backends' goal writers, rebuilds and reads, against I1174–I1182. 155
+  mutants, three shards (`MUTANTS_SHARD=0/3` … `2/3`), on the weekly run.
+- `scope-s3-key-plane.txt` (v60.0.0, slice S3): the key-record write doors
+  on one plan (#934 step 3): `key_plane::plan_key_record_write`, its
+  planners, the shared replicated apply, the row step, and each backend's
+  `store_planned_key_record` executor and doors, against I1183–I1188 and the
+  doors' standing witnesses. 129 mutants in three shards, 101 caught, 28
+  unviable, 0 missed (two rounds: the first left twelve survivors; ten were
+  witness gaps, now witnessed, two an equivalent branch, now removed), on
+  the weekly run.
+- `scope-s6v-vendor.txt` (v60.0.0, slice S6v): the CC `v1.0-rc9` vendor.
+  The policy table read at runtime (`governance_policy.rs`), the corridor
+  (`TwoPathPolicy::check_corridor`), the self-roster door's admission site
+  (`self_roster::policy`), and the registry loader the re-vendor moved
+  (`parse_manifest`, `registry`, `parse_polarity_classes`), and #1114's
+  three refusals (`check_content_hash`, `check_row_mirror_members_closed`,
+  `validate_subject_key_ids`), against I1300–I1311, I84, the 732 CC
+  governance vectors, the six self_roster traces and the registry pins.
+  108 mutants in three shards, on the weekly run.
+- `scope-s4-consent-sweep.txt` (v60.0.0, slice S4): the consent and sweep
+  planes on one plan (#934 step 4, #1105): `consent_admit` and `sweep_plan`
+  whole, the #1105 holdings read in `key_plane`, the key-grant doors' shared
+  bodies, the observation prune plan and its two executors, and each
+  backend's `ConsentStore` / `SweepStore` / `RoomEvictionStore` executors and
+  the doors that call the plans, against I1192–I1201 and the doors' standing
+  witnesses. 302 mutants in six shards, 256 caught, 46 unviable, 0
+  missed (three rounds), on the weekly run.
+- `scope-s5-memory-retire.txt` (v60.0.0, slice S5): what the memory
+  backend's retirement added (#1002): the one lifecycle predicate (#720,
+  `lifecycle_predicate`, `hiding_composers`), the from-disk tree binding
+  (#691, `store::tree_read`), the fountain assembler moved out of memory.rs,
+  the migrated in-memory clone (`store::sqlite_scratch`), and the genesis
+  scratch on both backends (`genesis::scratch`, the postgres scratch
+  database and its reaper, the replay's provision/release arms), against
+  I1320, I1321, I1323, I1329–I1332 and the lifecycle / fountain reads on
+  both backends. 44 mutants in one shard, 36 caught, 8 unviable, 0 missed
+  (round 2),
+  nightly. Every other scope dropped its `src/store/memory.rs` sites and
+  memory legs.
+- `scope-s6-affiliations.txt` (v60.0.0, slice S6): organisations as
+  affiliations (#1036 items 1-5, #1049, #1062, #1048): the licence authority
+  quorum and its `license` walk, the signed-instant verdicts with W in front
+  (licence, consent grant chain, key_grant sealer and the stream read), the
+  licence audience, the typed licence payload (`operational.rs`) and its
+  `revision` gate, the subject-withdraws carve-out and the contest, the
+  affiliation owner-binding, and the delegation term gate and lens, against
+  I1210–I1235 and the licensure-chain, grant-scope and key-grant witnesses
+  (plus I972, I126, I313, which guard neighbouring sites). 212 mutants, 186
+  caught, 26 unviable, 0 missed (three rounds: 28 then 9 survivors; all
+  witnessed, except two equivalent forms removed: the withdraws rule-3 cut
+  accumulation and the stream instants' `&&`), on the weekly run in eight
+  shards. It ran in five until the v60.0.0 CI run (40305453908): shard 1/5
+  took about 168 s per mutant, not the 120 s the sizing assumes, and three
+  of the five shards hit the 7200 s budget with mutants unrun (0 missed).
+  At 600 s + 168 s x 27, a shard of eight fits.
 - `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and
-  federation files that feed the counters. The issue's other starting modules
+  federation files that feed the counters, against I548–I551 and (v60.0.0)
+  I1340–I1341, the witnesses of `apply_planned`'s read-back and store-error
+  arms on sqlite and postgres. The issue's other starting modules
 (the `trust_root.rs` walks beyond `trust_root_valid`) are not yet scoped.
+
+From v60 every slice adds its own scope; see the next section.
+
+## Per-slice scopes (v60)
+
+Until v60 every slice ran its mutation round as an ad-hoc Python script
+outside the repo (`release53/*_mut*.py`, 20+ in v59 alone). Nobody could
+re-run them, the nightly matrix never learned the sites, and the results
+survived only as a handoff table. From v60.0.0 (docs/V60_TASK_PLAN.md §3):
+
+1. **Every slice ships `scripts/mutants/scope-<slice>.txt`**: a `tests:`
+   filter naming the slice's witnesses, a `features:` line when a site
+   compiles only under a non-default feature, and the files (functions, for
+   any file over a few thousand lines) the slice touched. The hand-written
+   mutation list a brief used to carry becomes this file.
+2. **One runner:** `scripts/cargo_guard.sh scripts/mutants.sh cargo-mutants
+   scripts/mutants/scope-<slice>.txt`. No ad-hoc mutation scripts. A
+   mutation the tool does not generate (a revert of the fix, say) is checked
+   by hand against a committed checkpoint and reported as such, never by a
+   script that rewrites source.
+3. **The matrix is the handoff's mutation table**, cited by path:
+   `target/certify-logs/mutants/<scope>[-shard-k-of-n]/matrix.json`,
+   `verdict.txt`, `unvalidated.txt`.
+4. **Green means exit 0 AND an empty `unvalidated.txt`.** Every mutant is
+   caught, or allow-listed with a tracking issue; and every witness in the
+   filter killed something (a witness that kills nothing is a witness about a
+   neighbouring gate). **Exit 3 means shard it** (`MUTANTS_SHARD=k/n`), never
+   shrink the scope to fit.
+5. **The scope joins the nightly matrix** (`.github/workflows/mutants.yml`),
+   budget-fitted and sharded; the release slice wires them.
+6. `scripts/mutants_scopes_check.py` (certify fast gate `mutscopes`, and CI)
+   keeps every scope honest from disk: it resolves, its `tests:` filter is a
+   well-formed filterset whose `test(...)` leaves match a `fn` or `mod` name
+   under `src/` or `tests/`, its `features:` exist, and every allow-list line
+   names an issue.
+
+A slice PR also gets the diff-scoped report: `scripts/mutants_diff.sh
+origin/main` runs in the `reports (non-gating)` workflow on every
+`release-*` PR (and on any PR labelled `run-mutants`), answering "which
+changed line can be mutated with no test noticing?" for the whole diff, not
+only the sites the scope chose.
+
+### The scope-file template
+
+```
+# Mutation scope: v<NN> slice <S> — <one line: what the slice changed>
+# (docs/V<NN>_TASK_PLAN.md §4 <S>; CIRISPersist#<issue>, ...).
+#
+# - #<issue>: <door or fold>, what changed. Witness I<nnnn> (<backends>).
+# - Named sites left OUT of the scope, and why (e.g. a site only an
+#   integration target can witness: scripts/mutants.sh runs --lib).
+#
+# Grammar: docs/MUTATION_TESTING.md "Scope files".
+tests: test(/i<nnnn>|i<mmmm>_/)
+features: postgres,sqlite,server            # only when not the default
+
+src/federation/<small_file>.rs              # every mutant in the file
+src/federation/<big_file>.rs fn_a fn_b      # only inside these functions
+```
+
+### The brief paragraph (copy it into every slice brief)
+
+> **Mutation.** Ship `scripts/mutants/scope-<slice>.txt` (template in
+> `docs/MUTATION_TESTING.md` "Per-slice scopes"): `tests:` names your
+> witnesses, the entries name the files and (for big files) functions you
+> changed, `features:` when a site needs a non-default feature. Check it with
+> `python3 scripts/mutants_scopes_check.py`, then run `MUTANTS_BUDGET_SECS=7200
+> scripts/cargo_guard.sh scripts/mutants.sh cargo-mutants
+> scripts/mutants/scope-<slice>.txt` under nohup (exit 3: shard with
+> `MUTANTS_SHARD=k/n`, never shrink). Green is exit 0 with an empty
+> `unvalidated.txt`; kill every survivor with a witness, or allow-list it in
+> `scripts/mutants/allowed_survivors.txt` with its tracking issue. No ad-hoc
+> mutation scripts. Your handoff's mutation table is the matrix by path
+> (`target/certify-logs/mutants/<scope>/matrix.json`, `verdict.txt`,
+> `unvalidated.txt`).
 
 ## Unvalidated witnesses
 
@@ -337,7 +486,9 @@ Across the runs above:
 
 - **Never per-PR.** The matrix scripts' own witnesses
   (`scripts/mutants_matrix_test.py`, fixtures, no cargo) run per-PR in
-  `ci.yml` and in certify's fast tier (`mutmatrix`).
+  `ci.yml` and in certify's fast tier (`mutmatrix`), and so does the
+  from-disk scope check (`mutscopes`, v60.0.0). The diff-scoped report
+  (`scripts/mutants_diff.sh`) runs, non-gating, on `release-*` PRs.
 - **Nightly** (v54.1.0): `scope-consent-gate`, and `scope-observe` as two
   shards, each its own job with `MUTANTS_JOBS=1` and a 2-hour budget. Each is
   a gate (exit codes above).
@@ -353,7 +504,7 @@ Across the runs above:
 | variable | default | meaning |
 |---|---|---|
 | `MUTANTS_BUDGET_SECS` | 7200 | wall budget; on expiry the matrix is written from what finished, `complete: false` |
-| `MUTANTS_FEATURES` | `postgres,sqlite,server` | for mutest set `sqlite,server` (postgres ICE) |
+| `MUTANTS_FEATURES` | the scope's `features:`, else `postgres,sqlite,server` | for mutest set `sqlite,server` (postgres ICE) |
 | `MUTANTS_JOBS` | 1 | cargo-mutants `-j`; each job is a full crate build |
 | `CARGO_BUILD_JOBS` | 3 | per-build parallelism |
 | `MUTANTS_SHARD` | none | `k/n`, 0-based: cargo-mutants' `--shard`; output `<scope>-shard-<k>-of-<n>` |

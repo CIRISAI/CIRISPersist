@@ -88,15 +88,119 @@ use super::{Error, FederationDirectory};
 /// `W_self` (CC 3.3.6.3): the lone path's window, 86 400 s.
 pub const W_SELF_SECS: i64 = 86_400;
 
-/// The self roster's conditions on the two paths (CC 3.3.6.3).
-#[must_use]
-pub fn policy() -> TwoPathPolicy {
-    TwoPathPolicy::self_roster(W_SELF_SECS)
+/// The self roster's conditions on the two paths (CC 3.3.6.3): v60.0.0
+/// (S6v), the CC governance policy table's `self_roster_add` /
+/// `self_roster_evict` rows (CC 4.5.13, vendored at `v1.0-rc9`), admitted
+/// inside the self corridor
+/// ([`PolicyTable::self_roster`](super::governance_policy::PolicyTable::self_roster)),
+/// with the door's own rule (an eviction's target silent all window; one open
+/// proposal per proposer and per target). Only the window may move, and only
+/// in a live test-anchor harness ([`w_self_secs`]).
+///
+/// # Errors
+///
+/// [`Error::GovernancePolicyRefused`] when the table's rows are outside the
+/// self corridor, unreadable, or disagree: the door decides nothing.
+pub fn policy() -> Result<TwoPathPolicy, Error> {
+    let table = super::governance_policy::table()?.self_roster()?;
+    Ok(harness_window(table))
 }
 
-/// The proposal row's dimension (CC 3.1.9.2 `objection:{state}`; minted here).
+/// A `test-anchor` build only: the live harness's window (#1111) replaces
+/// the table's, the same rule as [`w_self_secs`]. Without the feature there
+/// is nothing to replace, so production carries no window override at all.
+#[cfg(feature = "test-anchor")]
+fn harness_window(mut policy: TwoPathPolicy) -> TwoPathPolicy {
+    if super::genesis::test_anchor_override_active() {
+        if let Some(secs) = test_window::env_secs() {
+            policy.window_secs = secs;
+        }
+    }
+    policy
+}
+
+/// See the `test-anchor` twin: a production build decides under the table.
+#[cfg(not(feature = "test-anchor"))]
+fn harness_window(policy: TwoPathPolicy) -> TwoPathPolicy {
+    policy
+}
+
+/// `W_self` as this node applies it: [`W_SELF_SECS`], on every production
+/// build. v60.0.0 (CIRISPersist#1111, CIRISServer#794 T11) — a `test-anchor`
+/// build whose test-anchor override is LIVE (the feature, the runtime arm and
+/// verify's anti-production tripwire: [`test_window`]) uses
+/// `CIRIS_TEST_W_SELF_SECS` instead, so a harness binary can watch a lone
+/// path land without waiting a day. The window still runs on the node's
+/// clock from the node's receipt; only its length moves.
+#[must_use]
+pub fn w_self_secs() -> i64 {
+    #[cfg(feature = "test-anchor")]
+    {
+        test_window::window(
+            super::genesis::test_anchor_override_active(),
+            test_window::env_secs(),
+        )
+    }
+    #[cfg(not(feature = "test-anchor"))]
+    {
+        W_SELF_SECS
+    }
+}
+
+/// v60.0.0 (CIRISPersist#1111) — the test harness's `W_self`. Compiled only
+/// with `feature = "test-anchor"`: a production build carries no read of
+/// [`test_window::ENV`] (I1162's from-disk half pins that every read of it
+/// sits in this module).
+#[cfg(feature = "test-anchor")]
+pub mod test_window {
+    /// The variable a test-anchor harness sets: whole seconds, in
+    /// `1..=`[`W_SELF_SECS`](super::W_SELF_SECS). It can shorten the window,
+    /// never lengthen it; any other value is ignored with a warning.
+    pub const ENV: &str = "CIRIS_TEST_W_SELF_SECS";
+
+    /// [`ENV`], read once per process.
+    pub(super) fn env_secs() -> Option<i64> {
+        static SECS: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
+        *SECS.get_or_init(|| parse_secs(std::env::var(ENV).ok().as_deref()))
+    }
+
+    /// A value of [`ENV`]: whole seconds in `1..=`[`W_SELF_SECS`](super::W_SELF_SECS),
+    /// else `None` (with a warning when the variable was set).
+    #[must_use]
+    pub fn parse_secs(raw: Option<&str>) -> Option<i64> {
+        let raw = raw?;
+        let secs = raw
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|s| (1..=super::W_SELF_SECS).contains(s));
+        if secs.is_none() {
+            tracing::warn!(
+                value = %raw,
+                "{ENV} is not whole seconds in 1..={}: W_self stays {}",
+                super::W_SELF_SECS,
+                super::W_SELF_SECS
+            );
+        }
+        secs
+    }
+
+    /// The window: `env_secs` when the test-anchor override is active, else
+    /// [`W_SELF_SECS`](super::W_SELF_SECS). An env value without the
+    /// override is inert.
+    #[must_use]
+    pub fn window(override_active: bool, env_secs: Option<i64>) -> i64 {
+        match env_secs {
+            Some(secs) if override_active => secs,
+            _ => super::W_SELF_SECS,
+        }
+    }
+}
+
+/// The proposal row's dimension (CC 3.1.9.2 `objection:{state}`, whose open
+/// vocabulary CC rc9 lists as `proposal`, `assent`, `raised`; minted here).
 pub const DIMENSION_PROPOSAL: &str = "objection:proposal:v1";
-/// An assent row's dimension (minted here).
+/// An assent row's dimension (minted here; CC rc9 `objection:{state}`).
 pub const DIMENSION_ASSENT: &str = "objection:assent:v1";
 /// An objection row's dimension: the reverse quorum's own.
 pub const DIMENSION_OBJECTION: &str = super::reverse_quorum::DIMENSION_OBJECTION;
@@ -396,6 +500,16 @@ pub const PAST_FRESHNESS_W_SECS: i64 = 259_200;
 /// The refusal token of [`check_roster_act_fresh`] (CIRISPersist#1049).
 pub const ASSERTED_AT_STALE: &str = "asserted_at_stale";
 
+/// v60.0.0 (CIRISPersist#1049, #1036 item 2) — is `asserted_at` more than
+/// [`PAST_FRESHNESS_W_SECS`] behind `now`? The one reading of W every door
+/// that judges a chain at a row's signed instant applies before it lets that
+/// instant stand alone (CC 2.6.7): the roster gate below, the licensure door,
+/// the key_grant sealer and the consent `grant` chain.
+#[must_use]
+pub fn outside_past_freshness_window(asserted_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    asserted_at < now - chrono::Duration::seconds(PAST_FRESHNESS_W_SECS)
+}
+
 /// **The bound on [`acts_as_steward_at`]'s instant, at admission**
 /// (CIRISPersist#1049; CC 2.6.7 W as ruled in 3.3.6.3, rc9 69fd22e): a row
 /// whose author stands for one of `stewards` as a roster key at the row's
@@ -424,19 +538,18 @@ where
     if stewards.iter().any(|s| s == author) {
         return Ok(());
     }
-    let oldest = roster_clock() - chrono::Duration::seconds(PAST_FRESHNESS_W_SECS);
-    // (`now` below is the same clock: the receipt instant.)
-    if asserted_at >= oldest {
+    let now = roster_clock();
+    if !outside_past_freshness_window(asserted_at, now) {
         return Ok(());
     }
-    let now = roster_clock();
     for s in stewards {
         if is_roster_key_at(dir, s, author, asserted_at).await?
             && !is_roster_key_at(dir, s, author, now).await?
         {
             return Err(Error::AssertedAtStale {
                 author: author.to_owned(),
-                steward: s.clone(),
+                standing_for: s.clone(),
+                plane: "roster",
                 asserted_at,
                 w_secs: PAST_FRESHNESS_W_SECS,
             });
@@ -909,6 +1022,7 @@ async fn plan<D>(
     identity: &str,
     extra: Option<(&Carried, &str)>,
     now: DateTime<Utc>,
+    policy: &TwoPathPolicy,
 ) -> Result<Plan, Error>
 where
     D: FederationDirectory + ?Sized,
@@ -964,11 +1078,10 @@ where
         with_answers.push((p, a, c));
     }
     let refs: Vec<(&Proposal, &Answers)> = with_answers.iter().map(|(p, a, _)| (p, a)).collect();
-    let decided: Vec<(String, TwoPathDecision)> =
-        two_path::decide_all(&roster, &refs, now, &policy())
-            .into_iter()
-            .map(|(p, d)| (p.id.clone(), d))
-            .collect();
+    let decided: Vec<(String, TwoPathDecision)> = two_path::decide_all(&roster, &refs, now, policy)
+        .into_iter()
+        .map(|(p, d)| (p.id.clone(), d))
+        .collect();
     let mut entries = Vec::with_capacity(decided.len());
     for (id, d) in decided {
         if let Some(pos) = with_answers.iter().position(|(p, _, _)| p.id == id) {
@@ -1000,8 +1113,9 @@ pub async fn standing<D>(dir: &D, identity: &str) -> Result<Vec<Standing>, Error
 where
     D: FederationDirectory + ?Sized,
 {
+    let policy = policy()?;
     let now = roster_clock();
-    let plan = plan(dir, identity, None, now).await?;
+    let plan = plan(dir, identity, None, now, &policy).await?;
     Ok(plan
         .entries
         .into_iter()
@@ -1081,10 +1195,13 @@ where
     if !is_roster_change(dir, &carried, &roster).await? {
         return Ok(());
     }
+    // v60.0.0 (S6v) — the corridor at admission: the policy is the CC table's
+    // row, refused before anything is held when it is outside its corridor.
+    let policy = policy()?;
     let row = proposal_row(&carried)?;
     let id = row.attestation_id.clone();
     let now = roster_clock();
-    let plan = plan(dir, &identity, Some((&carried, &id)), now).await?;
+    let plan = plan(dir, &identity, Some((&carried, &id)), now, &policy).await?;
     let decision = plan
         .entries
         .iter()
@@ -1204,11 +1321,12 @@ pub async fn execute_for<D>(dir: &D, identity: &str) -> Result<usize, Error>
 where
     D: FederationDirectory + ?Sized,
 {
+    let policy = policy()?;
     let mut landed = 0;
     let mut tried: BTreeSet<String> = BTreeSet::new();
     loop {
         let now = roster_clock();
-        let plan = plan(dir, identity, None, now).await?;
+        let plan = plan(dir, identity, None, now, &policy).await?;
         for id in &plan.withdrawn {
             dir.settle_self_roster_proposal(id, WITHDRAWN_OUTCOME, now)
                 .await?;

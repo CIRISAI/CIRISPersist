@@ -26,7 +26,7 @@
 //!   cosign is re-checked against the head it names; the quorum counts
 //!   persons, not keys.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::accord_test_support as ops;
     use crate::federation::canonical_community as cc;
@@ -140,6 +140,7 @@ pub(crate) mod bodies {
         d.list_hard_case_events(HardCaseFilter {
             kind: Some(kind.to_owned()),
             since: None,
+            emitter_key_id: None,
         })
         .await
         .unwrap()
@@ -1850,7 +1851,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     macro_rules! rc6_runners {
         ($modname:ident, $fresh:expr) => {
@@ -2074,14 +2075,6 @@ mod runners {
             }
         };
     }
-    rc6_runners!(memory, async {
-        {
-            // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
-            let b = crate::store::memory::MemoryBackend::new();
-            crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
-            Some(b)
-        }
-    });
     #[cfg(feature = "sqlite")]
     rc6_runners!(sqlite, async {
         use crate::store::Backend as _;

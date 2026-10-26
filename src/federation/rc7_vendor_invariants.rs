@@ -26,7 +26,7 @@
 //! Each runs on memory, sqlite and postgres (postgres through
 //! `CIRIS_PERSIST_TEST_PG_URL`; without it the leg returns at once).
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::attestation_emit::{assemble, stamp_and_canonicalize};
     use crate::federation::envelope::EnvelopeCore;
@@ -301,7 +301,6 @@ pub(crate) mod bodies {
             }
         };
     }
-    runners!(memory, async { Some(crate::store::MemoryBackend::new()) });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

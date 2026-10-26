@@ -9,6 +9,10 @@ valid:
     #[serial_test::serial(engine_singleton, gil_teardown)]
     fn t() {}
   - |
+    #[tokio::test]
+    #[serial_test::serial(genesis_scratch)]
+    async fn t() {}
+  - |
     /// `#[serial]` in a doc comment is not an attribute
     #[test]
     fn t() {}

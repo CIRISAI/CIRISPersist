@@ -302,9 +302,6 @@ mod run {
             }
         };
     }
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;
@@ -618,9 +615,9 @@ mod run {
     #[test]
     fn i103_one_rule_every_door() {
         const REG: &str = include_str!("register.rs");
+        const KEY_PLANE: &str = include_str!("key_plane.rs");
         const SQLITE: &str = include_str!("../store/sqlite.rs");
         const PG: &str = include_str!("../store/postgres.rs");
-        const MEM: &str = include_str!("../store/memory.rs");
         const PYO3: &str = include_str!("../ffi/pyo3.rs");
         const ENGINE: &str = include_str!("../engine.rs");
         assert_eq!(
@@ -629,11 +626,7 @@ mod run {
             1,
             "I103: the plan produces Rebind in exactly one place"
         );
-        for (name, text) in [
-            ("sqlite.rs", SQLITE),
-            ("postgres.rs", PG),
-            ("memory.rs", MEM),
-        ] {
+        for (name, text) in [("sqlite.rs", SQLITE), ("postgres.rs", PG)] {
             let body = text
                 .split("fn store_rebound_key_record(")
                 .nth(1)
@@ -643,11 +636,25 @@ mod run {
                 !body.contains("verify_envelope_binds_subject("),
                 "I103: {name}'s store step re-decides the rule"
             );
+            // v60.0.0 (CIRISPersist#934 step 3) — every backend's apply is the
+            // one shared body, which dispatches the arm (below).
             assert!(
-                text.contains("ReplicatedKeyPlan::Rebind =>"),
-                "I103: {name}'s apply dispatches the arm"
+                text.contains("key_plane::apply_replicated_key_record_planned(self, record)"),
+                "I103: {name}'s apply is the shared apply"
             );
         }
+        let apply = KEY_PLANE
+            .split("pub(crate) async fn apply_replicated_key_record_planned<")
+            .nth(1)
+            .expect("I103: the shared apply");
+        let apply = &apply[..apply.find("\n}\n").expect("end")];
+        assert_eq!(
+            apply
+                .matches("P::Rebind => (KeyRecordWrite::Rebind { record }, O::Rebound)")
+                .count(),
+            1,
+            "I103: the shared apply dispatches the Rebind arm to the rebind write, once"
+        );
         for f in ["rebind_key_record", "rebind_self_federation_key"] {
             let d = PYO3
                 .split(&format!("    fn {f}("))

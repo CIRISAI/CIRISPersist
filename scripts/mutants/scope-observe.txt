@@ -11,7 +11,7 @@
 # Not in this scope: the backend byte meters and the fold entries in the
 # 3k-28k-line files; see scope-observe-sites.txt.
 
-tests: test(/i549|i550|i551|i552|i553|i69[0-9]/)
+tests: test(/i549|i550|i551|i552|i553|i69[0-9]|i116[34]_/)
 witnesses: src/observe/tests.rs
 
 src/observe/mod.rs

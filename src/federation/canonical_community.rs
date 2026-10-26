@@ -1644,6 +1644,7 @@ where
         subject_key_id: Some(community_key_id.to_owned()),
         detail: serde_json::json!({ "reason": reason, "at": now.to_rfc3339() }),
         emitted_at: now,
+        emitter_key_id: String::new(),
     };
     match super::hard_case::record_observation(directory, event).await {
         Ok(()) => Ok(()),
@@ -2216,6 +2217,7 @@ where
         subject_key_id: Some(lineage_key_id.to_owned()),
         detail: serde_json::to_value(e).unwrap_or_default(),
         emitted_at: now,
+        emitter_key_id: String::new(),
     };
     match super::hard_case::record_observation(directory, event).await {
         Ok(()) => Ok(()),
@@ -3934,7 +3936,7 @@ where
 /// v53.1.7 — I547's oracle: [`live_charter_rows`] as v53.1.6 shipped it,
 /// VERBATIM (the family's whole about-slice), `super::` spelled from the crate
 /// root.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod v53_1_6_reference {
     use super::*;
 

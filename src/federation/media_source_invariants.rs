@@ -5,7 +5,7 @@
 //! postgres; the blob-door bodies run where a `BlobStorage` exists (sqlite,
 //! postgres).
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::USER;
@@ -973,6 +973,7 @@ pub(crate) mod bodies {
 
 #[cfg(test)]
 mod run {
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
     }
@@ -990,7 +991,6 @@ mod run {
     fn i119_every_door_and_the_vocabulary() {
         const SQLITE: &str = include_str!("../store/sqlite.rs");
         const PG: &str = include_str!("../store/postgres.rs");
-        const MEM: &str = include_str!("../store/memory.rs");
         const ADMISSION: &str = include_str!("admission.rs");
         const ENVELOPE: &str = include_str!("envelope.rs");
         // v56.0.0 (CIRISPersist#934 step 1) — the ingest door's gate lives in
@@ -1014,11 +1014,7 @@ mod run {
             );
         }
         // Every backend's ingest and local doors are the shared doors.
-        for (name, text) in [
-            ("sqlite.rs", SQLITE),
-            ("postgres.rs", PG),
-            ("memory.rs", MEM),
-        ] {
+        for (name, text) in [("sqlite.rs", SQLITE), ("postgres.rs", PG)] {
             for door in [
                 "attestation_admit::put_attestation_planned(",
                 "attestation_admit::write_local_attestation_planned(",
@@ -1062,6 +1058,7 @@ mod run {
         );
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     macro_rules! runners {
         ($modname:ident, $fresh:expr) => {
             mod $modname {
@@ -1125,9 +1122,6 @@ mod run {
             }
         };
     }
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

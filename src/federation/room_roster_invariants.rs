@@ -817,7 +817,7 @@ pub mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
@@ -893,10 +893,6 @@ mod run {
             }
         };
     }
-
-    dyn_runners!(memory_dyn, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
 
     #[cfg(feature = "sqlite")]
     dyn_runners!(sqlite_dyn, async {

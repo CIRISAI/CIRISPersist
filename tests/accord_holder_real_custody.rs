@@ -171,12 +171,6 @@ async fn admits_real_holder<D: FederationDirectory + ?Sized>(dir: &D) {
 }
 
 #[tokio::test]
-async fn memory_admits_the_real_accord_holder_554() {
-    let backend = ciris_persist::store::memory::MemoryBackend::new();
-    admits_real_holder(&backend).await;
-}
-
-#[tokio::test]
 async fn sqlite_admits_the_real_accord_holder_554() {
     use ciris_persist::store::backend::Backend as _;
     let backend = ciris_persist::store::sqlite::SqliteBackend::open_in_memory()
@@ -209,7 +203,7 @@ async fn bundle_verifier_and_put_gate_agree_on_holder_evidence_554() {
         canonical_genesis_bundle, effective_accord_holder_records, verify_bundle_quorum,
     };
 
-    let backend = ciris_persist::store::memory::MemoryBackend::new();
+    let backend = ciris_persist::store::test_backend::test_backend();
     backend
         .seed_genesis_accord_holders(&effective_accord_holder_records())
         .await
@@ -272,7 +266,7 @@ async fn bundle_with_uninstallable_holder_evidence_is_refused_by_the_verifier_55
         canonical_genesis_bundle, effective_accord_holder_records, verify_bundle_quorum,
     };
 
-    let backend = ciris_persist::store::memory::MemoryBackend::new();
+    let backend = ciris_persist::store::test_backend::test_backend();
     backend
         .seed_genesis_accord_holders(&effective_accord_holder_records())
         .await

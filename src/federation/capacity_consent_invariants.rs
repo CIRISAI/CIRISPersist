@@ -8,7 +8,7 @@
 //! at emit. One body per invariant, generic over the directory, run on
 //! memory, sqlite and postgres.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::admission::ConsentGatedFamily;
     use crate::federation::consent_by_humans as cbh;
@@ -468,7 +468,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
@@ -506,9 +506,6 @@ mod run {
             }
         };
     }
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

@@ -20,6 +20,7 @@
 //! - **I370** (sqlite) — the shipped bundle's unlabelled rows still seed and
 //!   charter the accord on a fresh node: pinned-bundle members, held by nobody.
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) mod bodies {
     use crate::federation::operational::test_support as ops;
     use crate::federation::trust_root::{
@@ -262,7 +263,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     use super::bodies;
     use crate::federation::FederationDirectory;
@@ -299,9 +300,6 @@ mod run {
             }
         };
     }
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;
@@ -321,17 +319,6 @@ mod run {
         b.run_migrations().await.unwrap();
         Some(b)
     });
-
-    #[tokio::test]
-    async fn i369_held_rows_keep_their_reading_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        let h = bodies::i369_put_unlabelled(&b as &dyn FederationDirectory).await;
-        bodies::i369_assert(&b, &h, false).await;
-        for id in &h.ids {
-            b.mark_trust_direction_held(id);
-        }
-        bodies::i369_assert(&b, &h, true).await;
-    }
 
     /// The real upgrade: the rows are stored on a V166 schema (before the
     /// rule), V167 runs, and they keep their reading; rows put after it do not.

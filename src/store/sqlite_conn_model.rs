@@ -240,9 +240,6 @@ pub(crate) enum ConnClass {
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("add_peer_record", ConnClass::Write),
-    ("adopt_genesis_reanchor", ConnClass::Write),
-    ("adopt_scrub_upgrade", ConnClass::Write),
-    ("write_replaced_key_registration", ConnClass::Write),
     // #846 (§6.1) — the adopt floor: row + declared binding + holder claim in
     // one transaction.
     ("adopt_sealed_blob_at", ConnClass::Write),
@@ -251,9 +248,13 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("aggregate_scoring_factors_rollup_batch", ConnClass::Read),
     ("aggregate_scoring_factors_uncached", ConnClass::Read),
     ("aggregate_scrub_stats", ConnClass::Read),
-    ("attach_key_pqc_signature", ConnClass::Write),
     // v53.0.0 (#975) — the row-type census: one GROUP BY, read-only.
     ("attestation_type_census", ConnClass::Read),
+    // v60.0.0 (CIRISPersist#934 step 3) — the key-record executor: every
+    // key-record write door's one transaction.
+    ("store_planned_key_record", ConnClass::Write),
+    // v60.0.0 (CIRISPersist#1105) — the family-scoped holdings read.
+    ("read_key_plane_wire_hashes", ConnClass::Read),
     ("attestations_binding_content", ConnClass::Read),
     ("backfill_trace_dedup_shard_keys", ConnClass::Write),
     ("backfill_revocation_subject_digests", ConnClass::Write),
@@ -310,7 +311,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("enter_mesh", ConnClass::Write),
     ("evict_fountain_content_hard_delete", ConnClass::Write),
     ("evict_fountain_content_to_tier", ConnClass::Write),
-    ("evict_known_wire_hashes", ConnClass::Write),
+    ("evict_known_wire_hashes_before", ConnClass::Write),
     ("evict_scope_blobs", ConnClass::Write),
     ("execute_attestation_query", ConnClass::Read),
     ("factor_rollup_present", ConnClass::Read),
@@ -335,7 +336,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("get_scope_blob", ConnClass::Write),
     ("get_trace_detail", ConnClass::Read),
     ("get_trace_summary", ConnClass::Read),
-    ("grant_trust", ConnClass::Write),
+    ("store_planned_trust_grant", ConnClass::Write),
     ("has_blob", ConnClass::Write),
     ("hash_chain_gaps", ConnClass::Read),
     ("heartbeat_shared_instance", ConnClass::Write),
@@ -383,9 +384,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_family_membership_widenings_for", ConnClass::Read),
     // v49.0.0 (#912) — the listing plane's per-room read.
     ("list_community_membership_listings_for", ConnClass::Read),
-    ("list_consent_peers", ConnClass::Read),
+    ("read_consent_peer_rows", ConnClass::Read),
     // v44.6.0 (#857, V147) — the consent_peer_set_for projection read; same class as its twin.
-    ("list_consent_peers_for", ConnClass::Read),
     ("list_key_registration_history", ConnClass::Read),
     // v45.0.0 (#871) — the rendition index read and the puller's budget
     // read; plain SELECTs on the reader path.
@@ -400,9 +400,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // SELECT on the reader path (the community half delegates to
     // `community_dek_blob_epoch`, itself Read).
     ("minter_of_blob", ConnClass::Read),
-    ("list_consent_revocations", ConnClass::Read),
+    ("read_consent_revocation_candidates", ConnClass::Read),
     ("list_stored_delivery_receipts_for", ConnClass::Read),
-    ("list_expired_attestation_ids", ConnClass::Read),
+    ("read_expired_attestation_ids", ConnClass::Read),
     ("list_families_for_member", ConnClass::Read),
     ("list_family_membership_revocations_for", ConnClass::Read),
     ("list_federation_keys", ConnClass::Read),
@@ -411,25 +411,17 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_group_versions", ConnClass::Read),
     ("list_hard_case_events", ConnClass::Read),
     ("list_held_fountain_content", ConnClass::Read),
-    ("list_hybrid_pending_attestations", ConnClass::Read),
-    ("list_hybrid_pending_keys", ConnClass::Read),
+    ("read_hybrid_pending", ConnClass::Read),
     ("list_identity_occurrence_revocations_for", ConnClass::Read),
     ("list_identity_occurrences_for", ConnClass::Read),
     ("list_installed_storage_budgets", ConnClass::Read),
     ("list_keys_by_identity_type", ConnClass::Read),
     ("list_known_wire_hashes_since", ConnClass::Read),
-    ("list_live_consent_grants_by", ConnClass::Read),
-    ("list_live_consent_grants_for", ConnClass::Read),
+    ("read_live_consent_grant_candidates", ConnClass::Read),
     ("list_llm_calls", ConnClass::Read),
     ("list_local_tier_attestations", ConnClass::Read),
     ("list_location_proofs_for", ConnClass::Read),
-    ("list_org_memberships_for", ConnClass::Read),
-    ("list_org_memberships_since", ConnClass::Read),
-    ("list_organizations_for", ConnClass::Read),
-    ("list_organizations_since", ConnClass::Read),
     ("list_outbound", ConnClass::Read),
-    ("list_partner_records_for", ConnClass::Read),
-    ("list_partner_records_since", ConnClass::Read),
     ("list_revocations", ConnClass::Read),
     ("list_scope_blob_symbols", ConnClass::Write),
     ("list_scores", ConnClass::Read),
@@ -458,7 +450,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ),
     ("list_signed_identity_occurrences_for", ConnClass::Read),
     ("list_signed_location_proofs_since", ConnClass::Read),
-    ("list_signed_partner_records_since", ConnClass::Read),
     ("list_signed_transport_destinations_for", ConnClass::Read),
     ("list_signed_transport_destinations_since", ConnClass::Read),
     ("list_tasks", ConnClass::Read),
@@ -531,7 +522,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("stream_dek_list", ConnClass::Read),
     ("stream_dek_insert", ConnClass::Write),
     ("stream_dek_close", ConnClass::Write),
-    ("stream_dek_evict_room_chunks", ConnClass::Write),
+    ("evict_selected_room_epochs", ConnClass::Write),
     ("stream_dek_put_grants", ConnClass::Write),
     ("stream_dek_grants", ConnClass::Read),
     ("stream_dek_grants_for_recipient", ConnClass::Read),
@@ -583,7 +574,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("dag_link_backfill_cursor", ConnClass::Read),
     ("set_dag_link_backfill_cursor", ConnClass::Write),
     // v54.0.0 (#995 row 2) — the scrub re-hydration CAS and its test seam.
-    ("rehydrate_dropped_key_scrubs", ConnClass::Write),
     ("test_seam_drop_key_additional_scrubs", ConnClass::Write),
     // v54.0.0 (#995 row 4, V184) — the rooms of a shared plaintext blob.
     ("blob_associations", ConnClass::Read),
@@ -624,18 +614,12 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_family_local", ConnClass::Write),
     ("put_family_membership_revocation", ConnClass::Write),
     ("put_fountain_content", ConnClass::Write),
-    ("put_goal", ConnClass::Write),
     ("put_identity_occurrence", ConnClass::Write),
     ("put_identity_occurrence_local", ConnClass::Write),
     ("put_identity_occurrence_revocation_local", ConnClass::Write),
     ("put_installed_storage_budget", ConnClass::Write),
     ("put_location_proof", ConnClass::Write),
     ("withdraw_location_proof", ConnClass::Write),
-    ("put_org_membership", ConnClass::Write),
-    ("put_organization", ConnClass::Write),
-    ("put_partner_record", ConnClass::Write),
-    // v50.0.0 (review M5) — `put_public_key` delegates to this store step.
-    ("put_public_key_at_door", ConnClass::Write),
     // v50.0.0 (#928, V157) — the recorded admission depth of a `withdraws`.
     ("withdraws_admission_depth", ConnClass::Read),
     ("trust_direction_held_among", ConnClass::Read),
@@ -667,7 +651,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("repair_v070_checksum", ConnClass::Write),
     ("replay_abandoned", ConnClass::Write),
     ("resolve_scores", ConnClass::Read),
-    ("retire_goal", ConnClass::Write),
     ("revocations_for_subject", ConnClass::Read),
     ("revoke_trust", ConnClass::Write),
     // #845 (I55) — the nine documented steps, in one transaction: a free fn
@@ -678,9 +661,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("sample_public_keys", ConnClass::Read),
     ("scoring_ingest_watermark_ms", ConnClass::Read),
     ("seal_stream", ConnClass::Write),
-    ("seed_genesis_accord_holders", ConnClass::Write),
     ("set_active_halt", ConnClass::Write),
-    ("set_consent_role", ConnClass::Write),
+    ("store_planned_consent_role", ConnClass::Write),
     ("sqlite_load_stream_chunk_hashes", ConnClass::HelperRead),
     ("sqlite_next_key_serve_position", ConnClass::HelperRead),
     ("sqlite_next_plane_position", ConnClass::HelperRead),
@@ -743,6 +725,17 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("sqlite_record_hard_case_in_tx", ConnClass::HelperWrite),
     ("sqlite_project_hard_case", ConnClass::HelperWrite),
     ("sqlite_project_detection", ConnClass::HelperWrite),
+    // v60.0.0 (CIRISPersist#988 item 1) — the ledger projection's writer and
+    // its rebuild (into a scratch table, rolled back).
+    ("sqlite_project_ledger", ConnClass::HelperWrite),
+    ("sqlite_ledger_projection_rebuild", ConnClass::HelperWrite),
+    // v60.0.0 (CIRISPersist#988 item 4) — the goals projection's writer (the
+    // refold, on the executor's transaction) and its rebuild; the legacy
+    // goal reads and removals the rehome drives.
+    ("sqlite_project_goal", ConnClass::HelperWrite),
+    ("sqlite_goal_projection_rebuild", ConnClass::HelperWrite),
+    ("legacy_goals", ConnClass::Read),
+    ("delete_legacy_goal", ConnClass::Write),
     // v58.0.0 (CIRISPersist#991) — the key plane's rows and projections.
     ("sqlite_key_plane_present", ConnClass::HelperRead),
     ("sqlite_plane_rows", ConnClass::HelperRead),
@@ -782,7 +775,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("store_blob_local", ConnClass::Write),
     ("stream_consistency_proof", ConnClass::Read),
     ("stream_inclusion_proof", ConnClass::Read),
-    ("supersede_canonical_record", ConnClass::Write),
     ("supersede_group_row", ConnClass::Write),
     ("sweep_ack_timeouts", ConnClass::Write),
     ("sweep_candidates", ConnClass::Read),

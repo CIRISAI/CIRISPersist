@@ -1,0 +1,36 @@
+# Mutation scope: v60 slice S1 — the cirisnode silos onto `scores` rows
+# (CIRISPersist#988 item 1, #803, #854; docs/V60_TASK_PLAN.md §4 S1).
+#
+# - The rows: `src/cirisnode/rows.rs` plans each class as a `scores` row
+#   (contribution / vote / moderation / slashing / reconsideration / credits /
+#   expertise / takedown notice), refuses the retired objects by name, and
+#   decides the promotion record's and the delivery attestation's row rules.
+#   Witnesses I1167 (sqlite, postgres), I1168 (unit), I1170 (sqlite
+#   and postgres engines).
+# - The ledger projection: `src/federation/ledger_projection.rs` (the rule,
+#   the fold's order) and the backends' writers. Witnesses I1166
+#   (sqlite, postgres), I1169 (sqlite, postgres).
+# - The takedown notice as a row: its admission at the plane's put door, the
+#   door's row reader, the one-release compat read of a v59 Contribution, the
+#   CC spelling, and the binding fold that skips notice rows. Witnesses I1170,
+#   I1171, I786, I787, I789; `content_binding`'s live-binding legs
+#   (pre-v60, in scope because S1 touched the fn) are I772, I796, I798.
+# - #854: the one subject gate (`validate_subject_key_ids`). Witnesses I84,
+#   I1172.
+# - Not in `tests:`: I1173 (V203, SQL, not a mutation site) and I1107 (the
+#   held-shut table in admission.rs, not in this scope). Over the four shards
+#   of the 2026-10-22 run each killed no mutant; every other witness killed at
+#   least one (per-shard unvalidated.txt lists a witness whose kills fall in
+#   another shard).
+#
+# Grammar: docs/MUTATION_TESTING.md "Scope files".
+tests: test(/i1166|i1167|i1168|i1169|i1170|i1171|i1172|i84|i772|i786|i787|i789|i796|i798|legal_basis|the_basis_table|extract_takedown_notice_payload/)
+features: postgres,sqlite,server,cirisnode
+
+src/cirisnode/rows.rs
+src/cirisnode/takedown_handler.rs
+src/federation/ledger_projection.rs
+src/federation/takedown_tombstone.rs cc_basis_spelling notice_basis_of_dimension is_notice_row notice_row_shape check_takedown_notice_row_admission takedown_terms legacy_contribution_terms hold_notice_row content_binding
+src/federation/mod.rs validate_subject_key_ids
+src/store/sqlite.rs sqlite_project_ledger sqlite_ledger_projection_rebuild
+src/store/postgres.rs pg_project_ledger pg_ledger_projection_rebuild

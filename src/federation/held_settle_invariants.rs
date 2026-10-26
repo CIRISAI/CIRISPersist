@@ -447,9 +447,6 @@ mod from_disk {
             "put_community_membership_revocation",
         ),
         (EnvelopeKind::LocationProof, "put_location_proof"),
-        (EnvelopeKind::Organization, "put_organization"),
-        (EnvelopeKind::OrgMembership, "put_org_membership"),
-        (EnvelopeKind::PartnerRecord, "put_partner_record"),
         (
             EnvelopeKind::TransportDestination,
             "put_signed_transport_destination",
@@ -541,7 +538,7 @@ mod from_disk {
             assert!(reason.len() > 40, "I235: an exemption carries its reason");
         }
         let root = env!("CARGO_MANIFEST_DIR");
-        for backend in ["memory", "sqlite", "postgres"] {
+        for backend in ["sqlite", "postgres"] {
             let src = std::fs::read_to_string(format!("{root}/src/store/{backend}.rs")).unwrap();
             for (kind, door) in DOORS {
                 let body = body_lines(&src, door);
@@ -687,9 +684,6 @@ mod run {
             }
         };
     }
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

@@ -733,6 +733,62 @@ impl<E: AttestationQueryExec + ?Sized> AttestationReads for E {
     }
 }
 
+/// v60.0.0 (CIRISPersist#720, S5) — **the lifecycle filter, one predicate for
+/// both dialects.** A row is hidden when a composer of a type `view` still
+/// hides ([`LifecycleView::hiding_composers`]) names it, and that composer is
+/// the target's own author's or one the write door admitted under a resolved
+/// rule (#945). Every scores and CEG read interpolates this fragment instead
+/// of spelling its own copy, so the rule has one source while it runs inside
+/// the paginated statement (a post-load fold would short-page under `LIMIT`).
+///
+/// `outer` is the alias of the row being filtered; the composer types bind as
+/// text at placeholders `first_placeholder..`. `None` when the view hides
+/// nothing.
+///
+/// [`LifecycleView::hiding_composers`]: crate::read::LifecycleView::hiding_composers
+#[must_use]
+pub(crate) fn lifecycle_predicate(
+    view: crate::read::LifecycleView,
+    dialect: Dialect,
+    outer: &str,
+    first_placeholder: usize,
+) -> Option<(String, Vec<String>)> {
+    let hide = view.hiding_composers();
+    if hide.is_empty() {
+        return None;
+    }
+    let list = (first_placeholder..first_placeholder + hide.len())
+        .map(|n| match dialect {
+            Dialect::Sqlite => format!("?{n}"),
+            Dialect::Postgres => format!("${n}"),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let path = crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID;
+    let (table, target, id) = match dialect {
+        Dialect::Sqlite => (
+            "federation_attestations",
+            format!("json_extract(c.attestation_envelope, '$.{path}')"),
+            format!("{outer}.attestation_id"),
+        ),
+        Dialect::Postgres => (
+            "cirislens.federation_attestations",
+            format!("c.attestation_envelope::jsonb->>'{path}'"),
+            format!("{outer}.attestation_id::text"),
+        ),
+    };
+    Some((
+        format!(
+            "NOT EXISTS (SELECT 1 FROM {table} c \
+               WHERE (c.attesting_key_id = {outer}.attesting_key_id \
+                      OR c.withdraws_admission_rule IS NOT NULL) \
+                 AND c.attestation_type IN ({list}) \
+                 AND {target} = {id})"
+        ),
+        hide.iter().map(|t| (*t).to_owned()).collect(),
+    ))
+}
+
 /// The SQL dialect a statement is rendered for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {

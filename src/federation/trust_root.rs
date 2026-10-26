@@ -4416,7 +4416,7 @@ mod charter_threshold_tests {
 /// `trust_root_valid` pointed at its own oracle and `super::` spelled from the
 /// crate root. Held to the bounded walks by
 /// `bounded_reads_invariants::bodies::i547_trust_root_walks_read_what_they_select`.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod v53_1_6_reference {
     use super::*;
 

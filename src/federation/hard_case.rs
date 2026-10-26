@@ -194,6 +194,19 @@ pub struct HardCaseEvent {
     pub detail: serde_json::Value,
     /// When persist observed the condition.
     pub emitted_at: DateTime<Utc>,
+    /// v60.0.0 (CIRISConstitution#170 closed) — **which node emitted the
+    /// event**: the key id that SIGNED the stored `hard_case:*` row (its
+    /// `attesting_key_id`, the emitting node's `substrate_persist` identity).
+    /// Since the hold lifted, a listing holds peers' replicated events beside
+    /// this node's own, so every listed event names its emitter.
+    ///
+    /// Set by [`project_hard_case_row`] from the row and nowhere else: never
+    /// from `detail`, never from the signed body ([`hard_case_envelope`] drops
+    /// it, and a body's claim is overwritten), so it is the signer, not a
+    /// claim. Empty on an event an emitter is still building and on a pre-v57
+    /// silo row the rehome has not yet moved onto a signed row.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emitter_key_id: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -397,6 +410,7 @@ pub fn admin_action_event(
             admin_field::REASON: reason,
         }),
         emitted_at: at,
+        emitter_key_id: String::new(),
     }
 }
 
@@ -410,6 +424,11 @@ pub struct HardCaseFilter {
     /// Only events with `emitted_at >= since`. `None` = from the start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<DateTime<Utc>>,
+    /// v60.0.0 — only events whose row this key signed
+    /// ([`HardCaseEvent::emitter_key_id`]). `None` = every node's events,
+    /// replicated peers' included; this node's own key = the node-local view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emitter_key_id: Option<String>,
 }
 
 /// Effective consent stance of a subject over a target Contribution
@@ -583,6 +602,7 @@ pub fn membership_removed_event(
             "effective_at": effective_at.to_rfc3339(),
         }),
         emitted_at: effective_at,
+        emitter_key_id: String::new(),
     }
 }
 
@@ -641,6 +661,7 @@ pub fn trace_erasure_event(counts: &TraceErasureCounts, erased_at: DateTime<Utc>
         subject_key_id: None,
         detail: serde_json::to_value(counts).unwrap_or_default(),
         emitted_at: erased_at,
+        emitter_key_id: String::new(),
     }
 }
 
@@ -685,14 +706,10 @@ pub fn recipient_excluded_event_id(
 /// plane**, as the stable `kind()` tokens consumers key on. From-disk
 /// visible on purpose: the CHANGELOG, the Python surface and the gates all
 /// name these constants, never a spelling of their own.
+///
+/// v60.0.0 (CIRISConstitution#170 closed) — `federation_hard_case_replication_held`
+/// is gone: hard_case rows replicate like any attestation row.
 pub mod refusal {
-    /// A `hard_case:*` row offered to the federation tier (the crossing, the
-    /// put door, the replicated apply) while replication is held
-    /// ([`super::check_hard_case_replication_held`]). Unblocks when
-    /// CIRISConstitution#170 is ruled AND persist can tell which peers carry
-    /// the unpurgeable refusal (a peer capability advertisement, which
-    /// persist does not have today).
-    pub const REPLICATION_HELD: &str = "federation_hard_case_replication_held";
     /// This node cannot attest a `hard_case:*` row: it has no declared node
     /// key, or does not hold the one it declared. An act that must record
     /// one (an erasure, a peer removal, `record_hard_case`) is refused before
@@ -752,25 +769,37 @@ pub fn hard_case_attestation_id(event_id: &str) -> String {
 /// is written as: `{dimension, hard_case: <the event>}`. The event rides whole,
 /// as serde writes it, so the projection reads back exactly what the emitter
 /// observed.
+///
+/// v60.0.0 — the body never carries [`HardCaseEvent::emitter_key_id`]: the
+/// emitter is the row's signer, read off the row by the projection, so a
+/// caller-set value (a listed event re-recorded, say) is dropped here and
+/// the signed body keeps its v59 shape.
 pub fn hard_case_envelope(event: &HardCaseEvent) -> Result<serde_json::Value, serde_json::Error> {
+    let mut body = serde_json::to_value(event)?;
+    if let Some(members) = body.as_object_mut() {
+        members.remove("emitter_key_id");
+    }
     Ok(serde_json::json!({
         "dimension": hard_case_dimension(&event.kind),
-        BODY_MEMBER: serde_json::to_value(event)?,
+        BODY_MEMBER: body,
     }))
 }
 
 /// v57.0.0 (CIRISPersist#988 item 2; CLM-silo-projection-rebuildable) —
-/// **the projection, rows → `hard_case_events`.** The one function both the
-/// write step (in the same transaction as the row) and the from-rows rebuild
-/// call. `None` for every row that is not a local-tier `hard_case:*` row with
-/// a readable body: only the hard_case door writes those
-/// (`attestation_admit::plan_hard_case_row`), and the federation tier holds
-/// none while replication is held ([`check_hard_case_replication_held`]).
+/// **the projection, rows → `hard_case_events`.** The one function the
+/// hard_case door (in the same transaction as the row), the put door (also
+/// the replicated apply, in the row's transaction) and the from-rows rebuild
+/// call. `None` for every row that is not a `scores` `hard_case:*` row with a
+/// readable body whose dimension and id agree with it.
+///
+/// v60.0.0 (CIRISConstitution#170 closed) — tier-agnostic, as the detection
+/// projection is. The hold kept every hard_case row at the local tier, so the
+/// projection read the local tier alone; now the crossing moves this node's
+/// row to the federation tier in place, and a peer's row arrives at it, and
+/// the table must stay the rebuild of the rows held, both cases included.
 #[must_use]
 pub fn project_hard_case_row(row: &super::types::Attestation) -> Option<HardCaseEvent> {
-    if row.tier != super::types::attestation_tier::LOCAL
-        || row.attestation_type != super::types::attestation_type::SCORES
-    {
+    if row.attestation_type != super::types::attestation_type::SCORES {
         return None;
     }
     let dimension = row.attestation_envelope.get("dimension")?.as_str()?;
@@ -778,12 +807,17 @@ pub fn project_hard_case_row(row: &super::types::Attestation) -> Option<HardCase
         return None;
     }
     let body = row.attestation_envelope.get(BODY_MEMBER)?;
-    let event: HardCaseEvent = serde_json::from_value(body.clone()).ok()?;
+    let mut event: HardCaseEvent = serde_json::from_value(body.clone()).ok()?;
     // The body must be the event the dimension and the id name: a row whose
     // three disagree is not one this door wrote.
-    (hard_case_dimension(&event.kind) == dimension
-        && hard_case_attestation_id(&event.event_id) == row.attestation_id)
-        .then_some(event)
+    if hard_case_dimension(&event.kind) != dimension
+        || hard_case_attestation_id(&event.event_id) != row.attestation_id
+    {
+        return None;
+    }
+    // v60.0.0 — the emitter is the row's SIGNER, whatever the body says.
+    event.emitter_key_id = row.attesting_key_id.clone();
+    Some(event)
 }
 
 /// v57.0.0 (CIRISPersist#988 item 2) — record an OBSERVATION riding on
@@ -814,43 +848,10 @@ where
     }
 }
 
-/// v57.0.0 (CIRISPersist#988 item 2; CC guidance on #988, 2026-10-13) — **the
-/// held replication.** A `hard_case:*` row does not enter the federation tier:
-/// not by the crossing (`crossing::plan_enter_mesh`), not by the put door
-/// (`attestation_admit::plan_put_attestation`, which is also the replicated
-/// apply). Its rows stay at the local tier, which no serve read returns, so
-/// no peer receives one.
-///
-/// Why held: a `hard_case` row is the node's accountability record and must
-/// be unpurgeable on every node that holds it. This node refuses to purge one
-/// (`migration::ACCOUNTABILITY_RECORD_PREFIXES`); a peer on an earlier
-/// release does not. CIRISConstitution#170 asks the steward to add
-/// `hard_case:*` to CC 2.4.1.1's unpurgeable set.
-///
-/// What unblocks it: #170 ruled, AND a way to know a peer carries the
-/// refusal (persist has no peer capability advertisement today). Then this
-/// check becomes a per-peer serve filter instead of a refusal here.
-pub fn check_hard_case_replication_held(
-    row: &super::types::Attestation,
-) -> Result<(), super::Error> {
-    match row
-        .attestation_envelope
-        .get("dimension")
-        .and_then(|d| d.as_str())
-    {
-        Some(dimension) if is_hard_case_dimension(dimension) => {
-            Err(super::Error::HardCaseReplicationHeld {
-                attestation_id: row.attestation_id.clone(),
-                dimension: dimension.to_owned(),
-            })
-        }
-        _ => Ok(()),
-    }
-}
-
 /// Test support: hold `key_id` as a `lenscore_detector` key (a detection
 /// row's attester).
 #[cfg(test)]
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) async fn test_support_hold<D>(dir: &D, key_id: &str)
 where
     D: crate::federation::FederationDirectory + ?Sized,
@@ -873,18 +874,12 @@ where
 }
 
 /// Test support: give a bare backend the node identity a hard_case row needs.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_support {
     /// The inherent `set_node_key_id` of each backend, behind one name.
     pub(crate) trait DeclaresNode {
         /// Set this backend's node key id.
         fn declare_node_key_for_test(&self, key_id: &str);
-    }
-
-    impl DeclaresNode for crate::store::memory::MemoryBackend {
-        fn declare_node_key_for_test(&self, key_id: &str) {
-            self.set_node_key_id(key_id);
-        }
     }
 
     #[cfg(feature = "sqlite")]
@@ -945,6 +940,99 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// I1165 (v60.0.0) — with the tier filter gone, the body's agreement with
+    /// its row is the projection's only fence: a row projects only when its
+    /// dimension AND its id are the ones its body names. A peer's row whose
+    /// three disagree (either half alone) is not one a hard_case door wrote,
+    /// and lands in no `hard_case_events` table.
+    #[test]
+    fn i1165_a_row_whose_parts_disagree_does_not_project() {
+        use crate::federation::tier_ingest::test_support as ts;
+        let event = HardCaseEvent {
+            event_id: "i1165-parts".to_owned(),
+            kind: kind::CONSENT_SLA_BREACH.to_owned(),
+            target_key_id: None,
+            subject_key_id: None,
+            detail: serde_json::json!({}),
+            emitted_at: "2026-10-21T10:00:00Z".parse().unwrap(),
+            emitter_key_id: String::new(),
+        };
+        let row = |id: &str, envelope: serde_json::Value| {
+            let mut r = ts::bare_attestation(id, "i1165-node", "", &envelope);
+            r.attestation_type = super::super::types::attestation_type::SCORES.to_owned();
+            r
+        };
+        let id = hard_case_attestation_id(&event.event_id);
+        let whole = hard_case_envelope(&event).unwrap();
+        assert_eq!(
+            project_hard_case_row(&row(&id, whole.clone())).map(|e| e.event_id),
+            Some(event.event_id.clone()),
+            "I1165: a row whose parts agree projects, at any tier"
+        );
+        let mut fed = row(&id, whole.clone());
+        fed.tier = super::super::types::attestation_tier::FEDERATION.to_owned();
+        assert!(
+            project_hard_case_row(&fed).is_some(),
+            "I1165: tier-agnostic"
+        );
+        // The id disagrees, the dimension agrees.
+        assert_eq!(
+            project_hard_case_row(&row("not-the-derived-id", whole.clone())),
+            None,
+            "I1165: an id the body does not name"
+        );
+        // The dimension disagrees, the id agrees.
+        let mut other_dimension = whole;
+        other_dimension["dimension"] = serde_json::json!(hard_case_dimension("admin_action"));
+        assert_eq!(
+            project_hard_case_row(&row(&id, other_dimension)),
+            None,
+            "I1165: a dimension the body does not name"
+        );
+    }
+
+    /// I1165 (v60.0.0) — the emitter is the row's SIGNER, never a claim: the
+    /// projection sets it from `attesting_key_id` whatever the body says, and
+    /// the envelope never writes a caller-set value into the signed body.
+    #[test]
+    fn i1165_the_emitter_is_the_rows_signer_not_a_claim() {
+        use crate::federation::tier_ingest::test_support as ts;
+        let event = HardCaseEvent {
+            event_id: "i1165-emitter".to_owned(),
+            kind: kind::CONSENT_SLA_BREACH.to_owned(),
+            target_key_id: Some("i1165-target".to_owned()),
+            subject_key_id: Some("i1165-subject".to_owned()),
+            detail: serde_json::json!({"emitter_key_id": "i1165-detail-claim"}),
+            emitted_at: "2026-10-21T10:00:00Z".parse().unwrap(),
+            emitter_key_id: "i1165-caller-claim".to_owned(),
+        };
+        let envelope = hard_case_envelope(&event).unwrap();
+        assert!(
+            envelope[BODY_MEMBER].get("emitter_key_id").is_none(),
+            "I1165: the signed body carries no emitter: {envelope}"
+        );
+        let id = hard_case_attestation_id(&event.event_id);
+        let row = |envelope: &serde_json::Value| {
+            let mut r = ts::bare_attestation(&id, "i1165-signer", "", envelope);
+            r.attestation_type = super::super::types::attestation_type::SCORES.to_owned();
+            r
+        };
+        assert_eq!(
+            project_hard_case_row(&row(&envelope)).map(|e| e.emitter_key_id),
+            Some("i1165-signer".to_owned()),
+            "I1165: the emitter is the row's signer"
+        );
+        // A body that claims an emitter (a peer's hand-built row) is
+        // overruled by the row's signer.
+        let mut claimed = envelope.clone();
+        claimed[BODY_MEMBER]["emitter_key_id"] = serde_json::json!("i1165-body-claim");
+        assert_eq!(
+            project_hard_case_row(&row(&claimed)).map(|e| e.emitter_key_id),
+            Some("i1165-signer".to_owned()),
+            "I1165: a body's emitter claim is overwritten by the signer"
+        );
+    }
 
     #[test]
     fn membership_change_event_id_is_deterministic_and_sub_second_idempotent() {
@@ -1017,6 +1105,7 @@ mod tests {
             subject_key_id: None,
             detail,
             emitted_at: "2026-08-02T10:00:00Z".parse().unwrap(),
+            emitter_key_id: String::new(),
         }
     }
 

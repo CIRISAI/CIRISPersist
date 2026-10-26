@@ -9,8 +9,13 @@
 //! contract.
 
 pub mod backend;
+/// v60.0.0 (CIRISPersist#1002) — the tests the retired memory backend carried, on SQLite.
+#[cfg(all(test, feature = "sqlite"))]
+mod backend_suite;
 pub mod decompose;
-pub mod memory;
+/// v8.0.0 (CIRISPersist#227) — the shared fountain read assembler.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod fountain_read;
 // v3.12.x (CIRISPersist#156) — always-compiled migration-timing
 // diagnostic. Sibling to the `debug-tools`-gated panic hook in
 // `crate::debug`. Gated on `postgres` OR `sqlite` since the type
@@ -28,7 +33,7 @@ mod migration_immutability;
 pub mod migration_timing;
 /// v31.2.0 (CIRISPersist#670) — **the backend-parity gate.**
 ///
-/// Test-only, and deliberately so: it reads the three backend sources from
+/// Test-only, and deliberately so: it reads the backend sources from
 /// DISK as text and compares the ordered gate sequence of every door, which
 /// means the postgres arm is scanned under `--features sqlite` and under no
 /// features at all. A conformance check that only runs when the backend it
@@ -59,9 +64,19 @@ pub mod sqlite;
 /// `FSD/SQLITE_CONNECTION_MODEL.md`.
 #[cfg(feature = "sqlite")]
 pub mod sqlite_conn_model;
+/// v60.0.0 (CIRISPersist#1002) — a migrated in-memory clone of one template
+/// per process: the SQLite genesis scratch and the test constructor.
+#[cfg(feature = "sqlite")]
+pub(crate) mod sqlite_scratch;
+#[cfg(feature = "sqlite")]
+pub mod test_backend;
 /// v50.0.0 (PR #921 review) — test-only hooks inside a backend's own door.
 #[cfg(test)]
 pub(crate) mod test_hooks;
+/// v60.0.0 (CIRISPersist#691) — the from-disk gates bind their verdict to the
+/// tree they read.
+#[cfg(test)]
+mod tree_read;
 pub mod types;
 
 pub use backend::{Backend, InsertReport, PublicKeySample};
@@ -69,7 +84,6 @@ pub use decompose::{
     decompose, dedup_key, trace_dedup_shard_key, trace_dedup_shard_key_parts, Decomposed,
     TRACE_DEDUP_SHARD_COUNT,
 };
-pub use memory::MemoryBackend;
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresBackend;
 #[cfg(feature = "sqlite")]

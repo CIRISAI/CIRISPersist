@@ -7,17 +7,22 @@
 
 #[cfg(test)]
 pub(crate) mod bodies {
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::tier_ingest::test_support as ts;
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::types::identity_type::{NODE, USER};
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::types::{
         cohort_scope, device_class, Community, CommunityMember, IdentityOccurrence,
         IdentityOccurrenceRevocation,
     };
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::{
         would_hold, BlobError, BlobProvenance, DiskPressureSnapshot, FederationDirectory,
         HoldContext,
     };
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
         s.parse().unwrap()
     }
@@ -27,6 +32,7 @@ pub(crate) mod bodies {
     /// `bind(d, node, node, ..)` with the `agent` class; the login anchor is
     /// `bind(d, human, node, ..)` with the `server` class — the two rows every
     /// claimed node carries (#873).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn bind(d: &dyn FederationDirectory, identity: &str, occurrence: &str, when: &str) {
         let class = if identity == occurrence {
             device_class::AGENT
@@ -48,6 +54,7 @@ pub(crate) mod bodies {
         .unwrap_or_else(|e| panic!("bind {identity} through {occurrence}: {e}"));
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn revoke(d: &dyn FederationDirectory, identity: &str, occurrence: &str, when: &str) {
         d.put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
             identity_key_id: identity.to_owned(),
@@ -63,6 +70,7 @@ pub(crate) mod bodies {
     }
 
     /// A community founded by `founder` with `members` on its roster.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn room(d: &dyn FederationDirectory, comm: &str, members: &[&str]) {
         ts::register_identity_key(d, comm, USER).await;
         d.put_community(ts::sign_community(
@@ -93,6 +101,7 @@ pub(crate) mod bodies {
 
     /// `would_hold` on `node` for community content of `comm` authored by a
     /// stranger — the #873 shape, exactly.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn holds(
         d: &dyn FederationDirectory,
         node: &str,
@@ -122,6 +131,7 @@ pub(crate) mod bodies {
     /// **I121 — both rows present, singleton first: the principal is the
     /// owner; the ordered lookup returns the anchor; insertion order does
     /// not change the answer.**
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i121_the_principal_is_the_owner(d: &dyn FederationDirectory, s: &str) {
         let (node, owner) = (format!("i121-node-{s}"), format!("i121-owner-{s}"));
         ts::register_identity_key(d, &node, NODE).await;
@@ -192,6 +202,7 @@ pub(crate) mod bodies {
     /// owner, by the owner's other device and by the owner's other node; a
     /// stranger node reads none. Rust twin on every backend; the SQL twin
     /// through `ReadEngine::list_attestations` on sqlite / postgres.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i141_a_claimed_node_reads_its_own_self_rows<B>(d: &B, s: &str)
     where
         B: FederationDirectory + crate::ceg::ReadEngine,
@@ -578,6 +589,7 @@ pub(crate) mod bodies {
         let _ = CallerScope::Unauthenticated;
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i122_the_node_is_party_through_its_owner(d: &dyn FederationDirectory, s: &str) {
         let (node, owner, other, comm) = (
             format!("i122-node-{s}"),
@@ -636,6 +648,7 @@ pub(crate) mod bodies {
     /// **I123 — a revoked anchor returns the device to itself: the resolver
     /// answers the node, the owner's room leaves its audience, `would_hold`
     /// refuses `NotPartyTo` again.**
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i123_a_revoked_anchor_is_the_singleton_again(
         d: &dyn FederationDirectory,
         s: &str,
@@ -683,6 +696,7 @@ pub(crate) mod bodies {
     /// **I124 — two live anchors: the plural lists both, newest first; the
     /// single resolver answers the newest; the audience is both humans'
     /// rooms.**
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i124_a_shared_device_is_party_to_both(d: &dyn FederationDirectory, s: &str) {
         let (node, first, second, other) = (
             format!("i124-node-{s}"),
@@ -773,7 +787,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
@@ -811,9 +825,6 @@ mod run {
             }
         };
     }
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

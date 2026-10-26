@@ -8,8 +8,8 @@
 //!   row on the plane, attested by the node key; then the from-rows rebuild
 //!   of `hard_case_events` is byte-equal to the live table
 //!   ([`check_projection_rebuild`](crate::federation::silo_projection::check_projection_rebuild)).
-//!   The row is unpurgeable (the accountability-record family) and does not
-//!   enter the federation tier (held replication).
+//!   The row is unpurgeable (the accountability-record family). (v60.0.0:
+//!   it replicates; I1165 witnesses the crossing and the peer's copy.)
 //! - **I961 (`detection_events`)** — `put_detection_event` (twice, plus an
 //!   idempotent re-put and a conflicting one), then the DSAR erasure of one
 //!   detection's trace: its signed row is hard-deleted under a tombstone
@@ -44,7 +44,7 @@
 //! Each runner then TAMPERS with the live table (one column of one row) and
 //! asserts the gate goes red: a witness that cannot fail is a report.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::attestation_admit::AttestationStore;
     use crate::federation::hard_case::{self, HardCaseEvent};
@@ -67,6 +67,7 @@ pub(crate) mod bodies {
             subject_key_id: Some(format!("{id}-subject")),
             detail,
             emitted_at: chrono::Utc::now(),
+            emitter_key_id: String::new(),
         }
     }
 
@@ -134,7 +135,7 @@ pub(crate) mod bodies {
                 .expect("I960: get")
                 .expect("I960: the event is a row");
             assert_eq!(row.attesting_key_id, node, "I960: attester = the node key");
-            assert_eq!(row.tier, "local", "I960: replication is held");
+            assert_eq!(row.tier, "local", "I960: the door writes the local tier");
             assert_eq!(row.attestation_type, "scores");
             assert_eq!(
                 hard_case::project_hard_case_row(&row).map(|e| e.event_id),
@@ -145,13 +146,6 @@ pub(crate) mod bodies {
             assert!(
                 crate::federation::migration::check_purge_admission(&row).is_err(),
                 "I960: a hard_case row is the accountability record"
-            );
-            // Held: it does not cross to the federation tier.
-            assert_eq!(
-                hard_case::check_hard_case_replication_held(&row)
-                    .unwrap_err()
-                    .kind(),
-                "federation_hard_case_replication_held"
             );
         }
         let rebuild = check_projection_rebuild(b, SiloProjection::HardCaseEvents)
@@ -429,6 +423,7 @@ pub(crate) mod bodies {
             .list_hard_case_events(hard_case::HardCaseFilter {
                 kind: Some(hard_case::kind::TRACE_ERASURE.to_owned()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -712,7 +707,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     use super::bodies;
     use crate::federation::silo_projection::{check_projection_rebuild, SiloProjection};
@@ -721,107 +716,6 @@ mod run {
 
     fn tag(n: &str) -> String {
         format!("{n}-{}", uuid::Uuid::new_v4().simple())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i960_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        let t = tag("i960m");
-        let node = format!("{t}-node");
-        bodies::register_node(&b, &node).await;
-        b.set_node_key_id(&node);
-        bodies::i960_hard_case(&b, &node, &t).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i961_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        let t = tag("i961m");
-        let (a, c) = bodies::i961_detection(&b, &t).await;
-        let node = sub::signing_node(&b, &t).await;
-        b.set_node_key_id(&node.id);
-        let summary = b
-            .delete_traces_for_agent_id_hash(&format!("{t}-agent-h"))
-            .await
-            .unwrap();
-        assert_eq!(
-            summary.detection_events_tombstoned, 1,
-            "I961 memory: the row is erased"
-        );
-        bodies::i961_after_erasure(&b, &a, &c).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i962_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        let t = tag("i962m");
-        bodies::i962_refused_without_a_node_key(&b, &t).await;
-        let node = format!("{t}-node");
-        bodies::register_node(&b, &node).await;
-        b.set_node_key_id(&node);
-        bodies::i962_succeeds_with_the_node_key(&b, &node, &t).await;
-    }
-
-    /// Memory holds no pre-v57 rows: its rehome is a no-op (a declared
-    /// divergence in `store::parity`), and the gates hold.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i963_memory() {
-        use crate::federation::FederationDirectory as _;
-        let b = crate::store::memory::MemoryBackend::new();
-        let t = tag("i963m");
-        let node = format!("{t}-node");
-        bodies::register_node(&b, &node).await;
-        b.set_node_key_id(&node);
-        bodies::i960_hard_case(&b, &node, &t).await;
-        let before = b
-            .list_hard_case_events(crate::federation::hard_case::HardCaseFilter::default())
-            .await
-            .unwrap();
-        let attester = crate::federation::attestation_admit::HardCaseAttester {
-            key_id: node.clone(),
-            identity_type: crate::federation::types::identity_type::NODE.to_owned(),
-        };
-        use crate::federation::attestation_admit::AttestationStore as _;
-        b.rehome_legacy_hard_case_events(&attester, chrono::Utc::now())
-            .await
-            .unwrap();
-        assert_eq!(
-            b.list_hard_case_events(crate::federation::hard_case::HardCaseFilter::default())
-                .await
-                .unwrap(),
-            before
-        );
-        check_projection_rebuild(&b, SiloProjection::HardCaseEvents)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i964_memory() {
-        let b = crate::store::memory::MemoryBackend::new();
-        let t = tag("i964m");
-        let node = sub::signing_node(&b, &t).await;
-        b.set_node_key_id(&node.id);
-        bodies::i964_the_dsar_erasure(&b, &t, None, 1).await;
-    }
-
-    /// Memory has no SQL to tamper with; its red is the rebuild of a map
-    /// entry that names no row.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i960_memory_red_on_an_orphan_projection_row() {
-        let b = crate::store::memory::MemoryBackend::new();
-        let t = tag("i960mr");
-        let node = format!("{t}-node");
-        bodies::register_node(&b, &node).await;
-        b.set_node_key_id(&node);
-        bodies::i960_hard_case(&b, &node, &t).await;
-        b.test_insert_orphan_hard_case_projection(&format!("{t}-orphan"));
-        assert!(
-            check_projection_rebuild(&b, SiloProjection::HardCaseEvents)
-                .await
-                .is_err(),
-            "I960 memory: an entry no row produces is red"
-        );
     }
 
     #[cfg(feature = "sqlite")]
@@ -852,6 +746,36 @@ mod run {
                 .await
                 .is_err(),
             "I960 sqlite: a moved column is red"
+        );
+    }
+
+    /// The other red: a projection row no attestation produces (an orphan).
+    /// Until v60.0.0 only the retired memory backend witnessed it (#1002).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i960_sqlite_red_on_an_orphan_projection_row() {
+        let b = sqlite().await;
+        let t = tag("i960so");
+        let node = format!("{t}-node");
+        bodies::register_node(&b, &node).await;
+        b.set_node_key_id(&node);
+        bodies::i960_hard_case(&b, &node, &t).await;
+        // RED: a copy of a live row under ids no row produces, planted below
+        // the foreign key that keeps a door from writing one (the corruption
+        // this rebuild exists to see).
+        b.test_execute(&format!(
+            "PRAGMA foreign_keys = OFF; \
+             CREATE TEMP TABLE i960_orphan AS SELECT * FROM hard_case_events LIMIT 1; \
+             UPDATE i960_orphan SET event_id = '{t}-orphan', attestation_id = '{t}-orphan'; \
+             INSERT INTO hard_case_events SELECT * FROM i960_orphan; \
+             PRAGMA foreign_keys = ON;"
+        ))
+        .await;
+        assert!(
+            check_projection_rebuild(&b, SiloProjection::HardCaseEvents)
+                .await
+                .is_err(),
+            "I960 sqlite: an entry no row produces is red"
         );
     }
 

@@ -1,0 +1,26 @@
+# Mutation scope: v60 slice S2 — goals onto `goal:{scale}`
+# (CIRISPersist#988 item 4; docs/V60_TASK_PLAN.md §4 S2).
+#
+# - The row and its gate: `src/federation/goal.rs` (the scope rule, the body
+#   parser every door shares, the M-1 admission gate, the four planners, the
+#   retired typed body refused by name, the legacy rehome input, the Engine
+#   doors). Witnesses I1174–I1176 (unit), I1179 (sqlite, postgres),
+#   I1180 (sqlite and postgres engines).
+# - The projection: `src/federation/goal_projection.rs` (the chain, the
+#   retractions, the refold, which declaration a put touches) and the three
+#   backends' writers, rebuilds, row readers and legacy reads. Witnesses I1177
+#   (unit), I1178 (sqlite, postgres), I1180, I1181 (sqlite,
+#   postgres), I1182 (sqlite, postgres).
+# - Not in scope: the two lines of `attestation_admit::plan_put_attestation`
+#   that call the gate and the refold target (a mutant of that function is a
+#   mutant of every plane door, not of this slice's witnesses; deleting either
+#   call is caught by I1178/I1179); the Python wrappers in `src/ffi/pyo3.rs`
+#   (tests/python/test_goal_rows_surface.py drives them).
+#
+# Grammar: docs/MUTATION_TESTING.md "Scope files".
+tests: test(/i117[4-9]|i118[0-2]|canonicalize_collapses_whitespace|m1_dimension_wire_round_trip|goal_serde_round_trip/)
+
+src/federation/goal.rs
+src/federation/goal_projection.rs
+src/store/sqlite.rs get_goal list_goals legacy_goals delete_legacy_goal sqlite_row_to_goal sqlite_project_goal sqlite_goal_projection_rebuild
+src/store/postgres.rs get_goal list_goals legacy_goals delete_legacy_goal pg_row_to_goal pg_project_goal pg_goal_projection_rebuild

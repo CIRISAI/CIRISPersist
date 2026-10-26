@@ -1392,12 +1392,6 @@ mod tests {
         Box::pin(rts::exercise_reclaim_ceremony(&*dir, "sq")).await;
     }
 
-    #[tokio::test]
-    async fn ownership_reclaim_ceremony_memory() {
-        let dir = crate::store::memory::MemoryBackend::new();
-        Box::pin(rts::exercise_reclaim_ceremony(&dir, "mem")).await;
-    }
-
     #[cfg(feature = "postgres")]
     #[tokio::test]
     #[serial_test::serial(postgres)]

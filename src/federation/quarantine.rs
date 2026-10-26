@@ -1189,10 +1189,12 @@ pub(crate) mod test_support {
         scopes: &[&str],
         at: DateTime<Utc>,
     ) -> Attestation {
-        let envelope = serde_json::json!({
+        let mut envelope = serde_json::json!({
             "dimension": "delegation:duty:v1",
             "scope": scopes,
         });
+        // v60.0.0 (#1048) — a duty edge carries a term (CC 2.4).
+        crate::federation::admission::with_test_term(&mut envelope, at);
         let (och, ed_sig, pqc_sig) = sign_envelope(granter, &envelope);
         let mut sealed_row_ = Attestation {
             attestation_id: id.to_owned(),
@@ -1565,6 +1567,7 @@ pub(crate) mod test_support {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(quarantine_kind.clone()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .expect("list")
@@ -1602,6 +1605,7 @@ pub(crate) mod test_support {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(quarantine_kind),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .expect("list");

@@ -6,7 +6,7 @@
 //! (W1041b/c): a node's owner-binding for the `delegates_to` path, an active
 //! occurrence row for the `occurrence_of` path.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::admission::ConsentGatedFamily;
     use crate::federation::consent_by_humans::{
@@ -335,7 +335,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
@@ -362,9 +362,6 @@ mod run {
             }
         };
     }
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

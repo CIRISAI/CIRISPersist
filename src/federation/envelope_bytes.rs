@@ -98,7 +98,7 @@ pub(crate) fn awkward_envelope(extra: &[(&str, serde_json::Value)]) -> serde_jso
 // each backend's `put_*` — so the memory backend now runs the same body and
 // the parity claim covers all three. The default leg therefore has a live
 // caller and the dead-code hazard the old gate guarded against is gone.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_support {
     use super::awkward_envelope;
     use crate::federation::FederationDirectory;

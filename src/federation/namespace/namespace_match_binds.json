@@ -1,9 +1,9 @@
 {
  "_meta": {
-  "cc_commit": "157039d3c73e5f8192e88d07bd87aea7172e6b2f",
+  "cc_commit": "5d50c6bb160ecbee99a66e1700597c029846e6b6",
   "generator": "scripts/gen_namespace_match_binds.py",
   "reference": "tools/cc_namespace_match.py",
-  "vectors_sha256": "c1a989a73a66d3371939216fd61351ad56acc5e60289b0162a96f8d44e279b6d"
+  "vectors_sha256": "a1a6ce5f1f40420cd9af724b3265889edd3e112bd377ba1d0fddd3a1ce1db85e"
  },
  "binds": [
   {
@@ -4334,6 +4334,44 @@
    "binds": {
     "version": "v1"
    },
+   "dimension": "identity:occurrence_revocation:v1",
+   "family": "identity:occurrence_revocation",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "identity:occurrence_revocation:V1",
+   "family": "identity:occurrence_revocation",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "identity:occurrence_revocation:v1:v2",
+   "family": "identity:occurrence_revocation",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "identity:occurrence_revocation:v1beta",
+   "family": "identity:occurrence_revocation",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Identity:occurrence_revocation:v1",
+   "family": "identity:occurrence_revocation",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "identity:occurrence_revocation",
+   "family": "identity:occurrence_revocation",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
    "dimension": "identity_continuity:relational_anchor:v1",
    "family": "identity_continuity:relational_anchor",
    "refusal": null
@@ -5595,50 +5633,50 @@
   },
   {
    "binds": {
-    "state": "sample",
+    "state": "proposal",
     "version": "v1"
    },
-   "dimension": "objection:sample:v1",
+   "dimension": "objection:proposal:v1",
    "family": "objection:{state}",
    "refusal": null
   },
   {
    "binds": {},
-   "dimension": "objection:sample:V1",
+   "dimension": "objection:proposal:V1",
    "family": "objection:{state}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "objection:sample:v1:v2",
+   "dimension": "objection:proposal:v1:v2",
    "family": "objection:{state}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "objection:sample:v1beta",
+   "dimension": "objection:proposal:v1beta",
    "family": "objection:{state}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "Objection:sample:v1",
+   "dimension": "Objection:proposal:v1",
    "family": "objection:{state}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {
-    "state": "sample"
+    "state": "proposal"
    },
-   "dimension": "objection:sample",
+   "dimension": "objection:proposal",
    "family": "objection:{state}",
    "refusal": "missing_version_segment"
   },
   {
    "binds": {
-    "state": "SAMPLE"
+    "state": "PROPOSAL"
    },
-   "dimension": "objection:SAMPLE:v1",
+   "dimension": "objection:PROPOSAL:v1",
    "family": "objection:{state}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -7422,6 +7460,44 @@
    "binds": {},
    "dimension": "transparency_log:inclusion",
    "family": "transparency_log:inclusion",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "transport:canonical_rebind:v1",
+   "family": "transport:canonical_rebind",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "transport:canonical_rebind:V1",
+   "family": "transport:canonical_rebind",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "transport:canonical_rebind:v1:v2",
+   "family": "transport:canonical_rebind",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "transport:canonical_rebind:v1beta",
+   "family": "transport:canonical_rebind",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Transport:canonical_rebind:v1",
+   "family": "transport:canonical_rebind",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "transport:canonical_rebind",
+   "family": "transport:canonical_rebind",
    "refusal": "missing_version_segment"
   },
   {

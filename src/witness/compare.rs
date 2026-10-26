@@ -10,7 +10,10 @@
 //!   `(peer_id, epoch_id, namespace_set)` are non-repudiable; persist
 //!   does not delete/merge the pair.
 //! - [`WitnessComparison::Divergent`] → **trigger the EXISTING V058 R1/Q1
-//!   quorum-merge** for `revocation` / `partner_record` / `org_membership`.
+//!   quorum-merge** for `revocation` and `licensure` (v60.0.0,
+//!   CIRISPersist#1036: `partner_record` became the licence payload on a
+//!   `licensure:*` row, whose merge is the licensure status fold — `revoked`
+//!   absorbing; `org_membership` retired onto affiliation rows).
 //!   The witness is a divergence DETECTOR that TRIGGERS the merge — it
 //!   MUST NOT decide the merge, MUST NOT replace `monotonic_quorum` /
 //!   `revision` anti-rollback, and there is NO "reconstitute from any
@@ -61,7 +64,7 @@ pub enum WitnessReconcileAction {
 /// any of these must route through the EXISTING merge — never a
 /// fragment-pick — because a "reconstitute from any fragment" path on a
 /// `revocation` resurrects a revoked key (the worst-case bug).
-pub const QUORUM_MERGE_SUBJECT_KINDS: &[&str] = &["revocation", "partner_record", "org_membership"];
+pub const QUORUM_MERGE_SUBJECT_KINDS: &[&str] = &["revocation", "licensure"];
 
 /// Classify a set of **already-verified** witnesses into the action
 /// persist must take. PRECONDITION: every input passed
@@ -209,6 +212,7 @@ pub fn equivocation_hard_case(
             "witnesses": witnesses,
         }),
         emitted_at,
+        emitter_key_id: String::new(),
     }
 }
 

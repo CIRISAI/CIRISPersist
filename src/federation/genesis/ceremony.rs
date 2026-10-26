@@ -1034,11 +1034,16 @@ impl CeremonyState {
     ///
     /// [`CeremonyError::Incomplete`], or [`CeremonyError::Outputs`] naming the
     /// stage that refused.
-    pub async fn finish(&self) -> Result<CeremonyFinished, CeremonyError> {
+    /// `scratch` provisions the directory the doors run on (any backend:
+    /// [`GenesisScratch`](super::scratch::GenesisScratch)).
+    pub async fn finish(
+        &self,
+        scratch: &dyn super::scratch::GenesisScratch,
+    ) -> Result<CeremonyFinished, CeremonyError> {
         let bundle = self.assemble()?;
         let bundle_json = serde_json::to_string_pretty(&bundle)
             .map_err(|e| CeremonyError::InvalidInputs(format!("serialize bundle: {e}")))?;
-        let verified = super::verify_ceremony_outputs(&bundle_json)
+        let verified = super::verify_ceremony_outputs(&bundle_json, scratch)
             .await
             .map_err(CeremonyError::Outputs)?;
         Ok(CeremonyFinished {

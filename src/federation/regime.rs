@@ -467,6 +467,7 @@ mod tests {
     ///
     /// Returns `Ok(())` when both doors admitted.
     #[cfg(any(test, feature = "test-anchor"))]
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn regime_row_survives_both_doors(
         dir: &dyn crate::federation::FederationDirectory,
         suffix: &str,
@@ -479,6 +480,7 @@ mod tests {
     /// **Door 1** — the local-tier write, through the real `put_attestation`.
     /// Returns `(attestation_id, attester_key_id)`.
     #[cfg(any(test, feature = "test-anchor"))]
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn land_local(
         dir: &dyn crate::federation::FederationDirectory,
         suffix: &str,
@@ -498,6 +500,7 @@ mod tests {
 
     /// **Door 2** — the promotion, carrying a federation-visible placement.
     #[cfg(any(test, feature = "test-anchor"))]
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn promote_to_federation(
         dir: &dyn crate::federation::FederationDirectory,
         id: &str,
@@ -533,6 +536,7 @@ mod tests {
     /// **Door 3** — the DIRECT federation-tier write. A promotion ban that only
     /// covers the promote path is not a ban; an inbound peer row arrives here.
     #[cfg(any(test, feature = "test-anchor"))]
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn write_at_federation_tier(
         dir: &dyn crate::federation::FederationDirectory,
         suffix: &str,
@@ -549,6 +553,7 @@ mod tests {
     /// row on `dimension` (federation tier, federation scope — callers
     /// downgrade). Returns `(id, attester, row)`.
     #[cfg(any(test, feature = "test-anchor"))]
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn build_row(
         dir: &dyn crate::federation::FederationDirectory,
         suffix: &str,
@@ -574,6 +579,7 @@ mod tests {
     /// identical — is refused at the first door. One differing input, opposite
     /// verdicts, same production path.
     #[cfg(any(test, feature = "test-anchor"))]
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn regime_replication_body(dir: &dyn crate::federation::FederationDirectory, tag: &str) {
         for (i, dim) in REGIME_DIMENSIONS.iter().enumerate() {
             regime_row_survives_both_doors(dir, &format!("{tag}-{i}"), dim)
@@ -634,6 +640,7 @@ mod tests {
     /// key. Without it this test would pass just as happily if every
     /// reserved-prefix rule had been deleted.
     #[cfg(any(test, feature = "test-anchor"))]
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn cc_3414_r1_class_marking_admits_from_any_attester(
         dir: &dyn crate::federation::FederationDirectory,
         tag: &str,
@@ -719,6 +726,7 @@ mod tests {
     /// identity, role, or co-scrub that buys a private-use row a federation
     /// tier.
     #[cfg(any(test, feature = "test-anchor"))]
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn private_use_is_banned_from_federation_tier(
         dir: &dyn crate::federation::FederationDirectory,
         tag: &str,
@@ -762,12 +770,6 @@ mod tests {
             "federation_namespace_private_use_not_federatable",
             "the private-use ban must be what refuses the direct write on {tag}"
         );
-    }
-
-    #[tokio::test]
-    async fn regime_replicates_memory() {
-        let dir = crate::store::MemoryBackend::new();
-        regime_replication_body(&dir, "mem").await;
     }
 
     #[cfg(feature = "sqlite")]

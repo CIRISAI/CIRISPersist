@@ -262,6 +262,7 @@ fn i185_the_body_states_generation_only_and_nothing_else() {
 /// The door legs: the walk is REACHED at registration and where a replicated
 /// record lands, on every backend (a policy-level green proves enforcement,
 /// not reachability).
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub mod bodies {
     use super::*;
     use crate::federation::operational::test_support as ops;
@@ -356,6 +357,7 @@ pub mod bodies {
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod run {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
@@ -380,10 +382,6 @@ mod run {
             }
         };
     }
-
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
 
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {

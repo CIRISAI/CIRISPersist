@@ -1,10 +1,10 @@
 //! v53.1.8 (CIRISPersist#1014) — the read-telemetry witnesses.
 //!
-//! - **I549** (memory, sqlite, postgres): over a seeded consent fold, the
+//! - **I549** (sqlite, postgres): over a seeded consent fold, the
 //!   trust-root walks, the audience resolver and one admission, every
 //!   `(backend, door)` counter delta equals the test probe's totals for the
 //!   same calls — reads and rows exactly, bytes per the module doc's
-//!   definition (sqlite / postgres: the probe's envelope bytes; memory: 0) —
+//!   definition (the probe's envelope bytes) —
 //!   and each fold's delta is its one entry plus every read the probe saw
 //!   while it ran.
 //! - **I550** (sqlite, postgres): the snapshot, the cache counters and the
@@ -31,6 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::catalog::{self, TELEMETRY_CATALOG};
 use super::{Door, DoorReads, Fold, FoldReads, LocalCounters, StoreBackend, TelemetrySnapshot};
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 use crate::federation::read_probe;
 
 // ── I551 ─────────────────────────────────────────────────────────────────
@@ -194,12 +195,34 @@ fn i551_every_emitted_label_is_catalogued_and_every_catalogued_one_emitted() {
     }
 }
 
+/// v60.0.0 (CIRISPersist#934 step 4) — the doors recorded by ONE shared fold
+/// rather than by each backend: `(Door ident, the file whose fold records it)`.
+const SHARED_FOLD_DOORS: &[(&str, &str)] = &[
+    ("ListLiveConsentGrantsBy", "federation/consent_admit.rs"),
+    ("ListLiveConsentGrantsFor", "federation/consent_admit.rs"),
+];
+
+/// v60.0.0 — each shared-fold door is recorded in its fold's file.
+#[test]
+fn i551_shared_fold_doors_are_recorded_by_their_fold() {
+    let files = code_outside_observe();
+    for (door, file) in SHARED_FOLD_DOORS {
+        let (_, code) = files
+            .iter()
+            .find(|(p, _)| p.ends_with(file))
+            .expect("the fold's file");
+        assert!(
+            idents_after(code, "observe::Door::").contains(*door),
+            "I551 {file} records {door}"
+        );
+    }
+}
+
 /// Each backend file feeds the counters under its own backend label only.
 #[test]
 fn i551_each_backend_records_under_its_own_label() {
     let files = code_outside_observe();
     for (file, own) in [
-        ("store/memory.rs", "Memory"),
         ("store/sqlite.rs", "Sqlite"),
         ("store/postgres.rs", "Postgres"),
     ] {
@@ -215,12 +238,20 @@ fn i551_each_backend_records_under_its_own_label() {
         );
         // Every door that file serves is recorded there — except the typed
         // bounded read (v56.0.0, CIRISPersist#1001), which no backend records:
-        // its one wrapper does.
+        // its one wrapper does; and (v60.0.0, CIRISPersist#934 step 4) the
+        // doors a shared fold records once, for every backend.
+        let doors = idents_after(code, "observe::Door::");
         assert!(
-            idents_after(code, "observe::Door::").len() >= Door::COUNT - 2,
+            doors.len() >= Door::COUNT - 2 - SHARED_FOLD_DOORS.len(),
             "I551 {file} records {} doors",
-            idents_after(code, "observe::Door::").len()
+            doors.len()
         );
+        for (door, _) in SHARED_FOLD_DOORS {
+            assert!(
+                !doors.contains(*door),
+                "I551 {file} records {door}, which its shared fold records"
+            );
+        }
         assert!(
             !idents_after(code, "observe::Door::").contains("AttestationQuery")
                 && !code.contains("record_query_read"),
@@ -390,7 +421,7 @@ fn i552_the_weaver_registry_and_the_catalogue_agree() {
 // ── I553 ─────────────────────────────────────────────────────────────────
 
 /// Every `(backend, door)` read once (no rows, 1 byte), every fold entered
-/// once around one memory `get_attestation` read: then `emit_metrics` into a
+/// once around one sqlite `get_attestation` read: then `emit_metrics` into a
 /// debugging recorder must write every catalogued name with every catalogued
 /// label value and nothing else, each series at exactly the value the
 /// snapshot reads for it.
@@ -406,7 +437,7 @@ async fn i553_emit_metrics_writes_exactly_the_catalogue() {
     for f in Fold::ALL {
         super::fold(*f, async {
             super::record_read::<crate::federation::Attestation>(
-                StoreBackend::Memory,
+                StoreBackend::Sqlite,
                 Door::GetAttestation,
                 "i553",
                 &[],
@@ -525,10 +556,10 @@ async fn i553_emit_metrics_writes_exactly_the_catalogue() {
 
 // ── I690–I692 ────────────────────────────────────────────────────────────
 
-/// One memory read at `door` with no rows: one read, 0 rows, 1 byte.
+/// One sqlite read at `door` with no rows: one read, 0 rows, 1 byte.
 fn one_read(door: Door) {
     super::record_read::<crate::federation::Attestation>(
-        StoreBackend::Memory,
+        StoreBackend::Sqlite,
         door,
         "i69x",
         &[],
@@ -552,7 +583,7 @@ fn i690_the_snapshot_lists_only_doors_that_were_read() {
     assert_eq!(
         local.snapshot().reads,
         vec![DoorReads {
-            backend: StoreBackend::Memory.label(),
+            backend: StoreBackend::Sqlite.label(),
             door: Door::GetAttestation.label(),
             reads: 1,
             rows: 0,
@@ -631,9 +662,103 @@ fn i692_a_read_inside_folds_returns_within_a_deadline() {
     assert_eq!(inner, (1, 1, 0, 1), "I692 the inner fold's credit");
 }
 
+// ── I1163–I1164 (#1112) ──────────────────────────────────────────────────
+
+/// **I1163** (#1112) — `metrics_unit` maps a UCUM annotation `{x}` to a
+/// count and refuses every malformed brace form. The catalogue holds only
+/// well-formed units, so I553 never reached the guard's refusing side: the
+/// guard replaced with `true`, either `&&` with `||`, and `>` with `>=` all
+/// survived the nightly matrix. Each malformed case below is the one input
+/// a mutant answers `Count` for.
+#[test]
+fn i1163_metrics_unit_refuses_every_malformed_brace_form() {
+    fn unit(u: &'static str) -> Option<metrics::Unit> {
+        catalog::CatalogEntry {
+            name: "i1163",
+            kind: catalog::MetricKind::Counter,
+            unit: u,
+            labels: &[],
+            description: "I1163",
+        }
+        .metrics_unit()
+    }
+    assert_eq!(unit("By"), Some(metrics::Unit::Bytes), "I1163 By");
+    assert_eq!(unit("{x}"), Some(metrics::Unit::Count), "I1163 {{x}}");
+    assert_eq!(unit("{row}"), Some(metrics::Unit::Count), "I1163 {{row}}");
+    // `>` → `>=`: the empty annotation is two bytes.
+    assert_eq!(unit("{}"), None, "I1163 {{}} is not an annotation");
+    // the first `&&` → `||`: long enough, no opening brace.
+    assert_eq!(unit("ab}"), None, "I1163 ab}} has no opening brace");
+    assert_eq!(unit("abc"), None, "I1163 abc has no braces");
+    // the second `&&` → `||`: a closing brace alone.
+    assert_eq!(unit("}"), None, "I1163 }} alone");
+    assert_eq!(unit("x}"), None, "I1163 x}} has no opening brace");
+    assert_eq!(unit("{ab"), None, "I1163 {{ab has no closing brace");
+    assert_eq!(unit("{x"), None, "I1163 {{x has no closing brace");
+    assert_eq!(unit("{"), None, "I1163 {{ alone");
+    assert_eq!(unit("x"), None, "I1163 x");
+    assert_eq!(unit(""), None, "I1163 empty");
+}
+
+/// **I1164** (#1112) — a read inside three nested folds credits each of
+/// them exactly once and no other fold. The three folds sit at mask bits 0,
+/// 4 and 7, so a credit step that clears the wrong bit (`&=` → `|=`), or
+/// none (`-` → `+`, `-` → `/`), credits fold 0 or the lowest fold twice and
+/// leaves a higher one uncredited. Like I692 it runs on its own thread
+/// behind a 5 s deadline, so a loop that never ends is this witness's red.
+#[test]
+fn i1164_a_read_credits_each_active_fold_exactly_once() {
+    const ACTIVE: [Fold; 3] = [
+        Fold::ResolveScopedStanceByPrincipals,
+        Fold::ResolveServeTier,
+        Fold::IsPublicGroup,
+    ];
+    assert_eq!(
+        ACTIVE.map(|f| f as u32),
+        [0, 4, 7],
+        "I1164 the folds' mask bits"
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let local = LocalCounters::install();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        rt.block_on(super::fold(
+            ACTIVE[0],
+            super::fold(
+                ACTIVE[1],
+                super::fold(ACTIVE[2], async {
+                    one_read(Door::AttestationQuery);
+                    one_read(Door::AttestationQuery);
+                }),
+            ),
+        ));
+        let snap = local.snapshot();
+        let _ = tx.send(
+            Fold::ALL
+                .iter()
+                .map(|f| (*f, snap.fold(*f)))
+                .collect::<Vec<_>>(),
+        );
+    });
+    let got = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("I1164 a read inside three folds did not return within 5 s");
+    for (fold, tally) in got {
+        let want = if ACTIVE.contains(&fold) {
+            (1, 2, 0, 2)
+        } else {
+            (0, 0, 0, 0)
+        };
+        assert_eq!(tally, want, "I1164 {} credit", fold.label());
+    }
+}
+
 // ── I549 ─────────────────────────────────────────────────────────────────
 
 /// The probe's totals per door: (reads, rows, bytes).
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn probe_totals(log: &[read_probe::Read]) -> BTreeMap<&'static str, (u64, u64, u64)> {
     let mut out: BTreeMap<&'static str, (u64, u64, u64)> = BTreeMap::new();
     for r in log {
@@ -645,12 +770,14 @@ fn probe_totals(log: &[read_probe::Read]) -> BTreeMap<&'static str, (u64, u64, u
     out
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn delta3(a: (u64, u64, u64), b: (u64, u64, u64)) -> (u64, u64, u64) {
     (b.0 - a.0, b.1 - a.1, b.2 - a.2)
 }
 
 /// One step of I549: `before` → `after` against the probe `log` the step
 /// produced. Returns the probe's (reads, rows) for the step.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn assert_step(
     tag: &str,
     backend: StoreBackend,
@@ -662,13 +789,9 @@ fn assert_step(
     let probe = probe_totals(log);
     for door in Door::ALL {
         let (reads, rows, probe_bytes) = probe.get(door.label()).copied().unwrap_or_default();
-        let bytes = match backend {
-            StoreBackend::Memory => 0,
-            StoreBackend::Sqlite | StoreBackend::Postgres => probe_bytes,
-        };
         assert_eq!(
             delta3(before.door(backend, *door), after.door(backend, *door)),
-            (reads, rows, bytes),
+            (reads, rows, probe_bytes),
             "I549 {tag}: {} {} counters vs the probe (reads, rows, bytes)",
             backend.label(),
             door.label()
@@ -689,19 +812,16 @@ fn assert_step(
     let (c0, r0, w0, b0) = before.fold(fold);
     let (c1, r1, w1, b1) = after.fold(fold);
     assert!(c1 > c0, "I549 {tag}: {} was not entered", fold.label());
-    let bytes = match backend {
-        StoreBackend::Memory => 0,
-        _ => total.2,
-    };
     assert_eq!(
         (r1 - r0, w1 - w0, b1 - b0),
-        (total.0, total.1, bytes),
+        (total.0, total.1, total.2),
         "I549 {tag}: {} is credited every read made while it ran (reads, rows, bytes)",
         fold.label()
     );
     (total.0, total.1)
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) async fn i549_counters_equal_the_probe(
     d: &dyn crate::federation::FederationDirectory,
     s: &str,
@@ -879,18 +999,9 @@ pub(crate) async fn i550_the_snapshot_is_reachable_through_engine(
 
 // ── runners ──────────────────────────────────────────────────────────────
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn suffix() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
-}
-
-mod memory {
-    use super::*;
-
-    #[tokio::test]
-    async fn i549() {
-        let d = crate::store::memory::MemoryBackend::new();
-        i549_counters_equal_the_probe(&d, &suffix(), StoreBackend::Memory).await;
-    }
 }
 
 #[cfg(feature = "sqlite")]

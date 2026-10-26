@@ -17,6 +17,9 @@
 //! pushes it through the ingest pipeline, and asserts verify
 //! passes.
 
+// v60.0.0 (CIRISPersist#1002) — runs on the in-memory SQLite test backend.
+#![cfg(feature = "sqlite")]
+
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner};
@@ -24,7 +27,6 @@ use ed25519_dalek::{Signer as _, SigningKey};
 
 use ciris_persist::ingest::IngestPipeline;
 use ciris_persist::scrub::NullScrubber;
-use ciris_persist::store::MemoryBackend;
 use ciris_persist::verify::canonical::Canonicalizer;
 use ciris_persist::verify::PythonJsonDumpsCanonicalizer;
 
@@ -124,7 +126,7 @@ async fn build_signed_trace_with_wire_timestamps(
 }
 
 async fn run(bytes: &[u8], key_id: &str, sk: &SigningKey) -> Result<usize, String> {
-    let backend = MemoryBackend::new();
+    let backend = ciris_persist::store::test_backend::test_backend();
     backend.add_public_key(key_id, sk.verifying_key());
     // CIRISPersist#789 — the producer's ML-DSA-65 key must be IN THE
     // DIRECTORY. Admission resolves it by `pqc_key_id` and refuses when it is

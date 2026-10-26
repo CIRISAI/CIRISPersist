@@ -2794,7 +2794,7 @@ mod proptests {
         self_key_id_for, ClockStep, CoSign, Family, Op, OpKind, Principal, Scope, SigState, Tier,
         Transcript,
     };
-    use crate::store::{Backend as _, MemoryBackend, SqliteBackend};
+    use crate::store::{Backend as _, SqliteBackend};
 
     /// The differential property's case budget. Every case pays a fresh sqlite
     /// `run_migrations`, up to 8 ops × (real ML-DSA-65 keygen + sign + verify),
@@ -3055,12 +3055,6 @@ mod proptests {
     /// `set_self_key_id` is an inherent method on each concrete backend and
     /// `run_sequence` drives a `&dyn FederationDirectory`; see that function's
     /// doc for what a driver that skips it silently loses.
-    async fn run_on_memory(ops: &[Op], tag: &str) -> Transcript {
-        let dir = MemoryBackend::new();
-        dir.set_self_key_id(Some(self_key_id_for(tag)));
-        run_sequence(&dir, ops, tag).await
-    }
-
     async fn run_on_sqlite(ops: &[Op], tag: &str) -> Transcript {
         let dir = SqliteBackend::open_in_memory().await.expect("open sqlite");
         dir.run_migrations().await.expect("migrations");
@@ -3081,17 +3075,20 @@ mod proptests {
         /// `run_sequence` asserts I1 (the real verifier still passes), I2 (a
         /// refused op wrote nothing), I3 (an admitted op replays to the same
         /// state) and I4 (refusal is monotone under narrowing) as it goes, on
-        /// EACH backend independently. This body then asserts I5: memory and
-        /// sqlite agreed, op for op and byte for byte.
+        /// EACH backend independently. v60.0.0 (#1002): the in-process arm is
+        /// sqlite alone; I5 (the differential) runs sqlite against postgres in
+        /// [`substrate_state_machine_three_way_parity_postgres`]. A sequence
+        /// replayed on a second, independent sqlite node must produce the same
+        /// transcript (determinism of the machine itself).
         #[test]
         fn substrate_state_machine_holds_on_every_backend(ops in arb_sequence()) {
             let tag = fresh_tag();
-            let (mem, sq) = block_on(async {
-                let mem = run_on_memory(&ops, &tag).await;
-                let sq = run_on_sqlite(&ops, &tag).await;
-                (mem, sq)
+            let (a, b) = block_on(async {
+                let a = run_on_sqlite(&ops, &tag).await;
+                let b = run_on_sqlite(&ops, &tag).await;
+                (a, b)
             });
-            assert_parity(&ops, "memory", &mem, "sqlite", &sq);
+            assert_parity(&ops, "sqlite", &a, "sqlite (replayed)", &b);
         }
     }
 
@@ -3175,17 +3172,13 @@ mod proptests {
         {
             let ops = deadmission_lifecycle_ops();
             let tag = fresh_tag();
-            let mem = run_on_memory(&ops, &tag).await;
             let sq = run_on_sqlite(&ops, &tag).await;
             let pg = run_on_postgres(&ops, &tag, &dsn).await;
-            for (name, t) in [("memory", &mem), ("sqlite", &sq), ("postgres", &pg)] {
+            for (name, t) in [("sqlite", &sq), ("postgres", &pg)] {
                 assert_deadmission_lifecycle(name, t);
             }
-            assert_three_way_parity(
-                &ops,
-                &[("memory", &mem), ("sqlite", &sq), ("postgres", &pg)],
-            );
-            eprintln!("three-way parity: AV-77 de-admission lifecycle agreed on all three arms");
+            assert_three_way_parity(&ops, &[("sqlite", &sq), ("postgres", &pg)]);
+            eprintln!("parity: AV-77 de-admission lifecycle agreed on sqlite and postgres");
         }
 
         for case in 0..PG_CASES {
@@ -3194,19 +3187,12 @@ mod proptests {
                 .expect("generator produces a value")
                 .current();
             let tag = fresh_tag();
-            let mem = run_on_memory(&ops, &tag).await;
             let sq = run_on_sqlite(&ops, &tag).await;
             let pg = run_on_postgres(&ops, &tag, &dsn).await;
-            // memory first: on a 2-1 split the message names the minority arm,
-            // and the ORDER here is what the reader sees, so keep the two
-            // in-memory backends adjacent and postgres last.
-            assert_parity(&ops, "memory", &mem, "sqlite", &sq);
-            assert_three_way_parity(
-                &ops,
-                &[("memory", &mem), ("sqlite", &sq), ("postgres", &pg)],
-            );
+            assert_parity(&ops, "sqlite", &sq, "postgres", &pg);
+            assert_three_way_parity(&ops, &[("sqlite", &sq), ("postgres", &pg)]);
             eprintln!(
-                "three-way parity: case {case} of {PG_CASES} agreed ({} ops)",
+                "parity: case {case} of {PG_CASES} agreed ({} ops)",
                 ops.len()
             );
         }
@@ -3513,14 +3499,9 @@ mod proptests {
 
         let sq = SqliteBackend::open_in_memory().await.expect("open sqlite");
         sq.run_migrations().await.expect("migrations");
-        let mem = MemoryBackend::new();
         register_cast(&sq, TAG).await;
-        register_cast(&mem, TAG).await;
 
-        for (name, dir) in [
-            ("sqlite", &sq as &dyn FederationDirectory),
-            ("memory", &mem as &dyn FederationDirectory),
-        ] {
+        for (name, dir) in [("sqlite", &sq as &dyn FederationDirectory)] {
             dir.put_attestation(SignedAttestation {
                 attestation: first.clone(),
             })
@@ -3582,11 +3563,10 @@ mod proptests {
     async fn av77_deadmission_lifecycle_holds_and_agrees_across_backends() {
         const TAG: &str = "av77lifecyc";
         let ops = deadmission_lifecycle_ops();
-        let mem = run_on_memory(&ops, TAG).await;
         let sq = run_on_sqlite(&ops, TAG).await;
-        assert_deadmission_lifecycle("memory", &mem);
+        let again = run_on_sqlite(&ops, TAG).await;
         assert_deadmission_lifecycle("sqlite", &sq);
-        assert_parity(&ops, "memory", &mem, "sqlite", &sq);
+        assert_parity(&ops, "sqlite", &sq, "sqlite (replayed)", &again);
     }
 
     /// **A PEER CANNOT DE-ADMIT ON THIS NODE'S BEHALF.**
@@ -3613,13 +3593,7 @@ mod proptests {
         let sq = SqliteBackend::open_in_memory().await.expect("open sqlite");
         sq.run_migrations().await.expect("migrations");
         sq.set_self_key_id(Some(self_key_id_for(TAG)));
-        let mem = MemoryBackend::new();
-        mem.set_self_key_id(Some(self_key_id_for(TAG)));
-
-        for (name, dir) in [
-            ("sqlite", &sq as &dyn FederationDirectory),
-            ("memory", &mem as &dyn FederationDirectory),
-        ] {
+        for (name, dir) in [("sqlite", &sq as &dyn FederationDirectory)] {
             register_cast(dir, TAG).await;
             let me = self_key_id_for(TAG);
             let (b, c) = (Principal::B.key_id_in(TAG), Principal::C.key_id_in(TAG));
@@ -3855,24 +3829,27 @@ mod proptests {
         // Through the shared runners, so this test sees the SAME node identity
         // the property tests do — a backend built inline here would run with the
         // de-admission gate dormant, which is a different machine.
-        let mem_t = run_on_memory(&ops, TAG).await;
+        let sq2_t = run_on_sqlite(&ops, TAG).await;
         let sq_t = run_on_sqlite(&ops, TAG).await;
 
         // The withdraw names the row it aimed at...
-        let target = mem_t.outcomes[1]
+        let target = sq2_t.outcomes[1]
             .referenced
             .clone()
             .expect("the withdraw records the row it referenced");
         // ...and that row's provenance names the op that minted it, on BOTH sides.
-        let mem_p = mem_t.provenance.get(&target).expect("memory provenance");
+        let sq2_p = sq2_t
+            .provenance
+            .get(&target)
+            .expect("replayed sqlite provenance");
         let sq_p = sq_t.provenance.get(&target).expect("sqlite provenance");
-        assert_eq!(mem_p.minted_by_op, 0, "both name op 0 as the origin");
+        assert_eq!(sq2_p.minted_by_op, 0, "both name op 0 as the origin");
         assert_eq!(sq_p.minted_by_op, 0);
-        assert_eq!(mem_p.kind, OpKind::Put);
+        assert_eq!(sq2_p.kind, OpKind::Put);
         assert!(
-            mem_p.admitted && mem_p.stored,
-            "memory admitted op 0 AND stored the row: {}",
-            mem_p.describe()
+            sq2_p.admitted && sq2_p.stored,
+            "the replayed sqlite node admitted op 0 AND stored the row: {}",
+            sq2_p.describe()
         );
         assert!(
             sq_p.admitted && sq_p.stored,
@@ -3880,7 +3857,7 @@ mod proptests {
             sq_p.describe()
         );
 
-        let msg = explain_provenance(&target, "memory", &mem_t, "sqlite", &sq_t);
+        let msg = explain_provenance(&target, "sqlite (replayed)", &sq2_t, "sqlite", &sq_t);
         assert!(
             msg.contains("minted by op 0"),
             "the message must name the ORIGINATING op: {msg}"

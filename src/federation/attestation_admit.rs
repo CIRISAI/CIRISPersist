@@ -120,6 +120,20 @@ pub(crate) struct PlannedAttestation {
     /// `detection:*` row carrying a detection body projects to, written in the
     /// row's transaction.
     pub(crate) projected_detection: Option<crate::derived::detection_row::DetectionProjection>,
+    /// v60.0.0 (CIRISConstitution#170 closed) — the `hard_case_events` row a
+    /// `hard_case:*` row carrying a readable event projects to, written in the
+    /// row's transaction: a peer's replicated row is in this node's table as
+    /// its rebuild has it, the detection precedent.
+    pub(crate) projected_hard_case: Option<super::hard_case::HardCaseEvent>,
+    /// v60.0.0 (CIRISPersist#988 item 1) — the `credits_ledger` /
+    /// `expertise_ledger` row a ledger row signed by this node projects to,
+    /// written in the row's transaction when it supersedes the held one
+    /// ([`super::ledger_projection::supersedes`]).
+    pub(crate) projected_ledger: Option<super::ledger_projection::LedgerProjection>,
+    /// v60.0.0 (CIRISPersist#988 item 4) — the goal declaration this row
+    /// touches ([`super::goal_projection::goal_to_refold`]): the executor
+    /// refolds its `goals` row in the row's transaction, after the insert.
+    pub(crate) projected_goal: Option<String>,
     /// The signed-wire-index locator (#507b), federation tier only; the hash
     /// comes from the stored row (#646).
     pub(crate) wire_index_key: Option<String>,
@@ -566,10 +580,8 @@ where
     // not only the local producer: a remote signer can hybrid-sign a row
     // carrying a malformed subject, and replication would store the same
     // unmatchable revocation authority the emit path refuses.
-    crate::federation::validate_subject_key_ids_at(
-        &row.subject_key_ids,
-        crate::federation::SubjectGate::Ingest,
-    )?;
+    // v60.0.0 (CIRISPersist#854) — one gate, the emit gate's rule.
+    crate::federation::validate_subject_key_ids(&row.subject_key_ids)?;
     crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
     // v57.0.0 (CIRISPersist#988 item 3) — a `detection:*` row that carries a
     // detection body carries one the projection can read. Pure.
@@ -717,6 +729,12 @@ where
     // Source struct is refused by member name (a holding claim without a
     // positive `size` is the custody parse\'s to refuse, v55) Pure; the same gate at every door.
     crate::federation::media_source::check_media_source(&row.attestation_envelope)?;
+    // v60.0.0 (CIRISPersist#1036 item 4, CC 3.3.9) — a `licensure:*` row
+    // carrying the typed licence payload (the `partner_record` field set)
+    // carries one that parses, with sorted-and-unique sets and no
+    // payment-processor identifier anywhere in its envelope. Pure; the same
+    // gate at every door.
+    crate::federation::operational::check_licence_payload(&row)?;
 
     // v31.0.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
     // `consent:state:*` row is refused unless its signed envelope carries
@@ -1039,6 +1057,16 @@ where
     // moderators) or is reached by an steward-bound duty-holder via a live
     // scoped delegates_to chain. Absence ⇒ REJECT.
     crate::federation::admission::check_delegated_duty_scores_admission(dir, &row).await?;
+    // v60.0.0 (CIRISPersist#803, CC 3.1.1 / CC 4.5.5) — a
+    // `takedown_notice:{basis}:v1` row: its CC 3.3.2 shape, then the one
+    // takedown authority decision for its signer over the content as this
+    // node holds it. A no-op for every other row.
+    crate::federation::takedown_tombstone::check_takedown_notice_row_admission(dir, &row).await?;
+    // v60.0.0 (CIRISPersist#988 item 4, CC 3.1.9.7) — the goal family's
+    // gate: a `goal:*` declaration or amendment carries a well-formed body and
+    // M-1 alignment, and a `supersedes` of a held goal is its declarer's
+    // amendment. A no-op for every other row.
+    crate::federation::goal::check_goal_row_admission(dir, &row).await?;
     // v44.6.0 (#857) — a machine author may name only itself in for_key_id.
     crate::federation::admission::check_consent_for_key_admission(dir, &row).await?;
 
@@ -1065,6 +1093,11 @@ where
     // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
     // is refused: the recipient must not already reach the granter through live
     // `delegates_to` edges. Backend-symmetric with SQLite + Postgres; verify-before-mutation.
+    // v60.0.0 (CIRISPersist#1048, CC 2.4 / CC 4.4.3.2.8 C) — a term-bearing
+    // `delegates_to` (issuance, moderation, `sub_delegation`, or in an
+    // affiliation's hierarchy) carries a bounded term:
+    // `delegation_term_required`. Every backend, verify-before-mutation.
+    crate::federation::admission::check_delegation_term_admission(dir, &row).await?;
     crate::federation::admission::check_delegation_cycle_admission(dir, &row, received_at).await?;
 
     // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
@@ -1073,6 +1106,9 @@ where
     // is what makes the `self` cohort boundary well-defined. Backend-symmetric
     // with SQLite + Postgres; verify-before-mutation.
     crate::federation::admission::check_single_node_owner_admission(dir, &row).await?;
+    // v60.0.0 (CIRISPersist#1062) — an owner-binding that names an
+    // organisation is cosigned under that affiliation's protocol.
+    crate::federation::admission::check_owner_binding_affiliation_admission(dir, &row).await?;
 
     // v18.2.0 — trust-charter admission (the charter walk). AV-76: a
     // directory walk, so it stays in tier 4.
@@ -1110,13 +1146,6 @@ where
     // dimension-keyed `capacity:*` self-emission arm. Backend-symmetric
     // with SQLite + Postgres.
     crate::federation::admission::check_reserved_prefix_admission(dir, &row).await?;
-    // v57.0.0 (CIRISPersist#988 item 2) — hard_case replication is held: a
-    // `hard_case:*` row does not enter the federation tier by this door either
-    // (it is also the replicated apply). AFTER the reserved-prefix gate, so the
-    // #607 conferral refusal still names itself for a third-party row and a
-    // row that clears it is the one the hold stops.
-    super::hard_case::check_hard_case_replication_held(&row)?;
-
     // v22.0.0 (CIRISConstitution#46) — CONSENT BEFORE SCORING. A
     // federation-tier `capacity:*` claim about subject S from attester P is
     // refused unless a live `analyze` consent from S covering P exists in
@@ -1190,6 +1219,12 @@ where
         fold_at,
     )
     .await?;
+    // v60.0.0 (CIRISPersist#1036 item 4) — the licence payload's `revision`
+    // never goes backwards for the authority's own licences.
+    crate::federation::admission::check_partner_record_revision(dir, &row).await?;
+    // v60.0.0 (CIRISPersist#1036 item 3) — a licence has no public default;
+    // a non-public licence reaches other readers by re-emission.
+    crate::federation::admission::check_licence_audience(dir, &row).await?;
 
     // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
     // this node has de-admitted gets its writes refused here. No-op when
@@ -1237,6 +1272,17 @@ where
     // v57.0.0 (CIRISPersist#988 item 3) — the detection projection, read from
     // the row by the one function the rebuild calls too.
     let projected_detection = crate::derived::detection_row::project_detection_row(&row);
+    // v60.0.0 (CIRISConstitution#170 closed) — the hard_case projection, by
+    // the one function the hard_case door and the rebuild call too.
+    let projected_hard_case = super::hard_case::project_hard_case_row(&row);
+    // v60.0.0 (CIRISPersist#988 item 1) — the ledger projection, by the one
+    // function the rebuild calls too: this node's own `credits:` /
+    // `expertise:` rows only.
+    let projected_ledger =
+        super::ledger_projection::project_ledger_row(&row, dir.node_key_id().as_deref());
+    // v60.0.0 (CIRISPersist#988 item 4) — the goal declaration this row
+    // touches, refolded by the executor after the insert.
+    let projected_goal = super::goal_projection::goal_to_refold(dir, &row).await?;
     row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
     // v21.1.0 (CIRISPersist#507b) — wire-index this row (federation tier
     // only, the E5 invariant). v31.0.0 (CIRISPersist#646) — only the
@@ -1257,6 +1303,9 @@ where
         withdraws_depth,
         projected_trace,
         projected_detection,
+        projected_hard_case,
+        projected_ledger,
+        projected_goal,
         wire_index_key,
         cycle_gated,
         received_at,
@@ -1809,8 +1858,8 @@ pub(crate) struct PlannedHardCase {
 /// ([`super::hard_case::hard_case_attestation_id`]). Its signature is
 /// deferred, as on every local-tier row this node attests (the
 /// `trace:complete:v1` precedent): the node signs as the actor at the
-/// crossing, and the crossing is held
-/// ([`super::hard_case::check_hard_case_replication_held`]).
+/// crossing (`Engine::enter_mesh`), and the crossed row replicates like any
+/// attestation row (v60.0.0, CIRISConstitution#170 closed).
 ///
 /// The gates, in order: the envelope size, the dimension gate, the reserved
 /// genesis ids, the mirror and instant stamp, the size of the row as stored,

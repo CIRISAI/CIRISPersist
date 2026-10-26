@@ -289,6 +289,7 @@ pub(crate) mod test_clock {
         static AT: Cell<Option<chrono::DateTime<chrono::Utc>>> = const { Cell::new(None) };
     }
     /// Pin the purge clock to `at` (`None`: the system clock).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) fn set(at: Option<chrono::DateTime<chrono::Utc>>) {
         AT.with(|c| c.set(at));
     }
@@ -411,6 +412,26 @@ pub const ATTESTATION_PROJECTIONS: &[(&str, &str, ProjectionRemoval)] = &[
         "attestation_id",
         ProjectionRemoval::ForeignKeyCascade,
     ),
+    // v60.0.0 (CIRISPersist#988 item 1; V203) — the credits and expertise
+    // ledgers are projections of this node's balance rows and leave with the
+    // row they project.
+    (
+        "cirisnode_credits_ledger",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeyCascade,
+    ),
+    (
+        "cirisnode_expertise_ledger",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeyCascade,
+    ),
+    // v60.0.0 (CIRISPersist#988 item 4; V204) — `goals` is the projection of
+    // the goal rows; a goal leaves with the head row it projects.
+    (
+        "goals",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeyCascade,
+    ),
 ];
 
 /// Tables with an `*attestation_id` column that are NOT projections of a
@@ -418,18 +439,6 @@ pub const ATTESTATION_PROJECTIONS: &[(&str, &str, ProjectionRemoval)] = &[
 /// is spelled `attestation_id` (`table`, why).
 pub const INDEPENDENT_ATTESTATION_ID_TABLES: &[(&str, &str)] = &[
     ("federation_attestations", "the row itself"),
-    (
-        "federation_organizations",
-        "its own signed organization record; the id is that record's",
-    ),
-    (
-        "federation_org_memberships",
-        "its own signed membership record; the id is that record's",
-    ),
-    (
-        "federation_partner_records",
-        "its own signed partner record; the id is that record's",
-    ),
     (
         "cirisnode_promotion_attestations",
         "the cirisnode plane's own promotion records, written by src/cirisnode",

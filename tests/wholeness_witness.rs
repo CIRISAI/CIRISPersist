@@ -504,14 +504,6 @@ async fn hold_node_key<B: FederationDirectory>(backend: &B, node: &str) {
 }
 
 #[tokio::test]
-async fn memory_witness_projection() {
-    let backend = ciris_persist::store::MemoryBackend::default();
-    hold_node_key(&backend, "ww-node").await;
-    backend.set_node_key_id("ww-node");
-    run_projection_assertions(&backend, "memory", true).await;
-}
-
-#[tokio::test]
 async fn sqlite_witness_projection() {
     let backend = ciris_persist::store::SqliteBackend::open_in_memory()
         .await
@@ -547,10 +539,10 @@ async fn postgres_witness_projection() {
 }
 
 /// (d) compare_witnesses Equivocation → hard_case emitted, both witnesses
-/// retained (not reconciled). Memory backend (the verdict-routing path).
+/// retained (not reconciled), on the in-memory SQLite test backend.
 #[tokio::test]
 async fn equivocation_emits_hard_case_and_retains_both() {
-    let backend = ciris_persist::store::MemoryBackend::default();
+    let backend = ciris_persist::store::test_backend::test_backend();
     // v57.0.0 (CIRISPersist#988 item 2) — the equivocation proof is a
     // `hard_case:witness_equivocation:v1` row attested by THIS node's key, so
     // the node declares one it holds.
@@ -621,6 +613,7 @@ async fn equivocation_emits_hard_case_and_retains_both() {
         .list_hard_case_events(ciris_persist::federation::HardCaseFilter {
             kind: Some(WITNESS_EQUIVOCATION.to_owned()),
             since: None,
+            emitter_key_id: None,
         })
         .await
         .unwrap();
@@ -649,6 +642,7 @@ async fn equivocation_emits_hard_case_and_retains_both() {
         .list_hard_case_events(ciris_persist::federation::HardCaseFilter {
             kind: Some(WITNESS_EQUIVOCATION.to_owned()),
             since: None,
+            emitter_key_id: None,
         })
         .await
         .unwrap();
@@ -656,18 +650,15 @@ async fn equivocation_emits_hard_case_and_retains_both() {
 }
 
 /// (e) compare_witnesses Divergent on `revocation` → triggers the V058
-/// quorum-merge; the merge (monotonic_quorum/revision) decides — NOT a
+/// quorum-merge; the plane's merge decides — NOT a
 /// fragment-pick — and a previously-revoked record is NOT resurrected.
 ///
 /// This proves the SUBORDINATION: the witness yields ONLY a
 /// `TriggerQuorumMerge` directive (no winner, no root); the actual
-/// resolution runs through the EXISTING `resolve_monotonic_quorum`, which
-/// keeps the revoked record because a stale `active` can never overwrite a
-/// revoke at the same revision.
+/// resolution runs through the plane's own merge (v60.0.0: for a licence, the
+/// licensure status fold, where `revoked` absorbs).
 #[tokio::test]
 async fn divergent_triggers_quorum_merge_revoked_not_resurrected() {
-    use ciris_persist::federation::operational::{resolve_monotonic_quorum, PartnerRecord};
-
     // Two divergent witnesses across distinct peers (different roots).
     let wa = WholenessWitness {
         peer_id: "peer-a".into(),
@@ -698,47 +689,13 @@ async fn divergent_triggers_quorum_merge_revoked_not_resurrected() {
     // The trigger names the rollback-sensitive subject_kinds.
     assert!(QUORUM_MERGE_SUBJECT_KINDS.contains(&"revocation"));
 
-    // Fulfilling the directive: re-run the EXISTING §10.1.6 merge over the
-    // stored rows. The fragment that says "active" must NOT win over the
-    // "revoked" fragment at the same revision — proving the witness root
-    // never bypassed the merge to "reconstitute from any fragment".
-    let now = chrono::Utc::now();
-    let revoked = PartnerRecord {
-        attestation_id: "a".into(),
-        license_id: "lic-1".into(),
-        partner_id: "p".into(),
-        org_id: "o".into(),
-        license_type: "community".into(),
-        max_autonomy_tier: "A0".into(),
-        requires_supervisor: false,
-        deployment_limit: 1,
-        offline_grace_hours: 0,
-        status: "revoked".into(),
-        revision: 5,
-        issued_at: now,
-        expires_at: now,
-        asserted_at: now,
-        signed_envelope: serde_json::json!({}),
-        withdrawn_at: None,
-        persist_row_hash: String::new(),
-    };
-    let stale_active = PartnerRecord {
-        attestation_id: "b".into(),
-        status: "active".into(),
-        ..revoked.clone()
-    };
-    // Both fragments present; the merge resolver decides — not a pick of
-    // whichever fragment a witness root happened to commit.
-    let merge_set = [stale_active, revoked.clone()];
-    let winner = resolve_monotonic_quorum(&merge_set).unwrap();
-    assert_eq!(
-        winner.status, "revoked",
-        "(e) the quorum-merge keeps the REVOKED record — a revoked key is NOT resurrected"
-    );
-    assert_eq!(
-        winner.attestation_id, "a",
-        "(e) the merge (status rank), not a fragment-pick, chose the winner"
-    );
+    // v60.0.0 (CIRISPersist#1036) — a licence (the former `partner_record`)
+    // rides a `licensure:*` row, and its merge is the licensure status fold:
+    // a live `revoked` ABSORBS, so a stale `issued` fragment can never
+    // resurrect it (witnessed on rows in
+    // `federation::licensure::tests::revoked_absorbs_whatever_the_order_814`).
+    // The directive names that plane; the witness root never enters it.
+    assert!(QUORUM_MERGE_SUBJECT_KINDS.contains(&"licensure"));
 }
 
 #[tokio::test]

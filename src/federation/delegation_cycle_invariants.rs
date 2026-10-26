@@ -61,7 +61,7 @@
 //! database, so only the advisory lock can serialize them.
 
 /// The backend-agnostic witness body; `run` instantiates it per backend.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub mod bodies {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{
@@ -727,7 +727,7 @@ pub mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
@@ -768,7 +768,8 @@ mod run {
         };
     }
 
-    /// I597 on one backend `$b` (memory, sqlite): both writers share it.
+    /// I597 on one backend `$b`: both writers share it.
+    #[cfg(feature = "sqlite")]
     macro_rules! i597_single {
         ($b:expr) => {{
             let b = $b;
@@ -785,11 +786,6 @@ mod run {
             )
             .await;
         }};
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn i597_memory() {
-        i597_single!(crate::store::memory::MemoryBackend::new());
     }
 
     #[cfg(feature = "sqlite")]
@@ -842,10 +838,6 @@ mod run {
         .await;
         eprintln!("i597_postgres: RAN on {dsn}");
     }
-
-    dyn_runners!(memory_dyn, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
 
     #[cfg(feature = "sqlite")]
     dyn_runners!(sqlite_dyn, async {

@@ -318,19 +318,16 @@ pub async fn prune_announced_peers_not_seen_since_pg(
 ) -> Result<usize, RetentionError> {
     prune_observation_table_pg(
         backend,
-        "cirislens.announced_peers",
-        "last_seen_at",
-        None,
+        super::ObservationTable::AnnouncedPeers,
         cutoff,
         max_rows,
     )
     .await
 }
 
-/// v38.4.0 (#767 Ask 2) — the `transport_destinations` prune, PG arm. Ages on
-/// `COALESCE(last_seen_at, asserted_at)` for the same reason as the SQLite
-/// twin: `last_seen_at` is advisory and nullable, and a NULL must not make a
-/// row immortal.
+/// v38.4.0 (#767 Ask 2) — the `transport_destinations` prune, PG arm. Which
+/// rows it may age out (observed, unsigned, unretired) is
+/// [`super::ObservationTable::keep_predicate`]'s.
 pub async fn prune_transport_destinations_not_seen_since_pg(
     backend: &PostgresBackend,
     cutoff: DateTime<Utc>,
@@ -338,75 +335,34 @@ pub async fn prune_transport_destinations_not_seen_since_pg(
 ) -> Result<usize, RetentionError> {
     prune_observation_table_pg(
         backend,
-        "cirislens.transport_destinations",
-        // v38.7.0 (#776/#770) — `last_seen_at` alone; see the SQLite twin for
-        // why an assertion must not age on an observation's clock.
-        "last_seen_at",
-        // PR #769 review — never prune a V105 replicated tombstone; see the
-        // SQLite twin for why a retired route must outlive its observation.
-        Some("signature IS NULL AND retired_at IS NULL AND last_seen_at IS NOT NULL"),
+        super::ObservationTable::TransportDestinations,
         cutoff,
         max_rows,
     )
     .await
 }
 
-/// The shared PG prune body. Bounded by `ctid` so the SQL is identical
-/// whatever the table's key shape, with the age predicate repeated in the
-/// outer statement so a concurrent refresh cannot be deleted. Both call
-/// sites pass literals; nothing here is caller-supplied.
+/// The postgres executor of [`super::plan_observation_prune`]: the
+/// selection and its statement are the plan's.
 async fn prune_observation_table_pg(
     backend: &PostgresBackend,
-    table: &'static str,
-    age_expr: &'static str,
-    keep_predicate: Option<&'static str>,
+    table: super::ObservationTable,
     cutoff: DateTime<Utc>,
     max_rows: usize,
 ) -> Result<usize, RetentionError> {
-    if max_rows == 0 {
+    let Some(plan) = super::plan_observation_prune(table, cutoff, max_rows)? else {
         return Ok(0);
-    }
-    let limit_i64 = i64::try_from(max_rows)
-        .map_err(|_| RetentionError::InvalidArgument(format!("max_rows {max_rows} > i64::MAX")))?;
+    };
+    let sql = plan.render(crate::federation::attestation_query::Dialect::Postgres);
     let client = backend
         .pool()
         .get()
         .await
         .map_err(|e| RetentionError::Backend(format!("pool: {e}")))?;
-    // v38.4.0 (PR #769 review) — bound by `ctid`, and RE-CHECK the age in the
-    // outer DELETE.
-    //
-    // The first shape reused one parenthesised key expression on both sides,
-    // which for the composite key produced
-    // `WHERE (a,b,c) IN (SELECT (a,b,c) ...)` — a row-valued single column on
-    // the right against a three-column row on the left. PostgreSQL rejects
-    // it, and the destination prune failed on every call. Measured, not
-    // reviewed: the probe returned `PRUNE_DEST_ERR` while the single-column
-    // peer prune succeeded.
-    //
-    // `ctid` sidesteps key SHAPE entirely — one physical row identifier,
-    // identical SQL for both tables. And repeating `{age_expr} < $1` in the
-    // outer statement closes the refresh race: between the sub-select's
-    // snapshot and the delete, an announce can refresh `last_seen_at`, and
-    // without the re-check the DELETE would remove a row that is no longer
-    // stale because its ctid was selected a moment earlier.
-    let keep = keep_predicate
-        .map(|p| format!(" AND {p}"))
-        .unwrap_or_default();
-    let sql = format!(
-        "DELETE FROM {table} \
-         WHERE ctid IN ( \
-             SELECT ctid FROM {table} \
-             WHERE {age_expr} < $1{keep} \
-             ORDER BY {age_expr} \
-             LIMIT $2 \
-         ) \
-         AND {age_expr} < $1{keep}"
-    );
     let deleted = client
-        .execute(&sql, &[&cutoff, &limit_i64])
+        .execute(&sql, &[&plan.cutoff, &plan.limit])
         .await
-        .map_err(|e| RetentionError::Backend(format!("prune {table}: {e}")))?;
+        .map_err(|e| RetentionError::Backend(format!("prune {}: {e}", plan.table.name())))?;
     Ok(usize::try_from(deleted).unwrap_or(0))
 }
 

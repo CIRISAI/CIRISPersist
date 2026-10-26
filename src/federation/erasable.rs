@@ -1059,9 +1059,13 @@ mod tests {
 #[cfg(test)]
 mod ingest_gate_proof {
     use super::*;
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::tier_ingest::test_support::{register_hybrid_key, sign_envelope};
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::tier_ingest::verify_federation_tier_ingest;
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::types::{attestation_tier, attestation_type, compute_persist_row_hash};
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
 
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -1093,6 +1097,7 @@ mod ingest_gate_proof {
         })
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn row(attester: &str, envelope: serde_json::Value) -> Attestation {
         let (och, classical, pqc) = sign_envelope(attester, &envelope);
         let now = chrono::Utc::now();
@@ -1130,6 +1135,7 @@ mod ingest_gate_proof {
     /// sign, store, erase every member, then re-run the REAL gate over the
     /// unchanged row. Returns the erased row so the caller can hand it to an
     /// independent store — the peer half of the claim.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn erasable_survives_erasure(dir: &dyn FederationDirectory, tag: &str) -> Attestation {
         let attester = format!("erasable-attester-{tag}");
         register_hybrid_key(dir, &attester).await;
@@ -1207,6 +1213,8 @@ mod ingest_gate_proof {
     /// The peer half: a store that has never seen the object accepts and keeps
     /// the fully-erased row. This is the exact plane §7.3 says a redaction dies
     /// on.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[cfg(feature = "sqlite")]
     async fn a_peer_admits_the_erased_row(peer: &dyn FederationDirectory, erased: &Attestation) {
         register_hybrid_key(peer, &erased.attesting_key_id).await;
         peer.put_attestation(SignedAttestation {
@@ -1242,6 +1250,7 @@ mod ingest_gate_proof {
     /// performing a lawful erasure on a sealed object produces, at every peer,
     /// an alert indistinguishable from a forgery attempt against that
     /// authority's own key.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn sealed_erasure_is_refused(dir: &dyn FederationDirectory, tag: &str) {
         let attester = format!("sealed-attester-{tag}");
         register_hybrid_key(dir, &attester).await;
@@ -1341,17 +1350,6 @@ mod ingest_gate_proof {
             "the refusal must name {SD_MEMBER} so an operator knows which schema \
              to revise: {violations:?}"
         );
-    }
-
-    /// The gate runs on the memory backend in production, so the matrix runs
-    /// there too — with two genuinely independent stores.
-    #[tokio::test]
-    async fn memory() {
-        let origin = crate::store::memory::MemoryBackend::new();
-        let peer = crate::store::memory::MemoryBackend::new();
-        let erased = erasable_survives_erasure(&origin, "memory").await;
-        a_peer_admits_the_erased_row(&peer, &erased).await;
-        sealed_erasure_is_refused(&origin, "memory").await;
     }
 
     #[cfg(feature = "sqlite")]

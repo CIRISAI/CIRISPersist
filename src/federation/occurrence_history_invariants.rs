@@ -20,6 +20,7 @@
 //! provenance token) in `self_at_login`. Every body runs on memory, sqlite and
 //! postgres — the three folds agree on the same row sequence by construction.
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) mod bodies {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type as it;
@@ -299,7 +300,7 @@ pub(crate) mod bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..10].to_owned()
@@ -328,9 +329,6 @@ mod runners {
             }
         };
     }
-    runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]

@@ -298,7 +298,7 @@ pub struct ActiveHalt {
 
 /// #302 — shared test fixtures for the backend parity tests (build a proposal
 /// + a validly-signed participation that passes verify-core's verify).
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_fixtures {
     use super::*;
     use crate::federation::operational::test_support::Identity;

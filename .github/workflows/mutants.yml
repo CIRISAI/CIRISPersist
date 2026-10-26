@@ -39,6 +39,57 @@ jobs:
           - {scope: scope-observe, shard: '0/2', id: observe-0-of-2, weekly: false}
           - {scope: scope-observe, shard: '1/2', id: observe-1-of-2, weekly: false}
           - {scope: scope-observe-sites, shard: '', id: observe-sites, weekly: true}
+          # v60.0.0: the slice scopes. S0's two are 19 mutants each; S1's 215
+          # ran 8 h as 4 shards on the dev box (2 h each, the whole budget),
+          # so it rides 5 shards on the weekly run.
+          - {scope: scope-s0-hard-case, shard: '', id: s0-hard-case, weekly: false}
+          - {scope: scope-s0-roster-seam, shard: '', id: s0-roster-seam, weekly: false}
+          - {scope: scope-s1-cirisnode, shard: '0/5', id: s1-cirisnode-0-of-5, weekly: true}
+          - {scope: scope-s1-cirisnode, shard: '1/5', id: s1-cirisnode-1-of-5, weekly: true}
+          - {scope: scope-s1-cirisnode, shard: '2/5', id: s1-cirisnode-2-of-5, weekly: true}
+          - {scope: scope-s1-cirisnode, shard: '3/5', id: s1-cirisnode-3-of-5, weekly: true}
+          - {scope: scope-s1-cirisnode, shard: '4/5', id: s1-cirisnode-4-of-5, weekly: true}
+          - {scope: scope-s2-goals, shard: '0/3', id: s2-goals-0-of-3, weekly: true}
+          - {scope: scope-s2-goals, shard: '1/3', id: s2-goals-1-of-3, weekly: true}
+          - {scope: scope-s2-goals, shard: '2/3', id: s2-goals-2-of-3, weekly: true}
+          # v60.0.0 S3 (CIRISPersist#934 step 3): 129 mutants, three shards
+          # (600 s + 120 s x 43 = 5760 s each), weekly.
+          - {scope: scope-s3-key-plane, shard: '0/3', id: s3-key-plane-0-of-3, weekly: true}
+          - {scope: scope-s3-key-plane, shard: '1/3', id: s3-key-plane-1-of-3, weekly: true}
+          - {scope: scope-s3-key-plane, shard: '2/3', id: s3-key-plane-2-of-3, weekly: true}
+          # v60.0.0 slice S6v: the CC rc9 vendor (the policy table read at
+          # runtime, the corridor at admission, the registry loader) and
+          # #1114's three refusals. 108 mutants, three shards
+          # (600 s + 120 s x 36 = 4920 s each), weekly.
+          - {scope: scope-s6v-vendor, shard: '0/3', id: s6v-vendor-0-of-3, weekly: true}
+          - {scope: scope-s6v-vendor, shard: '1/3', id: s6v-vendor-1-of-3, weekly: true}
+          - {scope: scope-s6v-vendor, shard: '2/3', id: s6v-vendor-2-of-3, weekly: true}
+          # v60.0.0 S4 (CIRISPersist#934 step 4, #1105): 302 mutants, six
+          # shards (600 s + 120 s x 51 = 6720 s each), weekly.
+          - {scope: scope-s4-consent-sweep, shard: '0/6', id: s4-consent-sweep-0-of-6, weekly: true}
+          - {scope: scope-s4-consent-sweep, shard: '1/6', id: s4-consent-sweep-1-of-6, weekly: true}
+          - {scope: scope-s4-consent-sweep, shard: '2/6', id: s4-consent-sweep-2-of-6, weekly: true}
+          - {scope: scope-s4-consent-sweep, shard: '3/6', id: s4-consent-sweep-3-of-6, weekly: true}
+          - {scope: scope-s4-consent-sweep, shard: '4/6', id: s4-consent-sweep-4-of-6, weekly: true}
+          - {scope: scope-s4-consent-sweep, shard: '5/6', id: s4-consent-sweep-5-of-6, weekly: true}
+          # v60.0.0 S5 (CIRISPersist#1002): the sites the memory retirement
+          # added (the #720 lifecycle predicate, the #691 tree binding, the
+          # moved fountain assembler, the test constructor) and the genesis
+          # scratch on both backends with its reaper. 44 mutants, one shard
+          # (600 s + 120 s x 44 = 5880 s), nightly.
+          - {scope: scope-s5-memory-retire, shard: '', id: s5-memory-retire, weekly: false}
+          # v60.0.0 S6 (CIRISPersist#1036, #1049, #1062, #1048): 212 mutants,
+          # eight shards of <= 27, weekly. Five shards of 43 timed out on CI
+          # (run 40305453908: shard 1/5 measured ~168 s per mutant, 7234 s,
+          # INCOMPLETE with 0 missed); 600 s + 168 s x 27 = 5136 s fits 7200 s.
+          - {scope: scope-s6-affiliations, shard: '0/8', id: s6-affiliations-0-of-8, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '1/8', id: s6-affiliations-1-of-8, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '2/8', id: s6-affiliations-2-of-8, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '3/8', id: s6-affiliations-3-of-8, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '4/8', id: s6-affiliations-4-of-8, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '5/8', id: s6-affiliations-5-of-8, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '6/8', id: s6-affiliations-6-of-8, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '7/8', id: s6-affiliations-7-of-8, weekly: true}
     services:
       postgres:
         image: ghcr.io/cirisai/postgres:16
@@ -85,6 +136,10 @@ jobs:
       - name: mutants_matrix self-test
         if: steps.gate.outputs.run == 'true'
         run: python3 scripts/mutants_matrix_test.py
+      # v60.0.0 — the scope this job is about to run resolves and names tests.
+      - name: mutation scopes are well-formed (from disk)
+        if: steps.gate.outputs.run == 'true'
+        run: python3 scripts/mutants_scopes_check.py --self-test && python3 scripts/mutants_scopes_check.py
       - name: mutation matrix and verdict
         if: steps.gate.outputs.run == 'true'
         env:

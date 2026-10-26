@@ -140,6 +140,23 @@ pub enum LifecycleView {
     All,
 }
 
+impl LifecycleView {
+    /// The composer types whose retraction this view still hides (CIRISPersist
+    /// #720): `Live` hides all three, each `Include*` opts one class back in,
+    /// `All` hides nothing.
+    #[must_use]
+    pub(crate) fn hiding_composers(self) -> &'static [&'static str] {
+        use crate::federation::types::attestation_type::{RECANTS, SUPERSEDES, WITHDRAWS};
+        match self {
+            Self::Live => &[SUPERSEDES, WITHDRAWS, RECANTS],
+            Self::IncludeSuperseded => &[WITHDRAWS, RECANTS],
+            Self::IncludeWithdrawn => &[SUPERSEDES, RECANTS],
+            Self::IncludeRecanted => &[SUPERSEDES, WITHDRAWS],
+            Self::All => &[],
+        }
+    }
+}
+
 /// v17.4.0 (FSD-005 Appendix C.2) — trust-perspective attester filter.
 /// The v17.4.0 substrate honors ONLY set membership (`All` / `Explicit`);
 /// the DERIVED predicates (`holders_of` / `reachable_from` / `licensed_by`)

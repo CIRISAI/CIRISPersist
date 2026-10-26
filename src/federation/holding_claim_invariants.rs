@@ -300,7 +300,7 @@ mod pure {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod dyn_bodies {
     use crate::federation::membership_acceptance::test_support::{acceptance_row, proposal_row};
     use crate::federation::membership_acceptance::{
@@ -1480,7 +1480,7 @@ pub(crate) mod blob_bodies {
         establish(dir, "i778-producer", &owner.id, &hex::encode(sha)).await;
         let t = crate::federation::takedown_tombstone::takedown_tombstone(
             dir,
-            &notice(&owner, &hex::encode(sha), "dmca_512"),
+            &notice(&owner, &hex::encode(sha), "dmca512"),
             "i778-node",
         )
         .await
@@ -1601,7 +1601,7 @@ pub(crate) mod blob_bodies {
         establish(dir, "i778-producer", &owner.id, &hex::encode(claimed_sha)).await;
         crate::federation::takedown_tombstone::takedown_tombstone(
             dir,
-            &notice(&owner, &hex::encode(claimed_sha), "dmca_512"),
+            &notice(&owner, &hex::encode(claimed_sha), "dmca512"),
             "i778-node",
         )
         .await
@@ -2091,7 +2091,7 @@ pub(crate) mod engine_bodies {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
@@ -2124,10 +2124,6 @@ mod runners {
             }
         };
     }
-
-    dyn_runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
-    });
 
     #[cfg(feature = "sqlite")]
     dyn_runners!(sqlite, async {

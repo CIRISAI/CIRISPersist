@@ -103,6 +103,10 @@ pub mod rule {
     pub const HIERARCHY_DEPTH_OUT_OF_RANGE: &str = "hierarchy_depth_out_of_range";
     /// A designated official names an empty role or key.
     pub const DESIGNATED_OFFICIAL_INVALID: &str = "designated_official_invalid";
+    /// v60.0.0 (CIRISPersist#1036 item 3) — a `licence_audiences` entry names
+    /// an empty licence class or a scope outside the closed `cohort_scope`
+    /// set.
+    pub const LICENCE_AUDIENCE_INVALID: &str = "licence_audience_invalid";
 }
 
 /// CC 4.4.3.2.8's named presets. Closed: a preset persist does not know
@@ -302,6 +306,16 @@ pub struct AffiliationConfig {
     /// [`ROLE_TERM_CEILING_DAYS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_term: Option<u32>,
+    /// v60.0.0 (CIRISPersist#1036 item 3, CC 2.4.1.2.1, CIRISConstitution#162)
+    /// — **the licence audience per licence class**: `{license_type:
+    /// cohort_scope}`. "A licence has no public default: its `cohort_scope` is
+    /// the authority's declared choice per licence class in the affiliation's
+    /// charter, the smallest that fits." A class not named here has no
+    /// declared choice, so its licences may take any scope but a commons one
+    /// (the admission gate `admission::check_licence_audience`). Persist's
+    /// spelling: CC names the declaration, not the member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licence_audiences: Option<BTreeMap<String, String>>,
     /// Every other declared CC 4.4.3.2.8 limb, carried verbatim.
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
@@ -508,6 +522,21 @@ impl AffiliationConfig {
                 format!("designated official {o:?} names an empty role or key"),
             ));
         }
+        if let Some((class, scope)) = self
+            .licence_audiences
+            .iter()
+            .flatten()
+            .find(|(c, s)| c.is_empty() || !crate::federation::types::cohort_scope::is_valid(s))
+        {
+            return Err(invalid(
+                group,
+                rule::LICENCE_AUDIENCE_INVALID,
+                format!(
+                    "licence_audiences: class {class:?} → scope {scope:?}; a class is named and \
+                     its scope is a cohort_scope"
+                ),
+            ));
+        }
         Ok(())
     }
 }
@@ -604,6 +633,26 @@ pub fn check_community_record(c: &Community) -> Result<(), Error> {
         )),
         (_, None) => Ok(()),
     }
+}
+
+/// v60.0.0 (CIRISPersist#1048, CC 4.4.3.2.8 C) — the longest term, in
+/// seconds, an edge in `c`'s hierarchy may carry: the charter's `role_term ×
+/// 86400` when `c` is an affiliation that declares one, else `None` (only the
+/// constitutional [`ROLE_TERM_CEILING_SECONDS`] binds). Never above the
+/// ceiling: a record past it is refused at its door
+/// ([`rule::ROLE_TERM_OUT_OF_RANGE`]), and the `min` keeps a record admitted
+/// before that door from widening it.
+///
+/// # Errors
+/// As [`check_community_record`]: a record whose cohort or config does not
+/// parse is a refusal, never "no bound".
+pub fn role_term_seconds(c: &Community) -> Result<Option<i64>, Error> {
+    if declared_cohort(c)? != Cohort::Affiliations {
+        return Ok(None);
+    }
+    Ok(affiliation_config_of(c)?
+        .and_then(|cfg| cfg.role_term)
+        .map(|t| (i64::from(t) * 86_400).min(ROLE_TERM_CEILING_SECONDS)))
 }
 
 /// Refuse when `c` declares a cohort other than `addressed`.

@@ -2583,16 +2583,6 @@ pub(crate) mod carriage_tests {
         );
     }
 
-    #[test]
-    fn accord_concurrent_admissions_memory() {
-        use crate::store::memory::MemoryBackend;
-        concurrent_runtime().block_on(async {
-            run_concurrent_overlap_matrix(std::sync::Arc::new(MemoryBackend::new()), "ccm").await;
-            run_concurrent_carrier_bound_matrix(std::sync::Arc::new(MemoryBackend::new()), "cbm")
-                .await;
-        });
-    }
-
     #[cfg(feature = "sqlite")]
     #[test]
     fn accord_concurrent_admissions_sqlite() {
@@ -2674,17 +2664,6 @@ pub(crate) mod carriage_tests {
         c.run_migrations().await.unwrap();
         run_cursor_advance_matrix(&c, "sq").await;
         run_injected_roster_matrix(&c, "sq").await;
-    }
-
-    #[tokio::test]
-    async fn exclusion_carriage_memory() {
-        use crate::store::memory::MemoryBackend;
-        let a = MemoryBackend::new();
-        let b = MemoryBackend::new();
-        run_carriage_matrix(&a, &b, "mem").await;
-        run_revocation_cursor_matrix(&a, "mem").await;
-        run_cursor_advance_matrix(&MemoryBackend::new(), "mem").await;
-        run_injected_roster_matrix(&MemoryBackend::new(), "mem").await;
     }
 
     /// Two ISOLATED postgres databases — the cross-node property needs two

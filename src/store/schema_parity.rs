@@ -154,46 +154,21 @@ pub(crate) const PG_NARROWED_ID_COLUMNS: &[(&str, &str)] = &[
     ("cirisgraph.telemetry_metrics", "metric_id"),
     ("cirislens.audit_archives", "archive_id"),
     ("cirislens.audit_log", "entry_id"),
-    (
-        "cirislens.cirisnode_consent_sla_watch",
-        "target_contribution_id",
-    ),
-    (
-        "cirislens.cirisnode_revocation_promotion_watch",
-        "revocation_contribution_id",
-    ),
     ("cirislens.edge_detection_events", "detection_id"),
     ("cirislens.edge_outbound_queue", "queue_id"),
     ("cirislens.federation_trust_grants", "grant_id"),
-    ("cirislens.goals", "goal_id"),
     ("cirislens.incident_records", "incident_id"),
     ("cirislens_derived.detection_events", "detection_id"),
     ("cirislens_secrets.access_log", "secret_uuid"),
     ("cirislens_secrets.secrets", "secret_uuid"),
-    ("cirisnode.contributions", "contribution_id"),
-    ("cirisnode.credits_ledger", "last_update_contribution"),
-    ("cirisnode.expertise_ledger", "last_update_contribution"),
-    (
-        "cirisnode.federation_delivery_attestations",
-        "announcement_id",
-    ),
-    ("cirisnode.moderation_events", "moderation_id"),
+    // v60.0.0 (CIRISPersist#988 item 1; V203) — the six typed cirisnode
+    // tables and V056's two watch tables are dropped, and V203 relaxed the
+    // kept tables' row-naming columns (`credits_ledger` /
+    // `expertise_ledger.last_update_contribution`,
+    // `federation_delivery_attestations.announcement_id`,
+    // `scheduled_takedown_actions.notice_contribution_id`) to `TEXT`: they name
+    // rows now. The promotion record's own id stays `uuid`.
     ("cirisnode.promotion_attestations", "attestation_id"),
-    (
-        "cirisnode.reconsideration_attestations",
-        "reconsideration_id",
-    ),
-    ("cirisnode.reconsideration_attestations", "request_id"),
-    ("cirisnode.reconsideration_requests", "request_id"),
-    ("cirisnode.reconsideration_requests", "slashing_id"),
-    (
-        "cirisnode.scheduled_takedown_actions",
-        "notice_contribution_id",
-    ),
-    ("cirisnode.slashing_attestations", "moderation_id"),
-    ("cirisnode.slashing_attestations", "slashing_id"),
-    ("cirisnode.votes", "contribution_id"),
-    ("cirisnode.votes", "vote_id"),
 ];
 
 /// A column whose `NOT NULL` differs between the two trees, with the reason.
@@ -612,11 +587,13 @@ mod tests {
         files.sort();
         let mut tables: Tables = BTreeMap::new();
         for f in files {
-            let text = strip_sql(&std::fs::read_to_string(&f).expect("read migration"));
+            let text = strip_sql(&super::super::tree_read::read(&f));
             for st in statements(&text) {
                 apply_statement(&mut tables, &st);
             }
         }
+        // CIRISPersist#691 — the migrations read are still the text read.
+        super::super::tree_read::assert_unmoved();
         tables
     }
 
@@ -1094,7 +1071,17 @@ mod tests {
 
     /// `table -> the union of every column any INSERT in this file binds`.
     fn insert_columns(rel: &str) -> BTreeMap<String, BTreeSet<String>> {
-        let text = std::fs::read_to_string(manifest_dir().join(rel)).expect("read backend source");
+        // CIRISPersist#691 — the backend source this binary was compiled from.
+        let p = manifest_dir().join(rel);
+        let text = match rel {
+            "src/store/sqlite.rs" => {
+                super::super::tree_read::read_compiled(&p, include_str!("sqlite.rs"))
+            }
+            "src/store/postgres.rs" => {
+                super::super::tree_read::read_compiled(&p, include_str!("postgres.rs"))
+            }
+            _ => super::super::tree_read::read(&p),
+        };
         let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         // Assembled so this module's own doc text is not a match.
         let verb = ["INSERT"].join("");
