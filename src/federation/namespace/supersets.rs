@@ -1786,7 +1786,8 @@ mod tests {
         // CLM-delegation-term (1), CLM-admission-freshness-window (3),
         // CLM-canonicalization-array (1); CLM-merge moved off the retired
         // SubjectKind onto the licence revision gate (a move, not a new row).
-        const EXPECTED: usize = 342;
+        // v60.1.0 slice B: +1 (CIRISPersist#1120), CLM-identity-amendment-row.
+        const EXPECTED: usize = 343;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

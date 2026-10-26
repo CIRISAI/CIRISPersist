@@ -17162,6 +17162,15 @@
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v60-s6",
     "witness": "I1210 (sqlite, postgres), I1222 (unit): the licence payload's sets sorted AND unique in UTF-16 order"
+   },
+   {
+    "decimal_id": "3.1.5",
+    "claim_id": "CLM-identity-amendment-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/identity_amendment.rs#check_identity_amendment_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60.1-b",
+    "witness": "I1365 (sqlite, postgres): identity_amendment:v1 admits only citing an admitted, approved deferral response about the same agent by a seated WA; identity_amendment_unauthorized otherwise (CIRISPersist#1120)"
    }
   ],
   "CIRISServer": [
