@@ -305,8 +305,9 @@ did not fit its budget):
   (v60.0.0, #1112) I1163–I1164. 71 mutants, run as two shards
   (`MUTANTS_SHARD=0/2`, `1/2`).
 - `scope-s0-roster-seam.txt` (v60.0.0, slice S0): `nodes_owned_by` (#1109,
-  I1161) and the test-anchor `W_self` seam (#1111, I1162); the first scope
-  with a `features:` line (`test-anchor`).
+  I1161, and I1342 for the seek's owner-binding filter, which changes only
+  what is read) and the test-anchor `W_self` seam (#1111, I1162); the first
+  scope with a `features:` line (`test-anchor`).
 - `scope-s2-goals.txt` (v60.0.0, slice S2): goals as `goal:{scale}:v1`
   rows (#988 item 4): `goal.rs`, `goal_projection.rs` and the three
   backends' goal writers, rebuilds and reads, against I1174–I1182. 155
@@ -356,13 +357,18 @@ did not fit its budget):
   `revision` gate, the subject-withdraws carve-out and the contest, the
   affiliation owner-binding, and the delegation term gate and lens, against
   I1210–I1235 and the licensure-chain, grant-scope and key-grant witnesses
-  (plus I972, I126, I313, which guard neighbouring sites). 212 mutants in five
-  shards, 186 caught, 26 unviable, 0 missed (three rounds: 28 then 9
-  survivors; all witnessed, except two equivalent forms removed: the
-  withdraws rule-3 cut accumulation and the stream instants' `&&`), on the
-  weekly run.
+  (plus I972, I126, I313, which guard neighbouring sites). 212 mutants, 186
+  caught, 26 unviable, 0 missed (three rounds: 28 then 9 survivors; all
+  witnessed, except two equivalent forms removed: the withdraws rule-3 cut
+  accumulation and the stream instants' `&&`), on the weekly run in eight
+  shards. It ran in five until the v60.0.0 CI run (40305453908): shard 1/5
+  took about 168 s per mutant, not the 120 s the sizing assumes, and three
+  of the five shards hit the 7200 s budget with mutants unrun (0 missed).
+  At 600 s + 168 s x 27, a shard of eight fits.
 - `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and
-  federation files that feed the counters. The issue's other starting modules
+  federation files that feed the counters, against I548–I551 and (v60.0.0)
+  I1340–I1341, the witnesses of `apply_planned`'s read-back and store-error
+  arms on sqlite and postgres. The issue's other starting modules
 (the `trust_root.rs` walks beyond `trust_root_valid`) are not yet scoped.
 
 From v60 every slice adds its own scope; see the next section.

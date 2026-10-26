@@ -79,12 +79,17 @@ jobs:
           # (600 s + 120 s x 44 = 5880 s), nightly.
           - {scope: scope-s5-memory-retire, shard: '', id: s5-memory-retire, weekly: false}
           # v60.0.0 S6 (CIRISPersist#1036, #1049, #1062, #1048): 212 mutants,
-          # five shards (600 s + 120 s x 43 = 5760 s each), weekly.
-          - {scope: scope-s6-affiliations, shard: '0/5', id: s6-affiliations-0-of-5, weekly: true}
-          - {scope: scope-s6-affiliations, shard: '1/5', id: s6-affiliations-1-of-5, weekly: true}
-          - {scope: scope-s6-affiliations, shard: '2/5', id: s6-affiliations-2-of-5, weekly: true}
-          - {scope: scope-s6-affiliations, shard: '3/5', id: s6-affiliations-3-of-5, weekly: true}
-          - {scope: scope-s6-affiliations, shard: '4/5', id: s6-affiliations-4-of-5, weekly: true}
+          # eight shards of <= 27, weekly. Five shards of 43 timed out on CI
+          # (run 40305453908: shard 1/5 measured ~168 s per mutant, 7234 s,
+          # INCOMPLETE with 0 missed); 600 s + 168 s x 27 = 5136 s fits 7200 s.
+          - {scope: scope-s6-affiliations, shard: '0/8', id: s6-affiliations-0-of-8, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '1/8', id: s6-affiliations-1-of-8, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '2/8', id: s6-affiliations-2-of-8, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '3/8', id: s6-affiliations-3-of-8, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '4/8', id: s6-affiliations-4-of-8, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '5/8', id: s6-affiliations-5-of-8, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '6/8', id: s6-affiliations-6-of-8, weekly: true}
+          - {scope: scope-s6-affiliations, shard: '7/8', id: s6-affiliations-7-of-8, weekly: true}
     services:
       postgres:
         image: ghcr.io/cirisai/postgres:16
