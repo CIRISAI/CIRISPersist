@@ -35,15 +35,6 @@ pub struct ScratchDirectory {
     release: Option<Release>,
 }
 
-impl std::fmt::Debug for ScratchDirectory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ScratchDirectory")
-            .field("held", &self.dir.is_some())
-            .field("released", &self.release.is_none())
-            .finish()
-    }
-}
-
 impl ScratchDirectory {
     /// A scratch whose release is `release` (run after `dir` is dropped).
     #[must_use]
@@ -93,22 +84,27 @@ impl ScratchDirectory {
     }
 }
 
+/// Run a release step to completion on a thread of its own with its own
+/// runtime, so it neither needs nor blocks on the caller's runtime.
+fn release_blocking(r: Release) -> Result<(), Error> {
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| Error::Backend(format!("genesis scratch: release runtime: {e}")))?
+            .block_on(r())
+    })
+    .join()
+    .map_err(|_| Error::Backend("genesis scratch: the release thread panicked".into()))?
+}
+
 impl Drop for ScratchDirectory {
     fn drop(&mut self) {
         drop(self.dir.take());
+        // Unreleased: an early return or a panic.
         if let Some(r) = self.release.take() {
-            // Unreleased (an early return or a panic): release on a thread of
-            // its own with its own runtime, so it neither needs nor blocks on
-            // the caller's runtime.
-            let joined = std::thread::spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map(|rt| rt.block_on(r()))
-            })
-            .join();
-            if !matches!(joined, Ok(Ok(Ok(())))) {
-                tracing::error!("genesis scratch: release on drop failed; the scratch may remain");
+            if let Err(e) = release_blocking(r) {
+                tracing::error!(error = %e, "genesis scratch: release on drop failed; the scratch may remain");
             }
         }
     }
