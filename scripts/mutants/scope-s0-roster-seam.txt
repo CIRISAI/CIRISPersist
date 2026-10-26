@@ -17,7 +17,10 @@
 #   fence over where the variable is read, not a witness of these fns'
 #   logic: no generated mutant moves the read, so it would kill nothing and
 #   read UNVALIDATED (the S0b run, 2026-10-21). It runs in the lib suite.
-tests: test(/i1161|i1162_/) - test(i1162_only_a_test_anchor_build_reads_the_window_env)
+# v60.0.0 — I1342: the seek's owner-binding filter. Over-admitting a
+# candidate changes no `owner_of` verdict, only what is read, so I1161 could
+# not kill `&&` -> `||` there (the CI matrix, run 40305453908).
+tests: test(/i1161|i1162_|i1342/) - test(i1162_only_a_test_anchor_build_reads_the_window_env)
 features: postgres,sqlite,server,test-anchor
 
 src/federation/admission.rs nodes_owned_by

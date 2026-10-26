@@ -636,6 +636,55 @@ pub(crate) mod bodies {
         }
     }
 
+    /// **I1342** (v60.0.0) — `nodes_owned_by` walks `owner_of` only for an
+    /// owner-binding's node. A `delegates_to` the person signed for any other
+    /// purpose (a `moderate` delegation to a peer) names no candidate, so the
+    /// reverse walk reads nothing about its grantee; the owner-binding's node
+    /// is walked and placed (the control). Since the verdict is `owner_of`,
+    /// over-admitting a candidate changes no answer, only what is read, so
+    /// I1161 cannot see the seek's filter and the read probe can.
+    pub(crate) async fn i1342_the_seek_walks_owner_bindings_only(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::admission::{self, nodes_owned_by};
+        use crate::federation::read_probe;
+        let (f, peer, node) = (format!("f-{tag}"), format!("p-{tag}"), format!("n-{tag}"));
+        keys(d, &[&f, &peer]).await;
+        ts::register_hybrid_key_as(d, &node, &node, it::NODE).await;
+        d.put_attestation(SignedAttestation {
+            attestation: binding(&f, &node),
+        })
+        .await
+        .expect("I1342: f binds a node");
+        crate::federation::grant_scope_invariants::bodies::put_delegation(
+            d,
+            &f,
+            &f,
+            &peer,
+            admission::DELEGATION_SCOPE_MODERATE,
+            ms_now(),
+            None,
+        )
+        .await;
+        let _ = read_probe::take();
+        assert_eq!(
+            nodes_owned_by(d, &f).await.unwrap(),
+            vec![node.clone()],
+            "I1342: f owns its bound node, and the delegate is not a node"
+        );
+        let log = read_probe::take();
+        assert!(
+            log.iter().any(|r| r.door_key() == node),
+            "I1342: the owner-binding's node is walked (the probe sees the walk)"
+        );
+        let stray: Vec<_> = log.iter().filter(|r| r.door_key() == peer).collect();
+        assert!(
+            stray.is_empty(),
+            "I1342: a non-owner delegates_to names no candidate, so nothing reads its grantee: {stray:?}"
+        );
+    }
+
     /// **I1140** — a node is not a roster key: a node its owner bound may
     /// still publish its own occurrence under the owner, but its signature on
     /// a user-role key's occurrence is refused (`proposer_not_on_roster`) and
@@ -1363,6 +1412,7 @@ mod tests {
         i1161,
         bodies::i1161_nodes_owned_by_places_a_roster_keys_node
     );
+    on_every_backend!(i1342, bodies::i1342_the_seek_walks_owner_bindings_only);
     on_every_backend!(i1143, bodies::i1143_the_proposer_withdraws);
     on_every_backend!(i1307, bodies::i1307_the_corridor_runs_at_admission);
     on_every_backend!(
