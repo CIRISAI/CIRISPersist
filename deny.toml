@@ -106,6 +106,16 @@ ignore = [
     "RUSTSEC-2026-0371",  # zbus_names unmaintained — ciris-keyring → secret-service
     "RUSTSEC-2026-0370",  # zvariant unmaintained — same zbus stack
     "RUSTSEC-2026-0372",  # zvariant_derive unmaintained — same zbus stack
+    # v60.0.0 — three advisories published after v59.1.0. tokio (RUSTSEC-2026-0386,
+    # `AsyncFd::new` I/O safety) and ctutils (RUSTSEC-2026-0385, non-constant-time
+    # masks) are CLEARED by `cargo update` (tokio 1.54.1, ctutils 0.4.6), not
+    # ignored. crypto-bigint 0.5.5 (RUSTSEC-2026-0387, secret-dependent branches)
+    # is fixed only in 0.7.6, which elliptic-curve 0.13 cannot take; it is
+    # transitive only via p256 0.13 in ciris-crypto / ciris-keyring (CIRISVerify
+    # v20.2.0). Persist's federation identity is Ed25519 + ML-DSA-65; a P-256
+    # platform signer is refused as the federation key (`federation_key_id_of`,
+    # the PyEngine signer selection). Re-evaluate on the next ciris-verify bump.
+    "RUSTSEC-2026-0387",  # crypto-bigint 0.5 timing — p256 via CIRISVerify, no persist P-256 signing
 ]
 
 [sources]

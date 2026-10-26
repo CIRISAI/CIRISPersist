@@ -13,12 +13,12 @@ An architecture cut (docs/V60_TASK_PLAN.md): signed attestations are the only
 state (CEWPOS). The cirisnode classes and Goals become `scores` rows, the
 organisation planes become affiliation rows, the key-record, consent and
 sweep doors decide in one shared plan each, and the in-process memory backend
-is gone. No feature outside the issues named here. Sections 1–14 are in slice
-order (S1–S6, then S0's fixes and tooling); **§15 is the whole adoption list
-for CIRISEdge, CIRISServer and CIRISAgent**, derived from `git diff
-v59.1.0..` over the `.pyi`, `src/ffi`, the error enums and the migrations.
-Migrations V202–V205; witnesses from I1161; `supersets.rs` `EXPECTED` 313 →
-342.
+is gone. No feature outside the issues named here. Sections 1–14 are in
+slice order (S1–S6, then S0's fixes and tooling) and §15 is the advisories;
+**§16 is the whole adoption list for CIRISEdge, CIRISServer and
+CIRISAgent**, derived from `git diff v59.1.0..` over the `.pyi`, `src/ffi`,
+the error enums and the migrations. Migrations V202–V205; witnesses from
+I1161; `supersets.rs` `EXPECTED` 313 → 342.
 
 ### Changed — 1. the cirisnode classes are `scores` rows (S1; CIRISPersist#988 item 1, #803, #854)
 
@@ -147,7 +147,7 @@ backend's `set_admission_gate` (the plane's gate is the gate). New:
 `Engine::cirisnode_*` doors. `TakedownNoticePayload` drops `claimant_key_id`
 and `asserted_at` (the row's) and refuses unknown fields;
 `takedown_tombstone::takedown_terms` is `async (directory, notice, origin)`.
-What Edge, Server and Agent adapt: §15.
+What Edge, Server and Agent adapt: §16.
 
 - Witnesses: **I1166** (sqlite, postgres) the ledgers are this node's
   rows, arrival-independent, a peer's balance never projected, byte-equal
@@ -252,7 +252,7 @@ projection's read type (`goal_id: String`, `scope`, `score`,
 `LegacyGoal`, `GoalRehome`, `goal::{parse_goal_body, check_goal_row_admission,
 plan_goal_row, plan_goal_amendment_row, plan_goal_retraction_row,
 decode_goal_input}`, `goal_projection`, and `Engine::{put_goal, amend_goal,
-retire_goal, recant_goal, rehome_legacy_goals}`. What Edge adapts: §15.
+retire_goal, recant_goal, rehome_legacy_goals}`. What Edge adapts: §16.
 
 - Witnesses: **I1174–I1176** (unit) the scales, the M-1 rule, the four
   planners and the retired typed body refused by name; **I1177** (unit) the
@@ -792,7 +792,7 @@ is_term_bearing_edge, TERM_BEARING_SCOPES, SUBJECT_WITHDRAWS_CARVE_OUT}`;
 ListOrgMembershipsSince}` and `DirectoryOpResult::{Organizations,
 OrgMemberships}` removed.
 
-What Edge, Server and Agent adapt: §15.
+What Edge, Server and Agent adapt: §16.
 
 - Witnesses (sqlite, postgres unless noted): **I1210** the payload gate;
   **I1211** the revision anti-rollback; **I1212** the skew bound; **I1213**
@@ -968,7 +968,20 @@ The scheduled `mutants and powerset` job had been red every day since
   MISSED guard mutants had no witness because the catalogue holds only
   well-formed units.
 
-### Adoption — 15. what CIRISEdge, CIRISServer and CIRISAgent must handle
+### Security — 15. three advisories published after v59.1.0 (deny.toml)
+
+- RUSTSEC-2026-0386 (tokio `AsyncFd::new` I/O safety): cleared, tokio 1.52.3
+  → 1.54.1 in `Cargo.lock`.
+- RUSTSEC-2026-0385 (ctutils non-constant-time masks): cleared, ctutils 0.4.2
+  → 0.4.6 in `Cargo.lock`.
+- RUSTSEC-2026-0387 (crypto-bigint 0.5 secret-dependent branches): ignored
+  with its reason. The fix is 0.7.6, which elliptic-curve 0.13 cannot take;
+  the crate is transitive only via p256 0.13 in CIRISVerify v20.2.0's
+  ciris-crypto / ciris-keyring, and persist's federation identity is Ed25519
+  + ML-DSA-65 (a P-256 platform signer is refused as the federation key).
+  Re-evaluate on the next ciris-verify bump.
+
+### Adoption — 16. what CIRISEdge, CIRISServer and CIRISAgent must handle
 
 Every break in v60.0.0, from `git diff v59.1.0..` (python `.pyi`, `src/ffi`,
 the exhaustive enums, the migrations). Edge adapts once, to this head.
