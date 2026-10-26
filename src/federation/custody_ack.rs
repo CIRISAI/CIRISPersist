@@ -641,6 +641,30 @@ where
         .max())
 }
 
+/// v60.1.0 (CIRISPersist#1006) — each of `devices`' latest signed receipt
+/// instant for `stream_id` ([`signed_receipt_at`]); a device with none is
+/// absent from the map.
+async fn signed_receipts_of<D>(
+    directory: &D,
+    devices: &BTreeSet<String>,
+    stream_id: &str,
+    now: DateTime<Utc>,
+) -> Result<BTreeMap<String, DateTime<Utc>>, BlobError>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let mut out = BTreeMap::new();
+    for d in devices {
+        if let Some(at) = signed_receipt_at(directory, d, stream_id, now)
+            .await
+            .map_err(|e| BlobError::Backend(format!("delivery receipts of {d}: {e}")))?
+        {
+            out.insert(d.clone(), at);
+        }
+    }
+    Ok(out)
+}
+
 /// The custody of one blob across the devices this node can name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustodyView {
@@ -765,14 +789,7 @@ where
                 .into_iter()
                 .map(|r| r.receipt.subscriber_key_id),
         );
-        for d in &devices {
-            if let Some(at) = signed_receipt_at(backend, d, stream, now)
-                .await
-                .map_err(|e| BlobError::Backend(format!("delivery receipts of {d}: {e}")))?
-            {
-                receipts.insert(d.clone(), at);
-            }
-        }
+        receipts = signed_receipts_of(backend, &devices, stream, now).await?;
     }
     let hex_sha = hex::encode(at_rest_sha256);
     let mut out = Vec::with_capacity(devices.len());

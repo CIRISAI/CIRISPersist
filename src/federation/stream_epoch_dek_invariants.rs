@@ -755,6 +755,27 @@ pub(crate) mod bodies {
         assert!(r.already_registered);
     }
 
+    /// **I1401** (pure) — the DEK comparison reads every byte and is exact:
+    /// equal keys compare equal, and two keys whose differing bytes would
+    /// cancel under an XOR fold (two bytes differing by the same bit) still
+    /// compare unequal, as does a difference in the last byte alone.
+    #[test]
+    fn i1401_the_dek_comparison_is_exact() {
+        use crate::federation::chunk_dag_cascade::orchestrate::dek_eq_constant_time;
+        let a = [7u8; 32];
+        assert!(dek_eq_constant_time(&a, &a), "I1401: equal keys");
+        let mut b = a;
+        b[0] ^= 1;
+        b[1] ^= 1;
+        assert!(
+            !dek_eq_constant_time(&a, &b),
+            "I1401: cancelling differences"
+        );
+        let mut c = a;
+        c[31] ^= 0x80;
+        assert!(!dek_eq_constant_time(&a, &c), "I1401: the last byte");
+    }
+
     /// **I755** — see the module doc.
     pub(crate) async fn i755_a_supplied_epoch_is_the_callers_to_roll<B>(
         dsn_a: &str,

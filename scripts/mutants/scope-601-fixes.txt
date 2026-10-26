@@ -14,9 +14,11 @@
 #   in-transaction tombstone read (the shared decision
 #   `refuse_tombstoned_at_write`, its `From` into `BlobError::Purged`, each
 #   dialect's read / lock / switch). Witnesses I1402–I1406, I1408 (postgres),
-#   I1409, and the takedown door's standing witnesses I786–I790.
+#   I1409, and the takedown door's standing witnesses I786–I790 (and I153,
+#   which reads `evict_one_on`'s withdraws count through `evict_blob`).
 # - #1006: `received` ordered by the subscriber-signed instant
-#   (`signed_receipt_at`, `delivery_receipt_dimension`, `custody_view`).
+#   (`signed_receipt_at`, `delivery_receipt_dimension`, `signed_receipts_of`;
+#   `custody_view`'s older stream-binding arms are I513's, not this slice's).
 #   Witnesses I1407 and I513 (sqlite, postgres).
 # - Left OUT: `steward_purge::bytes_tombstone_lock_key` (any constant key
 #   still serializes every writer against every tombstone write, only more
@@ -25,7 +27,7 @@
 #   #1124 is a doc comment.
 #
 # Grammar: docs/MUTATION_TESTING.md "Scope files".
-tests: test(/i1400|i1401|i1402|i1403|i1404|i1405|i1406|i1407|i1408|i1409|i754|i780_i783|i786|i787|i788|i789|i790|i513_/)
+tests: test(/i1400|i1401|i1402|i1403|i1404|i1405|i1406|i1407|i1408|i1409|i754|i780_i783|i786|i787|i788|i789|i790|i153|i513_/)
 features: postgres,sqlite,server
 
 src/federation/blobs.rs refuse_positioned_plaintext_chunks check_plaintext_dag_manifest check_external_chunk_size
@@ -33,6 +35,6 @@ src/federation/chunk_dag_cascade.rs holds_this_dek dek_eq_constant_time already_
 src/engine.rs purge_finalize purge_evict_blob evict_one_on
 src/federation/takedown_tombstone.rs already_recorded takedown_tombstone apply_replicated_takedown
 src/federation/steward_purge.rs refuse_tombstoned_at_write from
-src/federation/custody_ack.rs signed_receipt_at delivery_receipt_dimension custody_view
+src/federation/custody_ack.rs signed_receipt_at delivery_receipt_dimension signed_receipts_of
 src/store/sqlite.rs sqlite_tombstone_at_write sqlite_refuse_tombstoned_at_write sqlite_purged_at_write bytes_tombstone_plane
 src/store/postgres.rs pg_lock_bytes_tombstones pg_lock_bytes_tombstones_exclusive pg_tombstone_at_write pg_refuse_tombstoned_at_write bytes_tombstone_plane

@@ -1026,7 +1026,7 @@ mod engine_bodies {
 
         // An expired receipt row does not count at a reader's later clock.
         let t_exp = t_none + chrono::Duration::seconds(45);
-        signed_receipt_row_until(
+        let expiring = signed_receipt_row_until(
             &l,
             run,
             &sid,
@@ -1054,6 +1054,22 @@ mod engine_bodies {
             .unwrap(),
             Some(t_after),
             "I1407 an expired row does not"
+        );
+        // At the instant it expires it no longer counts (live means strictly
+        // before `expires_at`), read back at the substrate's own resolution.
+        let expires_at = dir
+            .get_attestation(&expiring)
+            .await
+            .unwrap()
+            .unwrap()
+            .expires_at
+            .expect("the row's expiry");
+        assert_eq!(
+            signed_receipt_at(dir, &l.node_b, &sid, expires_at)
+                .await
+                .unwrap(),
+            Some(t_after),
+            "I1407 a row is not live at its own expiry instant"
         );
 
         // Withdrawn by the device: no longer counts.
