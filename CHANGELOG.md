@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [60.0.0] - UNRELEASED
+## [60.0.0] - 2026-10-26
 
 An architecture cut (docs/V60_TASK_PLAN.md): signed attestations are the only
 state (CEWPOS). The cirisnode classes and Goals become `scores` rows, the
