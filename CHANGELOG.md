@@ -42,6 +42,15 @@ threat-model citations because this crate's audit story is the point.
   an unclassified token. Witnesses I1362 and I742 (sqlite, postgres) classify
   the tokens the doors actually raise. The issue's optional single
   `Error::is_retryable()` over every federation error arm is not in this cut.
+- **#1095 — `chat:call:v1`, witnessed** (CIRISEdge ask, CC rc9): an A/V call
+  record is one self-subject `scores` row per attendee (attester = subject),
+  placed at the room's scope through the chat path. No persist change was
+  needed (`chat:*` is the registry's open wildcard and a self-subject row has
+  no refusing gate); I1363 (sqlite, postgres) now holds it: each member's row
+  admits and a non-member's is refused; members read the rows by subject and
+  a non-member reads none; the attendees are the union of subjects over a
+  `call_id`; an attendee's own `withdraws` retracts their row, the other
+  attendee's stands, and nobody withdraws another's.
 
 ## [60.0.0] - 2026-10-26
 

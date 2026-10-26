@@ -20,6 +20,14 @@
 //!   closed set and terminal, and a re-offer of the same bytes is refused the
 //!   same way. (The key-grant twin rides I742's doors: `signer_not_minter`
 //!   terminal, `recipient_not_in_audience` retryable.)
+//! - **I1363 (CIRISPersist#1095, CIRISEdge; CC rc9)** — an A/V call record is
+//!   one self-subject `chat:call:v1` row per attendee (attester = subject =
+//!   the attendee), placed at the ROOM's scope like a chat row: (a) each
+//!   member's row admits and a non-member's is refused; (b) a member reads the
+//!   rows by subject, and the call's attendees are the union of subjects over
+//!   the rows sharing a `call_id`, while a non-member reads none; (c) an
+//!   attendee's own `withdraws` retracts their row and the other attendee's
+//!   stands; nothing is superseded.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -196,6 +204,148 @@ pub(crate) mod bodies {
         }
         assert!(d.get_attestation(&id).await.unwrap().is_none());
     }
+
+    /// **I1363** — see the module doc.
+    pub(crate) async fn i1363_a_call_record_is_one_self_row_per_attendee(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{attestation_type, cohort_scope, Attestation};
+        use crate::federation::SignedAttestation;
+        use crate::read::{AttestationFilter, LifecycleView};
+
+        let room = format!("chat:room:v1:i1363-{tag}");
+        let (alice, bob, carol) = (
+            format!("i1363-alice-{tag}"),
+            format!("i1363-bob-{tag}"),
+            format!("i1363-carol-{tag}"),
+        );
+        ts::register_hybrid_key(d, &room).await;
+        for k in [&alice, &bob, &carol] {
+            ts::register_user_role_key(d, k).await;
+        }
+        ts::seed_two_member_community(d, &room, &alice, &bob).await;
+        let call_id = uuid::Uuid::new_v4().to_string();
+
+        let call_row = |who: &str| -> Attestation {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut r = ts::bare_attestation(
+                &id,
+                who,
+                who,
+                &serde_json::json!({
+                    "id": id,
+                    "dimension": "chat:call:v1",
+                    "call_id": call_id,
+                    "community_key_id": room,
+                    "started_at": "2026-10-26T12:00:00Z",
+                }),
+            );
+            r.attestation_type = attestation_type::SCORES.to_owned();
+            r.weight = None;
+            r.cohort_scope = cohort_scope::COMMUNITY.to_owned();
+            r.subject_key_ids = vec![who.to_owned()];
+            ts::seal_row_in_place(who, &mut r);
+            r
+        };
+
+        // (a) Each member's own row admits; a non-member's is refused.
+        let (a_row, b_row) = (call_row(&alice), call_row(&bob));
+        let (a_id, b_id) = (a_row.attestation_id.clone(), b_row.attestation_id.clone());
+        for r in [a_row, b_row] {
+            d.put_attestation(SignedAttestation { attestation: r })
+                .await
+                .unwrap_or_else(|e| panic!("I1363 (a): a member's chat:call:v1 row admits: {e}"));
+        }
+        let c_row = call_row(&carol);
+        let c_id = c_row.attestation_id.clone();
+        assert!(
+            d.put_attestation(SignedAttestation { attestation: c_row })
+                .await
+                .is_err(),
+            "I1363 (a): a non-member cannot place a call row in the room"
+        );
+        assert!(d.get_attestation(&c_id).await.unwrap().is_none());
+
+        // (b) Read by subject, as a member and as a non-member.
+        let by_subject = |subject: &str, lifecycle: LifecycleView| AttestationFilter {
+            subject_key_id: Some(subject.to_owned()),
+            dimension_prefixes: vec!["chat:call:".to_owned()],
+            lifecycle,
+            ..Default::default()
+        };
+        let read = |caller: String, subject: String, lifecycle: LifecycleView| {
+            let filter = by_subject(&subject, lifecycle);
+            async move {
+                d.list_scores(&caller, filter, None, 50)
+                    .await
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .map(|r| r.attestation_id)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            read(bob.clone(), alice.clone(), LifecycleView::Live).await,
+            vec![a_id.clone()],
+            "I1363 (b): a member reads the other attendee's row by subject"
+        );
+        assert_eq!(
+            read(alice.clone(), bob.clone(), LifecycleView::Live).await,
+            vec![b_id.clone()],
+            "I1363 (b): per attendee"
+        );
+        assert!(
+            read(carol.clone(), alice.clone(), LifecycleView::Live)
+                .await
+                .is_empty(),
+            "I1363 (b): a non-member reads no row of the room"
+        );
+        let mut attendees = std::collections::BTreeSet::new();
+        for who in [&alice, &bob, &carol] {
+            for id in read(alice.clone(), who.clone(), LifecycleView::Live).await {
+                let row = d.get_attestation(&id).await.unwrap().unwrap();
+                if row.attestation_envelope["call_id"] == serde_json::json!(call_id) {
+                    attendees.extend(row.subject_key_ids);
+                }
+            }
+        }
+        assert_eq!(
+            attendees,
+            [alice.clone(), bob.clone()].into_iter().collect(),
+            "I1363 (b): the attendees are the union of subjects over the call's rows"
+        );
+
+        // (c) Alice withdraws her own row; Bob's stands.
+        ts::put_retraction(d, &alice, &alice, &a_id, attestation_type::WITHDRAWS)
+            .await
+            .unwrap_or_else(|e| panic!("I1363 (c): the attendee withdraws their own row: {e}"));
+        assert!(
+            read(bob.clone(), alice.clone(), LifecycleView::Live)
+                .await
+                .is_empty(),
+            "I1363 (c): the withdrawn row is no longer live"
+        );
+        assert_eq!(
+            read(bob.clone(), alice.clone(), LifecycleView::IncludeWithdrawn).await,
+            vec![a_id.clone()],
+            "I1363 (c): the row is retracted, not destroyed"
+        );
+        assert_eq!(
+            read(alice.clone(), bob.clone(), LifecycleView::Live).await,
+            vec![b_id.clone()],
+            "I1363 (c): the other attendee's row stands"
+        );
+        // A non-subject cannot withdraw it.
+        assert!(
+            ts::put_retraction(d, &alice, &bob, &b_id, attestation_type::WITHDRAWS)
+                .await
+                .is_err(),
+            "I1363 (c): nobody withdraws another attendee's row"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -244,6 +394,10 @@ mod tests {
     on_every_backend!(i1360, bodies::i1360_accord_threshold_is_the_gates_threshold);
     on_every_backend!(i1361, bodies::i1361_infra_relay_is_accord_conferred);
     on_every_backend!(i1362, bodies::i1362_a_dimension_refusal_classifies_terminal);
+    on_every_backend!(
+        i1363,
+        bodies::i1363_a_call_record_is_one_self_row_per_attendee
+    );
 
     /// v60.1.0 (CIRISPersist#1064) — **every `DimensionRejected` reason is
     /// classified exactly once.** The closed set holds each token once, the
