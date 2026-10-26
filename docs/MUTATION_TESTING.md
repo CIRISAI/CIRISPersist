@@ -343,8 +343,12 @@ did not fit its budget):
   licence audience, the typed licence payload (`operational.rs`) and its
   `revision` gate, the subject-withdraws carve-out and the contest, the
   affiliation owner-binding, and the delegation term gate and lens, against
-  I1210–I1235 and the licensure-chain, grant-scope and key-grant witnesses.
-  217 mutants in five shards, on the weekly run.
+  I1210–I1235 and the licensure-chain, grant-scope and key-grant witnesses
+  (plus I972, I126, I313, which guard neighbouring sites). 212 mutants in five
+  shards, 186 caught, 26 unviable, 0 missed (three rounds: 28 then 9
+  survivors; all witnessed, except two equivalent forms removed: the
+  withdraws rule-3 cut accumulation and the stream instants' `&&`), on the
+  weekly run.
 - `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and
   federation files that feed the counters. The issue's other starting modules
 (the `trust_root.rs` walks beyond `trust_root_valid`) are not yet scoped.

@@ -755,8 +755,13 @@ payload's four sets before signing.
   keeps a wrap only from a sealer with standing at its row's instant), I798
   (its duty edge carries a term). Python:
   `tests/python/test_affiliation_surface.py`.
-- Mutation scope `scripts/mutants/scope-s6-affiliations.txt`: 217 mutants,
-  five weekly shards in `mutants.yml`.
+- Mutation scope `scripts/mutants/scope-s6-affiliations.txt`: 212 mutants in
+  five shards, 186 caught, 26 unviable, 0 missed, nothing allow-listed (three
+  rounds: 28, then 9 survivors, all witnessed or removed as equivalent).
+  Weekly, five shards, in `mutants.yml`.
+- `resolve_withdraws_admission_rule_at`: rule 3 no longer accumulates
+  `beyond_delegation_depth_cap` (rule 4 walks the same graph over a superset
+  of targets; the refusal reports the same cut).
 - Evidence (manifest round `v60-s6`): CLM-authority-id-is-org-id (3.3.9),
   CLM-licence-authority-quorum ×2, CLM-licence-judged-at-issuance,
   CLM-licence-audience (2.4.1.2.1), CLM-licence-contest ×2 (2.4.1.1),
