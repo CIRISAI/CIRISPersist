@@ -194,6 +194,8 @@ mod postgres {
             format!("{p}_42_ab"),
             format!("{p}x12_42_ab"),
             format!("{p}1a2_42_ab"),
+            // `u64::from_str` takes a leading `+`; the reaper must not.
+            format!("{p}+12_42_ab"),
             "ciris_t_12_42_ab".to_owned(),
             format!("other_{p}12_42_ab"),
         ] {
