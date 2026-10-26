@@ -26,10 +26,17 @@
 //!   `(stream, epoch)` this node never registered and holds no wrap for, is
 //!   admitted as ciphertext only: no stream DEK row, no wrap, no
 //!   `key_grant:stream:v1` row, no community binding.
-//! - **I754** (sqlite, postgres; #981) — a second supply for an epoch is
+//! - **I754** (sqlite, postgres; #981) — a second, different supply for an epoch is
 //!   `stream_epoch_dek_exists` and the stored key stays; a supply by a writer
 //!   that is not the stream's is `stream_not_authored`, naming the stream and
 //!   never its writer; nothing is written.
+//! - **I1401** (sqlite, postgres; v60.1.0, #1069) — a re-supply of the DEK an
+//!   epoch already holds is `Ok` with `already_registered`, and writes nothing
+//!   (no terminator, no DEK row, no wrap, no `key_grant:stream:v1` row), at the
+//!   newest epoch and below it; a different DEK for a held epoch is
+//!   `stream_epoch_dek_exists`, naming no key material. Two supplies racing for
+//!   one epoch: the same DEK is one write and one idempotent `Ok`; two DEKs are
+//!   one `Ok` and one conflict, and the stored key is the winner's.
 //! - **I755** (sqlite, postgres; #981) — a supplied, kept epoch whose
 //!   recipient leaves the audience refuses the next chunk with the retryable
 //!   `stream_epoch_rotation_required { reason: removal, removed_key_id }`;
@@ -606,6 +613,141 @@ pub(crate) mod bodies {
             l.bb.stream_dek_list(&stream).await.unwrap().is_empty(),
             "I754: nothing written"
         );
+    }
+
+    /// **I1401** — see the module doc.
+    pub(crate) async fn i1401_a_resupply_of_the_same_dek_is_idempotent<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let stream = format!("i1401-{run}");
+        let d0 = mls_exporter();
+        let first = l
+            .engine_a
+            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 0, &d0, None)
+            .await
+            .unwrap();
+        assert!(!first.already_registered, "I1401: the first supply writes");
+        write_room(&l, &stream, 1, 0).await;
+        let rows_before = stream_rows(l.ba.as_ref(), &l.node_a).await.len();
+        let grants_before = l.ba.stream_dek_grants(&stream, 0, &l.node_a).await.unwrap();
+
+        // The same DEK again: Ok, nothing written.
+        let again = l
+            .engine_a
+            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 0, &d0, None)
+            .await
+            .expect("I1401: the same DEK again is not refused");
+        assert!(again.already_registered, "I1401: {again:?}");
+        assert!(
+            again.granted.is_empty()
+                && again.excluded.is_empty()
+                && again.key_grant_emission.is_none(),
+            "I1401: an idempotent re-supply grants and emits nothing: {again:?}"
+        );
+        let e0 =
+            l.ba.stream_dek_list(&stream)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.epoch == 0)
+                .expect("I1401: epoch 0 held");
+        assert!(!e0.terminated, "I1401: no terminator written");
+        assert_eq!(e0.chunk_count, 1, "I1401: the epoch's chunks are untouched");
+        assert_eq!(
+            l.ba.stream_dek_list(&stream).await.unwrap().len(),
+            1,
+            "I1401: no DEK row written"
+        );
+        assert_eq!(
+            stream_rows(l.ba.as_ref(), &l.node_a).await.len(),
+            rows_before,
+            "I1401: no key_grant:stream:v1 row re-emitted"
+        );
+        assert_eq!(
+            l.ba.stream_dek_grants(&stream, 0, &l.node_a).await.unwrap(),
+            grants_before,
+            "I1401: no wrap re-written"
+        );
+
+        // The next epoch, then the old one again: still idempotent; a
+        // DIFFERENT DEK for either is the typed conflict, naming no key.
+        let d1 = mls_exporter();
+        let next = l
+            .engine_a
+            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 1, &d1, None)
+            .await
+            .unwrap();
+        assert!(!next.already_registered);
+        for (epoch, dek) in [(0u64, d0), (1, d1)] {
+            let r = l
+                .engine_a
+                .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, epoch, &dek, None)
+                .await
+                .unwrap_or_else(|e| panic!("I1401: epoch {epoch} again: {e:?}"));
+            assert!(r.already_registered, "I1401: epoch {epoch} again");
+        }
+        for (epoch, dek) in [(0u64, d1), (1, d0), (1, mls_exporter())] {
+            let e = l
+                .engine_a
+                .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, epoch, &dek, None)
+                .await
+                .expect_err("I1401: another DEK for a held epoch");
+            assert!(
+                matches!(&e, BlobError::StreamEpochDekExists { epoch: x, .. } if *x == epoch),
+                "I1401: {e:?}"
+            );
+            assert_eq!(e.kind(), "blob_stream_epoch_dek_exists");
+            assert!(
+                !e.to_string().contains(&hex::encode(dek)),
+                "I1401: the refusal names no key material"
+            );
+        }
+
+        // Two supplies racing for one epoch, judged as a stored row is: the
+        // same DEK twice is one write and one idempotent Ok; two DEKs are one
+        // Ok and one conflict, and the stored key is the winner's.
+        let same = format!("i1401-same-{run}");
+        let d = mls_exporter();
+        let (x, y) = tokio::join!(
+            l.engine_a
+                .register_stream_epoch_dek(COMMUNITY, &l.comm, &same, 0, &d, None),
+            l.engine_a
+                .register_stream_epoch_dek(COMMUNITY, &l.comm, &same, 0, &d, None),
+        );
+        let (x, y) = (x.unwrap(), y.unwrap());
+        assert_eq!(
+            [x.already_registered, y.already_registered]
+                .iter()
+                .filter(|a| !**a)
+                .count(),
+            1,
+            "I1401: one write between two equal supplies"
+        );
+        let split = format!("i1401-split-{run}");
+        let (da, db) = (mls_exporter(), mls_exporter());
+        let (x, y) = tokio::join!(
+            l.engine_a
+                .register_stream_epoch_dek(COMMUNITY, &l.comm, &split, 0, &da, None),
+            l.engine_a
+                .register_stream_epoch_dek(COMMUNITY, &l.comm, &split, 0, &db, None),
+        );
+        let winner = match (&x, &y) {
+            (Ok(r), Err(BlobError::StreamEpochDekExists { .. })) if !r.already_registered => da,
+            (Err(BlobError::StreamEpochDekExists { .. }), Ok(r)) if !r.already_registered => db,
+            other => panic!("I1401: two DEKs racing: {other:?}"),
+        };
+        let r = l
+            .engine_a
+            .register_stream_epoch_dek(COMMUNITY, &l.comm, &split, 0, &winner, None)
+            .await
+            .expect("I1401: the stored key is the winner's");
+        assert!(r.already_registered);
     }
 
     /// **I755** — see the module doc.
@@ -1615,6 +1757,11 @@ pub(crate) mod bodies {
                 async fn i754() {
                     let Some((a, b)) = $dsn else { return };
                     i754_exists_and_not_authored(&a, &b, &run(), $pick).await
+                }
+                #[tokio::test]
+                async fn i1401() {
+                    let Some((a, b)) = $dsn else { return };
+                    i1401_a_resupply_of_the_same_dek_is_idempotent(&a, &b, &run(), $pick).await
                 }
                 #[tokio::test]
                 async fn i757() {

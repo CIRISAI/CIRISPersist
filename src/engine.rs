@@ -7752,7 +7752,9 @@ impl Engine {
     /// [`seal_stream_chunk`](crate::federation::stream_seal::seal_stream_chunk)
     /// under that per-stream DEK. Chunks then go through
     /// [`put_blob_chunk_scoped`](Self::put_blob_chunk_scoped) at `epoch`.
-    /// Refusals: `stream_not_authored`, `stream_epoch_dek_exists`, or
+    /// Refusals: `stream_not_authored`, `stream_epoch_dek_exists` (a
+    /// DIFFERENT DEK for the epoch; v60.1.0, CIRISPersist#1069: the same DEK
+    /// again is `Ok` with `already_registered`, nothing written), or
     /// `InvalidArgument` (plaintext tier, an epoch below the newest, a
     /// per-chunk-keyed stream, another cohort).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]

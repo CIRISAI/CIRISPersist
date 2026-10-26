@@ -15353,8 +15353,12 @@ impl PyEngine {
     /// `put_blob_chunk_scoped` at `epoch`.
     ///
     /// Returns JSON: `stream_id`, `epoch`, `tier`, `granted`,
-    /// `excluded`, `roster`. Refusals (ValueError, token then JSON):
-    /// `blob_stream_not_authored`, `blob_stream_epoch_dek_exists`,
+    /// `excluded`, `roster`, `already_registered` (v60.1.0,
+    /// CIRISPersist#1069: `true` for a re-supply of the DEK the epoch already
+    /// holds, with nothing written and nothing granted). Refusals
+    /// (ValueError, token then JSON): `blob_stream_not_authored`,
+    /// `blob_stream_epoch_dek_exists` (a DIFFERENT DEK for the epoch; never
+    /// retryable),
     /// `blob_invalid_argument`. A later chunk may be refused
     /// `blob_stream_epoch_rotation_required` (`reason` `removal` naming
     /// `removed_key_id`, or `cap`) or `blob_stream_epoch_dek_missing`, both
@@ -15449,6 +15453,7 @@ impl PyEngine {
                     "granted": r.granted,
                     "excluded": r.excluded,
                     "roster": r.roster,
+                    "already_registered": r.already_registered,
                 })
                 .to_string())
             })

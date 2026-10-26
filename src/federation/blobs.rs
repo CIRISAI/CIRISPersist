@@ -4410,7 +4410,9 @@ pub enum BlobError {
     },
     /// v55.0.0 (CIRISPersist#981) — a DEK was supplied for a `(stream_id,
     /// epoch)` that already holds one. An epoch's key is never replaced.
-    /// Terminal for these arguments.
+    /// Terminal for these arguments. v60.1.0 (CIRISPersist#1069): only a
+    /// DIFFERENT DEK is refused (the split a rekey retry must not make); the
+    /// same DEK again is an idempotent `Ok`. Names no key material.
     #[error(
         "stream {stream_id} epoch {epoch} already holds a DEK; an epoch's key is never replaced"
     )]

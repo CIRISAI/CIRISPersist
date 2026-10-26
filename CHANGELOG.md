@@ -22,6 +22,18 @@ threat-model citations because this crate's audit story is the point.
   (`put_plaintext_dag_chunk`, `put_blob_chunks_signing`). Both used to be
   stored and then fail every read or every finalize. Witness I1400 (sqlite,
   postgres).
+- **CIRISPersist#1069** — `register_stream_epoch_dek`: a re-supply of the DEK
+  a `(stream, epoch)` already holds is `Ok` with the new
+  `RegisteredStreamEpoch::already_registered: true` (and the same key in the
+  Python JSON), writing nothing (no terminator, no DEK row, no wrap, no
+  `key_grant:stream:v1` row). A DIFFERENT DEK stays
+  `stream_epoch_dek_exists`, now meaning exactly the conflict (non-retryable,
+  naming no key material). Persist compares the two itself, in constant time,
+  by opening the stored self-retention wrap; the racing-insert case is judged
+  the same way. The issue's proposed `StreamEpochDekConflict` variant would be
+  a new arm of the exhaustive `BlobError`; it is not added in this MINOR (the
+  existing token now carries exactly that meaning). Witness I1401 (sqlite,
+  postgres).
 
 ## [60.0.0] - 2026-10-26
 
