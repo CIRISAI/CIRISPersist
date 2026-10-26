@@ -661,16 +661,30 @@ in parity.
   benches (`add_public_key`, `add_pqc_public_key`, `snapshot_events`); every
   other below-the-door seam is `cfg(test)`, so no consumer build links a
   writer that skips the doors.
-- **Feature gating:** the genesis doors whose scratch directory was a memory
-  node now open an in-memory SQLite one and need `sqlite`:
-  `Engine::install_genesis_bundle_roster`,
-  `federation::genesis::{install_genesis_bundle_roster, verify_ceremony_outputs}`,
-  `CeremonyState::finish`, `AmendState::{plan, finish}`. A `postgres`-only
-  build no longer has them.
+- **The genesis scratch is per backend** (steward ruling 2026-10-25: parity
+  even for genesis). The doors that replayed a bundle on a memory node
+  (`verify_ceremony_outputs`, the import door, `CeremonyState::finish`,
+  `AmendState::{plan, finish}`) take a `&dyn genesis::scratch::GenesisScratch`
+  and run on what the backend provisions: SQLite a migrated in-memory clone,
+  PostgreSQL a throwaway database in the live cluster created from the
+  configured DSN (`ciris_genesis_scratch_{pid}_{hex}`), migrated, and dropped
+  `WITH (FORCE)` when the replay ends — on success, on a refusal, and on drop
+  (a panic). The configured role needs `CREATEDB` for these doors. A rolled-back
+  transaction was not used: the replay runs a dozen doors, each on its own
+  connection. Every door compiles and runs with `postgres` alone and with
+  `sqlite` alone. Signature changes (clean break):
+  `verify_ceremony_outputs(bundle_json, scratch)`,
+  `install_genesis_bundle_roster(dir, scratch, bundle)`,
+  `CeremonyState::finish(scratch)`, `AmendState::plan(pinned, rows, scratch)`,
+  `AmendState::finish(scratch)`; `Engine::install_genesis_bundle_roster` and
+  `PyEngine.install_genesis_bundle_roster_json` pass their own backend. New
+  refusal `CeremonyOutputsRefusal::ScratchDirectory`
+  (`ceremony_scratch_directory`): the scratch could not be provisioned or
+  released. New `store::postgres::GENESIS_SCRATCH_DB_PREFIX`. Witnesses
+  I1324–I1331.
 - **Python:** no Python surface named or constructed the memory backend, so
-  nothing is renamed. `PyEngine.install_genesis_bundle_roster_json` now needs
-  the `sqlite` feature, which the published wheel carries (`pyproject.toml`
-  features); the `pyo3` (postgres-only) shape loses it. No `.pyi` change.
+  nothing is renamed. `PyEngine.install_genesis_bundle_roster_json` keeps its
+  signature and runs on every backend the build carries. No `.pyi` change.
 - **Telemetry:** the `backend` label set is `{sqlite, postgres}`
   (`observe::StoreBackend::Memory` and the registry member are gone;
   `telemetry/catalog.json` re-rendered). A dashboard keyed on

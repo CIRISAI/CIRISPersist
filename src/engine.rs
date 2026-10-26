@@ -3895,7 +3895,7 @@ impl Engine {
     /// the `ciris-canonical` birth — through the same function the boot seed
     /// uses. This node's own genesis posture is not changed. See
     /// [`crate::federation::genesis::install_genesis_bundle_roster`].
-    #[cfg(feature = "sqlite")]
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn install_genesis_bundle_roster(
         &self,
         bundle: &crate::federation::genesis::GenesisBundle,
@@ -3903,11 +3903,11 @@ impl Engine {
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(b) => {
-                crate::federation::genesis::install_genesis_bundle_roster(&**b, bundle).await
+                crate::federation::genesis::install_genesis_bundle_roster(&**b, &**b, bundle).await
             }
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => {
-                crate::federation::genesis::install_genesis_bundle_roster(&**b, bundle).await
+                crate::federation::genesis::install_genesis_bundle_roster(&**b, &**b, bundle).await
             }
         }
     }

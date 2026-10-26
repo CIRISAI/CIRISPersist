@@ -3540,58 +3540,184 @@ impl PostgresBackend {
     /// advisory lock. When the returned client drops, the
     /// connection task observes EOF and the session ends — the lock
     /// auto-releases. Includes the panic-mid-migration case.
-    #[cfg(not(feature = "tls"))]
     async fn dedicated_connect(&self) -> Result<tokio_postgres::Client, Error> {
-        let (client, connection) =
-            tokio_postgres::connect(&self.dsn, NoTls)
-                .await
-                .map_err(|e| Error::Migration {
-                    sqlstate: extract_sqlstate(&e),
-                    detail: format!("dedicated connect: {e}"),
-                })?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::warn!(error = %e, "migration-lock connection terminated");
-            }
-        });
-        Ok(client)
+        dedicated_connect_to(&self.dsn).await
     }
+}
 
-    #[cfg(feature = "tls")]
-    async fn dedicated_connect(&self) -> Result<tokio_postgres::Client, Error> {
-        use rustls::ClientConfig;
-        use tokio_postgres_rustls::MakeRustlsConnect;
-        ensure_rustls_provider();
-        let mut roots = rustls::RootCertStore::empty();
-        let cert_result = rustls_native_certs::load_native_certs();
-        for cert in cert_result.certs {
-            roots.add(cert).map_err(|e| Error::Migration {
-                sqlstate: None,
-                detail: format!("native-cert add: {e}"),
+/// A one-shot, non-pooled connection to `dsn` (see
+/// [`PostgresBackend::dedicated_connect`]); also the genesis scratch's admin
+/// connection (CIRISPersist#1002).
+#[cfg(not(feature = "tls"))]
+async fn dedicated_connect_to(dsn: &str) -> Result<tokio_postgres::Client, Error> {
+    let (client, connection) =
+        tokio_postgres::connect(dsn, NoTls)
+            .await
+            .map_err(|e| Error::Migration {
+                sqlstate: extract_sqlstate(&e),
+                detail: format!("dedicated connect: {e}"),
             })?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::warn!(error = %e, "migration-lock connection terminated");
         }
-        if !cert_result.errors.is_empty() {
-            tracing::warn!(
-                errors = ?cert_result.errors,
-                "some native certs failed to load (non-fatal)"
-            );
-        }
-        let tls_config = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let connector = MakeRustlsConnect::new(tls_config);
-        let (client, connection) = tokio_postgres::connect(&self.dsn, connector)
+    });
+    Ok(client)
+}
+
+#[cfg(feature = "tls")]
+async fn dedicated_connect_to(dsn: &str) -> Result<tokio_postgres::Client, Error> {
+    use rustls::ClientConfig;
+    use tokio_postgres_rustls::MakeRustlsConnect;
+    ensure_rustls_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    let cert_result = rustls_native_certs::load_native_certs();
+    for cert in cert_result.certs {
+        roots.add(cert).map_err(|e| Error::Migration {
+            sqlstate: None,
+            detail: format!("native-cert add: {e}"),
+        })?;
+    }
+    if !cert_result.errors.is_empty() {
+        tracing::warn!(
+            errors = ?cert_result.errors,
+            "some native certs failed to load (non-fatal)"
+        );
+    }
+    let tls_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = MakeRustlsConnect::new(tls_config);
+    let (client, connection) =
+        tokio_postgres::connect(dsn, connector)
             .await
             .map_err(|e| Error::Migration {
                 sqlstate: extract_sqlstate(&e),
                 detail: format!("dedicated connect (tls): {e}"),
             })?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::warn!(error = %e, "migration-lock connection terminated");
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::warn!(error = %e, "migration-lock connection terminated");
+        }
+    });
+    Ok(client)
+}
+
+/// v60.0.0 (CIRISPersist#1002) — the genesis scratch database's name prefix.
+/// The full name is `{prefix}{pid}_{12 hex}`: the creating process is in the
+/// name, so a witness can find exactly the scratches its own process made.
+pub const GENESIS_SCRATCH_DB_PREFIX: &str = "ciris_genesis_scratch_";
+
+/// `dsn` with its database name replaced by `dbname`, in the DSN's own form:
+/// a `postgres://` / `postgresql://` URL keeps its userinfo, host and query
+/// and takes `/dbname` as its path; a key/value DSN has its `dbname=` set (or
+/// appended).
+///
+/// # Errors
+///
+/// `dbname` is not a plain identifier (`[a-z0-9_]`), or the URL has no host.
+pub(crate) fn dsn_with_dbname(dsn: &str, dbname: &str) -> Result<String, Error> {
+    if dbname.is_empty()
+        || !dbname
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return Err(Error::Backend(format!(
+            "dsn_with_dbname: {dbname:?} is not a plain database name"
+        )));
+    }
+    for scheme in ["postgres://", "postgresql://"] {
+        if let Some(rest) = dsn.strip_prefix(scheme) {
+            let (authority_path, query) = match rest.find('?') {
+                Some(q) => (&rest[..q], &rest[q..]),
+                None => (rest, ""),
+            };
+            let authority = authority_path.split('/').next().unwrap_or("");
+            if authority.is_empty() {
+                return Err(Error::Backend(
+                    "dsn_with_dbname: the URL has no host".into(),
+                ));
             }
-        });
-        Ok(client)
+            return Ok(format!("{scheme}{authority}/{dbname}{query}"));
+        }
+    }
+    let mut parts: Vec<String> = dsn
+        .split_whitespace()
+        .filter(|kv| !kv.starts_with("dbname="))
+        .map(str::to_owned)
+        .collect();
+    parts.push(format!("dbname={dbname}"));
+    Ok(parts.join(" "))
+}
+
+#[async_trait::async_trait]
+impl crate::federation::genesis::scratch::GenesisScratch for PostgresBackend {
+    /// A throwaway database in this backend's cluster: created from the
+    /// configured DSN, migrated, seeded with `holders`, and dropped (`WITH
+    /// (FORCE)`) when the scratch is released or dropped. The configured role
+    /// needs `CREATEDB`.
+    async fn provision_genesis_scratch(
+        &self,
+        holders: &[crate::federation::SignedKeyRecord],
+    ) -> Result<crate::federation::genesis::scratch::ScratchDirectory, crate::federation::Error>
+    {
+        use crate::federation::genesis::scratch::ScratchDirectory;
+        let fail = |what: &str, e: &dyn std::fmt::Display| {
+            crate::federation::Error::Backend(format!("genesis scratch: {what}: {e}"))
+        };
+        let name = format!(
+            "{GENESIS_SCRATCH_DB_PREFIX}{}_{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        );
+        let scratch_dsn = dsn_with_dbname(&self.dsn, &name).map_err(|e| fail("dsn", &e))?;
+        let admin = dedicated_connect_to(&self.dsn)
+            .await
+            .map_err(|e| fail("admin connect", &e))?;
+        admin
+            .batch_execute(&format!("CREATE DATABASE \"{name}\""))
+            .await
+            .map_err(|e| fail("CREATE DATABASE", &e))?;
+        drop(admin);
+        let admin_dsn = self.dsn.clone();
+        let release = move || -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), crate::federation::Error>> + Send>,
+        > {
+            Box::pin(async move {
+                let admin = dedicated_connect_to(&admin_dsn).await.map_err(|e| {
+                    crate::federation::Error::Backend(format!(
+                        "genesis scratch: release connect: {e}"
+                    ))
+                })?;
+                admin
+                    .batch_execute(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+                    .await
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!(
+                            "genesis scratch: DROP DATABASE: {e}"
+                        ))
+                    })
+            })
+        };
+        // From here on the database exists: every exit releases it.
+        let backend = match PostgresBackend::connect(&scratch_dsn).await {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = release().await;
+                return Err(fail("connect", &e));
+            }
+        };
+        if let Err(e) = backend.run_migrations().await {
+            drop(backend);
+            let _ = release().await;
+            return Err(fail("migrate", &e));
+        }
+        if let Err(e) = backend.seed_genesis_accord_holders(holders).await {
+            drop(backend);
+            let _ = release().await;
+            return Err(e);
+        }
+        Ok(ScratchDirectory::new(Box::new(backend), release))
     }
 }
 

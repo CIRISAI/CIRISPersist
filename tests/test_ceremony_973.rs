@@ -160,7 +160,7 @@ async fn i350_minted_outputs_verify_offline() {
         "I350: the block is the #805 block, untouched"
     );
     let _armed = Armed::with(&c.block);
-    let v = verify_ceremony_outputs(&c.bundle_json().unwrap())
+    let v = verify_ceremony_outputs(&c.bundle_json().unwrap(), &scratch())
         .await
         .unwrap_or_else(|e| panic!("I350: the minted outputs verify: {e}"));
     assert_eq!(v.quorum_verified, 3, "I350: all three holders authorize");
@@ -371,7 +371,7 @@ async fn i354_verifier_refuses_by_name() {
 
     // malformed
     assert_eq!(
-        reason(verify_ceremony_outputs("{").await).reason,
+        reason(verify_ceremony_outputs("{", &scratch()).await).reason,
         R::Malformed
     );
     // one spelling: a delegation row after a roster record
@@ -379,33 +379,36 @@ async fn i354_verifier_refuses_by_name() {
     let list = v["attestations"].as_array_mut().unwrap();
     let row = list.remove(0);
     list.push(row);
-    let e = reason(verify_ceremony_outputs(&v.to_string()).await);
+    let e = reason(verify_ceremony_outputs(&v.to_string(), &scratch()).await);
     assert_eq!(e.reason, R::Malformed, "{e}");
 
     // one authorization: below the quorum
     let mut b1 = c.bundle.clone();
     b1.authorizations.truncate(1);
-    let e = reason(verify_ceremony_outputs(&json(&b1)).await);
+    let e = reason(verify_ceremony_outputs(&json(&b1), &scratch()).await);
     assert_eq!(e.reason, R::BundleQuorum, "{e}");
 
     // a carried holder that is not this build's roster
     let mut b2 = c.bundle.clone();
     b2.holders[0].record.key_id = "someone-else".into();
-    let e = reason(verify_ceremony_outputs(&json(&b2)).await);
+    let e = reason(verify_ceremony_outputs(&json(&b2), &scratch()).await);
     assert_eq!(e.reason, R::HolderRosterMismatch, "{e}");
 
     // no birth in the bundle
     let mut b0 = c.bundle.clone();
     b0.roster_records
         .retain(|r| !matches!(r, GenesisRosterRecord::Community(_)));
-    let e = reason(verify_ceremony_outputs(&json(&b0)).await);
+    let e = reason(verify_ceremony_outputs(&json(&b0), &scratch()).await);
     assert_eq!(e.reason, R::CommunityBirth, "{e}");
 
     // a founder who did not sign the birth (signatures are not content)
     let e = reason(
-        verify_ceremony_outputs(&json(&with_birth(&c.bundle, |b| {
-            b.cosignatures.pop();
-        })))
+        verify_ceremony_outputs(
+            &json(&with_birth(&c.bundle, |b| {
+                b.cosignatures.pop();
+            })),
+            &scratch(),
+        )
         .await,
     );
     assert_eq!(e.reason, R::CommunityBirth, "{e}");
@@ -424,22 +427,25 @@ async fn i354_verifier_refuses_by_name() {
             b.community.community_name = "Somebody Else's Services".into();
         }),
     ] {
-        let e = reason(verify_ceremony_outputs(&json(&tampered)).await);
+        let e = reason(verify_ceremony_outputs(&json(&tampered), &scratch()).await);
         assert_eq!(e.reason, R::BundleQuorum, "{e}");
     }
 
     // the accord family record: a holder's signature missing, or absent
     let e = reason(
-        verify_ceremony_outputs(&json(&with_family(&c.bundle, |f| {
-            f.cosignatures.pop();
-        })))
+        verify_ceremony_outputs(
+            &json(&with_family(&c.bundle, |f| {
+                f.cosignatures.pop();
+            })),
+            &scratch(),
+        )
         .await,
     );
     assert_eq!(e.reason, R::FamilyRecord, "{e}");
     let mut bf = c.bundle.clone();
     bf.roster_records
         .retain(|r| !matches!(r, GenesisRosterRecord::Family(_)));
-    let e = reason(verify_ceremony_outputs(&json(&bf)).await);
+    let e = reason(verify_ceremony_outputs(&json(&bf), &scratch()).await);
     assert_eq!(e.reason, R::FamilyRecord, "{e}");
 
     // a delegation row or a serve node altered after the holders authorized
@@ -447,17 +453,17 @@ async fn i354_verifier_refuses_by_name() {
     let mut b3 = c.bundle.clone();
     b3.attestations[1].attestation.attestation_envelope["scope"] =
         serde_json::json!(["infra:serve"]);
-    let e = reason(verify_ceremony_outputs(&json(&b3)).await);
+    let e = reason(verify_ceremony_outputs(&json(&b3), &scratch()).await);
     assert_eq!(e.reason, R::BundleQuorum, "{e}");
     let mut b4 = c.bundle.clone();
     b4.serve_nodes[0].record.identity_type = "canonical,node,steward".into();
-    let e = reason(verify_ceremony_outputs(&json(&b4)).await);
+    let e = reason(verify_ceremony_outputs(&json(&b4), &scratch()).await);
     assert_eq!(e.reason, R::BundleQuorum, "{e}");
 
     // a correctly authorized bundle whose rows the write door refuses (stamped
     // 15 minutes ahead): caught at the bake stage, by the door's own rule
     let f = mint(900);
-    let e = reason(verify_ceremony_outputs(&f.bundle_json().unwrap()).await);
+    let e = reason(verify_ceremony_outputs(&f.bundle_json().unwrap(), &scratch()).await);
     assert_eq!(e.reason, R::DelegationRow, "{e}");
     assert!(e.detail.contains("ahead of now"), "{e}");
 }
@@ -802,11 +808,14 @@ async fn i424_finish_runs_the_doors() {
     let (mut state, holders) = planned(at(-5));
     // incomplete: finish refuses before any door
     assert_eq!(
-        state.finish().await.unwrap_err().as_str(),
+        state.finish(&scratch()).await.unwrap_err().as_str(),
         "ceremony_incomplete"
     );
     sign_every_item(&mut state, &holders).unwrap();
-    let done = state.finish().await.expect("I424: the doors admit it");
+    let done = state
+        .finish(&scratch())
+        .await
+        .expect("I424: the doors admit it");
     assert_eq!(done.verified.quorum_verified, 3);
     assert_eq!(
         (
@@ -1155,6 +1164,13 @@ use ciris_persist::federation::accord_recovery::{
     AccordRecoveryRequest,
 };
 use ciris_persist::federation::accord_test_support::Identity;
+
+/// The genesis scratch the doors replay on: an in-memory SQLite clone
+/// (CIRISPersist#1002; the postgres scratch is witnessed in
+/// `genesis_scratch_parity.rs`).
+fn scratch() -> ciris_persist::store::sqlite::SqliteBackend {
+    ciris_persist::store::test_backend::test_backend()
+}
 
 /// A software key registered under its own id.
 async fn register(d: &dyn FederationDirectory, who: &Identity) {

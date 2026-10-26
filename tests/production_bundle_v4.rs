@@ -16,6 +16,13 @@ use base64::Engine as _;
 use ciris_persist::federation::genesis::*;
 use ciris_persist::federation::self_at_login::transit_kex_pair_for;
 
+/// The genesis scratch the doors replay on: an in-memory SQLite clone
+/// (CIRISPersist#1002; the postgres scratch is witnessed in
+/// `genesis_scratch_parity.rs`).
+fn scratch() -> ciris_persist::store::sqlite::SqliteBackend {
+    ciris_persist::store::test_backend::test_backend()
+}
+
 const CANONICAL_NODE: &str = "ciris-canonical-1-d7bdeu223k";
 const BAKED: &str = include_str!("../src/federation/genesis/canonical_seed.json");
 
@@ -29,7 +36,7 @@ async fn i1160_the_production_v4_bake_seeds_the_canonical_pair() {
     let row = &bundle.serve_transport_destinations[0];
     assert_eq!(row.attesting_key_id, CANONICAL_NODE);
 
-    verify_ceremony_outputs(BAKED)
+    verify_ceremony_outputs(BAKED, &scratch())
         .await
         .expect("I1160: the ceremony verifier accepts the baked v4 bundle");
 

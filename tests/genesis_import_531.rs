@@ -18,6 +18,14 @@ use ciris_persist::federation::{Error, FederationDirectory};
 use ciris_persist::store::backend::Backend as _;
 use ciris_persist::store::sqlite::SqliteBackend;
 
+/// A node the import door runs on: a directory that also provisions the
+/// genesis scratch (CIRISPersist#1002 — both backends, same door).
+trait Node: FederationDirectory + ciris_persist::federation::genesis::scratch::GenesisScratch {}
+impl<T: FederationDirectory + ciris_persist::federation::genesis::scratch::GenesisScratch> Node
+    for T
+{
+}
+
 const SEEDS: [[u8; 32]; 3] = [[0x31; 32], [0x32; 32], [0x33; 32]];
 const OTHER_SEEDS: [[u8; 32]; 3] = [[0x61; 32], [0x62; 32], [0x63; 32]];
 const NODE_SEED: [u8; 32] = [0x4E; 32];
@@ -116,7 +124,7 @@ async fn drop_db(base: &str, name: &str) {
 
 /// Boot a node against `c` (the bundle compiled in, as far as this process
 /// is concerned).
-async fn boot(d: &dyn FederationDirectory, c: &TestCeremonyOutputs) {
+async fn boot(d: &dyn Node, c: &TestCeremonyOutputs) {
     install_test_ceremony_outputs(c.bundle.clone());
     seed_family_and_canonical(d)
         .await
@@ -128,7 +136,7 @@ fn genesis_head_hash(c: &TestCeremonyOutputs) -> String {
 }
 
 /// Everything the door could write, as row hashes.
-async fn snapshot(d: &dyn FederationDirectory) -> Vec<String> {
+async fn snapshot(d: &dyn Node) -> Vec<String> {
     let mut out = vec![
         d.lookup_family(ACCORD)
             .await
@@ -160,7 +168,7 @@ async fn snapshot(d: &dyn FederationDirectory) -> Vec<String> {
 
 /// A user who accepts the accord through a labelled `trust:accepts` edge
 /// naming the head this node holds; the verdict.
-async fn accepts_accord(d: &dyn FederationDirectory, user: &str) -> bool {
+async fn accepts_accord(d: &dyn Node, user: &str) -> bool {
     ciris_persist::federation::accord_test_support::register_typed_key(
         d,
         user,
@@ -195,14 +203,14 @@ fn refused_with(o: &RosterRecordOutcome, token: &str) -> bool {
 /// becomes v2's genesis head, a labelled `trust:accepts` edge naming it
 /// attaches, and this node's own posture is what it was.
 async fn imports_a_later_ceremony(
-    d: &dyn FederationDirectory,
+    d: &dyn Node,
     v1: &TestCeremonyOutputs,
     v2: &TestCeremonyOutputs,
     tag: &str,
 ) {
     boot(d, v1).await;
     let posture_before = format!("{:?}", genesis_posture(d).await);
-    let r = install_genesis_bundle_roster(d, &v2.bundle)
+    let r = install_genesis_bundle_roster(d, d, &v2.bundle)
         .await
         .unwrap_or_else(|e| panic!("{tag} I490: import v2: {e}"));
     assert_eq!(
@@ -246,7 +254,7 @@ async fn imports_a_later_ceremony(
 /// I492 — a tampered bundle (a holder's signature over the family record
 /// broken) installs nothing.
 async fn tampered_installs_nothing(
-    d: &dyn FederationDirectory,
+    d: &dyn Node,
     v1: &TestCeremonyOutputs,
     v2: &TestCeremonyOutputs,
     tag: &str,
@@ -259,7 +267,7 @@ async fn tampered_installs_nothing(
             f.family.family_name = "NOT_THE_ACCORD".to_owned();
         }
     }
-    let err = install_genesis_bundle_roster(d, &bad).await.unwrap_err();
+    let err = install_genesis_bundle_roster(d, d, &bad).await.unwrap_err();
     assert!(
         matches!(&err, Error::GenesisBundleInvalid { detail } if detail.starts_with("ceremony_family_record")),
         "{tag} I492: refused at verification, by stage: {err}"
@@ -270,14 +278,14 @@ async fn tampered_installs_nothing(
 /// I493 — a ceremony of OTHER holders (another accord) is refused at
 /// verification and installs nothing.
 async fn another_accord_is_refused(
-    d: &dyn FederationDirectory,
+    d: &dyn Node,
     v1: &TestCeremonyOutputs,
     other: &TestCeremonyOutputs,
     tag: &str,
 ) {
     boot(d, v1).await;
     let before = snapshot(d).await;
-    let err = install_genesis_bundle_roster(d, &other.bundle)
+    let err = install_genesis_bundle_roster(d, d, &other.bundle)
         .await
         .unwrap_err();
     assert!(
@@ -289,20 +297,24 @@ async fn another_accord_is_refused(
 
 /// I494 — re-importing the same bundle writes nothing.
 async fn reimport_is_a_noop(
-    d: &dyn FederationDirectory,
+    d: &dyn Node,
     v1: &TestCeremonyOutputs,
     v2: &TestCeremonyOutputs,
     tag: &str,
 ) {
     boot(d, v1).await;
-    install_genesis_bundle_roster(d, &v2.bundle).await.unwrap();
+    install_genesis_bundle_roster(d, d, &v2.bundle)
+        .await
+        .unwrap();
     let before = snapshot(d).await;
     let versions = d
         .list_group_versions(ciris_persist::federation::cohort::Cohort::Family, ACCORD)
         .await
         .unwrap()
         .len();
-    let r = install_genesis_bundle_roster(d, &v2.bundle).await.unwrap();
+    let r = install_genesis_bundle_roster(d, d, &v2.bundle)
+        .await
+        .unwrap();
     assert_eq!(
         outcome(&r, "family"),
         &RosterRecordOutcome::AlreadyHeld,
@@ -327,11 +339,7 @@ async fn reimport_is_a_noop(
 
 /// I495 — a held accord row of other seats under the reserved id is refused
 /// by name and survives.
-async fn unrelated_held_row_survives(
-    d: &dyn FederationDirectory,
-    v2: &TestCeremonyOutputs,
-    tag: &str,
-) {
+async fn unrelated_held_row_survives(d: &dyn Node, v2: &TestCeremonyOutputs, tag: &str) {
     let roster: Vec<String> = effective_accord_holder_records()
         .iter()
         .map(|r| r.record.key_id.clone())
@@ -344,7 +352,7 @@ async fn unrelated_held_row_survives(
     );
     d.put_family_local(other).await.unwrap();
     let held = d.lookup_family(ACCORD).await.unwrap().unwrap();
-    let r = install_genesis_bundle_roster(d, &v2.bundle)
+    let r = install_genesis_bundle_roster(d, d, &v2.bundle)
         .await
         .unwrap_or_else(|e| panic!("{tag} I495: {e}"));
     assert!(
@@ -360,11 +368,7 @@ async fn unrelated_held_row_survives(
 
 /// I496 — the import's successor case on the v52 shape: a chartless accord
 /// row of this accord takes the bundle's genesis head.
-async fn chartless_row_takes_the_head(
-    d: &dyn FederationDirectory,
-    v2: &TestCeremonyOutputs,
-    tag: &str,
-) {
+async fn chartless_row_takes_the_head(d: &dyn Node, v2: &TestCeremonyOutputs, tag: &str) {
     let roster: Vec<String> = effective_accord_holder_records()
         .iter()
         .map(|r| r.record.key_id.clone())
@@ -377,7 +381,7 @@ async fn chartless_row_takes_the_head(
     ))
     .await
     .unwrap();
-    let r = install_genesis_bundle_roster(d, &v2.bundle)
+    let r = install_genesis_bundle_roster(d, d, &v2.bundle)
         .await
         .unwrap_or_else(|e| panic!("{tag} I496: {e}"));
     assert_eq!(
@@ -400,7 +404,7 @@ async fn chartless_row_takes_the_head(
 /// Before v53.1.0 it kept v1's head, whose charter the re-bake superseded, and
 /// the accord root read invalid while the posture said Entrenched.
 async fn reboot_takes_the_later_genesis(
-    d: &dyn FederationDirectory,
+    d: &dyn Node,
     v1: &TestCeremonyOutputs,
     v2: &TestCeremonyOutputs,
     tag: &str,
@@ -454,14 +458,14 @@ async fn reboot_takes_the_later_genesis(
 /// I498 — an OLDER ceremony imported onto a node seeded from a newer one is
 /// refused by the bake's anti-rollback rule and writes nothing.
 async fn older_ceremony_is_refused(
-    d: &dyn FederationDirectory,
+    d: &dyn Node,
     v1: &TestCeremonyOutputs,
     v2: &TestCeremonyOutputs,
     tag: &str,
 ) {
     boot(d, v2).await;
     let before = snapshot(d).await;
-    let err = install_genesis_bundle_roster(d, &v1.bundle)
+    let err = install_genesis_bundle_roster(d, d, &v1.bundle)
         .await
         .unwrap_err();
     assert!(
@@ -476,7 +480,7 @@ async fn older_ceremony_is_refused(
 /// delegation plane holds it the head is left standing (it cannot be told
 /// from a working root), after it the head is replaced.
 async fn replaced_only_once_the_bundle_charter_is_live(
-    d: &dyn FederationDirectory,
+    d: &dyn Node,
     v2: &TestCeremonyOutputs,
     tag: &str,
 ) {
@@ -568,7 +572,7 @@ async fn i497_reboot_takes_the_later_genesis() {
     reboot_takes_the_later_genesis(&sqlite().await, &v1, &v2, "sqlite").await;
 }
 
-async fn held_hash(d: &dyn FederationDirectory) -> String {
+async fn held_hash(d: &dyn Node) -> String {
     d.lookup_community(CANON)
         .await
         .unwrap()
@@ -587,7 +591,7 @@ fn birth_hash(c: &TestCeremonyOutputs) -> String {
 /// ceremony never replaces a held birth; a row that has moved past its birth
 /// (a version chain) is never rolled back by a bake.
 async fn bake_replaces_the_prior_birth(
-    d: &dyn FederationDirectory,
+    d: &dyn Node,
     v1: &TestCeremonyOutputs,
     v2: &TestCeremonyOutputs,
     v3: &TestCeremonyOutputs,
@@ -625,7 +629,7 @@ async fn bake_replaces_the_prior_birth(
     assert_eq!(held_hash(d).await, birth_hash(v2), "{tag} I501: idempotent");
 
     // An IMPORT of a later ceremony never replaces a held birth.
-    let r = install_genesis_bundle_roster(d, &v3.bundle)
+    let r = install_genesis_bundle_roster(d, d, &v3.bundle)
         .await
         .unwrap_or_else(|e| panic!("{tag} I501: {e}"));
     assert!(
@@ -672,13 +676,13 @@ async fn bake_replaces_the_prior_birth(
 /// delegation plane from its compiled bundle first, which moves every head
 /// the same way; that boot-level downgrade is tracked on #984.)
 async fn older_bake_keeps_the_newer_birth(
-    d: &dyn FederationDirectory,
+    d: &dyn Node,
     v2: &TestCeremonyOutputs,
     v3: &TestCeremonyOutputs,
     tag: &str,
 ) {
     install_test_ceremony_outputs(v3.bundle.clone());
-    let r = install_genesis_bundle_roster(d, &v3.bundle)
+    let r = install_genesis_bundle_roster(d, d, &v3.bundle)
         .await
         .unwrap_or_else(|e| panic!("{tag} I502: import v3: {e}"));
     assert_eq!(
@@ -717,13 +721,13 @@ async fn older_bake_keeps_the_newer_birth(
 /// root (`Entrenched` — the mesh's root is ahead of this binary, which is
 /// allowed), and a boot with the newer bundle compiled in changes nothing.
 async fn older_bake_leaves_the_imported_planes(
-    d: &dyn FederationDirectory,
+    d: &dyn Node,
     v2: &TestCeremonyOutputs,
     v3: &TestCeremonyOutputs,
     tag: &str,
 ) {
     install_test_ceremony_outputs(v3.bundle.clone());
-    let r = install_genesis_bundle_roster(d, &v3.bundle)
+    let r = install_genesis_bundle_roster(d, d, &v3.bundle)
         .await
         .unwrap_or_else(|e| panic!("{tag} I521: import v3: {e}"));
     assert_eq!(
@@ -811,7 +815,7 @@ async fn older_bake_leaves_the_imported_planes(
 /// a caller-supplied row handed to the public seeding function under `Bake`
 /// is never written through the raw supersede door.
 async fn a_forged_birth_never_replaces(
-    d: &dyn FederationDirectory,
+    d: &dyn Node,
     v1: &TestCeremonyOutputs,
     v2: &TestCeremonyOutputs,
     tag: &str,
@@ -898,7 +902,7 @@ async fn i490_i499_postgres() {
         ($b:ident => $e:expr) => {{
             let (pgb, base, name) = postgres().await.unwrap();
             {
-                let $b: &dyn FederationDirectory = &pgb;
+                let $b: &dyn Node = &pgb;
                 $e.await;
             }
             drop(pgb);

@@ -19,6 +19,13 @@ use ciris_persist::federation::{Error, FederationDirectory, SignedAttestation};
 use ciris_persist::store::backend::Backend as _;
 use ciris_persist::store::sqlite::SqliteBackend;
 
+/// The genesis scratch the doors replay on: an in-memory SQLite clone
+/// (CIRISPersist#1002; the postgres scratch is witnessed in
+/// `genesis_scratch_parity.rs`).
+fn scratch() -> ciris_persist::store::sqlite::SqliteBackend {
+    ciris_persist::store::test_backend::test_backend()
+}
+
 const SEEDS: [[u8; 32]; 3] = [[0x31; 32], [0x32; 32], [0x33; 32]];
 const NODE_SEED: [u8; 32] = [0x4E; 32];
 
@@ -154,7 +161,7 @@ async fn i1157_a_fresh_node_resolves_the_serve_pairs_offline() {
     assert_eq!(c.bundle.version, 4);
     assert_eq!(c.bundle.serve_transport_destinations.len(), 1);
     let _armed = Armed::with(&c.block);
-    verify_ceremony_outputs(&c.bundle_json().unwrap())
+    verify_ceremony_outputs(&c.bundle_json().unwrap(), &scratch())
         .await
         .expect("I1157: the v4 outputs verify");
     on_each_backend!(resolves_offline, &c.bundle);
@@ -188,7 +195,7 @@ async fn i1157_the_bundle_rows_are_checked() {
         c.bundle.holders[0].record.key_id.clone();
     refused(&by_holder, "a row by a non-serve key");
     assert!(
-        verify_ceremony_outputs(&serde_json::to_string(&by_holder).unwrap())
+        verify_ceremony_outputs(&serde_json::to_string(&by_holder).unwrap(), &scratch())
             .await
             .is_err()
     );
@@ -211,7 +218,7 @@ async fn i1157_the_bundle_rows_are_checked() {
         "I1157: the v4 digest binds the transport rows"
     );
     assert!(
-        verify_ceremony_outputs(&serde_json::to_string(&swapped).unwrap())
+        verify_ceremony_outputs(&serde_json::to_string(&swapped).unwrap(), &scratch())
             .await
             .is_err(),
         "I1157: a row swapped after authorization fails the quorum"
@@ -225,7 +232,7 @@ async fn i1157_the_bundle_rows_are_checked() {
         !v3_json.contains("serve_transport_destinations"),
         "I1157: a v3 bundle's wire is unchanged"
     );
-    verify_ceremony_outputs(&v3_json)
+    verify_ceremony_outputs(&v3_json, &scratch())
         .await
         .expect("I1157: a v3 bundle verifies");
     let d = sqlite().await;
@@ -330,7 +337,7 @@ async fn i1159_amend_is_two_of_three_for_every_holder_pair() {
     let holders = test_ceremony_holders(&SEEDS).unwrap();
     let row = test_serve_transport_destination(&NODE_SEED, at(-30), 0x71, 0x72).unwrap();
     for pair in [[0usize, 1], [1, 2], [0, 2]] {
-        let mut amend = AmendState::plan(&v3_json, vec![row.clone()])
+        let mut amend = AmendState::plan(&v3_json, vec![row.clone()], &scratch())
             .await
             .expect("the pinned v3 verifies");
         let bytes = amend.authz_bytes().unwrap();
@@ -340,7 +347,7 @@ async fn i1159_amend_is_two_of_three_for_every_holder_pair() {
                 .unwrap();
         }
         let done = amend
-            .finish()
+            .finish(&scratch())
             .await
             .unwrap_or_else(|e| panic!("I1159 {pair:?}: the amend finishes: {e}"));
         assert_eq!(done.bundle.version, 4);
@@ -359,7 +366,9 @@ async fn i1159_amend_is_two_of_three_for_every_holder_pair() {
         clear_test_ceremony_outputs();
     }
     // One holder, even twice: refused.
-    let mut one = AmendState::plan(&v3_json, vec![row.clone()]).await.unwrap();
+    let mut one = AmendState::plan(&v3_json, vec![row.clone()], &scratch())
+        .await
+        .unwrap();
     let bytes = one.authz_bytes().unwrap();
     for _ in 0..2 {
         one.add_authorization(test_amend_authorization(&holders[0], &bytes))
@@ -370,7 +379,9 @@ async fn i1159_amend_is_two_of_three_for_every_holder_pair() {
         other => panic!("I1159: one holder amended: {other:?}"),
     }
     // A carried byte altered: refused.
-    let mut altered = AmendState::plan(&v3_json, vec![row]).await.unwrap();
+    let mut altered = AmendState::plan(&v3_json, vec![row], &scratch())
+        .await
+        .unwrap();
     altered.base.produced_at = at(0).to_rfc3339();
     let bytes = altered.authz_bytes().unwrap();
     for i in [0, 1] {
