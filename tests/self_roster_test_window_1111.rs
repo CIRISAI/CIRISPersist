@@ -106,7 +106,7 @@ async fn sqlite() -> ciris_persist::store::sqlite::SqliteBackend {
 }
 
 /// **I1162 (armed, sqlite)** — the lone path lands after the short window.
-#[serial_test::serial]
+#[serial_test::serial(test_anchor_env)]
 #[tokio::test(flavor = "multi_thread")]
 async fn i1162_armed_lone_path_lands_after_the_short_window_sqlite() {
     short_window();
@@ -120,7 +120,7 @@ async fn i1162_armed_lone_path_lands_after_the_short_window_sqlite() {
 }
 
 /// **I1162 (unarmed, sqlite)** — the variable alone moves nothing.
-#[serial_test::serial]
+#[serial_test::serial(test_anchor_env)]
 #[tokio::test(flavor = "multi_thread")]
 async fn i1162_unarmed_the_env_is_inert_sqlite() {
     short_window();
@@ -147,7 +147,7 @@ async fn postgres() -> Option<ciris_persist::store::postgres::PostgresBackend> {
 
 /// **I1162 (armed, postgres)**.
 #[cfg(feature = "postgres")]
-#[serial_test::serial]
+#[serial_test::serial(test_anchor_env)]
 #[tokio::test(flavor = "multi_thread")]
 async fn i1162_armed_lone_path_lands_after_the_short_window_postgres() {
     short_window();
@@ -162,7 +162,7 @@ async fn i1162_armed_lone_path_lands_after_the_short_window_postgres() {
 
 /// **I1162 (unarmed, postgres)**.
 #[cfg(feature = "postgres")]
-#[serial_test::serial]
+#[serial_test::serial(test_anchor_env)]
 #[tokio::test(flavor = "multi_thread")]
 async fn i1162_unarmed_the_env_is_inert_postgres() {
     short_window();
