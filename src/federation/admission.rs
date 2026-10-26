@@ -237,6 +237,59 @@ impl DimensionRejectionReason {
             Self::ScoreOutsideDeclaredPolarity => "score_outside_declared_polarity",
         }
     }
+
+    /// v60.1.0 (CIRISPersist#1064) — every variant, for the token census.
+    pub const ALL: [DimensionRejectionReason; 5] = [
+        Self::MorallyChargedStem,
+        Self::MissingVersionSegment,
+        Self::EmptyOrMissingDimension,
+        Self::SelfDeclaredLevelReserved,
+        Self::ScoreOutsideDeclaredPolarity,
+    ];
+}
+
+/// v60.1.0 (CIRISPersist#1064, CIRISEdge) — **the closed set of
+/// [`Error::DimensionRejected`] reason tokens, and which of them a re-offer
+/// can turn into an admission.**
+///
+/// `reason` on that arm comes from two places: [`DimensionRejectionReason`]
+/// (the policy's own gate shapes) and three tokens raised on the same shape by
+/// other gates ([`REGISTERED_FAMILY_HELD_SHUT_REASON`],
+/// [`LEDGER_BINDING_REASON`], the invariant registry's self-emission
+/// refusal). A consumer that classifies refusals for retry reads
+/// [`is_retryable`](dimension_rejected_reason::is_retryable) instead of keeping
+/// its own table. Every one is TERMINAL for the bytes it names: each gate is
+/// pure over the signed row (its dimension, score and envelope), so no row
+/// landing later changes the answer. The census
+/// (`tests::every_dimension_rejected_reason_is_classified_once`) fails the
+/// build when a construction site raises a token this list does not hold.
+pub mod dimension_rejected_reason {
+    use super::{
+        DimensionRejectionReason, LEDGER_BINDING_REASON, REGISTERED_FAMILY_HELD_SHUT_REASON,
+    };
+
+    /// Every token `Error::DimensionRejected` carries.
+    pub const ALL: &[&str] = &[
+        DimensionRejectionReason::MorallyChargedStem.as_str(),
+        DimensionRejectionReason::MissingVersionSegment.as_str(),
+        DimensionRejectionReason::EmptyOrMissingDimension.as_str(),
+        DimensionRejectionReason::SelfDeclaredLevelReserved.as_str(),
+        DimensionRejectionReason::ScoreOutsideDeclaredPolarity.as_str(),
+        REGISTERED_FAMILY_HELD_SHUT_REASON,
+        LEDGER_BINDING_REASON,
+        crate::federation::invariant::INVARIANT_SELF_EMISSION_REASON,
+    ];
+
+    /// The tokens a later re-offer of the same row can turn into an
+    /// admission. Empty: every gate on this arm is pure over the signed row.
+    pub const RETRYABLE: &[&str] = &[];
+
+    /// May a re-offer of the row this `reason` refused be admitted later?
+    /// `None` for a token outside [`ALL`] — never a guess.
+    #[must_use]
+    pub fn is_retryable(reason: &str) -> Option<bool> {
+        ALL.contains(&reason).then(|| RETRYABLE.contains(&reason))
+    }
 }
 
 /// The configurable per-deployment policy. Default-deny on the

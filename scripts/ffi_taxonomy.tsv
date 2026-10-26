@@ -711,9 +711,11 @@ Engine	would_hold_json	deontic
 Engine	wrap_dek_for_recipient_v2_b64	deontic	
 MODULE	_test_inject_panic	structural	
 MODULE	accord_threshold_for	deontic	
+MODULE	dimension_rejection_is_retryable	procedural	
 MODULE	engine_teardown_wait	structural	
 MODULE	engine_teardowns_in_flight	structural	
 MODULE	install_panic_logger	structural	
+MODULE	key_grant_refusal_is_retryable	procedural	
 MODULE	namespace_manifest_version	axiomatic	
 MODULE	panic_count	structural	
 MODULE	persist_field_conformance	axiomatic	

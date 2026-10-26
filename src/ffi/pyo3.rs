@@ -38309,6 +38309,32 @@ fn accord_threshold_for(roster_size: usize) -> usize {
     crate::federation::accord_threshold(roster_size)
 }
 
+/// v60.1.0 (CIRISPersist#1064, CIRISEdge) — may a later re-offer of the row a
+/// `federation_key_grant_refused` refusal named succeed? `reason` is the
+/// refusal's stable token (the segment after the kind in the `ValueError`
+/// text). Persist's own answer, so a bridge keeps no table of its own.
+/// Raises `ValueError` for a token outside the set — never a guess.
+#[pyfunction]
+fn key_grant_refusal_is_retryable(reason: &str) -> PyResult<bool> {
+    crate::federation::key_grant::KeyGrantRefusalReason::from_token(reason)
+        .map(crate::federation::key_grant::KeyGrantRefusalReason::is_retryable)
+        .ok_or_else(|| {
+            PyValueError::new_err(format!("{reason:?} is not a key_grant refusal reason"))
+        })
+}
+
+/// v60.1.0 (CIRISPersist#1064, CIRISEdge) — may a later re-offer of the row a
+/// `federation_dimension_rejected` refusal named succeed? `reason` is the
+/// refusal's stable token. Every reason on that arm is terminal today; the
+/// answer is persist's, so a new retryable token needs no consumer change.
+/// Raises `ValueError` for a token outside the set — never a guess.
+#[pyfunction]
+fn dimension_rejection_is_retryable(reason: &str) -> PyResult<bool> {
+    crate::federation::admission::dimension_rejected_reason::is_retryable(reason).ok_or_else(|| {
+        PyValueError::new_err(format!("{reason:?} is not a dimension_rejected reason"))
+    })
+}
+
 /// Mirrors `ciris-lens-core`'s `pub fn register`. The `#[pymodule]` entry
 /// point below (the standalone `ciris_persist` wheel) simply delegates
 /// here, so the two paths register an identical surface.
@@ -38374,6 +38400,9 @@ pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(transform_algebra_hash, m)?)?;
     // v60.1.0 (CIRISPersist#1117) — the accord strict-majority rule.
     m.add_function(pyo3::wrap_pyfunction!(accord_threshold_for, m)?)?;
+    // v60.1.0 (CIRISPersist#1064) — persist's own retryability answers.
+    m.add_function(pyo3::wrap_pyfunction!(key_grant_refusal_is_retryable, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(dimension_rejection_is_retryable, m)?)?;
     // v0.5.4 (CIRISPersist#29) — feature-gated panic injector for the
     // Python regression suite. Off in release wheels.
     #[cfg(feature = "test-panic")]

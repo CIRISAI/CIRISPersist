@@ -4370,4 +4370,16 @@ def transform_algebra_hash() -> str:
     Axiomatic: cross-checked against the other processors' pinned copies.
     """
 
+
+# ==================================================================
+# PROCEDURAL  (descriptive)
+# Varying one of these changes orchestration — when and by whom, not what is true.
+# ==================================================================
+
+def dimension_rejection_is_retryable(reason: str) -> bool:
+    """(derived) procedural — v60.1.0 (CIRISPersist#1064, CIRISEdge) — may a later re-offer of the row a federation_dimension_rejected refusal named succeed? reason is the refus..."""
+
+def key_grant_refusal_is_retryable(reason: str) -> bool:
+    """(derived) procedural — v60.1.0 (CIRISPersist#1064, CIRISEdge) — may a later re-offer of the row a federation_key_grant_refused refusal named succeed? reason is the refusa..."""
+
 # --- pyi_surface: END GENERATED REGION ---

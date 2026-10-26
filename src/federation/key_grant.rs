@@ -336,6 +336,46 @@ impl KeyGrantRefusalReason {
         KeyGrantRefusalReason::RecipientNotInAudience,
         KeyGrantRefusalReason::SetRetired,
     ];
+
+    /// v60.1.0 (CIRISPersist#1064, CIRISEdge) — **may a later re-offer of the
+    /// same row succeed?** Exhaustive, so a new reason is a compile error
+    /// here rather than a consumer's guess.
+    ///
+    /// Retryable are the ordering gaps, where a row landing later on this node
+    /// turns the refusal into an admission: the signer's membership
+    /// ([`SignerNotActiveMember`](Self::SignerNotActiveMember): the roster
+    /// fold may not hold it yet) and the recipient's audience standing
+    /// ([`RecipientNotInAudience`](Self::RecipientNotInAudience): the
+    /// occurrence, the roster or the allow list may not have landed).
+    /// Terminal are the row's own defects (malformed, a non-v2 wrap, a scrub
+    /// that is not the signer's, the retired set carrier) and the sealer
+    /// refusals (minter, author, stream owner): the signer is not the party
+    /// the key belongs to, and nothing that arrives later makes them so. A
+    /// plane refusal ([`AttestationRefused`](Self::AttestationRefused)) is a
+    /// conflicting row under the same id; the same bytes are refused again.
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        match self {
+            KeyGrantRefusalReason::SignerNotActiveMember
+            | KeyGrantRefusalReason::RecipientNotInAudience => true,
+            KeyGrantRefusalReason::Malformed
+            | KeyGrantRefusalReason::WrapAlgorithmNotV2
+            | KeyGrantRefusalReason::SignerNotSelf
+            | KeyGrantRefusalReason::SignerNotMinter
+            | KeyGrantRefusalReason::SignerNotAuthor
+            | KeyGrantRefusalReason::AttestationRefused
+            | KeyGrantRefusalReason::SignerNotStreamOwner
+            | KeyGrantRefusalReason::SetRetired => false,
+        }
+    }
+
+    /// v60.1.0 (CIRISPersist#1064) — the reason a stable token names (the
+    /// `reason` an [`Error::KeyGrantRefused`](crate::federation::Error::KeyGrantRefused)
+    /// carries), or `None` for a token outside the set.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == token)
+    }
 }
 
 /// What [`admit_replicated_key_grant`] did with one row.
@@ -2652,5 +2692,27 @@ mod tests {
                 serde_json::Value::String(r.as_str().into())
             );
         }
+    }
+
+    /// v60.1.0 (CIRISPersist#1064) — every reason is classified exactly once,
+    /// the retryable set is exactly the two ordering gaps, and every token
+    /// names its reason back.
+    #[test]
+    fn retryability_is_classified_once_per_reason() {
+        let retryable: Vec<&str> = KeyGrantRefusalReason::ALL
+            .into_iter()
+            .filter(|r| r.is_retryable())
+            .map(KeyGrantRefusalReason::as_str)
+            .collect();
+        assert_eq!(
+            retryable,
+            ["signer_not_active_member", "recipient_not_in_audience"],
+            "only the ordering gaps are retryable"
+        );
+        for r in KeyGrantRefusalReason::ALL {
+            assert_eq!(KeyGrantRefusalReason::from_token(r.as_str()), Some(r));
+        }
+        assert_eq!(KeyGrantRefusalReason::from_token("not_a_reason"), None);
+        assert_eq!(KeyGrantRefusalReason::from_token(""), None);
     }
 }

@@ -28,6 +28,20 @@ threat-model citations because this crate's audit story is the point.
   no new row kind. APPENDED to `delegation_scope::ALL` (position 24) and
   `INFRA` (position 12), pinned by position. Witness I1361 (sqlite, postgres):
   co-scrubbed reads conferred, self-claimed does not.
+- **#1064 — persist answers "is this refusal retryable"** for the two
+  reason sets CIRISEdge kept its own table for.
+  `KeyGrantRefusalReason::is_retryable()` (exhaustive; retryable =
+  `signer_not_active_member`, `recipient_not_in_audience`; the sealer
+  refusals, `set_retired` and the row defects are terminal) and
+  `KeyGrantRefusalReason::from_token`; `admission::dimension_rejected_reason`
+  (`ALL`, `RETRYABLE`, `is_retryable(token) -> Option<bool>`) over every token
+  `Error::DimensionRejected` carries, all terminal (each gate is pure over the
+  signed row). Python: `key_grant_refusal_is_retryable(reason)`,
+  `dimension_rejection_is_retryable(reason)` (`ValueError` on an unknown
+  token). A from-disk census fails the build when a construction site raises
+  an unclassified token. Witnesses I1362 and I742 (sqlite, postgres) classify
+  the tokens the doors actually raise. The issue's optional single
+  `Error::is_retryable()` over every federation error arm is not in this cut.
 
 ## [60.0.0] - 2026-10-26
 

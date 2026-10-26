@@ -3,6 +3,9 @@
 - CIRISPersist#1117: ``accord_threshold_for(n)`` is the strict majority, and
   ``Engine.accord_threshold()`` reports ``(m, n)`` over this node's standing
   accord roster with ``m`` that same rule of ``n``.
+- CIRISPersist#1064: ``key_grant_refusal_is_retryable`` and
+  ``dimension_rejection_is_retryable`` answer for every reason token, and
+  refuse a token outside the set.
 """
 
 import pytest
@@ -46,3 +49,24 @@ def test_engine_accord_threshold_reports_m_of_its_standing_roster_1117(tmp_path)
     finally:
         del eng
         ciris_persist.reset_engine()
+
+
+def test_key_grant_refusal_retryability_is_persists_answer_1064() -> None:
+    assert ciris_persist.key_grant_refusal_is_retryable("recipient_not_in_audience") is True
+    assert ciris_persist.key_grant_refusal_is_retryable("signer_not_active_member") is True
+    for terminal in ("set_retired", "signer_not_minter", "malformed", "wrap_algorithm_not_v2"):
+        assert ciris_persist.key_grant_refusal_is_retryable(terminal) is False, terminal
+    with pytest.raises(ValueError):
+        ciris_persist.key_grant_refusal_is_retryable("not_a_reason")
+
+
+def test_dimension_rejection_retryability_is_persists_answer_1064() -> None:
+    for terminal in (
+        "registered_family_held_shut",
+        "morally_charged_stem",
+        "ledger_l1_binding_violation",
+        "invariant_registry_self_emission_forbidden",
+    ):
+        assert ciris_persist.dimension_rejection_is_retryable(terminal) is False, terminal
+    with pytest.raises(ValueError):
+        ciris_persist.dimension_rejection_is_retryable("not_a_reason")
