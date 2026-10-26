@@ -5527,6 +5527,9 @@ pub(crate) fn prepare_chunk_rows(
 ) -> Result<Vec<PreparedBlobRow>, BlobError> {
     // 1. total_size == sum(chunk sizes).
     manifest.validate_total_size()?;
+    // v60.1.0 (CIRISPersist#1072) — a plaintext manifest stored here must
+    // parse back.
+    refuse_positioned_plaintext_chunks(manifest)?;
 
     // 2. The chunks argument lines up 1:1 (by SHA, same order) with the
     //    manifest's chunk list.
@@ -5602,6 +5605,17 @@ pub(crate) fn prepare_dag_chunk_row(
             ("inline", Some(bytes.clone()), None, u64::from(mref.size))
         }
         BlobBody::External(e) => {
+            // v60.1.0 (CIRISPersist#1072) — the size is the entry's, as the
+            // inline arm checks: a mismatch stored here is refused at
+            // finalize, and storage is first-write-wins by SHA, so no
+            // corrected retry could repair it.
+            if e.size_bytes != u64::from(mref.size) {
+                return Err(BlobError::InvalidArgument(format!(
+                    "put_blob_chunks: chunk[{idx}] external size is {} bytes but manifest size \
+                     is {}",
+                    e.size_bytes, mref.size
+                )));
+            }
             let kind = body.storage_kind();
             (kind, None, Some(e.uri.clone()), e.size_bytes)
         }
@@ -5703,7 +5717,36 @@ pub(crate) fn check_plaintext_dag_manifest(manifest: &ChunkManifest) -> Result<(
             "finalize_blob_chunks_signing: the manifest names no chunks".into(),
         ));
     }
+    refuse_positioned_plaintext_chunks(manifest)?;
     manifest.validate_total_size()
+}
+
+/// v60.1.0 (CIRISPersist#1072, Codex r4 on #1065) — a version-1 (plaintext)
+/// manifest's chunks carry no `seq` and no `epoch`: both are the sealed DAG's
+/// position. [`ChunkManifest::from_manifest_bytes`] refuses them on a
+/// plaintext manifest, so a door that stored and announced one would publish
+/// a DAG no read can open. Both plaintext DAG doors ask this before anything
+/// is written.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn refuse_positioned_plaintext_chunks(
+    manifest: &ChunkManifest,
+) -> Result<(), BlobError> {
+    if manifest.v != CHUNK_MANIFEST_VERSION {
+        return Ok(());
+    }
+    if let Some((idx, c)) = manifest
+        .chunks
+        .iter()
+        .enumerate()
+        .find(|(_, c)| c.seq.is_some() || c.epoch.is_some())
+    {
+        return Err(BlobError::InvalidArgument(format!(
+            "put_blob_chunks: chunk[{idx}] {} of a plaintext (version {CHUNK_MANIFEST_VERSION}) \
+             manifest carries a seq or an epoch; those position a sealed DAG's chunks",
+            hex::encode(c.sha)
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(all(test, feature = "sqlite"))]

@@ -18,6 +18,11 @@
 //!   version, a `chunk_tier`, no chunks) before reading a row.
 //! - **I783** — the incremental write and the one-shot `put_blob_chunks_signing`
 //!   produce the same manifest address and the same row.
+//! - **I1400** (v60.1.0, CIRISPersist#1072) — the plaintext DAG doors refuse
+//!   a version-1 manifest whose chunk carries a `seq` or an `epoch` (finalize
+//!   and the one-shot door), and an `External` chunk whose size is not its
+//!   entry's (the chunk door and the one-shot door), with nothing stored or
+//!   announced; the corrected request then succeeds.
 //!
 //! The takedown on the tombstone (#1007; CC 4.5.3 step 2, CC 4.5.5, CC 2.3,
 //! CC 3.1.3.3 rule 4):
@@ -1422,6 +1427,142 @@ pub(crate) mod engine_bodies {
         );
     }
 
+    // ── I1400 ─────────────────────────────────────────────────────────────
+    /// v60.1.0 (CIRISPersist#1072, Codex r4 on #1065) — the plaintext DAG
+    /// doors refuse, before anything is stored or announced: a version-1
+    /// manifest whose chunk carries a `seq` or an `epoch` (at the incremental
+    /// finalize and at the one-shot door), and an `External` chunk body whose
+    /// size is not its manifest entry's (at the incremental chunk door and at
+    /// the one-shot door). The corrected request then succeeds: nothing the
+    /// refusal saw was kept first-write-wins.
+    pub(crate) async fn i1400_the_plaintext_dag_doors_refuse_malformed_input<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let author = format!("i1400-author-{run}");
+        ts::register_hybrid_key_as(l.ba.as_ref(), &author, &author, USER).await;
+        let e = &l.engine_a;
+        let nothing_at = |sha: [u8; 32], why: &'static str| {
+            let ba = l.ba.clone();
+            async move {
+                assert!(
+                    ba.blob_head(&sha).await.unwrap().is_none(),
+                    "I1400 {why}: nothing stored"
+                );
+                assert!(
+                    ba.list_holders(&sha).await.unwrap().is_empty(),
+                    "I1400 {why}: nothing announced"
+                );
+            }
+        };
+
+        // 1. Positioned fields on a plaintext manifest, at both doors.
+        for (why, seq, epoch) in [("a seq", Some(1u64), None), ("an epoch", None, Some(1u64))] {
+            let segs: Vec<Vec<u8>> = (0..2u8)
+                .map(|i| format!("i1400 {why} {run} {i} ").repeat(20).into_bytes())
+                .collect();
+            let clean = plaintext_manifest(&segs);
+            let mut positioned = clean.clone();
+            positioned.chunks[1].seq = seq;
+            positioned.chunks[1].epoch = epoch;
+            let psha: [u8; 32] = sha2::Sha256::digest(positioned.to_jcs_bytes()).into();
+            let bodies = || -> Vec<([u8; 32], BlobBody)> {
+                segs.iter()
+                    .map(|s| (sha2::Sha256::digest(s).into(), BlobBody::Inline(s.clone())))
+                    .collect()
+            };
+            let one_shot = e
+                .put_blob_chunks_signing(positioned.clone(), bodies(), &author)
+                .await;
+            assert!(
+                matches!(&one_shot, Err(BlobError::InvalidArgument(m)) if m.contains("chunk[1]")),
+                "I1400 one-shot, {why}: {one_shot:?}"
+            );
+            nothing_at(psha, "one-shot manifest").await;
+            for c in &clean.chunks {
+                nothing_at(c.sha, "one-shot chunk").await;
+            }
+            for (c, s) in clean.chunks.iter().zip(&segs) {
+                e.put_plaintext_dag_chunk(c, BlobBody::Inline(s.clone()), &author)
+                    .await
+                    .unwrap();
+            }
+            let fin = e
+                .finalize_blob_chunks_signing(positioned.clone(), &author)
+                .await;
+            assert!(
+                matches!(&fin, Err(BlobError::InvalidArgument(m)) if m.contains("chunk[1]")),
+                "I1400 finalize, {why}: {fin:?}"
+            );
+            nothing_at(psha, "finalize manifest").await;
+            // The clean manifest over the same chunks is admitted and reads.
+            let msha = e
+                .finalize_blob_chunks_signing(clean.clone(), &author)
+                .await
+                .expect("I1400: the clean manifest");
+            assert_eq!(
+                e.read_blob_as(&msha, "", None).await.unwrap(),
+                segs.concat(),
+                "I1400 {why}: the clean DAG reads whole"
+            );
+        }
+
+        // 2. An External chunk whose size is not its entry's, at both doors.
+        let entry = ChunkRef {
+            sha: sha2::Sha256::digest(format!("i1400 external {run}").as_bytes()).into(),
+            size: 4096,
+            seq: None,
+            epoch: None,
+        };
+        let external = |size_bytes: u64| {
+            BlobBody::External(crate::federation::ExternalRef {
+                uri: format!("s3://i1400/{run}"),
+                size_bytes,
+                media_type: None,
+            })
+        };
+        let wrong = e
+            .put_plaintext_dag_chunk(&entry, external(4095), &author)
+            .await;
+        assert!(
+            matches!(&wrong, Err(BlobError::InvalidArgument(m)) if m.contains("external size")),
+            "I1400 chunk door, external size: {wrong:?}"
+        );
+        nothing_at(entry.sha, "chunk door external").await;
+        let manifest = ChunkManifest {
+            v: crate::federation::blobs::CHUNK_MANIFEST_VERSION,
+            total_size: 4096,
+            chunks: vec![entry.clone()],
+            chunk_tier: None,
+            stream_id: None,
+        };
+        let msha: [u8; 32] = sha2::Sha256::digest(manifest.to_jcs_bytes()).into();
+        let wrong = e
+            .put_blob_chunks_signing(manifest.clone(), vec![(entry.sha, external(5000))], &author)
+            .await;
+        assert!(
+            matches!(&wrong, Err(BlobError::InvalidArgument(m)) if m.contains("external size")),
+            "I1400 one-shot, external size: {wrong:?}"
+        );
+        nothing_at(entry.sha, "one-shot external chunk").await;
+        nothing_at(msha, "one-shot external manifest").await;
+        // The corrected retry is not blocked by a stored mismatch.
+        e.put_plaintext_dag_chunk(&entry, external(4096), &author)
+            .await
+            .expect("I1400: the corrected external chunk");
+        assert_eq!(
+            e.finalize_blob_chunks_signing(manifest, &author)
+                .await
+                .expect("I1400: finalize over the corrected chunk"),
+            msha
+        );
+    }
+
     /// Hold `bytes` on `engine` under this node's own claim.
     async fn hold(engine: &crate::Engine, author: &str, bytes: &[u8]) -> [u8; 32] {
         let sha: [u8; 32] = sha2::Sha256::digest(bytes).into();
@@ -1968,6 +2109,17 @@ mod run {
                     let Some((a, b)) = $dsns else { return };
                     e::i780_i783_the_incremental_plaintext_dag(&a, &b, &super::suffix(), $pick)
                         .await
+                }
+                #[tokio::test]
+                async fn i1400() {
+                    let Some((a, b)) = $dsns else { return };
+                    e::i1400_the_plaintext_dag_doors_refuse_malformed_input(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
                 }
                 #[tokio::test]
                 async fn i774() {

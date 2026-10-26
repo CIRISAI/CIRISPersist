@@ -7,6 +7,22 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [60.1.0] - UNRELEASED
+
+### Fixed (slice A)
+
+- **CIRISPersist#1124** — `CryptoTier::InvisibleEncrypted`'s doc comment said
+  "Opt-in / default-off"; self/family sealing has been mandatory, with no
+  switch, since v43.0.0 (#827). The comment, `CryptoTier` itself and the
+  `FSD/SELF_FAMILY_DEK_CASCADE.md` §0.5 table now say so. Doc only.
+- **CIRISPersist#1072** — the plaintext DAG doors refuse, before anything is
+  stored or announced, a version-1 manifest whose chunk carries a `seq` or an
+  `epoch` (`finalize_blob_chunks_signing`, `put_blob_chunks_signing`), and an
+  `External` chunk whose `size_bytes` is not its manifest entry's
+  (`put_plaintext_dag_chunk`, `put_blob_chunks_signing`). Both used to be
+  stored and then fail every read or every finalize. Witness I1400 (sqlite,
+  postgres).
+
 ## [60.0.0] - 2026-10-26
 
 An architecture cut (docs/V60_TASK_PLAN.md): signed attestations are the only
