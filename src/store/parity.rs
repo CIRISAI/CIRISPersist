@@ -621,6 +621,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v60.0.0 (CIRISPersist#988 item 4) — the goal family's M-1 and
     // amendment gate, in the shared plan.
     ("check_goal_row_admission", Class::Gate),
+    // v60.1.0 (CIRISPersist#1120, CC 3.1.5) — the identity_amendment:v1
+    // gate (a cited, approved response by a seated WA), in the shared plan.
+    ("check_identity_amendment_admission", Class::Gate),
     // v44.6.0 (#857) — a machine author may name only itself in for_key_id;
     // refuses on the caller's input.
     ("check_consent_for_key_admission", Class::Gate),

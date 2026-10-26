@@ -383,10 +383,12 @@ pub mod emit;
 pub mod family_rules;
 pub mod genesis;
 pub mod goal;
+// v60.1.0 (CIRISPersist#1120, CC 3.1.5) — the identity_amendment:v1 gate.
 pub mod goal_projection;
 pub(crate) mod group_amendment;
 pub mod hardware_attestation;
 pub mod identity_aggregate;
+pub mod identity_amendment;
 // CIRISPersist#784 — a key named by the SHA-256 of its raw Ed25519 pubkey.
 pub mod key_digest;
 // CIRISPersist#848 (BLOB_REPLICATION.md Part II) — key transport:

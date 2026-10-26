@@ -28,6 +28,15 @@
 //!   the rows sharing a `call_id`, while a non-member reads none; (c) an
 //!   attendee's own `withdraws` retracts their row and the other attendee's
 //!   stands; nothing is superseded.
+//! - **I1365 (CIRISPersist#1120; CC 3.1.5 rc10)** — `identity_amendment:v1`
+//!   admits only citing an admitted `deferral:response:approved:v1` about the
+//!   same agent, signed by a seated WA (the agent node's owner, compared self
+//!   to self at the response's instant). Refused
+//!   `identity_amendment_unauthorized`, each with its condition: a response
+//!   not held, a rejected response, a response by a stranger, a response about
+//!   another agent, evidence that does not cite the response, an amendment
+//!   signed by a key that is not the agent's; an unowned agent has no seated
+//!   WA. Ill-shaped `amendment_digest` / `authorized_by` are malformed rows.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -346,6 +355,214 @@ pub(crate) mod bodies {
             "I1363 (c): nobody withdraws another attendee's row"
         );
     }
+
+    /// **I1365** — see the module doc.
+    pub(crate) async fn i1365_an_identity_amendment_needs_a_seated_was_approval(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::identity_amendment as ia;
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{attestation_type, cohort_scope, Attestation};
+        use crate::federation::{Error, SignedAttestation};
+
+        let owner = format!("i1365-owner-{tag}");
+        let stranger = format!("i1365-stranger-{tag}");
+        let agent = format!("i1365-agent-{tag}");
+        let other_agent = format!("i1365-other-{tag}");
+        let unowned = format!("i1365-unowned-{tag}");
+        for k in [&owner, &stranger] {
+            ts::register_user_role_key(d, k).await;
+        }
+        for k in [&agent, &other_agent, &unowned] {
+            ts::register_hybrid_key(d, k).await;
+        }
+        ts::put_owner_binding(d, &owner, &agent).await;
+        ts::put_owner_binding(d, &owner, &other_agent).await;
+
+        let put = |r: Attestation| async move {
+            d.put_attestation(SignedAttestation { attestation: r })
+                .await
+                .map(|_| ())
+        };
+        // A row by `by` on `dimension`, attested to `about`; `self_subject`
+        // makes `about` its subject too (the agent's own rows).
+        let row = |by: &str, about: &str, dimension: &str, extra: serde_json::Value| {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut env = serde_json::json!({ "id": id, "dimension": dimension });
+            for (k, v) in extra.as_object().unwrap() {
+                env[k] = v.clone();
+            }
+            let mut r = ts::bare_attestation(&id, by, about, &env);
+            r.attestation_type = attestation_type::SCORES.to_owned();
+            r.cohort_scope = cohort_scope::SELF.to_owned();
+            if by == about {
+                r.subject_key_ids = vec![about.to_owned()];
+            }
+            ts::seal_row_in_place(by, &mut r);
+            r
+        };
+        let request = row(
+            &agent,
+            &agent,
+            ia::DEFERRAL_REQUEST_DIMENSION,
+            serde_json::json!({ "deferral_id": "d-1", "reason_digest": "ab".repeat(32) }),
+        );
+        let request_id = request.attestation_id.clone();
+        put(request).await.expect("I1365: the deferral request");
+        let response = |by: &str, about: &str, dimension: &str| {
+            row(
+                by,
+                about,
+                dimension,
+                serde_json::json!({ "references_attestation_id": request_id }),
+            )
+        };
+        let amendment = |by: &str, about: &str, authorized_by: &str, cite: bool| {
+            let refs = if cite {
+                serde_json::json!([authorized_by])
+            } else {
+                serde_json::json!([])
+            };
+            row(
+                by,
+                about,
+                ia::IDENTITY_AMENDMENT_DIMENSION,
+                serde_json::json!({
+                    "amendment_digest": "cd".repeat(32),
+                    "authorized_by": authorized_by,
+                    "evidence_refs": refs,
+                }),
+            )
+        };
+        let refused = |e: Error, reason: &str, what: &str| {
+            let text = e.to_string();
+            assert!(
+                matches!(e, Error::InvalidArgument(_))
+                    && text.contains(&format!(
+                        "{}: {reason}",
+                        ia::IDENTITY_AMENDMENT_UNAUTHORIZED
+                    )),
+                "I1365 ({what}): expected {reason}, got {text}"
+            );
+        };
+
+        // The owner (the seated WA) approves: the amendment admits.
+        let approved = response(&owner, &agent, ia::DEFERRAL_APPROVED_DIMENSION);
+        let approved_id = approved.attestation_id.clone();
+        put(approved).await.expect("I1365: the owner's approval");
+        let ok = amendment(&agent, &agent, &approved_id, true);
+        let ok_id = ok.attestation_id.clone();
+        put(ok)
+            .await
+            .unwrap_or_else(|e| panic!("I1365: the authorised amendment admits: {e}"));
+        assert!(d.get_attestation(&ok_id).await.unwrap().is_some());
+
+        // A response this node does not hold.
+        let missing = uuid::Uuid::new_v4().to_string();
+        refused(
+            put(amendment(&agent, &agent, &missing, true))
+                .await
+                .unwrap_err(),
+            ia::unauthorized_reason::RESPONSE_NOT_HELD,
+            "not held",
+        );
+        // A rejected response.
+        let rejected = response(&owner, &agent, ia::DEFERRAL_REJECTED_DIMENSION);
+        let rejected_id = rejected.attestation_id.clone();
+        put(rejected).await.expect("I1365: the owner's rejection");
+        refused(
+            put(amendment(&agent, &agent, &rejected_id, true))
+                .await
+                .unwrap_err(),
+            ia::unauthorized_reason::NOT_APPROVED,
+            "rejected",
+        );
+        // An approval by a stranger, who holds no seat over this agent.
+        let by_stranger = response(&stranger, &agent, ia::DEFERRAL_APPROVED_DIMENSION);
+        let by_stranger_id = by_stranger.attestation_id.clone();
+        put(by_stranger)
+            .await
+            .expect("I1365: a stranger's row stores");
+        refused(
+            put(amendment(&agent, &agent, &by_stranger_id, true))
+                .await
+                .unwrap_err(),
+            ia::unauthorized_reason::NOT_A_SEATED_WA,
+            "stranger",
+        );
+        // An approval about another agent.
+        let elsewhere = response(&owner, &other_agent, ia::DEFERRAL_APPROVED_DIMENSION);
+        let elsewhere_id = elsewhere.attestation_id.clone();
+        put(elsewhere)
+            .await
+            .expect("I1365: the other agent's approval");
+        refused(
+            put(amendment(&agent, &agent, &elsewhere_id, true))
+                .await
+                .unwrap_err(),
+            ia::unauthorized_reason::ABOUT_ANOTHER_AGENT,
+            "another agent",
+        );
+        // Evidence that does not cite the response.
+        refused(
+            put(amendment(&agent, &agent, &approved_id, false))
+                .await
+                .unwrap_err(),
+            ia::unauthorized_reason::EVIDENCE_DOES_NOT_CITE,
+            "no citation",
+        );
+        // Signed by a key that is not the agent's.
+        let mut forged = amendment(&other_agent, &agent, &approved_id, true);
+        forged.subject_key_ids = vec![agent.clone()];
+        ts::seal_row_in_place(&other_agent, &mut forged);
+        assert!(
+            put(forged).await.is_err(),
+            "I1365: another key cannot amend this agent"
+        );
+        // An unowned agent has no seated WA: its own approval-shaped row by a
+        // stranger authorises nothing.
+        let for_unowned = row(
+            &stranger,
+            &unowned,
+            ia::DEFERRAL_APPROVED_DIMENSION,
+            serde_json::json!({}),
+        );
+        let for_unowned_id = for_unowned.attestation_id.clone();
+        put(for_unowned).await.expect("I1365: stores");
+        refused(
+            put(amendment(&unowned, &unowned, &for_unowned_id, true))
+                .await
+                .unwrap_err(),
+            ia::unauthorized_reason::NOT_A_SEATED_WA,
+            "unowned",
+        );
+
+        // Ill-shaped members are malformed rows, not authority questions.
+        for (member, value, reason) in [
+            (
+                "amendment_digest",
+                serde_json::json!("CD".repeat(32)),
+                crate::federation::malformed_row::ENVELOPE_MEMBER_INVALID,
+            ),
+            (
+                "authorized_by",
+                serde_json::json!("not-a-uuid"),
+                crate::federation::malformed_row::ENVELOPE_MEMBER_INVALID,
+            ),
+        ] {
+            let mut bad = amendment(&agent, &agent, &approved_id, true);
+            bad.attestation_envelope[member] = value;
+            if member == "authorized_by" {
+                bad.attestation_envelope["evidence_refs"] = serde_json::json!(["not-a-uuid"]);
+            }
+            ts::seal_row_in_place(&agent, &mut bad);
+            match put(bad).await.unwrap_err() {
+                Error::MalformedRow { reason: r, .. } => assert_eq!(r, reason, "I1365 {member}"),
+                other => panic!("I1365 {member}: expected a malformed row, got {other:?}"),
+            }
+        }
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -397,6 +614,10 @@ mod tests {
     on_every_backend!(
         i1363,
         bodies::i1363_a_call_record_is_one_self_row_per_attendee
+    );
+    on_every_backend!(
+        i1365,
+        bodies::i1365_an_identity_amendment_needs_a_seated_was_approval
     );
 
     /// v60.1.0 (CIRISPersist#1064) — **every `DimensionRejected` reason is

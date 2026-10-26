@@ -62,6 +62,22 @@ threat-model citations because this crate's audit story is the point.
   (`b6f6fd3f…`) waits on CIRISAgent#1255 merging (it is open at `b1d802c7`),
   and the `trace_field_shape_violation` door needs a new `schema::Error` arm
   or a renamed token, which is a break (v61).
+- **#1120 — the `identity_amendment:v1` admission gate** (CC 3.1.5, rc10
+  `cadd5a9`). `federation::identity_amendment::check_identity_amendment_admission`,
+  in the shared put plan (every backend, local and replicated): the amendment
+  (attester = an occurrence of the agent, subject = the agent) admits only
+  when `authorized_by` (a uuid, cited in `evidence_refs[]`) names an admitted
+  `deferral:response:approved:v1` about the same agent whose signer held a
+  Wise Authority seat at its `asserted_at`. Refused
+  `identity_amendment_unauthorized` (token-led `federation_invalid_argument`,
+  Python `ValueError`; the failed condition follows the token). A seat is the
+  producer's interim ruling (Eric, 2026-10-22): the agent node's owner,
+  compared self to self at the response's instant; the general WA-seat
+  primitive is #709. `amendment_digest` (lowercase hex64) and `authorized_by`
+  (uuid) are shape-checked as malformed rows. Dimension constants for the
+  deferral family (`DEFERRAL_REQUEST_DIMENSION`, `…_APPROVED_…`,
+  `…_REJECTED_…`). Before this a replicated amendment from any producer was
+  admitted ungated. Witness I1365 (sqlite, postgres).
 
 ## [60.0.0] - 2026-10-26
 
