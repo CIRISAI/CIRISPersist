@@ -258,6 +258,13 @@ mod tests {
     /// keeping both in one helper is what stops a fixture from re-signing half
     /// the change.
     fn resign_fix(row: &mut Attestation) {
+        // v60.0.0 (#1048) — a term-bearing `delegates_to` carries a term.
+        if row.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO {
+            crate::federation::admission::with_test_term(
+                &mut row.attestation_envelope,
+                row.asserted_at,
+            );
+        }
         crate::federation::tier_ingest::test_support::reseal(row);
     }
 

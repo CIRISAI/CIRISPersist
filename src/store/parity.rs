@@ -780,7 +780,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("index_stored_record", Class::Delegates),
     ("insert_trace_events_batch", Class::Delegates),
     ("insert_trace_llm_calls_batch", Class::Delegates),
-    ("iter", Class::Plumbing),
     ("load_or_init_content_master", Class::Delegates),
     // v50.0.0 (#920) — the content-master row load/init that
     // `load_or_init_content_master` now resolves; the same door, split.
