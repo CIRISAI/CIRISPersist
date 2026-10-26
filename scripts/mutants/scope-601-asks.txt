@@ -1,0 +1,34 @@
+# Mutation scope: v60.1 slice B — the consumer asks
+# (docs/V61_TASK_PLAN.md §2 slice B; CIRISPersist#1117, #1119, #1064, #1095,
+# #1089, #1120, #1113).
+#
+# - #1117: `accord_threshold` and the roster read over it
+#   (`accord_threshold_over_roster`, `accord_threshold_now`). Witness I1360
+#   (sqlite, postgres); the rule by value and the co-scrub gate agreeing.
+# - #1064: `KeyGrantRefusalReason::is_retryable` / `from_token` and
+#   `dimension_rejected_reason::is_retryable`. Witnesses
+#   `retryability_is_classified_once_per_reason` (unit), I742 (sqlite,
+#   postgres), I1362 (sqlite, postgres), the from-disk census.
+# - #1120: `identity_amendment.rs` (the whole gate). Witness I1365 (sqlite,
+#   postgres).
+# - #1113: the reversal fold (`takedown_reversal`, `is_reversal_of`,
+#   `notice_row_of_header`, `review_holders_of_content`), the withheld read
+#   (`withholding_notice`), the finalize skip (`purge_finalize`), the re-ack
+#   (`restore_reversed_takedown_claims`) and the ruling's authority
+#   (`check_takedown_reconsideration_admission` and the dispatch in
+#   `check_reconsideration_admission`). Witnesses I1366, I1367 (sqlite,
+#   postgres), with the finalize and reconsideration witnesses that already
+#   guard the two pre-existing functions (I655, I790, I773, I972, I1218).
+# - Left OUT: #1119 is a constant (the positional pin is its witness); #1095
+#   changed no code; #1089's two members are serde attributes (I1364 is
+#   their witness, and cargo-mutants generates no mutant in a field).
+#
+# Grammar: docs/MUTATION_TESTING.md "Scope files".
+tests: test(/v601_asks_invariants|takedown_reversal_invariants|retryability_is_classified_once_per_reason|key_grant_rows_invariants::directory::.*::i742|i1364|i655|i790|i773|i972|i1218/)
+
+src/federation/admission.rs accord_threshold accord_threshold_over_roster accord_threshold_now is_retryable check_takedown_reconsideration_admission check_reconsideration_admission
+src/federation/key_grant.rs is_retryable from_token
+src/federation/identity_amendment.rs
+src/federation/takedown_tombstone.rs notice_row_of_header is_reversal_of review_holders_of_content takedown_reversal
+src/federation/steward_purge.rs withholding_notice purge_finalize
+src/federation/holding_claim.rs restore_reversed_takedown_claims
