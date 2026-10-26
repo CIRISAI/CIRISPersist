@@ -123,50 +123,6 @@ impl LedgerProjection {
         }
     }
 
-    /// The key as one string (the memory backend's map key): the ledger, then
-    /// the key columns, `\u{1f}`-separated so no column value can collide.
-    #[must_use]
-    pub fn map_key(&self) -> String {
-        let (c, d, l, s) = self.key();
-        let tag = match self.ledger() {
-            Ledger::Credits => "credits",
-            Ledger::Expertise => "expertise",
-        };
-        format!("{tag}\u{1f}{c}\u{1f}{d}\u{1f}{l}\u{1f}{s}")
-    }
-
-    /// The ledger row as the memory backend renders it for the rebuild
-    /// comparison: every column, in the SQL tables' column order.
-    #[must_use]
-    pub fn render(&self) -> String {
-        let at = render_instant(self.asserted_at);
-        let v = match &self.body {
-            LedgerBody::Credits(c) => serde_json::json!([
-                c.contributor_id,
-                c.domain,
-                c.language,
-                c.subject,
-                c.balance,
-                c.source_contribution,
-                at,
-                at,
-                self.attestation_id,
-            ]),
-            LedgerBody::Expertise(e) => serde_json::json!([
-                e.contributor_id,
-                e.domain,
-                e.language,
-                e.expertise,
-                e.is_active,
-                at,
-                e.source_contribution,
-                at,
-                self.attestation_id,
-            ]),
-        };
-        v.to_string()
-    }
-
     /// The ledger key: `(contributor, domain, language, subject)`, the subject
     /// empty for expertise.
     #[must_use]
@@ -294,8 +250,8 @@ pub fn supersedes(
     }
 }
 
-/// The fixed-width UTC instant a ledger row stores on sqlite (and the memory
-/// backend renders): microseconds, `Z`. Fixed width, so the text orders as
+/// The fixed-width UTC instant a ledger row stores on sqlite: microseconds,
+/// `Z`. Fixed width, so the text orders as
 /// the instant does.
 #[must_use]
 pub fn render_instant(at: chrono::DateTime<chrono::Utc>) -> String {

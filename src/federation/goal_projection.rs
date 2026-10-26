@@ -93,30 +93,6 @@ impl GoalProjection {
             attestation_id: self.attestation_id.clone(),
         }
     }
-
-    /// The row as the memory backend renders it for the rebuild comparison:
-    /// every column, in the SQL table's column order.
-    #[must_use]
-    pub fn render(&self) -> String {
-        let at = super::ledger_projection::render_instant;
-        serde_json::json!([
-            self.goal_id,
-            self.declared_by_key_id,
-            at(self.declared_at),
-            self.body.goal_text,
-            self.goal_text_canonical(),
-            self.body.scope.scale(),
-            self.body.scope.cohort_id(),
-            self.body.meta_goal_alignment.dimension.as_str(),
-            self.body.meta_goal_alignment.rationale,
-            self.meta_deliberation(),
-            self.retired_at.map(at),
-            self.persist_row_hash,
-            self.attestation_id,
-            self.body.score,
-        ])
-        .to_string()
-    }
 }
 
 /// Is `row` a goal declaration (a `scores` row on the goal family with a
@@ -431,28 +407,32 @@ mod tests {
         );
     }
 
-    /// I1177 (unit) — the rendering carries every column in the table's
-    /// order, so two projections differing in any column render differently.
+    /// I1177 (unit) — the projection's columns as the backends' writers
+    /// read them (`sqlite_project_goal` / `pg_project_goal`): the derived
+    /// ones (canonical text, scale, cohort, dimension, deliberation) and the
+    /// carried ones; a deliberation reference renders as canonical JSON, and
+    /// the goal carries the declaration's id and score.
     #[test]
-    fn i1177_the_rendering_carries_every_column() {
+    fn i1177_the_projection_carries_every_column() {
         let d = row("d", "scores", "alice", body("  two   words "), 0);
         let p = fold_goal(&d, &[], &d).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&p.render()).unwrap();
-        assert_eq!(v.as_array().unwrap().len(), 14);
-        assert_eq!(v[0], "d");
-        assert_eq!(v[1], "alice");
-        assert_eq!(v[2], "1970-01-01T00:00:00.000000Z");
-        assert_eq!(v[3], "  two   words ");
-        assert_eq!(v[4], "two words");
-        assert_eq!(v[5], "self");
-        assert_eq!(v[6], serde_json::Value::Null);
-        assert_eq!(v[7], "justice");
-        assert_eq!(v[8], "r");
-        assert_eq!(v[9], serde_json::Value::Null);
-        assert_eq!(v[10], serde_json::Value::Null);
-        assert_eq!(v[11], "h-d");
-        assert_eq!(v[12], "d");
-        assert_eq!(v[13], serde_json::json!(0.5));
+        assert_eq!(p.goal_id, "d");
+        assert_eq!(p.declared_by_key_id, "alice");
+        assert_eq!(
+            super::super::ledger_projection::render_instant(p.declared_at),
+            "1970-01-01T00:00:00.000000Z"
+        );
+        assert_eq!(p.body.goal_text, "  two   words ");
+        assert_eq!(p.goal_text_canonical(), "two words");
+        assert_eq!(p.body.scope.scale(), "self");
+        assert_eq!(p.body.scope.cohort_id(), None);
+        assert_eq!(p.body.meta_goal_alignment.dimension.as_str(), "justice");
+        assert_eq!(p.body.meta_goal_alignment.rationale, "r");
+        assert_eq!(p.meta_deliberation(), None);
+        assert_eq!(p.retired_at, None);
+        assert_eq!(p.persist_row_hash, "h-d");
+        assert_eq!(p.attestation_id, "d");
+        assert_eq!(p.body.score, 0.5);
         let mut with_ref = body("t");
         with_ref["meta_goal_alignment"]["deliberation_ref"] =
             serde_json::json!({"artifact_type": "pdma", "artifact_id": "p"});
