@@ -25,7 +25,10 @@
 #   compiled bundle admitted and a tampered one refused on each backend's
 #   scratch; no postgres scratch survives), I1330 (a scratch that cannot be
 #   provisioned or released is `ceremony_scratch_directory`), I1331 (the
-#   postgres scratch is dropped released or not; the DSN keeps its form). The
+#   postgres scratch is dropped released or not; the DSN keeps its form),
+#   I1332 (the reaper: a scratch older than the reap age by its embedded
+#   instant is dropped at the next provisioning; a fresh one and an
+#   unreadable name are not). The
 #   door-by-door parity witnesses (I1324-I1328) are integration tests, which
 #   the tool does not build.
 #
@@ -35,7 +38,7 @@
 # gate over `include_str!` text, not a Rust site cargo-mutants reaches.
 #
 # Grammar: docs/MUTATION_TESTING.md "Scope files".
-tests: test(/i1320|i1321|i1323|i1329|i1330|i1331|lifecycle|i142|fountain|the_clone_is_migrated/)
+tests: test(/i1320|i1321|i1323|i1329|i1330|i1331|i1332|lifecycle|i142|fountain|the_clone_is_migrated/)
 features: postgres,sqlite,server
 
 src/federation/attestation_query.rs lifecycle_predicate
@@ -45,4 +48,4 @@ src/store/fountain_read.rs assemble_fountain_content
 src/store/sqlite_scratch.rs
 src/federation/genesis/scratch.rs
 src/federation/genesis/ceremony_verify.rs verify_ceremony_outputs
-src/store/postgres.rs dsn_with_dbname provision_genesis_scratch
+src/store/postgres.rs dsn_with_dbname provision_genesis_scratch stale_genesis_scratch reap_stale_genesis_scratches

@@ -667,11 +667,15 @@ in parity.
   `AmendState::{plan, finish}`) take a `&dyn genesis::scratch::GenesisScratch`
   and run on what the backend provisions: SQLite a migrated in-memory clone,
   PostgreSQL a throwaway database in the live cluster created from the
-  configured DSN (`ciris_genesis_scratch_{pid}_{hex}`), migrated, and dropped
+  configured DSN (`ciris_genesis_scratch_{unix_secs}_{pid}_{hex}`), migrated, and dropped
   `WITH (FORCE)` when the replay ends — on success, on a refusal, and on drop
   (a panic). The configured role needs `CREATEDB` for these doors. A rolled-back
   transaction was not used: the replay runs a dozen doors, each on its own
-  connection. Every door compiles and runs with `postgres` alone and with
+  connection. A scratch a killed process left behind (its name carries its creation
+  instant, `ciris_genesis_scratch_{unix_secs}_{pid}_{hex}`) is dropped by the
+  next provisioning once older than an hour
+  (`GENESIS_SCRATCH_REAP_AFTER_SECS`); a name the reaper cannot read is never
+  dropped. Every door compiles and runs with `postgres` alone and with
   `sqlite` alone. Signature changes (clean break):
   `verify_ceremony_outputs(bundle_json, scratch)`,
   `install_genesis_bundle_roster(dir, scratch, bundle)`,

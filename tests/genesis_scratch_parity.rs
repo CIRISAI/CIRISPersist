@@ -199,9 +199,9 @@ mod postgres {
         tokio::spawn(conn);
         admin
             .query_one(
-                "SELECT count(*) FROM pg_database WHERE datname LIKE $1",
+                "SELECT count(*) FROM pg_database WHERE datname ~ $1",
                 &[&format!(
-                    "{GENESIS_SCRATCH_DB_PREFIX}{}_%",
+                    "^{GENESIS_SCRATCH_DB_PREFIX}[0-9]+_{}_[0-9a-f]+$",
                     std::process::id()
                 )],
             )
@@ -287,5 +287,66 @@ mod postgres {
         drop(s);
         assert_eq!(my_scratches(&base).await, 0, "I1328: dropped unreleased");
         eprintln!("i1328 postgres: RAN");
+    }
+
+    /// I1332 — every provisioning first reaps the scratch databases a killed
+    /// process left: a name whose instant is older than the reap age is
+    /// dropped; a fresh one, and a name the reaper cannot read, are not.
+    #[serial_test::serial(test_anchor_env)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1332_provisioning_reaps_a_stale_scratch_and_nothing_else() {
+        use ciris_persist::store::postgres::GENESIS_SCRATCH_REAP_AFTER_SECS;
+        let Ok(base) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let pid = std::process::id();
+        let p = GENESIS_SCRATCH_DB_PREFIX;
+        let stale = format!(
+            "{p}{}_{pid}_aaaaaaaaaaaa",
+            now - 2 * GENESIS_SCRATCH_REAP_AFTER_SECS
+        );
+        let fresh = format!("{p}{now}_{pid}_bbbbbbbbbbbb");
+        let unreadable = format!("{p}x{pid}_cccc");
+        let (admin, conn) = tokio_postgres::connect(&base, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        for n in [&stale, &fresh, &unreadable] {
+            admin
+                .batch_execute(&format!("CREATE DATABASE \"{n}\""))
+                .await
+                .unwrap();
+        }
+        let provider = PostgresBackend::connect(&base).await.unwrap();
+        provider
+            .provision_genesis_scratch(&effective_accord_holder_records())
+            .await
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
+        let mut held = Vec::new();
+        for n in [&stale, &fresh, &unreadable] {
+            let c: i64 = admin
+                .query_one("SELECT count(*) FROM pg_database WHERE datname = $1", &[n])
+                .await
+                .unwrap()
+                .get(0);
+            held.push(c == 1);
+            let _ = admin
+                .batch_execute(&format!("DROP DATABASE IF EXISTS \"{n}\" WITH (FORCE)"))
+                .await;
+        }
+        assert_eq!(
+            held,
+            [false, true, true],
+            "I1332: the stale scratch is reaped; a fresh one and an unreadable name are kept"
+        );
+        eprintln!("i1332 postgres: RAN");
     }
 }

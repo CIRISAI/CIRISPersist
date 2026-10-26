@@ -3604,9 +3604,66 @@ async fn dedicated_connect_to(dsn: &str) -> Result<tokio_postgres::Client, Error
 }
 
 /// v60.0.0 (CIRISPersist#1002) — the genesis scratch database's name prefix.
-/// The full name is `{prefix}{pid}_{12 hex}`: the creating process is in the
-/// name, so a witness can find exactly the scratches its own process made.
+/// The full name is `{prefix}{unix_secs}_{pid}_{12 hex}`: the creation
+/// instant is what the reaper reads ([`stale_genesis_scratch`]); the creating
+/// process lets a witness find exactly the scratches its own process made.
 pub const GENESIS_SCRATCH_DB_PREFIX: &str = "ciris_genesis_scratch_";
+
+/// A scratch database older than this is a leak (its process died before it
+/// could drop it — a SIGKILL mid-replay) and the next provisioning drops it.
+/// A replay takes seconds; an hour is never a live one.
+pub const GENESIS_SCRATCH_REAP_AFTER_SECS: u64 = 3600;
+
+/// Is `datname` a genesis scratch created more than
+/// [`GENESIS_SCRATCH_REAP_AFTER_SECS`] before `now_secs`? A name without the
+/// prefix, or whose instant does not parse, is NOT stale: the reaper skips
+/// what it cannot read, never drops it.
+#[must_use]
+pub fn stale_genesis_scratch(datname: &str, now_secs: u64) -> bool {
+    let Some(rest) = datname.strip_prefix(GENESIS_SCRATCH_DB_PREFIX) else {
+        return false;
+    };
+    let Some((secs, tail)) = rest.split_once('_') else {
+        return false;
+    };
+    if tail.is_empty() || secs.is_empty() || !secs.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    secs.parse::<u64>()
+        .is_ok_and(|created| now_secs.saturating_sub(created) > GENESIS_SCRATCH_REAP_AFTER_SECS)
+}
+
+/// Drop every stale genesis scratch in the cluster `admin` is connected to.
+/// Best effort: a list or drop failure is logged and never fails the caller.
+async fn reap_stale_genesis_scratches(admin: &tokio_postgres::Client) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let names: Vec<String> = match admin
+        .query(
+            "SELECT datname FROM pg_database WHERE starts_with(datname, $1)",
+            &[&GENESIS_SCRATCH_DB_PREFIX],
+        )
+        .await
+    {
+        Ok(rows) => rows
+            .iter()
+            .filter_map(|r| r.try_get::<_, String>(0).ok())
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "genesis scratch reaper: list failed");
+            return;
+        }
+    };
+    for name in names.into_iter().filter(|n| stale_genesis_scratch(n, now)) {
+        if let Err(e) = admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+            .await
+        {
+            tracing::warn!(error = %e, scratch = %name, "genesis scratch reaper: drop failed");
+        }
+    }
+}
 
 /// `dsn` with its database name replaced by `dbname`, in the DSN's own form:
 /// a `postgres://` / `postgresql://` URL keeps its userinfo, host and query
@@ -3665,8 +3722,11 @@ impl crate::federation::genesis::scratch::GenesisScratch for PostgresBackend {
         let fail = |what: &str, e: &dyn std::fmt::Display| {
             crate::federation::Error::Backend(format!("genesis scratch: {what}: {e}"))
         };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
         let name = format!(
-            "{GENESIS_SCRATCH_DB_PREFIX}{}_{}",
+            "{GENESIS_SCRATCH_DB_PREFIX}{now}_{}_{}",
             std::process::id(),
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         );
@@ -3674,6 +3734,9 @@ impl crate::federation::genesis::scratch::GenesisScratch for PostgresBackend {
         let admin = dedicated_connect_to(&self.dsn)
             .await
             .map_err(|e| fail("admin connect", &e))?;
+        // A SIGKILL mid-replay leaves its scratch behind: every provisioning
+        // first drops the ones older than the reap age.
+        reap_stale_genesis_scratches(&admin).await;
         admin
             .batch_execute(&format!("CREATE DATABASE \"{name}\""))
             .await
