@@ -1419,7 +1419,10 @@ def test_reack_holding_claims_once_is_host_reachable_989() -> None:
             assert set(report) == {
                 "scanned", "renewed", "fresh", "not_held", "not_in_cohort", "failed", "converted",
                 "withheld", "deferred",
+                # v60.1.0 (#1113) — a reversed takedown's re-ack.
+                "restored",
             }, report
+            assert report["restored"] == 0, report
             assert report["withheld"] == 0, report
             # v56.0.0 (#1071): a pass renews at most the cap; the rest is deferred
             # to the next pass. One fresh claim defers nothing.
