@@ -340,10 +340,14 @@ did not fit its budget):
   backend's retirement added (#1002): the one lifecycle predicate (#720,
   `lifecycle_predicate`, `hiding_composers`), the from-disk tree binding
   (#691, `store::tree_read`), the fountain assembler moved out of memory.rs,
-  and `test_backend`, against I1320, I1321 and the lifecycle / fountain
-  reads on both backends. 15 mutants in one shard, 13 caught, 2 unviable,
-  0 missed (round 2), nightly. Every other
-  scope dropped its `src/store/memory.rs` sites and memory legs.
+  the migrated in-memory clone (`store::sqlite_scratch`), and the genesis
+  scratch on both backends (`genesis::scratch`, the postgres scratch
+  database and its reaper, the replay's provision/release arms), against
+  I1320, I1321, I1323, I1329–I1332 and the lifecycle / fountain reads on
+  both backends. 44 mutants in one shard, 36 caught, 8 unviable, 0 missed
+  (round 2),
+  nightly. Every other scope dropped its `src/store/memory.rs` sites and
+  memory legs.
 - `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and
   federation files that feed the counters. The issue's other starting modules
 (the `trust_root.rs` walks beyond `trust_root_valid`) are not yet scoped.

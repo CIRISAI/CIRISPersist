@@ -5495,7 +5495,7 @@ impl PyEngine {
     /// `refused`. Raises `ValueError` (`federation_genesis_bundle_invalid`)
     /// on a bundle that does not verify; NOTHING is written in that case.
     /// This node's own genesis posture is not changed.
-    #[cfg(feature = "sqlite")]
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     fn install_genesis_bundle_roster_json(
         &self,
         py: Python<'_>,
@@ -5513,13 +5513,17 @@ impl PyEngine {
                     let report = match &backend {
                         #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(b) => {
-                            crate::federation::genesis::install_genesis_bundle_roster(&**b, &bundle)
-                                .await
+                            crate::federation::genesis::install_genesis_bundle_roster(
+                                &**b, &**b, &bundle,
+                            )
+                            .await
                         }
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(b) => {
-                            crate::federation::genesis::install_genesis_bundle_roster(&**b, &bundle)
-                                .await
+                            crate::federation::genesis::install_genesis_bundle_roster(
+                                &**b, &**b, &bundle,
+                            )
+                            .await
                         }
                     }
                     .map_err(federation_err_to_py)?;

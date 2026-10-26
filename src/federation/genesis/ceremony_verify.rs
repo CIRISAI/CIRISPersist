@@ -20,10 +20,7 @@
 //! against the family this build seeds and against every holder's signature.
 //! A refusal is reported by the stage it came from, with the door's own words.
 
-#[cfg(feature = "sqlite")]
 use super::{BakeItemOutcome, GenesisBundle};
-#[cfg(feature = "sqlite")]
-use crate::federation::FederationDirectory as _;
 
 /// Which stage refused. The wire token is [`Self::as_str`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +46,9 @@ pub enum CeremonyOutputsRefusal {
     CommunityBirth,
     /// The birth was admitted but the community does not resolve live.
     CommunityNotLive,
+    /// v60.0.0 (CIRISPersist#1002) — the backend could not provision, or
+    /// could not release, the scratch directory the replay runs on.
+    ScratchDirectory,
 }
 
 impl CeremonyOutputsRefusal {
@@ -65,6 +65,7 @@ impl CeremonyOutputsRefusal {
             Self::FamilyRecord => "ceremony_family_record",
             Self::CommunityBirth => "ceremony_community_birth",
             Self::CommunityNotLive => "ceremony_community_not_live",
+            Self::ScratchDirectory => "ceremony_scratch_directory",
         }
     }
 }
@@ -86,7 +87,6 @@ impl std::fmt::Display for CeremonyOutputsRefused {
 
 impl std::error::Error for CeremonyOutputsRefused {}
 
-#[cfg(feature = "sqlite")]
 fn refused(
     reason: CeremonyOutputsRefusal,
     detail: impl std::fmt::Display,
@@ -114,18 +114,18 @@ pub struct CeremonyOutputsVerified {
 
 /// **Verify a ceremony's bundle** — its delegation plane, the accord family
 /// record and the community birth it carries — against this build's accord
-/// roster, through the ordinary doors, on a throwaway in-memory directory.
-/// Nothing outside that directory is read or written.
-///
-/// v60.0.0 (CIRISPersist#1002): the throwaway directory is an in-memory
-/// SQLite node (the memory backend is retired), so this needs `sqlite`.
+/// roster, through the ordinary doors, on a throwaway directory `scratch`
+/// provisions (an in-memory SQLite clone, or a scratch database in the
+/// postgres cluster — [`GenesisScratch`](super::scratch::GenesisScratch)).
+/// Nothing outside that directory is read or written, and it is released
+/// before this returns, whatever it returns.
 ///
 /// # Errors
 ///
 /// [`CeremonyOutputsRefused`] naming the stage; see the module doc.
-#[cfg(feature = "sqlite")]
 pub async fn verify_ceremony_outputs(
     bundle_json: &str,
+    scratch: &dyn super::scratch::GenesisScratch,
 ) -> Result<CeremonyOutputsVerified, CeremonyOutputsRefused> {
     use CeremonyOutputsRefusal as R;
     let bundle: GenesisBundle = super::parse_genesis_bundle(bundle_json)
@@ -166,34 +166,33 @@ pub async fn verify_ceremony_outputs(
     check_family_record(&bundle, &roster).map_err(|d| refused(R::FamilyRecord, d))?;
 
     // A fresh node: the holders and the accord family, nothing else.
-    // v60.0.0 (CIRISPersist#1002) — an in-memory SQLite node, migrated: the
-    // retired memory backend is no longer the scratch directory.
-    let dir = crate::store::sqlite::SqliteBackend::open_in_memory()
+    let provisioned = scratch
+        .provision_genesis_scratch(&roster)
         .await
-        .map_err(|e| {
-            refused(
-                R::HolderRosterMismatch,
-                format!("open the scratch directory: {e}"),
-            )
-        })?;
-    {
-        use crate::store::Backend as _;
-        dir.run_migrations().await.map_err(|e| {
-            refused(
-                R::HolderRosterMismatch,
-                format!("migrate the scratch directory: {e}"),
-            )
-        })?;
+        .map_err(|e| refused(R::ScratchDirectory, format!("provision: {e}")))?;
+    let replayed = replay(provisioned.directory(), &bundle, bundle_json, community).await;
+    let released = provisioned.release().await;
+    match (replayed, released) {
+        (Err(e), _) => Err(e),
+        (Ok(_), Err(e)) => Err(refused(R::ScratchDirectory, format!("release: {e}"))),
+        (Ok(v), Ok(())) => Ok(v),
     }
-    dir.seed_genesis_accord_holders(&roster)
-        .await
-        .map_err(|e| refused(R::HolderRosterMismatch, format!("seed holders: {e}")))?;
+}
+
+/// The replay itself, on the provisioned scratch `dir`.
+async fn replay(
+    dir: &dyn crate::federation::FederationDirectory,
+    bundle: &GenesisBundle,
+    bundle_json: &str,
+    community: crate::federation::SignedCommunity,
+) -> Result<CeremonyOutputsVerified, CeremonyOutputsRefused> {
+    use CeremonyOutputsRefusal as R;
     // v53.1.1 — the scratch node's family is the CANDIDATE's genesis record
     // (`check_family_record` has just held it to this build's roster and its
     // own charter), never the compiled bundle's: under a test anchor the
     // compiled bundle may be another ceremony's, and on a bake this is the
     // bundle being baked.
-    super::roster_install::install_accord_genesis_head(&dir, &bundle)
+    super::roster_install::install_accord_genesis_head(dir, bundle)
         .await
         .map_err(|e| {
             refused(
@@ -202,10 +201,10 @@ pub async fn verify_ceremony_outputs(
             )
         })?;
 
-    super::verify_bundle_quorum(&dir, &bundle)
+    super::verify_bundle_quorum(dir, bundle)
         .await
         .map_err(|e| refused(R::BundleQuorum, e))?;
-    let report = super::bake_assembled_genesis(&dir, bundle_json)
+    let report = super::bake_assembled_genesis(dir, bundle_json)
         .await
         .map_err(|e| refused(R::BundleBake, e))?;
     for (id, outcome) in &report.serve_nodes {
@@ -223,7 +222,7 @@ pub async fn verify_ceremony_outputs(
     dir.put_community(community)
         .await
         .map_err(|e| refused(R::CommunityBirth, e))?;
-    let resolved = crate::federation::canonical_community::resolve_community(&dir, &id)
+    let resolved = crate::federation::canonical_community::resolve_community(dir, &id)
         .await
         .map_err(|e| refused(R::CommunityNotLive, e))?
         .ok_or_else(|| refused(R::CommunityNotLive, format!("{id} does not resolve")))?;
@@ -250,7 +249,6 @@ pub async fn verify_ceremony_outputs(
 /// same founders, protocol, entrenchment and instant, naming the bundle's own
 /// charter), signed over its signing
 /// envelope by EVERY holder of this build's roster (the founding rule).
-#[cfg(feature = "sqlite")]
 fn check_family_record(
     bundle: &GenesisBundle,
     roster: &[crate::federation::SignedKeyRecord],

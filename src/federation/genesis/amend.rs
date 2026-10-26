@@ -103,12 +103,14 @@ impl AmendState {
     ///
     /// [`AMEND_INPUT_REFUSED`] when the pinned input does not verify or does
     /// not parse.
-    #[cfg(feature = "sqlite")]
+    /// `scratch` provisions the directory the doors run on (any backend:
+    /// [`GenesisScratch`](super::scratch::GenesisScratch)).
     pub async fn plan(
         pinned_json: &str,
         serve_transport_destinations: Vec<SignedTransportDestination>,
+        scratch: &dyn super::scratch::GenesisScratch,
     ) -> Result<Self, AmendRefused> {
-        super::verify_ceremony_outputs(pinned_json)
+        super::verify_ceremony_outputs(pinned_json, scratch)
             .await
             .map_err(|e| refused(AMEND_INPUT_REFUSED, format!("the pinned bundle: {e}")))?;
         let base = parse_genesis_bundle(pinned_json)
@@ -241,12 +243,15 @@ impl AmendState {
     ///
     /// As [`Self::assemble`]; [`AMEND_INPUT_REFUSED`] when the amended bundle
     /// does not verify.
-    #[cfg(feature = "sqlite")]
-    pub async fn finish(&self) -> Result<AmendFinished, AmendRefused> {
+    /// `scratch` as in [`Self::plan`].
+    pub async fn finish(
+        &self,
+        scratch: &dyn super::scratch::GenesisScratch,
+    ) -> Result<AmendFinished, AmendRefused> {
         let bundle = self.assemble()?;
         let bundle_json = serde_json::to_string_pretty(&bundle)
             .map_err(|e| refused(AMEND_INPUT_REFUSED, format!("encode: {e}")))?;
-        let verified = super::verify_ceremony_outputs(&bundle_json)
+        let verified = super::verify_ceremony_outputs(&bundle_json, scratch)
             .await
             .map_err(|e| refused(AMEND_INPUT_REFUSED, format!("the amended bundle: {e}")))?;
         Ok(AmendFinished {

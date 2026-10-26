@@ -322,11 +322,12 @@ where
 /// [`Error::GenesisBundleInvalid`] on a refused bundle; the bake's errors;
 /// directory failures.
 ///
-/// v60.0.0 (CIRISPersist#1002): step 1's throwaway directory is in-memory
-/// SQLite, so the import door needs `sqlite`.
-#[cfg(feature = "sqlite")]
+/// v60.0.0 (CIRISPersist#1002): step 1's throwaway directory is provisioned by
+/// `scratch` (normally the same backend as `dir`; see
+/// [`GenesisScratch`](super::scratch::GenesisScratch)).
 pub async fn install_genesis_bundle_roster<D>(
     dir: &D,
+    scratch: &dyn super::scratch::GenesisScratch,
     bundle: &GenesisBundle,
 ) -> Result<RosterInstall, Error>
 where
@@ -334,7 +335,7 @@ where
 {
     let json = serde_json::to_string(bundle)
         .map_err(|e| Error::Backend(format!("serialize the bundle: {e}")))?;
-    super::verify_ceremony_outputs(&json)
+    super::verify_ceremony_outputs(&json, scratch)
         .await
         .map_err(|r| Error::GenesisBundleInvalid {
             detail: r.to_string(),

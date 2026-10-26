@@ -33,7 +33,10 @@ pub mod bundle;
 pub mod ceremony;
 /// CIRISPersist#973 — verify a ceremony's two outputs before they are baked.
 pub mod ceremony_verify;
-#[cfg(feature = "sqlite")]
+/// v60.0.0 (CIRISPersist#1002) — the per-backend scratch a genesis replay runs on.
+pub mod scratch;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod scratch_invariants;
 pub use ceremony_verify::verify_ceremony_outputs;
 pub use ceremony_verify::{
     CeremonyOutputsRefusal, CeremonyOutputsRefused, CeremonyOutputsVerified,
@@ -63,7 +66,6 @@ pub use posture::{
     constitutional_seat, genesis_posture, require_constitutional_root, AbsentReason,
     BakeNotAdoptedReason, GenesisFault, GenesisLeg, GenesisPosture, ROOT_REQUIRING_GATES,
 };
-#[cfg(feature = "sqlite")]
 pub use roster_install::install_genesis_bundle_roster;
 pub use roster_install::{
     bundle_accord_genesis, install_accord_genesis_head, install_bundle_roster_records,

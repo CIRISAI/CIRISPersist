@@ -64,6 +64,10 @@ pub mod sqlite;
 /// `FSD/SQLITE_CONNECTION_MODEL.md`.
 #[cfg(feature = "sqlite")]
 pub mod sqlite_conn_model;
+/// v60.0.0 (CIRISPersist#1002) — a migrated in-memory clone of one template
+/// per process: the SQLite genesis scratch and the test constructor.
+#[cfg(feature = "sqlite")]
+pub(crate) mod sqlite_scratch;
 #[cfg(feature = "sqlite")]
 pub mod test_backend;
 /// v50.0.0 (PR #921 review) — test-only hooks inside a backend's own door.

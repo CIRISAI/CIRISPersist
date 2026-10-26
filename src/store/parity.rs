@@ -461,7 +461,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // minter, no refusal of the caller's input here.
     ("community_dek_blob_epoch", Class::Delegates),
     ("acquire_migration_lock", Class::Delegates),
-    ("add", Class::Plumbing),
     ("admission_gate", Class::Plumbing),
     // v47.3.0 (#901) — the one key-admission door predicate (structure for
     // every evidence-carrying row, + freshness for an accord_holder).
@@ -739,7 +738,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_write", Class::Gate),
     ("commit", Class::Plumbing),
     ("compute_persist_row_hash", Class::Plumbing),
-    ("connect", Class::Plumbing),
     ("decode", Class::Plumbing),
     // v45.0.0 (#871) — `list_derived_hex`'s argument decode: refuses a digest
     // that is not 64 hex characters, which is a fact about the caller's
