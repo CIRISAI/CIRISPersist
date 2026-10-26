@@ -131,6 +131,12 @@
 //!   `put_plaintext_dag_chunk`, `put_blob_chunks_signing`,
 //!   `finalize_blob_chunks_signing`): `blob_purged` naming the notice, nothing
 //!   lands. The adopt doors are `stream_epoch_dek_invariants`' I1406.
+//! - **I1408** (postgres; #1070 item 3) — a write already past its
+//!   in-transaction tombstone read (under the shared advisory lock) holds a
+//!   takedown of the same address off until it commits; the takedown's
+//!   finalize then deletes the bytes it landed.
+//! - **I1409** (sqlite, postgres; #1070 item 3) — a byte write on a schema
+//!   below V187 still lands (no tombstone table to read in the transaction).
 //! - **I1405** (sqlite, postgres; #1070, decided) — a plaintext chunk two
 //!   DAGs share stays with the live DAG: an immediate-removal takedown of one
 //!   destroys its manifest and its own chunks; the shared chunk is neither
@@ -2193,6 +2199,84 @@ pub(crate) mod engine_bodies {
         );
     }
 
+    /// v60.1.0 (CIRISPersist#1070 item 3; postgres) — **a write already past
+    /// its in-transaction tombstone read holds the takedown off until it
+    /// commits.** postgres's `store_blob_local` is paused inside its write
+    /// transaction (the tombstone read done under the shared advisory lock,
+    /// the insert not yet run); a takedown of the same address started then
+    /// does NOT complete while the write is held (its tombstone write waits
+    /// for the exclusive lock), and once the write commits, the takedown's
+    /// immediate finalize deletes the bytes it landed. Without the lock the
+    /// takedown completed against bytes not yet written and they stayed.
+    pub(crate) async fn i1408_the_tombstone_write_waits_for_a_write_in_flight<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+        arm_inside: fn(&B) -> std::sync::Arc<crate::store::test_hooks::Pause>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let author = format!("i1408-author-{run}");
+        ts::register_hybrid_key_as(l.ba.as_ref(), &author, &author, USER).await;
+        let owner = claimant(0x19);
+        let e = &l.engine_a;
+        let bytes = format!("i1408 {run}").into_bytes();
+        let sha: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+        establish(
+            l.ba.as_dyn_directory(),
+            &author,
+            &owner.id,
+            &hex::encode(sha),
+        )
+        .await;
+        let p = arm_inside(l.ba.as_ref());
+        let door = e.store_plaintext_local(&sha, bytes, None);
+        let rest = async {
+            tokio::time::timeout(std::time::Duration::from_secs(20), p.reached())
+                .await
+                .expect("the write reaches its insert");
+            let n = notice(&owner, &hex::encode(sha), "ncmec_csam");
+            let mut take = Box::pin(e.takedown_tombstone(&n));
+            let early =
+                tokio::time::timeout(std::time::Duration::from_millis(750), &mut take).await;
+            assert!(
+                early.is_err(),
+                "I1408: the takedown completed while a write past its tombstone read was \
+                 uncommitted: {early:?}"
+            );
+            p.resume();
+            take.await.expect("I1408: the takedown, after the write")
+        };
+        let (got, r) = Box::pin(async { tokio::join!(door, rest) }).await;
+        got.expect("I1408: the write committed before the tombstone");
+        assert!(
+            r.bytes_destroyed,
+            "I1408: the finalize found the bytes: {r:?}"
+        );
+        assert!(
+            !l.ba.has_blob(&sha).await.unwrap(),
+            "I1408: nothing is left on disk"
+        );
+    }
+
+    /// v60.1.0 (CIRISPersist#1070 item 3) — **a byte write on a schema below
+    /// V187 still lands**: there is no tombstone table to read inside the
+    /// transaction, so the read is skipped (`bytes_tombstone_plane`), exactly
+    /// as the pre-read answers `Unsupported` there.
+    pub(crate) async fn i1409_a_byte_write_below_the_purge_plane<B>(b: &B)
+    where
+        B: BlobStorage + Sync,
+    {
+        let bytes = b"i1409 below V187".to_vec();
+        let sha: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+        b.store_plaintext_local(&sha, bytes, None)
+            .await
+            .expect("I1409: a write below V187 is not refused by a table it cannot have");
+        assert!(b.has_blob(&sha).await.unwrap(), "I1409: it landed");
+    }
+
     // ── I1405 ─────────────────────────────────────────────────────────────
     /// v60.1.0 (CIRISPersist#1070 comment, decided) — a plaintext chunk two
     /// DAGs share stays with the live DAG: an immediate-removal takedown of
@@ -2638,6 +2722,51 @@ mod run {
         (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
             as Pick<crate::store::postgres::PostgresBackend>
     );
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i1408_postgres() {
+        let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
+            return;
+        };
+        crate::federation::doors_takedown_invariants::engine_bodies::i1408_the_tombstone_write_waits_for_a_write_in_flight(
+            &a,
+            &b,
+            &suffix(),
+            (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
+                as crate::federation::epoch_minter_invariants::bodies::Pick<
+                    crate::store::postgres::PostgresBackend,
+                >,
+            |b| {
+                b.test_hooks()
+                    .arm_pause(crate::store::test_hooks::BYTES_INSIDE_THE_WRITE)
+            },
+        )
+        .await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i1409_sqlite() {
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations_through(186).await.unwrap();
+        crate::federation::doors_takedown_invariants::engine_bodies::i1409_a_byte_write_below_the_purge_plane(&b).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i1409_postgres() {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations_through(186).await.unwrap();
+        crate::federation::doors_takedown_invariants::engine_bodies::i1409_a_byte_write_below_the_purge_plane(&b).await;
+    }
 
     // ── I794 — from disk ─────────────────────────────────────────────────
     /// Comments and every test-gated item stripped: what remains is

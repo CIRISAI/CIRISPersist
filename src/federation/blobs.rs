@@ -5607,17 +5607,7 @@ pub(crate) fn prepare_dag_chunk_row(
             ("inline", Some(bytes.clone()), None, u64::from(mref.size))
         }
         BlobBody::External(e) => {
-            // v60.1.0 (CIRISPersist#1072) — the size is the entry's, as the
-            // inline arm checks: a mismatch stored here is refused at
-            // finalize, and storage is first-write-wins by SHA, so no
-            // corrected retry could repair it.
-            if e.size_bytes != u64::from(mref.size) {
-                return Err(BlobError::InvalidArgument(format!(
-                    "put_blob_chunks: chunk[{idx}] external size is {} bytes but manifest size \
-                     is {}",
-                    e.size_bytes, mref.size
-                )));
-            }
+            check_external_chunk_size(idx, e, mref)?;
             let kind = body.storage_kind();
             (kind, None, Some(e.uri.clone()), e.size_bytes)
         }
@@ -5638,6 +5628,25 @@ pub(crate) fn prepare_dag_chunk_row(
         external_ref,
         size_bytes,
     })
+}
+
+/// v60.1.0 (CIRISPersist#1072, Codex r4 on #1065) — an `External` chunk's
+/// declared size is its manifest entry's, as the inline arm checks for its
+/// bytes: a mismatch stored here is refused at finalize, and storage is
+/// first-write-wins by SHA, so no corrected retry could repair it.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+fn check_external_chunk_size(
+    idx: usize,
+    e: &ExternalRef,
+    mref: &ChunkRef,
+) -> Result<(), BlobError> {
+    if e.size_bytes != u64::from(mref.size) {
+        return Err(BlobError::InvalidArgument(format!(
+            "put_blob_chunks: chunk[{idx}] external size is {} bytes but manifest size is {}",
+            e.size_bytes, mref.size
+        )));
+    }
+    Ok(())
 }
 
 /// The `chunk_dag` manifest row of `manifest`: its JCS bytes inline, its

@@ -70,6 +70,13 @@ pub(crate) struct Pause {
 #[allow(dead_code)]
 pub(crate) const BYTES_AFTER_TOMBSTONE_PRECHECK: &str = "bytes_after_tombstone_precheck";
 
+/// v60.1.0 (CIRISPersist#1070 item 3) — postgres's `store_blob_local` pauses
+/// here INSIDE its write transaction, after its tombstone read under the
+/// shared lock and before its insert: a takedown started now must wait for
+/// the write to commit.
+#[allow(dead_code)]
+pub(crate) const BYTES_INSIDE_THE_WRITE: &str = "bytes_inside_the_write";
+
 /// The longest a paused door waits for its witness.
 pub(crate) const PAUSE_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
 

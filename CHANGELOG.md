@@ -53,7 +53,11 @@ threat-model citations because this crate's audit story is the point.
      and finalize, adopt, the chunk floor) now reads the address's own
      tombstone again INSIDE its transaction; on postgres under a shared
      advisory lock the tombstone's write takes exclusively. Witnesses I1404
-     (plaintext doors) and I1406 (adopt and chunk floor), both red before.
+     (plaintext doors) and I1406 (adopt and chunk floor), both red before;
+     I1408 (postgres: a write past its in-transaction read holds the
+     takedown off until it commits, then the finalize deletes its bytes) and
+     I1409 (a write below V187, where no tombstone table exists, still
+     lands).
   4. decided: a plaintext chunk shared with a live DAG stays (not withheld,
      not evicted) when another DAG that uses it is taken down; the existing
      purge walk already does this. Witness I1405.

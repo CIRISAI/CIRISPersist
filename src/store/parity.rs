@@ -487,6 +487,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("pg_tombstone_at_write", Class::Plumbing),
     ("pg_lock_bytes_tombstones", Class::Plumbing),
     ("sqlite_purged_at_write", Class::Plumbing),
+    ("pg_lock_bytes_tombstones_exclusive", Class::Plumbing),
     // #832 — `build_transaction()…start()`: the REPEATABLE READ transaction
     // `stream_chunks` opens so the listing and the STH are one snapshot.
     // Driver plumbing; it cannot refuse anything about the caller's input.

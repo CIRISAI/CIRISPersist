@@ -306,6 +306,16 @@ impl SqliteBackend {
         &self.test_hooks
     }
 
+    /// v60.1.0 (CIRISPersist#1070 item 3) — does the bytes-plane tombstone
+    /// table exist, so a byte write's in-transaction tombstone read can run?
+    /// `false` only between a test-only `run_migrations_through` below V187
+    /// and the next full migration (the `pre_purge_schema` flag).
+    fn bytes_tombstone_plane(&self) -> bool {
+        !self
+            .pre_purge_schema
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// v57.0.0 (CIRISPersist#988, I960/I961) — run raw SQL on the writer: the
     /// projection witnesses tamper with a live table to prove the gate red.
     #[cfg(test)]
@@ -11858,9 +11868,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         crate::federation::steward_purge::refuse_tombstoned_bytes(self, sha256).await?;
         // v60.1.0 (#1070) — the in-transaction second look's switch, and the
         // witnesses' seam between the pre-read and the write.
-        let purge_plane = !self
-            .pre_purge_schema
-            .load(std::sync::atomic::Ordering::Acquire);
+        let purge_plane = self.bytes_tombstone_plane();
         #[cfg(test)]
         self.test_hooks()
             .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
@@ -12238,9 +12246,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         crate::federation::steward_purge::refuse_tombstoned_bytes(self, sha256).await?;
         // v60.1.0 (#1070) — the in-transaction second look's switch, and the
         // witnesses' seam between the pre-read and the write.
-        let purge_plane = !self
-            .pre_purge_schema
-            .load(std::sync::atomic::Ordering::Acquire);
+        let purge_plane = self.bytes_tombstone_plane();
         #[cfg(test)]
         self.test_hooks()
             .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
@@ -14631,9 +14637,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         }
         // v60.1.0 (#1070) — the in-transaction second look's switch, and the
         // witnesses' seam between the pre-read and the write.
-        let purge_plane = !self
-            .pre_purge_schema
-            .load(std::sync::atomic::Ordering::Acquire);
+        let purge_plane = self.bytes_tombstone_plane();
         #[cfg(test)]
         self.test_hooks()
             .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
@@ -14704,9 +14708,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         }
         // v60.1.0 (#1070) — the in-transaction second look's switch, and the
         // witnesses' seam between the pre-read and the write.
-        let purge_plane = !self
-            .pre_purge_schema
-            .load(std::sync::atomic::Ordering::Acquire);
+        let purge_plane = self.bytes_tombstone_plane();
         #[cfg(test)]
         self.test_hooks()
             .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
@@ -15776,9 +15778,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         crate::federation::steward_purge::refuse_tombstoned_bytes(self, &sha256).await?;
         // v60.1.0 (#1070) — the in-transaction second look's switch, and the
         // witnesses' seam between the pre-read and the write.
-        let purge_plane = !self
-            .pre_purge_schema
-            .load(std::sync::atomic::Ordering::Acquire);
+        let purge_plane = self.bytes_tombstone_plane();
         #[cfg(test)]
         self.test_hooks()
             .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
@@ -17505,9 +17505,7 @@ impl SqliteBackend {
         let ready = kept;
         // v60.1.0 (#1070) — the in-transaction second look's switch, and the
         // witnesses' seam between the pre-read and the write.
-        let purge_plane = !self
-            .pre_purge_schema
-            .load(std::sync::atomic::Ordering::Acquire);
+        let purge_plane = self.bytes_tombstone_plane();
         #[cfg(test)]
         self.test_hooks()
             .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
