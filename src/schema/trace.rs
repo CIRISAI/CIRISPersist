@@ -248,6 +248,60 @@ pub struct DeploymentProfile {
     /// Absent on v2.7.x traces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_format_version: Option<String>,
+    /// v60.1.0 (CIRISPersist#1089, CIRISAgent#1255 re-cut) — the axis
+    /// calibration the agent's scorer ran under
+    /// (`ciris_server.AXIS_CALIBRATION_VERSION`, `"crc-v2"` today). A SIGNED
+    /// member of the `trace_format` v2.8.0 profile, required and nullable
+    /// there, so it is tri-state here: absent (every v2.7.x profile, and the
+    /// v2.8.0 cut vendored before the re-cut) serializes nothing; present
+    /// `null` round-trips as `null`; a token round-trips as itself. Typed
+    /// rather than dropped: a member lost on deserialization changes the
+    /// re-canonicalized bytes and the signature no longer verifies.
+    #[serde(
+        default,
+        deserialize_with = "present_member",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub calibration_version: Option<Option<String>>,
+    /// v60.1.0 (CIRISPersist#1089, CIRISAgent#878 / #1245) — the AGENT's
+    /// pipeline provenance (which build, accord and persona produced the
+    /// trace). A signed v2.8.0 profile member, absent on v2.7.x. Distinct
+    /// from persist's own post-ingest `pipeline_metadata` column (stages and
+    /// timings), which persist computes itself and never reads from here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_metadata: Option<AgentPipelineMetadata>,
+}
+
+/// v60.1.0 (CIRISPersist#1089) — `deployment_profile.pipeline_metadata`, the
+/// agent's closed provenance object in `trace_format` v2.8.0. Every member is
+/// present on the wire; `null` means the agent has no source for it, and is
+/// serialized back as `null` so the signed bytes round-trip. Closed: an
+/// unknown member is a parse error by name, never dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPipelineMetadata {
+    /// `CIRIS_VERSION` of the emitting agent build (`"2.15.0-stable"`).
+    pub agent_version: String,
+    /// `ACCORD_VERSION` the agent reasons under.
+    pub accord_version: Option<String>,
+    /// The persona the agent runs under (`AgentIdentityRoot.identity_hash`);
+    /// `null` before the identity exists.
+    pub identity_hash: Option<String>,
+    /// The PDMA version; `null` until the agent versions it.
+    pub pdma_version: Option<String>,
+    /// The DSDMA domain registry version; `null` until the agent versions it.
+    pub dsdma_domain_registry_version: Option<String>,
+}
+
+/// A member that is present (`Some`) whether it carries a value or `null`;
+/// `#[serde(default)]` supplies `None` for an absent one. Keeps "absent" and
+/// "present, null" apart, which a signed member must.
+fn present_member<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
 }
 
 /// CC 3.1.5 (CIRISConstitution#166) — the closed `run_kind` vocabulary.

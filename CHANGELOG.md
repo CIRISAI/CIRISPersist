@@ -51,6 +51,17 @@ threat-model citations because this crate's audit story is the point.
   a non-member reads none; the attendees are the union of subjects over a
   `call_id`; an attendee's own `withdraws` retracts their row, the other
   attendee's stands, and nobody withdraws another's.
+- **#1089 (part) — the re-cut v2.8.0 profile members are typed.**
+  `DeploymentProfile` gains `calibration_version` (tri-state: absent, `null`,
+  or a token, each round-tripping as itself) and `pipeline_metadata`
+  (`schema::AgentPipelineMetadata`, closed: an unknown member is refused at
+  parse by name). Both are new OPTIONAL members, absent on every v2.7.x
+  profile, whose serialized bytes are unchanged. Before this a profile
+  carrying them lost them on parse and its signature failed. Witness I1364
+  (sqlite, postgres). Still open on #1089: the re-vendor of the re-cut schema
+  (`b6f6fd3f…`) waits on CIRISAgent#1255 merging (it is open at `b1d802c7`),
+  and the `trace_field_shape_violation` door needs a new `schema::Error` arm
+  or a renamed token, which is a break (v61).
 
 ## [60.0.0] - 2026-10-26
 

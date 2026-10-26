@@ -2878,6 +2878,8 @@ mod tests {
                 deployment_trust_mode: "federated_peer".into(),
                 run_kind: None,
                 trace_format_version: None,
+                calibration_version: None,
+                pipeline_metadata: None,
             }),
             cohort_scope: "federation".into(),
             cohort_target_id: None,
