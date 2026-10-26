@@ -7,6 +7,21 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [60.1.0] - UNRELEASED
+
+### Added
+
+- **#1117 — the accord threshold is a function** (CC 4.2.6 / CC 4.5.1.2,
+  rc10). `federation::accord_threshold(n)` is the strict majority
+  `⌊n/2⌋ + 1`, the one spelling every accord gate in the crate now counts
+  through (the co-scrub core, the destructive re-tally, the replicated-evidence
+  receive gate). `accord_threshold_over_roster` / `accord_threshold_now` and
+  `Engine::accord_threshold` report `AccordThreshold { m, n }` over this
+  node's standing roster (holders whose keys it holds). Python:
+  `Engine.accord_threshold() -> (m, n)` and `accord_threshold_for(n)`. CIRISEdge's
+  `verify_accord_carrier` calls it instead of a hard-coded `(2, 3)`.
+  Witness I1360 (sqlite, postgres): the reported `m` is the gate's.
+
 ## [60.0.0] - 2026-10-26
 
 An architecture cut (docs/V60_TASK_PLAN.md): signed attestations are the only

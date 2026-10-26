@@ -7093,6 +7093,36 @@ impl PyEngine {
         })
     }
 
+    /// v60.1.0 (CIRISPersist#1117; CC 4.2.6 / CC 4.5.1.2) — the accord
+    /// threshold over this node's standing accord-holder roster, as
+    /// `(m, n)`: `n` holders whose keys this node holds, `m = n // 2 + 1`
+    /// signatures required. The number every accord gate in the substrate
+    /// counts against; a consumer calls this instead of restating it.
+    fn accord_threshold(&self, py: Python<'_>) -> PyResult<(usize, usize)> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::accord_threshold_now(backend.as_ref()).await
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::accord_threshold_now(backend.as_ref()).await
+                    })
+                }
+            })
+            .map(|t| (t.m, t.n))
+            .map_err(federation_err_to_py)
+        })
+    }
+
     /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
     /// founding bootstrap servers** as a JSON array of `KeyRecord`s
     /// (`federation_keys` rows whose `identity_type` set contains `canonical`,
@@ -38270,6 +38300,15 @@ fn transform_algebra_hash() -> &'static str {
     crate::federation::transform::TRANSFORM_ALGEBRA_HASH
 }
 
+/// v60.1.0 (CIRISPersist#1117; CC 4.2.6) — the accord threshold over a
+/// standing roster of `roster_size` holders: the strict majority
+/// `roster_size // 2 + 1`. The one spelling of the rule, for a consumer that
+/// already holds its roster size.
+#[pyfunction]
+fn accord_threshold_for(roster_size: usize) -> usize {
+    crate::federation::accord_threshold(roster_size)
+}
+
 /// Mirrors `ciris-lens-core`'s `pub fn register`. The `#[pymodule]` entry
 /// point below (the standalone `ciris_persist` wheel) simply delegates
 /// here, so the two paths register an identical surface.
@@ -38333,6 +38372,8 @@ pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(persist_field_conformance, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(namespace_manifest_version, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(transform_algebra_hash, m)?)?;
+    // v60.1.0 (CIRISPersist#1117) — the accord strict-majority rule.
+    m.add_function(pyo3::wrap_pyfunction!(accord_threshold_for, m)?)?;
     // v0.5.4 (CIRISPersist#29) — feature-gated panic injector for the
     // Python regression suite. Off in release wheels.
     #[cfg(feature = "test-panic")]

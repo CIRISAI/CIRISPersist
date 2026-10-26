@@ -10221,6 +10221,20 @@ impl Engine {
         crate::federation::is_canonical_effective(directory.as_ref(), key_id).await
     }
 
+    /// v60.1.0 (CIRISPersist#1117; CC 4.2.6 / CC 4.5.1.2) — the accord
+    /// threshold over this node's standing accord-holder roster: `n` holders
+    /// whose keys this node holds, `m = ⌊n/2⌋ + 1` signatures required
+    /// ([`crate::federation::accord_threshold_now`]). The number every accord
+    /// gate in this crate counts against, for a consumer's wire gate to call
+    /// instead of restating it.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn accord_threshold(
+        &self,
+    ) -> Result<crate::federation::AccordThreshold, crate::federation::Error> {
+        let directory = self.federation_directory();
+        crate::federation::accord_threshold_now(directory.as_ref()).await
+    }
+
     /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
     /// founding bootstrap servers**: all `federation_keys` rows whose
     /// `identity_type` set contains `canonical`, stable-sorted by `key_id`.

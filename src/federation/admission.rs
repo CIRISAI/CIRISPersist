@@ -13414,7 +13414,7 @@ where
     // hardware-bound, touch-required, distinct-human scarcity mechanism).
     // `verify_quorum_policy` re-validates `2·M > N` and `N == founder_count`,
     // so this is NOT a frozen constant.
-    let m = std::cmp::max(n / 2 + 1, min_quorum);
+    let m = std::cmp::max(accord_threshold(n), min_quorum);
     if m > n {
         return Err(CoscrubFailure::Refused(format!(
             "accord quorum unreachable: floor {m} exceeds the {n} qualifying roster \
@@ -14386,6 +14386,73 @@ pub(crate) fn accord_holder_roster_key_ids() -> Vec<String> {
         .collect()
 }
 
+/// v60.1.0 (CIRISPersist#1117; CC 4.2.6 / CC 4.5.1.2, rc10) — **the accord
+/// threshold over a standing roster of `roster_size` holders**: the strict
+/// majority `M = ⌊N/2⌋ + 1`.
+///
+/// The ONE spelling of the rule. The co-scrub core
+/// ([`verify_accord_family_coscrub_typed`]), the destructive re-tally
+/// ([`verify_canonical_withdraw_authority`]) and the replicated-evidence
+/// receive gate (`accord_carriage`) all count through it, and a consumer's
+/// wire gate (CIRISEdge's `verify_accord_carrier`) calls it instead of
+/// restating the rule as a constant. An empty roster answers `1`, which no
+/// signature set over an empty roster can meet: fail-closed.
+#[must_use]
+pub const fn accord_threshold(roster_size: usize) -> usize {
+    roster_size / 2 + 1
+}
+
+/// v60.1.0 (CIRISPersist#1117) — the accord threshold over THIS node's
+/// standing roster: `n` is the holders of `roster_key_ids` whose keys resolve
+/// in this node's directory (the same resolution the co-scrub core and the
+/// destructive re-tally make, so an unregistered holder counts toward neither
+/// side), and `m` is [`accord_threshold`]`(n)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccordThreshold {
+    /// Signatures required: the strict majority of `n`.
+    pub m: usize,
+    /// Holders on the standing roster whose keys this node holds.
+    pub n: usize,
+}
+
+/// v60.1.0 (CIRISPersist#1117) — [`AccordThreshold`] over `roster_key_ids`.
+///
+/// # Errors
+///
+/// A directory read.
+pub async fn accord_threshold_over_roster<F>(
+    directory: &F,
+    roster_key_ids: &[String],
+) -> Result<AccordThreshold, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    let mut seen = std::collections::HashSet::new();
+    for kid in roster_key_ids {
+        if let Some(rec) = directory.lookup_public_key(kid).await? {
+            seen.insert(rec.key_id);
+        }
+    }
+    let n = seen.len();
+    Ok(AccordThreshold {
+        m: accord_threshold(n),
+        n,
+    })
+}
+
+/// v60.1.0 (CIRISPersist#1117) — [`AccordThreshold`] over the accord-holder
+/// roster this build is anchored to (the baked genesis holders).
+///
+/// # Errors
+///
+/// A directory read.
+pub async fn accord_threshold_now<F>(directory: &F) -> Result<AccordThreshold, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    accord_threshold_over_roster(directory, &accord_holder_roster_key_ids()).await
+}
+
 /// v13.1.0 (CIRISPersist#377) — verify a withdraw/supersede authority by
 /// **re-tallying persist's OWN cryptographically-verified state**, never a
 /// caller-supplied `AccordDecision` (whose `authorized` bool is an
@@ -14505,7 +14572,7 @@ async fn verify_canonical_authority_over_roster(
     // the family the same way canonical *add* does (2-of-3 today, 3-of-4 if the
     // family grows) — never a hardcoded constant.
     let n = roster.len();
-    let policy = ciris_verify_core::threshold::QuorumPolicy::new(n / 2 + 1, n);
+    let policy = ciris_verify_core::threshold::QuorumPolicy::new(accord_threshold(n), n);
     policy.validate().map_err(|e| {
         invalid(format!(
             "accord roster quorum policy invalid ({n} holders): {e:?}"
