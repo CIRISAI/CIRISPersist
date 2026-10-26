@@ -2809,6 +2809,38 @@ where
     })
 }
 
+/// v60.1.0 (CIRISPersist#1113, CC 4.5.3) — the notice that withholds the
+/// bytes `sha_hex` names directly: every notice tombstoning them is asked, in
+/// id order, and a takedown an admitted reconsideration reversed withholds
+/// nothing (re-derived here, at read, never stored). `None` when this backend
+/// has no purge plane (it withholds nothing and is not walked further);
+/// `Some(None)` when no standing notice tombstones the bytes themselves.
+async fn withholding_notice<F>(
+    directory: &F,
+    sha_hex: &str,
+) -> Result<Option<Option<String>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let notices = match directory
+        .purge_tombstone_notices(PurgePlane::Blob.as_str(), sha_hex)
+        .await
+    {
+        Ok(n) => n,
+        Err(Error::Unsupported { .. }) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    for notice_id in notices {
+        if super::takedown_tombstone::takedown_reversal(directory.as_dyn_directory(), &notice_id)
+            .await?
+            .is_none()
+        {
+            return Ok(Some(Some(notice_id)));
+        }
+    }
+    Ok(Some(None))
+}
+
 async fn purge_withheld_judge<F>(
     directory: &F,
     sha256: [u8; 32],
@@ -2819,28 +2851,11 @@ where
 {
     {
         // v60.1.0 (CIRISPersist#1113, CC 4.5.3) — withheld while a notice
-        // stands with no admitted reversal: every notice tombstoning the
-        // bytes is asked, in id order, and a takedown an admitted
-        // reconsideration reversed withholds nothing (re-derived here, at
-        // read, never stored).
-        let notices = match directory
-            .purge_tombstone_notices(PurgePlane::Blob.as_str(), &hex::encode(sha256))
-            .await
-        {
-            Ok(n) => n,
-            Err(Error::Unsupported { .. }) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        for notice_id in notices {
-            if super::takedown_tombstone::takedown_reversal(
-                directory.as_dyn_directory(),
-                &notice_id,
-            )
-            .await?
-            .is_none()
-            {
-                return Ok(Some(notice_id));
-            }
+        // stands with no admitted reversal.
+        match withholding_notice(directory, &hex::encode(sha256)).await? {
+            None => return Ok(None),
+            Some(Some(notice_id)) => return Ok(Some(notice_id)),
+            Some(None) => {}
         }
         let manifests = directory.dag_manifests_of_chunk(&sha256).await?;
         let mut first = None;
