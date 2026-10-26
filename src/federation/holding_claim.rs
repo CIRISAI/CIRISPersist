@@ -687,6 +687,11 @@ pub struct ReackReport {
     /// this pass's [`HOLDING_CLAIM_REACK_MAX_PER_PASS`]: the next pass takes
     /// them, oldest first.
     pub deferred: u64,
+    /// v60.1.0 (CIRISPersist#1113, CC 4.5.3) — blobs a takedown withheld,
+    /// whose claim this node retracted, and whose takedown an admitted
+    /// reconsideration has since reversed: still held, so claimed `here`
+    /// again (the holder's re-ack).
+    pub restored: u64,
 }
 
 /// **Re-acknowledge this node's own holdings** (CC 3.1.3.3 rule 5: "freshness
@@ -778,6 +783,76 @@ where
                     sha256_prefix = &hex::encode(sha)[..16],
                     "holding-claim re-ack failed; the next pass retries"
                 );
+            }
+        }
+    }
+    // v60.1.0 (CIRISPersist#1113, CC 4.5.3) — the reversal's re-ack: a blob
+    // this node still holds, whose every claim of its own is retired, that a
+    // takedown tombstoned and that no tombstone withholds any more (every
+    // takedown naming it is reversed) is claimed `here` again. Keyed on the
+    // tombstone, so a claim retracted for any other reason (an eviction that
+    // aborted after its retraction) is never re-advertised here.
+    let mut seen_restore: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut pages = AttestationQuery::by(&me, FOLD_PAGE)
+        .dimension_prefix(CUSTODY_ACK_DIMENSION)
+        .pages();
+    while let Some(page) = pages
+        .next(backend)
+        .await
+        .map_err(|e| BlobError::Backend(format!("reack: {e}")))?
+    {
+        for r in page {
+            let Some(hex_sha) = parse_custody_ack(&r)
+                .ok()
+                .flatten()
+                .map(|a| a.blob_sha256_hex)
+            else {
+                continue;
+            };
+            if !seen_restore.insert(hex_sha.clone()) {
+                continue;
+            }
+            let Ok(sha) = <[u8; 32]>::try_from(hex::decode(&hex_sha).unwrap_or_default()) else {
+                continue;
+            };
+            tokio::task::yield_now().await;
+            // Cheapest first: most blobs carry no tombstone at all (and a
+            // backend without the purge plane tombstones nothing).
+            let tombstoned = match backend
+                .purge_tombstone_notices(super::steward_purge::PurgePlane::Blob.as_str(), &hex_sha)
+                .await
+            {
+                Ok(n) => !n.is_empty(),
+                Err(Error::Unsupported { .. }) => false,
+                Err(e) => return Err(BlobError::Backend(format!("reack: {e}"))),
+            };
+            if !tombstoned
+                || backend.blob_head(&sha).await?.is_none()
+                || !super::custody_ack::custody_acks_of(backend, &me, &hex_sha)
+                    .await
+                    .map_err(|e| BlobError::Backend(format!("reack: {e}")))?
+                    .is_empty()
+                || withheld_by(backend, &sha).await?.is_some()
+            {
+                continue;
+            }
+            if budget == 0 {
+                report.deferred += 1;
+                continue;
+            }
+            budget -= 1;
+            match emit_holding_claim(backend, local, &sha, now).await {
+                Ok(HoldingClaimOutcome::Emitted { .. }) => report.restored += 1,
+                Ok(HoldingClaimOutcome::NotInCohort { .. }) => report.not_in_cohort += 1,
+                Err(BlobError::Purged { .. }) => report.withheld += 1,
+                Err(e) => {
+                    report.failed += 1;
+                    tracing::warn!(
+                        error = %e,
+                        sha256_prefix = &hex_sha[..16],
+                        "reversed-takedown re-ack failed; the next pass retries"
+                    );
+                }
             }
         }
     }

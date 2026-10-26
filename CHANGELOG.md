@@ -78,6 +78,30 @@ threat-model citations because this crate's audit story is the point.
   deferral family (`DEFERRAL_REQUEST_DIMENSION`, `…_APPROVED_…`,
   `…_REJECTED_…`). Before this a replicated amendment from any producer was
   admitted ungated. Witness I1365 (sqlite, postgres).
+- **#1113 — a reversed reconsideration reverses a takedown; withheld is
+  computed at read** (CC 4.5.3, rc10 `99bf187` / `62776bc`).
+  `takedown_tombstone::takedown_reversal(notice_id)` finds a live
+  `reconsideration:{grounds}` ruling with `outcome: reversed` naming the
+  notice row, placed at the content's community, and re-derives at every read
+  that its signer holds the `review` duty over the content as this node holds
+  it (never a stored verdict). `steward_purge::purge_withheld` asks it for
+  every takedown tombstoning the bytes: withheld while a notice stands with no
+  admitted reversal, so a reversed takedown's bytes serve again inside the
+  window and a remaining copy or a re-publication is admitted after it (an
+  immediate-removal basis gets standing back, never bytes). `purge_finalize`
+  skips a reversed takedown's bytes (`voided`). The holder's re-ack
+  (`reack_own_claims`) claims `here` again for held bytes whose takedown is
+  reversed (`ReackReport::restored`, a new member); it is keyed on the
+  tombstone, so a claim retracted for any other reason is never re-advertised.
+  `check_reconsideration_admission` now judges a filing or ruling against a
+  takedown notice by the CONTENT's communities from this node's binding rows
+  (CC 4.5.5); before, nobody could rule on a notice (it names no community).
+  The window is per holder (`settles_at` counts from this node's
+  `executed_at`). Witnesses I1366 (sqlite, postgres: the ruling, the fold,
+  withdrawal and expiry re-derived) and I1367 (two nodes, sqlite and
+  postgres: withheld on A and on B by bundle, the reversal delivered to each
+  serves and re-acks there, the post-window finalize skips the bytes, the
+  immediate-removal re-publication).
 
 ## [60.0.0] - 2026-10-26
 

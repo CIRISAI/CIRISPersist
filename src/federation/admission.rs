@@ -16971,6 +16971,25 @@ pub async fn check_reconsideration_admission(
         Some(id) => directory.get_attestation(id).await?,
         None => None,
     };
+    // v60.1.0 (CIRISPersist#1113, CC 4.5.3 / CC 4.5.5) — against a held
+    // `takedown_notice:{basis}:v1` row the action's communities are the
+    // CONTENT's, read from this node's binding rows (the notice names none it
+    // can be judged by): a ruling is the review-holders' of those communities,
+    // a filing also its signed subjects', and a row naming a community names
+    // one of them.
+    if let Some(t) = target
+        .as_ref()
+        .filter(|t| super::takedown_tombstone::is_notice_row(t))
+    {
+        return check_takedown_reconsideration_admission(
+            directory,
+            row,
+            t,
+            dimension,
+            declared_community_id,
+        )
+        .await;
+    }
     let community_id = match &target {
         Some(t) => {
             let held = t
@@ -17013,6 +17032,62 @@ pub async fn check_reconsideration_admission(
                 reconsideration_target_subjects(directory, &row.attesting_key_id, t).await?,
             );
         }
+    }
+    check_moderation_admission(
+        directory,
+        &row.attesting_key_id,
+        &holders,
+        DELEGATION_SCOPE_REVIEW,
+        dimension,
+    )
+    .await
+}
+
+/// v60.1.0 (CIRISPersist#1113; CC 4.5.3, CC 4.5.5) — who may file, and who
+/// may rule, a `reconsideration:{grounds}` against a held takedown notice
+/// row. The content's communities come from this node's binding rows
+/// ([`takedown_tombstone::content_binding`](super::takedown_tombstone::content_binding)):
+/// a ruling is admitted for a review-holder of one of them (as self or
+/// through a live `review`-scoped chain from a steward-bound root); a filing
+/// also for a signed subject of the content. A row naming a `community_id`
+/// must name one of the content's communities
+/// ([`RECONSIDERATION_COMMUNITY_MISMATCH`]). No binding row held: nobody
+/// here holds the duty, and the row is refused.
+///
+/// # Errors
+///
+/// [`Error::DelegatedScopeUnauthorized`];
+/// [`RECONSIDERATION_COMMUNITY_MISMATCH`]; directory reads.
+async fn check_takedown_reconsideration_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+    notice: &super::Attestation,
+    dimension: &str,
+    declared_community_id: &str,
+) -> Result<(), Error> {
+    let content = notice
+        .attestation_envelope
+        .get("content_sha256")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let (binding, mut holders) =
+        super::takedown_tombstone::review_holders_of_content(directory, content)
+            .await?
+            .unwrap_or_default();
+    if !declared_community_id.is_empty() && !binding.communities.contains(declared_community_id) {
+        return Err(Error::InvalidArgument(format!(
+            "{RECONSIDERATION_COMMUNITY_MISMATCH}: reconsideration {} names community \
+             {declared_community_id:?}; its takedown notice {} is over content bound into \
+             {:?} here — the action's community is the content's (CC 4.5.5)",
+            row.attestation_id, notice.attestation_id, binding.communities
+        )));
+    }
+    let is_ruling = row
+        .attestation_envelope
+        .get(RECONSIDERATION_OUTCOME_MEMBER)
+        .is_some();
+    if !is_ruling {
+        holders.extend(binding.subjects.iter().cloned());
     }
     check_moderation_admission(
         directory,

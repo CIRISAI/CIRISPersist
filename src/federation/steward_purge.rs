@@ -2391,6 +2391,14 @@ where
     }
     let records = complete_tombstone_records(directory, &e).await?;
     let total = records.len();
+    // v60.1.0 (CIRISPersist#1113, CC 4.5.3) — a takedown an admitted
+    // reconsideration reversed is void: the hard delete skips its bytes, which
+    // serve again (the tombstone stays, keyed by the notice, and withholds
+    // nothing while the reversal stands).
+    let reversed =
+        super::takedown_tombstone::takedown_reversal(directory.as_dyn_directory(), notice_id)
+            .await?
+            .is_some();
     for plane in PurgePlane::ALL {
         for (index, r) in records.iter().enumerate().filter(|(_, r)| r.plane == plane) {
             match plane {
@@ -2419,6 +2427,10 @@ where
                     }
                 }
                 PurgePlane::Blob => {
+                    if reversed {
+                        report.voided.push(r.record_id());
+                        continue;
+                    }
                     let mut sha = [0u8; 32];
                     let decoded = hex::decode_to_slice(&r.id, &mut sha).is_ok();
                     let outcome = match (bytes, decoded) {
@@ -2806,14 +2818,29 @@ where
     F: FederationDirectory + ?Sized,
 {
     {
-        match directory
-            .purge_tombstoned(PurgePlane::Blob.as_str(), &hex::encode(sha256))
+        // v60.1.0 (CIRISPersist#1113, CC 4.5.3) — withheld while a notice
+        // stands with no admitted reversal: every notice tombstoning the
+        // bytes is asked, in id order, and a takedown an admitted
+        // reconsideration reversed withholds nothing (re-derived here, at
+        // read, never stored).
+        let notices = match directory
+            .purge_tombstone_notices(PurgePlane::Blob.as_str(), &hex::encode(sha256))
             .await
         {
-            Ok(Some(notice_id)) => return Ok(Some(notice_id)),
-            Ok(None) => {}
+            Ok(n) => n,
             Err(Error::Unsupported { .. }) => return Ok(None),
             Err(e) => return Err(e),
+        };
+        for notice_id in notices {
+            if super::takedown_tombstone::takedown_reversal(
+                directory.as_dyn_directory(),
+                &notice_id,
+            )
+            .await?
+            .is_none()
+            {
+                return Ok(Some(notice_id));
+            }
         }
         let manifests = directory.dag_manifests_of_chunk(&sha256).await?;
         let mut first = None;

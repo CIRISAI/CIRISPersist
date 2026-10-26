@@ -692,6 +692,10 @@ mod malformed_reasons_1114_invariants;
 // v60.1.0 (docs/V61_TASK_PLAN.md §2 slice B) — the consumer asks, I1360+.
 #[cfg(test)]
 mod v601_asks_invariants;
+// v60.1.0 (CIRISPersist#1113, CC 4.5.3) — I1366/I1367: a reversed
+// reconsideration reverses a takedown; withheld is computed at read.
+#[cfg(test)]
+mod takedown_reversal_invariants;
 // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the key roster of a self: the
 // two-path door its additions and evictions go through, and the steward
 // predicate (a live roster key signs as the fedID).
