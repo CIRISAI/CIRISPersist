@@ -4,7 +4,10 @@
 # the backend byte meters and the fold entries. They sit in files of 3k-28k
 # lines, so each is named by function, not by file. Grammar: scope-consent.txt.
 
-tests: test(/i548|i549|i550|i551/)
+# v60.0.0 — I1340/I1341 (src/federation/attestation_apply_invariants.rs):
+# apply_planned's read-back predicate and its store-error guard: the v60.0.0
+# CI matrix (run 40305453908) left five of their mutants unkilled by I548-I551.
+tests: test(/i548|i549|i550|i551|i1340|i1341/)
 witnesses: src/observe/tests.rs
 
 src/store/sqlite.rs sqlite_row_to_attestation

@@ -53,6 +53,8 @@ pub(crate) mod attestation_admit;
 /// ATTESTATION-plane apply (`AttestationRefusalReason` /
 /// `ReplicatedAttestationOutcome`): the Key plane's #565 twin.
 pub mod attestation_apply;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod attestation_apply_invariants;
 /// v25.1.0 (CIRISPersist#582) — the backend-generic signed-ATTESTATION emit
 /// recipe (distinct from [`emit`], the trust-grant/audit-entry API).
 pub mod attestation_emit;
