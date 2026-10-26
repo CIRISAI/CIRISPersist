@@ -9,7 +9,18 @@ threat-model citations because this crate's audit story is the point.
 
 ## [60.0.0] - UNRELEASED
 
-### Changed — the cirisnode classes are `scores` rows (CIRISPersist#988 item 1, #803, #854)
+An architecture cut (docs/V60_TASK_PLAN.md): signed attestations are the only
+state (CEWPOS). The cirisnode classes and Goals become `scores` rows, the
+organisation planes become affiliation rows, the key-record, consent and
+sweep doors decide in one shared plan each, and the in-process memory backend
+is gone. No feature outside the issues named here. Sections 1–14 are in slice
+order (S1–S6, then S0's fixes and tooling); **§15 is the whole adoption list
+for CIRISEdge, CIRISServer and CIRISAgent**, derived from `git diff
+v59.1.0..` over the `.pyi`, `src/ffi`, the error enums and the migrations.
+Migrations V202–V205; witnesses from I1161; `supersets.rs` `EXPECTED` 313 →
+342.
+
+### Changed — 1. the cirisnode classes are `scores` rows (S1; CIRISPersist#988 item 1, #803, #854)
 
 Signed attestations are the only state (CEWPOS). Every cirisnode class is a
 dimension CC 3.1.9 registers, so each is now a hybrid-signed `scores` row on
@@ -32,7 +43,7 @@ tables that held self-signed, Ed25519-only, never-replicated copies are gone.
   the fold of THIS node's balance rows (a peer's balance about the same
   contributor is held, never projected), the latest `(asserted_at,
   attestation_id)` per key, written by the put door's executor in the row's
-  transaction on memory, sqlite and postgres. Each ledger row is a pure
+  transaction on sqlite and postgres. Each ledger row is a pure
   function of one row: `last_updated_at` and `created_at` are both its signed
   instant, and it carries the row's `attestation_id` (new column). New
   `SiloProjection::CreditsLedger` / `ExpertiseLedger`; a pre-V203 balance
@@ -136,22 +147,19 @@ backend's `set_admission_gate` (the plane's gate is the gate). New:
 `Engine::cirisnode_*` doors. `TakedownNoticePayload` drops `claimant_key_id`
 and `asserted_at` (the row's) and refuses unknown fields;
 `takedown_tombstone::takedown_terms` is `async (directory, notice, origin)`.
-**Edge adapts** (S7): `tests/federation_announcement.rs` writes the
-announcement through the removed `put_contribution`, and the durability
-test's local takedown builds a Contribution notice; the replicated purge
-bundle path needs no change this release.
+What Edge, Server and Agent adapt: §15.
 
-- Witnesses: **I1166** (memory, sqlite, postgres) the ledgers are this node's
+- Witnesses: **I1166** (sqlite, postgres) the ledgers are this node's
   rows, arrival-independent, a peer's balance never projected, byte-equal
-  rebuilds; **I1167** (memory, sqlite, postgres) each class admits as a row
+  rebuilds; **I1167** (sqlite, postgres) each class admits as a row
   and the moderation / reconsideration gates refuse the stranger;
   **I1168** the retired objects refused by name; **I1169** (sqlite, postgres)
   a legacy balance is red until superseded; **I1170** (sqlite and postgres
-  engines; and memory, sqlite, postgres for the binding) the notice row:
+  engines; and sqlite, postgres for the binding) the notice row:
   admitted for the subject, refused for a stranger, `steward_purge` held
   shut, drives the tombstone door, never binds its content; the balance
   doors, the rehome and the delivery attestation's row rule; **I1171**
-  (memory, sqlite, postgres) the one-release compat read; **I1172** one
+  (sqlite, postgres) the one-release compat read; **I1172** one
   subject gate at ingest; **I1173** (sqlite, postgres) V203 over an
   upgrading node's populated store. The takedown witnesses (I786–I799, I772,
   I778, I801) now build notice rows. Python:
@@ -165,9 +173,9 @@ bundle path needs no change this release.
   (their sites, the held-shut table and V203's SQL, are not mutation sites).
 - Evidence: CLM-takedown-notice-row (3.1.1) at the notice row's admission,
   the door's row reader and the planner; CLM-silo-projection-rebuildable
-  (2.4.2) at the ledger projection; `EXPECTED` 318.
+  (2.4.2) at the ledger projection.
 
-### Changed — a Goal is a signed `goal:{scale}:v1` row (CIRISPersist#988 item 4, CC 3.1.9.7)
+### Changed — 2. a Goal is a signed `goal:{scale}:v1` row (S2; CIRISPersist#988 item 4, CC 3.1.9.7)
 
 Signed attestations are the only state. A Goal was a typed value written by
 `put_goal` into `goals`, never signed by its declarer and never replicated by
@@ -219,8 +227,8 @@ lifecycle is the structural verbs:
   signature); one the gate would refuse is removed.
 - **No replication compat read.** Persist never replicated a Goal (no
   replication kind carried one); CIRISEdge carried its own `GoalDeclaration` /
-  `GoalRetirement` messages wrapping persist's `Goal`, which Edge retires at
-  S7. A goal now crosses as the row.
+  `GoalRetirement` messages wrapping persist's `Goal`, which Edge retires
+  with this release. A goal now crosses as the row.
 
 **Python surface:**
 
@@ -244,17 +252,15 @@ projection's read type (`goal_id: String`, `scope`, `score`,
 `LegacyGoal`, `GoalRehome`, `goal::{parse_goal_body, check_goal_row_admission,
 plan_goal_row, plan_goal_amendment_row, plan_goal_retraction_row,
 decode_goal_input}`, `goal_projection`, and `Engine::{put_goal, amend_goal,
-retire_goal, recant_goal, rehome_legacy_goals}`. **Edge adapts** (S7): its
-`GoalDeclaration` wraps `ciris_persist::federation::goal::Goal` and its test
-builds one with `Goal::new`; both retire with the two message types.
+retire_goal, recant_goal, rehome_legacy_goals}`. What Edge adapts: §15.
 
 - Witnesses: **I1174–I1176** (unit) the scales, the M-1 rule, the four
   planners and the retired typed body refused by name; **I1177** (unit) the
-  fold; **I1178** (memory, sqlite, postgres) the projection through the put
-  door, out of order included; **I1179** (memory, sqlite, postgres) the M-1
+  fold; **I1178** (sqlite, postgres) the projection through the put
+  door, out of order included; **I1179** (sqlite, postgres) the M-1
   gate at the door; **I1180** (sqlite and postgres engines) the four Engine
   doors, the declarer rule and the rehome; **I1181** (sqlite, postgres) V204
-  over an upgrading store; **I1182** (memory, sqlite, postgres)
+  over an upgrading store; **I1182** (sqlite, postgres)
   `approach:{goal_id}` binds the goal's row id. Python:
   `tests/python/test_goal_rows_surface.py`.
 - Mutation scope `scripts/mutants/scope-s2-goals.txt`: 155 mutants in three
@@ -264,10 +270,9 @@ builds one with `Goal::new`; both retire with the two message types.
   shards, in `mutants.yml`.
 - Evidence: CLM-nsproc-meta-goal-alignment-goal-scale (3.1.9.7) moves from
   the retired `Goal::new` to `check_goal_row_admission`;
-  CLM-silo-projection-rebuildable (2.4.2) at `goal_projection::fold_goal`;
-  `EXPECTED` 319.
+  CLM-silo-projection-rebuildable (2.4.2) at `goal_projection::fold_goal`.
 
-### Changed — the key-record write doors decide in one plan (CIRISPersist#934 step 3)
+### Changed — 3. the key-record write doors decide in one plan (S3; CIRISPersist#934 step 3)
 
 Every door that writes `federation_keys` (and with it the key's
 `key:record:v1` row) used to run its own copy of its decision on each of the
@@ -295,24 +300,16 @@ invisible to it), and `SHARED_DOORS` holds them there.
 
 **Behaviour that changed (each was a backend divergence):**
 
-- The memory backend gains the scrub upgrade and the canonical supersede:
-  `adopt_scrub_upgrade` no longer answers "not supported", and the
-  replicated apply's `Upgrade` / `Supersede` arms run instead of reporting
-  `StoreConflict`.
 - The genesis seed stores the whole scrub set: both SQL backends' seed
   INSERT left `additional_scrubs` out (the drop `RehydrateScrubs` repairs,
-  #995 row 2). The seeded row is also indexed, and on memory it gets its
-  `key:record:v1` row and admission position like the SQL backends'.
+  #995 row 2).
 - `consent_role` is normalized to its wire form before the hash on every
-  backend (memory already did): a record offered with the stored token
+  backend: a record offered with the stored token
   `'unregistered'` now hashes as the `None` it reads back as.
-- The memory insert door refuses a non-hybrid algorithm and a non-hex
-  content hash, as the SQL doors did.
 - A sqlite insert that loses a race to an identical row is settled, and to a
   differing row is `Conflict` (it was a primary-key `Backend` error); a
   rewrite whose guard matched nothing now rolls back on every backend (the
   re-anchor committed its row step before refusing).
-- A memory rewrite keeps the held `consent_role`, as the SQL `SET` lists do.
 - **The genesis re-anchor's anti-rollback compares at the substrate's
   resolution.** Postgres holds the anchored `valid_from` in microseconds, so
   a bundle record with a nanosecond instant (the v2 ceremony's canonical is
@@ -331,16 +328,15 @@ invisible to it), and `SHARED_DOORS` holds them there.
 
 **Rust surface (clean break):** the inherent `SqliteBackend` /
 `PostgresBackend::{adopt_scrub_upgrade, supersede_canonical_record,
-apply_replicated_key_record}` and `MemoryBackend::apply_replicated_key_record`
-are gone; the `FederationDirectory` methods of the same names are the doors
+apply_replicated_key_record}` are gone; the `FederationDirectory` methods of the same names are the doors
 (bring the trait into scope). No `FederationDirectory` method changed, no
 Python signature changed, no migration.
 
 - Witnesses: **I1183** (the insert door), **I1184** (the genesis seed),
   **I1185** (the scrub upgrade), **I1186** (the replicated apply), **I1187**
-  (each executor's atomic re-assertion, every write shape), all on memory,
-  sqlite and postgres; **I1189** (memory, sqlite, postgres) the re-anchor's
-  own refusals over the real v2 ceremony; **I1190** (memory, sqlite,
+  (each executor's atomic re-assertion, every write shape), all on sqlite
+  and postgres; **I1189** (sqlite, postgres) the re-anchor's
+  own refusals over the real v2 ceremony; **I1190** (sqlite,
   postgres) the supersede's settle, pubkey-change and policy refusals;
   **I1191** (sqlite, postgres) the bake door's anti-rollback at resolution;
   **I1188** (unit) the row step and the lost-race wording.
@@ -352,10 +348,179 @@ Python signature changed, no migration.
   and the role-bearing leg of I1183; two were the row step's self-scrub guard on
   sqlite and postgres, an equivalent branch, now removed on all three
   backends). Weekly, three shards, in `mutants.yml`.
-- Evidence: CLM-planes-as-rows (3.1.3) at `key_plane::plan_key_record_write`;
-  `EXPECTED` 320.
+- Evidence: CLM-planes-as-rows (3.1.3) at `key_plane::plan_key_record_write`.
 
-### Changed — CC v1.0-rc9 vendored at the tag; the policy table is runtime data; the corridor runs at admission (S6v)
+### Changed — 4. the consent and sweep planes decide in one function each (S4; CIRISPersist#934 step 4, #1105)
+
+Fourteen doors were written once per backend: the two consent writes
+(`set_consent_role`, `grant_trust`), the five consent reads
+(`list_consent_peers`, `list_consent_peers_for`,
+`list_live_consent_grants_by` / `_for`, `list_consent_revocations`) and the
+sweeps' selections (the PQC sweep's `list_hybrid_pending_keys` /
+`_attestations`, the reaper's `list_expired_attestation_ids`,
+`evict_known_wire_hashes`, the room retention leg
+`stream_dek_evict_room_chunks`, and the two observation prunes). Each now
+decides in one place:
+
+- **Writes** — `consent_admit::plan_set_consent_role` (the CC 3.4.7.2 token
+  gate, the wire normal form) and `consent_admit::plan_grant_trust` (the #721
+  authority gate first, then the shape, then the row), run by
+  `set_consent_role_planned` / `grant_trust_planned`, which also word the
+  no-row refusal. `validate_trust_grant` moved from `store::memory` to
+  `consent_admit`.
+- **Reads** — one fold each over a typed read (`ConsentRead::{Node, For}`):
+  the fold sorts and deduplicates the peers, filters the live grants to
+  `consent:replication:v1` and orders them, applies the subject-side
+  revocation rule (`is_subject_side_revocation`); the executor returns the
+  projection rows or a candidate superset and decides nothing.
+- **Sweeps** — one selection each in `sweep_plan`
+  (`HybridPendingSelection`, `ExpiredSelection`, `known_hash_eviction`,
+  `RoomChunkEviction::selects`) and `retention::plan_observation_prune`;
+  each backend keeps the delete (or the read) as its executor. The room leg's
+  executor runs the shared predicate inside its delete transaction, so the
+  selection and the delete stay one atomic step.
+- The executors are three new crate traits, compared by the parity scan like
+  any door: `ConsentStore`, `SweepStore`, `RoomEvictionStore`. The key-grant
+  doors (`key_grant_held_owner`, `project_key_grant_row`) already ran one
+  shared body; they now read as `shared` too.
+- The parity scan reports all of them `shared` (they were `identical x3` or
+  `gateless`) and `SHARED_DOORS` holds them; a new `SHARED_SELECTIONS` list
+  holds the read folds and sweep selections to the opposite rule from a plan:
+  a selection runs NO gate, and some door runs it.
+
+**#1105 — the family-scoped key-plane holdings read (Edge ask).**
+`FederationDirectory::list_key_plane_wire_hashes_since(family, after, limit)`:
+the `Attestation` wire hashes of the `scores` rows whose dimension is one of
+`key_plane::HOLDINGS_FAMILIES` (`key:record:v1`, `key:revocation:v1`,
+`identity:occurrence:v1`, `identity:occurrence_revocation:v1`), paged and
+cursored on the hash exactly like `list_wire_hashes_since`. One shared read
+plan (`key_plane::plan_key_plane_holdings`, the family gate refusing any
+other dimension as `InvalidArgument`, never an empty set) and one thin
+executor per backend (`KeyPlaneStore::read_key_plane_wire_hashes`). Routed
+through the directory capsule as `DirectoryOp::ListKeyPlaneWireHashesSince`
+(appended; `DIRECTORY_ABI_VERSION` unchanged; a refusal crosses the capsule
+as `Backend` text, like every op). Not on the Python surface.
+
+**Behaviour that changed (each was a backend divergence or an unordered
+tie):**
+
+- `list_hybrid_pending_keys` / `_attestations` with a zero or negative
+  `limit` return nothing on every backend; sqlite returned EVERY pending
+  row for `-1` (`LIMIT -1` is no limit) and postgres refused it. Ties on the
+  order instant come by id.
+- `list_expired_attestation_ids` orders ties on `expires_at` by id, so the
+  reaper's OFFSET paging is a total order (it could skip or repeat rows that
+  expired together); an offset past `i64::MAX` reads nothing (sqlite and
+  postgres paged from the start).
+- `list_live_consent_grants_by` / `_for` and `list_consent_revocations` order
+  ties on `asserted_at` by id, descending.
+- `grant_trust` stamps `trusted_at` with the door's one clock read on every
+  backend (postgres used the database's `NOW()`).
+- Postgres's room leg takes the minter's epoch rows `FOR UPDATE` in its
+  transaction, so two concurrent sweeps of one minter do not both read an
+  epoch as not yet evicted.
+- A postgres `grant_trust` whose row trips a V020 CHECK now reads as
+  `Backend` (it was re-worded `InvalidArgument`); the plan refuses both
+  shapes the CHECKs guard before the write, so no admitted grant reaches it.
+- The live-grant read counters are recorded by the shared fold, once per
+  read, under the executing backend's label (I551 learns the shape).
+
+**Rust surface:** `FederationDirectory::list_key_plane_wire_hashes_since`
+(new, default `Unsupported`); the directory capsule op above. No other
+`FederationDirectory` method changed, no Python signature changed, no
+migration.
+
+- Witnesses: **I1192** (the consent-role door), **I1193** (the trust-grant
+  door), **I1194** (the consent-peer and live-grant folds), **I1195** (the
+  consent-revocation fold), **I1196** (the PQC sweep's selection), **I1197**
+  (the reaper's selection), **I1198** (the known-hash eviction), **I1201**
+  (the #1105 holdings read), all on sqlite and postgres; **I1199**
+  (unit) the room leg's predicate; **I1200** (unit, and postgres) the
+  observation prune plan and its executor; I1196 / I1197 also unit.
+- Mutation scope `scripts/mutants/scope-s4-consent-sweep.txt`: 302 mutants in
+  six shards, 256 caught, 46 unviable, 0 missed, nothing allow-listed. Three
+  rounds: the first (304 mutants) left nineteen survivors. Fifteen were
+  witness gaps: a subject's rule-2 `withdraws` (I1195), the strict expiry
+  boundary (I1197), the attestation plane of the PQC sweep (I1196), and the
+  key-grant doors, whose witnesses the filter did not name (now I591 / I596,
+  I61, I800, I743). Two were the postgres trust executor's CHECK-name
+  mapping, unreachable behind the plan's shape validation, now removed. The
+  second round left the projection door (I743 added); the third, shard 1
+  again, was clean. Weekly, six shards, in `mutants.yml`.
+- Evidence: CLM-planes-as-rows (3.1.3) at
+  `key_plane::list_key_plane_wire_hashes_planned`; CLM-nsproc-tier-consent
+  (3.3.1) at `consent_admit::consent_revocations_planned`.
+- Size: the backend files did not shrink at S4 (sqlite +31, postgres +34
+  lines): what each backend kept is the SQL and row mapping, which is
+  the executor's, and what left (the decisions) was small. The decisions
+  are now written once.
+
+### Removed — 5. the in-process memory backend; every genesis door runs on each backend alone (S5; CIRISPersist#1002)
+
+Every test, bench and witness that ran on `MemoryBackend` runs on SQLite. The
+memory backend answered with its own in-process re-implementation of every
+door: real SQL, a real schema and real transactions are where the reds it
+could not produce come from, and each door it carried was a third copy to keep
+in parity.
+
+- **Removed (Rust, clean break):** `store::MemoryBackend` and `src/store/memory.rs`
+  (25,604 lines at v59.1.0; 11,949 when deleted, its tests moved first). No alias.
+- **Added (Rust):** `store::test_backend::test_backend()` (feature `sqlite`) —
+  a fresh, fully migrated in-memory `SqliteBackend`, cloned from one migrated
+  template per process with the SQLite backup API (7.1 ms a clone against
+  248 ms for `open_in_memory()` + every migration; `MemoryBackend::new` was
+  81 µs). Three doc-hidden fixtures stay public for the integration tests and
+  benches (`add_public_key`, `add_pqc_public_key`, `snapshot_events`); every
+  other below-the-door seam is `cfg(test)`, so no consumer build links a
+  writer that skips the doors.
+- **The genesis scratch is per backend** (steward ruling 2026-10-25: parity
+  even for genesis). The doors that replayed a bundle on a memory node
+  (`verify_ceremony_outputs`, the import door, `CeremonyState::finish`,
+  `AmendState::{plan, finish}`) take a `&dyn genesis::scratch::GenesisScratch`
+  and run on what the backend provisions: SQLite a migrated in-memory clone,
+  PostgreSQL a throwaway database in the live cluster created from the
+  configured DSN (`ciris_genesis_scratch_{unix_secs}_{pid}_{hex}`), migrated, and dropped
+  `WITH (FORCE)` when the replay ends — on success, on a refusal, and on drop
+  (a panic). The configured role needs `CREATEDB` for these doors. A rolled-back
+  transaction was not used: the replay runs a dozen doors, each on its own
+  connection. A scratch a killed process left behind (its name carries its creation
+  instant, `ciris_genesis_scratch_{unix_secs}_{pid}_{hex}`) is dropped by the
+  next provisioning once older than an hour
+  (`GENESIS_SCRATCH_REAP_AFTER_SECS`); a name the reaper cannot read is never
+  dropped. Every door compiles and runs with `postgres` alone and with
+  `sqlite` alone. Signature changes (clean break):
+  `verify_ceremony_outputs(bundle_json, scratch)`,
+  `install_genesis_bundle_roster(dir, scratch, bundle)`,
+  `CeremonyState::finish(scratch)`, `AmendState::plan(pinned, rows, scratch)`,
+  `AmendState::finish(scratch)`; `Engine::install_genesis_bundle_roster` and
+  `PyEngine.install_genesis_bundle_roster_json` pass their own backend. New
+  refusal `CeremonyOutputsRefusal::ScratchDirectory`
+  (`ceremony_scratch_directory`): the scratch could not be provisioned or
+  released. New `store::postgres::GENESIS_SCRATCH_DB_PREFIX`. Witnesses
+  I1324–I1331.
+- **Python:** no Python surface named or constructed the memory backend, so
+  nothing is renamed. `PyEngine.install_genesis_bundle_roster_json` keeps its
+  signature and runs on every backend the build carries. No `.pyi` change.
+- **Telemetry:** the `backend` label set is `{sqlite, postgres}`
+  (`observe::StoreBackend::Memory` and the registry member are gone;
+  `telemetry/catalog.json` re-rendered). A dashboard keyed on
+  `backend="memory"` sees no series.
+- **Benches:** `ingest_pipeline` and `queue` run on the test backend and need
+  `sqlite` (they declared `postgres` and never used it). Their numbers now
+  include SQL writes; the baselines move.
+- **Tests:** the memory arm of every witness is gone (its duplicates of a
+  sqlite leg dropped; the tests only memory carried moved to
+  `src/store/backend_suite.rs`); `store::parity` compares two backends; the
+  from-disk gates and `rules/` read two backend files. A build with no backend
+  feature allows dead code crate-wide (every caller of the shared plans is a
+  backend). The server and server-pipeline unit tests need `sqlite`.
+- **Folded:** #720 — the lifecycle filter is one plan-emitted predicate
+  (`attestation_query::lifecycle_predicate`, I1320) instead of four SQL
+  copies and a memory fold; #691 — `store::tree_read` binds the parity and
+  schema-parity verdicts to the tree they read (I1321); #787 — every
+  `DirectoryOp` has an `OpsDirectory` proxy or a stated reason (I1322).
+
+### Changed — 6. CC v1.0-rc9 vendored at the tag; the policy table is runtime data; the corridor runs at admission (S6v)
 
 CIRISConstitution tagged `v1.0-rc9` on 2026-10-21 (tag object `a1c2bea5`,
 commit `5d50c6bb160ecbee99a66e1700597c029846e6b6`, CIRISConstitution#182).
@@ -454,7 +619,7 @@ commit.
   directory; it skips, saying so, without one), I1303–I1306 (the table: every
   two-path row in its corridor, the self-roster policy is the table's at every
   roster size 1..=12, each corridor clause refused by its token, an unreadable
-  row refused not guessed), I1307 (memory, sqlite, postgres: under a table
+  row refused not guessed), I1307 (sqlite, postgres: under a table
   whose self row is outside its corridor every roster change is refused and
   nothing is held; under the vendored table the same changes land or are
   held), I1308. `scripts/check_vendored_cc.sh` compares all twelve files.
@@ -464,13 +629,12 @@ commit.
 - Evidence: `CLM-governance-policy-table` (4.5.13) at
   `governance_policy.rs#PolicyTable::admit`; `CLM-policy-corridor` (4.2.1.1)
   at `governance_policy.rs#PolicyTable::check_corridor` and
-  `two_path.rs#TwoPathPolicy::check_corridor` (`EXPECTED` 323 at this
-  commit; 326 with #1114 below).
+  `two_path.rs#TwoPathPolicy::check_corridor`.
 - Mutation: `scripts/mutants/scope-s6v-vendor.txt` (with #1114's three
   functions), 108 mutants, three weekly shards in `mutants.yml`.
 - No migration. No store-trait method added or removed.
 
-### Changed — three signed-object refusals carry their own `malformed_row` reasons (CIRISPersist#1114, CC 2.6.1.7 rc10)
+### Changed — 7. three signed-object refusals carry their own `malformed_row` reasons (S6v; CIRISPersist#1114, CC 2.6.1.7 rc10)
 
 The steward's ruling on CC rc10 `99bf187` (2026-10-21) appends three reasons
 to the closed `federation_malformed_row` set (appended, never reordered: the
@@ -490,117 +654,11 @@ replaces (`ValueError` throughout); only the `kind()` token and the reason move.
   `registration original_content_hash mismatch` is unchanged (not in #1114).
 - The three are rc10 tokens, after the `v1.0-rc9` tag persist vendors: I1308
   latches them as "named by no CC text at the pin" until the next re-pin.
-- Witnesses I1309–I1311 (memory, sqlite, postgres) through `put_attestation`.
-- Evidence: `CLM-signed-object` (2.6.1.7) at the three symbols; `EXPECTED` 326.
+- Witnesses I1309–I1311 (sqlite, postgres) through `put_attestation`.
+- Evidence: `CLM-signed-object` (2.6.1.7) at the three symbols.
 - Mutation: the three functions join `scope-s6v-vendor.txt`.
-### Changed — the consent and sweep planes decide in one function each (CIRISPersist#934 step 4, #1105)
 
-Fourteen doors were written once per backend: the two consent writes
-(`set_consent_role`, `grant_trust`), the five consent reads
-(`list_consent_peers`, `list_consent_peers_for`,
-`list_live_consent_grants_by` / `_for`, `list_consent_revocations`) and the
-sweeps' selections (the PQC sweep's `list_hybrid_pending_keys` /
-`_attestations`, the reaper's `list_expired_attestation_ids`,
-`evict_known_wire_hashes`, the room retention leg
-`stream_dek_evict_room_chunks`, and the two observation prunes). Each now
-decides in one place:
-
-- **Writes** — `consent_admit::plan_set_consent_role` (the CC 3.4.7.2 token
-  gate, the wire normal form) and `consent_admit::plan_grant_trust` (the #721
-  authority gate first, then the shape, then the row), run by
-  `set_consent_role_planned` / `grant_trust_planned`, which also word the
-  no-row refusal. `validate_trust_grant` moved from `store::memory` to
-  `consent_admit`.
-- **Reads** — one fold each over a typed read (`ConsentRead::{Node, For}`):
-  the fold sorts and deduplicates the peers, filters the live grants to
-  `consent:replication:v1` and orders them, applies the subject-side
-  revocation rule (`is_subject_side_revocation`); the executor returns the
-  projection rows or a candidate superset and decides nothing.
-- **Sweeps** — one selection each in `sweep_plan`
-  (`HybridPendingSelection`, `ExpiredSelection`, `known_hash_eviction`,
-  `RoomChunkEviction::selects`) and `retention::plan_observation_prune`;
-  each backend keeps the delete (or the read) as its executor. The room leg's
-  executor runs the shared predicate inside its delete transaction, so the
-  selection and the delete stay one atomic step.
-- The executors are three new crate traits, compared by the parity scan like
-  any door: `ConsentStore`, `SweepStore`, `RoomEvictionStore` (sqlite and
-  postgres only; memory has no blob plane). The key-grant doors
-  (`key_grant_held_owner`, `project_key_grant_row`) already ran one shared
-  body; they now read as `shared` too (memory runs the trait default, a
-  declared divergence).
-- The parity scan reports all of them `shared` (they were `identical x3` or
-  `gateless`) and `SHARED_DOORS` holds them; a new `SHARED_SELECTIONS` list
-  holds the read folds and sweep selections to the opposite rule from a plan:
-  a selection runs NO gate, and some door runs it.
-
-**#1105 — the family-scoped key-plane holdings read (Edge ask).**
-`FederationDirectory::list_key_plane_wire_hashes_since(family, after, limit)`:
-the `Attestation` wire hashes of the `scores` rows whose dimension is one of
-`key_plane::HOLDINGS_FAMILIES` (`key:record:v1`, `key:revocation:v1`,
-`identity:occurrence:v1`, `identity:occurrence_revocation:v1`), paged and
-cursored on the hash exactly like `list_wire_hashes_since`. One shared read
-plan (`key_plane::plan_key_plane_holdings`, the family gate refusing any
-other dimension as `InvalidArgument`, never an empty set) and one thin
-executor per backend (`KeyPlaneStore::read_key_plane_wire_hashes`). Routed
-through the directory capsule as `DirectoryOp::ListKeyPlaneWireHashesSince`
-(appended; `DIRECTORY_ABI_VERSION` unchanged; a refusal crosses the capsule
-as `Backend` text, like every op). Not on the Python surface.
-
-**Behaviour that changed (each was a backend divergence or an unordered
-tie):**
-
-- `list_hybrid_pending_keys` / `_attestations` with a zero or negative
-  `limit` return nothing on every backend; sqlite returned EVERY pending
-  row for `-1` (`LIMIT -1` is no limit) and postgres refused it. Ties on the
-  order instant come by id.
-- `list_expired_attestation_ids` orders ties on `expires_at` by id, so the
-  reaper's OFFSET paging is a total order (it could skip or repeat rows that
-  expired together); an offset past `i64::MAX` reads nothing (sqlite and
-  postgres paged from the start).
-- `list_live_consent_grants_by` / `_for` and `list_consent_revocations` order
-  ties on `asserted_at` by id, descending.
-- `grant_trust` stamps `trusted_at` with the door's one clock read on every
-  backend (postgres used the database's `NOW()`).
-- Postgres's room leg takes the minter's epoch rows `FOR UPDATE` in its
-  transaction, so two concurrent sweeps of one minter do not both read an
-  epoch as not yet evicted.
-- A postgres `grant_trust` whose row trips a V020 CHECK now reads as
-  `Backend` (it was re-worded `InvalidArgument`); the plan refuses both
-  shapes the CHECKs guard before the write, so no admitted grant reaches it.
-- The live-grant read counters are recorded by the shared fold, once per
-  read, under the executing backend's label (I551 learns the shape).
-
-**Rust surface:** `FederationDirectory::list_key_plane_wire_hashes_since`
-(new, default `Unsupported`); the directory capsule op above. No other
-`FederationDirectory` method changed, no Python signature changed, no
-migration.
-
-- Witnesses: **I1192** (the consent-role door), **I1193** (the trust-grant
-  door), **I1194** (the consent-peer and live-grant folds), **I1195** (the
-  consent-revocation fold), **I1196** (the PQC sweep's selection), **I1197**
-  (the reaper's selection), **I1198** (the known-hash eviction), **I1201**
-  (the #1105 holdings read), all on memory, sqlite and postgres; **I1199**
-  (unit) the room leg's predicate; **I1200** (unit, and postgres) the
-  observation prune plan and its executor; I1196 / I1197 also unit.
-- Mutation scope `scripts/mutants/scope-s4-consent-sweep.txt`: 302 mutants in
-  six shards, 256 caught, 46 unviable, 0 missed, nothing allow-listed. Three
-  rounds: the first (304 mutants) left nineteen survivors. Fifteen were
-  witness gaps: a subject's rule-2 `withdraws` (I1195), the strict expiry
-  boundary (I1197), the attestation plane of the PQC sweep (I1196), and the
-  key-grant doors, whose witnesses the filter did not name (now I591 / I596,
-  I61, I800, I743). Two were the postgres trust executor's CHECK-name
-  mapping, unreachable behind the plan's shape validation, now removed. The
-  second round left the projection door (I743 added); the third, shard 1
-  again, was clean. Weekly, six shards, in `mutants.yml`.
-- Evidence: CLM-planes-as-rows (3.1.3) at
-  `key_plane::list_key_plane_wire_hashes_planned`; CLM-nsproc-tier-consent
-  (3.3.1) at `consent_admit::consent_revocations_planned`; `EXPECTED` 322.
-- Size: the backend files did not shrink (sqlite +31, postgres +34, memory
-  +48 lines): what each backend kept is the SQL and row mapping, which is
-  the executor's, and what left (the decisions) was small. The decisions
-  are now written once.
-
-### Changed — an organisation is an affiliation; the three operational planes retire (CIRISPersist#1036 items 1–5, #1049, #1062, #1048; CC rc9)
+### Changed — 8. an organisation is an affiliation; the three operational planes retire (S6; CIRISPersist#1036 items 1–5, #1049, #1062, #1048; CC rc9)
 
 CC 3.3.9 moves `organization`, `org_membership` and `partner_record` onto the
 rows every community already uses (CIRISConstitution#161, #162, #164, #167,
@@ -734,13 +792,7 @@ is_term_bearing_edge, TERM_BEARING_SCOPES, SUBJECT_WITHDRAWS_CARVE_OUT}`;
 ListOrgMembershipsSince}` and `DirectoryOpResult::{Organizations,
 OrgMemberships}` removed.
 
-**Edge adapts** (S7): drop the `Organization`, `OrgMembership` and
-`PartnerRecord` replication kinds (send nothing on them; persist refuses them
-`federation_envelope_kind_retired`) and every use of the removed directory
-methods, types and capsule ops; carry a licence as the `licensure:` row it
-is, cosigned in `additional_scrubs[]`; pass a term to `grant_delegation` /
-`add_moderator` for term-bearing scopes; sort AND dedupe the licence
-payload's four sets before signing.
+What Edge, Server and Agent adapt: §15.
 
 - Witnesses (sqlite, postgres unless noted): **I1210** the payload gate;
   **I1211** the revision anti-rollback; **I1212** the skew bound; **I1213**
@@ -767,9 +819,9 @@ payload's four sets before signing.
   CLM-licence-audience (2.4.1.2.1), CLM-licence-contest ×2 (2.4.1.1),
   CLM-org-on-the-bond ×2 (3.2), CLM-delegation-term (4.4.3.2.8),
   CLM-admission-freshness-window ×3 (2.6.7), CLM-canonicalization-array
-  (2.6.1.1.1); CLM-merge repointed; `EXPECTED` 342.
+  (2.6.1.1.1); CLM-merge repointed.
 
-### Changed — hard_case rows replicate (CIRISConstitution#170 closed)
+### Changed — 9. hard_case rows replicate (S0; CIRISConstitution#170 closed)
 
 The steward ruled through CC (2026-10-21, CIRISConstitution#170 closed, rc9
 `6ce1674`): `hard_case:*` joins CC 2.4.1.1's unpurgeable accountability set,
@@ -797,7 +849,7 @@ as the actor) and a peer admits it at the put door and the replicated apply.
   node-local view. **V202** (both dialects) adds the
   `hard_case_events.emitter_key_id` column, backfilled from each projected
   row's signer.
-- Witness **I1165** (memory, sqlite, postgres): node A records a
+- Witness **I1165** (sqlite, postgres): node A records a
   `hard_case:consent_sla_breach:v1` row and crosses it; node B receives it
   only through A's advertised wire hashes and point read, applies it
   (`Inserted`), holds it at the federation tier, lists it, serves it, and
@@ -812,72 +864,22 @@ as the actor) and a peer admits it at the put door and the replicated apply.
   `CLM-accountability-record-unpurgeable` (2.4.1.1) gains
   `steward_purge.rs#accountability_record_of`.
 
-### Removed — the in-process memory backend (CIRISPersist#1002)
+### Fixed — 10. `nodes_owned_by` returns the nodes a roster key announced (S0; CIRISPersist#1109)
 
-Every test, bench and witness that ran on `MemoryBackend` runs on SQLite. The
-memory backend answered with its own in-process re-implementation of every
-door: real SQL, a real schema and real transactions are where the reds it
-could not produce come from, and each door it carried was a third copy to keep
-in parity.
+`admission::nodes_owned_by(fedID)` sought its candidates only among the
+`delegates_to` owner-bindings the fedID's own key signed. A device joined by
+approval announces its node with its roster key (`<fedID>-<fp>`), and since
+v59.0.0 `owner_of` credits that binding to the fedID (`self_of_at`), so the
+forward walk named the self as owner while the reverse walk never placed the
+node. The seek now also reads the bindings every key bound as an occurrence
+of the fedID signed; the verdict is still `owner_of`, so `n ∈
+nodes_owned_by(U) ⟺ owner_of(n) == U` holds by construction and a key of
+another self, or a key that bound a node after its eviction, adds nothing.
+**`nodes_owned_by` now returns roster-key-announced nodes**: CIRISServer can
+delete its `announced_nodes_of` workaround. Witness **I1161** (sqlite,
+postgres).
 
-- **Removed (Rust, clean break):** `store::MemoryBackend` and `src/store/memory.rs`
-  (11,946 lines). No alias.
-- **Added (Rust):** `store::test_backend::test_backend()` (feature `sqlite`) —
-  a fresh, fully migrated in-memory `SqliteBackend`, cloned from one migrated
-  template per process with the SQLite backup API (7.1 ms a clone against
-  248 ms for `open_in_memory()` + every migration; `MemoryBackend::new` was
-  81 µs). Three doc-hidden fixtures stay public for the integration tests and
-  benches (`add_public_key`, `add_pqc_public_key`, `snapshot_events`); every
-  other below-the-door seam is `cfg(test)`, so no consumer build links a
-  writer that skips the doors.
-- **The genesis scratch is per backend** (steward ruling 2026-10-25: parity
-  even for genesis). The doors that replayed a bundle on a memory node
-  (`verify_ceremony_outputs`, the import door, `CeremonyState::finish`,
-  `AmendState::{plan, finish}`) take a `&dyn genesis::scratch::GenesisScratch`
-  and run on what the backend provisions: SQLite a migrated in-memory clone,
-  PostgreSQL a throwaway database in the live cluster created from the
-  configured DSN (`ciris_genesis_scratch_{unix_secs}_{pid}_{hex}`), migrated, and dropped
-  `WITH (FORCE)` when the replay ends — on success, on a refusal, and on drop
-  (a panic). The configured role needs `CREATEDB` for these doors. A rolled-back
-  transaction was not used: the replay runs a dozen doors, each on its own
-  connection. A scratch a killed process left behind (its name carries its creation
-  instant, `ciris_genesis_scratch_{unix_secs}_{pid}_{hex}`) is dropped by the
-  next provisioning once older than an hour
-  (`GENESIS_SCRATCH_REAP_AFTER_SECS`); a name the reaper cannot read is never
-  dropped. Every door compiles and runs with `postgres` alone and with
-  `sqlite` alone. Signature changes (clean break):
-  `verify_ceremony_outputs(bundle_json, scratch)`,
-  `install_genesis_bundle_roster(dir, scratch, bundle)`,
-  `CeremonyState::finish(scratch)`, `AmendState::plan(pinned, rows, scratch)`,
-  `AmendState::finish(scratch)`; `Engine::install_genesis_bundle_roster` and
-  `PyEngine.install_genesis_bundle_roster_json` pass their own backend. New
-  refusal `CeremonyOutputsRefusal::ScratchDirectory`
-  (`ceremony_scratch_directory`): the scratch could not be provisioned or
-  released. New `store::postgres::GENESIS_SCRATCH_DB_PREFIX`. Witnesses
-  I1324–I1331.
-- **Python:** no Python surface named or constructed the memory backend, so
-  nothing is renamed. `PyEngine.install_genesis_bundle_roster_json` keeps its
-  signature and runs on every backend the build carries. No `.pyi` change.
-- **Telemetry:** the `backend` label set is `{sqlite, postgres}`
-  (`observe::StoreBackend::Memory` and the registry member are gone;
-  `telemetry/catalog.json` re-rendered). A dashboard keyed on
-  `backend="memory"` sees no series.
-- **Benches:** `ingest_pipeline` and `queue` run on the test backend and need
-  `sqlite` (they declared `postgres` and never used it). Their numbers now
-  include SQL writes; the baselines move.
-- **Tests:** the memory arm of every witness is gone (its duplicates of a
-  sqlite leg dropped; the tests only memory carried moved to
-  `src/store/backend_suite.rs`); `store::parity` compares two backends; the
-  from-disk gates and `rules/` read two backend files. A build with no backend
-  feature allows dead code crate-wide (every caller of the shared plans is a
-  backend). The server and server-pipeline unit tests need `sqlite`.
-- **Folded:** #720 — the lifecycle filter is one plan-emitted predicate
-  (`attestation_query::lifecycle_predicate`, I1320) instead of four SQL
-  copies and a memory fold; #691 — `store::tree_read` binds the parity and
-  schema-parity verdicts to the tree they read (I1321); #787 — every
-  `DirectoryOp` has an `OpsDirectory` proxy or a stated reason (I1322).
-
-### Added — a test-anchor seam on `W_self` (CIRISPersist#1111, CIRISServer#794 T11)
+### Added — 11. a test-anchor seam on `W_self` (S0; CIRISPersist#1111, CIRISServer#794 T11)
 
 A `test-anchor` harness binary could not watch the self roster's lone path
 land: `W_SELF_SECS` is 86 400 s and the node clock's seam is `cfg(test)`-only.
@@ -896,7 +898,7 @@ half pins the override condition and the parse, and a from-disk check pins
 every read of the variable inside the `#[cfg(feature = "test-anchor")]`
 module `self_roster::test_window`.
 
-### Added — one mutation discipline: a scope per slice, checked from disk (docs/V60_TASK_PLAN.md §3)
+### Added — 12. one mutation discipline: a scope per slice, checked from disk (S0; docs/V60_TASK_PLAN.md §3)
 
 Every slice since v53 ran its mutation round as an ad-hoc script outside the
 repo; nobody could re-run one, and the nightly matrix never learned the sites.
@@ -924,16 +926,16 @@ paragraph agents copy).
   `MUTANTS_DIFF_BUDGET_SECS` (7200 s) inside the job's 150 minutes; the
   summary lands in the step summary and the artifact.
 
-### Added — the CSD/4 coverage report (docs/V60_TASK_PLAN.md §3b, report-only)
+### Added — 13. the CSD/4 coverage report (S0; docs/V60_TASK_PLAN.md §3b, report-only)
 
-- `tests/fixtures/csd4/`: CIRISClient's `packaging/csd4/`
-  (`topology_vocabulary.json`, `traces.json`, `requirements.yaml`, `PIN.md`,
-  `topology_vocabulary.pin`) byte for byte, from CIRISClient main
-  `ab134ef2`; the README records the commit and the shas.
-- `tests/fixtures/csd4/csd4_chain.json`: CC's chain as data
-  (CIRISConstitution rc9 `manifests/csd4_chain.json`, byte for byte as last
-  changed at `6ce16745`; rc9 is untagged, so a fixture like
-  `governance_policy.json`): per atom its STATE_TABLE states, the invariants
+- `tests/fixtures/csd4/`: CIRISClient's `packaging/csd4/` (`traces.json`,
+  `requirements.yaml`, `PIN.md`, `topology_vocabulary.pin`) byte for byte,
+  from CIRISClient main `ab134ef2`; the README records the commit and the
+  shas. `topology_vocabulary.json` moved to the runtime manifests at the rc9
+  tag (§6).
+- `csd4_chain.json`: CC's chain as data, now a runtime manifest at
+  `src/federation/namespace/csd4_chain.json`, byte-identical to `git show
+  v1.0-rc9:manifests/csd4_chain.json` (§6): per atom its STATE_TABLE states, the invariants
   and claims over them (`by_invariant` | `by_section`), each claim's evidence
   pointers by repo, and the text's refusal tokens with their confidence.
 - `scripts/csd4_coverage.py` (stdlib, from disk) READS the join from the chain:
@@ -948,7 +950,7 @@ paragraph agents copy).
   stay. `docs/CSD4_COVERAGE_v60_S0.md` is its run at the slice head. A
   `reports (non-gating)` job runs it on every PR and weekly.
 
-### Fixed — the nightly mutants job is green again (CIRISPersist#1112)
+### Fixed — 14. the nightly mutants job is green again (S0; CIRISPersist#1112)
 
 The scheduled `mutants and powerset` job had been red every day since
 2026-10-14 with seven unkilled mutants in `src/observe`, and nobody read it.
@@ -966,20 +968,211 @@ The scheduled `mutants and powerset` job had been red every day since
   MISSED guard mutants had no witness because the catalogue holds only
   well-formed units.
 
-### Fixed — `nodes_owned_by` returns the nodes a roster key announced (CIRISPersist#1109)
+### Adoption — 15. what CIRISEdge, CIRISServer and CIRISAgent must handle
 
-`admission::nodes_owned_by(fedID)` sought its candidates only among the
-`delegates_to` owner-bindings the fedID's own key signed. A device joined by
-approval announces its node with its roster key (`<fedID>-<fp>`), and since
-v59.0.0 `owner_of` credits that binding to the fedID (`self_of_at`), so the
-forward walk named the self as owner while the reverse walk never placed the
-node. The seek now also reads the bindings every key bound as an occurrence
-of the fedID signed; the verdict is still `owner_of`, so `n ∈
-nodes_owned_by(U) ⟺ owner_of(n) == U` holds by construction and a key of
-another self, or a key that bound a node after its eviction, adds nothing.
-**`nodes_owned_by` now returns roster-key-announced nodes**: CIRISServer can
-delete its `announced_nodes_of` workaround. Witness **I1161** (memory,
-sqlite, postgres).
+Every break in v60.0.0, from `git diff v59.1.0..` (python `.pyi`, `src/ffi`,
+the exhaustive enums, the migrations). Edge adapts once, to this head.
+
+**Replication kinds (wire).**
+- `EnvelopeKind::{Organization, OrgMembership, PartnerRecord}` join
+  `RETIRED_FRAMED` (now 7: the four key-plane kinds from v59 and these
+  three). An inbound object of these kinds is refused
+  `federation_envelope_kind_retired`; send nothing on them. Their positions
+  in `EnvelopeKind::ALL` (19) are kept, so the manifest hash Edge and Server
+  pin does not move. Live kinds: 12. (§8)
+- The cirisnode classes (Contribution, vote, moderation, slashing,
+  reconsideration, ledger balances, takedown notice) and Goals never had a
+  replication kind; they now cross as `scores` rows on the attestation
+  plane. Edge retires its own `GoalDeclaration` / `GoalRetirement` messages,
+  which wrapped persist's `Goal`. (§1, §2)
+- A v59 peer's purge bundle carrying its takedown notice as a `takedown_notice`
+  Contribution is still applied for one release (v60.x; removed in v61). (§1)
+
+**Python methods removed** (`.pyi` and `src/ffi/pyo3.rs`):
+- `cirisnode_list_takedowns_for_json`, `cirisnode_list_key_grants_for_json`,
+  `cirisnode_list_key_grants_for_content_json`,
+  `cirisnode_list_key_grants_for_filtered_json`,
+  `cirisnode_list_key_grants_for_scope_epoch_json`,
+  `cirisnode_put_key_grant_json`, `cirisnode_retire_key_grants_json` (§1; the
+  key-grant plane, `key_grant:{axis}:v1`, is the one door for a wrapped key).
+- `put_organization`, `put_org_membership`, `put_partner_record`,
+  `list_organizations_for`, `list_org_memberships_for`,
+  `list_partner_records_for`, `list_organizations_since`,
+  `list_org_memberships_since`, `list_partner_records_since`,
+  `list_signed_partner_records_since` (§8).
+
+**Python methods re-signatured** (each now returns the row id it wrote,
+signed by the engine's own hybrid signer, where it returned `None`):
+- `cirisnode_put_contribution(body_json) -> str`,
+  `cirisnode_cast_vote(body_json) -> str`,
+  `cirisnode_update_credits_ledger(update_json) -> str`,
+  `cirisnode_update_expertise_ledger(update_json) -> str`,
+  `cirisnode_put_moderation_event(body_json) -> str`,
+  `cirisnode_put_slashing_attestation(body_json) -> str`,
+  `cirisnode_put_reconsideration_request(body_json) -> str`,
+  `cirisnode_put_reconsideration_attestation(body_json) -> str` (bodies in
+  the §1 table, not signed envelopes).
+- `cirisnode_list_contributions(author_id, filter_json=None,
+  cursor_json=None, limit=100)`, `cirisnode_list_votes(contribution_id,
+  voter_id=None, cursor_json=None, limit=100)`: items are rows, the cursor an
+  `AttestationCursor`.
+- `cirisnode_list_takedowns_for_filtered_json`: `filter_json` must name
+  `claimant_key_id`; items are notice rows.
+- `cirisnode_process_takedown_admission_json(notice_attestation_id)` (was the
+  Contribution JSON); the report adds `notice_attestation_id`.
+- `cirisnode_get_credits_ledger` / `cirisnode_get_expertise_ledger`: the entry
+  adds `attestation_id`; `created_at` is the row's instant.
+- `cirisnode_put_promotion_attestation`: `target_ids` are held row ids (no
+  `is_canonical` flip). `cirisnode_put_delivery_attestation`: the
+  announcement must be a held `contribution:federation_announcement:v1` row.
+- `cirisnode_put_goal_json(body_json) -> str` (a v59 typed `Goal` raises
+  `goal_typed_object_retired`), `cirisnode_retire_goal_json(goal_id) -> str`
+  (no `retired_at` argument), `cirisnode_get_goal_json(goal_id)` (`goal_id`
+  is the declaration's row id, not a UUID; the JSON carries `scale` /
+  `cohort_id`, `score`, `attestation_id`), `cirisnode_list_goals_json` (filter
+  `scale`, not `scope_kind`; unknown keys refused). (§2)
+- `grant_delegation(..., delegation_valid_from=None,
+  delegation_valid_until=None)` and `add_moderator(..., delegation_valid_from=None,
+  delegation_valid_until=None)` (RFC 3339): a term-bearing edge (`license`,
+  `grant`, `moderate`, `takedown`, `review`, `slash`, `sub_delegation`, or one
+  naming an affiliation) without a bounded `_until` raises `ValueError`
+  (`federation_delegation_term_required`). (§8)
+
+**Python methods added:** `cirisnode_rehome_ledgers() -> int`,
+`cirisnode_check_ledger_projection(projection) -> str`,
+`cirisnode_amend_goal_json(goal_id, body_json) -> str`,
+`cirisnode_recant_goal_json(goal_id) -> str`, `cirisnode_rehome_goals() -> str`,
+`cirisnode_check_goal_projection() -> str`. Run the two rehomes once after
+upgrading a node that held v59 ledgers or goals (§1, §2).
+
+**Refusal tokens and error kinds.**
+- New `kind()` tokens: `federation_governance_policy_refused`
+  (`Error::GovernancePolicyRefused { family, reason }`, `ValueError`; reasons
+  a `CorridorRefusal` token or `policy_row_missing`, `policy_not_two_path`,
+  `policy_row_unreadable`, `policy_base_not_built`, `policy_rows_disagree`;
+  §6), `federation_delegation_term_required` (`Error::DelegationTermRequired`,
+  `ValueError`; rules `term_missing`, `term_unreadable`, `over_ceiling`,
+  `over_role_term`; §8), `cirisnode_key_grant_retired` and
+  `cirisnode_typed_object_retired` (`cirisnode::Error::Retired`; §1),
+  `ceremony_scratch_directory` (`CeremonyOutputsRefusal::ScratchDirectory`;
+  §5).
+- New `federation_malformed_row` reasons, appended to the hashed
+  `malformed_row::ALL` (nothing reordered): `goal_meta_alignment_malformed`,
+  `goal_body_malformed`, `goal_typed_object_retired` (§2),
+  `content_hash_mismatch`, `envelope_row_member_unknown`,
+  `subject_key_id_malformed` (§7).
+- Moved token (#1114, §7, `ValueError` throughout): a content-hash mismatch
+  was `federation_tier_unverified` and a malformed `subject_key_ids` element
+  was `federation_invalid_argument`; both are now the TERMINAL
+  `federation_malformed_row`. A sender that retried either must stop.
+- New `federation_invalid_argument` prefixes (`ValueError`):
+  `licence_audience_refused:` (`class_not_declared_public`,
+  `scope_not_the_declared_choice`, `re_emission_names_no_reader`,
+  `re_emission_target_unknown`, `re_emission_diverges`),
+  `owner_binding_affiliation_refused:` (`affiliation_not_held`,
+  `not_an_affiliation`, `not_cosigned_under_protocol`). New
+  `Error::AffiliationConfigInvalid` rule `licence_audience_invalid` at the
+  community door. (§8)
+- `asserted_at_stale` (`Error::AssertedAtStale`, kind still
+  `federation_invalid_argument`) now also fires on the `licensure`,
+  `consent`, `key_grant` and `owner_binding` planes; the variant's
+  `steward` field is renamed `standing_for` and it gains `plane`. A
+  repeated licence set entry is now `federation_set_semantics_unsorted`.
+  (§8)
+- Retired, no longer returned: `federation_hard_case_replication_held`
+  (`Error::HardCaseReplicationHeld`, was a `RuntimeError`; §9),
+  `federation_operational_authority`, `federation_operational_envelope_unbound`
+  (`Error::{OperationalAuthority, OperationalEnvelopeUnbound}`; §8).
+- A postgres `grant_trust` row that trips a V020 CHECK reads `Backend`, not
+  `InvalidArgument` (the plan refuses both shapes first; §4).
+
+**Exhaustive enums that changed** (a `match` without a wildcard breaks):
+`federation::Error` (+`GovernancePolicyRefused`, +`DelegationTermRequired`,
+−`HardCaseReplicationHeld`, −`OperationalAuthority`,
+−`OperationalEnvelopeUnbound`; `AssertedAtStale`'s fields),
+`cirisnode::Error` (+`Retired`, +`Federation`), `CeremonyOutputsRefusal`
+(+`ScratchDirectory`), `SiloProjection` (+`CreditsLedger`,
++`ExpertiseLedger`, +`Goals`), `DirectoryOp` (+`ListKeyPlaneWireHashesSince`,
+−`ListOrganizationsSince`, −`ListOrgMembershipsSince`),
+`DirectoryOpResult` (−`Organizations`, −`OrgMemberships`),
+`observe::StoreBackend` (−`Memory`). Removed public enums:
+`operational::{SubjectKind, MergeIntent}`, `SubjectGate`,
+`cirisnode::{RetireKeyGrantsOutcome, RetireFailureStage, KeyGrantScope,
+WrapAlgorithm}`; `GoalScope` is a validated struct, not an enum. New:
+`LegacyLedgerRow`, `ledger_projection::{Ledger, LedgerBody}`,
+`takedown_tombstone::NoticeOrigin`. `LegalBasis` decodes CC's spellings
+`dmca512` / `dsa_article16` only.
+
+**Exhaustive structs that gained a field:** `HardCaseEvent.emitter_key_id`,
+`HardCaseFilter.emitter_key_id` (`Default`), `CreditsLedgerEntry` /
+`ExpertiseLedgerEntry.attestation_id`, `AffiliationConfig.licence_audiences`,
+`TakedownReport.notice_attestation_id`, `TakedownTerms.row`.
+
+**The directory capsule.** `DIRECTORY_ABI_VERSION` 10 → 11 (the two org ops
+and their results removed; `ListKeyPlaneWireHashesSince` appended, §4, §8).
+A consumer's capsule-receive check (`abi_version == DIRECTORY_ABI_VERSION`)
+built against 10 refuses the v60 capsule: rebuild against 11.
+
+**Rust surface (clean break, no aliases).**
+- `FederationDirectory`: removed `put_organization`, `put_org_membership`,
+  `put_partner_record`, `list_organizations_for`, `list_org_memberships_for`,
+  `list_partner_records_for`, `list_organizations_since`,
+  `list_org_memberships_since`, `list_partner_records_since`,
+  `list_signed_partner_records_since`, `put_goal`, `retire_goal`; changed
+  `get_goal(&str)`; added `legacy_goals`, `delete_legacy_goal`,
+  `list_key_plane_wire_hashes_since` (default `Unsupported`).
+- `NodeCoreService` and the cirisnode types per §1; `Goal`, `GoalScope`,
+  `GoalsFilter` per §2; the inherent `SqliteBackend` / `PostgresBackend`
+  key-record methods per §3; `operational` per §8;
+  `Engine::grant_delegation` / `add_moderator` take a `DelegationTermBounds`;
+  `TwoPathPolicy::self_roster(window)` removed and `self_roster::policy()`
+  returns `Result` (§6); `hard_case::check_hard_case_replication_held`
+  removed (§9).
+- **`store::MemoryBackend` is gone** (§5). Tests and embedders use
+  `store::test_backend::test_backend()` (feature `sqlite`).
+- **Genesis doors take a scratch** (§5): `verify_ceremony_outputs(bundle_json,
+  scratch)`, `install_genesis_bundle_roster(dir, scratch, bundle)`,
+  `CeremonyState::finish(scratch)`, `AmendState::plan(pinned, rows, scratch)`,
+  `AmendState::finish(scratch)`. `Engine::install_genesis_bundle_roster` and
+  the Python `install_genesis_bundle_roster_json` keep their signatures. **On
+  postgres the configured role needs `CREATEDB`** for these doors (a
+  throwaway `ciris_genesis_scratch_*` database per replay, reaped after an
+  hour if a process died holding it).
+- `takedown_tombstone::takedown_terms` is `async (directory, notice, origin)`;
+  `TakedownNoticePayload` drops `claimant_key_id` / `asserted_at` and refuses
+  unknown fields (§1).
+
+**Producers.** Sign a licence as the `licensure:{community_key_id}:v1` row,
+cosigned under the authority's protocol in `additional_scrubs[]`; call
+`PartnerRecord::canonicalize_sets` (sorted AND unique) before signing; pass a
+term on every term-bearing `delegates_to` (§8). Sign a takedown notice as a
+`takedown_notice:{basis}:v1` row (§1).
+
+**Migrations** (sqlite + postgres twins, run at open): V202
+(`hard_case_events.emitter_key_id`, backfilled), V203 (drops eight
+`cirisnode` tables; ledgers gain `attestation_id`; `purge_executions.legal_basis`
+rewritten to CC's spelling), V204 (`goals` rebuilt as a projection:
+`scope_kind` → `scale`), V205 (drops `federation_organizations`,
+`federation_org_memberships`, `federation_partner_records` and their index
+rows). Nothing outside persist wrote the dropped tables.
+
+**Telemetry.** The `backend` label set is `{sqlite, postgres}`; a dashboard
+keyed on `backend="memory"` sees no series (§5).
+
+**Per consumer.**
+- **CIRISEdge:** everything under replication kinds, the capsule ABI, the
+  exhaustive enums, the moved #1114 tokens, the Rust surface, producers. Its
+  own test sites named by the slices: `tests/federation_announcement.rs`
+  (announcement written through the removed typed `put_contribution`), the
+  durability test's local takedown (built a Contribution notice), its
+  `GoalDeclaration` (wraps `Goal`, built with the removed `Goal::new`).
+- **CIRISServer:** the Python methods above (cirisnode, goals, organisation,
+  `grant_delegation` / `add_moderator`), the refusal tokens, `CREATEDB` for
+  the genesis doors on postgres, the rehomes after upgrade; it can delete its
+  `announced_nodes_of` workaround (§10).
+- **CIRISAgent:** the Python breaks above are the whole Python break; an Agent
+  that calls none of the removed or re-signatured methods needs no change.
+  The `.pyi` is the contract.
 
 ## [59.1.0] - 2026-10-20
 
