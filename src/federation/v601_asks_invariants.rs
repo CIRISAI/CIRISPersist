@@ -538,6 +538,73 @@ pub(crate) mod bodies {
             "unowned",
         );
 
+        // A multi-occurrence agent: an occurrence key signs about its agent
+        // identity. The seat is the owner of the signing occurrence's node
+        // or, when that key has no owner binding, of the agent.
+        let occurrence_of = |identity: String, occ: String| async move {
+            d.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: identity,
+                occurrence_key_id: occ,
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now() - chrono::Duration::seconds(5),
+                valid_until: None,
+                encryption_pubkeys: None,
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("I1365: occurrence record: {e}"));
+        };
+        let about = |by: &str, agent: &str, authorized_by: &str| {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut r = ts::bare_attestation(
+                &id,
+                by,
+                agent,
+                &serde_json::json!({
+                    "id": id,
+                    "dimension": ia::IDENTITY_AMENDMENT_DIMENSION,
+                    "amendment_digest": "ef".repeat(32),
+                    "authorized_by": authorized_by,
+                    "evidence_refs": [authorized_by],
+                }),
+            );
+            r.attestation_type = attestation_type::SCORES.to_owned();
+            r.cohort_scope = cohort_scope::SELF.to_owned();
+            r.subject_key_ids = vec![agent.to_owned()];
+            ts::seal_row_in_place(by, &mut r);
+            r
+        };
+        for (n, owner_on_occurrence) in [(1, true), (2, false)] {
+            let multi = format!("i1365-multi{n}-{tag}");
+            let occ = format!("i1365-occ{n}-{tag}");
+            for k in [&multi, &occ] {
+                ts::register_hybrid_key(d, k).await;
+            }
+            occurrence_of(multi.clone(), occ.clone()).await;
+            if owner_on_occurrence {
+                ts::put_owner_binding(d, &owner, &occ).await;
+            } else {
+                ts::put_owner_binding(d, &owner, &multi).await;
+            }
+            let ok = response(&owner, &multi, ia::DEFERRAL_APPROVED_DIMENSION);
+            let ok_id = ok.attestation_id.clone();
+            put(ok)
+                .await
+                .expect("I1365: the owner approves for the agent");
+            put(about(&occ, &multi, &ok_id)).await.unwrap_or_else(|e| {
+                panic!(
+                    "I1365: an occurrence of the agent amends it (owner on the {}): {e}",
+                    if owner_on_occurrence {
+                        "occurrence"
+                    } else {
+                        "agent"
+                    }
+                )
+            });
+        }
+
         // Ill-shaped members are malformed rows, not authority questions.
         for (member, value, reason) in [
             (

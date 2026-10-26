@@ -224,8 +224,7 @@ pub async fn check_identity_amendment_admission(
     let at = response.asserted_at;
     let owner = match super::admission::owner_of(directory, signer).await? {
         Some(o) => Some(o),
-        None if agent != signer => super::admission::owner_of(directory, agent).await?,
-        None => None,
+        None => super::admission::owner_of(directory, agent).await?,
     };
     let seated = match owner {
         Some(owner) => {

@@ -763,6 +763,12 @@ where
         }
         due.push((latest.unwrap_or(DateTime::<Utc>::MIN_UTC), sha));
     }
+    // v60.1.0 (CIRISPersist#1113, CC 4.5.3) — the reversal's re-ack: held
+    // bytes whose takedown is reversed and whose own claims are all retired
+    // join the due set first (they carry no live claim at all), under the
+    // same cap, and count as `restored` rather than `renewed`.
+    let restoring = reversed_takedown_holdings(backend, &me).await?;
+    due.extend(restoring.iter().map(|sha| (DateTime::<Utc>::MIN_UTC, *sha)));
     // Oldest first: the nearest expiry is renewed before a later one, so the
     // cap defers only claims with the most time left (#1071).
     due.sort_unstable();
@@ -773,6 +779,9 @@ where
         }
         budget -= 1;
         match emit_holding_claim(backend, local, &sha, now).await {
+            Ok(HoldingClaimOutcome::Emitted { .. }) if restoring.contains(&sha) => {
+                report.restored += 1;
+            }
             Ok(HoldingClaimOutcome::Emitted { .. }) => report.renewed += 1,
             Ok(HoldingClaimOutcome::NotInCohort { .. }) => report.not_in_cohort += 1,
             Err(BlobError::Purged { .. }) => report.withheld += 1,
@@ -786,8 +795,6 @@ where
             }
         }
     }
-    // v60.1.0 (CIRISPersist#1113, CC 4.5.3) — the reversal's re-ack.
-    restore_reversed_takedown_claims(backend, local, &me, now, &mut budget, &mut report).await?;
     // The upgrade conversion: a blob this node still holds and announced
     // under the retired rc6 carrier (its OWN row; a peer's is inert, CC 2.4)
     // and has made no custody report about — not even `none` — is claimed
@@ -1133,25 +1140,22 @@ where
         .map_err(|e| BlobError::Backend(format!("tombstone: {e}")))
 }
 
-/// v60.1.0 (CIRISPersist#1113, CC 4.5.3) — **the reversal's re-ack**: a blob
-/// this node still holds, whose every claim of its own is retired, that a
-/// takedown tombstoned and that no tombstone withholds any more (every
-/// takedown naming it is reversed) is claimed `here` again
-/// ([`ReackReport::restored`]). Keyed on the tombstone, so a claim retracted
-/// for any other reason (an eviction that aborted after its retraction) is
-/// never re-advertised here. Shares the pass's budget.
-async fn restore_reversed_takedown_claims<B>(
+/// v60.1.0 (CIRISPersist#1113, CC 4.5.3) — **the reversal's re-ack
+/// candidates**: the blobs this node still holds, whose every claim of its
+/// own is retired, that a takedown tombstoned and that no tombstone withholds
+/// any more (every takedown naming them is reversed).
+/// [`reack_own_claims`] claims them `here` again ([`ReackReport::restored`]).
+/// Keyed on the tombstone, so a claim retracted for any other reason (an
+/// eviction that aborted after its retraction) is never re-advertised here.
+async fn reversed_takedown_holdings<B>(
     backend: &B,
-    local: &crate::signing::LocalSigner,
     me: &str,
-    now: DateTime<Utc>,
-    budget: &mut u64,
-    report: &mut ReackReport,
-) -> Result<(), BlobError>
+) -> Result<std::collections::BTreeSet<[u8; 32]>, BlobError>
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let mut seen_restore: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut out = std::collections::BTreeSet::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut pages = AttestationQuery::by(me, FOLD_PAGE)
         .dimension_prefix(CUSTODY_ACK_DIMENSION)
         .pages();
@@ -1168,7 +1172,7 @@ where
             else {
                 continue;
             };
-            if !seen_restore.insert(hex_sha.clone()) {
+            if !seen.insert(hex_sha.clone()) {
                 continue;
             }
             let Ok(sha) = <[u8; 32]>::try_from(hex::decode(&hex_sha).unwrap_or_default()) else {
@@ -1185,37 +1189,19 @@ where
                 Err(Error::Unsupported { .. }) => false,
                 Err(e) => return Err(BlobError::Backend(format!("reack: {e}"))),
             };
-            if !tombstoned
-                || backend.blob_head(&sha).await?.is_none()
-                || !super::custody_ack::custody_acks_of(backend, me, &hex_sha)
+            if tombstoned
+                && backend.blob_head(&sha).await?.is_some()
+                && super::custody_ack::custody_acks_of(backend, me, &hex_sha)
                     .await
                     .map_err(|e| BlobError::Backend(format!("reack: {e}")))?
                     .is_empty()
-                || withheld_by(backend, &sha).await?.is_some()
+                && withheld_by(backend, &sha).await?.is_none()
             {
-                continue;
-            }
-            if *budget == 0 {
-                report.deferred += 1;
-                continue;
-            }
-            *budget -= 1;
-            match emit_holding_claim(backend, local, &sha, now).await {
-                Ok(HoldingClaimOutcome::Emitted { .. }) => report.restored += 1,
-                Ok(HoldingClaimOutcome::NotInCohort { .. }) => report.not_in_cohort += 1,
-                Err(BlobError::Purged { .. }) => report.withheld += 1,
-                Err(e) => {
-                    report.failed += 1;
-                    tracing::warn!(
-                        error = %e,
-                        sha256_prefix = &hex_sha[..16],
-                        "reversed-takedown re-ack failed; the next pass retries"
-                    );
-                }
+                out.insert(sha);
             }
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 /// **`BlobStorage::evict_actor`, once.** Every blob `actor` claims `here`

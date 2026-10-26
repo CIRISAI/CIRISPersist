@@ -83,20 +83,21 @@ pub(crate) mod bodies {
         community: &str,
     ) -> Attestation {
         let id = uuid::Uuid::new_v4().to_string();
-        let mut row = ts::bare_attestation(
-            &id,
-            by,
-            by,
-            &serde_json::json!({
-                "id": id,
-                "dimension": "reconsideration:new_evidence:v1",
-                "score": 1.0,
-                "confidence": 1.0,
-                "references_attestation_id": notice_row_id,
-                "outcome": outcome,
-                "community_id": community,
-            }),
-        );
+        let mut env = serde_json::json!({
+            "id": id,
+            "dimension": "reconsideration:new_evidence:v1",
+            "score": 1.0,
+            "confidence": 1.0,
+            "references_attestation_id": notice_row_id,
+        });
+        // An empty `outcome` is a FILING; an empty `community` names none.
+        if !outcome.is_empty() {
+            env["outcome"] = serde_json::json!(outcome);
+        }
+        if !community.is_empty() {
+            env["community_id"] = serde_json::json!(community);
+        }
+        let mut row = ts::bare_attestation(&id, by, by, &env);
         row.attestation_type = attestation_type::SCORES.into();
         row.weight = None;
         row.cohort_scope = scope.into();
@@ -174,6 +175,37 @@ pub(crate) mod bodies {
                 .contains(crate::federation::admission::RECONSIDERATION_COMMUNITY_MISMATCH),
             "I1366: {e}"
         );
+        // The content's signed subject FILES (no outcome, naming no
+        // community): admitted. The subject cannot RULE: refused.
+        let author = format!("i1366-author-{tag}");
+        crate::federation::doors_takedown_invariants::bodies::establish(
+            dir, &author, &author, &sha,
+        )
+        .await;
+        put(
+            dir,
+            ruling(&author, &notice_row, "", cohort_scope::FEDERATION, ""),
+        )
+        .await
+        .expect("I1366: the content's subject files");
+        let e = put(
+            dir,
+            ruling(
+                &author,
+                &notice_row,
+                "reversed",
+                cohort_scope::FEDERATION,
+                "",
+            ),
+        )
+        .await
+        .expect_err("I1366: the subject cannot rule");
+        assert_eq!(
+            e.kind(),
+            "federation_delegated_scope_unauthorized",
+            "I1366: {e}"
+        );
+        assert_eq!(withheld().await, Some(r.notice_id.clone()), "I1366: filed");
         // Upheld: admitted, and the bytes stay withheld.
         put(
             dir,
@@ -327,7 +359,32 @@ pub(crate) mod engine_bodies {
             &hex::encode(csam),
         )
         .await;
-        let t = chrono::Utc::now();
+        // Whole seconds: the window's boundary is then exact on every backend.
+        let t = {
+            use chrono::SubsecRound as _;
+            chrono::Utc::now().trunc_subsecs(0)
+        };
+        // A blob A holds whose claim A retracted for another reason (an
+        // eviction that aborted after its retraction): no tombstone names it,
+        // so no re-ack ever re-advertises it.
+        let other = hold(
+            &l.engine_a,
+            &author,
+            format!("i1367-other-{run}").as_bytes(),
+        )
+        .await;
+        let signer_a = ts::local_signer(&format!("em-a-{run}"));
+        assert_eq!(signer_a.derived_key_id(), l.node_a, "the ladder's signer");
+        let n = crate::federation::holding_claim::retract_own_claims(
+            l.ba.as_dyn_directory(),
+            &l.node_a,
+            &signer_a,
+            &other,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "I1367: A's claim on the other blob retracted");
 
         // A counter-notice takedown at A: withheld, A's claim retracted.
         test_clock::set(Some(t));
@@ -359,6 +416,15 @@ pub(crate) mod engine_bodies {
             "I1367: withheld on B"
         );
 
+        // Before any reversal the re-ack restores nothing: the bytes are
+        // withheld, and the other blob carries no tombstone.
+        let before = l
+            .engine_a
+            .reack_holding_claims_once(chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(before.restored, 0, "I1367: withheld: {before:?}");
+
         // The review-holder reverses at A: A serves again and re-acks.
         let reversal = ruling(
             &moderator.id,
@@ -383,6 +449,11 @@ pub(crate) mod engine_bodies {
             .await
             .unwrap();
         assert_eq!(reack.restored, 1, "I1367: A re-acks `here`: {reack:?}");
+        assert_eq!(reack.failed, 0, "I1367: {reack:?}");
+        assert!(
+            !l.ba.list_holders(&other).await.unwrap().contains(&l.node_a),
+            "I1367: a claim retracted for another reason is never re-advertised"
+        );
         assert!(
             l.ba.list_holders(&sha).await.unwrap().contains(&l.node_a),
             "I1367: A is a holder again"
@@ -405,13 +476,13 @@ pub(crate) mod engine_bodies {
             bytes.as_bytes()
         );
 
-        // After A's window: the hard delete skips the reversed bytes.
-        test_clock::set(Some(
-            t + chrono::Duration::days(10) + chrono::Duration::seconds(1),
-        ));
+        // At A's window, exactly (`executed_at` + 10 days): the hard delete
+        // runs and skips the reversed bytes.
+        test_clock::set(Some(t + chrono::Duration::days(10)));
         let done = l.engine_a.purge_finalize(&r.notice_id).await;
         test_clock::set(None);
-        let done = done.expect("I1367: finalize after the window");
+        let done = done.expect("I1367: finalize at the window");
+        assert_eq!(done.notice_id, r.notice_id, "I1367: {done:?}");
         assert_eq!(done.blobs_evicted, 0, "I1367: nothing evicted: {done:?}");
         assert!(
             done.voided.contains(&format!("blob:{}", hex::encode(sha))),
@@ -457,6 +528,16 @@ pub(crate) mod engine_bodies {
         assert!(
             !l.ba.has_blob(&csam).await.unwrap(),
             "I1367: no bytes come back"
+        );
+        let after = l
+            .engine_a
+            .reack_holding_claims_once(chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            (after.restored, after.failed),
+            (0, 0),
+            "I1367: destroyed bytes are not re-acknowledged: {after:?}"
         );
         republish()
             .await

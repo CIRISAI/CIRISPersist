@@ -14,7 +14,7 @@
 # - #1113: the reversal fold (`takedown_reversal`, `is_reversal_of`,
 #   `notice_row_of_header`, `review_holders_of_content`), the withheld read
 #   (`withholding_notice`), the finalize skip (`purge_finalize`), the re-ack
-#   (`restore_reversed_takedown_claims`) and the ruling's authority
+#   (`reversed_takedown_holdings`) and the ruling's authority
 #   (`check_takedown_reconsideration_admission` and the dispatch in
 #   `check_reconsideration_admission`). Witnesses I1366, I1367 (sqlite,
 #   postgres), with the finalize and reconsideration witnesses that already
@@ -31,4 +31,4 @@ src/federation/key_grant.rs is_retryable from_token
 src/federation/identity_amendment.rs
 src/federation/takedown_tombstone.rs notice_row_of_header is_reversal_of review_holders_of_content takedown_reversal
 src/federation/steward_purge.rs withholding_notice purge_finalize
-src/federation/holding_claim.rs restore_reversed_takedown_claims
+src/federation/holding_claim.rs reversed_takedown_holdings
