@@ -34,6 +34,29 @@ threat-model citations because this crate's audit story is the point.
   a new arm of the exhaustive `BlobError`; it is not added in this MINOR (the
   existing token now carries exactly that meaning). Witness I1401 (sqlite,
   postgres).
+- **CIRISPersist#1070** — takedown immediate removal, the three Codex r2
+  cases and the shared-chunk question:
+  1. an Engine with no LocalSigner (`with_hardware_signer`, `from_shared`)
+     refused every immediate-removal takedown at `purge_finalize`
+     (`purge_retraction_inadmissible`), leaving the bytes on disk. The purge
+     path now deletes without the retraction it cannot sign (such an Engine
+     never announced a claim; the tombstone withholds the address at every
+     read door). Witness I1402.
+  2. a takedown whose tombstone committed but whose holder action did not
+     run could never complete once its notice expired or the signer's duty
+     lapsed: a re-run re-asked CC 4.5.5. A recorded execution is now RESUMED
+     (signature still verified; the execution keyed by the notice's own
+     digest), locally and for a replicated bundle. Witness I1403.
+  3. the bytes floor read the tombstone before its write transaction, so a
+     takedown committing in between let the bytes land after their
+     tombstone. Every byte write door (put, local store, chunk DAG one-shot
+     and finalize, adopt, the chunk floor) now reads the address's own
+     tombstone again INSIDE its transaction; on postgres under a shared
+     advisory lock the tombstone's write takes exclusively. Witnesses I1404
+     (plaintext doors) and I1406 (adopt and chunk floor), both red before.
+  4. decided: a plaintext chunk shared with a live DAG stays (not withheld,
+     not evicted) when another DAG that uses it is taken down; the existing
+     purge walk already does this. Witness I1405.
 
 ## [60.0.0] - 2026-10-26
 

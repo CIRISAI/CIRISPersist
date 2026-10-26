@@ -2252,6 +2252,83 @@ enum PgItemAppended {
     StreamCounterMoved,
     /// #969 — the stream epoch is closed / terminated / has no DEK row.
     StreamEpochClosed,
+    /// v60.1.0 (#1070) — a tombstone committed after the pre-read: the notice
+    /// naming the chunk's address.
+    Purged(String),
+}
+
+/// v60.1.0 (CIRISPersist#1070 item 3) — take, inside the caller's write
+/// transaction, the SHARED advisory lock on each address's bytes-plane
+/// tombstone ([`bytes_tombstone_lock_key`](crate::federation::steward_purge::bytes_tombstone_lock_key)),
+/// in sorted order so two writers and a tombstone writer can never deadlock.
+/// Held to commit: a tombstone write (which takes it EXCLUSIVE) waits for this
+/// write to commit, or this write waits for the tombstone and then reads it.
+/// `purge_plane` is `false` only on a test schema below V187.
+async fn pg_lock_bytes_tombstones(
+    tx: &tokio_postgres::Transaction<'_>,
+    shas: &[[u8; 32]],
+    purge_plane: bool,
+) -> Result<(), crate::federation::BlobError> {
+    if !purge_plane {
+        return Ok(());
+    }
+    let mut keys: Vec<String> = shas
+        .iter()
+        .map(|s| crate::federation::steward_purge::bytes_tombstone_lock_key(&hex::encode(s)))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    for k in &keys {
+        tx.execute(
+            "SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))",
+            &[k],
+        )
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("bytes tombstone lock: {e}")))?;
+    }
+    Ok(())
+}
+
+/// v60.1.0 (CIRISPersist#1070 item 3) — the notice whose bytes-plane
+/// tombstone names `sha256`, read inside the caller's transaction AFTER
+/// [`pg_lock_bytes_tombstones`] took its lock.
+async fn pg_tombstone_at_write(
+    tx: &tokio_postgres::Transaction<'_>,
+    sha256: &[u8; 32],
+    purge_plane: bool,
+) -> Result<Option<String>, crate::federation::BlobError> {
+    if !purge_plane {
+        return Ok(None);
+    }
+    let row = tx
+        .query_one(
+            "SELECT MIN(notice_id) FROM cirislens.purge_tombstones \
+              WHERE plane = $1 AND record_ref = $2",
+            &[
+                &crate::federation::steward_purge::PurgePlane::Blob.as_str(),
+                &hex::encode(sha256),
+            ],
+        )
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("bytes tombstone read: {e}")))?;
+    row.safe_get_with(0, crate::federation::BlobError::Backend)
+}
+
+/// Both: lock every address, then refuse the first one a tombstone names
+/// ([`refuse_tombstoned_at_write`](crate::federation::steward_purge::refuse_tombstoned_at_write)).
+async fn pg_refuse_tombstoned_at_write(
+    tx: &tokio_postgres::Transaction<'_>,
+    shas: &[[u8; 32]],
+    purge_plane: bool,
+) -> Result<(), crate::federation::BlobError> {
+    pg_lock_bytes_tombstones(tx, shas, purge_plane).await?;
+    for sha in shas {
+        crate::federation::steward_purge::refuse_tombstoned_at_write(
+            sha,
+            pg_tombstone_at_write(tx, sha, purge_plane).await?,
+        )?;
+    }
+    Ok(())
 }
 
 /// #957 — the batch's per-item constants.
@@ -2268,6 +2345,8 @@ struct PgChunkTx<'a> {
     bind_as_declared: bool,
     /// #969 — the STREAM-nonce slot a stream-keyed chunk was sealed at.
     stream_key: Option<crate::federation::StreamKeySlot>,
+    /// v60.1.0 (#1070) — the tombstone table exists.
+    purge_plane: bool,
 }
 
 /// #957 — one item's append inside its savepoint: the blob row, the nonce
@@ -2315,6 +2394,11 @@ async fn pg_append_chunk_item(
     } else {
         false
     };
+    // v60.1.0 (#1070) — the tombstone again, under the write (the batch took
+    // every item's lock when its transaction began).
+    if let Some(notice_id) = pg_tombstone_at_write(tx, &row.sha256, c.purge_plane).await? {
+        return Ok(PgItemAppended::Purged(notice_id));
+    }
     // 1. The chunk's bytes land as a normal federation_blobs row.
     //    Content-addressed + idempotent. Carries the cohort and the tier the
     //    door resolved (§11.1 / §12.1). #846 (§5) — the chunk's author is the
@@ -6469,6 +6553,27 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .transaction()
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
+        // v60.1.0 (CIRISPersist#1070 item 3) — a bytes-plane tombstone is
+        // written under the EXCLUSIVE lock a byte write holds shared from its
+        // in-transaction tombstone read to its commit (sorted, as the writers
+        // take theirs): a write already past that read commits first and the
+        // finalize that follows this commit deletes its bytes; a later write
+        // reads this tombstone and refuses.
+        let mut blob_keys: Vec<String> = tombstones
+            .iter()
+            .filter(|t| t.plane == crate::federation::steward_purge::PurgePlane::Blob)
+            .map(|t| crate::federation::steward_purge::bytes_tombstone_lock_key(&t.record_ref))
+            .collect();
+        blob_keys.sort();
+        blob_keys.dedup();
+        for k in &blob_keys {
+            tx.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[k],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("bytes tombstone lock: {e}")))?;
+        }
         let e = execution;
         let record_count = i64::try_from(e.record_count).unwrap_or(i64::MAX);
         let n = tx
@@ -14668,6 +14773,15 @@ impl crate::federation::BlobStorage for PostgresBackend {
         floor.check_scope(cohort_scope)?;
         // v55.0.0 (#1007) — taken-down bytes never come back.
         crate::federation::steward_purge::refuse_tombstoned_bytes(self, sha256).await?;
+        // v60.1.0 (#1070) — the in-transaction second look's switch, and the
+        // witnesses' seam between the pre-read and the write.
+        let purge_plane = !self
+            .pre_purge_schema
+            .load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
+            .await;
         let scope = cohort_scope.to_owned();
         let tier = floor.tier().as_str().to_owned();
         let group = group_key_id.map(str::to_owned);
@@ -14786,6 +14900,8 @@ impl crate::federation::BlobStorage for PostgresBackend {
 
         let sha_vec = sha256.to_vec();
         if floor.tier() == crate::federation::types::cohort_scope::CryptoTier::Plaintext {
+            // v60.1.0 (#1070) — the tombstone again, under the write.
+            pg_refuse_tombstoned_at_write(&tx, &[*sha256], purge_plane).await?;
             // #846 (§5) — the row records its AUTHOR: the attesting key of
             // the holder claim, which for a local write is the writer's
             // derived key (I23) and for a proxy write the peer's.
@@ -15036,6 +15152,15 @@ impl crate::federation::BlobStorage for PostgresBackend {
         floor.check_scope(cohort_scope)?;
         // v55.0.0 (#1007) — taken-down bytes never come back.
         crate::federation::steward_purge::refuse_tombstoned_bytes(self, sha256).await?;
+        // v60.1.0 (#1070) — the in-transaction second look's switch, and the
+        // witnesses' seam between the pre-read and the write.
+        let purge_plane = !self
+            .pre_purge_schema
+            .load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
+            .await;
         let scope = cohort_scope.to_owned();
         let tier = floor.tier().as_str().to_owned();
         let author = author_key_id.map(str::to_owned);
@@ -15090,6 +15215,8 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .transaction()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
+        // v60.1.0 (#1070) — the tombstone again, under the write.
+        pg_refuse_tombstoned_at_write(&tx, &[*sha256], purge_plane).await?;
         let sha_vec = sha256.to_vec();
         tx.execute(
             // #984 (V177) — the group the write named, on the row.
@@ -17593,6 +17720,15 @@ impl crate::federation::BlobStorage for PostgresBackend {
         for row in &rows {
             crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256).await?;
         }
+        // v60.1.0 (#1070) — the in-transaction second look's switch, and the
+        // witnesses' seam between the pre-read and the write.
+        let purge_plane = !self
+            .pre_purge_schema
+            .load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
+            .await;
 
         // Codex r2 on #1065 — the manifest's chunk relation, written in the
         // same transaction (the manifest row is the last prepared row).
@@ -17606,6 +17742,9 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .transaction()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
+        // v60.1.0 (#1070) — the tombstones again, under the write.
+        let shas: Vec<[u8; 32]> = rows.iter().map(|r| r.sha256).collect();
+        pg_refuse_tombstoned_at_write(&tx, &shas, purge_plane).await?;
         for row in &rows {
             let sha_vec = row.sha256.to_vec();
             // media_type is NULL for chunk rows + the manifest row.
@@ -17667,6 +17806,15 @@ impl crate::federation::BlobStorage for PostgresBackend {
         for c in &manifest.chunks {
             crate::federation::steward_purge::refuse_tombstoned_bytes(self, &c.sha).await?;
         }
+        // v60.1.0 (#1070) — the in-transaction second look's switch, and the
+        // witnesses' seam between the pre-read and the write.
+        let purge_plane = !self
+            .pre_purge_schema
+            .load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
+            .await;
         let mut client = self
             .get_client()
             .await
@@ -17695,6 +17843,12 @@ impl crate::federation::BlobStorage for PostgresBackend {
             // Dropping `tx` uncommitted rolls back; nothing was written.
             crate::federation::blobs::check_held_dag_chunk(idx, &c.sha, u64::from(c.size), held)?;
         }
+        // v60.1.0 (#1070) — the tombstones again, under the write: the
+        // manifest's own and every chunk's.
+        let shas: Vec<[u8; 32]> = std::iter::once(row.sha256)
+            .chain(manifest.chunks.iter().map(|c| c.sha))
+            .collect();
+        pg_refuse_tombstoned_at_write(&tx, &shas, purge_plane).await?;
         let media_type_null: Option<String> = None;
         tx.execute(
             "INSERT INTO cirislens.federation_blobs (\
@@ -18795,6 +18949,15 @@ impl crate::federation::BlobStorage for PostgresBackend {
         let sha256: [u8; 32] = sha2::Sha256::digest(&envelope_bytes).into();
         // v55.0.0 (#1007) — taken-down bytes never come back.
         crate::federation::steward_purge::refuse_tombstoned_bytes(self, &sha256).await?;
+        // v60.1.0 (#1070) — the in-transaction second look's switch, and the
+        // witnesses' seam between the pre-read and the write.
+        let purge_plane = !self
+            .pre_purge_schema
+            .load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
+            .await;
         let size_i64 = i64::try_from(envelope_bytes.len()).map_err(|_| {
             crate::federation::BlobError::InvalidArgument(
                 "adopt_sealed_blob_at: size_bytes exceeds i64".into(),
@@ -18863,6 +19026,8 @@ impl crate::federation::BlobStorage for PostgresBackend {
         if let Some(b) = &binding {
             lock_community_tx(&tx, &b.community_key_id).await?;
         }
+        // v60.1.0 (#1070) — the tombstone again, under the write.
+        pg_refuse_tombstoned_at_write(&tx, &[sha256], purge_plane).await?;
         // 1. The row, verbatim bytes, tier from the token, cohort and author
         //    AS DECLARED, and (v55.0.0) the group the provenance names (V177).
         //    First-write-wins on the address.
@@ -20022,6 +20187,15 @@ impl PostgresBackend {
             }
         }
         let ready = kept;
+        // v60.1.0 (#1070) — the in-transaction second look's switch, and the
+        // witnesses' seam between the pre-read and the write.
+        let purge_plane = !self
+            .pre_purge_schema
+            .load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
+            .await;
         let scope = cohort_scope.to_owned();
         let tier = floor.tier().as_str().to_owned();
 
@@ -20038,6 +20212,10 @@ impl PostgresBackend {
         if let Some(b) = &binding {
             lock_community_tx(&tx, &b.community_key_id).await?;
         }
+        // v60.1.0 (#1070) — every item's tombstone lock, sorted, for the
+        // whole batch; each item reads its tombstone again under it.
+        let shas: Vec<[u8; 32]> = ready.iter().map(|(_, r)| r.sha256).collect();
+        pg_lock_bytes_tombstones(&tx, &shas, purge_plane).await?;
 
         // 0. #837 (§12.9 / I41) — the STREAM's row, insert-if-absent in this
         //    transaction, then compared: a stream belongs to its first
@@ -20138,6 +20316,7 @@ impl PostgresBackend {
             binding: binding.as_ref(),
             bind_as_declared,
             stream_key: claim.stream_key,
+            purge_plane,
         };
         let mut landed = false;
         for (slot, row) in &ready {
@@ -20191,6 +20370,10 @@ impl PostgresBackend {
                         PgItemAppended::StreamEpochClosed => {
                             crate::federation::blobs::stream_epoch_closed_refusal(stream_id, epoch)
                         }
+                        PgItemAppended::Purged(notice_id) => crate::federation::BlobError::Purged {
+                            sha256_hex: hex::encode(row.sha256),
+                            notice_id,
+                        },
                         PgItemAppended::Ok => unreachable!("handled above"),
                     })
                 }

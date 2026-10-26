@@ -115,6 +115,26 @@
 //!   replicated takedown, its notice the retired Contribution in the old
 //!   spelling, is still applied (re-verified, re-asked, recorded in CC's
 //!   spelling); the local door refuses it as retired.
+//! - **I1402** (sqlite, postgres; v60.1.0, CIRISPersist#1070 item 1) — an
+//!   Engine with no LocalSigner (`from_shared`, `with_hardware_signer`)
+//!   executes an immediate-removal takedown to the end: the bytes are
+//!   destroyed on receipt and the execution finalized (the purge path deletes
+//!   without the retraction it cannot sign).
+//! - **I1403** (sqlite, postgres; #1070 item 2) — a recorded takedown
+//!   resumes: once the tombstone committed, a re-run of the same notice after
+//!   it expired completes the holder action on the originating node and on a
+//!   receiver of the bundle, without re-asking CC 4.5.5; an expired notice
+//!   never recorded here is still `takedown_unauthorised`.
+//! - **I1404** (sqlite, postgres; #1070 item 3) — a takedown that commits
+//!   between a byte door's tombstone pre-read and its write is seen by the
+//!   write (`put_blob_signing`, `store_plaintext_local`,
+//!   `put_plaintext_dag_chunk`, `put_blob_chunks_signing`,
+//!   `finalize_blob_chunks_signing`): `blob_purged` naming the notice, nothing
+//!   lands. The adopt doors are `stream_epoch_dek_invariants`' I1406.
+//! - **I1405** (sqlite, postgres; #1070, decided) — a plaintext chunk two
+//!   DAGs share stays with the live DAG: an immediate-removal takedown of one
+//!   destroys its manifest and its own chunks; the shared chunk is neither
+//!   withheld nor evicted and the other DAG reads whole.
 //! - **I795** (two nodes, sqlite and postgres) — the takedown delivered
 //!   through the planes: A takes content down, serves the tombstone as a
 //!   purge bundle over JSON, and B applies it, re-verified on B's state, and
@@ -1242,10 +1262,11 @@ pub(crate) mod bodies {
 /// The Engine-level witnesses: the bytes plane (sqlite, postgres).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod engine_bodies {
-    use super::bodies::{claimant, establish, notice};
+    use super::bodies::{claimant, establish, notice, notice_at};
     use crate::federation::epoch_minter_invariants::bodies::{ladder, Pick};
     use crate::federation::steward_purge::{self as sp, test_clock};
     use crate::federation::takedown_tombstone::TakedownDisposition;
+    use crate::federation::takedown_tombstone::{self as td, token};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::USER;
     use crate::federation::FederationDirectory;
@@ -1846,6 +1867,408 @@ pub(crate) mod engine_bodies {
         assert!(!l.ba.has_blob(&dmca).await.unwrap());
     }
 
+    // ── I1402 ─────────────────────────────────────────────────────────────
+    /// v60.1.0 (CIRISPersist#1070 item 1, Codex r2 on #1065) — an Engine with
+    /// no LocalSigner (`from_shared`, as `with_hardware_signer`) executes an
+    /// immediate-removal takedown to the end: the bytes are destroyed on
+    /// receipt and the execution is finalized, where it used to refuse
+    /// `purge_retraction_inadmissible` at the first blob and leave the bytes
+    /// on disk on every retry.
+    pub(crate) async fn i1402_a_takedown_without_a_local_signer_destroys<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let author = format!("i1402-author-{run}");
+        ts::register_hybrid_key_as(l.ba.as_ref(), &author, &author, USER).await;
+        let owner = claimant(0x14);
+        let dir = l.ba.as_dyn_directory();
+        let hw =
+            crate::Engine::from_shared(l.engine_a.backend().clone(), l.engine_a.signer().clone());
+        let bytes = format!("i1402-{run}").into_bytes();
+        let sha: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+        hw.store_plaintext_local(&sha, bytes, None).await.unwrap();
+        establish(dir, &author, &owner.id, &hex::encode(sha)).await;
+        let r = hw
+            .takedown_tombstone(&notice(&owner, &hex::encode(sha), "ncmec_csam"))
+            .await
+            .expect("I1402: an immediate-removal takedown on a host with no LocalSigner");
+        assert!(r.bytes_destroyed, "I1402: destroyed on receipt: {r:?}");
+        assert!(!l.ba.has_blob(&sha).await.unwrap(), "I1402: gone from disk");
+        assert_eq!(
+            hw.purge_status(&r.notice_id).await.unwrap().state,
+            sp::PurgeState::Finalized,
+            "I1402: the execution completes"
+        );
+    }
+
+    // ── I1403 ─────────────────────────────────────────────────────────────
+    /// v60.1.0 (CIRISPersist#1070 item 2, Codex r2 on #1065) — a recorded
+    /// takedown RESUMES: when the holder action did not run after the
+    /// tombstone committed (here: the directory door alone recorded it), a
+    /// re-run of the same notice after it EXPIRED completes the holder action
+    /// from the recorded decision, on the originating node and on a receiver
+    /// of the replicated bundle, instead of re-asking CC 4.5.5 and refusing
+    /// `takedown_unauthorised` forever. A notice never recorded here is still
+    /// refused once expired.
+    pub(crate) async fn i1403_a_recorded_takedown_resumes<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let author = format!("i1403-author-{run}");
+        let owner = claimant(0x15);
+        let bytes = format!("i1403-{run}");
+        let late = format!("i1403-late-{run}");
+        let mut sha = [0u8; 32];
+        let mut late_sha = [0u8; 32];
+        for (e, b) in [(&l.engine_a, l.ba.as_ref()), (&l.engine_b, l.bb.as_ref())] {
+            ts::register_hybrid_key_as(b, &author, &author, USER).await;
+            sha = hold(e, &author, bytes.as_bytes()).await;
+            late_sha = hold(e, &author, late.as_bytes()).await;
+            for s in [sha, late_sha] {
+                establish(b.as_dyn_directory(), &author, &owner.id, &hex::encode(s)).await;
+            }
+        }
+        // Notices that expire in three seconds: the withdraws a resumed
+        // holder action signs are stamped on the real clock, so the expiry
+        // is waited out, not simulated.
+        let t = chrono::Utc::now();
+        let ttl = chrono::Duration::seconds(3);
+        let n = notice_at(&owner, &hex::encode(sha), "ncmec_csam", t, t + ttl);
+        let never = notice_at(&owner, &hex::encode(late_sha), "ncmec_csam", t, t + ttl);
+        // The tombstone commits; the holder action never ran.
+        let recorded = td::takedown_tombstone(l.ba.as_dyn_directory(), &n, &l.node_a)
+            .await
+            .expect("I1403: the tombstone commits");
+        assert!(recorded.tombstoned);
+        assert!(
+            l.ba.has_blob(&sha).await.unwrap(),
+            "I1403: precondition, bytes stay"
+        );
+        let served = l.engine_a.list_purge_bundles_since(None, 10).await.unwrap();
+        assert_eq!(served.len(), 1, "I1403: one bundle on A");
+        let bundle = served.into_iter().next().expect("I1403: the bundle");
+        td::apply_replicated_takedown(
+            l.bb.as_dyn_directory(),
+            &td::TakedownNotice {
+                envelope: bundle.notice.envelope.clone(),
+            },
+            &bundle.record_ids,
+            &l.node_b,
+        )
+        .await
+        .expect("I1403: B records it");
+        assert!(l.bb.has_blob(&sha).await.unwrap());
+
+        // The notices expire.
+        let wait = (t + ttl + chrono::Duration::milliseconds(200)) - chrono::Utc::now();
+        if let Ok(w) = wait.to_std() {
+            tokio::time::sleep(w).await;
+        }
+        let resumed = l.engine_a.takedown_tombstone(&n).await;
+        let applied = l.engine_b.apply_replicated_purge(&bundle).await;
+        let fresh = l.engine_a.takedown_tombstone(&never).await;
+        let resumed = resumed.expect("I1403: the recorded takedown resumes on A");
+        assert!(resumed.bytes_destroyed, "I1403: A: {resumed:?}");
+        assert!(
+            !l.ba.has_blob(&sha).await.unwrap(),
+            "I1403: A's copy is gone"
+        );
+        applied.expect("I1403: the recorded takedown resumes on B");
+        assert!(
+            !l.bb.has_blob(&sha).await.unwrap(),
+            "I1403: B's copy is gone"
+        );
+        for (node, b) in [("A", l.ba.as_ref()), ("B", l.bb.as_ref())] {
+            assert!(
+                b.purge_execution(&recorded.notice_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .finalized_at
+                    .is_some(),
+                "I1403 {node}: the execution completes"
+            );
+        }
+        assert_eq!(
+            fresh.map(|_| ()).unwrap_err().kind(),
+            token::UNAUTHORISED,
+            "I1403: an expired notice never recorded here is still refused"
+        );
+        assert!(l.ba.has_blob(&late_sha).await.unwrap());
+    }
+
+    // ── I1404 ─────────────────────────────────────────────────────────────
+    /// Run `door` paused between its tombstone pre-read and its write; while it
+    /// waits, take `sha` down through `engine` (immediate removal: the
+    /// tombstone commits and the finalize runs); then let the door go on.
+    pub(crate) async fn with_a_takedown_after_the_pre_read<B, T>(
+        b: &B,
+        engine: &crate::Engine,
+        owner: &super::bodies::Claimant,
+        sha: [u8; 32],
+        door: impl std::future::Future<Output = T>,
+    ) -> (T, td::TakedownReport)
+    where
+        B: crate::store::test_hooks::ArmBytesPause,
+    {
+        let p = b.arm_bytes_pause();
+        let take = async {
+            tokio::time::timeout(std::time::Duration::from_secs(20), p.reached())
+                .await
+                .expect("the door reaches its tombstone pre-read");
+            let r = engine
+                .takedown_tombstone(&notice(owner, &hex::encode(sha), "ncmec_csam"))
+                .await
+                .expect("the takedown between the pre-read and the write");
+            p.resume();
+            r
+        };
+        tokio::join!(door, take)
+    }
+
+    /// v60.1.0 (CIRISPersist#1070 item 3, Codex r2 on #1065) — a takedown that
+    /// commits between a byte door's tombstone pre-read and its write is seen
+    /// by the write: the door answers `blob_purged` naming the notice and
+    /// nothing lands, on the plaintext doors `put_blob_signing`,
+    /// `store_plaintext_local`, `put_plaintext_dag_chunk`,
+    /// `put_blob_chunks_signing` and `finalize_blob_chunks_signing`. Before
+    /// the in-transaction look the bytes landed after their tombstone and the
+    /// finalized immediate-removal notice never revisited them.
+    pub(crate) async fn i1404_a_takedown_between_the_pre_read_and_the_write<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage
+            + FederationDirectory
+            + crate::store::test_hooks::ArmBytesPause
+            + Sync
+            + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let author = format!("i1404-author-{run}");
+        ts::register_hybrid_key_as(l.ba.as_ref(), &author, &author, USER).await;
+        let owner = claimant(0x17);
+        let dir = l.ba.as_dyn_directory();
+        let e = &l.engine_a;
+        let purged = |why: &str, r: Result<(), BlobError>, notice_id: &str| match r {
+            Err(BlobError::Purged { notice_id: n, .. }) => {
+                assert_eq!(n, notice_id, "I1404 {why}: the notice that took it down")
+            }
+            other => panic!("I1404 {why}: the write sees the takedown, got {other:?}"),
+        };
+        let fresh = |tag: &str| -> (Vec<u8>, [u8; 32]) {
+            let b = format!("i1404 {tag} {run} ").repeat(20).into_bytes();
+            let s = sha2::Sha256::digest(&b).into();
+            (b, s)
+        };
+
+        // put_blob_signing.
+        let (bytes, sha) = fresh("put_blob_signing");
+        establish(dir, &author, &owner.id, &hex::encode(sha)).await;
+        let (got, r) = Box::pin(with_a_takedown_after_the_pre_read(
+            l.ba.as_ref(),
+            e,
+            &owner,
+            sha,
+            e.put_blob_signing(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                &author,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            ),
+        ))
+        .await;
+        purged("put_blob_signing", got.map(|_| ()), &r.notice_id);
+        assert!(
+            !l.ba.has_blob(&sha).await.unwrap(),
+            "I1404 put_blob_signing"
+        );
+
+        // store_plaintext_local.
+        let (bytes, sha) = fresh("store_plaintext_local");
+        establish(dir, &author, &owner.id, &hex::encode(sha)).await;
+        let (got, r) = Box::pin(with_a_takedown_after_the_pre_read(
+            l.ba.as_ref(),
+            e,
+            &owner,
+            sha,
+            e.store_plaintext_local(&sha, bytes, None),
+        ))
+        .await;
+        purged("store_plaintext_local", got, &r.notice_id);
+        assert!(!l.ba.has_blob(&sha).await.unwrap());
+
+        // put_plaintext_dag_chunk.
+        let (bytes, sha) = fresh("put_plaintext_dag_chunk");
+        establish(dir, &author, &owner.id, &hex::encode(sha)).await;
+        let entry = ChunkRef {
+            sha,
+            size: bytes.len() as u32,
+            seq: None,
+            epoch: None,
+        };
+        let (got, r) = Box::pin(with_a_takedown_after_the_pre_read(
+            l.ba.as_ref(),
+            e,
+            &owner,
+            sha,
+            e.put_plaintext_dag_chunk(&entry, BlobBody::Inline(bytes), &author),
+        ))
+        .await;
+        purged("put_plaintext_dag_chunk", got.map(|_| ()), &r.notice_id);
+        assert!(!l.ba.has_blob(&sha).await.unwrap());
+
+        // put_blob_chunks_signing: one chunk taken down, nothing of the DAG lands.
+        let segs: Vec<Vec<u8>> = ["one-shot a", "one-shot b"]
+            .iter()
+            .map(|t| fresh(t).0)
+            .collect();
+        let m = plaintext_manifest(&segs);
+        let msha: [u8; 32] = sha2::Sha256::digest(m.to_jcs_bytes()).into();
+        let target = m.chunks[0].sha;
+        establish(dir, &author, &owner.id, &hex::encode(target)).await;
+        let chunks = segs
+            .iter()
+            .map(|s| (sha2::Sha256::digest(s).into(), BlobBody::Inline(s.clone())))
+            .collect();
+        let (got, r) = Box::pin(with_a_takedown_after_the_pre_read(
+            l.ba.as_ref(),
+            e,
+            &owner,
+            target,
+            e.put_blob_chunks_signing(m.clone(), chunks, &author),
+        ))
+        .await;
+        purged("put_blob_chunks_signing", got.map(|_| ()), &r.notice_id);
+        for s in [target, m.chunks[1].sha, msha] {
+            assert!(
+                !l.ba.has_blob(&s).await.unwrap(),
+                "I1404 one-shot: nothing lands"
+            );
+        }
+
+        // finalize_blob_chunks_signing: the manifest taken down.
+        let segs: Vec<Vec<u8>> = ["finalize a", "finalize b"]
+            .iter()
+            .map(|t| fresh(t).0)
+            .collect();
+        let m = plaintext_manifest(&segs);
+        let msha: [u8; 32] = sha2::Sha256::digest(m.to_jcs_bytes()).into();
+        for (c, s) in m.chunks.iter().zip(&segs) {
+            e.put_plaintext_dag_chunk(c, BlobBody::Inline(s.clone()), &author)
+                .await
+                .unwrap();
+        }
+        establish(dir, &author, &owner.id, &hex::encode(msha)).await;
+        let (got, r) = Box::pin(with_a_takedown_after_the_pre_read(
+            l.ba.as_ref(),
+            e,
+            &owner,
+            msha,
+            e.finalize_blob_chunks_signing(m, &author),
+        ))
+        .await;
+        purged(
+            "finalize_blob_chunks_signing",
+            got.map(|_| ()),
+            &r.notice_id,
+        );
+        assert!(
+            !l.ba.has_blob(&msha).await.unwrap(),
+            "I1404 finalize: no manifest row"
+        );
+    }
+
+    // ── I1405 ─────────────────────────────────────────────────────────────
+    /// v60.1.0 (CIRISPersist#1070 comment, decided) — a plaintext chunk two
+    /// DAGs share stays with the live DAG: an immediate-removal takedown of
+    /// one DAG destroys its manifest and the chunks only it relates, while the
+    /// shared chunk is neither withheld nor evicted and the other DAG reads
+    /// whole. The taken-down DAG is withheld at its own address.
+    pub(crate) async fn i1405_a_shared_chunk_stays_with_the_live_dag<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let author = format!("i1405-author-{run}");
+        ts::register_hybrid_key_as(l.ba.as_ref(), &author, &author, USER).await;
+        let owner = claimant(0x16);
+        let dir = l.ba.as_dyn_directory();
+        let shared = format!("i1405 shared {run} ").repeat(30).into_bytes();
+        let only_x = format!("i1405 x {run} ").repeat(30).into_bytes();
+        let only_y = format!("i1405 y {run} ").repeat(30).into_bytes();
+        let put = |segs: Vec<Vec<u8>>| {
+            let e = &l.engine_a;
+            let author = author.clone();
+            async move {
+                let m = plaintext_manifest(&segs);
+                let chunks = segs
+                    .iter()
+                    .map(|s| (sha2::Sha256::digest(s).into(), BlobBody::Inline(s.clone())))
+                    .collect();
+                (
+                    e.put_blob_chunks_signing(m, chunks, &author).await.unwrap(),
+                    segs.concat(),
+                )
+            }
+        };
+        let (x, _) = put(vec![only_x.clone(), shared.clone()]).await;
+        let (y, y_plain) = put(vec![shared.clone(), only_y.clone()]).await;
+        establish(dir, &author, &owner.id, &hex::encode(x)).await;
+        let r = l
+            .engine_a
+            .takedown_tombstone(&notice(&owner, &hex::encode(x), "ncmec_csam"))
+            .await
+            .expect("I1405: the takedown of X");
+        assert!(r.bytes_destroyed);
+        let sha = |b: &[u8]| -> [u8; 32] { sha2::Sha256::digest(b).into() };
+        assert!(
+            !l.ba.has_blob(&x).await.unwrap(),
+            "I1405: X's manifest is gone"
+        );
+        assert!(
+            !l.ba.has_blob(&sha(&only_x)).await.unwrap(),
+            "I1405: X's own chunk is gone"
+        );
+        assert!(
+            l.ba.has_blob(&sha(&shared)).await.unwrap(),
+            "I1405: the shared chunk stays"
+        );
+        assert_eq!(
+            sp::purge_withheld(dir, &sha(&shared)).await.unwrap(),
+            None,
+            "I1405: the shared chunk is not withheld"
+        );
+        assert_eq!(
+            l.engine_a.read_blob_as(&y, "", None).await.unwrap(),
+            y_plain,
+            "I1405: Y reads whole"
+        );
+        assert_eq!(
+            sp::purge_withheld(dir, &x).await.unwrap(),
+            Some(r.notice_id),
+            "I1405: X is withheld at its own address"
+        );
+    }
+
     // ── I791 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i791_only_the_holder_retracts_a_holding_claim<B>(
         dsn_a: &str,
@@ -2142,6 +2565,39 @@ mod run {
                         $pick,
                     )
                     .await
+                }
+                #[tokio::test]
+                async fn i1402() {
+                    let Some((a, b)) = $dsns else { return };
+                    e::i1402_a_takedown_without_a_local_signer_destroys(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i1403() {
+                    let Some((a, b)) = $dsns else { return };
+                    e::i1403_a_recorded_takedown_resumes(&a, &b, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i1404() {
+                    let Some((a, b)) = $dsns else { return };
+                    e::i1404_a_takedown_between_the_pre_read_and_the_write(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i1405() {
+                    let Some((a, b)) = $dsns else { return };
+                    e::i1405_a_shared_chunk_stays_with_the_live_dag(&a, &b, &super::suffix(), $pick)
+                        .await
                 }
                 #[tokio::test]
                 async fn i790() {

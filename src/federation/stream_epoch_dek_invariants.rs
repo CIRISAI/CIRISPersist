@@ -37,6 +37,11 @@
 //!   `stream_epoch_dek_exists`, naming no key material. Two supplies racing for
 //!   one epoch: the same DEK is one write and one idempotent `Ok`; two DEKs are
 //!   one `Ok` and one conflict, and the stored key is the winner's.
+//! - **I1406** (sqlite, postgres; v60.1.0, #1070 item 3) — a takedown that
+//!   commits between an adopt's tombstone pre-read and its write is seen by
+//!   the write: `adopt_sealed_chunk` (the batched chunk floor) and
+//!   `adopt_sealed_blob` (the adopt floor) answer `blob_purged` naming the
+//!   notice and nothing lands on the holder.
 //! - **I755** (sqlite, postgres; #981) — a supplied, kept epoch whose
 //!   recipient leaves the audience refuses the next chunk with the retryable
 //!   `stream_epoch_rotation_required { reason: removal, removed_key_id }`;
@@ -914,6 +919,105 @@ pub(crate) mod bodies {
         );
     }
 
+    /// **I1406** — see the module doc.
+    pub(crate) async fn i1406_a_takedown_between_the_adopt_pre_read_and_the_write<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage
+            + FederationDirectory
+            + crate::store::test_hooks::ArmBytesPause
+            + Sync
+            + 'static,
+    {
+        use crate::federation::doors_takedown_invariants::bodies::{claimant, establish};
+        use crate::federation::doors_takedown_invariants::engine_bodies::with_a_takedown_after_the_pre_read;
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let stream = format!("i1406-{run}");
+        write_room(&l, &stream, 2, 0).await;
+        let sealed = l
+            .engine_a
+            .seal_stream_scoped(COMMUNITY, Some(&l.comm), &stream, None, None)
+            .await
+            .expect("A seals the room stream");
+        l.engine_a.emit_pending_key_grants().await.unwrap();
+        for row in key_grant_rows_for(l.ba.as_ref(), &l.node_a, &l.node_b).await {
+            l.engine_b.apply_replicated_key_grant(row).await.unwrap();
+        }
+        let owner = claimant(0x18);
+        let producer = format!("i1406-producer-{run}");
+        let dir_b = l.bb.as_dyn_directory();
+        let purged = |why: &str, r: Result<[u8; 32], BlobError>, notice_id: &str| match r {
+            Err(BlobError::Purged { notice_id: n, .. }) => {
+                assert_eq!(n, notice_id, "I1406 {why}: the notice that took it down")
+            }
+            other => panic!("I1406 {why}: the write sees the takedown, got {other:?}"),
+        };
+
+        // The chunk floor (adopt_sealed_chunk → the batched chunk floor).
+        let c0 = l.ba.stream_chunk_at(&stream, 0).await.unwrap().unwrap();
+        establish(dir_b, &producer, &owner.id, &hex::encode(c0.chunk_sha)).await;
+        let chunk_prov = BlobProvenance {
+            author_key_id: l.node_a.clone(),
+            cohort_scope: COMMUNITY.to_owned(),
+            community_key_id: Some(l.comm.clone()),
+            epoch: None,
+            tier: CryptoTier::CommunityDek,
+            minter_key_id: None,
+        };
+        let env = inline(l.ba.as_ref(), &c0.chunk_sha).await;
+        let (got, r) = Box::pin(with_a_takedown_after_the_pre_read(
+            l.bb.as_ref(),
+            &l.engine_b,
+            &owner,
+            c0.chunk_sha,
+            l.engine_b.adopt_sealed_chunk(
+                &stream,
+                c0.seq,
+                &env,
+                c0.epoch,
+                c0.plaintext_size,
+                chunk_prov,
+            ),
+        ))
+        .await;
+        purged("adopt_sealed_chunk", got, &r.notice_id);
+        assert!(
+            !l.bb.has_blob(&c0.chunk_sha).await.unwrap(),
+            "I1406: no chunk"
+        );
+
+        // The adopt floor (adopt_sealed_blob → adopt_sealed_blob_at).
+        let root = sealed.manifest_sha256;
+        establish(dir_b, &producer, &owner.id, &hex::encode(root)).await;
+        let manifest_prov = BlobProvenance {
+            author_key_id: l.node_a.clone(),
+            cohort_scope: COMMUNITY.to_owned(),
+            community_key_id: Some(l.comm.clone()),
+            epoch: sealed.epoch,
+            tier: CryptoTier::CommunityDek,
+            minter_key_id: Some(l.node_a.clone()),
+        };
+        let env = inline(l.ba.as_ref(), &root).await;
+        let (got, r) = Box::pin(with_a_takedown_after_the_pre_read(
+            l.bb.as_ref(),
+            &l.engine_b,
+            &owner,
+            root,
+            l.engine_b.adopt_sealed_blob(
+                &env,
+                manifest_prov,
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            ),
+        ))
+        .await;
+        purged("adopt_sealed_blob", got.map(|o| o.sha256), &r.notice_id);
+        assert!(!l.bb.has_blob(&root).await.unwrap(), "I1406: no manifest");
+    }
+
     /// **I779** — see the module doc.
     pub(crate) async fn i779_an_open_stream_epoch_waits_for_its_terminator<B>(
         dsn_a: &str,
@@ -1762,6 +1866,12 @@ pub(crate) mod bodies {
                 async fn i1401() {
                     let Some((a, b)) = $dsn else { return };
                     i1401_a_resupply_of_the_same_dek_is_idempotent(&a, &b, &run(), $pick).await
+                }
+                #[tokio::test]
+                async fn i1406() {
+                    let Some((a, b)) = $dsn else { return };
+                    i1406_a_takedown_between_the_adopt_pre_read_and_the_write(&a, &b, &run(), $pick)
+                        .await
                 }
                 #[tokio::test]
                 async fn i757() {

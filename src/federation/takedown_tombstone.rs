@@ -864,9 +864,28 @@ pub async fn takedown_tombstone(
 ) -> Result<TakedownReport, Error> {
     let now = sp::purge_clock();
     let terms = takedown_terms(directory, notice, NoticeOrigin::Local).await?;
-    verify_takedown_authority(directory, &terms, now).await?;
+    if !already_recorded(directory, &terms).await? {
+        verify_takedown_authority(directory, &terms, now).await?;
+    }
     hold_notice_row(directory, &terms).await?;
     record(directory, &terms, executed_by, origin::LOCAL, now).await
+}
+
+/// v60.1.0 (CIRISPersist#1070, Codex r2 on #1065) — **is this notice's
+/// execution already recorded here?** Then a re-run RESUMES it: the decision
+/// was made (CC 4.5.5 asked, the tombstone committed) and is not asked again,
+/// so a holder action that failed after the commit completes even once the
+/// notice has expired or the signer's duty has lapsed. The notice's signature
+/// is still verified on every run ([`takedown_terms`]), and the execution is
+/// keyed by the notice id, the digest of the notice's own JCS, so only the
+/// same notice resumes. The header and its one tombstone are written in ONE
+/// transaction (`purge_put_execution`), so a held header is a held tombstone.
+async fn already_recorded(
+    directory: &dyn FederationDirectory,
+    terms: &TakedownTerms,
+) -> Result<bool, Error> {
+    Ok(terms.disposition != TakedownDisposition::AgeGate
+        && directory.purge_execution(&terms.notice_id).await?.is_some())
 }
 
 /// v60.0.0 (CIRISPersist#803) — the notice row the tombstone cites is HELD
@@ -933,7 +952,9 @@ pub async fn apply_replicated_takedown(
             }),
         ));
     }
-    verify_takedown_authority(directory, &terms, now).await?;
+    if !already_recorded(directory, &terms).await? {
+        verify_takedown_authority(directory, &terms, now).await?;
+    }
     hold_notice_row(directory, &terms).await?;
     record(directory, &terms, receiver_key_id, origin::REPLICATED, now).await
 }
