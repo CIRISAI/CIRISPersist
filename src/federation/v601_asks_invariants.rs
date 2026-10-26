@@ -8,6 +8,11 @@
 //!   of three (the reported `m` is 2) and do not over a roster of four (the
 //!   reported `m` is 3); a roster id this node holds no key for counts toward
 //!   neither.
+//! - **I1361 (CIRISPersist#1119; CC 5.4.6 item 4)** — `infra:relay` is
+//!   conferred on the accord plane exactly as `infra:serve` is: a key record
+//!   claiming it under a two-of-three holder co-scrub reads `true` through
+//!   `has_accord_conferred_role`, and the same claim scrubbed only by an
+//!   out-of-roster key reads `false`. No new row kind.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -16,8 +21,10 @@ pub(crate) mod bodies {
         AccordThreshold,
     };
     use crate::federation::operational::test_support::{
-        confer_roles, register_accord_holder, Identity,
+        confer_roles, register_accord_holder, signed_canonical_record_with_roles, Identity,
+        PLACEHOLDER_SUBJECT_ED25519_BASE64,
     };
+    use crate::federation::types::delegation_scope;
     use crate::federation::FederationDirectory;
 
     /// **I1360** — see the module doc.
@@ -92,6 +99,58 @@ pub(crate) mod bodies {
             "I1360: two of four is below the reported m = 3, and the gate agrees"
         );
     }
+
+    /// **I1361** — see the module doc.
+    pub(crate) async fn i1361_infra_relay_is_accord_conferred(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let relay = delegation_scope::INFRA_RELAY;
+        let subject = format!("i1361-relay-{tag}");
+        let roster = confer_roles(d, &subject, &[relay], &format!("i1361-{tag}"))
+            .await
+            .expect("I1361: the co-scrubbed relay standing stores");
+        assert!(
+            has_accord_conferred_role_over_roster(d, &subject, relay, &roster)
+                .await
+                .unwrap(),
+            "I1361: a holder-co-scrubbed infra:relay reads conferred"
+        );
+        assert!(
+            !has_accord_conferred_role_over_roster(
+                d,
+                &subject,
+                delegation_scope::INFRA_SERVE,
+                &roster
+            )
+            .await
+            .unwrap(),
+            "I1361: a relay standing is not a serve seat"
+        );
+
+        // The same claim, scrubbed only by a registered out-of-roster key.
+        let self_id = format!("i1361-self-{tag}");
+        let scrubber = Identity::new(&format!("i1361-selfscrub-{tag}"));
+        register_accord_holder(d, &scrubber).await.unwrap();
+        let record = signed_canonical_record_with_roles(
+            &self_id,
+            crate::federation::types::identity_type::NODE,
+            PLACEHOLDER_SUBJECT_ED25519_BASE64,
+            None,
+            vec![relay.to_owned()],
+            serde_json::json!({ "key_id": self_id }),
+            &[&scrubber],
+        );
+        d.put_public_key(crate::federation::types::SignedKeyRecord { record })
+            .await
+            .expect("I1361: a self-scrubbed record still stores");
+        assert!(
+            !has_accord_conferred_role_over_roster(d, &self_id, relay, &roster)
+                .await
+                .unwrap(),
+            "I1361: a self-claimed infra:relay buys nothing"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -138,4 +197,5 @@ mod tests {
     }
 
     on_every_backend!(i1360, bodies::i1360_accord_threshold_is_the_gates_threshold);
+    on_every_backend!(i1361, bodies::i1361_infra_relay_is_accord_conferred);
 }

@@ -21,6 +21,13 @@ threat-model citations because this crate's audit story is the point.
   `Engine.accord_threshold() -> (m, n)` and `accord_threshold_for(n)`. CIRISEdge's
   `verify_accord_carrier` calls it instead of a hard-coded `(2, 3)`.
   Witness I1360 (sqlite, postgres): the reported `m` is the gate's.
+- **#1119 — `delegation_scope::INFRA_RELAY = "infra:relay"`** (CC 5.4.6
+  item 4, rc10): a steward-conferred relay standing, seat-like in the onion
+  layer cap's denominator. Conferred on the accord plane under the same
+  co-scrub rule as `infra:serve` and read through `has_accord_conferred_role`;
+  no new row kind. APPENDED to `delegation_scope::ALL` (position 24) and
+  `INFRA` (position 12), pinned by position. Witness I1361 (sqlite, postgres):
+  co-scrubbed reads conferred, self-claimed does not.
 
 ## [60.0.0] - 2026-10-26
 
