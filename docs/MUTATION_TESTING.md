@@ -342,9 +342,10 @@ did not fit its budget):
   (#691, `store::tree_read`), the fountain assembler moved out of memory.rs,
   the migrated in-memory clone (`store::sqlite_scratch`), and the genesis
   scratch on both backends (`genesis::scratch`, the postgres scratch
-  database, the replay's provision/release arms), against I1320, I1321,
-  I1323, I1329–I1331 and the lifecycle / fountain reads on both backends.
-  35 mutants in one shard, 27 caught, 8 unviable, 0 missed (round 2),
+  database and its reaper, the replay's provision/release arms), against
+  I1320, I1321, I1323, I1329–I1332 and the lifecycle / fountain reads on
+  both backends. 44 mutants in one shard, 36 caught, 8 unviable, 0 missed
+  (round 2),
   nightly. Every other scope dropped its `src/store/memory.rs` sites and
   memory legs.
 - `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and

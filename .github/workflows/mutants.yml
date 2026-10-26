@@ -75,8 +75,8 @@ jobs:
           # v60.0.0 S5 (CIRISPersist#1002): the sites the memory retirement
           # added (the #720 lifecycle predicate, the #691 tree binding, the
           # moved fountain assembler, the test constructor) and the genesis
-          # scratch on both backends. 35 mutants, one shard
-          # (600 s + 120 s x 35 = 4800 s), nightly.
+          # scratch on both backends with its reaper. 44 mutants, one shard
+          # (600 s + 120 s x 44 = 5880 s), nightly.
           - {scope: scope-s5-memory-retire, shard: '', id: s5-memory-retire, weekly: false}
     services:
       postgres:
