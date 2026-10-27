@@ -202,6 +202,30 @@ threat-model citations because this crate's audit story is the point.
   (#1117, #1064, #1120, #1113): 110 mutants, 99 caught, 11 unviable, 0
   missed, four weekly shards (`.github/workflows/mutants.yml`).
 
+### Fixed (the slice A × slice B merge)
+
+- **#1070 × #1113 — a re-publication after a reversal lands; a tombstone not
+  reversed still refuses inside the write.** #1070's in-transaction look read
+  "is there a tombstone" (`MIN(notice_id)`), not "is one still in force", so
+  after #1113's reversal the immediate-removal re-publication was refused
+  (I1367 red on both backends). The read doors and the in-transaction look
+  now ask ONE decision, `steward_purge::standing_notice`: the first notice, in
+  id order, that no admitted reversal lifted. The reversal fold reads
+  attestations through the directory and cannot run on a write connection, so
+  a door's pre-read (`refuse_tombstoned_bytes`) evaluates it and carries the
+  reversed notices into its transaction (`TombstoneFloor`); the transaction
+  reads every tombstone naming the address and passes over only those. A
+  takedown that commits after the pre-read is never among them and refuses
+  the write; a reversal that lands after the pre-read is not credited to the
+  write in flight (it is refused, and a retry lands). On postgres the write
+  still holds #1070's shared advisory lock from its tombstone read to its
+  commit. Witness I1369 (sqlite, postgres).
+- **#1070 × #1113 — a byte write below V187 lands again.**
+  `purge_tombstone_notices`, which #1113's withheld read moved to, answered a
+  database error on a schema with no tombstone table; it now answers
+  `Unsupported` there, as `purge_tombstoned` does (I1409 red on both
+  backends).
+
 ## [60.0.0] - 2026-10-26
 
 An architecture cut (docs/V60_TASK_PLAN.md): signed attestations are the only

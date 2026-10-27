@@ -20,6 +20,16 @@
 //!   the hard delete skips the reversed bytes (`voided`). An immediate-removal
 //!   basis destroys the bytes on receipt, and its reversal restores standing,
 //!   never bytes: the same content re-published is admitted again.
+//! - **I1369** (sqlite, postgres; #1113 × #1070) — the write floor's
+//!   in-transaction look asks the read doors' decision
+//!   (`steward_purge::standing_notice`): a re-publication after a reversal
+//!   lands, while a takedown that is NOT reversed, committed between the
+//!   door's pre-read and its write, still refuses the write inside its
+//!   transaction, naming that notice. A reversal landing after the pre-read is
+//!   not credited to the write in flight: the write is refused on its own
+//!   pre-read and a retry lands. On postgres a write admitted over reversed
+//!   takedowns still holds a new takedown off under the shared advisory lock
+//!   until it commits, and that takedown then destroys the bytes it landed.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -544,6 +554,160 @@ pub(crate) mod engine_bodies {
             .expect("I1367: the same content re-published is admitted again");
         assert!(l.ba.has_blob(&csam).await.unwrap());
     }
+    // ── I1369 ─────────────────────────────────────────────────────────────
+    /// v60.1.0 (CIRISPersist#1113 × #1070) — **a tombstone not reversed still
+    /// refuses the write inside its transaction.** `arm_inside` (postgres)
+    /// pauses `store_plaintext_local` inside its write transaction, under the
+    /// shared advisory lock.
+    pub(crate) async fn i1369_a_standing_tombstone_refuses_in_the_write<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+        arm_inside: Option<fn(&B) -> std::sync::Arc<crate::store::test_hooks::Pause>>,
+    ) where
+        B: BlobStorage
+            + FederationDirectory
+            + crate::store::test_hooks::ArmBytesPause
+            + Sync
+            + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let author = format!("i1369-author-{run}");
+        let moderator = claimant(0x94);
+        let comm = format!("i1369-comm-{run}");
+        let bytes = format!("i1369-{run}");
+        let dir = l.ba.as_dyn_directory();
+        let e = &l.engine_a;
+        ts::register_hybrid_key_as(l.ba.as_ref(), &author, &author, USER).await;
+        community_of(dir, &comm, &moderator.id).await;
+        let sha = hold(e, &author, bytes.as_bytes()).await;
+        bind_into(dir, &moderator.id, &comm, &hex::encode(sha)).await;
+        let take = |sha: [u8; 32]| {
+            let n = notice(&moderator, &hex::encode(sha), "ncmec_csam");
+            async move { e.takedown_tombstone(&n).await }
+        };
+        let reverse = |r: &crate::federation::takedown_tombstone::TakedownReport| {
+            put(
+                dir,
+                ruling(
+                    &moderator.id,
+                    r.notice_attestation_id.as_deref().unwrap(),
+                    "reversed",
+                    cohort_scope::COMMUNITY,
+                    &comm,
+                ),
+            )
+        };
+        let republish = || {
+            e.put_blob_signing(
+                &sha,
+                BlobBody::Inline(bytes.as_bytes().to_vec()),
+                None,
+                &author,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+        };
+        let refused_by = |got: Result<(), BlobError>, notice_id: &str, what: &str| match got {
+            Err(BlobError::Purged { notice_id: n, .. }) => {
+                assert_eq!(
+                    n, notice_id,
+                    "I1369 {what}: refused naming the standing notice"
+                );
+            }
+            other => panic!("I1369 {what}: refused in the transaction: {other:?}"),
+        };
+
+        // N1, destroyed on receipt, then reversed: lifted at read.
+        let n1 = take(sha).await.expect("I1369: the first takedown");
+        assert!(n1.bytes_destroyed, "I1369: {n1:?}");
+        reverse(&n1).await.expect("I1369: N1 reversed");
+        assert_eq!(
+            sp::purge_withheld(l.ba.as_ref(), &sha).await.unwrap(),
+            None,
+            "I1369: N1 lifted at read"
+        );
+
+        // A takedown NOT reversed commits between the pre-read (which found
+        // only N1, reversed) and the write: the write's own look refuses it.
+        let p = l.ba.arm_bytes_pause();
+        let (got, n2) = tokio::join!(republish(), async {
+            tokio::time::timeout(std::time::Duration::from_secs(20), p.reached())
+                .await
+                .expect("the write reaches its pre-read");
+            let r = take(sha).await.expect("I1369: N2 after the pre-read");
+            p.resume();
+            r
+        });
+        assert_ne!(n2.notice_id, n1.notice_id, "I1369: two notices");
+        refused_by(got, &n2.notice_id, "N2 not reversed");
+        assert!(!l.ba.has_blob(&sha).await.unwrap(), "I1369: nothing landed");
+
+        // A reversal landing after the pre-read is not credited to the write
+        // in flight: N2 reversed, then N3 AND its reversal land at the pause;
+        // the write is refused on its own pre-read, a retry lands.
+        reverse(&n2).await.expect("I1369: N2 reversed");
+        let p = l.ba.arm_bytes_pause();
+        let (got, n3) = tokio::join!(republish(), async {
+            tokio::time::timeout(std::time::Duration::from_secs(20), p.reached())
+                .await
+                .expect("the write reaches its pre-read");
+            let r = take(sha).await.expect("I1369: N3 after the pre-read");
+            reverse(&r)
+                .await
+                .expect("I1369: N3 reversed after the pre-read");
+            p.resume();
+            r
+        });
+        refused_by(got, &n3.notice_id, "N3 reversed after the pre-read");
+        assert!(!l.ba.has_blob(&sha).await.unwrap(), "I1369: nothing landed");
+        republish()
+            .await
+            .expect("I1369: every takedown reversed: the re-publication lands");
+        assert!(l.ba.has_blob(&sha).await.unwrap(), "I1369: it landed");
+
+        // postgres: a write admitted over a reversed takedown, paused under
+        // the shared lock, holds a new takedown off until it commits.
+        let Some(arm_inside) = arm_inside else {
+            return;
+        };
+        let other = format!("i1369-locked-{run}").into_bytes();
+        let osha = hold(e, &author, &other).await;
+        bind_into(dir, &moderator.id, &comm, &hex::encode(osha)).await;
+        let m1 = take(osha)
+            .await
+            .expect("I1369: the locked address's takedown");
+        assert!(m1.bytes_destroyed, "I1369: {m1:?}");
+        reverse(&m1).await.expect("I1369: reversed");
+        let p = arm_inside(l.ba.as_ref());
+        let door = e.store_plaintext_local(&osha, other.clone(), None);
+        let rest = async {
+            tokio::time::timeout(std::time::Duration::from_secs(20), p.reached())
+                .await
+                .expect("the write reaches its insert");
+            let mut next = Box::pin(take(osha));
+            let early =
+                tokio::time::timeout(std::time::Duration::from_millis(750), &mut next).await;
+            assert!(
+                early.is_err(),
+                "I1369: a takedown completed while a write admitted over a reversal was \
+                 uncommitted: {early:?}"
+            );
+            p.resume();
+            next.await.expect("I1369: the takedown, after the write")
+        };
+        let (got, m2) = Box::pin(async { tokio::join!(door, rest) }).await;
+        got.expect("I1369: the write over a reversed takedown committed first");
+        assert!(
+            m2.bytes_destroyed,
+            "I1369: the takedown found the bytes: {m2:?}"
+        );
+        assert!(
+            !l.ba.has_blob(&osha).await.unwrap(),
+            "I1369: nothing is left on disk"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -606,6 +770,46 @@ mod run {
             &suffix(),
             (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
                 as Pick<crate::store::postgres::PostgresBackend>,
+        )
+        .await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i1369_sqlite() {
+        use crate::federation::epoch_minter_invariants::bodies::Pick;
+        Box::pin(
+            super::engine_bodies::i1369_a_standing_tombstone_refuses_in_the_write(
+                "sqlite::memory:",
+                "sqlite::memory:",
+                &suffix(),
+                (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
+                    as Pick<crate::store::sqlite::SqliteBackend>,
+                None,
+            ),
+        )
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i1369_postgres() {
+        use crate::federation::epoch_minter_invariants::bodies::Pick;
+        let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
+            return;
+        };
+        Box::pin(
+            super::engine_bodies::i1369_a_standing_tombstone_refuses_in_the_write(
+                &a,
+                &b,
+                &suffix(),
+                (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
+                    as Pick<crate::store::postgres::PostgresBackend>,
+                Some(|b: &crate::store::postgres::PostgresBackend| {
+                    b.test_hooks()
+                        .arm_pause(crate::store::test_hooks::BYTES_INSIDE_THE_WRITE)
+                }),
+            ),
         )
         .await;
     }

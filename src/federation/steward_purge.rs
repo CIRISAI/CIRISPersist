@@ -2783,11 +2783,25 @@ pub async fn purge_withheld<F>(directory: &F, sha256: &[u8; 32]) -> Result<Optio
 where
     F: FederationDirectory + ?Sized,
 {
+    Ok(purge_withheld_lifting(directory, sha256).await?.0)
+}
+
+/// [`purge_withheld`], and the takedowns tombstoning `sha256` ITSELF that an
+/// admitted reversal lifted on the way: the write floor's pre-read hands them
+/// to its in-transaction look ([`refuse_tombstoned_at_write`]).
+async fn purge_withheld_lifting<F>(
+    directory: &F,
+    sha256: &[u8; 32],
+) -> Result<(Option<String>, ReversedTakedowns), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     // Memoized per walk: a manifest reached twice (a diamond) answers the
     // same; one still being judged (a cycle, which a sealed DAG never has)
     // counts as not withheld.
     let mut memo: BTreeMap<[u8; 32], Option<String>> = BTreeMap::new();
-    purge_withheld_walk(directory, *sha256, &mut memo).await
+    memo.insert(*sha256, None);
+    Box::pin(purge_withheld_judge(directory, *sha256, &mut memo)).await
 }
 
 fn purge_withheld_walk<'a, F>(
@@ -2803,22 +2817,56 @@ where
             return Ok(known.clone());
         }
         memo.insert(sha256, None);
-        let verdict = purge_withheld_judge(directory, sha256, memo).await?;
+        let (verdict, _) = purge_withheld_judge(directory, sha256, memo).await?;
         memo.insert(sha256, verdict.clone());
         Ok(verdict)
     })
 }
 
+/// v60.1.0 (CIRISPersist#1113 × #1070, CC 4.5.3) — the takedowns an
+/// admitted reconsideration REVERSED, as a door learned them before its write
+/// transaction. A notice is reversed or not as a whole (the fold reads the
+/// notice, never an address), so a door writing several addresses carries one
+/// set ([`Self::absorb`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReversedTakedowns(BTreeSet<String>);
+
+impl ReversedTakedowns {
+    /// Add the reversals another address's pre-read found.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub(crate) fn absorb(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+}
+
+/// v60.1.0 (CIRISPersist#1113 × #1070, CC 4.5.3) — **THE "this address is
+/// withheld" decision over its own tombstones**: the first notice, in id
+/// order, that no admitted reversal lifted. `notices` is every notice whose
+/// bytes-plane tombstone names the address, sorted; `reversed` the takedowns
+/// a reversal lifted. The read doors ask it ([`withholding_notice`], the
+/// reversal fold evaluated per notice) and so does every byte write's
+/// in-transaction look ([`refuse_tombstoned_at_write`], over the tombstones
+/// read inside the transaction and the reversals the door's pre-read found):
+/// a tombstone that committed after the pre-read is never among them, so it
+/// refuses the write.
+pub(crate) fn standing_notice(
+    notices: impl IntoIterator<Item = String>,
+    reversed: &ReversedTakedowns,
+) -> Option<String> {
+    notices.into_iter().find(|n| !reversed.0.contains(n))
+}
+
 /// v60.1.0 (CIRISPersist#1113, CC 4.5.3) — the notice that withholds the
-/// bytes `sha_hex` names directly: every notice tombstoning them is asked, in
-/// id order, and a takedown an admitted reconsideration reversed withholds
-/// nothing (re-derived here, at read, never stored). `None` when this backend
-/// has no purge plane (it withholds nothing and is not walked further);
-/// `Some(None)` when no standing notice tombstones the bytes themselves.
+/// bytes `sha_hex` names directly ([`standing_notice`]): every notice
+/// tombstoning them is asked, in id order, whether an admitted reconsideration
+/// reversed it (re-derived here, at read, never stored), up to the first that
+/// stands. `None` when this backend has no purge plane (it withholds nothing
+/// and is not walked further); otherwise the standing notice, if any, and the
+/// reversals found before it.
 async fn withholding_notice<F>(
     directory: &F,
     sha_hex: &str,
-) -> Result<Option<Option<String>>, Error>
+) -> Result<Option<(Option<String>, ReversedTakedowns)>, Error>
 where
     F: FederationDirectory + ?Sized,
 {
@@ -2830,33 +2878,35 @@ where
         Err(Error::Unsupported { .. }) => return Ok(None),
         Err(e) => return Err(e),
     };
-    for notice_id in notices {
-        if super::takedown_tombstone::takedown_reversal(directory.as_dyn_directory(), &notice_id)
+    let mut reversed = ReversedTakedowns::default();
+    for notice_id in &notices {
+        if super::takedown_tombstone::takedown_reversal(directory.as_dyn_directory(), notice_id)
             .await?
             .is_none()
         {
-            return Ok(Some(Some(notice_id)));
+            break;
         }
+        reversed.0.insert(notice_id.clone());
     }
-    Ok(Some(None))
+    Ok(Some((standing_notice(notices, &reversed), reversed)))
 }
 
 async fn purge_withheld_judge<F>(
     directory: &F,
     sha256: [u8; 32],
     memo: &mut BTreeMap<[u8; 32], Option<String>>,
-) -> Result<Option<String>, Error>
+) -> Result<(Option<String>, ReversedTakedowns), Error>
 where
     F: FederationDirectory + ?Sized,
 {
     {
         // v60.1.0 (CIRISPersist#1113, CC 4.5.3) — withheld while a notice
         // stands with no admitted reversal.
-        match withholding_notice(directory, &hex::encode(sha256)).await? {
-            None => return Ok(None),
-            Some(Some(notice_id)) => return Ok(Some(notice_id)),
-            Some(None) => {}
-        }
+        let reversed = match withholding_notice(directory, &hex::encode(sha256)).await? {
+            None => return Ok((None, ReversedTakedowns::default())),
+            Some((Some(notice_id), reversed)) => return Ok((Some(notice_id), reversed)),
+            Some((None, reversed)) => reversed,
+        };
         let manifests = directory.dag_manifests_of_chunk(&sha256).await?;
         let mut first = None;
         for m in manifests {
@@ -2864,10 +2914,10 @@ where
                 Some(n) => {
                     first.get_or_insert(n);
                 }
-                None => return Ok(None),
+                None => return Ok((None, reversed)),
             }
         }
-        Ok(first)
+        Ok((first, reversed))
     }
 }
 
@@ -2883,6 +2933,10 @@ where
 /// possession (CC 4.5.3 step 2). The from-disk gate I797 holds every floor
 /// to it.
 ///
+/// v60.1.0 (CIRISPersist#1113 × #1070) — admitted, it answers the takedowns
+/// tombstoning the address that a reversal lifted: the door carries them into
+/// its transaction ([`TombstoneFloor`]), where only those are passed over.
+///
 /// # Errors
 ///
 /// [`BlobError::Purged`](super::BlobError::Purged); the lookup's read error.
@@ -2890,13 +2944,13 @@ where
 pub(crate) async fn refuse_tombstoned_bytes<F>(
     directory: &F,
     sha256: &[u8; 32],
-) -> Result<(), super::BlobError>
+) -> Result<ReversedTakedowns, super::BlobError>
 where
     F: FederationDirectory + ?Sized,
 {
-    match purge_withheld(directory, sha256).await {
-        Ok(None) => Ok(()),
-        Ok(Some(notice_id)) => Err(super::BlobError::Purged {
+    match purge_withheld_lifting(directory, sha256).await {
+        Ok((None, reversed)) => Ok(reversed),
+        Ok((Some(notice_id), _)) => Err(super::BlobError::Purged {
             sha256_hex: hex::encode(sha256),
             notice_id,
         }),
@@ -2919,19 +2973,52 @@ where
 /// [`BlobError::Purged`](super::BlobError::Purged) naming its notice, and
 /// nothing is written.
 ///
+/// v60.1.0 (CIRISPersist#1113 × #1070) — "found" is [`standing_notice`], the
+/// read doors' own decision: `notices` are every tombstone naming the address
+/// as read inside the transaction, and only a takedown the door's pre-read
+/// found REVERSED is passed over (`floor`), so a re-publication after a
+/// reversal lands while a tombstone that is not reversed, including one that
+/// committed after the pre-read, still refuses.
+///
 /// Scope: the address's OWN tombstone. A DAG child withheld only through its
 /// manifests (the [`purge_withheld`] walk) is still judged by the pre-read.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) fn refuse_tombstoned_at_write(
     sha256: &[u8],
-    notice_id: Option<String>,
+    notices: Vec<String>,
+    floor: &TombstoneFloor,
 ) -> Result<(), TombstonedAtWrite> {
-    match notice_id {
+    match standing_notice(notices, &floor.reversed) {
         None => Ok(()),
         Some(notice_id) => Err(TombstonedAtWrite {
             sha256_hex: hex::encode(sha256),
             notice_id,
         }),
+    }
+}
+
+/// v60.1.0 (CIRISPersist#1070 × #1113) — what a byte write door carries from
+/// its tombstone pre-read into its write transaction: whether the
+/// bytes-plane tombstone table exists (`false` only on a test schema below
+/// V187, the backends' `pre_purge_schema`), and the takedowns the pre-read
+/// found reversed ([`refuse_tombstoned_bytes`]).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+#[derive(Debug, Clone)]
+pub(crate) struct TombstoneFloor {
+    plane: bool,
+    reversed: ReversedTakedowns,
+}
+
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+impl TombstoneFloor {
+    /// The floor of a door whose pre-read found `reversed`.
+    pub(crate) fn new(plane: bool, reversed: ReversedTakedowns) -> Self {
+        Self { plane, reversed }
+    }
+
+    /// Is there a tombstone table to read inside the transaction?
+    pub(crate) fn plane(&self) -> bool {
+        self.plane
     }
 }
 
