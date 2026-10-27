@@ -399,3 +399,4 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 2.6.7	CLM-admission-freshness-window	CIRISPersist	src/federation/admission.rs#check_consent_for_key_admission	ciris-persist@60.0.0
 2.6.7	CLM-admission-freshness-window	CIRISPersist	src/federation/admission.rs#check_licensure_delegator_is_authority	ciris-persist@60.0.0
 2.6.1.1.1	CLM-canonicalization-array	CIRISPersist	src/federation/operational.rs#check_partner_record_sets	ciris-persist@60.0.0
+3.1.5	CLM-identity-amendment-row	CIRISPersist	src/federation/identity_amendment.rs#check_identity_amendment_admission	ciris-persist@60.0.0

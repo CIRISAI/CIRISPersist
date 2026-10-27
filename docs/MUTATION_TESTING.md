@@ -374,6 +374,21 @@ did not fit its budget):
   I780–I783, I786, I788–I790, I153 and I513. 81 mutants: 64 caught, 17
   unviable, 0 missed in one round (two local shards; I787 killed nothing
   and left the filter). Three shards of <= 27 on the weekly run.
+- `scope-601-asks.txt` (v60.1.0, slice B): the consumer asks — the accord
+  threshold function and its roster read (#1117), the key-grant and
+  `DimensionRejected` retryability predicates (#1064), the
+  `identity_amendment:v1` gate (#1120), and the takedown reversal: the fold,
+  the withheld read, the finalize skip, the re-ack candidates and the
+  ruling's authority (#1113), against I1360–I1367, I742 and the finalize and
+  reconsideration witnesses that guard the two pre-existing functions in
+  scope (I655, I790, I773, I972, I1218). Round 1: 126 mutants, 18 missed
+  (the re-ack arm's own counters, the ruling arm's `!`s, the finalize
+  boundary, the owner fallback's guard): the re-ack arm now feeds the
+  existing due loop, the guard was equivalent and is gone, and the rest are
+  witnessed. Round 2: 110 mutants, 99 caught, 11 unviable, 0 missed, in four
+  shards of <= 28 (1223–1426 s each on the dev box), weekly. I1363 (#1095,
+  no code change) and I1364 (#1089, serde members) guard no mutable site and
+  kill nothing, by construction.
 - `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and
   federation files that feed the counters, against I548–I551 and (v60.0.0)
   I1340–I1341, the witnesses of `apply_planned`'s read-back and store-error

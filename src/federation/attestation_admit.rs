@@ -1067,6 +1067,11 @@ where
     // M-1 alignment, and a `supersedes` of a held goal is its declarer's
     // amendment. A no-op for every other row.
     crate::federation::goal::check_goal_row_admission(dir, &row).await?;
+    // v60.1.0 (CIRISPersist#1120, CC 3.1.5 rc10) — an `identity_amendment:v1`
+    // admits only citing an admitted, approved response about this agent,
+    // signed by a seated Wise Authority at its instant. A no-op for every
+    // other row.
+    crate::federation::identity_amendment::check_identity_amendment_admission(dir, &row).await?;
     // v44.6.0 (#857) — a machine author may name only itself in for_key_id.
     crate::federation::admission::check_consent_for_key_admission(dir, &row).await?;
 

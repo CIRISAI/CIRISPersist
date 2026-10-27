@@ -687,6 +687,11 @@ pub struct ReackReport {
     /// this pass's [`HOLDING_CLAIM_REACK_MAX_PER_PASS`]: the next pass takes
     /// them, oldest first.
     pub deferred: u64,
+    /// v60.1.0 (CIRISPersist#1113, CC 4.5.3) — blobs a takedown withheld,
+    /// whose claim this node retracted, and whose takedown an admitted
+    /// reconsideration has since reversed: still held, so claimed `here`
+    /// again (the holder's re-ack).
+    pub restored: u64,
 }
 
 /// **Re-acknowledge this node's own holdings** (CC 3.1.3.3 rule 5: "freshness
@@ -758,6 +763,12 @@ where
         }
         due.push((latest.unwrap_or(DateTime::<Utc>::MIN_UTC), sha));
     }
+    // v60.1.0 (CIRISPersist#1113, CC 4.5.3) — the reversal's re-ack: held
+    // bytes whose takedown is reversed and whose own claims are all retired
+    // join the due set first (they carry no live claim at all), under the
+    // same cap, and count as `restored` rather than `renewed`.
+    let restoring = reversed_takedown_holdings(backend, &me).await?;
+    due.extend(restoring.iter().map(|sha| (DateTime::<Utc>::MIN_UTC, *sha)));
     // Oldest first: the nearest expiry is renewed before a later one, so the
     // cap defers only claims with the most time left (#1071).
     due.sort_unstable();
@@ -768,6 +779,9 @@ where
         }
         budget -= 1;
         match emit_holding_claim(backend, local, &sha, now).await {
+            Ok(HoldingClaimOutcome::Emitted { .. }) if restoring.contains(&sha) => {
+                report.restored += 1;
+            }
             Ok(HoldingClaimOutcome::Emitted { .. }) => report.renewed += 1,
             Ok(HoldingClaimOutcome::NotInCohort { .. }) => report.not_in_cohort += 1,
             Err(BlobError::Purged { .. }) => report.withheld += 1,
@@ -1124,6 +1138,70 @@ where
     super::steward_purge::purge_withheld(dir, sha256)
         .await
         .map_err(|e| BlobError::Backend(format!("tombstone: {e}")))
+}
+
+/// v60.1.0 (CIRISPersist#1113, CC 4.5.3) — **the reversal's re-ack
+/// candidates**: the blobs this node still holds, whose every claim of its
+/// own is retired, that a takedown tombstoned and that no tombstone withholds
+/// any more (every takedown naming them is reversed).
+/// [`reack_own_claims`] claims them `here` again ([`ReackReport::restored`]).
+/// Keyed on the tombstone, so a claim retracted for any other reason (an
+/// eviction that aborted after its retraction) is never re-advertised here.
+async fn reversed_takedown_holdings<B>(
+    backend: &B,
+    me: &str,
+) -> Result<std::collections::BTreeSet<[u8; 32]>, BlobError>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    let mut out = std::collections::BTreeSet::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut pages = AttestationQuery::by(me, FOLD_PAGE)
+        .dimension_prefix(CUSTODY_ACK_DIMENSION)
+        .pages();
+    while let Some(page) = pages
+        .next(backend)
+        .await
+        .map_err(|e| BlobError::Backend(format!("reack: {e}")))?
+    {
+        for r in page {
+            let Some(hex_sha) = parse_custody_ack(&r)
+                .ok()
+                .flatten()
+                .map(|a| a.blob_sha256_hex)
+            else {
+                continue;
+            };
+            if !seen.insert(hex_sha.clone()) {
+                continue;
+            }
+            let Ok(sha) = <[u8; 32]>::try_from(hex::decode(&hex_sha).unwrap_or_default()) else {
+                continue;
+            };
+            tokio::task::yield_now().await;
+            // Cheapest first: most blobs carry no tombstone at all (and a
+            // backend without the purge plane tombstones nothing).
+            let tombstoned = match backend
+                .purge_tombstone_notices(super::steward_purge::PurgePlane::Blob.as_str(), &hex_sha)
+                .await
+            {
+                Ok(n) => !n.is_empty(),
+                Err(Error::Unsupported { .. }) => false,
+                Err(e) => return Err(BlobError::Backend(format!("reack: {e}"))),
+            };
+            if tombstoned
+                && backend.blob_head(&sha).await?.is_some()
+                && super::custody_ack::custody_acks_of(backend, me, &hex_sha)
+                    .await
+                    .map_err(|e| BlobError::Backend(format!("reack: {e}")))?
+                    .is_empty()
+                && withheld_by(backend, &sha).await?.is_none()
+            {
+                out.insert(sha);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// **`BlobStorage::evict_actor`, once.** Every blob `actor` claims `here`

@@ -208,6 +208,12 @@ def _py_return(rust: str, owner_class: str) -> str:
         return "int"
     if r in ("f32", "f64"):
         return "float"
+    # A tuple of mappable scalars (`(usize, usize)` → `tuple[int, int]`).
+    tup = re.fullmatch(r"\((.+)\)", r)
+    if tup and "<" not in tup.group(1) and "(" not in tup.group(1):
+        parts = [_py_return(p, owner_class) for p in tup.group(1).split(",") if p.strip()]
+        if len(parts) > 1 and "Any" not in parts:
+            return f"tuple[{', '.join(parts)}]"
     if r in ("Self", "PyEngine") or r.endswith(f"<{owner_class}>"):
         return owner_class
     if r in CLASS_FOR_IMPL.values():

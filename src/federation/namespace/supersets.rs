@@ -1791,7 +1791,8 @@ mod tests {
         // CLM-one-chunk-seal at the stored-key comparison (1),
         // CLM-one-tombstone-row at the resumed execution and the bytes
         // floor's in-transaction tombstone read (2).
-        const EXPECTED: usize = 346;
+        // v60.1.0 slice B: +1 (CIRISPersist#1120), CLM-identity-amendment-row.
+        const EXPECTED: usize = 347;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

@@ -100,6 +100,103 @@ threat-model citations because this crate's audit story is the point.
 - `scripts/mutants/scope-601-fixes.txt`: 81 mutants, 64 caught, 17
   unviable, 0 missed; three weekly shards in `mutants.yml`.
 
+### Added
+
+- **#1117 — the accord threshold is a function** (CC 4.2.6 / CC 4.5.1.2,
+  rc10). `federation::accord_threshold(n)` is the strict majority
+  `⌊n/2⌋ + 1`, the one spelling every accord gate in the crate now counts
+  through (the co-scrub core, the destructive re-tally, the replicated-evidence
+  receive gate). `accord_threshold_over_roster` / `accord_threshold_now` and
+  `Engine::accord_threshold` report `AccordThreshold { m, n }` over this
+  node's standing roster (holders whose keys it holds). Python:
+  `Engine.accord_threshold() -> (m, n)` and `accord_threshold_for(n)`. CIRISEdge's
+  `verify_accord_carrier` calls it instead of a hard-coded `(2, 3)`.
+  Witness I1360 (sqlite, postgres): the reported `m` is the gate's.
+- **#1119 — `delegation_scope::INFRA_RELAY = "infra:relay"`** (CC 5.4.6
+  item 4, rc10): a steward-conferred relay standing, seat-like in the onion
+  layer cap's denominator. Conferred on the accord plane under the same
+  co-scrub rule as `infra:serve` and read through `has_accord_conferred_role`;
+  no new row kind. APPENDED to `delegation_scope::ALL` (position 24) and
+  `INFRA` (position 12), pinned by position. Witness I1361 (sqlite, postgres):
+  co-scrubbed reads conferred, self-claimed does not.
+- **#1064 — persist answers "is this refusal retryable"** for the two
+  reason sets CIRISEdge kept its own table for.
+  `KeyGrantRefusalReason::is_retryable()` (exhaustive; retryable =
+  `signer_not_active_member`, `recipient_not_in_audience`; the sealer
+  refusals, `set_retired` and the row defects are terminal) and
+  `KeyGrantRefusalReason::from_token`; `admission::dimension_rejected_reason`
+  (`ALL`, `RETRYABLE`, `is_retryable(token) -> Option<bool>`) over every token
+  `Error::DimensionRejected` carries, all terminal (each gate is pure over the
+  signed row). Python: `key_grant_refusal_is_retryable(reason)`,
+  `dimension_rejection_is_retryable(reason)` (`ValueError` on an unknown
+  token). A from-disk census fails the build when a construction site raises
+  an unclassified token. Witnesses I1362 and I742 (sqlite, postgres) classify
+  the tokens the doors actually raise. The issue's optional single
+  `Error::is_retryable()` over every federation error arm is not in this cut.
+- **#1095 — `chat:call:v1`, witnessed** (CIRISEdge ask, CC rc9): an A/V call
+  record is one self-subject `scores` row per attendee (attester = subject),
+  placed at the room's scope through the chat path. No persist change was
+  needed (`chat:*` is the registry's open wildcard and a self-subject row has
+  no refusing gate); I1363 (sqlite, postgres) now holds it: each member's row
+  admits and a non-member's is refused; members read the rows by subject and
+  a non-member reads none; the attendees are the union of subjects over a
+  `call_id`; an attendee's own `withdraws` retracts their row, the other
+  attendee's stands, and nobody withdraws another's.
+- **#1089 (part) — the re-cut v2.8.0 profile members are typed.**
+  `DeploymentProfile` gains `calibration_version` (tri-state: absent, `null`,
+  or a token, each round-tripping as itself) and `pipeline_metadata`
+  (`schema::AgentPipelineMetadata`, closed: an unknown member is refused at
+  parse by name). Both are new OPTIONAL members, absent on every v2.7.x
+  profile, whose serialized bytes are unchanged. Before this a profile
+  carrying them lost them on parse and its signature failed. Witness I1364
+  (sqlite, postgres). Still open on #1089: the re-vendor of the re-cut schema
+  (`b6f6fd3f…`) waits on CIRISAgent#1255 merging (it is open at `b1d802c7`),
+  and the `trace_field_shape_violation` door needs a new `schema::Error` arm
+  or a renamed token, which is a break (v61).
+- **#1120 — the `identity_amendment:v1` admission gate** (CC 3.1.5, rc10
+  `cadd5a9`). `federation::identity_amendment::check_identity_amendment_admission`,
+  in the shared put plan (every backend, local and replicated): the amendment
+  (attester = an occurrence of the agent, subject = the agent) admits only
+  when `authorized_by` (a uuid, cited in `evidence_refs[]`) names an admitted
+  `deferral:response:approved:v1` about the same agent whose signer held a
+  Wise Authority seat at its `asserted_at`. Refused
+  `identity_amendment_unauthorized` (token-led `federation_invalid_argument`,
+  Python `ValueError`; the failed condition follows the token). A seat is the
+  producer's interim ruling (Eric, 2026-10-22): the agent node's owner,
+  compared self to self at the response's instant; the general WA-seat
+  primitive is #709. `amendment_digest` (lowercase hex64) and `authorized_by`
+  (uuid) are shape-checked as malformed rows. Dimension constants for the
+  deferral family (`DEFERRAL_REQUEST_DIMENSION`, `…_APPROVED_…`,
+  `…_REJECTED_…`). Before this a replicated amendment from any producer was
+  admitted ungated. Witness I1365 (sqlite, postgres).
+- **#1113 — a reversed reconsideration reverses a takedown; withheld is
+  computed at read** (CC 4.5.3, rc10 `99bf187` / `62776bc`).
+  `takedown_tombstone::takedown_reversal(notice_id)` finds a live
+  `reconsideration:{grounds}` ruling with `outcome: reversed` naming the
+  notice row, placed at the content's community, and re-derives at every read
+  that its signer holds the `review` duty over the content as this node holds
+  it (never a stored verdict). `steward_purge::purge_withheld` asks it for
+  every takedown tombstoning the bytes: withheld while a notice stands with no
+  admitted reversal, so a reversed takedown's bytes serve again inside the
+  window and a remaining copy or a re-publication is admitted after it (an
+  immediate-removal basis gets standing back, never bytes). `purge_finalize`
+  skips a reversed takedown's bytes (`voided`). The holder's re-ack
+  (`reack_own_claims`) claims `here` again for held bytes whose takedown is
+  reversed (`ReackReport::restored`, a new member); it is keyed on the
+  tombstone, so a claim retracted for any other reason is never re-advertised.
+  `check_reconsideration_admission` now judges a filing or ruling against a
+  takedown notice by the CONTENT's communities from this node's binding rows
+  (CC 4.5.5); before, nobody could rule on a notice (it names no community).
+  The window is per holder (`settles_at` counts from this node's
+  `executed_at`). Witnesses I1366 (sqlite, postgres: the ruling, the fold,
+  withdrawal and expiry re-derived) and I1367 (two nodes, sqlite and
+  postgres: withheld on A and on B by bundle, the reversal delivered to each
+  serves and re-acks there, the post-window finalize skips the bytes, the
+  immediate-removal re-publication).
+- **Mutation scope `scope-601-asks`** over the slice's new predicates
+  (#1117, #1064, #1120, #1113): 110 mutants, 99 caught, 11 unviable, 0
+  missed, four weekly shards (`.github/workflows/mutants.yml`).
+
 ## [60.0.0] - 2026-10-26
 
 An architecture cut (docs/V60_TASK_PLAN.md): signed attestations are the only

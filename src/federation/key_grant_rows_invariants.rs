@@ -67,7 +67,7 @@ mod sqlite_serve {
 /// which is backend-gated.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) mod directory {
-    use crate::federation::key_grant::{KeyGrantAxis, KeyGrantRow};
+    use crate::federation::key_grant::{KeyGrantAxis, KeyGrantRefusalReason, KeyGrantRow};
     use crate::federation::key_grant_invariants::two_node::sign_row_unstored;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::USER;
@@ -253,7 +253,15 @@ pub(crate) mod directory {
             .await
             .attestation)
         .await;
-        assert_eq!(reason(&r.expect_err("I742 (3)")), "signer_not_minter");
+        let refused = reason(&r.expect_err("I742 (3)"));
+        assert_eq!(refused, "signer_not_minter");
+        // v60.1.0 (CIRISPersist#1064) — the token the door raised classifies
+        // through persist's own predicate: a sealer refusal is terminal.
+        assert_eq!(
+            KeyGrantRefusalReason::from_token(refused).map(KeyGrantRefusalReason::is_retryable),
+            Some(false),
+            "I742 (3) / #1064: signer_not_minter is terminal"
+        );
         assert!(d.get_attestation(&id).await.unwrap().is_none(), "I742 (3)");
 
         // (4) The minter to a key that is no member's occurrence.
@@ -261,9 +269,14 @@ pub(crate) mod directory {
             .await
             .attestation)
         .await;
+        let refused = reason(&r.expect_err("I742 (4)"));
+        assert_eq!(refused, "recipient_not_in_audience");
+        // v60.1.0 (CIRISPersist#1064) — an ordering gap: the recipient's
+        // occurrence may land later, so the same row is re-offered.
         assert_eq!(
-            reason(&r.expect_err("I742 (4)")),
-            "recipient_not_in_audience"
+            KeyGrantRefusalReason::from_token(refused).map(KeyGrantRefusalReason::is_retryable),
+            Some(true),
+            "I742 (4) / #1064: recipient_not_in_audience is retryable"
         );
         assert!(d.get_attestation(&id).await.unwrap().is_none(), "I742 (4)");
 

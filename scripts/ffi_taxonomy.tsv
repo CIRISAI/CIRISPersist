@@ -142,6 +142,7 @@
 # DERIVED (see `pyi_surface.py report`), never pinned. 158 methods are
 # build-conditional and a `.pyi` structurally cannot express that.
 Engine	__init__	structural	
+Engine	accord_threshold	deontic	
 Engine	active_community_members_json	empirical	
 Engine	active_family_members_json	empirical	
 Engine	add_community_member	deontic	
@@ -709,9 +710,12 @@ Engine	withdraw_canonical_role	deontic
 Engine	would_hold_json	deontic	
 Engine	wrap_dek_for_recipient_v2_b64	deontic	
 MODULE	_test_inject_panic	structural	
+MODULE	accord_threshold_for	deontic	
+MODULE	dimension_rejection_is_retryable	procedural	
 MODULE	engine_teardown_wait	structural	
 MODULE	engine_teardowns_in_flight	structural	
 MODULE	install_panic_logger	structural	
+MODULE	key_grant_refusal_is_retryable	procedural	
 MODULE	namespace_manifest_version	axiomatic	
 MODULE	panic_count	structural	
 MODULE	persist_field_conformance	axiomatic	
