@@ -783,6 +783,222 @@ pub(crate) mod bodies {
         );
     }
 
+    /// v59.1.1 — the creator's view of a pair-room invitee's node: the
+    /// invitee's announced owner binding `delegates_to(k → node)` and, when
+    /// `unagreed_row`, the invitee's login-ceremony occurrence row
+    /// `{identity: k, occurrence: node}` signed by the identity alone — held
+    /// because it was replicated, never agreed to by the node (#932 H1).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn invitee_seen_from_the_creator(
+        d: &dyn FederationDirectory,
+        k: &str,
+        node: &str,
+        unagreed_row: bool,
+    ) {
+        nodes(d, &[node]).await;
+        put(
+            d,
+            &ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), k, node),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("owner binding {k} → {node}: {e}"));
+        if unagreed_row {
+            d.put_identity_occurrence(ts::signed_content_only_occurrence(k, k, node, ago(2)).await)
+                .await
+                .unwrap_or_else(|e| panic!("the identity's own claim {k} → {node}: {e}"));
+        }
+    }
+
+    /// A pair-room proposal of `invitee` by `creator` into a fresh room.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn pair_room_proposal(
+        d: &dyn FederationDirectory,
+        cid: &str,
+        creator: &str,
+        invitee: &str,
+    ) -> Attestation {
+        use crate::federation::membership_acceptance_invariants::bodies as ma;
+        ma::reg(d, &[cid, creator]).await;
+        ma::found_community(d, cid, "founder_only", &[creator], &[])
+            .await
+            .unwrap();
+        let p = ma::proposal(
+            creator,
+            COMMUNITY,
+            cid,
+            invitee,
+            None,
+            Utc::now(),
+            Some(Duration::days(7)),
+        );
+        ma::put(d, &p).await.unwrap();
+        p
+    }
+
+    /// **I1470** (v59.1.1, CIRISServer's shape — live chat) — the creator
+    /// holds the invitee's owner binding and the invitee's identity-signed,
+    /// never-agreed occurrence row for the invitee's node. The row resolves
+    /// nothing (#932 H1) and is no revocation, so the owner binding still
+    /// lifts the node to the invitee: the invitation reaches it. Before the
+    /// fix `principals_of` read "a row exists" as "revoked" and dropped the
+    /// owner — principals = [], the proposal NotInAudience.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) async fn i1470_an_unagreed_occurrence_row_is_not_a_revocation(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::self_collective::principals_of;
+        let (cid, creator, k, knode) = (
+            format!("i1470-c-{s}"),
+            format!("i1470-f-{s}"),
+            format!("i1470-k-{s}"),
+            format!("i1470-kn-{s}"),
+        );
+        users(d, &[&k]).await;
+        invitee_seen_from_the_creator(d, &k, &knode, true).await;
+        assert!(
+            d.active_identities_for_occurrence(&knode)
+                .await
+                .unwrap()
+                .is_empty(),
+            "I1470 precondition — #932 H1: the unagreed row resolves nothing"
+        );
+        assert_eq!(
+            crate::federation::admission::owner_of(d, &knode)
+                .await
+                .unwrap(),
+            Some(k.clone()),
+            "I1470 precondition — the owner binding names the invitee"
+        );
+        assert_eq!(
+            principals_of(d, &knode).await.unwrap(),
+            vec![k.clone()],
+            "I1470 an unagreed occurrence row does not drop the node's owner"
+        );
+        let p = pair_room_proposal(d, &cid, &creator, &k).await;
+        assert_eq!(
+            ra::may_receive(d, &knode, &p).await.unwrap(),
+            ra::Verdict::Yes(ra::Reason::RefersTo),
+            "I1470 the invitee's node receives the pair-room invitation"
+        );
+    }
+
+    /// **I1471** (v59.1.1, the PR #889 P1 case kept) — the owner REVOKED the
+    /// occurrence; a live owner binding beside the revocation is the lost
+    /// device's shape and does not give the owner back. Agreed or not, the
+    /// revoked node has no principal and the invitation does not reach it.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) async fn i1471_a_revoked_occurrence_still_drops_the_owner(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::self_collective::principals_of;
+        let (cid, creator, k, agreed, unagreed) = (
+            format!("i1471-c-{s}"),
+            format!("i1471-f-{s}"),
+            format!("i1471-k-{s}"),
+            format!("i1471-an-{s}"),
+            format!("i1471-un-{s}"),
+        );
+        users(d, &[&k]).await;
+        // `agreed`: claimed by k, agreed to by the node — then revoked.
+        invitee_seen_from_the_creator(d, &k, &agreed, true).await;
+        d.put_identity_occurrence(
+            ts::signed_content_only_occurrence(&agreed, &k, &agreed, ago(2)).await,
+        )
+        .await
+        .expect("I1471 the occurrence's agreement is admitted");
+        assert_eq!(
+            principals_of(d, &agreed).await.unwrap(),
+            vec![k.clone()],
+            "I1471 precondition — the agreed occurrence's principal is its owner"
+        );
+        // `unagreed`: the I1470 shape — then revoked.
+        invitee_seen_from_the_creator(d, &k, &unagreed, true).await;
+        unclaim(d, &k, &agreed).await;
+        unclaim(d, &k, &unagreed).await;
+        let p = pair_room_proposal(d, &cid, &creator, &k).await;
+        for n in [&agreed, &unagreed] {
+            assert_eq!(
+                crate::federation::admission::owner_of(d, n).await.unwrap(),
+                Some(k.clone()),
+                "I1471 precondition — the owner binding to {n} is still live"
+            );
+            assert!(
+                principals_of(d, n).await.unwrap().is_empty(),
+                "I1471 a revoked occurrence ({n}) does not get its owner back"
+            );
+            assert!(
+                !ra::may_receive(d, n, &p).await.unwrap().allowed(),
+                "I1471 the revoked node {n} does not receive the invitation"
+            );
+        }
+    }
+
+    /// **I1472** (v59.1.1) — the owner is KEPT: an agreed, active occurrence;
+    /// a node the owner never bound as an occurrence (KEM-less: ownership is
+    /// the only fact); an unagreed row whose only revocation is of ANOTHER
+    /// device of the owner's, or of this one but not yet effective.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) async fn i1472_a_live_owner_binding_is_kept(d: &dyn FederationDirectory, s: &str) {
+        use crate::federation::self_collective::principals_of;
+        let (cid, creator, k, agreed, kemless, unagreed, other, later) = (
+            format!("i1472-c-{s}"),
+            format!("i1472-f-{s}"),
+            format!("i1472-k-{s}"),
+            format!("i1472-an-{s}"),
+            format!("i1472-kl-{s}"),
+            format!("i1472-un-{s}"),
+            format!("i1472-ot-{s}"),
+            format!("i1472-la-{s}"),
+        );
+        users(d, &[&k]).await;
+        invitee_seen_from_the_creator(d, &k, &agreed, true).await;
+        d.put_identity_occurrence(
+            ts::signed_content_only_occurrence(&agreed, &k, &agreed, ago(2)).await,
+        )
+        .await
+        .expect("I1472 the occurrence's agreement is admitted");
+        assert_eq!(
+            d.active_identities_for_occurrence(&agreed).await.unwrap(),
+            vec![k.clone()],
+            "I1472 precondition — the agreed occurrence resolves"
+        );
+        invitee_seen_from_the_creator(d, &k, &kemless, false).await;
+        invitee_seen_from_the_creator(d, &k, &unagreed, true).await;
+        invitee_seen_from_the_creator(d, &k, &other, true).await;
+        unclaim(d, &k, &other).await;
+        invitee_seen_from_the_creator(d, &k, &later, true).await;
+        d.put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
+            identity_key_id: k.clone(),
+            occurrence_key_id: later.clone(),
+            revoked_at: ago(1),
+            effective_at: ms(Utc::now() + Duration::days(3)),
+            reason: None,
+            witness_set: vec![k.clone()],
+            persist_row_hash: String::new(),
+        })
+        .await
+        .expect("I1472 a future-dated revocation is admitted");
+        let p = pair_room_proposal(d, &cid, &creator, &k).await;
+        for n in [&agreed, &kemless, &unagreed, &later] {
+            assert_eq!(
+                principals_of(d, n).await.unwrap(),
+                vec![k.clone()],
+                "I1472 {n} keeps its owner as principal"
+            );
+            assert_eq!(
+                ra::may_receive(d, n, &p).await.unwrap(),
+                ra::Verdict::Yes(ra::Reason::RefersTo),
+                "I1472 {n} receives the invitation"
+            );
+        }
+        assert!(
+            principals_of(d, &other).await.unwrap().is_empty(),
+            "I1472 control — the revoked device itself is dropped"
+        );
+    }
+
     /// **I398c** — an acceptance or decline goes back to the proposer's
     /// nodes (resolved from the proposal it answers), and to nobody else
     /// outside the group's plane.
@@ -1500,6 +1716,9 @@ mod runners {
         [
             i395_live_invitee_receives_the_planes,
             i398b_a_proposal_reaches_the_invitees_nodes,
+            i1470_an_unagreed_occurrence_row_is_not_a_revocation,
+            i1471_a_revoked_occurrence_still_drops_the_owner,
+            i1472_a_live_owner_binding_is_kept,
             i398c_an_answer_returns_to_the_proposers_nodes,
             i398d_affiliations_is_the_rooms_plane
         ]
@@ -1520,6 +1739,9 @@ mod runners {
         [
             i395_live_invitee_receives_the_planes,
             i398b_a_proposal_reaches_the_invitees_nodes,
+            i1470_an_unagreed_occurrence_row_is_not_a_revocation,
+            i1471_a_revoked_occurrence_still_drops_the_owner,
+            i1472_a_live_owner_binding_is_kept,
             i398c_an_answer_returns_to_the_proposers_nodes,
             i398d_affiliations_is_the_rooms_plane
         ]
