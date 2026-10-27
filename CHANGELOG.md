@@ -25,9 +25,10 @@ threat-model citations because this crate's audit story is the point.
   whether the occurrence had been revoked. The node's principals came out
   empty, and `may_receive(invitee_node, membership:proposal:v1)` was
   `No(NotInAudience)`, so the invitation never reached the invitee.
-- **The fix.** The owner is dropped only when a held identity-occurrence
-  revocation naming `(owner, k)` is effective now and `k` has not been
-  re-established by an agreed occurrence asserted after it. A unilateral row
+- **The fix.** The owner binding no longer lifts `k` once a held
+  identity-occurrence revocation naming `(owner, k)` is effective. If `k` was
+  re-established after that by an agreed occurrence, the active fold still
+  carries the owner. A unilateral row
   that never resolved is not evidence either way, so the live owner binding
   lifts the node to its owner. #889's case is unchanged: a revoked device with
   a live owner binding still has no principal. The same fold serves
@@ -39,9 +40,10 @@ threat-model citations because this crate's audit story is the point.
   - **I1471**, the #889 case kept: a revoked occurrence (agreed or unagreed)
     beside a live owner binding has no principal and does not receive the
     invitation.
-  - **I1472**, the owner is kept in four cases: an agreed, active
+  - **I1472**, the owner is kept in five cases: an agreed, active
     occurrence; a KEM-less node; an unagreed row whose only revocation is of
-    another device; and an unagreed row whose revocation is future-dated.
+    another device; an unagreed row whose revocation is future-dated; and an
+    occurrence that was revoked and then agreed again after the revocation.
   - **I141** and **I392** stay green.
 
 ### Adoption

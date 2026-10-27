@@ -938,7 +938,8 @@ pub(crate) mod bodies {
     /// **I1472** (v59.1.1) — the owner is KEPT: an agreed, active occurrence;
     /// a node the owner never bound as an occurrence (KEM-less: ownership is
     /// the only fact); an unagreed row whose only revocation is of ANOTHER
-    /// device of the owner's, or of this one but not yet effective.
+    /// device of the owner's, or of this one but not yet effective; an
+    /// occurrence revoked and then re-agreed after the revocation.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn i1472_a_live_owner_binding_is_kept(d: &dyn FederationDirectory, s: &str) {
         use crate::federation::self_collective::principals_of;
@@ -952,6 +953,7 @@ pub(crate) mod bodies {
             format!("i1472-ot-{s}"),
             format!("i1472-la-{s}"),
         );
+        let readded = format!("i1472-ra-{s}");
         users(d, &[&k]).await;
         invitee_seen_from_the_creator(d, &k, &agreed, true).await;
         d.put_identity_occurrence(
@@ -980,8 +982,26 @@ pub(crate) mod bodies {
         })
         .await
         .expect("I1472 a future-dated revocation is admitted");
+        // `readded`: agreed, revoked, then agreed again after the revocation
+        // (the #421 re-establishment) — the active fold carries the owner.
+        invitee_seen_from_the_creator(d, &k, &readded, true).await;
+        d.put_identity_occurrence(
+            ts::signed_content_only_occurrence(&readded, &k, &readded, ago(2)).await,
+        )
+        .await
+        .expect("I1472 the occurrence's first agreement is admitted");
+        unclaim(d, &k, &readded).await;
+        assert!(
+            principals_of(d, &readded).await.unwrap().is_empty(),
+            "I1472 precondition — revoked, the device has no principal"
+        );
+        d.put_identity_occurrence(
+            ts::signed_content_only_occurrence(&readded, &k, &readded, ms(Utc::now())).await,
+        )
+        .await
+        .expect("I1472 the occurrence's re-agreement is admitted");
         let p = pair_room_proposal(d, &cid, &creator, &k).await;
-        for n in [&agreed, &kemless, &unagreed, &later] {
+        for n in [&agreed, &kemless, &unagreed, &later, &readded] {
             assert_eq!(
                 principals_of(d, n).await.unwrap(),
                 vec![k.clone()],
