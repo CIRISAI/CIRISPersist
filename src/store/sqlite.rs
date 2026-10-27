@@ -52238,6 +52238,56 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
             backend
         }
 
+        /// **I1412** (sqlite; CIRISPersist#1132, CC 5.3.3.6) — a receipt
+        /// whose `subscriber_key_id` or `stream_id` does not fit a `u32`
+        /// length prefix is refused at `put_delivery_receipt`'s verifier
+        /// with `InvalidArgument`, never verified over a clamped prefix; the
+        /// same receipt with the field restored is accepted, so the refusal
+        /// is the length's. Outside the mutation filter: under a surviving
+        /// mutant it would copy 4 GiB (I1411 is the scope's witness).
+        #[cfg(target_pointer_width = "64")]
+        #[tokio::test]
+        async fn i1412_an_over_long_receipt_field_is_refused_sqlite() {
+            use crate::federation::stream_receipt::over_long_receipt_field;
+            let backend = fresh().await;
+            let stream_id = "stream-i1412";
+            let root = [0x41u8; 32];
+            let (receipt, ed_b64, mldsa_b64) =
+                signed_receipt(stream_id, "sub-i1412", 0, 1, root, 0x12, 0x34).await;
+            seed_subscriber_key(&backend, "sub-i1412", &ed_b64, &mldsa_b64);
+            seed_published_sth(&backend, stream_id, 1, root);
+
+            for field in ["subscriber_key_id", "stream_id"] {
+                let mut long = receipt.clone();
+                if field == "stream_id" {
+                    long.stream_id = over_long_receipt_field();
+                } else {
+                    long.subscriber_key_id = over_long_receipt_field();
+                }
+                match backend.put_delivery_receipt(long).await {
+                    Err(crate::federation::BlobError::InvalidArgument(m)) => assert!(
+                        m.contains(field) && m.contains("MUST fit u32"),
+                        "I1412: the refusal names {field} and the u32 rule ({} bytes)",
+                        m.len()
+                    ),
+                    Err(_) => panic!("I1412: over-long {field} must be InvalidArgument"),
+                    Ok(()) => panic!("I1412: over-long {field} must be refused"),
+                }
+            }
+            assert!(
+                backend
+                    .list_delivery_receipts_for(stream_id, 10)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "I1412: a refused receipt stores nothing"
+            );
+            backend
+                .put_delivery_receipt(receipt)
+                .await
+                .expect("I1412: the same receipt, fields in range, is accepted");
+        }
+
         /// Positive: a correctly-signed receipt whose chunk_root is a
         /// published STH root (tree_size >= k) is accepted, listed, and
         /// is idempotent on re-PUT.

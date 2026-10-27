@@ -48087,6 +48087,62 @@ mod tests {
         );
     }
 
+    /// **I1412** (postgres; CIRISPersist#1132, CC 5.3.3.6) — the
+    /// over-long receipt field refusal on the PG door (see the sqlite
+    /// witness of the same name).
+    #[cfg(target_pointer_width = "64")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn i1412_an_over_long_receipt_field_is_refused_postgres() {
+        use crate::federation::stream_receipt::over_long_receipt_field;
+        use crate::federation::BlobStorage;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let suffix = uuid_like();
+        let stream_id = format!("stream-i1412-{suffix}");
+        let sub = format!("sub-i1412-{suffix}");
+        let root = [0x41u8; 32];
+        let (receipt, ed_b64, mldsa_b64) =
+            pg_signed_receipt(&stream_id, &sub, 0, 1, root, 0x12, 0x34).await;
+        pg_seed_subscriber_key(&backend, &sub, &ed_b64, &mldsa_b64).await;
+        pg_seed_published_sth(&backend, &stream_id, 1, root).await;
+
+        for field in ["subscriber_key_id", "stream_id"] {
+            let mut long = receipt.clone();
+            if field == "stream_id" {
+                long.stream_id = over_long_receipt_field();
+            } else {
+                long.subscriber_key_id = over_long_receipt_field();
+            }
+            match backend.put_delivery_receipt(long).await {
+                Err(crate::federation::BlobError::InvalidArgument(m)) => assert!(
+                    m.contains(field) && m.contains("MUST fit u32"),
+                    "I1412: the refusal names {field} and the u32 rule ({} bytes)",
+                    m.len()
+                ),
+                Err(_) => panic!("I1412: over-long {field} must be InvalidArgument"),
+                Ok(()) => panic!("I1412: over-long {field} must be refused"),
+            }
+        }
+        assert!(
+            backend
+                .list_delivery_receipts_for(&stream_id, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "I1412: a refused receipt stores nothing"
+        );
+        backend
+            .put_delivery_receipt(receipt)
+            .await
+            .expect("I1412: the same receipt, fields in range, is accepted");
+    }
+
     // ── Cut #171 phase 1: local-tier write on live Postgres ──
 
     fn pg_local_input(
