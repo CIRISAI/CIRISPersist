@@ -82,6 +82,12 @@ expect red-verdict "$D" 1 'NOT CERTIFIED — 1 leg\(s\) RED'
 green_dir "$D"; printf ' \n' >"$D/fmt.rc"
 expect blank-rc "$D" 3 'UNKNOWN +fmt' 'green +fmt '
 
+# A leg with no `.secs` (a leg cut short) prints `-` for its time and no
+# shell error: the verdict read `<"$k.secs"` before silencing stderr, so every
+# cheap leg printed `fmt.secs: No such file or directory` above its row.
+green_dir "$D"; rm -f "$D/fmt.secs"
+expect no-secs "$D" 0 'green +fmt +exit=0 +-s ' 'No such file'
+
 echo
 echo "=== prune_target.py ==="
 T="$WORK/target"; DEPS="$T/debug/deps"; INC="$T/debug/incremental"
