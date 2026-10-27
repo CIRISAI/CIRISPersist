@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [59.1.1] - UNRELEASED
+## [59.1.1] - 2026-10-27
 
 ### Fixed — a node's owner is dropped only by a REVOCATION, not by an unagreed occurrence row (pair-room invitations, live chat)
 
