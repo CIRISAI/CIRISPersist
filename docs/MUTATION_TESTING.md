@@ -365,6 +365,15 @@ did not fit its budget):
   took about 168 s per mutant, not the 120 s the sizing assumes, and three
   of the five shards hit the 7200 s budget with mutants unrun (0 missed).
   At 600 s + 168 s x 27, a shard of eight fits.
+- `scope-601-fixes.txt` (v60.1.0, slice A): the bug fixes' predicates —
+  #1072's plaintext DAG caller-input checks, #1069's idempotent DEK re-supply
+  (the exact comparison and the stored-key read), #1070's purge path without
+  a LocalSigner, the resumed takedown and the bytes floor's in-transaction
+  tombstone read on both dialects (postgres's shared/exclusive advisory
+  locks), and #1006's signed receipt instant — against I1400–I1409, I754,
+  I780–I783, I786, I788–I790, I153 and I513. 81 mutants: 64 caught, 17
+  unviable, 0 missed in one round (two local shards; I787 killed nothing
+  and left the filter). Three shards of <= 27 on the weekly run.
 - `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and
   federation files that feed the counters, against I548–I551 and (v60.0.0)
   I1340–I1341, the witnesses of `apply_planned`'s read-back and store-error
