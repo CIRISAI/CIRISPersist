@@ -97,8 +97,9 @@ threat-model citations because this crate's audit story is the point.
 
 ### Mutation (slice A)
 
-- `scripts/mutants/scope-601-fixes.txt`: 81 mutants, 64 caught, 17
-  unviable, 0 missed; three weekly shards in `mutants.yml`.
+- `scripts/mutants/scope-601-fixes.txt`: 92 mutants, 75 caught, 17
+  unviable, 0 missed (with the merge fix's shared predicate); three weekly
+  shards in `mutants.yml`.
 
 ### Added
 
@@ -199,8 +200,9 @@ threat-model citations because this crate's audit story is the point.
   serves and re-acks there, the post-window finalize skips the bytes, the
   immediate-removal re-publication).
 - **Mutation scope `scope-601-asks`** over the slice's new predicates
-  (#1117, #1064, #1120, #1113): 110 mutants, 99 caught, 11 unviable, 0
-  missed, four weekly shards (`.github/workflows/mutants.yml`).
+  (#1117, #1064, #1120, #1113): 115 mutants, 104 caught, 11 unviable, 0
+  missed at the merge fix, four weekly shards
+  (`.github/workflows/mutants.yml`).
 
 ### Fixed (the slice A × slice B merge)
 
