@@ -226,6 +226,14 @@ threat-model citations because this crate's audit story is the point.
   `Unsupported` there, as `purge_tombstoned` does (I1409 red on both
   backends).
 
+### Evidence (CC ids)
+
+- Two rows join `evidence/cc_impl.tsv` (from the manifest,
+  `scripts/evidence_tsv.py write`; the exact-count pin 347 → 349):
+  CLM-takedown-reversal (4.5.3) at `takedown_tombstone.rs#takedown_reversal`
+  and CLM-scope-infra-relay (4.4.3.4.3) at
+  `types.rs#delegation_scope::INFRA`.
+
 ## [60.0.0] - 2026-10-26
 
 An architecture cut (docs/V60_TASK_PLAN.md): signed attestations are the only

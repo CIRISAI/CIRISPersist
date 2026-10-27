@@ -1792,7 +1792,9 @@ mod tests {
         // CLM-one-tombstone-row at the resumed execution and the bytes
         // floor's in-transaction tombstone read (2).
         // v60.1.0 slice B: +1 (CIRISPersist#1120), CLM-identity-amendment-row.
-        const EXPECTED: usize = 347;
+        // v60.1.0 CC ids: +2, CLM-takedown-reversal (4.5.3, #1113) and
+        // CLM-scope-infra-relay (4.4.3.4.3, #1119).
+        const EXPECTED: usize = 349;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \
@@ -1877,6 +1879,8 @@ mod tests {
         "BlobBackedSchemaResolver",
         "Attestation",
         "LocalAttestationInput",
+        // v60.1.0 (#1119) — the `infra:*` axis set, a const (CLM-scope-infra-relay).
+        "delegation_scope::INFRA",
     ];
 
     /// Cited processors that are **exported API surface**: `pub` functions or

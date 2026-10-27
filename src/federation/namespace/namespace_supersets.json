@@ -17207,6 +17207,24 @@
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v60.1-b",
     "witness": "I1365 (sqlite, postgres): identity_amendment:v1 admits only citing an admitted, approved deferral response about the same agent by a seated WA; identity_amendment_unauthorized otherwise (CIRISPersist#1120)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-takedown-reversal",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/takedown_tombstone.rs#takedown_reversal",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60.1-b",
+    "witness": "I1366, I1367, I1369 (sqlite, postgres): an admitted reconsideration with outcome reversed, signed under the review duty, lifts the takedown at read and at the write floor; withdrawn or expired, it lifts nothing (CIRISPersist#1113)"
+   },
+   {
+    "decimal_id": "4.4.3.4.3",
+    "claim_id": "CLM-scope-infra-relay",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/types.rs#delegation_scope::INFRA",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60.1-b",
+    "witness": "infra_relay_is_appended_and_pinned_by_position (unit): infra:relay is ALL[24] and INFRA[12], appended; I1361 (sqlite, postgres) (CIRISPersist#1119)"
    }
   ],
   "CIRISServer": [
