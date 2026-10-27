@@ -1,0 +1,11 @@
+# Mutation scope: `principals_of`, the self-collective's principal fold
+# (v59.1.1). The PR #889 clause asked whether a row existed and not whether
+# the occurrence was revoked. A peer-replicated occurrence row the occurrence
+# never agreed to (#932 H1) dropped the owner that the live owner binding
+# names, and pair-room invitations never reached the invitee's node.
+# I1470-I1472 and I141 (the #889 case) kill all 7 mutants (0 missed, measured
+# 2026-10-27). I121-I124 run too and killed none; they stay in for the fold's
+# active-principal leg, which cargo-mutants generates no operator for.
+# Grammar: docs/MUTATION_TESTING.md.
+tests: test(/i147[0-2]|occurrence_principal_invariants::run::/)
+src/federation/self_collective.rs principals_of
