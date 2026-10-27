@@ -2208,6 +2208,7 @@ pub(crate) mod engine_bodies {
     /// for the exclusive lock), and once the write commits, the takedown's
     /// immediate finalize deletes the bytes it landed. Without the lock the
     /// takedown completed against bytes not yet written and they stayed.
+    #[cfg(feature = "postgres")]
     pub(crate) async fn i1408_the_tombstone_write_waits_for_a_write_in_flight<B>(
         dsn_a: &str,
         dsn_b: &str,
