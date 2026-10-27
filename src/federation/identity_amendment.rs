@@ -42,6 +42,8 @@ use super::admission::envelope_dimension;
 use super::types::{attestation_type, Attestation};
 use super::{malformed_row, Error, FederationDirectory};
 
+/// The family stem the gate rules on (`federation::family_rules` derives it).
+pub const IDENTITY_AMENDMENT_FAMILY_STEM: &str = "identity_amendment:";
 /// `identity_amendment:v1` — the agent applied a change an approved response
 /// authorised.
 pub const IDENTITY_AMENDMENT_DIMENSION: &str = "identity_amendment:v1";
