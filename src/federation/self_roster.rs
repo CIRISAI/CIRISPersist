@@ -284,7 +284,7 @@ pub const fn landed_outcome(path: LandingPath) -> &'static str {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Does `key`'s record carry the `user` role?
-async fn is_user_key<D>(dir: &D, key: &str) -> Result<bool, Error>
+pub(crate) async fn is_user_key<D>(dir: &D, key: &str) -> Result<bool, Error>
 where
     D: FederationDirectory + ?Sized,
 {

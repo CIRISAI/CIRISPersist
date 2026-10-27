@@ -227,7 +227,9 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
                agent, amendment_digest hex64, authorized_by a uuid cited in evidence_refs) \
                admits only when the cited deferral:response:approved:v1 is admitted here, is \
                about the same agent, and its signer held a WA seat at its asserted_at (the \
-               agent node's owner, self to self); identity_amendment_unauthorized otherwise",
+               agent node's owner, self to self; on a split home, whose owner binds only the \
+               node, the user the signing agent key is an occurrence of); \
+               identity_amendment_unauthorized otherwise",
         enforced_at: &["federation::identity_amendment::check_identity_amendment_admission"],
         gap: RowRuleGap::NoRuleOnTheRow,
         minted_by_persist: false,

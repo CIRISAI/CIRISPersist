@@ -168,7 +168,12 @@ threat-model citations because this crate's audit story is the point.
   (uuid) are shape-checked as malformed rows. Dimension constants for the
   deferral family (`DEFERRAL_REQUEST_DIMENSION`, `…_APPROVED_…`,
   `…_REJECTED_…`). Before this a replicated amendment from any producer was
-  admitted ungated. Witness I1365 (sqlite, postgres).
+  admitted ungated. On a split home (CIRISServer 0.5.189+: the owner binds
+  only the node, the agent key is the owner's occurrence through the
+  `self:delegates_to:agent_occurrence:v1` login anchor) the owner is the
+  `user` the signing key is an occurrence of, when neither the key nor the
+  agent carries an owner binding; a non-user principal or an unanchored key
+  still has no seat. Witnesses I1365, I1368 (sqlite, postgres).
 - **#1113 — a reversed reconsideration reverses a takedown; withheld is
   computed at read** (CC 4.5.3, rc10 `99bf187` / `62776bc`).
   `takedown_tombstone::takedown_reversal(notice_id)` finds a live

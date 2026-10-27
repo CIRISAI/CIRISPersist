@@ -37,6 +37,14 @@
 //!   another agent, evidence that does not cite the response, an amendment
 //!   signed by a key that is not the agent's; an unowned agent has no seated
 //!   WA. Ill-shaped `amendment_digest` / `authorized_by` are malformed rows.
+//! - **I1368 (CIRISPersist#1120, CIRISServer#601)** — the split home: the
+//!   owner (a `user`) binds the NODE (`responsible_for`), the agent key is
+//!   the owner's occurrence (the `self:delegates_to:agent_occurrence:v1`
+//!   anchor and its occurrence row) and has no owner binding. The owner's
+//!   approval authorises the agent's self-subject amendment: the person the
+//!   signing key is an occurrence of is its owner. The same shape whose
+//!   principal is not a `user`, and an agent key with no anchor, are still
+//!   refused `response_signer_not_a_seated_wa`.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -630,6 +638,163 @@ pub(crate) mod bodies {
             }
         }
     }
+
+    /// **I1368** — see the module doc.
+    pub(crate) async fn i1368_a_split_home_owner_is_the_agents_person(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::identity_amendment as ia;
+        use crate::federation::self_at_login as sal;
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{
+            attestation_type, cohort_scope, device_class, identity_type, Attestation,
+            IdentityOccurrence,
+        };
+        use crate::federation::{Error, SignedAttestation};
+
+        let put = |r: Attestation| async move {
+            d.put_attestation(SignedAttestation { attestation: r })
+                .await
+                .map(|_| ())
+        };
+        let row = |by: &str, about: &str, dimension: &str, extra: serde_json::Value| {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut env = serde_json::json!({ "id": id, "dimension": dimension });
+            for (k, v) in extra.as_object().unwrap() {
+                env[k] = v.clone();
+            }
+            let mut r = ts::bare_attestation(&id, by, about, &env);
+            r.attestation_type = attestation_type::SCORES.to_owned();
+            r.cohort_scope = cohort_scope::SELF.to_owned();
+            if by == about {
+                r.subject_key_ids = vec![about.to_owned()];
+            }
+            ts::seal_row_in_place(by, &mut r);
+            r
+        };
+        // The login ceremony's two halves: the occurrence row (owner → agent
+        // key) and the federation-tier anchor `delegates_to` (no purpose).
+        let anchor = |owner: String, agent: String| async move {
+            d.put_identity_occurrence_local(IdentityOccurrence {
+                identity_key_id: owner.clone(),
+                occurrence_key_id: agent.clone(),
+                device_class: device_class::AGENT.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now() - chrono::Duration::seconds(5),
+                valid_until: None,
+                encryption_pubkeys: None,
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("I1368: occurrence record: {e}"));
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut env = sal::delegates_to_agent_envelope(
+                &agent,
+                &format!("pair-{id}"),
+                &sal::SELF_AT_LOGIN_DELEGATION_SCOPE,
+            );
+            env["id"] = serde_json::json!(id);
+            let mut r = ts::bare_attestation(&id, &owner, &agent, &env);
+            r.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+            ts::seal_row_in_place(&owner, &mut r);
+            put(r)
+                .await
+                .unwrap_or_else(|e| panic!("I1368: the agent_occurrence anchor: {e}"));
+        };
+        // The deferral, the principal's approval, the agent's amendment.
+        let amend = |agent: String, approver: String| async move {
+            let request = row(
+                &agent,
+                &agent,
+                ia::DEFERRAL_REQUEST_DIMENSION,
+                serde_json::json!({ "deferral_id": "d-1", "reason_digest": "ab".repeat(32) }),
+            );
+            let request_id = request.attestation_id.clone();
+            put(request).await.expect("I1368: the deferral request");
+            let approved = row(
+                &approver,
+                &agent,
+                ia::DEFERRAL_APPROVED_DIMENSION,
+                serde_json::json!({ "references_attestation_id": request_id }),
+            );
+            let approved_id = approved.attestation_id.clone();
+            put(approved).await.expect("I1368: the approval stores");
+            put(row(
+                &agent,
+                &agent,
+                ia::IDENTITY_AMENDMENT_DIMENSION,
+                serde_json::json!({
+                    "amendment_digest": "cd".repeat(32),
+                    "authorized_by": approved_id,
+                    "evidence_refs": [approved_id],
+                }),
+            ))
+            .await
+        };
+        let refused = |r: Result<(), Error>, what: &str| {
+            let e = r.expect_err(what);
+            let text = e.to_string();
+            assert!(
+                matches!(e, Error::InvalidArgument(_))
+                    && text.contains(&format!(
+                        "{}: {}",
+                        ia::IDENTITY_AMENDMENT_UNAUTHORIZED,
+                        ia::unauthorized_reason::NOT_A_SEATED_WA
+                    )),
+                "I1368 ({what}): expected not-a-seated-WA, got {text}"
+            );
+        };
+
+        // The split home: owner → node is the only owner binding.
+        let owner = format!("i1368-owner-{tag}");
+        let node = format!("i1368-node-{tag}");
+        let agent = format!("i1368-agent-{tag}");
+        ts::register_user_role_key(d, &owner).await;
+        ts::register_hybrid_key_as(d, &node, &node, identity_type::NODE).await;
+        ts::register_hybrid_key(d, &agent).await;
+        ts::put_owner_binding(d, &owner, &node).await;
+        anchor(owner.clone(), agent.clone()).await;
+        assert_eq!(
+            crate::federation::admission::owner_of(d, &agent)
+                .await
+                .unwrap(),
+            None,
+            "I1368: the agent key carries no owner binding"
+        );
+        amend(agent.clone(), owner.clone())
+            .await
+            .unwrap_or_else(|e| panic!("I1368: the split home's amendment admits: {e}"));
+        // A stranger's approval on the same home still holds no seat.
+        let stranger = format!("i1368-stranger-{tag}");
+        ts::register_user_role_key(d, &stranger).await;
+        refused(
+            amend(agent.clone(), stranger.clone()).await,
+            "a stranger on the split home",
+        );
+
+        // The same shape whose principal is not a person.
+        let principal = format!("i1368-principal-{tag}");
+        let agent2 = format!("i1368-agent2-{tag}");
+        ts::register_hybrid_key(d, &principal).await;
+        ts::register_hybrid_key(d, &agent2).await;
+        anchor(principal.clone(), agent2.clone()).await;
+        assert_eq!(
+            d.active_identity_for_occurrence(&agent2).await.unwrap(),
+            principal,
+            "I1368: the agent key is the principal's occurrence"
+        );
+        refused(
+            amend(agent2.clone(), principal.clone()).await,
+            "a non-user principal",
+        );
+
+        // An unanchored agent key: nobody's occurrence, nobody's node.
+        let agent3 = format!("i1368-agent3-{tag}");
+        ts::register_hybrid_key(d, &agent3).await;
+        refused(amend(agent3, owner.clone()).await, "an unanchored agent");
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -686,6 +851,7 @@ mod tests {
         i1365,
         bodies::i1365_an_identity_amendment_needs_a_seated_was_approval
     );
+    on_every_backend!(i1368, bodies::i1368_a_split_home_owner_is_the_agents_person);
 
     /// v60.1.0 (CIRISPersist#1064) — **every `DimensionRejected` reason is
     /// classified exactly once.** The closed set holds each token once, the

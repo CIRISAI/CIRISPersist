@@ -27,8 +27,12 @@
 //! self ([`self_of_at`](super::self_roster::self_of_at)) is the self of the
 //! owner ([`owner_of`](super::admission::owner_of)) of the amendment's
 //! signing occurrence (or, when that key has no owner binding, of the agent
-//! identity the amendment is about). An unowned agent has no seated WA, so
-//! nothing authorises its amendment.
+//! identity the amendment is about). When neither has an owner binding and
+//! the signing key's active identity is a person (a `user` identity the key
+//! is an occurrence of: the split home of CIRISServer 0.5.189+, where the
+//! owner binds the NODE and the agent key is the owner's occurrence through
+//! the login anchor), that person is the owner. An unowned agent has no
+//! seated WA, so nothing authorises its amendment.
 //!
 //! # The refusal's shape
 //!
@@ -111,6 +115,22 @@ fn is_hex64(s: &str) -> bool {
 pub fn is_identity_amendment(row: &Attestation) -> bool {
     row.attestation_type == attestation_type::SCORES
         && envelope_dimension(&row.attestation_envelope) == Some(IDENTITY_AMENDMENT_DIMENSION)
+}
+
+/// v60.1.0 (CIRISPersist#1120, CIRISServer#601) — **the person `occurrence`
+/// is an occurrence of**, when its active identity is a `user`: on a split
+/// home the agent key is its human's occurrence (the login anchor) and the
+/// owner-binding names only the node, so that person is the owner the seat
+/// reads. `None` when the active identity is the key itself or not a person.
+async fn person_of_occurrence(
+    directory: &dyn FederationDirectory,
+    occurrence: &str,
+) -> Result<Option<String>, Error> {
+    let identity = directory.active_identity_for_occurrence(occurrence).await?;
+    if identity != occurrence && super::self_roster::is_user_key(directory, &identity).await? {
+        return Ok(Some(identity));
+    }
+    Ok(None)
 }
 
 /// v60.1.0 (CIRISPersist#1120; CC 3.1.5) — the gate. A no-op for every row
@@ -226,7 +246,10 @@ pub async fn check_identity_amendment_admission(
     let at = response.asserted_at;
     let owner = match super::admission::owner_of(directory, signer).await? {
         Some(o) => Some(o),
-        None => super::admission::owner_of(directory, agent).await?,
+        None => match super::admission::owner_of(directory, agent).await? {
+            Some(o) => Some(o),
+            None => person_of_occurrence(directory, signer).await?,
+        },
     };
     let seated = match owner {
         Some(owner) => {

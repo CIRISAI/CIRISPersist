@@ -9,7 +9,8 @@
 #   `dimension_rejected_reason::is_retryable`. Witnesses
 #   `retryability_is_classified_once_per_reason` (unit), I742 (sqlite,
 #   postgres), I1362 (sqlite, postgres), the from-disk census.
-# - #1120: `identity_amendment.rs` (the whole gate). Witness I1365 (sqlite,
+# - #1120: `identity_amendment.rs` (the whole gate, the split-home
+#   `person_of_occurrence` arm included). Witnesses I1365, I1368 (sqlite,
 #   postgres).
 # - #1113: the reversal fold (`takedown_reversal`, `is_reversal_of`,
 #   `notice_row_of_header`, `review_holders_of_content`), the withheld read
