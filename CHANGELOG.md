@@ -9,6 +9,57 @@ threat-model citations because this crate's audit story is the point.
 
 ## [60.1.0] - UNRELEASED
 
+### Adoption — what CIRISEdge, CIRISServer and CIRISAgent see
+
+No break: nothing to change to keep working on this head. From
+`git diff v60.0.0..` over `python/*.pyi`, `src/ffi/pyo3.rs`, the pub items in
+`src/` and the pub enums: no Python method or function is removed or
+re-signed, no enum gains or loses a variant (`BlobError`, `Error`,
+`DimensionRejectionReason`, `KeyGrantRefusalReason` unchanged), no wire byte
+moves (the delivery receipt's signed layout and every envelope kind are
+unchanged). Additive:
+
+- **New functions.** Rust: `federation::accord_threshold(n)`,
+  `accord_threshold_over_roster`, `accord_threshold_now`,
+  `Engine::accord_threshold` (`AccordThreshold { m, n }`);
+  `KeyGrantRefusalReason::is_retryable` / `from_token`;
+  `admission::dimension_rejected_reason::{ALL, RETRYABLE, is_retryable}`;
+  `identity_amendment::{is_identity_amendment,
+  check_identity_amendment_admission}` and its constants;
+  `takedown_tombstone::{takedown_reversal, is_reversal_of, REVERSED_OUTCOME}`;
+  `custody_ack::{signed_receipt_at, delivery_receipt_dimension}`;
+  `stream_receipt::try_receipt_signing_bytes` (#1132). Python:
+  `Engine.accord_threshold() -> (m, n)`, `accord_threshold_for(n)`,
+  `key_grant_refusal_is_retryable(reason)`,
+  `dimension_rejection_is_retryable(reason)` (`ValueError` on an unknown
+  token), on the native module and the package.
+- **New members.** `RegisteredStreamEpoch.already_registered` and the same
+  key in `register_stream_epoch_dek`'s Python JSON (#1069);
+  `ReackReport.restored` and its serialized key (#1113); `DeploymentProfile`'s
+  two optional members `calibration_version` and `pipeline_metadata`
+  (`schema::AgentPipelineMetadata`, #1089), absent on every v2.7.x profile,
+  whose serialized bytes are unchanged. A Rust caller that builds one of
+  these three structs with an exhaustive struct literal must name the new
+  member (none of Edge, Server, Lens, Node or Verify does).
+- **Vocabulary.** `delegation_scope::INFRA_RELAY = "infra:relay"`, APPENDED
+  to `delegation_scope::ALL` (position 24) and `INFRA` (position 12).
+- **Meanings that narrowed.** `blob_stream_epoch_dek_exists`
+  (`StreamEpochDekExists`) now means exactly a DIFFERENT DEK for the
+  `(stream, epoch)`; a re-supply of the held DEK is `Ok` with
+  `already_registered: true` (#1069). Custody's `received` is now ordered by
+  the subscriber-SIGNED `delivery_receipt:{stream_id}:v1` scores row's
+  instant, not by a stored v1 receipt's storage stamp (#1006).
+- **New refusals, under existing tokens.** An `identity_amendment:v1` row
+  admits only when `authorized_by` names an admitted approved deferral
+  response about the same agent whose signer held a Wise Authority seat at
+  its instant (the agent node's owner; on a split home, the `user` the
+  signing key is an occurrence of, through the
+  `self:delegates_to:agent_occurrence:v1` login anchor); otherwise
+  `identity_amendment_unauthorized` under `federation_invalid_argument`,
+  Python `ValueError` (#1120). A delivery receipt whose `subscriber_key_id`
+  or `stream_id` does not fit a `u32` length is refused
+  (`BlobError::InvalidArgument`, Python `ValueError`) (#1132).
+
 ### Fixed (slice A)
 
 - **CIRISPersist#1124** — `CryptoTier::InvisibleEncrypted`'s doc comment said
@@ -227,6 +278,31 @@ threat-model citations because this crate's audit story is the point.
   database error on a schema with no tombstone table; it now answers
   `Unsupported` there, as `purge_tombstoned` does (I1409 red on both
   backends).
+
+### Fixed (slice C)
+
+- **CIRISPersist#1132** — `stream_receipt::receipt_signing_bytes` wrote
+  `u32::try_from(len).unwrap_or(u32::MAX)` for the `subscriber_key_id` and
+  `stream_id` length prefixes, so a field longer than `u32::MAX` bytes was
+  verified over a clamped prefix instead of refused (CC 5.3.3.6: "a length
+  MUST fit u32 and is refused otherwise"). `try_receipt_signing_bytes`
+  refuses either field with `BlobError::InvalidArgument` (Python
+  `ValueError`) before copying a byte, and `verify_receipt_signature`
+  (`put_delivery_receipt`'s first step, both backends and the Python door)
+  builds its bytes there. The infallible `receipt_signing_bytes` keeps its
+  signature; the bytes it returns for such a field are ones no verifier
+  accepts. No wire change: in-range receipts sign the same bytes. Witnesses
+  I1411 (the length rule and the layout, allocation-free) and I1412 (sqlite,
+  postgres: either over-long field is refused and stores nothing, and the same
+  receipt in range is accepted); the pinned-layout test carries the over-long
+  case.
+- **`scripts/certify.sh` printed `<leg>.secs: No such file or directory`**
+  for every cheap leg (fmt, pyi, featmatrix, ...) and `-s` for its time: the
+  verdict opened `.secs` before silencing stderr, and `run_bg` never wrote
+  one. `run_bg` now times its leg (`.secs` before `.rc`; the recorded exit
+  code is unchanged), and the verdict prints a clean `-` when a `.secs` is
+  missing. `certify_selfcheck.sh` case `no-secs` is red against the old
+  reader. The verdict's exit codes are unchanged.
 
 ### Evidence (CC ids)
 
