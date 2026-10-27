@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [60.1.0] - UNRELEASED
+## [60.1.0] - 2026-10-27
 
 ### Adoption — what CIRISEdge, CIRISServer and CIRISAgent see
 
