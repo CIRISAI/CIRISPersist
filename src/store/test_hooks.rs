@@ -64,6 +64,19 @@ pub(crate) struct Pause {
     resume: tokio::sync::Notify,
 }
 
+/// v60.1.0 (CIRISPersist#1070 item 3) — the pause point every byte write
+/// door reaches between its tombstone pre-read and its write transaction: a
+/// witness commits a takedown there, then resumes the door.
+#[allow(dead_code)]
+pub(crate) const BYTES_AFTER_TOMBSTONE_PRECHECK: &str = "bytes_after_tombstone_precheck";
+
+/// v60.1.0 (CIRISPersist#1070 item 3) — postgres's `store_blob_local` pauses
+/// here INSIDE its write transaction, after its tombstone read under the
+/// shared lock and before its insert: a takedown started now must wait for
+/// the write to commit.
+#[allow(dead_code)]
+pub(crate) const BYTES_INSIDE_THE_WRITE: &str = "bytes_inside_the_write";
+
 /// The longest a paused door waits for its witness.
 pub(crate) const PAUSE_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -171,5 +184,28 @@ impl TestHooks {
             Some((p, _)) if *p == at => armed.take().map(|(_, r)| r),
             _ => None,
         }
+    }
+}
+
+/// v60.1.0 (CIRISPersist#1070 item 3) — arm the pause at
+/// [`BYTES_AFTER_TOMBSTONE_PRECHECK`] on whichever backend a generic witness
+/// body runs over.
+#[allow(dead_code)]
+pub(crate) trait ArmBytesPause {
+    /// Arm the one-shot pause and return its handle.
+    fn arm_bytes_pause(&self) -> std::sync::Arc<Pause>;
+}
+
+#[cfg(feature = "sqlite")]
+impl ArmBytesPause for crate::store::sqlite::SqliteBackend {
+    fn arm_bytes_pause(&self) -> std::sync::Arc<Pause> {
+        self.test_hooks().arm_pause(BYTES_AFTER_TOMBSTONE_PRECHECK)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl ArmBytesPause for crate::store::postgres::PostgresBackend {
+    fn arm_bytes_pause(&self) -> std::sync::Arc<Pause> {
+        self.test_hooks().arm_pause(BYTES_AFTER_TOMBSTONE_PRECHECK)
     }
 }

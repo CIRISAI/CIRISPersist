@@ -14160,7 +14160,9 @@ impl PyEngine {
     /// one blob as JSON: `{sha256_hex, devices: [{device_key_id, state,
     /// reported_at?, received_at?, size?, challengeable}], copies_here,
     /// receipts_consulted}`, `state` ∈ `here` | `received` | `none` |
-    /// `unknown`. `stream_id` adds that stream's delivery receipts. Authorized
+    /// `unknown`. `stream_id` adds that stream's delivery receipts, ordered by
+    /// the subscriber's signed `delivery_receipt:{stream_id}:v1` row (v60.1.0,
+    /// CIRISPersist#1006). Authorized
     /// like `read_blob_as` (`blob_not_granted` for a stranger). Never render
     /// `unknown` as `none`, nor a lapsed `here` as a copy.
     #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, stream_id=None))]
@@ -15353,8 +15355,12 @@ impl PyEngine {
     /// `put_blob_chunk_scoped` at `epoch`.
     ///
     /// Returns JSON: `stream_id`, `epoch`, `tier`, `granted`,
-    /// `excluded`, `roster`. Refusals (ValueError, token then JSON):
-    /// `blob_stream_not_authored`, `blob_stream_epoch_dek_exists`,
+    /// `excluded`, `roster`, `already_registered` (v60.1.0,
+    /// CIRISPersist#1069: `true` for a re-supply of the DEK the epoch already
+    /// holds, with nothing written and nothing granted). Refusals
+    /// (ValueError, token then JSON): `blob_stream_not_authored`,
+    /// `blob_stream_epoch_dek_exists` (a DIFFERENT DEK for the epoch; never
+    /// retryable),
     /// `blob_invalid_argument`. A later chunk may be refused
     /// `blob_stream_epoch_rotation_required` (`reason` `removal` naming
     /// `removed_key_id`, or `cap`) or `blob_stream_epoch_dek_missing`, both
@@ -15449,6 +15455,7 @@ impl PyEngine {
                     "granted": r.granted,
                     "excluded": r.excluded,
                     "roster": r.roster,
+                    "already_registered": r.already_registered,
                 })
                 .to_string())
             })

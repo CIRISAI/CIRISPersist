@@ -7,6 +7,99 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [60.1.0] - UNRELEASED
+
+### Fixed (slice A)
+
+- **CIRISPersist#1124** — `CryptoTier::InvisibleEncrypted`'s doc comment said
+  "Opt-in / default-off"; self/family sealing has been mandatory, with no
+  switch, since v43.0.0 (#827). The comment, `CryptoTier` itself and the
+  `FSD/SELF_FAMILY_DEK_CASCADE.md` §0.5 table now say so. Doc only.
+- **CIRISPersist#1072** — the plaintext DAG doors refuse, before anything is
+  stored or announced, a version-1 manifest whose chunk carries a `seq` or an
+  `epoch` (`finalize_blob_chunks_signing`, `put_blob_chunks_signing`), and an
+  `External` chunk whose `size_bytes` is not its manifest entry's
+  (`put_plaintext_dag_chunk`, `put_blob_chunks_signing`). Both used to be
+  stored and then fail every read or every finalize. Witness I1400 (sqlite,
+  postgres).
+- **CIRISPersist#1069** — `register_stream_epoch_dek`: a re-supply of the DEK
+  a `(stream, epoch)` already holds is `Ok` with the new
+  `RegisteredStreamEpoch::already_registered: true` (and the same key in the
+  Python JSON), writing nothing (no terminator, no DEK row, no wrap, no
+  `key_grant:stream:v1` row). A DIFFERENT DEK stays
+  `stream_epoch_dek_exists`, now meaning exactly the conflict (non-retryable,
+  naming no key material). Persist compares the two itself, in constant time,
+  by opening the stored self-retention wrap; the racing-insert case is judged
+  the same way. The issue's proposed `StreamEpochDekConflict` variant would be
+  a new arm of the exhaustive `BlobError`; it is not added in this MINOR (the
+  existing token now carries exactly that meaning). Witness I1401 (sqlite,
+  postgres).
+- **CIRISPersist#1070** — takedown immediate removal, the three Codex r2
+  cases and the shared-chunk question:
+  1. an Engine with no LocalSigner (`with_hardware_signer`, `from_shared`)
+     refused every immediate-removal takedown at `purge_finalize`
+     (`purge_retraction_inadmissible`), leaving the bytes on disk. The purge
+     path now deletes without the retraction it cannot sign (such an Engine
+     never announced a claim; the tombstone withholds the address at every
+     read door). Witness I1402.
+  2. a takedown whose tombstone committed but whose holder action did not
+     run could never complete once its notice expired or the signer's duty
+     lapsed: a re-run re-asked CC 4.5.5. A recorded execution is now RESUMED
+     (signature still verified; the execution keyed by the notice's own
+     digest), locally and for a replicated bundle. Witness I1403.
+  3. the bytes floor read the tombstone before its write transaction, so a
+     takedown committing in between let the bytes land after their
+     tombstone. Every byte write door (put, local store, chunk DAG one-shot
+     and finalize, adopt, the chunk floor) now reads the address's own
+     tombstone again INSIDE its transaction; on postgres under a shared
+     advisory lock the tombstone's write takes exclusively. Witnesses I1404
+     (plaintext doors) and I1406 (adopt and chunk floor), both red before;
+     I1408 (postgres: a write past its in-transaction read holds the
+     takedown off until it commits, then the finalize deletes its bytes) and
+     I1409 (a write below V187, where no tombstone table exists, still
+     lands).
+  4. decided: a plaintext chunk shared with a live DAG stays (not withheld,
+     not evicted) when another DAG that uses it is taken down; the existing
+     purge walk already does this. Witness I1405.
+- **CIRISPersist#1006** — `custody_view`'s `received` was ordered by this
+  node's storage stamp on a stored `ciris-delivery-receipt/v1` receipt (whose
+  signed bytes carry no instant), so a receipt stored late outranked the
+  device's later signed `none`. `received` is now ordered only by the instant
+  the subscriber SIGNED on its `delivery_receipt:{stream_id}:v1` scores row
+  (CC 3.4.6; the spelling CIRISEdge's receiver already emits), its latest
+  live, unretired, unexpired one (`custody_ack::signed_receipt_at`). A stored
+  v1 receipt still joins the STH and names the subscriber as a device, and is
+  no longer custody evidence on its own. No wire change: the v1 receipt bytes
+  are unchanged. Not in this cut: the issue's membership check at
+  `put_delivery_receipt` (it reverses `stream_receipt.rs`'s documented
+  consumer-policy posture and awaits a ruling). Witness I1407 (sqlite,
+  postgres); I513's control now signs its receipt row.
+
+- **CIRISPersist#1066** — investigated, not fixed in this cut. The premise
+  ("the room-chunk sweep never evicts adopted stream-keyed chunks on a
+  holder") is true, and it is not a chunk-only gap: the holder's community
+  sweep walks only the holder's OWN `(community, minter)` counter (#848), so a
+  peer-minted room DAG, its manifest AND its chunks, is retained on the holder
+  whole; `sweep_all_communities` does not even visit a room the holder holds
+  only peers' bindings for. Witness I1410 (sqlite, postgres) pins the
+  property that holds either way (a holder keeps or drops a peer's DAG whole,
+  never half) and the #848 policy as it stands. Holder-side retention of peer
+  content is a policy ruling, open on the issue.
+
+### Evidence (slice A)
+
+- Four rows join `evidence/cc_impl.tsv` (from the manifest,
+  `scripts/evidence_tsv.py write`; the exact-count pin 342 → 346):
+  CLM-custody-receipt (3.1.3.3) at `custody_ack.rs#signed_receipt_at`;
+  CLM-one-chunk-seal (5.3.3.2.5) at `chunk_dag_cascade.rs#holds_this_dek`;
+  CLM-one-tombstone-row (4.5.3) at `takedown_tombstone.rs#already_recorded`
+  and `steward_purge.rs#refuse_tombstoned_at_write`.
+
+### Mutation (slice A)
+
+- `scripts/mutants/scope-601-fixes.txt`: 81 mutants, 64 caught, 17
+  unviable, 0 missed; three weekly shards in `mutants.yml`.
+
 ## [60.0.0] - 2026-10-26
 
 An architecture cut (docs/V60_TASK_PLAN.md): signed attestations are the only

@@ -2864,6 +2864,79 @@ where
     }
 }
 
+/// v60.1.0 (CIRISPersist#1070 item 3, Codex r2 on #1065) — **the bytes
+/// floor's second look, inside the write transaction.** [`refuse_tombstoned_bytes`]
+/// is read before a door's transaction begins, so a takedown that committed
+/// in between let the bytes land after their tombstone, and an
+/// immediate-removal notice already finalized never revisited them. Each
+/// backend's byte insert now reads the address's own tombstone again inside
+/// its transaction (sqlite: the one writer connection serializes it with the
+/// tombstone's write; postgres: under a shared transaction-scoped advisory
+/// lock on [`bytes_tombstone_lock_key`], which the tombstone's write takes
+/// exclusively), and this is the one decision both ask: a tombstone found is
+/// [`BlobError::Purged`](super::BlobError::Purged) naming its notice, and
+/// nothing is written.
+///
+/// Scope: the address's OWN tombstone. A DAG child withheld only through its
+/// manifests (the [`purge_withheld`] walk) is still judged by the pre-read.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn refuse_tombstoned_at_write(
+    sha256: &[u8],
+    notice_id: Option<String>,
+) -> Result<(), TombstonedAtWrite> {
+    match notice_id {
+        None => Ok(()),
+        Some(notice_id) => Err(TombstonedAtWrite {
+            sha256_hex: hex::encode(sha256),
+            notice_id,
+        }),
+    }
+}
+
+/// [`refuse_tombstoned_at_write`]'s refusal as it leaves a backend's
+/// transaction closure (a typed payload a driver error can carry).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TombstonedAtWrite {
+    /// The address refused.
+    pub(crate) sha256_hex: String,
+    /// The notice whose tombstone names it.
+    pub(crate) notice_id: String,
+}
+
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+impl std::fmt::Display for TombstonedAtWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} was taken down by notice {} before this write committed",
+            self.sha256_hex, self.notice_id
+        )
+    }
+}
+
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+impl std::error::Error for TombstonedAtWrite {}
+
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+impl From<TombstonedAtWrite> for super::BlobError {
+    fn from(t: TombstonedAtWrite) -> Self {
+        super::BlobError::Purged {
+            sha256_hex: t.sha256_hex,
+            notice_id: t.notice_id,
+        }
+    }
+}
+
+/// The postgres advisory-lock name of `sha256`'s bytes-plane tombstone: a
+/// byte write holds it SHARED from its in-transaction tombstone read to its
+/// commit, the tombstone's write takes it EXCLUSIVE, so the two serialize per
+/// address (the key is `hashtextextended` of this text).
+#[cfg(feature = "postgres")]
+pub(crate) fn bytes_tombstone_lock_key(sha256_hex: &str) -> String {
+    format!("ciris-persist:bytes-tombstone:{sha256_hex}")
+}
+
 /// **Is a key with this `identity_type` a person?** Its comma-separated
 /// roles name `user`. THE predicate the interim no-human-subject rule asks,
 /// in Rust ([`human_subject_records`], the arrival gates) and, rendered from

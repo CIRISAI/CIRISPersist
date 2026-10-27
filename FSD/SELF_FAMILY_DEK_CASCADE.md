@@ -26,7 +26,7 @@ Per CEG 0.17 (`v-ceg-0.17`) the cohort scopes resolve to **three** at-rest postu
 
 | Tier | scope | recipients | DEK | discovery | posture |
 |---|---|---|---|---|---|
-| **self / family** | `self`, `family` | `list_identity_occurrences_active` / `list_families_for_member_active` (#161) | **per-write**, fresh | suppressed (no `holds_bytes`) | **opt-in / default-off** (defense-in-depth over already-invisible bytes; v1 migration posture) |
+| **self / family** | `self`, `family` | `list_identity_occurrences_active` / `list_families_for_member_active` (#161) | **per-write**, fresh | suppressed (no `holds_bytes`) | **mandatory, no switch, since v43.0.0** (#827; was opt-in / default-off at v4.14.0, the v1 migration posture; corrected #1124) |
 | **Community** | `community`, `affiliations` | `resolve_community().members` | **shared per-community DEK** = the §10.5.3 **epoch-DEK cascade** (C3b, shipped), wrapped per-member only on membership change | `holds_bytes:*` **with cleartext provenance** | **mandatory** (the DEK is community content's *sole* confidentiality boundary) |
 | **Commons** | `species`, `biosphere`, `federation` | — | none | `holds_bytes:*` plaintext | plaintext |
 

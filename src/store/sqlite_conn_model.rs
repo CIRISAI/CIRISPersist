@@ -664,6 +664,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("set_active_halt", ConnClass::Write),
     ("store_planned_consent_role", ConnClass::Write),
     ("sqlite_load_stream_chunk_hashes", ConnClass::HelperRead),
+    // v60.1.0 (CIRISPersist#1070 item 3) — the bytes floor's tombstone read
+    // INSIDE a byte door's write transaction (a read; the caller writes).
+    ("sqlite_tombstone_at_write", ConnClass::HelperRead),
+    ("sqlite_refuse_tombstoned_at_write", ConnClass::HelperRead),
     ("sqlite_next_key_serve_position", ConnClass::HelperRead),
     ("sqlite_next_plane_position", ConnClass::HelperRead),
     (

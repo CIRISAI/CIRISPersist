@@ -7462,7 +7462,10 @@ impl Engine {
     /// one blob for `viewer_key_id`: per device, `here` | `received` | `none`
     /// | `unknown`, folded at this node's clock. `stream_id`, when the caller
     /// knows the blob's stream, adds its delivery receipts (a receipt with no
-    /// later live report reads `received`). Authorized like
+    /// later live report reads `received`; v60.1.0, CIRISPersist#1006: ordered
+    /// by the instant the subscriber signed on its
+    /// `delivery_receipt:{stream_id}:v1` row, never by this node's storage
+    /// stamp on a stored v1 receipt). Authorized like
     /// [`blob_custody`](Self::blob_custody): a stranger is `NotGranted`.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn custody_view(
@@ -7752,7 +7755,9 @@ impl Engine {
     /// [`seal_stream_chunk`](crate::federation::stream_seal::seal_stream_chunk)
     /// under that per-stream DEK. Chunks then go through
     /// [`put_blob_chunk_scoped`](Self::put_blob_chunk_scoped) at `epoch`.
-    /// Refusals: `stream_not_authored`, `stream_epoch_dek_exists`, or
+    /// Refusals: `stream_not_authored`, `stream_epoch_dek_exists` (a
+    /// DIFFERENT DEK for the epoch; v60.1.0, CIRISPersist#1069: the same DEK
+    /// again is `Ok` with `already_registered`, nothing written), or
     /// `InvalidArgument` (plaintext tier, an epoch below the newest, a
     /// per-chunk-keyed stream, another cohort).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
@@ -9081,11 +9086,11 @@ impl Engine {
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
-                evict_blob_on(arc.as_ref(), &node, signer, sha256, now).await
+                evict_blob_on(arc.as_ref(), &node, Some(signer), sha256, now).await
             }
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(arc) => {
-                evict_blob_on(arc.as_ref(), &node, signer, sha256, now).await
+                evict_blob_on(arc.as_ref(), &node, Some(signer), sha256, now).await
             }
         }
     }
@@ -9180,9 +9185,15 @@ impl Engine {
 
     /// v54.1.0 (CIRISPersist#1046) — **finalize** (hard-delete) an executed
     /// purge after it settled, judged on THIS node's clock (Codex round 2 on
-    /// PR #1057: no purge surface takes a caller's instant). Blob records go through [`Self::evict_blob`]
-    /// (the bytes plane's own retract-then-delete), which needs this Engine's
-    /// LocalSigner; without one a purge holding blobs refuses at the first.
+    /// PR #1057: no purge surface takes a caller's instant). Blob records go
+    /// through [`Self::evict_blob`]'s retract-then-delete. v60.1.0
+    /// (CIRISPersist#1070): an Engine with no LocalSigner (built
+    /// `with_hardware_signer` or `from_shared`) deletes the bytes without the
+    /// retraction instead of refusing at the first blob. Such an Engine never
+    /// announced a claim (announcing needs the LocalSigner), and a tombstoned
+    /// address is withheld at every read door whatever claim names it, so a
+    /// legal deletion is never held hostage to a signature this host cannot
+    /// make.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn purge_finalize(
         &self,
@@ -9208,9 +9219,7 @@ impl Engine {
         crate::federation::steward_purge::purge_finalize(
             directory.as_ref(),
             notice_id,
-            self.local_signer
-                .is_some()
-                .then_some(&bytes as &dyn crate::federation::steward_purge::BytesEvictor),
+            Some(&bytes as &dyn crate::federation::steward_purge::BytesEvictor),
         )
         .await
     }
@@ -9222,19 +9231,16 @@ impl Engine {
     /// binding row in the same finalize, so the DAG fold reads the manifest
     /// `Unbound`, not `Withdrawn`, and `evict_blob`'s own chunk pass (keyed
     /// on `Withdrawn`) would leave the chunks readable by hash. A chunk
-    /// another live manifest relates stays.
+    /// another live manifest relates stays. v60.1.0 (CIRISPersist#1070):
+    /// without a LocalSigner the bytes are deleted with no retraction (see
+    /// [`Self::purge_finalize`]).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub(crate) async fn purge_evict_blob(
         &self,
         sha256: &[u8; 32],
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::federation::EvictBlobReport, crate::federation::BlobError> {
-        let signer = self.local_signer.as_ref().ok_or_else(|| {
-            crate::federation::BlobError::Backend(
-                "purge_evict_blob requires a LocalSigner (evict_blob's retract-then-delete)"
-                    .to_string(),
-            )
-        })?;
+        let signer = self.local_signer.as_deref();
         let node = self.local_derived_key_id().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("purge_evict_blob signer: {e}"))
         })?;
@@ -11510,7 +11516,7 @@ fn plaintext_dag_provenance(author_key_id: &str) -> crate::federation::BlobProve
 async fn evict_blob_on<B>(
     backend: &B,
     node: &str,
-    signer: &crate::signing::LocalSigner,
+    signer: Option<&crate::signing::LocalSigner>,
     sha256: &[u8; 32],
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<crate::federation::EvictBlobReport, crate::federation::BlobError>
@@ -11551,7 +11557,7 @@ where
 async fn purge_evict_blob_on<B>(
     backend: &B,
     node: &str,
-    signer: &crate::signing::LocalSigner,
+    signer: Option<&crate::signing::LocalSigner>,
     sha256: &[u8; 32],
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<crate::federation::EvictBlobReport, crate::federation::BlobError>
@@ -11612,12 +11618,14 @@ where
     Ok(report)
 }
 
-/// One sha, retract-then-delete (the pre-#979 [`evict_blob_on`]).
+/// One sha, retract-then-delete (the pre-#979 [`evict_blob_on`]). v60.1.0
+/// (CIRISPersist#1070): `signer` is `None` only on the purge path of an
+/// Engine with no LocalSigner, which deletes without a retraction.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 async fn evict_one_on<B>(
     backend: &B,
     node: &str,
-    signer: &crate::signing::LocalSigner,
+    signer: Option<&crate::signing::LocalSigner>,
     sha256: &[u8; 32],
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<crate::federation::EvictBlobReport, crate::federation::BlobError>
@@ -11630,14 +11638,18 @@ where
     // `withdraws` at the claim's scope. A refused retraction aborts: bytes and
     // binding stay (I18). A retry finds nothing already retracted (the fold
     // drops it).
-    let retracted =
-        crate::federation::holding_claim::retract_own_claims(backend, node, signer, sha256, now)
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!(
-                    "evict_blob: eviction ABORTED, the bytes stay (I18): {e}"
-                ))
-            })?;
+    let retracted = match signer {
+        Some(signer) => {
+            crate::federation::holding_claim::retract_own_claims(backend, node, signer, sha256, now)
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!(
+                        "evict_blob: eviction ABORTED, the bytes stay (I18): {e}"
+                    ))
+                })?
+        }
+        None => 0,
+    };
     let mut report = EvictBlobReport {
         withdraws_emitted: retracted,
         ..EvictBlobReport::default()

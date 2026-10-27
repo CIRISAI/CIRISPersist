@@ -2415,14 +2415,19 @@ pub mod cohort_scope {
     /// provenance; Commons is plaintext. v55.0.0 (CIRISPersist#989) — every
     /// tier carries holding claims, placed at the content's scope: the
     /// sealed tiers at their own cohort, the plaintext tier at `federation`.
+    /// Both encrypted tiers are **mandatory, no switch, since v43.0.0**
+    /// (CIRISPersist#827): no operator setting writes plaintext at either.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub enum CryptoTier {
         /// `self` / `family` — per-write fresh DEK wrapped to every active
         /// occurrence/member; structurally invisible (holding claims stay in
         /// the cohort).
-        /// **Opt-in / default-off** (defense-in-depth over already-invisible
-        /// bytes; the v1 migration posture). #152.
+        /// **Mandatory, no switch, since v43.0.0** (CIRISPersist#827,
+        /// `BLOB_ENCRYPTION_AT_REST.md` §11.2): `put_blob_signing_scoped`
+        /// refuses every body-taking write at an encrypted tier and
+        /// `resolve_write_tier` reads the tier from the directory. The #152
+        /// (v4.14.0) opt-in posture is gone (CIRISPersist#1124).
         InvisibleEncrypted,
         /// `community` / `affiliations` — a shared per-community DEK (the
         /// §10.5.3 epoch-DEK cascade with the roster as subscriber set),

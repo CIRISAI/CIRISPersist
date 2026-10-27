@@ -26,10 +26,22 @@
 //!   `(stream, epoch)` this node never registered and holds no wrap for, is
 //!   admitted as ciphertext only: no stream DEK row, no wrap, no
 //!   `key_grant:stream:v1` row, no community binding.
-//! - **I754** (sqlite, postgres; #981) — a second supply for an epoch is
+//! - **I754** (sqlite, postgres; #981) — a second, different supply for an epoch is
 //!   `stream_epoch_dek_exists` and the stored key stays; a supply by a writer
 //!   that is not the stream's is `stream_not_authored`, naming the stream and
 //!   never its writer; nothing is written.
+//! - **I1401** (sqlite, postgres; v60.1.0, #1069) — a re-supply of the DEK an
+//!   epoch already holds is `Ok` with `already_registered`, and writes nothing
+//!   (no terminator, no DEK row, no wrap, no `key_grant:stream:v1` row), at the
+//!   newest epoch and below it; a different DEK for a held epoch is
+//!   `stream_epoch_dek_exists`, naming no key material. Two supplies racing for
+//!   one epoch: the same DEK is one write and one idempotent `Ok`; two DEKs are
+//!   one `Ok` and one conflict, and the stored key is the winner's.
+//! - **I1406** (sqlite, postgres; v60.1.0, #1070 item 3) — a takedown that
+//!   commits between an adopt's tombstone pre-read and its write is seen by
+//!   the write: `adopt_sealed_chunk` (the batched chunk floor) and
+//!   `adopt_sealed_blob` (the adopt floor) answer `blob_purged` naming the
+//!   notice and nothing lands on the holder.
 //! - **I755** (sqlite, postgres; #981) — a supplied, kept epoch whose
 //!   recipient leaves the audience refuses the next chunk with the retryable
 //!   `stream_epoch_rotation_required { reason: removal, removed_key_id }`;
@@ -76,6 +88,13 @@
 //!   NEWER room epoch, the DAG is retained whole by the next sweep (it reads
 //!   in full); once the DAG's own epoch falls out of retention the manifest
 //!   and every chunk go in one sweep and nothing is advertised. Never half.
+//! - **I1410** (sqlite, postgres; v60.1.0, CIRISPersist#1066) — a holder
+//!   keeps or drops a peer's room DAG WHOLE: after both nodes sweep past the
+//!   epoch, the minter's manifest and chunks are gone and the holder's
+//!   manifest and every chunk agree. Pinned as the #848 holder policy: the
+//!   holder's sweep walks its own counter, so it retains the peer's DAG whole
+//!   and it still reads (holder-side retention of peer content is #1066's
+//!   open half, awaiting a ruling).
 //! - **I756** (pure; #981) — the roll rule: cap and removal roll a minted
 //!   epoch and refuse a supplied one with the reason; nothing else does.
 
@@ -608,6 +627,162 @@ pub(crate) mod bodies {
         );
     }
 
+    /// **I1401** — see the module doc.
+    pub(crate) async fn i1401_a_resupply_of_the_same_dek_is_idempotent<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let stream = format!("i1401-{run}");
+        let d0 = mls_exporter();
+        let first = l
+            .engine_a
+            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 0, &d0, None)
+            .await
+            .unwrap();
+        assert!(!first.already_registered, "I1401: the first supply writes");
+        write_room(&l, &stream, 1, 0).await;
+        let rows_before = stream_rows(l.ba.as_ref(), &l.node_a).await.len();
+        let grants_before = l.ba.stream_dek_grants(&stream, 0, &l.node_a).await.unwrap();
+
+        // The same DEK again: Ok, nothing written.
+        let again = l
+            .engine_a
+            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 0, &d0, None)
+            .await
+            .expect("I1401: the same DEK again is not refused");
+        assert!(again.already_registered, "I1401: {again:?}");
+        assert!(
+            again.granted.is_empty()
+                && again.excluded.is_empty()
+                && again.key_grant_emission.is_none(),
+            "I1401: an idempotent re-supply grants and emits nothing: {again:?}"
+        );
+        let e0 =
+            l.ba.stream_dek_list(&stream)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.epoch == 0)
+                .expect("I1401: epoch 0 held");
+        assert!(!e0.terminated, "I1401: no terminator written");
+        assert_eq!(e0.chunk_count, 1, "I1401: the epoch's chunks are untouched");
+        assert_eq!(
+            l.ba.stream_dek_list(&stream).await.unwrap().len(),
+            1,
+            "I1401: no DEK row written"
+        );
+        assert_eq!(
+            stream_rows(l.ba.as_ref(), &l.node_a).await.len(),
+            rows_before,
+            "I1401: no key_grant:stream:v1 row re-emitted"
+        );
+        assert_eq!(
+            l.ba.stream_dek_grants(&stream, 0, &l.node_a).await.unwrap(),
+            grants_before,
+            "I1401: no wrap re-written"
+        );
+
+        // The next epoch, then the old one again: still idempotent; a
+        // DIFFERENT DEK for either is the typed conflict, naming no key.
+        let d1 = mls_exporter();
+        let next = l
+            .engine_a
+            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 1, &d1, None)
+            .await
+            .unwrap();
+        assert!(!next.already_registered);
+        for (epoch, dek) in [(0u64, d0), (1, d1)] {
+            let r = l
+                .engine_a
+                .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, epoch, &dek, None)
+                .await
+                .unwrap_or_else(|e| panic!("I1401: epoch {epoch} again: {e:?}"));
+            assert!(r.already_registered, "I1401: epoch {epoch} again");
+        }
+        for (epoch, dek) in [(0u64, d1), (1, d0), (1, mls_exporter())] {
+            let e = l
+                .engine_a
+                .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, epoch, &dek, None)
+                .await
+                .expect_err("I1401: another DEK for a held epoch");
+            assert!(
+                matches!(&e, BlobError::StreamEpochDekExists { epoch: x, .. } if *x == epoch),
+                "I1401: {e:?}"
+            );
+            assert_eq!(e.kind(), "blob_stream_epoch_dek_exists");
+            assert!(
+                !e.to_string().contains(&hex::encode(dek)),
+                "I1401: the refusal names no key material"
+            );
+        }
+
+        // Two supplies racing for one epoch, judged as a stored row is: the
+        // same DEK twice is one write and one idempotent Ok; two DEKs are one
+        // Ok and one conflict, and the stored key is the winner's.
+        let same = format!("i1401-same-{run}");
+        let d = mls_exporter();
+        let (x, y) = tokio::join!(
+            l.engine_a
+                .register_stream_epoch_dek(COMMUNITY, &l.comm, &same, 0, &d, None),
+            l.engine_a
+                .register_stream_epoch_dek(COMMUNITY, &l.comm, &same, 0, &d, None),
+        );
+        let (x, y) = (x.unwrap(), y.unwrap());
+        assert_eq!(
+            [x.already_registered, y.already_registered]
+                .iter()
+                .filter(|a| !**a)
+                .count(),
+            1,
+            "I1401: one write between two equal supplies"
+        );
+        let split = format!("i1401-split-{run}");
+        let (da, db) = (mls_exporter(), mls_exporter());
+        let (x, y) = tokio::join!(
+            l.engine_a
+                .register_stream_epoch_dek(COMMUNITY, &l.comm, &split, 0, &da, None),
+            l.engine_a
+                .register_stream_epoch_dek(COMMUNITY, &l.comm, &split, 0, &db, None),
+        );
+        let winner = match (&x, &y) {
+            (Ok(r), Err(BlobError::StreamEpochDekExists { .. })) if !r.already_registered => da,
+            (Err(BlobError::StreamEpochDekExists { .. }), Ok(r)) if !r.already_registered => db,
+            other => panic!("I1401: two DEKs racing: {other:?}"),
+        };
+        let r = l
+            .engine_a
+            .register_stream_epoch_dek(COMMUNITY, &l.comm, &split, 0, &winner, None)
+            .await
+            .expect("I1401: the stored key is the winner's");
+        assert!(r.already_registered);
+    }
+
+    /// **I1401** (pure) — the DEK comparison reads every byte and is exact:
+    /// equal keys compare equal, and two keys whose differing bytes would
+    /// cancel under an XOR fold (two bytes differing by the same bit) still
+    /// compare unequal, as does a difference in the last byte alone.
+    #[test]
+    fn i1401_the_dek_comparison_is_exact() {
+        use crate::federation::chunk_dag_cascade::orchestrate::dek_eq_constant_time;
+        let a = [7u8; 32];
+        assert!(dek_eq_constant_time(&a, &a), "I1401: equal keys");
+        let mut b = a;
+        b[0] ^= 1;
+        b[1] ^= 1;
+        assert!(
+            !dek_eq_constant_time(&a, &b),
+            "I1401: cancelling differences"
+        );
+        let mut c = a;
+        c[31] ^= 0x80;
+        assert!(!dek_eq_constant_time(&a, &c), "I1401: the last byte");
+    }
+
     /// **I755** — see the module doc.
     pub(crate) async fn i755_a_supplied_epoch_is_the_callers_to_roll<B>(
         dsn_a: &str,
@@ -769,6 +944,187 @@ pub(crate) mod bodies {
         assert_eq!(
             again.evicted_objects, 0,
             "I757: a second sweep evicts nothing more"
+        );
+    }
+
+    /// **I1406** — see the module doc.
+    pub(crate) async fn i1406_a_takedown_between_the_adopt_pre_read_and_the_write<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage
+            + FederationDirectory
+            + crate::store::test_hooks::ArmBytesPause
+            + Sync
+            + 'static,
+    {
+        use crate::federation::doors_takedown_invariants::bodies::{claimant, establish};
+        use crate::federation::doors_takedown_invariants::engine_bodies::with_a_takedown_after_the_pre_read;
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let stream = format!("i1406-{run}");
+        write_room(&l, &stream, 2, 0).await;
+        let sealed = l
+            .engine_a
+            .seal_stream_scoped(COMMUNITY, Some(&l.comm), &stream, None, None)
+            .await
+            .expect("A seals the room stream");
+        l.engine_a.emit_pending_key_grants().await.unwrap();
+        for row in key_grant_rows_for(l.ba.as_ref(), &l.node_a, &l.node_b).await {
+            l.engine_b.apply_replicated_key_grant(row).await.unwrap();
+        }
+        let owner = claimant(0x18);
+        let producer = format!("i1406-producer-{run}");
+        let dir_b = l.bb.as_dyn_directory();
+        let purged = |why: &str, r: Result<[u8; 32], BlobError>, notice_id: &str| match r {
+            Err(BlobError::Purged { notice_id: n, .. }) => {
+                assert_eq!(n, notice_id, "I1406 {why}: the notice that took it down")
+            }
+            other => panic!("I1406 {why}: the write sees the takedown, got {other:?}"),
+        };
+
+        // The chunk floor (adopt_sealed_chunk → the batched chunk floor).
+        let c0 = l.ba.stream_chunk_at(&stream, 0).await.unwrap().unwrap();
+        establish(dir_b, &producer, &owner.id, &hex::encode(c0.chunk_sha)).await;
+        let chunk_prov = BlobProvenance {
+            author_key_id: l.node_a.clone(),
+            cohort_scope: COMMUNITY.to_owned(),
+            community_key_id: Some(l.comm.clone()),
+            epoch: None,
+            tier: CryptoTier::CommunityDek,
+            minter_key_id: None,
+        };
+        let env = inline(l.ba.as_ref(), &c0.chunk_sha).await;
+        let (got, r) = Box::pin(with_a_takedown_after_the_pre_read(
+            l.bb.as_ref(),
+            &l.engine_b,
+            &owner,
+            c0.chunk_sha,
+            l.engine_b.adopt_sealed_chunk(
+                &stream,
+                c0.seq,
+                &env,
+                c0.epoch,
+                c0.plaintext_size,
+                chunk_prov,
+            ),
+        ))
+        .await;
+        purged("adopt_sealed_chunk", got, &r.notice_id);
+        assert!(
+            !l.bb.has_blob(&c0.chunk_sha).await.unwrap(),
+            "I1406: no chunk"
+        );
+
+        // The adopt floor (adopt_sealed_blob → adopt_sealed_blob_at).
+        let root = sealed.manifest_sha256;
+        establish(dir_b, &producer, &owner.id, &hex::encode(root)).await;
+        let manifest_prov = BlobProvenance {
+            author_key_id: l.node_a.clone(),
+            cohort_scope: COMMUNITY.to_owned(),
+            community_key_id: Some(l.comm.clone()),
+            epoch: sealed.epoch,
+            tier: CryptoTier::CommunityDek,
+            minter_key_id: Some(l.node_a.clone()),
+        };
+        let env = inline(l.ba.as_ref(), &root).await;
+        let (got, r) = Box::pin(with_a_takedown_after_the_pre_read(
+            l.bb.as_ref(),
+            &l.engine_b,
+            &owner,
+            root,
+            l.engine_b.adopt_sealed_blob(
+                &env,
+                manifest_prov,
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            ),
+        ))
+        .await;
+        purged("adopt_sealed_blob", got.map(|o| o.sha256), &r.notice_id);
+        assert!(!l.bb.has_blob(&root).await.unwrap(), "I1406: no manifest");
+    }
+
+    /// **I1410** — see the module doc.
+    pub(crate) async fn i1410_a_holder_keeps_a_peers_room_dag_whole<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::community_dek::orchestrate::sweep_rotated_epochs;
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let stream = format!("i1410-{run}");
+        let plain = write_room(&l, &stream, 3, 0).await;
+        let sealed = l
+            .engine_a
+            .seal_stream_scoped(COMMUNITY, Some(&l.comm), &stream, None, None)
+            .await
+            .expect("A seals the room stream");
+        let root = sealed.manifest_sha256;
+        deliver_dag(&l, &stream, &root, sealed.epoch.unwrap()).await;
+        let chunks = l.bb.stream_chunks(&stream).await.unwrap().chunks;
+        assert!(!chunks.is_empty(), "I1410: B holds the stream's chunks");
+        // Both nodes move past the epoch under `retain_past_epochs = 0`, each
+        // on its own counter, and sweep.
+        for (b, alias, me) in [
+            (l.ba.clone(), format!("em-a-{run}"), l.node_a.clone()),
+            (l.bb.clone(), format!("em-b-{run}"), l.node_b.clone()),
+        ] {
+            b.community_dek_bump_epoch(&l.comm, &me).await.unwrap();
+            b.community_dek_bump_epoch(&l.comm, &me).await.unwrap();
+            b.community_dek_set_retain_past_epochs(&l.comm, &me, Some(0))
+                .await
+                .unwrap();
+            sweep_rotated_epochs(
+                b.as_ref(),
+                &l.comm,
+                &ts::local_signer(&alias),
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("I1410: the sweep runs");
+        }
+        // The minter's copy goes whole (I757's rule).
+        assert!(
+            l.ba.blob_head(&root).await.unwrap().is_none(),
+            "I1410: A's manifest"
+        );
+        for c in &chunks {
+            assert!(
+                l.ba.blob_head(&c.chunk_sha).await.unwrap().is_none(),
+                "I1410: A's chunk"
+            );
+        }
+        // The holder's: never half — the manifest and every chunk together.
+        let manifest_held = l.bb.blob_head(&root).await.unwrap().is_some();
+        for c in &chunks {
+            assert_eq!(
+                l.bb.blob_head(&c.chunk_sha).await.unwrap().is_some(),
+                manifest_held,
+                "I1410: the holder keeps or drops a peer's room DAG WHOLE: chunk {} disagrees \
+                 with its manifest",
+                c.seq
+            );
+        }
+        // And, pinned (CIRISPersist#1066, #848): a holder's sweep walks its OWN
+        // counter only, so a peer-minted room DAG is retained there whole and
+        // still reads. If this flips, holder-side retention for peer content
+        // landed: the never-half assertion above must still hold.
+        assert!(
+            manifest_held,
+            "I1410: KNOWN POLICY, pinned — a holder retains a peer's room DAG (#848: a peer's \
+             epochs have no key state here to sweep; CIRISPersist#1066)"
+        );
+        assert_eq!(
+            l.engine_b
+                .read_blob_as(&root, &l.node_b, None)
+                .await
+                .expect("I1410: B still reads the DAG"),
+            plain
         );
     }
 
@@ -1615,6 +1971,22 @@ pub(crate) mod bodies {
                 async fn i754() {
                     let Some((a, b)) = $dsn else { return };
                     i754_exists_and_not_authored(&a, &b, &run(), $pick).await
+                }
+                #[tokio::test]
+                async fn i1401() {
+                    let Some((a, b)) = $dsn else { return };
+                    i1401_a_resupply_of_the_same_dek_is_idempotent(&a, &b, &run(), $pick).await
+                }
+                #[tokio::test]
+                async fn i1406() {
+                    let Some((a, b)) = $dsn else { return };
+                    i1406_a_takedown_between_the_adopt_pre_read_and_the_write(&a, &b, &run(), $pick)
+                        .await
+                }
+                #[tokio::test]
+                async fn i1410() {
+                    let Some((a, b)) = $dsn else { return };
+                    i1410_a_holder_keeps_a_peers_room_dag_whole(&a, &b, &run(), $pick).await
                 }
                 #[tokio::test]
                 async fn i757() {
