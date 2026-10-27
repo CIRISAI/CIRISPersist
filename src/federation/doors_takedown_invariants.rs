@@ -1279,7 +1279,7 @@ pub(crate) mod engine_bodies {
     use crate::federation::{BlobBody, BlobError, BlobStorage, ChunkManifest, ChunkRef};
     use sha2::Digest as _;
 
-    fn plaintext_manifest(segs: &[Vec<u8>]) -> ChunkManifest {
+    pub(crate) fn plaintext_manifest(segs: &[Vec<u8>]) -> ChunkManifest {
         ChunkManifest {
             v: crate::federation::blobs::CHUNK_MANIFEST_VERSION,
             total_size: segs.iter().map(|s| s.len() as u64).sum(),

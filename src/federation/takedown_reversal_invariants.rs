@@ -667,6 +667,36 @@ pub(crate) mod engine_bodies {
             .expect("I1369: every takedown reversed: the re-publication lands");
         assert!(l.ba.has_blob(&sha).await.unwrap(), "I1369: it landed");
 
+        // A door writing several addresses carries every address's reversals
+        // into its transaction: a reversed takedown of the FIRST chunk of a
+        // DAG re-published in one shot does not refuse it.
+        let segs: Vec<Vec<u8>> = ["dag a", "dag b"]
+            .iter()
+            .map(|t| format!("i1369 {t} {run}").into_bytes())
+            .collect();
+        let c0 = hold(e, &author, &segs[0]).await;
+        bind_into(dir, &moderator.id, &comm, &hex::encode(c0)).await;
+        let d1 = take(c0).await.expect("I1369: the chunk's takedown");
+        assert!(d1.bytes_destroyed, "I1369: {d1:?}");
+        reverse(&d1)
+            .await
+            .expect("I1369: the chunk's takedown reversed");
+        let m =
+            crate::federation::doors_takedown_invariants::engine_bodies::plaintext_manifest(&segs);
+        let msha: [u8; 32] = sha2::Sha256::digest(m.to_jcs_bytes()).into();
+        let chunks = segs
+            .iter()
+            .map(|s| (sha2::Sha256::digest(s).into(), BlobBody::Inline(s.clone())))
+            .collect();
+        e.put_blob_chunks_signing(m, chunks, &author)
+            .await
+            .expect("I1369: a DAG over a reversed chunk lands");
+        assert!(
+            l.ba.has_blob(&c0).await.unwrap(),
+            "I1369: the chunk is back"
+        );
+        assert!(l.ba.has_blob(&msha).await.unwrap(), "I1369: the manifest");
+
         // postgres: a write admitted over a reversed takedown, paused under
         // the shared lock, holds a new takedown off until it commits.
         let Some(arm_inside) = arm_inside else {
