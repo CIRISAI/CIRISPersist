@@ -6770,6 +6770,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         plane: &str,
         record_ref: &str,
     ) -> Result<Vec<String>, crate::federation::Error> {
+        // v60.1.0 (#1070 × #1113) — below V187 there is no tombstone table:
+        // the plane is absent (`Unsupported`), exactly as `purge_tombstoned`
+        // answers, so the withheld read it now serves withholds nothing there.
+        if self
+            .pre_purge_schema
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(crate::federation::Error::Unsupported {
+                method: "purge_tombstone_notices",
+            });
+        }
         let client = self
             .get_client()
             .await
