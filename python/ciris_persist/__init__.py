@@ -41,8 +41,11 @@ from .ciris_persist import (
     ScoringFactorStream,
     Transient,
     __version__,
+    accord_threshold_for,
+    dimension_rejection_is_retryable,
     engine_teardown_wait,
     engine_teardowns_in_flight,
+    key_grant_refusal_is_retryable,
     namespace_manifest_version,
     persist_field_conformance,
     reset_engine,
@@ -88,6 +91,12 @@ __all__ = [
     "namespace_manifest_version",
     "persist_field_conformance",
     "transform_algebra_hash",
+    # v60.1.0 (CIRISPersist#1117, #1064) — the accord strict-majority rule and
+    # persist's own retryability answers, on the package, not only the native
+    # module.
+    "accord_threshold_for",
+    "dimension_rejection_is_retryable",
+    "key_grant_refusal_is_retryable",
 ]
 
 # v3.12.2 (CIRISPersist#156) — diagnostic harness surface. Re-exported

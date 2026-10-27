@@ -814,6 +814,162 @@ pub async fn takedown_authority(
     }
 }
 
+/// v60.1.0 (CIRISPersist#1113; CC 4.5.3, rc10 `99bf187` / `62776bc`) — the
+/// `outcome` of a `reconsideration:{grounds}` ruling that reverses the action
+/// it names.
+pub const REVERSED_OUTCOME: &str = "reversed";
+
+/// v60.1.0 (CIRISPersist#1113) — the `notice_jcs` of a takedown header, read
+/// back as the notice ROW it records: `(row attestation_id, content_sha256)`.
+/// `None` for a legacy Contribution notice (it has no row to cite) or a
+/// header that is not a takedown's.
+fn notice_row_of_header(execution: &PurgeExecution) -> Option<(String, String)> {
+    let env: serde_json::Value = serde_json::from_str(&execution.notice_jcs).ok()?;
+    if !is_notice_row_value(&env) {
+        return None;
+    }
+    let row: super::Attestation = serde_json::from_value(env).ok()?;
+    let shape = notice_row_shape(&row).ok()?;
+    Some((row.attestation_id, shape.content_sha256))
+}
+
+/// v60.1.0 (CIRISPersist#1113) — is `row` a `reconsideration:{grounds}`
+/// RULING with `outcome: reversed` naming `notice_row_id`?
+#[must_use]
+pub fn is_reversal_of(row: &super::Attestation, notice_row_id: &str) -> bool {
+    row.attestation_type == super::types::attestation_type::SCORES
+        && super::admission::envelope_dimension(&row.attestation_envelope)
+            .is_some_and(|d| d.starts_with(super::admission::RECONSIDERATION_DIMENSION_PREFIX))
+        && row
+            .attestation_envelope
+            .get(super::admission::RECONSIDERATION_OUTCOME_MEMBER)
+            .and_then(serde_json::Value::as_str)
+            == Some(REVERSED_OUTCOME)
+        && super::precedence::references_attestation_id_from_envelope(&row.attestation_envelope)
+            == Some(notice_row_id)
+}
+
+/// v60.1.0 (CIRISPersist#1113; CC 4.5.3) — the review-holders over a
+/// takedown's content as THIS node holds it: the duty roots of every
+/// community the content's live binding rows place it in (CC 4.5.5 — "the
+/// ruling stays with the review-holders"; never a community a ruling or a
+/// notice names). `None` when no binding row is held.
+///
+/// # Errors
+///
+/// Directory reads.
+pub(crate) async fn review_holders_of_content(
+    directory: &dyn FederationDirectory,
+    content_sha256: &str,
+) -> Result<Option<(ContentBinding, std::collections::HashSet<String>)>, Error> {
+    let Some(binding) = content_binding(directory, content_sha256).await? else {
+        return Ok(None);
+    };
+    let mut holders = std::collections::HashSet::new();
+    for community in &binding.communities {
+        holders.extend(
+            super::admission::community_duty_roots(
+                directory,
+                community,
+                super::admission::DELEGATION_SCOPE_REVIEW,
+            )
+            .await?,
+        );
+    }
+    Ok(Some((binding, holders)))
+}
+
+/// v60.1.0 (CIRISPersist#1113; CC 4.5.3, rc10) — **has an admitted
+/// reconsideration reversed the takedown `notice_id`?** `Some(ruling id)`
+/// when a live `reconsideration:{grounds}` ruling with `outcome: reversed`
+/// names the notice's row and its signer holds the `review` duty over the
+/// content as this node holds it NOW (re-derived at every read, the shape of
+/// `blob_tombstone::retiring_composer`: never a stored verdict).
+///
+/// The read-time half of CC 4.5.3's reversal: the bytes are withheld while an
+/// admitted notice stands with no admitted reversal ([`steward_purge::purge_withheld`](super::steward_purge::purge_withheld)
+/// asks this for every takedown tombstoning them), the hard delete skips a
+/// reversed takedown's bytes, and the holder re-acknowledges `here`. Inside
+/// a holder's window the bytes serve again; after it (counted from THIS
+/// node's `executed_at`, `settles_at`) the notice is void and the tombstone
+/// no longer refuses a remaining copy or a re-publication; an
+/// immediate-removal basis gets standing back, never bytes (they were
+/// destroyed on receipt). `None` for a steward purge, an erasure, a legacy
+/// Contribution notice, or content no binding row places in a community
+/// (nobody here holds the review duty over it).
+///
+/// The ruling is found where it is placed: at `community` (or
+/// `affiliations`) scope naming one of the content's communities.
+///
+/// # Errors
+///
+/// Directory reads.
+pub async fn takedown_reversal(
+    directory: &dyn FederationDirectory,
+    notice_id: &str,
+) -> Result<Option<String>, Error> {
+    let Some(execution) = directory.purge_execution(notice_id).await? else {
+        return Ok(None);
+    };
+    if !matches!(
+        basis_disposition(&execution.legal_basis),
+        Some(
+            TakedownDisposition::DestroyOnReceipt | TakedownDisposition::WithholdThenDelete { .. }
+        )
+    ) {
+        return Ok(None);
+    }
+    let Some((notice_row_id, content)) = notice_row_of_header(&execution) else {
+        return Ok(None);
+    };
+    let Some((binding, holders)) = review_holders_of_content(directory, &content).await? else {
+        return Ok(None);
+    };
+    let now = sp::purge_clock();
+    let scopes = [
+        super::types::cohort_scope::COMMUNITY,
+        super::types::cohort_scope::AFFILIATIONS,
+    ];
+    for community in &binding.communities {
+        let rulings = match directory
+            .list_targeted_by_dimension_prefix(
+                &scopes,
+                community,
+                super::admission::RECONSIDERATION_DIMENSION_PREFIX,
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            Err(Error::Unsupported { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        for ruling in rulings {
+            if !is_reversal_of(&ruling, &notice_row_id)
+                || ruling.expires_at.is_some_and(|e| e <= now)
+                || super::blob_tombstone::retiring_composer(directory, &ruling)
+                    .await?
+                    .is_some()
+            {
+                continue;
+            }
+            match super::admission::check_moderation_admission(
+                directory,
+                &ruling.attesting_key_id,
+                &holders,
+                super::admission::DELEGATION_SCOPE_REVIEW,
+                TAKEDOWN_NOTICE_SUBJECT_KIND,
+            )
+            .await
+            {
+                Ok(()) => return Ok(Some(ruling.attestation_id)),
+                Err(Error::DelegatedScopeUnauthorized { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// What a takedown did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TakedownReport {
@@ -864,9 +1020,28 @@ pub async fn takedown_tombstone(
 ) -> Result<TakedownReport, Error> {
     let now = sp::purge_clock();
     let terms = takedown_terms(directory, notice, NoticeOrigin::Local).await?;
-    verify_takedown_authority(directory, &terms, now).await?;
+    if !already_recorded(directory, &terms).await? {
+        verify_takedown_authority(directory, &terms, now).await?;
+    }
     hold_notice_row(directory, &terms).await?;
     record(directory, &terms, executed_by, origin::LOCAL, now).await
+}
+
+/// v60.1.0 (CIRISPersist#1070, Codex r2 on #1065) — **is this notice's
+/// execution already recorded here?** Then a re-run RESUMES it: the decision
+/// was made (CC 4.5.5 asked, the tombstone committed) and is not asked again,
+/// so a holder action that failed after the commit completes even once the
+/// notice has expired or the signer's duty has lapsed. The notice's signature
+/// is still verified on every run ([`takedown_terms`]), and the execution is
+/// keyed by the notice id, the digest of the notice's own JCS, so only the
+/// same notice resumes. The header and its one tombstone are written in ONE
+/// transaction (`purge_put_execution`), so a held header is a held tombstone.
+async fn already_recorded(
+    directory: &dyn FederationDirectory,
+    terms: &TakedownTerms,
+) -> Result<bool, Error> {
+    Ok(terms.disposition != TakedownDisposition::AgeGate
+        && directory.purge_execution(&terms.notice_id).await?.is_some())
 }
 
 /// v60.0.0 (CIRISPersist#803) — the notice row the tombstone cites is HELD
@@ -933,7 +1108,9 @@ pub async fn apply_replicated_takedown(
             }),
         ));
     }
-    verify_takedown_authority(directory, &terms, now).await?;
+    if !already_recorded(directory, &terms).await? {
+        verify_takedown_authority(directory, &terms, now).await?;
+    }
     hold_notice_row(directory, &terms).await?;
     record(directory, &terms, receiver_key_id, origin::REPLICATED, now).await
 }

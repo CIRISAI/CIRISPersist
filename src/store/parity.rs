@@ -475,6 +475,19 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("prepare_manifest_row", Class::Plumbing),
     // v55.0.0 (CIRISPersist#1007) — Gate: taken-down or purged bytes never come back.
     ("refuse_tombstoned_bytes", Class::Gate),
+    // v60.1.0 (CIRISPersist#1070 item 3) — the same refusal again INSIDE the
+    // write transaction: the shared decision is the Gate; each dialect's
+    // wrapper Delegates to it (so both doors read `refuse_tombstoned_at_write`);
+    // the in-transaction read, postgres's advisory lock and sqlite's error
+    // carrier are Plumbing.
+    ("refuse_tombstoned_at_write", Class::Gate),
+    ("sqlite_refuse_tombstoned_at_write", Class::Delegates),
+    ("pg_refuse_tombstoned_at_write", Class::Delegates),
+    ("sqlite_tombstone_at_write", Class::Plumbing),
+    ("pg_tombstone_at_write", Class::Plumbing),
+    ("pg_lock_bytes_tombstones", Class::Plumbing),
+    ("sqlite_purged_at_write", Class::Plumbing),
+    ("pg_lock_bytes_tombstones_exclusive", Class::Plumbing),
     // #832 — `build_transaction()…start()`: the REPEATABLE READ transaction
     // `stream_chunks` opens so the listing and the STH are one snapshot.
     // Driver plumbing; it cannot refuse anything about the caller's input.
@@ -621,6 +634,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v60.0.0 (CIRISPersist#988 item 4) — the goal family's M-1 and
     // amendment gate, in the shared plan.
     ("check_goal_row_admission", Class::Gate),
+    // v60.1.0 (CIRISPersist#1120, CC 3.1.5) — the identity_amendment:v1
+    // gate (a cited, approved response by a seated WA), in the shared plan.
+    ("check_identity_amendment_admission", Class::Gate),
     // v44.6.0 (#857) — a machine author may name only itself in for_key_id;
     // refuses on the caller's input.
     ("check_consent_for_key_admission", Class::Gate),

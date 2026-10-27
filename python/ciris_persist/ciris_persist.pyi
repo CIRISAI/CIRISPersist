@@ -569,6 +569,9 @@ class Engine:
     def abandon_stream_json(self, stream_id: str) -> str:
         """(derived) deontic — v52.0.0 (CIRISPersist#954) — abandon an unsealed stream this node owns (a streaming publish refused midway): the stream is tombstoned (stream_aband..."""
 
+    def accord_threshold(self) -> tuple[int, int]:
+        """(derived) deontic — v60.1.0 (CIRISPersist#1117; CC 4.2.6 / CC 4.5.1.2) — the accord threshold over this node's standing accord-holder roster, as (m, n): n holders whos..."""
+
     def add_community_member(self, community_key_id: str, member_json: str, admit_spec_json: str) -> bool:
         """(derived) deontic — #249 Cut B — incrementally add one member to a community roster (mirror of add_family_member). member_json is a [crate::federation::types::Communit..."""
 
@@ -4325,6 +4328,15 @@ def reset_engine(timeout_seconds: float = 10.0) -> str:
 
 
 # ==================================================================
+# DEONTIC  (BINDING)
+# Varying one of these changes what the mesh permits — a wrong entry here is a security finding.
+# ==================================================================
+
+def accord_threshold_for(roster_size: int) -> int:
+    """(derived) deontic — v60.1.0 (CIRISPersist#1117; CC 4.2.6) — the accord threshold over a standing roster of roster_size holders: the strict majority roster_size // 2 +..."""
+
+
+# ==================================================================
 # AXIOMATIC  (BINDING)
 # Varying one of these changes the decomposition premise two repos are cross-checking.
 # ==================================================================
@@ -4357,5 +4369,17 @@ def transform_algebra_hash() -> str:
 
     Axiomatic: cross-checked against the other processors' pinned copies.
     """
+
+
+# ==================================================================
+# PROCEDURAL  (descriptive)
+# Varying one of these changes orchestration — when and by whom, not what is true.
+# ==================================================================
+
+def dimension_rejection_is_retryable(reason: str) -> bool:
+    """(derived) procedural — v60.1.0 (CIRISPersist#1064, CIRISEdge) — may a later re-offer of the row a federation_dimension_rejected refusal named succeed? reason is the refus..."""
+
+def key_grant_refusal_is_retryable(reason: str) -> bool:
+    """(derived) procedural — v60.1.0 (CIRISPersist#1064, CIRISEdge) — may a later re-offer of the row a federation_key_grant_refused refusal named succeed? reason is the refusa..."""
 
 # --- pyi_surface: END GENERATED REGION ---

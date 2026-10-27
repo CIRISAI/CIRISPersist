@@ -2168,6 +2168,111 @@ pub(crate) mod bodies {
         );
     }
 
+    /// I1364 (v60.1.0, CIRISPersist#1089, CIRISAgent#1255 re-cut) — the two
+    /// signed profile members the re-cut adds, `calibration_version`
+    /// (required, nullable) and `pipeline_metadata` (a closed object of
+    /// nullable members), are typed: a trace carrying them, with a token or
+    /// with `null`, re-canonicalises to the bytes the producer signed, admits
+    /// with its signature verified, and the stored trace keeps every member.
+    /// Before v60.1.0 both were dropped on parse and the signature failed. A
+    /// `pipeline_metadata` with a member outside the closed set is refused at
+    /// parse, by name, and nothing is written.
+    pub(crate) async fn i1364_the_recut_profile_members_are_typed_and_signed<D: Seams>(d: &D) {
+        use crate::schema::{BatchEnvelope, BatchEvent};
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        let metadata = serde_json::json!({
+            "agent_version": "2.16.5-stable",
+            "accord_version": "1.2b",
+            "identity_hash": null,
+            "pdma_version": null,
+            "dsdma_domain_registry_version": null,
+        });
+        for (tid, calibration) in [
+            ("trace-i1364-token", serde_json::json!("crc-v2")),
+            ("trace-i1364-null", serde_json::Value::Null),
+        ] {
+            let mut t = v28_trace_json(tid, AGENT, Some("production"), Some("2.8.0"));
+            t["deployment_profile"]["calibration_version"] = calibration.clone();
+            t["deployment_profile"]["pipeline_metadata"] = metadata.clone();
+            let (signed, signed_bytes) = sign_v28(t, AGENT);
+            let bytes = v28_batch(&signed, "generic");
+            let env = BatchEnvelope::from_json(&bytes).expect("I1364: parses");
+            let BatchEvent::CompleteTrace { trace, .. } = &env.events[0];
+            let profile = trace.deployment_profile.as_ref().expect("profile");
+            assert_eq!(
+                profile.calibration_version,
+                Some(calibration.as_str().map(str::to_owned)),
+                "I1364 ({tid}): present, with its value or null"
+            );
+            assert_eq!(
+                profile
+                    .pipeline_metadata
+                    .as_ref()
+                    .map(|m| m.agent_version.as_str()),
+                Some("2.16.5-stable"),
+                "I1364 ({tid})"
+            );
+            assert_eq!(
+                serde_json::to_value(profile).unwrap(),
+                signed["deployment_profile"],
+                "I1364 ({tid}): the typed profile serializes back to the wire profile"
+            );
+            let canon = crate::verify::canonical::canonicalizer_for(
+                crate::verify::ed25519::canon_version_for_trace_schema("3.0.0"),
+            );
+            let re = crate::verify::ed25519::canonical_bytes_for_trace(trace, canon).unwrap();
+            assert!(
+                re == signed_bytes,
+                "I1364 ({tid}): re-canonicalised bytes differ from the signed bytes"
+            );
+            let summary = ingest_full(d, &bytes)
+                .await
+                .unwrap_or_else(|e| panic!("I1364 ({tid}): admits: {e}"));
+            assert_eq!(summary.signatures_verified, 1, "I1364 ({tid})");
+            let att = dir
+                .get_attestation(&crate::ingest::trace_attestation_id(tid))
+                .await
+                .unwrap()
+                .expect("I1364: the trace attestation");
+            assert_eq!(
+                att.attestation_envelope["trace"]["deployment_profile"],
+                signed["deployment_profile"],
+                "I1364 ({tid}): the stored trace keeps every signed profile member"
+            );
+        }
+        // A v2.7.x-shaped profile (neither member) serializes neither.
+        let plain = v28_profile(Some("production"), Some("2.8.0"));
+        let typed: crate::schema::DeploymentProfile =
+            serde_json::from_value(plain.clone()).unwrap();
+        assert_eq!(
+            typed.calibration_version, None,
+            "I1364: absent stays absent"
+        );
+        assert_eq!(serde_json::to_value(&typed).unwrap(), plain, "I1364");
+        // A pipeline_metadata member outside the closed set: refused, by name.
+        let tid = "trace-i1364-extra";
+        let mut t = v28_trace_json(tid, AGENT, Some("production"), Some("2.8.0"));
+        t["deployment_profile"]["calibration_version"] = serde_json::json!("crc-v2");
+        let mut extra = metadata.clone();
+        extra["smuggled"] = serde_json::json!("x");
+        t["deployment_profile"]["pipeline_metadata"] = extra;
+        let (signed, _) = sign_v28(t, AGENT);
+        let e = ingest_full(d, &v28_batch(&signed, "generic"))
+            .await
+            .expect_err("I1364: an unknown pipeline_metadata member is refused");
+        assert_eq!(e.kind(), "schema_malformed_json", "I1364: {e}");
+        assert!(
+            e.to_string().contains("smuggled"),
+            "I1364: the refusal names the member: {e}"
+        );
+        assert_eq!(
+            dir.purge_trace_row_counts(&[tid.to_owned()]).await.unwrap(),
+            (0, 0),
+            "I1364: nothing written"
+        );
+    }
+
     pub(crate) async fn i1032_a_v27_trace_is_unchanged<D: Seams>(d: &D) {
         root(d).await;
         let dir = d.as_dyn_directory();
@@ -4461,6 +4566,11 @@ mod run {
                 async fn i1034() {
                     let Some(d) = $fresh.await else { return };
                     b::i1034_the_oversize_mint_copies_the_profile_run_kind(&d).await
+                }
+                #[tokio::test]
+                async fn i1364() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i1364_the_recut_profile_members_are_typed_and_signed(&d).await
                 }
                 #[tokio::test]
                 async fn i668() {

@@ -947,6 +947,17 @@ pub mod delegation_scope {
     pub const INFRA_TRANSPORT: &str = "infra:transport";
     /// `infra:attest` — emit infrastructure self-attestations.
     pub const INFRA_ATTEST: &str = "infra:attest";
+    /// v60.1.0 (CIRISPersist#1119; CC 5.4.6 item 4, rc10) — `infra:relay` — a
+    /// steward-conferred relay standing: on an owner-bound, bundle-rooted
+    /// identity it counts as seat-like in the onion layer cap's denominator,
+    /// so the steward grows the layers by conferring rather than by adding
+    /// serve seats. Conferred on the accord plane under the same co-scrub rule
+    /// as [`INFRA_SERVE`] and read through
+    /// [`has_accord_conferred_role`](crate::federation::has_accord_conferred_role);
+    /// no new row kind. A standing owes no seat conformance (that is a serve
+    /// seat's). The consumer (CIRISEdge `deal_layers`) imports this const and
+    /// never spells the token.
+    pub const INFRA_RELAY: &str = "infra:relay";
 
     /// `agency:act_on_behalf` — take action attributable to a principal.
     pub const AGENCY_ACT_ON_BEHALF: &str = "agency:act_on_behalf";
@@ -1082,6 +1093,9 @@ pub mod delegation_scope {
         SCOPE_GRANT,
         // recovery / succession standing, re-exported from `ownership_reclaim`.
         SCOPE_OWNER_BINDING_RECOVERY,
+        // v60.1.0 (CIRISPersist#1119) — APPENDED, never inserted: a consumer
+        // mirrors this list by position.
+        INFRA_RELAY,
     ];
 
     /// v30.7.0 (CIRISPersist#625) — the `infra:*` axis: what a key may do as
@@ -1105,6 +1119,8 @@ pub mod delegation_scope {
         INFRA_RECORD_HARD_CASE,
         INFRA_PUBLISH_RATING,
         INFRA_CLASSIFY_CONTENT,
+        // v60.1.0 (CIRISPersist#1119) — appended.
+        INFRA_RELAY,
     ];
 
     /// v30.7.0 (CIRISPersist#625) — the `agency:*` axis: what a key may do ON
@@ -2415,14 +2431,19 @@ pub mod cohort_scope {
     /// provenance; Commons is plaintext. v55.0.0 (CIRISPersist#989) — every
     /// tier carries holding claims, placed at the content's scope: the
     /// sealed tiers at their own cohort, the plaintext tier at `federation`.
+    /// Both encrypted tiers are **mandatory, no switch, since v43.0.0**
+    /// (CIRISPersist#827): no operator setting writes plaintext at either.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub enum CryptoTier {
         /// `self` / `family` — per-write fresh DEK wrapped to every active
         /// occurrence/member; structurally invisible (holding claims stay in
         /// the cohort).
-        /// **Opt-in / default-off** (defense-in-depth over already-invisible
-        /// bytes; the v1 migration posture). #152.
+        /// **Mandatory, no switch, since v43.0.0** (CIRISPersist#827,
+        /// `BLOB_ENCRYPTION_AT_REST.md` §11.2): `put_blob_signing_scoped`
+        /// refuses every body-taking write at an encrypted tier and
+        /// `resolve_write_tier` reads the tier from the directory. The #152
+        /// (v4.14.0) opt-in posture is gone (CIRISPersist#1124).
         InvisibleEncrypted,
         /// `community` / `affiliations` — a shared per-community DEK (the
         /// §10.5.3 epoch-DEK cascade with the roster as subscriber set),
@@ -6774,6 +6795,32 @@ mod tests {
                 && ds::MODERATION.len() >= 5
                 && !ds::RECOVERY.is_empty()
         );
+    }
+
+    /// v60.1.0 (CIRISPersist#1119) — `infra:relay` is APPENDED to `ALL` and to
+    /// `INFRA`, never inserted: a consumer mirrors the lists by position, and an
+    /// insertion moves every later member under it while every name-keyed test
+    /// stays green. The count pins say "something changed"; the last-member
+    /// pins say the new token is last.
+    #[test]
+    fn infra_relay_is_appended_and_pinned_by_position() {
+        use super::delegation_scope as ds;
+        assert_eq!(ds::INFRA_RELAY, "infra:relay");
+        assert_eq!(ds::ALL.len(), 25);
+        assert_eq!(
+            ds::ALL[24],
+            ds::INFRA_RELAY,
+            "appended to ALL, never inserted"
+        );
+        assert_eq!(ds::ALL[23], ds::SCOPE_OWNER_BINDING_RECOVERY);
+        assert_eq!(ds::INFRA.len(), 13);
+        assert_eq!(
+            ds::INFRA[12],
+            ds::INFRA_RELAY,
+            "appended to INFRA, never inserted"
+        );
+        assert_eq!(ds::INFRA[11], ds::INFRA_CLASSIFY_CONTENT);
+        assert!(ds::INFRA_RELAY.starts_with(ds::INFRA_PREFIX));
     }
 
     /// v30.7.0 (CIRISPersist#625) — **every `delegation_scope` constant is either

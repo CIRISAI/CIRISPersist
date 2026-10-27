@@ -4410,7 +4410,9 @@ pub enum BlobError {
     },
     /// v55.0.0 (CIRISPersist#981) — a DEK was supplied for a `(stream_id,
     /// epoch)` that already holds one. An epoch's key is never replaced.
-    /// Terminal for these arguments.
+    /// Terminal for these arguments. v60.1.0 (CIRISPersist#1069): only a
+    /// DIFFERENT DEK is refused (the split a rekey retry must not make); the
+    /// same DEK again is an idempotent `Ok`. Names no key material.
     #[error(
         "stream {stream_id} epoch {epoch} already holds a DEK; an epoch's key is never replaced"
     )]
@@ -5527,6 +5529,9 @@ pub(crate) fn prepare_chunk_rows(
 ) -> Result<Vec<PreparedBlobRow>, BlobError> {
     // 1. total_size == sum(chunk sizes).
     manifest.validate_total_size()?;
+    // v60.1.0 (CIRISPersist#1072) — a plaintext manifest stored here must
+    // parse back.
+    refuse_positioned_plaintext_chunks(manifest)?;
 
     // 2. The chunks argument lines up 1:1 (by SHA, same order) with the
     //    manifest's chunk list.
@@ -5602,6 +5607,7 @@ pub(crate) fn prepare_dag_chunk_row(
             ("inline", Some(bytes.clone()), None, u64::from(mref.size))
         }
         BlobBody::External(e) => {
+            check_external_chunk_size(idx, e, mref)?;
             let kind = body.storage_kind();
             (kind, None, Some(e.uri.clone()), e.size_bytes)
         }
@@ -5622,6 +5628,25 @@ pub(crate) fn prepare_dag_chunk_row(
         external_ref,
         size_bytes,
     })
+}
+
+/// v60.1.0 (CIRISPersist#1072, Codex r4 on #1065) — an `External` chunk's
+/// declared size is its manifest entry's, as the inline arm checks for its
+/// bytes: a mismatch stored here is refused at finalize, and storage is
+/// first-write-wins by SHA, so no corrected retry could repair it.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+fn check_external_chunk_size(
+    idx: usize,
+    e: &ExternalRef,
+    mref: &ChunkRef,
+) -> Result<(), BlobError> {
+    if e.size_bytes != u64::from(mref.size) {
+        return Err(BlobError::InvalidArgument(format!(
+            "put_blob_chunks: chunk[{idx}] external size is {} bytes but manifest size is {}",
+            e.size_bytes, mref.size
+        )));
+    }
+    Ok(())
 }
 
 /// The `chunk_dag` manifest row of `manifest`: its JCS bytes inline, its
@@ -5703,7 +5728,36 @@ pub(crate) fn check_plaintext_dag_manifest(manifest: &ChunkManifest) -> Result<(
             "finalize_blob_chunks_signing: the manifest names no chunks".into(),
         ));
     }
+    refuse_positioned_plaintext_chunks(manifest)?;
     manifest.validate_total_size()
+}
+
+/// v60.1.0 (CIRISPersist#1072, Codex r4 on #1065) — a version-1 (plaintext)
+/// manifest's chunks carry no `seq` and no `epoch`: both are the sealed DAG's
+/// position. [`ChunkManifest::from_manifest_bytes`] refuses them on a
+/// plaintext manifest, so a door that stored and announced one would publish
+/// a DAG no read can open. Both plaintext DAG doors ask this before anything
+/// is written.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn refuse_positioned_plaintext_chunks(
+    manifest: &ChunkManifest,
+) -> Result<(), BlobError> {
+    if manifest.v != CHUNK_MANIFEST_VERSION {
+        return Ok(());
+    }
+    if let Some((idx, c)) = manifest
+        .chunks
+        .iter()
+        .enumerate()
+        .find(|(_, c)| c.seq.is_some() || c.epoch.is_some())
+    {
+        return Err(BlobError::InvalidArgument(format!(
+            "put_blob_chunks: chunk[{idx}] {} of a plaintext (version {CHUNK_MANIFEST_VERSION}) \
+             manifest carries a seq or an epoch; those position a sealed DAG's chunks",
+            hex::encode(c.sha)
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(all(test, feature = "sqlite"))]

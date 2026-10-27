@@ -90,6 +90,21 @@ jobs:
           - {scope: scope-s6-affiliations, shard: '5/8', id: s6-affiliations-5-of-8, weekly: true}
           - {scope: scope-s6-affiliations, shard: '6/8', id: s6-affiliations-6-of-8, weekly: true}
           - {scope: scope-s6-affiliations, shard: '7/8', id: s6-affiliations-7-of-8, weekly: true}
+          # v60.1.0 slices A and C (CIRISPersist#1072, #1069, #1070, #1006,
+          # #1132): 97 mutants, four shards of <= 25 at S6's measured 168 s
+          # per mutant (600 s + 168 s x 25 = 4800 s), weekly. Three shards
+          # would hold 33.
+          - {scope: scope-601-fixes, shard: '0/4', id: 601-fixes-0-of-4, weekly: true}
+          - {scope: scope-601-fixes, shard: '1/4', id: 601-fixes-1-of-4, weekly: true}
+          - {scope: scope-601-fixes, shard: '2/4', id: 601-fixes-2-of-4, weekly: true}
+          - {scope: scope-601-fixes, shard: '3/4', id: 601-fixes-3-of-4, weekly: true}
+          # v60.1.0 slice B (CIRISPersist#1117, #1064, #1120, #1113): the
+          # consumer asks. 110 mutants, four shards of <= 28
+          # (600 s + 168 s x 28 = 5304 s each at the CI rate), weekly.
+          - {scope: scope-601-asks, shard: '0/4', id: 601-asks-0-of-4, weekly: true}
+          - {scope: scope-601-asks, shard: '1/4', id: 601-asks-1-of-4, weekly: true}
+          - {scope: scope-601-asks, shard: '2/4', id: 601-asks-2-of-4, weekly: true}
+          - {scope: scope-601-asks, shard: '3/4', id: 601-asks-3-of-4, weekly: true}
     services:
       postgres:
         image: ghcr.io/cirisai/postgres:16

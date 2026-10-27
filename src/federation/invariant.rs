@@ -210,7 +210,7 @@ pub const NEWLY_ENFORCED_SELF_EMISSION_PREFIXES: &[&str] = &["health:liveness:"]
 /// `as_str()` values are for gate-shape rejections `DimensionAdmissionPolicy`
 /// itself defines; this is a distinct, invariant-registry-attributed reason
 /// so a caller inspecting the string can tell the two provenances apart.
-const INVARIANT_SELF_EMISSION_REASON: &str = "invariant_registry_self_emission_forbidden";
+pub const INVARIANT_SELF_EMISSION_REASON: &str = "invariant_registry_self_emission_forbidden";
 
 /// The admission-time enforcement half of this cut: apply the
 /// [`NEWLY_ENFORCED_SELF_EMISSION_PREFIXES`] self-emission ban(s) for the

@@ -1786,7 +1786,15 @@ mod tests {
         // CLM-delegation-term (1), CLM-admission-freshness-window (3),
         // CLM-canonicalization-array (1); CLM-merge moved off the retired
         // SubjectKind onto the licence revision gate (a move, not a new row).
-        const EXPECTED: usize = 342;
+        // v60.1.0 slice A: +4 (CIRISPersist#1006, #1069, #1070):
+        // CLM-custody-receipt at the signed receipt instant (1),
+        // CLM-one-chunk-seal at the stored-key comparison (1),
+        // CLM-one-tombstone-row at the resumed execution and the bytes
+        // floor's in-transaction tombstone read (2).
+        // v60.1.0 slice B: +1 (CIRISPersist#1120), CLM-identity-amendment-row.
+        // v60.1.0 CC ids: +2, CLM-takedown-reversal (4.5.3, #1113) and
+        // CLM-scope-infra-relay (4.4.3.4.3, #1119).
+        const EXPECTED: usize = 349;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \
@@ -1871,6 +1879,8 @@ mod tests {
         "BlobBackedSchemaResolver",
         "Attestation",
         "LocalAttestationInput",
+        // v60.1.0 (#1119) — the `infra:*` axis set, a const (CLM-scope-infra-relay).
+        "delegation_scope::INFRA",
     ];
 
     /// Cited processors that are **exported API surface**: `pub` functions or

@@ -15354,6 +15354,15 @@
     "manifest_round": "v55-981"
    },
    {
+    "decimal_id": "5.3.3.2.5",
+    "claim_id": "CLM-one-chunk-seal",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/chunk_dag_cascade.rs#holds_this_dek",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60.1-a",
+    "witness": "I1401 (sqlite, postgres)"
+   },
+   {
     "decimal_id": "3.4.5",
     "claim_id": "CLM-config-self-or-owner-gate",
     "repo": "CIRISPersist",
@@ -15859,6 +15868,15 @@
     "manifest_round": "cc-rc7-536b8cb-989"
    },
    {
+    "decimal_id": "3.1.3.3",
+    "claim_id": "CLM-custody-receipt",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/custody_ack.rs#signed_receipt_at",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60.1-a",
+    "witness": "I1407 (sqlite, postgres)"
+   },
+   {
     "decimal_id": "3.2",
     "claim_id": "CLM-public-community",
     "repo": "CIRISPersist",
@@ -15962,6 +15980,24 @@
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v55-c-1007",
     "witness": "I664, I787 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-one-tombstone-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/takedown_tombstone.rs#already_recorded",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60.1-a",
+    "witness": "I1403 (sqlite, postgres)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-one-tombstone-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#refuse_tombstoned_at_write",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60.1-a",
+    "witness": "I1404, I1406, I1409 (sqlite, postgres); I1408 (postgres)"
    },
    {
     "decimal_id": "2.4.1.1",
@@ -17162,6 +17198,33 @@
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v60-s6",
     "witness": "I1210 (sqlite, postgres), I1222 (unit): the licence payload's sets sorted AND unique in UTF-16 order"
+   },
+   {
+    "decimal_id": "3.1.5",
+    "claim_id": "CLM-identity-amendment-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/identity_amendment.rs#check_identity_amendment_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60.1-b",
+    "witness": "I1365 (sqlite, postgres): identity_amendment:v1 admits only citing an admitted, approved deferral response about the same agent by a seated WA; identity_amendment_unauthorized otherwise (CIRISPersist#1120)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-takedown-reversal",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/takedown_tombstone.rs#takedown_reversal",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60.1-b",
+    "witness": "I1366, I1367, I1369 (sqlite, postgres): an admitted reconsideration with outcome reversed, signed under the review duty, lifts the takedown at read and at the write floor; withdrawn or expired, it lifts nothing (CIRISPersist#1113)"
+   },
+   {
+    "decimal_id": "4.4.3.4.3",
+    "claim_id": "CLM-scope-infra-relay",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/types.rs#delegation_scope::INFRA",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60.1-b",
+    "witness": "infra_relay_is_appended_and_pinned_by_position (unit): infra:relay is ALL[24] and INFRA[12], appended; I1361 (sqlite, postgres) (CIRISPersist#1119)"
    }
   ],
   "CIRISServer": [

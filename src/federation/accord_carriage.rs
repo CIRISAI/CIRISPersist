@@ -241,7 +241,7 @@ pub enum AccordAdmissionEffect {
 /// uses (`QuorumPolicy::new(n / 2 + 1, n)`, CIRISPersist#383), so the receive
 /// gate and the local destructive ops cannot drift apart.
 fn strict_majority_policy(n: usize) -> ciris_verify_core::threshold::QuorumPolicy {
-    ciris_verify_core::threshold::QuorumPolicy::new(n / 2 + 1, n)
+    ciris_verify_core::threshold::QuorumPolicy::new(super::admission::accord_threshold(n), n)
 }
 
 /// Resolve `roster_key_ids` to their PINNED directory pubkeys — never

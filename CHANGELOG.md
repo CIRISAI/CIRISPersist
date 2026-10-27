@@ -7,6 +7,315 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [60.1.0] - 2026-10-27
+
+### Adoption — what CIRISEdge, CIRISServer and CIRISAgent see
+
+No break: nothing to change to keep working on this head. From
+`git diff v60.0.0..` over `python/*.pyi`, `src/ffi/pyo3.rs`, the pub items in
+`src/` and the pub enums: no Python method or function is removed or
+re-signed, no enum gains or loses a variant (`BlobError`, `Error`,
+`DimensionRejectionReason`, `KeyGrantRefusalReason` unchanged), no wire byte
+moves (the delivery receipt's signed layout and every envelope kind are
+unchanged). Additive:
+
+- **New functions.** Rust: `federation::accord_threshold(n)`,
+  `accord_threshold_over_roster`, `accord_threshold_now`,
+  `Engine::accord_threshold` (`AccordThreshold { m, n }`);
+  `KeyGrantRefusalReason::is_retryable` / `from_token`;
+  `admission::dimension_rejected_reason::{ALL, RETRYABLE, is_retryable}`;
+  `identity_amendment::{is_identity_amendment,
+  check_identity_amendment_admission}` and its constants;
+  `takedown_tombstone::{takedown_reversal, is_reversal_of, REVERSED_OUTCOME}`;
+  `custody_ack::{signed_receipt_at, delivery_receipt_dimension}`;
+  `stream_receipt::try_receipt_signing_bytes` (#1132). Python:
+  `Engine.accord_threshold() -> (m, n)`, `accord_threshold_for(n)`,
+  `key_grant_refusal_is_retryable(reason)`,
+  `dimension_rejection_is_retryable(reason)` (`ValueError` on an unknown
+  token), on the native module and the package.
+- **New members.** `RegisteredStreamEpoch.already_registered` and the same
+  key in `register_stream_epoch_dek`'s Python JSON (#1069);
+  `ReackReport.restored` and its serialized key (#1113); `DeploymentProfile`'s
+  two optional members `calibration_version` and `pipeline_metadata`
+  (`schema::AgentPipelineMetadata`, #1089), absent on every v2.7.x profile,
+  whose serialized bytes are unchanged. A Rust caller that builds one of
+  these three structs with an exhaustive struct literal must name the new
+  member (none of Edge, Server, Lens, Node or Verify does).
+- **Vocabulary.** `delegation_scope::INFRA_RELAY = "infra:relay"`, APPENDED
+  to `delegation_scope::ALL` (position 24) and `INFRA` (position 12).
+- **Meanings that narrowed.** `blob_stream_epoch_dek_exists`
+  (`StreamEpochDekExists`) now means exactly a DIFFERENT DEK for the
+  `(stream, epoch)`; a re-supply of the held DEK is `Ok` with
+  `already_registered: true` (#1069). Custody's `received` is now ordered by
+  the subscriber-SIGNED `delivery_receipt:{stream_id}:v1` scores row's
+  instant, not by a stored v1 receipt's storage stamp (#1006).
+- **New refusals, under existing tokens.** An `identity_amendment:v1` row
+  admits only when `authorized_by` names an admitted approved deferral
+  response about the same agent whose signer held a Wise Authority seat at
+  its instant (the agent node's owner; on a split home, the `user` the
+  signing key is an occurrence of, through the
+  `self:delegates_to:agent_occurrence:v1` login anchor); otherwise
+  `identity_amendment_unauthorized` under `federation_invalid_argument`,
+  Python `ValueError` (#1120). A delivery receipt whose `subscriber_key_id`
+  or `stream_id` does not fit a `u32` length is refused
+  (`BlobError::InvalidArgument`, Python `ValueError`) (#1132).
+
+### Fixed (slice A)
+
+- **CIRISPersist#1124** — `CryptoTier::InvisibleEncrypted`'s doc comment said
+  "Opt-in / default-off"; self/family sealing has been mandatory, with no
+  switch, since v43.0.0 (#827). The comment, `CryptoTier` itself and the
+  `FSD/SELF_FAMILY_DEK_CASCADE.md` §0.5 table now say so. Doc only.
+- **CIRISPersist#1072** — the plaintext DAG doors refuse, before anything is
+  stored or announced, a version-1 manifest whose chunk carries a `seq` or an
+  `epoch` (`finalize_blob_chunks_signing`, `put_blob_chunks_signing`), and an
+  `External` chunk whose `size_bytes` is not its manifest entry's
+  (`put_plaintext_dag_chunk`, `put_blob_chunks_signing`). Both used to be
+  stored and then fail every read or every finalize. Witness I1400 (sqlite,
+  postgres).
+- **CIRISPersist#1069** — `register_stream_epoch_dek`: a re-supply of the DEK
+  a `(stream, epoch)` already holds is `Ok` with the new
+  `RegisteredStreamEpoch::already_registered: true` (and the same key in the
+  Python JSON), writing nothing (no terminator, no DEK row, no wrap, no
+  `key_grant:stream:v1` row). A DIFFERENT DEK stays
+  `stream_epoch_dek_exists`, now meaning exactly the conflict (non-retryable,
+  naming no key material). Persist compares the two itself, in constant time,
+  by opening the stored self-retention wrap; the racing-insert case is judged
+  the same way. The issue's proposed `StreamEpochDekConflict` variant would be
+  a new arm of the exhaustive `BlobError`; it is not added in this MINOR (the
+  existing token now carries exactly that meaning). Witness I1401 (sqlite,
+  postgres).
+- **CIRISPersist#1070** — takedown immediate removal, the three Codex r2
+  cases and the shared-chunk question:
+  1. an Engine with no LocalSigner (`with_hardware_signer`, `from_shared`)
+     refused every immediate-removal takedown at `purge_finalize`
+     (`purge_retraction_inadmissible`), leaving the bytes on disk. The purge
+     path now deletes without the retraction it cannot sign (such an Engine
+     never announced a claim; the tombstone withholds the address at every
+     read door). Witness I1402.
+  2. a takedown whose tombstone committed but whose holder action did not
+     run could never complete once its notice expired or the signer's duty
+     lapsed: a re-run re-asked CC 4.5.5. A recorded execution is now RESUMED
+     (signature still verified; the execution keyed by the notice's own
+     digest), locally and for a replicated bundle. Witness I1403.
+  3. the bytes floor read the tombstone before its write transaction, so a
+     takedown committing in between let the bytes land after their
+     tombstone. Every byte write door (put, local store, chunk DAG one-shot
+     and finalize, adopt, the chunk floor) now reads the address's own
+     tombstone again INSIDE its transaction; on postgres under a shared
+     advisory lock the tombstone's write takes exclusively. Witnesses I1404
+     (plaintext doors) and I1406 (adopt and chunk floor), both red before;
+     I1408 (postgres: a write past its in-transaction read holds the
+     takedown off until it commits, then the finalize deletes its bytes) and
+     I1409 (a write below V187, where no tombstone table exists, still
+     lands).
+  4. decided: a plaintext chunk shared with a live DAG stays (not withheld,
+     not evicted) when another DAG that uses it is taken down; the existing
+     purge walk already does this. Witness I1405.
+- **CIRISPersist#1006** — `custody_view`'s `received` was ordered by this
+  node's storage stamp on a stored `ciris-delivery-receipt/v1` receipt (whose
+  signed bytes carry no instant), so a receipt stored late outranked the
+  device's later signed `none`. `received` is now ordered only by the instant
+  the subscriber SIGNED on its `delivery_receipt:{stream_id}:v1` scores row
+  (CC 3.4.6; the spelling CIRISEdge's receiver already emits), its latest
+  live, unretired, unexpired one (`custody_ack::signed_receipt_at`). A stored
+  v1 receipt still joins the STH and names the subscriber as a device, and is
+  no longer custody evidence on its own. No wire change: the v1 receipt bytes
+  are unchanged. Not in this cut: the issue's membership check at
+  `put_delivery_receipt` (it reverses `stream_receipt.rs`'s documented
+  consumer-policy posture and awaits a ruling). Witness I1407 (sqlite,
+  postgres); I513's control now signs its receipt row.
+
+- **CIRISPersist#1066** — investigated, not fixed in this cut. The premise
+  ("the room-chunk sweep never evicts adopted stream-keyed chunks on a
+  holder") is true, and it is not a chunk-only gap: the holder's community
+  sweep walks only the holder's OWN `(community, minter)` counter (#848), so a
+  peer-minted room DAG, its manifest AND its chunks, is retained on the holder
+  whole; `sweep_all_communities` does not even visit a room the holder holds
+  only peers' bindings for. Witness I1410 (sqlite, postgres) pins the
+  property that holds either way (a holder keeps or drops a peer's DAG whole,
+  never half) and the #848 policy as it stands. Holder-side retention of peer
+  content is a policy ruling, open on the issue.
+
+### Evidence (slice A)
+
+- Four rows join `evidence/cc_impl.tsv` (from the manifest,
+  `scripts/evidence_tsv.py write`; the exact-count pin 342 → 346):
+  CLM-custody-receipt (3.1.3.3) at `custody_ack.rs#signed_receipt_at`;
+  CLM-one-chunk-seal (5.3.3.2.5) at `chunk_dag_cascade.rs#holds_this_dek`;
+  CLM-one-tombstone-row (4.5.3) at `takedown_tombstone.rs#already_recorded`
+  and `steward_purge.rs#refuse_tombstoned_at_write`.
+
+### Mutation (slice A)
+
+- `scripts/mutants/scope-601-fixes.txt`: 92 mutants, 75 caught, 17
+  unviable, 0 missed (with the merge fix's shared predicate); three weekly
+  shards in `mutants.yml`.
+
+### Added
+
+- **#1117 — the accord threshold is a function** (CC 4.2.6 / CC 4.5.1.2,
+  rc10). `federation::accord_threshold(n)` is the strict majority
+  `⌊n/2⌋ + 1`, the one spelling every accord gate in the crate now counts
+  through (the co-scrub core, the destructive re-tally, the replicated-evidence
+  receive gate). `accord_threshold_over_roster` / `accord_threshold_now` and
+  `Engine::accord_threshold` report `AccordThreshold { m, n }` over this
+  node's standing roster (holders whose keys it holds). Python:
+  `Engine.accord_threshold() -> (m, n)` and `accord_threshold_for(n)`. CIRISEdge's
+  `verify_accord_carrier` calls it instead of a hard-coded `(2, 3)`.
+  Witness I1360 (sqlite, postgres): the reported `m` is the gate's.
+- **#1119 — `delegation_scope::INFRA_RELAY = "infra:relay"`** (CC 5.4.6
+  item 4, rc10): a steward-conferred relay standing, seat-like in the onion
+  layer cap's denominator. Conferred on the accord plane under the same
+  co-scrub rule as `infra:serve` and read through `has_accord_conferred_role`;
+  no new row kind. APPENDED to `delegation_scope::ALL` (position 24) and
+  `INFRA` (position 12), pinned by position. Witness I1361 (sqlite, postgres):
+  co-scrubbed reads conferred, self-claimed does not.
+- **#1064 — persist answers "is this refusal retryable"** for the two
+  reason sets CIRISEdge kept its own table for.
+  `KeyGrantRefusalReason::is_retryable()` (exhaustive; retryable =
+  `signer_not_active_member`, `recipient_not_in_audience`; the sealer
+  refusals, `set_retired` and the row defects are terminal) and
+  `KeyGrantRefusalReason::from_token`; `admission::dimension_rejected_reason`
+  (`ALL`, `RETRYABLE`, `is_retryable(token) -> Option<bool>`) over every token
+  `Error::DimensionRejected` carries, all terminal (each gate is pure over the
+  signed row). Python: `key_grant_refusal_is_retryable(reason)`,
+  `dimension_rejection_is_retryable(reason)` (`ValueError` on an unknown
+  token). A from-disk census fails the build when a construction site raises
+  an unclassified token. Witnesses I1362 and I742 (sqlite, postgres) classify
+  the tokens the doors actually raise. The issue's optional single
+  `Error::is_retryable()` over every federation error arm is not in this cut.
+- **#1095 — `chat:call:v1`, witnessed** (CIRISEdge ask, CC rc9): an A/V call
+  record is one self-subject `scores` row per attendee (attester = subject),
+  placed at the room's scope through the chat path. No persist change was
+  needed (`chat:*` is the registry's open wildcard and a self-subject row has
+  no refusing gate); I1363 (sqlite, postgres) now holds it: each member's row
+  admits and a non-member's is refused; members read the rows by subject and
+  a non-member reads none; the attendees are the union of subjects over a
+  `call_id`; an attendee's own `withdraws` retracts their row, the other
+  attendee's stands, and nobody withdraws another's.
+- **#1089 (part) — the re-cut v2.8.0 profile members are typed.**
+  `DeploymentProfile` gains `calibration_version` (tri-state: absent, `null`,
+  or a token, each round-tripping as itself) and `pipeline_metadata`
+  (`schema::AgentPipelineMetadata`, closed: an unknown member is refused at
+  parse by name). Both are new OPTIONAL members, absent on every v2.7.x
+  profile, whose serialized bytes are unchanged. Before this a profile
+  carrying them lost them on parse and its signature failed. Witness I1364
+  (sqlite, postgres). Still open on #1089: the re-vendor of the re-cut schema
+  (`b6f6fd3f…`) waits on CIRISAgent#1255 merging (it is open at `b1d802c7`),
+  and the `trace_field_shape_violation` door needs a new `schema::Error` arm
+  or a renamed token, which is a break (v61).
+- **#1120 — the `identity_amendment:v1` admission gate** (CC 3.1.5, rc10
+  `cadd5a9`). `federation::identity_amendment::check_identity_amendment_admission`,
+  in the shared put plan (every backend, local and replicated): the amendment
+  (attester = an occurrence of the agent, subject = the agent) admits only
+  when `authorized_by` (a uuid, cited in `evidence_refs[]`) names an admitted
+  `deferral:response:approved:v1` about the same agent whose signer held a
+  Wise Authority seat at its `asserted_at`. Refused
+  `identity_amendment_unauthorized` (token-led `federation_invalid_argument`,
+  Python `ValueError`; the failed condition follows the token). A seat is the
+  producer's interim ruling (Eric, 2026-10-22): the agent node's owner,
+  compared self to self at the response's instant; the general WA-seat
+  primitive is #709. `amendment_digest` (lowercase hex64) and `authorized_by`
+  (uuid) are shape-checked as malformed rows. Dimension constants for the
+  deferral family (`DEFERRAL_REQUEST_DIMENSION`, `…_APPROVED_…`,
+  `…_REJECTED_…`). Before this a replicated amendment from any producer was
+  admitted ungated. On a split home (CIRISServer 0.5.189+: the owner binds
+  only the node, the agent key is the owner's occurrence through the
+  `self:delegates_to:agent_occurrence:v1` login anchor) the owner is the
+  `user` the signing key is an occurrence of, when neither the key nor the
+  agent carries an owner binding; a non-user principal or an unanchored key
+  still has no seat. Witnesses I1365, I1368 (sqlite, postgres).
+- **#1113 — a reversed reconsideration reverses a takedown; withheld is
+  computed at read** (CC 4.5.3, rc10 `99bf187` / `62776bc`).
+  `takedown_tombstone::takedown_reversal(notice_id)` finds a live
+  `reconsideration:{grounds}` ruling with `outcome: reversed` naming the
+  notice row, placed at the content's community, and re-derives at every read
+  that its signer holds the `review` duty over the content as this node holds
+  it (never a stored verdict). `steward_purge::purge_withheld` asks it for
+  every takedown tombstoning the bytes: withheld while a notice stands with no
+  admitted reversal, so a reversed takedown's bytes serve again inside the
+  window and a remaining copy or a re-publication is admitted after it (an
+  immediate-removal basis gets standing back, never bytes). `purge_finalize`
+  skips a reversed takedown's bytes (`voided`). The holder's re-ack
+  (`reack_own_claims`) claims `here` again for held bytes whose takedown is
+  reversed (`ReackReport::restored`, a new member); it is keyed on the
+  tombstone, so a claim retracted for any other reason is never re-advertised.
+  `check_reconsideration_admission` now judges a filing or ruling against a
+  takedown notice by the CONTENT's communities from this node's binding rows
+  (CC 4.5.5); before, nobody could rule on a notice (it names no community).
+  The window is per holder (`settles_at` counts from this node's
+  `executed_at`). Witnesses I1366 (sqlite, postgres: the ruling, the fold,
+  withdrawal and expiry re-derived) and I1367 (two nodes, sqlite and
+  postgres: withheld on A and on B by bundle, the reversal delivered to each
+  serves and re-acks there, the post-window finalize skips the bytes, the
+  immediate-removal re-publication).
+- **Mutation scope `scope-601-asks`** over the slice's new predicates
+  (#1117, #1064, #1120, #1113): 115 mutants, 104 caught, 11 unviable, 0
+  missed at the merge fix, four weekly shards
+  (`.github/workflows/mutants.yml`).
+
+### Fixed (the slice A × slice B merge)
+
+- **#1070 × #1113 — a re-publication after a reversal lands; a tombstone not
+  reversed still refuses inside the write.** #1070's in-transaction look read
+  "is there a tombstone" (`MIN(notice_id)`), not "is one still in force", so
+  after #1113's reversal the immediate-removal re-publication was refused
+  (I1367 red on both backends). The read doors and the in-transaction look
+  now ask ONE decision, `steward_purge::standing_notice`: the first notice, in
+  id order, that no admitted reversal lifted. The reversal fold reads
+  attestations through the directory and cannot run on a write connection, so
+  a door's pre-read (`refuse_tombstoned_bytes`) evaluates it and carries the
+  reversed notices into its transaction (`TombstoneFloor`); the transaction
+  reads every tombstone naming the address and passes over only those. A
+  takedown that commits after the pre-read is never among them and refuses
+  the write; a reversal that lands after the pre-read is not credited to the
+  write in flight (it is refused, and a retry lands). On postgres the write
+  still holds #1070's shared advisory lock from its tombstone read to its
+  commit. Witness I1369 (sqlite, postgres).
+- **#1070 × #1113 — a byte write below V187 lands again.**
+  `purge_tombstone_notices`, which #1113's withheld read moved to, answered a
+  database error on a schema with no tombstone table; it now answers
+  `Unsupported` there, as `purge_tombstoned` does (I1409 red on both
+  backends).
+
+### Fixed (slice C)
+
+- **CIRISPersist#1132** — `stream_receipt::receipt_signing_bytes` wrote
+  `u32::try_from(len).unwrap_or(u32::MAX)` for the `subscriber_key_id` and
+  `stream_id` length prefixes, so a field longer than `u32::MAX` bytes was
+  verified over a clamped prefix instead of refused (CC 5.3.3.6: "a length
+  MUST fit u32 and is refused otherwise"). `try_receipt_signing_bytes`
+  refuses either field with `BlobError::InvalidArgument` (Python
+  `ValueError`) before copying a byte, and `verify_receipt_signature`
+  (`put_delivery_receipt`'s first step, both backends and the Python door)
+  builds its bytes there. The infallible `receipt_signing_bytes` keeps its
+  signature; the bytes it returns for such a field are ones no verifier
+  accepts. No wire change: in-range receipts sign the same bytes. Witnesses
+  I1411 (the length rule and the layout, allocation-free) and I1412 (sqlite,
+  postgres: either over-long field is refused and stores nothing, and the same
+  receipt in range is accepted); the pinned-layout test carries the over-long
+  case.
+- **`scripts/certify.sh` printed `<leg>.secs: No such file or directory`**
+  for every cheap leg (fmt, pyi, featmatrix, ...) and `-s` for its time: the
+  verdict opened `.secs` before silencing stderr, and `run_bg` never wrote
+  one. `run_bg` now times its leg (`.secs` before `.rc`; the recorded exit
+  code is unchanged), and the verdict prints a clean `-` when a `.secs` is
+  missing. `certify_selfcheck.sh` case `no-secs` is red against the old
+  reader. The verdict's exit codes are unchanged.
+- **Mutation (slice C).** `scope-601-fixes` adds `length_prefix` and
+  `try_receipt_signing_bytes` against I1411: 97 mutants, now four weekly
+  shards of <= 25. Shard 2/4, which holds the five new mutants: 25 mutants,
+  22 caught, 3 unviable, 0 missed.
+
+### Evidence (CC ids)
+
+- Two rows join `evidence/cc_impl.tsv` (from the manifest,
+  `scripts/evidence_tsv.py write`; the exact-count pin 347 → 349):
+  CLM-takedown-reversal (4.5.3) at `takedown_tombstone.rs#takedown_reversal`
+  and CLM-scope-infra-relay (4.4.3.4.3) at
+  `types.rs#delegation_scope::INFRA`.
+
 ## [60.0.0] - 2026-10-26
 
 An architecture cut (docs/V60_TASK_PLAN.md): signed attestations are the only

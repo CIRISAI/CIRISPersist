@@ -311,7 +311,7 @@ print_verdict() {
     n_red=0; n_disk=0; n_killed=0; n_unknown=0; n_notrun=0; oom=0; skipped=0
     for k in $ALL_KEYS; do
         classify "$k"
-        secs="$(tr -dc '0-9' < "$LOG_DIR/$k.secs" 2>/dev/null)"; [ -n "$secs" ] || secs="-"
+        secs="$(tr -dc '0-9' 2>/dev/null <"$LOG_DIR/$k.secs")"; [ -n "$secs" ] || secs="-"
         cnt="$(grep -oE '[0-9]+ tests run: [0-9]+ passed|[0-9]+ passed in [0-9.]+s' "$LOG_DIR/$k.log" 2>/dev/null | tail -1)"
         case "$CLS" in
             SKIP)
@@ -351,7 +351,7 @@ print_verdict() {
     if [ -n "${T_END:-}" ]; then
         SUM=0
         for k in $LEGS default clippy python; do
-            s="$(tr -dc '0-9' < "$LOG_DIR/$k.secs" 2>/dev/null)"; SUM=$(( SUM + ${s:-0} ))
+            s="$(tr -dc '0-9' 2>/dev/null <"$LOG_DIR/$k.secs")"; SUM=$(( SUM + ${s:-0} ))
         done
         # SUM is the sum of leg times AS RUN — under contention, not in isolation. It
         # GROWS with the lane count, because wider lanes make every leg individually
@@ -556,7 +556,13 @@ echo "cores=$CORES  ram=${RAM_G}G  free-disk=${FREE_G}G"
 # surface thirty minutes into a run.
 echo
 echo "=== fast static gates (concurrent) ==="
-run_bg() { local name="$1"; shift; ( "$@" >"$LOG_DIR/$name.log" 2>&1; echo $? >"$LOG_DIR/$name.rc" ) </dev/null & }
+# A cheap leg times itself like a lane leg, so the verdict prints its seconds.
+# `.secs` lands before `.rc`: a reader that waits on `.rc` finds both.
+run_bg() {
+    local name="$1"; shift
+    ( t0=$(date +%s); "$@" >"$LOG_DIR/$name.log" 2>&1; rc=$?
+      echo $(( $(date +%s) - t0 )) >"$LOG_DIR/$name.secs"; echo "$rc" >"$LOG_DIR/$name.rc" ) </dev/null &
+}
 
 run_bg fmt        cargo fmt --all --check
 run_bg pyi        python3 scripts/pyi_surface.py check

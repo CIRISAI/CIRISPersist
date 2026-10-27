@@ -148,6 +148,11 @@ pub struct RegisteredStreamEpoch {
     /// The stream-axis rows the caller emits (`None` when no new wrap was
     /// written).
     pub key_grant_emission: Option<crate::federation::key_grant::KeyGrantAxis>,
+    /// v60.1.0 (CIRISPersist#1069) — `true` when `(stream_id, epoch)`
+    /// already held THIS DEK: an idempotent re-supply. Nothing was written
+    /// (no terminator, no DEK row, no wrap), `granted` / `excluded` /
+    /// `roster` are empty and `key_grant_emission` is `None`.
+    pub already_registered: bool,
 }
 
 /// What `seal_stream_scoped` did.
@@ -942,8 +947,13 @@ pub mod orchestrate {
     /// - `stream_not_authored` when the stream is recorded under another
     ///   writer (naming the stream, never the writer: I41);
     /// - `stream_epoch_dek_exists` when `(stream_id, epoch)` already holds a
-    ///   DEK (an epoch's key is never replaced; a racing second supply is
-    ///   caught at the insert);
+    ///   DIFFERENT DEK (an epoch's key is never replaced; a racing second
+    ///   supply is caught at the insert and compared the same way). v60.1.0
+    ///   (CIRISPersist#1069): a re-supply of the SAME DEK is not refused; it
+    ///   answers `Ok` with [`RegisteredStreamEpoch::already_registered`] and
+    ///   writes nothing. Persist compares the two itself, in constant time,
+    ///   by unwrapping the stored self-retention wrap; no fingerprint of the
+    ///   key is exposed and the refusal names no key material;
     /// - `InvalidArgument` at a plaintext tier (no key to supply), for an
     ///   epoch below the stream's newest (epochs are monotonic, CC 5.1), for a
     ///   stream written before #969 with per-chunk keys (one DAG never mixes),
@@ -1038,16 +1048,22 @@ pub mod orchestrate {
                     Some(group_key_id),
                 ));
             }
-            if backend
+            if let Some(held) = backend
                 .stream_dek_list(stream_id)
                 .await?
-                .iter()
-                .any(|r| r.epoch == epoch)
+                .into_iter()
+                .find(|r| r.epoch == epoch)
             {
-                return Err(BlobError::StreamEpochDekExists {
-                    stream_id: stream_id.to_owned(),
-                    epoch,
-                });
+                // v60.1.0 (CIRISPersist#1069) — the same DEK is an
+                // idempotent re-supply; another is the split it would be.
+                return if holds_this_dek(backend, &held, dek).await? {
+                    Ok(already_registered(stream_id, epoch, tier))
+                } else {
+                    Err(BlobError::StreamEpochDekExists {
+                        stream_id: stream_id.to_owned(),
+                        epoch,
+                    })
+                };
             }
             if epoch < l.epoch {
                 return Err(BlobError::InvalidArgument(format!(
@@ -1080,12 +1096,17 @@ pub mod orchestrate {
             })
             .await?;
         // The insert keeps a racing first supply: ours is stored only if the
-        // stored row carries the wrap we just made.
+        // stored row carries the wrap we just made. The racing row is judged
+        // as a stored one is (CIRISPersist#1069).
         if rec.self_retention_wrap != self_retention_wrap {
-            return Err(BlobError::StreamEpochDekExists {
-                stream_id: stream_id.to_owned(),
-                epoch,
-            });
+            return if holds_this_dek(backend, &rec, dek).await? {
+                Ok(already_registered(stream_id, epoch, tier))
+            } else {
+                Err(BlobError::StreamEpochDekExists {
+                    stream_id: stream_id.to_owned(),
+                    epoch,
+                })
+            };
         }
         let (targets, report) = stream_targets(backend, cohort_scope, group_key_id).await?;
         let granted_new =
@@ -1105,7 +1126,53 @@ pub mod orchestrate {
                     owner_key_id: group_key_id.to_owned(),
                 }
             }),
+            already_registered: false,
         })
+    }
+
+    /// v60.1.0 (CIRISPersist#1069) — does the stored epoch row `held` carry
+    /// `dek`? Its self-retention wrap is opened under this node's content
+    /// master and compared in constant time. A wrap that does not open is a
+    /// backend fault, never a match.
+    async fn holds_this_dek<B>(
+        backend: &B,
+        held: &crate::federation::StreamDekRecord,
+        dek: &[u8; 32],
+    ) -> Result<bool, BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        let content_master = backend.load_or_init_content_master().await?;
+        let stored = crate::federation::at_rest_cascade::unwrap_dek_for_persist(
+            &content_master,
+            &held.self_retention_wrap,
+        )
+        .map_err(map_at_rest_err)?;
+        Ok(dek_eq_constant_time(&stored, dek))
+    }
+
+    /// Byte equality that reads every byte whatever the first difference.
+    pub(crate) fn dek_eq_constant_time(a: &[u8; 32], b: &[u8; 32]) -> bool {
+        let diff = a
+            .iter()
+            .zip(b.iter())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y));
+        std::hint::black_box(diff) == 0
+    }
+
+    /// The answer to an idempotent re-supply: nothing written, nothing to
+    /// emit.
+    fn already_registered(stream_id: &str, epoch: u64, tier: CryptoTier) -> RegisteredStreamEpoch {
+        RegisteredStreamEpoch {
+            stream_id: stream_id.to_owned(),
+            epoch,
+            tier,
+            granted: Vec::new(),
+            excluded: Vec::new(),
+            roster: RosterPartition::default(),
+            key_grant_emission: None,
+            already_registered: true,
+        }
     }
 
     /// v55.0.0 (#981) — what an append does at its epoch.

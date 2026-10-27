@@ -24,8 +24,9 @@
 //! `minted_by_persist` entries — scoped to the three families persist is the
 //! PRODUCER of, because CC 3.1.7 R2(a) is a producer obligation. R2(a) is not
 //! the whole exposure. Measured on the vendored rc5 @ 4b624513 cut, the minted
-//! set is **4 of 21** (three from #590, plus `mesh_config:` — CIRISPersist#570
-//! ask 1; v60.0.0 added `goal:`, CIRISPersist#988 item 4). v50.0.0 (CIRISPersist#924): CC's `_meta.case_rule.reserved_stems`
+//! set is **4 of 22** (three from #590, plus `mesh_config:` — CIRISPersist#570
+//! ask 1; v60.0.0 added `goal:`, CIRISPersist#988 item 4; v60.1.0 added
+//! `identity_amendment:`, CIRISPersist#1120). v50.0.0 (CIRISPersist#924): CC's `_meta.case_rule.reserved_stems`
 //! now states the `capacity:` and `detection:` rules at the FAMILY (the
 //! CIRISConstitution#67 ask), so those two pins retired, and `licensure:`
 //! joined (CC made the row an open emitter; persist still rules on the
@@ -215,6 +216,27 @@ pub struct PersistFamilyRule {
 /// Ordered by gap kind then prefix, so the three populations read as the three
 /// different asks they are.
 pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
+    // v60.1.0 (CIRISPersist#1120) — CC rc10 (`cadd5a9`, untagged) makes the
+    // rule normative and registers `identity_amendment:v1` with it; persist
+    // vendors rc9, which has no row, so the gate's rule is pinned here until
+    // the rc12 re-vendor (v61 S0), when `pinned_rules_are_still_missing_from_the_registry`
+    // turns red and this line goes.
+    PersistFamilyRule {
+        prefix: "identity_amendment:",
+        rule: "an identity_amendment:v1 (attester an occurrence of the agent, subject the \
+               agent, amendment_digest hex64, authorized_by a uuid cited in evidence_refs) \
+               admits only when the cited deferral:response:approved:v1 is admitted here, is \
+               about the same agent, and its signer held a WA seat at its asserted_at (the \
+               agent node's owner, self to self; on a split home, whose owner binds only the \
+               node, the user the signing agent key is an occurrence of); \
+               identity_amendment_unauthorized otherwise",
+        enforced_at: &["federation::identity_amendment::check_identity_amendment_admission"],
+        gap: RowRuleGap::NoRuleOnTheRow,
+        minted_by_persist: false,
+        cc_ask: "none outstanding: CC rc10 cadd5a9 registers the row with this rule \
+                 (CIRISConstitution main, carried ahead of the rc12 cut by \
+                 CIRISConstitution#188); it reaches persist with the rc12 re-vendor (v61 S0)",
+    },
     // v38.7.0 (CIRISPersist#782) — the session-claim plane. CC has not ruled
     // on `session:` yet, so persist states a rule the row does not carry and
     // pins the gap here rather than letting a downstream read the classifier
@@ -559,6 +581,13 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
 /// declaration cannot outlive its truth.
 pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
     (
+        "deferral:",
+        "v60.1.0 (CIRISPersist#1120) — `identity_amendment::DEFERRAL_*_DIMENSION` name the \
+         deferral family's dimensions so the identity_amendment gate can READ the response \
+         an amendment cites (approved or not) and producers stop spelling them. Persist \
+         states no rule on a deferral row; it admits like any open-vocabulary row.",
+    ),
+    (
         "contribution:",
         "v60.0.0 (CIRISPersist#988 item 1) — `cirisnode::rows::CONTRIBUTION_PREFIX` \
          BUILDS a Contribution row's dimension (`contribution:{subject_kind}:v1`) and \
@@ -876,6 +905,11 @@ pub fn persist_ruled_prefixes() -> Vec<String> {
                 // `goal:`: the M-1 admission gate and the amendment rule
                 // (`goal::check_goal_row_admission`).
                 crate::federation::goal::GOAL_DIMENSION_PREFIX,
+                // v60.1.0 (CIRISPersist#1120, CC 3.1.5 rc10) — persist rules on
+                // `identity_amendment:`: an amendment admits only citing an
+                // admitted, approved response about the same agent by a seated
+                // WA (`identity_amendment::check_identity_amendment_admission`).
+                crate::federation::identity_amendment::IDENTITY_AMENDMENT_FAMILY_STEM,
             ]
             .into_iter()
             .map(str::to_owned),
@@ -1167,9 +1201,9 @@ mod tests {
         // stop, so it is checked here rather than trusted.
         assert_eq!(
             RULES_NOT_ON_THE_ROW.len(),
-            21,
+            22,
             "the inventory now has {} entries; this module's doc says the minted set is \"4 of \
-             21\". Update BOTH numbers so the claim a reader acts on is the claim the build \
+             22\". Update BOTH numbers so the claim a reader acts on is the claim the build \
              checked.",
             RULES_NOT_ON_THE_ROW.len()
         );

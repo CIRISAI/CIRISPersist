@@ -306,6 +306,16 @@ impl SqliteBackend {
         &self.test_hooks
     }
 
+    /// v60.1.0 (CIRISPersist#1070 item 3) — does the bytes-plane tombstone
+    /// table exist, so a byte write's in-transaction tombstone read can run?
+    /// `false` only between a test-only `run_migrations_through` below V187
+    /// and the next full migration (the `pre_purge_schema` flag).
+    fn bytes_tombstone_plane(&self) -> bool {
+        !self
+            .pre_purge_schema
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// v57.0.0 (CIRISPersist#988, I960/I961) — run raw SQL on the writer: the
     /// projection witnesses tamper with a live table to prove the gate red.
     #[cfg(test)]
@@ -3798,6 +3808,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         plane: &str,
         record_ref: &str,
     ) -> Result<Vec<String>, crate::federation::Error> {
+        // v60.1.0 (#1070 × #1113) — below V187 there is no tombstone table:
+        // the plane is absent (`Unsupported`), exactly as `purge_tombstoned`
+        // answers, so the withheld read it now serves withholds nothing there.
+        if self
+            .pre_purge_schema
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(crate::federation::Error::Unsupported {
+                method: "purge_tombstone_notices",
+            });
+        }
         let (plane, record_ref) = (plane.to_owned(), record_ref.to_owned());
         self.read(move |conn| -> Result<Vec<String>, rusqlite::Error> {
             let mut stmt = conn.prepare(
@@ -11855,7 +11876,19 @@ impl crate::federation::BlobStorage for SqliteBackend {
     ) -> Result<(), crate::federation::BlobError> {
         floor.check_scope(cohort_scope)?;
         // v55.0.0 (#1007) — taken-down bytes never come back.
-        crate::federation::steward_purge::refuse_tombstoned_bytes(self, sha256).await?;
+        let reversed =
+            crate::federation::steward_purge::refuse_tombstoned_bytes(self, sha256).await?;
+        // v60.1.0 (#1070) — the in-transaction second look's inputs (the
+        // switch, and #1113's reversals the pre-read found), and the
+        // witnesses' seam between the pre-read and the write.
+        let tombstones = crate::federation::steward_purge::TombstoneFloor::new(
+            self.bytes_tombstone_plane(),
+            reversed,
+        );
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
+            .await;
         let scope = cohort_scope.to_owned();
         let tier = floor.tier().as_str().to_owned();
         let group = group_key_id.map(str::to_owned);
@@ -12012,6 +12045,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     rusqlite::params![sha_vec, row_author],
                 )?;
             } else {
+                // v60.1.0 (#1070) — the tombstone again, under the write.
+                sqlite_refuse_tombstoned_at_write(&tx, &sha_vec, &tombstones)?;
                 // #846 (§5) — the row records its AUTHOR: the attesting key of
                 // the holder claim, which for a local write is the writer's
                 // derived key (I23) and for a proxy write the peer's.
@@ -12062,6 +12097,9 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 return crate::federation::BlobError::NotHeld {
                     sha256_hex: hex::encode(sha256),
                 };
+            }
+            if let Some(purged) = sqlite_purged_at_write(&e) {
+                return purged;
             }
             let msg = e.to_string();
             if msg.contains("FOREIGN KEY") {
@@ -12221,7 +12259,19 @@ impl crate::federation::BlobStorage for SqliteBackend {
     ) -> Result<(), crate::federation::BlobError> {
         floor.check_scope(cohort_scope)?;
         // v55.0.0 (#1007) — taken-down bytes never come back.
-        crate::federation::steward_purge::refuse_tombstoned_bytes(self, sha256).await?;
+        let reversed =
+            crate::federation::steward_purge::refuse_tombstoned_bytes(self, sha256).await?;
+        // v60.1.0 (#1070) — the in-transaction second look's inputs (the
+        // switch, and #1113's reversals the pre-read found), and the
+        // witnesses' seam between the pre-read and the write.
+        let tombstones = crate::federation::steward_purge::TombstoneFloor::new(
+            self.bytes_tombstone_plane(),
+            reversed,
+        );
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
+            .await;
         let scope = cohort_scope.to_owned();
         let tier = floor.tier().as_str().to_owned();
         let author = author_key_id.map(str::to_owned);
@@ -12279,6 +12329,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let inject_association_fault = false;
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             let tx = conn.transaction()?;
+            // v60.1.0 (#1070) — the tombstone again, under the write.
+            sqlite_refuse_tombstoned_at_write(&tx, &sha_vec, &tombstones)?;
             tx.execute(
                 // #984 (V177) — the group the write named, on the row.
                 "INSERT INTO federation_blobs (\
@@ -12317,7 +12369,11 @@ impl crate::federation::BlobStorage for SqliteBackend {
             tx.commit()
         })
         .await
-        .map_err(|e| crate::federation::BlobError::Backend(format!("store_blob_local: {e}")))?;
+        .map_err(|e| {
+            sqlite_purged_at_write(&e).unwrap_or_else(|| {
+                crate::federation::BlobError::Backend(format!("store_blob_local: {e}"))
+            })
+        })?;
         Ok(())
     }
 
@@ -14597,9 +14653,24 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let rows = crate::federation::blobs::prepare_chunk_rows(&manifest, &chunks, cap)?;
         // v55.0.0 (#1007) — taken-down bytes never come back: no chunk, and
         // not the manifest.
+        let mut reversed = crate::federation::steward_purge::ReversedTakedowns::default();
         for row in &rows {
-            crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256).await?;
+            reversed.absorb(
+                crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256)
+                    .await?,
+            );
         }
+        // v60.1.0 (#1070) — the in-transaction second look's inputs (the
+        // switch, and #1113's reversals the pre-read found), and the
+        // witnesses' seam between the pre-read and the write.
+        let tombstones = crate::federation::steward_purge::TombstoneFloor::new(
+            self.bytes_tombstone_plane(),
+            reversed,
+        );
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
+            .await;
 
         let now_iso = chrono::Utc::now().to_rfc3339();
         // Codex r2 on #1065 — the manifest's chunk relation, in the same
@@ -14610,6 +14681,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
             let tx = conn.transaction()?;
             for row in &rows {
                 let sha_vec = row.sha256.to_vec();
+                // v60.1.0 (#1070) — the tombstone again, under the write.
+                sqlite_refuse_tombstoned_at_write(&tx, &sha_vec, &tombstones)?;
                 tx.execute(
                     "INSERT INTO federation_blobs (\
                         sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
@@ -14639,7 +14712,11 @@ impl crate::federation::BlobStorage for SqliteBackend {
             Ok(())
         })
         .await
-        .map_err(|e| crate::federation::BlobError::Backend(format!("put_blob_chunks tx: {e}")))?;
+        .map_err(|e| {
+            sqlite_purged_at_write(&e).unwrap_or_else(|| {
+                crate::federation::BlobError::Backend(format!("put_blob_chunks tx: {e}"))
+            })
+        })?;
         Ok(())
     }
 
@@ -14654,10 +14731,24 @@ impl crate::federation::BlobStorage for SqliteBackend {
             crate::federation::blobs::prepare_manifest_row(&manifest, self.inline_bytes_cap())?;
         // v55.0.0 (#1007) — taken-down bytes never come back: neither the
         // manifest nor a withheld chunk becomes a DAG.
-        crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256).await?;
+        let mut reversed =
+            crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256).await?;
         for c in &manifest.chunks {
-            crate::federation::steward_purge::refuse_tombstoned_bytes(self, &c.sha).await?;
+            reversed.absorb(
+                crate::federation::steward_purge::refuse_tombstoned_bytes(self, &c.sha).await?,
+            );
         }
+        // v60.1.0 (#1070) — the in-transaction second look's inputs (the
+        // switch, and #1113's reversals the pre-read found), and the
+        // witnesses' seam between the pre-read and the write.
+        let tombstones = crate::federation::steward_purge::TombstoneFloor::new(
+            self.bytes_tombstone_plane(),
+            reversed,
+        );
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
+            .await;
         let chunks: Vec<([u8; 32], u64)> = manifest
             .chunks
             .iter()
@@ -14684,6 +14775,17 @@ impl crate::federation::BlobStorage for SqliteBackend {
                             idx, chunk_sha, *size, held,
                         ) {
                             return Ok(Err(e));
+                        }
+                    }
+                    // v60.1.0 (#1070) — the tombstones again, under the write:
+                    // the manifest's own and every chunk's.
+                    for sha in std::iter::once(&row.sha256).chain(chunks.iter().map(|(c, _)| c)) {
+                        if let Err(t) = crate::federation::steward_purge::refuse_tombstoned_at_write(
+                            sha,
+                            sqlite_tombstone_at_write(&tx, sha, &tombstones)?,
+                            &tombstones,
+                        ) {
+                            return Ok(Err(t.into()));
                         }
                     }
                     tx.execute(
@@ -15710,7 +15812,19 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // the bytes that are stored — never trusted from the sender.
         let sha256: [u8; 32] = sha2::Sha256::digest(&envelope_bytes).into();
         // v55.0.0 (#1007) — taken-down bytes never come back.
-        crate::federation::steward_purge::refuse_tombstoned_bytes(self, &sha256).await?;
+        let reversed =
+            crate::federation::steward_purge::refuse_tombstoned_bytes(self, &sha256).await?;
+        // v60.1.0 (#1070) — the in-transaction second look's inputs (the
+        // switch, and #1113's reversals the pre-read found), and the
+        // witnesses' seam between the pre-read and the write.
+        let tombstones = crate::federation::steward_purge::TombstoneFloor::new(
+            self.bytes_tombstone_plane(),
+            reversed,
+        );
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
+            .await;
         let size_i64 = i64::try_from(envelope_bytes.len()).map_err(|_| {
             crate::federation::BlobError::InvalidArgument(
                 "adopt_sealed_blob_at: size_bytes exceeds i64".into(),
@@ -15774,6 +15888,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let now_iso = chrono::Utc::now().to_rfc3339();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             let tx = conn.transaction()?;
+            // v60.1.0 (#1070) — the tombstone again, under the write.
+            sqlite_refuse_tombstoned_at_write(&tx, &sha_vec, &tombstones)?;
             // 1. The row, verbatim bytes, tier from the token, cohort and
             //    author AS DECLARED. First-write-wins on the address.
             // v55.0.0 — and the group the provenance names (V177), as the
@@ -15826,6 +15942,9 @@ impl crate::federation::BlobStorage for SqliteBackend {
         })
         .await
         .map_err(|e| {
+            if let Some(purged) = sqlite_purged_at_write(&e) {
+                return purged;
+            }
             let msg = e.to_string();
             if msg.contains("FOREIGN KEY") {
                 crate::federation::BlobError::AttestationEmissionFailed(format!(
@@ -16796,6 +16915,65 @@ impl crate::federation::BlobStorage for SqliteBackend {
     }
 }
 
+/// v60.1.0 (CIRISPersist#1070 item 3) — every notice whose bytes-plane
+/// tombstone names `sha256`, sorted, read INSIDE the caller's write
+/// transaction. The one writer connection serializes it with the tombstone's
+/// own write, so a takedown cannot commit between this read and the byte
+/// insert that follows
+/// ([`refuse_tombstoned_at_write`](crate::federation::steward_purge::refuse_tombstoned_at_write)
+/// decides which of them, if any, still stands).
+///
+/// Empty on a test schema migrated below V187 (no tombstone table, so
+/// nothing can be tombstoned): `SqliteBackend::pre_purge_schema`.
+fn sqlite_tombstone_at_write(
+    conn: &Connection,
+    sha256: &[u8],
+    tombstones: &crate::federation::steward_purge::TombstoneFloor,
+) -> Result<Vec<String>, rusqlite::Error> {
+    if !tombstones.plane() {
+        return Ok(Vec::new());
+    }
+    let mut st = conn.prepare_cached(
+        "SELECT DISTINCT notice_id FROM purge_tombstones \
+          WHERE plane = ?1 AND record_ref = ?2 ORDER BY notice_id",
+    )?;
+    let rows = st.query_map(
+        rusqlite::params![
+            crate::federation::steward_purge::PurgePlane::Blob.as_str(),
+            hex::encode(sha256)
+        ],
+        |r| r.get(0),
+    )?;
+    rows.collect()
+}
+
+/// [`sqlite_tombstone_at_write`] as a refusal a `rusqlite::Error` closure can
+/// return; [`sqlite_purged_at_write`] reads it back out.
+fn sqlite_refuse_tombstoned_at_write(
+    conn: &Connection,
+    sha256: &[u8],
+    tombstones: &crate::federation::steward_purge::TombstoneFloor,
+) -> Result<(), rusqlite::Error> {
+    crate::federation::steward_purge::refuse_tombstoned_at_write(
+        sha256,
+        sqlite_tombstone_at_write(conn, sha256, tombstones)?,
+        tombstones,
+    )
+    .map_err(|t| rusqlite::Error::UserFunctionError(Box::new(t)))?;
+    Ok(())
+}
+
+/// The `Purged` refusal a write closure returned through
+/// [`sqlite_refuse_tombstoned_at_write`], if `e` is one.
+fn sqlite_purged_at_write(e: &rusqlite::Error) -> Option<crate::federation::BlobError> {
+    match e {
+        rusqlite::Error::UserFunctionError(b) => b
+            .downcast_ref::<crate::federation::steward_purge::TombstonedAtWrite>()
+            .map(|t| t.clone().into()),
+        _ => None,
+    }
+}
+
 /// v55.0.0 (CIRISPersist#989) — **insert one admitted holding claim** inside
 /// the caller's transaction: the row
 /// [`prepare_holding_claim_row`](crate::federation::holding_claim::prepare_holding_claim_row)
@@ -17018,6 +17196,9 @@ enum ItemAppended {
     StreamCounterMoved,
     /// #969 — the stream epoch is closed / terminated / has no DEK row.
     StreamEpochClosed,
+    /// v60.1.0 (#1070) — a tombstone committed after the pre-read: the
+    /// notice naming the chunk's address.
+    Purged(String),
 }
 
 /// #957 — the batch's per-item constants.
@@ -17035,6 +17216,9 @@ struct SqliteChunkTx<'a> {
     bind_as_declared: bool,
     /// #969 — the STREAM-nonce slot a stream-keyed chunk was sealed at.
     stream_key: Option<crate::federation::StreamKeySlot>,
+    /// v60.1.0 (#1070, #1113) — the in-transaction tombstone look's inputs
+    /// (see `sqlite_tombstone_at_write`).
+    tombstones: &'a crate::federation::steward_purge::TombstoneFloor,
 }
 
 /// #957 — one item's append inside its savepoint: the blob row, the nonce
@@ -17077,6 +17261,14 @@ fn sqlite_append_chunk_item(
     } else {
         false
     };
+    // v60.1.0 (#1070) — the tombstone again, under the write.
+    if let Err(t) = crate::federation::steward_purge::refuse_tombstoned_at_write(
+        &sha_vec,
+        sqlite_tombstone_at_write(conn, &sha_vec, c.tombstones)?,
+        c.tombstones,
+    ) {
+        return Ok(ItemAppended::Purged(t.notice_id));
+    }
     // 1. The chunk's bytes as a normal federation_blobs row
     //    (content-addressed + idempotent), carrying the cohort and the tier
     //    the door resolved (§11.1 / §12.1). #846 (§5) — the chunk's author is
@@ -17355,14 +17547,29 @@ impl SqliteBackend {
         // v55.0.0 (#1007) — taken-down bytes never come back: that item's
         // answer is the refusal, as for any other per-item refusal.
         let mut kept: Vec<SqliteChunkRow> = Vec::with_capacity(ready.len());
+        let mut reversed = crate::federation::steward_purge::ReversedTakedowns::default();
         for row in ready {
             match crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256).await
             {
-                Ok(()) => kept.push(row),
+                Ok(r) => {
+                    reversed.absorb(r);
+                    kept.push(row);
+                }
                 Err(e) => results[row.slot] = Some(Err(e)),
             }
         }
         let ready = kept;
+        // v60.1.0 (#1070) — the in-transaction second look's inputs (the
+        // switch, and #1113's reversals the pre-read found), and the
+        // witnesses' seam between the pre-read and the write.
+        let tombstones = crate::federation::steward_purge::TombstoneFloor::new(
+            self.bytes_tombstone_plane(),
+            reversed,
+        );
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
+            .await;
 
         let meta: Vec<(u64, [u8; 32])> = ready.iter().map(|r| (r.seq, r.sha256)).collect();
         let now_iso = chrono::Utc::now().to_rfc3339();
@@ -17474,6 +17681,7 @@ impl SqliteBackend {
                     binding: bind.as_ref(),
                     bind_as_declared,
                     stream_key: claim_tx.stream_key,
+                    tombstones: &tombstones,
                 };
                 let mut appended = Vec::with_capacity(ready.len());
                 for row in &ready {
@@ -17560,6 +17768,10 @@ impl SqliteBackend {
                 ItemAppended::StreamEpochClosed => Err(
                     crate::federation::blobs::stream_epoch_closed_refusal(stream_id, epoch),
                 ),
+                ItemAppended::Purged(notice_id) => Err(crate::federation::BlobError::Purged {
+                    sha256_hex: hex::encode(sha),
+                    notice_id,
+                }),
             });
         }
         Ok(results
@@ -52024,6 +52236,56 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
             let backend = SqliteBackend::open_in_memory().await.unwrap();
             backend.run_migrations().await.unwrap();
             backend
+        }
+
+        /// **I1412** (sqlite; CIRISPersist#1132, CC 5.3.3.6) — a receipt
+        /// whose `subscriber_key_id` or `stream_id` does not fit a `u32`
+        /// length prefix is refused at `put_delivery_receipt`'s verifier
+        /// with `InvalidArgument`, never verified over a clamped prefix; the
+        /// same receipt with the field restored is accepted, so the refusal
+        /// is the length's. Outside the mutation filter: under a surviving
+        /// mutant it would copy 4 GiB (I1411 is the scope's witness).
+        #[cfg(target_pointer_width = "64")]
+        #[tokio::test]
+        async fn i1412_an_over_long_receipt_field_is_refused_sqlite() {
+            use crate::federation::stream_receipt::over_long_receipt_field;
+            let backend = fresh().await;
+            let stream_id = "stream-i1412";
+            let root = [0x41u8; 32];
+            let (receipt, ed_b64, mldsa_b64) =
+                signed_receipt(stream_id, "sub-i1412", 0, 1, root, 0x12, 0x34).await;
+            seed_subscriber_key(&backend, "sub-i1412", &ed_b64, &mldsa_b64);
+            seed_published_sth(&backend, stream_id, 1, root);
+
+            for field in ["subscriber_key_id", "stream_id"] {
+                let mut long = receipt.clone();
+                if field == "stream_id" {
+                    long.stream_id = over_long_receipt_field();
+                } else {
+                    long.subscriber_key_id = over_long_receipt_field();
+                }
+                match backend.put_delivery_receipt(long).await {
+                    Err(crate::federation::BlobError::InvalidArgument(m)) => assert!(
+                        m.contains(field) && m.contains("MUST fit u32"),
+                        "I1412: the refusal names {field} and the u32 rule ({} bytes)",
+                        m.len()
+                    ),
+                    Err(_) => panic!("I1412: over-long {field} must be InvalidArgument"),
+                    Ok(()) => panic!("I1412: over-long {field} must be refused"),
+                }
+            }
+            assert!(
+                backend
+                    .list_delivery_receipts_for(stream_id, 10)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "I1412: a refused receipt stores nothing"
+            );
+            backend
+                .put_delivery_receipt(receipt)
+                .await
+                .expect("I1412: the same receipt, fields in range, is accepted");
         }
 
         /// Positive: a correctly-signed receipt whose chunk_root is a

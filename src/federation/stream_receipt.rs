@@ -90,10 +90,59 @@ pub struct StoredDeliveryReceipt {
     pub received_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// v60.1.0 (CIRISPersist#1132, CC 5.3.3.6) — the `u32` little-endian
+/// length prefix of one variable field, or a refusal: "a length MUST fit
+/// u32 and is refused otherwise". The one place the receipt layout decides
+/// whether a length fits.
+fn length_prefix(field: &str, len: usize) -> Result<[u8; 4], crate::federation::BlobError> {
+    u32::try_from(len).map(u32::to_le_bytes).map_err(|_| {
+        crate::federation::BlobError::InvalidArgument(format!(
+            "delivery receipt: {field} is {len} bytes; a length prefix MUST fit u32 \
+             (CC 5.3.3.6)"
+        ))
+    })
+}
+
+/// v60.1.0 (CIRISPersist#1132) — the canonical signing bytes for a receipt,
+/// refusing a `subscriber_key_id` or `stream_id` longer than `u32::MAX`
+/// bytes ([`BlobError::InvalidArgument`](crate::federation::BlobError))
+/// before any byte is copied. [`verify_receipt_signature`] builds its bytes
+/// here.
+pub fn try_receipt_signing_bytes(
+    subscriber_key_id: &str,
+    stream_id: &str,
+    epoch: u64,
+    chunk_root: &[u8; 32],
+    k: u64,
+) -> Result<Vec<u8>, crate::federation::BlobError> {
+    let sub = subscriber_key_id.as_bytes();
+    let sid = stream_id.as_bytes();
+    let sub_len = length_prefix("subscriber_key_id", sub.len())?;
+    let sid_len = length_prefix("stream_id", sid.len())?;
+    let mut buf = Vec::with_capacity(
+        RECEIPT_SIGNING_DOMAIN.len() + 4 + sub.len() + 4 + sid.len() + 8 + 32 + 8,
+    );
+    buf.extend_from_slice(RECEIPT_SIGNING_DOMAIN);
+    buf.extend_from_slice(&sub_len);
+    buf.extend_from_slice(sub);
+    buf.extend_from_slice(&sid_len);
+    buf.extend_from_slice(sid);
+    buf.extend_from_slice(&epoch.to_le_bytes());
+    buf.extend_from_slice(chunk_root);
+    buf.extend_from_slice(&k.to_le_bytes());
+    Ok(buf)
+}
+
 /// Build the canonical signing bytes for a receipt (§10.5.4 — the sole
 /// place this cross-impl encoding lives). Matches
 /// [`SignedTreeHead::signing_bytes`]: a `u32` little-endian length
 /// prefix on each variable field, little-endian multi-byte integers.
+///
+/// A field longer than `u32::MAX` bytes has no canonical bytes (CC
+/// 5.3.3.6): this infallible form clamps its prefix, and the bytes it
+/// returns are ones no verifier accepts — [`verify_receipt_signature`]
+/// refuses the receipt first. [`try_receipt_signing_bytes`] is the
+/// refusing form.
 pub fn receipt_signing_bytes(
     subscriber_key_id: &str,
     stream_id: &str,
@@ -157,7 +206,15 @@ where
         witness_signatures: Vec::new(),
     };
     let (ed25519_sig_b64, ml_dsa_65_sig_b64) = hybrid_signature_b64_parts(&sth_like);
-    let signing_bytes = receipt_signing_bytes_of(receipt);
+    // #1132: an over-long field is refused here, never signed over a
+    // clamped prefix.
+    let signing_bytes = try_receipt_signing_bytes(
+        &receipt.subscriber_key_id,
+        &receipt.stream_id,
+        receipt.epoch,
+        &receipt.chunk_root,
+        receipt.k,
+    )?;
     crate::verify::verify_hybrid_via_directory(
         directory,
         &signing_bytes,
@@ -178,9 +235,52 @@ where
     })
 }
 
+/// A receipt field one byte longer than a `u32` length prefix can carry
+/// (CIRISPersist#1132). Zero-filled, so the 4 GiB allocation maps the zero
+/// page and costs no resident memory until something copies it — which
+/// only a door that fails to refuse it does.
+#[cfg(all(test, target_pointer_width = "64"))]
+pub(crate) fn over_long_receipt_field() -> String {
+    String::from_utf8(vec![0u8; u32::MAX as usize + 1]).expect("NUL is UTF-8")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **I1411** (CIRISPersist#1132, CC 5.3.3.6) — a length prefix fits
+    /// `u32` or is refused, and the refusing builder's bytes are the
+    /// pinned layout's. Allocation-free on purpose: this is the mutation
+    /// scope's witness, and a surviving mutant must not copy a 4 GiB field.
+    #[test]
+    fn i1411_a_length_prefix_fits_u32_or_is_refused() {
+        assert_eq!(
+            length_prefix("stream_id", 7).unwrap(),
+            7u32.to_le_bytes(),
+            "I1411: an in-range length is its u32 LE prefix"
+        );
+        assert_eq!(
+            length_prefix("stream_id", u32::MAX as usize).unwrap(),
+            u32::MAX.to_le_bytes(),
+            "I1411: u32::MAX itself fits"
+        );
+        #[cfg(target_pointer_width = "64")]
+        {
+            let err = length_prefix("stream_id", u32::MAX as usize + 1).unwrap_err();
+            let crate::federation::BlobError::InvalidArgument(m) = err else {
+                panic!("I1411: an over-long length is InvalidArgument, got {err:?}");
+            };
+            assert!(
+                m.contains("stream_id") && m.contains("MUST fit u32"),
+                "I1411: the refusal names the field and the rule: {m}"
+            );
+        }
+        assert_eq!(
+            try_receipt_signing_bytes("sub-key", "stream-1", 3, &[0xAB; 32], 7).unwrap(),
+            receipt_signing_bytes("sub-key", "stream-1", 3, &[0xAB; 32], 7),
+            "I1411: the refusing builder writes the pinned layout"
+        );
+    }
 
     #[test]
     fn signing_bytes_layout_is_pinned() {
@@ -208,6 +308,32 @@ mod tests {
         assert_eq!(&bytes[off..off + 8], &7u64.to_le_bytes());
         off += 8;
         assert_eq!(off, bytes.len(), "no trailing bytes");
+
+        // The refusing builder writes the same bytes ...
+        assert_eq!(
+            try_receipt_signing_bytes("sub-key", "stream-1", 3, &[0xAB; 32], 7).unwrap(),
+            bytes
+        );
+        // ... and refuses a field whose length does not fit the u32 prefix
+        // (#1132, CC 5.3.3.6), for either variable field.
+        #[cfg(target_pointer_width = "64")]
+        {
+            let long = over_long_receipt_field();
+            for (sub, sid, field) in [
+                (long.as_str(), "stream-1", "subscriber_key_id"),
+                ("sub-key", long.as_str(), "stream_id"),
+            ] {
+                match try_receipt_signing_bytes(sub, sid, 3, &[0xAB; 32], 7) {
+                    Err(crate::federation::BlobError::InvalidArgument(m)) => {
+                        assert!(m.contains(field) && m.contains("MUST fit u32"), "{m}")
+                    }
+                    other => panic!(
+                        "over-long {field} must be refused, got {:?}",
+                        other.map(|b| b.len())
+                    ),
+                }
+            }
+        }
     }
 
     #[test]

@@ -237,6 +237,59 @@ impl DimensionRejectionReason {
             Self::ScoreOutsideDeclaredPolarity => "score_outside_declared_polarity",
         }
     }
+
+    /// v60.1.0 (CIRISPersist#1064) — every variant, for the token census.
+    pub const ALL: [DimensionRejectionReason; 5] = [
+        Self::MorallyChargedStem,
+        Self::MissingVersionSegment,
+        Self::EmptyOrMissingDimension,
+        Self::SelfDeclaredLevelReserved,
+        Self::ScoreOutsideDeclaredPolarity,
+    ];
+}
+
+/// v60.1.0 (CIRISPersist#1064, CIRISEdge) — **the closed set of
+/// [`Error::DimensionRejected`] reason tokens, and which of them a re-offer
+/// can turn into an admission.**
+///
+/// `reason` on that arm comes from two places: [`DimensionRejectionReason`]
+/// (the policy's own gate shapes) and three tokens raised on the same shape by
+/// other gates ([`REGISTERED_FAMILY_HELD_SHUT_REASON`],
+/// [`LEDGER_BINDING_REASON`], the invariant registry's self-emission
+/// refusal). A consumer that classifies refusals for retry reads
+/// [`is_retryable`](dimension_rejected_reason::is_retryable) instead of keeping
+/// its own table. Every one is TERMINAL for the bytes it names: each gate is
+/// pure over the signed row (its dimension, score and envelope), so no row
+/// landing later changes the answer. The census
+/// (`tests::every_dimension_rejected_reason_is_classified_once`) fails the
+/// build when a construction site raises a token this list does not hold.
+pub mod dimension_rejected_reason {
+    use super::{
+        DimensionRejectionReason, LEDGER_BINDING_REASON, REGISTERED_FAMILY_HELD_SHUT_REASON,
+    };
+
+    /// Every token `Error::DimensionRejected` carries.
+    pub const ALL: &[&str] = &[
+        DimensionRejectionReason::MorallyChargedStem.as_str(),
+        DimensionRejectionReason::MissingVersionSegment.as_str(),
+        DimensionRejectionReason::EmptyOrMissingDimension.as_str(),
+        DimensionRejectionReason::SelfDeclaredLevelReserved.as_str(),
+        DimensionRejectionReason::ScoreOutsideDeclaredPolarity.as_str(),
+        REGISTERED_FAMILY_HELD_SHUT_REASON,
+        LEDGER_BINDING_REASON,
+        crate::federation::invariant::INVARIANT_SELF_EMISSION_REASON,
+    ];
+
+    /// The tokens a later re-offer of the same row can turn into an
+    /// admission. Empty: every gate on this arm is pure over the signed row.
+    pub const RETRYABLE: &[&str] = &[];
+
+    /// May a re-offer of the row this `reason` refused be admitted later?
+    /// `None` for a token outside [`ALL`] — never a guess.
+    #[must_use]
+    pub fn is_retryable(reason: &str) -> Option<bool> {
+        ALL.contains(&reason).then(|| RETRYABLE.contains(&reason))
+    }
 }
 
 /// The configurable per-deployment policy. Default-deny on the
@@ -13414,7 +13467,7 @@ where
     // hardware-bound, touch-required, distinct-human scarcity mechanism).
     // `verify_quorum_policy` re-validates `2·M > N` and `N == founder_count`,
     // so this is NOT a frozen constant.
-    let m = std::cmp::max(n / 2 + 1, min_quorum);
+    let m = std::cmp::max(accord_threshold(n), min_quorum);
     if m > n {
         return Err(CoscrubFailure::Refused(format!(
             "accord quorum unreachable: floor {m} exceeds the {n} qualifying roster \
@@ -14386,6 +14439,73 @@ pub(crate) fn accord_holder_roster_key_ids() -> Vec<String> {
         .collect()
 }
 
+/// v60.1.0 (CIRISPersist#1117; CC 4.2.6 / CC 4.5.1.2, rc10) — **the accord
+/// threshold over a standing roster of `roster_size` holders**: the strict
+/// majority `M = ⌊N/2⌋ + 1`.
+///
+/// The ONE spelling of the rule. The co-scrub core
+/// ([`verify_accord_family_coscrub_typed`]), the destructive re-tally
+/// ([`verify_canonical_withdraw_authority`]) and the replicated-evidence
+/// receive gate (`accord_carriage`) all count through it, and a consumer's
+/// wire gate (CIRISEdge's `verify_accord_carrier`) calls it instead of
+/// restating the rule as a constant. An empty roster answers `1`, which no
+/// signature set over an empty roster can meet: fail-closed.
+#[must_use]
+pub const fn accord_threshold(roster_size: usize) -> usize {
+    roster_size / 2 + 1
+}
+
+/// v60.1.0 (CIRISPersist#1117) — the accord threshold over THIS node's
+/// standing roster: `n` is the holders of `roster_key_ids` whose keys resolve
+/// in this node's directory (the same resolution the co-scrub core and the
+/// destructive re-tally make, so an unregistered holder counts toward neither
+/// side), and `m` is [`accord_threshold`]`(n)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccordThreshold {
+    /// Signatures required: the strict majority of `n`.
+    pub m: usize,
+    /// Holders on the standing roster whose keys this node holds.
+    pub n: usize,
+}
+
+/// v60.1.0 (CIRISPersist#1117) — [`AccordThreshold`] over `roster_key_ids`.
+///
+/// # Errors
+///
+/// A directory read.
+pub async fn accord_threshold_over_roster<F>(
+    directory: &F,
+    roster_key_ids: &[String],
+) -> Result<AccordThreshold, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    let mut seen = std::collections::HashSet::new();
+    for kid in roster_key_ids {
+        if let Some(rec) = directory.lookup_public_key(kid).await? {
+            seen.insert(rec.key_id);
+        }
+    }
+    let n = seen.len();
+    Ok(AccordThreshold {
+        m: accord_threshold(n),
+        n,
+    })
+}
+
+/// v60.1.0 (CIRISPersist#1117) — [`AccordThreshold`] over the accord-holder
+/// roster this build is anchored to (the baked genesis holders).
+///
+/// # Errors
+///
+/// A directory read.
+pub async fn accord_threshold_now<F>(directory: &F) -> Result<AccordThreshold, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    accord_threshold_over_roster(directory, &accord_holder_roster_key_ids()).await
+}
+
 /// v13.1.0 (CIRISPersist#377) — verify a withdraw/supersede authority by
 /// **re-tallying persist's OWN cryptographically-verified state**, never a
 /// caller-supplied `AccordDecision` (whose `authorized` bool is an
@@ -14505,7 +14625,7 @@ async fn verify_canonical_authority_over_roster(
     // the family the same way canonical *add* does (2-of-3 today, 3-of-4 if the
     // family grows) — never a hardcoded constant.
     let n = roster.len();
-    let policy = ciris_verify_core::threshold::QuorumPolicy::new(n / 2 + 1, n);
+    let policy = ciris_verify_core::threshold::QuorumPolicy::new(accord_threshold(n), n);
     policy.validate().map_err(|e| {
         invalid(format!(
             "accord roster quorum policy invalid ({n} holders): {e:?}"
@@ -16851,6 +16971,25 @@ pub async fn check_reconsideration_admission(
         Some(id) => directory.get_attestation(id).await?,
         None => None,
     };
+    // v60.1.0 (CIRISPersist#1113, CC 4.5.3 / CC 4.5.5) — against a held
+    // `takedown_notice:{basis}:v1` row the action's communities are the
+    // CONTENT's, read from this node's binding rows (the notice names none it
+    // can be judged by): a ruling is the review-holders' of those communities,
+    // a filing also its signed subjects', and a row naming a community names
+    // one of them.
+    if let Some(t) = target
+        .as_ref()
+        .filter(|t| super::takedown_tombstone::is_notice_row(t))
+    {
+        return check_takedown_reconsideration_admission(
+            directory,
+            row,
+            t,
+            dimension,
+            declared_community_id,
+        )
+        .await;
+    }
     let community_id = match &target {
         Some(t) => {
             let held = t
@@ -16893,6 +17032,62 @@ pub async fn check_reconsideration_admission(
                 reconsideration_target_subjects(directory, &row.attesting_key_id, t).await?,
             );
         }
+    }
+    check_moderation_admission(
+        directory,
+        &row.attesting_key_id,
+        &holders,
+        DELEGATION_SCOPE_REVIEW,
+        dimension,
+    )
+    .await
+}
+
+/// v60.1.0 (CIRISPersist#1113; CC 4.5.3, CC 4.5.5) — who may file, and who
+/// may rule, a `reconsideration:{grounds}` against a held takedown notice
+/// row. The content's communities come from this node's binding rows
+/// ([`takedown_tombstone::content_binding`](super::takedown_tombstone::content_binding)):
+/// a ruling is admitted for a review-holder of one of them (as self or
+/// through a live `review`-scoped chain from a steward-bound root); a filing
+/// also for a signed subject of the content. A row naming a `community_id`
+/// must name one of the content's communities
+/// ([`RECONSIDERATION_COMMUNITY_MISMATCH`]). No binding row held: nobody
+/// here holds the duty, and the row is refused.
+///
+/// # Errors
+///
+/// [`Error::DelegatedScopeUnauthorized`];
+/// [`RECONSIDERATION_COMMUNITY_MISMATCH`]; directory reads.
+async fn check_takedown_reconsideration_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+    notice: &super::Attestation,
+    dimension: &str,
+    declared_community_id: &str,
+) -> Result<(), Error> {
+    let content = notice
+        .attestation_envelope
+        .get("content_sha256")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let (binding, mut holders) =
+        super::takedown_tombstone::review_holders_of_content(directory, content)
+            .await?
+            .unwrap_or_default();
+    if !declared_community_id.is_empty() && !binding.communities.contains(declared_community_id) {
+        return Err(Error::InvalidArgument(format!(
+            "{RECONSIDERATION_COMMUNITY_MISMATCH}: reconsideration {} names community \
+             {declared_community_id:?}; its takedown notice {} is over content bound into \
+             {:?} here — the action's community is the content's (CC 4.5.5)",
+            row.attestation_id, notice.attestation_id, binding.communities
+        )));
+    }
+    let is_ruling = row
+        .attestation_envelope
+        .get(RECONSIDERATION_OUTCOME_MEMBER)
+        .is_some();
+    if !is_ruling {
+        holders.extend(binding.subjects.iter().cloned());
     }
     check_moderation_admission(
         directory,

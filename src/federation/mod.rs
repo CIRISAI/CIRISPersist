@@ -383,10 +383,12 @@ pub mod emit;
 pub mod family_rules;
 pub mod genesis;
 pub mod goal;
+// v60.1.0 (CIRISPersist#1120, CC 3.1.5) — the identity_amendment:v1 gate.
 pub mod goal_projection;
 pub(crate) mod group_amendment;
 pub mod hardware_attestation;
 pub mod identity_aggregate;
+pub mod identity_amendment;
 // CIRISPersist#784 — a key named by the SHA-256 of its raw Ed25519 pubkey.
 pub mod key_digest;
 // CIRISPersist#848 (BLOB_REPLICATION.md Part II) — key transport:
@@ -687,6 +689,13 @@ pub mod governance_policy;
 // get their own malformed_row reasons, on every backend.
 #[cfg(test)]
 mod malformed_reasons_1114_invariants;
+// v60.1.0 (docs/V61_TASK_PLAN.md §2 slice B) — the consumer asks, I1360+.
+#[cfg(test)]
+mod v601_asks_invariants;
+// v60.1.0 (CIRISPersist#1113, CC 4.5.3) — I1366/I1367: a reversed
+// reconsideration reverses a takedown; withheld is computed at read.
+#[cfg(test)]
+mod takedown_reversal_invariants;
 // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the key roster of a self: the
 // two-path door its additions and evictions go through, and the steward
 // predicate (a live roster key signs as the fedID).
@@ -786,6 +795,7 @@ pub(crate) mod serde_bytes_b64 {
 }
 
 pub use admission::{
+    accord_threshold, accord_threshold_now, accord_threshold_over_roster,
     canonical_withdrawal_payload_sha256, check_accord_role_admission_over_roster,
     check_canonical_role_admission, check_canonical_role_admission_over_roster,
     check_co_steward_role_admission, check_co_steward_role_admission_over_roster,
@@ -797,7 +807,7 @@ pub use admission::{
     supersede_canonical, verify_canonical_supersede_authority, verify_canonical_withdraw_authority,
     verify_signed_touch_claim, verify_signed_transport_destination, verify_touch_claim_admission,
     withdraw_accord_role, withdraw_accord_role_over_roster, withdraw_canonical_role,
-    withdraw_infra_attest_role, CanonicalWithdrawal, DimensionAdmissionPolicy,
+    withdraw_infra_attest_role, AccordThreshold, CanonicalWithdrawal, DimensionAdmissionPolicy,
     DimensionRejectionReason, NamespaceConformanceReason, ReachabilityVerdict, ReservedPrefixRule,
     RoleWithdrawal, ATTESTATION_LADDER_MECHANISMS, DEFAULT_MAX_TOUCH_SKEW,
     MINTED_NAMESPACE_FAMILIES, UNREGISTERED_GATED_FAMILIES,
