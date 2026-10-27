@@ -7,6 +7,48 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [59.1.1] - UNRELEASED
+
+### Fixed — a node's owner is dropped only by a REVOCATION, not by an unagreed occurrence row (pair-room invitations, live chat)
+
+- **The shape** (reproduced by CIRISServer on v59.1.0; live run CIRISAgent
+  40585063240). The creator of a pair room holds the invitee's announced
+  owner binding `delegates_to(invitee → invitee_node)`, so
+  `owner_of(invitee_node) = invitee`. It also holds the invitee's
+  login-ceremony occurrence row `{identity: invitee, occurrence: invitee_node}`,
+  which was replicated to it and is signed by the identity only. By #932 (H1)
+  that row resolves nothing: the occurrence never agreed to it, so
+  `active_identities_for_occurrence(invitee_node)` is empty.
+  `self_collective::principals_of` then dropped the owner too. PR #889's
+  clause ("a revoked occurrence does not get its owner back through the owner
+  binding") tested whether any held occurrence row named the owner, not
+  whether the occurrence had been revoked. The node's principals came out
+  empty, and `may_receive(invitee_node, membership:proposal:v1)` was
+  `No(NotInAudience)`, so the invitation never reached the invitee.
+- **The fix.** The owner is dropped only when a held identity-occurrence
+  revocation naming `(owner, k)` is effective now and `k` has not been
+  re-established by an agreed occurrence asserted after it. A unilateral row
+  that never resolved is not evidence either way, so the live owner binding
+  lifts the node to its owner. #889's case is unchanged: a revoked device with
+  a live owner binding still has no principal. The same fold serves
+  `speaks_for`, the send set, the hold path and the read gate.
+- **Witnesses** (`replication_audience_invariants`, sqlite and postgres):
+  - **I1470**, the Server shape: `principals_of(invitee_node) = [invitee]`
+    and the proposal reaches the node with `Yes(RefersTo)`. It was red on
+    v59.1.0 with `left: []`.
+  - **I1471**, the #889 case kept: a revoked occurrence (agreed or unagreed)
+    beside a live owner binding has no principal and does not receive the
+    invitation.
+  - **I1472**, the owner is kept in four cases: an agreed, active
+    occurrence; a KEM-less node; an unagreed row whose only revocation is of
+    another device; and an unagreed row whose revocation is future-dated.
+  - **I141** and **I392** stay green.
+
+### Adoption
+
+- No break. No signature, wire or schema change. Server and Edge re-pin
+  59.1.1 and the invitation reaches the invitee's node.
+
 ## [59.1.0] - 2026-10-20
 
 ### Changed — the production genesis bundle is the v4 amend (CIRISPersist#1106, CC 5.3.4)
