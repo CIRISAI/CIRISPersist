@@ -88,6 +88,13 @@
 //!   NEWER room epoch, the DAG is retained whole by the next sweep (it reads
 //!   in full); once the DAG's own epoch falls out of retention the manifest
 //!   and every chunk go in one sweep and nothing is advertised. Never half.
+//! - **I1410** (sqlite, postgres; v60.1.0, CIRISPersist#1066) — a holder
+//!   keeps or drops a peer's room DAG WHOLE: after both nodes sweep past the
+//!   epoch, the minter's manifest and chunks are gone and the holder's
+//!   manifest and every chunk agree. Pinned as the #848 holder policy: the
+//!   holder's sweep walks its own counter, so it retains the peer's DAG whole
+//!   and it still reads (holder-side retention of peer content is #1066's
+//!   open half, awaiting a ruling).
 //! - **I756** (pure; #981) — the roll rule: cap and removal roll a minted
 //!   epoch and refuse a supplied one with the reason; nothing else does.
 
@@ -1039,6 +1046,88 @@ pub(crate) mod bodies {
         assert!(!l.bb.has_blob(&root).await.unwrap(), "I1406: no manifest");
     }
 
+    /// **I1410** — see the module doc.
+    pub(crate) async fn i1410_a_holder_keeps_a_peers_room_dag_whole<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::community_dek::orchestrate::sweep_rotated_epochs;
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let stream = format!("i1410-{run}");
+        let plain = write_room(&l, &stream, 3, 0).await;
+        let sealed = l
+            .engine_a
+            .seal_stream_scoped(COMMUNITY, Some(&l.comm), &stream, None, None)
+            .await
+            .expect("A seals the room stream");
+        let root = sealed.manifest_sha256;
+        deliver_dag(&l, &stream, &root, sealed.epoch.unwrap()).await;
+        let chunks = l.bb.stream_chunks(&stream).await.unwrap().chunks;
+        assert!(!chunks.is_empty(), "I1410: B holds the stream's chunks");
+        // Both nodes move past the epoch under `retain_past_epochs = 0`, each
+        // on its own counter, and sweep.
+        for (b, alias, me) in [
+            (l.ba.clone(), format!("em-a-{run}"), l.node_a.clone()),
+            (l.bb.clone(), format!("em-b-{run}"), l.node_b.clone()),
+        ] {
+            b.community_dek_bump_epoch(&l.comm, &me).await.unwrap();
+            b.community_dek_bump_epoch(&l.comm, &me).await.unwrap();
+            b.community_dek_set_retain_past_epochs(&l.comm, &me, Some(0))
+                .await
+                .unwrap();
+            sweep_rotated_epochs(
+                b.as_ref(),
+                &l.comm,
+                &ts::local_signer(&alias),
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("I1410: the sweep runs");
+        }
+        // The minter's copy goes whole (I757's rule).
+        assert!(
+            l.ba.blob_head(&root).await.unwrap().is_none(),
+            "I1410: A's manifest"
+        );
+        for c in &chunks {
+            assert!(
+                l.ba.blob_head(&c.chunk_sha).await.unwrap().is_none(),
+                "I1410: A's chunk"
+            );
+        }
+        // The holder's: never half — the manifest and every chunk together.
+        let manifest_held = l.bb.blob_head(&root).await.unwrap().is_some();
+        for c in &chunks {
+            assert_eq!(
+                l.bb.blob_head(&c.chunk_sha).await.unwrap().is_some(),
+                manifest_held,
+                "I1410: the holder keeps or drops a peer's room DAG WHOLE: chunk {} disagrees \
+                 with its manifest",
+                c.seq
+            );
+        }
+        // And, pinned (CIRISPersist#1066, #848): a holder's sweep walks its OWN
+        // counter only, so a peer-minted room DAG is retained there whole and
+        // still reads. If this flips, holder-side retention for peer content
+        // landed: the never-half assertion above must still hold.
+        assert!(
+            manifest_held,
+            "I1410: KNOWN POLICY, pinned — a holder retains a peer's room DAG (#848: a peer's \
+             epochs have no key state here to sweep; CIRISPersist#1066)"
+        );
+        assert_eq!(
+            l.engine_b
+                .read_blob_as(&root, &l.node_b, None)
+                .await
+                .expect("I1410: B still reads the DAG"),
+            plain
+        );
+    }
+
     /// **I779** — see the module doc.
     pub(crate) async fn i779_an_open_stream_epoch_waits_for_its_terminator<B>(
         dsn_a: &str,
@@ -1893,6 +1982,11 @@ pub(crate) mod bodies {
                     let Some((a, b)) = $dsn else { return };
                     i1406_a_takedown_between_the_adopt_pre_read_and_the_write(&a, &b, &run(), $pick)
                         .await
+                }
+                #[tokio::test]
+                async fn i1410() {
+                    let Some((a, b)) = $dsn else { return };
+                    i1410_a_holder_keeps_a_peers_room_dag_whole(&a, &b, &run(), $pick).await
                 }
                 #[tokio::test]
                 async fn i757() {

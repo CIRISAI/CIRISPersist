@@ -75,6 +75,17 @@ threat-model citations because this crate's audit story is the point.
   consumer-policy posture and awaits a ruling). Witness I1407 (sqlite,
   postgres); I513's control now signs its receipt row.
 
+- **CIRISPersist#1066** — investigated, not fixed in this cut. The premise
+  ("the room-chunk sweep never evicts adopted stream-keyed chunks on a
+  holder") is true, and it is not a chunk-only gap: the holder's community
+  sweep walks only the holder's OWN `(community, minter)` counter (#848), so a
+  peer-minted room DAG, its manifest AND its chunks, is retained on the holder
+  whole; `sweep_all_communities` does not even visit a room the holder holds
+  only peers' bindings for. Witness I1410 (sqlite, postgres) pins the
+  property that holds either way (a holder keeps or drops a peer's DAG whole,
+  never half) and the #848 policy as it stands. Holder-side retention of peer
+  content is a policy ruling, open on the issue.
+
 ### Evidence (slice A)
 
 - Four rows join `evidence/cc_impl.tsv` (from the manifest,
