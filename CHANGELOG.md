@@ -303,6 +303,10 @@ unchanged). Additive:
   code is unchanged), and the verdict prints a clean `-` when a `.secs` is
   missing. `certify_selfcheck.sh` case `no-secs` is red against the old
   reader. The verdict's exit codes are unchanged.
+- **Mutation (slice C).** `scope-601-fixes` adds `length_prefix` and
+  `try_receipt_signing_bytes` against I1411: 97 mutants, now four weekly
+  shards of <= 25. Shard 2/4, which holds the five new mutants: 25 mutants,
+  22 caught, 3 unviable, 0 missed.
 
 ### Evidence (CC ids)
 

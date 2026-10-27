@@ -373,7 +373,12 @@ did not fit its budget):
   locks), and #1006's signed receipt instant — against I1400–I1409, I754,
   I780–I783, I786, I788–I790, I153 and I513. 81 mutants: 64 caught, 17
   unviable, 0 missed in one round (two local shards; I787 killed nothing
-  and left the filter). Three shards of <= 27 on the weekly run.
+  and left the filter). Slice C adds #1132's delivery-receipt length rule
+  (`length_prefix`, `try_receipt_signing_bytes`) against I1411, the
+  allocation-free witness; I1412 stays out of the filter, since under a
+  surviving mutant it would copy a 4 GiB field. 97 mutants, four shards of
+  <= 25 on the weekly run; shard 2/4 (which holds all five new mutants):
+  25 mutants, 22 caught, 3 unviable, 0 missed, each new one killed by I1411.
 - `scope-601-asks.txt` (v60.1.0, slice B): the consumer asks — the accord
   threshold function and its roster read (#1117), the key-grant and
   `DimensionRejected` retryability predicates (#1064), the
