@@ -115,6 +115,14 @@ pub(crate) mod bodies {
             .live
     }
 
+    /// Does the projected ledger row carry `balance` as its balance? Matched
+    /// as the balance COLUMN (sqlite renders `…|7.25|…`, postgres
+    /// `"balance":7.25,`), never as a bare substring: `"3.5"` is inside an
+    /// instant like `…:43.572…`, which made I1166 a coin flip on the clock.
+    fn balance_is(row: &str, balance: &str) -> bool {
+        row.contains(&format!("|{balance}|")) || row.contains(&format!("\"balance\":{balance},"))
+    }
+
     // ── I1166 ─────────────────────────────────────────────────────────────
     pub(crate) async fn i1166_the_ledgers_are_this_nodes_rows<B>(b: &B, tag: &str)
     where
@@ -133,7 +141,7 @@ pub(crate) mod bodies {
         credits(b, &node, &alice, 12.5, Some(t0)).await;
         let rows = live(b, SiloProjection::CreditsLedger).await;
         assert_eq!(rows.len(), 1, "I1166: one key, one ledger row: {rows:?}");
-        assert!(rows[0].contains("12.5"), "I1166: the balance: {rows:?}");
+        assert!(balance_is(&rows[0], "12.5"), "I1166: the balance: {rows:?}");
 
         // A newer row on the key replaces the balance.
         let newer = credits(
@@ -147,7 +155,7 @@ pub(crate) mod bodies {
         let rows = live(b, SiloProjection::CreditsLedger).await;
         assert_eq!(rows.len(), 1);
         assert!(
-            rows[0].contains("7.25") && rows[0].contains(&newer),
+            balance_is(&rows[0], "7.25") && rows[0].contains(&newer),
             "I1166: {rows:?}"
         );
 
@@ -162,7 +170,7 @@ pub(crate) mod bodies {
         .await;
         let rows = live(b, SiloProjection::CreditsLedger).await;
         assert!(
-            rows[0].contains("7.25") && !rows[0].contains("3.5"),
+            balance_is(&rows[0], "7.25") && !balance_is(&rows[0], "3.5"),
             "I1166: the fold keeps the greatest signed instant: {rows:?}"
         );
 
@@ -171,7 +179,7 @@ pub(crate) mod bodies {
         assert!(b.get_attestation(&peers).await.unwrap().is_some());
         let rows = live(b, SiloProjection::CreditsLedger).await;
         assert!(
-            rows.len() == 1 && rows[0].contains("7.25") && !rows[0].contains("99.5"),
+            rows.len() == 1 && balance_is(&rows[0], "7.25") && !balance_is(&rows[0], "99.5"),
             "I1166: a peer's row never overwrites this node's balance: {rows:?}"
         );
 
@@ -199,7 +207,7 @@ pub(crate) mod bodies {
         // balance on the same contributor and cell.
         let rows = live(b, SiloProjection::CreditsLedger).await;
         assert!(
-            rows.len() == 1 && rows[0].contains("7.25"),
+            rows.len() == 1 && balance_is(&rows[0], "7.25"),
             "I1166: the credits balance stands beside the expertise: {rows:?}"
         );
         // A malformed body is held but never projected.
