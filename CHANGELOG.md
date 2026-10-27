@@ -102,6 +102,9 @@ threat-model citations because this crate's audit story is the point.
   postgres: withheld on A and on B by bundle, the reversal delivered to each
   serves and re-acks there, the post-window finalize skips the bytes, the
   immediate-removal re-publication).
+- **Mutation scope `scope-601-asks`** over the slice's new predicates
+  (#1117, #1064, #1120, #1113): 110 mutants, 99 caught, 11 unviable, 0
+  missed, four weekly shards (`.github/workflows/mutants.yml`).
 
 ## [60.0.0] - 2026-10-26
 
