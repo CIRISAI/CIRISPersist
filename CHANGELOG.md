@@ -75,6 +75,20 @@ threat-model citations because this crate's audit story is the point.
   consumer-policy posture and awaits a ruling). Witness I1407 (sqlite,
   postgres); I513's control now signs its receipt row.
 
+### Evidence (slice A)
+
+- Four rows join `evidence/cc_impl.tsv` (from the manifest,
+  `scripts/evidence_tsv.py write`; the exact-count pin 342 → 346):
+  CLM-custody-receipt (3.1.3.3) at `custody_ack.rs#signed_receipt_at`;
+  CLM-one-chunk-seal (5.3.3.2.5) at `chunk_dag_cascade.rs#holds_this_dek`;
+  CLM-one-tombstone-row (4.5.3) at `takedown_tombstone.rs#already_recorded`
+  and `steward_purge.rs#refuse_tombstoned_at_write`.
+
+### Mutation (slice A)
+
+- `scripts/mutants/scope-601-fixes.txt`: 81 mutants, 64 caught, 17
+  unviable, 0 missed; three weekly shards in `mutants.yml`.
+
 ## [60.0.0] - 2026-10-26
 
 An architecture cut (docs/V60_TASK_PLAN.md): signed attestations are the only

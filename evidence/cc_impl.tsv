@@ -167,6 +167,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.3.2	CLM-key-grant-rows	CIRISPersist	src/federation/key_grant.rs#project_key_grant_row	ciris-persist@60.0.0
 5.3.3.2.5	CLM-one-chunk-seal	CIRISPersist	src/federation/chunk_dag_cascade.rs#register_stream_epoch_dek	ciris-persist@60.0.0
 5.3.3.2.5	CLM-one-chunk-seal	CIRISPersist	src/federation/chunk_dag_cascade.rs#stream_epoch_verdict	ciris-persist@60.0.0
+5.3.3.2.5	CLM-one-chunk-seal	CIRISPersist	src/federation/chunk_dag_cascade.rs#holds_this_dek	ciris-persist@60.0.0
 3.4.5	CLM-config-self-or-owner-gate	CIRISPersist	src/federation/admission.rs#check_config_self_or_owner_admission	ciris-persist@60.0.0
 3.4.5.1	CLM-self-report-route	CIRISPersist	src/federation/admission.rs#check_config_sensitive_leaf_floor	ciris-persist@60.0.0
 3.4.5.1	CLM-self-report-route	CIRISPersist	src/federation/admission.rs#check_config_renewal_supersedes	ciris-persist@60.0.0
@@ -230,6 +231,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.1.3.3	CLM-custody-receipt	CIRISPersist	src/federation/holding_claim.rs#emit_holding_claim	ciris-persist@60.0.0
 3.1.3.3	CLM-custody-receipt	CIRISPersist	src/federation/holding_claim.rs#check_holding_claim_scope	ciris-persist@60.0.0
 3.1.3.3	CLM-custody-receipt	CIRISPersist	src/federation/custody_ack.rs#check_custody_withdraws_signer	ciris-persist@60.0.0
+3.1.3.3	CLM-custody-receipt	CIRISPersist	src/federation/custody_ack.rs#signed_receipt_at	ciris-persist@60.0.0
 3.2	CLM-public-community	CIRISPersist	src/federation/public_room.rs#check_public_room_conformance	ciris-persist@60.0.0
 3.2	CLM-public-community	CIRISPersist	src/federation/public_room.rs#check_community_listing_admission	ciris-persist@60.0.0
 4.5.3	CLM-one-tombstone-row	CIRISPersist	src/federation/takedown_tombstone.rs#takedown_tombstone	ciris-persist@60.0.0
@@ -237,6 +239,8 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 4.5.3	CLM-one-tombstone-row	CIRISPersist	src/federation/takedown_tombstone.rs#settles_at	ciris-persist@60.0.0
 4.5.3	CLM-one-tombstone-row	CIRISPersist	src/engine.rs#takedown_holder_action	ciris-persist@60.0.0
 4.5.3	CLM-one-tombstone-row	CIRISPersist	src/federation/steward_purge.rs#purge_rows	ciris-persist@60.0.0
+4.5.3	CLM-one-tombstone-row	CIRISPersist	src/federation/takedown_tombstone.rs#already_recorded	ciris-persist@60.0.0
+4.5.3	CLM-one-tombstone-row	CIRISPersist	src/federation/steward_purge.rs#refuse_tombstoned_at_write	ciris-persist@60.0.0
 2.4.1.1	CLM-derived-rows-follow-reason	CIRISPersist	src/federation/steward_purge.rs#resolve_selection	ciris-persist@60.0.0
 2.4.1.1	CLM-derived-rows-follow-reason	CIRISPersist	src/federation/steward_purge.rs#withhold_orphaned_derivatives	ciris-persist@60.0.0
 2.4.1.1	CLM-derived-rows-follow-reason	CIRISPersist	src/federation/takedown_tombstone.rs#takedown_tombstone	ciris-persist@60.0.0
