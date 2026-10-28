@@ -1,18 +1,18 @@
-# FSD: CIRISPersist v4.0 — Data Access Surface
+# FSD: CIRISPersist — Data Access Surface
 
-**Status:** Accepted — implemented in the v4.0.0 cut (commits A–I on `v4.0-das`). Pending CIRISConformance adversarial pass before tag. Note: the threat-model entries are **AV-57** (read-side escalation) + **AV-58** (write-side downgrade) — the earlier "AV-44/AV-45" labels collided with existing entries and were renumbered.
-**Author:** Eric Moore (CIRIS Team) with Claude Opus 4.7 / Opus 4.8
-**Created:** 2026-06-05
-**Repo:** `~/CIRISPersist`
-**Risk:** Cut release. Hard break — every consumer (CIRISLens, CIRISLensCore, sovereign-mode agent, CIRISBridge, CIRISNodeCore, sister repos) must update to the v4.0 API. No deprecation window, no aliases. Eric notifies the sisters and federation on cut; downstream PRs land against v4.0.
-**Upstream issues:** CIRISPersist#159 (`get_repository_statistics`), CIRISPersist#135 (attestation listing by target), CIRISPersist#150 (cohort_scope read-side honesty), CIRISLens#mock-routing-removal, CIRISEdge#48-A (consumer-side cohort_scope check).
-**Replaces / supersedes:** the v3.x ad-hoc surface of `list_*`, `aggregate_*`, scattered `Backend::fetch_*` methods, and the proposal in #159 to ship sqlite NotImplemented.
+**Status:** Implemented. The read surface lives under `src/ceg/` (re-exported through `crate::read` and the prelude), caller scoping under `src/scope/`, the cache under `src/cache/`; both backends. Threat-model entries: **AV-57** (read-side escalation) and **AV-58** (write-side downgrade).
+**Scope:** Every consumer (CIRISLens, CIRISLensCore, sovereign-mode agent, CIRISBridge, CIRISNodeCore) reads through this one surface.
+**Upstream issues:**
+
+
+ CIRISPersist#159 (`get_repository_statistics`), CIRISPersist#135 (attestation listing by target), CIRISPersist#150 (cohort_scope read-side honesty), CIRISLens#mock-routing-removal, CIRISEdge#48-A (consumer-side cohort_scope check).
+**Replaces:** an ad-hoc surface of per-consumer `list_*` / `aggregate_*` methods and scattered `Backend::fetch_*` methods, and the proposal in #159 to ship sqlite `NotImplemented`.
 
 ---
 
-## 0. TL;DR for reviewers
+## 0. Summary
 
-v4.0 reorganizes the persist read surface around four primitives — **CallerScope**, **Filter**, **Aggregate**, **Cache** — and reorganizes the module tree under topic-named CEG namespaces. Every read primitive becomes scope-aware; every aggregate becomes cache-aware; both backends implement everything in the same cut. The cut also ships the `federation_communities` substrate (V060) so the lens-trace community flow — agent + bootstrap servers form a community, lens-capable peers receive traces via `service_announcement` discovery (NodeCore SCHEMA §4.23) and edge `ServiceRequest` delivery — has end-to-end substrate support, not just a label. The driving consumer is CIRISLens' `get_repository_statistics` (#159), but the surface lands as a substrate-wide capability that any federation consumer — lens, bridge, node-core, sovereign-mode agent — uses identically. Edge backs persist as a second, independent enforcement layer for cohort_scope (CEG 0.10 §10.1.4 structural invisibility); persist refuses if edge fails open, edge refuses if persist fails open — defense in depth.
+The persist read surface is organized around four primitives — **CallerScope**, **Filter**, **Aggregate**, **Cache** — under topic-named CEG namespaces. Every read primitive is scope-aware; every aggregate is cache-aware; both backends implement everything. The `federation_communities` substrate (V060) means so the lens-trace community flow — agent + bootstrap servers form a community, lens-capable peers receive traces via `service_announcement` discovery (NodeCore SCHEMA §4.23) and edge `ServiceRequest` delivery — has end-to-end substrate support, not just a label. The driving consumer was CIRISLens' `get_repository_statistics` (#159); the surface is a substrate-wide capability that any federation consumer — lens, bridge, node-core, sovereign-mode agent — uses identically. Edge backs persist as a second, independent enforcement layer for cohort_scope (CEG 0.10 §10.1.4 structural invisibility); persist refuses if edge fails open, edge refuses if persist fails open — defense in depth.
 
 ---
 
@@ -20,13 +20,13 @@ v4.0 reorganizes the persist read surface around four primitives — **CallerSco
 
 ### 1.1 The driving observation
 
-The v3.x read surface (`src/read/`) grew per-consumer: `list_trace_summaries` for lens dashboards, `aggregate_scoring_factors` for Coherence Ratchet, `corpus_shape` for `scripts/corpus_shape.py`, `list_federation_keys` for federation observability. Each landed honestly — typed filter struct + cursor + page result. But three structural problems compounded as the surface grew:
+A read surface that grows per-consumer looks like this: `list_trace_summaries` for lens dashboards, `aggregate_scoring_factors` for Coherence Ratchet, `corpus_shape` for `scripts/corpus_shape.py`, `list_federation_keys` for federation observability. Each is honest — typed filter struct + cursor + page result — but three structural problems compound as such a surface grows:
 
-1. **Scope is implicit.** Every primitive returns everything the backing tables contain. CEG 0.10 §10.1.4 (structural-invisibility for `cohort_scope: self|family` content) is enforced *upstream* at CIRISEdge#48-A — a consumer-side check that filters at egress. The substrate has no first-class scope concept; if a consumer forgets to apply the cohort gate, persist returns the wrong rows. **A single substrate-side gate is missing.**
-2. **Aggregates are one-shot.** Every `aggregate_*` recomputes from the raw rows on every call. A Coherence Ratchet dashboard refreshing every 30s re-runs the same windowed scan against `trace_events`. v3.x has no cache primitive — a consumer either bolts on its own (lens does, via FastAPI middleware) or eats the cost.
-3. **Filtering is non-composable.** `TraceFilter`, `LlmCallFilter`, `AttestationFilter` are parallel structs with overlapping fields (`agent_id_hash`, `deployment_domain`, time windows). No shared filter primitive; no way to layer cohort_scope on top.
+1. **Scope is implicit.** If every primitive returns everything the backing tables contain, CEG §10.1.4 (structural invisibility for `cohort_scope: self|family` content) is enforced only *upstream* at CIRISEdge#48-A, a consumer-side egress check; a consumer that forgets the cohort gate gets the wrong rows. **The substrate needs its own gate** (§4).
+2. **Aggregates are one-shot.** Every `aggregate_*` recomputes from raw rows on every call; a Coherence Ratchet dashboard refreshing every 30s re-runs the same windowed scan. Without a cache primitive a consumer bolts on its own or eats the cost (§7).
+3. **Filtering is non-composable.** Parallel filter structs with overlapping fields (`agent_id_hash`, `deployment_domain`, time windows) and no shared primitive to layer cohort_scope on (§5).
 
-The #159 ask (`get_repository_statistics(filter, scope)`) makes all three structural problems visible in one call. Filter + scope + aggregate + cache — and the result feeds a UI that's repaint-sensitive. Fixing #159 in isolation papers over the structural shape. **Fixing the structural shape lets every future read primitive — and there will be more, the federation is young — slot in.**
+The #159 ask (`get_repository_statistics(filter, scope)`) exercises all three in one call: filter + scope + aggregate + cache, feeding a repaint-sensitive UI. Solving the structural shape lets every further read primitive slot in.
 
 ### 1.2 Alignment against MISSION.md
 
@@ -34,35 +34,35 @@ This is not feature-add; it's substrate-shape work. Each pillar:
 
 - **Mission (§1.1 — Justice + Integrity)** — A federation peer running on a Raspberry Pi or iPhone needs to query its own repository's statistics under the same scope discipline as a datacenter peer. The DAS is one shape across every deployment tier (§1.5 parity); the cache substrate makes "this peer cannot afford to re-aggregate on every dashboard repaint" not be the same as "this peer is degraded."
 - **Mission (§1.2 — N_eff measurement)** — Statistics and aggregates ARE the corpus measurement. `pass_rate`, `override_rate`, `fragile_trace_rate` are the numerators of ρ. If the aggregate substrate silently coerces (cache returns stale data without saying so; sample_count is elided when small; scope leaks suppressed content into an Unauthenticated caller) the measurement is corrupted at the load-bearing layer.
-- **Apophatic bound (§1.4 — not a columnar engine)** — The DAS is a *fixed*, named, query-shaped surface. Covering indexes (V042 lineage; V060 v4.0 cut adds scope predicates + `federation_communities`). It deliberately is not an OLAP layer — no ad-hoc SQL, no caller-composed projections, no JSONPath. Consumers pick a primitive; the substrate runs the named query.
+- **Apophatic bound (§1.4 — not a columnar engine)** — The DAS is a *fixed*, named, query-shaped surface. Covering indexes (V042 lineage; V060 adds scope predicates + `federation_communities`). It deliberately is not an OLAP layer — no ad-hoc SQL, no caller-composed projections, no JSONPath. Consumers pick a primitive; the substrate runs the named query.
 - **Relational fabric, not Cartesian gate (§1.7)** — `CallerScope::Authenticated { admission }` is *recorded admission*, not *adjudicated admission*. Identity, family memberships, and community memberships are resolved from `federation_identity_occurrences` / `federation_families` / `federation_communities` — what the chain has admitted — and the substrate applies them. The substrate doesn't decide who is "really" a peer, who is "really" in a family, or who is "really" in a community; it applies the policy the federation chain expresses.
 - **Fail-honest (§1.6)** — The cache substrate reports `cache_hit: bool` and `evaluated_at: i64` on every aggregate result. A stale read is *labelled stale*, not silently served. `sample_count` is on every aggregate — small-N is *labelled small*, never hidden. AV-43 k-anonymity is the consumer's policy; the substrate gives the consumer the count to enforce it.
-- **Parity (§1.5)** — Both backends implement every v4.0 primitive in the cut. SQLite uses correlated subqueries where Postgres uses a CTE. The shape of the answer is identical; the wall-clock differs. **No NotImplemented for sqlite.** This explicitly invalidates the v3-era proposal in #159's first draft to ship sqlite NotImplemented.
+- **Parity (§1.5)** — Both backends implement every primitive. SQLite uses correlated subqueries where Postgres uses a CTE. The shape of the answer is identical; the wall-clock differs. **No `NotImplemented` for sqlite.**
 
-### 1.3 Why a 4.0 (not a 3.15)
+### 1.3 The structural changes, taken together
 
-Six structural changes land together:
+Six structural changes make up the surface:
 
-1. **Module reorganization** — `src/read/` modules rehome under topic-named `src/ceg/` namespaces. Public paths change.
-2. **CallerScope** added to every CEG-protected read trait method. Trait signatures change.
-3. **Cache primitive** lands as a first-class substrate concept (`src/cache/`). New module.
-4. **Filter trait** replaces per-surface `*Filter` structs. Filter struct shapes change (back-compat-incompatible for callers building filters by struct-literal).
-5. **PyO3 method signatures** gain a `scope: str` parameter at every CEG-protected entry point. Python callers update at the call site.
-6. **The `prelude` reshapes** — re-exports follow the new module tree.
+1. **Module organization** — the read primitives live under topic-named `src/ceg/` namespaces.
+2. **CallerScope** on every CEG-protected read trait method.
+3. **Cache primitive** as a first-class substrate concept (`src/cache/`).
+4. **Filter trait** in place of unrelated per-surface `*Filter` structs.
+5. **PyO3 methods** take a `caller_occurrence_key_id` at every CEG-protected entry point (§11.2).
+6. **The `prelude`** re-exports follow the module tree.
 
-Each of these alone is a soft break the team has absorbed in a minor before. **All six together is a 4.0** — and the per-issue feedback (`feedback_clean_break_renames`, `feedback_rename_consistency`, `feedback_no_pg_only_no_deferral`) lines up: one cut, no aliases, internal+external renamed together, both backends implement everything. Eric explicitly directed "hard cut, just roll 4.0 and I will notify the sisters and federation to move."
+They are one change of API shape: no aliases, internal and external names change together, and both backends implement everything.
 
 ---
 
 ## 2. Scope
 
-### 2.1 In scope for v4.0 (the cut)
+### 2.1 In scope
 
 | Surface | Concrete deliverable |
 |---|---|
-| **Module reorg** | `src/read/{trace,task,llm,scoring,scrub,corpus,federation,types}.rs` → topic-named `src/ceg/{cohort_scope,identity,family,community,structural_invisibility,streaming,aggregates,list,types}/*.rs`; CEG version provenance lives in each module's header doc. `src/read/mod.rs` is removed in v4.0 |
+| **Module reorg** | `src/read/{trace,task,llm,scoring,scrub,corpus,federation,types}.rs` → topic-named `src/ceg/{cohort_scope,identity,family,community,structural_invisibility,streaming,aggregates,list,types}/*.rs`; CEG version provenance lives in each module's header doc. `src/read/mod.rs` remains as a one-line re-export of `crate::ceg` |
 | **CallerScope primitive** | `src/scope/caller.rs` — `CallerScope::{Unauthenticated, Authenticated { admission: CallerAdmission }}` enum. Two variants; the federation cohorts (self / family / community) are NOT enum variants — they are *admission resolutions* on the `Authenticated` caller's occurrence key |
-| **CallerAdmission** | `{ occurrence_key_id, identity_key_id, family_key_ids, community_key_ids }` — substrate-built by resolving the caller's occurrence key through `federation_identity_occurrences` (V059) + `federation_families` (V059) + `federation_communities` (V060 this cut). Never caller-asserted |
+| **CallerAdmission** | `{ occurrence_key_id, identity_key_id, family_key_ids, community_key_ids }` — substrate-built by resolving the caller's occurrence key through `federation_identity_occurrences` (V059) + `federation_families` (V059) + `federation_communities` (V060). Never caller-asserted |
 | **`federation_communities` substrate (V060)** | Analogous to `federation_families` (V059) but with §8.1.13.3 NO-suppression semantics. New table + `put_community` / `lookup_community` / `list_communities_for_member` trait methods on `FederationDirectory` |
 | **SQL helper** | `cohort_scope_sql_predicate(backend, table_alias, emitter_key_col, scope_col, &CallerScope) -> (String, Vec<Param>)` — emits the WHERE-fragment + JOIN clauses for identity / family / community admission. Postgres uses `EXISTS` against `federation_identity_occurrences` / `federation_families` / `federation_communities`; sqlite uses the same shape with json_each / json_extract |
 | **Filter trait** | `trait Filter` — composable over time windows, agent ids, deployment domains, cohort scope; concrete `RepositoryFilter`, `TraceFilter`, `LlmCallFilter`, `AttestationFilter` implement it |
@@ -73,28 +73,28 @@ Each of these alone is a soft break the team has absorbed in a minor before. **A
 | **`list_attestations_for`** | #135 + part of #150 — `(target_key_id, scope) → page` — substrate-side scope honesty |
 | **PyO3 v2 surface** | `Engine.get_repository_statistics(filter, scope)`, `Engine.list_attestations_for(target, scope)`, `Engine.cache_stats() → CacheStats` |
 | **Migration V060** | (a) `federation_communities` table — the §8.1.13.3 community substrate; (b) scope-aware covering indexes on `trace_events.cohort_scope`, `federation_attestations.cohort_scope` + emitter_key joins to `federation_identity_occurrences` / `federation_families` / `federation_communities` |
-| **THREAT_MODEL.md** | New AV-57 (scope-escalation via caller assertion) — mitigation: admission set built by substrate from `federation_keys`, never caller-asserted |
+| **THREAT_MODEL.md** | AV-57 (scope-escalation via caller assertion) — mitigation: admission set built by substrate from `federation_keys`, never caller-asserted |
 
-### 2.2 Out of scope for v4.0 (named, not deferred)
+### 2.2 Out of scope
 
 - **No distributed cache** — local-process LRU only. A federation peer wanting cross-node statistics builds it from per-node DAS calls. (Federation is the trust boundary; persist does not aggregate across peers.)
 - **No ad-hoc SQL** — DAS is the *fixed query set* per §1.4 apophatic bound. The substrate refuses to be a columnar engine.
 - **No caller-composed projections** — every primitive returns its named shape; no `SELECT only these fields`. Consumers receive the full named struct and pick the fields they want at their layer.
-- ~~**No write-path scope.**~~ **Reversed (CIRISPersist#160 review, comment 4):** v4.0 now closes the write-side too. The earlier "v4.0 is read-surface only" posture left AV-58 (write-side cohort_scope downgrade) as an open forge surface, which structurally collapses §9's defense-in-depth claim on the write side — edge's Layer 2 can only catch what Layer 1 missed, and with no Layer 1 on writes a downgraded `cohort_scope: federation` row is admissible to every Unauthenticated reader under the §4.3 predicate. Closing AV-57 by construction while leaving AV-58 open is asymmetric in a way the cut posture explicitly rejects.
+- **Write-path scope is in scope, not out** (CIRISPersist#160): a read-only gate would leave AV-58 (write-side cohort_scope downgrade) open, and §9's defense in depth needs a Layer 1 on writes too — with none, a downgraded `cohort_scope: federation` row is admissible to every Unauthenticated reader under the §4.3 predicate.
 
-  The fold is small (reviewer's split (a)): extend `DimensionAdmissionPolicy` (`src/federation/admission.rs`) with one cohort_scope predicate using the same `CallerAdmission` primitive `CallerScope::Authenticated` already carries. See §4.6 for shape. v4.0 lands as: AV-57 closed (read-side, §4.3), **AV-58 closed (write-side, §4.6)**, joint defense-in-depth complete on both sides.
+  `DimensionAdmissionPolicy` (`src/federation/admission.rs`) carries one cohort_scope predicate using the same `CallerAdmission` primitive `CallerScope::Authenticated` carries (§4.6). AV-57 is closed on the read side (§4.3), **AV-58 on the write side (§4.6)**.
 - **No third CallerScope variant.** `CallerScope` expresses *who is asking* (two variants: Unauthenticated, Authenticated). The CEG cohort vocabulary `{self, family, community, affiliations, species, biosphere, federation}` lives on *rows*, not on callers. A sovereign-mode agent is an `Authenticated` caller whose `CallerAdmission.identity_key_id` is its own identity and whose family/community sets reflect what the federation chain has admitted.
 
-- **No peer-capability table added by v4.0.** Peer capabilities are already first-class as the `service_announcement` Contribution subject_kind (NodeCore SCHEMA §4.23). Capability advertisement is a *routing* primitive (used by NodeCore + CIRISEdge to discover who to send what to); persist's CallerScope is a *visibility* primitive (admission to read what's already stored). The two are deliberately separate — capabilities don't appear in persist's read predicate.
+- **No peer-capability table.** Peer capabilities are already first-class as the `service_announcement` Contribution subject_kind (NodeCore SCHEMA §4.23). Capability advertisement is a *routing* primitive (used by NodeCore + CIRISEdge to discover who to send what to); persist's CallerScope is a *visibility* primitive (admission to read what's already stored). The two are deliberately separate — capabilities don't appear in persist's read predicate.
 
-### 2.3 Backend parity — both ship in the cut
+### 2.3 Backend parity
 
-Per MISSION.md §6 anti-pattern #4. Both backends implement every primitive in this FSD by v4.0 tag. Performance characteristics may differ:
+Per MISSION.md §6 anti-pattern #4, both backends implement every primitive in this FSD. Performance characteristics differ:
 
 - **Postgres** — single CTE for `get_repository_statistics`; covering index lookups on V060; ~5–15ms p50 for 7-day window on a 1M-trace tenant.
 - **SQLite** — correlated subqueries or a sequence of small queries combined in Rust; covering indexes shape the same; ~30–80ms p50 for the same window on the same tenant.
 
-Performance asymmetry is *characterized*, not labelled as a defect. A Raspberry Pi peer running SQLite gets honest 30–80ms statistics; that is a first-class deployment tier. The DAS spec includes a perf table in `docs/PUBLIC_SCHEMA_CONTRACT.md` (updated this cut).
+Performance asymmetry is *characterized*, not labelled as a defect. A Raspberry Pi peer running SQLite gets honest 30–80ms statistics; that is a first-class deployment tier. `docs/PUBLIC_SCHEMA_CONTRACT.md` carries the DAS perf table.
 
 ---
 
@@ -156,9 +156,9 @@ src/
 
 The topic subpath is documentation of subject area; the flat re-export is what consumers use. CEG version provenance lives in each module's header doc — `git log` answers "when did this land?"
 
-### 3.3 What moves where
+### 3.3 Where things live
 
-| v3.x location | v4.0 location |
+| Former `src/read/` location | Location |
 |---|---|
 | `src/read/trace.rs::TraceSummary, TraceDetail, …` | `src/ceg/list/traces.rs` |
 | `src/read/trace.rs::DivergenceRow, TemporalDriftRow, OverrideRateRow, HashChainGap` | `src/ceg/aggregates/scoring.rs` |
@@ -170,7 +170,7 @@ The topic subpath is documentation of subject area; the flat re-export is what c
 | `src/read/task.rs` | `src/ceg/list/tasks.rs` |
 | `src/read/types.rs::TimeWindow, TraceCursor, TraceFilter, DeviationMetric` | `src/ceg/types/{window,cursor,filter}.rs` |
 
-`src/read/mod.rs` is **removed** in v4.0. Consumers re-import from `ciris_persist::ceg::*` or `ciris_persist::prelude::*`. The `src/federation/` module is **not** moved — federation directory primitives (`federation_keys`, `federation_identity_occurrences`, `federation_families`, `federation_communities`) stay there; the `src/ceg/` namespace is the *read-surface* reorganization. `src/ceg/community/`, `src/ceg/family/`, `src/ceg/identity/` *consume* the federation substrate via trait methods, they don't replace it.
+`src/read/mod.rs` is a one-line re-export of `crate::ceg`; consumers import from `ciris_persist::ceg::*` or `ciris_persist::prelude::*`. The `src/federation/` module is **not** moved — federation directory primitives (`federation_keys`, `federation_identity_occurrences`, `federation_families`, `federation_communities`) stay there; the `src/ceg/` namespace is the *read-surface* reorganization. `src/ceg/community/`, `src/ceg/family/`, `src/ceg/identity/` *consume* the federation substrate via trait methods, they don't replace it.
 
 ---
 
@@ -226,7 +226,7 @@ pub struct CallerAdmission {
 
     /// Every community the caller's IDENTITY is a member of —
     /// resolved via list_communities_for_member(identity_key_id)
-    /// against federation_communities (V060 this cut).
+    /// against federation_communities (V060).
     /// Same identity-keys-as-members shape as families.
     pub community_key_ids: BTreeSet<KeyId>,
 }
@@ -303,7 +303,7 @@ OR (<scope_col> = 'community' AND <target_col> = ANY($reader_community_key_ids))
 
 **The lens-trace path.** An agent routes traces to its lens community by stamping `cohort_scope: community, cohort_target_id: <that community_key_id>` (its distribution policy's expression). A lens-capable peer in that community reads them because `<that community> ∈ reader.community_key_ids`. Persist never needs to know "lens" as a routing concept — routing happened upstream (NodeCore `service_announcement` discovery + Edge `ServiceRequest`); persist records the target the policy named and gates on the reader's membership in it.
 
-**Scope-tier coverage boundary (v4.0).** Precise target-membership gating is implemented for the three cohorts that have a membership substrate: **self** (`federation_identity_occurrences`, V059), **family** (`federation_families`, V059), **community** (`federation_communities`, V060). The broader belonging-scales `affiliations` / `species` / `biosphere` have **no membership substrate table** today, so they cannot be target-gated and are treated as broad-tier (authenticated-visible); `federation` is the genuinely-wide tier (also unauthenticated-visible). Adding target-membership for affiliations/species/biosphere is a noted follow-up gated on those cohorts getting substrate membership tables — named here, not silently dropped.
+**Scope-tier coverage boundary.** Precise target-membership gating is implemented for the three cohorts that have a membership substrate: **self** (`federation_identity_occurrences`, V059), **family** (`federation_families`, V059), **community** (`federation_communities`, V060). The broader belonging-scales `affiliations` / `species` / `biosphere` have **no membership substrate table** today, so they cannot be target-gated and are treated as broad-tier (authenticated-visible); `federation` is the genuinely-wide tier (also unauthenticated-visible). Adding target-membership for affiliations/species/biosphere is a noted follow-up gated on those cohorts getting substrate membership tables — named here, not silently dropped.
 
 ### 4.4 The singleton-identity fallback
 
@@ -315,12 +315,12 @@ This is the sovereign-mode posture in concrete form: no occurrence binding, no f
 
 The §4.3 predicate is JOIN-heavy. Two implementation choices:
 
-- **Path A (v4.0 default)** — query-time joins against `federation_identity_occurrences` / `federation_families` / `federation_communities`. Indexable on `(occurrence_key_id)` + `(identity_key_id)` + `(family_key_id)` + `(community_key_id)`. Correct, honest, slower on big tenants.
-- **Path B (v4.1+ perf cleanup)** — precomputed materialized projection: per-row `admitted_identity_key_id` denormalized at insert (substrate maintains alongside the row). Query-time becomes `WHERE admitted_identity_key_id = $caller_identity OR scope IN (...)`. Fast read; complicates writes; requires backfill at landing.
+- **Path A (implemented)** — query-time joins against `federation_identity_occurrences` / `federation_families` / `federation_communities`. Indexable on `(occurrence_key_id)` + `(identity_key_id)` + `(family_key_id)` + `(community_key_id)`. Correct, honest, slower on big tenants.
+- **Path B (not implemented)** — precomputed materialized projection: per-row `admitted_identity_key_id` denormalized at insert (substrate maintains alongside the row). Query-time becomes `WHERE admitted_identity_key_id = $caller_identity OR scope IN (...)`. Fast read; complicates writes; requires backfill at landing.
 
-v4.0 ships Path A. Path B is named-not-deferred per `feedback_no_pg_only_no_deferral` — tracked issue at v4.0 tag.
+Persist runs Path A. Path B is a possible performance step, not built.
 
-### 4.6 Write-path admission — AV-58 closure (v4.0)
+### 4.6 Write-path admission — AV-58 closure
 
 The same `CallerAdmission` primitive `CallerScope::Authenticated` carries on the read side admits a one-predicate extension on the write side. At write time, the writer's claimed cohort_scope must be consistent with what their admission permits emitting:
 
@@ -400,14 +400,14 @@ impl DimensionAdmissionPolicy {
 
 ### 4.7 Performance headroom — Path A vs Path B
 
-**Estimated perf headroom Path B leaves on the table** (so the v4.1 deferral is calibrated, not vague):
+**Estimated perf headroom of Path B:**
 
-| Backend | Path A (v4.0 ships) | Path B (v4.1+ deferred) |
+| Backend | Path A (implemented) | Path B (not implemented) |
 |---|---|---|
 | Postgres | 5–15 ms p50 (1M-trace 7d window) | sub-millisecond p50 (covering-index single fetch) |
 | SQLite | 30–80 ms p50 (same corpus) | 5–10 ms p50 (denormalized projection, single scan) |
 
-The lens dashboard refresh budget (15s) makes Path A non-blocking at v4.0 for current corpora. Path B's value scales with corpus size: at 10M+ traces, Path A's CTE-join becomes the dominant repaint cost; v4.1 timing is gated on when that crossover hits in production.
+The lens dashboard refresh budget (15s) makes Path A non-blocking for current corpora. Path B's value scales with corpus size: at 10M+ traces, Path A's CTE-join becomes the dominant repaint cost.
 
 ---
 
@@ -616,7 +616,7 @@ Test: `sample_count_top_level_vs_nested_documented` constructs a corpus with int
 
 ### 7.1 Why a substrate cache (not bolted on)
 
-Eric's directive: *"yeah we need a cache and the full cache mechanics, caching should be a generic persist capability."* Three reasons it's substrate-level, not per-consumer:
+Caching is a generic persist capability, with full cache mechanics. Three reasons it is substrate-level, not per-consumer:
 
 1. **One eviction policy** — a federation peer running lens + sovereign-agent + bridge in one cohabiting process has one cache, one memory budget, one eviction LRU.
 2. **One observability** — `cache_stats()` answers "what's hot in this peer's read path right now" across every consumer.
@@ -723,7 +723,7 @@ pub struct CacheKey { ... }
 - **Cache miss path is the only path to backend.** The DAS primitive checks cache → on miss, runs the SQL → stores result → returns. The path is uniform; per-primitive code is the SQL + result shape, not the caching dance.
 - **Eviction observable.** `cache_stats()` returns the struct above; cohabitation `Engine.cache_stats()` exposes it through PyO3.
 - **No write-through.** Cache is read-only side-effect of read primitives. Writes invalidate by **window-overlap bucket set**: every cached aggregate's key carries the *set* of buckets its `[window.start, window.end]` overlaps (not just the bucket of `window.end`). When a write lands at timestamp `t`, the cache evicts every entry whose bucket-set contains `bucket_of(t)`.
-  - **Correctness motivation (CIRISPersist#160 comment 2).** An earlier draft keyed only on `bucket_of(window.end)`. That was unsound for the case where `window` straddles a bucket boundary: window `[t-7d, t]` lives in bucket B (where `bucket_of(t) = B`), but a write at `t-1.5h` falls into bucket B-1 — yet that write IS inside the window and DOES change the aggregate's answer. v4.0 keys on the full overlap set so any write inside the window invalidates the entry.
+  - **Correctness motivation (CIRISPersist#160).** Keying only on `bucket_of(window.end)` would be unsound for the case where `window` straddles a bucket boundary: window `[t-7d, t]` lives in bucket B (where `bucket_of(t) = B`), but a write at `t-1.5h` falls into bucket B-1 — yet that write IS inside the window and DOES change the aggregate's answer. Persist keys on the full overlap set so any write inside the window invalidates the entry.
   - **Reverse index.** The cache maintains `bucket → set<CacheKey>` so write-invalidation is O(1) per bucket: on write at `t`, look up `bucket_of(t)`, evict every entry in that bucket's set.
   - **Trade-off.** Bigger windows touch more buckets and pay more invalidations per write. For repository-statistics over 7-day windows at 1h buckets, each entry occupies 168 buckets and a single write evicts ≤1 entry per affected window-key. Net: write-invalidation is bounded by `O(distinct_active_cache_keys)`, not by window size.
   - **Bucket granularity is a substrate setting**, not a per-call concern. Smaller bucket = tighter invalidation timing but more buckets per window-key; larger bucket = fewer buckets per window-key but coarser invalidation. Default 1h matches the Coherence Ratchet / lens dashboard refresh cadences.
@@ -737,7 +737,7 @@ The cache **never silently extends staleness**. If TTL fires and the backend is 
 
 `build_caller_admission(engine, occurrence_key_id)` issues ~3 backend reads per invocation (identity_occurrence lookup + family fan-out + community fan-out). For consumer hot paths — e.g. lens-core's `ScoresOracle::for_agent_window` in a relay handler — those reads dominate the resolution cost ahead of the substrate aggregate cache.
 
-v4.0 ships **both** mitigations (belt-and-suspenders):
+Persist ships **both** mitigations (belt-and-suspenders):
 
 ```rust
 // src/cache/admission.rs
@@ -948,7 +948,7 @@ pub trait ReadEngine: Send + Sync {
 
 ### 8.2 The `Error` enum sheds `NotImplemented`, gains structured `ScopeRefused`
 
-`Error::NotImplemented` was the v3.x escape hatch for sqlite-incomplete primitives. v4.0 ships both backends in the cut; the variant goes away. Backend-shape differences (Postgres CTE vs sqlite correlated subquery) are implementation details, not error states.
+The read `Error` has no `NotImplemented` variant: both backends implement every primitive. Backend-shape differences (Postgres CTE vs sqlite correlated subquery) are implementation details, not error states.
 
 `ScopeRefused` carries a structured reason — `&'static str` was insufficient because consumers (lens UI, audit dashboards, automated policy enforcement) need to distinguish *why* the scope refused: wrong identity vs no family membership vs no community membership vs boundary auth failure are different conditions with different consumer remediations.
 
@@ -965,7 +965,7 @@ pub enum Error {
     Backend(String),
 
     #[error("scope refused: {0}")]
-    ScopeRefused(#[from] ScopeRefusalReason),  // new in v4.0
+    ScopeRefused(#[from] ScopeRefusalReason),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, thiserror::Error)]
@@ -1009,7 +1009,7 @@ The `kind()` mapping drops `read_not_implemented` and adds `read_scope_refused`.
 
 ### 9.1 The two-layer enforcement
 
-Eric: *"defensive in depth with edge backing us up."*
+Defense in depth: CIRISEdge backs persist up.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -1024,7 +1024,7 @@ Eric: *"defensive in depth with edge backing us up."*
 │                       │                                      │
 │                       ▼                                      │
 │  ┌──────────────────────────────────────────────┐           │
-│  │ CIRISPersist v4.0 DAS                         │ ← layer 1 │
+│  │ CIRISPersist DAS                              │ ← layer 1 │
 │  │ Substrate cohort_scope predicate. Refuses    │           │
 │  │ suppressed content at SQL level. Telemetry:   │           │
 │  │ persist_refused_scope.                        │           │
@@ -1071,7 +1071,7 @@ The cut now closes both forge surfaces by the same construction discipline:
 | Layer 2 (edge) | CIRISEdge#48-A — consumer-side cohort_scope re-check at egress | Edge pre-ingest verification — writer's claimed scope matches the routing they used |
 | Closed by construction | `CallerAdmission` private constructor + substrate-only builder | Writer admission resolved from the verified envelope signer; no caller-asserted scope label trusted |
 
-With both sides closed, defense in depth is uniform. v4.0 doesn't leave one half of the asymmetry open.
+With both sides closed, defense in depth is uniform; neither half of the asymmetry is left open.
 
 ---
 
@@ -1090,7 +1090,7 @@ With both sides closed, defense in depth is uniform. v4.0 doesn't leave one half
 - `list_attestations_for` — same index, sqlite syntax.
 - **No NotImplemented.** Wall-clock differs; correctness identical.
 
-### 10.3 Substrate methods landing in this cut
+### 10.3 Community substrate methods
 
 `federation_communities` substrate (V060) requires four new trait methods on `FederationDirectory` (symmetric with V059 family methods at `src/federation/mod.rs:344-380`):
 
@@ -1100,11 +1100,11 @@ async fn lookup_community(&self, community_key_id: &str) -> Result<Option<Commun
 async fn list_communities_for_member(&self, member_identity_key_id: &str) -> Result<Vec<Community>, Error>;
 ```
 
-Both backends implement these in Commit D (§15) alongside the rest of the v4.0 break. The shape mirrors family ones one-for-one; the difference is the `cohort_scope::suppresses_holds_bytes` classification (false for community, true for family) — read paths apply the predicate accordingly.
+Both backends implement these. The shape mirrors family ones one-for-one; the difference is the `cohort_scope::suppresses_holds_bytes` classification (false for community, true for family) — read paths apply the predicate accordingly.
 
 ### 10.4 Parity conformance suite
 
-`tests/ceg/parity.rs` runs every v4.0 primitive against both backends with identical input and asserts byte-equal output (modulo `evaluated_at_unix_ms` which differs per run). The suite is per-primitive × per-scope × per-backend = `N_primitives × 3 × 2` matrix; new primitives add a row.
+`tests/ceg/parity.rs` runs every DAS primitive against both backends with identical input and asserts byte-equal output (modulo `evaluated_at_unix_ms` which differs per run). The suite is per-primitive × per-scope × per-backend = `N_primitives × 3 × 2` matrix; new primitives add a row.
 
 ---
 
@@ -1150,7 +1150,7 @@ Python passes a *caller occurrence key id* — `None` means `Unauthenticated`, `
 
 1. Resolves `occurrence_key_id → identity_key_id` via `lookup_identity_for_occurrence` (V059 §5.6.8.8). Singleton-identity fallback (§4.4) when no binding exists.
 2. Resolves `identity_key_id → family_key_ids` via `list_families_for_member` (V059 §5.6.8.9).
-3. Resolves `identity_key_id → community_key_ids` via `list_communities_for_member` (V060 this cut).
+3. Resolves `identity_key_id → community_key_ids` via `list_communities_for_member` (V060).
 
 **Python NEVER passes admission fields.** No scope-string parameter; the variant is determined by whether the occurrence key is present. The AV-57 forge surface is closed by construction — there's no admission field a caller can lie about, and no string label to mislabel.
 
@@ -1162,19 +1162,19 @@ Python passes a *caller occurrence key id* — `None` means `Unauthenticated`, `
 
 ## 12. Migration V060
 
-V057 is already taken (peer_metadata_cohort_scope_index, v3.9.x); V058–V059 are the v3.11/v3.12 cuts. V060 is the next free number and lands as the v4.0 DAS migration. **Three** concerns in one numbered cut: (A) `federation_communities` substrate, (B) `trace_events.cohort_scope` column, (C) DAS covering indexes.
+V060 is the DAS migration (V057 is peer_metadata_cohort_scope_index; V058–V059 precede it). **Three** concerns in one migration: (A) `federation_communities` substrate, (B) `trace_events.cohort_scope` column, (C) DAS covering indexes.
 
-### 12.0 Schema-reconciliation notes (Barrier-1 findings, CIRISPersist#160 implementation)
+### 12.0 Schema-reconciliation notes (CIRISPersist#160)
 
-Two facts the FSD's first draft got wrong about the real schema, corrected here:
+Two facts about the real schema that shape V060:
 
-1. **`trace_events` had no `cohort_scope` column.** The first draft's Part-B trace index referenced a column that didn't exist. Per the #160 trace-scope decision (add cohort_scope to the trace corpus, so the §9 community-lens flow gates at trace-read), Part B(i) below now *creates* **two** columns:
+1. **`trace_events` had no `cohort_scope` column before V060.** Per the #160 trace-scope decision (add cohort_scope to the trace corpus, so the §9 community-lens flow gates at trace-read), Part B(i) below now *creates* **two** columns:
    - `cohort_scope TEXT NOT NULL DEFAULT 'federation'` + closed-set CHECK, mirroring V056's discipline for `federation_attestations`.
    - `cohort_target_id TEXT` (nullable) — the §4.3 scope **target**: the `family_id`/`community_id` the producer policy routed the trace to, or (for `self`) the owner identity the substrate resolves from the verified signer at write. NULL for the broad belonging-tiers.
 
-   **Default `'federation'` + NULL target is backward-compat-safe**: existing trace rows predate any scope and are federation-visible today, so the default preserves current behavior. The trace wire format gains **optional** `cohort_scope` + `cohort_target_id` envelope fields (serde default / `skip_serializing_if`) so existing trace canonical bytes / signatures are unchanged (MISSION §3 byte-exactness preserved); producers that omit them ride the default. The substrate **resolves and stamps** the `self` target from the verified `scrub_key_id` (never trusting a caller-supplied self-target), and the write-gate (§4.6) verifies the writer is a member of any family/community target it stamps. **Producer adoption** (CIRISAgent emitting per-trace `cohort_scope` + target) is a tracked cross-repo follow-up; until then all traces are `'federation'`. The columns + predicate + optional fields ship in v4.0 so the substrate is ready the moment producers adopt.
+   **Default `'federation'` + NULL target is backward-compat-safe**: rows written before the column existed predate any scope and are federation-visible, so the default preserves their behaviour. The trace wire format gains **optional** `cohort_scope` + `cohort_target_id` envelope fields (serde default / `skip_serializing_if`) so existing trace canonical bytes / signatures are unchanged (MISSION §3 byte-exactness preserved); producers that omit them ride the default. The substrate **resolves and stamps** the `self` target from the verified `scrub_key_id` (never trusting a caller-supplied self-target), and the write-gate (§4.6) verifies the writer is a member of any family/community target it stamps. **Producer adoption** (CIRISAgent emitting per-trace `cohort_scope` + target) is a cross-repo concern; a trace that omits the fields is `'federation'`.
 
-2. **`federation_attestations` real columns differ from the first draft.** It has no `subject_key_id` / `asserter_key_id` / `attestation_kind` columns; the real target column is `attested_key_id` (V055 also added a plural `subject_key_ids` JSONB array), and the emitter column is `scrub_key_id`. The Part-B attestation indexes below use the real columns.
+2. **`federation_attestations` real columns.** It has no `subject_key_id` / `asserter_key_id` / `attestation_kind` columns; the real target column is `attested_key_id` (V055 also added a plural `subject_key_ids` JSONB array), and the emitter column is `scrub_key_id`. The Part-B attestation indexes below use the real columns.
 
 Two concerns mirror the V059 dual-substrate pattern; the trace-column addition is the third:
 
@@ -1294,7 +1294,7 @@ A caller presenting an `occurrence_key_id` they don't actually control is a sepa
 
 ## 14. Test discipline
 
-Per MISSION.md §5 — every test answers a mission question. v4.0 adds:
+Per MISSION.md §5 — every test answers a mission question:
 
 | Category | Test |
 |---|---|
@@ -1318,69 +1318,57 @@ Per MISSION.md §5 — every test answers a mission question. v4.0 adds:
 
 ---
 
-## 15. Cut sequence — logical commits inside one tagged release
+## 15. Construction order
 
-Per §16.4 the v4.0 cut is **one big break** — there are no separately landing PRs ahead of v4.0.0. The cut lands as a single tagged release on `main`. The substeps below are reviewable *commits within that cut*, ordered for review legibility (each commit could in principle be reverted to the prior state and still build / test green):
+The surface is built in this dependency order; each step builds and tests green on its own:
 
-1. **Commit A — module reorganization** (no behavior change): move `src/read/*` → `src/ceg/*` under the topic-named namespaces; update internal call sites. Façade re-exports preserve current public API at this commit. Tests pass unchanged.
-2. **Commit B — CallerScope + admission + SQL helper** (additive): `src/scope/` lands with `CallerScope`, `CallerAdmission`, `build_caller_admission`, `cohort_scope_sql_predicate`. New types; not yet wired into trait methods. Unit tests for the predicate per scope × per backend.
-3. **Commit C — Cache primitive** (additive): `src/cache/` lands; `CacheConfig::default_for_tier`; admission cache (§7.5); `Engine.cache_stats()` exposed. No aggregates use it yet.
-4. **Commit D — `federation_communities` substrate**: V060 migration Part A; `put_community` / `lookup_community` / `list_communities_for_member` on `FederationDirectory`; both backend implementations; parity tests.
-5. **Commit E — `ReadEngine` v2 trait** (the read-side break): adds `scope` to every read method, drops `Error::NotImplemented`, adds `Error::ScopeRefused(ScopeRefusalReason)`; both backends implement every primitive; PyO3 surface updates.
-6. **Commit F — write-path admission (AV-58 closure)**: extends `DimensionAdmissionPolicy` with `check_write_cohort_scope` (§4.6); wired into `Engine::receive_and_persist`, `put_attestation`, `put_revocation`, `put_takedown_notice`. Tests: write-side forge attempts refused (downgrade attempt → `ScopeRefusalReason`). Closes AV-58 candidate; joint `cohort_scope_write_double_miss_total` observable.
-7. **Commit G — `get_repository_statistics`**: the #159 primitive, both backends, scope-gated, cache-aware. V060 migration Part B (DAS covering indexes).
-8. **Commit H — `list_attestations_for`**: #135 + part of #150.
-9. **Commit I — docs**: MISSION.md cross-references, PUBLIC_SCHEMA_CONTRACT.md update, THREAT_MODEL.md AV-57 + AV-58 (both closed in v4.0), this FSD marked Accepted.
+1. **Module organization** — the read primitives under the topic-named `src/ceg/` namespaces, with the `crate::read` re-export.
+2. **CallerScope + admission + SQL helper** — `src/scope/`: `CallerScope`, `CallerAdmission`, `build_caller_admission`, `cohort_scope_sql_predicate`, with predicate unit tests per scope × per backend.
+3. **Cache primitive** — `src/cache/`, `CacheConfig::default_for_tier`, the admission cache (§7.5), `Engine.cache_stats()`.
+4. **`federation_communities` substrate** — V060 Part A; `put_community` / `lookup_community` / `list_communities_for_member` on `FederationDirectory`; both backends; parity tests.
+5. **`ReadEngine` with scope** — `scope` on every read method; no `NotImplemented`; `Error::ScopeRefused(ScopeRefusalReason)`; both backends; PyO3.
+6. **Write-path admission (AV-58)** — `check_write_cohort_scope` (§4.6) wired into `Engine::receive_and_persist`, `put_attestation`, `put_revocation`, `put_takedown_notice`; downgrade attempts refused with a `ScopeRefusalReason`; the joint `cohort_scope_write_double_miss_total` observable.
+7. **`get_repository_statistics`** — the #159 primitive, both backends, scope-gated, cache-aware; V060 Part B (DAS covering indexes).
+8. **`list_attestations_for`** — #135 + part of #150.
+9. **Docs** — MISSION.md cross-references, `PUBLIC_SCHEMA_CONTRACT.md`, THREAT_MODEL.md AV-57 + AV-58.
 
-The whole sequence lands in one PR against `main`, tagged v4.0.0. The commit-axis review is for legibility (reviewer can walk commit-by-commit); the break is at Commit E (read-side trait) + Commit F (write-side admission extension). Eric notifies sisters and federation when the tag publishes.
+### 15.5 Consumer adoption order (CIRISPersist#160)
 
-### 15.5 Consumer migration order (CIRISPersist#160 comment 1 ask)
+Sister repos that consume the read or write surface adopt in this order:
 
-The v4.0 tag triggers a documented consumer-update cascade. Sister repos that consume persist's read or write surface coordinate against this sequence:
+| Step | Repo | Notes |
+|---|---|---|
+| 1 | CIRISLensCore | Adopts the `ceg::*` import paths; `ScoresOracle::{for_trace, for_agent_window, detector_history}` take `scope`; its error mapping carries `ScopeRefused { reason: ScopeRefusalReason }`. Internal-only aggregate callers use the `*_internal` siblings (§8.1). |
+| 2 | CIRISEdge | Consumer-side §48-A read check + write-side pre-ingest verification (§9.3); the joint `_double_miss` counters. |
+| 3 | CIRISLensCore | Node UX read endpoints with the `caller_occurrence_key_id` PyO3 contract (CIRISLensCore#15). |
+| 4 | CIRISBridge / CIRISNodeCore | Bridge consumes lens-core, not persist directly; NodeCore has no `scope`-aware reads in its hot path. |
+| 5 | CIRISConformance | Records the cohabitation pin set as its baseline. |
 
-| Step | Repo | Bump | Notes |
-|---|---|---|---|
-| 0 | CIRISPersist | tag `v4.0.0` | Wheel + crate publish |
-| 1 | CIRISLensCore | `v0.5.0` | Cohabitation pin v3.14.3 → v4.0; adopt `ceg::*` import paths; `ScoresOracle::{for_trace, for_agent_window, detector_history}` gain `scope` parameter; error-mapping in `src/scoring/result.rs` extends with `ScopeRefused { reason: ScopeRefusalReason }`. PyO3 surface unchanged at v0.5.0 (lens-core's read-API endpoints land at v0.6.0 with CIRISLensCore#15). Internal-only aggregate callers migrate to `*_internal` siblings per §8.1. |
-| 2 | CIRISEdge | follow-up release | Consumer-side §48-A read check + write-side pre-ingest verification (§9.3). The joint `_double_miss` counters land here. |
-| 3 | CIRISLensCore | `v0.6.0` | Node UX read endpoints with `caller_occurrence_key_id` PyO3 contract (CIRISLensCore#15 close). |
-| 4 | CIRISBridge / CIRISNodeCore | bumps as needed | Bridge consumes lens-core, not persist directly. NodeCore's persist consumption (audit chain + federation directory) is internal; no `scope`-aware reads in NodeCore's hot path. |
-| 5 | CIRISConformance | matrix bump | Records the v4.0 + v0.5 + v0.6 cohabitation pin sets as the new baseline. |
-
-**Where calibration_bundles lands post-reorg** (per lens-core's specific ask): the `derived/` substrate is NOT part of the `ceg/` read-surface reorganization. `src/derived/{mod,types}.rs` and `DerivedSchema::{put_calibration_bundle, get_current_calibration_bundle, get_calibration_bundle_by_version}` keep their current paths. The `ceg/` namespace is for read primitives that take a `CallerScope`; the derived-schema substrate is consumer-facing write+read surface for calibration artifacts and stays where it is. Lens-core's `derived::{CalibrationBundle, CohortCentroid, ProjectionMetadata, Standardization}` imports do not change in v4.0.
+**`derived/` is not part of the `ceg/` read surface.** `src/derived/{mod,types}.rs` and `DerivedSchema::{put_calibration_bundle, get_current_calibration_bundle, get_calibration_bundle_by_version}` are the consumer-facing write+read surface for calibration artifacts, and lens-core's `derived::{CalibrationBundle, CohortCentroid, ProjectionMetadata, Standardization}` imports are unaffected by the `ceg/` organization.
 
 ---
 
-## 16. Open questions for sign-off
-
-These are the points where I want explicit user confirmation before the v4.0 cut PR lands:
-
-**Locked (Eric, 2026-06-05):**
+## 16. Design decisions
 
 1. **CEG namespace granularity** — topic-only (`src/ceg/cohort_scope/`, `src/ceg/identity/`, `src/ceg/community/`, `src/ceg/structural_invisibility/`, `src/ceg/streaming/`); CEG version provenance documented in each module's header doc.
-2. **Cache TTL default** — 30s for aggregates, per-primitive override available.
-3. **CallerScope shape** — two variants, `Unauthenticated` and `Authenticated { admission: CallerAdmission }`. `CallerAdmission` resolves the caller's `occurrence_key_id` through `federation_identity_occurrences` (identity) + `federation_families` (V059) + `federation_communities` (V060 this cut). Self / family / community are admission resolutions, not enum variants. Sovereign-mode is the singleton-identity fallback (§4.4).
-4. **One big cut break** — the v4.0 cut lands as a single PR against `main`; §15 substeps are commits within that PR, ordered for review legibility (Commit A is the module reorg, Commit E is the read-side break, Commit F is the write-side break). No separately-landing PRs.
-5. **Rollout** — tag v4.0.0 → wheel artifacts publish → Eric notifies sisters/federation → consumer PRs land per §15.5. No staging cut.
-6. **No scope-string at PyO3 boundary.** Removed entirely. The PyO3 surface takes `caller_occurrence_key_id: Optional[str]`; `None` → Unauthenticated, `Some(key)` → Authenticated with substrate-resolved admission. No admission fields cross the boundary; no string label a caller can lie about; AV-57 forge surface closed by construction.
-7. **`federation_communities` ships in v4.0 (Option 1).** V060 migration + symmetric `put_community` / `lookup_community` / `list_communities_for_member` substrate methods. Closes the gap that would otherwise leave the lens-trace community flow theoretical until v4.1.
-8. **Peer capabilities** — NOT added by v4.0. Already first-class as the `service_announcement` Contribution subject_kind (NodeCore SCHEMA §4.23). Capabilities are routing, not scoping; persist doesn't need to model them at the read predicate.
-9. **Write-side scope folds into v4.0 (CIRISPersist#160 comment 4).** AV-57 + AV-58 close together. `DimensionAdmissionPolicy::check_write_cohort_scope` (§4.6) enforced at every write path carrying a cohort_scope label. Symmetric defense in depth (§9.4) on both sides.
-10. **Admission cache (CIRISPersist#160 comment 3).** Substrate-side default-on with 5-min TTL + chain-write invalidation; consumers SHOULD also reuse `CallerAdmission` across logical sessions. Belt-and-suspenders bounding of resolution overhead.
-11. **Cache window-overlap correctness (CIRISPersist#160 comment 2).** Cache keys carry the full set of buckets `[window.start, window.end]` overlaps, not just `bucket_of(window.end)`. A write inside any cached entry's window invalidates that entry regardless of which bucket the write timestamp falls in.
-12. **Consumer migration order (CIRISPersist#160 comment 1).** §15.5 names the v4.0 → lens-core v0.5 → edge → lens-core v0.6 → bridge/node-core sequence. `src/derived/` is NOT moved by the reorg; calibration_bundles paths stay at `derived::*`.
+2. **Cache TTL default** — 30s for aggregates, with per-primitive override.
+3. **CallerScope shape** — two variants, `Unauthenticated` and `Authenticated { admission: CallerAdmission }`. `CallerAdmission` resolves the caller's `occurrence_key_id` through `federation_identity_occurrences` (identity) + `federation_families` (V059) + `federation_communities` (V060). Self / family / community are admission resolutions, not enum variants. Sovereign mode is the singleton-identity fallback (§4.4).
+4. **One change of API shape** — no aliases, no deprecation window.
+5. **No scope string at the PyO3 boundary.** The PyO3 surface takes `caller_occurrence_key_id: Optional[str]`; `None` → Unauthenticated, `Some(key)` → Authenticated with substrate-resolved admission. No admission fields cross the boundary and there is no label a caller can lie about; the AV-57 forge surface is closed by construction.
+6. **`federation_communities` is part of the surface.** V060 + `put_community` / `lookup_community` / `list_communities_for_member`, so the lens-trace community flow is real, not theoretical.
+7. **Peer capabilities are not modelled here.** They are the `service_announcement` Contribution subject_kind (NodeCore SCHEMA §4.23): routing, not scoping.
+8. **Write-side scope** — `DimensionAdmissionPolicy::check_write_cohort_scope` (§4.6) at every write path carrying a cohort_scope label; AV-57 and AV-58 closed together; symmetric defense in depth (§9.4).
+9. **Admission cache** — substrate-side, default on, 5-minute TTL + chain-write invalidation; consumers SHOULD also reuse `CallerAdmission` across logical sessions (§7.5).
+10. **Cache window-overlap correctness** — cache keys carry every bucket `[window.start, window.end]` overlaps; a write inside any cached entry's window invalidates it (§7.3).
+11. **`src/derived/` stays where it is** (§15.5).
 
 ---
 
-## 17. Out-of-scope-but-tracked
+## 17. Not implemented, and refused
 
-Per `feedback_no_pg_only_no_deferral` — anything named here gets a tracked issue, not a "deferred" label:
-
-- **v4.1 — Path B perf cleanup.** Precomputed `admitted_identity_key_id` denormalization on hot tables, eliminating the query-time identity-occurrence join. Tracked: opened on v4.0 tag.
-- **v4.x — Cross-process / cross-node cache coordination.** Out of scope (federation is the trust boundary; persist is local). Issue not opened; documented here as "deliberately not pursued."
-- **v4.x — Ad-hoc query surface.** Refused per §1.4 apophatic bound. Not tracked; this is a "no" with a reason.
-
-(Earlier draft listed "v4.1 sovereign-mode scope semantics" — removed: sovereign-mode is the singleton-identity fallback in §4.4, no enum work needed. Earlier draft also flagged a "capability advertisement primitive" gap — also removed: peer capabilities are first-class as `service_announcement` Contributions per NodeCore SCHEMA §4.23, and they're a routing concern, not a substrate visibility concern. Earlier draft deferred "v4.1 write-path scope (AV-58 candidate)" — also removed per CIRISPersist#160 comment 4: write-side admission folds into v4.0 (Commit F, §4.6), closing AV-57 + AV-58 together as a single cohesive cut.)
+- **Path B perf step** (§4.5, §4.7) — a precomputed `admitted_identity_key_id` denormalization on hot tables, removing the query-time identity-occurrence join. Not implemented; no tracking issue.
+- **Cross-process / cross-node cache coordination** — deliberately not pursued: federation is the trust boundary and persist's cache is local; TTL bounds staleness across processes.
+- **Ad-hoc query surface** — refused per the §1.4 apophatic bound.
 
 ---
 
@@ -1389,20 +1377,17 @@ Per `feedback_no_pg_only_no_deferral` — anything named here gets a tracked iss
 - **`MISSION.md` §1.5** — backend parity (load-bearing for §2.3 of this FSD)
 - **`MISSION.md` §1.6** — fail-honest (load-bearing for §6.1 + §7.4)
 - **`MISSION.md` §1.7** — relational fabric (load-bearing for §4.2)
-- **`MISSION.md` §6 anti-pattern #4** — no PG-only / no deferred (the discipline that invalidates the #159 first draft)
+- **`MISSION.md` §6 anti-pattern #4** — no PG-only / no deferred surface (why #159 does not ship sqlite `NotImplemented`)
 - **`MISSION.md` §6 anti-pattern #10** — storing trust ≠ conferring trust (load-bearing for §4.2)
-- **CEG 0.10 §10.1.4** — structural invisibility (load-bearing for §4.3)
-- **CEG 0.10 §8.1.13.3** — community non-suppression (load-bearing for `federation_communities` shipping in v4.0 without suppression bits)
-- **NodeCore SCHEMA §4.23** — `service_announcement` Contribution subject_kind — the routing-side counterpart to persist's visibility-side scoping (validates that capability advertisement is upstream of substrate, not part of v4.0)
-- **`docs/THREAT_MODEL.md`** — AV-43 (k-anonymity), new AV-57 (scope escalation)
-- **`docs/PUBLIC_SCHEMA_CONTRACT.md`** — v4.0 update names the DAS perf table
-- **CIRISPersist#159** — the driving #159 issue; this FSD supersedes its sqlite-NotImplemented proposal
-- **CIRISPersist#135** — `list_attestations_for` ask (closed by Commit G)
-- **CIRISPersist#150** — read-side cohort_scope honesty (partial close by §4.3 + Commit E)
-- **CIRISPersist#160** — external Opus 4.7 FSD review (this revision addresses all 7 concerns + 3 nits; close on v4.0 tag)
+- **CEG §10.1.4** — structural invisibility (load-bearing for §4.3)
+- **CEG §8.1.13.3** — community non-suppression (why `federation_communities` carries no suppression bits)
+- **NodeCore SCHEMA §4.23** — `service_announcement` Contribution subject_kind — the routing-side counterpart to persist's visibility-side scoping (capability advertisement is upstream of the substrate)
+- **`docs/THREAT_MODEL.md`** — AV-43 (k-anonymity), AV-57 (scope escalation), AV-58 (write-side downgrade)
+- **`docs/PUBLIC_SCHEMA_CONTRACT.md`** — the DAS perf table
+- **CIRISPersist#159** — the driving issue (`get_repository_statistics`)
+- **CIRISPersist#135** — `list_attestations_for`
+- **CIRISPersist#150** — read-side cohort_scope honesty (§4.3)
+- **CIRISPersist#160** — design review of this surface (write-side scope, cache window overlap, admission cache, consumer order)
 - **CIRISEdge#48-A** — consumer-side cohort_scope check (the §9 layer-2 partner)
 - **`FSD/CIRIS_PERSIST.md`** — the base substrate FSD
-- **`FSD/V0_5_0_FEDERATION_READ_PRIMITIVES.md`** — v0.5 read-primitive precedent
-- **`feedback_clean_break_renames`** — discipline applied to §1.3
-- **`feedback_rename_consistency`** — discipline applied to §2.1 PyO3 + Filter renames in one cut
-- **`feedback_no_pg_only_no_deferral`** — discipline applied to §2.3 + §17
+- **`FSD/V0_5_0_FEDERATION_READ_PRIMITIVES.md`** — the read primitives this surface scopes

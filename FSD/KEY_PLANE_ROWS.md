@@ -1,8 +1,8 @@
 # The key plane as rows: id domains and admission rules
 
-Status: shipped in v58.0.0 (CIRISPersist#991, CC 3.1.3 / 3.3.6 / 2.4.1.1,
-`CLM-planes-as-rows`); carrier added in v59.0.0 (CIRISPersist#1104, CC 3.1.5
-rc9 `c901645`, `CLM-occurrence-revocation-carrier`). Code:
+Status: implemented (CIRISPersist#991, CC 3.1.3 / 3.3.6 / 2.4.1.1,
+`CLM-planes-as-rows`; the carrier: CIRISPersist#1104, CC 3.1.5,
+`CLM-occurrence-revocation-carrier`). Code:
 `src/federation/key_plane.rs`, `src/federation/occurrence_revocation_carrier.rs`.
 
 This page is for a second implementation. It must derive the same row ids and
@@ -29,7 +29,7 @@ column that differs, as `federation_malformed_row` / `typed_diverges_from_envelo
 
 | dimension | member | score | id domain | attester | admitted when |
 |---|---|---|---|---|---|
-| `key:record:v1` | `key_record` | +1 | `ciris:key:record:v1:` | the key | proof of possession over the registration envelope (and, from v59, the key id ends in `-<fp>`, CC 2.6.8) |
+| `key:record:v1` | `key_record` | +1 | `ciris:key:record:v1:` | the key | proof of possession over the registration envelope (and the key id ends in `-<fp>`, CC 2.6.8) |
 | `key:revocation:v1` | `revocation` | −1 | `ciris:key:revocation:v1:` | the revoker | hybrid signature over the revocation envelope; never withdrawn |
 | `identity:occurrence:v1` | `identity_occurrence` | +1 | `ciris:identity:occurrence:v1:` | the occurrence's signer | `signer_acts_for` (for a user self, the two-path roster door, CC 3.3.6.3) |
 | `identity:occurrence_revocation:v1` | `occurrence_revocation` | −1 | `ciris:identity:occurrence_revocation:v1:` | the revoker | the structural rule below; never withdrawn |
@@ -37,8 +37,8 @@ column that differs, as `federation_malformed_row` / `typed_diverges_from_envelo
 ## `identity:occurrence_revocation:v1`: the carrier of a legacy revocation
 
 The carrier gives a replicable row to a framed occurrence revocation signed
-before v59. On a v59 node such a revocation is a local `legacy_framed`
-projection row (V200).
+before the key plane moved onto rows. Held locally, such a revocation is a
+`legacy_framed` projection row (V200).
 
 - **Object**: `{attesting_key_id, signed_envelope, signature}`.
   - `signed_envelope` is the exact envelope the revoker signed. It holds

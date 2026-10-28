@@ -1,16 +1,16 @@
 # The contextual-integrity envelope — fields, axes, and the consent lifecycle
 
-**Status:** v44.8.0 — designed and built (C1, C1b, C2, C3); C4 filed. Filed from
-CIRISPersist#866 (sub-scoping is two grammars) and #867 (three principles
-have no enforcing layer), both from CIRISEdge's transmission-principle
-audit. Operator decision 2026-09-18: **the envelope member is normative** —
-the scope of a consent is the `scope` member of the `consent:state:granted`
-row's own signed envelope, not a companion `consent:scope:{kind}` row.
-Constitution erratum: CIRISConstitution#103.
+**Status:** Implemented (CIRISPersist#866, #867): the scope grammar (C1),
+`retain` windows (C1b), `principle` on the transfer plane (C2) and the
+expiry sweep (C3). Decay-row emission (C4) is open, tracked as
+CIRISAgent#1180.
 
-Every claim below marked with a `file::fn` is verified against v44.7.0
-source. Claims marked **(cut)** are the work this document commits persist
-to, with the invariant that will witness it.
+**The envelope member is normative:** the scope of a consent is the `scope`
+member of the `consent:state:granted` row's own signed envelope, not a
+companion `consent:scope:{kind}` row. Constitution erratum:
+CIRISConstitution#103.
+
+Claims marked with a `file::fn` name the code that implements them.
 
 ## 1. The frame: five parameters, nine axes
 
@@ -25,7 +25,7 @@ axis):
 
 | axis | the question | answered by |
 |---|---|---|
-| `sender` | who is speaking | `attesting_key_id` — the fabric is never the sender of an actor's claim (v39.0.0) |
+| `sender` | who is speaking | `attesting_key_id` — the fabric is never the sender of an actor's claim (`FSD/PROMOTION_PRESERVES_THE_ACTOR_SIGNATURE.md`) |
 | `data_subject` | who it is about | `subject_key_ids` (`Nobody` is an explicit answer) |
 | `recipient_see` | who may learn it exists | `cohort_scope` + the cohort target (`family_key_id` / `community_key_id`) |
 | `recipient_revoke` | who may withdraw it | derived: the producer, plus every `subject_key_ids` member (CC 2.4.1.1) |
@@ -54,7 +54,7 @@ so rather than implying otherwise.
 | `attested_key_id` | the *target* of the claim | the actor | the fold's row selection (`resolve_scoped_consent(target, …)` lists `list_attestations_for(target)`); for a consent row, the target is the party being consented *to* |
 | `subject_key_ids` | data_subject; recipient_revoke | the actor | the crossing cross-check; CC 2.4.1.1 withdrawal authority; on a `consent:replication:v1` grant, the **peers** the grant extends to (`consent_peer_set` projection) |
 | `dimension` | information_type | the actor | `attestation_family`; the reserved-prefix admission table; the consent folds key on the `consent:state:` prefix (`consent::consent_dimension::STATE_PREFIX`) |
-| `cohort_scope` (+ `family_key_id` / `community_key_id`) | recipient_see | the actor; a widening is a NEW `supersedes` row, never an edit (v39.0.0) | `crossing::check_widening`; the put door's membership proof (AV-45); `Audience::discoverable` (CC 5.2: `self` / `family` never emit `holds_bytes`) |
+| `cohort_scope` (+ `family_key_id` / `community_key_id`) | recipient_see | the actor; a widening is a NEW `supersedes` row, never an edit | `crossing::check_widening`; the put door's membership proof (AV-45); `Audience::discoverable` (CC 5.2: `self` / `family` never emit `holds_bytes`) |
 | `delivery_mode` | recipient_receive | the actor | the delivery plane |
 | `asserted_at` | temporal_lifecycle (created) | the actor; bound at write and cross-checked at admission (`admission::check_instant_binding`, #598 — the typed column must equal the signed member) | every fold's clock component; the SLA watch's revocation instant |
 | `expires_at` | temporal_lifecycle (lapse) | the actor | the fold drops a lapsed row from the candidate set (`fold_stance`: `expires_at > now`) |
@@ -84,7 +84,7 @@ The transfer policy's members, and who reads each (`engine::promote_consented_ba
 | `valid_until` | instant | yes — a lapsed grant covers nothing |
 | `restrictions` | `strip_field` / `recipient_capability` | `strip_field` yes — the placement's strip set (`engine.rs` `load_active_egress_grants` → placement); `recipient_capability` is parsed here and **enforced by Edge's bridge as a WITHHOLD** (`CIRISEdge src/replication/bridge.rs#recipient_capability_withholds`, its `field_conformance` table) — the transport, not the promoter, decides per recipient |
 | `for_key_id` | key id | not by the promoter — read by the #857 admission gate and the V147 `consent_peer_set_for` projection, which the by-principals send-set doors consult |
-| `principle` | `retain` / `share` (default) / `analyze` / `train` / `publish` | yes since v44.8.0 (C2): only `share` / `publish` propagate; a `retain` / `analyze` / `train` grant is declined by name and counted in the report. Before, carried only — every principle replicated like `share`. |
+| `principle` | `retain` / `share` (default) / `analyze` / `train` / `publish` | yes (C2): only `share` / `publish` propagate; a `retain` / `analyze` / `train` grant is declined by name and counted in the report |
 | `purpose` | free text | descriptive |
 
 ## 3. The three consent planes and how they relate
@@ -101,7 +101,7 @@ A **subject's** standing stance toward a **target**, scoped. Rows:
 scope is the envelope `scope` member (§4). Resolved by
 `FederationDirectory::resolve_consent_state` (all scopes) and
 `resolve_scoped_consent(target, subject, scope, qualifier, now)`, both one
-body (`consent::fold_stance`, v36.0.0), and by the `*_by_principals` doors
+body (`consent::fold_stance`), and by the `*_by_principals` doors
 that walk from any key to the humans it stands for (#857).
 
 Who asks:
@@ -111,8 +111,8 @@ Who asks:
 | **persist** `admission::check_capacity_consent_admission` | `analyze` | at admission of a federation-tier `capacity:*` row whose attester ≠ subject (CC 3.4.5 / CIRISConstitution#46) — refused before persistence unless `Granted` |
 | CIRISServer infohazard gate | `view` + `content_class` | before serving classified content (CIRISServer#161/#243) |
 | the crossing | — | `CrossingBasis::ConsentGrant` is verified against a live **transfer** grant (§3.2), not a stance |
-| the processor (Agent CEM / LensCore) | `train`, `publish` | **nobody today** — carried-only until adopted (§6) |
-| persist retention | `retain:<duration>` | **not yet** — the sweeps act on `Revoked` state (cut C1) |
+| the processor (Agent CEM / LensCore) | `train`, `publish` | **no consumer** — carried-only until adopted (§6) |
+| persist retention | `retain:<duration>` | fountain eviction and the deletion-window watch, through `resolve_scoped_stance` (§4.2, C1b) |
 
 ### 3.2 The transfer plane — `consent:replication:v1`
 
@@ -129,8 +129,8 @@ where the node sends.
 
 ### 3.3 The crossing plane — `enter_mesh` / `widen_audience`
 
-The moment a row's answers become irrevocable because edge replicates it on
-its next round (v39.0.0). `transmission_principle` here is
+The moment a row's answers become irrevocable because CIRISEdge replicates
+it on its next round (`FSD/PROMOTION_PRESERVES_THE_ACTOR_SIGNATURE.md`). `transmission_principle` here is
 `CrossingBasis`: `ProducerAuthority` (the actor's own claim, the admission
 stack decides whether that suffices — consent-gated families refuse it
 there) or `ConsentGrant { attestation_id }` — a live, self-authored, egress
@@ -150,7 +150,7 @@ gate refuses. That is fail-closed and it is also the constitution's common
 case being inert; hence the erratum (CIRISConstitution#103), not a second
 fold.
 
-## 4. The scope token grammar **(cut C1)**
+## 4. The scope token grammar (C1)
 
 ### 4.1 Syntax
 
@@ -165,35 +165,34 @@ sub          := [a-z0-9_-]+               -- per-kind meaning for the canonical 
   (`types::transmission_principle::ALL`) have per-kind sub-scope semantics
   persist honours; any other well-formed kind is a consumer's own scope and
   gets the generic rule of §4.3 (Server's infohazard gate uses `view` +
-  `content_class` today — `CIRISServer src/safety/infohazard.rs` — and that
-  keeps working unchanged). What is **refused at admission** for
+  `content_class` — `CIRISServer src/safety/infohazard.rs`). What is **refused at admission** for
   `consent:state:*` rows is a *malformed* token — empty or ill-formed
   segments, a canonical kind whose sub-scope does not parse, a
-  `share:cohort:<x>` wider than the row's own `cohort_scope` — the v44.4.0
+  `share:cohort:<x>` wider than the row's own `cohort_scope` — the
   canonical-id posture: never admit a token the fold cannot match.
 - Sub-scopes ride IN the token (CC 3.3.1: `retain:90d`,
   `share:cohort:family`). `content_class` stays a separate member.
-- `CONSENT_GRAMMAR_HASH` does not move: the `scope` member is not in the
-  pinned manifest (`FSD/CONSENT_BY_HUMANS.md`). The `envelope_vocabulary`
-  hash does not move either — no new member name.
+- The grammar is outside `CONSENT_GRAMMAR_HASH`: the `scope` member is not
+  in the pinned manifest (`FSD/CONSENT_BY_HUMANS.md`), and it adds no member
+  name to the `envelope_vocabulary` hash.
 
 ### 4.2 Per-kind sub-scope semantics
 
 | kind | sub form | meaning | kind of constraint | honoured by |
 |---|---|---|---|---|
-| `retain` | `retain:<n>d` / `retain:<n>h` (a duration) | keep the bytes for at most this long from `asserted_at` of the grant | lifecycle **bound** | built (C1b): `resolve_scoped_stance` returns `retain_until` and reads `Expired` past it; `Engine::evict_fountain_content_by_consent` treats a lapsed window as a withdrawal (`fountain::retention_action_with_retain_window`, HardDelete rare or not); `run_deletion_window_watch` records `hard_case:retain_window_breach` for a row the producer still holds about the subject past the window |
+| `retain` | `retain:<n>d` / `retain:<n>h` (a duration) | keep the bytes for at most this long from `asserted_at` of the grant | lifecycle **bound** | C1b: `resolve_scoped_stance` returns `retain_until` and reads `Expired` past it; `Engine::evict_fountain_content_by_consent` treats a lapsed window as a withdrawal (`fountain::retention_action_with_retain_window`, HardDelete rare or not); `run_deletion_window_watch` records `hard_case:retain_window_breach` for a row the producer still holds about the subject past the window |
 | `share` | `share:cohort:<cohort_scope>` | propagate no wider than this audience | audience **narrowing** | the crossing (`Audience` ⊆ the narrowing) and any caller asking `share` at an audience |
-| `analyze` | `analyze:<family>` | derive scores only in this family | information-type **narrowing** | `check_capacity_consent_admission` asks `analyze:capacity` (built: a bare `analyze` grant covers it, `analyze:capacity` covers it, `analyze:trust` does not) |
+| `analyze` | `analyze:<family>` | derive scores only in this family | information-type **narrowing** | `check_capacity_consent_admission` asks `analyze:capacity` (a bare `analyze` grant covers it, `analyze:capacity` covers it, `analyze:trust` does not) |
 | `train` | open | reserved for the processor | narrowing | processor (§6) |
 | `publish` | open | reserved for the processor | narrowing | processor (§6) |
 
 ### 4.3 Matching
 
-`matches_scoped_query(row, query, qualifier)` becomes, for a row token `g`
-and a query token `q`:
+`matches_scoped_query(row, query, qualifier)`, for a row token `g` and a
+query token `q`:
 
-1. `kind(g) == kind(q)`, else unrelated (unchanged: a row naming other
-   scopes never reads as blanket).
+1. `kind(g) == kind(q)`, else unrelated (a row naming other scopes never
+   reads as blanket).
 2. For a **narrowing** kind: `g` covers `q` iff `sub(g)` is absent (a bare
    grant is the widest) or `sub(g) ⊇ sub(q)` in that kind's order
    (`cohort_scope` widening order for `share`; prefix containment for
@@ -209,8 +208,8 @@ and a query token `q`:
    prefix of `sub(q)`. A bare `view` covers `view:x`; `view:x` covers
    `view:x:y` and not `view` or `view:z`. Persist assigns no meaning to the
    segments; the consumer that minted the kind does.
-4. Then the `content_class` qualifier, exactly as today.
-5. The asymmetry is unchanged (v16.1.1): a **non-grant** naming no genuine
+4. Then the `content_class` qualifier.
+5. The asymmetry: a **non-grant** naming no genuine
    scope is BLANKET and matches every query; a **grant** naming no genuine
    scope matches nothing; latest-wins by `(causal_rank, asserted_at)`.
 
@@ -260,12 +259,12 @@ The stack a consent row runs at `put_attestation`, in order
    3.4.5 is enforced by the fold's authorship filter (§5.5), not here;
 6. **the analyze gate** (`check_capacity_consent_admission`) — on the
    `capacity:*` row being scored, not on the consent row;
-7. then, in each backend's put door (all three, parity-gated):
+7. then, in each backend's put door (both backends, parity-gated):
    `for_key_id` (`check_consent_for_key_admission`, #857 — a machine author
    may name only itself) and the transfer-grant grammar
    (`consent_grammar::validate_grant_admission` — whole-grant reject on any
    non-conforming member);
-8. **(C1)** scope-token parse for `consent:state:*` rows (§4.4), beside 7.
+8. scope-token parse for `consent:state:*` rows (§4.4, C1), beside 7.
 
 ### 5.3 Cross
 
@@ -287,10 +286,10 @@ the covering grants agree on, the `strip_field` set from their
 `restrictions`), and runs `enter_mesh` / `widen_audience` for it. Who
 receives is the V109 / V147 projection of the grants' `subject_key_ids`
 (`consent_peers` / `consent_peers_by_principals`, the latter filtered to
-live stewards). `principle` is not consulted **(C2)**: after the cut, only
-`share` (and `publish`, for the external plane) authorize propagation;
-`retain` / `analyze` / `train` grants cover nothing on the send set, and the
-promoter's report names the principle it declined. `recipient_capability`
+live stewards). `principle` is consulted (C2): only `share` (and `publish`,
+for the external plane) authorize propagation; `retain` / `analyze` /
+`train` grants cover nothing on the send set, and the promoter's report
+names the principle it declined. `recipient_capability`
 restrictions are Edge's: the bridge withholds the row from a recipient that
 does not hold the capability (never routed through the strip pipeline).
 
@@ -322,12 +321,12 @@ rows that name a *different* machine in `for_key_id` are not this machine's.
 
 | principle | enforcing layer | mechanism | status |
 |---|---|---|---|
-| `analyze` | **persist** | `check_capacity_consent_admission` at admission | enforced (v22.0.0) |
+| `analyze` | **persist** | `check_capacity_consent_admission` at admission | enforced |
 | `share` (stance) | the crossing / callers | a stance is what the subject permits; the **transfer grant** is what the node sends | stance carried; propagation governed by §3.2 |
-| `retain` | **persist** | fountain eviction + the deletion-window watch honour `retain:<window>` through `resolve_scoped_stance` | enforced (v44.8.0, C1b) |
+| `retain` | **persist** | fountain eviction + the deletion-window watch honour `retain:<window>` through `resolve_scoped_stance` | enforced (C1b) |
 | `train` | the processor (Agent CEM / LensCore) | `resolve_scoped_consent_by_principals(target, k, "train", …)` before training | **carried-only** until adopted; the door exists |
 | `publish` | the processor | same door before any external publication | **carried-only** |
-| `principle` (transfer) | **persist** | the promoter: only `share` / `publish` propagate (`TransmissionPrinciple::propagates`); the report counts `declined_by_principle` | enforced (v44.8.0, C2) |
+| `principle` (transfer) | **persist** | the promoter: only `share` / `publish` propagate (`TransmissionPrinciple::propagates`); the report counts `declined_by_principle` | enforced (C2) |
 
 A subject that declines `analyze` cannot be scored: `capacity:composite` is
 undefined for them (CC 3.4.5 — consent gates scoring, never accountability;
@@ -342,9 +341,8 @@ Widening is a new row; the prior row is never edited.
 
 `expires_at` on a grant lapses it at fold time. CC 3.3.1 says
 `consent:state:expired` is **substrate-emitted** when `valid_until` passes
-without renewal; before v44.8.0 persist recognised the leaf in the fold and
-emitted no such row — expiry was computed per node, not recorded. **(C3,
-built)**: `consent_expiry::run_consent_expiry_sweep` (Engine
+without renewal, so expiry is recorded rather than computed per node (C3):
+`consent_expiry::run_consent_expiry_sweep` (Engine
 `run_consent_expiry_sweep`, PyO3 `run_consent_expiry_sweep_json`, called
 from the same maintenance loop as the deletion-window watch) records every
 lapsed grant — its `expires_at` or its `retain:<window>`, whichever is
@@ -370,7 +368,7 @@ Two commitments, two watches, one posture — evidence, never a verdict:
   deadline, #519 c1). `deletion_window::run_deletion_window_watch(now)`
   sweeps stored rows: a window that has passed with the row still present and
   no deletion proof is a breach, recorded through the same `hard_case:*`
-  surface (v22.0.0: "the network itself raises a breach signal").
+  surface ("the network itself raises a breach signal").
 
 Neither watch erases. Persist deletes what *persist* holds through its
 retention plane; a producer's own stores are the producer's duty, and the
@@ -384,21 +382,20 @@ sole evidence for `slashing:*` — the WA quorum is.
 consent-decay sweep (`Engine::sweep_consent_decay_once`: a per-class clock
 that evicts fountain symbols down a tier — byte eviction, not a protocol
 stage) and emits no `consent:decay:*` row; the three stages are the
-CIRISAgent CEM's 90-day protocol, which only the CEM can observe. **(C4,
-filed as CIRISAgent#1180)**: persist recommends the CEM emits the stage
-rows and the CC row's emitter moves to the agent; until one lands the leaf is
-carried-only.
+CIRISAgent CEM's 90-day protocol, which only the CEM can observe. **Open
+(C4, CIRISAgent#1180):** whether the CEM emits the stage rows and the CC
+row's emitter moves to the agent. Until then the leaf is carried-only.
 
 ## 6. Documentation of duty (the #867 answer)
 
-Persist provides the doors; it enforces `analyze` today and `retain` after
-C1b; it will read `principle` on the transfer plane after C2. `train` and
-`publish` are the processor's, through the existing door, and are
-**carried-only** until a processor adopts them — no reader, and no subject,
-should believe a `train` revocation is honoured before then. This table is
-the contract; a processor that adopts a token files against this document.
+Persist provides the doors; it enforces `analyze` and `retain`, and reads
+`principle` on the transfer plane. `train` and `publish` are the
+processor's, through the existing door, and are **carried-only** until a
+processor adopts them — no reader, and no subject, should believe a `train`
+revocation is honoured before then. The §5.6 table is the contract; a
+processor that adopts a token files against this document.
 
-## 7. Invariants (witnessed by the v44.8.0 cut)
+## 7. Invariants
 
 - **I104** — a `consent:state:*` row whose `scope` carries a malformed
   token, or a canonical-kind sub-scope that does not parse, or a
@@ -430,16 +427,18 @@ the contract; a processor that adopts a token files against this document.
   `matches_scoped_query`; the five canonical kinds are spelled in exactly one
   place (`transmission_principle::ALL`).
 
-## 8. The cut list
+## 8. Implementation map
 
-| id | what | where | hash |
+| id | what | where | status |
 |---|---|---|---|
-| C1 | scope-token parser, per-kind match, refusal at every door | `consent_scope.rs`, `consent.rs`, the seven door call sites | none — **built v44.8.0** |
-| C1b | `retain:<window>` honoured; `ScopedStance` (`resolve_scoped_stance`, `_by_principals`) | `consent.rs`, `fountain/retention.rs`, `deletion_window.rs`, trait + Engine + PyO3 | none — **built v44.8.0** (the old door stays, and returns `.state`) |
-| C2 | `principle` read by the promoter (only `share` / `publish` propagate; the report counts what it declined) | `engine.rs`, `consent_grammar.rs` | none — **built v44.8.0** |
-| C3 | `consent:state:expired` emission sweep, edge-bound admission in the fold | `consent_expiry.rs`, `consent.rs`, Engine + PyO3 | none — **built v44.8.0** |
-| C4 | decay emission — decide with the Agent team | CIRISAgent#1180 | filed; carried-only until decided |
+| C1 | scope-token parser, per-kind match, refusal at every door | `consent_scope.rs`, `consent.rs`, the seven door call sites | implemented |
+| C1b | `retain:<window>` honoured; `ScopedStance` (`resolve_scoped_stance`, `_by_principals`) | `consent.rs`, `fountain/retention.rs`, `deletion_window.rs`, trait + Engine + PyO3 | implemented (`resolve_scoped_consent` returns `.state`) |
+| C2 | `principle` read by the promoter (only `share` / `publish` propagate; the report counts what it declined) | `engine.rs`, `consent_grammar.rs` | implemented |
+| C3 | `consent:state:expired` emission sweep, edge-bound admission in the fold | `consent_expiry.rs`, `consent.rs`, Engine + PyO3 | implemented |
+| C4 | decay-stage emission | CIRISAgent#1180 | open; carried-only |
 | — | CC erratum | CIRISConstitution#103 | — |
+
+None of C1–C3 moves `CONSENT_GRAMMAR_HASH`.
 
 ## 9. Not in scope
 
@@ -447,7 +446,7 @@ the contract; a processor that adopts a token files against this document.
 - Moving `content_class` into the token: it is CC 3.3.12's content
   classification, an orthogonal axis the Server gate depends on.
 - Any change to `CONSENT_GRAMMAR_HASH`: the stance `scope` member is not in
-  the manifest; if a later cut adds the sub-scope production to the manifest
-  it re-pins deliberately, like v44.3.0 and v44.6.0.
+  the manifest; adding the sub-scope production to the manifest would re-pin
+  it deliberately.
 - Deleting a producer's stores: the SLA watch reports; persist erases only
   what persist holds.
