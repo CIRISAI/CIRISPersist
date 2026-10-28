@@ -1,25 +1,17 @@
 # The media Source struct, and size on every claim (CIRISPersist#871)
 
-> **v55.0.0 (CIRISPersist#989, CIRISConstitution#141) — superseded on the
-> holding claim.** Wherever this document says `holds_bytes:sha256:{prefix}`,
-> read the one holding claim: `custody:ack:v1` `here`, placed at the
-> CONTENT's scope (`federation` for Commons-tier content, the bytes' own
-> `self` / `family` / room cohort otherwise), freshness its own `expires_at`
-> (72 h), retracted by its signer alone. `src/federation/holding_claim.rs` is
-> its home. A `holds_bytes` row is a retired carrier: refused at every door,
-> never served, read by no fold.
+**Status:** implemented. From CIRISEdge#871, the persist half of
+CIRISConstitution#104: CC 3.3.13 (the multimedia Source struct), CC 5.3.2.5
+(size checked first), CC 5.3.2.6 (the render tier is receiver policy).
+Consumers: CIRISServer#614 (the node's ingest pipeline), CIRISServer#615 (the
+client blob contract), CIRISEdge.
 
-**Status:** v45.0.0 design. Filed from CIRISEdge's #871 (the persist half of
-CIRISConstitution#104, ruled on rc5: CC 3.3.13 the multimedia Source struct,
-CC 5.3.2.5 size checked first, CC 5.3.2.6 the render tier is receiver
-policy). Consumers: CIRISServer#614 (the node's ingest pipeline),
-CIRISServer#615 (the client blob contract), CIRISEdge's sibling issue.
-Sequenced after #870 (v44.8.1): a peer can now learn a holder.
-
-**Numbering.** MAJOR, on our own rule: the signed `holds_bytes` claim gains
-a REQUIRED member and the door refuses a claim without it; the envelope
-vocabulary re-pins. There are no blobs in production, so the strictness
-costs nothing today and never has to be introduced later.
+**The holding claim.** A node's claim to hold a blob is `custody:ack:v1` with
+`custody_state: here` (`src/federation/holding_claim.rs`, CC 3.1.3.3), placed
+at the CONTENT's scope (`federation` for Commons-tier content, the bytes' own
+`self` / `family` / room cohort otherwise), fresh until its own `expires_at`
+(72 h), retracted by its signer alone. The retired `holds_bytes:sha256:{prefix}`
+carrier is refused at every door, never served, and read by no fold.
 
 ## 1. What the constitution says, verbatim
 
@@ -45,45 +37,42 @@ correction."* Enforcement *"belongs on the node."*
 Three consequences for the substrate, all decided by the text:
 
 1. `size` rides **beside** the digest, never inside `evidence_refs[]`. The
-   `[{sha, size}]` form in #871's ask 2 contradicts CC 3.3.13 and breaks
-   every reader (persist's `envelope_binds_content` and Edge's
-   `evidence_refs: Vec<String>` both read strings). Not built.
+   `[{sha, size}]` entry form would contradict CC 3.3.13 and break every
+   reader (persist's `envelope_binds_content` and Edge's
+   `evidence_refs: Vec<String>` both read strings).
 2. Persist validates the **grammar** of the struct and refuses a malformed
    one by name; it never sniffs bytes and never decides a render tier.
    Those are the node's (CIRISServer#614) and the client's (#615).
-3. `size` is **required** wherever a blob is described — the `holds_bytes`
-   claim and the Source struct — and refused when absent. An optional size
-   is a size nobody checks; requiring it is strictly stronger and, with no
-   production blobs, free.
+3. `size` is **required** wherever a blob is described — the holding claim
+   and the Source struct — and refused when absent. An optional size is a
+   size nobody checks.
 
 ## 2. The threat model this closes
 
-Persist bounds the WRITE side today: AV-7 (8 MiB body limit), AV-40
+Persist bounds the WRITE side: AV-7 (8 MiB body limit), AV-40
 (`body_size_bytes ≤ 8 MiB` schema CHECK), the inline-put deployment cap in
-`blobs.rs`, AV-76's cheapest-first tiering. Nothing bounds the PULL side: a
-puller doing a `ContentFetch` has no declared length, reads to EOF, then
+`blobs.rs`, AV-76's cheapest-first tiering. The PULL side needs a declared
+length: without one, a puller doing a `ContentFetch` reads to EOF, then
 hashes — a lying or hostile holder streams unbounded bytes at it before the
 full-SHA check (CC 5.3.2.5) can refuse.
 
-| AV | threat | mitigation (this cut) |
+| AV | threat | mitigation |
 |---|---|---|
-| **AV-88** | Unbounded `ContentFetch`: the puller reads to EOF and hashes after — memory/disk exhaustion by a holder, before any refusal | `size` is a REQUIRED, signed member of every `holds_bytes` claim and every Source struct; the puller caps its read at the declared size and refuses on overrun or underrun BEFORE hashing (AV-76's discipline on the byte plane). Persist supplies the number in the signed bytes a peer already verifies; Edge enforces the cap (its half). |
+| **AV-88** | Unbounded `ContentFetch`: the puller reads to EOF and hashes after — memory/disk exhaustion by a holder, before any refusal | `size` is a REQUIRED, signed member of every holding claim and every Source struct; the puller caps its read at the declared size and refuses on overrun or underrun BEFORE hashing (AV-76's discipline on the byte plane). Persist supplies the number in the signed bytes a peer already verifies; Edge enforces the cap (its half). |
 | **AV-89** | Size divergence: a holder's claim says one length, the author's descriptor another — the holder is lying, or holds different bytes under the same sha (impossible) or a truncation | The author's size (Source struct / descriptor) and the holder's size (claim) must agree; `list_holders_sized` returns both parties' numbers so a puller refuses a holder whose claim disagrees with the descriptor it is fetching for. Persist refuses, at its own adopt door, to announce a claim whose size is not the byte length it just stored. |
 
 `content_digest` (plaintext hash beside the ciphertext hash on sealed
-scopes) is carried because rc5 ruled it. Named here so it is accepted, not
-discovered: AAD binding stops substitution; it does **not** stop a
-dictionary check — anyone holding the row can confirm a candidate plaintext
-for a community blob. That is a property of the ruling, recorded.
+scopes) is carried (CC 3.3.13). AAD binding stops substitution; it does
+**not** stop a dictionary check — anyone holding the row can confirm a
+candidate plaintext for a community blob. That is a known property of the
+field.
 
 ## 3. The struct
 
 Envelope member **`media`**, a typed member of `EnvelopeCore` (byte-preserving
 `Option<serde_json::Value>`, validated by the door gate — a decode error is
 a generic refusal, the gate's is a named one), listed in the envelope
-vocabulary (`paths::MEDIA`; **`ENVELOPE_VOCABULARY_SHA256` re-pins**, the
-v31.0.0 / v44.6.0 motion — every consumer asserting the hash re-pins in
-the same window).
+vocabulary (`paths::MEDIA`, pinned by `ENVELOPE_VOCABULARY_SHA256`).
 
 ```
 media := {
@@ -117,8 +106,8 @@ generic unknown. A live stream in progress is the one struct with no total
 init segment, never as an absent `size` here — the struct always has one.
 
 **The one gate** `media_source::check_media_source(envelope)` runs at every
-door (three ingest, three local, the promotion chokepoint — the #866
-pattern) and refuses with `Error::MediaSourceInvalid { member, reason }`
+door (the shared ingest plan, the shared local-write plan and the
+promotion chokepoint, which both backends reach — the #866 pattern) and refuses with `Error::MediaSourceInvalid { member, reason }`
 (kind `federation_media_source_invalid`). It also requires
 `digest` (and `captions`, when present) to appear in the row's
 `evidence_refs[]` — the struct describes what the row cites, and the fold
@@ -134,21 +123,21 @@ marking rule (CC 3.3.12 R1: a `trainedAlgorithmicMedia` row must carry
 
 ## 4. `size` on the holder claim
 
-`holds_bytes_attestation_row(sha, attester, id, asserted_at, size)` — the
-ONE definition (v31.0.0, #652) gains `size: u64` in the envelope:
-`{kind, evidence_refs, size, asserted_at, …}`. Persist rebuilds the
-envelope at the local door and checks the signer's hash against the rebuild
-(unchanged), so the signer (`sign_holds_bytes_claim`) takes the size too.
-Both blob doors pass the byte length they store. **The receive side
-refuses** a `holds_bytes:*` row whose envelope has no `size`, or a `size`
-that is not a positive integer (`Error::MediaSourceInvalid { member:
-"size", … }` — the same kind; a claim is a one-member descriptor).
+The holding claim carries `size: u64` in its envelope: a `here` report
+carries the blob's stored length, a `none` report carries none
+(`custody_ack.rs`). The ONE row builder is `holding_claim_row`, signed by
+`sign_holding_claim`; both blob write doors (`put_blob_with_scope`,
+`adopt_sealed_blob_at`) pass the byte length they store. **The receive side
+refuses** a `here` claim whose envelope has no `size`, or a `size` that is not
+a positive integer (`custody_ack_malformed` — a malformed report is refused,
+never read as an absent one).
 
-`list_holders_sized(sha) -> Vec<HolderClaim { key_id, size }>` is the new
-read; `list_holders(sha) -> Vec<String>` stays (Edge compiles). PyO3
-`list_holders_sized_json`.
+`list_holders_sized(sha) -> Vec<HolderClaim { key_id, size }>` returns each
+holder's committed size (its own retractions and later `none` folded out;
+withheld bytes return nothing); `list_holders(sha) -> Vec<String>` is the
+key-only read. PyO3 `list_holders_sized_json`.
 
-A public `store_blob_local(sha, bytes, media_type)` (#863 ask 1): the
+A public `store_blob_local(sha, bytes, media_type)` (#863): the
 commons/plaintext LocalOnly store — content-address checked, no claim
 emitted, the sealed adopt door's `LocalOnly` semantics for plaintext.
 
@@ -167,9 +156,10 @@ original's `cohort_scope` and audience and is placed in the same crossing.
 Enforced where persist can see it: when the original blob is held locally,
 a rendition row whose `cohort_scope` differs from the original's is refused
 (`MediaSourceInvalid { member: "derived_from", … }`); when the original is
-not held, the row is admitted and the rule is the node's. `self` / `family`
-renditions emit no `holds_bytes` exactly as their originals
-(`suppresses_holds_bytes`, unchanged).
+not held, the row is admitted and the rule is the node's. A rendition's holding
+claim is placed at its own content's scope, exactly as its original's, so
+`self` / `family` renditions stay structurally invisible
+(`is_structurally_invisible`).
 
 `role` is the struct's `name` when it parses as one of `thumbnail`,
 `poster`, `transcode`, `caption_track`; else `other`. A rendition's
@@ -178,46 +168,44 @@ rendition).
 
 ## 6. Lifecycle, by door
 
-| door | what changes |
+| door | what it does |
 |---|---|
-| local write (3 backends) | `check_media_source`; `blob_renditions` projection |
-| federation ingest (3) | `check_media_source`; the `holds_bytes` size refusal; projection |
-| promotion chokepoint | `check_media_source` (a local row admitted before this cut does not cross without it) |
+| local write (both backends) | `check_media_source`; `blob_renditions` projection |
+| federation ingest (both) | `check_media_source`; the holding-claim size refusal; projection |
+| promotion chokepoint | `check_media_source` (a local row does not cross without passing it) |
 | `put_blob_with_scope` / `adopt_sealed_blob_at` (2 backends) | the claim carries the stored byte length; adopt refuses to announce a size ≠ the length it stored |
-| `list_holders_sized`, `list_derived`, `store_blob_local` | new reads / the LocalOnly plaintext door |
-| envelope vocabulary | `paths::MEDIA`; re-pin |
+| `list_holders_sized`, `list_derived`, `store_blob_local` | reads / the LocalOnly plaintext door |
+| envelope vocabulary | `paths::MEDIA`, pinned |
 
 ## 7. Invariants
 
-- **I115** — a malformed struct is refused by name at all seven doors:
+- **I115** — a malformed struct is refused by name at every door:
   missing `size`, `size: 0`, missing `format`, `format: "Image/JPEG"`,
   `format: "image/jpeg; q=1"`, `video/mp4` without `codec`, a `name` with
   `/` or a control character, a `placeholder` over the cap, an unknown
   member, and each of `safe` / `renderable` / `tier` / `crypto_tier` /
   `render_tier` (the CC 5.3.2.6 refusal names the rule). A well-formed
-  struct is admitted on all three backends.
+  struct is admitted on both backends.
 - **I116** — `digest` not in `evidence_refs[]` is refused; `captions` not
   in `evidence_refs[]` is refused; `evidence_refs` entries stay strings —
   a row with an object entry is refused by `envelope_binds_content`'s
-  reading, unchanged (pinned, so ask 2's shape cannot creep in).
-- **I117** — a `holds_bytes` claim without `size`, or with `size: 0` /
-  `"12"` / `-1`, is refused at ingest on all three backends; the claims the
+  reading (pinned, so the object shape cannot creep in).
+- **I117** — a holding claim without `size`, or with `size: 0` /
+  `"12"` / `-1`, is refused at ingest on both backends; the claims the
   two blob doors write carry the exact stored length; `list_holders_sized`
   returns it; a two-node delivery (the #870 I113c shape) carries the size
   to the peer.
 - **I118** — a row with `derived_from` projects one `blob_renditions` row
-  in the same write on all three backends; `list_derived(original)` returns
+  in the same write on both backends; `list_derived(original)` returns
   it; retiring the row removes it; a rendition at a different
   `cohort_scope` than a locally held original is refused; a rendition whose
   digest equals its `derived_from` is refused.
 - **I119** — from disk: every blob write door stores `size` and the
   validated `format` into `federation_blobs` (`size_bytes`, `media_type`),
   and the claim a peer receives carries `size` — the local column alone
-  proves nothing to a peer (#871 ask 5); the gate call appears at all seven
-  doors; the vocabulary manifest lists `paths::MEDIA`.
-- **I120** — the vocabulary hash is re-pinned deliberately: the test that
-  asserts `ENVELOPE_VOCABULARY_SHA256 == envelope_vocabulary_sha256()`
-  stays; the CHANGELOG names the old and new hash.
+  proves nothing to a peer; the gate call appears at every door; the vocabulary manifest lists `paths::MEDIA`.
+- **I120** — the vocabulary hash is pinned: the test asserts
+  `ENVELOPE_VOCABULARY_SHA256 == envelope_vocabulary_sha256()`.
 
 ## 8. Not in scope
 
@@ -225,22 +213,22 @@ rendition).
 - `evidence_refs[]` entries as objects (contradicts CC 3.3.13; breaks
   every reader).
 - Changing `list_holders`'s signature.
-- `settlement:*`, hop/TTL (#672), the community principal (#860) — next.
+- `settlement:*` and hop/TTL (#672).
 
-## 9. `sealed_descriptor` — the description inside the seal (v51.0.0; CIRISPersist#922 / #923; CIRISConstitution#114)
+## 9. `sealed_descriptor` — the description inside the seal (CIRISPersist#922 / #923; CIRISConstitution#114)
 
-**Ruling (CIRISConstitution#114, 2026-09-27).** In CC 3.3.13's encrypted
+**The rule (CC 3.3.13, CIRISConstitution#114).** In CC 3.3.13's encrypted
 two-hash case, `name`, `format` (and `codec`) live INSIDE the seal; `size`,
 the address digest, the room target, `content_digest` and `placeholder` stay
 in clear. "May read the name" and "may open the bytes" are one fact: the
 descriptor is sealed under the SAME DEK the bytes were sealed under (the
 pointer's tier / community / epoch), never an edge-derived key.
 
-### 9.1 The struct change
+### 9.1 The struct
 
 ```
 media := {
-  … (§3 unchanged) …
+  … (as §3) …
   format              string  REQUIRED iff sealed_descriptor is ABSENT
   codec               string  as §3, iff format is present in clear
   name                string  optional; FORBIDDEN beside sealed_descriptor
@@ -252,29 +240,28 @@ media := {
 ```
 
 Exactly one description: a struct carries `format` (+ `codec`) in clear XOR
-`sealed_descriptor`. `KNOWN_MEMBERS` gains `sealed_descriptor` (15). The
-member joins `paths::MEDIA`'s object, not the envelope vocabulary: no
-vocabulary path moves (`ENVELOPE_VOCABULARY_SHA256` unchanged — the
-vocabulary lists the `media` member, not its keys; asserted by the existing
-hash pin).
+`sealed_descriptor`. `KNOWN_MEMBERS` includes `sealed_descriptor` (15). The
+member belongs to `paths::MEDIA`'s object, not the envelope vocabulary: the
+vocabulary lists the `media` member, not its keys, so
+`ENVELOPE_VOCABULARY_SHA256` does not cover it.
 
-### 9.2 The gate (`check_media_source`, all seven doors)
+### 9.2 The gate (`check_media_source`, every door)
 
 Four shapes, one parser, refusals by member name (`Error::MediaSourceInvalid
-{ member, reason }`, kind unchanged):
-1. clear `format` (+`codec`), no seal — admitted as today;
+{ member, reason }`):
+1. clear `format` (+`codec`), no seal — admitted;
 2. `sealed_descriptor` present, `format`/`codec`/`name` ABSENT in clear —
    admitted iff the seal decodes (base64) to an at-rest envelope of at least
    `magic + nonce + tag` bytes; persist NEVER opens it (no DEK on the row
    plane) and never sniffs (CC 5.3.2.6 runs where bytes decrypt);
-3. neither — refused, member `format` (today's token, unchanged);
+3. neither — refused, member `format`;
 4. both a seal and clear `format` or `codec` — refused, member
    `sealed_descriptor`, reason `one description: format/codec in clear beside
    a seal`; `name` in clear beside a seal — refused, member `name`, reason
    `the name lives inside the seal` (CC 3.3.13 two-hash case).
 `size`, `digest`, the room target, `content_digest`, `placeholder` are
-required/checked BEFORE any hashing exactly as before (CC 5.3.2.5 / AV-88).
-`MediaSource.format` becomes `Option<String>` (Rust clean break); the blob
+required/checked BEFORE any hashing (CC 5.3.2.5 / AV-88).
+`MediaSource.format` is `Option<String>`; the blob
 write doors store `media_type` only when it is in clear (a sealed row's
 `media_type` is NULL — a reader learns it after the DEK opens; I119's
 "validated format" clause reads "when present in clear").
@@ -313,13 +300,13 @@ open_descriptor_for_blob(at_rest_sha256, viewer_key_id, sealed)   -> Result<Vec<
 
 ### 9.4 Invariants
 
-- **I121** — the four shapes of §9.2 on memory, sqlite, postgres at the
+- **I121** — the four shapes of §9.2 on sqlite and postgres at the
   ingest door and the local door: (1) admitted; (2) admitted, stored
   `media_type` NULL; (3) refused `format`; (4) refused `sealed_descriptor`
   (both) and `name` (name beside seal); a seal that is not base64, or decodes
   short of the envelope header, is refused by member `sealed_descriptor`.
-  `ENVELOPE_VOCABULARY_SHA256` is unchanged (the pin test stays green
-  without a re-pin).
+  `ENVELOPE_VOCABULARY_SHA256` does not cover the member (the pin test
+  holds with or without it).
 - **I122** — the doors: a member of the room seals `{name, format}` for a
   community-sealed blob and opens it back; a non-member is `NotGranted` on
   both doors and learns nothing; the invisible tier likewise for its owner
@@ -333,30 +320,27 @@ open_descriptor_for_blob(at_rest_sha256, viewer_key_id, sealed)   -> Result<Vec<
   replicates, the second node's member opens the descriptor and reads
   `format`; the same node's non-member sees the row (size, digest, room) and
   cannot open the descriptor.
-- **I124** — from disk: the gate call is unchanged at all seven doors; every
+- **I124** — from disk: the gate call is at every door; every
   blob write door's `media_type` store reads the clear `format` only.
 
-### 9.5 Mixed fleet and adopters
+### 9.5 Readers
 
-A v50 reader ADMITS a `file:v1` row whose `content` pointer carries
-`sealed_descriptor` (no `media` member — the gate never sees it) and
-REFUSES a `media` struct with no clear `format`; a v51 reader admits both
-shapes. Producers must not emit the sealed `media` struct until every
-reader runs v51 (CIRISEdge#698 sequences after this cut; CIRISNodeCore's
-MEDIA_SHARING schema and CIRISServer's FileRef read after the DEK opens
-take the same vectors).
+A `file:v1` row whose `content` pointer carries `sealed_descriptor` has no
+`media` member, so the gate never sees it. A `media` struct with no clear
+`format` is admitted only by a reader that implements §9.2; a producer emits
+the sealed `media` struct only once every reader it serves does
+(CIRISEdge#698; CIRISNodeCore's MEDIA_SHARING schema and CIRISServer's FileRef
+read the description after the DEK opens).
 
-### 9.6 Not in this cut
+### 9.6 Not in scope
 
-- **#784 (moderation / de-admission / revocation addressed by key
-  fingerprint).** Deferred, stated: it is a wire-vocabulary change on three
-  planes (`revoked_key_id` and the moderation subject fields would carry a
-  second identifier form) and a CC §4.5.1 Standards Action, not a persist
-  ruling; bundling it here would hold the cut Edge is waiting on. It is
-  filed for the cut after v51 with the CC ask.
+- Moderation / de-admission / revocation addressed by key fingerprint
+  (#784): a wire-vocabulary change on three planes (`revoked_key_id` and the
+  moderation subject fields would carry a second identifier form) and a
+  CC §4.5.1 Standards Action. Tracked on #784.
 - The disclosure store (#914): its own FSD.
 
-### 9.7 Mutation round (v51.0.0)
+### 9.7 Mutation table
 
 | # | Mutant | Verdict | Killed by |
 |---|---|---|---|
