@@ -881,6 +881,18 @@ pub(crate) mod bodies {
             ra::Verdict::Yes(ra::Reason::RefersTo),
             "I1470 the invitee's node receives the pair-room invitation"
         );
+        // I1473 (v59.1.1, the second link — CIRISServer live chat): the same
+        // node receives the GROUP's record and membership planes as a live
+        // invitee's node, through the same principal fold. Before the fix
+        // `may_receive_group_plane` read `active_identities_for_occurrence`
+        // only, so the joiner never learned it was seated.
+        assert_eq!(
+            ra::may_receive_group_plane(d, &knode, COMMUNITY, &cid, None)
+                .await
+                .unwrap(),
+            ra::Verdict::Yes(ra::Reason::Cohort),
+            "I1473 the invitee's node receives the room's record and membership planes"
+        );
     }
 
     /// **I1471** (v59.1.1, the PR #889 P1 case kept) — the owner REVOKED the
@@ -931,6 +943,13 @@ pub(crate) mod bodies {
             assert!(
                 !ra::may_receive(d, n, &p).await.unwrap().allowed(),
                 "I1471 the revoked node {n} does not receive the invitation"
+            );
+            assert!(
+                !ra::may_receive_group_plane(d, n, COMMUNITY, &cid, None)
+                    .await
+                    .unwrap()
+                    .allowed(),
+                "I1473 the revoked node {n} does not receive the room's membership planes"
             );
         }
     }
