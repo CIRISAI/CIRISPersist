@@ -1,6 +1,6 @@
 # Releasing CIRISPersist
 
-Three checked-in scripts take a release from a written CHANGELOG section to a published GitHub release. No agent or person has to act between their stages.
+Two checked-in commands take a release from a written CHANGELOG section to a published, verified GitHub release. Nobody has to act between their stages.
 
 ```
 scripts/release.sh <version> [--pr-body FILE] [--merge-body FILE] [--skip-codex] [--hold]   # stages 1-10, ends at the tag push (or held before it)
@@ -11,13 +11,13 @@ scripts/release_finish.sh <version> <tag-run-id>                    # tag CI →
 
 ## Before you start
 
-- Work in the release worktree, on a branch that is **not** named `v<version>`. A branch named like the tag makes the tag push ambiguous (v52.0.1). Use `release-<version>` or a topic name.
+- Work in the release worktree, on a branch that is **not** named `v<version>`. A branch named like the tag makes the tag push ambiguous. Use `release-<version>` or a topic name.
 - `Cargo.toml` is still at the previous release. The bump is stage 3.
 - `CHANGELOG.md` has the header `## [<version>] - UNRELEASED` with the full section under it. That section becomes the PR body, the merge body, the tag annotation and the release body, so write it before you start.
 - For a release that names a CC version, run `scripts/check_vendored_cc.sh <cc-tag>` first.
 - `scripts/release.sh --dry-run <version>` runs preflight and prints the plan, the cheap-leg commands and the commit subject. It writes nothing.
-- A gh with `gh attestation` (2.49+). Stage 10's `release_finish.sh` verifies the published wheels with it, and the system gh here is 2.45: v53.2.0's finish failed on it after the release was public. Preflight checks it (v54.1.0, #1045); `GH=/path/to/gh` selects another, and the printed finish command carries it.
-- `CARGO_BUILD_JOBS` defaults to 6 in `release.sh` and `certify.sh` (v54.1.0, #1045). This host has 32 cores, and cargo at `-j32` was reaped three times for memory during v53.2.0. Set it in the environment to override.
+- A gh with `gh attestation` (2.49+). `release_finish.sh` verifies the published wheels with it, so preflight checks for it before anything is published. `GH=/path/to/gh` selects another gh, and the printed finish command carries it.
+- `CARGO_BUILD_JOBS` defaults to 6 in `release.sh` and `certify.sh`: cargo at one job per core exhausts memory on the release host. Set it in the environment to override.
 
 ## Stages
 
@@ -27,8 +27,8 @@ scripts/release_finish.sh <version> <tag-run-id>                    # tag CI →
 | 2 | cheap | `cargo check --all-targets --no-default-features --features <axis>` for each of `ci_feature_matrix.AXIS_LEGS`, the pyo3 lane (`nextest --features pyo3,sqlite -E 'test(/pyo3/)'`), clippy on the lint set and on `--all-features`, and `pyi_surface.py check`. RUSTFLAGS is read from ci.yml, as certify reads it. | `cheap.done` + one per leg, **at a sha** |
 | 3 | bump | Cargo version, `evidence/cc_impl.tsv` re-stamp (`ciris-persist@<prev>` → `@<version>`, count asserted), CHANGELOG date, `cargo check --features sqlite`, the evidence pin test, and the commit `release(v<version>): version, evidence re-stamp — <### headings>`. The hooks run. | `bump.done` |
 | 4 | pr | Pushes the branch if origin differs from HEAD, then opens the PR or reuses the open one, through REST. The body is `--pr-body` or the section. | runs every time (idempotent) |
-| 5 | codex | Reads `chatgpt-codex-connector[bot]`'s review of HEAD if one exists, and does not wait for one: `CODEX_TIMEOUT_SECS` defaults to 0 since the subscription ended (2026-10-13; the free tier reviews at random). A value above 0 restores the wait, polled every `CODEX_POLL_SECS` (default 60). Reviewed means a bot review whose `commit_id` is HEAD, or the bot's summary comment showing a Completed row for HEAD's short sha (a clean pass posts no review, only a 👍). A review of an older head does not count. Any bot inline comment made on HEAD (its `original_commit_id`, or it belongs to a bot review of HEAD) stops the release with exit 30 and prints each finding's `path:line` and title. With no review present (or none arriving within a positive timeout) the stage proceeds and says so. `--skip-codex` skips even the read (an operator override, printed loudly). It runs before certify (see below). | `codex.done`, **at a sha** |
-| 6 | certify | Waits while any foreign cargo runs, until none has run for `RELEASE_QUIET_SECS` (60), at most `RELEASE_STRAY_WAIT_SECS` (7200; then exit 24): certify's stray-cargo guard used to refuse, and the stage exited 24 with nothing red. `CERTIFY_IGNORE_STRAY=1` skips the wait, as it skips certify's guard. Then `LANES=${LANES:-1} scripts/certify.sh full` > `.release/<v>/certify.log`. Green means exit 0 **and** the line `EVERY CI LEG GREEN BY EXIT CODE.` | `certify.done`, **at a sha** |
+| 5 | codex | Reads `chatgpt-codex-connector[bot]`'s review of HEAD if one exists, and by default does not wait for one (`CODEX_TIMEOUT_SECS` defaults to 0). A value above 0 waits, polled every `CODEX_POLL_SECS` (default 60). Reviewed means a bot review whose `commit_id` is HEAD, or the bot's summary comment showing a Completed row for HEAD's short sha (a clean pass posts no review, only a 👍). A review of an older head does not count. Any bot inline comment made on HEAD (its `original_commit_id`, or it belongs to a bot review of HEAD) stops the release with exit 30 and prints each finding's `path:line` and title. With no review present (or none arriving within a positive timeout) the stage proceeds and says so. `--skip-codex` skips even the read (an operator override, printed loudly). It runs before certify (see below). | `codex.done`, **at a sha** |
+| 6 | certify | Waits while any foreign cargo runs, until none has run for `RELEASE_QUIET_SECS` (60), at most `RELEASE_STRAY_WAIT_SECS` (7200; then exit 24), so certify's stray-cargo guard does not refuse a tree that is merely busy. `CERTIFY_IGNORE_STRAY=1` skips the wait, as it skips certify's guard. Then `LANES=${LANES:-1} scripts/certify.sh full` > `.release/<v>/certify.log`. Green means exit 0 **and** the line `EVERY CI LEG GREEN BY EXIT CODE.` | `certify.done`, **at a sha** |
 | 7 | prci | Waits for the PR's CI run on HEAD (`PRCI_TIMEOUT_MIN`, default 180). Auto-retry reruns are respected (see below). | `prci.done`, **at a sha** |
 | 8 | hold | Only with `--hold`: prints `RELEASE_HELD` and exits 0 with everything green and nothing merged. The same command without `--hold` resumes at ship. For a head an external party (Edge's re-gate) must report on before the tag. | — |
 | 9 | ship | `release_ship.sh <pr> <version> <head7> "<subject>" <merge-body>`: merge, tag at the merge commit, push the tag once main's run is visible, and print `TAG_RUN_ID`. | `ship.done` + `tag_run` |
@@ -36,9 +36,9 @@ scripts/release_finish.sh <version> <tag-run-id>                    # tag CI →
 
 Then run `release_finish.sh`. It checks that the run id is this tag's CI push run, waits for it (`FINISH_TIMEOUT_MIN`, default 180) and re-runs it if the same-SHA dedup cancelled it. It then waits for the release to exist, sets the body from the annotation of origin's tag (never a local copy; a different local tag is refused), asserts the body is at least the tag body's bytes minus 64, runs `scripts/verify_release.sh` (below), and prints `RELEASE_SHIP_DONE`.
 
-### Why the tag is pushed once main's run EXISTS (#1008)
+### Why the tag is pushed once main's run exists (#1008)
 
-The tag run and main's push run on the merge commit share one concurrency group (#397, keyed on the SHA, `cancel-in-progress`), so whichever run is queued later cancels the other. In v50.0.0 the two were queued in the same second, main's came second, and it cancelled the tag run, which is the one that publishes. v51 then waited for main's run to complete, which cost 64–65 min per release. Waiting only until main's run is visible makes the tag run the newer one, so it cancels main's run. `release_finish.sh` re-runs a cancelled tag run as a backstop.
+The tag run and main's push run on the merge commit share one concurrency group (#397, keyed on the SHA, `cancel-in-progress`), so whichever run is queued later cancels the other. The tag run is the one that publishes, so it must be the later one. `release_ship.sh` waits only until main's run is visible, then pushes the tag; the tag run is queued second and cancels main's. Waiting for main's run to complete would cost about an hour per release for nothing. `release_finish.sh` re-runs a cancelled tag run as a backstop.
 
 ### Main's run after a tree-equal merge
 
@@ -48,17 +48,15 @@ On a push to main, CI's `tree equality (main merges only)` job skips the whole r
 
 ### Why there are two commands
 
-v53.1.8's ship script was killed at the harness's 2-hour background cap while tag CI queued on macOS. `release.sh` ends at the tag push. `release_finish.sh` is a separate, re-runnable command, so each half fits under the cap. If either one is killed, run the same command again.
+A background job in the release harness is capped at two hours, and tag CI can queue longer than that on macOS runners. `release.sh` therefore ends at the tag push, and `release_finish.sh` is a separate, re-runnable command, so each half fits under the cap. If either one is killed, run the same command again.
 
-### Why release.sh waits for Codex (CIRISPersist#1039)
+### The review stage
 
-On PR #1039 the chain would have merged and tagged v53.2.0 about ten minutes after Codex posted six findings, one of them a P1 that emptied the CHANGELOG cut under gawk. Certify and PR CI were green, and nothing in the chain read the review. It was stopped by hand. The `codex` stage reads it. Findings are keyed to the commit Codex reviewed, not to a comment's current `commit_id`: GitHub moves that forward to the newest head while the line is unchanged, so an old finding that was already fixed would otherwise block every later push. The stage fails open after its timeout because Codex is an external service, and its absence must not hold a release indefinitely. The warning line makes that visible.
+The `codex` stage reads the automated review of the PR head so that a review finding stops the chain before it merges. Findings are keyed to the commit that was reviewed, not to a comment's current `commit_id`: GitHub moves that forward to the newest head while the line is unchanged, so an old, already-fixed finding would otherwise block every later push. The stage does not wait by default, because the reviewer is an external service whose absence must not hold a release; it says so when no review is present.
 
-### Why Codex runs before certify, and what `--hold` is for (v55.0.0)
+It runs right after the PR push and before certify. Certify takes about an hour; a finding read before certify costs one fix commit, not a re-certification of a head that the finding then replaces.
 
-Codex reviews a pushed head within minutes; certify takes about an hour. With codex after certify, every finding cost a fix commit and a full re-certify of the new head. v55.0.0 went through four Codex rounds that way, and six chain launches in all: most of a night was spent re-certifying heads that a finding then replaced. With codex right after the PR push, a finding stops the chain before certify starts, and the hour is spent once, on the head that ships.
-
-The chain has no other external gate. v55.0.0 was tagged minutes after its last clean Codex pass, before Edge had reported its re-gate on that head, because nothing waited for it. `--hold` is that wait: the chain stops green after PR CI and prints `RELEASE_HELD`; the same command without the flag resumes at ship.
+`--hold` is the wait for an external party. The chain stops green after PR CI and prints `RELEASE_HELD`; the same command without the flag resumes at ship. Use it when a consumer (for example CIRISEdge's re-gate) must report on the head before it is tagged.
 
 ## The resume rule
 
@@ -131,7 +129,7 @@ gh attestation verify evidence/cc_impl.tsv -R CIRISAI/CIRISPersist \
 
 `verify_release.sh` also runs `scripts/bits_changed.sh` on each desktop wheel (below), against the registry. Its `ok    bits` and `ok    bits (registered)` lines are per target.
 
-Releases before v53.2.0 carry no attestations. Through v53.1.8 the wheel artifacts also held stale wheels restored from the build cache, and build-manifest registered a v29.0.0 wheel's hash for linux-aarch64 and windows-x86_64. v53.2.0 clears `target/wheels/` before the build and selects only `ciris_persist-<v>-*.whl`.
+Releases before 53.2.0 carry no attestations. The wheel build clears `target/wheels/` first and selects only `ciris_persist-<v>-*.whl`, so a stale wheel restored from the build cache can never be signed or registered; the hashes of the stale wheels that some 53.x releases registered are listed in `evidence/manifest_remediation/known_stale_hashes.txt`, which the bits-changed gate refuses.
 
 ## The bits-changed gate
 
@@ -149,7 +147,7 @@ Releases before v53.2.0 carry no attestations. Through v53.1.8 the wheel artifac
 | — | a registry read failed: not 200, and not a 404 where one is allowed | 17 |
 | — | no previous version could be found | 18 |
 
-`python-source-tree` is the fifth target. It is not a wheel: pass its tree hash as `--sha256 <hex>`. Checks 1 and 2 are skipped for it. Check 3 lets its hash equal the previous release's only when `git diff --quiet v<prev> v<version> -- python/ciris_persist` is empty, and the gate prints that it allowed it on that basis. That tree is three files, which were unchanged from v13.0.0 through v17.6.0, so an equal hash is often genuine. A wheel never gets this exemption, because it embeds its version. The tag job's `build-manifest` checkout fetches full history so the tags are there.
+`python-source-tree` is the fifth target. It is not a wheel: pass its tree hash as `--sha256 <hex>`. Checks 1 and 2 are skipped for it. Check 3 lets its hash equal the previous release's only when `git diff --quiet v<prev> v<version> -- python/ciris_persist` is empty, and the gate prints that it allowed it on that basis. That tree is three small files that often go unchanged across releases, so an equal hash is often genuine. A wheel never gets this exemption, because it embeds its version. The tag job's `build-manifest` checkout fetches full history so the tags are there.
 
 The target map is `aarch64-unknown-linux-gnu` to `manylinux*_aarch64`, `x86_64-unknown-linux-gnu` to `manylinux*_x86_64`, `x86_64-pc-windows-msvc` to `win_amd64`, and `aarch64-apple-darwin` to `macosx*_arm64`. The previous version is the newest `v` tag below `<version>`, from `git tag`, or `git ls-remote` in a shallow checkout. `--prev` or `BITS_CHANGED_PREV` overrides it. The registry is `BITS_CHANGED_REGISTRY_BASE`; the tag job points it at the registry it writes to. A 429 or 5xx is retried, honouring `Retry-After`.
 
@@ -157,46 +155,41 @@ Where it runs: the tag job runs checks 1 to 4 before each sign and check 5 after
 
 ### The signer's own refusal (CIRISPersist#992)
 
-The tag job and `reregister-manifests.yml` sign with `ciris-build-sign` v20.1.0. The version lives in one place, `TOOL_VERSION` in `scripts/build_manifest.sh`. From v20.1.0 the signer reads a wheel's own `*.dist-info` before it signs, through the same check the verifier runs (CIRISVerify#306/#307). It refuses, exits 1 and writes nothing when either of these is true:
+The tag job and `reregister-manifests.yml` sign with `ciris-build-sign`, at the version pinned in one place, `TOOL_VERSION` in `scripts/build_manifest.sh`. The signer reads a wheel's own `*.dist-info` before it signs, through the same check the verifier runs (CIRISVerify#306/#307). It refuses, exits 1 and writes nothing when either of these is true:
 
 - the wheel's `Version:` is not `--binary-version`;
 - no `Tag:` platform fits `--target`, using the same four-target map as above.
 
 This is the second line behind `bits_changed.sh` checks 1 and 2, and it does not replace the gate. The signer cannot know check 3, the previous release's registered hash, or check 4, the known-stale list, and the gate still runs first. The signer's check engages only when `sign` is given the `.whl` itself with `--binary`. A `--binary-hash` sign skips it, and the script never uses one for a wheel. `scripts/build_manifest.sh sign` refuses to run unless the `ciris-build-sign` on PATH reports exactly `TOOL_VERSION`, because an older binary signs any wheel it is given. `install` makes the same check.
 
-The switch from v2.1.5 changes nothing else the registry sees. The CLI flags, the `python-source-tree` hash, the manifest fields and the `register --dry-run` payload preview were identical between the two tools on the v53.2.0 tree and wheels. On those four wheels, v20.1.0 refused a claimed version of 54.0.0 and every wrong target, and v2.1.5 signed the wrong version.
-
 ## Remediating a registered manifest
 
-CIRISRegistry keys manifest rows by (project, version, target) and upserts them in place. It keeps no history until CIRISRegistry#144 lands. Each version has five targets: `python-source-tree`, a hash over `python/ciris_persist`, and one row per wheel.
+CIRISRegistry keys manifest rows by (project, version, target) and upserts them in place; it keeps no history (CIRISRegistry#144 tracks that). Each version has five targets: `python-source-tree`, a hash over `python/ciris_persist`, and one row per wheel.
 
-The wheels exist only as each tag run's `ciris_persist-wheel-<label>` artifacts. PyPI publishing stopped at 22.0.1 (#615), and the GitHub release carries only the iOS and Android tarballs.
+The wheels exist only as each tag run's `ciris_persist-wheel-<label>` artifacts. They are not on PyPI (#615), and the GitHub release carries only the iOS and Android tarballs.
 
-The rule is check first. A dispatch with the defaults (`mode: check`, `dry_run: true`, all five targets) writes nothing.
+`.github/workflows/reregister-manifests.yml` repairs a registered row. The rule is check first: a dispatch with the defaults (`mode: check`, `dry_run: true`, all five targets) writes nothing.
 
 1. **The first dispatch is always the check pass,** over every affected version and all five targets:
    ```
-   gh workflow run reregister-manifests.yml \
-     -f versions="53.0.1 53.1.0 53.1.1 53.1.2 53.1.3 53.1.4 53.1.5 53.1.6 53.1.7 53.1.8"
+   gh workflow run reregister-manifests.yml -f versions="<v1> <v2> ..."
    ```
    Per (version, target), the run prints the registered `binary_hash` beside the local hash, with `MATCH`, `MISMATCH` or `NOROW`.
    - A wheel's local hash is the sha256 of that version's wheel. It is selected by version from the tag run's artifact. The tag run is the newest CI push run of `v<version>` with unexpired wheel artifacts.
    - `python-source-tree`'s local hash is recomputed from the version's tag exactly as the tag job signs it, with `ciris-build-sign sign --tree python/ --tree-include ciris_persist` and the same exemptions, using a throwaway keypair. The tree hash does not depend on the key. It is compared with the registered `binary_hash` like any other row.
    - The table is in the step summary and in each version's `manifests-check-<v>` artifact.
-2. **Snapshot all five targets of every version you will repost, and commit them.** The snapshot is the only record of what is overwritten. `register` rewrites all five targets of a version, not only the MISMATCH ones, so the repost refuses a version unless all five are committed. The 11 MISMATCH pairs known from #1029 are already committed. The other targets of those versions are not yet.
+2. **Snapshot all five targets of every version you will repost, and commit them.** The snapshot is the only record of what is overwritten. `register` rewrites all five targets of a version, not only the MISMATCH ones, so the repost refuses a version unless all five are committed. Snapshots live in `evidence/manifest_remediation/<version>/`.
    ```
    scripts/snapshot_manifests.sh <version> python-source-tree x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc
    git add evidence/manifest_remediation/<version>/ && git commit
    ```
    The script refuses to overwrite an existing snapshot (exit 4). It writes nothing for a pair whose reads are not all 200 (exit 5).
-3. **Repost** only the versions and targets that showed MISMATCH, with `mode: repost` and `dry_run: false`, from a ref that has the snapshots. A repost left at `dry_run: true` stops at `ciris-build-sign register --dry-run`. For #1029 the expected command is:
+3. **Repost** only the versions and targets that showed MISMATCH, with `mode: repost` and `dry_run: false`, from a ref that has the snapshots. A repost left at `dry_run: true` stops at `ciris-build-sign register --dry-run`.
    ```
    gh workflow run reregister-manifests.yml -f mode=repost -f dry_run=false \
-     -f versions="53.0.1 53.1.0 53.1.1 53.1.2 53.1.3 53.1.4 53.1.5 53.1.6 53.1.7" -f targets="x86_64-pc-windows-msvc"
-   gh workflow run reregister-manifests.yml -f mode=repost -f dry_run=false \
-     -f versions="53.1.8" -f targets="aarch64-unknown-linux-gnu x86_64-pc-windows-msvc"
+     -f versions="<versions>" -f targets="<targets>"
    ```
-   Use the check pass's table, not this list, if they differ. Within the targets given, a repost re-signs only the rows its own check step finds MISMATCH. Any target, `python-source-tree` included, is re-signed only on MISMATCH. It refuses a version unless all five targets have committed snapshots and every live row, compared whole as canonical JSON, still equals its snapshot.
+   Within the targets given, a repost re-signs only the rows its own check step finds MISMATCH. Any target, `python-source-tree` included, is re-signed only on MISMATCH. It refuses a version unless all five targets have committed snapshots and every live row, compared whole as canonical JSON, still equals its snapshot.
    - The MISMATCH targets are re-signed after `bits_changed.sh` checks 1 to 4.
    - Every other target is re-posted unchanged, from the registry's live build-manifest read, never from the tag run's artifact. That fetched body must equal the committed snapshot, and its manifest is checked against its wheel or against the tag's tree. `register` writes one `binary_manifests` map per version, so a partial re-post would drop the rest.
    - `register` also rewrites every target's `builds` row. The run therefore saves its own copy of all five live rows first, in the `manifests-repost-<v>` artifact.

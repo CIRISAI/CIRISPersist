@@ -1,49 +1,48 @@
 # v60.1.0 and v61.0.0 — task plan: the additive cut, then finish the refactor
 
-Written 2026-10-26 from the post-v60 backlog pass (75 open issues; 13 closed as shipped in
-v60.0.0). Operator ruling 2026-10-26: "Is the refactoring 100%? … Yep, proceed" — v61 is the
-finish-the-refactor major, and the feature asks that touch the membership planes (rooms,
-census) are built on the new rows, not before them.
+v60.1.0 is the additive cut and has shipped (§2). v61.0.0 is the major that finishes the
+refactor. The feature asks that touch the membership planes (rooms, census) are built on the new
+rows (§3 S1), not before them.
 
-## 0. Where v60.0.0 left the two programs
+## 0. The two programs at v60.0.0
 
-Measured at the v60.0.0 head (8dec0dea; `release53/v60_acceptance.md`):
+Measured at the v60.0.0 release:
 
 | program | state at v60 | what remains |
 |---|---|---|
 | shared logic across backends (#934) | 355 doors: **40 shared** (+8 shared selections), **43 identical** (the same gate written in sqlite and postgres, not lifted), 1 declared, 271 gateless (per-dialect SQL, no decision). Backends 134,737 → 105,198 lines, three copies → two. | lift the 43 identical gates; #934 step 5 (coverage, diff mutants); then #1004 (workspace split) as the end state for the gateless SQL |
-| everything as `scores` rows (#988, #991) | done: traces, cirisnode (7 classes), goals, hard_case, detection, the key plane, key grants, takedown notices | **11 typed wire kinds** still cross as their own objects with their own tables: Family, Community, the six membership planes (3 revocations, 2 widenings, the listing), LocationProof, TransportDestination, AccordQuorumEvidence. Below the wire: the accord tables (held for steward ratification, CC 4.2), `consent_peer_set`, the 25 `cirislens_*` tables (unscheduled long arc) |
+| everything as `scores` rows (#988, #991) | done: traces, cirisnode (7 classes), goals, hard_case, detection, the key plane, key grants, takedown notices | **11 typed wire kinds** still cross as their own objects with their own tables: Family, Community, the six membership planes (3 revocations, 2 widenings, the listing), LocationProof, TransportDestination, AccordQuorumEvidence. Below the wire: the accord tables (awaiting steward ratification, CC 4.2), `consent_peer_set`, the 25 `cirislens_*` tables (unscheduled long arc) |
 
-The v60 plan's own target was ≤ 7 typed kinds; v60 ended at 11. v61 takes it to 3 (LocationProof,
-TransportDestination, AccordQuorumEvidence) and schedules those three after.
+v61 takes the typed kinds from 11 to 3 (LocationProof, TransportDestination,
+AccordQuorumEvidence) and schedules those three after.
 
 ## 1. Order and ownership
 
 Two releases, in order:
 
-1. **v60.1.0** (MINOR, one week): bugs and the additive Edge/Server asks. Nothing on the wire, the
-   Python surface or an exhaustive enum changes shape; new vocabulary is appended. Three slices,
-   two in parallel (A, B) and one after (C). Branch `release-60.1.0` from main 8dec0dea.
-2. **v61.0.0** (MAJOR, two weeks): every break together, so Edge adapts once. Branch
-   `release-61.0.0` from the v60.1.0 tag. Five slices plus release.
+1. **v60.1.0** (MINOR, shipped): bugs and the additive Edge/Server asks. Nothing on the wire, the
+   Python surface or an exhaustive enum changed shape; new vocabulary is appended. Three slices,
+   two in parallel (A, B) and one after (C).
+2. **v61.0.0** (MAJOR): every break together, so Edge adapts once. Branch `release-61.0.0` from
+   the v60.1.0 tag. Five slices plus release.
 
-Each slice is one Opus agent in its own worktree, reporting a handoff with every claim TESTED or
-BELIEVED; the lead reviews, merges into the release branch, runs the slice's witnesses on the
-merged head, and briefs the next slice. The rules of §6 apply unchanged from v60.
+Each slice is built in its own worktree and handed off with every claim marked TESTED or
+BELIEVED. It is reviewed, merged into the release branch, and its witnesses are re-run on the
+merged head before the next slice is briefed. The process rules are in §5.
 
-Decisions still with the operator (none block v60.1; the first two shape v61 S2/S3):
+Open decisions (the first shapes v61 S3):
 
-- **W beyond 72 h (#1049):** S6 refuses only when the standing has also lapsed at receipt (the
-  #1099 reading); CC 2.6.7's text refuses unconditionally. If the ruling goes to CC's text it is a
+- **W beyond 72 h (#1049):** the door refuses only when the standing has also lapsed at receipt
+  (the #1099 reading); CC 2.6.7's text refuses unconditionally. Following CC's text is a
   behaviour break and rides v61 S3.
 - **`DELEGATION_TERM_ADOPTED_AT`:** fixed at 2026-10-23; the alternative is the v60.0.0 release
-  date (2026-10-26). A one-line change, v60.1 slice C if ruled.
+  date (2026-10-26). A one-line change.
 - **RUSTSEC-2026-0387 (#1127):** stays ignored until CIRISVerify moves to elliptic-curve 0.14;
-  the re-pin rides whichever cut it lands in (verify pins flip together).
+  the re-pin rides whichever cut that lands in (verify pins flip together).
 
-## 2. v60.1.0 — the additive cut
+## 2. v60.1.0 — the additive cut (shipped)
 
-### Slice A — bugs (worktree wt-60s0, branch `v601-a`)
+### Slice A — bugs
 
 | issue | what | witness |
 |---|---|---|
@@ -51,13 +50,13 @@ Decisions still with the operator (none block v60.1; the first two shape v61 S2/
 | #1069 | `register_stream_epoch_dek`: an identical re-supply is idempotent `Ok`; a different DEK is a typed conflict | both arms, both backends |
 | #1006 | `custody_view`'s `received` orders by this node's storage stamp, not a subscriber-signed instant; `put_delivery_receipt` has no signed instant to order by | ordering by the signed instant; a receipt without one refused |
 | #798 | type-keyed folds resolve a claim through its `supersedes` chain | a superseded claim read through the chain |
-| #1070 | takedown immediate-removal: no-LocalSigner engines, resume a recorded execution, tombstone/write race | the three Codex cases |
+| #1070 | takedown immediate-removal: no-LocalSigner engines, resume a recorded execution, tombstone/write race | the three cases filed on #1070 |
 | #1072 | plaintext DAG doors refuse positioned chunk fields and a mismatched external size at the door | both refusals |
-| #1124 | `CryptoTier::InvisibleEncrypted` doc comment says opt-in; sealing has been mandatory since v43 | doc only; grep `docs/` and `FSD/` for the same wording |
+| #1124 | `CryptoTier::InvisibleEncrypted` doc comment says opt-in; sealing is mandatory | doc only; grep `docs/` and `FSD/` for the same wording |
 
 Mutation scope `scope-601-fixes` over the touched predicates; ≤ 55 mutants.
 
-### Slice B — consumer asks (worktree wt-60s6v, branch `v601-b`)
+### Slice B — consumer asks
 
 | issue | ask | shape |
 |---|---|---|
@@ -74,13 +73,13 @@ Mutation scope `scope-601-fixes` over the touched predicates; ≤ 55 mutants.
 Every new token registered with CC before the handoff (CC stages it on the ticket). Mutation scope
 `scope-601-asks`; ≤ 55 mutants per shard.
 
-### Slice C — tail (after A and B merge; worktree wt-60s0, branch `v601-c`)
+### Slice C — tail (after A and B merge)
 
 - #854: cirisnode `subject_key_ids` take canonical ids, so the Emit/Ingest subject gate is one
   gate (the cirisnode rows just moved; this is their last cirisnode-shaped seam).
 - #720, second half: the §6.1-precedence read in the lifecycle predicate.
 - `certify.sh:314`: the cheap legs' `.secs` files are never written, so their times print `-s`.
-- `DELEGATION_TERM_ADOPTED_AT` to the release date, if ruled.
+- `DELEGATION_TERM_ADOPTED_AT` to the release date, if so decided.
 - #1127's re-pin, only if CIRISVerify has tagged the bump.
 
 ### v60.1.0 release
@@ -88,14 +87,14 @@ Every new token registered with CC before the handoff (CC stages it on the ticke
 CHANGELOG `## [60.1.0]` with an Adoption subsection that says, truthfully, "no break; new
 functions and tokens only"; the five axes, pyo3, both clippy, pyi before the chain;
 `release.sh 60.1.0 --hold`; Edge gets the candidate; tag on Edge's green. The mutants matrix is
-dispatched on the candidate BEFORE the hold is lifted (v60 lesson: a slice that deletes or moves
-tests re-runs every scope those tests witnessed).
+dispatched on the candidate BEFORE the hold is lifted (a slice that deletes or moves tests re-runs
+every scope those tests witnessed).
 
 ## 3. v61.0.0 — finish the refactor
 
 ### S0 — vendor CC rc12 at its tag; re-pin; the signed-object cleanup (#1098)
 
-- rc12 vendored at the tag (never the PR branch): the #1125 readings, the rc11 room ruling, the
+- rc12 vendored at the tag (never the PR branch): the #1125 readings, the rc11 rooms text, the
   affiliation tokens, `observation:access_assumption` at +1.0, the census families and tokens as
   registered on #1121. Goal tokens repointed from CC#67 to 3.1.9.7.
 - #1098 F2 (a bare scope token admitted as the one-element array it denotes; signed bytes never
@@ -130,7 +129,7 @@ v60 typed rows rehomed once, `rehome_group_records()`, checked by a from-disk co
 - #1063: deliver a public room's standing proposal to a non-member requester.
 - #1100 item 2(i): the reverse path for membership adds, through `two_path`.
 
-### S3 — record-shape breaks (#1126, #1101, #1116, #1122; the W ruling if it changes the door)
+### S3 — record-shape breaks (#1126, #1101, #1116, #1122; #1049 if it changes the door)
 
 - #1126 partnership rows take the `consent_record` shape; readers fold both shapes; the bare shape
   refused at admission (`partnership_shape_retired`, registered with CC).
@@ -139,7 +138,7 @@ v60 typed rows rehomed once, `rehome_group_records()`, checked by a from-disk co
   the door.
 - #1122 transport destinations: one destination, one live key; a newer route supersedes, or a
   retire door.
-- #1049 if the steward rules to CC 2.6.7's text: refuse beyond W unconditionally.
+- #1049, if the decision is to follow CC 2.6.7's text: refuse beyond W unconditionally.
 
 ### S4 — the 43 identical gates onto shared plans; #934 step 5; #1067
 
@@ -180,15 +179,15 @@ certify, the mutants matrix on the candidate, `--hold` for Edge's re-gate, tag o
 
 ## 5. Process rules
 
-Unchanged from `docs/V60_TASK_PLAN.md` §6, plus what v60 taught:
+The rules of `docs/V60_TASK_PLAN.md` §6, plus:
 
 - Every cargo / nextest / maturin call and every `git commit` through `scripts/cargo_guard.sh`;
   `CARGO_GUARD_SLOTS=2` for two parallel slices, `=1` for a lone builder; prebuild a cold
   all-features lane at `CARGO_BUILD_JOBS=1 --no-run` first.
-- No `--no-verify`, no `--amend`, no `reset` of another's commit, agents never push. An agent's
-  "DONE" is not a handoff of its worktree while a message to it is unread: the lead stops the
-  agent, kills its shell tree, confirms no cargo of its is running, then edits.
-- Every job in the foreground under `timeout`; background completion never wakes a subagent.
+- No `--no-verify`, no `--amend`, no `reset` of another's commit; nobody but the release lead
+  pushes. A worktree is handed off only when its builder has stopped: no shell or cargo of its is
+  still running, and no instruction to it is unread.
+- Every job in the foreground under `timeout`.
 - A slice that deletes or moves tests re-runs every mutation scope those tests witnessed before
   its handoff. The matrix is dispatched on the candidate before the hold is lifted.
 - A wire claim to another project is read from the function body, never its doc comment.

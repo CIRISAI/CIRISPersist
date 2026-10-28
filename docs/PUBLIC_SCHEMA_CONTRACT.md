@@ -1,13 +1,11 @@
-# PUBLIC_SCHEMA_CONTRACT.md
+# Public Schema Contract
 
 CIRISPersist's `cirislens` schema is the analytical substrate for every
 federation peer that reads persist's data — lens science scripts,
-partner sites, registry dashboards, sovereign-mode operators. Today
-those consumers connect with the same DSN as the write path, which
-works but conflates privilege levels and gives no contract about which
-columns persist guarantees vs. which are internal.
-
-This doc + the `cirislens_reader` role provisioned by V005 fix that.
+partner sites, registry dashboards, sovereign-mode operators. Analytical
+consumers connect through the read-only `cirislens_reader` role (V005),
+not the write-path DSN, and this document states which columns persist
+guarantees and which are internal.
 
 ## Scope
 
@@ -53,7 +51,7 @@ per attempt. Time-series via `ts`; deduped on
 | `step_point`              | text        | stable    | Wire-format §3 step taxonomy. |
 | `event_type`              | text        | stable    | Reasoning event taxonomy (`PERFORM_ASPDMA_THOUGHT`, etc.). |
 | `attempt_index`           | int         | stable    | Per-event retry index; 0 for first attempt. |
-| `ts`                      | timestamptz | stable    | Event timestamp from agent (TimescaleDB hypertable key). |
+| `ts`                      | timestamptz | stable    | Event timestamp from the agent; the time axis. |
 | `agent_name`              | text        | stable    | Human-readable agent identifier. |
 | `agent_id_hash`           | text        | stable    | Cryptographic agent identifier; load-bearing for AV-9 dedup. |
 | `cognitive_state`         | text        | stable    | Agent cognitive state at event time. |
@@ -74,7 +72,7 @@ per attempt. Time-series via `ts`; deduped on
 ### `cirislens.trace_llm_calls`
 
 Per-LLM-call rows linked to a parent `trace_events` row by `trace_id`
-+ `parent_event_type` + `parent_attempt_index` (v2.7.9 wire format).
++ `parent_event_type` + `parent_attempt_index`.
 
 | Column                  | Type        | Tier     | Notes |
 |-------------------------|-------------|----------|-------|
@@ -83,10 +81,10 @@ Per-LLM-call rows linked to a parent `trace_events` row by `trace_id`
 | `thought_id`            | text        | stable   | Joins to `trace_events.thought_id`. |
 | `task_id`               | text        | stable   | Optional. |
 | `parent_event_id`       | bigint      | stable   | FK-shape join to `trace_events.event_id` when computable. |
-| `parent_event_type`     | text        | stable   | v2.7.9: parent event taxonomy. |
-| `parent_attempt_index`  | int         | stable   | v2.7.9: parent's `attempt_index`. |
+| `parent_event_type`     | text        | stable   | Parent event taxonomy. |
+| `parent_attempt_index`  | int         | stable   | Parent's `attempt_index`. |
 | `attempt_index`         | int         | stable   | LLM call's own retry index. |
-| `ts`                    | timestamptz | stable   | Call timestamp (hypertable key). |
+| `ts`                    | timestamptz | stable   | Call timestamp; the time axis. |
 | `duration_ms`           | float8      | stable   | Wall-clock latency. |
 | `handler_name`          | text        | stable   | Handler that issued the call. |
 | `service_name`          | text        | stable   | Inference provider service identifier. |
@@ -113,11 +111,11 @@ Federation public-key directory. Hybrid Ed25519 + ML-DSA-65 per
 
 | Column                       | Type        | Tier     | Notes |
 |------------------------------|-------------|----------|-------|
-| `key_id`                     | text        | stable   | Primary key. Joins to `signature_key_id` on traces. |
+| `key_id`                     | text        | stable   | Primary key. Joins to `signing_key_id` on traces. |
 | `pubkey_ed25519_base64`      | text        | stable   | 32 raw bytes base64 → 44 chars. |
 | `pubkey_ml_dsa_65_base64`    | text        | stable   | 1952 raw bytes base64 → ~2604 chars; null until cold-path PQC fill-in completes. |
 | `algorithm`                  | text        | stable   | Always `'hybrid'` (CHECK constraint). |
-| `identity_type`              | text        | stable   | `agent` \| `primitive` \| `steward` \| `partner`. |
+| `identity_type`              | text        | stable   | Identity class of the key (e.g. `agent`, `steward`, `node`, `accord_holder`). |
 | `identity_ref`               | text        | stable   | Shape varies by `identity_type`; see V004 schema header. |
 | `valid_from`                 | timestamptz | stable   | Validity start. |
 | `valid_until`                | timestamptz | stable   | Validity end; null = no expiry. |
@@ -143,7 +141,7 @@ itself.
 | `attestation_id`             | uuid        | stable   | Primary key. |
 | `attesting_key_id`           | text        | stable   | FK to `federation_keys.key_id`. |
 | `attested_key_id`            | text        | stable   | FK to `federation_keys.key_id`. |
-| `attestation_type`           | text        | stable   | v2.4.0 vocabulary (CIRISPersist#102): `scores` (workhorse) \| `delegates_to` \| `supersedes` \| `withdraws` \| `recants` \| (consumer extensions). Replaces the pre-2.4.0 `vouches_for` / `witnesses` / `referred` / `delegated_to` set. See `docs/FEDERATION_DIRECTORY.md` §"attestation_type vocabulary" for full semantics + admission-gate rules on `scores.dimension`. |
+| `attestation_type`           | text        | stable   | `scores` (workhorse) \| `delegates_to` \| `supersedes` \| `withdraws` \| `recants` (CIRISPersist#102). See `docs/FEDERATION_DIRECTORY.md` §"attestation_type vocabulary" for full semantics + admission-gate rules on `scores.dimension`. |
 | `weight`                     | numeric     | stable   | Attester-supplied weight; null = consumer policy decides. |
 | `asserted_at`                | timestamptz | stable   | When the attestation was made. |
 | `expires_at`                 | timestamptz | stable   | Expiry; null = no expiry. |
@@ -162,9 +160,8 @@ Append-only revocation log. Consumers compute "is K revoked at T?" by
 querying revocations of K with `effective_at <= T` and applying their
 own consensus policy.
 
-v25.1.0 (CIRISPersist#570 ask 4) adds the second question a consumer can now
-ask: **"does a statement K made at T still stand?"** — see `revoked_after`
-below, and `federation::register::resolve_key_statement_standing` for the fold
+A consumer can also ask **"does a statement K made at T still stand?"**
+(CIRISPersist#570) — see `revoked_after` below, and `federation::register::resolve_key_statement_standing` for the fold
 (and for the explicit list of read paths that do NOT honour the bound).
 
 | Column                       | Type        | Tier     | Notes |
@@ -175,7 +172,7 @@ below, and `federation::register::resolve_key_statement_standing` for the fold
 | `reason`                     | text        | stable   | Free-form; consumers parse if they care. |
 | `revoked_at`                 | timestamptz | stable   | When the revocation was issued. |
 | `effective_at`               | timestamptz | stable   | When it takes effect; may be past (retroactive) or future (scheduled). |
-| `revoked_after`              | timestamptz | stable   | v25.1.0 (V118, #570 ask 4) — the **history bound**: the last instant this key's statements are still stood behind. A statement asserted at or before it survives the revocation; one asserted after it is suspect. NULL (the default, and every pre-v25.1 row) means all-or-nothing, which is what an unbounded revocation has always meant. **Signed**: admission refuses any row whose value is not mirrored, to the second, by a `revoked_after` in `revocation_envelope`, or whose bound is later than `effective_at`. |
+| `revoked_after`              | timestamptz | stable   | (V118) The **history bound**: the last instant this key's statements are still stood behind. A statement asserted at or before it survives the revocation; one asserted after it is suspect. NULL (the default) means all-or-nothing — an unbounded revocation. **Signed**: admission refuses any row whose value is not mirrored, to the second, by a `revoked_after` in `revocation_envelope`, or whose bound is later than `effective_at`. |
 | `revocation_envelope`        | jsonb       | stable   | Canonical bytes that were signed. |
 | `original_content_hash`      | bytea       | stable   | SHA-256 of canonical envelope. |
 | `scrub_signature_classical`  | text        | stable   | Ed25519 signature, base64. |
@@ -185,11 +182,13 @@ below, and `federation::register::resolve_key_statement_standing` for the fold
 | `pqc_completed_at`           | timestamptz | stable   | When PQC was attached; null while hybrid-pending. |
 | `persist_row_hash`           | text        | stable-ro| Server-computed canonical hash. |
 
-### `cirislens.accord_public_keys` *(deprecated, retires at v0.4.0)*
+### `cirislens.accord_public_keys` *(legacy)*
 
-Legacy lens-canonical pubkey directory. v0.2.0+ writes to
-`federation_keys`; the verify path dual-reads both tables (federation
-first, accord fallback). v0.4.0 retires this table.
+The legacy lens-canonical Ed25519 pubkey directory. `federation_keys` is the
+canonical pubkey directory; the trace verify path (`lookup_public_key`) reads
+`federation_keys` only. The table stays in the schema for historical reads
+through `cirislens_reader`. New readers should use `federation_keys` and
+`federation_revocations`.
 
 | Column              | Type        | Tier        | Notes |
 |---------------------|-------------|-------------|-------|
@@ -203,21 +202,13 @@ first, accord fallback). v0.4.0 retires this table.
 | `revoked_reason`    | text        | deprecated  | Use `federation_revocations.reason`. |
 | `added_by`          | text        | deprecated  | No equivalent in `federation_keys`. |
 
-**Migration**: at or before v0.4.0, point any reader at
-`federation_keys` and treat `accord_public_keys` rows older than the
-v0.2.0 cutover as historical-only. v0.3.x's persist dual-reads both
-tables for verify, so the read path is unaffected by retiring the
-legacy table.
+## Mapping from lens's `accord_traces` shape
 
-## Legacy lens migration: `accord_traces` → `trace_events` + `trace_llm_calls`
-
-Lens's pre-v0.2.x `accord_traces` table (renamed from `covenant_traces`
-in lens migration 022) stored one wide row per trace with denormalized
-columns for every IDMA / CSDMA / DSDMA / conscience field. v0.2.x+
-splits these into `trace_events` (one row per agent step) +
-`trace_llm_calls` (one row per LLM call). Lens analytical scripts
-that still query `accord_traces` shapes can migrate using this
-mapping:
+Lens's older `accord_traces` table stored one wide row per trace with
+denormalized columns for every IDMA / CSDMA / DSDMA / conscience field.
+Persist stores `trace_events` (one row per agent step) and
+`trace_llm_calls` (one row per LLM call). Analytical scripts written
+against `accord_traces` map as follows:
 
 | `accord_traces` column          | `trace_events` / `trace_llm_calls` location | Notes |
 |---------------------------------|----------------------------------------------|-------|
@@ -225,7 +216,7 @@ mapping:
 | `thought_id`                    | `trace_events.thought_id`                    | Direct. |
 | `agent_id_hash`                 | `trace_events.agent_id_hash`                 | Direct. |
 | `agent_name`                    | `trace_events.agent_name`                    | Direct. |
-| `timestamp`                     | `trace_events.ts`                            | Renamed `ts` for hypertable consistency. |
+| `timestamp`                     | `trace_events.ts`                            | Named `ts`. |
 | `idma_k_eff`                    | `trace_events.payload->>'k_eff'`             | On `event_type='PERFORM_ASPDMA_THOUGHT'` rows. |
 | `idma_correlation_risk`         | `trace_events.payload->>'correlation_risk'`  | Same row as `k_eff`. |
 | `idma_fragility_flag`           | `trace_events.payload->>'fragility_flag'`    | Same row. |
@@ -270,9 +261,8 @@ trace-scope analytics.
 This contract is part of persist's public API surface. Changes
 follow the semver discipline above (`stable` → major bump for
 breaking change, with at least one minor's deprecation window).
-Persist's CHANGELOG entries call out any column tier changes; consumers
-can monitor by pinning persist version and reading the changelog
-between bumps.
+CHANGELOG entries call out any column tier change; consumers pin a
+persist version and read the changelog between bumps.
 
 Schema migrations land in `migrations/postgres/lens/V*.sql`; the
 column inventory in this doc is the source of truth for what's

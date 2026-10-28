@@ -1,4 +1,4 @@
-# CIRISPersist Wire Vocabulary — Tier-2 `kind` allocations
+# CIRISPersist Wire Vocabulary — `kind` allocations
 
 **Range steward:** CIRISPersist
 **Reserved range (§3.1):** `0x0005_0000..=0x0005_FFFF` — "persist-tier telemetry"
@@ -8,130 +8,153 @@
 — exported as `ciris_persist::WIRE_VOCABULARY_HASH`, byte-identical to
 `CIRISEdge::WIRE_VOCABULARY_HASH` (CIRISEdge#241) and the artifact-steward copy.
 
+This file covers two separate vocabularies persist owns:
+
+1. the **Tier-2 `kind: u32` allocations** in persist's reserved range (the
+   human-readable table behind `src/wire_vocabulary.rs`), and
+2. the **replicated `EnvelopeKind` set** persist owns as the APPLY authority
+   (`src/federation/replication_policy.rs`).
+
 ---
 
-## What this document is
+## Part 1 — Tier-2 `kind` allocations
 
 The CC 0.7 wire vocabulary is **two-tier** (RFC 8126 registration policy).
 Tier 1 is the closed `MessageType` set carrying the ethical primitives, owned
 by CIRISEdge and amended only through CC §4.5.1. Tier 2 is three opaque
 channels — `OpaqueRequest` / `OpaqueResponse` / `OpaqueEvent` — each carrying a
 `kind: u32` drawn from a per-repo reserved range. Edge treats the `payload` as
-opaque bytes and enforces only the outer envelope signature + the global body
+opaque bytes and enforces only the outer envelope signature and the global body
 caps; **the range steward owns the inner schema, its canonicalization, and the
 convenience surface** (§3.3), documented here.
 
-§3.1 assigns CIRISPersist the range above. This file is the authoritative
-`kind → semantics` table for it. Edge does not know or enforce what a persist
+§3.1 assigns CIRISPersist the range above. This table is the authoritative
+`kind → semantics` map for it. Edge does not know or enforce what a persist
 `kind` means; a peer that receives a persist-range `kind` it does not implement
 returns `OpaqueResponse { status: 501 }` — never a silent drop.
 
 Allocating a new `kind` inside this range is a steward action (RFC 8126 Private
-Use): no CC amendment, just an entry below + the matching constant in
+Use): no CC amendment, just an entry below and the matching constant in
 `src/wire_vocabulary.rs`.
 
----
-
-## Allocations
+### Allocations
 
 | `kind` | Name | Channel | Payload | Status |
 |---|---|---|---|---|
-| `0x0005_0001` | accord trace-events batch | `OpaqueEvent` | canonical JSON of `ciris_persist::schema::BatchEnvelope` | **Ratified** (v11.9.0) |
+| `0x0005_0001` | accord trace-events batch | `OpaqueEvent` | canonical JSON of `ciris_persist::schema::BatchEnvelope` | **Ratified** |
 | `0x0005_0002..=0x0005_00FF` | — | — | reserved for future persist telemetry | Unallocated |
 | DSAR (`0x0005_0100..=0x0005_01FF`) | data-subject access/erasure | — | — | **Reserved, not allocated** (see below) |
 | `0x0005_0200..=0x0005_FFFF` | — | — | unallocated | — |
 
 ### `0x0005_0001` — accord trace-events batch
 
-The §3.3 migrant of the retired `MessageType::AccordEventsBatch`.
+The §3.3 migrant of the retired Tier-1 `MessageType::AccordEventsBatch`.
 
 - **Channel:** `OpaqueEvent { kind: 0x0005_0001, payload }` — Durable,
-  fire-and-forget (no ack). Trace/telemetry: hash-chain verify + scrub +
-  persist happen inside lens/persist; edge is agnostic.
+  fire-and-forget (no ack). Hash-chain verify, scrub and persist happen inside
+  lens/persist; edge is agnostic.
 - **Payload:** the canonical JSON bytes of a `BatchEnvelope` — exactly the
   bytes the HTTP ingest path posts and `Engine::receive_and_persist` consumes.
-  No `serde_json::Value` anywhere in the type (MISSION.md §3 anti-pattern #1);
+  No `serde_json::Value` anywhere in the type (MISSION.md §6 anti-pattern #6);
   every field is typed, so the bytes parse losslessly.
-- **Schema owner:** `ciris_persist::schema::BatchEnvelope` (this repo,
-  `src/schema/envelope.rs`).
+- **Schema owner:** `ciris_persist::schema::BatchEnvelope` (`src/schema/envelope.rs`).
 - **Canonicalization (produce):** `ciris_persist::trace_batch_payload_bytes(&BatchEnvelope)`.
 - **Verify-before-persist (receive):** `BatchEnvelope::from_json(&payload)` —
   all schema-version / trace-level / required-field / `MAX_DATA_DEPTH` gates
   fire there and return typed errors before anything is persisted.
 - **Constant:** `ciris_persist::TRACE_BATCH_KIND`.
 - **Body cap:** the global `MAX_BODY_BYTES` (8 MiB, §3.2); no smaller per-kind
-  sub-cap declared.
+  sub-cap.
 
 **Consumers:**
-- *Receiver* — CIRISServer / lens-core relay repins its provisional
-  `ACCORD_EVENTS_KIND = 0x0005_0001` onto `ciris_persist::TRACE_BATCH_KIND`.
-- *Emitter* — CIRISAgent#904 (pending) produces the payload via
+- *Receiver* — the CIRISServer / lens-core relay subscribes on
+  `ciris_persist::TRACE_BATCH_KIND`.
+- *Emitter* — CIRISAgent (CIRISAgent#904) produces the payload via
   `trace_batch_payload_bytes` and sends it over edge's generic
   `send_opaque_event(TRACE_BATCH_KIND, bytes)`.
 
 ### DSAR — reserved, **not** allocated
 
 The §3.1 range scope names "trace batches, **DSAR**", but §3.3 resolves that
-`DSARRequest` / `DSARResponse` **stay Tier-1** and do not migrate:
-data-subject access/erasure is rights-bearing (consent-weight, adjacent to
-`Withdraws`) **and** rides Durable + requires-ack — the erasure-completion
-receipt the three opaque channels cannot express (§3 delivery-expressiveness
-limit). No DSAR `kind` is allocated here. The sub-range is held reserved so
-that, should a durable ack-bearing opaque channel ever be added and DSAR be
-revisited, its allocation lands in a stable place.
+`DSARRequest` / `DSARResponse` **stay Tier-1**: data-subject access/erasure is
+rights-bearing (consent-weight, adjacent to `Withdraws`) **and** rides Durable +
+requires-ack — the erasure-completion receipt the three opaque channels cannot
+express (§3 delivery-expressiveness limit). No DSAR `kind` is allocated here.
+The sub-range is held so that, should a durable ack-bearing opaque channel ever
+exist and DSAR be revisited, its allocation has a stable place.
+
+### Why persist exposes no `send_trace_batch` wrapper
+
+§3.3's worked example — `CIRISAgent::send_inline_text(text)` wrapping
+`edge.send_opaque_event(kind, app_canonicalize(text))` — works because
+CIRISAgent sits *above* CIRISEdge. **CIRISPersist sits below edge** (edge links
+persist; the reverse would be a dependency cycle), so a `send_trace_batch(edge,
+…)` wrapper cannot live in this repo. Persist owns and exports the *shared
+definition* — the ratified `kind`, the `BatchEnvelope` schema, and the
+`trace_batch_payload_bytes` / `from_json` canonicalization pair — and the
+emitter/receiver tiers (which depend on both persist and edge) compose it with
+edge's generic `send_opaque_event` / `subscribe_opaque`. "App owns meaning"
+holds on the wire and in the stewardship graph; there is no transport-tier
+typed struct for this migrant.
 
 ---
 
-## Replicated `EnvelopeKind`s — the sixteenth kind, `KeyGrant` (v44.3.0, #848)
+## Part 2 — Replicated `EnvelopeKind`s
 
-Distinct from the Tier-2 `kind: u32` range above: the **replicated wire
-kinds** are the closed `EnvelopeKind` set persist owns as the APPLY authority
-(`src/federation/replication_policy.rs`, pinned by `REPLICATION_POLICY_HASH`;
+The **replicated wire kinds** are a closed, ordered set persist owns as the
+APPLY authority (`src/federation/replication_policy.rs`, `EnvelopeKind::ALL`).
 CIRISEdge's `replication::protocol::EnvelopeKind` mirrors the names in order,
-CIRISServer pins the hash). Fifteen kinds shipped through v44.2.1; v44.3.0
-**appends** the sixteenth — never inserts, the order is hashed:
+and CIRISServer pins the hash. The order is hashed, so a new kind is always
+**appended**, never inserted, and a retired kind keeps its position.
 
-| # | `EnvelopeKind` | carries | signer | binding | projections |
-|---|---|---|---|---|---|
-| 16 | `KeyGrant` | one CC 3 `key_grant` **set**: every recipient wrap for one identity | `RegisteredSigner` | `SelfOwn` | `[KeyGrants]` |
+**Pins:**
+- `REPLICATION_POLICY_HASH` = `1860451cf166879431dadf433422f6fdb43a911b5c889b0f55ca491262393869`
+  (covers every kind's `KindPolicy`: signer, binding, projections, tier, audience).
+- `CONSENT_GRAMMAR_HASH` = `4d473eac6f2bfde1a78b01e9a2ac8442fc9adb5207c7adeb51d509215b79e843`
+  (its `kind_transferability` covers the kind list).
 
-- **Wire shape.** A `SignedKeyGrantSet` is an attestation row whose
-  `attestation_type` is `key_grant:epoch:v1` (epoch axis: identity
-  `(community_key_id, minter_key_id, epoch)`, signed by the MINTER's
-  occurrence key) or `key_grant:content:v1` (content axis: identity
-  `(at_rest_sha256, cohort_scope, owner_key_id)`, signed by the blob's
-  AUTHOR), and whose envelope carries `{"kind":"key_grant", "axis", …identity…,
-  "wraps":[{"recipient_occurrence_key_id","wrap_algorithm","wrapped_dek"}]}`
-  — CC 3's vocabulary, canonicalised and hybrid-signed like every other
-  attestation. It rides the attestation cursor (`list_attestations_since`);
-  a receiver routes it by `attestation_type` to `apply_replicated_key_grant`.
-- **Admission** (`key_grant::admit_replicated_key_grant`): the signer is
-  resolved from the admitting node's own directory; epoch axis — the signer
-  is the set's `minter_key_id` AND an active member of the community at
-  `asserted_at` per the replicated roster fold; content axis — the signer is
-  the blob row's `author_key_id` when the row is present (accepted before the
-  row arrives: order independence); every wrap is v2. Anything else is a
-  typed `federation_key_grant_refused`.
-- **Projection** `KeyGrants`: every wrap, in one transaction, as a UNION
-  (`ON CONFLICT DO NOTHING`). Grants are never retracted (CC 3: "cannot
-  retroactively un-share"); forward secrecy is by rotation. There is no
-  withdraw for this kind.
-- **Plane.** `Plane::KeyGrant { axis }` projects `SelfOwn` at self / family
-  (the content axis) and `Cohort` everywhere else (the epoch axis); never
-  `Global`. Tombstone ceiling: the row max, `Cohort` — unreachable, since the
-  kind has no withdraw.
-- **Pins moved:** `REPLICATION_POLICY_HASH`
-  `3af30bcc…23bbef` → `c1082c12db13b6d0f2240b910da2c0008a85b363df4f9b9b73a013ab28cb389d`;
-  `CONSENT_GRAMMAR_HASH` (its `kind_transferability` covers the kind list;
-  `KeyGrant` is `StructuralPlane`)
-  `b66870da…290d69f` → `79c74e4d4d04aeb624a7139d705d4882c25f32f6654e5bf017e2f5b99eec38ac`.
+### The nineteen kinds, in hashed order
 
-`FSD/BLOB_REPLICATION.md` Part II (§11–§19) is the design.
+| # | `EnvelopeKind` | Table / carrier | Framed carriage |
+|---|---|---|---|
+| 1 | `Key` | `federation_keys` | retired — travels as its row (an `Attestation`) |
+| 2 | `Attestation` | `federation_attestations` — the whole claim namespace rides here | live |
+| 3 | `Revocation` | `federation_revocations` | retired — travels as its row |
+| 4 | `IdentityOccurrence` | `federation_identity_occurrences` | retired — travels as its row |
+| 5 | `Family` | `federation_families` | live |
+| 6 | `Community` | `federation_communities` | live |
+| 7 | `IdentityOccurrenceRevocation` | `federation_identity_occurrence_revocations` | retired — travels as its row |
+| 8 | `FamilyMembershipRevocation` | `federation_family_membership_revocations` | live |
+| 9 | `CommunityMembershipRevocation` | `federation_community_membership_revocations` (insert rotates the DEK epoch) | live |
+| 10 | `LocationProof` | `federation_location_proofs` | live |
+| 11 | `Organization` | — | retired (CC 3.3.9): an organisation is an affiliation's community record |
+| 12 | `OrgMembership` | — | retired (CC 3.3.9): a member is a `membership:{stage}` seat plus a hierarchy edge |
+| 13 | `PartnerRecord` | — | retired (CC 3.3.9): a partner is a `licensure:{community_key_id}:v1` row on the `Attestation` kind |
+| 14 | `TransportDestination` | `federation_transport_destinations` | live |
+| 15 | `AccordQuorumEvidence` | `accord_proposal` + its `accord_participation` set, as one bundle | live |
+| 16 | `KeyGrant` | `key_grant:*` rows (see below) | live |
+| 17 | `CommunityMembershipWidening` | `federation_community_membership_widenings` | live |
+| 18 | `FamilyMembershipWidening` | `federation_family_membership_widenings` | live |
+| 19 | `CommunityMembershipListing` | `federation_community_membership_listings` | live |
 
-### v55.0.0 — the set is retired; one `scores` row per recipient (#989, CC 3.3.2 rc7)
+An inbound framed object of a retired kind (`RETIRED_FRAMED`) is refused with
+`federation_envelope_kind_retired`, whose detail names the kind in snake_case.
 
-CC rc7 closes the row-type slot at the five structural types (CC 2.4,
-CIRISConstitution#143), so the `key_grant:{axis}:v1` SET above is retired:
+### Who a kind is served to (CIRISEdge#761, CIRISPersist#963)
+
+Every `KindPolicy` carries an `audience` (`ServeAudience`):
+
+- `cohort` — `Attestation`, `KeyGrant`: decided per row, per peer
+  (`replication_audience::may_receive`).
+- `membership_plane` — `Family`, `Community` and the five membership planes
+  (`may_receive_group_plane`): public groups to every peer; a private group's
+  to members' nodes, live invitees' nodes and the named member's nodes.
+- `public` — every other kind.
+
+### 16 — `KeyGrant` (#848, #989, CC 3.3.2)
+
+A key grant is one `scores` row per recipient. The `KeyGrant` kind is the
+plane these rows project into.
 
 - **Wire shape.** A `SignedKeyGrantRow` (`{"attestation": {…}}`, the
   `SignedAttestation` shape) is a `scores` row with envelope `dimension`
@@ -148,31 +171,38 @@ CIRISConstitution#143), so the `key_grant:{axis}:v1` SET above is retired:
 - **Admission** (`key_grant::check_key_grant_row_admission`, asked of every
   federation-tier row on every backend): the shape, a v2 wrap, self-signed, the
   sealer rule, and the recipient rule (an occurrence the one audience rule
-  lets hold the cohort's key). A `withdraws` / `recants` naming one is refused.
-  A key-grant SET row is a retired carrier: the row-type gate refuses it
-  `attestation_type_unregistered` at the plane doors, and the key-grant door
-  (`apply_replicated_key_grant`) answers `set_retired`.
+  lets hold the cohort's key). A `withdraws` / `recants` naming a key-grant row
+  is refused.
 - **Projection.** Both typed attestation doors (`apply_replicated_attestation`,
   `put_attestation_synced`) project the row's wrap into the grant tables as a
   union keyed by the row's identity `(dimension, attester, attested, axis
   identity)`; CC 2's latest-wins over `(attester, dimension, attested)` does
-  not apply. `apply_replicated_key_grant` remains as the door that reports the
-  projection.
-- **Delivery.** A row reaches its recipient's node (refers-to) when the
-  cohort's audience contains that node, and no other node.
-- **Held sets** are not served (`registry::RETIRED_CARRIER_STEMS`); each
-  node re-emits its own wraps as rows once (V192 marks every axis dirty).
-- The `KeyGrant` kind keeps its place in the hashed, appended vocabulary as the
-  plane the rows project into; no pin moved.
+  not apply. `apply_replicated_key_grant` is the door that reports the
+  projection. Grants are never retracted (CC 3: "cannot retroactively
+  un-share"); forward secrecy is by rotation.
+- **Plane.** `Plane::KeyGrant { axis }` projects `SelfOwn` at self / family
+  (the content axis) and `Cohort` everywhere else; never `Global`.
+- **Delivery.** A row reaches its recipient's node when the cohort's audience
+  contains that node, and no other node.
+- **Retired set carrier.** The earlier carrier — one signed SET of every
+  recipient wrap for one identity, typed `key_grant:{axis}:v1` — is retired
+  (CC 2.4 closes the row-type slot at the five structural types). The
+  row-type gate refuses a set row `attestation_type_unregistered` at the plane
+  doors, the key-grant door answers `set_retired`, and held sets are not
+  served (`registry::RETIRED_CARRIER_STEMS`); each node re-emits its own wraps
+  as rows (V192 marks every axis dirty).
 
-## Replicated `EnvelopeKind`s — the seventeenth kind, `CommunityMembershipWidening` (v48.0.0, #860)
+`FSD/BLOB_REPLICATION.md` Part II (§11–§19) is the design.
 
-Sixteen kinds shipped through v47.4.0; v48.0.0 **appends** the seventeenth
-after `KeyGrant` — never inserts, the order is hashed:
+### 17 — `CommunityMembershipWidening` (#860)
 
-| # | `EnvelopeKind` | carries | signer | binding | projections |
-|---|---|---|---|---|---|
-| 17 | `CommunityMembershipWidening` | one row of `federation_community_membership_widenings`: `(community_key_id, member_key_id, effective_at)` + `joined_at`, `role` — the addition plane, the mirror of `CommunityMembershipRevocation` | `RegisteredSigner` | `OwnerOf` | `[]` (E4: the row IS the projection) |
+| signer | binding | projections |
+|---|---|---|
+| `RegisteredSigner` | `OwnerOf` | `[]` (E4: the row IS the projection) |
+
+One row of `federation_community_membership_widenings`:
+`(community_key_id, member_key_id, effective_at)` + `joined_at`, `role` — the
+addition plane, the mirror of `CommunityMembershipRevocation`.
 
 - **Wire shape.** A `SignedCommunityMembershipWidening` is the widening row
   plus the room authority's hybrid scrub over its canonical (JCS) envelope
@@ -187,21 +217,19 @@ after `KeyGrant` — never inserts, the order is hashed:
   latest event per member wins; a removal wins a tie. Every read-time gate
   goes through `effective_roster` / `is_active_community_member`. The DEK
   epoch does NOT rotate on a widening.
-- **Pins moved:** `REPLICATION_POLICY_HASH`
-  `c1082c12…389d` → `9d62d3a86f7a0ab955969256a10c8160da73a390953ba3c87167a2da96828a19`;
-  `CONSENT_GRAMMAR_HASH` (`CommunityMembershipWidening` is `StructuralPlane`)
-  `ed2b0f2c…482` → `07a677bbcdff236e2018f0786e8d9b0d0ef6b5b7cc2b871d41459e26ff8864a9`.
 
 `FSD/ROOM_ROSTER_PLANES.md` is the design.
 
-## Replicated `EnvelopeKind`s — the eighteenth kind, `FamilyMembershipWidening` (v49.0.0, #910)
+### 18 — `FamilyMembershipWidening` (#910)
 
-Seventeen kinds shipped through v48.0.0; v49.0.0 **appends** the eighteenth
-after `CommunityMembershipWidening` — never inserts, the order is hashed:
+| signer | binding | projections |
+|---|---|---|
+| `RegisteredSigner` | `OwnerOf` | `[]` (E4: the row IS the projection) |
 
-| # | `EnvelopeKind` | carries | signer | binding | projections |
-|---|---|---|---|---|---|
-| 18 | `FamilyMembershipWidening` | one row of `federation_family_membership_widenings`: `(family_key_id, member_key_id, effective_at)` + `joined_at`, `role`, `cosignatures` — the family addition plane, the twin of `CommunityMembershipWidening` | `RegisteredSigner` | `OwnerOf` | `[]` (E4: the row IS the projection) |
+One row of `federation_family_membership_widenings`:
+`(family_key_id, member_key_id, effective_at)` + `joined_at`, `role`,
+`cosignatures` — the family addition plane, the twin of
+`CommunityMembershipWidening`.
 
 - **Wire shape.** A `SignedFamilyMembershipWidening` is the widening row plus
   the primary signer's hybrid scrub over its canonical (JCS) envelope with
@@ -223,24 +251,21 @@ after `CommunityMembershipWidening` — never inserts, the order is hashed:
   fan-out and `verify_membership_quorum`'s prior roster all read it.
   `add_family_member` is the local door onto the plane; no door rewrites a
   family record to grow it.
-- **The family revocation key** gains `effective_at` (V154): a re-added
+- **The family revocation key** includes `effective_at` (V154): a re-added
   member can be removed again; the since-read's resume id and the wire-index
   record key are the three-part compound.
-- **Pins moved:** `REPLICATION_POLICY_HASH`
-  `9d62d3a8…8a19` → `7d0e97b45c83b4ef4f0cc49a2c75f2064b2f9bd090ee2b89264ab2c8da084bae`;
-  `CONSENT_GRAMMAR_HASH` (`FamilyMembershipWidening` is `StructuralPlane`)
-  `07a677bb…64a9` → `62de16961aa7e631d999611b30bdcf9dc42c683e9e69a0c142b710609f9e133c`.
 
 `FSD/ROOM_ROSTER_AUTHORITY.md` §10 is the design.
 
-## Replicated `EnvelopeKind`s — the nineteenth kind, `CommunityMembershipListing` (v49.0.0, #912)
+### 19 — `CommunityMembershipListing` (#912)
 
-Eighteen kinds through the #910 slice; v49.0.0 **appends** the nineteenth
-after `FamilyMembershipWidening` — never inserts, the order is hashed:
+| signer | binding | projections |
+|---|---|---|
+| `RegisteredSigner` | `SelfOwn` | `[]` (the row IS the projection) |
 
-| # | `EnvelopeKind` | carries | signer | binding | projections |
-|---|---|---|---|---|---|
-| 19 | `CommunityMembershipListing` | one row of `federation_community_membership_listings`: `(community_key_id, member_key_id, effective_at)` + `listed` (`"public"` or absent) — one member's CC 2 public-listing choice in one room | `RegisteredSigner` | `SelfOwn` | `[]` (the row IS the projection) |
+One row of `federation_community_membership_listings`:
+`(community_key_id, member_key_id, effective_at)` + `listed` (`"public"` or
+absent) — one member's CC 2 public-listing choice in one room.
 
 - **Wire shape.** A `SignedCommunityMembershipListing` is the listing row plus
   the signer's hybrid scrub over its canonical (JCS) envelope with
@@ -261,45 +286,8 @@ after `FamilyMembershipWidening` — never inserts, the order is hashed:
   listing at or before the instant is `public`. Forward-only: clearing is a
   later row with `listed` absent; nothing is rewritten. The only roster view a
   non-member may be served (the host gates the endpoint).
-- **Vocabulary.** `listed` joined `universal_paths` (`paths::LISTED`):
-  `ENVELOPE_VOCABULARY_SHA256`
-  `4d7054a6…589b` → `a6a84cc9d5f4d6bd6295cfc78b42bce35145d2bb9ff14391bfe32ab027116a6a`.
-  `history_on_join` is NOT adopted in v49.0.0 (a recorded decision; see the
-  re-pin log in `envelope.rs`).
-- **Pins moved:** `REPLICATION_POLICY_HASH`
-  `7d0e97b4…4bae` → `5501d6b9621e0af400ed89c0c803515b33c084676be5cd5182c3629277d9714a`;
-  `CONSENT_GRAMMAR_HASH` (`CommunityMembershipListing` is `StructuralPlane`)
-  `62de1696…133c` → `8230589131945c4b4db3c2e7ca2187e6c02543cd8f084b0f8862eb951d2c82ac`;
-  both directory-capsule wire digests (one op, one result appended — growth,
-  `DIRECTORY_ABI_VERSION` stays 5).
+- **Vocabulary.** `listed` is a `universal_paths` member (`paths::LISTED`),
+  covered by `ENVELOPE_VOCABULARY_SHA256`. `history_on_join` is not adopted
+  (see the pin notes in `src/federation/envelope.rs`).
 
 `FSD/ROOM_ROSTER_AUTHORITY.md` §11 is the design.
-
-### v53.0.0 — who a kind is served to (CIRISEdge#761, CIRISPersist#963)
-
-- Every `KindPolicy` gains `audience` (`ServeAudience`): `cohort` (Attestation,
-  KeyGrant — per row, per peer, `replication_audience::may_receive`),
-  `membership_plane` (Family, Community and the five membership planes —
-  `may_receive_group_plane`: public groups to every peer, a private group's to
-  members' nodes, live invitees' nodes and the named member's nodes) and
-  `public` (every other kind). No kind is added or reordered.
-- **Pins moved:** `REPLICATION_POLICY_HASH`
-  `5501d6b9…714a` → `1860451cf166879431dadf433422f6fdb43a911b5c889b0f55ca491262393869`;
-  `CONSENT_GRAMMAR_HASH` (the `cohorts` payload member)
-  `82305891…82ac` → `4d473eac6f2bfde1a78b01e9a2ac8442fc9adb5207c7adeb51d509215b79e843`.
-
----
-
-## Why persist exposes no `send_trace_batch` wrapper
-
-§3.3's worked example — `CIRISAgent::send_inline_text(text)` wrapping
-`edge.send_opaque_event(kind, app_canonicalize(text))` — works because
-CIRISAgent sits *above* CIRISEdge. **CIRISPersist sits below edge** (edge links
-persist; the reverse would be a dependency cycle), so a `send_trace_batch(edge,
-…)` wrapper cannot live in this repo. Persist therefore owns and exports the
-*shared definition* — the ratified `kind`, the `BatchEnvelope` schema, and the
-`trace_batch_payload_bytes` / `from_json` canonicalization pair — and the
-emitter/receiver tiers (which depend on both persist and edge) compose it with
-edge's generic `send_opaque_event` / `subscribe_opaque`. "App owns meaning" is
-honored on the wire and in the stewardship graph; the only thing that never
-exists is a transport-tier typed struct for this migrant.
