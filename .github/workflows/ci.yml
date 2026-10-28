@@ -3,20 +3,19 @@ name: CI
 on:
   push:
     branches: [main]
-    # v0.1.12 — also fire on v-prefixed release tags. Without this,
-    # tag pushes don't trigger CI at all and the tag-gated jobs
-    # (gated on `refs/tags/v*`) never runs even when the tag exists.
+    # Also fire on v-prefixed release tags: the tag-gated jobs (gated on
+    # `refs/tags/v*`) run only on a tag push.
     tags: ['v*']
   pull_request:
 
 concurrency:
   # CIRISPersist#397 — dedup the same-SHA double-run. A merge lands the commit
   # on `refs/heads/main`; the release tag push lands the SAME commit on
-  # `refs/tags/v*`. Keying on `github.ref` put them in DIFFERENT groups, so both
-  # ran the full wheel matrix on the identical SHA and raced each other for the
-  # same CIRISCache keys (the restore-vs-save hang that skipped publish on
-  # v13.4.1). Key push events on the SHA instead: main-push and tag-push on one
-  # commit now share a group, and cancel-in-progress lets the tag run (pushed
+  # `refs/tags/v*`. Keyed on `github.ref`, both would run the full wheel matrix
+  # on the identical SHA and race each other for the same CIRISCache keys (a
+  # restore-vs-save hang that can skip publish). Push events key on the SHA
+  # instead: main-push and tag-push on one commit share a group, and
+  # cancel-in-progress lets the tag run (pushed
   # after the merge; the strict superset that also publishes) cancel the
   # redundant main run. PRs keep ref-keying so a new push still cancels the
   # stale PR run. A tag-less merge still gets its single (non-redundant) main run.
@@ -25,8 +24,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # v54.1.1 — Python's stdio is UTF-8 on every runner (Windows defaults to
-  # cp1252; a non-ASCII print failed the v54.1.0 tag's windows wheel job).
+  # Python's stdio is UTF-8 on every runner (Windows defaults to cp1252, and
+  # a non-ASCII print fails the windows wheel job).
   PYTHONUTF8: "1"
   RUSTFLAGS: -D warnings
   # CIRISPersist#297 — network resilience for recurring crates.io registry
@@ -44,40 +43,34 @@ permissions:
   packages: write   # CIRISCache save pushes to GHCR; PRs only restore, so fork PRs are unaffected
 
 jobs:
-  # 2026-09-23 (CIRISPersist#895) — the `tag-precheck` job that stood here is
-  # REMOVED, not repaired. Recorded so the next person does not re-derive it:
+  # Why there is no tag-run precheck that skips the matrix (CIRISPersist#895):
   #
-  #   * v46.4.0 shipped it asking "does a successful CI run exist for this SHA
-  #     on a branch push?". Never true — the `concurrency` group above keys
-  #     push events on the SHA (#397) so the TAG run cancels the main-push run
-  #     for that commit. It waited 45 min for a run its own workflow had
-  #     cancelled, then ran the matrix anyway: +45 min per release.
-  #   * The tree-comparing repair DID fire, and was worse. The only
-  #     Linux-x86_64 `CIRISCache/save` in this workflow lives in the
+  #   * "Does a successful CI run exist for this SHA on a branch push?" is
+  #     never true — the `concurrency` group above keys push events on the SHA
+  #     (#397), so the TAG run cancels the main-push run for that commit.
+  #   * Skipping the matrix on a tag whose tree was already tested is worse.
+  #     The only Linux-x86_64 `CIRISCache/save` in this workflow lives in the
   #     `linux-x86_64-test` matrix (the `core-1` entry, below) and publishes on
   #     `main || tags/v*`. Main is cancelled by the tag; PR runs restore
   #     without saving. Skip the matrix on the tag and the versioned Linux
   #     cache for that release is never published — every consumer cold-
   #     compiles, which is the global pessimization `always warm the cache`
-  #     exists to prevent. Found by Codex review on PR #896.
-  #   * And it buys nothing anyway: the matrix legs run in PARALLEL (no
-  #     `max-parallel`), so nine legs cost about one leg of wall clock —
-  #     measured on v46.3.1's tag run, 9 legs spanning 21:21→21:57. Skipping
-  #     six of nine saves machine time and ~zero wall.
+  #     exists to prevent.
+  #   * And it buys nothing: the matrix legs run in PARALLEL (no
+  #     `max-parallel`), so nine legs cost about one leg of wall clock.
+  #     Skipping six of nine saves machine time and ~zero wall.
   #
-  # What actually removed a redundant wait is `scripts/release_ship.sh`: when
-  # the merge commit's TREE equals the PR head's, the PR run already certified
-  # those bytes and the main-CI wait is skipped. That is where tree equality
-  # belongs, and it is measured (−35 min on v46.4.0's ship).
+  # `scripts/release_ship.sh` removes the redundant wait instead: when the
+  # merge commit's TREE equals the PR head's, the PR run already certified
+  # those bytes and the main-CI wait is skipped.
   #
-  # v53.2.0 (CIRISPersist#1021) — tree equality DOES now gate one run, and it is not the run #895
-  # removed: the `tree` job below skips MAIN's run of a merge commit whose
-  # tree equals its PR head's tree, when that PR head has a successful CI run.
-  # It never skips a tag run, so the tag still publishes the versioned
-  # CIRISCache blob (the #896 finding stands). Measured before this cut: 5 of
-  # the last 10 main runs were cancelled — by the tag push on the same SHA
-  # (#397's group) or by the next merge — after holding up to 2.5 h of
-  # runners for bytes the PR run had already certified.
+  # Tree equality gates one run here (CIRISPersist#1021): the `tree` job below
+  # skips MAIN's run of a merge commit whose tree equals its PR head's tree,
+  # when that PR head has a successful CI run. It never skips a tag run, so
+  # the tag still publishes the versioned CIRISCache blob. Without it, main
+  # runs hold runners for bytes the PR run already certified, only to be
+  # cancelled by the tag push on the same SHA (#397's group) or the next
+  # merge.
   tree:
     name: tree equality (main merges only)
     # Runs ONLY for a push to main. Everywhere else it is skipped, and the
@@ -148,11 +141,10 @@ jobs:
             echo "::notice title=iOS runs on main::the PR run did not build iOS (paths filter), so main builds it."
           fi
 
-  # v53.2.0 (CIRISPersist#1019) — the iOS build runs on a PR only when the diff
-  # can break it. `ios-build` was ungated: 48 and 52 min per PR (run
-  # 37662321512) on the macOS pool, which is the tag run's critical path. It
-  # still runs on every push to main (minus the tree-skip above, which keeps
-  # iOS unless the PR run built it green) and on every tag — so an iOS break is
+  # The iOS build runs on a PR only when the diff can break it
+  # (CIRISPersist#1019): ungated, it costs ~50 min per PR on the macOS pool,
+  # which is the tag run's critical path. It runs on every push to main
+  # (minus the tree-skip above, which keeps iOS unless the PR run built it green) and on every tag — so an iOS break is
   # caught at merge, never first at the tag.
   #
   # iOS-relevant, by path: the FFI surface (`src/ffi/`), the manifest and lock
@@ -229,13 +221,11 @@ jobs:
   # the linux-x86_64 path that runs the full feature set with a
   # real Postgres backing the integration tests.
   linux-x86_64-test:
-    # v2.0.1 (CIRISPersist#95-track) — substrate-axis matrix. The 2.0
-    # feature-gap fix turned every substrate on (audit/secrets/nodecore/
-    # graph/telemetry) and the single test job ballooned to ~12 min.
-    # Each substrate's `cfg` gates are independent, so splitting the
-    # one widened invocation into a parallel matrix — one entry per
-    # substrate — drops the test job's wall-clock to whichever entry
-    # is slowest (~3-5 min) instead of the sum. The "core" entry
+    # Substrate-axis matrix (CIRISPersist#95). With every substrate on
+    # (audit/secrets/nodecore/graph/telemetry) a single test job is slow.
+    # Each substrate's `cfg` gates are independent, so a parallel matrix
+    # — one entry per substrate — makes the test job's wall-clock that
+    # of the slowest entry instead of the sum. The "core" entry
     # additionally runs the fixture suite + the pytest catch_panic
     # regression (kept on a single entry to avoid duplicating the
     # ~5-min release maturin-develop build). The wheel job already
@@ -248,7 +238,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # v22.0.0 (CIRISPersist#543) — `gauntlet` controls whether this entry
+        # CIRISPersist#543 — `gauntlet` controls whether this entry
         # runs the `substrate_machine` stateful-proptest gauntlet. It runs on
         # `core` ONLY, and the exclusion on the other five is deliberate.
         #
@@ -261,44 +251,39 @@ jobs:
         # global pessimization on a limited runner pool.
         #
         # It stays on `core`, which carries `postgres sqlite` and gets
-        # CIRIS_PERSIST_TEST_PG_URL, so BOTH arms run: the memory+sqlite
-        # differential AND the three-way parity against real postgres. That
-        # matters — the postgres arm exists precisely because two v22 bugs sat
-        # identically in postgres and the two-arm oracle found NEITHER.
+        # CIRIS_PERSIST_TEST_PG_URL, so BOTH arms run: sqlite AND the parity
+        # check against real postgres. That matters — a differential oracle
+        # cannot see a bug that sits identically in every backend it compares,
+        # so the postgres arm is needed.
         #
         # If a future feature ever gates substrate write-path code, flip
         # `gauntlet: true` on that entry. That is a real reason; "more is
         # safer" is not.
         #
-        # v25.x (CIRISPersist#585) — a row names a LEG, not a feature list.
+        # CIRISPersist#585 — a row names a LEG, not a feature list.
         # `scripts/ci_feature_matrix.py set <leg>` derives the list from
-        # `Cargo.toml [features]` at run time. Until this cut the lists were
-        # spelled out here, which made this file a second inventory of which
-        # features exist — and it drifted: `secrets-server` was on no list, so
-        # NO job compiled it, and it sat broken through three releases with CI
-        # green. The `rest` leg is the COMPLEMENT (everything not carried by a
+        # `Cargo.toml [features]` at run time, so this file is not a second
+        # inventory of which features exist (one that drifts: a feature on no
+        # list is compiled by NO job and can break with CI green).
+        # The `rest` leg is the COMPLEMENT (everything not carried by a
         # row above and not held out in `NOT_TESTED`), so a feature added to
         # Cargo.toml is tested without anyone remembering to come here.
         substrate:
-          # v30.9.0 — the slowest legs are PARTITIONED across two runners each
-          # (originally three legs; `secrets` was reverted — see below).
-          # Measured on run 31397353461: secrets 28m, core 25m, rest 22m were
-          # the critical path. `nextest --partition count:N/M` shards by
+          # The slowest legs (core, rest) are PARTITIONED across two runners
+          # each; `secrets` is not — see below. `nextest --partition count:N/M` shards by
           # test, so each half runs ~half the tests with no fixture changes.
           #
-          # This is the CI analogue of the offline certify script's lanes, which
-          # took a serial 4302s to 1620s. CI already parallelises across FEATURE
-          # legs; what it did not do is parallelise WITHIN one. `part` is the
-          # shard index and `parts` the count — absent means "run everything",
-          # so the untouched legs keep their exact current invocation.
+          # This is the CI analogue of the offline certify script's lanes: CI
+          # parallelises across FEATURE legs, and this parallelises WITHIN one.
+          # `part` is the shard index and `parts` the count — absent means
+          # "run everything".
           # BOTH core shards carry `gauntlet: true`, and that is load-bearing.
           #
           # `--partition` shards BY TEST, so the 10 `substrate_machine` bodies
           # split 5/5 across the two shards. Pinning the gauntlet to shard 1 and
           # excluding it on shard 2 — the obvious-looking arrangement — would
           # leave **shard 2's five gauntlet tests running NOWHERE**, while both
-          # runners reported green. Measured before this comment was written:
-          # total=10, shard1=5, shard2=5.
+          # runners reported green. Measured: total=10, shard1=5, shard2=5.
           #
           # With `gauntlet: true` on both, the exclusion filter is off on both and
           # the partition itself does the splitting: 5 bodies per runner, all ten
@@ -306,24 +291,22 @@ jobs:
           # bodies, so splitting them loses no depth — each still runs its own
           # full case count.
           #
-          # ── WHY `secrets` IS NOT PARTITIONED, THOUGH IT ONCE WAS ──────────
+          # ── WHY `secrets` IS NOT PARTITIONED ──────────────────────
           # A partition is not free: each shard is a whole JOB, and every job
           # pays ~7m45s of fixed cost (Free-runner-disk + ciriscache restore)
           # before it runs a single test. Splitting is only worth it when the
-          # leg's TEST time exceeds that overhead. Measured on run 31420018561:
+          # leg's TEST time exceeds that overhead. Measured:
           #
           #     leg      fixed    nextest    verdict
           #     secrets  ~8m      6m16s+6m41s (12m57s total)  -> LOSS
           #     rest     ~8m      8m42s+8m21s (17m03s total)  -> keeps its split
           #     core     ~8m      7m28s+6m32s + 8m python     -> keeps its split
           #
-          # Splitting `secrets` duplicated ~8m of restore to save ~6m30s of
+          # Splitting `secrets` duplicates ~8m of restore to save ~6m30s of
           # tests. That is a loss before queueing even enters it — and queueing
-          # did enter it: the run holds 24 jobs against ~16 concurrent slots, so
-          # `secrets-2` (same matrix as `secrets-1`, no `needs:`) sat **16m44s
-          # waiting for a runner** and finished at 32m26s, making it the true
-          # critical path. `core-1`, the job everyone looks at, was only third
-          # at 24m11s.
+          # does enter it: a run holds more jobs than there are concurrent
+          # slots, so a second `secrets` shard (same matrix, no `needs:`) can
+          # wait ~16 min for a runner and become the true critical path.
           #
           # The lesson generalises: **partitioning helps only if a free slot
           # exists.** Past the slot ceiling the marginal shard does not run in
@@ -339,27 +322,24 @@ jobs:
           - { name: cirisnode,  leg: cirisnode,  gauntlet: false }
           - { name: cirisgraph, leg: cirisgraph, gauntlet: false }
           - { name: telemetry,  leg: telemetry,  gauntlet: false }
-          # v53.2.0 (CIRISPersist#1009) — the `test-anchor` CONFIGURATION gets
-          # its own row. It was a rider step on `cirisaudit`, chosen as "~2 min,
-          # rides the shortest leg"; it grew to 3,440 tests, ~900 s of test time
-          # plus a 2m29s rebuild, and made `cirisaudit` the longest job of every
-          # run (60–71 min against 47–55 for the other Linux legs). As a row it
-          # pays the ~8 min fixed cost (disk free + CIRISCache restore) on a
-          # runner of its own, in parallel, and the critical path drops by the
-          # rider's 15–17.5 min.
+          # CIRISPersist#1009 — the `test-anchor` CONFIGURATION gets its own
+          # row: ~3,400 tests, ~900 s of test time plus a rebuild. As a rider
+          # step on another leg it would make that leg the longest job of every
+          # run; as a row it pays the ~8 min fixed cost (disk free + CIRISCache
+          # restore) on a runner of its own, in parallel.
           #
           # Not moved to `darwin-aarch64 (no postgres)`, the cheaper-looking
-          # host: macOS runners are the SCARCE pool. On the v53.1.8 tag run
-          # (37692136047) the darwin wheel waited 40 min and the iOS simulator
-          # build 48 min for a macOS runner; adding ~20 min to a mac job would
-          # have lengthened exactly the queue the tag run's manifest waits on.
+          # host: macOS runners are the SCARCE pool. A tag run's darwin wheel
+          # and iOS simulator build can each wait 40+ min for a macOS runner;
+          # adding ~20 min to a mac job lengthens exactly the queue the tag
+          # run's manifest waits on.
           #
           # Why it is an invocation of its own and not a flag on another leg
           # (the env-switched genesis relaxation; nextest's per-test process
           # isolation): RIDERS in scripts/ci_feature_matrix.py.
           #
-          # `gauntlet: true` keeps the rider's exact selection: it ran with no
-          # `substrate_machine` exclusion (sqlite-only, so the sqlite arms). The
+          # `gauntlet: true` means no `substrate_machine` exclusion
+          # (sqlite-only, so the sqlite arms). The
           # row's postgres service starts and goes unused — `set test-anchor`
           # carries no `postgres`.
           - { name: test-anchor, leg: test-anchor, gauntlet: true }
@@ -371,14 +351,13 @@ jobs:
         # scoring rollup is a plain table refreshed by an idempotent upsert,
         # so the rollup tests run (not skip) here against the plain table.
         #
-        # v32.1.1 — pulled from GHCR, not Docker Hub. A service image is pulled
-        # ONCE PER MATRIX LEG, so this job alone issued eight anonymous Docker
-        # Hub pulls per CI run from GitHub's SHARED runner IPs, where the
-        # anonymous allowance (100/6h/IP) is spent by every other customer on
-        # that address. A 429 there kills the job at "Initialize containers" —
-        # before a line of our code runs — and `auto-retry.yml` then re-ran it,
-        # issuing eight MORE pulls against the limit that had just rejected us.
-        # The retry fed the rate limit it was retrying against.
+        # Pulled from GHCR, not Docker Hub. A service image is pulled ONCE PER
+        # MATRIX LEG; from Docker Hub that is several anonymous pulls per CI run
+        # from GitHub's SHARED runner IPs, where the anonymous allowance
+        # (100/6h/IP) is spent by every other customer on that address. A 429
+        # there kills the job at "Initialize containers" — before a line of our
+        # code runs — and an `auto-retry.yml` rerun only issues more pulls
+        # against the same limit.
         #
         # GHCR pulls inside Actions are not rate limited, need no secret beyond
         # the built-in token, and are same-datacenter. `ci-hygiene.yml` mirrors
@@ -424,11 +403,10 @@ jobs:
       # Reclaim runner disk BEFORE the cache restore + full-feature build.
       # ubuntu-latest ships ~25 GB of preinstalled toolchains a Rust
       # substrate build never touches (android SDK ~9 GB, .NET ~2 GB,
-      # Haskell/ghc ~5 GB, CodeQL ~5 GB, boost). The 6-leg matrix ×
-      # target/ + the CIRISCache restore + the postgres service image
-      # intermittently filled the ~14 GB default free space → a
-      # non-deterministic ENOSPC on whichever leg lost the race (e.g.
-      # `linux-x86_64 (cirisaudit)`, 2026-07-15). Inline `rm` (no
+      # Haskell/ghc ~5 GB, CodeQL ~5 GB, boost). target/ + the CIRISCache
+      # restore + the postgres service image can fill the ~14 GB default
+      # free space → a non-deterministic ENOSPC on whichever leg loses
+      # the race. Inline `rm` (no
       # third-party action → no supply-chain surface on the substrate
       # repo); `df -h` before/after so any future disk pressure is
       # attributable in the log, not a silent build write-error.
@@ -442,9 +420,9 @@ jobs:
                       /usr/local/share/boost 2>/dev/null || true
           sudo docker image prune -af 2>/dev/null || true
           echo "after:"; df -h / | tail -1
-      # v10.7.0 (CIRISVerify v8.0.0) — no libtss2-dev: ciris-keyring deleted
-      # the link-time tss-esapi backend (#141); the TPM plugin is dlopen'd at
-      # runtime and the keyring link-binds no libtss2 on any target.
+      # No libtss2-dev: ciris-keyring has no link-time tss-esapi backend
+      # (#141); the TPM plugin is dlopen'd at runtime and the keyring
+      # link-binds no libtss2 on any target.
       - uses: dtolnay/rust-toolchain@1.97.0
       # CIRISCache (CIRISPersist#311/#316) — canonical key + layered
       # verify→persist restore, via the shared composite (single source of
@@ -454,86 +432,53 @@ jobs:
       - uses: ./.github/actions/ciriscache
         with:
           plat: linux-x86_64
-      # v2.0.1 — nextest, not cargo test: streams per-test PASS/FAIL/
-      # SLOW lines so a hung test surfaces in the live log as "the
-      # last RUN with no follow-up" instead of disappearing into a
-      # buffered cargo-test silence. `.config/nextest.toml` carries
-      # `slow-timeout` + `terminate-after` so a hung test is killed
-      # at a bounded time with its name in the log — pre-2.0.1 the
-      # whole CI sat for >1h before I cancelled by hand.
+      # nextest, not cargo test: streams per-test PASS/FAIL/SLOW lines
+      # so a hung test surfaces in the live log as "the last RUN with
+      # no follow-up" instead of disappearing into a buffered cargo-test
+      # silence. `.config/nextest.toml` carries `slow-timeout` +
+      # `terminate-after` so a hung test is killed at a bounded time
+      # with its name in the log.
       - name: install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: cargo nextest (leg ${{ matrix.substrate.leg }} — features derived from Cargo.toml)
-        # v2.0.1 — workflow-level kill switch independent of nextest:
-        # if nextest itself stalls (or the runner does), GA aborts at
-        # 35 min instead of waiting an hour.
+        # Workflow-level kill switch independent of nextest: if nextest
+        # itself stalls (or the runner does), GA aborts at the bound below.
         #
-        # v22.0.0 (CIRISPersist#543) — 25 → 35. The `core` entry now also runs
-        # the `substrate_machine` gauntlet (two stateful-proptest bodies plus
-        # the three-way postgres arm, ~4-6 min of added wall time on a CI
-        # runner). Per-test hangs are caught much earlier and by name via
-        # `.config/nextest.toml` (`terminate-after = 6` for the suite, 20 for
-        # the gauntlet), so this step-level number is a backstop against the
-        # RUNNER stalling, not the primary hang detector — which is why adding
-        # headroom here costs no diagnostic sharpness.
-        #
-        # v25.x (CIRISPersist#585) — 50 for `rest` only. That leg carries the
-        # ~30 features no named leg does, so it compiles a wider graph from a
-        # cache warmed for the `core` shape, and runs 2678 tests (measured
-        # green locally: 2678 passed, 10 skipped, 986s of test time) — more
-        # than any existing leg. Same reasoning as #543's 25→35: this is the
-        # runner-stall backstop, not the hang detector — `.config/nextest.toml`
-        # still kills a hung test by name at its own bound — so the headroom
-        # costs no diagnostic sharpness.
-        #
-        # v53.0.0 — 35 → 50 for every leg. PR #978's run timed `cirisaudit` out
-        # at 35.2 min with 4391/4392 tests done, and `cirisgraph` (34.1) and
-        # `telemetry` (34.2) finished within a minute of the bound. The slow
-        # test runs 27.3s on v53 vs 26.2s on v52.0.2 locally, so the code did
-        # not slow down. The same legs vary 17–34 min between runs of one tree
-        # (cirisgraph 16.9 on v52.0.2's main run, 34.1 here), so the bound was
-        # inside the runner's variance. Same reasoning as above: the per-test
-        # hang detector is `.config/nextest.toml`, this is the runner backstop.
-        #
-        # v55.0.1 — 50 → 75. The `secrets` leg is ~46 min warm, and a cold or
-        # repaired cache adds up to 25 min of compile (v55.0.1's PR run: the
-        # first unit repair over a manifest-less blob took the compile phase
-        # from 8.3 to 23.5 min and timed the leg out at test 655/4935). A hung
-        # test is still caught by `.config/nextest.toml`, by name.
+        # This is a backstop against the RUNNER stalling, not the hang
+        # detector: `.config/nextest.toml` kills a hung test by name at its
+        # own bound (`terminate-after = 6` for the suite, 20 for the
+        # `substrate_machine` gauntlet), so headroom here costs no diagnostic
+        # sharpness. 75 min because the `secrets` leg is ~46 min warm, a cold
+        # or repaired cache adds up to 25 min of compile, and the same leg
+        # varies by up to 2x between runs of one tree on shared runners.
         timeout-minutes: 75
         env:
           CIRIS_PERSIST_TEST_PG_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
-        # v30.2.0 (CIRISPersist#17) — `--test-threads=1` is GONE, and with it
-        # the reason for it.
+        # Tests run in parallel, not `--test-threads=1` (CIRISPersist#17).
         #
-        # The old note (kept here because the reasoning was right and only the
-        # remedy was wrong): nextest spawns each test in its own PROCESS, the
-        # substrate PG tests shared schema state in
-        # cirislens_secrets / cirislens.federation_* / cirislens.audit_log plus
-        # process-local caches (SOFTWARE_KEYS), and two concurrent processes
-        # racing TRUNCATEs left caches and rows mismatched.
+        # nextest spawns each test in its own PROCESS. Substrate PG tests that
+        # shared schema state (cirislens_secrets / cirislens.federation_* /
+        # cirislens.audit_log) plus process-local caches (SOFTWARE_KEYS) would
+        # race TRUNCATEs and leave caches and rows mismatched.
         # `#[serial_test::serial(postgres)]` cannot help — its lock is
         # process-local, so under nextest it does nothing at all.
         #
-        # `--test-threads=1` did kill the class, at a MEASURED 2.8x: the
-        # cirisaudit leg ran 154.8 s parallel against 436.5 s serial.
-        #
         # `src/test_pg.rs` removes the shared state instead of serializing
         # around it: one postgres database PER TEST PROCESS, copied from an
-        # already-migrated template. Tests cannot race over state they no
-        # longer share. Measured on the same leg, 2326/2326 passing:
+        # already-migrated template. Tests cannot race over state they do not
+        # share. Measured on one leg, 2326/2326 passing:
         #
-        #     serial, shared DB      436.5 s   (what this line used to do)
+        #     serial, shared DB      436.5 s
         #     parallel, no template 1134.8 s   (isolation alone is a REGRESSION —
         #                                       116 migrations per test)
         #     parallel, templated     246.0 s  (+ ~23 s once per cold runner to
         #                                       build the template)
         #
         # The template is what makes it pay; isolation without it is 2.6x worse
-        # than the serial config it replaces. Per-test databases are reaped by
-        # PID at provision time, so a killed process cannot leak them.
+        # than serial. Per-test databases are reaped by PID at provision time,
+        # so a killed process cannot leak them.
         #
-        # v25.x (CIRISPersist#585) — the feature list is DERIVED from
+        # CIRISPersist#585 — the feature list is DERIVED from
         # `Cargo.toml [features]`, never spelled here. It is echoed first so a
         # failure is attributable to an exact set from the log alone.
         run: |
@@ -544,7 +489,7 @@ jobs:
             --features "${FEATURES}" \
             ${{ matrix.substrate.parts && format('--partition count:{0}/{1}', matrix.substrate.part, matrix.substrate.parts) || ' ' }} \
             ${{ matrix.substrate.gauntlet && ' ' || '-E ''not test(/substrate_machine/)''' }}
-      # v31.0.0 (CIRISPersist#658) — the BUILD and the RUN are SEPARATE steps
+      # CIRISPersist#658 — the BUILD and the RUN are SEPARATE steps
       # with separate budgets, because they fail for different reasons and only
       # one of them is a defect.
       #
@@ -552,9 +497,9 @@ jobs:
       # feature set: every other step passes
       # `--features "$(ci_feature_matrix.py set …)"`, so arriving here rebuilds
       # the dependency graph and the crate itself from scratch. That build is
-      # minutes of work on a cold or contended runner, and it used to sit inside
-      # the same `timeout-minutes: 5` as the nine fixture tests. So a slow BUILD
-      # surfaced as a JOB TIMEOUT: a killed step, no test output, no failing test
+      # minutes of work on a cold or contended runner. Inside the same
+      # `timeout-minutes: 5` as the nine fixture tests, a slow BUILD would
+      # surface as a JOB TIMEOUT: a killed step, no test output, no failing test
       # name, no `::error` annotation — the least attributable outcome this
       # workflow can produce, and exactly what "every CI failure must be
       # attributable" forbids.
@@ -576,15 +521,14 @@ jobs:
         # this is a cache hit plus nine tests. A breach is a hang, not a slow box.
         timeout-minutes: 5
         run: cargo nextest run --test wire_format_fixtures
-      # v0.5.4 (CIRISPersist#29) — Python regression test for the FFI
+      # CIRISPersist#29 — Python regression test for the FFI
       # catch_panic layer. Builds the wheel with the `test-panic`
       # feature gate enabled (release wheels don't), then pytest
       # confirms a Rust panic crossing the FFI surfaces as
       # `LensQueryError` (Exception) and NOT `PanicException`
-      # (BaseException) — the v0.5.3+v0.5.4 invariant. Closes the
-      # CIRISPersist#24 failure class regression-test gap.
-      # v2.0.1 — pytest catch_panic regression runs on the "core"
-      # matrix entry only. The `--release maturin develop` step is
+      # (BaseException) — the regression test for the CIRISPersist#24
+      # failure class.
+      # It runs on the "core" matrix entry only. The `--release maturin develop` step is
       # ~5 min by itself; duplicating it per substrate matrix entry
       # would defeat the matrix parallelization. The substrate
       # feature axis doesn't change what this test exercises (the
@@ -595,8 +539,8 @@ jobs:
           python-version: "3.11"
       - name: install maturin + pytest
         if: matrix.substrate.name == 'core-1'
-        # v1.1.2 (CIRISVerify v2.1.1 hardening): retry pip install
-        # against PyPI transient blips. 3 attempts with backoff.
+        # Retry pip install against PyPI transient blips. 3 attempts
+        # with backoff.
         run: |
           for attempt in 1 2 3; do
             if pip install maturin pytest; then break; fi
@@ -669,16 +613,15 @@ jobs:
       # (no second ~9-min tar+push of byte-identical content). The versioned key
       # is the primary (edge's cross-repo exact-pin restores it); `phead` is a
       # registry alias for cross-version incremental restore (see the ciriscache
-      # composite). Was two full saves back-to-back (~18.5 min on the v17.5.0 tag
-      # run); now push-once + ~1s retag.
-      # v54.1.0 (#1022) — this crate's own lib/test/bench outputs go before the
-      # save: every run rebuilds them on a new commit and no downstream build
-      # can reuse them, yet they were most of target/ (21.9 GB on the v54.0.0
-      # tag run's core-1, 12 GB budget), so the save's oldest-mtime prune
-      # deleted DEPENDENCY fingerprints instead and the next restore recompiled
-      # their dependents. Trimmed, target/ fits and nothing is pruned.
+      # composite). Push-once + ~1s retag, not two full saves.
+      # #1022 — this crate's own lib/test/bench outputs go before the save:
+      # every run rebuilds them on a new commit and no downstream build can
+      # reuse them, yet they are most of target/. Left in, they push target/
+      # past the budget, the save's oldest-mtime prune deletes DEPENDENCY
+      # fingerprints instead, and the next restore recompiles their
+      # dependents. Trimmed, target/ fits and nothing is pruned.
       - name: drop this crate's own build outputs before the CIRISCache save (#1022)
-        # A cache optimisation never fails the build it follows (v54.1.1).
+        # A cache optimisation never fails the build it follows.
         continue-on-error: true
         if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core-1'
         shell: bash
@@ -687,7 +630,7 @@ jobs:
         if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core-1'
         shell: bash
         run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
-      - name: seal build-script units before the CIRISCache save (v55.0.1)
+      - name: seal build-script units before the CIRISCache save
         # Each unit's out.manifest, and its out/ files touched to now so the
         # LRU prune drops them last. An optimisation: never fails the build.
         continue-on-error: true
@@ -696,7 +639,7 @@ jobs:
         run: for py in python3 python; do "$py" -c 'import sys' 2>/dev/null && exec "$py" scripts/ci_cache_units.py seal target; done; echo '::warning::no python for the unit seal'
       - uses: CIRISAI/CIRISCache/save@v1.1
         id: cache_save
-        # v53.2.0 (#1022) — CIRISCache v1.1: the TAG run's save is strict (a failed
+        # #1022 — CIRISCache v1.1: the TAG run's save is strict (a failed
         # publish fails the release: Edge/Server exact-pin this blob); main stays
         # fail-open and the next step warns.
         continue-on-error: ${{ !startsWith(github.ref, 'refs/tags/v') }}
@@ -706,12 +649,11 @@ jobs:
           alias-keys: ${{ env.CIRISCACHE_KEY_HEAD }}
           token: ${{ secrets.GITHUB_TOKEN }}
           strict: ${{ startsWith(github.ref, 'refs/tags/v') && 'true' || 'false' }}
-          # v53.2.0 (#1022) — 12 GB, BELIEVED until measured: the customers are
+          # #1022 — 12 GB, an estimate until measured: the customers are
           # Edge/Server exact-pin restores that need persist's RELEASE units, and
           # 4096 is likely under one release target. The size step above logs
           # target/release and target/debug per run; set budget = size(target/release)
-          # + headroom from the SECOND run after adoption (the first prunes a stale
-          # generation). The prune is least recently BUILT (CIRISCache#3 notes).
+          # + headroom. The prune is least recently BUILT (CIRISCache#3 notes).
           max-size-mb: "12288"
       - name: CIRISCache save result
         if: ${{ !cancelled() && ((github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core-1') }}
@@ -726,14 +668,10 @@ jobs:
             echo "::warning::CIRISCache save not published (key ${KEY:-?}): ${REASON:-no reason given}"
           fi
 
-  # NOTE: the prior `linux-aarch64-build` cross-compile job was removed
-  # in v0.1.15. Its purpose ("prove the crate cross-compiles to arm64
-  # from an x86_64 host") is fully subsumed by the native arm64 wheel
-  # build on `ubuntu-24.04-arm` (see `pyo3-wheel` matrix), which has
-  # been GA + free for public repos since 2025-01. The cross-compile
-  # job had become pure churn — it required a fragile apt install of
-  # gcc-aarch64-linux-gnu (Azure mirror flakiness) without producing a
-  # consumable artifact.
+  # No arm64 cross-compile job: the native arm64 wheel build on
+  # `ubuntu-24.04-arm` (see `pyo3-wheel` matrix) proves the crate builds
+  # for arm64, and a cross-compile would need a fragile apt install of
+  # gcc-aarch64-linux-gnu without producing a consumable artifact.
 
 
   # Mission alignment: macOS dev path (PLATFORM_ARCHITECTURE.md §1).
@@ -745,15 +683,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.97.0
-      # v0.7.2 — `cache-bin: false` on macos-14: the runner image
+      # `cache-bin: false` on macos-14: the runner image
       # ships a rustup stub at `/Users/runner/.cargo/bin/cargo` that
       # falls through to `rustup-init` when the toolchain isn't
       # installed locally. dtolnay's action installs the real cargo
-      # over it, but the rust-cache restore was overwriting the
+      # over it, but a rust-cache restore can overwrite the
       # freshly-installed cargo with the stub from cached
       # `~/.cargo/bin/`. Disabling bin caching keeps the dtolnay-
       # installed cargo intact. Build cache (registry + target) is
-      # unaffected. (v0.7.0/v0.7.1 main CI + v0.7.2 tag CI flakes.)
+      # unaffected.
       # CIRISCache (#316) — macos-14 (Apple silicon) ⇒ PLAT=macos-aarch64.
       - uses: ./.github/actions/ciriscache
         with:
@@ -793,15 +731,13 @@ jobs:
       # version's build restore this warm target/ and recompile only changed
       # files instead of rebuilding persist's deps from the verify baseline.
       # CIRISPersist#762 — SAVE DISABLED on this leg (restore-only). The
-      # tar+gzip+push of target/ starved the macos-14 hosted runner to death
-      # 3/3 on main/tag runs (v37.1.0, v38.0.0 run 32372467201, e119eff run
-      # 32492420694): tests green, then "the hosted runner lost communication
-      # with the server" at this step, ~62 min in. continue-on-error cannot
-      # rescue a job whose VM died. Three attempts warmed NOTHING — the save
-      # never completed — so restore-only loses no cache that exists, while
-      # un-redding every tag run. Re-enable via #762 when CIRISCache can save
-      # under the mac VM resource ceiling.
-      - name: seal build-script units before the CIRISCache save (v55.0.1)
+      # tar+gzip+push of target/ starves the macos-14 hosted runner: tests
+      # green, then "the hosted runner lost communication with the server" at
+      # this step. continue-on-error cannot rescue a job whose VM died, and the
+      # save never completes, so restore-only loses no cache that exists.
+      # Re-enable via #762 when CIRISCache can save under the mac VM resource
+      # ceiling.
+      - name: seal build-script units before the CIRISCache save
         # Each unit's out.manifest, and its out/ files touched to now so the
         # LRU prune drops them last. An optimisation: never fails the build.
         continue-on-error: true
@@ -811,24 +747,24 @@ jobs:
       - uses: CIRISAI/CIRISCache/save@v1.1
         id: cache_save
         if: false   # CIRISPersist#762 — see above; was: main + tags/v*
-        # v53.2.0 (#1022) — pinned to v1.1 with the rest; the size and result
-        # steps the other saves carry are left off while this save is disabled.
+        # Pinned to v1.1 with the rest (#1022); the size and result steps the
+        # other saves carry are left off while this save is disabled.
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
           alias-keys: ${{ env.CIRISCACHE_KEY_HEAD }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          # v1/ff52ca3 — LRU-prune target/ to 4GB before tar: breaks the
-          # fat-blob ratchet (240–400s ciriscache steps; superseded dep
-          # generations re-saved forever after every re-pin).
+          # LRU-prune target/ to 4GB before tar: without it superseded dep
+          # generations are re-saved forever after every re-pin and the blob
+          # only grows.
           max-size-mb: "4096"
 
   # CIRISPersist#463 — publish a macos-x86_64 CIRISCache substrate blob.
   # persist's wheel matrix intentionally OMITS darwin-x86_64 (macos-13 Intel
-  # runner capacity — FSD §3.5 "sunset target, keep CI green only"), so NO job
-  # produced a macos-x86_64 blob. Consequence: CIRISServer's macos-x86_64
-  # release wheel restored only the verify leaf and COLD-COMPILED persist+edge
-  # every release (~19-min leg). This is a SAVE-ONLY warm job — no wheel, no
+  # runner capacity — FSD §3.5 "sunset target, keep CI green only"), so no
+  # other job produces a macos-x86_64 blob, and without one CIRISServer's
+  # macos-x86_64 release wheel restores only the verify leaf and COLD-COMPILES
+  # persist+edge every release. This is a SAVE-ONLY warm job — no wheel, no
   # artifact, not in any release job's needs graph — so the Intel-runner capacity
   # objection doesn't bind: it runs on main AND release tags, and being off the
   # needs graph + continue-on-error means a queued/failed Intel runner never
@@ -839,13 +775,11 @@ jobs:
   # different target/ subtree + fingerprints that would NOT overlay onto server's
   # native build. --release so target/release/ warms server's release wheel
   # (server pins the same dtolnay 1.97.0 → the rustc<X> key matches).
-  # v30.2.0 — NON-BLOCKING. `runs-on: macos-13` is GitHub's INTEL macOS image,
-  # and this file already says of the wheel matrix that those runners "have
-  # ongoing capacity issues (jobs queue indefinitely)". That lesson was applied
-  # to the wheel matrix and not here, so this one job sat unschedulable while
-  # every other job in the run completed — and because a workflow's status is
-  # the aggregate, THREE RELEASES reported `queued` for hours with a real
-  # clippy failure hidden inside them.
+  # NON-BLOCKING. `runs-on: macos-13` is GitHub's INTEL macOS image, and
+  # those runners "have ongoing capacity issues (jobs queue indefinitely)"
+  # (see the wheel matrix). A workflow's status is the aggregate, so one
+  # unschedulable job keeps the whole run `queued` and can hide a real
+  # failure inside it.
   #
   # darwin-x86_64 is a "sunset target — keep CI green only" per
   # FSD/PLATFORM_ARCHITECTURE.md §3.5, so warming its cache must never gate a
@@ -859,12 +793,10 @@ jobs:
     # doesn't delay the release; it just guarantees the released version's blob
     # exists for CIRISServer instead of leaving it to cold-compile.
     # CIRISPersist#762 — DISABLED: GitHub retired macos-13 (the last Intel
-    # image), so this job can never be scheduled — it queued forever on every
-    # main/tag push, holding the whole run open so it could never conclude
-    # (and auto-retry, keyed on a concluded run, never fired). The #463
-    # macos-x86_64 blob has not re-published since the retirement, so nothing
-    # that exists today is lost. Re-enable via #762 as a macos-14 (arm64)
-    # cross-compile with --target x86_64-apple-darwin.
+    # image), so this job can never be scheduled — enabled, it queues forever
+    # on every main/tag push, holding the whole run open so it never concludes
+    # (and auto-retry, keyed on a concluded run, never fires). Re-enable via
+    # #762 as a macos-14 (arm64) cross-compile with --target x86_64-apple-darwin.
     if: false   # CIRISPersist#762 — see above; was: main + tags/v*
     runs-on: macos-13
     # Bound a hung Intel build (the runner-capacity caveat is about QUEUE time,
@@ -904,9 +836,9 @@ jobs:
         run: cargo build --release --features server
       # Save under the macos-x86_64 key + alias the rolling phead (push-once +
       # retag, #458). continue-on-error: a flaky/queued Intel runner is non-fatal.
-      # v54.1.0 (#1022) — this crate's own outputs go first; see the core-1 save.
+      # This crate's own outputs go first (#1022); see the core-1 save.
       - name: drop this crate's own build outputs before the CIRISCache save (#1022)
-        # A cache optimisation never fails the build it follows (v54.1.1).
+        # A cache optimisation never fails the build it follows.
         continue-on-error: true
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -915,7 +847,7 @@ jobs:
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
-      - name: seal build-script units before the CIRISCache save (v55.0.1)
+      - name: seal build-script units before the CIRISCache save
         # Each unit's out.manifest, and its out/ files touched to now so the
         # LRU prune drops them last. An optimisation: never fails the build.
         continue-on-error: true
@@ -930,9 +862,9 @@ jobs:
           key: ${{ env.CIRISCACHE_KEY }}
           alias-keys: ${{ env.CIRISCACHE_KEY_HEAD }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          # v1/ff52ca3 — LRU-prune target/ to 4GB before tar: breaks the
-          # fat-blob ratchet (240–400s ciriscache steps; superseded dep
-          # generations re-saved forever after every re-pin).
+          # LRU-prune target/ to 4GB before tar: without it superseded dep
+          # generations are re-saved forever after every re-pin and the blob
+          # only grows.
           max-size-mb: "4096"
       - name: CIRISCache save result
         if: ${{ !cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
@@ -950,7 +882,7 @@ jobs:
   # Mission category §4 + PLATFORM_ARCHITECTURE.md §3.1: iOS device +
   # simulator build path. Runs on macOS with the iOS targets.
   #
-  # v2.0.4 — iOS PyO3 cross-compilation. Builds ciris_persist.abi3.so
+  # iOS PyO3 cross-compilation. Builds ciris_persist.abi3.so
   # for aarch64-apple-ios (device) and aarch64-apple-ios-sim (simulator).
   # Uses cargo build (not maturin — maturin 1.13's platform check rejects
   # darwin→iOS cross-compile) with PyO3 cross-compilation env vars and
@@ -964,10 +896,9 @@ jobs:
     needs: [tree, ios-paths]
     if: ${{ !cancelled() && needs.tree.outputs.skip_ios != 'true' && needs.ios-paths.outputs.ios != 'false' }}
     runs-on: macos-14
-    # ci-perf — split the two iOS targets into a 2-entry matrix so they
-    # build in PARALLEL (was one ~20m job building device then simulator
-    # sequentially — cargo's target-dir lock prevents in-job parallelism,
-    # so a matrix is the way). `ios-package` below recombines them into
+    # The two iOS targets are a 2-entry matrix so they build in PARALLEL
+    # (cargo's target-dir lock prevents in-job parallelism, so a matrix is
+    # the way). `ios-package` below recombines them into
     # the single `ciris-persist-ios` tar that mobile-release consumes.
     # Mirrors the android build-matrix → android-package shape.
     strategy:
@@ -1003,8 +934,8 @@ jobs:
       # iOS isn't in CIRISServer#99's <PLAT> table (no cross-repo sibling), so
       # the fail-safe keeps the target triple as the token.
       # CIRISCache (#316) — PLAT=ios-<target triple>, byte-identical to verify's
-      # `ios-${{ matrix.target }}` token (#316 aligned this: was `ios-aarch64`,
-      # which never matched verify's `ios-aarch64-apple-ios` blob).
+      # `ios-${{ matrix.target }}` token, so it matches verify's
+      # `ios-aarch64-apple-ios` blob.
       - uses: ./.github/actions/ciriscache
         with:
           plat: ios-${{ matrix.target }}
@@ -1109,9 +1040,9 @@ jobs:
       # second ~9-min tar+push of byte-identical content). `phead` lets the NEXT
       # version's build restore this warm target/ and recompile only changed
       # files instead of rebuilding persist's deps from the verify baseline.
-      # v54.1.0 (#1022) — this crate's own outputs go first; see the core-1 save.
+      # This crate's own outputs go first (#1022); see the core-1 save.
       - name: drop this crate's own build outputs before the CIRISCache save (#1022)
-        # A cache optimisation never fails the build it follows (v54.1.1).
+        # A cache optimisation never fails the build it follows.
         continue-on-error: true
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -1120,7 +1051,7 @@ jobs:
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
-      - name: seal build-script units before the CIRISCache save (v55.0.1)
+      - name: seal build-script units before the CIRISCache save
         # Each unit's out.manifest, and its out/ files touched to now so the
         # LRU prune drops them last. An optimisation: never fails the build.
         continue-on-error: true
@@ -1135,9 +1066,9 @@ jobs:
           key: ${{ env.CIRISCACHE_KEY }}
           alias-keys: ${{ env.CIRISCACHE_KEY_HEAD }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          # v1/ff52ca3 — LRU-prune target/ to 4GB before tar: breaks the
-          # fat-blob ratchet (240–400s ciriscache steps; superseded dep
-          # generations re-saved forever after every re-pin).
+          # LRU-prune target/ to 4GB before tar: without it superseded dep
+          # generations are re-saved forever after every re-pin and the blob
+          # only grows.
           max-size-mb: "4096"
       - name: CIRISCache save result
         if: ${{ !cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
@@ -1152,7 +1083,7 @@ jobs:
             echo "::warning::CIRISCache save not published (key ${KEY:-?}): ${REASON:-no reason given}"
           fi
 
-  # ci-perf — recombine the two parallel iOS target builds into the single
+  # Recombine the two parallel iOS target builds into the single
   # `ciris-persist-ios` tar that mobile-release uploads. Mirrors
   # android-package. Runs on every PR (NOT tag-gated), so the recombine is
   # validated before any release — only the mobile-release UPLOAD itself
@@ -1161,10 +1092,10 @@ jobs:
     name: package ios artifacts
     runs-on: ubuntu-latest
     needs: [ios-build]
-    # v53.2.0 — explicit result check, because `tree` (an ANCESTOR) is skipped on
+    # Explicit result check, because `tree` (an ANCESTOR) is skipped on
     # every PR and tag run, and the implicit `success()` reads the whole
-    # ancestor chain: a skipped grandparent skips this job even though its
-    # direct need succeeded. Same semantics as before, minus that.
+    # ancestor chain: a skipped grandparent would skip this job even though
+    # its direct need succeeded.
     if: ${{ !cancelled() && needs.ios-build.result == 'success' }}
     steps:
       - uses: actions/checkout@v6
@@ -1194,7 +1125,7 @@ jobs:
           name: ciris-persist-ios
           path: dist/ciris-persist-v*-ios.tar.gz
 
-  # v2.0.7 — per-ABI matrix Android builds (#99). Each runner builds
+  # Per-ABI matrix Android builds (#99). Each runner builds
   # both the plain .so and the PyO3 Chaquopy abi3 .so for one ABI.
   # Downstream android-package job collects artifacts into tarballs.
   android-ndk:
@@ -1238,12 +1169,11 @@ jobs:
         with:
           ndk-version: r26b
           add-to-path: true
-          # #445 postscript (v20.0.0): `local-cache: true` was tried and
-          # REVERTED — the restored NDK cache came back without the
-          # toolchain binaries (clang missing → every ABI's link failed
-          # identically). The direct download + the auto-retry
-          # co-occurrence signature (the other #445 half, kept) is the
-          # reliable configuration.
+          # No `local-cache: true` (#445): a restored NDK cache can come
+          # back without the toolchain binaries (clang missing → every
+          # ABI's link fails identically). The direct download + the
+          # auto-retry co-occurrence signature is the reliable
+          # configuration.
       - name: install cargo-ndk
         run: cargo install cargo-ndk
       - name: extract version from Cargo.toml
@@ -1253,9 +1183,9 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       # x86_64 only: OpenSSL 3.6.x SM4-NI workaround
-      # v11.7.0 CI-perf — x86_64-android also built OpenSSL from source every
-      # run (the SM4-NI workaround). Cache the install dir keyed on the pinned
-      # OpenSSL version; build only on a miss. The env-export step below runs
+      # x86_64-android builds OpenSSL from source (the SM4-NI workaround).
+      # Cache the install dir keyed on the pinned OpenSSL version; build only
+      # on a miss. The env-export step below runs
       # regardless (points the linker at the cached-or-built dir).
       - name: cache pre-built OpenSSL (x86_64-android)
         if: matrix.needs_openssl
@@ -1388,9 +1318,9 @@ jobs:
       # second ~9-min tar+push of byte-identical content). `phead` lets the NEXT
       # version's build restore this warm target/ and recompile only changed
       # files instead of rebuilding persist's deps from the verify baseline.
-      # v54.1.0 (#1022) — this crate's own outputs go first; see the core-1 save.
+      # This crate's own outputs go first (#1022); see the core-1 save.
       - name: drop this crate's own build outputs before the CIRISCache save (#1022)
-        # A cache optimisation never fails the build it follows (v54.1.1).
+        # A cache optimisation never fails the build it follows.
         continue-on-error: true
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -1399,7 +1329,7 @@ jobs:
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
-      - name: seal build-script units before the CIRISCache save (v55.0.1)
+      - name: seal build-script units before the CIRISCache save
         # Each unit's out.manifest, and its out/ files touched to now so the
         # LRU prune drops them last. An optimisation: never fails the build.
         continue-on-error: true
@@ -1414,9 +1344,9 @@ jobs:
           key: ${{ env.CIRISCACHE_KEY }}
           alias-keys: ${{ env.CIRISCACHE_KEY_HEAD }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          # v1/ff52ca3 — LRU-prune target/ to 4GB before tar: breaks the
-          # fat-blob ratchet (240–400s ciriscache steps; superseded dep
-          # generations re-saved forever after every re-pin).
+          # LRU-prune target/ to 4GB before tar: without it superseded dep
+          # generations are re-saved forever after every re-pin and the blob
+          # only grows.
           max-size-mb: "4096"
       - name: CIRISCache save result
         if: ${{ !cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
@@ -1436,10 +1366,10 @@ jobs:
     name: package android artifacts
     runs-on: ubuntu-latest
     needs: [android-ndk]
-    # v53.2.0 — explicit result check, because `tree` (an ANCESTOR) is skipped on
+    # Explicit result check, because `tree` (an ANCESTOR) is skipped on
     # every PR and tag run, and the implicit `success()` reads the whole
-    # ancestor chain: a skipped grandparent skips this job even though its
-    # direct need succeeded. Same semantics as before, minus that.
+    # ancestor chain: a skipped grandparent would skip this job even though
+    # its direct need succeeded.
     if: ${{ !cancelled() && needs.android-ndk.result == 'success' }}
     steps:
       - uses: actions/checkout@v6
@@ -1550,10 +1480,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      # v25.x (CIRISPersist#585) — this job now also runs an --all-features
-      # clippy pass, which pulls the Candle/ORT graph on top of the ~3.7 GB
-      # CIRISCache restore. Check-only, so no object code, but the headroom is
-      # cheap and the ENOSPC-kills-the-agent signature (v17.5.0/.1) is not.
+      # This job runs an --all-features clippy pass (CIRISPersist#585), which
+      # pulls the Candle/ORT graph on top of the ~3.7 GB CIRISCache restore.
+      # Check-only, so no object code, but the headroom is cheap and an
+      # ENOSPC that kills the runner agent is not.
       # Same inline rm the test + wheel legs use — no third-party action.
       - name: Free runner disk (reclaim unused preinstalled toolchains)
         run: |
@@ -1563,8 +1493,8 @@ jobs:
                       /usr/local/share/boost 2>/dev/null || true
           sudo docker image prune -af 2>/dev/null || true
           echo "after:"; df -h / | tail -1
-      # v10.7.0 (CIRISVerify v8.0.0, #141) — no libtss2-dev; clippy compiles
-      # the full graph but ciris-keyring no longer link-binds tss-esapi.
+      # No libtss2-dev (#141); clippy compiles the full graph but
+      # ciris-keyring does not link-bind tss-esapi.
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy, rustfmt
@@ -1576,19 +1506,17 @@ jobs:
           plat: linux-x86_64
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
-      # v25.x (CIRISPersist#585) — the coverage gate. Pure Python over
+      # CIRISPersist#585 — the coverage gate. Pure Python over
       # Cargo.toml + this file; ~40 ms, no compilation, so it fails FIRST and
       # names the uncovered feature instead of letting a 10-minute build
-      # discover it. This is the inversion #585 asks for: omission is now an
-      # error, where before it was silence.
+      # discover it. Omission is an error, not silence.
       - name: feature-matrix coverage gate
         run: python3 scripts/ci_feature_matrix.py check
-      # v35.0.0 (CIRISPersist#710) — the wheel-coverage gate, same shape and
+      # CIRISPersist#710 — the wheel-coverage gate, same shape and
       # same reason as the feature-matrix gate above, one artifact further
       # downstream: the wheel pytest tests must be a SUPERSET of the wheel
       # users install (pyproject [tool.maturin] features minus written
-      # exclusions, plus test-only riders). The v34 tested wheel was a
-      # hand-maintained 4-feature subset of a ~27-feature release wheel;
+      # exclusions, plus test-only riders), not a hand-maintained subset;
       # this fails, by name, the first time either list drifts or a
       # `maturin develop --features` line is hand-spelled again.
       - name: wheel-coverage gate (tested wheel ⊇ shipped wheel)
@@ -1599,8 +1527,8 @@ jobs:
       # the symbol.
       #
       # It enforces three things a green test suite cannot see. (1) Every
-      # PyO3-exported symbol is DESCRIBED in the stub — since v26.0.0 the wheel
-      # ships a PEP 561 `py.typed` marker, so an omitted method is reported to a
+      # PyO3-exported symbol is DESCRIBED in the stub — the wheel ships a
+      # PEP 561 `py.typed` marker, so an omitted method is reported to a
       # consumer's type checker as NOT EXISTING, for API that works. (2) Every
       # symbol is CLASSIFIED in scripts/ffi_taxonomy.tsv by the kind of wrong
       # varying it causes (CIRISConstitution#83), so a reclassification is a
@@ -1613,15 +1541,14 @@ jobs:
       # from the Rust and are semantically unverified.
       - name: FFI surface + taxonomy gate
         run: python3 scripts/pyi_surface.py check
-      # v28.3.0 (CIRISPersist#599) — every `vX.Y.Z` a src/ comment names must be
-      # a version that SHIPPED (git tag or CHANGELOG entry). v25.2.0 was cited
-      # 30 times and never existed: written during the cut that went out as
-      # 26.0.0, unnoticed for three majors, and copied forward by every agent
-      # who grepped the convention. 223 such references remain, grandfathered by
-      # version in evidence/doc_version_baseline.tsv; the ratchet only tightens.
+      # CIRISPersist#599 — every `vX.Y.Z` a src/ comment names must be
+      # a version that SHIPPED (git tag or CHANGELOG entry), so a version that
+      # never existed cannot be cited and copied forward. Existing exceptions
+      # are grandfathered by version in evidence/doc_version_baseline.tsv; the
+      # ratchet only tightens.
       - name: doc version references name shipped versions
         run: python3 scripts/doc_version_refs.py
-      # v31.5.0 (CIRISPersist#688) — the generated `FederationDirectory` double
+      # CIRISPersist#688 — the generated `FederationDirectory` double
       # must still match the trait it was generated from.
       #
       # The COMPILER is the primary backstop and covers the common case: a new
@@ -1631,53 +1558,53 @@ jobs:
       # to the generated file, or the generator itself moving without a
       # regeneration.
       #
-      # It ran in `certify.sh` only, which meant a stale double reached `main`
-      # unless someone ran a full local certification. #603's whole thesis is
-      # that a zero is not evidence unless the instrument can fail — and the
-      # double IS an instrument, so an ungated generated one can drift from the
-      # thing it measures without anyone being told.
+      # Run here and not only in `certify.sh`, so a stale double cannot reach
+      # `main` without a full local certification. #603's thesis is that a
+      # zero is not evidence unless the instrument can fail — and the double IS
+      # an instrument, so an ungated generated one can drift from the thing it
+      # measures without anyone being told.
       - name: generated directory double is current
         run: python3 scripts/gen_directory_double.py --check
-      # v53.2.0 (#1027) — the telemetry registry: `weaver registry check` over
+      # #1027 — the telemetry registry: `weaver registry check` over
       # telemetry/registry/ and telemetry/catalog.json is its rendering (I552
       # then holds that rendering equal to TELEMETRY_CATALOG). The script
       # downloads its pinned weaver and checks the tarball's sha256.
       - name: telemetry registry (OTel Weaver check + rendering current)
         run: scripts/weaver_check.sh
-      # v53.2.0 (#1026) — the from-disk gate counts ported to ast-grep: a call
+      # #1026 — the from-disk gate counts, in ast-grep: a call
       # in a comment or a string is not a call, by construction. Exact per-file
       # counts in rules/expected.json; inventory in docs/FROM_DISK_GATES.md.
       - name: ast-grep gate counts (rules/ vs rules/expected.json)
         run: scripts/ast_gates.sh
-      # v53.2.0 (#1029) — the bits-changed gate (scripts/bits_changed.sh) that the
+      # #1029 — the bits-changed gate (scripts/bits_changed.sh) that the
       # tag job runs before signing a wheel's manifest; offline witnesses with a
       # stub registry, including the `ls | head -1` mutant.
       - name: bits-changed gate witnesses
         run: scripts/bits_changed_test.sh
-      # v54.1.0 (#1045 item 4, #1051) — the mutation matrix's reader and
-      # verdict, against the first nightly run's own (trimmed) output. Fixtures
+      # #1045 item 4, #1051 — the mutation matrix's reader and verdict,
+      # against a real nightly run's (trimmed) output. Fixtures
       # only, no cargo: the nightly job's gate must not first be tested by the
       # nightly job.
       - name: mutation matrix witnesses
         run: python3 scripts/mutants_matrix_test.py
-      # v60.0.0 (docs/V60_TASK_PLAN.md §3) — every scripts/mutants/scope-*.txt
+      # docs/V60_TASK_PLAN.md §3 — every scripts/mutants/scope-*.txt
       # resolves, names tests that exist, and every allow-list line an issue.
       - name: mutation scopes are well-formed (from disk)
         run: python3 scripts/mutants_scopes_check.py --self-test && python3 scripts/mutants_scopes_check.py
-      # v54.1.0 (#1022) — the pre-save trim removes this crate's outputs and no
+      # #1022 — the pre-save trim removes this crate's outputs and no
       # dependency's (fixture target/, no cargo).
       - name: cache trim witnesses
         run: python3 scripts/ci_cache_trim_test.py
-      # v55.0.1 — the unit seal and the restore repair: a pruned build-script
+      # The unit seal and the restore repair: a pruned build-script
       # unit and a manifest-less one are removed with their fingerprints, a
       # consistent one is kept (fixture target/, no cargo).
       - name: cache unit witnesses
         run: python3 scripts/ci_cache_units.py --self-test
-      # v54.1.0 (#1052) — evidence/cc_impl.tsv is generated from the manifest's
+      # #1052 — evidence/cc_impl.tsv is generated from the manifest's
       # evidence export; the committed file must be exactly the generated one.
       - name: evidence tsv is generated from the manifest
         run: python3 scripts/evidence_tsv_test.py
-      # v56.0.0 (#934, #1076 slice T item 0) — every src/ row of
+      # #934 — every src/ row of
       # evidence/cc_impl.tsv names a DEFINITION in its cited file at this
       # commit (comments and literals blanked; a mention or a call site does
       # not resolve). A GATE: a dead pointer is a false evidence claim.
@@ -1686,19 +1613,19 @@ jobs:
           set -euo pipefail
           python3 scripts/evidence_pointers_test.py
           python3 scripts/evidence_pointers.py check
-      # v56.0.0 (#934) — the size counter behind evidence/size.tsv (fixtures, no
+      # #934 — the size counter behind evidence/size.tsv (fixtures, no
       # cargo). The size DELTA itself is a report (ci-hygiene.yml, reports.yml);
       # this step only proves the instrument counts what it claims to.
       - name: size report witnesses
         run: python3 scripts/size_report_test.py
-      # v43.0.0 (BLOB_ENCRYPTION_AT_REST.md I22) — the storage floor token is
+      # BLOB_ENCRYPTION_AT_REST.md I22 — the storage floor token is
       # unconstructible outside the crate. The witness is a `compile_fail`
       # doctest, and nextest never runs doctests, so it gets its own step.
       - name: storage floor is unconstructible outside the crate (I22)
         run: |
           set -euo pipefail
           cargo test --quiet --doc --features sqlite -- StorageFloor 2>&1 | tee /dev/stderr | grep -q "test result: ok. 1 passed"
-      # v2.0 — clippy over the shipped-shape feature set. NOT redundant with
+      # Clippy over the shipped-shape feature set. NOT redundant with
       # the --all-features pass below: `dead_code` / `unused_imports` fire only
       # when a feature is OFF, so the narrow pass catches lints the total pass
       # structurally cannot. The set is derived (`set lint`), not spelled.
@@ -1708,11 +1635,10 @@ jobs:
           FEATURES="$(python3 scripts/ci_feature_matrix.py set lint)"
           echo "--features \"${FEATURES}\""
           cargo clippy --all-targets --features "${FEATURES}" -- -D warnings
-      # v25.x (CIRISPersist#585) — the COMPILE-totality gate, and the one
-      # `secrets-server` needed. `--all-features` cannot omit a feature, so a
-      # feature added to Cargo.toml is compiled + linted from the moment it
-      # exists; `secrets-server` went three releases uncompiled precisely
-      # because the list here was written by hand and it was not on it.
+      # CIRISPersist#585 — the COMPILE-totality gate. `--all-features` cannot
+      # omit a feature, so a feature added to Cargo.toml is compiled + linted
+      # from the moment it exists; a hand-written list can leave one
+      # uncompiled with CI green.
       #
       # Check-only (clippy emits metadata, never links or codegens), so despite
       # pulling the Candle/ORT graph this is far cheaper than a build job, and
@@ -1723,7 +1649,7 @@ jobs:
       - name: cargo clippy (--all-features — every feature compiled, none omittable)
         run: cargo clippy --all-features --all-targets -- -D warnings
 
-      # v30.4.1 (CIRISPersist#618) — the SUBSET leg, and it is not redundant
+      # CIRISPersist#618 — the SUBSET leg, and it is not redundant
       # with --all-features above.
       #
       # --all-features is totality by UNION: every feature is compiled, so a
@@ -1731,11 +1657,11 @@ jobs:
       # the other direction — a configuration that enables feature A WITHOUT
       # feature B — because it can never omit anything.
       #
-      # v30.4.0 shipped exactly that bug. `src/ffi/pyo3.rs` is gated on `_pyffi`;
+      # The case that matters: `src/ffi/pyo3.rs` is gated on `_pyffi`;
       # `pyo3 = ["_pyffi", "postgres"]` and `pyo3-sqlite = ["_pyffi"]` both turn
-      # it on. A `#[cfg(feature = "pyo3")]` on a binding whose USE was unguarded
-      # compiled fine everywhere persist tests — every leg touching that module
-      # enables `pyo3` — and broke every consumer building the sqlite-only PyO3
+      # it on. A `#[cfg(feature = "pyo3")]` on a binding whose USE is unguarded
+      # compiles fine everywhere persist tests — every leg touching that module
+      # enables `pyo3` — and breaks every consumer building the sqlite-only PyO3
       # shape, which is the mobile cross-compile shape (CIRISEdge iOS + Android).
       #
       # This leg builds `_pyffi` WITHOUT `pyo3`. `cargo check`, not a test run:
@@ -1746,9 +1672,9 @@ jobs:
           cargo check --no-default-features --features \
             "pyo3-sqlite sqlite secrets cirisnode cirisgraph cirisaudit telemetry cirisincident classify scrub extract"
 
-      # v54.0.0 (CIRISPersist#1030) — the features a consumer enables ON THEIR
-      # OWN, each compiled with nothing beside it. The #1025 powerset found
-      # `tls` and `pyo3-sqlite` failing alone; each now implies its
+      # CIRISPersist#1030 — the features a consumer enables ON THEIR
+      # OWN, each compiled with nothing beside it (e.g. `tls`, `pyo3-sqlite`).
+      # Each implies its
       # prerequisite, and `ci_feature_matrix.py check` fails if that drops.
       - name: cargo check (features alone — `ci_feature_matrix.py alone`)
         run: |
@@ -1777,12 +1703,12 @@ jobs:
       # musl rustup which reads our rust-toolchain.toml and prints
       #   error: override toolchain 'stable-x86_64-unknown-linux-musl' is not installed
       # on every run (cosmetic, but permanent log noise). Being containerized it
-      # also didn't inherit the workflow-level CARGO_NET_* crates.io-flake
-      # hardening (lines 25-27) for the advisory-DB fetch. Installing the binary
-      # onto the host toolchain (same taiki-e/install-action already used for
-      # nextest) fixes both: zero override noise + inherited flake env. Config
-      # is unchanged — `cargo deny check` runs advisories + bans + licenses +
-      # sources per deny.toml, exactly as the action did.
+      # also doesn't inherit the workflow-level CARGO_NET_* crates.io-flake
+      # hardening (the top-level `env:` block) for the advisory-DB fetch.
+      # Installing the binary onto the host toolchain (same
+      # taiki-e/install-action used for nextest) fixes both: zero override
+      # noise + inherited flake env. `cargo deny check` runs advisories + bans
+      # + licenses + sources per deny.toml.
       - uses: taiki-e/install-action@cargo-deny
       - run: cargo deny check
 
@@ -1811,7 +1737,7 @@ jobs:
   # Build the abi3-py311 wheel via maturin. Per
   # PLATFORM_ARCHITECTURE.md §3.5: one wheel per (os, arch) pair.
   #
-  # v0.1.13 — matrix build covering the agent's full PyPI surface:
+  # Matrix build covering the agent's full PyPI surface:
   #   linux x86_64, linux aarch64, darwin arm64, darwin x86_64.
   # iOS / Android don't ship via PyPI (xcframework / UniFFI native
   # packaging) so they're out of scope here; Phase 1 spec.
@@ -1825,16 +1751,15 @@ jobs:
     name: maturin abi3-py311 wheel (${{ matrix.label }})
     needs: tree
     if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
-    # v30.9.0 — the CROSS-PLATFORM wheels build on TAGS ONLY.
+    # The CROSS-PLATFORM wheels build on TAGS ONLY.
     #
-    # Measured on the last successful PR run (31397353461), which took 38m wall:
-    # `windows-x86_64` alone was **27m** — co-critical with the slowest test leg,
-    # so cutting one without the other bought nothing. linux-aarch64 (11m) and
-    # darwin-aarch64 (14m) are the same shape.
+    # `windows-x86_64` alone takes ~27m on a PR run — co-critical with the
+    # slowest test leg. linux-aarch64 (~11m) and darwin-aarch64 (~14m) are the
+    # same shape.
     #
-    # Nothing consumes them on a PR. Since v30.4.0 nothing consumes them at ALL
-    # outside a release: PyPI publishing was removed (CIRISPersist#615), so their
-    # only reader is `build-manifest`'s signed CanonicalBuild registration, which
+    # Nothing consumes them outside a release: there is no PyPI publishing
+    # (CIRISPersist#615), so their only reader is `build-manifest`'s signed
+    # CanonicalBuild registration, which
     # matters at a tag.
     #
     # `linux-x86_64` still builds on EVERY event, deliberately: it is the shape
@@ -1847,16 +1772,15 @@ jobs:
     # `::warning::No wheel found … skipping`, not a failure.
     # NOTE: this selection CANNOT be a job-level `if:` referencing `matrix` — that
     # context is unavailable when GitHub evaluates job conditions, and using it
-    # there fails the WHOLE workflow at startup with zero jobs run (observed: run
-    # 31409392578). The matrix itself is varied by ref instead, via `fromJSON` of a
+    # there fails the WHOLE workflow at startup with zero jobs run. The matrix
+    # itself is varied by ref instead, via `fromJSON` of a
     # conditional string — the supported way to make a matrix depend on context.
     strategy:
       fail-fast: false
       matrix:
           # windows-x86_64 wheel — standard `x86_64-pc-windows-msvc` target
-          # on stable (Win10+ baseline; Win7 support dropped, which
-          # removed the Tier-3 win7 target + `-Zbuild-std` machinery). Runs
-          # unchanged on Win10/11. openssl-sys is satisfied by vcpkg static
+          # on stable (Win10+ baseline; no Tier-3 win7 target, no
+          # `-Zbuild-std`). Runs on Win10/11. openssl-sys is satisfied by vcpkg static
           # x64-windows-static (the `pyo3`→`postgres`→`dep:openssl` chain),
           # mirroring the proven CIRISEdge#90 setup.
         # linux-x86_64 on every event; the other three only on a tag ref.
@@ -1872,8 +1796,8 @@ jobs:
           # FSD/PLATFORM_ARCHITECTURE.md §3.5 already classifies
           # darwin-x86_64 as "sunset target — keep CI green only";
           # publishing a wheel for it is nice-to-have, not load-
-          # bearing for the lens cutover. Add back via manual upload
-          # if a real consumer materializes.
+          # bearing. Add it via manual upload if a real consumer
+          # materializes.
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -1881,10 +1805,10 @@ jobs:
       # substrate blob (→ a much larger uncompressed target/) and maturin builds
       # the release wheel + auditwheel repairs it. Linux only (ubuntu ships ~25
       # GB of preinstalled toolchains a Rust wheel build never touches). The
-      # linux-x86_64 wheel leg has no dedicated free-space headroom, and a
-      # release-tag run lost the runner mid-extract (job `failure`, restore step
-      # stuck `in_progress`, log blob never uploaded = the ENOSPC-kills-the-agent
-      # signature) — orphaning the v17.5.0 AND v17.5.1 publishes until a rerun.
+      # linux-x86_64 wheel leg has no dedicated free-space headroom; without
+      # this a release-tag run can lose the runner mid-extract (job `failure`,
+      # restore step stuck `in_progress`, log blob never uploaded = the
+      # ENOSPC-kills-the-agent signature) and orphan the publish until a rerun.
       # Mirrors the linux-x86_64-test reclaim (inline rm, no third-party action).
       - name: Free runner disk (reclaim unused preinstalled toolchains)
         if: runner.os == 'Linux'
@@ -1895,22 +1819,20 @@ jobs:
                       /usr/local/share/boost 2>/dev/null || true
           sudo docker image prune -af 2>/dev/null || true
           echo "after:"; df -h / | tail -1
-      # v3.5.3 (CIRISPersist#133) — libsqlite3-dev for the dynamic
-      # libsqlite3 link. v3.5.2 narrowed the `bundled` rusqlite feature
-      # to Android-only, but the Linux wheel-build runner had no
-      # libsqlite3-dev installed so `pkg-config --libs sqlite3` failed
-      # and the wheel still ended up with libsqlite3 statically embedded.
-      # That defeated #132's cross-cdylib SIGSEGV fix at the wheel tier
-      # (CIRISEdge#50 still SEGV against the v3.5.2 wheel). The
-      # post-build `readelf` gate below catches any future regression.
+      # CIRISPersist#133 — libsqlite3-dev for the dynamic libsqlite3 link.
+      # The `bundled` rusqlite feature is Android-only; without
+      # libsqlite3-dev on the Linux wheel-build runner, `pkg-config --libs
+      # sqlite3` fails and the wheel ends up with libsqlite3 statically
+      # embedded, which defeats #132's cross-cdylib SIGSEGV fix at the wheel
+      # tier (CIRISEdge#50). The post-build `readelf` gate below catches a
+      # regression.
       #
-      # v10.7.0 (CIRISVerify v8.0.0, #141) — the former libtss2-dev half is
-      # dropped: ciris-keyring no longer link-binds tss-esapi (the TPM plugin
-      # is dlopen'd at runtime), so only libsqlite3-dev remains.
+      # No libtss2-dev (#141): ciris-keyring does not link-bind tss-esapi
+      # (the TPM plugin is dlopen'd at runtime).
       - name: install libsqlite3-dev (SQLite build dep)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
-      # v5.5.4 (CIRISPersist#205) — Windows openssl-sys link. The `pyo3`
+      # CIRISPersist#205 — Windows openssl-sys link. The `pyo3`
       # feature force-includes `postgres` → `dep:openssl` → openssl-sys;
       # Linux/macOS have a system OpenSSL, Windows does not. vcpkg's
       # static x64-windows-static triplet matches openssl-sys's expected
@@ -1919,9 +1841,9 @@ jobs:
       # is the proven CIRISEdge#90 approach (Strawberry-Perl/openssl-src
       # and Chocolatey both failed there — perl @INC clash / wrong lib
       # layout respectively).
-      # v11.7.0 CI-perf — the vcpkg static OpenSSL was rebuilt FROM SOURCE
-      # every Windows run (~369s, measured). Cache the installed tree and
-      # build only on a miss; on a hit we bypass `vcpkg install` entirely and
+      # Building the vcpkg static OpenSSL FROM SOURCE costs ~369s per Windows
+      # run. Cache the installed tree and build only on a miss; on a hit we
+      # bypass `vcpkg install` entirely and
       # point openssl-sys straight at the restored libs (~369s → ~10s). Bump
       # the key's `-vN` if the runner's vcpkg OpenSSL major ever changes.
       - name: resolve vcpkg OpenSSL path (Windows)
@@ -1957,16 +1879,14 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "::notice::OPENSSL_DIR=${win_root} (vcpkg static, cache-hit=${{ steps.vcpkg-openssl.outputs.cache-hit }})"
           ls -la "${ROOT}/lib/libssl.lib" "${ROOT}/lib/libcrypto.lib"
-      # Win7 support dropped. The Windows wheel now builds the
-      # STANDARD `x86_64-pc-windows-msvc` target (ships precompiled std) on
-      # STABLE, like every other platform. The pinned nightly + `rust-src` +
-      # `-Zbuild-std` existed ONLY for the Tier-3 `x86_64-win7-windows-msvc`
-      # target (no precompiled std) — all removed with win7 support.
+      # The Windows wheel builds the STANDARD `x86_64-pc-windows-msvc` target
+      # (ships precompiled std) on STABLE, like every other platform — no
+      # pinned nightly, `rust-src` or `-Zbuild-std`.
       - uses: dtolnay/rust-toolchain@1.97.0
       # CIRISCache (#316) — layered restore for the RELEASE wheel build so the
       # cross-repo registry (verify crypto/keyring) + persist's own prior wheel
       # blob warm it instead of cold-recompiling. Placed AFTER the toolchain so
-      # `rustc -V` is the right channel (stable on every platform now) and
+      # `rustc -V` is the right channel (stable on every platform) and
       # BEFORE the per-label rust-cache
       # below (which wins on the wheel's own target/). Sets CIRISCACHE_KEY for
       # the save@v1.1 at the end of the job (#314, linux-aarch64 + windows-x64).
@@ -1985,11 +1905,10 @@ jobs:
       # Non-Windows: rust-cache handles the registry + target dep
       # artifacts (linux/darwin wheels recompile the verify+pyo3+postgres
       # graph cold otherwise). Keyed per label so entries don't thrash.
-      # rust-cache now handles EVERY wheel platform (Windows too):
-      # the standard `x86_64-pc-windows-msvc` target ships precompiled std,
-      # so there's no from-source std to preserve — the bespoke win7
-      # `-Zbuild-std` target cache (keyed on Cargo.toml, so it missed every
-      # version bump) is gone. Deps warm via ciriscache (above) + rust-cache.
+      # rust-cache handles EVERY wheel platform (Windows too): the standard
+      # `x86_64-pc-windows-msvc` target ships precompiled std, so there's no
+      # from-source std to preserve. Deps warm via ciriscache (above) +
+      # rust-cache.
       - uses: Swatinem/rust-cache@v2
         with:
           key: wheel-${{ matrix.label }}
@@ -1999,8 +1918,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: install maturin
-        # v1.1.2 (CIRISVerify v2.1.1 hardening): retry pip install
-        # against PyPI transient blips.
+        # Retry pip install against PyPI transient blips.
         shell: bash
         run: |
           for attempt in 1 2 3; do
@@ -2009,7 +1927,7 @@ jobs:
             sleep $((attempt * 5))
             [ "$attempt" = "3" ] && { echo "::error::pip install failed 3x"; exit 1; }
           done
-      # v3.6.2 (CIRISPersist#136) — `--auditwheel skip` on Linux so
+      # CIRISPersist#136 — `--auditwheel skip` on Linux so
       # we can invoke `auditwheel repair --exclude libsqlite3.so.0`
       # explicitly in the next step. Maturin's default auto-repair
       # mangles the libsqlite3 SONAME to `libsqlite3-<hash>.so.0` and
@@ -2022,25 +1940,24 @@ jobs:
       #
       # On macOS, `--auditwheel skip` is a no-op (auditwheel doesn't
       # run there).
-      # ONE build for every wheel platform. Win7 support dropped,
-      # so Windows builds the standard `x86_64-pc-windows-msvc` target
+      # ONE build for every wheel platform. Windows builds the standard
+      # `x86_64-pc-windows-msvc` target
       # (precompiled std, stable toolchain) — no `-Zbuild-std`, no win7
       # target, no LNK1181 `windows.*.lib` LIB fixup (the linker
       # auto-discovers import libs with precompiled std). On Windows
       # `--auditwheel skip` is a no-op (auditwheel is Linux-only); the
       # vcpkg-OpenSSL env for the postgres backend is already exported above.
       #
-      # v53.2.0 (#1028) — clear target/wheels/ first. The CIRISCache restore
-      # carries the wheels earlier releases built (29.0.0..30.2.0 were found in
-      # v53.1.8's tag artifacts), every later step globs `target/wheels/*.whl`,
-      # and build-manifest's `ls | head -1` picked 29.0.0 — v53.1.8 registered
-      # a 29.0.0 wheel's hash for linux-aarch64 and windows-x86_64.
+      # #1028 — clear target/wheels/ first. The CIRISCache restore can carry
+      # wheels earlier releases built, every later step globs
+      # `target/wheels/*.whl`, and a stale wheel there can be signed and
+      # registered under this release's version.
       - name: maturin build
         shell: bash
         run: |
           rm -rf target/wheels
           maturin build --release --strip --auditwheel skip
-      # v3.6.2 (CIRISPersist#136) — explicit auditwheel-repair with
+      # CIRISPersist#136 — explicit auditwheel-repair with
       # libsqlite3 excluded from the bundling pass. This is the same
       # pattern `pyarrow` uses (excludes libssl/libcrypto/libz) and
       # `psycopg2-binary` uses (excludes libssl) for libraries that
@@ -2053,7 +1970,7 @@ jobs:
       # Required: production hosts must have `libsqlite3.so.0`
       # installed system-wide. Every manylinux base image includes
       # it; macOS / Windows / Android have their own postures
-      # (covered upstream by CIRISVerify v4.4.x target-narrowed
+      # (covered upstream by CIRISVerify's target-narrowed
       # bundled feature).
       - name: auditwheel repair (Linux, libsqlite3 excluded)
         if: runner.os == 'Linux'
@@ -2080,7 +1997,7 @@ jobs:
           done
           mv target/wheels/repaired/*.whl target/wheels/
           rmdir target/wheels/repaired
-      # v3.5.3 (CIRISPersist#133) — wheel-tier libsqlite3 dynamic-link
+      # CIRISPersist#133 — wheel-tier libsqlite3 dynamic-link
       # verification. The source-tier #132 fix (Cargo.toml target-
       # narrowed `bundled`) requires libsqlite3-dev present at build
       # time so pkg-config succeeds. If pkg-config fails or any
@@ -2088,17 +2005,14 @@ jobs:
       # libsqlite3 statically embedded and the cross-cdylib SIGSEGV
       # class returns.
       #
-      # v3.6.1 (CIRISPersist#133 follow-up) — gate is LINUX-ONLY.
-      # The cross-cdylib SIGSEGV (CIRISEdge#50) is a Linux-specific
-      # symbol-merging issue. CIRISVerify v4.4.x intentionally bundles
-      # libsqlite3 on macOS + Windows + Android.
+      # This gate is LINUX-ONLY: the cross-cdylib SIGSEGV (CIRISEdge#50)
+      # is a Linux symbol-merging issue (the macOS step below has its
+      # own Mach-O check).
       #
-      # v3.6.2 (CIRISPersist#136) — gate now asserts the PLAIN
-      # libsqlite3.so.0 SONAME and rejects the auditwheel-mangled
-      # `libsqlite3-<hash>.so.0` + sidecar form. v3.6.1's wheel passed
-      # the older gate but still SEGVed in CIRISEdge#50 because
-      # auditwheel had mangled the SONAME. This gate now would have
-      # caught it.
+      # CIRISPersist#136 — the gate asserts the PLAIN libsqlite3.so.0
+      # SONAME and rejects the auditwheel-mangled
+      # `libsqlite3-<hash>.so.0` + sidecar form: a mangled SONAME
+      # links dynamically but still SEGVs in CIRISEdge#50.
       - name: verify wheel links libsqlite3 dynamically (Linux only)
         if: runner.os == 'Linux'
         shell: bash
@@ -2143,14 +2057,11 @@ jobs:
             rm -rf "$tmpdir"
             echo "::endgroup::"
           done
-      # v3.6.9 (CIRISPersist#141) — macOS Mach-O parity gate. Mirrors
-      # the Linux readelf check above. The bug surfaced when CIRISVerify
-      # v4.4.1's target table silently activated rusqlite/bundled on
-      # macOS (the v4.4.1 hypothesis was "the cross-cdylib SIGSEGV is
-      # Linux-ELF-only" — turned out wrong: Mach-O has the same
-      # per-cdylib isolation behavior). CIRISVerify v4.4.3 dropped the
-      # macOS bundling; this gate makes any future regression
-      # immediately visible instead of latent.
+      # CIRISPersist#141 — macOS Mach-O parity gate. Mirrors the Linux
+      # readelf check above: Mach-O has the same per-cdylib isolation
+      # behavior as ELF, so a dependency that turns on rusqlite/bundled
+      # for macOS brings back the cross-cdylib SIGSEGV. This gate makes
+      # such a regression immediately visible instead of latent.
       #
       # Checks via `otool -L` (LC_LOAD_DYLIB) and `nm -gU` (defined
       # global externals) for the abi3 .so inside the macOS wheel:
@@ -2197,10 +2108,10 @@ jobs:
             echo "::endgroup::"
           done
       - name: confirm wheel shape
-        # Reject anything that isn't cp310-abi3 — the v0.1.10 regression
-        # showed mixed-mode maturin can silently emit cp31N-cp31N
-        # wheels which break consumer install on other minors. Catching
-        # at build time, before the wheel reaches PyPI.
+        # Reject anything that isn't cp310-abi3 — mixed-mode maturin
+        # can silently emit cp31N-cp31N wheels which break consumer
+        # install on other minors. Caught at build time, before the
+        # wheel is signed and registered.
         # shell: bash so the glob/test syntax runs on Windows too (the
         # runner default is pwsh).
         shell: bash
@@ -2225,9 +2136,9 @@ jobs:
       # `alias-keys` retags the rolling `phead` blob onto the same manifest
       # server-side (no second tar+push). Windows was the worst offender here:
       # the wheel target/ is large and a second full push serialized ~9 min.
-      # v54.1.0 (#1022) — this crate's own outputs go first; see the core-1 save.
+      # This crate's own outputs go first (#1022); see the core-1 save.
       - name: drop this crate's own build outputs before the CIRISCache save (#1022)
-        # A cache optimisation never fails the build it follows (v54.1.1).
+        # A cache optimisation never fails the build it follows.
         continue-on-error: true
         if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
         shell: bash
@@ -2236,7 +2147,7 @@ jobs:
         if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
         shell: bash
         run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
-      - name: seal build-script units before the CIRISCache save (v55.0.1)
+      - name: seal build-script units before the CIRISCache save
         # Each unit's out.manifest, and its out/ files touched to now so the
         # LRU prune drops them last. An optimisation: never fails the build.
         continue-on-error: true
@@ -2252,9 +2163,9 @@ jobs:
           key: ${{ env.CIRISCACHE_KEY }}
           alias-keys: ${{ env.CIRISCACHE_KEY_HEAD }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          # v1/ff52ca3 — LRU-prune target/ to 4GB before tar: breaks the
-          # fat-blob ratchet (240–400s ciriscache steps; superseded dep
-          # generations re-saved forever after every re-pin).
+          # LRU-prune target/ to 4GB before tar: without it superseded dep
+          # generations are re-saved forever after every re-pin and the blob
+          # only grows.
           max-size-mb: "4096"
       - name: CIRISCache save result
         if: ${{ !cancelled() && ((github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')) }}
@@ -2269,80 +2180,63 @@ jobs:
             echo "::warning::CIRISCache save not published (key ${KEY:-?}): ${REASON:-no reason given}"
           fi
 
-  # ── PyPI publishing REMOVED (CIRISPersist#615) ──────────────────────────
+  # ── No PyPI publishing (CIRISPersist#615) ───────────────────────────────
   #
-  # `publish-pypi` and `assert-published` (the #458 release tripwire) lived here
-  # and were deleted deliberately. Recorded rather than silently dropped, because
-  # the tripwire was a real control and its absence should be a decision someone
-  # can find.
+  # There is no `publish-pypi` job and no `assert-published` tripwire (#458).
+  # Nobody consumes the PyPI wheel — consumers build from the git tag — and the
+  # project is past PyPI's 10 GB per-project cap; the only remedies are a quota
+  # increase or deleting released artifacts, which would break
+  # `pip install ciris-persist==X` for anyone pinned.
   #
-  # WHY. The upload had been failing since 22.0.1 — eight majors — with a hard
-  # `400 Project size too large`: 342 releases totalling 10.73 GB against PyPI's
-  # 10 GB per-project cap. Every publish since was rejected at upload. The only
-  # remedies were a PyPI quota increase, or deleting released artifacts, which
-  # would break `pip install ciris-persist==X` for anyone pinned and is contrary
-  # to this crate's reproducibility posture.
+  # `pyo3-wheel` BUILDS the abi3 wheels — they are CI artifacts, shape-checked,
+  # and the input to `build-manifest`'s signed CanonicalBuild registration.
   #
-  # The deciding fact is simpler: **nobody consumes the PyPI wheel.** Consumers
-  # build from the git tag. A publish path nothing installs from is not worth a
-  # quota negotiation, and the tripwire guarding it was paging about an artifact
-  # with no audience.
-  #
-  # WHAT REMAINS. `pyo3-wheel` still BUILDS the abi3 wheels on every run — they
-  # are still CI artifacts, still shape-checked, and still the input to
-  # `build-manifest`'s signed CanonicalBuild registration. Nothing about how a
-  # consumer verifies a build changed; only the upload to PyPI is gone.
-  #
-  # IF PYPI EVER MATTERS AGAIN, restore BOTH jobs together. `publish-pypi`
+  # IF PYPI EVER MATTERS, add BOTH jobs together. `publish-pypi`
   # without `assert-published` is precisely the #458 failure: a tagged release
   # whose publish was silently skipped, with nothing paging.
 
 
-  # Build manifest registration (v0.9.2+, CIRISPersist#42 closed).
-  # Signs FOUR per-target BuildManifests covering:
+  # Build manifest registration (CIRISPersist#42).
+  # Signs FIVE per-target BuildManifests covering:
   # - `python-source-tree` (FileTreeExtras over python/ciris_persist/
   #   — what iOS / Android agent rebuilds verify against)
   # - `x86_64-unknown-linux-gnu` (binary manifest over linux x86_64 wheel)
   # - `aarch64-unknown-linux-gnu` (binary manifest over linux aarch64 wheel)
   # - `aarch64-apple-darwin` (binary manifest over macOS arm64 wheel)
+  # - `x86_64-pc-windows-msvc` (binary manifest over windows x86_64 wheel)
   #
   # Then registers them via `ciris-build-sign register` (CanonicalBuild
-  # v2 path, CIRISVerify v2.0.3+) so consumer-side
+  # v2 path) so consumer-side
   # `verify_tree(project="ciris-persist", target=...)` can pull the
   # matching per-target manifest from `/v1/builds/<v>?project=...`.
   build-manifest:
     name: Sign + register multi-target build manifests (CanonicalBuild v2)
     runs-on: ubuntu-latest
     needs: pyo3-wheel
-    # v53.2.0 — explicit result check, because `tree` (an ANCESTOR) is skipped on
+    # Explicit result check, because `tree` (an ANCESTOR) is skipped on
     # every PR and tag run, and the implicit `success()` reads the whole
-    # ancestor chain: a skipped grandparent skips this job even though its
-    # direct need succeeded. Same semantics as before, minus that.
+    # ancestor chain: a skipped grandparent would skip this job even though
+    # its direct need succeeded.
     if: ${{ !cancelled() && needs.pyo3-wheel.result == 'success' }}
-    # v3.6.6 — hard-fail restored. The hybrid-signing secrets
-    # (CIRIS_BUILD_ED25519_SECRET / CIRIS_BUILD_MLDSA_SECRET) are now
-    # configured; a manifest failure means either the secrets rotated
-    # without CI being updated OR the registry is unreachable — both
-    # block PyPI publish so consumers always have a verifiable
-    # BuildManifest round-trip via /v1/builds/<v>?project=ciris-persist.
-    # v3.6.5's tag run was the last to ship with the v2.5.0 soft posture
-    # (registry was 503'ing during that publish; manifest never
-    # registered; PyPI published anyway). Hardening here so that mode
-    # can't recur.
+    # Hard-fail. A manifest failure means either the hybrid-signing secrets
+    # (CIRIS_BUILD_ED25519_SECRET / CIRIS_BUILD_MLDSA_SECRET) rotated without
+    # CI being updated OR the registry is unreachable — both fail the release,
+    # so consumers always have a verifiable BuildManifest round-trip via
+    # /v1/builds/<v>?project=ciris-persist.
     permissions:
       contents: read
-      # v1.6.0 hardening — `gh run download` retry block below needs
+      # The `gh run download` retry block below needs
       # actions:read on the GITHUB_TOKEN.
       actions: read
     steps:
       - uses: actions/checkout@v6
         with:
-          # v53.2.0 (#1029) — the v-tags: bits_changed.sh finds the previous
+          # #1029 — the v-tags: bits_changed.sh finds the previous
           # release, and lets python-source-tree's hash equal it only when
           # `git diff v<prev> v<this> -- python/ciris_persist` is empty.
           fetch-depth: 0
-      # v10.7.0 (CIRISVerify v8.0.0, #141) — no libtss2-dev; this step
-      # compiles the crate but ciris-keyring no longer link-binds tss-esapi.
+      # No libtss2-dev (#141); this step compiles the crate but
+      # ciris-keyring does not link-bind tss-esapi.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           # CIRISPersist#396 — exact pin, lockstep with rust-toolchain.toml.
@@ -2354,22 +2248,20 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "ciris-persist version: $VERSION"
       - name: install ciris-build-sign v20.1.0 (prebuilt from CIRISVerify release)
-        # v53.2.0 (#1029) — the sign/register logic lives once, in
+        # #1029 — the sign/register logic lives once, in
         # scripts/build_manifest.sh, shared with reregister-manifests.yml.
-        # History of these steps (v0.9.2 #42 multi-target, v1.1.2 tool v2.1.5,
-        # v1.6.0 retries, #809/#926 preflight gate) is in that script's header
-        # and in git log. v54.0.0 (#992): tool v20.1.0 (TOOL_VERSION in the
-        # script), which refuses to sign a wheel whose own Version or platform
+        # Tool v20.1.0 (TOOL_VERSION in the script, #992) refuses to sign a
+        # wheel whose own Version or platform
         # tag is not the one claimed (CIRISVerify#307); `sign` refuses any
         # other binary on PATH.
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/build_manifest.sh install
-      # v16.0.0 (CIRISPersist#400) — warm the compile before the emit step:
-      # this job previously COLD-compiled persist + the whole verify crypto
-      # graph in release, for a JSON blob whose content (migration-set hash +
-      # `cargo tree` metadata + a const) is independent of how the binary is
-      # compiled. Restore the substrate blob the core leg already saved.
+      # CIRISPersist#400 — warm the compile before the emit step: the emitted
+      # JSON blob's content (migration-set hash + `cargo tree` metadata + a
+      # const) is independent of how the binary is compiled, so restore the
+      # substrate blob the core leg saved instead of cold-compiling persist +
+      # the whole verify crypto graph.
       - uses: ./.github/actions/ciriscache
         with:
           plat: linux-x86_64
@@ -2391,15 +2283,14 @@ jobs:
           echo "PersistExtras emitted:"
           cat "dist/persist-extras-${{ steps.version.outputs.version }}.json"
       - name: download all multi-arch wheels for per-target manifest signing (with retry)
-        # v0.9.2 (CIRISPersist#42) — every wheel target needs its
+        # CIRISPersist#42 — every wheel target needs its
         # own BuildManifest row in CanonicalBuild v2 so consumer-
         # side `verify_tree(project="ciris-persist", target=...)`
         # can match. Single artifact dir per target.
         #
-        # v1.6.0 — replaces `actions/download-artifact@v8` to absorb
-        # transient ListArtifacts 403s (the same retry shape the removed
-        # underlying GitHub Actions infrastructure flake the v1.5.24
-        # tag run surfaced). No flatten step here — the sign script
+        # Used instead of `actions/download-artifact@v8` to absorb
+        # transient ListArtifacts 403s (a GitHub Actions infrastructure
+        # flake). No flatten step here — the sign script
         # below walks per-target subdirs to map wheel → arch.
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2425,10 +2316,10 @@ jobs:
         # Five manifests, one hybrid Ed25519 + ML-DSA-65 key: `python-source-tree`
         # (FileTreeExtras over python/ciris_persist, what iOS / Android agent
         # rebuilds verify against) and one binary manifest per published wheel
-        # (`binary_hash = sha256(wheel)`). v53.2.0 (#1028/#1029): exactly ONE
+        # (`binary_hash = sha256(wheel)`). #1028/#1029: exactly ONE
         # `ciris_persist-<v>-*.whl` per target, and scripts/bits_changed.sh
-        # checks 1-4 pass before each sign — v53.1.8 signed a v29.0.0 wheel.
-        # v54.0.0 (#992): then ciris-build-sign v20.1.0 itself refuses a wheel
+        # checks 1-4 pass before each sign. #992: then ciris-build-sign
+        # v20.1.0 itself refuses a wheel
         # whose dist-info Version / platform tag disagrees (CIRISVerify#307).
         env:
           CIRIS_BUILD_ED25519_SECRET: ${{ secrets.CIRIS_BUILD_ED25519_SECRET }}
@@ -2439,7 +2330,7 @@ jobs:
           scripts/build_manifest.sh sign --version "$VERSION" --wheels dist/wheels --out dist \
             --extras "dist/persist-extras-${VERSION}.json" --source-tree
       - name: pre-flight registry trust-root check
-        # CIRISPersist#809 — a GATE since v50.0.0 (ruling on #926). The self-test
+        # CIRISPersist#809, #926 — a GATE. The self-test
         # runs first, so a guard that stopped refusing reds instead of passing.
         # Gated: the bundle's consensus_protocol quorum (or a deployed steward on
         # the old shape); unrecognised / unreachable / not JSON fails closed.
@@ -2447,10 +2338,9 @@ jobs:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
         run: scripts/build_manifest.sh preflight --out dist
       - name: register multi-target build with CIRISRegistry
-        # v53.2.0 — tag runs only. PR and main runs sign and gate (the
-        # artifacts and bits_changed.sh checks 1-4) but never write the live
-        # registry: through v53.2.0's PR runs this step upserted the release's
-        # rows from an unmerged head (PR run 37662321512 and earlier).
+        # Tag runs only. PR and main runs sign and gate (the artifacts and
+        # bits_changed.sh checks 1-4) but never write the live registry, so
+        # an unmerged head can never upsert a release's rows.
         if: startsWith(github.ref, 'refs/tags/v')
         # `ciris-build-sign register`: per target a `builds` row (POST /v1/builds)
         # and a build-manifest row (POST /v1/verify/build-manifest), plus the one
@@ -2470,8 +2360,8 @@ jobs:
         run: scripts/build_manifest.sh roundtrip --version "${{ steps.version.outputs.version }}" --out dist
       - name: bits-changed check 5 — each registered row carries this run's wheel
         if: startsWith(github.ref, 'refs/tags/v')   # reads back what the tag run registered
-        # v53.2.0 (#1029) — the registry upserts in place, so read back what it
-        # now serves for (version, target) and compare with what we signed:
+        # #1029 — the registry upserts in place, so read back what it
+        # serves for (version, target) and compare with what we signed:
         # each wheel's sha256 and python-source-tree's tree hash.
         env:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
@@ -2488,7 +2378,7 @@ jobs:
             dist/round-trip-*.json
             dist/signed-binary-targets.txt
 
-  # v2.0.3 — Mobile release assets on GitHub Releases. Tag-gated.
+  # Mobile release assets on GitHub Releases. Tag-gated.
   # Uploads iOS and Android tar.gz archives so the agent team
   # (CIRISAgent 2.9.0+) can pull pre-built native libraries without
   # building from source. Asset naming follows CIRISVerify's pattern:
@@ -2510,10 +2400,10 @@ jobs:
       - android-package
       - lint
       - license-audit
-    # v53.2.0 — explicit result check, because `tree` (an ANCESTOR) is skipped on
+    # Explicit result check, because `tree` (an ANCESTOR) is skipped on
     # every PR and tag run, and the implicit `success()` reads the whole
-    # ancestor chain: a skipped grandparent skips this job even though its
-    # direct need succeeded. Same semantics as before, minus that.
+    # ancestor chain: a skipped grandparent would skip this job even though
+    # its direct need succeeded.
     if: >-
       ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled()
           && needs.ios-package.result == 'success' && needs.android-package.result == 'success'
@@ -2643,7 +2533,7 @@ jobs:
             echo "- \`SHA256SUMS\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # v53.2.0 (CIRISPersist#1028) — attest the release and the conformance
+  # CIRISPersist#1028 — attest the release and the conformance
   # evidence, so an adopter can verify them without trusting this repo's
   # history. Two GitHub artifact attestations (an in-toto Statement in a DSSE
   # envelope, signed through Sigstore's public-good instance, since the repo is

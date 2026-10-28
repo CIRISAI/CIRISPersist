@@ -1,17 +1,15 @@
 name: Bench
 
-# v0.1.7 — performance trend tracking. Mirrors CIRISAgent's
-# memory-benchmark.yml trigger shape (weekly cron + manual). Push-to-main
-# and PR runs were both removed later; see the `on:` block for why.
+# Performance trend tracking. Mirrors CIRISAgent's memory-benchmark.yml
+# trigger shape (weekly cron + manual); the `on:` block says why there is
+# no push or PR trigger.
 #
-# The five bench harnesses (`benches/{ingest_pipeline,canonicalize,
-# sign,dedup_key,queue}.rs`) are criterion-based; criterion writes
-# JSON to `target/criterion/` which `benchmark-action/github-action-
+# The bench harnesses (`benches/*.rs`) are criterion-based; criterion
+# writes JSON to `target/criterion/` which `benchmark-action/github-action-
 # benchmark` consumes for the gh-pages publish.
 #
-# SECURITY_AUDIT_v0.1.4.md §3.4 cited per-batch latency as a
-# v0.2.x track item; this workflow is the regression baseline for
-# that work.
+# This workflow is the per-batch latency regression baseline that
+# docs/SECURITY_AUDIT_v0.1.4.md §3.4 asks for.
 
 on:
   schedule:
@@ -19,20 +17,19 @@ on:
     # so a single coffee surveys both PoB primitives' health.
     - cron: '0 7 * * 1'
   workflow_dispatch:
-  # v30.12.0 (CIRISPersist#639) — the `pull_request` trigger is GONE.
+  # No `pull_request` trigger (CIRISPersist#639).
   # This job books a runner for the better part of an hour, and the org's
   # slot pool is shared with every sibling repo; a persist PR that touched
   # `Cargo.toml` took a slot away from the CI matrix that actually gates
   # the merge. `workflow_dispatch` covers the "I want to see this PR's
   # numbers" case on demand.
   #
-  # v53.2.0 (CIRISPersist#1020) — the `push: main` trigger is GONE too, for the same reason one
-  # step further along. Every merge booked 34–47 min of a 16–20-slot pool
-  # while the merge's own CI matrix and the release tag run were queueing for
-  # those slots. The trend chart does not need a point per merge: the weekly
+  # No `push: main` trigger either (CIRISPersist#1020), for the same reason:
+  # every merge would book 34–47 min of a 16–20-slot pool while the merge's
+  # own CI matrix and the release tag run queue for those slots. The trend chart does not need a point per merge: the weekly
   # cron keeps the series continuous, and a release that wants its own point
   # dispatches this workflow on main (`gh workflow run bench.yml --ref main`),
-  # which publishes exactly as a push did — see the publish step's gate.
+  # which publishes to gh-pages — see the publish step's gate.
 
 permissions:
   # benchmark-action needs `contents: write` to push to the
@@ -56,19 +53,19 @@ jobs:
   bench:
     name: Criterion bench suite
     runs-on: ubuntu-latest
-    # Eleven benches. The original five are ~60s each; the v1.10.x
-    # bench-coverage cut (sequence_contention, engine_cold_start,
-    # read_engine_analytics, secrets_crypto, occurrence_registry,
-    # storage_floor) adds ~9-11 min — read_engine_analytics dominates
-    # (size-swept seeds up to 25k traces). Observed ~14 min locally;
-    # headroom for the runner. Bump if we add more benches.
+    # The core benches are ~60s each; sequence_contention,
+    # engine_cold_start, read_engine_analytics, secrets_crypto,
+    # occurrence_registry and storage_floor add ~9-11 min —
+    # read_engine_analytics dominates (size-swept seeds up to 25k traces).
+    # ~14 min locally; the rest is headroom for the runner. Bump if
+    # more benches are added.
     timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v6
 
-      # Reclaim ~21 GB of unused preinstalled toolchains before the 11-bench
-      # release-mode build (same rationale + safety as the ci.yml test job).
+      # Reclaim ~21 GB of unused preinstalled toolchains before the
+      # release-mode bench build (same rationale + safety as the ci.yml test job).
       - name: Free runner disk (reclaim unused preinstalled toolchains)
         run: |
           echo "before:"; df -h / | tail -1
@@ -87,28 +84,22 @@ jobs:
           # miss the restore. Bump in lockstep with the toolchain file.
           toolchain: "1.97.0"
 
-      # v30.12.0 (CIRISPersist#639) — the `ciriscache` restore is GONE, and its
-      # absence is the point. It cost **8m27s** per run and could not help:
-      # it restores the DEV/TEST-profile `target/` saved by ci.yml, while
-      # benches build the BENCH profile. Cargo keys artifacts by profile, so
-      # nothing in that blob was ever reusable here — the step's own comment
-      # claimed it stopped the bench "cold-compiling the ML-DSA / ML-KEM /
-      # keyring / tokio-postgres graph every run", and it never did.
-      # Registry and git are cached by the `actions/cache` step below, which
-      # is what actually made the downloads cheap.
+      # No `ciriscache` restore here (CIRISPersist#639). That blob is the
+      # DEV/TEST-profile `target/` saved by ci.yml, while benches build the
+      # BENCH profile; Cargo keys artifacts by profile, so nothing in it is
+      # reusable here, and the restore costs ~8.5 min. Registry and git are
+      # cached by the `actions/cache` step below, which keeps downloads cheap.
 
       - name: Cache criterion baseline
         uses: actions/cache@v5
         with:
           # CIRISPersist#335 — cache ONLY the criterion baseline, NOT the
-          # full compiled `target/`. Caching all of `target/` here was ~3 GB
-          # of redundancy — its two branch-scoped copies
-          # pushed the repo cache to 13.9 GB / 10 GB, LRU-evicting the small
-          # vcpkg-OpenSSL (28 MB) + wheel `target/` blobs and forcing a
-          # 382 s OpenSSL rebuild + cold wheel compiles every run. Scoping
-          # to `target/criterion` (the per-bench `base` snapshot the
-          # regression analysis compares against) drops this blob from ~3 GB
-          # to a few MB. Registry/git stay cached (cheap, high-value).
+          # full compiled `target/`. A cached `target/` is ~3 GB per branch
+          # scope; it overflows the 10 GB repo cache and LRU-evicts the small
+          # vcpkg-OpenSSL (28 MB) + wheel `target/` blobs, forcing a 382 s
+          # OpenSSL rebuild + cold wheel compiles. `target/criterion` (the
+          # per-bench `base` snapshot the regression analysis compares
+          # against) is a few MB. Registry/git stay cached (cheap, high-value).
           # Cargo.lock is gitignored (library convention), so the key hashes
           # Cargo.toml — version bumps + new deps invalidate cleanly.
           path: |
@@ -119,8 +110,8 @@ jobs:
           restore-keys: |
             bench-${{ runner.os }}-
 
-      # v10.7.0 (CIRISVerify v8.0.0, #141) — no libtss2-dev: ciris-keyring
-      # deleted the link-time tss-esapi backend; nothing to apt-install.
+      # No libtss2-dev: ciris-keyring has no link-time tss-esapi backend
+      # (#141), so there is nothing to apt-install.
 
       - name: System info
         run: |
@@ -135,24 +126,23 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run criterion benches
-        # v1.10.x bench-coverage cut adds the bottom five. SQLite-backed
+        # SQLite-backed
         # benches (open_in_memory) need no service. `MALLOC_ARENA_MAX`
         # caps glibc's per-thread arenas so the multi-threaded benches'
         # virtual footprint stays sane on the runner.
         #
-        # v2.12.0 (CIRISPersist#116) — runs FIRST as the calibration
+        # The calibration bench (CIRISPersist#116) runs FIRST as the
         # anchor. Pure-compute SplitMix64 microbench produces an
         # `ns/iter` that captures THIS runner's wall-time-per-CPU-op
         # rate. The normalization step further down divides every
         # other bench's value by this calibration, so published
         # metrics are runner-independent.
         #
-        # Why this exists: 2.11.0 vs 2.10.0 (a 15-line PyCapsule + a
-        # verify pin bump that touches NO benched hot path) tripped
-        # 40 performance alerts purely from neighbor-tenant runner
-        # load. Absolute ns/iter on shared runners is too noisy for
-        # the 1.1× alert threshold; normalization against a pure-CPU
-        # calibration anchor solves it.
+        # Why: absolute ns/iter on shared runners swings with
+        # neighbor-tenant load — a change touching no benched hot path
+        # can trip dozens of alerts. That is too noisy for the 1.1×
+        # alert threshold; normalization against a pure-CPU
+        # calibration anchor removes it.
         env:
           MALLOC_ARENA_MAX: "4"
         run: |
@@ -297,7 +287,7 @@ jobs:
             exit 1
           fi
 
-      # v2.12.0 (CIRISPersist#116) — normalize every ns/iter against
+      # CIRISPersist#116 — normalize every ns/iter against
       # the calibration anchor. Output value is scaled so 1
       # calibration tick = 1,000,000 normalized units; keeps numbers
       # readable AND a 2× bench change still shows as a 2× chart
@@ -418,7 +408,7 @@ jobs:
         if: always()
         with:
           name: criterion-${{ github.run_id }}
-          # v2.12.0 (CIRISPersist#116) — keep raw + calibration
+          # CIRISPersist#116 — keep raw + calibration
           # alongside the normalized output. The normalized file
           # is what benchmark-action consumes; the raw + calibration
           # are ground truth for post-hoc analysis (e.g. "did the
