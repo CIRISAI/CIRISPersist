@@ -1,21 +1,18 @@
-# Telemetry Tag Conventions (v1.0.0)
+# Telemetry tag conventions
 
-Canonical tag-key vocabulary for `crate::telemetry::Observation.labels`
-and `MetricSummary.labels`. Codified from CIRISAgent's
-`GraphTelemetryService` emitter survey (CIRISAgent#756 concern #3
-audit). Persist consumers (CIRISLensCore dashboards, CIRISEdge
-metric routers) should adopt these keys 1:1 so cross-substrate
-queries don't drift on label spelling.
+The canonical tag-key vocabulary for `crate::telemetry::Observation.labels` and
+`MetricSummary.labels`. It matches the keys CIRISAgent's telemetry emitters use
+(CIRISAgent#756). Consumers (CIRISLensCore dashboards, CIRISEdge metric
+routers) use these keys 1:1 so cross-substrate queries do not drift on label
+spelling.
 
 ## Why this exists
 
-- Persist's `Observation.labels` and `MetricSummary.labels` are
-  `JSONB` / canonical-JSON-TEXT — schema-free at the storage layer.
-- Schema-free labels make cardinality + key-name drift unbounded.
-- The agent team's `GraphTelemetryService` (CIRISAgent v2.x) has
-  established a working set of tag keys. CIRISPersist 1.0.0 mirrors
-  that set as substrate-canonical so the cutover (CIRISAgent v2.9.0)
-  preserves dashboard queries.
+- `Observation.labels` and `MetricSummary.labels` are `JSONB` /
+  canonical-JSON-TEXT, schema-free at the storage layer.
+- Schema-free labels let cardinality and key spelling drift without bound.
+- One written vocabulary, shared with the emitter, keeps dashboard queries
+  stable.
 
 ## Canonical keys
 
@@ -35,39 +32,27 @@ queries don't drift on label spelling.
 
 ## Keys that should NOT be used
 
-The cutover audit (CIRISAgent#756) surfaced two redundant keys that
-the agent team confirmed should be dropped:
+- **`source`** — a constant (`"telemetry"`) on this substrate; everyone
+  reading these rows already knows they are telemetry observations.
+- **`timestamp`** — redundant with persist's first-class `observed_at`
+  column (TIMESTAMPTZ / RFC 3339).
 
-- **`source`** — agent's `GraphTelemetryService` auto-attached
-  `tags["source"] = "telemetry"`. Constant value on this substrate
-  (everyone reading these rows knows they're telemetry-substrate
-  observations). Drop on cutover.
-- **`timestamp`** — agent's `GraphTelemetryService` auto-attached
-  `tags["timestamp"] = iso8601_now()`. Redundant with persist's
-  first-class `observed_at` TIMESTAMPTZ / RFC 3339 column. Drop on
-  cutover.
+## Changing the vocabulary
 
-## Evolution
-
-Additive-only, in lockstep with CIRISAgent's emitter changes. New
-keys land here + in the agent's emitter source simultaneously;
-old keys go through a deprecation comment + a migration window
-before removal. Removing a key from this canonical list is a
-**major-version-bump consideration** (consumers' dashboards
-depend on the spelling).
+Additive only, in step with CIRISAgent's emitter: a new key is added here and
+in the emitter source together. A key is removed only after a deprecation
+comment and a migration window. Removing a key from this list is a breaking
+change for consumers, whose dashboards depend on the spelling.
 
 ## Consumer expectations
 
-- **CIRISLensCore dashboards** — query by canonical key. If a key
-  isn't in this table, treat it as deployment-specific extension
-  and don't surface in default dashboards.
-- **CIRISEdge metric routers** — preserve canonical keys when
-  proxying observations between agents and the federation
-  substrate. Don't rename / lowercase / strip prefixes.
-- **CIRISAgent v2.9.0+** — emit via the canonical keys directly;
-  the dual-write phase carries both old + new spellings, the
-  read-side cutover snaps to canonical keys when the wheel-side
-  switchover completes.
+- **CIRISLensCore dashboards** — query by canonical key. A key not in this
+  table is a deployment-specific extension; do not surface it in default
+  dashboards.
+- **CIRISEdge metric routers** — preserve canonical keys when proxying
+  observations between agents and the federation substrate. Do not rename,
+  lowercase or strip prefixes.
+- **CIRISAgent** — emits the canonical keys directly.
 
 ## See also
 
@@ -75,5 +60,4 @@ depend on the spelling).
   `Observation` + `MetricSummary` table schemas.
 - `src/telemetry/types.rs` — `Observation`, `MetricSummary`,
   `ConsolidationLevel`.
-- `CIRISAgent#756 comment 4455250673` — the original audit + diff
-  that this doc codifies.
+- CIRISAgent#756 — the emitter survey this vocabulary comes from.

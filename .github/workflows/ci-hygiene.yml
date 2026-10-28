@@ -3,16 +3,16 @@
 #
 # ── WHY THE MIRROR ───────────────────────────────────────────────────────
 # `ci.yml`'s test matrix declares `services: postgres`, and a service image is
-# pulled ONCE PER MATRIX LEG. At eight legs that is eight anonymous Docker Hub
-# pulls per CI run, from GitHub's SHARED runner IPs — where Docker Hub's
+# pulled ONCE PER MATRIX LEG. From Docker Hub that is one anonymous pull per
+# leg per CI run, from GitHub's SHARED runner IPs — where Docker Hub's
 # anonymous allowance (100 per 6h per IP) is spent by every other customer on
 # that address too.
 #
 # The failure mode is self-feeding, which is what makes it worth engineering
 # away rather than retrying harder:
 #
-#   8 pulls/run -> a 429 at "Initialize containers" -> the job dies before it
-#   runs a line of our code -> auto-retry.yml reruns the failed jobs -> EIGHT
+#   N pulls/run -> a 429 at "Initialize containers" -> the job dies before it
+#   runs a line of our code -> auto-retry.yml reruns the failed jobs -> N
 #   MORE PULLS against the limit that just rejected us.
 #
 # The retry is aimed at the thing the retry is causing. `auto-retry.yml`'s own
@@ -122,7 +122,7 @@ jobs:
           done
           echo "::notice::Pruned $n skipped auto-retry run(s)."
 
-  # v56.0.0 (CIRISPersist#934, #1076 slice T item 0) — a GATE, unlike the
+  # A GATE, unlike the
   # reports job below: every evidence/cc_impl.tsv pointer on main names a
   # definition. ci.yml's lint job runs the same check per PR; this one re-asks
   # daily on main, so a pointer that died in a merge nobody re-linted shows red.
@@ -139,7 +139,7 @@ jobs:
           python3 scripts/evidence_pointers_test.py
           python3 scripts/evidence_pointers.py check | tee -a "$GITHUB_STEP_SUMMARY"
 
-  # v56.0.0 (CIRISPersist#934, #1076 slice T) — REPORTS, not gates. Every step
+  # REPORTS, not gates. Every step
   # here prints what it found and the job stays green: nothing new goes red on
   # main without the operator. docs/TOOLING.md lists which tool is which.
   reports:
@@ -158,8 +158,8 @@ jobs:
           python3 scripts/size_report_test.py
           { echo '```'; python3 scripts/size_report.py check; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
       # Unused dependencies. `--with-metadata` resolves renamed crates through
-      # `cargo metadata`; the plain mode reported nothing on v55.0.0 where this
-      # one names two dev-dependencies. A finding is the operator's to act on
+      # `cargo metadata`, which the plain mode misses (it can report nothing
+      # where this one names unused dev-dependencies). A finding is the operator's to act on
       # (remove, or list it under [package.metadata.cargo-machete] ignored
       # with the reason): this step only prints it.
       - uses: dtolnay/rust-toolchain@1.97.0

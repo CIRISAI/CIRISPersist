@@ -1,10 +1,10 @@
 # Migration immutability — an applied migration's bytes are the contract
 
-**CIRISPersist#840.** A one-word edit inside a SQL *comment* took the CIRIS
-canonical down for ~7 minutes and crash-looped it 16 times, and bricked every
-release from v43.0.0 through v44.1.0 for any node that had applied V070 before
-2026-09-09. This document states the invariant that edit broke, the repair for
-the nodes it already reached, and the gate that makes the class unrepeatable.
+**CIRISPersist#840.** refinery checksums a migration's whole file text, so an
+edit inside a SQL *comment* of a shipped migration stops every node that
+applied the old bytes from booting. This document states the invariant, the
+narrow repair persist carries for the one shipped migration whose bytes did
+change (V070), and the gate that keeps the class from recurring.
 
 ## 1. What refinery actually checksums
 
@@ -29,11 +29,7 @@ comment is indistinguishable from changed DDL, and the failure lands inside
 `run_migrations`, inside `Engine::with_*`, **before anything binds** — the node
 does not start.
 
-This was known and written down. `src/store/postgres.rs` has carried a v7.0.0
-note since the TimescaleDB removal explaining that V079 is "left IMMUTABLE and
-unmodified … because the shipped migration is unchanged, its checksum still
-matches what `schema_history` recorded". The doctrine was correct and a
-documentation rename walked straight past it, because doctrine is not a gate.
+A rule that is only written down does not hold; §4 is the gate that holds it.
 
 ## 2. The invariant
 
@@ -41,32 +37,26 @@ documentation rename walked straight past it, because doctrine is not a gate.
 > Not "its DDL is immutable": its **bytes** are. A correction to a shipped
 > migration is a NEW migration, never an edit to the old one.
 
-The one thing a shipped migration may not carry is a reference that has to be
-kept current. A comment naming a design document is a liability the moment the
-document is renamed, which is exactly how #840 happened. Shipped migrations
+A shipped migration therefore cannot carry a reference that has to be kept
+current. A comment naming a design document goes stale the moment the document
+is renamed, and the migration cannot be edited to follow it. Shipped migrations
 name documents **as of their own date**; the reader follows the pointer through
-the FSD index, not by trusting the comment to be fresh. V070's comment
-therefore still says `ENCRYPTED_AT_REST.md`, which is this document's
-predecessor under its former name, and it stays that way permanently.
+the FSD index, not by trusting the comment to be fresh. V070's comment says
+`ENCRYPTED_AT_REST.md`, a document name that no longer exists, and it stays
+that way permanently.
 
 ## 3. Two populations, and why a plain revert is not enough
 
-The reported fix — revert the comment — is correct and is what this cut does.
-But it is only half the repair, because by 2026-09-11 there are two populations
-of nodes and they recorded **different** checksums for the same version:
+V070's file carries its original (pre-edit) bytes. Two populations of nodes
+recorded **different** checksums for that version:
 
-| population | applied V070 | recorded checksum | plain revert |
+| population | applied V070 from | recorded checksum | against the original bytes alone |
 |---|---|---|---|
-| **A** — with history | before 2026-09-09, from ≤ v42.1.0 | pre-edit | un-bricked |
-| **B** — fresh since the break | on/after 2026-09-09, from v43.0.0–v44.1.0 | post-edit | **newly bricked** |
+| **A** — with history | a release carrying the original file | pre-edit | boots |
+| **B** — created while the edited file shipped | a release carrying the edited file | post-edit | **would not boot** |
 
-Population B is every node whose database was created in the two days the
-broken releases were current. A revert alone moves the outage from A to B, and
-B's failure would look identical and arrive with the fix that was supposed to
-end it.
-
-So the cut **normalises** instead of merely reverting: the file returns to its
-pre-edit bytes, and before refinery validates anything, persist rewrites a V070
+Restoring the original bytes alone would move the failure from A to B. So
+persist **normalises**: before refinery validates anything, it rewrites a V070
 history row carrying the post-edit checksum to the pre-edit one.
 
 > **I44 — a node that recorded the bricked V070 checksum boots.**
@@ -101,20 +91,18 @@ Because a from-disk gate fails toward a pass when it simply finds nothing, the
 witness also asserts the **count** both ways: a file with no row and a row with
 no file are both red.
 
-This closes #840's second ask. The deploy role that diagnosed the outage
-proposed exactly this gate, keyed on released tags; keying on a pinned manifest
-instead makes it hermetic — it needs no tags, no network and no git history, so
-it runs identically in a shallow CI clone and in a worktree.
+The gate is keyed on a pinned manifest rather than on released tags, which
+makes it hermetic: it needs no tags, no network and no git history, so it runs
+identically in a shallow CI clone and in a worktree.
 
 ## 5. What this does not cover
 
-The scan that found #840 also found two older migrations whose bytes changed
-after their first release: postgres `V001__trace_events.sql` (0.1.0 → 0.1.2,
-2026-04-30) and postgres `V059__ceg_07_identity_occurrence_and_family.sql`
-(3.12.0 → 3.12.1, 2026-06-03). Both were same-day corrections, and V059's
-original was **rejected by postgres** (sqlstate 42P17) so no node can have
-recorded it. Neither is live today. They are pinned at their current bytes,
-which is what any surviving node has, and the gate holds them there from here.
+Two older postgres migrations changed bytes after their first release:
+`V001__trace_events.sql` and `V059__ceg_07_identity_occurrence_and_family.sql`.
+Both were same-day corrections, and V059's original was **rejected by
+postgres** (sqlstate 42P17), so no node can have recorded it. Neither has a
+repair. They are pinned at their current bytes, which is what any surviving
+node has, and the gate holds them there.
 
 ## 6. Schema text a shipped migration cannot change: the portable-default repair (#845)
 
@@ -126,8 +114,8 @@ error: `datetime()` returns **NULL**, silently, and the `INSERT` that relied
 on the default meets `NOT NULL`. Debian bookworm — current stable — ships
 3.40.1; Ubuntu 22.04 ships 3.37. On either, the first encrypted-at-rest
 write fails at `federation_content_master.created_at` and nothing after it
-succeeds. Every CI lane runs a newer SQLite, so the class was invisible until
-CIRISEdge's mesh harness ran on a bookworm image (CIRISEdge#600).
+succeeds. Every ordinary CI lane runs a newer SQLite, which is why the
+bookworm witness (§6.3) exists (CIRISEdge#600).
 
 ### 6.1 Why neither obvious fix is available
 
@@ -221,13 +209,12 @@ see it.
 
 ### 6.5 Statements, not only defaults
 
-The audit that built the repair found a second class the repair cannot
-reach: nine runtime SQL statements in `src/` evaluated
-`datetime('now', 'subsec')` directly — the community-DEK epoch rotation
-(`rotated_at`), maintenance locks, incident records, telemetry locks and
-workers. On 3.40.1 those wrote NULL silently into a nullable column, or failed
-`NOT NULL`. They are source, so they are simply changed to the portable form;
-what keeps them changed is I58.
+A second class is out of the repair's reach: runtime SQL statements in
+`src/` that evaluate a timestamp directly (the community-DEK epoch rotation's
+`rotated_at`, maintenance locks, incident records, telemetry locks and
+workers). With the `subsec` modifier, on 3.40.1 such a statement writes NULL
+silently into a nullable column, or fails `NOT NULL`. Those statements use the
+portable form; I58 keeps it that way.
 
 | # | invariant | falsified by | gate |
 |---|---|---|---|

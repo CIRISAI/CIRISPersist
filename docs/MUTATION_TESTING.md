@@ -1,30 +1,26 @@
-# Mutation testing — the per-witness detection matrix (CIRISPersist#1024)
+# Mutation testing — the per-witness detection matrix
 
-Until v53.2.0 every mutation round was hand-picked per PR and recorded only in
-the CHANGELOG ("the 10-mutant round"). Nothing said which witness was
-load-bearing for which site after the PR merged. A surviving mutant is a claim
-about the WITNESS; the matrix is that claim, regenerated on demand, without
-hand selection.
+A surviving mutant is a claim about the WITNESS: some test that should guard a
+site does not. The mutation matrix records, for each scope, which mutants were
+generated, which witnesses killed each one, and which witnesses killed nothing.
+It is regenerated on demand by a tool, not chosen by hand (CIRISPersist#1024).
 
     scripts/mutants.sh <cargo-mutants|mutest> <scope-file>
 
 writes `target/certify-logs/mutants/<scope>/matrix.{json,md}`,
-`unvalidated.txt` and `verdict.txt`.
+`unvalidated.txt` and `verdict.txt`. `scripts/certify.sh mutants <scope>` runs
+the same thing under certify's lock.
 
-## The gate (v54.1.0, CIRISPersist#1051)
+## The gate
 
-Until v54.1.0 the run was report-only. The first scheduled run (650024b1,
-2026-10-09) hit its 2-hour budget with 8 of 85 mutants untested, had 6
-survivors, and its job was **green**. Its `unvalidated.txt` said "0 witnesses
-ran", because `CARGO_TERM_COLOR=always` coloured nextest's status lines and
-the matrix reader matched none of them. Now:
+A run is a gate, not a report (CIRISPersist#1051). Its exit code:
 
 | exit | meaning |
 |---:|---|
 | 0 | complete, and every surviving mutant is allow-listed with an issue |
 | 1 | no matrix (tool missing, red baseline, broken build, or a green baseline whose log yields no status line) |
 | 2 | usage, an unresolvable scope, or a malformed allow-list |
-| 3 | refused before building: the scope does not fit the budget at `MUTANTS_BASELINE_SECS + N × MUTANTS_SECS_PER_MUTANT` (600 + 120 s; measured on that run: baseline 305 s, p90 105 s per mutant) |
+| 3 | refused before building: the scope does not fit the budget at `MUTANTS_BASELINE_SECS + N × MUTANTS_SECS_PER_MUTANT` (600 + 120 s by default) |
 | 4 | INCOMPLETE: the budget expired or a mutant was never tested |
 | 5 | a surviving mutant (`missed`, `timeout`, `caught_out_of_scope`) not in `scripts/mutants/allowed_survivors.txt`; or a mutant cargo-mutants ran that the matrix filed out of scope ("scope disagreement": it was tested and judged nowhere) |
 
@@ -34,188 +30,47 @@ or an incomplete run, `::warning` for an allowed one). An allow-list entry is
 `<file>[:<line>] <cargo-mutants' mutation text> #<issue>`: the text is the
 tool's own, compared exactly, and a line without an issue number is refused.
 
-**Selection is by line, through `--in-diff`.** cargo-mutants 27.1 applies
-neither `-F` nor `-E` to its struct-field deletions, so a function-name regex
-let `delete field as_of` in four functions outside the scope, and two field
-deletions in `#[cfg(all(test, ..))] mod r2_test_support`, into every run.
-`resolve` now writes the scope as a diff that adds exactly its lines, minus
-every test-only item (`#[cfg(test)]`, `#[cfg(all(test, ..))]`, a `mod
-*test_support*`), and passes `--in-diff`. The matrix keeps a mutant whose
-span touches a scope line, as `--in-diff` does; by first line alone,
-`counters()`'s whole-body replacement (it starts on a `#[cfg(test)]`
-statement) was tested and then dropped unjudged.
+The matrix reader strips SGR colour escapes before it matches nextest's
+status lines (CI sets `CARGO_TERM_COLOR=always`), and a green baseline whose log
+yields no status line is exit 1, never a green run with zero witnesses.
+
+**Selection is by line, through `--in-diff`.** cargo-mutants applies neither
+`-F` nor `-E` to its struct-field deletions, so a function-name regex alone
+lets mutants from outside the scope in. `resolve` writes the scope as a diff
+that adds exactly its lines, minus every test-only item (`#[cfg(test)]`,
+`#[cfg(all(test, ..))]`, a `mod *test_support*`), and passes `--in-diff`. The
+matrix keeps a mutant whose span touches a scope line, as `--in-diff` does, so a
+whole-body replacement that starts on a test-gated statement is still judged.
 
 **A hung witness fails in 60 s.** The run uses nextest's `mutants` profile
 (`.config/nextest.toml`): a witness that hangs under a mutant is killed after
 three 20 s periods and reads as its FAIL, instead of a 300 s tool timeout
-credited to no witness (`record_read`'s three loop mutants cost 1049 s of the
-first run). I692 additionally bounds the fold-mask loop in a 5 s deadline.
-That was not enough (CIRISPersist#1112, red nightly 2026-10-14 to 10-21):
-seventeen witnesses read inside a fold, each hung to the 60 s leash under
-the same mutant, four at a time, and the whole run still outlived
-cargo-mutants' 300 s floor: three TIMEOUTs credited to no witness. A witness
-cannot end an infinite loop, so v60.0.0 bounds the loop itself (by the mask's
-popcount); the mutants now return at once with the wrong fold credited, and
-I1164 counts every fold.
+credited to no witness. A witness cannot end an infinite loop in the code under
+test, so loops that a mutant could make unbounded are bounded in the code itself
+(the fold-mask loop in `src/observe/` is bounded by the mask's popcount, I692 and
+I1164).
 
-## Verdict: cargo-mutants
+## Tool choice: cargo-mutants
 
-Three runs on 2026-10-07/08, all numbers read from the matrices on disk:
-
-- `scope-consent` with cargo-mutants: stopped by the harness at 51 of 74
-  (memory pressure from a build beside it). **INCOMPLETE.**
-- `scope-consent-gate` with cargo-mutants: the two consent files only, run
-  alone after that. **Complete.**
-- `scope-consent` with mutest-rs. Complete, but it reached almost nothing.
-
-| | cargo-mutants 27.1.0 | mutest-rs (git 430efed9) |
+| | cargo-mutants | mutest-rs |
 |---|---|---|
-| toolchain | the repo's pinned stable, 1.97.0 | `nightly-2026-07-18` (rustc-driver; must match the mutest build) |
-| features | `postgres,sqlite,server` | `sqlite,server` only: with `postgres` the build hits an internal compiler error in `mutest-emit` (`analysis/res.rs:758`, `deadpool::managed::pool::Pool` path resolution) |
-| build | baseline 114–267 s; each mutant an incremental rebuild of about 17–83 s | 257 s once (meta-mutant binary), peak RSS 8.2 GiB |
-| test | baseline 4–10 s for the scope's witnesses; 3–11 s per mutant, 300 s on a timeout | reference profiling of the WHOLE lib suite: 1688 s (3351 tests; it has no test filter), then 0.2 s of mutant runs |
-| witnesses run | every one in the filter, on memory, sqlite and postgres | 1 of 16 |
-| mutants generated in the consent gate | 13 | 0 |
+| toolchain | the repo's pinned stable | a pinned nightly (rustc-driver; must match the mutest build) |
+| features | `postgres,sqlite,server` | `sqlite,server` only: with `postgres` the build hits an internal compiler error in `mutest-emit` (`deadpool::managed::pool::Pool` path resolution) |
+| build | one incremental rebuild per mutant (about 17–83 s) | one meta-mutant build, peak RSS 8.2 GiB |
+| test | the scope's witnesses per mutant | a whole-lib-suite profiling pass (about 28 min; it has no test filter), then the mutants |
+| async witnesses | all run | its static call graph does not reach them: on the consent scope it ran 1 of 16 witnesses and generated no mutant in the consent gate, where cargo-mutants found 13 |
 
-| run | in scope | caught | missed | timeout | unviable | not run | wall |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| cargo-mutants `scope-consent` | 74 | 42 | 2 | 3 | 4 | 23 | 2954 s, stopped |
-| cargo-mutants `scope-consent-gate` | 13 | 9 | 1 | 0 | 3 | 0 | 654 s |
-| mutest `scope-consent` | 14 | 2 | 12 | 0 | 0 | 0 | 1941 s |
+cargo-mutants runs on the pinned stable toolchain, builds every backend, and
+runs every witness under every mutant through nextest with `--no-fail-fast`, so
+`killed_by` lists every witness that went red, not only the first. Its cost is
+a rebuild per mutant, about 50–55 s each locally and about 168 s on CI runners.
+Run it alone (`MUTANTS_JOBS=1`): a build beside it can exhaust memory.
 
-**Why not mutest-rs, though it is the faster design.** Its static call graph
-does not reach persist's async witnesses. Of the 16 in-scope witnesses it ran
-one, `observe::tests::i551_samples_carry_exactly_the_catalogued_names_and_labels`,
-the only synchronous one. Every `i548*`, `i549`, `i550` witness is marked
-"never run". The run logged 697 "encountered dynamic call" warnings during call
-graph construction (the executor capsule's vtable, `Box::pin(self.run(..))`
-futures), and it generated **no mutant at all** in `consent_by_humans.rs` or
-`admission.rs`, where cargo-mutants found 13 and the I548 witnesses kill 9.
-Add the pinned nightly, the postgres ICE, the 8.2 GiB build and a 28-minute
-whole-suite profiling pass per run, and it does not answer the question #1024
-asks. Revisit when mutest-rs resolves async call edges.
+mutest-rs stays supported by `scripts/mutants.sh` for local comparison, and is
+not wired into CI. Revisit it when it resolves async call edges.
 
-**Why cargo-mutants.** It runs on the pinned stable toolchain, builds every
-backend, and runs every witness under every mutant through nextest with
-`--no-fail-fast`, so `killed_by` lists every witness that went red, not the
-first. Cost is a rebuild per mutant. Measured: about 55 s per mutant on the
-observe run (51 mutants in 2954 s, three of them 300 s timeouts) and 50 s on
-the gate run (13 in 654 s). A complete 74-mutant `scope-consent` run is
-therefore about 70 min serially (PROJECTED from those rates). Peak RAM per job
-was not recorded; the observe run was stopped for memory when a build ran
-beside it, so run it alone, `MUTANTS_JOBS=1`.
-
-**The 2 MB test-thread stack / ML-DSA.** mutest's reference pass profiled 3351
-lib tests, the ML-DSA hybrid-verify tests among them, with no stack overflow
-and no SIGSEGV in the log. The one panic it printed is the intended
-`#354 containment probe`. cargo-mutants runs the ordinary nextest binary, so
-it inherits the existing stack handling unchanged.
-
-## What the matrices say, against the hand rounds
-
-CHANGELOG `## [53.1.8]` records I548 3/3 and I549–I551 10/10. The tool does
-not reproduce those exact mutants. It generates its own, at the same sites.
-At those sites it agrees with the hand rounds wherever both ran, and it found
-three survivors the hand rounds never tried.
-
-### Consent gate: `scope-consent-gate`, complete
-
-13 mutants in `check_capacity_consent_admission` and the three
-`consent_by_humans.rs` folds: 9 caught, 3 unviable, 1 missed. The 3 unviable
-are the `Ok(Default::default())` body replacements: the return types have no
-`Default`. All 13 I548 witnesses killed at least one mutant, on all three
-backends:
-
-| witness (each of memory, sqlite, postgres) | kills |
-|---|---:|
-| `i548a` | 5 |
-| `i548b` | 4 |
-| `i548c` | 9 |
-| `i548d` | 4 |
-| `i548e_one_fold_every_door` (backend-independent) | 1 |
-
-- `check_capacity_consent_admission -> Ok(())` was killed by i548e and every
-  b, c and d. The stance check at `admission.rs:4540` was killed by every
-  a–d. The tier and self-attestation checks at `:4515` and `:4518` were
-  killed by every b–d.
-- The fold's subject filter (`:258`), steward skip (`:275`) and the universe
-  predicate's `:281`, `:283:21` and `:283:63` operators were killed by i548a
-  and i548c; `:281` by i548c alone.
-- **The hand round's 3 mutants have no tool equivalent.** All three are
-  semantic swaps no operator produces: calling the subject-only
-  `resolve_scoped_consent` instead, asking bare `analyze`, and printing the
-  constant in the refusal. The tool's 13 cover the same two functions with
-  coarser edits. Both sets show the same witnesses load-bearing. The hand
-  round's gate reversion went red on i548a, c and e; the tool's `Ok(())` and
-  `:4540` flip together went red on all five.
-- **The survivor is a witness gap, filed as #1038.** It is
-  `consent_by_humans.rs:282:21`, the first `||` replaced with `&&` in
-  `resolve_scoped_stance_by_principals_body`. The predicate builds each
-  steward `p`'s universe:
-
-  ```rust
-  a.attesting_key_id != *p
-      || super::precedence::is_structural_composer(&a.attestation_type)
-      || for_key_id_of(&a.attestation_envelope) == Some(subject_key_id)
-  ```
-
-  The mutant makes it `(A && B) || C`, so a row from another author survives
-  only if it is a composer or names the subject. The steward's fold reads one
-  kind of row from another author: the substrate's `consent:state:expired`
-  record, through `substrate_expiry_bound_to_subject`. That record is not a
-  composer and deliberately carries no `for_key_id` (`consent_expiry.rs`
-  module doc), so the mutant drops it. A steward's grant that lapsed by
-  `expires_at` and was swept then reads `Unspecified` instead of `Expired`
-  from `capacity_consent_stance`. The admit verdict is unchanged, because
-  neither is `Granted`. So it is not equivalent: the reported stance changes,
-  and no I548 case has a swept steward grant. That analysis is from reading
-  the code; it was not reproduced with a test.
-
-### Read and fold counters: `scope-consent`, INCOMPLETE at 51 of 74
-
-All 51 that ran are in `src/observe/mod.rs`: 42 caught, 4 unviable, 3
-timeouts, 2 missed. The 23 not run are 10 in `src/observe/mod.rs`
-(`TelemetrySnapshot::fold` constants from `(1, 0, 0, 1)` on, its `==` at
-`:424`, and both `TelemetrySnapshot::samples` replacements at `:431`) and
-the 13 consent-gate mutants, which `scope-consent-gate` then ran in full.
-
-| witness | kills |
-|---|---:|
-| `sqlite::i549` | 41 |
-| `memory::i549` | 38 |
-| `postgres::i549` | 38 |
-| `sqlite::i550` | 25 |
-| `postgres::i550` | 24 |
-| every `i551*` | 0 so far |
-
-- **The 3 timeouts** are `record_read`'s mask loop at `:316` (`&=` to `|=`,
-  `-` to `+`, `-` to `/`). Each never clears the mask, so the witness hangs
-  until nextest's 300 s limit. cargo-mutants counts a timeout as detected,
-  but no witness is credited with it.
-- **The 2 survivors are filed as #1037.** One is `Counters::snapshot`'s
-  `n > 0` changed to `>=` (`:247`). The other is `fold`'s `|` changed to `^`
-  (`:330`), which only differs when a fold is re-entered with its own bit
-  already set.
-- **Against I549–I551's 10 hand mutants:**
-  - Four have tool equivalents that were caught by the same witness:
-    - "a fold scope that omits its own bit" is `Fold::bit -> 0`, killed by
-      i549 on all three backends.
-    - "`record_read` skipping a door increment" (two hand mutants) is
-      `record_read` replaced with `()`, killed by i549 and i550, and the
-      `!=` to `==` at `:313`, killed by i549.
-    - "sqlite's row mapper not noting envelope bytes" is
-      `note_decoded_bytes` replaced with `()`, killed by sqlite::i549.
-  - One, "the fold credit dropped from `record_read`", corresponds to the
-    `:316` timeouts: detected, not attributed.
-  - Three (`pg_envelope_bytes`, `trust_root_valid`, `put_attestation`) are in
-    `scope-observe-sites.txt`, which has not run.
-  - Two, a value dropped from or added to `catalog::DOOR_VALUES`, cannot be
-    generated: neither tool mutates a `const` slice literal or generated any
-    mutant in `src/observe/catalog.rs`. I551's from-disk catalogue checks stay
-    hand-mutated witnesses.
-- **mutest's 12 survivors** are all at `src/observe/mod.rs:431`, inside the
-  `Vec::with_capacity` size hint of `TelemetrySnapshot::samples`. They are
-  equivalent mutants: a capacity hint never changes the output.
+cargo-mutants runs the ordinary nextest binary, so it inherits the existing
+stack handling for the ML-DSA tests unchanged.
 
 ## The matrix format
 
@@ -230,14 +85,14 @@ Schema `ciris-persist/mutants-matrix/v1`, one format for both tools
   "test_filter": "test(/i548|i549|i550|i551/)",
   "features": "postgres,sqlite,server",
   "wall_secs": 2954, "budget_secs": 7200, "complete": false,
-  "tests": ["observe::tests::memory::i549", "..."],
+  "tests": ["observe::tests::sqlite::i549", "..."],
   "mutants": [{"id": 1, "file": "src/observe/mod.rs", "line": 175, "col": 9,
                "description": "src/observe/mod.rs:175:9: replace Fold::bit -> u32 with 0",
-               "outcome": "caught", "killed_by": ["observe::tests::memory::i549", "..."]}],
+               "outcome": "caught", "killed_by": ["observe::tests::sqlite::i549", "..."]}],
   "out_of_scope": ["<generated by the tool, outside every scope range>"],
   "summary": {"mutants": 74, "caught": 42, "caught_out_of_scope": 0, "crashed": 0,
               "missed": 2, "timeout": 3, "unviable": 4, "not_run": 23},
-  "kills_per_test": {"observe::tests::memory::i549": 38},
+  "kills_per_test": {"observe::tests::sqlite::i549": 41},
   "tests_killing_nothing": ["..."],
   "tests_never_run": ["<mutest only: outside its static call graph>"]
 }
@@ -251,17 +106,14 @@ Schema `ciris-persist/mutants-matrix/v1`, one format for both tools
   mutest runs the whole lib suite and the matrix keeps only the scope's
   witnesses. `caught` means a retained witness detected the mutant or crashed
   under it, and `killed_by` names it. `caught_out_of_scope` means the mutant
-  was detected, but only by tests outside the scope: it counts as a
-  detection by the suite, never as a kill by the witness set the matrix
-  measures. `crashed` means the harness crashed under the mutant and no
-  test's row attributes it. Until the Codex review of PR #1039 the mutest
-  outcome was copied from mutest's whole-suite flag, which labelled
-  out-of-scope detections `caught` with an empty killer list.
+  was detected, but only by tests outside the scope: it counts as a detection
+  by the suite, never as a kill by the witness set the matrix measures.
+  `crashed` means the harness crashed under the mutant and no test's row
+  attributes it.
 - `complete` is false when the budget expired or any in-scope mutant is
   `not_run`. For cargo-mutants the not-run set is read from the tool's own
-  `mutants.json`: an interrupted run's `outcomes.json` lists only the mutants
-  that finished, and a matrix built from it alone read "complete" until
-  v53.2.0 fixed that.
+  `mutants.json`, because an interrupted run's `outcomes.json` lists only the
+  mutants that finished.
 - `matrix.md` is the same data as two tables: one row per mutant with its
   killers, one row per witness with its kill count. A zero is bold; a witness
   the tool never ran says so.
@@ -274,7 +126,7 @@ Schema `ciris-persist/mutants-matrix/v1`, one format for both tools
 # comment to end of line
 tests: <nextest filterset>      the witnesses measured; required
 features: <feature>[,<feature>] the cargo features the sites compile under
-                                (v60.0.0; default postgres,sqlite,server;
+                                (default postgres,sqlite,server;
                                 MUTANTS_FEATURES still wins)
 witnesses: <path> ...           extra witness files for the unvalidated report
                                 (every *_invariants.rs counts without listing)
@@ -295,131 +147,51 @@ To add one:
 4. Run it: `MUTANTS_BUDGET_SECS=7200 scripts/mutants.sh cargo-mutants <scope>`.
    If it exits 3, shard it.
 
-The scopes (v54.1.0; `scope-consent.txt` held the first two together and
-did not fit its budget):
+### The scopes
 
-- `scope-consent-gate.txt`: the consent gate, against the I548 and I570
-  witnesses. 19 mutants. v54.0.0 had moved the gate's universe predicate into
-  `per_principal_stances`, which the scope did not name: it is named now.
-- `scope-observe.txt`: `src/observe/`, against I549–I553, I690–I699 and
-  (v60.0.0, #1112) I1163–I1164. 71 mutants, run as two shards
-  (`MUTANTS_SHARD=0/2`, `1/2`).
-- `scope-s0-roster-seam.txt` (v60.0.0, slice S0): `nodes_owned_by` (#1109,
-  I1161, and I1342 for the seek's owner-binding filter, which changes only
-  what is read) and the test-anchor `W_self` seam (#1111, I1162); the first
-  scope with a `features:` line (`test-anchor`).
-- `scope-s2-goals.txt` (v60.0.0, slice S2): goals as `goal:{scale}:v1`
-  rows (#988 item 4): `goal.rs`, `goal_projection.rs` and the three
-  backends' goal writers, rebuilds and reads, against I1174–I1182. 155
-  mutants, three shards (`MUTANTS_SHARD=0/3` … `2/3`), on the weekly run.
-- `scope-s3-key-plane.txt` (v60.0.0, slice S3): the key-record write doors
-  on one plan (#934 step 3): `key_plane::plan_key_record_write`, its
-  planners, the shared replicated apply, the row step, and each backend's
-  `store_planned_key_record` executor and doors, against I1183–I1188 and the
-  doors' standing witnesses. 129 mutants in three shards, 101 caught, 28
-  unviable, 0 missed (two rounds: the first left twelve survivors; ten were
-  witness gaps, now witnessed, two an equivalent branch, now removed), on
-  the weekly run.
-- `scope-s6v-vendor.txt` (v60.0.0, slice S6v): the CC `v1.0-rc9` vendor.
-  The policy table read at runtime (`governance_policy.rs`), the corridor
-  (`TwoPathPolicy::check_corridor`), the self-roster door's admission site
-  (`self_roster::policy`), and the registry loader the re-vendor moved
-  (`parse_manifest`, `registry`, `parse_polarity_classes`), and #1114's
-  three refusals (`check_content_hash`, `check_row_mirror_members_closed`,
-  `validate_subject_key_ids`), against I1300–I1311, I84, the 732 CC
-  governance vectors, the six self_roster traces and the registry pins.
-  108 mutants in three shards, on the weekly run.
-- `scope-s4-consent-sweep.txt` (v60.0.0, slice S4): the consent and sweep
-  planes on one plan (#934 step 4, #1105): `consent_admit` and `sweep_plan`
-  whole, the #1105 holdings read in `key_plane`, the key-grant doors' shared
-  bodies, the observation prune plan and its two executors, and each
-  backend's `ConsentStore` / `SweepStore` / `RoomEvictionStore` executors and
-  the doors that call the plans, against I1192–I1201 and the doors' standing
-  witnesses. 302 mutants in six shards, 256 caught, 46 unviable, 0
-  missed (three rounds), on the weekly run.
-- `scope-s5-memory-retire.txt` (v60.0.0, slice S5): what the memory
-  backend's retirement added (#1002): the one lifecycle predicate (#720,
-  `lifecycle_predicate`, `hiding_composers`), the from-disk tree binding
-  (#691, `store::tree_read`), the fountain assembler moved out of memory.rs,
-  the migrated in-memory clone (`store::sqlite_scratch`), and the genesis
-  scratch on both backends (`genesis::scratch`, the postgres scratch
-  database and its reaper, the replay's provision/release arms), against
-  I1320, I1321, I1323, I1329–I1332 and the lifecycle / fountain reads on
-  both backends. 44 mutants in one shard, 36 caught, 8 unviable, 0 missed
-  (round 2),
-  nightly. Every other scope dropped its `src/store/memory.rs` sites and
-  memory legs.
-- `scope-s6-affiliations.txt` (v60.0.0, slice S6): organisations as
-  affiliations (#1036 items 1-5, #1049, #1062, #1048): the licence authority
-  quorum and its `license` walk, the signed-instant verdicts with W in front
-  (licence, consent grant chain, key_grant sealer and the stream read), the
-  licence audience, the typed licence payload (`operational.rs`) and its
-  `revision` gate, the subject-withdraws carve-out and the contest, the
-  affiliation owner-binding, and the delegation term gate and lens, against
-  I1210–I1235 and the licensure-chain, grant-scope and key-grant witnesses
-  (plus I972, I126, I313, which guard neighbouring sites). 212 mutants, 186
-  caught, 26 unviable, 0 missed (three rounds: 28 then 9 survivors; all
-  witnessed, except two equivalent forms removed: the withdraws rule-3 cut
-  accumulation and the stream instants' `&&`), on the weekly run in eight
-  shards. It ran in five until the v60.0.0 CI run (40305453908): shard 1/5
-  took about 168 s per mutant, not the 120 s the sizing assumes, and three
-  of the five shards hit the 7200 s budget with mutants unrun (0 missed).
-  At 600 s + 168 s x 27, a shard of eight fits.
-- `scope-601-fixes.txt` (v60.1.0, slice A): the bug fixes' predicates —
-  #1072's plaintext DAG caller-input checks, #1069's idempotent DEK re-supply
-  (the exact comparison and the stored-key read), #1070's purge path without
-  a LocalSigner, the resumed takedown and the bytes floor's in-transaction
-  tombstone read on both dialects (postgres's shared/exclusive advisory
-  locks), and #1006's signed receipt instant — against I1400–I1409, I754,
-  I780–I783, I786, I788–I790, I153 and I513. 81 mutants: 64 caught, 17
-  unviable, 0 missed in one round (two local shards; I787 killed nothing
-  and left the filter). Slice C adds #1132's delivery-receipt length rule
-  (`length_prefix`, `try_receipt_signing_bytes`) against I1411, the
-  allocation-free witness; I1412 stays out of the filter, since under a
-  surviving mutant it would copy a 4 GiB field. 97 mutants, four shards of
-  <= 25 on the weekly run; shard 2/4 (which holds all five new mutants):
-  25 mutants, 22 caught, 3 unviable, 0 missed, each new one killed by I1411.
-- `scope-601-asks.txt` (v60.1.0, slice B): the consumer asks — the accord
-  threshold function and its roster read (#1117), the key-grant and
-  `DimensionRejected` retryability predicates (#1064), the
-  `identity_amendment:v1` gate (#1120), and the takedown reversal: the fold,
-  the withheld read, the finalize skip, the re-ack candidates and the
-  ruling's authority (#1113), against I1360–I1367, I742 and the finalize and
-  reconsideration witnesses that guard the two pre-existing functions in
-  scope (I655, I790, I773, I972, I1218). Round 1: 126 mutants, 18 missed
-  (the re-ack arm's own counters, the ruling arm's `!`s, the finalize
-  boundary, the owner fallback's guard): the re-ack arm now feeds the
-  existing due loop, the guard was equivalent and is gone, and the rest are
-  witnessed. Round 2: 110 mutants, 99 caught, 11 unviable, 0 missed, in four
-  shards of <= 28 (1223–1426 s each on the dev box), weekly. I1363 (#1095,
-  no code change) and I1364 (#1089, serde members) guard no mutable site and
-  kill nothing, by construction.
-- `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and
-  federation files that feed the counters, against I548–I551 and (v60.0.0)
-  I1340–I1341, the witnesses of `apply_planned`'s read-back and store-error
-  arms on sqlite and postgres. The issue's other starting modules
-(the `trust_root.rs` walks beyond `trust_root_valid`) are not yet scoped.
+The shard counts and cadence are in `.github/workflows/mutants.yml`. Each
+scope's header comment names the issues and invariants it covers.
 
-From v60 every slice adds its own scope; see the next section.
+| scope | sites | witnesses | cadence |
+|---|---|---|---|
+| `scope-consent-gate` | the consent gate (`check_capacity_consent_admission`, the `consent_by_humans.rs` folds, `per_principal_stances`) | I548, I570 | nightly |
+| `scope-observe` | `src/observe/`: the read and fold counters | I549–I553, I690–I699, I1163–I1164 | nightly, 2 shards |
+| `scope-observe-sites` | the call sites in the backend and federation files that feed the counters, and `apply_planned`'s read-back and store-error arms | I548–I551, I1340–I1341 | weekly |
+| `scope-s0-hard-case` | `hard_case` rows replicate: the put door and the replicated apply project the row in its transaction | I1165, I960, I962 | nightly |
+| `scope-s0-roster-seam` | `nodes_owned_by` (and its owner-binding seek filter) and the test-anchor `W_self` seam; built with `features: test-anchor` | I1161, I1162, I1342 | nightly |
+| `scope-s1-cirisnode` | the cirisnode classes as `scores` rows (`src/cirisnode/rows.rs`), the retired objects refused by name, the promotion and delivery row rules | I1166–I1172 and the takedown and legal-basis witnesses | weekly, 5 shards |
+| `scope-s2-goals` | goals as `goal:{scale}:v1` rows: `goal.rs`, `goal_projection.rs`, and the backends' goal writers, rebuilds and reads | I1174–I1182 | weekly, 3 shards |
+| `scope-s3-key-plane` | the key-record write doors on one plan: `key_plane::plan_key_record_write`, its planners, the shared replicated apply, and each backend's `store_planned_key_record` executor | I1183–I1188 and the doors' standing witnesses | weekly, 3 shards |
+| `scope-s4-consent-sweep` | the consent and sweep planes on one plan: `consent_admit`, `sweep_plan`, the holdings read in `key_plane`, the key-grant doors' shared bodies, the observation prune plan, and each backend's `ConsentStore` / `SweepStore` / `RoomEvictionStore` executors | I1192–I1201 and the doors' standing witnesses | weekly, 6 shards |
+| `scope-s5-memory-retire` | the single lifecycle predicate (`lifecycle_predicate`, `hiding_composers`), the from-disk tree binding (`store::tree_read`), the fountain assembler, the migrated in-memory sqlite clone (`store::sqlite_scratch`), and the genesis scratch database on both backends with its reaper | I1320, I1321, I1323, I1329–I1332 and the lifecycle and fountain reads | nightly |
+| `scope-s6-affiliations` | organisations as affiliations: the licence authority quorum and its walk, the signed-instant verdicts, the licence audience and typed payload, the subject-withdraws carve-out and contest, the affiliation owner-binding, and the delegation term gate | I1210–I1235 and the licensure-chain, grant-scope and key-grant witnesses | weekly, 8 shards |
+| `scope-s6v-vendor` | the vendored CC policy: the policy table read at runtime (`governance_policy.rs`), `TwoPathPolicy::check_corridor`, the self-roster admission site, the registry loader, and three refusals (`check_content_hash`, `check_row_mirror_members_closed`, `validate_subject_key_ids`) | I1300–I1311, I84, the CC governance vectors, the self_roster traces and the registry pins | weekly, 3 shards |
+| `scope-601-fixes` | the plaintext DAG caller-input checks, idempotent DEK re-supply, the purge path without a `LocalSigner`, the resumed takedown and the bytes floor's in-transaction tombstone read, the signed receipt instant, and the delivery-receipt length rule | I1400–I1409, I1411, I754, I780–I783, I786, I788–I790, I153, I513 | weekly, 4 shards |
+| `scope-601-asks` | the accord threshold and its roster read, the key-grant and `DimensionRejected` retryability predicates, the `identity_amendment:v1` gate, and the takedown reversal (fold, withheld read, finalize skip, re-ack candidates, the reversal's authority) | I1360–I1367, I742, I655, I790, I773, I972, I1218 | weekly, 4 shards |
 
-## Per-slice scopes (v60)
+The scope file names carry the work item that introduced them; the name is
+what CI and the allow-list key on, so it does not change.
 
-Until v60 every slice ran its mutation round as an ad-hoc Python script
-outside the repo (`release53/*_mut*.py`, 20+ in v59 alone). Nobody could
-re-run them, the nightly matrix never learned the sites, and the results
-survived only as a handoff table. From v60.0.0 (docs/V60_TASK_PLAN.md §3):
+Some witnesses guard no mutable site by construction (for example I1363 and
+I1364 in `scope-601-asks`, which check wire shapes), and kill nothing. Some
+witnesses read source files as text, such as I551's catalogue checks; no tool
+mutates the string literals and `const` lists they check, so they are shown
+red by hand edits against a committed checkpoint.
 
-1. **Every slice ships `scripts/mutants/scope-<slice>.txt`**: a `tests:`
-   filter naming the slice's witnesses, a `features:` line when a site
-   compiles only under a non-default feature, and the files (functions, for
-   any file over a few thousand lines) the slice touched. The hand-written
-   mutation list a brief used to carry becomes this file.
+## Per-slice scopes
+
+Every unit of release work (a "slice" of a release plan) ships its own scope:
+
+1. **A scope file, `scripts/mutants/scope-<slice>.txt`**: a `tests:` filter
+   naming the slice's witnesses, a `features:` line when a site compiles only
+   under a non-default feature, and the files (functions, for any file over a
+   few thousand lines) the slice touched.
 2. **One runner:** `scripts/cargo_guard.sh scripts/mutants.sh cargo-mutants
-   scripts/mutants/scope-<slice>.txt`. No ad-hoc mutation scripts. A
-   mutation the tool does not generate (a revert of the fix, say) is checked
-   by hand against a committed checkpoint and reported as such, never by a
-   script that rewrites source.
-3. **The matrix is the handoff's mutation table**, cited by path:
+   scripts/mutants/scope-<slice>.txt`. No ad-hoc mutation scripts. A mutation
+   the tool does not generate (a revert of the fix, say) is checked by hand
+   against a committed checkpoint and reported as such, never by a script that
+   rewrites source.
+3. **The matrix is the mutation evidence**, cited by path:
    `target/certify-logs/mutants/<scope>[-shard-k-of-n]/matrix.json`,
    `verdict.txt`, `unvalidated.txt`.
 4. **Green means exit 0 AND an empty `unvalidated.txt`.** Every mutant is
@@ -427,25 +199,25 @@ survived only as a handoff table. From v60.0.0 (docs/V60_TASK_PLAN.md §3):
    filter killed something (a witness that kills nothing is a witness about a
    neighbouring gate). **Exit 3 means shard it** (`MUTANTS_SHARD=k/n`), never
    shrink the scope to fit.
-5. **The scope joins the nightly matrix** (`.github/workflows/mutants.yml`),
-   budget-fitted and sharded; the release slice wires them.
+5. **The scope joins the scheduled matrix** (`.github/workflows/mutants.yml`),
+   budget-fitted and sharded.
 6. `scripts/mutants_scopes_check.py` (certify fast gate `mutscopes`, and CI)
    keeps every scope honest from disk: it resolves, its `tests:` filter is a
    well-formed filterset whose `test(...)` leaves match a `fn` or `mod` name
    under `src/` or `tests/`, its `features:` exist, and every allow-list line
    names an issue.
 
-A slice PR also gets the diff-scoped report: `scripts/mutants_diff.sh
-origin/main` runs in the `reports (non-gating)` workflow on every
-`release-*` PR (and on any PR labelled `run-mutants`), answering "which
-changed line can be mutated with no test noticing?" for the whole diff, not
-only the sites the scope chose.
+A release PR also gets the diff-scoped report: `scripts/mutants_diff.sh
+origin/main` runs in the `reports (non-gating)` workflow on every `release-*`
+PR (and on any PR labelled `run-mutants`), answering "which changed line can be
+mutated with no test noticing?" for the whole diff, not only the sites the
+scope chose.
 
 ### The scope-file template
 
 ```
-# Mutation scope: v<NN> slice <S> — <one line: what the slice changed>
-# (docs/V<NN>_TASK_PLAN.md §4 <S>; CIRISPersist#<issue>, ...).
+# Mutation scope: <slice> — <one line: what the slice changed>
+# (docs/V<NN>_TASK_PLAN.md §<n>; CIRISPersist#<issue>, ...).
 #
 # - #<issue>: <door or fold>, what changed. Witness I<nnnn> (<backends>).
 # - Named sites left OUT of the scope, and why (e.g. a site only an
@@ -479,9 +251,9 @@ src/federation/<big_file>.rs fn_a fn_b      # only inside these functions
 
 `scripts/unvalidated_witnesses.py <matrix.json> [<scope>]` lists every witness
 in a `*_invariants.rs` file, or a file on the scope's `witnesses:` line, that
-ran and killed zero mutants. In Beyer 2022's sense such a witness is
-**unvalidated**: it has never been shown red, so it is a hypothesis about a
-gate, not evidence of one.
+ran and killed zero mutants. Such a witness is **unvalidated** (in Beyer's
+sense): it has never been shown red, so it is a hypothesis about a gate, not
+evidence of one.
 
 - A zero is where to look, not automatically a defect: the scope may not
   contain the code the witness guards.
@@ -489,44 +261,22 @@ gate, not evidence of one.
   because a mutant still `not_run` may be the one it kills.
 - A witness the tool never executed (mutest's call-graph misses) is `NOT RUN`,
   with no verdict either way.
-- Report-only this cut: always exit 0 when the matrix reads. The intended
-  next step is a gate on a complete matrix: a non-empty `UNVALIDATED` list for
-  a named scope fails the scheduled job.
-
-Across the runs above:
-
-- **`scope-consent-gate`, complete.** No unvalidated witness. All 13 I548
-  witnesses killed at least one mutant.
-- **`scope-consent`, incomplete.** 17 witnesses at `ZERO SO FAR`. The 13
-  `i548*` among them are settled by the gate run above: their mutants simply
-  had not run here. The 4 `i551*` remain.
-- **mutest.** `i551_samples_carry_exactly_the_catalogued_names_and_labels`
-  killed 2 mutants (the `.clone()` at `src/observe/mod.rs:444`), which
-  validates it.
-- **Still never shown red by a tool:** `i551_each_backend_records_under_its_own_label`,
-  `i551_every_emitted_label_is_catalogued_and_every_catalogued_one_emitted`
-  and `i551_strip_comments_strips_both_shapes`. They read source files as
-  text, and neither tool mutates the string literals and `const` lists they
-  check. The 53.1.8 hand round showed the second one red (the `DOOR_VALUES`
-  edits). The other two have no recorded red. Mutating them needs hand
-  edits, not a tool.
+- The script itself always exits 0 when the matrix reads; the per-slice rule
+  above (an empty `unvalidated.txt`) is where it gates.
 
 ## Cadence
 
 - **Never per-PR.** The matrix scripts' own witnesses
   (`scripts/mutants_matrix_test.py`, fixtures, no cargo) run per-PR in
-  `ci.yml` and in certify's fast tier (`mutmatrix`), and so does the
-  from-disk scope check (`mutscopes`, v60.0.0). The diff-scoped report
-  (`scripts/mutants_diff.sh`) runs, non-gating, on `release-*` PRs.
-- **Nightly** (v54.1.0): `scope-consent-gate`, and `scope-observe` as two
-  shards, each its own job with `MUTANTS_JOBS=1` and a 2-hour budget. Each is
-  a gate (exit codes above).
-- **Weekly**: `scope-observe-sites` (12 mutants), also a gate.
-- Locally: `certify.sh mutants <scope>` once wired (see
-  `docs/CI_WIRING_53_2_0.md`), never alongside another cargo in the same tree,
-  and never next to `scripts/powerset.sh check`: that rewrites `Cargo.toml`
-  without `[dev-dependencies]` for its whole run. The first mutest build here
-  failed with 544 "cannot find crate" errors for exactly that reason.
+  `ci.yml` and in certify's fast tier (`mutmatrix`), and so does the from-disk
+  scope check (`mutscopes`). The diff-scoped report (`scripts/mutants_diff.sh`)
+  runs, non-gating, on `release-*` PRs.
+- **Nightly and weekly**, in `.github/workflows/mutants.yml`: each scope (or
+  shard) is its own job with `MUTANTS_JOBS=1` and a 2-hour budget, and each is a
+  gate (exit codes above). The weekly Sunday run adds the larger scopes.
+- **Locally**: `certify.sh mutants <scope>`, never alongside another cargo in
+  the same tree, and never next to `scripts/powerset.sh check`, which rewrites
+  `Cargo.toml` without `[dev-dependencies]` for its whole run.
 
 ## Knobs
 
@@ -540,14 +290,7 @@ Across the runs above:
 | `MUTANTS_ALLOW` | `scripts/mutants/allowed_survivors.txt` | the allow-list |
 | `MUTANTS_BASELINE_SECS`, `MUTANTS_SECS_PER_MUTANT` | 600, 120 | the sizing model for exit 3 |
 
-**mutest-rs is not wired into the nightly job** (#1051 asked). The verdict
-above still stands: on CI it would need the pinned nightly toolchain and a
-from-git build of mutest (no release binary), it cannot build with `postgres`
-(the `mutest-emit` ICE), it profiles the whole 3351-test lib suite (28 min)
-per run, and it reaches 1 of the scope's async witnesses. A nightly job
-would run about 30 minutes to measure one synchronous test.
-
-With `postgres` on, the run goes through `scripts/pg_test_db.sh`, so a
-postgres witness gets a fresh database. Without one it returns before its
-first assertion, kills nothing, and is reported unvalidated for a reason that
-is not its own.
+With `postgres` on, the run goes through `scripts/pg_test_db.sh`, so a postgres
+witness gets a fresh database. Without one it returns before its first
+assertion, kills nothing, and is reported unvalidated for a reason that is not
+its own.

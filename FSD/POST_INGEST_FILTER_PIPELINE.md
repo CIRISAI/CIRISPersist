@@ -1,13 +1,9 @@
 # FSD: Post-Ingest Filter Pipeline + Federated Secrets Service
 
-**Status:** Locked
-**Author:** Eric Moore (CIRIS Team) with Claude Opus 4.7
-**Created:** 2026-05-02
-**Locked:** 2026-05-04
-**Closes:** CIRISPersist#19 (Absorb trace scrubber + feature extractor as post-ingest filter pipeline)
-**Drives:** CIRISEdge issue (forthcoming) — primary call site for the pipeline
+**Status:** Implemented — `src/pipeline/` (classify, scrub, extract), `src/secrets/` (the federated `SecretsService` with postgres, sqlite and HTTP-client implementations), the pipeline ingest route `POST /api/v1/pipeline/ingest` (feature `server`), and migrations V009 (pipeline columns) and V010 (secrets schema). Not implemented items are marked where they appear (hardware-backed secrets keys, §2.4; parts of the §5.4 Engine API).
+**Closes:** CIRISPersist#19 (absorb the trace scrubber + feature extractor as a post-ingest filter pipeline)
 **Adjacent:** CIRISPersist#7 (canonicalization), #14 (`verify_hybrid_via_directory`), #17 (`StewardSigner`), #18 (`detection_events` + `calibration_bundles`)
-**Risk:** Architectural. Two new substrate surfaces: (1) a typed multi-stage pipeline behind the existing `Scrubber` trait slot, (2) a federated `SecretsService` that absorbs the full agent-side `SecretsServiceProtocol` surface so agents can delegate secrets CRUD to persist. Heavy ML deps and crypto deps stay opt-in behind cargo features. No agent breakage at any phase — agent's local SecretsService becomes a thin client over persist's API.
+**Shape:** Two substrate surfaces: (1) a typed multi-stage pipeline behind the `Scrubber` trait slot, (2) a federated `SecretsService` covering the agent-side `SecretsServiceProtocol`, so agents can delegate secrets CRUD to persist. Heavy ML and crypto dependencies stay opt-in behind Cargo features.
 
 ---
 
@@ -15,16 +11,16 @@
 
 Persist already owns the **wire-to-storage boundary**: `Engine.receive_and_persist` parses, verifies, and decomposes a hybrid-signed `BatchEnvelope` into rows. The `Scrubber` trait (`src/scrub/mod.rs`) is the documented hook between verify and store; `docs/INTEGRATION_LENS.md:336` already documents `Engine(scrubber=my_scrubber)` as a constructor parameter; `docs/PUBLIC_SCHEMA_CONTRACT.md` already exposes `pii_scrubbed: bool` as a tier-stable column.
 
-**What is missing today:**
+**What the pipeline adds over a bare `Scrubber` slot:**
 
-1. **A default scrubber.** `NullScrubber` is a passthrough. Production deployments must inject a real scrubber, and the only canonical implementation lives in lens-core (lifted from `cirislens-core`).
-2. **A typed feature extractor.** Lens-core's `extract/` module produces a `Features` struct that every consumer wants (RATCHET, registry, partner, sovereign), reachable today only through lens-core.
-3. **A content-class taxonomy.** CIRISAgent ships `SecretsFilter` (12 secret types, AES-256-GCM, regex) and `AdaptiveFilterService` (6 trigger types, 5 priorities, learning loop). They run **inside the agent**, before traces are emitted. Persist has no visibility into what they detected and consumers downstream can't reproduce the same decisions on stored traces.
-4. **A federated secrets store.** The agent's `SecretsServiceProtocol` covers full CRUD + decapsulation + key rotation + hardware-key migration + audit logging (~13 methods, see §3.1). Today every agent runs a private SQLite store. There is no canonical federated surface for: recalling a secret across agents in the same federation, key rotation across the fleet, audit-trail aggregation, hardware-key delegation to CIRISVerify across hosts.
+1. **A default scrubber.** `NullScrubber` is a passthrough; the pipeline's `scrub` stage is the canonical implementation.
+2. **A typed feature extractor.** The `extract` stage produces the `Features` struct every consumer wants (RATCHET, registry, partner, sovereign).
+3. **A content-class taxonomy.** CIRISAgent ships `SecretsFilter` (12 secret types, AES-256-GCM, regex) and `AdaptiveFilterService` (6 trigger types, 5 priorities, learning loop). They run **inside the agent**, before traces are emitted. Without a substrate taxonomy, consumers downstream cannot see what they detected or reproduce the same decisions on stored traces.
+4. **A federated secrets store.** The agent's `SecretsServiceProtocol` covers full CRUD + decapsulation + key rotation + hardware-key migration + audit logging (~13 methods, see §3.1). Without a federated store, every agent runs a private SQLite store, with no canonical surface for: recalling a secret across agents in the same federation, key rotation across the fleet, audit-trail aggregation, hardware-key delegation to CIRISVerify across hosts.
 
 **The claim:** these four surfaces are one substrate concern at four layers of granularity (classify → scrub → extract → encrypt-and-store). They share inputs, share output shape, share the storage column, and share the trust boundary. Persist should ship them as a single `pipeline` module + `secrets` module with a unified taxonomy. Edge invokes the pipeline on the receive boundary so persist's storage never sees cleartext PII or unencrypted secrets. **Secrets are on us.**
 
-This FSD locks down both surfaces.
+This document specifies both surfaces.
 
 ## 2. Scope
 
@@ -61,7 +57,7 @@ src/secrets/
 │                         AES-256-GCM, PBKDF2, HKDF, HMAC all come through
 │                         ciris-crypto re-exports. See §7.6 for the boundary.
 ├── hardware.rs         — Thin facade over ciris-keyring (CIRISVerify TPM/Keystore)
-│                         for hardware-backed master keys (cfg(feature = "secrets-hw"))
+│                         for hardware-backed master keys (feature `secrets-hw`, not implemented)
 ├── decapsulate.rs      — Action-context decapsulation (whitelist-checked)
 ├── audit.rs            — Access-log row + audit append
 ├── rotate.rs           — reencrypt_all + master-key rotation (calls ciris-crypto)
@@ -96,24 +92,25 @@ extract          = ["scrub"]                                                    
 
 # Secrets — ALL crypto goes through ciris-crypto / ciris-keyring (CIRISVerify).
 # Persist does NOT take direct deps on aes-gcm / pbkdf2 / hkdf / hmac /
-# any other primitive crate. If a primitive is missing from ciris-crypto,
-# the prerequisite is to add it there first (see §7.6).
-secrets          = ["ciris-crypto/aes-gcm", "ciris-crypto/kdf", "ciris-crypto/hmac"]   # software-key crypto via ciris-crypto
-secrets-hw       = ["secrets", "ciris-keyring/symmetric-derivation"]                   # CIRISVerify TPM/Keystore
-secrets-server   = ["secrets", "server"]                                               # HTTP API for federated CRUD
+# any other primitive crate (§7.5a).
+secrets          = ["classify", "ciris-crypto/aes-gcm", "ciris-crypto/kdf", "ciris-crypto/hmac", "ciris-crypto/random"]
+secrets-server   = ["secrets", "server"]                                            # HTTP API for federated CRUD
+secrets-client   = ["secrets", "reqwest", "url"]                                    # HTTP client implementation
 
 # Bundles
-default-pipeline = ["scrub-ner", "extract", "secrets"]                              # production lens / edge ingest
-default-sovereign = ["scrub", "extract", "secrets"]                                 # Pi-class / sovereign mode (no ML)
+default-pipeline-ml     = ["scrub-ner", "extract"]                                  # production lens / edge ingest
+default-sovereign-light = ["scrub", "extract"]                                      # Pi-class / sovereign mode (no ML)
 ```
 
-Sovereign-mode + Pi-class deployments build with `default-sovereign` (regex-only scrubber, no ML). Production federated deployments build with `default-pipeline`. Agent-side embedded persist (umbrella FSD Phase 3) builds with `classify + scrub + secrets` — agents delegate secrets CRUD to the embedded persist; the agent's own `SecretsService` becomes a Rust-FFI client.
+Sovereign-mode and Pi-class deployments build with `default-sovereign-light` (regex-only scrubber, no ML); production federated deployments build with `default-pipeline-ml`; either adds `secrets` as needed. An agent embedding persist builds with `classify + scrub + secrets` and delegates secrets CRUD to it.
+
+**Not implemented:** a `secrets-hw` feature (hardware-backed TPM/Keystore master keys via `ciris-keyring`); secrets keys are software keys derived through `ciris-crypto` (§7.5a).
 
 ### 2.5 Out of scope
 
 - Replacing CIRISAgent's `AdaptiveFilterService` (it remains at the agent's wire-receive boundary; it's adapter-context-aware in ways persist isn't).
-- Federation-side **policy** about content classes (consumers may disagree on what "PII" means; this FSD specifies shape, not policy).
-- The 16-CRC projection itself (lives in `cirislens-core` per CIRISLensCore#3; this FSD only covers the upstream `Features` struct).
+- Federation-side **policy** about content classes (consumers may disagree on what "PII" means; this document specifies shape, not policy).
+- The 16-CRC projection itself (lives in `cirislens-core` per CIRISLensCore#3; this document covers only the upstream `Features` struct).
 
 ## 3. Reference: existing CIRISAgent surfaces
 
@@ -202,7 +199,7 @@ class FilterPriority(str, Enum):
 
 ### 3.5 Lens-core scrubber + extractor
 
-Lifted code in `CIRISLensCore/src/{scrub,extract}/` — ~3,300 LOC, 47 tests passing per persist#19. Detailed module breakdown was in the v0.5.0 draft; absorbed verbatim with `crate::scrub` → `crate::pipeline::scrub` rename.
+The pipeline's scrub and extract stages are the code that lived in `CIRISLensCore/src/{scrub,extract}/` (~3,300 LOC), under `crate::pipeline::scrub` / `crate::pipeline::extract`.
 
 ## 4. Architecture: edge as call site, persist as substrate
 
@@ -409,57 +406,26 @@ persist verifies (edge_signature, agent BatchEnvelope signature, invariants)
 backend.insert_batch → cirislens.trace_events.{
     payload                  -- scrubbed JSONB                 (existing)
     pii_scrubbed             -- bool                           (existing)
-    extracted_features       -- Features as JSONB              (NEW v0.5.0)
-    classifications          -- Vec<Vec<ContentClassMatch>>    (NEW v0.5.0)
-    pipeline_metadata        -- PipelineMetadata as JSONB      (NEW v0.5.0)
+    extracted_features       -- Features as JSONB              (V009)
+    classifications          -- Vec<Vec<ContentClassMatch>>    (V009)
+    pipeline_metadata        -- PipelineMetadata as JSONB      (V009)
 }
     +
 secrets_backend.batch_store_encrypted →
   cirislens_secrets.secrets (one row per encrypted_secrets[i])
 ```
 
-### 5.4 Engine API additions
+### 5.4 Engine API
 
-```rust
-impl Engine {
-    /// Receive a PipelineEnvelope from edge.
-    pub async fn receive_pipeline_envelope(
-        &self,
-        env: PipelineEnvelope,
-    ) -> Result<BatchSummary, IngestError>;
+What exists:
 
-    /// Read typed features for one (trace, thought).
-    pub async fn get_features(
-        &self,
-        trace_id: &str,
-        thought_id: &str,
-    ) -> Result<Option<Features>, Error>;
+- **Pipeline ingest:** `POST /api/v1/pipeline/ingest` (`src/server/pipeline.rs`, feature `server`) accepts a `PipelineEnvelope` from edge, verifies the edge sidecar signature, checks the envelope's internal consistency (schema version, `pii_scrubbed` against classifications, classification counts, orphan secrets) and persists it.
+- **Feature and classification reads:** `get_features(trace_id, thought_id)` and `get_classifications(trace_id, thought_id)` on the Python `Engine`.
+- **Secrets:** the `SecretsService` trait (`src/secrets/service.rs`) with postgres, sqlite and HTTP-client (`secrets-client`) implementations, including `process_incoming_text` and `decapsulate_secrets_in_parameters`.
 
-    /// Read typed classifications for one (trace, thought).
-    pub async fn get_classifications(
-        &self,
-        trace_id: &str,
-        thought_id: &str,
-    ) -> Result<Vec<Vec<ContentClassMatch>>, Error>;
+**Not implemented** from the original design: a Rust `Engine::receive_pipeline_envelope`, `iter_features_by_cohort` (a cohort-keyed feature stream for calibration consumers), `Engine::with_pipeline` (replacing the default pipeline), and an `Engine::secrets()` accessor.
 
-    /// Iterator over (cohort, features) pairs for calibration consumers.
-    pub fn iter_features_by_cohort(
-        &self,
-        filter: FeatureFilter,
-    ) -> impl Stream<Item = Result<(CohortKey, Features), Error>>;
-
-    /// Replace the default pipeline (advanced).
-    pub fn with_pipeline(self, pipeline: Pipeline) -> Self;
-
-    /// Borrow the federated secrets service. Used by agents (via PyO3
-    /// or HTTP) for CRUD on the encrypted store.
-    pub fn secrets(&self) -> &dyn SecretsService;
-}
-```
-
-PyO3 surface mirrors the CIRISPersist#17 wraps-Rust pattern. `PyEngine::receive_pipeline_envelope`, `PyEngine::get_features`, `PyEngine::get_classifications`, `PyEngine::secrets()` — all thin async-bridged wrappers, no Python reimplementation.
-
-## 6. Unified content-class taxonomy — the matrix (locked)
+## 6. Unified content-class taxonomy — the matrix
 
 ### 6.1 Five orthogonal dimensions
 
@@ -534,7 +500,7 @@ Rows are **content classes (D1)**. Columns are detection methods (D2). Cells sho
 
 **Total: 36 built-in classes × 8 detection methods × 4 sensitivities × 7 actions × 5 learning states.**
 
-### 6.3 Locked Rust shapes
+### 6.3 Rust shapes
 
 ```rust
 // src/pipeline/classify/mod.rs
@@ -638,7 +604,7 @@ pub struct ContentClassMatch {
 }
 ```
 
-## 7. Secrets module — locked surface
+## 7. Secrets module — surface
 
 ### 7.1 Trait
 
@@ -764,7 +730,7 @@ pub trait SecretsService: Send + Sync {
 
     /// Migrate the master key from software file to CIRISVerify
     /// TPM/Keystore. Re-encrypts every secret as part of the migration.
-    /// Requires the `secrets-hw` feature.
+    /// Requires the `secrets-hw` feature (not implemented; §2.4).
     #[cfg(feature = "secrets-hw")]
     async fn migrate_to_hardware_key(
         &self,
@@ -795,7 +761,7 @@ pub struct SecretRecord {
     pub source_message_id: Option<String>,
     pub auto_decapsulate_for_actions: Vec<String>,
     pub manual_access_only: bool,
-    /// Schema version for forward-compat. v1.0 today.
+    /// Schema version for forward-compat (currently v1.0).
     pub record_schema_version: String,
 }
 
@@ -1034,7 +1000,7 @@ Every crypto operation in `src/secrets/` routes through `ciris-crypto`. The `src
 | Random bytes (master key, nonces, salts)          | `ciris_crypto::random::fill(&mut buf)`                     |
 | Hardware-backed master key (CIRISVerify TPM)      | `ciris_keyring::HardwareSigner::*` (existing v1.7+ API)    |
 
-If `ciris-crypto` does not yet expose one of the above, that function is added to `ciris-crypto` first (a pre-req PR against `CIRISVerify`), the version is bumped, and persist depends on the new release. Persist does not work around the gap with a direct primitive-crate dep, ever.
+A primitive `ciris-crypto` does not expose is added to `ciris-crypto` first (in CIRISVerify), and persist depends on that release. Persist never works around a gap with a direct primitive-crate dependency.
 
 The ciris-crypto features persist enables:
 
@@ -1042,14 +1008,14 @@ The ciris-crypto features persist enables:
 ciris-crypto = { version = "1", features = [
     "ed25519",            # already enabled — for signing
     "pqc-ml-dsa",         # already enabled — for hybrid sigs
-    "aes-gcm",            # NEW — symmetric encryption for secrets at rest
-    "kdf",                # NEW — PBKDF2 + HKDF for key derivation
-    "hmac",               # NEW — for EncryptedSecretRecord integrity
-    "random",             # NEW — RNG facade (so we don't depend on rand directly)
+    "aes-gcm",            # symmetric encryption for secrets at rest
+    "kdf",                # PBKDF2 + HKDF for key derivation
+    "hmac",               # EncryptedSecretRecord integrity
+    "random",             # RNG facade (no direct rand dependency)
 ] }
 ```
 
-If those features don't exist in ciris-crypto v1.9.0, the prerequisite tracking issue is filed against `CIRISVerify` before `ciris-persist v0.5.0` lands. **No persist release ships that sidesteps this.**
+(enabled by the `secrets` feature; see `Cargo.toml` for the exact list.)
 
 ### 7.6 SQLite mirror
 
@@ -1057,9 +1023,9 @@ Symmetric tables in SQLite for sovereign-mode. `BYTEA` → `BLOB`; `JSONB` → `
 
 ## 8. Federation-stable HTTP API
 
-### 8.1 New federation roles
+### 8.1 Federation roles
 
-`PUBLIC_SCHEMA_CONTRACT.md @ v0.3.3` adds two role tags to `federation_keys`:
+`PUBLIC_SCHEMA_CONTRACT.md` declares two role tags on `federation_keys`:
 
 | Role tag                    | Permits                                                      |
 |-----------------------------|--------------------------------------------------------------|
@@ -1140,7 +1106,7 @@ ok = await secrets.test_encryption()
 result = await secrets.reencrypt_all(new_master_key_ref, accessor="operator")
 new_ref = await secrets.rotate_master_key(new_master=None, accessor="operator")
 
-# Hardware migration (cfg(feature = "secrets-hw")).
+# Hardware migration (cfg(feature = "secrets-hw") — not implemented; §2.4).
 new_ref = await secrets.migrate_to_hardware_key(accessor="operator")
 ```
 
@@ -1157,75 +1123,63 @@ Repeated for clarity:
 
 Stays in agent: it is **adapter-context-aware** (Discord vs CLI vs API), **pre-emit** (runs before traces are constructed), and feeds **agent governance** (deferral, trust scoring, consent gaming). The pipeline this FSD specifies is a **substrate-layer second pass** that produces a consumer-stable annotation shape; it is not a replacement for the agent's pre-emit filtering. The two compose: agent filters at message-receive; pipeline filters at trace-receive; both are visible in `classifications`.
 
-## 12. Migration plan
+## 12. Rollout and compatibility
 
 ### 12.0 Prerequisite — ciris-crypto exposes AES-GCM + KDF + HMAC + RNG
 
-Filed against `CIRISVerify`: add `aes-gcm`, `kdf`, `hmac`, `random` features to `ciris-crypto`, exposing the operations enumerated in §7.5a. Bump `ciris-crypto` (and `ciris-verify-core` / `ciris-keyring` for tag coherence) to v1.10.0. Persist v0.5.0 depends on v1.10.0. **No persist work that touches symmetric crypto starts until this prerequisite ships.**
+`ciris-crypto` (CIRISVerify) exposes `aes-gcm`, `kdf`, `hmac` and `random`, the operations enumerated in §7.5a. Persist's symmetric crypto goes only through them.
 
-### 12.1 v0.5.0 — pipeline + secrets land in persist
+### 12.1 What persist holds
 
-- `src/pipeline/` module (classify + scrub + extract).
-- `src/secrets/` module (full SecretsService trait + postgres + sqlite impls).
-- `src/secrets/crypto.rs` is the sole import site for `ciris_crypto::{aes_gcm,kdf,hmac,random}`.
-- V007 migration: `extracted_features`, `classifications`, `pipeline_metadata` columns on `cirislens.trace_events`.
-- V008 migration: `cirislens_secrets` schema (4 tables) + `cirislens_pseudonyms` table.
-- `Engine::default_pipeline()` + `Engine::receive_pipeline_envelope()` + `Engine::secrets()`.
-- 18-method `SecretsService` trait + impl.
-- HTTP endpoints (§8.2) behind `secrets-server` feature.
-- PyO3 wraps-Rust surface (§9).
-- `PUBLIC_SCHEMA_CONTRACT.md @ v0.3.3` declares all new columns + roles tier=stable.
-- Cargo features: `classify`, `scrub`, `scrub-ner`, `scrub-ort`, `extract`, `secrets`, `secrets-hw`, `secrets-server`, `default-pipeline`, `default-sovereign`.
+- `src/pipeline/` (classify + scrub + extract).
+- `src/secrets/` (the `SecretsService` trait + postgres + sqlite + HTTP-client implementations).
+- `src/secrets/crypto.rs` is the sole import site for `ciris_crypto::{aes_gcm,kdf,hmac,random}` (§7.5a).
+- V009: `extracted_features`, `classifications`, `pipeline_metadata` columns on `cirislens.trace_events` (nullable; rows written without the pipeline stay valid).
+- V010: the `cirislens_secrets` schema and `cirislens_pseudonyms`.
+- HTTP endpoints (§8.2) behind `secrets-server`; the pipeline ingest route behind `server`.
+- The PyO3 surface (§9).
+- `PUBLIC_SCHEMA_CONTRACT.md` declares the columns and roles tier=stable.
 
-### 12.2 v0.5.1 — edge cutover
+### 12.2 Edge
 
-CIRISEdge issue (filed concurrent with this FSD lock):
-- Edge depends on `ciris-persist` with `default-pipeline + secrets`.
-- Edge runs `pipeline.run(env)` after `verify_hybrid` and before forward.
-- Edge constructs `PipelineEnvelope`, signs sidecar with `StewardSigner`, POSTs to `/api/v1/pipeline/ingest`.
-- Edge's existing FSD wire format (agent → edge) stays unchanged.
-- Old persist endpoint `POST /api/v1/accord/events` continues to accept un-piped envelopes for transition window; logs a warning; sovereign deployments are exempt.
+- CIRISEdge depends on `ciris-persist` with the pipeline features and `secrets`.
+- Edge runs the pipeline after `verify_hybrid` and before forwarding, signs the `PipelineEnvelope` sidecar with `StewardSigner`, and POSTs to `/api/v1/pipeline/ingest`.
+- The agent → edge wire format is unchanged.
+- `POST /api/v1/accord/events` continues to accept envelopes that did not go through the pipeline (sovereign deployments rely on it).
 
-### 12.3 v0.5.2 — lens-core unwinds
+### 12.3 Lens-core
 
-- Delete `CIRISLensCore/src/scrub/` + `src/extract/{features,static_extract,json_path}.rs`.
-- Drop candle, ort, tokenizers, hf-hub, log, env_logger, anyhow, parking_lot, hex, uuid deps + `ner` + `ner-ort` features.
-- Keep `src/cohort/`, `src/detector/`, `src/scoring/`, `src/signing/`, `src/pipeline/` (lens-side projection only), `src/extract/projection.rs` reading `Features` via `Engine.get_features`.
+Lens-core's own scrub/extract code is superseded by persist's; it keeps the lens-side projection (`cohort/`, `detector/`, `scoring/`, `signing/`, the CRC projection reading `Features`). A CIRISLensCore concern.
 
-### 12.4 v0.5.3 — RATCHET cutover
+### 12.4 RATCHET
 
-- RATCHET reads `extracted_features` directly via `cirislens_reader` role.
-- `projection_version = "crc-v1"` pins to `PUBLIC_SCHEMA_CONTRACT.md @ v0.3.3`.
-- CIRISLensCore#3 calibration ask fulfilled.
+RATCHET reads `extracted_features` through the `cirislens_reader` role; `projection_version = "crc-v1"` pins to `PUBLIC_SCHEMA_CONTRACT.md`. Fulfils CIRISLensCore#3's calibration ask.
 
-### 12.5 v0.5.4 — agent cutover (optional)
+### 12.5 Agent (optional)
 
-- CIRISAgent's `SecretsService` becomes a thin client over persist's federated secrets API.
-- Agent's local SQLite secrets store deprecated; data migrated to persist via `migrate_to_hardware_key`-shaped one-shot tool.
-- Agent's `AdaptiveFilterService` keeps running; persist's pipeline is the second pass.
+- CIRISAgent's `SecretsService` can be a thin client over persist's federated secrets API (`secrets-client`).
+- Its local SQLite secrets store can move to persist via a `migrate_to_hardware_key`-shaped one-shot.
+- The agent's `AdaptiveFilterService` keeps running; persist's pipeline is the second pass (§11).
 
 ### 12.6 Testing strategy
 
-- **Property tests.** Every `Vec<ContentClassMatch>` round-trips through serde JSONB without loss. `EncryptedSecretRecord` round-trips through encrypt → decrypt → original. (Already a proptest invariant in lens-core's lifted scrubber.)
-- **Real-fixture tests.** Existing `tests/fixtures/2.7.0/*.json` fixtures get classification expectations.
-- **Differential test vs CIRISAgent SecretsFilter.** Same input through both; check every `SecretRecord` from agent has corresponding `EncryptedSecretRecord` in persist's pipeline output.
-- **Differential test vs `AdaptiveFilterService`.** Same content; check `(triggered_filters, priority)` → `(matcher_id, sensitivity)`.
-- **End-to-end edge → persist.** Spin up edge with embedded persist crate, agent with mock signer, verify scrubbed payload + encrypted secrets land in postgres.
-- **Replay safety.** Send the same `PipelineEnvelope` twice; second insert is idempotent (dedup_key already exists in `BatchEnvelope`).
-- **Tampering detection.** Replay with mutated sidecar; persist rejects on edge_signature verify.
+- **Property tests.** Every `Vec<ContentClassMatch>` round-trips through serde JSONB without loss. `EncryptedSecretRecord` round-trips through encrypt → decrypt → original.
+- **Real-fixture tests.** The `tests/fixtures/2.7.0/*.json` fixtures carry classification expectations.
+- **Differential test vs CIRISAgent SecretsFilter.** Same input through both; every `SecretRecord` from the agent has a corresponding `EncryptedSecretRecord` in persist's pipeline output.
+- **Differential test vs `AdaptiveFilterService`.** Same content; `(triggered_filters, priority)` → `(matcher_id, sensitivity)`.
+- **End-to-end edge → persist.** Edge with embedded persist, agent with mock signer; scrubbed payload and encrypted secrets land in postgres.
+- **Replay safety.** The same `PipelineEnvelope` twice; the second insert is idempotent (dedup key in `BatchEnvelope`).
+- **Tampering detection.** A mutated sidecar is rejected on edge-signature verify.
 - **Decapsulation whitelist.** `auto_decapsulate_for_actions = ["tool"]` blocks `action_type = "speak"`.
-- **Key rotation.** `reencrypt_all` is atomic — no decrypt failures during the rotation window.
-- **Bench harness.** New `[[bench]] name = "pipeline"` and `[[bench]] name = "secrets_crud"`.
+- **Key rotation.** `reencrypt_all` is atomic — no decrypt failures during rotation.
+- **Benches.** `pipeline` and `secrets_crud`.
 
 ### 12.7 Rollback
 
-Each phase is independently rollback-safe:
-
-- v0.5.0 columns are nullable; pre-pipeline rows stay valid.
-- v0.5.1 edge cutover: edge can revert to the pre-pipeline path; persist continues to accept un-piped envelopes through v0.5.x for the transition window.
-- v0.5.2 lens-core unwind: lens-core can keep its own scrub/extract for one minor version while RATCHET migrates; persist is the source of truth either way.
-- v0.5.3 RATCHET: keeps a fallback reader against the legacy lens-core projection during cutover.
-- v0.5.4 agent cutover: agent can run both local + federated SecretsService side-by-side until traffic is fully on the federated path.
+- The V009 columns are nullable; rows written without the pipeline stay valid.
+- Edge can fall back to `POST /api/v1/accord/events`.
+- RATCHET can keep a fallback reader against the lens-core projection.
+- An agent can run its local and the federated `SecretsService` side by side.
 
 ## 13. References
 

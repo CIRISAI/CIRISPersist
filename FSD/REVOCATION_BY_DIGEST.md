@@ -1,4 +1,4 @@
-# Revocation by digest — the subject without its label (CIRISPersist#784, v52.0.0)
+# Revocation by digest — the subject without its label (CIRISPersist#784)
 
 ## 1. The problem
 
@@ -6,7 +6,7 @@
 
 ## 2. The identifier
 
-`federation::key_digest::Sha256Ed25519Raw`: SHA-256 over the **raw 32-byte Ed25519 public key**, spelled as exactly 64 lowercase hex digits. It is the digest `derive_key_id` truncates into its suffix. It is stable for the life of the key, carries no label, and makes evasion cost a new key. There is one preimage: nothing hashes base64 text. The old text-digest helper is renamed `sha256_of_pubkey_base64_text` and serves only as a rotation-collision diagnostic.
+`federation::key_digest::Sha256Ed25519Raw`: SHA-256 over the **raw 32-byte Ed25519 public key**, spelled as exactly 64 lowercase hex digits. It is the digest `derive_key_id` truncates into its suffix. It is stable for the life of the key, carries no label, and makes evasion cost a new key. There is one preimage: nothing hashes base64 text. `sha256_of_pubkey_base64_text` serves only as a rotation-collision diagnostic.
 
 SQL: postgres `encode(sha256(decode(pubkey_ed25519_base64,'base64')),'hex')`; sqlite `ciris_sha256_ed25519_raw(pubkey_ed25519_base64)`, a deterministic function registered on every backend connection and used in queries only, never in a migration file (migrations must run on a bare connection).
 
@@ -38,7 +38,7 @@ The binding (`admission::revocation_binding`) has 8 members. The check is `admis
 
 ## 6. Moderation (D2, additive)
 
-`moderation:*` scores may carry `subject_sha256_ed25519_raw`. `admission::moderation_subject_digest` is the one reading. A present malformed value is refused in `check_delegated_duty_scores_admission`. Label-bearing rows are not refused in v52.
+`moderation:*` scores may carry `subject_sha256_ed25519_raw`. `admission::moderation_subject_digest` is the one reading. A present malformed value is refused in `check_delegated_duty_scores_admission`. Label-bearing rows are not refused.
 
 ## 7. Deliberately not changed
 
@@ -46,4 +46,4 @@ Room-roster removal rows (`removed_identity_key_id`, community and family) reach
 
 ## 8. Witnesses
 
-I220–I227 and I229 (see CHANGELOG [52.0.0] `### #784`). I228 is reserved for the de-admission planes.
+I220–I227 and I229. I228 is reserved for the de-admission planes.

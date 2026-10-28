@@ -7,7 +7,7 @@
 # registered binary_hash beside the local one and MATCH / MISMATCH / NOROW:
 #   * a wheel target: sha256 of that version's wheel, selected by version from
 #     the tag run's `ciris_persist-wheel-<label>` artifact (the only place the
-#     wheels live: no PyPI since #615, not release assets);
+#     wheels live: no PyPI (#615), not release assets);
 #   * python-source-tree: the tree hash recomputed from the TAG's
 #     python/ciris_persist exactly as the tag job's sign computes it.
 # mode: repost re-posts ONLY the MISMATCH rows of each version, and refuses a
@@ -86,7 +86,7 @@ jobs:
       - uses: actions/checkout@v6
       # The selection logic is scripts/reregister_plan.sh: among the version's
       # tag runs, the one covering the MOST needed wheels (a tie goes to the
-      # newer), never merely the newest with any wheel (Codex on PR #1039).
+      # newer), never merely the newest with any wheel.
       - id: p
         env:
           GH_TOKEN: ${{ github.token }}
@@ -223,7 +223,7 @@ jobs:
           done
 
       - name: install ciris-build-sign (the version pinned in scripts/build_manifest.sh)
-        # v54.0.0 (#992) — v20.1.0: it refuses to sign a wheel whose own
+        # From 20.1.0 (#992) it refuses to sign a wheel whose own
         # Version or platform tag is not the one claimed (CIRISVerify#307), the
         # second line behind bits_changed.sh checks 1-4.
         run: scripts/build_manifest.sh install

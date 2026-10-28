@@ -1,47 +1,32 @@
 # FSD: The SQLite Connection Model — CIRISPersist
 
-**Status:** Adopted (CIRISPersist#829, the v43.0.0 → next-minor headline)
-**Author:** Eric Moore (CIRIS Team) with Claude
-**Created:** 2026-09-09
-**Repo:** `~/CIRISPersist`
-**Risk:** Storage-layer, node-local. No on-disk format change, no wire
-change. Post-2.9.0 persist is the sole DB opener, so the connection model
-is persist's to change **unilaterally**; consumers see only latency.
+**Status:** Implemented (CIRISPersist#829) in `src/store/sqlite.rs`, gated
+by `src/store/sqlite_conn_model.rs`.
+**Scope:** Storage-layer, node-local. No on-disk format and no wire
+consequence. Persist is the sole database opener, so the connection model is
+persist's alone; consumers see only latency.
 
 ---
 
 ## 1. Why this exists
 
-`src/store/sqlite.rs` is 45k lines and its module doc was wrong about the
-one thing that decides how the file behaves under load. It said:
+A server node serves a read API off the same engine that ingests and
+admits rows. On SQLite that means many concurrent readers alongside one
+writer, and a long read must not stall anyone else.
 
-> **Async adapter**: `tokio::task::spawn_blocking` wraps every SQL call.
+A single shared connection cannot do that. With one connection behind one
+mutex, two 30 s reconcile loops calling the filtered `list_attestations`
+stall a node's own `GET /v1/identity` from p50 1.1 ms to **780 ms — ~700×,
+with zero non-200s** (CIRISServer#575). Carried to its end, the connection
+holder sits in `state=D` page-faulting a corpus scan, every other runtime
+thread waits in `futex_wait` behind it, health times out, and the node never
+recovers (CIRISEdge#547).
 
-Twenty lines below, a comment records that this stopped being true in
-v3.14.0 (CIRISPersist#158). In v43.0.0 the file has **351 `conn.lock()`
-sites and 20 `spawn_blocking` sites**, one `Arc<Mutex<Connection>>`, and
-WAL on. The premise the doc gave for the single connection —
+This document specifies the connection model that prevents that: one
+writer, a pool of read-only readers, and every call dispatched off the async
+runtime.
 
-> Phase 1 has one ingest writer per process … contention on the mutex is
-> structurally negligible
-
-— described a lens landing traces. It does not describe a node that serves
-a read API off the same engine, which is every server node today.
-
-The cost was measured downstream before it was measured here.
-CIRISServer#575: two 30 s reconcile loops whose ticks call the filtered
-`list_attestations` (inline, under the mutex) stall the node's own
-`GET /v1/identity` from p50 1.1 ms to **780 ms — ~700×, zero non-200s**.
-CIRISEdge#547 is the same mechanism carried to its end: the connection
-holder is in `state=D` page-faulting a corpus scan, every other runtime
-thread is in `futex_wait` behind it, health times out, and the node never
-recovers. **Two stalls and one hang, in two repos, from one connection.**
-
-This document is the connection model as it is now, and the record of why
-the previous one was wrong. It exists *before* the code because the
-previous doc was the thing that was wrong.
-
-## 2. The model as it was (v3.14.0 → v43.0.0)
+## 2. What a single connection costs
 
 ```
                  ┌──────────────────────────┐
@@ -51,43 +36,40 @@ previous doc was the thing that was wrong.
                  └──────────────────────────┘
 ```
 
-- **One connection**, writer and reader alike, behind one sync mutex.
-- **Inline-sync**: every call ran the SQL on whichever tokio worker polled
-  it, with no `.await` point on the sqlite path. A 700 ms scan occupied a
-  worker for 700 ms; on a 2-vCPU node that is half the runtime.
-- **The mutex wait was also inline**: `parking_lot::Mutex::lock()` in an
-  async fn parks the *worker thread*. A reader waiting for the connection
-  did not just delay its own caller — it consumed a worker that was
-  serving unrelated requests. This is why more workers (CIRISServer#446,
-  #501) did not help: more workers is more threads in `futex_wait`.
-- WAL was on, but WAL's concurrency (many readers alongside one writer)
-  is a property of *separate connections*. With one connection there were
-  no separate readers for WAL to serve. The pragma bought crash
-  durability and nothing else.
+- **One connection**, writer and reader alike, behind one sync mutex,
+  serialises every read behind every other.
+- **Inline-sync** calls run the SQL on whichever tokio worker polled them,
+  with no `.await` point. A 700 ms scan occupies a worker for 700 ms; on a
+  2-vCPU node that is half the runtime.
+- **An inline mutex wait parks the worker thread.** A reader waiting for the
+  connection does not just delay its own caller — it consumes a worker that
+  serves unrelated requests. More workers do not help (CIRISServer#446,
+  #501): more workers is more threads in `futex_wait`.
+- WAL's concurrency (many readers alongside one writer) is a property of
+  *separate connections*. With one connection there are no separate readers
+  for WAL to serve; the pragma buys crash durability and nothing else.
 
-### 2.1 Why v3.14.0 removed `spawn_blocking`, and why that reason still binds
+### 2.1 Why the sqlite path never calls `spawn_blocking` blindly
 
-#158 was real and its rationale is preserved, not overridden.
 `tokio::task::spawn_blocking` reads a **thread-local** — the current
-runtime of the tokio crate *that compiled the call*. Under the
-cohabitation path (CIRISPersist#157) a consumer wheel statically links its
-own copy of persist, compiled against its own tokio; when that copy's
-`spawn_blocking` runs on a persist-owned worker, its thread-local is unset
-and it panics with `there is no reactor running`. Five fixes were tried
-(a `Handle` field — ABI break; a `OnceLock<Handle>` — per-DSO statics; a
-`#[no_mangle]` accessor — `RTLD_LOCAL`; `RTLD_GLOBAL` — `Handle`'s
-private layout is not stable across tokio patches). The inline rewrite was
-the fifth: stop calling tokio primitives at all.
+runtime of the tokio crate *that compiled the call*. Under the cohabitation
+path (CIRISPersist#157) a consumer wheel statically links its own copy of
+persist, compiled against its own tokio; when that copy's `spawn_blocking`
+runs on a persist-owned worker, its thread-local is unset and it panics with
+`there is no reactor running` (CIRISPersist#158). Carrying a runtime handle
+across the boundary does not work: a `Handle` field is an ABI break, a
+`OnceLock<Handle>` is a per-DSO static, a `#[no_mangle]` accessor is defeated
+by `RTLD_LOCAL`, and under `RTLD_GLOBAL` `Handle`'s private layout is not
+stable across tokio patches.
 
-What v3.14.0 did not consider is the sixth option: **ask the thread-local
-instead of assuming it.** `tokio::runtime::Handle::try_current()` is the
-same thread-local read, but it returns `Err` where `spawn_blocking` would
-panic. §3.3 builds on exactly that. The #158 property — *persist's sqlite
-path never panics for lack of a runtime* — is kept as invariant I5 and has
-a witness that drives the backend from a hand-rolled executor with no
-tokio runtime on the thread at all.
+The answer is to **ask the thread-local instead of assuming it.**
+`tokio::runtime::Handle::try_current()` is the same thread-local read, but
+it returns `Err` where `spawn_blocking` would panic. §3.3 builds on exactly
+that. The property — *persist's sqlite path never panics for lack of a
+runtime* — is invariant I5, witnessed by driving the backend from a
+hand-rolled executor with no tokio runtime on the thread at all.
 
-## 3. The model as it is now (#829)
+## 3. The model (#829)
 
 ```
                              ┌───────────────────────────────┐
@@ -104,8 +86,8 @@ tokio runtime on the thread at all.
 
 ### 3.1 One writer, N readers
 
-- The **writer** is the existing `Arc<parking_lot::Mutex<Connection>>`,
-  opened exactly as before (`Connection::open`, then the PRAGMA block).
+- The **writer** is an `Arc<parking_lot::Mutex<Connection>>`, opened with
+  `Connection::open` and then the PRAGMA block.
   It is the only connection that ever writes, runs migrations, or changes a
   database-level PRAGMA. `conn_handle()` / `from_conn_handle()` — the
   public surface sibling modules ride on — keep returning it.
@@ -164,18 +146,17 @@ match tokio::runtime::Handle::try_current() {
   to poll something else. This is the half of the defect that
   "restore `spawn_blocking`" alone would fix.
 - With no runtime current (the cohabitation copy on a foreign worker, or
-  any caller driving the future by hand), the call runs inline exactly as
-  v3.14.0 did. It cannot panic: `try_current` is the same thread-local
-  read `spawn_blocking` would have done, asked politely.
+  any caller driving the future by hand), the call runs inline. It cannot
+  panic: `try_current` is the same thread-local read `spawn_blocking` would
+  have done, asked politely.
 - A panic inside the closure is re-raised on the caller with
   `resume_unwind`, so the observable behaviour matches the inline case.
   A join cancelled by runtime shutdown is a panic naming the cause; there
   is no value to return and the caller's task is being torn down anyway.
 
-**Writes move too.** The runtime-stall half of #829 applies to writes
-identically — a write waiting for the writer mutex behind a long
-transaction parks its worker just as a read did — and #158's reason for
-not doing this is answered by the fallback above. Writes keep the single
+**Writes are dispatched the same way.** A write waiting for the writer
+mutex behind a long transaction would park its worker just as a read would,
+and the no-runtime fallback above answers #158. Writes keep the single
 writer mutex; that is what SQLite's one-writer rule needs, and what
 `BEGIN IMMEDIATE`/`transaction()` bodies assume.
 
@@ -213,9 +194,9 @@ scratch — gets **a pool of zero readers; reads fall back to the writer
 connection**, dispatched exactly as §3.3 (off the runtime when there is
 one).
 
-The alternative was a shared-cache URI
+The alternative — a shared-cache URI
 (`file:<unique>?mode=memory&cache=shared`) so N connections see one
-in-memory database. Rejected, for this cut, because shared-cache is a
+in-memory database — is not used, because shared-cache is a
 different concurrency model, not a smaller instance of WAL: locking is
 per-table, a reader can receive `SQLITE_LOCKED` (which `busy_timeout`
 does not retry — it needs `sqlite3_unlock_notify`), `journal_mode = WAL`
@@ -253,13 +234,12 @@ go through the doors as `backend.read(…)` / `backend.write(…)`
 (`check_revocation_anti_rollback_sqlite`, `sqlite_update_peer_field`);
 they are filed `Read` / `Write` like any method. Token matching is
 whitespace-insensitive because rustfmt splits `self.read(` into
-`self\n    .read(` in a chained expression — the first version of the gate
-found 200 of 286 fns for exactly that reason, and a parser floor
-(≥ 350 production fns, ≥ 250 touching a connection) is what turned that
-into a red rather than a quiet pass.
+`self\n    .read(` in a chained expression; a token-exact matcher would miss
+most fns and pass quietly. A parser floor (`PARSER_FLOOR`: ≥ 350 production
+fns, ≥ 250 touching a connection) turns a parser that finds too little into
+a red rather than a pass.
 
-As shipped: **286 rows — Read 155, Write 121, Door 4, HelperRead 3,
-HelperWrite 3, unclassified 0.**
+The table has no unclassified rows; `Door` is exactly four names.
 
 The gate is from-disk (the `parity.rs` / `blob_surface_gates.rs` idiom:
 read the source as text, strip test modules, scan) and is a **partition in
@@ -274,10 +254,10 @@ The rule for filing: **classify by what the body does, not what the name
 says.** `has_blob` writes. `list_*` reads. A method that writes in one
 branch is a `Write`.
 
-## 6. The one-by-one review (things that assumed a single connection)
+## 6. Sites that assume a single connection, and their disposition
 
-Filled in as the build proceeded; every row is a place the author
-had to look, not a list of things that were broken.
+Every row is a site where a single-connection assumption had to be checked
+against the pool, and what the code does there.
 
 | site | assumption | disposition |
 |---|---|---|
@@ -285,15 +265,15 @@ had to look, not a list of things that were broken.
 | `insert_trace_events_batch` — `MAX(admitted_at)` read inside the tx | the read must see concurrent batches | inside the write tx on the writer — unchanged |
 | `register_accord_public_key` — insert-then-read-on-no-op | same connection sees the row that won | one `Write` closure — unchanged |
 | `get_blob` / `get_blob_range` / `has_blob` | read-named; write `access_count` in a tx | `Write` (§3.4) |
-| `sqlite_load_stream_chunk_hashes(&Arc<Mutex<Connection>>, …)` | took the writer handle by reference | now takes `&Connection` (`HelperRead`); its three callers run it inside `self.read(…)` |
-| `check_revocation_anti_rollback_sqlite(&Arc<Mutex<Connection>>, …)` | same | now takes `&SqliteBackend` and reads through `backend.read(…)` (`Read`); the write it guards happens after it on the writer — the window between was already there, since the check and the insert were two lock acquisitions |
+| `sqlite_load_stream_chunk_hashes` | taking the writer handle by reference | takes `&Connection` (`HelperRead`); its three callers run it inside `self.read(…)` |
+| `check_revocation_anti_rollback_sqlite` | same | takes `&SqliteBackend` and reads through `backend.read(…)` (`Read`); the write it guards happens after it on the writer. The check and the insert are two separate acquisitions, so a window exists between them |
 | `sqlite_update_peer_field(backend, …)` | free fn that opened a tx on the writer | `backend.write(…)` (`Write`) |
 | `sqlite_next_key_serve_position` / `sqlite_next_plane_position` | `MAX(position)` reads called from inside write closures to allocate the next position | `HelperRead` by body; every production caller is a `Write` closure, so the allocation stays under the writer mutex. `next_key_admission_position` (the door for callers that do NOT yet hold the writer) became `async` and reads on a reader — it never held the lock across the following write |
-| `put_revocation` / `put_accord_proposal` / `put_accord_participation` — `MAX(admitted_at | created_at | server_arrival_at)` read before the INSERT | the comment claimed "read under the same connection lock as the INSERT" | it was not: the block released the guard before the write closure took it. The read now runs on a reader; the comment is corrected. Folding the read into the write closure (as `insert_trace_events_batch` does) is the real fix for the two-writer tie and is out of scope here |
+| `put_revocation` / `put_accord_proposal` / `put_accord_participation` — `MAX(admitted_at | created_at | server_arrival_at)` read before the INSERT | that the read and the INSERT share one lock acquisition | they do not: the read runs on a reader before the write closure takes the writer. **Limit:** two concurrent writers can tie; folding the read into the write closure (as `insert_trace_events_batch` does) would close it |
 | `sqlite_upsert_wire_index` / `sqlite_project_attestation_subjects` / `sqlite_project_consent_peer_set` | take `&Connection`/`&Transaction` and write | `HelperWrite`; the gate refuses any `Read` body that names them |
 | `index_stored_record` | `sqlite_upsert_wire_index(&conn.lock(), …)` inside an `async` block | one `self.write(…)` |
 | `load_or_init_content_master` — local closure over `&Arc<Mutex<Connection>>` | read-before-insert-then-re-read on one handle | nested `fn(&Connection)` run through `self.read(…)` twice; the INSERT between them is `ON CONFLICT DO NOTHING` on the writer and the re-read is the authority, as before |
-| `reanchor_*` / `list_scores` / `list_attestation_log` / `record_announced_peer` / `list_announced_peers` / `resolve_scores` (the 20 `spawn_blocking` sites) | already off the runtime, still on the one connection | rewritten to the doors; their `join` error arms are gone (the dispatcher re-raises a panic and never returns a join error) |
+| `reanchor_*` / `list_scores` / `list_attestation_log` / `record_announced_peer` / `list_announced_peers` / `resolve_scores` | off the runtime but on one connection | go through the doors; no `join` error arms (the dispatcher re-raises a panic and never returns a join error) |
 | `has_blob` / `get_blob` / `get_blob_range` | `let mut conn` + `transaction()` | `Write` (§3.4) — filed by body |
 | `get_attestation` (FederationDirectory) and `list_attestations_for` / `lookup_public_key` (two impls each) | same name, two bodies | keyed by name; both occurrences must carry one class and the gate checks each |
 | `run_migrations_through` (test-anchor) | refinery needs `&mut Connection` | writer |
@@ -301,7 +281,7 @@ had to look, not a list of things that were broken.
 | `last_insert_rowid` / `changes()` | none in `sqlite.rs` | rule stated in §3.4 |
 | `TEMP` tables | none | — |
 | `from_conn_handle` views (`cirisnode::sqlite` ×3, `engine.rs`, `ffi/pyo3.rs`) | one connection per view | zero readers, reads fall back to the writer (§4); reads through the pool need `from_handles` |
-| Sibling modules that lock `conn_handle()` themselves (`audit/sqlite.rs` 22 sites, `retention`, `telemetry`, `scheduled_tasks`, `secrets`, `ledgers`, `cirisnode`, …) | inline, single connection | **out of scope for #829** — they are not `sqlite.rs` and the issue's stall is `sqlite.rs`'s `list_*` family. Recorded here so the next cut has the list; the same `read`/`write` dispatcher is what they should adopt |
+| Sibling modules that lock `conn_handle()` themselves (`audit/sqlite.rs`, `retention`, `telemetry`, `scheduled_tasks`, `secrets`, `ledgers`, `cirisnode`, …) | inline, single connection | **Not converted.** The gate covers `sqlite.rs` only. These modules still lock the writer inline; the `read`/`write` dispatcher is what they would adopt |
 
 ## 7. Invariants
 
@@ -337,16 +317,16 @@ had to look, not a list of things that were broken.
   when the environment does not override it, and `open` uses it.
   `default_reader_count_is_clamped_and_open_honours_it`.
 
-### 7.1 Mutations (the witnesses were tested, not just the fix)
+### 7.1 Mutations (the witnesses are tested, not just the fix)
 
 - **M1** — `get_attestation` routed through `self.write(…)` instead of
   `self.read(…)`. RED: the I4 gate (`get_attestation reaches the writer via
-  self.write(`), I2 (the read waited 2.000 s behind the held writer), and
+  self.write(`), I2 (the read waits 2.000 s behind the held writer), and
   the reader arm of I3 (its premise — the read must wait on the reader —
-  no longer held). 12/15 otherwise green; reverted.
+  no longer holds).
 - **M2** — `dispatch_blocking` forced onto its inline arm. RED: both I3
-  witnesses (the 10 ms sleep fired after ~1.0 s on the in-memory arm and
-  the reader arm alike). 13/15 otherwise green; reverted.
+  witnesses (the 10 ms sleep fires after ~1.0 s on the in-memory arm and
+  the reader arm alike).
 
 ## 8. The measurement
 
@@ -355,9 +335,8 @@ The issue's shape: a synthetic corpus of 24 000 `observation:` + 12
 looping the filtered `list_attestations` (attester pinned, `observation:`
 prefix, limit 10 000 — the reconcile tick); a point read
 (`get_attestation`) probed every 5 ms for 8 s on a two-worker runtime.
-p50/p95 of the point read, before and after, **interleaved A/B in one
-process on one corpus file** (a blocked run cannot tell a regression from
-a co-tenant; see `feedback_interleave_ab_perf_runs`). Arm A opens the
+p50/p95 of the point read, **interleaved A/B in one process on one corpus
+file** (a blocked run cannot tell a regression from a co-tenant). Arm A opens the
 backend with `readers = 0` — the single-connection model exactly: same
 writer, every read behind the same mutex. Arm B is the default pool.
 
@@ -380,24 +359,23 @@ Three things the table says, in order of importance:
 1. **p50 ~700× lower** with the pool (≈180 ms → ≈250 µs), the same ratio
    CIRISServer#575 measured on the canonical (1.1 ms → 780 ms). The point
    read no longer waits for a scan to finish.
-2. **The probe loop itself was starved on arm A** — 32–41 probes in 8 s
+2. **The probe loop itself starves on arm A** — 32–41 probes in 8 s
    against ~1200 — which is the "nothing fails, it hangs" the issue
    describes: an uptime check on arm A would have called the node healthy.
 3. **Scan throughput rose** (35–44 → 65–76 per 8 s) because the two loops
    run on two readers instead of taking turns on one connection.
 
 Absolute numbers are debug-profile and box-specific; the ratio is the
-finding. Arm A is not byte-for-byte v43.0.0 — v43.0.0 also ran the wait
-*inline on the worker*, which this harness cannot show as latency (it is
-I3's domain); arm A reproduces the serialization, which is the half that
-produced the numbers above.
+finding. Arm A reproduces the serialisation of a single connection. It does
+not reproduce an inline wait on the worker, which this harness cannot show
+as latency; that is I3's domain.
 
 ## 9. What this does not do
 
 - It does not make any single query faster. A 700 ms scan is still 700 ms;
   it no longer costs anyone else 700 ms.
 - It does not pool writers. SQLite has one.
-- It does not change the sibling modules (§6, last row).
-- It does not touch Postgres, whose `deadpool` pool already had this
-  shape; the parity gate (`store::parity`) sees `read`/`write` as
+- It does not cover the sibling modules (§6, last row).
+- It does not apply to Postgres, whose `deadpool` pool has this shape
+  natively; the parity gate (`store::parity`) sees `read`/`write` as
   `Plumbing`, which is what they are.

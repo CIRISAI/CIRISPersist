@@ -1,183 +1,156 @@
 # CIRISPersist
 
-A Rust crate that decides **which claims about identity, authority, and consent
-are allowed to become state** — and stores them so the decision can be
-re-derived later by anyone holding the same rows.
+CIRISPersist is the storage layer of the CIRIS federation. It is a Rust crate,
+also shipped as a Python wheel, that decides **which claims about identity,
+authority and consent may become stored state**, and stores them so that anyone
+holding the same rows can re-derive the decision later.
 
-Not a database with a policy layer bolted on. The admission gates *are* the API:
-`put_attestation` refuses, and the refusal is typed and names the thing that was
-missing. Postgres, SQLite, or in-memory — the same behaviour on all three, as an
-enforced invariant. Embeddable as a Rust library or a Python wheel.
+The admission gates are the API. `put_attestation` either stores a row or
+refuses it, and a refusal is a typed error that names what was missing. Persist
+runs on **PostgreSQL** or **SQLite** (a file, or in memory) and behaves the
+same on both, as an enforced invariant: `store::parity` fails the build when one
+backend's write door runs a gate, or an order of gates, the other does not
+and no declared divergence explains why.
 
-> **Version, pins, and history:** see [CHANGELOG.md](CHANGELOG.md) and
-> `Cargo.toml`. This file deliberately hard-codes **no** version numbers — the
-> previous README claimed `v8.5.0` for twenty-two majors because nothing checked
-> it, and a fact nothing checks is a fact that rots.
+The crate version, dependency pins and release history are in `Cargo.toml` and
+[CHANGELOG.md](CHANGELOG.md). This file names no version numbers, so it never
+goes stale against them.
 
-## The idea
+## How it works
 
-Everything upstream of a substrate produces **claims**: an agent's reasoning, a
-witness's assurance, a peer's replicated row, an operator's admin action. Most
-systems store claims and sort out authority somewhere else, later, in a service
-that may or may not be consulted.
+Everything above a storage layer produces **claims**: an agent's reasoning
+trace, a witness's assurance, a peer's replicated row, an operator's action.
+Most systems store claims and settle authority elsewhere, in a service that may
+or may not be consulted.
 
-CIRISPersist inverts that. A claim reaches storage only by passing the gate that
-governs it, and the gate answers by **re-deriving authority from rows this node
-already holds and verified** — never from a flag, a token, or a boolean the
-caller passed in. There is no "trusted caller" path, because in a federation
-there is no trusted memory.
+Persist settles authority at the write. A claim reaches storage only through the
+gate that governs it, and the gate decides by **re-deriving authority from rows
+this node already holds and has verified**. It never relies on a flag, a token
+or a boolean the caller passes in. There is no "trusted caller" path: in a
+federation, no caller's memory is trusted.
 
-Concretely, that means questions like *may this key assert an age-assurance rung
-about a third party?* or *may this key file a record about someone else?* are
-answered by walking a signed delegation graph to a root **this node** trusts, at
-the moment of the write, every time.
+So a question such as *may this key assert an age-assurance rung about someone
+else?* or *may this key file a record about another person?* is answered at
+write time by walking a signed delegation graph to a root that **this node**
+trusts.
 
-## What you can use it for
+## What it provides
 
-Four areas, adoptable independently:
+Four areas, each usable on its own:
 
-| area | what it gives you |
+| area | what you get |
 |---|---|
-| **federation directory & conferral graph** | hybrid (Ed25519 + ML-DSA-65) key records, `delegates_to` chains, revocation and withdrawal folds, quorum tallies, and a resolver that answers "does a root I trust confer scope S on key K?" from local verified state |
-| **admission gates** | write chokepoints that refuse on governance grounds, with typed refusals that name the missing conferral rather than returning a bare boolean |
-| **verifiable attestation store** | one signed envelope shape for every object, canonicalised per RFC 8785 (JCS), content-hashed, append-only with tombstone semantics, across three backends at enforced parity |
-| **consent & erasure lifecycle** | consent modelled as a projection over the edge graph rather than a flag on a row; cascading erasure; per-community data-encryption keys with zero-window rotation on member removal |
+| **Federation directory and conferral graph** | Hybrid (Ed25519 + ML-DSA-65) key records, `delegates_to` chains, revocation and withdrawal, quorum tallies, and a resolver that answers "does a root I trust confer scope S on key K?" from local verified state. |
+| **Admission gates** | Write doors that refuse on governance grounds. A refusal is typed and names the missing conferral. |
+| **Verifiable attestation store** | One signed envelope shape for every object, canonicalised with RFC 8785 (JCS), content-hashed, append-only with tombstones. |
+| **Consent and erasure** | Consent is a projection over the signed edge graph, not a flag on a row. Erasure cascades. Each community has its own data-encryption keys, rotated with no exposure window when a member is removed. |
 
-Plus the substrates built on top: signed reasoning-trace log, hash-chained audit
-log (RFC 6962 Merkle), memory graph, telemetry, secrets-at-rest,
-fountain-coded content, and the lens schemas.
+Built on these: the signed reasoning-trace log, a hash-chained audit log
+(RFC 6962 Merkle), the memory graph, telemetry, secrets at rest, encrypted and
+replicated blob storage, fountain-coded content, and the lens schemas.
 
-## Who this is not for
+Optional parts are Cargo features (`postgres`, `sqlite`, `pyo3`, `cirisgraph`,
+`cirisaudit`, `telemetry`, `secrets`, `server`, `tls`, and others).
+[docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md) lists them and how CI covers
+each combination. The Python wheel ships the feature set listed under
+`[tool.maturin]` in `pyproject.toml`.
 
-Be direct about it — most projects should use something else:
+## When not to use it
 
-- **You want a general-purpose database.** Use Postgres. This one refuses writes
-  on governance grounds and that is not a bug you can configure away.
-- **You want to swap the policy engine.** OPA and Cedar users can. Here you get
-  these gates or you fork — see *The bill*, below.
-- **You need CBOR/COSE on the wire.** Not supported. If you are building to
-  RATS/EAT or a COSE-native profile, look at
-  [Veraison](https://github.com/veraison) first.
-- **You want a store that trusts what an upstream admitted.** The entire value
-  here is that it does not.
-- **You need horizontal sharding.** This is a library, not a service.
+- **You want a general-purpose database.** Use PostgreSQL. Persist refuses
+  writes on governance grounds, and that cannot be configured away.
+- **You want to swap the policy engine.** With OPA or Cedar you can. Here you use
+  these gates or you fork.
+- **You need CBOR/COSE on the wire.** Not supported. For RATS/EAT or a
+  COSE-native profile, look at [Veraison](https://github.com/veraison).
+- **You want a store that trusts what an upstream service admitted.** Persist
+  does not, by design.
+- **You need horizontal sharding.** Persist is a library, not a service.
 
-## Standing on other people's standards
+## Standards it builds on
 
-Most of this surface is a competent implementation of work done elsewhere, and
-saying so is the point:
+- **Canonicalisation:** RFC 8785 (JCS).
+- **Audit log:** RFC 6962 Merkle trees, from
+  [CIRISVerify](https://github.com/CIRISAI/CIRISVerify). Persist implements no
+  Merkle, preimage or signature logic of its own.
+- **Delegation chains:** the idea behind UCAN, Biscuit, ZCAP-LD and macaroons.
+- **Authorisation walk:** the idea behind Zanzibar, SpiceDB and OpenFGA.
+- **Erasure coding:** RFC 6330.
+- **Post-quantum signatures:** FIPS 204 (ML-DSA-65), paired with Ed25519.
+- **Verifiable append-only state:** the ground immudb, Trillian, Rekor and IETF
+  SCITT stand on.
 
-- **Canonicalisation** is RFC 8785 (JCS), not a bespoke scheme.
-- **The audit log** is RFC 6962 Merkle, consumed from
-  [CIRISVerify](https://github.com/CIRISAI/CIRISVerify) rather than re-rolled.
-  Persist never implements Merkle, preimage, or signature logic itself.
-- **Delegation chains** are the idea behind UCAN, Biscuit, ZCAP-LD, and
-  macaroons.
-- **The authorization walk** is the idea behind Zanzibar / SpiceDB / OpenFGA.
-- **Erasure coding** is RFC 6330's.
-- **Post-quantum signatures** are FIPS 204 (ML-DSA-65), hybridised with Ed25519.
-- **Verifiable append-only state** is the ground immudb, Trillian, Rekor, and
-  IETF SCITT already stand on.
+No single project is a direct peer. Roughly, persist covers the union of
+**immudb** (verifiable append-only state), **SCITT** (a transparency service
+whose registration policy decides what may be logged) and **SpiceDB** (schema,
+relationship graph, checks and store in one system).
 
-There is no single peer project. The closest honest description is that
-CIRISPersist occupies roughly the union of **immudb** (verifiable append-only
-state), **SCITT** (a transparency service whose *registration policy* decides
-what may be logged), and **SpiceDB** (schema, relationship graph, checks, and
-store fused into one system).
+## What is different
 
-## What is actually different
+1. **The registration policy is a named, versioned, hash-pinned corpus.** The
+   governing vocabulary (consent grammar, replication policy, namespace
+   manifest) is pinned by hash, and a refusal names the rule that refused. A
+   peer can learn *why* a row was refused.
+2. **Each conferral declares where it is enforced, and the build checks it.** An
+   authority-conferring claim declares whether it is enforced at registration
+   or resolved at use. The build fails if a claim declared "resolved at use" is
+   consumed by a plain membership test.
+3. **Consent is a projection over the edge graph**, not a column.
+4. **Commons operations use a reverse quorum:** one of N may protect, m of n are
+   needed to undo, and the protective side is capped, never floored.
+5. **Backend parity is enforced.** SQLite and PostgreSQL run the same test
+   bodies through the real write path.
 
-Held to a short list on purpose:
+## The trade-offs
 
-1. **Registration policy as a named, versioned, hash-pinned corpus.** SCITT has
-   registration policies, but they are per-operator and opaque — a peer cannot
-   learn *why* a row was refused. Here the governing vocabulary is pinned by
-   hash (consent grammar, replication policy, the namespace manifest) and the
-   refusal names the branch.
-2. **Conferral modes as a declared contract the build checks.** Each
-   authority-conferring claim declares *where* it is enforced — at registration,
-   or resolved at use. A gate then fails the build when a claim declaring
-   "resolved at use" is consumed by a plain membership test. Writing down where
-   a rule is enforced is common; failing the build when nothing enforces it
-   there is not.
-3. **Consent as a projection over the edge graph**, not a column.
-4. **Reverse quorum for commons operations** — one-of-N to protect, m-of-n to
-   undo, with the protective side capped and never floored.
-5. **Backend parity as an enforced invariant, not an aspiration.** Memory,
-   SQLite, and Postgres run the same witness bodies through the real write path.
-   Memory tolerates what the SQL backends reject, which is exactly why it gets
-   its own leg.
-
-## The bill
-
-Fusing vocabulary, logic, enforcement, and storage into one process buys
-coherence and costs flexibility. The costs are real:
+Putting vocabulary, logic, enforcement and storage in one process buys
+coherence and costs flexibility:
 
 - **You cannot swap the policy engine.**
-- **Vocabulary version is crate version.** A governance change is a code
-  release. That is why the major number is high — the taxonomy ships honestly
-  rather than drifting silently — but a reader is entitled to read a high major
-  count as churn, so: it is the former, and the CHANGELOG is the evidence.
+- **The vocabulary version is the crate version.** A governance change is a code
+  release, which is why the major version number is high. The CHANGELOG records
+  what each major changed.
 - **Downstream cannot run a different rule set**, so every tightening is a
   coordinated adoption across consumers.
-- **The gates are only as good as their witnesses.** This repo's own history is
-  the argument for that caution: multiple gates have shipped green over holes
-  they could not see, and were caught by an issue rather than by the build.
+- **A gate is only as good as its witnesses.** Every gate has tests, and the
+  load-bearing ones are mutation-tested, but a gate can still pass over a case
+  nobody thought to test.
 
-## Validation and review status
+## Validation and review
 
-**Independent conformance.** [CIRISConformance](https://github.com/CIRISAI) is a
-separate suite that drives the **real built wheel — never a mock** — and it has
-filed findings that became fixes here. Two concrete ones:
+**Independent conformance.**
+[CIRISConformance](https://github.com/CIRISAI) is a separate suite that drives
+the real built wheel, never a mock. Its findings have become fixes here, for
+example an admission bypass where a raw emit carrying only the constitutional
+marker skipped the single-owner gate. That is the kind of hole an in-repo suite
+misses: a gate that passes its author's fixtures.
 
-- `test_551` found an admission bypass: the single-owner gate keyed on persist's
-  *internal* dimension, so a raw emit carrying only the constitutional marker
-  (`delegation_purpose: "owner_binding"`, no `dimension`) went **ungated** and a
-  second distinct owner was admitted.
-- `#11 round 2` found the repository-statistics cache was a process global, so a
-  fresh engine was served a prior engine's row.
+**In this repository.** Several thousand tests across the feature matrix, each
+run on both backends; property tests; mutation testing of the load-bearing gates
+([docs/MUTATION_TESTING.md](docs/MUTATION_TESTING.md)); source gates that read
+the code itself ([docs/FROM_DISK_GATES.md](docs/FROM_DISK_GATES.md)); and a
+benchmark [trend dashboard](https://cirisai.github.io/CIRISPersist/dev/bench/)
+updated on every commit to main. Benchmark figures are kept on the dashboard,
+not in this file.
 
-Both are the class an in-repo suite is worst at catching: a gate that passes its
-author's fixtures because the author tested the path they were thinking about.
+**External review: none of this crate yet.** Two external reviews of the CIRIS
+stack exist and neither examines CIRISPersist. The public one, at
+[towards-alignment.com](https://towards-alignment.com/cards/field-agendas/ciris/),
+is an alignment assessment, not a security audit, and covers Accord,
+CIRISAgent, Verify, Lens and Proxy. The other is not public and does not cover
+this crate either.
 
-**In-repo.** Several thousand tests across a feature matrix, every leg run
-against all three backends; property tests; mutation testing on load-bearing
-gates; and a benchmark
-[trend dashboard](https://cirisai.github.io/CIRISPersist/dev/bench/) published
-per commit. Benchmark numbers are deliberately **not** copied into this file —
-that is how the old one came to quote a throughput figure against a
-seven-major-old dependency.
+Treat every security property described here as a claim backed by our own
+tests, one independent conformance suite and a published
+[threat model](docs/THREAT_MODEL.md), **not as audited**. An adversarial reader
+is worth more to us than a pull request.
 
-**External review — the headline is that there has been none of this crate.**
+## Using it
 
-Two external reviews of the CIRIS stack exist. **Neither examines
-CIRISPersist.**
+### Rust
 
-- The public one is a field assessment at
-  [towards-alignment.com](https://towards-alignment.com/cards/field-agendas/ciris/),
-  relating the stack to seven AI-safety cruxes. It is an **alignment
-  assessment, not a security audit**, and the components it names are Accord,
-  CIRISAgent, Verify, Lens, and Proxy.
-- The second is not public, and also does not cover this crate.
-
-So: treat every security property described above as a claim backed by our own
-tests, one independent conformance suite, and a published threat model — **not
-as audited**. The substrate that enforces the stack's admission rules is the
-part of the stack no outside reviewer has yet read.
-
-That is the gap to close, and an adversarial reader is worth more to us than a
-pull request.
-
-The public assessment also makes, from outside, the argument this codebase keeps
-re-learning from inside:
-
-> "Green attestation does not imply correction uptake; a signed agent record
-> does not imply the real agent."
-
-## Quick start
-
-Rust — this snippet is compiled by CI as
-[`examples/readme.rs`](examples/readme.rs), so it cannot silently rot:
+Add the crate from its git tag with the backend features you need. This snippet
+is compiled in CI as [`examples/readme.rs`](examples/readme.rs):
 
 ```rust
 use ciris_persist::signing::{LocalSigner, LocalSignerConfig};
@@ -199,7 +172,10 @@ async fn open_node() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Python:
+### Python
+
+The wheel is an abi3 build for Python 3.10 and later. It is built by CI from
+each release tag (`maturin build`); it is not published to PyPI.
 
 ```python
 import ciris_persist as cp
@@ -209,100 +185,82 @@ engine.register_consumer("my-adapter", ["cirisgraph"])
 summary = engine.receive_and_persist(request_body_bytes)
 ```
 
-## Running the tests
+The backend is chosen by the DSN scheme (`postgres://…` or `sqlite://…`).
+[docs/COHABITATION.md](docs/COHABITATION.md) explains how several components
+share one `Engine` in a process.
 
-The Postgres suite needs a database to itself. Several tests assert on **global**
-row counts, and one does `DROP SCHEMA cirislens CASCADE`, so a second suite
-sharing the database reds tests that have nothing to do with either change.
-Measured, two concurrent copies of the same suite over six iterations: one shared
-database → 6/6 iterations red; separate fresh databases → 0/6.
-
-It is *not* the migration advisory lock, which is the common guess. PostgreSQL
-builds the advisory-lock tag from `MyDatabaseId` plus the key, so advisory locks
-are per-database — two suites on two databases cannot contend on one no matter
-what key they use.
+## Building and testing
 
 ```bash
-# fresh single-use database, dropped afterwards, exit code propagated exactly
+cargo build --features sqlite                 # SQLite only
+cargo build --features postgres,sqlite        # both backends
+cargo nextest run --features sqlite           # SQLite suite, no database needed
+```
+
+The PostgreSQL suite needs a database to itself: some tests assert on global
+row counts and one drops a schema. `scripts/pg_test_db.sh` creates a fresh
+single-use database, runs the command, drops the database and passes the exit
+code through:
+
+```bash
 scripts/pg_test_db.sh -- cargo nextest run --features postgres,sqlite
-
-scripts/pg_test_db.sh --check     # who is on which database right now
+scripts/pg_test_db.sh --check     # show which suite is on which database
 ```
 
-Within a run, each test **process** gets its own database cloned from an
-already-migrated template. Per-test isolation *alone* is a 2.6× regression,
-because every test then replays the full migration set into an empty database;
-`CREATE DATABASE … TEMPLATE` is what makes isolation cheaper than sharing rather
-than more expensive. Anyone adopting half of that change gets a slower suite and
-concludes the approach failed.
+Within a run, each test process gets its own database cloned from an
+already-migrated template (`CREATE DATABASE … TEMPLATE`), so isolation costs
+less than replaying migrations.
 
-**Fix the database before tuning parallelism.** The same full certification, one
-warm tree, 19,340 tests, as a 2×2 — either row alone gives the wrong answer:
-
-| | 5 lanes × 4 | 8 lanes × 4 |
-|---|---|---|
-| stock postgres | 1437s | 1443s |
-| tuned postgres | 917s | 731s |
-| tuned + PGDATA on tmpfs | — | **643s** |
-
-On a stock cluster, asking for 32 test threads and asking for 20 produce the
-same wall clock — the signature of work that is not CPU-bound, and the reason
-two rounds of lane tuning bought 0.4%. The database was the constraint, and it
-was *hiding* the CPU one. Fix it and the same comparison becomes a real 20%.
-
-So tune postgres, once, and only then think about lanes:
+The test cluster is disposable, so it can run without crash safety, which makes
+the suite much faster. `scripts/pg_tune_test_cluster.sh` turns off `fsync`,
+`synchronous_commit`, `full_page_writes` and JIT, and can put `PGDATA` on tmpfs.
+It refuses to run until a marker file is placed in the container, and prints the
+command to place it:
 
 ```bash
-scripts/pg_tune_test_cluster.sh                  # fsync/synchronous_commit/full_page_writes/jit off
-scripts/pg_tune_test_cluster.sh --recreate-tmpfs # PGDATA in RAM (DESTRUCTIVE, a further 12%)
-scripts/pg_tune_test_cluster.sh --reset          # back to stock
+scripts/pg_tune_test_cluster.sh                  # tune the test cluster
+scripts/pg_tune_test_cluster.sh --recreate-tmpfs # PGDATA in RAM (destroys the cluster's data)
+scripts/pg_tune_test_cluster.sh --reset          # back to stock settings
 ```
 
-Every database in the test cluster is created from a template and dropped
-afterwards, so crash safety on it is a cost with nothing bought. That trade is
-only sound *because* the data is disposable — `fsync = off` can leave a cluster
-corrupt rather than merely missing recent commits — so the script refuses to run
-until a marker file is deliberately placed inside the container, and prints the
-command to place it.
+`scripts/certify.sh full` runs every leg CI runs, locally, and its exit code is
+the verdict; `certify.sh quick` is a fast pre-push check.
+[docs/TOOLING.md](docs/TOOLING.md) describes the local and CI tools, and
+[docs/RELEASE.md](docs/RELEASE.md) the release procedure.
 
-Parallel worktrees each grow a large `target/`. To reclaim the finished ones:
+Parallel worktrees each grow a large `target/`. `scripts/reap_worktree_targets.sh`
+(dry run by default, `--apply` to act) removes `target/` from linked worktrees
+that are merged, clean, unlocked, idle and cold for an hour.
 
-```bash
-scripts/reap_worktree_targets.sh            # dry run — prints verdict + reason
-scripts/reap_worktree_targets.sh --apply
-```
+## Documentation
 
-It removes `target/`, and only `target/`, and only from a linked worktree that is
-unlocked, merged into `origin/main`, clean (untracked counts as dirty), has no
-process living in it, and whose `target/` has been cold for an hour. Any one of
-those failing skips it.
-
-## Docs
-
-| Doc | What |
+| document | contents |
 |---|---|
-| [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | Threat model — the `AV-*` attack vectors and their shipped mitigations |
-| [FSD/CIRIS_PERSIST.md](FSD/CIRIS_PERSIST.md) | Full functional spec |
-| [docs/PUBLIC_SCHEMA_CONTRACT.md](docs/PUBLIC_SCHEMA_CONTRACT.md) | Stable schema contract |
-| [docs/COHABITATION.md](docs/COHABITATION.md) | In-process cohabitation model |
-| [docs/FEDERATION_DIRECTORY.md](docs/FEDERATION_DIRECTORY.md) | Directory surface |
-| [MISSION.md](MISSION.md) | Mission alignment |
-| [CHANGELOG.md](CHANGELOG.md) | Per-release history — and the record of what each major actually changed |
+| [MISSION.md](MISSION.md) | What persist is for, and the rules every change is held to |
+| [FSD/CIRIS_PERSIST.md](FSD/CIRIS_PERSIST.md) | Functional specification; the other files in [FSD/](FSD) specify individual surfaces |
+| [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | Threat model: the `AV-*` attack vectors and their mitigations |
+| [docs/PUBLIC_SCHEMA_CONTRACT.md](docs/PUBLIC_SCHEMA_CONTRACT.md) | The stable schema contract for readers of the database |
+| [docs/FEDERATION_DIRECTORY.md](docs/FEDERATION_DIRECTORY.md) | The federation directory: keys, attestations, trust anchors |
+| [docs/COHABITATION.md](docs/COHABITATION.md) | Sharing one `Engine` between components in a process |
+| [docs/INTEGRATION_LENS.md](docs/INTEGRATION_LENS.md) | Integrating CIRISLens with persist |
+| [WIRE_VOCABULARY_KINDS.md](WIRE_VOCABULARY_KINDS.md) | The wire vocabulary's kinds and what each means |
+| [docs/V61_TASK_PLAN.md](docs/V61_TASK_PLAN.md) | The plan for the next release |
+| [CHANGELOG.md](CHANGELOG.md) | Release history |
 
-For cryptographic primitives, hardware attestation, and post-quantum posture,
-[CIRISVerify](https://github.com/CIRISAI/CIRISVerify) is the authority; persist
-consumes it and pins it, and does not restate its claims here.
+For cryptographic primitives, hardware attestation and post-quantum posture,
+[CIRISVerify](https://github.com/CIRISAI/CIRISVerify) is the authority. Persist
+uses it and pins it, and does not restate its claims.
 
 ## Where it sits
 
-CIRIS is the reference deployment, not the definition. Within it: Verify owns
+CIRIS is the reference deployment, not the definition. In it, Verify owns the
 cryptographic primitives, Edge owns transport, the agent does the reasoning, and
 adjudication belongs to a quorum of human authorities. Persist holds the state
-those decisions are made from and enforces what may enter it — **the substrate
+those decisions are made from and enforces what may enter it. **The substrate
 observes; it does not adjudicate.**
 
 ## License
 
-AGPL-3.0-or-later. The persistence path is auditable line-by-line by design:
-closed-source forks are forbidden, which makes the audit story structurally
-enforceable rather than socially expected.
+AGPL-3.0-or-later. The persistence path is meant to be auditable line by line,
+and the license forbids closed-source forks, so that audit stays possible for
+every deployment.

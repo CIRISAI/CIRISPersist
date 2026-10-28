@@ -17,15 +17,14 @@ env:
   # No RUSTFLAGS: -D warnings here would make most mutants unviable.
 
 jobs:
-  # v54.1.0 (CIRISPersist#1051) — the first scheduled run (650024b1) was GREEN
-  # with the budget hit (rc 124, 8 of 85 mutants untested) and 6 survivors no
-  # one saw. Now every leg is a gate: scripts/mutants.sh refuses a scope that
+  # Every leg is a gate (CIRISPersist#1051): a run that hits its budget or
+  # leaves survivors must not read green. scripts/mutants.sh refuses a scope that
   # does not fit its budget before building (exit 3), fails an INCOMPLETE run
   # (4) and any surviving mutant not in scripts/mutants/allowed_survivors.txt
   # (5), and writes the verdict to the step summary with annotations.
   #
-  # Sizing: 600 s + 120 s per mutant (measured on that run: baseline 305 s,
-  # p90 105 s per mutant). scope-observe's 71 mutants need 9120 s, so it runs
+  # Sizing: 600 s + 120 s per mutant (measured: baseline 305 s, p90 105 s per
+  # mutant). scope-observe's 71 mutants need 9120 s, so it runs
   # as two shards; scope-consent-gate's 19 need 2880 s.
   mutants:
     name: mutants (${{ matrix.scope }}${{ matrix.shard && format(' {0}', matrix.shard) || '' }})
@@ -39,9 +38,8 @@ jobs:
           - {scope: scope-observe, shard: '0/2', id: observe-0-of-2, weekly: false}
           - {scope: scope-observe, shard: '1/2', id: observe-1-of-2, weekly: false}
           - {scope: scope-observe-sites, shard: '', id: observe-sites, weekly: true}
-          # v60.0.0: the slice scopes. S0's two are 19 mutants each; S1's 215
-          # ran 8 h as 4 shards on the dev box (2 h each, the whole budget),
-          # so it rides 5 shards on the weekly run.
+          # The s0 scopes are 19 mutants each. s1's 215 take about 8 h, so
+          # they run as 5 shards on the weekly run.
           - {scope: scope-s0-hard-case, shard: '', id: s0-hard-case, weekly: false}
           - {scope: scope-s0-roster-seam, shard: '', id: s0-roster-seam, weekly: false}
           - {scope: scope-s1-cirisnode, shard: '0/5', id: s1-cirisnode-0-of-5, weekly: true}
@@ -52,19 +50,19 @@ jobs:
           - {scope: scope-s2-goals, shard: '0/3', id: s2-goals-0-of-3, weekly: true}
           - {scope: scope-s2-goals, shard: '1/3', id: s2-goals-1-of-3, weekly: true}
           - {scope: scope-s2-goals, shard: '2/3', id: s2-goals-2-of-3, weekly: true}
-          # v60.0.0 S3 (CIRISPersist#934 step 3): 129 mutants, three shards
+          # The key plane (CIRISPersist#934 step 3): 129 mutants, three shards
           # (600 s + 120 s x 43 = 5760 s each), weekly.
           - {scope: scope-s3-key-plane, shard: '0/3', id: s3-key-plane-0-of-3, weekly: true}
           - {scope: scope-s3-key-plane, shard: '1/3', id: s3-key-plane-1-of-3, weekly: true}
           - {scope: scope-s3-key-plane, shard: '2/3', id: s3-key-plane-2-of-3, weekly: true}
-          # v60.0.0 slice S6v: the CC rc9 vendor (the policy table read at
+          # The CC rc9 vendor (the policy table read at
           # runtime, the corridor at admission, the registry loader) and
           # #1114's three refusals. 108 mutants, three shards
           # (600 s + 120 s x 36 = 4920 s each), weekly.
           - {scope: scope-s6v-vendor, shard: '0/3', id: s6v-vendor-0-of-3, weekly: true}
           - {scope: scope-s6v-vendor, shard: '1/3', id: s6v-vendor-1-of-3, weekly: true}
           - {scope: scope-s6v-vendor, shard: '2/3', id: s6v-vendor-2-of-3, weekly: true}
-          # v60.0.0 S4 (CIRISPersist#934 step 4, #1105): 302 mutants, six
+          # The consent sweep (CIRISPersist#934 step 4, #1105): 302 mutants, six
           # shards (600 s + 120 s x 51 = 6720 s each), weekly.
           - {scope: scope-s4-consent-sweep, shard: '0/6', id: s4-consent-sweep-0-of-6, weekly: true}
           - {scope: scope-s4-consent-sweep, shard: '1/6', id: s4-consent-sweep-1-of-6, weekly: true}
@@ -72,16 +70,16 @@ jobs:
           - {scope: scope-s4-consent-sweep, shard: '3/6', id: s4-consent-sweep-3-of-6, weekly: true}
           - {scope: scope-s4-consent-sweep, shard: '4/6', id: s4-consent-sweep-4-of-6, weekly: true}
           - {scope: scope-s4-consent-sweep, shard: '5/6', id: s4-consent-sweep-5-of-6, weekly: true}
-          # v60.0.0 S5 (CIRISPersist#1002): the sites the memory retirement
-          # added (the #720 lifecycle predicate, the #691 tree binding, the
+          # The sites added when the memory backend was retired
+          # (CIRISPersist#1002): the #720 lifecycle predicate, the #691 tree binding, the
           # moved fountain assembler, the test constructor) and the genesis
           # scratch on both backends with its reaper. 44 mutants, one shard
           # (600 s + 120 s x 44 = 5880 s), nightly.
           - {scope: scope-s5-memory-retire, shard: '', id: s5-memory-retire, weekly: false}
-          # v60.0.0 S6 (CIRISPersist#1036, #1049, #1062, #1048): 212 mutants,
-          # eight shards of <= 27, weekly. Five shards of 43 timed out on CI
-          # (run 40305453908: shard 1/5 measured ~168 s per mutant, 7234 s,
-          # INCOMPLETE with 0 missed); 600 s + 168 s x 27 = 5136 s fits 7200 s.
+          # Affiliations (CIRISPersist#1036, #1049, #1062, #1048): 212 mutants,
+          # eight shards of <= 27, weekly. This scope measures ~168 s per
+          # mutant on CI, so shards of 43 do not fit; 600 s + 168 s x 27 =
+          # 5136 s fits 7200 s.
           - {scope: scope-s6-affiliations, shard: '0/8', id: s6-affiliations-0-of-8, weekly: true}
           - {scope: scope-s6-affiliations, shard: '1/8', id: s6-affiliations-1-of-8, weekly: true}
           - {scope: scope-s6-affiliations, shard: '2/8', id: s6-affiliations-2-of-8, weekly: true}
@@ -90,16 +88,16 @@ jobs:
           - {scope: scope-s6-affiliations, shard: '5/8', id: s6-affiliations-5-of-8, weekly: true}
           - {scope: scope-s6-affiliations, shard: '6/8', id: s6-affiliations-6-of-8, weekly: true}
           - {scope: scope-s6-affiliations, shard: '7/8', id: s6-affiliations-7-of-8, weekly: true}
-          # v60.1.0 slices A and C (CIRISPersist#1072, #1069, #1070, #1006,
-          # #1132): 97 mutants, four shards of <= 25 at S6's measured 168 s
+          # Fixes (CIRISPersist#1072, #1069, #1070, #1006, #1132):
+          # 97 mutants, four shards of <= 25 at the measured 168 s
           # per mutant (600 s + 168 s x 25 = 4800 s), weekly. Three shards
           # would hold 33.
           - {scope: scope-601-fixes, shard: '0/4', id: 601-fixes-0-of-4, weekly: true}
           - {scope: scope-601-fixes, shard: '1/4', id: 601-fixes-1-of-4, weekly: true}
           - {scope: scope-601-fixes, shard: '2/4', id: 601-fixes-2-of-4, weekly: true}
           - {scope: scope-601-fixes, shard: '3/4', id: 601-fixes-3-of-4, weekly: true}
-          # v60.1.0 slice B (CIRISPersist#1117, #1064, #1120, #1113): the
-          # consumer asks. 110 mutants, four shards of <= 28
+          # The consumer asks (CIRISPersist#1117, #1064, #1120, #1113).
+          # 110 mutants, four shards of <= 28
           # (600 s + 168 s x 28 = 5304 s each at the CI rate), weekly.
           - {scope: scope-601-asks, shard: '0/4', id: 601-asks-0-of-4, weekly: true}
           - {scope: scope-601-asks, shard: '1/4', id: 601-asks-1-of-4, weekly: true}
@@ -151,7 +149,7 @@ jobs:
       - name: mutants_matrix self-test
         if: steps.gate.outputs.run == 'true'
         run: python3 scripts/mutants_matrix_test.py
-      # v60.0.0 — the scope this job is about to run resolves and names tests.
+      # The scope this job is about to run resolves and names tests.
       - name: mutation scopes are well-formed (from disk)
         if: steps.gate.outputs.run == 'true'
         run: python3 scripts/mutants_scopes_check.py --self-test && python3 scripts/mutants_scopes_check.py
@@ -176,9 +174,9 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '43 6 * * 0'
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # v54.0.0 (CIRISPersist#1030) — the two known-red sets (`tls` without
-    # `postgres`, `pyo3-sqlite` without `pyo3`) compile: each feature now implies
-    # its prerequisite. The job is blocking, as planned when #1030 was filed.
+    # Blocking. Every feature implies its prerequisites, so sets such as `tls`
+    # without `postgres` or `pyo3-sqlite` without `pyo3` compile
+    # (CIRISPersist#1030).
     strategy:
       fail-fast: false
       matrix:

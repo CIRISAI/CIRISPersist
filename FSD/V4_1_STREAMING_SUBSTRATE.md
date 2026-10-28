@@ -1,31 +1,27 @@
-# FSD: CIRISPersist — Streaming substrate (CEG 0.10 §10.5 impl)
+# FSD: CIRISPersist — Streaming substrate (CEG §10.5)
 
-**Status:** Proposed (on-ramp to CIRISPersist#142; ratifies #144 adopt/roll decisions)
-**Author:** Eric Moore (CIRIS Team) with Claude Opus 4.8
-**Created:** 2026-06-06
-**Repo:** `~/CIRISPersist`
-**Risk:** Substrate evolution, multi-cut. Additive at the grammar layer (CEG §3 1+4 lockdown holds) but **one bounded CHECK-constraint migration** at the `key_grant` layer (RC1-1c, §6.4). Sequenced so each cut stands alone.
-**Upstream issues:** CIRISPersist#142 (substrate proposal), #144 (library survey — ratified here), #145 (swarm fetch, downstream), CIRISRegistry#34 (STH consistency-proof enforcement, accountable tier), CIRISVerify#47 (hybrid KEM, shipped).
-**Spec of record (protocol):** `CIRISRegistry/FSD/CEG/10_endpoints.md` §10.5 (V1/V2/V3 locks), §7.9 (`delivery_receipt:{stream_id}`), §0.9 (JCS canonical). This FSD is the **substrate mapping** of that protocol; where the two differ, CEG §10.5 is normative and this doc is wrong.
+**Status:** Implemented — ranged reads (`get_blob_range`), `ChunkDag` blobs (V061), live stream chunks (`federation_stream_chunks`, V062), per-stream STHs (V063) and stream/epoch-addressed `key_grant` rows (V064), on both backends. Not implemented: an HTTP `206` tier, IPFS interop, and the accountable (witness-cosign) STH tier (CIRISRegistry#34).
+**Upstream issues:** CIRISPersist#142 (substrate proposal), #144 (library survey), #145 (swarm fetch, downstream), CIRISRegistry#34 (STH consistency-proof enforcement, accountable tier), CIRISVerify#47 (hybrid KEM).
+**Spec of record (protocol):** `CIRISRegistry/FSD/CEG/10_endpoints.md` §10.5 (V1/V2/V3 locks), §7.9 (`delivery_receipt:{stream_id}`), §0.9 (JCS canonical). This FSD is the **substrate mapping** of that protocol; where the two differ, CEG §10.5 is normative.
 
 ---
 
-## 0. TL;DR
+## 0. Summary
 
-CEG 0.10 closed the **delivery axis** (visibility + revocability + *delivery*). Its media-multicast half is "spec-now, impl substrate-pending **CIRISPersist#142**." This FSD turns #142's three primitives — `get_range`, `BlobBody::ChunkDag`, live `put_blob_chunk`/`seal_stream` — into a substrate spec **re-grounded against CEG 0.10 §10.5** (which advanced well past #142's pre-0.10 sketch). The strategic call from #144 holds: **substrate stays SHA-256** (BLAKE3/iroh would force a 7-repo wire migration not justified by keyframe-aligned seek). Most building blocks already exist in-tree (`SignedTreeHead`/`TransparencyStore`, `aes-gcm`, `hkdf`, the hybrid KEM); the net-new substrate is one table, one BlobBody variant, one range API, and one bounded CHECK migration.
+CEG §10.5 defines the **delivery axis** (visibility + revocability + *delivery*), including media multicast. This substrate implements its three primitives — ranged reads, `BlobBody::ChunkDag`, and live `put_blob_chunk` / `seal_stream` — over **SHA-256** (BLAKE3/iroh would force a wire migration across every repo, not justified by keyframe-aligned seek). It reuses the in-tree `SignedTreeHead` / transparency machinery, `aes-gcm`, `hkdf` and the hybrid KEM.
 
-**What CEG 0.10 §10.5 added beyond #142 (the re-grounding deltas):**
-1. **Per-stream transparency log** — each stream is its own RFC 6962 log (`log_id = stream_id`), reusing the `SignedTreeHead` shape, NOT a `scores`-attestation `chunk_available` dimension (#142's original). Keeps media chunks out of the global provenance tree (§10.5.0).
-2. **PQC wrap MANDATORY** — streaming epoch DEKs MUST wrap with `wrap_algorithm: v2 = x25519+ml-kem-768` (§10.5.3), not #142's `v1` X25519-only. Harvest-now-decrypt-later defense for indefinitely-persisted content.
-3. **STREAM nonce layout** (§10.5.2 V2 lock) — exact `prefix[7] ‖ counter_be[4] ‖ last_flag[1]` construction, not #142's looser `HKDF(DEK,"chunk-iv"||idx)`.
-4. **Epoch axis + RC1-1c CHECK migration** — the per-`(stream_id, epoch)` key_grant axis needs a parallel CHECK arm at the V054 constraint (§6.4); explicitly NOT pure-additive there.
-5. **Delivery receipts** (§10.5.4 V3 lock) — `delivery_receipt:{stream_id}` reserved prefix; verify is a JOIN against the published root, not a sig-check.
+What CEG §10.5 requires of the substrate:
+1. **Per-stream transparency log** — each stream is its own RFC 6962 log (`log_id = stream:<id>`), reusing the `SignedTreeHead` shape, not a `scores`-attestation dimension. Media chunks stay out of the global provenance tree (§10.5.0).
+2. **PQC wrap mandatory** — streaming epoch DEKs wrap with `wrap_algorithm: v2 = x25519+ml-kem-768` (§10.5.3).
+3. **STREAM nonce layout** (§10.5.2 V2 lock) — `prefix[7] ‖ counter_be[4] ‖ last_flag[1]`.
+4. **Epoch axis** — `key_grant` rows addressed by `(stream_id, epoch)`, which needs a parallel CHECK arm beside the content-addressed one (§4.4).
+5. **Delivery receipts** (§10.5.4 V3 lock) — `delivery_receipt:{stream_id}` reserved prefix; verification is a JOIN against the published root, not a signature check.
 
 ---
 
 ## 1. Why — mission + the CEG dependency
 
-CEG 0.10 (`CIRISRegistry/FSD/CEG/`) is at Public Working Draft; its streaming-multicast half cannot reach impl-live, and **CEG cannot progress toward 1.0**, while #142 is open. Persist is the named blocker. This is the CEG-1.0 critical path.
+CEG's streaming-multicast half (`CIRISRegistry/FSD/CEG/` §10.5) needs a substrate that stores, serves and verifies live, chunked, encrypted content. This is that substrate.
 
 Mission grounding (MISSION.md):
 - **§1.2 N_eff / evidence** — a live stream is signed evidence like any trace; the per-stream transparency log (§10.5.1) makes a stream's chunk sequence tamper-evident under the same RFC 6962 algorithm persist already runs for audit chains. Streams don't get a weaker integrity story.
@@ -38,11 +34,11 @@ Mission grounding (MISSION.md):
 
 ## 2. Scope
 
-### 2.1 In scope (the substrate, across cuts)
+### 2.1 In scope
 
-| Primitive | CEG §10.5 anchor | Cut |
+| Primitive | CEG §10.5 anchor | Part |
 |---|---|---|
-| `get_range(sha, start, end) → bytes` (byte-range read, both backends + External proxy) | — (substrate primitive; enables §10.5 chunk fetch) | A |
+| `get_blob_range(sha, start, end_inclusive)` (byte-range read, both backends + External proxy) | — (substrate primitive; enables §10.5 chunk fetch) | A |
 | `BlobBody::ChunkDag { manifest_sha }` + manifest format + `put_blob_chunks` atomic upload | §10.1.1 Merkle-over-chunks | B |
 | `federation_stream_chunks (stream_id, seq) → chunk_sha` index table | §10.5.3 table | C |
 | `put_blob_chunk(stream_id, seq, …)` + `seal_stream(stream_id)` live append | §10.5.0/.1 | C |
@@ -51,20 +47,20 @@ Mission grounding (MISSION.md):
 | Epoch-DEK `key_grant` cascade w/ `wrap_algorithm: v2` (PQC) + the RC1-1c CHECK migration | §10.5.3 D2/D3 | C |
 | `delivery_receipt:{stream_id}` ingest/read (reserved prefix) | §10.5.4 V3 | C |
 
-### 2.2 Out of scope (named, not silently dropped)
+### 2.2 Out of scope
 
 - **Container parsing** — substrate is format-blind (§1.4). `symphonia`/`mp4parse`/`webm-iterable` live at edge/consumer (#144 track-don't-adopt).
-- **Multi-peer swarm fetch** — CIRISPersist#145; consumes #142's `get_range`/`ChunkDag` primitives, separate cut.
-- **MoQ / QUIC live transport** — lives at CIRISEdge; substrate exposes bytes (`get_range` PyO3 + optional HTTP/3 206), edge does the wire. `quinn`/`h3`/`wtransport` are edge deps (#144).
-- **HTTP server surface** — persist has none today; the optional 206 HTTP tier (§4.1) is deferred behind the PyO3 path which cohabitation callers want first.
+- **Multi-peer swarm fetch** — CIRISPersist#145; consumes the ranged-read and `ChunkDag` primitives.
+- **MoQ / QUIC live transport** — lives at CIRISEdge; the substrate exposes bytes through PyO3, CIRISEdge does the wire. `quinn`/`h3`/`wtransport` are edge deps (#144).
+- **HTTP `206` range tier** — not implemented; ranged reads are served through PyO3 (§4.1).
 - **BLAKE3 / Bao-tree verified streaming** — refused (§3.1); substrate stays SHA-256.
-- **MLS-style O(log N) rekey tree** — CEG §10.5.3 marks it "1.x, additive" (rides the opaque key_grant payload); not this cut.
+- **MLS-style O(log N) rekey tree** — CEG §10.5.3 marks it "1.x, additive" (rides the opaque key_grant payload); not implemented.
 
 ---
 
-## 3. #144 adopt/roll decisions — RATIFIED
+## 3. Adopt/roll decisions (CIRISPersist#144)
 
-CIRISPersist#144's decision matrix is sound and is hereby ratified into the design of record (close #144 against this). The load-bearing calls:
+The load-bearing calls:
 
 ### 3.1 Strategic: SHA-256, not BLAKE3 (LOCKED)
 
@@ -74,11 +70,10 @@ CEG §10.1.1 fixes the substrate hash as SHA-256 — every `federation_key`, eve
 
 | Concern | Crate | Note |
 |---|---|---|
-| Range header parsing (if HTTP tier) | `axum-extra` `headers::Range` | only if/when §4.1 HTTP tier lands |
 | BLOB-substr reads | `rusqlite` incremental `Blob` I/O; PG `substring(bytea,…)` | both backends native partial reads |
 | Per-segment AEAD | `aes-gcm` (RustCrypto) | in stack via ciris-keyring |
 | Per-chunk nonce/key HKDF | `hkdf` (RustCrypto) | in stack |
-| Epoch-DEK hybrid wrap | `ciris-crypto` `hybrid_kex` + `ml_kem` (CIRISVerify#47) | **shipped**; this is the §10.5.3 `wrap_algorithm: v2` |
+| Epoch-DEK hybrid wrap | `ciris-crypto` `hybrid_kex` + `ml_kem` (CIRISVerify#47) | the §10.5.3 `wrap_algorithm: v2` |
 | `(stream_id, seq)` monotonicity | DB `UNIQUE` constraint | substrate primitive, not a lib |
 | Manifest compression (sidecar only) | `zstd` | in stack; manifests/playlists only — NEVER video bytes |
 | Per-stream RFC 6962 log | **in-tree** `SignedTreeHead`/`TransparencyStore` (CIRISVerify 2.3.0 transparency) | instantiate per `stream_id` |
@@ -94,29 +89,27 @@ CEG §10.1.1 fixes the substrate hash as SHA-256 — every `federation_key`, eve
 
 ### 3.4 Explicitly NOT adopting (with reasons, from #144)
 
-`tink-rs` (incomplete/unmaintained), `iroh-blobs` now (BLAKE3, §3.1), zstd seekable format (v0.1.0 since 2017), IPFS UnixFS wire (CID v1 + dag-pb commitment — defer until a real IPFS consumer), `actix-web` (stack is axum/tokio). Track-don't-adopt: `moq-rs` (when IETF MoQ → RFC; forward bet), `libp2p-bitswap` (#145 design ref), `iroh-blobs` (if federation ever rides iroh gossip).
+`tink-rs` (incomplete/unmaintained), `iroh-blobs` (BLAKE3, §3.1), zstd seekable format (v0.1.0 since 2017), IPFS UnixFS wire (CID v1 + dag-pb commitment — defer until a real IPFS consumer), `actix-web` (stack is axum/tokio). Track-don't-adopt: `moq-rs` (when IETF MoQ → RFC; forward bet), `libp2p-bitswap` (#145 design ref), `iroh-blobs` (if federation ever rides iroh gossip).
 
 ---
 
 ## 4. Substrate mapping — the three primitives
 
-### 4.1 `get_range` (Cut A — pure additive, no CEG change)
+### 4.1 `get_blob_range` — ranged read
 
 ```rust
-// Backend trait + Engine + PyO3
-async fn get_range(&self, content_sha256: &str, start: u64, end_inclusive: u64)
-    -> Result<Bytes, BlobError>;
+// BlobStore trait + Engine + PyO3
+fn get_blob_range(&self, sha256: &[u8; 32], range_start: u64, range_end_inclusive: u64)
+    -> impl Future<Output = Result<Option<BlobRange>, BlobError>> + Send;
 ```
 
 - **`BlobBody::Inline`** — server-side substring, no full-buffer load: SQLite `rusqlite` incremental `Blob` read at `(offset, len)`; Postgres `SELECT substring(bytes_inline FROM $start+1 FOR $len)`.
 - **`BlobBody::External(ExternalRef)`** — proxy `Range: bytes=start-end` to the upstream object store; honor `206`/`Content-Range`.
-- **`BlobBody::ChunkDag`** (Cut B) — walk the manifest prefix-sum, fetch covering chunk(s), slice at the boundaries.
+- **`BlobBody::ChunkDag`** — walk the manifest prefix-sum, fetch covering chunk(s), slice at the boundaries.
 - **Bounds** — reject `start > end`, `end ≥ total_size` clamped per RFC 9110 §14.4 semantics; typed `BlobError::RangeNotSatisfiable`.
-- **Surface (open question resolved, §8):** **PyO3 first** (cohabitation callers — lens-core, sovereign agent — want in-process bytes). An optional HTTP/3 `206` tier (`axum` + `axum-extra` Range) is deferred to a later cut behind the same `get_range` core; remote viewers ride edge's transport meanwhile.
+- **Surface:** **PyO3** (cohabitation callers — lens-core, sovereign agent — want in-process bytes). Remote viewers use CIRISEdge's transport. The decrypting range read for sealed content is `read_blob_range_as` (§8.1); `get_blob_range` serves stored bytes to relays.
 
-Cut A ships against today's `Inline | External` with zero CEG/schema change — immediate value (ranged reads for existing media) and the seam every later cut builds on.
-
-### 4.2 `BlobBody::ChunkDag` (Cut B)
+### 4.2 `BlobBody::ChunkDag`
 
 `federation_blobs.bytes_inline` stores the **manifest** (JCS-canonical JSON per CEG §0.9), `content_sha256` = SHA(manifest bytes):
 
@@ -128,17 +121,17 @@ Cut A ships against today's `Inline | External` with zero CEG/schema change — 
 - **CEG §10.1.1 satisfaction**: consumer verifies manifest SHA (= row `content_sha256`) before consumption, then each chunk's SHA on read. Full-SHA-before-consumption holds at both levels; no prefix short-circuit.
 - `put_blob_chunks(manifest, chunks…)` — atomic multi-row insert (manifest + N chunk rows in one txn).
 - Adds one `storage_kind`/`BlobBody` variant; the chunk relation rides CEG open-vocab `topical_relation:has_chunk` (no grammar change).
-- **Chunk size: 1 MiB** (§8 resolved) — IPFS UnixFS 2025 profile; below fMP4 2–6s segment sizes; 16-byte GCM tag overhead < 0.002%.
+- **Chunk size: 1 MiB** (§8) — IPFS UnixFS 2025 profile; below fMP4 2–6s segment sizes; 16-byte GCM tag overhead < 0.002%.
 
-#### 4.2.1 V061 migration (correction — Cut B is NOT pure-additive at the CHECK layer)
+#### 4.2.1 V061 migration — not pure-additive at the CHECK layer
 
-`federation_blobs.storage_kind` (V047) carries `CHECK (storage_kind IN ('inline','s3','external_url'))` **plus a cross-column CHECK** tying storage_kind → which body column is present (inline→`bytes_inline`, s3/external_url→`external_ref`). Admitting `'chunk_dag'` (manifest stored in `bytes_inline`) requires extending **both** CHECKs on **both** backends:
+`federation_blobs.storage_kind` (V047) carries `CHECK (storage_kind IN ('inline','s3','external_url'))` **plus a cross-column CHECK** tying storage_kind → which body column is present (inline→`bytes_inline`, s3/external_url→`external_ref`). Admitting `'chunk_dag'` (manifest stored in `bytes_inline`) extends **both** CHECKs on **both** backends:
 - **Postgres** — `DROP CONSTRAINT` + `ADD CONSTRAINT` for the storage_kind enum + the cross-column rule, adding the `(chunk_dag → bytes_inline present)` arm. Bounded.
-- **SQLite** — table-level CHECKs are baked into `CREATE TABLE` and cannot be `ALTER`ed, so this is the **12-step table-rebuild** (create `federation_blobs_new` with the extended CHECKs, copy rows, drop old, rename, recreate indexes/triggers + the holds_bytes linkage). The riskier half; the migration must preserve every column, index, and the access-tracking columns (V123).
+- **SQLite** — table-level CHECKs are baked into `CREATE TABLE` and cannot be `ALTER`ed, so this is the **12-step table rebuild** (create the new table with the extended CHECKs, copy rows, drop old, rename, recreate indexes/triggers and the holds_bytes linkage), preserving every column and index.
 
-This is the same class of "named, not silently additive" finding as the RC1-1c CHECK migration (§4.4) — Cut B's `storage_kind` CHECK extension is its smaller sibling. Migration number: V061 (next free after V060).
+It is the smaller sibling of the stream/epoch CHECK migration (§4.4).
 
-### 4.3 Live append + per-stream log (Cut C)
+### 4.3 Live append + per-stream log
 
 ```rust
 async fn put_blob_chunk(&self, stream_id: &str, seq: u64, body: Bytes, epoch: u64, …)
@@ -146,14 +139,14 @@ async fn put_blob_chunk(&self, stream_id: &str, seq: u64, body: Bytes, epoch: u6
 async fn seal_stream(&self, stream_id: &str) -> Result<SealedStream, StreamError>;
 ```
 
-- New table `federation_stream_chunks (stream_id TEXT, seq BIGINT, chunk_sha TEXT, epoch BIGINT, …, PRIMARY KEY (stream_id, seq))` — the `UNIQUE(stream_id, seq)` is the monotonicity guarantee. Each chunk also lands as a normal `federation_blobs` row.
-- **Per-stream transparency log (§10.5.1 V1)** — instantiate the in-tree `TransparencyStore`/`SignedTreeHead` with `log_id = stream_id`; chunks are leaves; the producer publishes a **producer-signed STH** (hybrid Ed25519 + ML-DSA-65, §10.3 `signing_bytes`) every **K=64 chunks OR T=2s, always at an epoch boundary + at `sealed_at`**. Witness cosign is OPTIONAL (best-effort = producer-signed only; accountable = §10.3.1 consistency proof, also gated on CIRISRegistry#34). **A live_stream MUST NOT append into the global provenance log** (§10.5.0) — separate per-stream instance.
+- Table `federation_stream_chunks (stream_id TEXT, seq BIGINT, chunk_sha TEXT, epoch BIGINT, …, PRIMARY KEY (stream_id, seq))` (V062) — the `UNIQUE(stream_id, seq)` is the monotonicity guarantee. Each chunk also lands as a normal `federation_blobs` row.
+- **Per-stream transparency log (§10.5.1 V1)** — a stream is its own RFC 6962 log (`log_id = stream:<id>`) whose leaves are the chunk hashes in `seq` order. The **producer** signs the STH (hybrid Ed25519 + ML-DSA-65, §10.3 `signing_bytes`; mint with `stream_sth::produce_stream_sth`, PyO3 `sign_stream_sth_json`) every **K=64 chunks OR T=2s, always at an epoch boundary and at `sealed_at`**. Persist does not sign stream STHs. `put_stream_sth` (V063) gates them in order: parse the stream id from `log_id`; load the first `tree_size` chunk hashes (fewer → refused); recompute the root with CIRISVerify's transparency store; refuse a mismatch; verify the producer's hybrid signature; insert — a `(stream_id, tree_size)` conflict with a different root is refused as equivocation, an identical re-put is idempotent. Witness cosignatures are stored as provided and not enforced (best-effort tier); the accountable tier (§10.3.1 consistency proof) waits on CIRISRegistry#34. **A live stream never appends into the global provenance log** (§10.5.0).
 - `seal_stream` builds the `ChunkDag` manifest from the index, computes its SHA, writes the final `federation_blobs` row + final STH with `last_flag` chunk.
 - **Subscribe-while-live** rides the existing CEG attestation-subscribe path; no new `attestation_type` (1+4 lockdown).
 
-### 4.4 The RC1-1c CHECK migration (the one non-additive piece)
+### 4.4 The stream/epoch `key_grant` CHECK migration (V064)
 
-CEG §10.5.3 is explicit: today's V054 cross-column CHECK requires `key_grant` rows be **content-addressed** (`media_content_sha256 IS NOT NULL`). The streaming epoch-key axis is **stream/epoch-addressed** (`(stream_id, epoch[, recipient])`, NULL `media_content_sha256`) → rejected by the current CHECK. The migration adds a **parallel CHECK arm**: `(content-addressed) OR (stream/epoch-addressed)` — a bounded constraint migration on both backends (PG `DROP/ADD CONSTRAINT`, SQLite trigger rewrite per V054/V056 discipline). This is the only place the cut is not pure-additive at the constraint layer; named here so no one claims otherwise.
+CEG §10.5.3: the V054 cross-column CHECK requires `key_grant` rows be **content-addressed** (`media_content_sha256 IS NOT NULL`). The streaming epoch-key axis is **stream/epoch-addressed** (`(stream_id, epoch[, recipient])`, NULL `media_content_sha256`) → rejected by that CHECK alone. V064 adds a **parallel CHECK arm**: `(content-addressed) OR (stream/epoch-addressed)` — a bounded constraint migration on both backends (PG `DROP/ADD CONSTRAINT`, SQLite trigger rewrite per V054/V056 discipline).
 
 ---
 
@@ -174,42 +167,40 @@ Key invariants:
 - **STREAM nonce safety** — within an epoch the 32-bit `counter_be` is strictly monotonic and MUST NOT wrap; substrate forces an epoch roll before `2³²−1` (operational cap `MAX_CHUNKS_PER_EPOCH = 2²⁴`). Across epochs the DEK changes, so a reset counter is a distinct `(key, nonce)` pair — cross-epoch reset is nonce-safe. `last_flag=0x01` on the final chunk gives truncation+append resistance.
 - **Epoch triggers** — **member removal ⇒ MANDATORY rotation** (forward-only unsubscribe); member addition ⇒ no rotation + Option-A catch-up bounded by `history_on_join`; time/bytes ⇒ optional hygiene. Forward-only, NO PCS (consistent with CEG 0.7 §11.7.1 Option A).
 - **Consumer MUST reject** a streaming epoch grant carrying `wrap_algorithm: v1`.
-- **Catch-up bound (P4)** — `min(operator depth cap, chunk-eviction horizon)`; an evicted-epoch request returns `ContentMiss` (fail-honest). Operators MUST ship the P4 cap *with* the cascade (else 10⁶ grants/rekey worst case).
+- **Catch-up bound (P4)** — `min(operator depth cap, chunk-eviction horizon)`; an evicted-epoch request returns `ContentMiss` (fail-honest). Operators MUST set the P4 cap with the cascade (otherwise the worst case is 10⁶ grants per rekey).
 
 No per-segment `key_grant` rows — HKDF derives per-chunk keys from one epoch DEK (§142 anti-recommendation; §10.5.3).
 
 ---
 
-## 6. Integration with the v4.0 cohort_scope machinery
+## 6. Integration with the cohort_scope machinery
 
-A stream is scoped content. A `live_stream` delivered to a community rides the **same v4.0 target-membership gate**: the stream's `cohort_scope`/`cohort_target_id` names the audience (a `community_key_id`), and the epoch-DEK `key_grant` cascade is the Policy-L cascade over **that community's roster** (§10.5.3) against the rotating epoch key. The read-side §4.3 predicate and write-side §4.6 AV-58 gate apply to stream chunks exactly as to traces — no new scope machinery, the streaming cut reuses v4.0's `CallerScope`/`CallerAdmission` + `cohort_scope_sql_predicate`. Member removal triggering epoch rotation (§5) is the cryptographic enforcement of the same forward-only-unsubscribe the v4.1 revocation substrate (#161) enforces at the membership-row layer.
-
-This is why streaming lands *after* v4.0: it composes on the cohort substrate rather than reinventing it.
+A stream is scoped content. A `live_stream` delivered to a community rides the **same target-membership gate**: the stream's `cohort_scope`/`cohort_target_id` names the audience (a `community_key_id`), and the epoch-DEK `key_grant` cascade is the Policy-L cascade over **that community's roster** (§10.5.3) against the rotating epoch key. The read-side §4.3 predicate and write-side §4.6 AV-58 gate apply to stream chunks exactly as to traces — no new scope machinery; streaming reuses `CallerScope`/`CallerAdmission` + `cohort_scope_sql_predicate` (`FSD/V4_0_DATA_ACCESS_SURFACE.md`). Member removal triggering epoch rotation (§5) is the cryptographic enforcement of the same forward-only-unsubscribe the revocation substrate (#161) enforces at the membership-row layer.
 
 ---
 
-## 7. Cut sequence
+## 7. Parts and migrations
 
-| Cut | Deliverable | CEG / gate | Non-additive? |
+| Part | Deliverable | CEG | Migration |
 |---|---|---|---|
-| **A** | `get_range` over `Inline`+`External` (PyO3) | none | no |
-| **B** | `BlobBody::ChunkDag` + manifest + `put_blob_chunks` + `get_range` over ChunkDag | §10.1.1 | **yes — V061 storage_kind CHECK migration** (correction, §4.2.1) |
-| **C** | `federation_stream_chunks` + `put_blob_chunk`/`seal_stream` + per-stream STH + STREAM-nonce AEAD + epoch-DEK v2 cascade + `delivery_receipt:{stream_id}` | §10.5.1–.4; gated on CEG 0.10 §10.5 ratified (it is, PWD) + CIRISRegistry#34 for accountable tier | **yes — RC1-1c CHECK migration (§4.4)** |
+| **A** | `get_blob_range` over `Inline` + `External` (PyO3) | none | none |
+| **B** | `BlobBody::ChunkDag` + manifest + `put_blob_chunks` + ranged reads over ChunkDag | §10.1.1 | V061 (`storage_kind` CHECK) |
+| **C** | `federation_stream_chunks` + `put_blob_chunk` / `seal_stream` + per-stream STH + STREAM-nonce AEAD + epoch-DEK v2 cascade + `delivery_receipt:{stream_id}` | §10.5.1–.4 | V062, V063, V064 |
 
-Cuts A and B are immediately shippable (pure additive, no upstream dependency). Cut C is the CEG-1.0-unblocking cut and carries the one CHECK migration + the epoch cascade; the **accountable** witness-cosign tier additionally waits on CIRISRegistry#34, but the **best-effort** tier (producer-signed STH only) ships with Cut C.
+The accountable witness-cosign tier additionally waits on CIRISRegistry#34; the best-effort tier (producer-signed STH only) is what runs.
 
 ---
 
-## 8. Open questions — resolved
+## 8. Decisions
 
-| #142 open question | Resolution |
+| Question | Decision |
 |---|---|
-| Chunk size | **1 MiB** (IPFS 2025 profile; below fMP4 segment sizes; tag overhead negligible). Per-content-class tuning deferred — operator knob, not a substrate constant. |
-| Live latency target | **CMAF/LL-HLS now, MoQ forward bet.** Substrate exposes bytes; transport choice lives at edge. `moq-rs` track-don't-adopt until IETF moq-transport → RFC. |
-| `get_range` surface | **PyO3 first** (cohabitation callers); HTTP/3 206 tier deferred behind the same core. |
-| IPFS interop | **Defer** until a real IPFS consumer appears (CID v1 + dag-pb is a non-trivial commitment). |
+| Chunk size | **1 MiB** (IPFS 2025 profile; below fMP4 segment sizes; tag overhead negligible). Per-content-class tuning would be an operator knob, not a substrate constant. |
+| Live latency target | **CMAF/LL-HLS; MoQ is the forward bet.** The substrate exposes bytes; transport choice lives at CIRISEdge. `moq-rs` is tracked, not adopted, until IETF moq-transport is an RFC. |
+| Ranged-read surface | **PyO3** (cohabitation callers). An HTTP `206` tier is not implemented. |
+| IPFS interop | **Not implemented**; worth doing only for a real IPFS consumer (CID v1 + dag-pb is a non-trivial commitment). |
 | Encryption at-rest seek | **Resolved by CEG §10.5.2** — per-segment AES-256-GCM + STREAM nonce; whole-object GCM refused. |
-| DEK wrap algorithm | **Resolved by CEG §10.5.3** — `wrap_algorithm: v2` hybrid PQC MANDATORY (changed from #142's v1). |
+| DEK wrap algorithm | **Set by CEG §10.5.3** — `wrap_algorithm: v2` hybrid PQC, mandatory. |
 
 ---
 
@@ -225,17 +216,17 @@ manifest is `ChunkManifest` **v2** — ciphertext shas, PLAINTEXT sizes,
 `chunk_tier` — sealed under the same DEK; the seal door checks the chunk ROWS'
 recorded tier; the decrypting range read is `read_blob_range_as` beside
 `read_blob_as`, while `get_blob_range` keeps serving stored bytes to relays;
-and `stream_chunks` is the live-stream handle (§4.3's "read before seal"
-question, answered). Cut B's v1 manifest is unchanged for plaintext DAGs.
+and `stream_chunks` is the live-stream handle (reads before seal). The v1
+manifest is unchanged for plaintext DAGs.
 
 ## 9. Cross-references
 
-- **CEG 0.10** `CIRISRegistry/FSD/CEG/10_endpoints.md` §10.5 (.0 framing, .1 per-stream STH V1, .2 STREAM nonce V2, .3 epoch cascade D2/D3 + PQC wrap, .4 delivery receipts V3); §7.9 reserved prefix; §0.9 JCS; §10.1.1 full-SHA MUST; §10.3 SignedTreeHead reuse.
-- **CIRISPersist#142** — the substrate proposal this re-grounds.
-- **CIRISPersist#144** — adopt/roll survey, ratified in §3.
-- **CIRISPersist#145** — multi-peer swarm fetch (consumes A/B primitives).
+- **CEG** `CIRISRegistry/FSD/CEG/10_endpoints.md` §10.5 (.0 framing, .1 per-stream STH V1, .2 STREAM nonce V2, .3 epoch cascade D2/D3 + PQC wrap, .4 delivery receipts V3); §7.9 reserved prefix; §0.9 JCS; §10.1.1 full-SHA MUST; §10.3 SignedTreeHead reuse.
+- **CIRISPersist#142** — the substrate proposal.
+- **CIRISPersist#144** — adopt/roll survey (§3).
+- **CIRISPersist#145** — multi-peer swarm fetch (consumes the A/B primitives).
 - **CIRISPersist#161** — revocation substrate (the membership-row layer the epoch rotation enforces cryptographically).
-- **CIRISVerify#47** — hybrid X25519+ML-KEM-768 KEX (shipped; the §10.5.3 `wrap_algorithm: v2`).
+- **CIRISVerify#47** — hybrid X25519+ML-KEM-768 KEX (the §10.5.3 `wrap_algorithm: v2`).
 - **CIRISRegistry#34** — STH consistency-proof enforcement (accountable-tier gate).
 - **MISSION.md** §1.4 (format-blind), §1.5 (parity), §1.6 (fail-honest), §3 (canonical bytes).
 - In-tree reuse: `ciris_verify_core::transparency` (`SignedTreeHead`/`TransparencyStore`), `ciris-crypto` (`hybrid_kex`/`ml_kem`/`aes_gcm`/`hkdf`), `federation_blobs`, V054 `key_grant` constraint.

@@ -1,24 +1,14 @@
 # FSD: Blob Encryption at Rest — CIRISPersist
 
-> **Renamed 2026-09-09** from `ENCRYPTED_AT_REST.md` / "Content Encryption
-> at Rest". The document now leads with **blob encryption at rest** — the
-> cohort-keyed DEK cascade that is actually being implemented (§10).
->
-> §3's boundary map for the other substrates (`trace_events`, `cirisgraph`,
-> `audit_log`, the agent runtime tables, …) is **retained unchanged** as the
-> forward plan; it is not superseded by the rename, and §9's sequencing
-> still governs it. The attestation question specifically is tracked as
-> **JC-10** and remains undecided.
-
-**Status:** Proposed (locked design — this document formalizes a settled
-exploration; it is the spec, not a re-exploration)
-**Author:** Eric Moore (CIRIS Team) with Claude Opus 4.7
-**Created:** 2026-05-22
-**Repo:** `~/CIRISPersist`
-**Risk:** Architectural, on-disk format. Multi-release, phased. The
-on-disk format change sits entirely behind the `Engine` API; post-2.9.0
-persist is the sole DB opener, so the change is **unilateral** — no
-downstream coordination, gated only on absorption completeness.
+**Status:** two parts. **Blob encryption at rest** — the cohort-keyed DEK
+cascade (§10), its guarantees (§11) and chunked content (§12) — is implemented.
+**Content encryption for the other substrates** (`trace_events`, `cirisgraph`,
+`audit_log`, the agent runtime tables, …: §1–§9) is a forward plan; §3 is its
+boundary map and §9 its sequencing. The attestation-envelope question is open
+as **JC-10**.
+**Risk:** on-disk format, behind the `Engine` API. Persist is the sole DB
+opener, so format changes are **unilateral** — no downstream coordination,
+gated only on absorption completeness.
 
 ---
 
@@ -26,8 +16,8 @@ downstream coordination, gated only on absorption completeness.
 
 Every CIRISPersist substrate stores, at rest, the *reasoning content* of
 CIRIS agents — the raw payloads of trace events, the attributes of
-memory-graph nodes, the context of audit entries. Today the at-rest
-confidentiality of that content is **delegated to deployment full-disk
+memory-graph nodes, the context of audit entries. Outside the blob plane, the
+at-rest confidentiality of that content is **delegated to deployment full-disk
 encryption** (`docs/THREAT_MODEL.md:738` — "software-backed deployments
 have no key isolation beyond OS keyring file permissions … mitigations
 are deployment-level (full-disk encryption …)"). That is the right
@@ -428,7 +418,7 @@ The boundary map does **not** silently decide these. Each is a genuine
 | **JC-5** | `trace_llm_calls` `base_url`, `model`, `service_name`, `handler_name` | `base_url` can be a private/internal LLM endpoint URL. User: plaintext operational labels, or encrypt `base_url` (and possibly `model`)? |
 | **JC-6** | `cirisgraph.nodes` GIN index | Encrypting `attributes` kills `nodes_attributes_gin`. User: (a) drop the GIN index and accept full-scan attribute reads (V013 says the real workload doesn't need it), or (b) commission a `cirisgraph` shredding migration analogous to V042-final. |
 | **JC-7** | `cirisgraph.edges.attributes`, `telemetry_metrics.labels`, `occurrence_registry.metadata`, `cirisnode` `witness_set` / `aggregate_evidence`, `federation_keys` `registration_envelope` / `*_envelope`, `federation_revocations.reason` | Free-form JSONB/text blobs on otherwise projection-only substrates. Each *leans* projection (structural/provenance, not reasoning content) but none is a closed type. User: blanket "free-form blobs on projection-only tables stay plaintext", or encrypt case-by-case? |
-| **JC-10** | `cirislens.federation_attestations.attestation_envelope`, **scoped by cohort** | **REOPENED 2026-09-09 at the operator's request.** Distinct from JC-7, which asks whether free-form blobs on projection-only tables stay plaintext as a *class*. This asks something JC-7 does not contemplate: should the attestation envelope be **encrypted under the cohort's DEK** for `family` / `community` / `affiliations` (and possibly `self`), leaving commons plaintext — i.e. the envelope joins the §2.2 content side, keyed by `cohort_scope` rather than by column. §8(4) currently exempts this substrate as "a transparency substrate by purpose"; that exemption is what is being reconsidered. **Measured cost, if adopted:** (i) the generated `dimension` column (sqlite V106/V114/V117, postgres V106/V122) cannot be derived from ciphertext, which also voids V137's seek index; (ii) 14 SQL sites read inside the envelope — 12 postgres, 2 sqlite — over `references_attestation_id` (×4), `dimension` (×3), `evidence_refs` (×1); (iii) the postgres GIN on `evidence_refs` dies, making citation lookup a scan-plus-decrypt; (iv) **the sharpest one — the retraction folds are `NOT EXISTS` subqueries matching `w.attestation_envelope->>'references_attestation_id'` against another row's id, 23 sites per backend. Encrypt the withdrawing row and the match yields NULL, `NOT EXISTS` becomes true, and a retracted row reads as LIVE. That fails toward disclosure, silently.** **Prerequisite either way:** hoist the join keys (`references_attestation_id`, `dimension`, `evidence_refs`) into maintained plaintext columns first, with a gate asserting no SQL reads inside the envelope; after that the scope choice is policy, not correctness. **Note on scoping to family/community/affiliations while excluding `self`:** that excludes the *cheapest* scope — `self` never federates (`suppresses_holds_bytes`) and is never peer-verified — and encrypts the three that do reach peers. It is defensible on volume (self is the hot internal path) but it is not the cheap subset, and a mixed-encryption table makes the negative predicates in (iv) worse, not better. **User decides:** (a) keep the §8(4) exemption — the directory is the transparency surface, per the same argument that made the audit log commit to ciphertext in §8(1); (b) adopt cohort-scoped envelope encryption, after the join-key hoist; (c) adopt it only for `self`/`family`, which is where the peer-verification cost is lowest. |
+| **JC-10** | `cirislens.federation_attestations.attestation_envelope`, **scoped by cohort** | **Open.** Distinct from JC-7, which asks whether free-form blobs on projection-only tables stay plaintext as a *class*. This asks something JC-7 does not contemplate: should the attestation envelope be **encrypted under the cohort's DEK** for `family` / `community` / `affiliations` (and possibly `self`), leaving commons plaintext — i.e. the envelope joins the §2.2 content side, keyed by `cohort_scope` rather than by column. §8(4) exempts this substrate as "a transparency substrate by purpose"; JC-10 reconsiders that exemption. **Measured cost, if adopted:** (i) the generated `dimension` column (sqlite V106/V114/V117, postgres V106/V122) cannot be derived from ciphertext, which also voids V137's seek index; (ii) 14 SQL sites read inside the envelope — 12 postgres, 2 sqlite — over `references_attestation_id` (×4), `dimension` (×3), `evidence_refs` (×1); (iii) the postgres GIN on `evidence_refs` dies, making citation lookup a scan-plus-decrypt; (iv) **the sharpest one — the retraction folds are `NOT EXISTS` subqueries matching `w.attestation_envelope->>'references_attestation_id'` against another row's id, 23 sites per backend. Encrypt the withdrawing row and the match yields NULL, `NOT EXISTS` becomes true, and a retracted row reads as LIVE. That fails toward disclosure, silently.** **Prerequisite either way:** hoist the join keys (`references_attestation_id`, `dimension`, `evidence_refs`) into maintained plaintext columns first, with a gate asserting no SQL reads inside the envelope; after that the scope choice is policy, not correctness. **Note on scoping to family/community/affiliations while excluding `self`:** that excludes the *cheapest* scope — `self` never federates beyond the self-collective (`is_structurally_invisible`) and is never peer-verified — and encrypts the three that do reach peers. It is defensible on volume (self is the hot internal path) but it is not the cheap subset, and a mixed-encryption table makes the negative predicates in (iv) worse, not better. **User decides:** (a) keep the §8(4) exemption — the directory is the transparency surface, per the same argument that made the audit log commit to ciphertext in §8(1); (b) adopt cohort-scoped envelope encryption, after the join-key hoist; (c) adopt it only for `self`/`family`, which is where the peer-verification cost is lowest. |
 | **JC-8** | `tickets.email` / `tickets.user_identifier` (V028) | The genuine conflict (§3.10): PII that is also a lookup key. **Options:** (a) plaintext (FDE-only protection for ticket PII); (b) encrypt the value, keep a separate `email_hash` plaintext column for lookup (a deterministic-hash sidecar — equality lookup works, no range/substring); (c) encrypt and accept that ticket lookup-by-email becomes a decrypt-and-scan. |
 | **JC-9** | `wa_cert` `oauth_external_id`, `oauth_links` (V034) | `password_hash` / `api_key_hash` are already non-reversible hashes (leave plaintext). `oauth_external_id` / `oauth_links` are identifying. User: encrypt the OAuth identity columns? |
 
@@ -613,7 +603,7 @@ because this phase makes them real.
 
 ## 6. Backend-agnostic guarantee
 
-This is non-negotiable (`MEMORY`: no PG-only declarations).
+This is non-negotiable: no postgres-only or sqlite-only behaviour.
 
 - **One mechanism.** Application-layer AES-256-GCM via
   `src/secrets/crypto.rs` → `ciris_crypto::aes_gcm`. Not SQLCipher
@@ -703,7 +693,7 @@ persist.
 The skeleton/content cleavage is real and most substrates fit it
 cleanly. The genuinely hard parts:
 
-1. **Audit-leaf canonical form — RESOLVED (2026-05-22): the chain and
+1. **Audit-leaf canonical form — RESOLVED: the chain and
    Merkle tree both commit to ciphertext (§3.4, §3.7).** The open
    question was whether the audit hash chain and Merkle tree commit to
    plaintext `canonical(payload)` or to the encrypted form. Resolved
@@ -722,7 +712,7 @@ cleanly. The genuinely hard parts:
    content key. Three orthogonal layers, cleanly (§3.4). Plaintext-
    commitment would additionally have been *redundant* — the actor
    signature already gives a key-holder content integrity — and a
-   marginal known-plaintext oracle. No longer open.
+   marginal known-plaintext oracle.
 
 2. **`trace_llm_calls` has no per-row signature (§3.2).** Its integrity
    rides on the parent `trace_events` row. Encrypting `prompt` /
@@ -740,11 +730,10 @@ cleanly. The genuinely hard parts:
 4. **Substrates that do not fit the cleavage** — stated plainly rather
    than forced: `telemetry_metrics` (§3.5) has *no content column* and
    no signature — exempt; the federation directory (§3.6) is a
-   *transparency substrate* by purpose — projection-only, exempt **(this
-   exemption is REOPENED as JC-10, 2026-09-09: the operator has asked
-   whether the attestation envelope should be encrypted under the cohort
-   DEK for the encrypted cohorts. The exemption stands until JC-10 is
-   decided — it is not silently overridden by the blob work)**; the
+   *transparency substrate* by purpose — projection-only, exempt **(JC-10
+   asks whether the attestation envelope should be encrypted under the
+   cohort DEK for the encrypted cohorts; the exemption stands until JC-10 is
+   decided, and the blob work does not override it)**; the
    coordination primitives (§3.11) have no content — exempt;
    `credits_ledger` / `expertise_ledger` (§3.9) are pure derived
    projection — exempt. "Exempt" is an honest classification, not a gap:
@@ -755,61 +744,25 @@ cleanly. The genuinely hard parts:
    No option is free; the user picks among plaintext / hash-sidecar /
    decrypt-and-scan.
 
-7. **The §4.3 master-key root was DECLARED and never IMPLEMENTED —
-   found 2026-09-09, unresolved.** Corrected from a first reading that
-   called this a deliberate second root; the truth is less deliberate and
-   more concerning.
-
-   `at_rest_cascade.rs` documents the §4.3 design exactly — *"the persist
-   content master key (`content_master_key`) … Hardware-rooted HKDF over
-   the secrets-store sealed seed under a distinct context, with a
-   software fallback honest about being software"* — and defines the
-   constant §4.3 calls for:
-
-   ```rust
-   pub const CONTENT_MASTER_CONTEXT: &str = "content-at-rest-master-v1";
-   ```
-
-   **Neither is wired.** `content_master_key` does not exist: the module
-   header links to it and no such function is defined anywhere in the
-   tree. `CONTENT_MASTER_CONTEXT` has **zero call sites** — a "stable
-   wire constant" nothing derives from.
-
-   What runs instead is `load_or_init_content_master()`, the backend
-   table path, which generates a random software key into
-   `federation_content_master` with the descriptor *"software
-   content-at-rest master (no hardware seed wired)"*. So the software
-   fallback is not a fallback — it is the only path, reached by default
-   rather than by decision, while the constant and the doc assert
-   otherwise. A reader of this module would conclude the hardware root is
-   in place.
-
-   Consequences, all of which compound with corpus size:
+7. **The content master and its rotation surface.** The §4.3 root is
+   `content_master_key` — HKDF over the secrets-store sealed seed under
+   `CONTENT_MASTER_CONTEXT = "content-at-rest-master-v1"`, with a software
+   fallback honest about being software (`load_or_init_content_master`,
+   recorded in `federation_content_master.key_kind`) — §10.2. Open:
    - **No rotation surface on the blob key material.** §4.4 specifies
      `encryption_key_ref` FK'ing into a content-key-meta table mirroring
      `master_key_meta` "so master-key rotation has one surface." Secrets
      rows carry that column; `federation_community_dek`,
      `federation_community_dek_member_grants` and
      `federation_blob_key_grants` carry no equivalent, and there is no
-     content-key-meta table. There is also no content-master rotation
-     code anywhere in the tree.
+     content-key-meta table or content-master rotation code.
    - **`federation_community_dek.wrap_algorithm` admits exactly one
-     value**, `aes256_gcm_content_master`, so every community DEK wrap
-     hangs off that single software root. Losing or rotating it leaves
-     the per-member hybrid wraps
-     (`federation_community_dek_member_grants`) as the only recovery
-     path.
-   - Each blob sealed before this is reconciled is a blob that must be
-     re-wrapped afterwards. The fix is O(1) now and O(corpus) later.
-
-   **Decision needed before blob storage extends to more cohorts:**
-   (a) adopt the §4.3 root — derive the content master from the secrets
-   master under a `content-at-rest-master-v1` HKDF context, migrating the
-   existing single row; or (b) amend §4.3 to sanction a separate
-   federation content root, and say why. Either way §4.4's rotation
-   surface (`encryption_key_ref` + content-key-meta) should land *before*
-   the corpus grows, because it is a schema change over sealed rows once
-   it does.
+     value**, `aes256_gcm_content_master`, so every community DEK
+     self-retention wrap hangs off the content master. Losing or rotating
+     it leaves the per-member hybrid wraps
+     (`federation_community_dek_member_grants`) as the only recovery path.
+   - The rotation surface is a schema change over sealed rows, so it grows
+     more expensive with the corpus.
 
 8. **The GIN index on `cirisgraph.nodes.attributes` (§3.3, JC-6)** is a
    second, smaller V042 — encrypting `attributes` kills predicate
@@ -882,11 +835,11 @@ reconciliation surfaces divergence as a typed error) and belongs in the
 
 ---
 
-## 10. Blob encryption at rest — the cohort-keyed DEK cascade (LOCKED 2026-09-09)
+## 10. Blob encryption at rest — the cohort-keyed DEK cascade
 
-This section is the **committed design** for blob encryption across all
-four encrypted cohorts. It supersedes nothing in §3 (the other substrates'
-boundary map stands); it makes the blob half implementable.
+This section is the design for blob encryption across all four encrypted
+cohorts, implemented as §11 and §12 specify. §3's boundary map for the other
+substrates is separate.
 
 ### 10.1 Scope — four cohorts, three tiers, one cascade
 
@@ -902,39 +855,34 @@ cohorts are encrypted:
 
 `species` / `biosphere` / `federation` are `Plaintext` — commons, and the
 correct answer, not a gap. The **CC 4.4.3.2.1 infrastructure opt-out**
-stands unchanged: an *authorized* `cohort_subkind: infrastructure`
+holds: an *authorized* `cohort_subkind: infrastructure`
 community (own key is the `substrate_persist` authority) takes Commons
 plaintext, no DEK. A self-labeled one that is *not* authorized gets the
 full cascade — an unauthorized label can never force plaintext.
 
-### 10.2 The root — `content_master_key` MUST be implemented before minting
+### 10.2 The root — `content_master_key`
 
 §4.3 specifies **no new master-key root**: derive from the secrets sealed
-seed under a distinct HKDF context. `at_rest_cascade.rs` already declares
-the constant —
+seed under a distinct HKDF context —
 
 ```rust
 pub const CONTENT_MASTER_CONTEXT: &str = "content-at-rest-master-v1";
 ```
 
-— and documents `content_master_key` as *"Hardware-rooted HKDF over the
-secrets-store sealed seed under a distinct context, with a software
-fallback honest about being software."* **Neither is wired** (§8(7)):
-`content_master_key` does not exist, the constant has zero call sites, and
-`load_or_init_content_master()` generates a random software key instead.
+— `content_master_key` is *"Hardware-rooted HKDF over the secrets-store sealed
+seed under a distinct context, with a software fallback honest about being
+software."* It is the sole supplier to `wrap_dek_for_persist`.
+`load_or_init_content_master` is the *software fallback path only*, and is
+honest about it (`SecretsError::HardwareKeyUnavailable` discipline, MISSION
+§1.6). The persisted `federation_content_master` row records which root this
+node uses (`key_kind`), and the row wins thereafter (§11.7).
 
-**Locked:** implement `content_master_key` as specified and make it the
-sole supplier to `wrap_dek_for_persist`. `load_or_init_content_master`
-becomes the *software fallback path only*, and must be honest about it
-(`SecretsError::HardwareKeyUnavailable` discipline, MISSION §1.6).
-
-**This lands FIRST.** There are no communities and no sealed blobs today,
-so there is nothing to migrate. Every blob sealed before this is one that
-must be re-wrapped after: O(1) now, O(corpus) later.
+The root precedes every mint: a blob sealed before the root exists would have
+to be re-wrapped after, O(corpus).
 
 ### 10.3 HKDF derives; it cannot deliver
 
-A recurring question, settled here. **HKDF covers all four cohorts for
+**HKDF covers all four cohorts for
 derivation and none of them for delivery**, because delivery targets a
 party holding a *different* secret:
 
@@ -952,9 +900,9 @@ so even self content is delivered, not merely derived.
 v1 wraps remain unrepresentable (V087 CHECK) — CC 4.4.3.4.1 / CC 5.2 HNDL.
 
 
-#### 10.3.1 Delivery is SETTLED — one pipeline, four cohorts
+#### 10.3.1 Delivery — one pipeline, four cohorts
 
-Delivery is not an open question. Every cohort resolves to the **same
+Every cohort resolves to the **same
 terminal**, and only the first step differs:
 
 ```
@@ -990,13 +938,11 @@ unrepresentable at the schema level (CC 4.4.3.4.1 / CC 5.2, HNDL). A
 recipient we cannot wrap to is a recipient who does not receive, and that
 is recorded rather than silently tolerated.
 
-**What this settles for §10.** The delivery half needs no new design and no
-new primitive for any cohort — including `self`, whose multiple
-occurrences make it a delivery problem like the others rather than a
-derivation-only one. The work in §10.10 is therefore confined to the
-ROOT (§10.2), the KEYSET STATE (§10.5), and the SWEEP (§10.7). Minting a
-community DEK reuses this pipeline unchanged, per epoch, over
-`resolve_community_members` at the bumped epoch.
+**Consequence.** The delivery half needs no separate primitive for any cohort —
+including `self`, whose multiple occurrences make it a delivery problem like
+the others rather than a derivation-only one. Minting a community DEK reuses
+this pipeline per epoch, over `resolve_community_members` at the bumped
+epoch.
 
 ### 10.4 The keyset model — Tink semantics, not the Tink crate
 
@@ -1004,7 +950,7 @@ We adopt [Tink's keyset design](https://developers.google.com/tink/design/keyset
 a set of keys, exactly one **primary**, old keys retained **decrypt-only**,
 and a key identifier carried with the ciphertext so decryption never scans.
 
-**We do not take the dependency.** `project-oak/tink-rust` is explicitly
+**Persist does not take the dependency.** `project-oak/tink-rust` is explicitly
 *"not an official port … not supported by Google's cryptography teams"*,
 is *"under construction"* with an API subject to change without warning,
 and implements no cryptography itself — it is an API layer over the same
@@ -1013,39 +959,36 @@ insert an unofficial, self-disclaimed layer between us and primitives we
 already use correctly, in exchange for a table shape. MISSION §1.4 stands:
 all crypto routes through `ciris_crypto`.
 
-Our schema is already three-quarters of a keyset:
+The schema is a keyset:
 
 | Tink | ours |
 |---|---|
 | keyset | `federation_community_dek (community_key_id, epoch)` |
 | primary pointer | `federation_community_dek_epoch.epoch` |
 | key id in ciphertext | `federation_scope_blobs.group_dek_epoch` (inline) / `federation_community_blob_epoch` (side table) |
-| **per-key state** | **NEW — §10.5** |
+| **per-key state** | `key_state` — §10.5 |
 
 ### 10.5 Key state — and the AV-70 amendment
 
-**AV-70 today ratifies "forward-only (old-epoch blobs keep grants)"** —
+**AV-70's base is "forward-only (old-epoch blobs keep grants)"** —
 Option-A's *"once shared, always shared."* A removed member keeps read
 access to pre-rotation blobs they were already a grantee on. That is the
 same posture MLS and Tink both take: forward secrecy protects *future*
 content, not past.
 
-**This design moves past it**, at the operator's direction. Adding a
-destroy path makes the property "shared until the epoch is destroyed",
-which is **stronger than either MLS or Tink offers** and therefore ours to
-own. AV-70 is amended accordingly, and the cost is stated below rather
-than discovered later.
+**AV-70 as amended goes further.** A destroy path makes the property "shared
+until the epoch is destroyed", which is **stronger than either MLS or Tink
+offers** and therefore persist's to own. The cost is stated below.
 
-Every DEK row gains a state:
+Every DEK row carries a state:
 
 | state | new seals | decrypts | meaning |
 |---|---|---|---|
 | `enabled` | yes | yes | the primary |
-| `disabled` | no | yes | rotated past; AV-70's original behaviour, now one state among three |
+| `disabled` | no | yes | rotated past; AV-70's base behaviour |
 | `destroyed` | no | **no** | key material gone |
 
-**Key state is per MINTER (v44.3.0, #848 — `BLOB_REPLICATION.md` §11,
-§16).** The keyset above is keyed `(community_key_id, minter_key_id, epoch)`,
+**Key state is per MINTER (#848 — `BLOB_REPLICATION.md` §11, §16).** The keyset above is keyed `(community_key_id, minter_key_id, epoch)`,
 not `(community, epoch)`: an epoch belongs to the occurrence whose cascade
 minted it, so two members writing at the same epoch number are two keysets,
 not a fork, and each minter's `enabled` / `disabled` / `destroyed` is its own.
@@ -1077,7 +1020,7 @@ plane's `tombstone_ceiling` regardless of scope**, precisely so a
 retraction can never be out-run by the record it retracts — *anywhere a
 copy could have travelled*. Eviction-on-rotate rides that plane.
 
-**The KEY reaches every holder the same way (v44.3.0, #848).** The wraps
+**The KEY reaches every holder the same way (#848).** The wraps
 travel on the attestation plane as `EnvelopeKind::KeyGrant` sets — one per
 `(community, minter, epoch)` for the community tiers, one per blob for
 self / family — projected `Cohort` / `SelfOwn` by the `KeyGrant` plane and
@@ -1099,8 +1042,7 @@ Two triggers, deliberately different in kind:
 1. **Revocation-driven (immediate, synchronous).**
    `put_community_membership_revocation` already bumps the epoch
    transactionally, and future-dated `effective_at` is rejected at write
-   time (SecReview F4). Exposure window for *new* content is zero. This
-   stays exactly as-is.
+   time (SecReview F4). Exposure window for *new* content is zero.
 
 2. **Sweep-driven (background, asynchronous).** Re-seal and eviction are
    O(objects at the epoch) and must **never run inline with a membership
@@ -1127,23 +1069,20 @@ A blob is sealed **before** it is fountained. Fountaining plaintext and
 encrypting afterwards leaves plaintext shards on peers that no subsequent
 rotation can recall, and the tombstone plane cannot un-see them.
 
-**Reach, stated honestly (2026-09-10, from the Edge adoption thread #826).**
-Even for sealed shards, "rotation is not recall" reaches only as far as the
-shard plane's tombstone ceiling — and a ceiling wide enough helps only if
-shards stay under it. Edge's shard plane today has a serve gate and no
-STORE gate: the fountain converger pushes shards toward `target_holders`
-without asking who may hold, so a shard can land on a node outside the
-cohort, and a `Cohort`-ceiling tombstone will not reach it. The store gate
-itself is built — CIRISEdge#581 shipped `admit_blob_store` in edge v23.1.0
-(trust, audience, operator consent; `StoreAndAnnounce` / `StoreLocalOnly` /
-`Refuse`) — and persist's receiver side is `adopt_sealed_blob`
-(`FSD/BLOB_REPLICATION.md` §6, v44.2.0), which stores what the gate admits
-and refuses anything this node is not party to (I48). What is still open is
-ARMING the gate over the converger's push path, which is CIRISEdge#601; until
-that lands the recall this section relies on is an INTENDED reach, not an
-enforced one, and Edge will return with a bound it can defend to be pinned
-here as the shard plane's number. CIRISEdge#582 is the mirror — what the
-converger deletes on an unverified holder count.
+**Reach, stated honestly (#826).** Even for sealed shards, "rotation is not
+recall" reaches only as far as the shard plane's tombstone ceiling — and a
+ceiling wide enough helps only if shards stay under it. If a fountain
+converger pushed shards toward `target_holders` without asking who may hold,
+a shard could land on a node outside the cohort, and a `Cohort`-ceiling
+tombstone would not reach it. The store gate is Edge's `admit_blob_store`
+(CIRISEdge#581: trust, audience, operator consent; `StoreAndAnnounce` /
+`StoreLocalOnly` / `Refuse`), and persist's receiver side is
+`adopt_sealed_blob` (`FSD/BLOB_REPLICATION.md` §6), which stores what the gate
+admits and refuses anything this node is not party to (I48). Arming the gate
+over the converger's push path is CIRISEdge#601; until Edge pins a bound it
+can defend as the shard plane's number, the recall this section relies on is
+an INTENDED reach on the converger path, not an enforced one. CIRISEdge#582 is
+the mirror — what the converger deletes on an unverified holder count.
 
 This is a **gate**, not a convention: the fountain path must refuse a
 plaintext body whose `cohort_scope` resolves to an encrypted tier.
@@ -1151,50 +1090,39 @@ plaintext body whose `cohort_scope` resolves to an encrypted tier.
 ### 10.9 Schema deltas
 
 1. `key_state TEXT NOT NULL DEFAULT 'enabled' CHECK (key_state IN ('enabled','disabled','destroyed'))` on `federation_community_dek`.
-2. `CREATE INDEX … ON federation_community_blob_epoch (community_key_id, epoch)` — the reverse lookup the DESTROY precondition and the sweep both need. Today the PK is `at_rest_sha256` alone, so enumerating an epoch's objects full-scans. Self/family already has the analogous seek (`federation_blob_key_grants_by_recipient`, `(cohort_scope, recipient_key_id)`); this closes the asymmetry.
+2. `CREATE INDEX … ON federation_community_blob_epoch (community_key_id, epoch)` — the reverse lookup the DESTROY precondition and the sweep both need (the PK is `at_rest_sha256` alone, so without it enumerating an epoch's objects full-scans). Self/family already has the analogous seek (`federation_blob_key_grants_by_recipient`, `(cohort_scope, recipient_key_id)`); this closes the asymmetry.
 3. `encryption_key_ref` + a content-key-meta table mirroring `master_key_meta` (§4.4), so master-key rotation has one surface. Secrets rows carry this; blob key material does not.
 4. `retain_past_epochs` on the community DEK epoch record.
 
-### 10.10 Implementation order
+Deltas 1, 2 and 4 are V138 (and V145 re-keys them per minter); delta 3 is
+not built for blobs.
 
-Each step stands alone and is separately witnessed.
+### 10.10 Build order
 
-1. **`content_master_key`** (§10.2) — the real root. Nothing else is safe to mint on.
-2. **Schema deltas** (§10.9) — cheap now, a migration over sealed rows later.
-3. **Community DEK mint/rotate** on the real root, with key state.
-4. **The encrypt-then-fountain gate** (§10.8).
-5. **The background sweep** (§10.6/§10.7) — re-seal, evict, then destroy.
-
-Steps 1–2 are prerequisites in the strong sense: they are O(1) today and
-O(corpus) once content exists.
-
-**Delivery is absent from this list on purpose** (§10.3.1). The
-cohort → occurrences → `encryption_pubkeys` → hybrid-wrap pipeline is
-built, wired and identical for all four cohorts, and persist performs no
-key exchange — it wraps to signature-bound material admission has already
-validated. Nothing in §10 requires a new delivery primitive; minting a
-community DEK reuses that pipeline per epoch.
+Each step stands alone and is separately witnessed: the root (§10.2); the
+schema deltas (§10.9); community DEK mint/rotate on the real root, with key
+state; the encrypt-then-fountain gate (§10.8); the background sweep
+(§10.6/§10.7) — re-seal, evict, then destroy. The root and the schema precede
+any sealed content because they are O(1) before it and O(corpus) after.
+Delivery (§10.3.1) needs no step of its own: minting a community DEK reuses
+the pipeline per epoch.
 
 ---
 
-## 11. The shape that §10 should have had — REBUILT 2026-09-09 after three reviews
+## 11. The guarantees, by construction
 
-§10 locked the *design*. The first implementation of it (`fd43e74`, PR #827) was
-reviewed three ways — a local code review (15 findings), Codex (8), and a cloud
-ultrareview (4) — and ~17 verified issues clustered into ten root causes. None
-of them was a typo. They were the same mistake in ten places: **each guarantee
-was implemented as a check at one site, and nothing made the check the only
-way through.** A gate on a door nobody calls; authorization on two of three
-branches; "sealed" tested by an 8-byte prefix; "destroyed" as a text column;
-a precondition the sweep satisfied by zeroing the thing it then read.
-
-This section states the shape those guarantees need in order to be true **by
-construction**, so that a test can falsify them through the surface a consumer
-holds. §10's decisions stand; §11 is how they are made unbypassable.
+Each guarantee of §10 must hold **by construction**: a check at one site is
+not a guarantee unless nothing can go around it. A gate on a door nobody
+calls, authorization on two of three branches, "sealed" tested by an 8-byte
+prefix, "destroyed" as a text column, a precondition satisfied by zeroing the
+thing it then reads — each is a guarantee established at one site and not
+carried to the next. This section states the shape that makes each guarantee
+true by construction, so that a test can falsify it through the surface a
+consumer holds.
 
 ### 11.1 The blob row is the authority on its own tier
 
-`federation_blobs` gains two columns (V139, both dialects, each CHECKed
+`federation_blobs` carries two columns (V139, both dialects, each CHECKed
 against its closed set): `cohort_scope` — the cohort the write named, kept as
 provenance — and **`crypto_tier`** (`plaintext` / `invisible_encrypted` /
 `community_dek`) — **the tier the write door RESOLVED**, which is what reads
@@ -1202,38 +1130,34 @@ dispatch on. Both are written by the door in §11.2; only `crypto_tier` is read
 by the door in §11.3. **Nothing sniffs bytes to decide a tier, and nothing
 re-derives a tier from a label.**
 
-Two columns because they are two facts. The first rebuild stored only the
-scope and had reads recompute the tier from it with `crypto_tier(scope, None)`
-— the exact call §11.2(2) says the write door must not make, because it drops
-the directory axis. So an authorized infrastructure community's write resolved
-`Plaintext`, was stored under the literal scope `community`, and every read
-then classified that same row `CommunityDek`, looked for a binding a plaintext
-row correctly does not have, and failed. The write-time resolution was
-discarded on the way to disk. Recording the resolved tier is what "the row is
-the authority" has to mean; recording the input to the resolution is not.
+Two columns because they are two facts. Recomputing the tier from the scope
+with `crypto_tier(scope, None)` — the call §11.2(2) says the write door must
+not make, because it drops the directory axis — would classify an authorized
+infrastructure community's `Plaintext` write, stored under the literal scope
+`community`, as `CommunityDek` on read, look for a binding a plaintext row
+correctly does not have, and fail. Recording the resolved tier is what "the
+row is the authority" has to mean; recording the input to the resolution is
+not.
 
-This is the single change that removes two root causes at once. The first
-implementation had reads inspecting the body for the envelope magic to decide
-whether a blob was sealed — so a commons payload that happened to begin with
-`CRBLOB\x01\x00` was routed down the encrypted path, and a plaintext body in a
-private cohort was returned as public. When the row says what it is, the
-question "is this sealed?" becomes "does this row's tier require sealing, and
-does its body parse as an envelope?" — a structural check, not a guess.
+Sniffing the body for the envelope magic to decide whether a blob is sealed
+would route a commons payload that happens to begin with `CRBLOB\x01\x00`
+down the encrypted path, and return a plaintext body in a private cohort as
+public. When the row says what it is, the question "is this sealed?" becomes
+"does this row's tier require sealing, and does its body parse as an
+envelope?" — a structural check, not a guess.
 
-**Backfill — corrected.** The first rebuild wrote "blob storage had not
-shipped, so there is no encrypted legacy" and defaulted every pre-V139 row to
-commons. That premise was false: `Engine::put_blob_encrypted_self_family`
-shipped in v42, and the community cascade has bound blobs to epochs since V087.
-Under that default, every ciphertext row an upgraded node already held would
-have read back through §11.3's plaintext arm — grant check skipped, envelope
-bytes returned to any viewer. A migration default is a security decision.
+**Backfill.** Rows written before V139 include self/family ciphertext and
+community blobs bound to epochs (since V087). Defaulting them to commons would
+read every ciphertext row back through §11.3's plaintext arm — grant check
+skipped, envelope bytes returned to any viewer. A migration default is a
+security decision.
 
 V139 classifies each existing row from the row's OWN evidence, in this order:
 a row with a `federation_community_blob_epoch` binding is `community_dek` /
 `community`; a row with a `federation_blob_key_grants` row is
 `invisible_encrypted` under that grant's recorded `cohort_scope`; what remains
 is commons. It also deletes bindings and grants whose blob row no longer exists
-(earlier eviction paths deleted the blob and left them — §11.5). I16 seeds
+(left by eviction paths that deleted only the blob — §11.5). I16 seeds
 rows of each kind through V138, runs V139, and reads them back.
 
 ### 11.2 One write door, and the storage floor is not a door
@@ -1247,39 +1171,36 @@ storage method). It:
 2. **resolves the tier from the directory, never from the caller.** For
    `community` / `affiliations` it looks the community up and applies
    `is_authorized_infrastructure_community` — CC 4.4.3.2.1's carve-out is a
-   property of the community record and its authority, which is exactly why
-   the first implementation's `crypto_tier(scope, None)` was wrong: it dropped
-   the one axis a caller must not be allowed to assert;
-3. dispatches: **Plaintext** → store + announce `holds_bytes`;
-   **InvisibleEncrypted** → the self/family cascade (fresh DEK, per-occurrence
-   wraps, no `holds_bytes`); **CommunityDek** → the community cascade (epoch
-   DEK, per-member wraps) **and** announce `holds_bytes`, because community
-   content federates with cleartext provenance and the cascade never emitted
-   the announcement it documented as the caller's job;
+   property of the community record and its authority, which is why
+   `crypto_tier(scope, None)` is never called here: it drops the one axis a
+   caller must not be allowed to assert;
+3. dispatches: **Plaintext** → store + announce the holding claim at
+   `federation`; **InvisibleEncrypted** → the self/family cascade (fresh DEK,
+   per-occurrence wraps; the holding claim stays in the cohort);
+   **CommunityDek** → the community cascade (epoch DEK, per-member wraps)
+   **and** announce the holding claim within the roster, because community
+   content federates with cleartext provenance;
 4. records `cohort_scope` **and the resolved `crypto_tier`** on the row;
 5. **screens the PLAINTEXT with the perceptual-hash matcher, exactly once,
-   before anything is sealed.** The first rebuild reached the matcher only
-   through the announce step, which for a community write receives the
-   randomized ciphertext envelope — a matcher configured to refuse known-bad
-   images was handed bytes it could never match, after the cascade had already
-   persisted them — and the self/family cascade never reached it at all. The
-   screening is one shared function; the encrypted tiers call it at this door,
+   before anything is sealed.** Screening at the announce step would hand the
+   matcher the randomized ciphertext envelope of a community write — bytes a
+   matcher configured to refuse known-bad images can never match, after the
+   cascade has persisted them. The screening is one shared function; the encrypted tiers call it at this door,
    and the commons tier is screened by the floor it lands on, so every path is
    screened once and no path twice;
 6. **derives the attesting key id from the signer it was given**, by the same
    recipe as `Engine::local_derived_key_id` (#275: `derive_key_id(alias,
    Ed25519 pubkey)`, refusing a non-Ed25519 signer). The door takes no key-id
-   argument. The first rebuild took one, and the Python binding passed the
-   scrub alias it holds — a `holds_bytes` row that either FK-fails or names a
-   key the sweep does not search under, so the announcement could never be
-   retracted (§11.5). A parameter that has exactly one correct value is not a
-   parameter.
+   argument: a caller-supplied one (the scrub alias a Python binding holds)
+   would yield a holding claim that FK-fails or names a key the sweep does not
+   search under, so the announcement could never be retracted (§11.5). A
+   parameter that has exactly one correct value is not a parameter.
 7. **takes caller-supplied associated data and binds it into the seal, never
    into the row** (#831, from #830). `aad: Option<&[u8]>` (Python `aad_b64`)
    is folded into the AES-GCM tag through `ciris_crypto::aes_gcm::encrypt_aad`
    at both encrypted tiers — the self/family cascade and the community
    cascade's `seal_store_bind_at` — and is **not stored**: not on the row, not
-   in the `AtRestEnvelope` (whose on-disk layout is unchanged), not in any
+   in the `AtRestEnvelope` (whose on-disk layout carries no AAD), not in any
    grant. The reader supplies it again at the read door, so what it binds is
    whatever the caller holds elsewhere — for a chat message, the referencing
    row's author, signed instant and epoch. Under a per-epoch community DEK a
@@ -1291,11 +1212,11 @@ storage method). It:
    — commons, or the authorized-infrastructure carve-out — is refused
    (`InvalidArgument`): there is no seal to bind it to, and dropping it
    silently would leave the caller believing in a binding that does not
-   exist. Transfers are unchanged: the ciphertext ships verbatim, and a peer
+   exist. Transfers ship the ciphertext verbatim, and a peer
    that holds the referencing row also holds what it needs to open it.
 
-The pre-existing commons doors (`put_blob_signing`, `put_blob_json`) remain and
-are **commons-only by construction**: they record `federation`. There is no
+The commons doors (`put_blob_signing`, `put_blob_json`) are **commons-only by
+construction**: they record `federation`. There is no
 consumer-reachable path that stores bytes at an encrypted cohort without
 sealing them, because the only function that accepts an encrypted cohort is
 the one that seals.
@@ -1309,8 +1230,8 @@ private cohort; a from-disk gate (I14) reds on any other production caller.
 
 **Out-of-crate, the floor is unconstructible.** `BlobStorage` is a `pub` trait
 and CIRISServer consumes this crate from Rust, so every `pub` method on it is a
-door for a Rust consumer; the first rebuild's I14 read the in-crate text and
-called the floor sealed. Each floor method now requires a `StorageFloor`
+door for a Rust consumer, and an in-crate text gate cannot seal it. Each floor
+method requires a `StorageFloor`
 token — a type with a private field and a `pub(crate)` constructor. An
 external caller cannot name one, so `put_blob_with_scope(…, "self", plaintext)`
 from outside the crate is a compile error, not a policy. I22 is a
@@ -1343,28 +1264,26 @@ agent holds. Its order is fixed and the order **is** the guarantee:
    try to distinguish them. `Some(aad)` against a plaintext row is refused as
    at the write door, for the same reason: nothing bound it.
 
-The first implementation authorized inside two of three branches and let the
-third return bytes to anyone. Authorization that lives inside a branch is
-authorization the next branch forgets. Here it lives above the dispatch, so
-adding a fourth tier cannot skip it.
+Authorization that lives inside a branch is authorization the next branch
+forgets. Here it lives above the dispatch, so adding a fourth tier cannot skip
+it.
 
-A destroyed-epoch refusal is reachable only **after** step 2 passes. The first
-implementation checked destruction first and named the community and epoch in
-the error, disclosing a blob's binding to a non-grantee.
+A destroyed-epoch refusal is reachable only **after** step 2 passes: checked
+first, it would name the community and epoch to a non-grantee, disclosing a
+blob's binding.
 
 ### 11.4 Key state is cryptographic, atomic, and honest about its reach
 
 **Destroy deletes key material.** Moving an epoch to `destroyed` deletes the
 persist self-retention wrap **and every member-grant row for that epoch**, in
 the same transaction as the state change. A text column that says "destroyed"
-while every wrap survives is a read-door refusal, not destruction; the first
-implementation shipped exactly that.
+while every wrap survives is a read-door refusal, not destruction.
 
 **Bind requires the CURRENT epoch, not merely an enabled one.** Rotation bumps
 the pointer; the sweep that disables the old epoch runs later, in the
 background. In that window the old epoch is still `enabled`, so an emission
-that read epoch N before a revocation bumped it to N+1 would — under the first
-rebuild's predicate — seal under N's DEK and bind to N, and the member just
+that read epoch N before a revocation bumped it to N+1 would — under an
+"enabled" predicate — seal under N's DEK and bind to N, and the member just
 removed, who keeps N's wrap by AV-70, could read content written AFTER their
 removal. Forward secrecy would hold for every write except the one racing the
 revocation. The bind is therefore conditional on `epoch = current pointer AND
@@ -1384,15 +1303,14 @@ to advance it. Rotation retires an epoch; the key-state door only ever acts on
 epochs rotation has already left behind.
 
 **One serialization boundary per community.** "Mutually exclusive by
-statement" is true on sqlite, where every call holds the one connection
-mutex, and was FALSE on postgres: under READ COMMITTED a bind's `EXISTS
+statement" holds on sqlite, where every call holds the one connection
+mutex, and not on postgres by itself: under READ COMMITTED a bind's `EXISTS
 (enabled)` and a destroy's `NOT EXISTS (binding)` are non-locking snapshot
 reads, so a seal that read *enabled* and a destroy that read *no binding*
-can both commit, leaving a blob bound to a destroyed epoch — the exact
-interleaving §11.4 claimed impossible. Every operation that reads or moves a
-community's epoch state on postgres — bind, key-state change, rotation
-(`bump_epoch`), eviction, and the holder announcement of a community blob —
-now runs in a transaction that first takes
+could both commit, leaving a blob bound to a destroyed epoch. Every operation
+that reads or moves a community's epoch state on postgres — bind, key-state
+change, rotation (`bump_epoch`), eviction, and the holder announcement of a
+community blob — runs in a transaction that first takes
 `pg_advisory_xact_lock(hashtext('community_dek:' ‖ community_key_id))`. The
 lock is per community, transaction-scoped, released at commit or rollback,
 and cheap; it makes the statement predicates below sufficient rather than
@@ -1409,10 +1327,8 @@ write, or neither commits. No lock is taken across check-seal-bind because
 the check *is* the write.
 
 **The precondition is local, and says so.** "No object is sealed under this
-epoch" means **no object on this node**. Persist cannot know what peers hold;
-the first implementation's precondition said "evicted from every holder",
-which it then satisfied by zeroing a node-local count — a precondition that
-cannot be checked is one that gets asserted. Recall of fountained copies is the
+epoch" means **no object on this node**. Persist cannot know what peers hold,
+and a precondition that cannot be checked is one that gets asserted. Recall of fountained copies is the
 tombstone plane's job (§10.6), and destroy does not claim it.
 
 **What destroyed cannot undo.** A recipient who already recovered the DEK
@@ -1420,44 +1336,39 @@ from a delivered wrap holds it. That is AV-70's forward-only guarantee stated
 from the other side, and it remains true. `destroyed` means *persist's* copies
 of the key material are gone and *persist* will never serve that content
 again. It does not mean the ciphertext is unreadable by a party who already
-had the key — no key-management scheme can offer that, and the FSD stops
-implying it.
+had the key — no key-management scheme can offer that.
 
 ### 11.5 Eviction retracts what it announced
 
-Community content is announced (`holds_bytes`). The sweep's eviction therefore
+Community content is announced (the holding claim). The sweep's eviction therefore
 follows the established `evict_actor` discipline: emit `withdraws` for the
 local holder attestation, **then** delete. This requires a signer, which is why
 the sweep is an **Engine** operation (§11.6) and not a backend one.
 
-**A failed withdraws aborts the eviction.** The first rebuild wrote "deletion
-proceeds even if the withdraws fails (an orphan withdraws is better than a
-missing one)" and called it fail-honest. Read again, it is the opposite: on
-failure there is no withdraws at all, the bytes are deleted anyway, and
-`list_holders` advertises this node for content it cannot serve until the
-holder TTL expires — the precise defect I9 exists to catch, reintroduced on the
-error path. Now a withdraws that cannot be signed or stored propagates, the
-bytes stay, and the sweep reports the epoch as blocked; the next run retries.
+**A failed withdraws aborts the eviction.** Deleting anyway would leave no
+withdraws at all while the holder list advertises this node for content it
+cannot serve until the claim's freshness lapses — the defect I9 exists to
+catch, on the error path. A withdraws that cannot be signed or stored
+propagates, the bytes stay, and the sweep reports the epoch as blocked; the
+next run retries.
 Retry is safe because announcements this node has already retracted are
 skipped (the withdraws this node signed name their targets), so a partial
 failure never double-retracts.
 
 **A blob's satellite rows die with it.** `delete_blob` — the floor every
 eviction path ends at — removes the epoch binding and the at-rest grants in the
-same transaction as the blob row, on both backends. The first rebuild deleted
-only the blob row from the pre-existing finite-budget sweeper's path, so an
-evicted community blob left its binding behind, the epoch object count stayed
-non-zero forever, and that epoch's DEK could never be destroyed even though the
-bytes were gone. A count is only a precondition if every deletion maintains it.
+same transaction as the blob row, on both backends. A binding left behind would
+hold the epoch object count above zero forever, so that epoch's DEK could never
+be destroyed even though the bytes were gone. A count is only a precondition
+if every deletion maintains it.
 
 **An announcement never stores.** The community arm of the write door seals,
-stores and binds in the cascade, then announces `holds_bytes`. The second
-rebuild announced through the signing floor, whose row insert is
-`ON CONFLICT DO NOTHING`: if a rotation and a retention sweep evicted the
-blob between the bind and the announcement, the announcement RE-INSERTED the
-ciphertext row — without its binding — and returned success for a row
-`read_blob_as` then reported as corrupt. The announcement is now its own
-floor operation that emits the holder attestation **only for a row that
+stores and binds in the cascade, then announces the holding claim. Announcing
+through the signing floor, whose row insert is `ON CONFLICT DO NOTHING`, would
+— if a rotation and a retention sweep evicted the blob between the bind and the
+announcement — RE-INSERT the ciphertext row without its binding and return
+success for a row `read_blob_as` then reports as corrupt. So the announcement
+is its own floor operation that emits the holder attestation **only for a row that
 exists**, and for a community-tier row only while its binding exists, in one
 transaction under the community's serialization boundary. Evicted under the
 writer's feet ⇒ the writer is told (`NotHeld`), never handed a success for
@@ -1472,11 +1383,11 @@ lets a caller name one, resolved through `select_signer`) is that key's holder's
 to retract; this node cannot sign a `withdraws` for it and does not pretend to.
 Invariant I9 asserts the own-key case, which is the production shape.
 
-**Eviction is a fact a reader is told; deletion is not (#833).** After a
-retention sweep the first v43 shape reported an evicted community blob as
+**Eviction is a fact a reader is told; deletion is not (#833).** If a
+retention sweep deleted the binding, an evicted community blob would read as
 "carries no community-DEK binding" — indistinguishable from a sha that was
-never ours, because I19 deletes a blob's satellites with it. The binding was
-deleted for a good reason (a binding that outlives its blob held the epoch's
+never ours, because I19 deletes a blob's satellites with it. Deleting the
+binding has a reason (a binding that outlives its blob held the epoch's
 object count above zero and made its DEK undestroyable), and a per-blob
 tombstone is unbounded growth, which is what eviction exists to prevent.
 The bounded shape: **the sweep's eviction deletes the blob row and its
@@ -1518,28 +1429,22 @@ never as evicted; a row-less sha with no binding is `NotHeld` as before —
 `Engine::community_dek_set_key_state`, `Engine::sweep_community_epochs`,
 `Engine::sweep_all_communities` (the shape a scheduler calls), and
 `Engine::community_dek_set_retain_past_epochs` — the retention policy the
-sweep enforces — with PyO3 bindings. The second rebuild exposed the sweep and
-not the policy, so a Python-only deployment could run a sweep that was
-structurally unable to evict anything: `retain_past_epochs` defaults to
-retain-indefinitely and nothing on the surface could change it. A sweep
-report also carries `failed` (epochs whose retraction could not be admitted,
-§11.5), and the Python serializer carries every field the report has (I30);
-the second rebuild dropped `failed`, so an operator saw a clean report over
-retained bytes. The first implementation built the state machine and the sweep with
-zero facades and zero bindings — the CHANGELOG advertised "rotate, sweep …
-from Rust and from Python" over a lifecycle that was inert outside the test
-binary. The same defect this cut had just found three times in older code.
+sweep enforces — with PyO3 bindings. Exposing the sweep without the policy
+would leave a Python-only deployment with a sweep structurally unable to evict
+anything (`retain_past_epochs` defaults to retain-indefinitely). A sweep
+report carries `failed` (epochs whose retraction could not be admitted,
+§11.5), and the Python serializer carries every field the report has (I30),
+so an operator never sees a clean report over retained bytes.
 
 ### 11.7 The root never re-mints
 
 `derive_hardware_master_for_context(context, create_seed_if_absent)`. The
 secrets store's first migration legitimately creates the seed. The content
 path, once a `hardware` row exists, passes `false`: an absent seed is a hard
-error naming the consequence. The first implementation claimed this and did
-the opposite — the shared derivation sealed a fresh seed on absence, so a lost
-keyring directory silently produced a different master, every prior blob and
-every sealed content-KEM private half failed to unwrap with an opaque AEAD
-error, and new writes succeeded under the new root.
+error naming the consequence. Sealing a fresh seed on absence would silently
+produce a different master after a lost keyring directory: every prior blob and
+every sealed content-KEM private half would fail to unwrap with an opaque AEAD
+error while new writes succeeded under the new root.
 
 ### 11.8 Cost discipline
 
@@ -1550,18 +1455,17 @@ error, and new writes succeeded under the new root.
   not held across a per-row loop.
 - The read door loads the body once.
 
-**The cache remembers only success.** The hardware-master cache stored
-whatever the first derivation returned — including `None` from a transient
-TPM or filesystem error or a failed join — in a process-wide `OnceLock`, so
-one bad moment at boot made the entire encrypted corpus unavailable until
-restart. Only a successfully derived key is cached; a failed derivation
+**The cache remembers only success.** Caching whatever the first derivation
+returned — including `None` from a transient TPM or filesystem error or a
+failed join — in a process-wide `OnceLock` would make the entire encrypted
+corpus unavailable until restart after one bad moment at boot. Only a
+successfully derived key is cached; a failed derivation
 returns the error and the next call derives again (I29).
 
 ### 11.9 Every backend, every surface, every error
 
 - The cross-backend lifecycle harness covers the sweep — disable, evict-with-
-  withdraws, destroy — on sqlite **and** postgres. The first implementation's
-  sweep had zero postgres coverage across three backend methods that differ
+  withdraws, destroy — on sqlite **and** postgres; the backend methods differ
   materially in implementation.
 - Every PyO3 blob binding maps `BlobError` through `blob_err_to_py`, so Python
   keeps the stable `blob_not_granted` / `blob_not_held` tokens it branches on
@@ -1569,170 +1473,102 @@ returns the error and the next call derives again (I29).
 
 ### 11.10 Invariants — each falsifiable through a consumer-held door
 
-| # | invariant | falsified by | catches |
-|---|---|---|---|
-| I1 | No consumer-reachable write stores an unsealed body at an encrypted cohort. | `Engine::put_blob_scoped("self", …, plaintext)` stores plaintext | A1 |
-| I2 | The blob row records its RESOLVED tier; reads dispatch on that column, never on bytes and never on a re-derivation from the scope. | commons body beginning with the magic is refused/misrouted; a private plaintext row is served; an infra community's plaintext row is unreadable | B1, C1, C2-1 |
-| I3 | In an encrypted tier the stored body parses as an `AtRestEnvelope`. | magic + garbage accepted | C1 |
-| I4 | Every read door authorizes by tier **before** any dispatch, and a refusal names only sha + viewer. | stranger reads a self blob; destroyed-epoch error names the community | B1, B2 |
-| I5 | `destroyed` ⇒ zero persist key material for that epoch. | a wrap row survives destroy | D1 |
-| I6 | Bind requires `enabled`; destroy requires zero bound; both atomic. | a blob bound to a destroyed epoch | D3 |
-| I7 | The precondition destroy checks is the precondition destroy states. | doc says "every holder", code counts local | D2 |
-| I8 | Rotate/sweep/key-state are reachable from Engine and FFI. | 0 facades | A2 |
-| I9 | Eviction of announced content emits `withdraws` before delete. | `list_holders` still names this node after eviction | G1 |
-| I10 | The tier of a community blob is resolved from the directory, including the infra carve-out. | authorized infra community cannot store by any route | E1 |
-| I11 | A hardware root never re-mints. | absent seed ⇒ new master | F1 |
-| I12 | The lifecycle harness, sweep included, runs on every backend from one function. | a sqlite-only sweep test | H1 |
-| I13 | FFI preserves `BlobError` class. | `NotGranted` arrives as `ValueError` | I1 |
-| I14 | `store_blob_local` is reached only by the two cascades, or with a literal commons scope. | a floor call carrying a variable scope | A3 |
-| I15 | An authorized infrastructure community's write resolves `Plaintext`, stores that tier, and reads back through `read_blob_as`. | write succeeds, read reports "no binding" | C2-1 |
-| I16 | V139 classifies pre-existing rows from their grants and bindings; a pre-V139 self/family/community ciphertext row is NOT served as commons after upgrade. | upgraded node serves envelope bytes to a stranger | C2-4 |
-| I17 | Bind requires the CURRENT epoch; a bind against a rotated-past `enabled` epoch is refused, and the cascade re-seals under the current epoch leaving no orphan row. | post-revocation content sealed under the old DEK | C2-2 |
-| I18 | A withdraws failure aborts the eviction: bytes intact, error propagated, already-retracted announcements skipped on retry. | bytes gone, `list_holders` still names this node | C2-3 |
-| I19 | `delete_blob` removes the epoch binding and the at-rest grants transactionally; a deleted blob cannot hold an epoch's object count above zero. | destroy blocked forever by a binding whose blob is gone | C2-9 |
-| I20 | The current epoch cannot be disabled or destroyed through the key-state door. | pointer names a destroyed epoch; every write fails | C2-8 |
-| I21 | The matcher screens the plaintext, once, before sealing, on every tier. | matcher sees ciphertext; self/family never screened | C2-6 |
-| I22 | The storage floor is unconstructible outside the crate (`compile_fail`). | external Rust caller stores plaintext at `self` | C2-7 |
-| I23 | The write door derives the attesting key id from its signer; no surface passes an alias. | Python announces under the scrub alias; sweep cannot retract | C2-5 |
-| I24 | The row records the cohort the write NAMED; an `affiliations` write is not collapsed to `community`. | `blob_cohort_scope` reports `community` for an affiliations write | U4 |
-| I25 | The floor refuses a self-contradicting row: `self`/`family` at `plaintext`, commons at a sealed tier. | a token-holding in-crate caller records a private plaintext row | — |
-| I26 | Every backend resolves a hardware content master through the process cache; the uncached resolver has no backend caller. | the cache has zero callers; TPM I/O per read | U2 |
-| I27 | On postgres, bind / key-state / rotation / eviction / community announcement each take the community's transaction lock: none completes while another session holds it. | a blob bound to a destroyed epoch under READ COMMITTED | C3-1 |
-| I28 | The community announcement emits only for an existing, bound row; evicted between bind and announce ⇒ `NotHeld`, no row re-inserted. | a bindingless ciphertext row after a raced sweep | C3-2 |
-| I29 | The hardware-master cache stores only a successful derivation; a transient failure is retried on the next call. | one failed derivation at boot ⇒ corpus unavailable until restart | C3-3 |
-| I30 | The retention policy is settable from the Engine and Python, and the Python sweep report carries every `SweepReport` field. | a Python sweep that can never evict; `failed` dropped | C3-4, C3-5 |
-| I31 | The retention sweep keeps the epoch binding and stamps `evicted_at`; the object count ignores evicted bindings; an authorized viewer (epoch grantee or current roster occurrence) reading an evicted sha — through the whole-blob door, the range door, or as a DAG's covering chunk — gets `Evicted{community, epoch, evicted_at}`, a stranger gets `NotGranted`, an unknown sha gets `NotHeld`, and destroy after the sweep still succeeds. | a member's read after a sweep is `NotHeld` ("never ours"); a stranger's read names the epoch; an evicted binding blocks destroy | #833 |
-| I32 | Every seal door checks the chunk ROWS: a `chunk_dag` row is written only over chunks whose recorded `crypto_tier` (and, for a community, whose epoch binding's community) is the DAG's own; the commons `seal_stream` refuses a sealed chunk row and the scoped seal refuses a plaintext one. | a public manifest over community-sealed chunks; a "sealed" manifest over a plaintext chunk | #832 |
-| I33 | A sealed DAG's manifest row is content-addressed by its CIPHERTEXT, recorded at the DAG's tier, and the storage layer (`get_blob`, `get_blob_range`) hands out only its opaque bytes; the read door refuses a stranger before touching manifest or chunk. | `get_blob` parses (or fails to parse) a sealed manifest; a stranger reads a chunk or the manifest | #832 |
-| I34 | The decrypting range read authorizes at the manifest before dispatch, maps a PLAINTEXT range to the covering chunk set, opens each chunk independently, and returns exactly `[start, end]` of the plaintext; `start ≥ total` is `RangeNotSatisfiable` naming the plaintext size. | a ciphertext substring; an off-by-one at a chunk boundary; bytes for a non-grantee | #832 |
-| I35 | The whole read of a DAG (`read_any_for_viewer`) returns the concatenated content when `total_size ≤ DAG_WHOLE_READ_CAP_BYTES` and refuses above it with `InvalidArgument` naming the cap and the range door; a commons DAG reads the same way. | a `chunk_dag` row refused to every reader; an unbounded allocation | #832 |
-| I36 | The transfer path never decrypts: every `serve_blob*` Engine facade and both backends' `get_blob_range` contain no `open(`, `unwrap_dek`, `read_any` or `read_for_viewer` call (from-disk gate). | a relay that hands plaintext to a peer | #832, #821 |
-| I37 | `stream_chunks(stream_id)` lists a LIVE stream's chunks in `seq` order with each chunk's sha, recorded tier and plaintext size before any seal, together with the latest STH's `tree_size`, read in one transaction. | DVR/catch-up has no handle on an unsealed stream; a listing that disagrees with the STH it reports | #832 |
-| I38 | A chunk keeps the epoch it was sealed under: after a rotation the reader recovers each chunk's DEK from the CHUNK's own binding, and a viewer holding no grant on that chunk's epoch is refused `NotGranted` (AV-70 per chunk). | the manifest's epoch used for every chunk; a post-rotation joiner reads pre-join segments | #832 |
-| I39 | Every seal/open call site this cut adds carries `aad: Option<&[u8]>` down to `seal` / `open`, and until CIRISVerify#279 lands those two IGNORE it — pinned by a test, so #831 is a flip of two lines and not a hunt for surfaces. | a new door without the parameter; `seal` silently binding AAD before the primitive exists | #832, #831 |
-| I40 | Caller-supplied associated data is bound into the seal and never stored: a seal under `A` opens under `A` and fails under `A'` — after authorization (a non-member presenting `A` is `NotGranted`), as a crypto-class error, at both encrypted tiers; `Some(aad)` at a plaintext tier is refused at EVERY seal/open door — whole-blob, chunk write, stream seal, range read. | the `A'` open succeeds; a mismatch surfaces as `NotGranted`; a commons write accepts and drops the data | #830 |
-| I41 | A stream belongs to its first append: the chunk floor records `(cohort_scope, community_key_id, owner = the first attributed writer's derived key id)` on a stream's first chunk, in the chunk's transaction, and refuses every later append that does not match all three — a different writer at its FIRST chunk (nothing stored), a different cohort or community naming the stream's; the refusal never names the owner's key to a non-owner; the scoped seal refuses a non-owner signer and a foreign cohort/community BEFORE I32, and I32 still refuses a mixed stream; an unclaimed (`NULL`-owner: pre-V143 or commons-started) stream is adopted by its first attributed append; V143 backfills every existing stream from its first chunk's row and binding. | two writers interleave on one id; a foreign seal; a refusal that leaks the owner's key id; a legacy stream with no row | #837 |
-| I42 | A chunk is bound to its position: `chunk_aad(caller_aad, stream_id, seq)` — domain-separated, length-prefixed, bytes pinned — is the AAD of every sealed chunk at write; sealed manifest v2 carries `stream_id` and each chunk's `seq` (required, strictly increasing; v1 byte-identical); every reader rebuilds the AAD from the manifest, so a chunk at another index or in another stream's DAG fails as a crypto-class error AFTER authorization (never `NotGranted`); a stream chunk is read by position through `read_stream_chunk_as`, reachable from the Engine and Python. | a swapped manifest opens; a lifted chunk opens in a second stream; a mismatch reported as `NotGranted`; a by-position read nobody can call | #838 |
-| I54 | The cascade result partitions the ROSTER: every active member of the cohort (roster minus effective removals) is exactly one of `roster.granted` (with the occurrences the grant reached) / `roster.excluded` (occurrences present, none usable) / `roster.absent` (no active occurrence at all); the per-occurrence `granted` / `excluded` keep their meaning; `readable_by_nobody()` is a roster fact — true iff no member holds a grant, including when nothing was enumerated and nothing was excluded — and `false` at the plaintext tier; carried by every cascade result, `put_blob_scoped` on both backends, the Engine door and the five Python serializers. | a member with no occurrence named nowhere; "nobody can read" derived from the occurrence list; a removed member reported absent; a commons write reported unreadable; a serializer that drops the partition | #843 |
+| # | invariant | falsified by |
+|---|---|---|
+| I1 | No consumer-reachable write stores an unsealed body at an encrypted cohort. | `Engine::put_blob_scoped("self", …, plaintext)` stores plaintext |
+| I2 | The blob row records its RESOLVED tier; reads dispatch on that column, never on bytes and never on a re-derivation from the scope. | commons body beginning with the magic is refused/misrouted; a private plaintext row is served; an infra community's plaintext row is unreadable |
+| I3 | In an encrypted tier the stored body parses as an `AtRestEnvelope`. | magic + garbage accepted |
+| I4 | Every read door authorizes by tier **before** any dispatch, and a refusal names only sha + viewer. | stranger reads a self blob; destroyed-epoch error names the community |
+| I5 | `destroyed` ⇒ zero persist key material for that epoch. | a wrap row survives destroy |
+| I6 | Bind requires `enabled`; destroy requires zero bound; both atomic. | a blob bound to a destroyed epoch |
+| I7 | The precondition destroy checks is the precondition destroy states. | doc says "every holder", code counts local |
+| I8 | Rotate/sweep/key-state are reachable from Engine and FFI. | 0 facades |
+| I9 | Eviction of announced content emits `withdraws` before delete. | `list_holders` still names this node after eviction |
+| I10 | The tier of a community blob is resolved from the directory, including the infra carve-out. | authorized infra community cannot store by any route |
+| I11 | A hardware root never re-mints. | absent seed ⇒ new master |
+| I12 | The lifecycle harness, sweep included, runs on every backend from one function. | a sqlite-only sweep test |
+| I13 | FFI preserves `BlobError` class. | `NotGranted` arrives as `ValueError` |
+| I14 | `store_blob_local` is reached only by the two cascades, or with a literal commons scope. | a floor call carrying a variable scope |
+| I15 | An authorized infrastructure community's write resolves `Plaintext`, stores that tier, and reads back through `read_blob_as`. | write succeeds, read reports "no binding" |
+| I16 | V139 classifies pre-existing rows from their grants and bindings; a pre-V139 self/family/community ciphertext row is NOT served as commons after upgrade. | upgraded node serves envelope bytes to a stranger |
+| I17 | Bind requires the CURRENT epoch; a bind against a rotated-past `enabled` epoch is refused, and the cascade re-seals under the current epoch leaving no orphan row. | post-revocation content sealed under the old DEK |
+| I18 | A withdraws failure aborts the eviction: bytes intact, error propagated, already-retracted announcements skipped on retry. | bytes gone, `list_holders` still names this node |
+| I19 | `delete_blob` removes the epoch binding and the at-rest grants transactionally; a deleted blob cannot hold an epoch's object count above zero. | destroy blocked forever by a binding whose blob is gone |
+| I20 | The current epoch cannot be disabled or destroyed through the key-state door. | pointer names a destroyed epoch; every write fails |
+| I21 | The matcher screens the plaintext, once, before sealing, on every tier. | matcher sees ciphertext; self/family never screened |
+| I22 | The storage floor is unconstructible outside the crate (`compile_fail`). | external Rust caller stores plaintext at `self` |
+| I23 | The write door derives the attesting key id from its signer; no surface passes an alias. | Python announces under the scrub alias; sweep cannot retract |
+| I24 | The row records the cohort the write NAMED; an `affiliations` write is not collapsed to `community`. | `blob_cohort_scope` reports `community` for an affiliations write |
+| I25 | The floor refuses a self-contradicting row: `self`/`family` at `plaintext`, commons at a sealed tier. | a token-holding in-crate caller records a private plaintext row |
+| I26 | Every backend resolves a hardware content master through the process cache; the uncached resolver has no backend caller. | the cache has zero callers; TPM I/O per read |
+| I27 | On postgres, bind / key-state / rotation / eviction / community announcement each take the community's transaction lock: none completes while another session holds it. | a blob bound to a destroyed epoch under READ COMMITTED |
+| I28 | The community announcement emits only for an existing, bound row; evicted between bind and announce ⇒ `NotHeld`, no row re-inserted. | a bindingless ciphertext row after a raced sweep |
+| I29 | The hardware-master cache stores only a successful derivation; a transient failure is retried on the next call. | one failed derivation at boot ⇒ corpus unavailable until restart |
+| I30 | The retention policy is settable from the Engine and Python, and the Python sweep report carries every `SweepReport` field. | a Python sweep that can never evict; `failed` dropped |
+| I31 | The retention sweep keeps the epoch binding and stamps `evicted_at`; the object count ignores evicted bindings; an authorized viewer (epoch grantee or current roster occurrence) reading an evicted sha — through the whole-blob door, the range door, or as a DAG's covering chunk — gets `Evicted{community, epoch, evicted_at}`, a stranger gets `NotGranted`, an unknown sha gets `NotHeld`, and destroy after the sweep still succeeds. | a member's read after a sweep is `NotHeld` ("never ours"); a stranger's read names the epoch; an evicted binding blocks destroy |
+| I32 | Every seal door checks the chunk ROWS: a `chunk_dag` row is written only over chunks whose recorded `crypto_tier` (and, for a community, whose epoch binding's community) is the DAG's own; the commons `seal_stream` refuses a sealed chunk row and the scoped seal refuses a plaintext one. | a public manifest over community-sealed chunks; a "sealed" manifest over a plaintext chunk |
+| I33 | A sealed DAG's manifest row is content-addressed by its CIPHERTEXT, recorded at the DAG's tier, and the storage layer (`get_blob`, `get_blob_range`) hands out only its opaque bytes; the read door refuses a stranger before touching manifest or chunk. | `get_blob` parses (or fails to parse) a sealed manifest; a stranger reads a chunk or the manifest |
+| I34 | The decrypting range read authorizes at the manifest before dispatch, maps a PLAINTEXT range to the covering chunk set, opens each chunk independently, and returns exactly `[start, end]` of the plaintext; `start ≥ total` is `RangeNotSatisfiable` naming the plaintext size. | a ciphertext substring; an off-by-one at a chunk boundary; bytes for a non-grantee |
+| I35 | The whole read of a DAG (`read_any_for_viewer`) returns the concatenated content when `total_size ≤ DAG_WHOLE_READ_CAP_BYTES` and refuses above it with `InvalidArgument` naming the cap and the range door; a commons DAG reads the same way. | a `chunk_dag` row refused to every reader; an unbounded allocation |
+| I36 | The transfer path never decrypts: every `serve_blob*` Engine facade and both backends' `get_blob_range` contain no `open(`, `unwrap_dek`, `read_any` or `read_for_viewer` call (from-disk gate). | a relay that hands plaintext to a peer |
+| I37 | `stream_chunks(stream_id)` lists a LIVE stream's chunks in `seq` order with each chunk's sha, recorded tier and plaintext size before any seal, together with the latest STH's `tree_size`, read in one transaction. | DVR/catch-up has no handle on an unsealed stream; a listing that disagrees with the STH it reports |
+| I38 | A chunk keeps the epoch it was sealed under: after a rotation the reader recovers each chunk's DEK from the CHUNK's own binding, and a viewer holding no grant on that chunk's epoch is refused `NotGranted` (AV-70 per chunk). | the manifest's epoch used for every chunk; a post-rotation joiner reads pre-join segments |
+| I39 | Every seal/open call site carries `aad: Option<&[u8]>` down to `seal` / `open` (I40 is the binding it carries). | a door without the parameter |
+| I40 | Caller-supplied associated data is bound into the seal and never stored: a seal under `A` opens under `A` and fails under `A'` — after authorization (a non-member presenting `A` is `NotGranted`), as a crypto-class error, at both encrypted tiers; `Some(aad)` at a plaintext tier is refused at EVERY seal/open door — whole-blob, chunk write, stream seal, range read. | the `A'` open succeeds; a mismatch surfaces as `NotGranted`; a commons write accepts and drops the data |
+| I41 | A stream belongs to its first append: the chunk floor records `(cohort_scope, community_key_id, owner = the first attributed writer's derived key id)` on a stream's first chunk, in the chunk's transaction, and refuses every later append that does not match all three — a different writer at its FIRST chunk (nothing stored), a different cohort or community naming the stream's; the refusal never names the owner's key to a non-owner; the scoped seal refuses a non-owner signer and a foreign cohort/community BEFORE I32, and I32 still refuses a mixed stream; an unclaimed (`NULL`-owner: pre-V143 or commons-started) stream is adopted by its first attributed append; V143 backfills every existing stream from its first chunk's row and binding. | two writers interleave on one id; a foreign seal; a refusal that leaks the owner's key id; a legacy stream with no row |
+| I42 | A chunk is bound to its position: `chunk_aad(caller_aad, stream_id, seq)` — domain-separated, length-prefixed, bytes pinned — is the AAD of every sealed chunk at write; sealed manifest v2 carries `stream_id` and each chunk's `seq` (required, strictly increasing; v1 byte-identical); every reader rebuilds the AAD from the manifest, so a chunk at another index or in another stream's DAG fails as a crypto-class error AFTER authorization (never `NotGranted`); a stream chunk is read by position through `read_stream_chunk_as`, reachable from the Engine and Python. | a swapped manifest opens; a lifted chunk opens in a second stream; a mismatch reported as `NotGranted`; a by-position read nobody can call |
+| I54 | The cascade result partitions the ROSTER: every active member of the cohort (roster minus effective removals) is exactly one of `roster.granted` (with the occurrences the grant reached) / `roster.excluded` (occurrences present, none usable) / `roster.absent` (no active occurrence at all); the per-occurrence `granted` / `excluded` keep their meaning; `readable_by_nobody()` is a roster fact — true iff no member holds a grant, including when nothing was enumerated and nothing was excluded — and `false` at the plaintext tier; carried by every cascade result, `put_blob_scoped` on both backends, the Engine door and the five Python serializers. | a member with no occurrence named nowhere; "nobody can read" derived from the occurrence list; a removed member reported absent; a commons write reported unreadable; a serializer that drops the partition |
 
-Every one of these is written **before** the corresponding fix and confirmed
-red — I1–I14 on `fd43e74`, I15–I23 on `30fde79` — and each turns red again
-under mutation of the logic it guards. I24–I26 (the ultrareview's nits and
-the floor's self-contradiction refusal) were written alongside their fixes,
-so their evidence is the mutation alone: each turns red when its guard is
-removed, and that is stated here rather than implied. Two honest exceptions, recorded
-rather than hidden: I18(a) (no double retraction) is held by the directory's
-retraction fold at write (#502 E7), so a second filter in the evict loop was
-mutation-tested, found to guard nothing, and removed; and the key-state
-door's "current epoch" check (I20) is a friendlier message in front of the
-backend statement that is the real guard — removing the message alone leaves
-I20 green, removing the statement's predicate turns it red. I22 is a
-`compile_fail` doctest, which `cargo nextest` never runs; it has its own
-certify gate and CI step so the witness executes. On postgres the community
-announcement (I28) refuses an evicted row at two points — the binding lookup
-that names the community to lock, and the existence check under that lock —
-and each alone refuses the evicted case, so removing either survives; the
-pair removed together turns I28 red, which is the evidence recorded. I40 (#831)
-was written before the binding existed and confirmed red on the re-pinned
-tree with `aad` threaded through every seal and open but unused — the
-self-tier `A'` open returned Alice's plaintext; it reds again when either
-twin drops the data (the seal, or the open), when the community cascade stops
-passing it, and when the plaintext-tier refusal is removed at either door. A test that is green on
-the code it was written to catch is a report.
-
-**I31 (#833)** was written first and confirmed red on v43.0.0 (`170cc89`),
-failing at its first structural assertion: the sweep deleted the binding.
-Mutation evidence, every restore `cmp`-verified: removing `evicted_at IS
-NULL` from the object count turns I31, I5 and I6 red (sqlite) and I31 and
-I5 red (postgres); removing it from the destroy statement's own `NOT
-EXISTS` predicate turns I31, I5, I6 and I9 red (sqlite) and I31 and I5 red
-(postgres) — that third site was found by the EXISTING witnesses when the
-first two were changed alone, which is what they are for; making the sweep
-delete the binding instead of stamping it turns I31 red on both backends;
-removing the read door's authorization hands a stranger `Evicted` naming the
-community and epoch (I31 red); removing the roster leg refuses a current
-member `NotGranted` after the production sweep (I31 red); removing the grant
-leg refuses a removed member who still holds the epoch grant (I31 red). Two
-edits survive and are recorded rather than dressed up as guards: the
-`evicted_at IS NULL` filter on the sweep's object SELECT (the UPDATE's own
-predicate is the guard; the filter only spares the retraction scan) and the
-same filter on the announcement's binding check (the row-existence check
-refuses an evicted sha alone; the filter is belt to those braces). A
-row-less sha with a LIVE binding — the `None => NotHeld` arm — is the state
-I19 forbids and cannot be constructed through a door, so that arm is
-untested and said so here.
-
-**C2 = the second Codex review (2026-09-09, of `30fde79`).** Nine findings,
-all verified real, six root causes: the row stored the tier's INPUT not the
-tier (C2-1, C2-4); "enabled" was not "current" (C2-2, C2-8); the error path
-of eviction undid what the happy path guaranteed (C2-3, C2-9); a screen ran on
-the wrong bytes (C2-6); an in-crate text gate was mistaken for an API boundary
-(C2-7); and a parameter with one correct value was left as a parameter (C2-5).
-The common thread with §11's own diagnosis of `fd43e74`: each was a guarantee
-established at one site and not carried to the next — into the row, across the
-race window, down the error path, past the crate boundary.
-
-**U = the cloud ultrareview of `30fde79`**, five findings. U1 is C2-1 (the
-infra read). U2: the §11.8 hardware-master cache existed with zero callers —
-the perf fix its docstring described was never applied; both backends now
-resolve through it, and I26 reds if either stops. U3: the Python
-`store_blob_local_json` still documented itself as the self/family privacy
-primitive while writing a commons plaintext row that `read_blob_as` serves
-to anyone; its contract now says what it is — unannounced is not private —
-and points private content at `put_blob_scoped`. U4: the community cascade
-hard-coded `community` on the row for an `affiliations` write (I24). U5: the
-V139 sqlite header claimed the final-name rebuild shape while the DDL used
-`__v139` + RENAME; the header now says that shape is safe for THIS table and
-why it is not a template.
-
-**I32–I39 (#832)** are the chunked-content rows (§12). Two of them were
-confirmed RED on `170cc89` (v43.0.0) through doors that already existed: the
-commons half of I32 (`seal_stream` wrote a plaintext manifest over a chunk row
-the community cascade had sealed) and the commons half of I35
-(`read_any_for_viewer` refused every `chunk_dag` row). The rest exercise doors
-this cut adds, so their evidence is the mutation alone, recorded in §12.8.
-
-**I41–I42 (#837, #838)** were written first in a PROBE form against the
-v44.0.0 surface — the chunk door had no writer parameter, so I41's foreign
-append was a second community, a second cohort and the commons door on one
-id, and I42's swapped manifest carried no positions — and confirmed RED on
-`8d5e860` on sqlite and postgres (I41: the second community's append
-returned `Ok`; I42: "a chunk moved to another index OPENED (100 bytes)").
-The final forms use two node signers and a positioned swapped manifest; the
-legacy backfill has its own per-backend witness on an empty database seeded
-through V142. §12.10 carries the mutation summary.
-
-**C3 = Codex's third review, of `45bd9b4`**, five findings, all real. Two
-are the same root cause — a serialization boundary that existed on sqlite by
-accident of its single connection mutex and did not exist on postgres at
-all: the bind/destroy race under READ COMMITTED (C3-1) and the
-announce-after-cascade window that could re-insert an evicted row (C3-2).
-One is a cache that remembered failure (C3-3). Two are the same shape as
-§11.6's own finding about the first implementation — a surface that
-exposes the operation and not its policy or its report (C3-4, C3-5).
-
-**I54 (#843)** was written first in a PROBE form — asserting only that the
-author of the write was NAMED anywhere in the result — and confirmed RED on
-the v44.1.1 tree on sqlite and postgres: `granted=[] excluded=[…bob-phone…]`,
-alice nowhere. §12.11 carries the mutation record.
+**Witness notes.** Each invariant turns red under mutation of the logic it
+guards; where a guard has two layers, the record says which one the witness
+measures.
+- I18(a) (no double retraction) is held by the directory's retraction fold at
+  write (#502 E7); a second filter in the evict loop would guard nothing.
+- I20: the key-state door's "current epoch" check is a friendlier message in
+  front of the backend statement that is the real guard — removing the message
+  alone leaves I20 green, removing the statement's predicate turns it red.
+- I22 is a `compile_fail` doctest, which `cargo nextest` never runs; it has its
+  own certify gate and CI step so the witness executes.
+- I28 on postgres: the community announcement refuses an evicted row at two
+  points — the binding lookup that names the community to lock, and the
+  existence check under that lock — and each alone refuses the evicted case;
+  the pair removed together turns I28 red.
+- I40 (#831) reds when either twin drops the data (the seal, or the open), when
+  the community cascade stops passing it, and when the plaintext-tier refusal
+  is removed at either door.
+- I31 (#833): removing `evicted_at IS NULL` from the object count, or from the
+  destroy statement's own `NOT EXISTS` predicate, turns I31 and I5 red (and I6
+  / I9 on sqlite); making the sweep delete the binding instead of stamping it
+  turns I31 red on both backends; removing the read door's authorization hands
+  a stranger `Evicted` naming the community and epoch; removing the roster leg
+  refuses a current member `NotGranted` after the sweep; removing the grant leg
+  refuses a removed member who still holds the epoch grant. Two filters are
+  belts, not guards: `evicted_at IS NULL` on the sweep's object SELECT (the
+  UPDATE's own predicate guards) and on the announcement's binding check (the
+  row-existence check refuses an evicted sha alone). A row-less sha with a LIVE
+  binding — the `None => NotHeld` arm — is the state I19 forbids and cannot be
+  constructed through a door, so that arm is untested.
+- `store_blob_local_json` writes a commons plaintext row that `read_blob_as`
+  serves to anyone — unannounced is not private; private content goes through
+  `put_blob_scoped`. The V139 sqlite migration uses `__v139` + RENAME, which is
+  safe for that table and is not a template.
+- I32–I42 are the chunked-content rows (§12); their mutation record is §12.8
+  and §12.10. I54's is §12.11.
 
 ---
 
-## 12. Chunked content under the envelope — LOCKED 2026-09-09 (#832)
+## 12. Chunked content under the envelope (#832)
 
-§10 sealed a **whole body** under one envelope; `FSD/V4_1_STREAMING_SUBSTRATE.md`
-made a body **many rows** — chunks under a `chunk_dag` manifest, appended live
-by `put_blob_chunk`, frozen by `seal_stream`, served by `get_blob_range`. The
-two documents never crossed, and the seam showed at the write door:
-`body_is_sealed(ChunkDag)` answered *Unverifiable* because the door saw only
-the manifest, and in an encrypted cohort cannot-verify is a refusal. Correct
-for that door, and it meant **community-scope video was unwritable** —
-chunking is what makes seek and range possible, and chunking is exactly what
-the encrypted door refused. On the read side `get_blob_range` over a sealed
-whole blob returned a ciphertext substring, which is not a plaintext range.
-
-This section is the crossing. Everything in §11 stands; §12 states how a DAG
-lives under the same tier column, the same doors, the same read order.
+§10 seals a **whole body** under one envelope; `FSD/V4_1_STREAMING_SUBSTRATE.md`
+makes a body **many rows** — chunks under a `chunk_dag` manifest, appended live
+by `put_blob_chunk`, frozen by `seal_stream`, served by `get_blob_range`. This
+section crosses the two. At the write door an encrypted cohort refuses what it
+cannot verify, and a DAG's manifest alone cannot prove its chunks are sealed
+(`body_is_sealed(ChunkDag)` is *Unverifiable*), so chunked content needs its own
+seal door that checks the chunk rows (§12.3). On the read side a range of a
+sealed whole blob is not a ciphertext substring, so the range read decrypts
+(§12.4). Everything in §11 holds; §12 states how a DAG lives under the same
+tier column, the same doors, the same read order.
 
 ### 12.1 The shape — each chunk is a whole blob
 
@@ -1742,7 +1578,7 @@ a fresh random nonce per chunk, and its `federation_blobs` row is
 content-addressed by the SHA-256 of its **ciphertext**. Consequences, each
 deliberate:
 
-- **Transfer, dedup and the swarm's hash verifier are unchanged.** A relay
+- **Transfer, dedup and the swarm's hash verifier treat chunks as blobs.** A relay
   fetches `(manifest_sha, chunk_sha)`, verifies the chunk's sha over the bytes
   it received, and stores what it cannot read. Chunks ship as opaque bytes
   exactly like whole blobs (§10.6, the transfer model).
@@ -1752,8 +1588,9 @@ deliberate:
   (§11.1). That is what makes "is this DAG sealed?" **verifiable**: the seal
   door asks the chunk ROWS, not the manifest's word (§12.3).
 - **The CEG §10.5.2 STREAM nonce is not used here.** `stream_seal.rs` (Cut C2,
-  the `prefix[7] ‖ counter_be[4] ‖ last_flag[1]` layout) remains the
-  consumer-side/interop format it was. The substrate's own seal is the
+  the `prefix[7] ‖ counter_be[4] ‖ last_flag[1]` layout) is the
+  consumer-side/interop format; self/family streams use the STREAM nonce under
+  a per-`(stream, epoch)` DEK (§12.13). The substrate's own seal is the
   `CRBLOB` envelope with a random nonce because the epoch DEK is **shared by
   every writer in the community** — a counter nonce is only safe with one
   writer per `(key, prefix)`, and persist does not police writer count; a
@@ -1773,10 +1610,10 @@ sizes**, so a plaintext byte range maps to a chunk set by prefix sum. It is a
 
 - `v: 2` and `chunk_tier` appear **only for a sealed DAG**. A plaintext DAG —
   the commons `seal_stream`, `put_blob_chunks`, or the scoped seal resolving
-  `Plaintext` — keeps emitting `v: 1` byte-for-byte as before, so every
-  build-manifest and commons-video address a consumer already holds is
-  unchanged.
-- **This is the MAJOR for manifest consumers.** A parser that rejects an
+  `Plaintext` — emits `v: 1` byte-for-byte, so every build-manifest and
+  commons-video address is stable. (A v2 manifest also carries `stream_id`
+  and per-chunk `seq`, §12.10; v4 adds per-chunk epochs, §12.13.)
+- **Manifest consumers.** A parser that rejects an
   unknown `v` or an unknown key breaks on a v2 manifest; a consumer that
   checks `sum(size) == Σ chunk row size_bytes` breaks, because a sealed
   chunk's stored length is `size + 36`. `chunk_tier` is self-description for
@@ -1788,12 +1625,12 @@ sizes**, so a plaintext byte range maps to a chunk set by prefix sum. It is a
   the sealed manifest bytes, and its `size_bytes` is the **stored** (envelope)
   length — the number `get_blob_range` bounds on — not the plaintext total,
   which lives inside the manifest. For a v1 plaintext DAG `size_bytes` stays
-  `total_size`, as Cut B specified.
+  `total_size`.
 - **At the storage layer a sealed manifest is opaque.** `get_blob` on a
   `chunk_dag` row whose tier column is not `plaintext` returns
   `BlobBody::Inline(envelope_bytes)` — a relay receives bytes it can forward
   and cannot parse; `get_blob_range` serves a substring of those bytes, the
-  storage contract it has always had. Neither reads the tier from the bytes:
+  storage contract. Neither reads the tier from the bytes:
   the dispatch is `(storage_kind, crypto_tier)`, both columns (I33).
 
 ### 12.3 The write doors — and the seal door checks the rows
@@ -1827,15 +1664,14 @@ row through the manifest floor — with the epoch binding in-transaction for a
 community, with the self-retention and occurrence grants for `self`/`family`.
 The floor additionally refuses if the stream's chunk count changed between
 the listing and the write (a seal over a moving stream is refused, not
-truncated). A `Plaintext` or `CommunityDek` seal announces `holds_bytes` for
-the manifest sha under the signer's derived key, as `put_blob_scoped` does;
-`InvisibleEncrypted` announces nothing.
+truncated). A seal announces this node's holding claim for the manifest sha under the
+signer's derived key at the content's scope, as `put_blob_scoped` does.
 
-**The commons `seal_stream` is a seal door too**, and I32 binds it: it now
-refuses a stream any of whose chunk rows is not at `plaintext`. Before #832 it
-wrote a public manifest over community-sealed rows the community cascade had
-stored (staged through `put_blob_chunk`'s `ON CONFLICT DO NOTHING`), which is
-the exact "self-contradicting DAG" the row-check exists to make unrepresentable.
+**The commons `seal_stream` is a seal door too**, and I32 binds it: it
+refuses a stream any of whose chunk rows is not at `plaintext`. Otherwise it
+could write a public manifest over community-sealed rows (staged through
+`put_blob_chunk`'s `ON CONFLICT DO NOTHING`) — the "self-contradicting DAG"
+the row-check makes unrepresentable.
 
 **The floor.** `put_blob_chunk_with_scope` and `seal_stream_with_scope` are
 storage-floor methods on `BlobStorage`: each takes a `StorageFloor` token, so
@@ -1849,7 +1685,7 @@ body does not parse as an envelope, or whose declared plaintext size is not
 
 ### 12.4 Reads — one door, authorize first, then per chunk
 
-**`read_any_for_viewer(sha, viewer, aad)`** keeps §11.3's order and gains the
+**`read_any_for_viewer(sha, viewer, aad)`** keeps §11.3's order and has a
 DAG arm: after the row-tier authorization it reads the row HEAD (`storage_kind`,
 `crypto_tier`, `size_bytes`); for a `chunk_dag` it opens the manifest (sealed
 tiers) or parses it (plaintext), and returns the **concatenated content** when
@@ -1860,7 +1696,7 @@ request handler. The cap is a judgement recorded here: 64 chunks at the 1 MiB
 inline cap is the largest allocation the whole-read door will ever make.
 
 **`read_any_range_for_viewer(sha, viewer, start, end_inclusive, aad)`** is the
-door beside it — the decrypting range read the issue asked for. Order:
+door beside it — the decrypting range read. Order:
 
 1. row head; absent ⇒ `NotHeld`;
 2. **authorize by the row's tier, before touching any body** (§11.3, I4);
@@ -1902,7 +1738,7 @@ without turning a test red.
 A blob is addressable only once immutable, because the address IS the content;
 that rule does not move. A growing stream is addressed by
 `(stream_id, tree_size)` on the STH plane, and each chunk by its own sha from
-the moment `put_blob_chunk*` returns. What was missing was the join:
+the moment `put_blob_chunk*` returns. The join:
 
 **`stream_chunks(stream_id) → StreamChunks { chunks: [(seq, chunk_sha,
 epoch, size_bytes, plaintext_size, crypto_tier, cohort_scope)], sth_tree_size }`**
@@ -1911,8 +1747,8 @@ records and its plaintext size, plus the latest producer-signed STH's
 `tree_size`, read in ONE transaction so the listing and the STH it reports are
 the same snapshot. A DVR consumer reads the prefix `[0, tree_size)` as
 tamper-evident and the tail as best-effort; it then reads each chunk by
-POSITION (`read_stream_chunk_as(stream_id, seq, …)` — since #838 a sealed chunk
-opens only under the position it was written at, §12.10; the relay's
+POSITION (`read_stream_chunk_as(stream_id, seq, …)` — a sealed chunk opens
+only under the position it was written at, §12.10; the relay's
 `get_blob_range` on the chunk sha stays the opaque transfer). Reachable from the Engine and from Python (I8).
 
 **Handoff (Q4): stream into persist as produced.** `put_blob_chunk_scoped`
@@ -1924,30 +1760,24 @@ at seal: the seal writes a manifest over rows that already exist.
 
 ### 12.6 Schema — V142
 
-`federation_stream_chunks.plaintext_size_bytes` (both dialects, `NOT NULL`,
-backfilled `= size_bytes` for every pre-V142 row, which were all plaintext).
+`federation_stream_chunks.plaintext_size_bytes` (both dialects, `NOT NULL`;
+V142 backfilled `= size_bytes` for the rows it found, which were plaintext).
 `size_bytes` keeps meaning the stored length; the manifest and `stream_chunks`
 report the plaintext length from this column, never from `stored − 36`
 arithmetic at read time (every preimage field is persisted). The chunk row's
 tier and cohort live on `federation_blobs` (V139) — one fact, one table.
 
-### 12.7 AAD per chunk — the hook points, and what #831 / #838 made of them
+### 12.7 AAD per chunk — the hook points
 
 #831 binds a ciphertext to its referencing row through the GCM tag
-(`ciris_crypto::aes_gcm::{encrypt_aad, decrypt_aad}`, CIRISVerify 15.1.0).
-#832 threaded the parameter through every new surface before the primitive
-existed; #831 landed in the SAME release (v44.0.0) and flipped the two
-primitives, so the table below is the state of the code, not a plan. The
-"accepted and ignored — pinned by a test" row this section carried between
-the two cuts was stale the day v44.0.0 shipped (the `seal_ignores_aad_until_831`
-pin was deleted when #831 landed); I40 is the pin now, and it says the
-opposite.
+(`ciris_crypto::aes_gcm::{encrypt_aad, decrypt_aad}`), and #838 binds each
+chunk to its position. The hook points:
 
-| hook | today (v44.0.0 + #838) |
+| hook | binding |
 |---|---|
 | `at_rest_cascade::seal(dek, plaintext, aad)` / `open(dek, envelope, aad)` | `aad` is **bound** into the GCM tag by `seal_aad` / `open_aad`; a mismatch is a crypto-class error (I40) |
 | `chunk_dag_cascade::orchestrate::put_blob_chunk_scoped(…, aad)` | the caller's data is folded with the chunk's POSITION into `chunk_aad` (§12.10) and that is what `seal` binds |
-| `chunk_dag_cascade::orchestrate::seal_stream_scoped(…, aad)` | passed to `seal` for the manifest, unchanged — the manifest's AAD is the caller's |
+| `chunk_dag_cascade::orchestrate::seal_stream_scoped(…, aad)` | passed to `seal` for the manifest — the manifest's AAD is the caller's |
 | `at_rest_cascade::orchestrate::read_any_for_viewer(…, aad)` and `read_any_range_for_viewer(…, aad)` | the caller's data opens the manifest; each chunk is opened under `chunk_aad(aad, manifest.stream_id, chunk.seq)` |
 | `chunk_dag_cascade::orchestrate::read_stream_chunk_as(stream_id, seq, …, aad)` | the by-position read of one chunk (§12.10); opens under `chunk_aad(aad, stream_id, seq)` |
 | `Engine::{put_blob_chunk_scoped, seal_stream_scoped, read_blob_as, read_blob_range_as, read_stream_chunk_as}` | `aad: Option<&[u8]>` |
@@ -1957,51 +1787,38 @@ opposite.
 (`refuse_aad_at_plaintext`, I40). The per-chunk binding the issue first
 named — `(manifest sha, index)` — cannot be computed at chunk-write time
 because the manifest sha does not exist until seal; the binding that CAN be
-is `(stream_id, seq)`, both known at `put_blob_chunk_scoped`, and that is
-what #838 built (§12.10). The manifest commits to both.
+is `(stream_id, seq)`, both known at `put_blob_chunk_scoped` (§12.10). The manifest commits to both.
 
-### 12.8 What this cut does not do
+### 12.8 Limits and the mutation record
 
 - No `External` chunks under an encrypted tier (the floor cannot see the
-  bytes; §10.8's cannot-verify-is-a-refusal stands for them).
-- No nested DAGs (Cut B's one-level rule).
-- No stream-level DEK for `self`/`family`: per-chunk fresh DEKs cost
-  O(chunks × occurrences) grant rows and buy per-blob semantics that every
-  existing grant walker (`rekey_for_newcomers`, `list_at_rest_blobs_for_recipients`,
-  `delete_blob`'s satellite removal) already gets right. Recorded as the
-  judgement; a stream DEK keyed off the manifest is a later optimization that
-  must not change any door.
-- `put_blob_chunks` (Cut B's atomic multi-row upload) stays commons-only; the
+  bytes; §10.8's cannot-verify-is-a-refusal holds for them).
+- Nesting is fixed at depth 2 (a v3 root over v2/v4 children, §12.12).
+- Self/family streams use one DEK per `(stream, epoch)` (§12.13); a stream
+  sealed with per-chunk DEKs stays per-chunk (legacy manifests read as before).
+- `put_blob_chunks` (Cut B's atomic multi-row upload) is commons-only; the
   encrypted path is the live-append one, which is what video needs.
 
-**Mutation record (§11.10 discipline).** Fourteen mutations, each applied,
-the named witnesses run, the file restored from the committed baseline; all
-fourteen KILLED. Three needed a second pass, and each of the three was the
-class §11.10 warns about — the right outcome through a neighbouring gate:
-the dropped chunk-row tier check (I32) was caught by the cohort check because
-the witness's plaintext chunk was a commons row; the dropped range-read
-authorization (I34) was masked by the community open's defense-in-depth
-re-check and by the per-chunk grant; the dropped per-chunk grant check (I34b)
-was masked by the manifest authorization. The witnesses now stage a plaintext
-row at the SAME cohort, read a sealed self WHOLE blob by range as a stranger,
-and read as an occurrence granted on the manifest but not on the chunk row.
-The full table is in the CHANGELOG entry for this cut. (The `seal_ignores_aad_until_831` pin was deleted when #831 landed in the same release; I40
-is the pin for I39's other half: it turns red the day #831 flips `seal` /
-`open`.
+**Mutation record (§11.10 discipline).** Fourteen mutations over §12.1–§12.6,
+all KILLED. Three witnesses discriminate a neighbouring gate by construction:
+I32 stages a plaintext row at the SAME cohort (so the cohort check cannot
+catch a dropped tier check); I34 reads a sealed self WHOLE blob by range as a
+stranger (so the community open's re-check and the per-chunk grant cannot
+mask a dropped range-read authorization); I34b reads as an occurrence granted
+on the manifest but not on the chunk row (so the manifest authorization cannot
+mask a dropped per-chunk grant check).
 
 ### 12.9 A stream belongs to its first append (#837, from #836 Q2)
 
-**The gap.** `federation_stream_chunks` is `PRIMARY KEY (stream_id, seq)` and
-carries no cohort, community or writer. Two writers on one `stream_id`: the
-same `seq` is refused (monotonicity); a *different* `seq` interleaves into one
-stream, and the mismatch surfaces only at `seal_stream_scoped`, where I32
-refuses a manifest over rows not all at the DAG's tier and community.
-`MAX_CHUNKS_PER_EPOCH` is per `(stream_id, epoch)`, so a shared id lets one
-writer spend another's budget until the seal refuses. Uniqueness of the id
-was the caller's (`<writer derived key id>-<ULID>`), and the substrate did not
-check it.
+**The hazard.** `federation_stream_chunks` is `PRIMARY KEY (stream_id, seq)` and
+carries no cohort, community or writer. Without a stream row, two writers on
+one `stream_id` would interleave at different `seq`s, with the mismatch
+surfacing only at `seal_stream_scoped`; and since `MAX_CHUNKS_PER_EPOCH` is
+per `(stream_id, epoch)`, a shared id would let one writer spend another's
+budget. Uniqueness of the id is the caller's convention
+(`<writer derived key id>-<ULID>`); the stream row makes it the substrate's.
 
-**The shape.** A stream is a row. V143 adds `federation_streams (stream_id
+**The shape.** A stream is a row. V143 holds `federation_streams (stream_id
 PK, cohort_scope, community_key_id NULL, owner_key_id NULL, created_at)` on
 both dialects. The chunk floor writes it **insert-if-absent in the same
 transaction as the chunk** — under the community lock on postgres when the
@@ -2017,8 +1834,8 @@ what the row says to what this append claims:
   different key is refused with an `InvalidArgument` that says the stream
   belongs to another writer and **never names that writer's key** (I4b's
   class: a refusal discloses no more than the fact of refusal).
-- A `NULL` owner is an **unclaimed** stream: every pre-V143 stream (the
-  backfill cannot attribute them — no writer column existed) and every
+- A `NULL` owner is an **unclaimed** stream: a stream V143 backfilled (it
+  cannot attribute them — there was no writer column) and every
   stream the commons `put_blob_chunk` starts (that door has no signer). The
   first attributed append **adopts** it — `UPDATE … SET owner_key_id WHERE
   owner_key_id IS NULL`, so two adopters racing resolve to one — and from
@@ -2033,32 +1850,31 @@ what the row says to what this append claims:
 with the listing (one snapshot) and refuses a signer that is not the owner
 (same disclosure rule), a cohort or community that is not the stream's, and
 then runs I32 over the chunk rows as before. I32's cohort and community legs
-are now reachable only by direct row manipulation — the floor refuses the
-inputs that used to stage them — and stay as defense in depth; its TIER leg
-is still live (an authorized infra community resolves `Plaintext`, so a
+are reachable only by direct row manipulation — the floor refuses the inputs
+that would stage them — and stay as defense in depth; its TIER leg is live (an authorized infra community resolves `Plaintext`, so a
 stream can honestly hold a plaintext row beside a sealed one if the
 community's standing changes mid-stream). The commons `seal_stream` refuses
 a stream whose row is not at `cohort_scope::FEDERATION`.
 
-**Backfill (V143).** Every existing stream gets a row from its lowest-`seq`
+**Backfill (V143).** Every stream that existed at the migration gets a row from its lowest-`seq`
 chunk: `cohort_scope` from that chunk's blob row (V139 classified every row),
 `community_key_id` from the chunk's epoch binding where one exists, owner
 `NULL`. `stream_chunks` reports the row beside the listing, so a consumer
 sees who owns a stream and at what cohort before appending.
 
 **What this does not do.** The stream row does not police `MAX_CHUNKS_PER_EPOCH`
-differently — the cap stays per `(stream_id, epoch)`; what changed is that
-only one writer can reach it. No FK from `federation_stream_chunks` to
+differently — the cap stays per `(stream_id, epoch)`; only one writer can
+reach it. No FK from `federation_stream_chunks` to
 `federation_streams` (SQLite's `ADD CONSTRAINT` does not exist; the floor is
 the only writer and it writes both in one transaction).
 
 ### 12.10 A chunk is bound to its position (#838, from #836 Q3)
 
-**The gap.** v44.0.0 folds ONE caller `aad` into every chunk and into the
-manifest of a DAG. Across DAGs a lifted chunk does not open; within one DAG a
-chunk could be moved to another index and still open, so only the sealed
-manifest's ordered list fixed the order and `read_blob_range_as` was the only
-in-contract assembly — a hand-assembler had no way to detect a reorder.
+**The hazard.** With ONE caller `aad` folded into every chunk and into the
+manifest of a DAG, a lifted chunk does not open across DAGs, but within one
+DAG a chunk could be moved to another index and still open; only the sealed
+manifest's ordered list would fix the order, and a hand-assembler could not
+detect a reorder.
 
 **The AAD.** Both `stream_id` and `seq` ARE known at `put_blob_chunk_scoped`.
 Persist folds them, domain-separated and length-prefixed, into each CHUNK's
@@ -2076,23 +1892,22 @@ unit test, no backend `cfg`. A chunk's AAD is therefore ALWAYS `Some` at a
 sealed tier — a caller passing no data still gets the position binding. The
 manifest's own AAD stays the caller's (it has no position).
 
-**Manifest v2 carries the position.** A sealed manifest now has a top-level
+**Manifest v2 carries the position.** A sealed manifest has a top-level
 `stream_id` and a per-chunk `seq`:
 
 ```json
 {"chunk_tier":"community_dek","chunks":[{"seq":0,"sha":"…","size":…},…],"stream_id":"…","total_size":…,"v":2}
 ```
 
-JCS key order is unchanged in kind (`chunk_tier` < `chunks` < `stream_id` <
+JCS key order (`chunk_tier` < `chunks` < `stream_id` <
 `total_size` < `v`; `seq` < `sha` < `size`). Both fields are **required** in
 v2 and refused in v1; the plaintext v1 manifest is byte-identical to Cut B
 (pinned). A v2 manifest's `seq` values must be strictly increasing in list
 order, so the list order and the position order are one fact. Sealed
 manifests are read only by persist — a v2 manifest opens only under the DEK —
-so this is a minor, and a v44.0.0 sealed manifest (no `stream_id`, no `seq`)
-is refused by the parser naming this section rather than opened under a
-guessed binding: nothing sealed under v44.0.0 exists outside a test, and a
-tolerant branch would be an untested downgrade arm.
+and a sealed manifest without `stream_id` / `seq` is refused by the parser
+naming this section rather than opened under a guessed binding: a tolerant
+branch would be an untested downgrade arm.
 
 **Every reader reconstructs.** The DAG whole read and the range read open
 each chunk under `chunk_aad(caller_aad, manifest.stream_id, chunk.seq)`. A
@@ -2100,18 +1915,17 @@ chunk placed at another index, or lifted into another stream's DAG, fails to
 open as a crypto-class error (`Backend`) **after** authorization — never
 `NotGranted`, never a parse of anything the viewer was not granted.
 
-**A stream chunk is read by POSITION.** A consequence, stated rather than
-hidden: a sealed chunk row no longer opens by its sha alone through
+**A stream chunk is read by POSITION.** A consequence, stated: a sealed chunk
+row does not open by its sha alone through
 `read_blob_as` / `read_blob_range_as` (the reader would need the position to
 rebuild the AAD, and the sha does not carry it — the sha IS the ciphertext,
-and the ciphertext is bound to where it was written). The DVR / catch-up read
-§12.5 described becomes `read_stream_chunk_as(stream_id, seq, viewer, aad)`:
+and the ciphertext is bound to where it was written). The DVR / catch-up read of
+§12.5 is `read_stream_chunk_as(stream_id, seq, viewer, aad)`:
 `stream_chunk_at(stream_id, seq)` names the row, the row's tier authorizes
 the viewer (I4, I38 per chunk), and the chunk opens under its position. A
 plaintext chunk reads the same way (and refuses `Some(aad)`). `get_blob` /
-`get_blob_range` on a chunk sha are unchanged — opaque bytes for a relay.
-Reachable from the Engine and Python (I8). The hand-assembly answer to Edge's
-Q3 is "don't", and now the AAD enforces it: the manifest stays the contract,
+`get_blob_range` on a chunk sha return opaque bytes for a relay.
+Reachable from the Engine and Python (I8). Hand assembly outside the manifest is not supported, and the AAD enforces it: the manifest stays the contract,
 and a chunk read outside it fails.
 
 **Mutation record (§11.10 discipline).** Twenty-two mutations over the
@@ -2120,32 +1934,27 @@ KILLED, 2 SURVIVED and recorded: the adoption `UPDATE`'s `IS NULL` predicate
 (a race guard a serial witness cannot see) and the by-position door's
 authorize-first step (shadowed by the per-chunk grant check behind it; the
 ordering is unobservable through a door because I25 refuses the staging).
-Three kills needed a discriminator written first — the seal's stream-row
-refusal asserted by its text ahead of I32's, a sparse-seq stream for a
-reader that would use the list index, a positioned-but-unnamed manifest for
-a parser that would lean on the per-chunk check. The table is in the
-CHANGELOG entry for this cut.
+Three witnesses carry a discriminator — the seal's stream-row refusal
+asserted by its text ahead of I32's, a sparse-seq stream for a reader that
+would use the list index, a positioned-but-unnamed manifest for a parser that
+would lean on the per-chunk check.
 
 ### 12.11 The cascade result partitions the ROSTER (#843)
 
-Every cascade enumerated its cohort per **occurrence** and partitioned that
-list into `granted` / `excluded`. A roster member with no active occurrence
-contributed nothing to the list and so appeared in neither. The observed
-result (CIRISServer#590 / CIRISEdge#599): a pair community's write reported
-`granted=[]`, `excluded=["bob-v1-phone"]` — one unrelated device — while
-alice, the author, a founder and the identity the request authenticated,
-was named nowhere, because she had no occurrence. The one field a caller
-reads to answer "who cannot read what I just wrote" answered *bob's phone*
-about content nobody could read, the sender included. The two states have
-different remedies — register a key on a device you have; this identity
-has no content-KEM presence at all — and the API rendered the second as a
-milder version of the first.
+A cascade enumerates its cohort per **occurrence** and partitions that list
+into `granted` / `excluded`. A roster member with no active occurrence
+contributes nothing to that list, so an occurrence-only result would name
+them nowhere: a pair community's write could report `granted=[]`,
+`excluded=["bob-v1-phone"]` while the author, with no occurrence, is unnamed
+(CIRISServer#590 / CIRISEdge#599). The two states have different remedies —
+register a key on a device you have; this identity has no content-KEM
+presence at all — so the result partitions the ROSTER.
 
 **The shape.** `RosterPartition { granted: Vec<MemberGrant>, excluded,
 absent }` rides every cascade result — `CascadeResult`,
 `CommunityCascadeResult`, `PutBlobScopedResult`, `PutChunkScopedResult`,
 `SealStreamScopedResult` — as `roster`, beside the per-occurrence
-`granted` / `excluded`, whose meaning is unchanged:
+`granted` / `excluded`:
 
 | list | who | remedy |
 |---|---|---|
@@ -2172,21 +1981,18 @@ pure and the one place every cascade — self/family, community, chunk —
 decides who is granted, excluded or absent. `resolve_recipients` (self /
 family) and `active_member_occurrences` (community; also the roster leg of
 `may_learn_epoch_fate`, §11.5) return members WITH their occurrences, so an
-empty enumeration is still a member on the list. The community cascade's
-private copy of `usable_keys` is gone with it.
+empty enumeration is still a member on the list.
 
 **Surfaces.** The five Python cascade serializers — `put_blob_scoped`,
 `put_blob_encrypted_community`, `put_blob_encrypted_self_family`,
-`put_blob_chunk_scoped`, `seal_stream_scoped` — add `roster` and
-`readable_by_nobody`; existing keys are unchanged. A from-disk gate
+`put_blob_chunk_scoped`, `seal_stream_scoped` — carry `roster` and
+`readable_by_nobody`. A from-disk gate
 (`i54_every_cascade_serializer_carries_the_roster_partition`, the I30
 shape) reds if any of the five drops them.
 
-**Not done here.** `hard_case:recipient_excluded` is still emitted per
-excluded OCCURRENCE; an `absent` member emits nothing, because there is no
-occurrence to key the event on. Whether a member-keyed hard case is wanted
-is a question for the consumers that surfaced #843, not decided by this
-cut.
+**Open.** `hard_case:recipient_excluded` is emitted per excluded OCCURRENCE;
+an `absent` member emits nothing, because there is no occurrence to key the
+event on. Whether a member-keyed hard case is wanted is open (#843).
 
 **Witnesses.** `exercise_i54_the_cascade_result_partitions_the_roster`
 (sqlite + postgres, through `put_blob_scoped`): the #843 roster; a lone
@@ -2204,7 +2010,7 @@ Two unit tests on the pure partition.
 | b | derive `readable_by_nobody` from the occurrence list: `granted.is_empty() && !excluded.is_empty()` ("every enumerated occurrence was excluded") | `PutBlobScopedResult::readable_by_nobody` | KILLED — unit test (an empty roster at a sealed tier), I54 (I54/2: the lone member — nothing enumerated, nothing excluded) |
 | b2 | derive it from the granted occurrences alone: `granted.is_empty()` | same | SURVIVED — an equivalent mutant: a granted occurrence always belongs to a roster member, so "no occurrence granted" and "no member granted" coincide by construction on every constructible input. Recorded, not dressed up: the roster's contribution is what it NAMES (a, c, d), not this bit. |
 | c | drop the member-level `excluded` — a bare-only member goes nowhere | `partition_roster` | KILLED — unit test, I54 (I54/1: bob), Engine door |
-| d | re-introduce the original enumeration: skip a member whose occurrence list is empty | `active_member_occurrences` | KILLED — I54 (I54/1: "alice — on the roster, no occurrence — is ABSENT, and named"), Engine door |
+| d | skip a member whose occurrence list is empty | `active_member_occurrences` | KILLED — I54 (I54/1: "alice — on the roster, no occurrence — is ABSENT, and named"), Engine door |
 | e | drop the plaintext-tier exception in `readable_by_nobody` | `PutBlobScopedResult::readable_by_nobody` | KILLED — unit test, I54 (I54/5: a commons write) |
 
 Every restore verified by an empty diff. The wheel test was not run under
@@ -2227,11 +2033,10 @@ key-grant sets already emitted stay (CC 3). The full account is
 
 ### 12.13 One DEK per (stream, epoch) for self/family streams (#969)
 
-Before v53 a self/family chunk was a whole blob: a fresh DEK per chunk and a
-content-axis `key_grant` set per chunk, so a 1024-chunk file carried 1024
-wraps per recipient and a new device needed 1024 re-grants. CC 5.3.3.1 seals a
-stream under one DEK per `(stream_id, epoch)` with the STREAM nonce, and CC
-part 5 §5.1 distributes that key O(N) per epoch. v53 does both.
+CC 5.3.3.1 seals a stream under one DEK per `(stream_id, epoch)` with the
+STREAM nonce, and CC part 5 §5.1 distributes that key O(N) per epoch. A
+per-chunk DEK with a per-chunk content-axis set would cost a 1024-chunk file
+1024 wraps per recipient and a new device 1024 re-grants. So:
 
 - **The DEK** (V168 `federation_stream_deks`, PK `(stream_id, epoch)`): minted
   on the epoch's first chunk, self-retained under the content master, held only
@@ -2275,8 +2080,8 @@ part 5 §5.1 distributes that key O(N) per epoch. v53 does both.
 - **The manifest** is v4: v2 plus the top-level member `"chunk_keys":
   "stream_epoch"` and each chunk's `epoch`, inside the sealed manifest, so both
   are authoritative. A v3 root's children are v4. A manifest without the member
-  is legacy (per-chunk DEKs) and reads as before, forever. A stream that already
-  held per-chunk-keyed chunks when v53 arrived stays per-chunk to its seal (one
+  is legacy (per-chunk DEKs) and reads as before, forever. A stream that holds
+  per-chunk-keyed chunks stays per-chunk to its seal (one
   DAG never mixes the two).
 - **Reads.** The reader opens a v4 chunk under the viewer's stream grant of the
   chunk's epoch (one recovery per epoch per read), recomputes the nonce from
@@ -2313,20 +2118,15 @@ local signature, per-row KDF throughput, `tickets.email` — are named,
 not hidden, and the substrates that do not fit the cleavage are
 classified exempt, honestly.
 
----
 
-**§10 (added 2026-09-09)** locks the blob half: the cohort-keyed DEK
-cascade, its real HKDF root, Tink keyset semantics with a destroy state,
-and the AV-70 amendment that a destroyed epoch's content must be
-re-sealed or evicted first. §3's boundary map for the other substrates
-is unchanged, and the attestation question stays open as JC-10.
-
-**§12 (added 2026-09-09, #832)** crosses the envelope with the streaming
-substrate: a chunk is a whole blob (its own `CRBLOB` envelope, addressed by
-ciphertext), the manifest carries plaintext sizes and is sealed under the same
-DEK, the seal door checks chunk ROWS, the range read decrypts per chunk with
-per-epoch authorization, the transfer path never decrypts, and `stream_chunks`
-is the live-stream handle. §12.9–§12.10 (#837, #838) bind a stream to its
-first append and a chunk to its position. §12.11 (#843) partitions the
-cascade result by roster MEMBER, so a write nobody can read says so.
-
+§10–§12 specify the blob half, which is implemented: the cohort-keyed DEK
+cascade on its HKDF root, Tink keyset semantics with a destroy state and the
+AV-70 amendment (§10); the guarantees made true by construction (§11); and
+chunked content under the envelope — a chunk is a whole blob addressed by its
+ciphertext, the manifest carries plaintext sizes under the same DEK, the seal
+door checks chunk ROWS, the range read decrypts per chunk with per-epoch
+authorization, the transfer path never decrypts, a stream belongs to its first
+append, a chunk is bound to its position, the cascade result partitions the
+roster, and self/family streams use one DEK per `(stream, epoch)` (§12). §3's
+boundary map for the other substrates is a forward plan, and the attestation
+question is open as JC-10.

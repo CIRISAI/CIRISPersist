@@ -1,11 +1,10 @@
 # Auto-retry CI on transient infrastructure flakes.
 #
-# Why: CI's `linux-x86_64-test` matrix spins up a `services: postgres`
-# container pulled from Docker Hub at job-init. Docker Hub rate-limits /
-# transient outages make that pull fail ("Initialize containers: Docker
-# pull failed with exit code 1") on shared-runner IPs — GitHub's own 3×
-# init-pull retries don't always clear it. Because the tag-gated PyPI
-# publish `needs:` the whole matrix, ONE such flake blocks a release and
+# Why: transient infrastructure failures — a container pull failing at
+# "Initialize containers", a crates.io registry blip, runner disk
+# pressure — can fail a job before or outside our code, and GitHub's own
+# retries don't always clear them. Because the tag-gated release jobs
+# `needs:` the whole matrix, ONE such flake blocks a release and
 # forces a manual `gh run rerun --failed`. This automates that rerun —
 # but ONLY for transient infra signatures, never to mask a real failure.
 #

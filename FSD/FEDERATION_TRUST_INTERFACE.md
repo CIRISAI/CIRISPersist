@@ -1,26 +1,18 @@
 # FSD: Federation Trust Interface — purpose-scoped trust grants as signed events
 
-**Status:** Design (draft v1) — kickoff for CIRISPersist v1.5.0.
-**Author:** Eric Moore (CIRIS Team) with Claude Opus 4.7
-**Created:** 2026-05-16
-**Risk:** Architectural. Replaces the v1.3.0 trust-column shape on
-`federation_keys` with a purpose-scoped grant table backed by signed
-audit-chain events. Decentralizes the trust-write surface: any
-participant's local directory can emit grants; Registry is no longer
-the only authority.
+**Status:** Implemented in persist: the `federation_trust_grants` projection and the per-tenant Merkle layer (V021, V045), the emit API (`federation::emit::grant_trust` / `revoke_trust_grant`), the read API (`lookup_trust_grant`, `list_trust_grants`) and the proof API (`trust_grant_inclusion_proof`, `trust_grant_consistency_proof`, `current_sth`), on both backends. **Not implemented:** the backfill of V020 trust columns into grant events, and the drop of the V020 columns (§2.3, §6); heartbeat STHs (§4.4).
+**Scope:** Purpose-scoped trust grants backed by signed audit-chain events. Any participant's local directory can emit grants; Registry is not the only authority.
 
 **Cross-coordinates with:**
-- **CIRISVerify** — [#23](https://github.com/CIRISAI/CIRISVerify/issues/23) — SOTA upgrade to `ciris-verify-core::transparency` (RFC 6962 + STH + ConsistencyProof + generic `TransparencyLeaf` + `TransparencyStore` abstraction + per-`log_id` scoping). v1.5.0 pins to whichever minor ships this; persist consumes the upgraded primitives as the canonical transparency-log substrate. **Verify is the wellspring; persist consumes; edge consumes** — no parallel Merkle implementations.
+- **CIRISVerify** — [#23](https://github.com/CIRISAI/CIRISVerify/issues/23) — `ciris-verify-core::transparency` (RFC 6962 + STH + ConsistencyProof + generic `TransparencyLeaf` + `TransparencyStore` abstraction + per-`log_id` scoping). Persist consumes these primitives as the canonical transparency-log substrate. **Verify is the wellspring; persist consumes; edge consumes** — no parallel Merkle implementations.
 - **CIRISNodeCore** — Accord §RC `subject_kind` extension for
-  `TrustGrant` (LANDED in [`871ebab`](https://github.com/CIRISAI/CIRISNodeCore/commit/871ebab)); downstream rewire of `crate::trust::resolve_trust` to
-  read the new table.
+  `TrustGrant` ([`871ebab`](https://github.com/CIRISAI/CIRISNodeCore/commit/871ebab)); `crate::trust::resolve_trust` reads grants (§6.4).
 - **CIRISLensCore** — sign-emit path for grants issued by lens-tier
   operators; `verify_hybrid_via_directory` becomes verify-and-check-grant against STH+inclusion-proof.
-- **CIRISPortal** — UI surface for human-issued grants (later cut).
-- **CIRISPersist#47 / FSD `V020`** — V020 columns (`trust_type`,
-  `trust_relationship`, `trust_domains`, `trusted_by`, `trusted_at`,
-  `expires_at`) become a transitional shape; this FSD's V021 migration
-  decomposes them into the new grant table.
+- **CIRISPortal** — UI surface for human-issued grants.
+- **CIRISPersist#47 / `V020`** — the V020 trust columns on `federation_keys`
+  (`trust_type`, `trust_relationship`, `trust_domains`, `trusted_by`,
+  `trusted_at`, `expires_at`) coexist with the grant table (§2.3).
 
 ---
 
@@ -52,9 +44,8 @@ plus the identities those grants reference. It is the unit of
 federation handshake: when two directories peer, they exchange
 TrustGrant events to bring each other's trust state into view.
 Naming the concept explicitly (matching SPIFFE/SPIRE's usage)
-gives the forthcoming gossip FSD a clean boundary object to talk
-about; the concept is implicit in this FSD's schema and made
-explicit here only as vocabulary.
+gives federation gossip a clean boundary object; the concept is
+implicit in the schema and named here only as vocabulary.
 
 ### 1.1b Why not DIDs / Verifiable Credentials
 
@@ -74,14 +65,14 @@ CIRIS keeps the cryptography, skips the URI/registry layer.
 ### 1.2 Trust is purpose-scoped, not flat
 
 A human (or any agent acting in stewarding capacity) trusts other
-agents *for specific purposes*. The v1.3.0 trust columns collapse this
+agents *for specific purposes*. The V020 trust columns collapse this
 to one Boolean-ish axis (`trust_relationship` Direct vs Registry, plus
 a flat `trust_domains` list). That's not expressive enough to support
 "I trust this server for manifest verification but not for deferral
 resolution," which is exactly the dial the 3.0 decentralization model
 needs.
 
-Three purposes, each with a purpose-specific scope shape:
+Purposes, each with a purpose-specific scope shape (the fourth, `Service`, is in §3.2–§3.3):
 
 | Purpose | Scope shape | Example |
 |---|---|---|
@@ -106,14 +97,16 @@ peer's local directory and replayable on the audit chain. Therefore:
 
 This makes the audit chain the source of truth for grants. The
 directory table is a materialized projection — rebuildable from the
-chain at any time. Gossip protocols (forthcoming) carry grants between
-directories the same way they carry any other contribution.
+chain at any time. Gossip carries grants between directories the same
+way it carries any other contribution.
 
 ---
 
 ## 2. Schema
 
 ### 2.1 V021 migration — Postgres
+
+The design shape (the shipped migration lives in the `cirislens.` schema, references `federation_keys(key_id)`, adds `tenant_id`, admits a fourth purpose `service`, and V045 makes `(tenant_id, chain_event_id)` unique):
 
 ```sql
 CREATE TABLE federation_trust_grants (
@@ -147,24 +140,27 @@ no `TEXT[]` (none used here — scope is a single TEXT per row, by
 design). The grant table is dialect-clean in a way V020's trust
 columns weren't.
 
-### 2.3 v1.3.0 trust-column deprecation
+### 2.3 V020 trust columns
 
-V020 columns (`trust_type`, `trust_relationship`, `trust_domains`,
-`trusted_by`, `trusted_at`, `expires_at`) remain on `federation_keys`
-through v1.5.x as a read-only compatibility shim. V022 (cut in v1.6.0)
-drops them after one full minor of co-existence.
+The V020 columns (`trust_type`, `trust_relationship`, `trust_domains`,
+`trusted_by`, `trusted_at`, `expires_at`) remain on `federation_keys`.
+`FederationDirectory::grant_trust` / `revoke_trust` still write them,
+each taking a signed request (`SignedTrustGrant` /
+`SignedTrustRevocation`) whose signer must prove it is the granter
+(`admission::check_trust_grant_authority`); only the granter withdraws
+its own grant.
 
-A V021 backfill emits synthetic `TrustGrant` events for every existing
-v1.3.0 trust row:
+**Not implemented:** dropping the V020 columns (V022 is an unrelated
+migration), and backfilling V020 rows into synthetic `TrustGrant`
+events. The intended mapping:
 
-| v1.3.0 row | Synthetic events emitted |
+| V020 row | Synthetic events |
 |---|---|
 | `trust_relationship='direct'` (any `trust_type`) | one `TrustGrant` with `purpose='deferral', scope='*'` (legacy wildcard) |
 | `trust_relationship='registry'`, `trust_domains=[d1, d2]` | N events: one `(purpose='deferral', scope=d1)`, one `(purpose='deferral', scope=d2)` |
 
-The backfill is one-shot; subsequent grants flow only via the event
-path. Backfill events are signed by the legacy `trusted_by` key as
-recovered from the V020 column.
+A backfill would be one-shot and would sign each event with the legacy
+`trusted_by` key recovered from the V020 column.
 
 ---
 
@@ -174,9 +170,8 @@ recovered from the V020 column.
 
 Same pattern as `registry_vouch` (Accord §3.2): encoded as
 `contribution_type=proposal` with `subject.subject_kind="trust_grant"`.
-No new top-level `ContributionType` variant. No coordinated release
-across all federation consumers — persist accepts the envelope today
-unchanged.
+No new top-level `ContributionType` variant, so no coordinated release
+across federation consumers is needed.
 
 ```
 contribution_type = proposal
@@ -262,9 +257,9 @@ issued in the wild SHOULD use canonical strings only:
 | `proposal:failure_pattern` | §3.2 | Failure-pattern ticket |
 | `proposal:registry_vouch` | §3.2 | Registry vouching (FSD/TRUST_HIERARCHY) |
 | `proposal:trust_grant` | (this FSD) | The TrustGrant itself — meta-trust |
-| `proposal:test_result` | (NEW — needs SCHEMA addition) | Result of running a battery/question against an agent |
-| `proposal:improvement` | (NEW — needs SCHEMA addition) | Substrate or content improvement proposals |
-| `proposal:gratitude_signal` | (NEW — needs SCHEMA addition; PoB §5.6) | Peer-to-peer credit; acceptance policy hangs on Contribution-purpose trust grants |
+| `proposal:test_result` | NodeCore §RC | Result of running a battery/question against an agent |
+| `proposal:improvement` | NodeCore §RC | Substrate or content improvement proposals |
+| `proposal:gratitude_signal` | NodeCore §RC (PoB §5.6) | Peer-to-peer credit; acceptance policy hangs on Contribution-purpose trust grants |
 | `vote:<any-of-above>` | (votes themselves, per MISSION Primitive 2) | Vote on any votable Contribution |
 
 **All Contribution types must be votable.** The `vote:` prefix
@@ -275,11 +270,9 @@ distinctly from "trust K to author them." A grant of
 typically grant both; gating them separately is the seam that lets
 policy distinguish proposers from ratifiers.
 
-The three new `subject_kind`s (`test_result`, `improvement`,
-`gratitude_signal`) were proposed as upstream blockers in an earlier
-draft; **NodeCore §RC landed those plus 12 additional subject_kinds**
-in [`871ebab`](https://github.com/CIRISAI/CIRISNodeCore/commit/871ebab)
-via the MESSAGE_TAXONOMY FSD. All 15 are now wire-ready.
+NodeCore §RC defines `test_result`, `improvement`, `gratitude_signal`
+and 12 further subject_kinds (MESSAGE_TAXONOMY FSD,
+[`871ebab`](https://github.com/CIRISAI/CIRISNodeCore/commit/871ebab)).
 
 **Service scopes** are canonical strings under `Service` purpose:
 
@@ -297,8 +290,7 @@ service providers agree on canonical kinds per MESSAGE_TAXONOMY §6.1);
 the `<resource>` axis distinguishes offerings within a kind. The trust
 grant gates whether the grantee may invoke; per-invocation RPC
 authorization rides edge transport (CIRISEdge `ServiceRequest` /
-`ServiceResponse` `MessageType` — separate issue, non-blocking for
-v1.5.0).
+`ServiceResponse` `MessageType`).
 
 Wildcard semantics: a grant with `scope='*'` matches all scopes within
 its purpose. Wildcards are a strict trust elevation; consumers should
@@ -464,7 +456,7 @@ pub struct TrustGrantInclusionProof {
 The signer is the engine's local signing key (post-#51 `local_sign`).
 The granter field on the event is the local public key. Self-grant
 (`granter == grantee`) is rejected at the API boundary, matching the
-v1.3.0 `trusted_by != key` integrity rule.
+V020 `trusted_by != key` integrity rule.
 
 ### 4.2 Ingest — automatic on chain landing
 
@@ -474,7 +466,7 @@ updates the corresponding `federation_trust_grants` row. The hook is
 idempotent — same `chain_event_id` arriving twice is a no-op.
 
 No public API for ingest. It runs in the audit-chain commit path,
-analogous to how `registry_vouch` rows index automatically today.
+analogous to how `registry_vouch` rows index automatically.
 
 ### 4.3 Read API
 
@@ -541,7 +533,7 @@ Rationale — every-append is the right cadence for CIRIS's governance-paced vol
 
 STH freshness is the verifier's responsibility — the substrate signs every STH; consumers decide their own window (strict consumers may require seconds; historical replay tooling accepts any STH that covers the leaf). The CIRIS Accord doesn't pin freshness — it's policy.
 
-**Heartbeat STHs** (signed STH at fixed cadence even when idle) — deferred to the witness-cosigning era. The substrate ships every-append in v1.5.0; heartbeat is additive.
+**Heartbeat STHs** (a signed STH at a fixed cadence even when idle) — not implemented. The substrate signs an STH on every append; a heartbeat would be additive and matters once witness cosigning exists.
 
 ```rust
 // From ciris_verify_core::transparency
@@ -610,66 +602,54 @@ steward" guarantee.
 
 ---
 
-## 6. Migration from v1.3.0
+## 6. Migration and consumers
 
-### 6.1 v1.4.0 — interim cut
+### 6.1 Before the grant table
 
-- Ship the SQLite-parity port for v1.3.0's `federation_*` methods
-  (CIRISPersist#52) so SQLite directories can hold V020 trust columns.
-- Ship the `steward_* → local_*` rename (CIRISPersist#51) with
-  deprecated aliases.
-- No schema changes. v1.4.0 is the last release on the V020 shape.
+V020 trust columns on `federation_keys`, with SQLite parity for the
+`federation_*` methods (CIRISPersist#52) and the `steward_* → local_*`
+rename (CIRISPersist#51).
 
-### 6.2 v1.5.0 — substrate cut (this FSD)
+### 6.2 The grant substrate
 
-- V021 migration: `federation_trust_grants` table on both dialects.
-- Backfill: V021 emits synthetic `TrustGrant` events for every live
-  V020 trust row (signed by the recovered `trusted_by` key).
-- Emit / ingest / read API per §4.
-- V020 trust columns stay readable; new code reads grants table.
-- Bumps minimum CIRISNodeCore version to whatever ships the Accord §RC
-  `trust_grant` `subject_kind` addition.
+- V021: `federation_trust_grants` and the Merkle tables on both dialects.
+- Emit / ingest / read / proof API per §4.
+- V020 trust columns stay; the grant API reads the grants table.
+- Requires a CIRISNodeCore that defines the Accord §RC `trust_grant` `subject_kind`.
 
-### 6.3 v1.6.0 — V020 column drop
+### 6.3 V020 column drop
 
-- V022 migration: drop V020 trust columns from `federation_keys`.
-- Consumers that still read V020 columns at v1.6.0 release have one
-  full minor of notice; the deprecation timeline tracks the CHANGELOG.
+**Not implemented.** Dropping the V020 columns would follow a backfill
+(§2.3); neither exists.
 
 ### 6.4 NodeCore rewire
 
-`crate::trust::resolve_trust` rewires from
-`directory.lookup_trust(key)` to
-`directory.list_trust_grants(filter)`. Transitive vouching unchanged
-in shape — `registry_vouch` Contributions still drive the transitive
-edges; only the trust-grant lookup path changes.
-
-NodeCore ships this in its v0.8.x cut once Persist v1.5.0 is out.
+`crate::trust::resolve_trust` reads `directory.list_trust_grants(filter)`
+rather than `directory.lookup_trust(key)`. Transitive vouching is
+unchanged in shape — `registry_vouch` Contributions drive the transitive
+edges; only the trust-grant lookup path differs. (A CIRISNodeCore change.)
 
 ### 6.5 LensCore rewire
 
-`verify_hybrid_via_directory` becomes
 `verify_hybrid_and_check_grant(purpose, scope)`: signature check first,
-then check that the signer holds a live grant for the purpose+scope of
-the trace being verified. LensCore ships this when CIRISLensCore#21's
-counter-RII detector wires through.
+then a check that the signer holds a live grant for the purpose+scope of
+the trace being verified. A CIRISLensCore change, tied to
+CIRISLensCore#21's counter-RII detector.
 
 ### 6.6 Portal rewire
 
-Portal builds a "Manage Trust" UI surface that submits signed
-`TrustGrant` events to the operator's local Persist (or to Registry's
-Persist for CIRISRegistry-anchored deployments). Out of scope for this
-FSD — Portal owns the UI design.
+A "Manage Trust" UI that submits signed `TrustGrant` events to the
+operator's local persist (or to Registry's for CIRISRegistry-anchored
+deployments). Portal owns the UI design.
 
 ---
 
 ## 7. Out of scope
 
 - **Gossip transport** — how `TrustGrant` events propagate between
-  directories. Same channel as other Contribution events; the
-  forthcoming federation-gossip FSD covers it.
+  directories. Same channel as other Contribution events.
 - **Portal UI shape** — Portal owns the trust-management surface.
-  This FSD pins only the wire format and persist API.
+  This document pins only the wire format and persist API.
 - **Domain taxonomy ownership** — covered by TRUST_HIERARCHY.md §9.
 - **Purpose taxonomy evolution** — adding a fourth purpose (e.g.
   `governance`) is a future Accord §RC amendment, not a Persist
@@ -682,26 +662,23 @@ FSD — Portal owns the UI design.
 
 ---
 
-## 8. Implementation order
+## 8. Implementation map
 
-| # | Step | Repo | Dep |
+| # | Step | Repo | Status |
 |---|---|---|---|
-| 1 | ~~Accord §RC additions: 15 new subject_kinds + MESSAGE_TAXONOMY FSD~~ **LANDED** in NodeCore [`871ebab`](https://github.com/CIRISAI/CIRISNodeCore/commit/871ebab) | CIRISNodeCore | ✅ done |
-| 2 | ciris-verify-core::transparency SOTA upgrade (RFC 6962 + STH + ConsistencyProof + generic leaf + storage abstraction + per-log_id) — **[CIRISVerify#23](https://github.com/CIRISAI/CIRISVerify/issues/23)** | CIRISVerify | 🔴 upstream gate for v1.5.0 |
-| 3 | V021 migration (Postgres + SQLite) — `federation_trust_grants` + `merkle_leaves` + `merkle_sth_log` + `merkle_nodes` | CIRISPersist | (2) |
-| 4 | `AuditLeaf: TransparencyLeaf` impl + `PgTransparencyStore` / `SqliteTransparencyStore` | CIRISPersist | (2) (3) |
-| 5 | `TrustGrantPayload` + chain-commit ingest hook (incl. witness_set activation + Merkle tree update + STH cadence trigger) | CIRISPersist | (1) (3) (4) |
-| 6 | `grant_trust` / `revoke_trust_grant` emit API + PyO3 wrappers | CIRISPersist | (5) |
-| 7 | `lookup_trust_grant` / `list_trust_grants` read API + PyO3 | CIRISPersist | (3) |
-| 8 | `trust_grant_inclusion_proof` / `trust_grant_consistency_proof` / `current_sth` proof APIs + PyO3 wrappers | CIRISPersist | (4) (5) |
-| 9 | V021 backfill from V020 columns (synthetic TrustGrant events signed by recovered `trusted_by`) | CIRISPersist | (5) (6) |
-| 10 | `crate::trust::resolve_trust` rewire to grants table | CIRISNodeCore | (7) |
-| 11 | `verify_hybrid_and_check_grant` + STH/inclusion-proof verification | CIRISLensCore | (7) (8) |
-| 12 | "Manage Trust" UI | CIRISPortal | (6) |
-| 13 | V022 drop of V020 trust columns | CIRISPersist | one minor after (9) |
-
-Steps 1-6 are the v1.5.0 cut. Steps 7-9 land in successive downstream
-minors. Step 10 is v1.6.0.
+| 1 | Accord §RC subject_kinds + MESSAGE_TAXONOMY FSD ([`871ebab`](https://github.com/CIRISAI/CIRISNodeCore/commit/871ebab)) | CIRISNodeCore | done |
+| 2 | `ciris-verify-core::transparency` (RFC 6962 + STH + ConsistencyProof + generic leaf + storage abstraction + per-log_id) — [CIRISVerify#23](https://github.com/CIRISAI/CIRISVerify/issues/23) | CIRISVerify | done |
+| 3 | V021 migration (Postgres + SQLite) — `federation_trust_grants` + `merkle_leaves` + `merkle_sth_log` | CIRISPersist | implemented |
+| 4 | Audit leaves on the transparency store (`src/audit/merkle_store.rs`, `merkle_leaf.rs`) | CIRISPersist | implemented |
+| 5 | Chain-commit ingest hook: Merkle update, STH, grant projection | CIRISPersist | implemented |
+| 6 | `grant_trust` / `revoke_trust_grant` emit API + PyO3 | CIRISPersist | implemented |
+| 7 | `lookup_trust_grant` / `list_trust_grants` read API + PyO3 | CIRISPersist | implemented |
+| 8 | `trust_grant_inclusion_proof` / `trust_grant_consistency_proof` / `current_sth` + PyO3 | CIRISPersist | implemented |
+| 9 | Backfill of V020 columns into synthetic `TrustGrant` events | CIRISPersist | not implemented |
+| 10 | `crate::trust::resolve_trust` reads grants | CIRISNodeCore | consumer-side |
+| 11 | `verify_hybrid_and_check_grant` + STH/inclusion-proof verification | CIRISLensCore | consumer-side |
+| 12 | "Manage Trust" UI | CIRISPortal | consumer-side |
+| 13 | Drop of V020 trust columns | CIRISPersist | not implemented |
 
 ---
 
@@ -712,9 +689,9 @@ minors. Step 10 is v1.6.0.
 - `/home/emoore/CIRISNodeCore/SCHEMA.md` §3.1 / §3.2 — Contribution
   type taxonomy this FSD extends
 - CIRISPersist V020 (`federation_keys_trust_hierarchy.sql`) — the
-  transitional shape this FSD replaces
-- CIRISPersist#51 — `steward_* → local_*` rename (v1.4.0 interim)
-- CIRISPersist#52 — SQLite parity for federation_* methods (v1.4.0)
+  columnar trust shape that coexists with the grant table
+- CIRISPersist#51 — `steward_* → local_*` rename
+- CIRISPersist#52 — SQLite parity for federation_* methods
 - CIRISAgent#760 — Accord §RC consent_role primitive
-- Memory: `project_one_key_primitive.md` — Ed25519+ML-DSA hybrid
-  pubkey is the identity ground; trust grants compose over that ground
+- The identity ground: the Ed25519 + ML-DSA-65 hybrid pubkey; trust
+  grants compose over it

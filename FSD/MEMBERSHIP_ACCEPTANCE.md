@@ -1,8 +1,8 @@
 # FSD — Membership acceptance: nobody joins without their own signed consent
 
-**Issue:** CIRISPersist#955 · **Normative source:** CIRISConstitution#133 (CC 4.4.3.2.3 admit predicate and its family twin) · **Target:** v52.0.0 (MAJOR) · **Adopter contract:** accepted by CIRISServer as posted in #955 issuecomment-5903472278 (Server mirror: `FSD/MEMBERSHIP_INVITES.md` @8bd5e522).
+**Issue:** CIRISPersist#955 · **Normative source:** CC 4.4.3.2.3 (the admit predicate and its family twin; CIRISConstitution#133) · **Adopter contract:** the CIRISServer mirror is `FSD/MEMBERSHIP_INVITES.md`.
 
-**Rulings (maintainer, 2026-09-30):**
+**Rules:**
 - Nobody joins a family or community without their own signed acceptance. This holds under every `consensus_protocol`, `founder_only` included.
 - Founding-roster members consent by SIGNING the founding record (its authority or a co-signer); anyone listed who did not sign joins only by proposal and acceptance (§9 Q1).
 - A supersede never adds a member; every addition rides the widening planes (§9 Q2).
@@ -10,14 +10,14 @@
 
 ---
 
-## 1. The hole
+## 1. Entry points
 
-Membership grows through four entry points:
+Membership grows through these entry points:
 - the widening planes (`put_family_membership_widening`, `put_community_membership_widening`, and the local `add_member` → `add_{family,community}_member`, which write a widening row);
 - a roster-growing supersede (`supersede_{family,community}_with_quorum`, and replicated `put_family` / `apply_replicated_community` through `group_amendment::route_occupied_*`);
 - the founding record (the first insert of `put_family` / `put_community` / `apply_replicated_community`).
 
-Each asks the EXISTING members' standing under `consensus_protocol` (`check_{family,community}_roster_authority`, `verify_membership_quorum`). None asks the member being added. The only newcomer-signed input anywhere is `geographic`'s `location_proof`.
+Each asks the EXISTING members' standing under `consensus_protocol` (`check_{family,community}_roster_authority`, `verify_membership_quorum`). That check does not involve the member being added (the only newcomer-signed input it reads is `geographic`'s `location_proof`), so the acceptance gate of §5 runs beside it at every entry point.
 
 ## 2. Three claim dimensions on the attestation plane
 
@@ -34,7 +34,7 @@ No new `EnvelopeKind`. The attestation plane carries every claim family, and a n
 - K is named in `subject_key_ids`, NOT in `attested_key_id`: AV-84 makes a targeted row's `attested_key_id` its own producer.
 - A proposal for a K who is already active in the group at `asserted_at` is not an error. It simply has nothing to admit.
 
-The dimension family is governed by persist. It is registered through CIRISConstitution#133. Until the re-vendor lands it is a declared exception (`UNREGISTERED_GATED_FAMILIES`), never a staged family: a staged family refuses at federation tier and would stop delivery.
+The dimension family is governed by persist and registered in the Constitution as `membership:{stage}` (CC 4.4.3.2.3, CIRISConstitution#133); the vendored namespace registry governs the stem.
 
 ## 3. Two narrow arms
 
@@ -42,7 +42,7 @@ The dimension family is governed by persist. It is registered through CIRISConst
 A `membership:proposal:v1` row is readable by a caller whose self-collective (`admission.self_key_ids`) contains an entry of the row's `subject_key_ids`.
 - The Rust gate `CallerScope::admits` and the SQL twin `cohort_scope_sql_predicate_full` move together. The SQL twin is an `EXISTS` over the V106 `attestation_subjects` projection, keyed on the row's `attestation_id` and gated on `attestation_type = 'membership:proposal:v1'`.
 - Only the proposal dimension gets this arm; nothing else in the room becomes visible to a non-member.
-- The serve cursor (`list_attestations_since`) is unchanged: it already serves every federation-tier row. Routing a proposal to K's node is the transport's job (Edge), keyed on `subject_key_ids`.
+- The serve cursor (`list_attestations_since`) needs no arm: it serves every federation-tier row. Routing a proposal to K's node is the transport's job (Edge), keyed on `subject_key_ids`.
 
 ### 3.2 Write: K's reply at a group K is not in
 AV-45 (`check_write_cohort_scope_for`) refuses a non-member's row at a group target. An acceptance or decline is admitted there iff:
@@ -50,14 +50,14 @@ AV-45 (`check_write_cohort_scope_for`) refuses a non-member's row at a group tar
 - the referenced proposal is held on this node;
 - group id, `proposal_hash` and (acceptance) `role` agree with it.
 
-A reply whose proposal is not held here refuses RETRYABLE: `membership_proposal_unresolved`, the #797 shape. A reply that disagrees refuses TERMINAL: `membership_acceptance_mismatch`. Every other non-member row still refuses as today.
+A reply whose proposal is not held here refuses RETRYABLE: `membership_proposal_unresolved`, the #797 shape. A reply that disagrees refuses TERMINAL: `membership_acceptance_mismatch`. Every other non-member row is refused.
 
 **Replies conflict.** The door refuses the second reply (acceptance after decline, decline after acceptance) by the same K to the same proposal: `membership_reply_conflict`. A node that holds both, because they replicated in different orders, treats the proposal as dead (§5).
 
 ## 4. Who proposes; where the quorum lives
 - `founder_only`: the proposer is an active founder (role `founder`).
 - Any other protocol: any active member at the proposal's `asserted_at`.
-- **The consensus quorum stays on the growth record** (the widening's primary signer and cosigners, or the supersede's `quorum_signatures`), judged exactly as today by `check_*_roster_authority` / `verify_membership_quorum`. The proposal carries no quorum: it is an invitation; the group's decision is the growth. One quorum check, not two.
+- **The consensus quorum stays on the growth record** (the widening's primary signer and cosigners, or the supersede's `quorum_signatures`), judged by `check_*_roster_authority` / `verify_membership_quorum`. The proposal carries no quorum: it is an invitation; the group's decision is the growth. One quorum check, not two.
 - Consequence: under a quorum protocol K can accept and still not be admitted. Server shows this as "accepted, awaiting the group".
 
 ## 5. The gate: every growth, every protocol, put AND apply
@@ -68,11 +68,11 @@ For each identity K that a growth ADDS — not active in the group's authorized 
 3. `acceptance.asserted_at ≤ P.expires_at`;
 4. the growth's own signed instant `≤ P.expires_at`.
 
-Expiry is judged on the instants the parties signed, never on a receiver's clock. Every node gives the same verdict for the same rows ([[feedback-a-signer-chosen-instant-is-not-an-axis-for-readmission]]: the instants are the consenting parties' own).
+Expiry is judged on the instants the parties signed, never on a receiver's clock. Every node gives the same verdict for the same rows: the instants are the consenting parties' own.
 
 A role change for an already-active member is not a growth and needs no acceptance.
 
-**Refusals** (one new `Error::MembershipAcceptanceRefused { group_key_id, member_key_id, rule }`, Python `ValueError` as the sibling `RosterAuthorityUnauthorized`, message `"<kind>: <rule>"`; CC surface `hard_case:community_consensus_protocol_violation:{C}`):
+**Refusals** (one `Error::MembershipAcceptanceRefused { group_key_id, member_key_id, rule }`, Python `ValueError` as the sibling `RosterAuthorityUnauthorized`, message `"<kind>: <rule>"`; CC surface `hard_case:community_consensus_protocol_violation:{C}`):
 
 | rule | class |
 |---|---|
@@ -91,15 +91,15 @@ A role change for an already-active member is not a growth and needs no acceptan
 |---|---|---|
 | widening (family, community) | `put_*_membership_widening` via `add_*_member` | the same door; the gate lives in `check_{family,community}_roster_authority`, which both reach |
 | supersede | `supersede_*_signed` (`group_amendment.rs`) | `route_occupied_*` (`group_amendment.rs`) |
-| founding record | `put_family` / `put_community` first insert (memory, sqlite, postgres) | `put_family` (replicated) / `apply_replicated_community` Insert route |
+| founding record | `put_family` / `put_community` first insert (sqlite, postgres) | `put_family` (replicated) / `apply_replicated_community` Insert route |
 
-**Founding record (Q1):** every listed member signed the record — its authority or a `cosignatures[]` entry, compared as identities — else `membership_founding_member_unsigned`. `SignedFamily` gains `cosignatures` (V162, persisted and served like a community row's V158 column).
+**Founding record (Q1):** every listed member signed the record — its authority or a `cosignatures[]` entry, compared as identities — else `membership_founding_member_unsigned`. `SignedFamily` carries `cosignatures` (V162, persisted and served like a community row's V158 column).
 
 **Supersede (Q2):** a supersede's roster may keep, re-list or drop members but never add one (`membership_supersede_cannot_add`), on the local door and the replicated amendment. One exception: a trust-root-grade community's founders' amendment (#926 HIGH-3 — founder seats move only through the record) may seat a key that SIGNED that version; signing is consent (Q1) and there is no proposal whose expiry could be judged.
 
 ### 5.1 A node gives no acceptance (CIRISPersist#972; CC 3.1.3.2)
 
-Operator ruling 2026-10-01: "Nodes do not vote/consent, they have no agency." A node member of an `infrastructure` community is seated by the founders' quorum and is never asked for an acceptance, on the widening plane and at the founding alike.
+Nodes do not vote or consent; they have no agency (CC 3.1.3.2). A node member of an `infrastructure` community is seated by the founders' quorum and is never asked for an acceptance, on the widening plane and at the founding alike.
 
 One predicate, `node_seated_without_acceptance(community, member, at)`, read by the growth gate and by the community founding rule:
 
@@ -107,15 +107,14 @@ One predicate, `node_seated_without_acceptance(community, member, at)`, read by 
 2. the member key is node-bearing at the record's instant (the #925 predicate: its own `identity_type` set, or an agreed occurrence of a `node` identity);
 3. the node's own key record carries the conferring family's m-of-n scrub — the accord's, re-verified from the row against the live accord roster.
 
-The founders' quorum is the roster-authority check (§4), which runs first and is unchanged. The owner binding is NOT read here: it is `self`-scope on the node, so no other node could verify it, and carrying it in a bundle would publish a person-to-node custody edge. The claim (CC 6.1.5.3) is enforced where the node operates.
+The founders' quorum is the roster-authority check (§4), which runs first. The owner binding is NOT read here: it is `self`-scope on the node, so no other node could verify it, and carrying it in a bundle would publish a person-to-node custody edge. The claim (CC 6.1.5.3) is enforced where the node operates.
 
-Unchanged: a person in an infrastructure community still needs an acceptance (or, at the founding, their signature); a node in an ordinary community or in any family is not exempt. Witnesses I335–I339.
+Not exempt: a person in an infrastructure community still needs an acceptance (or, at the founding, their signature); a node in an ordinary community or in any family is not exempt. Witnesses I335–I339.
 
 ## 6. Decline, withdrawal, leave
 - A decline is terminal for its proposal; a new invitation is a new proposal.
 - The proposer may withdraw a proposal with the ordinary `withdraws`; a withdrawn proposal is treated as expired.
-- A growth already admitted is never re-judged. A member leaves only by their own forward-only `withdraws`, unchanged.
-- Rows stored before v52 are not re-judged.
+- A growth already admitted is never re-judged. A member leaves only by their own forward-only `withdraws`.
 
 ## 7. Delivery (both directions)
 - **Proposal → K's node:** the transport routes by `subject_key_ids`. K's node applies it through `apply_replicated_attestation`, whose AV-45 gate asks whether the proposer is a member of the group. So K's node must hold the group's record and roster planes to admit the proposal (§9 Q4).
@@ -136,14 +135,14 @@ Unchanged: a person in an infrastructure community still needs an acceptance (or
 | I218 | Under a quorum protocol, an accepted K with an under-signed widening is refused `roster_authority_*` ("accepted, awaiting the group"), then admitted at quorum. |
 | I219 | Two nodes, end to end through the planes: the proposal on A is applied and read on K's node B; K accepts on B; A applies the acceptance; A's widening is admitted and B applies it. |
 
-## 9. Resolved (operator rulings of 2026-09-30, and persist's calls)
+## 9. Resolved questions
 
-- **Q1 — founding (operator):** a founding member is admitted iff it signed the founding record (authority or co-signer). Signing is consent. `SignedFamily.cosignatures` + V162.
-- **Q2 — supersede (operator):** a supersede may not add members; additions ride the widening planes, which carry the signed instant expiry is judged on. Trust-root founders' amendments keep their record-only founder seats for keys that signed the version (§5).
-- **Q3 — namespace (persist):** `membership:` is admitted through `UNREGISTERED_GATED_FAMILIES` (and recorded in `PERSIST_AUTHORED_GATED_UNCATALOGUED_FAMILIES`) until CIRISConstitution#133 registers the three rows; the re-vendor deletes both lines (the tests fail until it does). Not a staged family: that would refuse at federation tier and stop delivery.
-- **Q4 — K's node (persist):** a proposal whose group this node does NOT hold is stored without the roster check (the subject-apply arm) and is readable there only by its subject; the proposer's standing is judged where the roster lives, when the growth arrives. A reply is admitted wherever its proposal is held — it never needs the group's roster.
+- **Q1 — founding:** a founding member is admitted iff it signed the founding record (authority or co-signer). Signing is consent. `SignedFamily.cosignatures` + V162.
+- **Q2 — supersede:** a supersede may not add members; additions ride the widening planes, which carry the signed instant expiry is judged on. Trust-root founders' amendments keep their record-only founder seats for keys that signed the version (§5).
+- **Q3 — namespace:** `membership:{stage}` is a registered family (CC 4.4.3.2.3), governed by the vendored registry reading like every registered stem. It was never a staged family: that would refuse at federation tier and stop delivery.
+- **Q4 — K's node:** a proposal whose group this node does NOT hold is stored without the roster check (the subject-apply arm) and is readable there only by its subject; the proposer's standing is judged where the roster lives, when the growth arrives. A reply is admitted wherever its proposal is held — it never needs the group's roster.
 
-## 10. Decisions the build forced
+## 10. Design decisions
 
 - **Rows are `scores` claims.** The three dimensions ride the envelope's `dimension` (like every claim family); a proposer retracts with the ordinary `withdraws`.
 - **The reply is attested to K.** `attested_key_id` = the invitee, signed by K or a key acting for K (AV-84 admits a device signing about its own identity), so `list_attestations_for(K)` finds K's replies.

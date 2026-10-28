@@ -6,13 +6,7 @@
 > file. Methodology: `~/CIRISAgent/FSD/MISSION_DRIVEN_DEVELOPMENT.md`
 > and the overview at [ciris.ai/mdd](https://ciris.ai/mdd).
 
-**Version**: 1.3
-**Status**: Active — current as of `main` at **v9.0.0**
-(CIRIS Constitution 0.1.5 alignment cut; Coherence Epistemic Graph
-1.0-RC17 — §19 / §19.7 holonomic forever-memory substrate conformance)
-**Date**: 2026-06-18
-
-This is the reverse-engineered MDD charter for CIRISPersist: it maps the
+This is the MDD charter for CIRISPersist: it maps the
 four pillars — Mission (WHY) / Protocols (WHO) / Schemas (WHAT) / Logic
 (HOW) — onto the code as it stands. Every claim is anchored to a file
 path or constant; a reviewer should be able to grep from any sentence to
@@ -156,8 +150,8 @@ it is.
   bytes never reach the backend — proven by
   `signature_mismatch_rejected_no_writes` asserting the backend
   received zero rows.
-- **A partial migration reports honestly.** The #87 hardware-key
-  migration (`src/secrets/hardware.rs`) refuses to *call* a software
+- **A partial migration reports honestly.** The hardware-key
+  migration (#87) (`src/secrets/hardware.rs`) refuses to *call* a software
   fallback a "hardware" key — when no real secure storage exists it
   returns `SecretsError::HardwareKeyUnavailable` ("deriving a
   'hardware' master from that is dishonest, so …") rather than
@@ -168,7 +162,7 @@ it is.
 
 ### 1.7 Persist is relational fabric, not a Cartesian gate
 
-v3.0.0 (CIRISPersist#116, CEG 0.2 §0.5) — when reviewing the
+(CIRISPersist#116, CEG 0.2 §0.5.) When reviewing the
 admission surface (`src/federation/admission.rs` and the structural-
 composer §6.1 path), anchor against this frame: **the substrate
 records the relational fabric the federation produces; it does not
@@ -200,8 +194,7 @@ The two gate classes the admission policy carries
   rule (CEG §7.0 — `system:*`, `audit_chain:*`,
   `transparency_log:cosigned:*`, …), the four-test
   operational-language gate (T1/T2/T3/T4 — names must describe
-  machine-checkable mechanisms, not subjective qualities), the
-  CEG 0.1 → 0.2 attestation-ladder transition-window dual-acceptance.
+  machine-checkable mechanisms, not subjective qualities).
   None of these arbitrate "is the attester really X"; they enforce
   that the row's prefix string is a wire-format shape that
   consumers can compose over.
@@ -222,10 +215,10 @@ reasonable-looking gate additions.
 
 ### 1.8 Holonomic substrate / forever-memory (CEG §19 / §19.7, 1.0)
 
-v8.0.0–v8.5.0 (CEG 1.0-RC11→RC17, CIRISPersist#225/#227–#231) bring the
-**holonomic / forever-memory** substrate online. The mission frame is the
-single most load-bearing idea in §19.7, and persist is built to embody it
-rather than route around it:
+(CIRISPersist#225/#227–#231.) Persist is a **holonomic /
+forever-memory** substrate. The mission frame is the single most
+load-bearing idea in CEG §19.7, and persist embodies it rather than
+routing around it:
 
 - **One retirement operator, not many.** Revocation, capacity-eviction,
   scheduled expiry, and natural aging are *the same operation at different
@@ -267,20 +260,18 @@ rather than route around it:
   never enters that resolution, so there is no "reconstitute from any
   fragment" path and a revoked key is never resurrected. The witness MUST
   NOT decide the merge or replace `monotonic_quorum` / `revision`.
-- **The Registry → Verify → Persist family pattern.** This whole surface is
-  cut as a *three-repo lockstep* and the discipline is mission-load-bearing:
-  **CEG (CIRISRegistry) locks** the normative wire shape and the freeze (§19
-  ratified at RC11, §19.7 promoted to 1.0 at RC16); **CIRISVerify proves**
+- **The Registry → Verify → Persist family pattern.** This surface moves
+  as a *three-repo lockstep* and the discipline is mission-load-bearing:
+  **CEG (CIRISRegistry) locks** the normative wire shape; **CIRISVerify proves**
   it — it ships the verifiers (`verify_witness`, `verify_aggregation_meta`,
   `verify_member_commitment`, `ejection_verdict`, `compute_merkle_root`) and
   the cross-impl conformance vectors; **CIRISPersist conforms** — it is the
   *second implementation*, consuming verify-core's verifiers and reproducing
   the §19.7 conformance vectors byte-for-byte (`tests/conformance_vectors_v19_7.rs`).
   Persist rolls no §19 crypto and re-rolls no Merkle. The wire-churn firewall
-  is the same discipline as §3's canonical-bytes mandate: where the §19.7
-  shape was unfrozen, persist shipped the storage column (`aggregation_meta`)
-  as **opaque bytes** so the contract could finalize without a migration —
-  the column was byte-unchanged across the freeze (V086).
+  is the same discipline as §3's canonical-bytes mandate: persist stores
+  `aggregation_meta` as **opaque bytes** (V086), so the wire contract can
+  evolve without a storage migration.
 
 ### 1.9 Privacy non-goals — cohort scope hides content, not contact
 
@@ -321,7 +312,7 @@ does not conceal contact.
 
 ### 1.10 No agency, no verdict — the substrate stores, infrastructure is not a brain
 
-Two refusals the v9.0.0 constitution-alignment cut makes wire-checkable:
+Two refusals persist makes wire-checkable:
 
 - **The substrate stores; it never adjudicates** (**CC 1.13.4**). "The
   substrate stores; the wire transports; CEG describes the shape of the
@@ -352,12 +343,13 @@ with deliberate cross-repo coordination.
 
 - **The `Engine` process-singleton** (`src/ffi/pyo3.rs`,
   `ENGINE_SINGLETON: OnceLock<Mutex<Option<Arc<EngineCell>>>>`) — the
-  CIRIS 3.0 in-process cohabitation contract (`docs/COHABITATION.md`).
+  in-process cohabitation contract (`docs/COHABITATION.md`).
   One process hosting the agent **plus** CIRISNodeCore **plus**
   CIRISLensCore shares one runtime, one pool, one Ed25519 identity.
   Every `Engine(...)` call with a matching config returns an
-  `Arc`-clone of the same cell; `reset_engine()` (test-only) clears the
-  slot. `panic = "unwind"` (`Cargo.toml` `[profile.release]`) is
+  `Arc`-clone of the same cell; `reset_engine()` closes and un-pins the
+  singleton without needing a handle, and reports `drained` / `deferred`
+  / `timed_out` / `no_engine` rather than blocking under the GIL. `panic = "unwind"` (`Cargo.toml` `[profile.release]`) is
   mandatory so a bad row becomes a typed `LensQueryError` instead of a
   `SIGABRT` that takes down every cohabiting worker (the #24 prod wedge).
 - **The `Backend` trait** (`src/store/backend.rs`) — the sealed
@@ -435,7 +427,7 @@ staying queryable across a trace's lifetime.
   `src/secrets/crypto.rs::PBKDF2_ITERS`) from a master key that is
   itself derived via `ciris_verify_core::derive_symmetric_key` over a
   hardware-sealed seed (`src/secrets/hardware.rs`). Freed key material
-  is `Zeroizing`-wrapped (the #87 review-H2 fix).
+  is `Zeroizing`-wrapped.
 - **The analytics `ReadEngine`** (`src/read/`) — a *fixed* scoring
   query set served by the V042 covering indexes as index-only scans
   (`cross_agent_divergence` ~−42% vs. a raw table scan).
@@ -541,10 +533,10 @@ CIRISPersist does not stand alone. The authoritative federation map is
   `TransparencyLeaf` traits, so persist's hash-chained per-tenant
   chains are transparency logs in the federation-wide sense
   (`docs/AUDIT_CHAIN_BRIDGE.md`).
-- In-flight: the absorption track — CIRISPersist is the *only* library
-  that opens the engine DB file, ending CIRISAgent's direct
-  `sqlite3` / `psycopg2` / `aiosqlite` access (the 11-substrate
-  `cirislens_*` features in `Cargo.toml`, CIRISPersist#59 / #64 / #70).
+- CIRISPersist is the *only* library that opens the engine DB file;
+  CIRISAgent's storage surfaces go through it rather than through direct
+  `sqlite3` / `psycopg2` / `aiosqlite` access (the `cirislens_*`
+  features in `Cargo.toml`, CIRISPersist#59 / #64 / #70).
 
 ## 10. License-locked mission preservation
 
@@ -560,7 +552,7 @@ expected.
 
 ## 11. How to maintain this document
 
-A working document, not a release artifact. Update it whenever:
+Update this document whenever:
 
 - A substrate / feature in `Cargo.toml` is added or its contract changes
 - A canonical-bytes or audit-chain format in §3 changes shape

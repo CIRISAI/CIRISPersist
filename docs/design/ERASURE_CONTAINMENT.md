@@ -1,9 +1,11 @@
 # Erasability is decided at mint, never at erasure
 
-**Status:** the containment ruling CIRISVerify#241 and CIRISConstitution#78
-both left to whoever owns the objects, plus the evidence for it.
-**Answers:** CIRISPersist#573.
-**Prerequisite read:** `docs/design/PAYLOAD_ENUMERATION.md`, especially §7.
+**What this is:** persist's design for erasure containment, the decision
+CIRISVerify#241 and CIRISConstitution#78 leave to the owner of the objects, and
+the evidence for it. It answers CIRISPersist#573.
+**Background:** `PAYLOAD_ENUMERATION.md`, the enumeration of where arbitrary
+payload lives, cited below by section. It is not on `main`; it is on the branch
+`design-payload-enumeration`.
 
 Claims are marked **[TESTED]** with the test or command that produced them, or
 **[BELIEVED]** with the basis. A heading carries no warrant.
@@ -12,8 +14,8 @@ Claims are marked **[TESTED]** with the test or command that produced them, or
 
 ## 0. The question, and the answer
 
-CC 2.6 (rc3) ruled the signed-discriminator shape out, bound three substrate
-constraints normatively, and kept one option open:
+CC 2.6 rules the signed-discriminator shape out, binds three substrate
+constraints normatively, and keeps one option open:
 
 > **(d) the third option stays open** — a redacted row MAY simply be a
 > *different object carrying a different kind*, relocating the work entirely
@@ -21,7 +23,7 @@ constraints normatively, and kept one option open:
 CIRISVerify#241 built the cryptography for it — `ciris_verify_core::redactable`,
 SD-JWT/mDoc salted digests committing to member count and index ordering — and
 deliberately did not answer (d), *"to keep the wire-break scope a separate
-decision from the cryptography."* That decision is ours.
+decision from the cryptography."* That decision belongs to persist.
 
 **The answer is neither of (d)'s two branches, because both presuppose a
 redacted object exists. Persist should never produce one.**
@@ -118,7 +120,7 @@ failure to be the ambiguous `original_content_hash mismatch` — *"envelope
 canonicalizes to X, row declares Y"* — with the complaint that a reader cannot
 tell redaction from tampering.
 
-**[TESTED]** — `federation::erasable::ingest_gate_proof::{memory,sqlite}`, the
+**[TESTED]** — `federation::erasable::ingest_gate_proof`, the
 sealed control. The hybrid signature is verified **before** the hash
 cross-check (`verify_envelope_hybrid_signature` runs `verify_hybrid`, then
 compares the declared hash). So a sealed row that an authority lawfully
@@ -175,7 +177,7 @@ merely *that*.
 it with real deterministic keys, stores it through `put_attestation`, erases
 **every** member, and then re-runs the real
 `tier_ingest::verify_federation_tier_ingest` over the unchanged row. It is
-admitted. On memory and sqlite it is then handed to a **second, independent
+admitted. It is then handed to a **second, independent
 store that has never seen it** — the exact plane §7.3 says a redaction dies on
 — and is admitted *and stored*.
 
@@ -196,9 +198,9 @@ at two.
 
 ### 3.3 No wire break — with one measured exception
 
-**[TESTED]** — `put_attestation` runs a per-dimension JSON Schema check on all
-three backends (`schema_resolver::validate_envelope_against_schema`, reached
-from `memory.rs`, `sqlite.rs` and `postgres.rs`). `_ciris_sd` is an *additional
+**[TESTED]** — `put_attestation` runs a per-dimension JSON Schema check on both
+backends (`schema_resolver::validate_envelope_against_schema`, reached from
+`sqlite.rs` and `postgres.rs`). `_ciris_sd` is an *additional
 property*, so:
 
 - a dimension with an **open** schema carries an erasable envelope today, with
@@ -233,9 +235,9 @@ The resolution, in `RecognitionPolicy`:
 - An **unsalted recognition hash is opt-in per erasure**, never a default, and
   is an explicit *operator assertion* of high entropy.
 - Persist enforces the one thing it can check — a length floor — and says
-  plainly that a floor is a minimum, not a measurement. The v23.1.0 custody
-  note's declared-depth discipline: never let the declared strength exceed the
-  actual provenance.
+  plainly that a floor is a minimum, not a measurement. The declared-depth
+  discipline applies: never let the declared strength exceed the actual
+  provenance.
 
 **[TESTED]** — withheld is the default; below-floor content is refused; the
 published hash is reproducible across calls and domain-separated from a member
@@ -245,14 +247,13 @@ commitment.
 
 ## 5. What is left
 
-Named as asks rather than half-built, per the sequencing lesson this arc was
-opened to avoid.
+These are named as asks, not half-built.
 
 ### 5.1 CIRISPersist — the disclosure store and `erase_object` (needs a migration)
 
 Nothing stores disclosures today, so nothing can yet be erased. That needs a
 table (`V121` is free) plus `put_disclosures` / `list_disclosures` /
-`erase_disclosures` on all three backends, and `erase_object(target, authority,
+`erase_disclosures` on both backends, and `erase_object(target, authority,
 reason) -> ErasureSummary` over them, with #573's five requirements — atomic,
 tombstoning, `hard_case:*`-emitting, idempotent, authority-carrying.
 
@@ -270,8 +271,7 @@ re-invented:
 
 **Do not model it on `evict_actor`.** #573's table lists it as an existing
 erasure primitive, and it is — but not one to copy. It lives on `BlobStorage`
-rather than `FederationDirectory` (`src/federation/blobs.rs:1263`), **the
-memory backend does not implement it at all**, it runs **no transaction**
+rather than `FederationDirectory` (`src/federation/blobs.rs`), it runs **no transaction**
 (a per-holding loop of autocommit `DELETE`s plus a separate `put_attestation`
 each), and it is **not idempotent on the audit side**: the holdings query
 carries no `withdraws` filter and each withdraws mints a fresh
@@ -309,15 +309,14 @@ integrity column was ever added. The write path agrees from the other side:
 both inserts name exactly those six columns and compute no hash
 (`src/store/sqlite.rs:945`, `src/store/postgres.rs:1793`).
 
-**A commitment alone does not fix this, and an earlier draft of this document
-said it did.** The claim was that holding the reason as a disclosure with a
+**A commitment alone does not fix this.** It is tempting to claim that holding the reason as a disclosure with a
 salted commitment would make it *withholdable but not replaceable*. That is
 false for an unsigned, mutable row: **an actor who can rewrite the reason can
 equally rewrite the commitment sitting beside it.** A commitment binds only to
 the extent that whatever carries it is itself integrity-protected, and here
 nothing is.
 
-Two details that make it worse than the retracted claim assumed, not better:
+Two details make it worse, not better:
 
 - **There is no `reason` column** — `reason` is a *key inside* `detail`
   (`admin_field::REASON`); `grep reason` over V075 returns zero hits. So a
@@ -384,16 +383,14 @@ peers. It is not one.
 
 ### 5.2 CIRISVerify — the news is that nothing is required (#241)
 
-CIRISVerify#241 is holding implementation pending exactly this ruling. What it
-should hear:
+What this means for CIRISVerify (#241):
 
 1. **Nothing is required on the envelope plane.** Under the mint-time
    distinction no signed bytes are ever rewritten, so the redacted-vs-tampered
    discriminator #241 was opened for does not need to exist. `redactable`
    already shipped the part that was needed.
-2. **The bounded-set heuristic did not survive contact** (§1.1), but the
-   conclusion it was reaching for did, by a different route. Worth recording so
-   the next reader inherits the corrected reasoning and not just the verdict.
+2. **The bounded-set heuristic does not hold** (§1.1), but the conclusion it
+   was reaching for does, by a different route.
 3. **The signature is verified before the hash cross-check** (§1.3), so #241's
    description of the operator experience is understated. If verify ever adds
    an erasure-aware message, that ordering is where it has to land.
@@ -408,8 +405,7 @@ should hear:
    same kind with redacted members, or a distinct redacted kind — describe an
    object whose bytes were rewritten. Persist's answer is that the object should
    not exist, and that the distinction belongs at **mint** (sealed vs erasable)
-   rather than at **redaction**. Worth recording in-clause, because the phrasing
-   is what a next drafter will inherit.
+   rather than at **redaction**.
 2. **CC 6.1.2's zero-descent carve-out is needed for *sealed* objects only.**
    #573 asked for a class where forced descent goes to zero because *"you cannot
    keep a blur of CSAM."* For an **erasable** object the carve-out is
@@ -430,13 +426,13 @@ should hear:
 - **The 50 non-federation carriers are still unread** — inherited from
   `PAYLOAD_ENUMERATION.md` §5 and not closed here.
 - **Whether disclosures should replicate, and under which consent edge**, is
-  the open question in §5.1, not a gap in the ruling.
+  the open question in §5.1.
 - **Only `put_attestation`'s gates were exercised.** The other write doors
   (`put_public_key`, `put_community`, …) run their own admission chains; an
   erasable envelope has not been put through them. The per-dimension schema
   gate (§3.3) is the one that generalizes structurally, but that is a belief,
   not a test. **[BELIEVED — basis: the schema check is invoked from the
-  attestation write path on all three backends; the other doors were not
+  attestation write path on both backends; the other doors were not
   read.]**
 - **`federation_group_versions.snapshot` is unaffected but unaddressed.**
   `PAYLOAD_ENUMERATION.md` §1.2a's finding stands: a payload erased from a live
