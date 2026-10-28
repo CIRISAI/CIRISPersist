@@ -46,6 +46,16 @@ threat-model citations because this crate's audit story is the point.
     occurrence that was revoked and then agreed again after the revocation.
   - **I141** and **I392** stay green.
 
+### Security — five advisories published after v59.1.0 (deny.toml, Cargo.lock)
+
+- tokio 1.54.1 (RUSTSEC-2026-0386), ctutils 0.4.6 (RUSTSEC-2026-0385),
+  rustls-webpki 0.103.16 (RUSTSEC-2026-0382, distrusted intermediates) and
+  webpki-roots 1.0.11 (RUSTSEC-2026-0381, distrusted emSign roots) are
+  updated in the lockfile.
+- crypto-bigint 0.5.5 (RUSTSEC-2026-0387) is ignored, as in v60.0.0: it is
+  transitive only via CIRISVerify's p256/k256 and persist's own code calls
+  neither curve; #1127 tracks the verify bump that clears it.
+
 ### Adoption
 
 - No break. No signature, wire or schema change. Server and Edge re-pin
