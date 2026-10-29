@@ -28,6 +28,16 @@
 //! private family's rows reach a member and the member a row names, never a
 //! stranger.
 //!
+//! I1490 — the rebuild gate can fail: a roster event whose row is gone, or a
+//! projection column that no row says, is a red naming the table.
+//!
+//! I1491 — the row carries the bytes its signer signed: a nanosecond-signed
+//! record replicates to a node that admits it (on a backend that keeps
+//! microseconds, a row minted from the read-back would not verify); the
+//! receiver's signature rule takes the row and refuses it one byte off; a
+//! re-offer of a held row settles; and a roster event re-put under the same key
+//! with other co-signers leaves the row that matches what the store kept.
+//!
 //! I1489 — an upgraded node: a v60 schema (through V205) holds signed typed
 //! records and roster events with no rows; V206/V207 and the rehome at open
 //! give every one its row, checked by a from-disk count (no signed projection
@@ -79,11 +89,26 @@ pub(crate) mod bodies {
     {
         let read = d.read_group_plane(table).await.expect("read group plane");
         for (signed, id) in &read.live {
+            let Some(id) = id else {
+                panic!(
+                    "{tag}: {} row of {} holds no row",
+                    table.as_str(),
+                    signed.group_key_id()
+                );
+            };
+            // The row is served: it resolves by its Attestation-kind hash.
+            let row = d
+                .get_attestation(id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{tag}: row {id} is held"));
+            let hash = crate::federation::wire_index::content_hash_of(&row).unwrap();
             assert!(
-                id.is_some(),
-                "{tag}: {} row of {} holds no row",
-                table.as_str(),
-                signed.group_key_id()
+                d.lookup_signed_record_by_content_hash("Attestation", &hash)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{tag}: row {id} resolves by its wire hash"
             );
         }
         check_projection_rebuild(d, table.projection())
@@ -782,10 +807,48 @@ pub(crate) mod bodies {
         }
         let (fam, _) = family_with_history(old, tag).await;
         let room = room_with_history(old, tag).await;
+        // A trusted-local family the runner then gives an Ed25519-only
+        // signature: held signed, but with no hybrid signature to mint a row
+        // from.
+        old.put_family_local(Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
+            family_key_id: ed25519_only_family(tag),
+            family_name: "ed25519-only".into(),
+            members: vec![FamilyMember {
+                key_id: format!("ann-{tag}"),
+                joined_at: at("2026-01-01T00:00:00Z"),
+                role: Some("founder".to_owned()),
+            }],
+            founded_at: at("2026-01-01T00:00:00Z"),
+            consensus_protocol: "founder_only".to_owned(),
+            consensus_protocol_entrenched: false,
+            dissolved_at: None,
+            persist_row_hash: String::new(),
+        })
+        .await
+        .expect("a trusted-local family");
         (fam, room)
     }
 
-    /// I1489, after V206/V207 and the rehome at open.
+    /// The I1489 family held with an Ed25519-only signature.
+    pub(crate) fn ed25519_only_family(tag: &str) -> String {
+        format!("ed-{tag}")
+    }
+
+    /// The SQL that gives it that signature, on `schema`.
+    pub(crate) fn ed25519_only_sql(schema: &str, tag: &str) -> String {
+        format!(
+            "UPDATE {schema}federation_families SET authority_key_id = 'ann-{tag}', \
+                scrub_signature_classical = 'c2ln', scrub_signature_pqc = NULL \
+              WHERE family_key_id = '{}'",
+            ed25519_only_family(tag)
+        )
+    }
+
+    /// I1489, after V206/V207 and the rehome at open: every signed object
+    /// that can have a row has one, from disk; the one that cannot is held
+    /// without one, named by the rebuild gate and counted by the rehome.
     pub(crate) async fn i1489_after_upgrade<D>(
         d: &D,
         tag: &str,
@@ -795,22 +858,227 @@ pub(crate) mod bodies {
     ) where
         D: FederationDirectory + GroupPlaneStore + AttestationStore,
     {
-        assert!(signed_before >= 6, "{tag}: the v60 node held its records");
-        assert_eq!(unlinked_after, 0, "{tag}: every signed object has its row");
+        assert!(signed_before >= 7, "{tag}: the v60 node held its records");
         assert_eq!(
-            plane_after, signed_before,
-            "{tag}: one row per signed object, from disk"
+            unlinked_after, 1,
+            "{tag}: only the Ed25519-only record is held without its row"
+        );
+        assert_eq!(
+            plane_after,
+            signed_before - 1,
+            "{tag}: one row per hybrid-signed object, from disk"
         );
         for t in GroupPlaneTable::ALL {
+            if t == GroupPlaneTable::Families {
+                continue;
+            }
             all_linked(d, t, tag).await;
         }
+        let red = check_projection_rebuild(d, GroupPlaneTable::Families.projection())
+            .await
+            .expect_err("a signed family held without its row is a red");
+        assert!(
+            red.to_string().contains("federation_families"),
+            "{tag}: the gate names the table: {red}"
+        );
         let again = crate::federation::group_plane::rehome_group_records(d)
             .await
             .expect("rehome again");
         assert_eq!(
             again,
-            crate::federation::group_plane::GroupRehomeReport::default(),
-            "{tag}: the rehome is once"
+            crate::federation::group_plane::GroupRehomeReport {
+                linked: 0,
+                without_row: 1,
+            },
+            "{tag}: the rehome is once; the Ed25519-only record stays counted"
+        );
+    }
+
+    /// I1490 — the rebuild gate goes red; the runner then renames the family
+    /// in its projection table ([`i1490_tamper_sql`]).
+    pub(crate) async fn i1490_the_gate_can_fail<D>(d: &D, tag: &str)
+    where
+        D: FederationDirectory + GroupPlaneStore + AttestationStore,
+    {
+        let dd: &dyn FederationDirectory = d;
+        for n in ["ann", "ben", "cat", "dan"] {
+            user(dd, &format!("{n}-{tag}")).await;
+        }
+        let (fam, _) = family_with_history(d, tag).await;
+        for t in [
+            GroupPlaneTable::Families,
+            GroupPlaneTable::FamilyWidenings,
+            GroupPlaneTable::FamilyRevocations,
+        ] {
+            all_linked(d, t, tag).await;
+        }
+        // A roster event whose row is gone is held without one.
+        let widening = one(
+            d,
+            &fam,
+            gp::MEMBERSHIP_WIDENING_DIMENSION,
+            GroupPlaneTable::FamilyWidenings,
+        )
+        .await;
+        assert!(d
+            .delete_attestation(&widening.attestation_id, None)
+            .await
+            .unwrap());
+        let red = check_projection_rebuild(d, GroupPlaneTable::FamilyWidenings.projection())
+            .await
+            .expect_err("a widening held without its row is a red");
+        assert!(
+            red.to_string()
+                .contains("federation_family_membership_widenings"),
+            "{tag}: {red}"
+        );
+        // A projection column no row says: the runner tampers next.
+        check_projection_rebuild(d, GroupPlaneTable::Families.projection())
+            .await
+            .expect("the record is its row before the tamper");
+    }
+
+    /// I1490, after the runner's tamper: the record no longer is its row.
+    pub(crate) async fn i1490_after_tamper<D>(d: &D, tag: &str)
+    where
+        D: FederationDirectory + GroupPlaneStore + AttestationStore,
+    {
+        let red = check_projection_rebuild(d, GroupPlaneTable::Families.projection())
+            .await
+            .expect_err("a renamed record is not its row");
+        assert!(
+            red.to_string().contains("federation_families"),
+            "{tag}: {red}"
+        );
+    }
+
+    /// The SQL that renames I1490's family in its projection, on `schema`.
+    pub(crate) fn i1490_tamper_sql(schema: &str, tag: &str) -> String {
+        format!(
+            "UPDATE {schema}federation_families SET family_name = 'renamed' \
+              WHERE family_key_id = 'fam-{tag}'"
+        )
+    }
+
+    /// I1491 — the row carries the bytes its signer signed.
+    pub(crate) async fn i1491_the_row_is_the_signed_bytes<D>(a: &D, b: &D, tag: &str)
+    where
+        D: FederationDirectory + GroupPlaneStore + AttestationStore,
+    {
+        for d in [a, b] {
+            for n in ["ann", "ben", "cat"] {
+                user(d, &format!("{n}-{tag}")).await;
+            }
+        }
+        let [ann, ben, cat] = ["ann", "ben", "cat"].map(|n| format!("{n}-{tag}"));
+        let fam = format!("nsfam-{tag}");
+        // Nanoseconds a microsecond backend does not keep.
+        let founded: chrono::DateTime<chrono::Utc> =
+            "2026-01-01T00:00:00.123456789Z".parse().unwrap();
+        a.put_family(ts::sign_family(
+            &ann,
+            Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                family_key_id: fam.clone(),
+                family_name: "household".into(),
+                members: [&ann, &ben, &cat]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| FamilyMember {
+                        key_id: (*k).clone(),
+                        joined_at: founded,
+                        role: (i == 0).then(|| "founder".to_owned()),
+                    })
+                    .collect(),
+                founded_at: founded,
+                consensus_protocol: "quorum:2/3".to_owned(),
+                consensus_protocol_entrenched: false,
+                dissolved_at: None,
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .expect("a nanosecond-signed family is admitted");
+        let record = one(
+            a,
+            &fam,
+            gp::GROUP_ROSTER_DIMENSION,
+            GroupPlaneTable::Families,
+        )
+        .await;
+        // The receiver's signature rule: the row, and not one byte off it.
+        crate::federation::tier_ingest::verify_row_hybrid_signature(a, &record)
+            .await
+            .expect("the row verifies as its object");
+        let mut off = record.clone();
+        off.attestation_envelope[gp::GROUP_RECORD_MEMBER]["family"]["family_name"] =
+            "renamed".into();
+        assert!(
+            crate::federation::tier_ingest::verify_row_hybrid_signature(a, &off)
+                .await
+                .is_err(),
+            "{tag}: a row one byte off its object does not verify"
+        );
+        // B takes the row, and a re-offer settles.
+        use crate::federation::attestation_apply::ReplicatedAttestationOutcome as O;
+        let first = b
+            .apply_replicated_attestation(crate::federation::SignedAttestation {
+                attestation: record.clone(),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: B admits the nanosecond-signed row: {e}"));
+        assert_eq!(first, O::Inserted, "{tag}: B admits the row");
+        let again = b
+            .apply_replicated_attestation(crate::federation::SignedAttestation {
+                attestation: record.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(again, O::Unchanged, "{tag}: a held row's re-offer settles");
+        all_linked(b, GroupPlaneTable::Families, tag).await;
+
+        // A removal re-put under the same key with another co-signer: the
+        // store keeps the first, and the row follows what it kept.
+        let removal = FamilyMembershipRevocation {
+            family_key_id: fam.clone(),
+            removed_identity_key_id: cat.clone(),
+            removed_at: at("2026-03-01T00:00:00Z"),
+            effective_at: at("2026-03-01T00:00:00Z"),
+            reason: None,
+            witness_set: vec![],
+            persist_row_hash: String::new(),
+        };
+        let mut by_ben = ts::sign_family_membership_revocation(&ann, removal.clone());
+        ts::cosign_family_membership_revocation(&mut by_ben, &ben);
+        a.put_family_membership_revocation(by_ben)
+            .await
+            .expect("2 of 3 remove");
+        let mut by_cat = ts::sign_family_membership_revocation(&ann, removal);
+        ts::cosign_family_membership_revocation(&mut by_cat, &cat);
+        a.put_family_membership_revocation(by_cat)
+            .await
+            .expect("an exact-key re-put is the idempotent no-op");
+        all_linked(a, GroupPlaneTable::FamilyRevocations, tag).await;
+        let rows = rows(
+            a,
+            GroupPlaneTable::FamilyRevocations,
+            gp::MEMBERSHIP_REMOVAL_DIMENSION,
+        )
+        .await;
+        let mine: Vec<_> = rows
+            .iter()
+            .filter(|r| r.attestation_envelope["family_key_id"] == fam.as_str())
+            .collect();
+        assert_eq!(mine.len(), 1, "{tag}: one removal row");
+        assert_eq!(
+            mine[0]
+                .additional_scrubs
+                .iter()
+                .map(|s| s.scrub_key_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![ben.as_str()],
+            "{tag}: the row is the removal the store kept"
         );
     }
 
@@ -999,6 +1267,14 @@ mod run {
                         .await;
                 }
                 #[tokio::test]
+                async fn i1491() {
+                    let (Some(a), Some(b)) = ($fresh.await, $fresh.await) else {
+                        return;
+                    };
+                    super::super::bodies::i1491_the_row_is_the_signed_bytes(&a, &b, &super::tag())
+                        .await;
+                }
+                #[tokio::test]
                 async fn i1487() {
                     let Some(d) = $fresh.await else { return };
                     super::super::bodies::i1487_cosigned_withdraws(&d, &super::tag()).await;
@@ -1032,6 +1308,8 @@ mod run {
             .unwrap();
         old.run_migrations_through(205).await.unwrap();
         super::bodies::i1489_seed_v60(&old, &t).await;
+        old.test_execute(&super::bodies::ed25519_only_sql("", &t))
+            .await;
         let mut before = 0;
         for tb in crate::federation::group_plane::GroupPlaneTable::ALL {
             before += old.test_count(&super::bodies::signed_sql("", tb)).await;
@@ -1069,6 +1347,8 @@ mod run {
         old.run_migrations_through(205).await.unwrap();
         super::bodies::i1489_seed_v60(&old, &t).await;
         let s = "cirislens.";
+        old.test_execute(&super::bodies::ed25519_only_sql(s, &t))
+            .await;
         let mut before = 0;
         for tb in crate::federation::group_plane::GroupPlaneTable::ALL {
             before += old.test_count(&super::bodies::signed_sql(s, tb)).await;
@@ -1091,6 +1371,39 @@ mod run {
         let plane = old.test_count(&super::bodies::plane_rows_sql(s)).await;
         super::bodies::i1489_after_upgrade(&old, &t, before, plane, unlinked).await;
         eprintln!("i1489_postgres: RAN");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1490_sqlite() {
+        use crate::store::Backend as _;
+        let t = tag();
+        let d = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        d.run_migrations().await.unwrap();
+        super::bodies::i1490_the_gate_can_fail(&d, &t).await;
+        d.test_execute(&super::bodies::i1490_tamper_sql("", &t))
+            .await;
+        super::bodies::i1490_after_tamper(&d, &t).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1490_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let t = tag();
+        let d = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        d.run_migrations().await.unwrap();
+        super::bodies::i1490_the_gate_can_fail(&d, &t).await;
+        d.test_execute(&super::bodies::i1490_tamper_sql("cirislens.", &t))
+            .await;
+        super::bodies::i1490_after_tamper(&d, &t).await;
     }
 
     #[cfg(feature = "sqlite")]

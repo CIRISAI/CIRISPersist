@@ -522,40 +522,6 @@ impl GroupSigned {
         }
     }
 
-    /// The signer of the object (its `authority_key_id`).
-    #[must_use]
-    pub fn authority_key_id(&self) -> &str {
-        self.base().authority_key_id
-    }
-
-    /// The bytes every scrub covers: the object's own `signing_envelope()`.
-    #[must_use]
-    pub fn signing_envelope(&self) -> serde_json::Value {
-        match self {
-            Self::Family(s) => s.family.signing_envelope(),
-            Self::Community(s) => s.community.signing_envelope(),
-            Self::FamilyRevocation(s) => s.family_membership_revocation.signing_envelope(),
-            Self::CommunityRevocation(s) => s.community_membership_revocation.signing_envelope(),
-            Self::FamilyWidening(s) => s.family_membership_widening.signing_envelope(),
-            Self::CommunityWidening(s) => s.community_membership_widening.signing_envelope(),
-        }
-    }
-
-    /// Every scrub the row carries, base first: the object's authority scrub
-    /// and each co-signature, in the row's `ScrubSig` shape.
-    #[must_use]
-    pub fn scrubs(&self) -> Vec<ScrubSig> {
-        let base = self.base();
-        std::iter::once(ScrubSig {
-            scrub_key_id: base.authority_key_id.to_owned(),
-            scrub_signature_classical: base.classical.to_owned(),
-            scrub_signature_pqc: base.pqc.map(str::to_owned),
-            cosigned_at: None,
-        })
-        .chain(base.cosignatures.iter().map(cosignature_scrub))
-        .collect()
-    }
-
     /// The object as the row carries it: the signed wrapper, the record's
     /// recomputed `persist_row_hash` left out.
     ///
@@ -586,7 +552,8 @@ impl GroupSigned {
     }
 
     /// Read an object back from a row's carried member: the inverse of
-    /// [`Self::object`], the record's `persist_row_hash` recomputed. `None`
+    /// [`Self::object`] (the record's `persist_row_hash` is left empty: the
+    /// door that stores it computes its own). `None`
     /// when it does not parse as `family`'s object of `kind`.
     #[must_use]
     pub fn of_object(
@@ -605,7 +572,7 @@ impl GroupSigned {
             );
             serde_json::from_value(v).ok()
         }
-        let mut signed = match (family, kind) {
+        let signed = match (family, kind) {
             (GroupPlaneFamily::Roster, GroupKind::Family) => Self::Family(parse(object, "family")?),
             (GroupPlaneFamily::Roster, GroupKind::Community) => {
                 Self::Community(parse(object, "community")?)
@@ -623,7 +590,6 @@ impl GroupSigned {
                 Self::CommunityRevocation(parse(object, "community_membership_revocation")?)
             }
         };
-        signed.stamp_persist_row_hash().ok()?;
         (signed.family() == family).then_some(signed)
     }
 
@@ -639,35 +605,6 @@ impl GroupSigned {
         };
         let mine = at_substrate(self);
         mine.is_some() && mine == at_substrate(other)
-    }
-
-    /// Recompute the record's `persist_row_hash` in place.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Backend`] when the record does not hash.
-    pub fn stamp_persist_row_hash(&mut self) -> Result<(), Error> {
-        use super::types::compute_persist_row_hash as h;
-        match self {
-            Self::Family(s) => s.family.persist_row_hash = h(&s.family)?,
-            Self::Community(s) => s.community.persist_row_hash = h(&s.community)?,
-            Self::FamilyRevocation(s) => {
-                s.family_membership_revocation.persist_row_hash =
-                    h(&s.family_membership_revocation)?;
-            }
-            Self::CommunityRevocation(s) => {
-                s.community_membership_revocation.persist_row_hash =
-                    h(&s.community_membership_revocation)?;
-            }
-            Self::FamilyWidening(s) => {
-                s.family_membership_widening.persist_row_hash = h(&s.family_membership_widening)?;
-            }
-            Self::CommunityWidening(s) => {
-                s.community_membership_widening.persist_row_hash =
-                    h(&s.community_membership_widening)?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -1427,14 +1364,12 @@ where
             }
         }
     }
-    if report != GroupRehomeReport::default() {
-        tracing::info!(
-            linked = report.linked,
-            without_row = report.without_row,
-            "group-plane rehome at open (v61, CIRISPersist#991): every signed v60 group record \
-             and roster event has its row; the counted rest is held without one (Ed25519-only)"
-        );
-    }
+    tracing::info!(
+        linked = report.linked,
+        without_row = report.without_row,
+        "group-plane rehome at open (v61, CIRISPersist#991): every signed v60 group record \
+         and roster event has its row; the counted rest is held without one (Ed25519-only)"
+    );
     Ok(report)
 }
 
@@ -1514,6 +1449,68 @@ mod tests {
         for t in GroupPlaneTable::ALL {
             assert_eq!(GroupPlaneTable::of_projection(t.projection()), Some(t));
         }
+    }
+
+    fn family(proof: Option<GroupSupersedeProof>) -> GroupSigned {
+        let at = |s: &str| -> chrono::DateTime<chrono::Utc> { s.parse().unwrap() };
+        GroupSigned::Family(SignedFamily {
+            family: super::super::types::Family {
+                family_key_id: "fam".into(),
+                family_name: "household".into(),
+                members: vec![super::super::types::FamilyMember {
+                    key_id: "ann".into(),
+                    joined_at: at("2026-01-01T00:00:00Z"),
+                    role: Some("founder".into()),
+                }],
+                founded_at: at("2026-01-01T00:00:00Z"),
+                consensus_protocol: "founder_only".into(),
+                consensus_protocol_entrenched: false,
+                dissolved_at: None,
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                persist_row_hash: String::new(),
+            },
+            authority_key_id: "ann".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: Some("cHFj".into()),
+            supersede_proof: proof,
+            cosignatures: Vec::new(),
+        })
+    }
+
+    /// A record's row is signed at its head instant: an amendment's
+    /// `amended_at`, else `founded_at`. An Ed25519-only record has no row;
+    /// a row reads back to the object it was minted from.
+    #[test]
+    fn a_record_row_is_signed_at_its_head_instant() {
+        let founded = plan_group_row(&family(None)).unwrap().unwrap();
+        assert_eq!(
+            founded.asserted_at.to_rfc3339(),
+            "2026-01-01T00:00:00+00:00"
+        );
+        let amended = plan_group_row(&family(Some(GroupSupersedeProof {
+            prior_persist_row_hash: "prior".into(),
+            change_envelope: serde_json::json!({
+                super::super::canonical_community::AMENDED_AT: "2026-03-04T05:06:07Z"
+            }),
+            quorum_signatures: Vec::new(),
+        })))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            amended.asserted_at.to_rfc3339(),
+            "2026-03-04T05:06:07+00:00"
+        );
+        assert_eq!(
+            group_signed_of_row(&founded).unwrap(),
+            Some(family(None)),
+            "the row carries its object"
+        );
+        let mut ed25519_only = family(None);
+        if let GroupSigned::Family(f) = &mut ed25519_only {
+            f.scrub_signature_pqc = None;
+        }
+        assert!(plan_group_row(&ed25519_only).unwrap().is_none());
     }
 
     /// The wire names CC cites (posted on CIRISPersist#991): the envelope

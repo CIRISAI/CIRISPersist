@@ -5,7 +5,7 @@
 #   parser, the canonical-row check, the consensus-source dispatch, the
 #   inbound row door, the signature rule at a receiver, the cosigned
 #   withdraws and its projection effect, the generic-path refusal, the sync,
-#   the rehome, the rebuild). Witnesses I1484–I1489 (sqlite, postgres), the
+#   the rehome, the rebuild). Witnesses I1484–I1491 (sqlite, postgres), the
 #   module's unit tests, I706 (the refusals outside the door).
 # - The two backends' executors: the presence probe, the object and plane
 #   reads, the unlinked probe, the link and the retraction drop.
@@ -16,7 +16,7 @@
 #   every roster door, witnessed by I176 and I1484–I1486 in the wider lane).
 #
 # Grammar: docs/MUTATION_TESTING.md "Scope files".
-tests: test(/i148[4-9]|i706|group_plane::tests/)
+tests: test(/i148[4-9]|i149[01]|i706|group_plane::tests/)
 
 src/federation/group_plane.rs
 src/store/sqlite.rs sqlite_group_link_where group_plane_present read_group_object unlinked_group_objects link_group_plane_row drop_group_projection_row read_group_plane
