@@ -109,6 +109,16 @@ pub(crate) mod bodies {
             "I1478 names the member: {message}"
         );
 
+        // The #1151 carve-out is `role` on the two membership families only:
+        // `role: null` on any other family is still refused.
+        let e = put(d, sealed_with(&a, serde_json::json!({ "role": null })))
+            .await
+            .expect_err("I1478: role null outside membership rows is refused");
+        assert_eq!(
+            malformed_reason(e, "I1478 role"),
+            malformed_row::ENVELOPE_MEMBER_NULL
+        );
+
         put(d, sealed_with(&a, serde_json::json!({ "context": "x" })))
             .await
             .expect("I1478: the member carried as a value admits");

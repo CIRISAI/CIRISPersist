@@ -7111,21 +7111,41 @@ pub const WITNESSES_MEMBER: &str = "witnesses";
 /// Nothing is re-sorted or normalised: the signed bytes are the producer's,
 /// so a relay cannot repair them.
 ///
+/// One carve-out, until CIRISPersist#1151 retires it: `role: null` on a
+/// `membership:proposal` / `membership:acceptance` row (a v60 peer's form) is
+/// admitted and read as absent.
+///
 /// The key plane's `revocation_envelope` binds absent optionals as explicit
 /// `null` inside its own signed object (CC 2.6.1.1.1 names it as the one
 /// exception); it is a nested member and this check does not read inside it.
 pub(crate) fn check_envelope_member_shapes(row: &super::Attestation) -> Result<(), Error> {
     use crate::federation::envelope::paths;
+    let Some(members) = row.attestation_envelope.as_object() else {
+        return Ok(());
+    };
+    // CIRISPersist#1151 (the sunset) — a v60 peer writes `"role": null` on a
+    // membership proposal or acceptance when no role is offered. Until every
+    // peer emits the absent form, that one member on those two families is
+    // admitted and read as absent (`membership_acceptance::env_role` already
+    // reads null as no role). Nothing else is carved out.
+    let membership_role_carve_out = matches!(
+        envelope_dimension(&row.attestation_envelope),
+        Some(
+            super::membership_acceptance::PROPOSAL_DIMENSION
+                | super::membership_acceptance::ACCEPTANCE_DIMENSION
+        )
+    );
     let null_member = |members: &serde_json::Map<String, serde_json::Value>| {
         members
             .iter()
             .find(|(_, v)| v.is_null())
             .map(|(k, _)| k.clone())
     };
-    let Some(members) = row.attestation_envelope.as_object() else {
-        return Ok(());
-    };
-    let nulled = null_member(members).or_else(|| {
+    let top_level_null = members
+        .iter()
+        .find(|(k, v)| v.is_null() && !(membership_role_carve_out && k.as_str() == "role"))
+        .map(|(k, _)| k.clone());
+    let nulled = top_level_null.or_else(|| {
         members
             .get(paths::ROW)
             .and_then(serde_json::Value::as_object)

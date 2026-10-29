@@ -475,6 +475,77 @@ pub(crate) mod bodies {
     // ── I212 ──────────────────────────────────────────────────────────────
     /// **I212 — a growth needs the member's acceptance (founder_only, both
     /// planes); a role change of an active member needs none.**
+    /// **I1483 (CIRISPersist#1151, the sunset)** — a v60 peer's
+    /// `membership:proposal` and `membership:acceptance` carry `"role": null`
+    /// when no role is offered. They are admitted, read as no role, and the
+    /// growth they authorise lands as a plain member. A `null` on any OTHER
+    /// member of the same rows is still refused `envelope_member_null`.
+    pub async fn i1483_a_v60_null_role_is_read_as_absent<D: FederationDirectory + ?Sized>(
+        d: &D,
+        s: &str,
+    ) {
+        let (cid, founder, k) = (
+            format!("i1483-c-{s}"),
+            format!("i1483-f-{s}"),
+            format!("i1483-k-{s}"),
+        );
+        reg(d, &[&cid, &founder, &k]).await;
+        found_community(d, &cid, "founder_only", &[&founder], &[])
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let mut p = proposal(
+            &founder,
+            COMMUNITY,
+            &cid,
+            &k,
+            None,
+            now,
+            Some(Duration::days(7)),
+        );
+        p.attestation_envelope["role"] = serde_json::Value::Null;
+        ts::seal_row_in_place(&founder, &mut p);
+
+        let mut other = p.clone();
+        other.attestation_envelope["note"] = serde_json::Value::Null;
+        ts::seal_row_in_place(&founder, &mut other);
+        let e = put(d, &other)
+            .await
+            .expect_err("I1483: a null on another member of the row is refused");
+        assert!(
+            matches!(
+                &e,
+                Error::MalformedRow { reason, .. }
+                    if *reason == crate::federation::malformed_row::ENVELOPE_MEMBER_NULL
+            ) && e.to_string().contains("`note`"),
+            "I1483: {e}"
+        );
+
+        put(d, &p)
+            .await
+            .expect("I1483: a v60 proposal with role null is admitted");
+        let mut a = reply(&k, &k, &p, true, now);
+        a.attestation_envelope["role"] = serde_json::Value::Null;
+        ts::seal_row_in_place(&k, &mut a);
+        put(d, &a)
+            .await
+            .expect("I1483: a v60 acceptance with role null is admitted");
+        let held = d
+            .get_attestation(&p.attestation_id)
+            .await
+            .unwrap()
+            .expect("I1483: the proposal is held");
+        assert_eq!(
+            held.attestation_envelope["role"],
+            serde_json::Value::Null,
+            "I1483: the signed bytes are kept as written"
+        );
+        widen_community(d, &cid, &[&founder], &k, None, now)
+            .await
+            .expect("I1483: the null role reads as no role, so the role-less growth matches");
+        assert!(active_in_community(d, &cid, &k).await, "I1483: K is in");
+    }
+
     pub async fn i212_growth_needs_acceptance<D: FederationDirectory + ?Sized>(d: &D, s: &str) {
         let (cid, fid, founder, k, j) = (
             format!("i212-c-{s}"),
@@ -1072,6 +1143,11 @@ mod run {
                 async fn i211() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i211_the_reply_arm(&b, &bodies::suffix()).await
+                }
+                #[tokio::test]
+                async fn i1483() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i1483_a_v60_null_role_is_read_as_absent(&b, &bodies::suffix()).await
                 }
                 #[tokio::test]
                 async fn i212() {
