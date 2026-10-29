@@ -103,6 +103,11 @@ jobs:
           - {scope: scope-601-asks, shard: '1/4', id: 601-asks-1-of-4, weekly: true}
           - {scope: scope-601-asks, shard: '2/4', id: 601-asks-2-of-4, weekly: true}
           - {scope: scope-601-asks, shard: '3/4', id: 601-asks-3-of-4, weekly: true}
+          # The principal fold (v59.1.1): `principals_of`'s owner-revocation
+          # clause, `may_receive_group_plane` reading it, and `epoch_minter::resolve`
+          # narrowing several granting minters to the author's sealer.
+          # 14 mutants, one shard (600 s + 168 s x 14 = 2952 s), nightly.
+          - {scope: scope-5911-principals, shard: '', id: 5911-principals, weekly: false}
     services:
       postgres:
         image: ghcr.io/cirisai/postgres:16

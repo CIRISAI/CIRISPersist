@@ -69,6 +69,21 @@ Signed attestations are the only state: the cirisnode classes and Goals become `
 - Producers: sign a licence as a cosigned `licensure:{community_key_id}:v1` row, call `PartnerRecord::canonicalize_sets` before signing, and pass a term on every term-bearing `delegates_to`.
 - Migrations: V202 (`hard_case_events.emitter_key_id`), V203 (drops eight cirisnode tables; ledgers gain `attestation_id`), V204 (`goals` rebuilt, `scope_kind` → `scale`), V205 (drops the organisation tables).
 - Telemetry: the `backend` label set is `{sqlite, postgres}`.
+## [59.1.1] - 2026-10-28
+
+### Fixed
+
+- `self_collective::principals_of` drops a node's owner only when a held identity-occurrence revocation naming `(owner, node)` is effective. An occurrence row the node never agreed to resolves nothing and is not evidence either way, so the live owner binding still lifts the node to its owner; a pair-room invitation now reaches the invitee's node. A revoked occurrence beside a live owner binding still has no principal, and an occurrence agreed again after its revocation keeps the owner. The same fold serves `speaks_for`, the send set, the hold path and the read gate.
+- `replication_audience::may_receive_group_plane` reads `principals_of`, so a split-home invitee's node receives the room's record and membership planes.
+- `epoch_minter::resolve`: when several minters grant the reader, it keeps those that are the author or whose `principals_of` names the author. One survivor is the minter; with none or several it falls back to the author. A pair-room blob adopted after both members minted the same epoch binds to the author's sealer instead of a key that holds no DEK.
+
+### Security
+
+- RUSTSEC-2026-0386 (tokio 1.54.1), RUSTSEC-2026-0385 (ctutils 0.4.6), RUSTSEC-2026-0382 (rustls-webpki 0.103.16) and RUSTSEC-2026-0381 (webpki-roots 1.0.11) cleared by lockfile bumps; RUSTSEC-2026-0387 (crypto-bigint 0.5, transitive via p256 in ciris-verify) ignored as unreachable.
+
+### Adoption
+
+- No break: no wire, schema or Python change. `epoch_minter::resolve`, `adopt_cascade::resolve_adopt` and `adopt_cascade::resolve_provenance` gain a `FederationDirectory` bound.
 
 ## [59.1.0] - 2026-10-20
 
