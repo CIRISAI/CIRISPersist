@@ -6256,6 +6256,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             &crate::federation::wire_index::record_key(&[("family_key_id", &family_key_id)]),
         )
         .await?;
+        // v61 (CIRISPersist#991) — the row follows its object.
+        crate::federation::group_plane::sync_group_row(
+            self,
+            crate::federation::group_plane::GroupRowLink::record(
+                crate::federation::group_plane::GroupKind::Family,
+                &family_key_id,
+            ),
+        )
+        .await?;
         Ok(())
     }
 
@@ -6645,6 +6654,19 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         self.index_stored_record(
             kind,
             &crate::federation::wire_index::record_key(&[(key_field, &group_key_id)]),
+        )
+        .await?;
+        // v61 (CIRISPersist#991) — the new head's `group:roster:v1` row
+        // replaces the prior head's.
+        crate::federation::group_plane::sync_group_row(
+            self,
+            crate::federation::group_plane::GroupRowLink::record(
+                match cohort {
+                    Cohort::Family => crate::federation::group_plane::GroupKind::Family,
+                    _ => crate::federation::group_plane::GroupKind::Community,
+                },
+                &group_key_id,
+            ),
         )
         .await?;
         Ok(new_version)
@@ -7695,6 +7717,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // instant is part of the row's identity.
             ("effective_at", &effective_at_rfc3339),
         ]);
+        let group_link = crate::federation::group_plane::GroupRowLink::plane(
+            crate::federation::group_plane::GroupPlaneTable::FamilyRevocations,
+            &row.family_key_id,
+            &row.removed_identity_key_id,
+            row.effective_at,
+        );
         let inserted = self
             .write(move |conn| -> Result<bool, rusqlite::Error> {
                 // v47.1.0 (CIRISPersist#861) — one transaction, so a repeat can
@@ -7750,6 +7778,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // no attester records nothing; the removal already landed.
             crate::federation::hard_case::record_observation(self, removal_event).await?;
         }
+        // v61 (CIRISPersist#991) — the row follows its object.
+        crate::federation::group_plane::sync_group_row(self, group_link).await?;
         Ok(())
     }
 
@@ -7827,6 +7857,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ("member_key_id", &row.member_key_id),
             ("effective_at", &effective_at_rfc3339),
         ]);
+        let group_link = crate::federation::group_plane::GroupRowLink::plane(
+            crate::federation::group_plane::GroupPlaneTable::FamilyWidenings,
+            &row.family_key_id,
+            &row.member_key_id,
+            row.effective_at,
+        );
         let inserted = self
             .write(move |conn| -> Result<bool, rusqlite::Error> {
                 let admitted_at = sqlite_next_plane_position(
@@ -7874,6 +7910,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             self.index_stored_record("FamilyMembershipWidening", &wire_index_key)
                 .await?;
         }
+        // v61 (CIRISPersist#991) — the row follows its object.
+        crate::federation::group_plane::sync_group_row(self, group_link).await?;
         Ok(())
     }
 
@@ -20015,6 +20053,13 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
     ) -> Result<crate::federation::silo_projection::ProjectionRebuild, crate::federation::Error>
     {
         use crate::federation::silo_projection::SiloProjection;
+        // v61 (CIRISPersist#991) — a group table's rebuild is the group
+        // plane's, over the executor's two reads.
+        if let Some(table) =
+            crate::federation::group_plane::GroupPlaneTable::of_projection(projection)
+        {
+            return crate::federation::group_plane::projection_rebuild(self, table).await;
+        }
         let node = crate::federation::FederationDirectory::node_key_id(self);
         self.write(
             move |conn| -> Result<crate::federation::silo_projection::ProjectionRebuild, rusqlite::Error> {
@@ -20064,6 +20109,16 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                         tx.rollback()?;
                         return Ok(rebuild);
                     }
+                    // Answered above, before the transaction.
+                    SiloProjection::Families
+                    | SiloProjection::Communities
+                    | SiloProjection::FamilyMembershipRevocations
+                    | SiloProjection::CommunityMembershipRevocations
+                    | SiloProjection::FamilyMembershipWidenings
+                    | SiloProjection::CommunityMembershipWidenings => {
+                        tx.rollback()?;
+                        return Ok(Default::default());
+                    }
                 };
                 tx.execute_batch(&format!(
                     "CREATE TEMP TABLE {scratch} AS SELECT * FROM {live_table} WHERE 0"
@@ -20103,7 +20158,13 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                         | SiloProjection::IdentityOccurrences
                         | SiloProjection::CreditsLedger
                         | SiloProjection::ExpertiseLedger
-                        | SiloProjection::Goals => {}
+                        | SiloProjection::Goals
+                        | SiloProjection::Families
+                        | SiloProjection::Communities
+                        | SiloProjection::FamilyMembershipRevocations
+                        | SiloProjection::CommunityMembershipRevocations
+                        | SiloProjection::FamilyMembershipWidenings
+                        | SiloProjection::CommunityMembershipWidenings => {}
                         SiloProjection::DetectionEvents => {
                             if let Some(event) =
                                 crate::derived::detection_row::project_detection_row_under(
@@ -21595,6 +21656,9 @@ pub(crate) fn sqlite_insert_plane_row(
     let envelope_text = serde_json::to_string(&row.attestation_envelope).map_err(to_sql_err)?;
     let original_content_hash: Vec<u8> = hex::decode(&row.original_content_hash)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    // v61 (CIRISPersist#991) — a group-plane row carries its
+    // co-signatures; a key-plane row carries none (`[]`).
+    let additional_scrubs = serde_json::to_string(&row.additional_scrubs).map_err(to_sql_err)?;
     let admitted_at = sqlite_next_plane_position(tx, "federation_attestations", POS_ATTESTATION)?;
     tx.execute(
         "INSERT OR IGNORE INTO federation_attestations (\
@@ -21605,7 +21669,7 @@ pub(crate) fn sqlite_insert_plane_row(
             subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
             additional_scrubs, admitted_at\
          ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
-                   '[]', NULL, ?14, ?15, NULL, '[]', ?16)",
+                   '[]', NULL, ?14, ?15, NULL, ?17, ?16)",
         rusqlite::params![
             row.attestation_id,
             row.attesting_key_id,
@@ -21623,6 +21687,7 @@ pub(crate) fn sqlite_insert_plane_row(
             row.cohort_scope,
             row.tier,
             admitted_at.to_rfc3339(),
+            additional_scrubs,
         ],
     )
 }
@@ -27396,6 +27461,193 @@ impl SqliteBackend {
         }
         self.key_plane_rehomed.store(true, Ordering::Release);
         Ok(())
+    }
+}
+
+/// v61 (CIRISPersist#991) — the primary-key predicate of a group-plane
+/// projection row, and its binds (`effective_at` as the RFC 3339 text every
+/// writer stores).
+fn sqlite_group_link_where(
+    link: &crate::federation::group_plane::GroupRowLink,
+) -> (String, Vec<SqlValue>) {
+    use crate::federation::group_plane::GroupPlaneTable as T;
+    let group = match link.table.kind() {
+        crate::federation::group_plane::GroupKind::Family => "family_key_id",
+        crate::federation::group_plane::GroupKind::Community => "community_key_id",
+    };
+    let member = match link.table {
+        T::Families | T::Communities => None,
+        T::FamilyRevocations | T::CommunityRevocations => Some("removed_identity_key_id"),
+        T::FamilyWidenings | T::CommunityWidenings => Some("member_key_id"),
+    };
+    let mut binds = vec![SqlValue::Text(link.group_key_id.clone())];
+    let mut sql = format!("{group} = ?1");
+    if let (Some(col), Some(m), Some(at)) = (member, &link.member_key_id, link.effective_at) {
+        sql.push_str(&format!(" AND {col} = ?2 AND effective_at = ?3"));
+        binds.push(SqlValue::Text(m.clone()));
+        binds.push(SqlValue::Text(at.to_rfc3339()));
+    }
+    (sql, binds)
+}
+
+/// v61 (CIRISPersist#991) — the group plane's executor on sqlite.
+/// Storage only: the row is `group_plane::plan_group_row`'s.
+#[async_trait::async_trait]
+impl crate::federation::group_plane::GroupPlaneStore for SqliteBackend {
+    async fn read_group_object(
+        &self,
+        link: &crate::federation::group_plane::GroupRowLink,
+    ) -> Result<Option<crate::federation::group_plane::GroupSigned>, crate::federation::Error> {
+        use crate::federation::group_plane::{GroupPlaneTable as T, GroupSigned as G};
+        let table = link.table;
+        let (pk, binds) = sqlite_group_link_where(link);
+        self.read(move |conn| -> Result<_, rusqlite::Error> {
+            conn.query_row(
+                &format!(
+                    "SELECT * FROM {} WHERE {pk} \
+                       AND authority_key_id IS NOT NULL AND authority_key_id <> ''",
+                    table.as_str()
+                ),
+                params_from_iter(binds.iter()),
+                |r| {
+                    Ok(match table {
+                        T::Families => G::Family(sqlite_row_to_signed_family(r)?),
+                        T::Communities => G::Community(sqlite_row_to_signed_community(r)?),
+                        T::FamilyRevocations => G::FamilyRevocation(
+                            sqlite_row_to_signed_family_membership_revocation(r)?,
+                        ),
+                        T::CommunityRevocations => G::CommunityRevocation(
+                            sqlite_row_to_signed_community_membership_revocation(r)?,
+                        ),
+                        T::FamilyWidenings => {
+                            G::FamilyWidening(sqlite_row_to_signed_family_membership_widening(r)?)
+                        }
+                        T::CommunityWidenings => G::CommunityWidening(
+                            sqlite_row_to_signed_community_membership_widening(r)?,
+                        ),
+                    })
+                },
+            )
+            .optional()
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("read group object: {e}")))
+    }
+
+    async fn link_group_plane_row(
+        &self,
+        link: crate::federation::group_plane::GroupRowLink,
+        row: Option<crate::federation::Attestation>,
+    ) -> Result<bool, crate::federation::Error> {
+        let id = row.as_ref().map(|r| r.attestation_id.clone());
+        let table = link.table.as_str();
+        let (pk, binds) = sqlite_group_link_where(&link);
+        let n = binds.len();
+        let linked = self
+            .write(move |conn| -> Result<Option<bool>, rusqlite::Error> {
+                let tx = conn.transaction()?;
+                let current: Option<Option<String>> = tx
+                    .query_row(
+                        &format!("SELECT attestation_id FROM {table} WHERE {pk}"),
+                        params_from_iter(binds.iter()),
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let Some(current) = current else {
+                    return Ok(None);
+                };
+                let new_id = row.as_ref().map(|r| r.attestation_id.clone());
+                if current == new_id {
+                    return Ok(Some(false));
+                }
+                if let Some(row) = &row {
+                    sqlite_insert_plane_row(&tx, row)?;
+                }
+                let mut update = binds.clone();
+                update.push(new_id.map_or(SqlValue::Null, SqlValue::Text));
+                tx.execute(
+                    &format!("UPDATE {table} SET attestation_id = ?{} WHERE {pk}", n + 1),
+                    params_from_iter(update.iter()),
+                )?;
+                // A superseded record's head leaves the plane with its pointer.
+                if let Some(old) = current {
+                    tx.execute(
+                        "DELETE FROM federation_attestations WHERE attestation_id = ?1",
+                        [old],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(Some(true))
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("link group-plane row: {e}")))?;
+        if linked == Some(true) {
+            self.index_plane_row(id.as_deref()).await?;
+        }
+        Ok(linked.is_some())
+    }
+
+    async fn read_group_plane(
+        &self,
+        table: crate::federation::group_plane::GroupPlaneTable,
+    ) -> Result<crate::federation::group_plane::GroupPlaneRead, crate::federation::Error> {
+        use crate::federation::group_plane::{GroupPlaneTable as T, GroupSigned as G};
+        let dimensions: Vec<SqlValue> = table
+            .families()
+            .iter()
+            .map(|f| SqlValue::Text(f.dimension().to_owned()))
+            .collect();
+        self.read(move |conn| -> Result<_, rusqlite::Error> {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT * FROM {} WHERE authority_key_id IS NOT NULL AND authority_key_id <> ''",
+                table.as_str()
+            ))?;
+            let live = stmt
+                .query_map([], |r| {
+                    let signed = match table {
+                        T::Families => G::Family(sqlite_row_to_signed_family(r)?),
+                        T::Communities => G::Community(sqlite_row_to_signed_community(r)?),
+                        T::FamilyRevocations => G::FamilyRevocation(
+                            sqlite_row_to_signed_family_membership_revocation(r)?,
+                        ),
+                        T::CommunityRevocations => G::CommunityRevocation(
+                            sqlite_row_to_signed_community_membership_revocation(r)?,
+                        ),
+                        T::FamilyWidenings => {
+                            G::FamilyWidening(sqlite_row_to_signed_family_membership_widening(r)?)
+                        }
+                        T::CommunityWidenings => G::CommunityWidening(
+                            sqlite_row_to_signed_community_membership_widening(r)?,
+                        ),
+                    };
+                    Ok((signed, r.get::<_, Option<String>>("attestation_id")?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let placeholders = (1..=dimensions.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
+                    additional_scrubs \
+                 FROM federation_attestations \
+                 WHERE attestation_type = 'scores' AND dimension IN ({placeholders}) \
+                 ORDER BY attestation_id"
+            ))?;
+            let rows = stmt
+                .query_map(
+                    params_from_iter(dimensions.iter()),
+                    sqlite_row_to_attestation,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(crate::federation::group_plane::GroupPlaneRead { live, rows })
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("read group plane: {e}")))
     }
 }
 

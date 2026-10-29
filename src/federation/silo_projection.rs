@@ -56,11 +56,33 @@ pub enum SiloProjection {
     /// amendment chain and retractions ([`super::goal_projection`]). A
     /// pre-V204 typed goal with no row is a red until the rehome moves it.
     Goals,
+    /// v61 (CIRISPersist#991, CC 3.1.3) — the signed rows of
+    /// `federation_families` ← `group:roster:v1` rows of kind `family`
+    /// ([`super::group_plane`]). A trusted-local (unsigned) record is the
+    /// node's own write, outside the projection; a signed one held without its
+    /// row (Ed25519-only) is a red.
+    Families,
+    /// v61 — the signed rows of `federation_communities` ←
+    /// `group:roster:v1` rows of kind `community`.
+    Communities,
+    /// v61 (CC 3.1.3.2) — `federation_family_membership_revocations` ←
+    /// `membership:removal:v1` and `membership:resignation:v1` rows of kind
+    /// `family`.
+    FamilyMembershipRevocations,
+    /// v61 — `federation_community_membership_revocations` ← the removal
+    /// and resignation rows of kind `community`.
+    CommunityMembershipRevocations,
+    /// v61 — `federation_family_membership_widenings` ←
+    /// `membership:widening:v1` rows of kind `family`.
+    FamilyMembershipWidenings,
+    /// v61 — `federation_community_membership_widenings` ←
+    /// `membership:widening:v1` rows of kind `community`.
+    CommunityMembershipWidenings,
 }
 
 impl SiloProjection {
     /// Every projection, in declaration order.
-    pub const ALL: [SiloProjection; 8] = [
+    pub const ALL: [SiloProjection; 14] = [
         Self::HardCaseEvents,
         Self::DetectionEvents,
         Self::FederationKeys,
@@ -69,6 +91,12 @@ impl SiloProjection {
         Self::CreditsLedger,
         Self::ExpertiseLedger,
         Self::Goals,
+        Self::Families,
+        Self::Communities,
+        Self::FamilyMembershipRevocations,
+        Self::CommunityMembershipRevocations,
+        Self::FamilyMembershipWidenings,
+        Self::CommunityMembershipWidenings,
     ];
 
     /// The stable name: the projection's table name without a schema.
@@ -83,6 +111,12 @@ impl SiloProjection {
             Self::CreditsLedger => "credits_ledger",
             Self::ExpertiseLedger => "expertise_ledger",
             Self::Goals => "goals",
+            Self::Families => "federation_families",
+            Self::Communities => "federation_communities",
+            Self::FamilyMembershipRevocations => "federation_family_membership_revocations",
+            Self::CommunityMembershipRevocations => "federation_community_membership_revocations",
+            Self::FamilyMembershipWidenings => "federation_family_membership_widenings",
+            Self::CommunityMembershipWidenings => "federation_community_membership_widenings",
         }
     }
 }

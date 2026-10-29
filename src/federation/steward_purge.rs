@@ -432,6 +432,40 @@ pub const ATTESTATION_PROJECTIONS: &[(&str, &str, ProjectionRemoval)] = &[
         "attestation_id",
         ProjectionRemoval::ForeignKeyCascade,
     ),
+    // v61 (CIRISPersist#991; V206) — the group records and the roster
+    // planes. SET NULL, the key plane's rule: a hard delete of a row leaves
+    // the group and its roster events held, without their rows, and the
+    // rebuild gate names them.
+    (
+        "federation_families",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeySetNull,
+    ),
+    (
+        "federation_communities",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeySetNull,
+    ),
+    (
+        "federation_family_membership_revocations",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeySetNull,
+    ),
+    (
+        "federation_community_membership_revocations",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeySetNull,
+    ),
+    (
+        "federation_family_membership_widenings",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeySetNull,
+    ),
+    (
+        "federation_community_membership_widenings",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeySetNull,
+    ),
 ];
 
 /// Tables with an `*attestation_id` column that are NOT projections of a

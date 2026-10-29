@@ -121,7 +121,9 @@ pub(crate) struct PlannedCommunityListing {
 /// Storage only: every refusal is a plan's. (A missing room or member key on
 /// memory is its stand-in for the SQL backends' foreign keys.)
 #[async_trait::async_trait]
-pub(crate) trait CommunityStore: FederationDirectory + Sized {
+pub(crate) trait CommunityStore:
+    FederationDirectory + super::group_plane::GroupPlaneStore + Sized
+{
     /// Insert a planned community record with its authority signature,
     /// supersede proof, co-signatures and lineage, then index it. An id taken
     /// by the time of the insert writes nothing and reports the stored hash.
@@ -203,9 +205,15 @@ where
         community,
         occupied,
     } = planned;
+    let link = super::group_plane::GroupRowLink::record(
+        super::group_plane::GroupKind::Community,
+        &community.community.community_key_id,
+    );
     if let OccupiedRoute::Settled(written) =
         group_amendment::apply_occupied_community(dir, &community, occupied).await?
     {
+        // v61 (CIRISPersist#991) — the head's `group:roster:v1` row.
+        super::group_plane::sync_group_row(dir, link).await?;
         return Ok(written);
     }
     let insert = community_insert(community)?;
@@ -217,7 +225,11 @@ where
     dir.rival_community_write_at(crate::store::test_hooks::RivalPoint::BeforeInsert)
         .await?;
     match dir.store_planned_community(insert).await? {
-        StoredCommunity::Inserted => Ok(CommunityWrite::Inserted),
+        StoredCommunity::Inserted => {
+            // v61 (CIRISPersist#991) — the record's `group:roster:v1` row.
+            super::group_plane::sync_group_row(dir, link).await?;
+            Ok(CommunityWrite::Inserted)
+        }
         // v38.2.0 (#758) — the insert found the id taken: identical content is
         // `Unchanged`, a differing record is refused.
         StoredCommunity::Occupied {
@@ -342,7 +354,12 @@ where
         received_at: chrono::Utc::now(),
     };
     let planned = plan_put_community_membership_revocation(dir, revocation, instants).await?;
-    dir.store_planned_community_revocation(planned).await
+    // v61 (CIRISPersist#991) — the removal's (or resignation's) row.
+    let link =
+        super::group_plane::GroupSigned::CommunityRevocation(planned.revocation.clone()).link();
+    dir.store_planned_community_revocation(planned).await?;
+    super::group_plane::sync_group_row(dir, link).await?;
+    Ok(())
 }
 
 /// **The decision** for a community-membership revocation. Reads the
@@ -455,7 +472,11 @@ where
         received_at: chrono::Utc::now(),
     };
     let planned = plan_put_community_membership_widening(dir, widening, instants).await?;
-    dir.store_planned_community_widening(planned).await
+    // v61 (CIRISPersist#991) — the widening's row.
+    let link = super::group_plane::GroupSigned::CommunityWidening(planned.widening.clone()).link();
+    dir.store_planned_community_widening(planned).await?;
+    super::group_plane::sync_group_row(dir, link).await?;
+    Ok(())
 }
 
 /// **The decision** for a community-membership widening (CIRISPersist#860,

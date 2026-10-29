@@ -361,6 +361,223 @@ where
     client.query(&stmt.sql, &params_ref[..]).await
 }
 
+/// v61 (CIRISPersist#991) — the primary-key predicate of a group-plane
+/// projection row, from bind position `first`.
+fn pg_group_link_where(
+    link: &crate::federation::group_plane::GroupRowLink,
+    first: usize,
+) -> (
+    String,
+    Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+) {
+    use crate::federation::group_plane::GroupPlaneTable as T;
+    let group = match link.table.kind() {
+        crate::federation::group_plane::GroupKind::Family => "family_key_id",
+        crate::federation::group_plane::GroupKind::Community => "community_key_id",
+    };
+    let member = match link.table {
+        T::Families | T::Communities => None,
+        T::FamilyRevocations | T::CommunityRevocations => Some("removed_identity_key_id"),
+        T::FamilyWidenings | T::CommunityWidenings => Some("member_key_id"),
+    };
+    let mut binds: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+        vec![Box::new(link.group_key_id.clone())];
+    let mut sql = format!("{group} = ${first}");
+    if let (Some(col), Some(m), Some(at)) = (member, &link.member_key_id, link.effective_at) {
+        sql.push_str(&format!(
+            " AND {col} = ${} AND effective_at = ${}",
+            first + 1,
+            first + 2
+        ));
+        binds.push(Box::new(m.clone()));
+        binds.push(Box::new(at));
+    }
+    (sql, binds)
+}
+
+/// v61 (CIRISPersist#991) — the group plane's executor on postgres.
+/// Storage only: the row is `group_plane::plan_group_row`'s.
+#[async_trait::async_trait]
+impl crate::federation::group_plane::GroupPlaneStore for PostgresBackend {
+    async fn read_group_object(
+        &self,
+        link: &crate::federation::group_plane::GroupRowLink,
+    ) -> Result<Option<crate::federation::group_plane::GroupSigned>, crate::federation::Error> {
+        use crate::federation::group_plane::{GroupPlaneTable as T, GroupSigned as G};
+        use crate::federation::Error;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        let (pk, binds) = pg_group_link_where(link, 1);
+        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            binds.iter().map(|b| b.as_ref() as _).collect();
+        let Some(r) = client
+            .query_opt(
+                &format!(
+                    "SELECT * FROM cirislens.{} WHERE {pk} \
+                       AND authority_key_id IS NOT NULL AND authority_key_id <> ''",
+                    link.table.as_str()
+                ),
+                &refs,
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("read group object: {e}")))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(match link.table {
+            T::Families => G::Family(pg_row_to_signed_family(r)?),
+            T::Communities => G::Community(pg_row_to_signed_community(r)?),
+            T::FamilyRevocations => {
+                G::FamilyRevocation(pg_row_to_signed_family_membership_revocation(r)?)
+            }
+            T::CommunityRevocations => {
+                G::CommunityRevocation(pg_row_to_signed_community_membership_revocation(r)?)
+            }
+            T::FamilyWidenings => {
+                G::FamilyWidening(pg_row_to_signed_family_membership_widening(r)?)
+            }
+            T::CommunityWidenings => {
+                G::CommunityWidening(pg_row_to_signed_community_membership_widening(r)?)
+            }
+        }))
+    }
+
+    async fn link_group_plane_row(
+        &self,
+        link: crate::federation::group_plane::GroupRowLink,
+        row: Option<crate::federation::Attestation>,
+    ) -> Result<bool, crate::federation::Error> {
+        use crate::federation::Error;
+        let table = link.table.as_str();
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("link group-plane row: begin: {e}")))?;
+        let (pk, binds) = pg_group_link_where(&link, 1);
+        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            binds.iter().map(|b| b.as_ref() as _).collect();
+        let current = tx
+            .query_opt(
+                &format!("SELECT attestation_id FROM cirislens.{table} WHERE {pk} FOR UPDATE"),
+                &refs,
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("link group-plane row: read: {e}")))?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        let current: Option<String> = current.get(0);
+        let new_id = row.as_ref().map(|r| r.attestation_id.clone());
+        if current == new_id {
+            return Ok(true);
+        }
+        if let Some(row) = &row {
+            pg_insert_plane_row(&tx, row).await?;
+        }
+        let (pk2, binds2) = pg_group_link_where(&link, 2);
+        let mut refs2: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&new_id];
+        refs2.extend(
+            binds2
+                .iter()
+                .map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)),
+        );
+        tx.execute(
+            &format!("UPDATE cirislens.{table} SET attestation_id = $1 WHERE {pk2}"),
+            &refs2,
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("link group-plane row: point: {e}")))?;
+        // A superseded record's head leaves the plane with its pointer.
+        if let Some(old) = current {
+            tx.execute(
+                "DELETE FROM cirislens.federation_attestations WHERE attestation_id::text = $1",
+                &[&old],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("link group-plane row: drop prior: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("link group-plane row: commit: {e}")))?;
+        drop(client);
+        self.index_plane_row(new_id.as_deref()).await?;
+        Ok(true)
+    }
+
+    async fn read_group_plane(
+        &self,
+        table: crate::federation::group_plane::GroupPlaneTable,
+    ) -> Result<crate::federation::group_plane::GroupPlaneRead, crate::federation::Error> {
+        use crate::federation::group_plane::{GroupPlaneTable as T, GroupSigned as G};
+        use crate::federation::Error;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT * FROM cirislens.{} \
+                     WHERE authority_key_id IS NOT NULL AND authority_key_id <> ''",
+                    table.as_str()
+                ),
+                &[],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("read group plane: {e}")))?;
+        let mut live = Vec::with_capacity(rows.len());
+        for r in rows {
+            let attestation_id: Option<String> = r
+                .try_get("attestation_id")
+                .map_err(|e| Error::Backend(format!("read group plane: attestation_id: {e}")))?;
+            let signed = match table {
+                T::Families => G::Family(pg_row_to_signed_family(r)?),
+                T::Communities => G::Community(pg_row_to_signed_community(r)?),
+                T::FamilyRevocations => {
+                    G::FamilyRevocation(pg_row_to_signed_family_membership_revocation(r)?)
+                }
+                T::CommunityRevocations => {
+                    G::CommunityRevocation(pg_row_to_signed_community_membership_revocation(r)?)
+                }
+                T::FamilyWidenings => {
+                    G::FamilyWidening(pg_row_to_signed_family_membership_widening(r)?)
+                }
+                T::CommunityWidenings => {
+                    G::CommunityWidening(pg_row_to_signed_community_membership_widening(r)?)
+                }
+            };
+            live.push((signed, attestation_id));
+        }
+        let dimensions: Vec<String> = table
+            .families()
+            .iter()
+            .map(|f| f.dimension().to_owned())
+            .collect();
+        let plane = client
+            .query(
+                &format!(
+                    "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+                     WHERE attestation_type = 'scores' \
+                       AND (dimension COLLATE \"C\") = ANY($1) ORDER BY attestation_id"
+                ),
+                &[&dimensions],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("read group plane rows: {e}")))?;
+        let rows = plane
+            .into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::federation::group_plane::GroupPlaneRead { live, rows })
+    }
+}
+
 /// v60.0.0 (CIRISPersist#934 step 4) — the sweeps' executor on postgres.
 /// Storage only: the selections are `federation::sweep_plan`'s.
 #[async_trait::async_trait]
@@ -9260,6 +9477,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             &crate::federation::wire_index::record_key(&[("family_key_id", &family_key_id)]),
         )
         .await?;
+        // v61 (CIRISPersist#991) — the row follows its object.
+        crate::federation::group_plane::sync_group_row(
+            self,
+            crate::federation::group_plane::GroupRowLink::record(
+                crate::federation::group_plane::GroupKind::Family,
+                &family_key_id,
+            ),
+        )
+        .await?;
         Ok(())
     }
 
@@ -9622,6 +9848,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         self.index_stored_record(
             kind,
             &crate::federation::wire_index::record_key(&[(key_field, &group_key_id)]),
+        )
+        .await?;
+        // v61 (CIRISPersist#991) — the new head's `group:roster:v1` row
+        // replaces the prior head's.
+        crate::federation::group_plane::sync_group_row(
+            self,
+            crate::federation::group_plane::GroupRowLink::record(
+                match cohort {
+                    Cohort::Family => crate::federation::group_plane::GroupKind::Family,
+                    _ => crate::federation::group_plane::GroupKind::Community,
+                },
+                &group_key_id,
+            ),
         )
         .await?;
         Ok(next as u32)
@@ -10719,6 +10958,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         drop(client);
         self.index_stored_record("FamilyMembershipRevocation", &wire_index_key)
             .await?;
+        // v61 (CIRISPersist#991) — the row follows its object.
+        crate::federation::group_plane::sync_group_row(
+            self,
+            crate::federation::group_plane::GroupRowLink::plane(
+                crate::federation::group_plane::GroupPlaneTable::FamilyRevocations,
+                &row.family_key_id,
+                &row.removed_identity_key_id,
+                row.effective_at,
+            ),
+        )
+        .await?;
         // CEG §7.7 (CIRISPersist#161 Ask 5) — emit the removal-direction
         // membership-change hard_case (`change_kind: "removed"`), keyed on
         // the re-key epoch. Idempotent on event_id (ON CONFLICT DO NOTHING).
@@ -10850,6 +11100,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             self.index_stored_record("FamilyMembershipWidening", &wire_index_key)
                 .await?;
         }
+        // v61 (CIRISPersist#991) — the row follows its object.
+        crate::federation::group_plane::sync_group_row(
+            self,
+            crate::federation::group_plane::GroupRowLink::plane(
+                crate::federation::group_plane::GroupPlaneTable::FamilyWidenings,
+                &row.family_key_id,
+                &row.member_key_id,
+                row.effective_at,
+            ),
+        )
+        .await?;
         Ok(())
     }
 
@@ -22286,6 +22547,13 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
     {
         use crate::federation::silo_projection::SiloProjection;
         use crate::federation::Error;
+        // v61 (CIRISPersist#991) — a group table's rebuild is the group
+        // plane's, over the executor's two reads.
+        if let Some(table) =
+            crate::federation::group_plane::GroupPlaneTable::of_projection(projection)
+        {
+            return crate::federation::group_plane::projection_rebuild(self, table).await;
+        }
         let (live_table, scratch, order, family) = match projection {
             SiloProjection::HardCaseEvents => (
                 "cirislens.hard_case_events",
@@ -22343,6 +22611,13 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                     .map_err(|e| Error::Backend(e.to_string()))?;
                 return pg_goal_projection_rebuild(&mut client).await;
             }
+            // Answered above.
+            SiloProjection::Families
+            | SiloProjection::Communities
+            | SiloProjection::FamilyMembershipRevocations
+            | SiloProjection::CommunityMembershipRevocations
+            | SiloProjection::FamilyMembershipWidenings
+            | SiloProjection::CommunityMembershipWidenings => return Ok(Default::default()),
         };
         let mut client = self
             .get_client()
@@ -22377,7 +22652,13 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                 | SiloProjection::IdentityOccurrences
                 | SiloProjection::CreditsLedger
                 | SiloProjection::ExpertiseLedger
-                | SiloProjection::Goals => {}
+                | SiloProjection::Goals
+                | SiloProjection::Families
+                | SiloProjection::Communities
+                | SiloProjection::FamilyMembershipRevocations
+                | SiloProjection::CommunityMembershipRevocations
+                | SiloProjection::FamilyMembershipWidenings
+                | SiloProjection::CommunityMembershipWidenings => {}
                 SiloProjection::HardCaseEvents => {
                     if let Some(event) = crate::federation::hard_case::project_hard_case_row(&row) {
                         pg_project_hard_case(&*tx, scratch, &row.attestation_id, &event).await?;
@@ -23725,6 +24006,10 @@ async fn pg_insert_plane_row(
         .map_err(|e| Error::Backend(format!("original_content_hash hex decode: {e}")))?;
     let attestation_envelope_text = serde_json::to_string(&row.attestation_envelope)
         .map_err(|e| Error::Backend(format!("attestation_envelope encode: {e}")))?;
+    // v61 (CIRISPersist#991) — a group-plane row carries its
+    // co-signatures; a key-plane row carries none (`[]`).
+    let additional_scrubs = serde_json::to_string(&row.additional_scrubs)
+        .map_err(|e| Error::Backend(format!("additional_scrubs encode: {e}")))?;
     let admitted_at = pg_next_plane_position(tx, "federation_attestations").await?;
     tx.execute(
         "INSERT INTO cirislens.federation_attestations (\
@@ -23735,7 +24020,7 @@ async fn pg_insert_plane_row(
             subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
             additional_scrubs, admitted_at\
          ) VALUES ($1, $2, $3, $4, NULL, $5, NULL, $6, $7, $8, $9, $10, $11, $12, $13, \
-                   '[]'::jsonb, NULL, $14, $15, NULL, '[]', $16) \
+                   '[]'::jsonb, NULL, $14, $15, NULL, $17, $16) \
          ON CONFLICT (attestation_id) DO NOTHING",
         &[
             &row.attestation_id,
@@ -23754,6 +24039,7 @@ async fn pg_insert_plane_row(
             &row.cohort_scope,
             &row.tier,
             &admitted_at,
+            &additional_scrubs,
         ],
     )
     .await

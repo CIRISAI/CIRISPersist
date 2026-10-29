@@ -753,6 +753,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
         ConnClass::HelperRead,
     ),
     ("rehome_legacy_key_plane", ConnClass::Write),
+    // v61 (CIRISPersist#991) — the group plane's executor.
+    ("read_group_object", ConnClass::Read),
+    ("link_group_plane_row", ConnClass::Write),
+    ("read_group_plane", ConnClass::Read),
     ("store_planned_revocation", ConnClass::Write),
     ("index_stored_key_row", ConnClass::Read),
     ("sqlite_render_table", ConnClass::HelperRead),

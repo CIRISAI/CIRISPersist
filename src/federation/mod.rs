@@ -215,6 +215,10 @@ pub(crate) mod grant_supersede_invariants;
 /// v49.0.0 (CIRISPersist#910.5) — I178: a group amendment replicates.
 #[cfg(test)]
 pub mod group_amendment_invariants;
+/// v61 (CIRISPersist#991) — I1484/I1485: the group records and the
+/// roster planes are rows; the tables are their projections.
+#[cfg(test)]
+pub(crate) mod group_plane_invariants;
 /// v52.0.0 (CIRISPersist#672) — I230–I235: the held-record settle.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod held_settle_invariants;
@@ -386,6 +390,9 @@ pub mod goal;
 // v60.1.0 (CIRISPersist#1120, CC 3.1.5) — the identity_amendment:v1 gate.
 pub mod goal_projection;
 pub(crate) mod group_amendment;
+// v61 (CIRISPersist#991 planes 2 and 3; CC 3.1.3, 3.1.3.2) — the group
+// records and the membership planes as rows.
+pub mod group_plane;
 pub mod hardware_attestation;
 pub mod identity_aggregate;
 pub mod identity_amendment;

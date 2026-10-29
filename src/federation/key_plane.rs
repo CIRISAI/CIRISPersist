@@ -446,10 +446,57 @@ pub(crate) fn minted_row(
     asserted_at: chrono::DateTime<chrono::Utc>,
     signature: PlaneSignature,
 ) -> Result<Attestation, Error> {
+    minted_row_placed(
+        family,
+        attesting_key_id,
+        attested_key_id,
+        object,
+        asserted_at,
+        signature,
+        MintedPlacement::federation(),
+    )
+}
+
+/// v61 (CIRISPersist#991, CC 3.1.3) — where a minted row is placed and
+/// what rides beside its object: the key plane's rows are federation-wide
+/// with nothing else; a group-plane row (`super::group_plane`) is placed at
+/// its group, names it as the cohort target, and carries its co-signatures
+/// as `additional_scrubs`.
+#[derive(Debug, Clone)]
+pub(crate) struct MintedPlacement {
+    /// The row's `cohort_scope`.
+    pub(crate) cohort_scope: &'static str,
+    /// Envelope members beside the object, each a pure function of it.
+    pub(crate) members: serde_json::Map<String, serde_json::Value>,
+    /// The co-signatures over the object's own signed bytes.
+    pub(crate) additional_scrubs: Vec<super::types::ScrubSig>,
+}
+
+impl MintedPlacement {
+    /// Federation-wide, nothing beside the object, no co-signature.
+    pub(crate) fn federation() -> Self {
+        Self {
+            cohort_scope: cohort_scope::FEDERATION,
+            members: serde_json::Map::new(),
+            additional_scrubs: Vec::new(),
+        }
+    }
+}
+
+/// [`minted_row`] at a [`MintedPlacement`].
+pub(crate) fn minted_row_placed(
+    family: MintedFamily,
+    attesting_key_id: &str,
+    attested_key_id: &str,
+    object: serde_json::Value,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    signature: PlaneSignature,
+    placement: MintedPlacement,
+) -> Result<Attestation, Error> {
     let mut object = object;
     super::canonical_at_rest::canonicalize_in_place(&mut object)?;
     let attestation_id = minted_attestation_id(family.id_domain, &object)?;
-    let mut members = serde_json::Map::new();
+    let mut members = placement.members;
     members.insert("dimension".to_owned(), family.dimension.into());
     members.insert("score".to_owned(), family.score.into());
     members.insert("confidence".to_owned(), 1.into());
@@ -473,10 +520,10 @@ pub(crate) fn minted_row(
         persist_row_hash: String::new(),
         subject_key_ids: Vec::new(),
         withdraws_admission_rule: None,
-        cohort_scope: cohort_scope::FEDERATION.to_owned(),
+        cohort_scope: placement.cohort_scope.to_owned(),
         tier: attestation_tier::FEDERATION.to_owned(),
         promoted_at: None,
-        additional_scrubs: Vec::new(),
+        additional_scrubs: placement.additional_scrubs,
     };
     // The signed instant and the row mirror, through the one placement every
     // persist-minted row uses.

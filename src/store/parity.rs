@@ -426,6 +426,18 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // (The three roster executors are each a shared door's tail call, which
     // the scan does not record for Plumbing.)
     ("store_planned_community", Class::Plumbing),
+    // v61 (CIRISPersist#991) — the revocation and widening executors are
+    // no longer tail calls: the group-plane row follows them.
+    ("store_planned_community_revocation", Class::Plumbing),
+    ("store_planned_community_widening", Class::Plumbing),
+    // v61 (CIRISPersist#991) — the row follows its object, after the
+    // typed write landed: it reads the stored object back, mints its row and
+    // links the projection. It refuses nothing about the caller's input (the
+    // door admitted the object already); it fails only on the substrate's own
+    // encoding or storage.
+    ("sync_group_row", Class::Plumbing),
+    // The group-table arm of a projection rebuild: a lookup, no refusal.
+    ("of_projection", Class::Plumbing),
     // The row as inserted: the hash and the wire-index locator, derived.
     ("community_insert", Class::Plumbing),
     // The `cfg(test)` rival write, reached through the executor trait; never
