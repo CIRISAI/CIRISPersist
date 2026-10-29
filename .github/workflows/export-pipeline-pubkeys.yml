@@ -1,0 +1,67 @@
+name: Export pipeline pubkeys (bless a CI keypair)
+
+# Surfaces the PUBLIC halves of persist's build-pipeline signing keypair
+# (ciris-persist-build-v1) so an accord holder can bless it: delegate
+# infra:attest to the pipeline key_id and pin its pubkeys as the
+# pipeline_member. Derives from the SAME secrets ci.yml signs with
+# (CIRIS_BUILD_ED25519_SECRET / CIRIS_BUILD_MLDSA_SECRET, base64 as
+# scripts/build_manifest.sh decodes them), so the blessed key provably matches
+# the signing key. Never prints or uploads a secret byte.
+#
+# Manual only. Mirrors CIRISServer's and CIRISVerify's export-pipeline-pubkeys.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      key_id:
+        description: "Pipeline node key_id these pubkeys belong to"
+        required: true
+        default: "ciris-persist-build-v1"
+
+permissions:
+  contents: read
+
+jobs:
+  export-pubkeys:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: install ciris-build-sign (the version pinned in scripts/build_manifest.sh)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/build_manifest.sh install
+
+      - name: derive + surface the pipeline pubkeys (no secret ever printed)
+        env:
+          CIRIS_BUILD_ED25519_SECRET: ${{ secrets.CIRIS_BUILD_ED25519_SECRET }}
+          CIRIS_BUILD_MLDSA_SECRET: ${{ secrets.CIRIS_BUILD_MLDSA_SECRET }}
+          KEY_ID: ${{ inputs.key_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CIRIS_BUILD_ED25519_SECRET:-}" ] || [ -z "${CIRIS_BUILD_MLDSA_SECRET:-}" ]; then
+            echo "::error::CIRIS_BUILD_* secrets are not set on this repo; nothing to derive."
+            exit 1
+          fi
+          k="$(mktemp -d)"; chmod 0700 "$k"
+          trap 'shred -u "$k"/* 2>/dev/null || rm -f "$k"/*; rmdir "$k" 2>/dev/null || true' EXIT
+          printf '%s' "$CIRIS_BUILD_ED25519_SECRET" | base64 -d >"$k/ed25519.seed"
+          printf '%s' "$CIRIS_BUILD_MLDSA_SECRET" | base64 -d >"$k/mldsa65.secret"
+          chmod 0600 "$k"/*
+          ciris-build-sign pubkey \
+            --ed25519-seed "$k/ed25519.seed" \
+            --mldsa-secret "$k/mldsa65.secret" \
+            --key-id "$KEY_ID" \
+            > pipeline-pubkeys.json 2>/dev/null
+          {
+            echo "## Bless this CI keypair"
+            echo "Paste into the client's *bless a CI keypair* card (public material only):"
+            echo '```json'
+            cat pipeline-pubkeys.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pipeline-pubkeys
+          path: pipeline-pubkeys.json
