@@ -1379,6 +1379,94 @@ mod authorization_digest_tests {
         .is_err());
     }
 
+    /// I1476 (CIRISPersist#1141) — **persist's digest is byte-identical
+    /// to the one CIRISVerify owns, on every vector it was cut from.**
+    ///
+    /// The seven files in `tests/vectors/genesis_bundle/` are copied byte for
+    /// byte from CIRISVerify v22.0.0's
+    /// `src/ciris-verify-core/tests/vectors/genesis_bundle/`. They were produced
+    /// by persist's own `authorization_digest` (v2 is the live registry bundle,
+    /// v3 is persist at c45a1519, v4 is the v59.1.0 seed) plus four v4 variants
+    /// that edit holder 0's record where a raw-JSON projection and a typed one
+    /// differ: an `Option` written as `null`, `roles` absent, a `+00:00` instant,
+    /// and an unknown member. The expected digests are the ones verify's own test
+    /// pins. Each vector goes through persist's parser and persist's
+    /// `authorization_digest`, and separately through verify's
+    /// `GenesisBundle::from_value` over the raw file, so a drift on either side
+    /// reds here.
+    #[test]
+    fn i1476_authorization_digest_matches_verify_on_every_vector() {
+        use ciris_verify_core::genesis_bundle as vgb;
+        const V4_DIGEST: &str = "8e5f5a7c5af3ecad7f4e370b6b53b624683bd69729e39bcf4ee41b39077a198a";
+        macro_rules! vector {
+            ($f:literal) => {
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/vectors/genesis_bundle/",
+                    $f
+                ))
+            };
+        }
+        let cases: [(&str, &str, &str); 7] = [
+            (
+                "v2_registry_live",
+                vector!("v2_registry_live.json"),
+                "787d0632ae8a645d2c52c6f65909724d8cb370399b14b4c7077786229dabe952",
+            ),
+            (
+                "v3_persist_c45a1519",
+                vector!("v3_persist_c45a1519.json"),
+                "4ccbed38990cb4b6127ff13c2444126fe5e8ca168f5d4e69832b5b9a399eaf0f",
+            ),
+            (
+                "v4_persist_v59_1_0",
+                vector!("v4_persist_v59_1_0.json"),
+                V4_DIGEST,
+            ),
+            (
+                "v4_variant_valid_until_null",
+                vector!("v4_variant_valid_until_null.json"),
+                V4_DIGEST,
+            ),
+            (
+                "v4_variant_roles_absent",
+                vector!("v4_variant_roles_absent.json"),
+                V4_DIGEST,
+            ),
+            (
+                "v4_variant_offset_instant",
+                vector!("v4_variant_offset_instant.json"),
+                V4_DIGEST,
+            ),
+            (
+                "v4_variant_null_and_unknown",
+                vector!("v4_variant_null_and_unknown.json"),
+                "ee49f07c7e32cecfd26250c13e278876c20174219259089b7f607c0cf51222e1",
+            ),
+        ];
+        for (name, src, want) in cases {
+            let bundle = parse_genesis_bundle(src).unwrap_or_else(|e| panic!("{name}: parse: {e}"));
+            let ours = authorization_digest(&bundle).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(hex::encode(&ours), want, "{name}: persist's digest");
+            let raw: serde_json::Value = serde_json::from_str(src).expect("vector is JSON");
+            let theirs = vgb::authorization_digest(
+                &vgb::GenesisBundle::from_value(&raw).unwrap_or_else(|e| panic!("{name}: {e}")),
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(hex::encode(theirs), want, "{name}: verify's digest");
+        }
+        // The compiled-in seed is the v4 vector's bundle (the same JSON), so it
+        // carries the same digest. Parsed from the embedded bytes, not through
+        // `canonical_genesis_bundle`, which a test anchor can stand in for.
+        let seed = parse_genesis_bundle(crate::federation::genesis::CANONICAL_SEED_JSON)
+            .expect("the embedded seed parses");
+        assert_eq!(
+            hex::encode(authorization_digest(&seed).expect("seed digest")),
+            V4_DIGEST,
+            "the compiled-in production seed"
+        );
+    }
+
     /// v31.2.0 (CIRISPersist#660, CIRISServer#398 §5) — **the field set of
     /// `KeyRecord` is pinned, so widening the record widens the digest as a
     /// REVIEWED act.**
