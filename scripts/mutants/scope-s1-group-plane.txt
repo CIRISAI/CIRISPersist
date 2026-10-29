@@ -1,0 +1,23 @@
+# Mutation scope: v61 slice S1 — the group records and the roster planes as
+# rows (CIRISPersist#991 planes 2 and 3; docs/V61_TASK_PLAN.md §3 S1).
+#
+# - The plane: `src/federation/group_plane.rs` (the row builder and its
+#   parser, the canonical-row check, the consensus-source dispatch, the
+#   inbound row door, the signature rule at a receiver, the cosigned
+#   withdraws and its projection effect, the generic-path refusal, the sync,
+#   the rehome, the rebuild). Witnesses I1484–I1489 (sqlite, postgres), the
+#   module's unit tests, I706 (the refusals outside the door).
+# - The two backends' executors: the presence probe, the object and plane
+#   reads, the unlinked probe, the link and the retraction drop.
+# - Not in scope: the one-line hooks that call the door from
+#   `attestation_admit`, `attestation_apply` and `tier_ingest` (a mutant of
+#   those functions is a mutant of every plane door; deleting a hook is caught
+#   by I1486/I1487); the co-signature count in `tier_ingest` (reached through
+#   every roster door, witnessed by I176 and I1484–I1486 in the wider lane).
+#
+# Grammar: docs/MUTATION_TESTING.md "Scope files".
+tests: test(/i148[4-9]|i706|group_plane::tests/)
+
+src/federation/group_plane.rs
+src/store/sqlite.rs sqlite_group_link_where group_plane_present read_group_object unlinked_group_objects link_group_plane_row drop_group_projection_row read_group_plane
+src/store/postgres.rs pg_group_link_where group_plane_present read_group_object unlinked_group_objects link_group_plane_row drop_group_projection_row read_group_plane
