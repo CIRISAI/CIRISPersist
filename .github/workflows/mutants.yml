@@ -108,9 +108,9 @@ jobs:
           # narrowing several granting minters to the author's sealer.
           # 14 mutants, one shard (600 s + 168 s x 14 = 2952 s), nightly.
           - {scope: scope-5911-principals, shard: '', id: 5911-principals, weekly: false}
-          # The group plane (CIRISPersist#991 planes 2 and 3): 171 mutants, six
-          # shards of <= 29 at the measured 168 s per mutant
-          # (600 s + 168 s x 29 = 5472 s each), weekly.
+          # The group plane (CIRISPersist#991 planes 2 and 3): 162 mutants, six
+          # shards of <= 27 at the measured 168 s per mutant
+          # (600 s + 168 s x 27 = 5136 s each), weekly.
           - {scope: scope-s1-group-plane, shard: '0/6', id: s1-group-plane-0-of-6, weekly: true}
           - {scope: scope-s1-group-plane, shard: '1/6', id: s1-group-plane-1-of-6, weekly: true}
           - {scope: scope-s1-group-plane, shard: '2/6', id: s1-group-plane-2-of-6, weekly: true}

@@ -1144,6 +1144,37 @@ pub(crate) mod bodies {
         );
     }
 
+    /// I1489, last: after the runner clears every widening's pointer, the
+    /// rehome links each back and counts it (and still counts the
+    /// Ed25519-only record).
+    pub(crate) async fn i1489_relinked<D>(d: &D, tag: &str, cleared: i64)
+    where
+        D: FederationDirectory + GroupPlaneStore + AttestationStore,
+    {
+        assert!(cleared >= 2, "{tag}: the runner cleared the widenings");
+        let report = crate::federation::group_plane::rehome_group_records(d)
+            .await
+            .expect("rehome after the pointers were cleared");
+        assert_eq!(
+            report,
+            crate::federation::group_plane::GroupRehomeReport {
+                linked: u64::try_from(cleared).unwrap(),
+                without_row: 1,
+            },
+            "{tag}: every cleared pointer is linked back, and counted"
+        );
+        all_linked(d, GroupPlaneTable::FamilyWidenings, tag).await;
+        all_linked(d, GroupPlaneTable::CommunityWidenings, tag).await;
+    }
+
+    /// The SQL that clears the widenings' pointers, on `schema`.
+    pub(crate) fn i1489_clear_sql(schema: &str) -> String {
+        format!(
+            "UPDATE {schema}federation_family_membership_widenings SET attestation_id = NULL; \
+             UPDATE {schema}federation_community_membership_widenings SET attestation_id = NULL;"
+        )
+    }
+
     /// I1485 — the room plane as rows.
     pub(crate) async fn i1485_room_plane<D>(d: &D, tag: &str)
     where
@@ -1399,6 +1430,20 @@ mod run {
         assert_eq!(signed, before, "{t}: the upgrade keeps every record");
         let plane = old.test_count(&super::bodies::plane_rows_sql("")).await;
         super::bodies::i1489_after_upgrade(&old, &t, before, plane, unlinked).await;
+        let cleared = old
+            .test_count(&super::bodies::signed_sql(
+                "",
+                crate::federation::group_plane::GroupPlaneTable::FamilyWidenings,
+            ))
+            .await
+            + old
+                .test_count(&super::bodies::signed_sql(
+                    "",
+                    crate::federation::group_plane::GroupPlaneTable::CommunityWidenings,
+                ))
+                .await;
+        old.test_execute(&super::bodies::i1489_clear_sql("")).await;
+        super::bodies::i1489_relinked(&old, &t, cleared).await;
     }
 
     #[cfg(feature = "postgres")]
@@ -1438,6 +1483,20 @@ mod run {
         assert_eq!(signed, before, "{t}: the upgrade keeps every record");
         let plane = old.test_count(&super::bodies::plane_rows_sql(s)).await;
         super::bodies::i1489_after_upgrade(&old, &t, before, plane, unlinked).await;
+        let cleared = old
+            .test_count(&super::bodies::signed_sql(
+                s,
+                crate::federation::group_plane::GroupPlaneTable::FamilyWidenings,
+            ))
+            .await
+            + old
+                .test_count(&super::bodies::signed_sql(
+                    s,
+                    crate::federation::group_plane::GroupPlaneTable::CommunityWidenings,
+                ))
+                .await;
+        old.test_execute(&super::bodies::i1489_clear_sql(s)).await;
+        super::bodies::i1489_relinked(&old, &t, cleared).await;
         eprintln!("i1489_postgres: RAN");
     }
 
