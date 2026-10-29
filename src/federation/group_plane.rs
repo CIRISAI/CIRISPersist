@@ -1511,6 +1511,84 @@ mod tests {
             f.scrub_signature_pqc = None;
         }
         assert!(plan_group_row(&ed25519_only).unwrap().is_none());
+        // Unsigned either way: no signer, or no signature.
+        for unsigned in [
+            |f: &mut SignedFamily| f.authority_key_id.clear(),
+            |f: &mut SignedFamily| f.scrub_signature_classical.clear(),
+        ] {
+            let mut g = family(None);
+            if let GroupSigned::Family(f) = &mut g {
+                unsigned(f);
+            }
+            assert!(plan_group_row(&g).unwrap().is_none());
+        }
+        // T6's two digests ride beside the record when it has them, and only
+        // then.
+        let mut g = family(None);
+        if let GroupSigned::Family(f) = &mut g {
+            f.family.prev_head_digest = "aa".repeat(32);
+        }
+        let row = plan_group_row(&g).unwrap().unwrap();
+        assert_eq!(
+            row.attestation_envelope[PREV_HEAD_DIGEST_MEMBER],
+            "aa".repeat(32)
+        );
+        assert!(row
+            .attestation_envelope
+            .get(CHARTER_DIGEST_MEMBER)
+            .is_none());
+        let mut c = GroupSigned::Community(SignedCommunity {
+            community: super::super::types::Community {
+                community_key_id: "room".into(),
+                community_name: "room".into(),
+                members: Vec::new(),
+                founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                consensus_protocol: "founder_only".into(),
+                policy_blob: None,
+                prev_head_digest: String::new(),
+                charter_digest: "bb".repeat(32),
+                persist_row_hash: String::new(),
+            },
+            authority_key_id: "ann".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: Some("cHFj".into()),
+            supersede_proof: None,
+            cosignatures: Vec::new(),
+            lineage: Vec::new(),
+        });
+        let row = plan_group_row(&c).unwrap().unwrap();
+        assert_eq!(
+            row.attestation_envelope[CHARTER_DIGEST_MEMBER],
+            "bb".repeat(32)
+        );
+        assert!(row
+            .attestation_envelope
+            .get(PREV_HEAD_DIGEST_MEMBER)
+            .is_none());
+        if let GroupSigned::Community(x) = &mut c {
+            x.community.charter_digest.clear();
+        }
+        let row = plan_group_row(&c).unwrap().unwrap();
+        assert!(row
+            .attestation_envelope
+            .get(CHARTER_DIGEST_MEMBER)
+            .is_none());
+    }
+
+    /// Outside the door, a group-plane dimension is a retraction's (which
+    /// names its target) or nobody's.
+    #[test]
+    fn a_group_dimension_outside_the_door_is_refused() {
+        for t in [attestation_type::WITHDRAWS, attestation_type::RECANTS] {
+            check_generic_row_dimension(t, GROUP_ROSTER_DIMENSION).unwrap();
+        }
+        for t in [attestation_type::SCORES, attestation_type::DELEGATES_TO] {
+            for f in GroupPlaneFamily::ALL {
+                assert!(check_generic_row_dimension(t, f.dimension()).is_err());
+            }
+        }
+        check_generic_row_dimension(attestation_type::DELEGATES_TO, "membership:proposal:v1")
+            .unwrap();
     }
 
     /// The wire names CC cites (posted on CIRISPersist#991): the envelope

@@ -336,6 +336,14 @@ pub(crate) mod bodies {
     where
         D: FederationDirectory,
     {
+        family_with_history_under(d, tag, "quorum:2/3").await
+    }
+
+    /// [`family_with_history`] under `protocol`.
+    async fn family_with_history_under<D>(d: &D, tag: &str, protocol: &str) -> (String, [String; 4])
+    where
+        D: FederationDirectory,
+    {
         let fam = format!("fam-{tag}");
         let keys = ["ann", "ben", "cat", "dan"].map(|n| format!("{n}-{tag}"));
         let [ann, ben, cat, dan] = &keys;
@@ -357,7 +365,7 @@ pub(crate) mod bodies {
                     })
                     .collect(),
                 founded_at: founded,
-                consensus_protocol: "quorum:2/3".to_owned(),
+                consensus_protocol: protocol.to_owned(),
                 consensus_protocol_entrenched: false,
                 dissolved_at: None,
                 persist_row_hash: String::new(),
@@ -605,9 +613,19 @@ pub(crate) mod bodies {
             .unwrap()
             .is_none());
         // Two signatures retract it: dan leaves the roster and the projection.
-        put_row(dd, withdraws_of(&ann, &[&ben], &widening))
+        let retraction = withdraws_of(&ann, &[&ben], &widening);
+        put_row(dd, retraction.clone())
             .await
             .expect("2 of 3 retract the widening");
+        assert_eq!(
+            dd.get_attestation(&retraction.attestation_id)
+                .await
+                .unwrap()
+                .expect("the retraction is held")
+                .withdraws_admission_rule,
+            Some(1),
+            "{tag}: the widening's own signer leads the retraction: rule 1"
+        );
         assert!(
             !sorted_active(dd, &fam).await.contains(&dan),
             "{tag}: the retracted widening seats nobody"
@@ -1082,6 +1100,50 @@ pub(crate) mod bodies {
         );
     }
 
+    /// I1492 — a retraction moves the roster in a direction, and the
+    /// group's protocol reads it: under `reverse_quorum` one member may
+    /// retract a widening (a removal: protective), never a removal (an
+    /// addition: m of n).
+    pub(crate) async fn i1492_a_retraction_has_a_direction<D>(d: &D, tag: &str)
+    where
+        D: FederationDirectory + GroupPlaneStore + AttestationStore,
+    {
+        let dd: &dyn FederationDirectory = d;
+        for n in ["ann", "ben", "cat", "dan"] {
+            user(dd, &format!("{n}-{tag}")).await;
+        }
+        let (fam, [ann, _ben, _cat, dan]) =
+            family_with_history_under(d, tag, "reverse_quorum:2/3:86400").await;
+        let removal = one(
+            d,
+            &fam,
+            gp::MEMBERSHIP_REMOVAL_DIMENSION,
+            GroupPlaneTable::FamilyRevocations,
+        )
+        .await;
+        let e = put_row(dd, withdraws_of(&ann, &[], &removal))
+            .await
+            .expect_err("one member does not put a removed member back");
+        assert!(
+            matches!(e, Error::RosterAuthorityUnauthorized { .. }),
+            "{tag}: {e}"
+        );
+        let widening = one(
+            d,
+            &fam,
+            gp::MEMBERSHIP_WIDENING_DIMENSION,
+            GroupPlaneTable::FamilyWidenings,
+        )
+        .await;
+        put_row(dd, withdraws_of(&ann, &[], &widening))
+            .await
+            .expect("one member may retract a widening: protective");
+        assert!(
+            !sorted_active(dd, &fam).await.contains(&dan),
+            "{tag}: the retracted widening seats nobody"
+        );
+    }
+
     /// I1485 — the room plane as rows.
     pub(crate) async fn i1485_room_plane<D>(d: &D, tag: &str)
     where
@@ -1272,6 +1334,12 @@ mod run {
                         return;
                     };
                     super::super::bodies::i1491_the_row_is_the_signed_bytes(&a, &b, &super::tag())
+                        .await;
+                }
+                #[tokio::test]
+                async fn i1492() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i1492_a_retraction_has_a_direction(&d, &super::tag())
                         .await;
                 }
                 #[tokio::test]
