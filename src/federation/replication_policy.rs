@@ -187,7 +187,14 @@ pub const ENVELOPE_KIND_RETIRED: &str = "federation_envelope_kind_retired";
 /// with the typed licence payload. Their tables went at V205; an inbound
 /// object of either kind is refused [`ENVELOPE_KIND_RETIRED`]. Appended here,
 /// never renumbered in [`EnvelopeKind::ALL`] (its order is hashed).
-pub const RETIRED_FRAMED: [EnvelopeKind; 7] = [
+///
+/// v61 (CIRISPersist#991, CC 3.1.3 / 3.1.3.2) — a group's record and its
+/// widening and revocation planes are rows (`group:roster:v1`,
+/// `membership:{widening,removal,resignation}:v1`, `super::group_plane`):
+/// the six framed kinds join. Their tables stay as the rows' projections.
+/// The manifest ([`REPLICATION_POLICY_HASH`]) does not move: this list is
+/// not in it.
+pub const RETIRED_FRAMED: [EnvelopeKind; 13] = [
     EnvelopeKind::Key,
     EnvelopeKind::Revocation,
     EnvelopeKind::IdentityOccurrence,
@@ -195,6 +202,12 @@ pub const RETIRED_FRAMED: [EnvelopeKind; 7] = [
     EnvelopeKind::Organization,
     EnvelopeKind::OrgMembership,
     EnvelopeKind::PartnerRecord,
+    EnvelopeKind::Family,
+    EnvelopeKind::Community,
+    EnvelopeKind::FamilyMembershipRevocation,
+    EnvelopeKind::CommunityMembershipRevocation,
+    EnvelopeKind::CommunityMembershipWidening,
+    EnvelopeKind::FamilyMembershipWidening,
 ];
 
 /// v59.0.0 — refuse a wire-kind token (`EnvelopeKind::as_str()`) naming a
@@ -711,6 +724,42 @@ pub const SETTLE_EXEMPT: &[(EnvelopeKind, &str)] = &[
         EnvelopeKind::PartnerRecord,
         "v60.0.0 (CIRISPersist#1036, CC 3.3.9): retired with its table (V205); a partner is a \
          licensure row with the typed licence payload, which the attestation door settles",
+    ),
+    (
+        EnvelopeKind::Family,
+        "v61 (CIRISPersist#991, CC 3.1.3): the framed carriage is retired; the object rides as \
+         its group-plane row, which group_plane::apply_group_plane_row settles by its held \
+         row's hash (the #672 rule); the table is the row's projection",
+    ),
+    (
+        EnvelopeKind::Community,
+        "v61 (CIRISPersist#991, CC 3.1.3): the framed carriage is retired; the object rides as \
+         its group-plane row, which group_plane::apply_group_plane_row settles by its held \
+         row's hash (the #672 rule); the table is the row's projection",
+    ),
+    (
+        EnvelopeKind::FamilyMembershipRevocation,
+        "v61 (CIRISPersist#991, CC 3.1.3): the framed carriage is retired; the object rides as \
+         its group-plane row, which group_plane::apply_group_plane_row settles by its held \
+         row's hash (the #672 rule); the table is the row's projection",
+    ),
+    (
+        EnvelopeKind::CommunityMembershipRevocation,
+        "v61 (CIRISPersist#991, CC 3.1.3): the framed carriage is retired; the object rides as \
+         its group-plane row, which group_plane::apply_group_plane_row settles by its held \
+         row's hash (the #672 rule); the table is the row's projection",
+    ),
+    (
+        EnvelopeKind::CommunityMembershipWidening,
+        "v61 (CIRISPersist#991, CC 3.1.3): the framed carriage is retired; the object rides as \
+         its group-plane row, which group_plane::apply_group_plane_row settles by its held \
+         row's hash (the #672 rule); the table is the row's projection",
+    ),
+    (
+        EnvelopeKind::FamilyMembershipWidening,
+        "v61 (CIRISPersist#991, CC 3.1.3): the framed carriage is retired; the object rides as \
+         its group-plane row, which group_plane::apply_group_plane_row settles by its held \
+         row's hash (the #672 rule); the table is the row's projection",
     ),
 ];
 

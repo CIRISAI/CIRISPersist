@@ -5597,22 +5597,44 @@ pub trait FederationDirectory: Send + Sync {
     /// here — serving it would hand the edge advertise/serve responder empty
     /// signature bytes, which fails hybrid-Strict verify downstream and
     /// reopens the exact keyless-declaration forgery class E4 closed.
+    ///
+    /// v61 (CIRISPersist#991) — a PROJECTION read of the signed rows the
+    /// group plane minted, no longer a replication surface: the kind's
+    /// framed carriage is retired (`RETIRED_FRAMED`) and the row rides the
+    /// attestation plane. Off the directory capsule (ABI 12). Default:
+    /// [`Error::Unsupported`]; the backends override.
     async fn list_signed_families_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<ServedFamily>, Error>;
+    ) -> Result<Vec<ServedFamily>, Error> {
+        let _ = (since, limit);
+        Err(Error::Unsupported {
+            method: "list_signed_families_since",
+        })
+    }
 
     /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
     /// [`SignedCommunity`] wrappers since a cursor. Structural mirror of
     /// [`Self::list_signed_families_since`]: pair-cursor on
     /// `(admitted_at, community_key_id)` (#668), signed-rows-only contract
     /// identical.
+    ///
+    /// v61 (CIRISPersist#991) — a PROJECTION read of the signed rows the
+    /// group plane minted, no longer a replication surface: the kind's
+    /// framed carriage is retired (`RETIRED_FRAMED`) and the row rides the
+    /// attestation plane. Off the directory capsule (ABI 12). Default:
+    /// [`Error::Unsupported`]; the backends override.
     async fn list_signed_communities_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<ServedCommunity>, Error>;
+    ) -> Result<Vec<ServedCommunity>, Error> {
+        let _ = (since, limit);
+        Err(Error::Unsupported {
+            method: "list_signed_communities_since",
+        })
+    }
 
     /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
     /// [`SignedLocationProof`] wrappers since a cursor. Structural mirror of
@@ -5633,22 +5655,44 @@ pub trait FederationDirectory: Send + Sync {
     /// pair-cursor (#668) whose resume id is the compound of
     /// `(family_key_id, removed_identity_key_id, effective_at)` (v49.0.0,
     /// #910.1); signed-rows-only contract identical.
+    ///
+    /// v61 (CIRISPersist#991) — a PROJECTION read of the signed rows the
+    /// group plane minted, no longer a replication surface: the kind's
+    /// framed carriage is retired (`RETIRED_FRAMED`) and the row rides the
+    /// attestation plane. Off the directory capsule (ABI 12). Default:
+    /// [`Error::Unsupported`]; the backends override.
     async fn list_signed_family_membership_revocations_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<ServedFamilyMembershipRevocation>, Error>;
+    ) -> Result<Vec<ServedFamilyMembershipRevocation>, Error> {
+        let _ = (since, limit);
+        Err(Error::Unsupported {
+            method: "list_signed_family_membership_revocations_since",
+        })
+    }
 
     /// v49.0.0 (CIRISPersist#910) — bulk-list the signed
     /// [`SignedFamilyMembershipWidening`] wrappers since a cursor: the family
     /// twin of [`Self::list_signed_community_membership_widenings_since`];
     /// resume id = the compound of `(family_key_id, member_key_id,
     /// effective_at)`.
+    ///
+    /// v61 (CIRISPersist#991) — a PROJECTION read of the signed rows the
+    /// group plane minted, no longer a replication surface: the kind's
+    /// framed carriage is retired (`RETIRED_FRAMED`) and the row rides the
+    /// attestation plane. Off the directory capsule (ABI 12). Default:
+    /// [`Error::Unsupported`]; the backends override.
     async fn list_signed_family_membership_widenings_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<ServedFamilyMembershipWidening>, Error>;
+    ) -> Result<Vec<ServedFamilyMembershipWidening>, Error> {
+        let _ = (since, limit);
+        Err(Error::Unsupported {
+            method: "list_signed_family_membership_widenings_since",
+        })
+    }
 
     /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
     /// [`SignedCommunityMembershipRevocation`] wrappers since a cursor.
@@ -5656,21 +5700,43 @@ pub trait FederationDirectory: Send + Sync {
     /// pair-cursor (#668) whose resume id is the compound of
     /// `(community_key_id, removed_identity_key_id)`; signed-rows-only
     /// contract identical.
+    ///
+    /// v61 (CIRISPersist#991) — a PROJECTION read of the signed rows the
+    /// group plane minted, no longer a replication surface: the kind's
+    /// framed carriage is retired (`RETIRED_FRAMED`) and the row rides the
+    /// attestation plane. Off the directory capsule (ABI 12). Default:
+    /// [`Error::Unsupported`]; the backends override.
     async fn list_signed_community_membership_revocations_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<ServedCommunityMembershipRevocation>, Error>;
+    ) -> Result<Vec<ServedCommunityMembershipRevocation>, Error> {
+        let _ = (since, limit);
+        Err(Error::Unsupported {
+            method: "list_signed_community_membership_revocations_since",
+        })
+    }
     /// v48.0.0 (CIRISPersist#860) — bulk-list the signed
     /// [`SignedCommunityMembershipWidening`] wrappers since a cursor: the
     /// structural mirror of
     /// [`Self::list_signed_community_membership_revocations_since`]; resume
     /// id = the compound of `(community_key_id, member_key_id, effective_at)`.
+    ///
+    /// v61 (CIRISPersist#991) — a PROJECTION read of the signed rows the
+    /// group plane minted, no longer a replication surface: the kind's
+    /// framed carriage is retired (`RETIRED_FRAMED`) and the row rides the
+    /// attestation plane. Off the directory capsule (ABI 12). Default:
+    /// [`Error::Unsupported`]; the backends override.
     async fn list_signed_community_membership_widenings_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<ServedCommunityMembershipWidening>, Error>;
+    ) -> Result<Vec<ServedCommunityMembershipWidening>, Error> {
+        let _ = (since, limit);
+        Err(Error::Unsupported {
+            method: "list_signed_community_membership_widenings_since",
+        })
+    }
 
     /// v49.0.0 (CIRISPersist#912) — bulk-list the signed
     /// [`SignedCommunityMembershipListing`] wrappers since a cursor (the 19th
@@ -9699,7 +9765,8 @@ pub enum Error {
     /// consumer, which receives the Display, reads the token too.
     #[error(
         "federation_envelope_kind_retired: {} — the framed {} carriage is retired; it \
-         replicates as its key-plane row (sealed-transport floor, operator ruling 2026-10-19)",
+         replicates as its row on the attestation plane (sealed-transport floor, operator \
+         ruling 2026-10-19; CIRISPersist#991)",
         replication_policy::retired_detail(*kind),
         replication_policy::retired_detail(*kind)
     )]

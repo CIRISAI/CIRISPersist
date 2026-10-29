@@ -61,7 +61,6 @@ deontic	binding	182	Engine	adopt_sealed_chunks_json
 deontic	binding	182	Engine	adopt_sealed_manifest_child_json	
 deontic	binding	182	Engine	apply_replicated_accord_evidence	
 deontic	binding	182	Engine	apply_replicated_attestation	
-deontic	binding	182	Engine	apply_replicated_community_json	
 deontic	binding	182	Engine	apply_replicated_key_grant	
 deontic	binding	182	Engine	apply_replicated_key_record	
 deontic	binding	182	Engine	apply_replicated_purge_json	
@@ -445,10 +444,6 @@ epistemic	descriptive	32	Engine	get_repository_statistics
 epistemic	descriptive	32	Engine	lineage_head_json	
 epistemic	descriptive	32	Engine	list_purge_bundles_since_json	
 epistemic	descriptive	32	Engine	list_signed_accord_quorum_evidence_since	
-epistemic	descriptive	32	Engine	list_signed_communities_since	
-epistemic	descriptive	32	Engine	list_signed_community_membership_revocations_since	
-epistemic	descriptive	32	Engine	list_signed_families_since	
-epistemic	descriptive	32	Engine	list_signed_family_membership_revocations_since	
 epistemic	descriptive	32	Engine	list_signed_identity_occurrences_for_json	
 epistemic	descriptive	32	Engine	list_signed_location_proofs_since	
 epistemic	descriptive	32	Engine	list_signed_transport_destinations_since	

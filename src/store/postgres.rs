@@ -77,6 +77,20 @@ impl PostgresBackend {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// v61 (CIRISPersist#991) — test-only: one integer a SQL statement
+    /// selects, read straight off the database (the from-disk count a rehome
+    /// witness checks, independent of the executor it witnesses).
+    #[cfg(test)]
+    pub(crate) async fn test_count(&self, sql: &str) -> i64 {
+        let client = self.get_client().await.expect("test_count client");
+        client
+            .query_one(sql, &[])
+            .await
+            .expect("test_count")
+            .try_get::<_, i64>(0)
+            .expect("test_count: an integer")
+    }
+
     /// v57.0.0 (CIRISPersist#988, I960/I961) — run raw SQL: the projection
     /// witnesses tamper with a live table to prove the gate red.
     #[cfg(test)]
@@ -399,6 +413,68 @@ fn pg_group_link_where(
 /// Storage only: the row is `group_plane::plan_group_row`'s.
 #[async_trait::async_trait]
 impl crate::federation::group_plane::GroupPlaneStore for PostgresBackend {
+    async fn unlinked_group_objects(
+        &self,
+        table: crate::federation::group_plane::GroupPlaneTable,
+    ) -> Result<Vec<crate::federation::group_plane::GroupSigned>, crate::federation::Error> {
+        use crate::federation::group_plane::{GroupPlaneTable as T, GroupSigned as G};
+        use crate::federation::Error;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT * FROM cirislens.{} WHERE attestation_id IS NULL \
+                       AND authority_key_id IS NOT NULL AND authority_key_id <> ''",
+                    table.as_str()
+                ),
+                &[],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("unlinked group objects: {e}")))?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(match table {
+                    T::Families => G::Family(pg_row_to_signed_family(r)?),
+                    T::Communities => G::Community(pg_row_to_signed_community(r)?),
+                    T::FamilyRevocations => {
+                        G::FamilyRevocation(pg_row_to_signed_family_membership_revocation(r)?)
+                    }
+                    T::CommunityRevocations => {
+                        G::CommunityRevocation(pg_row_to_signed_community_membership_revocation(r)?)
+                    }
+                    T::FamilyWidenings => {
+                        G::FamilyWidening(pg_row_to_signed_family_membership_widening(r)?)
+                    }
+                    T::CommunityWidenings => {
+                        G::CommunityWidening(pg_row_to_signed_community_membership_widening(r)?)
+                    }
+                })
+            })
+            .collect()
+    }
+
+    async fn group_plane_present(&self) -> Result<bool, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .query_opt(
+                "SELECT 1 FROM information_schema.columns \
+                  WHERE table_schema = 'cirislens' AND table_name = 'federation_families' \
+                    AND column_name = 'attestation_id'",
+                &[],
+            )
+            .await
+            .map(|r| r.is_some())
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("group plane schema probe: {e}"))
+            })
+    }
+
     async fn read_group_object(
         &self,
         link: &crate::federation::group_plane::GroupRowLink,
@@ -1417,10 +1493,7 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         &self,
         planned: crate::federation::community_admit::CommunityInsert,
     ) -> Result<crate::federation::community_admit::StoredCommunity, crate::federation::Error> {
-        let crate::federation::community_admit::CommunityInsert {
-            community,
-            wire_index_key,
-        } = planned;
+        let crate::federation::community_admit::CommunityInsert { community } = planned;
         let row = community.community;
         let supersede_proof_value = pg_supersede_proof_value(community.supersede_proof.as_ref())?;
         // v50.0.0 (CIRISPersist#926, V158) — persisted beside the authority
@@ -1508,8 +1581,6 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
             );
         }
         drop(client);
-        self.index_stored_record("Community", &wire_index_key)
-            .await?;
         Ok(crate::federation::community_admit::StoredCommunity::Inserted)
     }
 
@@ -1520,7 +1591,6 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         let crate::federation::community_admit::PlannedCommunityRevocation {
             revocation,
             removal_event,
-            wire_index_key,
         } = planned;
         let row = revocation.community_membership_revocation;
         let witness = serde_json::json!(row.witness_set);
@@ -1654,8 +1724,6 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
         drop(client);
-        self.index_stored_record("CommunityMembershipRevocation", &wire_index_key)
-            .await?;
         Ok(())
     }
 
@@ -1663,10 +1731,7 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         &self,
         planned: crate::federation::community_admit::PlannedCommunityWidening,
     ) -> Result<(), crate::federation::Error> {
-        let crate::federation::community_admit::PlannedCommunityWidening {
-            widening,
-            wire_index_key,
-        } = planned;
+        let crate::federation::community_admit::PlannedCommunityWidening { widening } = planned;
         let row = widening.community_membership_widening;
         let authority_key_id = widening.authority_key_id;
         let scrub_signature_classical = widening.scrub_signature_classical;
@@ -1685,37 +1750,32 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         let admitted_at = self
             .next_plane_position(&tx, "federation_community_membership_widenings")
             .await?;
-        let inserted = tx
-            .execute(
-                "INSERT INTO cirislens.federation_community_membership_widenings (\
+        tx.execute(
+            "INSERT INTO cirislens.federation_community_membership_widenings (\
                 community_key_id, member_key_id, joined_at, effective_at, role, \
                 persist_row_hash, authority_key_id, scrub_signature_classical, \
                 scrub_signature_pqc, admitted_at, cosignatures\
              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
              ON CONFLICT (community_key_id, member_key_id, effective_at) DO NOTHING",
-                &[
-                    &row.community_key_id,
-                    &row.member_key_id,
-                    &row.joined_at,
-                    &row.effective_at,
-                    &row.role,
-                    &row.persist_row_hash,
-                    &authority_key_id,
-                    &scrub_signature_classical,
-                    &scrub_signature_pqc,
-                    &admitted_at,
-                    &cosignatures,
-                ],
-            )
-            .await
-            .map_err(map_revocation_pg_err("community_membership_widening"))?;
+            &[
+                &row.community_key_id,
+                &row.member_key_id,
+                &row.joined_at,
+                &row.effective_at,
+                &row.role,
+                &row.persist_row_hash,
+                &authority_key_id,
+                &scrub_signature_classical,
+                &scrub_signature_pqc,
+                &admitted_at,
+                &cosignatures,
+            ],
+        )
+        .await
+        .map_err(map_revocation_pg_err("community_membership_widening"))?;
         tx.commit()
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
-        if inserted == 1 {
-            self.index_stored_record("CommunityMembershipWidening", &wire_index_key)
-                .await?;
-        }
         Ok(())
     }
 
@@ -4770,6 +4830,10 @@ impl Backend for PostgresBackend {
             self.rehome_key_plane_at_open()
                 .await
                 .map_err(|e| Error::Backend(format!("key-plane rehome at open: {e}")))?;
+            // v61 (CIRISPersist#991) — and so is the group-plane rehome.
+            crate::federation::group_plane::rehome_group_records(self)
+                .await
+                .map_err(|e| Error::Backend(format!("group-plane rehome at open: {e}")))?;
             // v59.0.0 (CIRISPersist#1096) — count, never rewrite.
             self.legacy_community_trust_grants_at_open()
                 .await
@@ -4944,6 +5008,11 @@ impl Backend for PostgresBackend {
         self.rehome_key_plane_at_open()
             .await
             .map_err(|e| Error::Backend(format!("key-plane rehome at open: {e}")))?;
+        // v61 (CIRISPersist#991) — the v60 group records and roster events
+        // rehomed once onto their group-plane rows, before anything serves.
+        crate::federation::group_plane::rehome_group_records(self)
+            .await
+            .map_err(|e| Error::Backend(format!("group-plane rehome at open: {e}")))?;
         // v59.0.0 (CIRISPersist#1096) — count, never rewrite, the held
         // node-authored capture grants in the v52 shape.
         self.legacy_community_trust_grants_at_open()
@@ -9416,21 +9485,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         family: crate::federation::SignedFamily,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::Family,
-            &family,
-        )
-        .await?
-        {
-            return Ok(());
-        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step. Hybrid-Strict vs the authority's registered
         // pubkeys — was FK-existence only, a forgeable keyless declaration.
         crate::federation::verify_family_admission(self, &family).await?;
+        // v61 (CIRISPersist#991) — the object as signed, for its row.
+        let offered = crate::federation::group_plane::GroupSigned::Family(family.clone());
         // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
         // is a no-op, a proof-carrying amendment this node's own state
         // authorizes is applied as a supersede, anything else is refused.
@@ -9502,18 +9562,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // site had the right instinct and its own implementation of it; the
         // instinct is now the rule and the implementation is one function.
         drop(client);
-        self.index_stored_record(
-            "Family",
-            &crate::federation::wire_index::record_key(&[("family_key_id", &family_key_id)]),
-        )
-        .await?;
         // v61 (CIRISPersist#991) — the row follows its object.
-        crate::federation::group_plane::sync_group_row(
+        crate::federation::group_plane::sync_group_row_offered(
             self,
-            crate::federation::group_plane::GroupRowLink::record(
-                crate::federation::group_plane::GroupKind::Family,
-                &family_key_id,
-            ),
+            offered.link(),
+            Some(&offered),
         )
         .await?;
         Ok(())
@@ -9580,6 +9633,22 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         new_snapshot: serde_json::Value,
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, crate::federation::Error> {
+        // v61 (CIRISPersist#991) — the new head as its signer signed it, for
+        // its `group:roster:v1` row.
+        let offered_head = match cohort {
+            crate::federation::cohort::Cohort::Family => {
+                serde_json::from_value::<crate::federation::SignedFamily>(new_snapshot.clone())
+                    .ok()
+                    .map(crate::federation::group_plane::GroupSigned::Family)
+            }
+            crate::federation::cohort::Cohort::Community
+            | crate::federation::cohort::Cohort::Affiliations => {
+                serde_json::from_value::<crate::federation::SignedCommunity>(new_snapshot.clone())
+                    .ok()
+                    .map(crate::federation::group_plane::GroupSigned::Community)
+            }
+            crate::federation::cohort::Cohort::SelfId => None,
+        };
         // Test-only (PR #921 review, F3): a rival supersede of the same
         // community lands here, before this one re-checks its prior.
         #[cfg(test)]
@@ -9869,20 +9938,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             Cohort::SelfId => unreachable!("guarded above"),
         };
         drop(client);
-        // v49.0.0 (#910.5) — a supersede changes the served record; re-index
-        // it, or a peer's content-hash lookup never sees the new version.
-        let (kind, key_field) = match cohort {
-            Cohort::Family => ("Family", "family_key_id"),
-            _ => ("Community", "community_key_id"),
-        };
-        self.index_stored_record(
-            kind,
-            &crate::federation::wire_index::record_key(&[(key_field, &group_key_id)]),
-        )
-        .await?;
         // v61 (CIRISPersist#991) — the new head's `group:roster:v1` row
         // replaces the prior head's.
-        crate::federation::group_plane::sync_group_row(
+        crate::federation::group_plane::sync_group_row_offered(
             self,
             crate::federation::group_plane::GroupRowLink::record(
                 match cohort {
@@ -9891,6 +9949,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 },
                 &group_key_id,
             ),
+            offered_head.as_ref(),
         )
         .await?;
         Ok(next as u32)
@@ -10887,20 +10946,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         revocation: crate::federation::SignedFamilyMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::FamilyMembershipRevocation,
-            &revocation,
-        )
-        .await?
-        {
-            return Ok(());
-        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step.
         crate::federation::verify_family_membership_revocation_admission(self, &revocation).await?;
+        // v61 (CIRISPersist#991) — the object as signed, for its row.
+        let offered =
+            crate::federation::group_plane::GroupSigned::FamilyRevocation(revocation.clone());
         let mut row = revocation.family_membership_revocation;
         // v49.0.0 (CIRISPersist#910.3) — standing, by the family's own
         // `consensus_protocol` at the row's instant (the #908 family half).
@@ -10977,19 +11028,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         if inserted == 0 {
             return Ok(());
         }
-        // v21.1.0 (CIRISPersist#507b) — computed after the INSERT succeeds
-        // (`row` still owns its final `persist_row_hash`).
-        let effective_at_rfc3339 = row.effective_at.to_rfc3339();
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("family_key_id", &row.family_key_id),
-            ("removed_identity_key_id", &row.removed_identity_key_id),
-            ("effective_at", &effective_at_rfc3339),
-        ]);
         drop(client);
-        self.index_stored_record("FamilyMembershipRevocation", &wire_index_key)
-            .await?;
         // v61 (CIRISPersist#991) — the row follows its object.
-        crate::federation::group_plane::sync_group_row(
+        crate::federation::group_plane::sync_group_row_offered(
             self,
             crate::federation::group_plane::GroupRowLink::plane(
                 crate::federation::group_plane::GroupPlaneTable::FamilyRevocations,
@@ -10997,6 +11038,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 &row.removed_identity_key_id,
                 row.effective_at,
             ),
+            Some(&offered),
         )
         .await?;
         // CEG §7.7 (CIRISPersist#161 Ask 5) — emit the removal-direction
@@ -11041,20 +11083,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         widening: crate::federation::SignedFamilyMembershipWidening,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::FamilyMembershipWidening,
-            &widening,
-        )
-        .await?
-        {
-            return Ok(());
-        }
         // v49.0.0 (CIRISPersist#910) — the family twin of the room's widening
         // door; see the sqlite twin for the legs.
         crate::federation::verify_family_membership_widening_admission(self, &widening).await?;
+        // v61 (CIRISPersist#991) — the object as signed, for its row.
+        let offered = crate::federation::group_plane::GroupSigned::FamilyWidening(widening.clone());
         let mut row = widening.family_membership_widening;
         crate::federation::reject_future_dated_family_widening(row.effective_at)?;
         crate::federation::check_family_roster_authority(
@@ -11093,45 +11126,34 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let admitted_at = self
             .next_plane_position(&tx, "federation_family_membership_widenings")
             .await?;
-        let inserted = tx
-            .execute(
-                "INSERT INTO cirislens.federation_family_membership_widenings (\
+        tx.execute(
+            "INSERT INTO cirislens.federation_family_membership_widenings (\
                 family_key_id, member_key_id, joined_at, effective_at, role, \
                 persist_row_hash, authority_key_id, scrub_signature_classical, \
                 scrub_signature_pqc, admitted_at, cosignatures\
              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
              ON CONFLICT (family_key_id, member_key_id, effective_at) DO NOTHING",
-                &[
-                    &row.family_key_id,
-                    &row.member_key_id,
-                    &row.joined_at,
-                    &row.effective_at,
-                    &row.role,
-                    &row.persist_row_hash,
-                    &authority_key_id,
-                    &scrub_signature_classical,
-                    &scrub_signature_pqc,
-                    &admitted_at,
-                    &cosignatures,
-                ],
-            )
-            .await
-            .map_err(map_revocation_pg_err("family_membership_widening"))?;
+            &[
+                &row.family_key_id,
+                &row.member_key_id,
+                &row.joined_at,
+                &row.effective_at,
+                &row.role,
+                &row.persist_row_hash,
+                &authority_key_id,
+                &scrub_signature_classical,
+                &scrub_signature_pqc,
+                &admitted_at,
+                &cosignatures,
+            ],
+        )
+        .await
+        .map_err(map_revocation_pg_err("family_membership_widening"))?;
         tx.commit()
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
-        if inserted == 1 {
-            let effective_at_rfc3339 = row.effective_at.to_rfc3339();
-            let wire_index_key = crate::federation::wire_index::record_key(&[
-                ("family_key_id", &row.family_key_id),
-                ("member_key_id", &row.member_key_id),
-                ("effective_at", &effective_at_rfc3339),
-            ]);
-            self.index_stored_record("FamilyMembershipWidening", &wire_index_key)
-                .await?;
-        }
         // v61 (CIRISPersist#991) — the row follows its object.
-        crate::federation::group_plane::sync_group_row(
+        crate::federation::group_plane::sync_group_row_offered(
             self,
             crate::federation::group_plane::GroupRowLink::plane(
                 crate::federation::group_plane::GroupPlaneTable::FamilyWidenings,
@@ -11139,6 +11161,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 &row.member_key_id,
                 row.effective_at,
             ),
+            Some(&offered),
         )
         .await?;
         Ok(())
@@ -51202,11 +51225,23 @@ mod tests {
             .find(|r| r.family.family.family_key_id == fam)
             .expect("family row present")
             .family;
-        let content_hash = crate::federation::wire_index::content_hash_of(&mine).unwrap();
-        let expected_bytes = serde_json::to_vec(&mine).unwrap();
+        // v61 (CIRISPersist#991) — the family rides as its `group:roster:v1`
+        // row, an Attestation-kind entry; the framed `Family` kind is retired.
+        let row = crate::federation::group_plane::plan_group_row(
+            &crate::federation::group_plane::GroupSigned::Family(mine.clone()),
+        )
+        .unwrap()
+        .expect("a hybrid-signed family has a row");
+        let held = backend
+            .get_attestation(&row.attestation_id)
+            .await
+            .unwrap()
+            .expect("the family's row is held");
+        let content_hash = crate::federation::wire_index::content_hash_of(&held).unwrap();
+        let expected_bytes = serde_json::to_vec(&held).unwrap();
 
         let hit = backend
-            .lookup_signed_record_by_content_hash("Family", &content_hash)
+            .lookup_signed_record_by_content_hash("Attestation", &content_hash)
             .await
             .unwrap()
             .expect("indexed at put_family");
@@ -51214,9 +51249,11 @@ mod tests {
             hit, expected_bytes,
             "point-read must return byte-exact bytes"
         );
-
         assert!(backend
-            .lookup_signed_record_by_content_hash("Family", "0000000000000000")
+            .lookup_signed_record_by_content_hash(
+                "Family",
+                &crate::federation::wire_index::content_hash_of(&mine).unwrap()
+            )
             .await
             .unwrap()
             .is_none());
@@ -51224,14 +51261,15 @@ mod tests {
         let client = backend.get_client().await.unwrap();
         client
             .execute(
-                "DELETE FROM cirislens.signed_wire_index WHERE kind = 'Family' AND content_hash = $1",
+                "DELETE FROM cirislens.signed_wire_index \
+                  WHERE kind = 'Attestation' AND content_hash = $1",
                 &[&content_hash],
             )
             .await
             .unwrap();
         assert!(
             backend
-                .lookup_signed_record_by_content_hash("Family", &content_hash)
+                .lookup_signed_record_by_content_hash("Attestation", &content_hash)
                 .await
                 .unwrap()
                 .is_none(),
@@ -51239,9 +51277,9 @@ mod tests {
         );
 
         let indexed = backend.rebuild_signed_wire_index().await.unwrap();
-        assert!(indexed >= 1, "rebuild must index at least the family row");
+        assert!(indexed >= 1, "rebuild must index at least the family's row");
         let rehit = backend
-            .lookup_signed_record_by_content_hash("Family", &content_hash)
+            .lookup_signed_record_by_content_hash("Attestation", &content_hash)
             .await
             .unwrap()
             .expect("rebuild_signed_wire_index must reindex the row");

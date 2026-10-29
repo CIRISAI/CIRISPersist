@@ -778,18 +778,23 @@ pub mod bodies {
             !roster(d, &room).await.contains(&bob),
             "{tag} I167: bob is out after t3"
         );
-        // Both removals are content-hash addressable and distinct: the
-        // wire-index key names WHICH removal (the three-part PK).
+        // Both removals are content-hash addressable and distinct. v61
+        // (CIRISPersist#991): each is its own `membership:removal:v1` row, an
+        // Attestation-kind entry (the framed kind is retired).
         let mut seen = std::collections::BTreeSet::new();
         for s in &mine {
-            let hash = crate::federation::wire_index::content_hash_of(&s.revocation).unwrap();
-            let bytes = d
-                .lookup_signed_record_by_content_hash("CommunityMembershipRevocation", &hash)
-                .await
-                .unwrap()
-                .unwrap_or_else(|| panic!("{tag} I167: revocation {hash} is addressable by hash"));
-            let back: crate::federation::SignedCommunityMembershipRevocation =
-                serde_json::from_slice(&bytes).unwrap();
+            let back = by_row_hash(
+                d,
+                crate::federation::group_plane::GroupSigned::CommunityRevocation(
+                    s.revocation.clone(),
+                ),
+                tag,
+            )
+            .await;
+            let crate::federation::group_plane::GroupSigned::CommunityRevocation(back) = back
+            else {
+                panic!("{tag} I167: a removal row carries its revocation")
+            };
             assert!(
                 seen.insert(back.community_membership_revocation.effective_at),
                 "{tag} I167: each hash resolves to its own removal"
@@ -805,15 +810,48 @@ pub mod bodies {
             .iter()
             .find(|w| w.widening.community_membership_widening.community_key_id == room)
             .expect("the widening is served");
-        let whash = crate::federation::wire_index::content_hash_of(&w.widening).unwrap();
-        let wbytes = d
-            .lookup_signed_record_by_content_hash("CommunityMembershipWidening", &whash)
+        let wback = by_row_hash(
+            d,
+            crate::federation::group_plane::GroupSigned::CommunityWidening(w.widening.clone()),
+            tag,
+        )
+        .await;
+        let crate::federation::group_plane::GroupSigned::CommunityWidening(mut wback) = wback
+        else {
+            panic!("{tag} I167: a widening row carries its widening")
+        };
+        let mut want = w.widening.clone();
+        want.community_membership_widening.persist_row_hash = String::new();
+        wback.community_membership_widening.persist_row_hash = String::new();
+        assert_eq!(wback, want, "{tag} I167: byte-exact by hash");
+    }
+
+    /// v61 (CIRISPersist#991) — the group-plane row a held roster event
+    /// minted, fetched by its Attestation-kind content hash, read back to the
+    /// object it carries.
+    async fn by_row_hash(
+        d: &dyn FederationDirectory,
+        signed: crate::federation::group_plane::GroupSigned,
+        tag: &str,
+    ) -> crate::federation::group_plane::GroupSigned {
+        let row = crate::federation::group_plane::plan_group_row(&signed)
+            .unwrap()
+            .expect("a hybrid-signed roster event has a row");
+        let held = d
+            .get_attestation(&row.attestation_id)
             .await
             .unwrap()
-            .unwrap_or_else(|| panic!("{tag} I167: the widening is addressable by hash"));
-        let wback: crate::federation::SignedCommunityMembershipWidening =
-            serde_json::from_slice(&wbytes).unwrap();
-        assert_eq!(wback, w.widening, "{tag} I167: byte-exact by hash");
+            .unwrap_or_else(|| panic!("{tag} I167: the row {} is held", row.attestation_id));
+        let hash = crate::federation::wire_index::content_hash_of(&held).unwrap();
+        let bytes = d
+            .lookup_signed_record_by_content_hash("Attestation", &hash)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{tag} I167: row {hash} is addressable by hash"));
+        let back: crate::federation::Attestation = serde_json::from_slice(&bytes).unwrap();
+        crate::federation::group_plane::group_signed_of_row(&back)
+            .unwrap()
+            .expect("a group-plane row")
     }
 }
 

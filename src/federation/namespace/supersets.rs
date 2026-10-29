@@ -1794,7 +1794,11 @@ mod tests {
         // v60.1.0 slice B: +1 (CIRISPersist#1120), CLM-identity-amendment-row.
         // v60.1.0 CC ids: +2, CLM-takedown-reversal (4.5.3, #1113) and
         // CLM-scope-infra-relay (4.4.3.4.3, #1119).
-        const EXPECTED: usize = 352;
+        // v61 slice S1: +5 (CIRISPersist#991 planes 2 and 3): CLM-planes-as-rows
+        // at the group-plane row builder, its door and the rehome (3);
+        // CLM-cosigned-rows at the one co-signature count and the cosigned
+        // withdraws (2).
+        const EXPECTED: usize = 357;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

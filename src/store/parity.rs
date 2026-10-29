@@ -442,7 +442,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // links the projection. It refuses nothing about the caller's input (the
     // door admitted the object already); it fails only on the substrate's own
     // encoding or storage.
-    ("sync_group_row", Class::Plumbing),
+    ("sync_group_row_offered", Class::Plumbing),
+    // The one-way rehome at open: a data sweep over signed projection rows
+    // without their row; refuses nothing.
+    ("rehome_group_records", Class::Plumbing),
     // The group-table arm of a projection rebuild: a lookup, no refusal.
     ("of_projection", Class::Plumbing),
     // The row as inserted: the hash and the wire-index locator, derived.

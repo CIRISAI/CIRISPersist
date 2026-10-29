@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 102 delegations, generated. Every one: fault first, then delegate.
+// 96 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -698,16 +698,6 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_signed_accord_quorum_evidence_since(since, limit)
             .await
     }
-    async fn list_signed_communities_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedCommunity>, Error> {
-        if let Some(e) = self.faulted("list_signed_communities_since") {
-            return Err(e);
-        }
-        self.inner.list_signed_communities_since(since, limit).await
-    }
     async fn list_signed_community_membership_listings_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -718,64 +708,6 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .list_signed_community_membership_listings_since(since, limit)
-            .await
-    }
-    async fn list_signed_community_membership_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedCommunityMembershipRevocation>, Error> {
-        if let Some(e) = self.faulted("list_signed_community_membership_revocations_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_community_membership_revocations_since(since, limit)
-            .await
-    }
-    async fn list_signed_community_membership_widenings_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedCommunityMembershipWidening>, Error> {
-        if let Some(e) = self.faulted("list_signed_community_membership_widenings_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_community_membership_widenings_since(since, limit)
-            .await
-    }
-    async fn list_signed_families_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedFamily>, Error> {
-        if let Some(e) = self.faulted("list_signed_families_since") {
-            return Err(e);
-        }
-        self.inner.list_signed_families_since(since, limit).await
-    }
-    async fn list_signed_family_membership_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedFamilyMembershipRevocation>, Error> {
-        if let Some(e) = self.faulted("list_signed_family_membership_revocations_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_family_membership_revocations_since(since, limit)
-            .await
-    }
-    async fn list_signed_family_membership_widenings_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedFamilyMembershipWidening>, Error> {
-        if let Some(e) = self.faulted("list_signed_family_membership_widenings_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_family_membership_widenings_since(since, limit)
             .await
     }
     async fn list_signed_location_proofs_since(

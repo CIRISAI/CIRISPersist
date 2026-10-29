@@ -27,6 +27,12 @@
 //! I1488 — the rows are served to the group's membership-plane audience: a
 //! private family's rows reach a member and the member a row names, never a
 //! stranger.
+//!
+//! I1489 — an upgraded node: a v60 schema (through V205) holds signed typed
+//! records and roster events with no rows; V206/V207 and the rehome at open
+//! give every one its row, checked by a from-disk count (no signed projection
+//! row names no row; the plane holds one row per signed object), every
+//! projection rebuilds byte-equal, and a second rehome links nothing.
 
 /// The backend-agnostic witness bodies; `run` instantiates them per backend.
 #[cfg(test)]
@@ -665,6 +671,149 @@ pub(crate) mod bodies {
         );
     }
 
+    /// A room `room-{tag}` of ann (founder), ben and cat under `quorum:2/3`,
+    /// dan widened and cat removed by ann + ben, through the local doors.
+    async fn room_with_history<D>(d: &D, tag: &str) -> String
+    where
+        D: FederationDirectory,
+    {
+        let room = format!("room-{tag}");
+        let [ann, ben, cat, dan] = ["ann", "ben", "cat", "dan"].map(|n| format!("{n}-{tag}"));
+        let founded = at("2026-01-01T00:00:00Z");
+        d.put_community(ts::sign_community(
+            &ann,
+            Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                community_key_id: room.clone(),
+                community_name: "room".into(),
+                members: [&ann, &ben, &cat]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| CommunityMember {
+                        key_id: (*k).clone(),
+                        joined_at: founded,
+                        role: (i == 0).then(|| "founder".to_owned()),
+                    })
+                    .collect(),
+                founded_at: founded,
+                consensus_protocol: "quorum:2/3".to_owned(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .expect("room admitted");
+        let mut w = ts::sign_community_membership_widening(
+            &ann,
+            CommunityMembershipWidening {
+                community_key_id: room.clone(),
+                member_key_id: dan.clone(),
+                joined_at: at("2026-02-01T00:00:00Z"),
+                effective_at: at("2026-02-01T00:00:00Z"),
+                role: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        ts::cosign_community_membership_widening(&mut w, &ben);
+        d.put_community_membership_widening_consented(w)
+            .await
+            .expect("2 of 3 widen");
+        let mut r = ts::sign_community_membership_revocation(
+            &ann,
+            CommunityMembershipRevocation {
+                community_key_id: room.clone(),
+                removed_identity_key_id: cat.clone(),
+                removed_at: at("2026-03-01T00:00:00Z"),
+                effective_at: at("2026-03-01T00:00:00Z"),
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        );
+        ts::cosign_community_membership_revocation(&mut r, &ben);
+        d.put_community_membership_revocation(r)
+            .await
+            .expect("2 of 3 remove");
+        room
+    }
+
+    /// The from-disk counts I1489 reads, each a SQL statement over one schema
+    /// prefix (`""` on sqlite, `"cirislens."` on postgres).
+    pub(crate) fn signed_without_row_sql(schema: &str, table: GroupPlaneTable) -> String {
+        format!(
+            "SELECT COUNT(*) FROM {schema}{} WHERE attestation_id IS NULL \
+               AND authority_key_id IS NOT NULL AND authority_key_id <> ''",
+            table.as_str()
+        )
+    }
+
+    /// Signed rows of `table`, whatever they point at.
+    pub(crate) fn signed_sql(schema: &str, table: GroupPlaneTable) -> String {
+        format!(
+            "SELECT COUNT(*) FROM {schema}{} \
+              WHERE authority_key_id IS NOT NULL AND authority_key_id <> ''",
+            table.as_str()
+        )
+    }
+
+    /// Group-plane rows on the attestation plane.
+    pub(crate) fn plane_rows_sql(schema: &str) -> String {
+        format!(
+            "SELECT COUNT(*) FROM {schema}federation_attestations \
+              WHERE attestation_type = 'scores' AND dimension IN \
+                ('{}', '{}', '{}', '{}')",
+            gp::GROUP_ROSTER_DIMENSION,
+            gp::MEMBERSHIP_WIDENING_DIMENSION,
+            gp::MEMBERSHIP_REMOVAL_DIMENSION,
+            gp::MEMBERSHIP_RESIGNATION_DIMENSION
+        )
+    }
+
+    /// I1489, before the upgrade: the v60 node holds signed typed records and
+    /// roster events (seeded through its own doors), and no group-plane row.
+    /// Returns the tag's group ids.
+    pub(crate) async fn i1489_seed_v60<D>(old: &D, tag: &str) -> (String, String)
+    where
+        D: FederationDirectory,
+    {
+        for n in ["ann", "ben", "cat", "dan"] {
+            user(old, &format!("{n}-{tag}")).await;
+        }
+        let (fam, _) = family_with_history(old, tag).await;
+        let room = room_with_history(old, tag).await;
+        (fam, room)
+    }
+
+    /// I1489, after V206/V207 and the rehome at open.
+    pub(crate) async fn i1489_after_upgrade<D>(
+        d: &D,
+        tag: &str,
+        signed_before: i64,
+        plane_after: i64,
+        unlinked_after: i64,
+    ) where
+        D: FederationDirectory + GroupPlaneStore + AttestationStore,
+    {
+        assert!(signed_before >= 6, "{tag}: the v60 node held its records");
+        assert_eq!(unlinked_after, 0, "{tag}: every signed object has its row");
+        assert_eq!(
+            plane_after, signed_before,
+            "{tag}: one row per signed object, from disk"
+        );
+        for t in GroupPlaneTable::ALL {
+            all_linked(d, t, tag).await;
+        }
+        let again = crate::federation::group_plane::rehome_group_records(d)
+            .await
+            .expect("rehome again");
+        assert_eq!(
+            again,
+            crate::federation::group_plane::GroupRehomeReport::default(),
+            "{tag}: the rehome is once"
+        );
+    }
+
     /// I1485 — the room plane as rows.
     pub(crate) async fn i1485_room_plane<D>(d: &D, tag: &str)
     where
@@ -856,6 +1005,92 @@ mod run {
                 }
             }
         };
+    }
+
+    async fn i1489_counts<F, Fut>(count: F, schema: &str) -> (i64, i64)
+    where
+        F: Fn(String) -> Fut,
+        Fut: std::future::Future<Output = i64>,
+    {
+        use crate::federation::group_plane::GroupPlaneTable;
+        let mut signed = 0;
+        let mut unlinked = 0;
+        for t in GroupPlaneTable::ALL {
+            signed += count(super::bodies::signed_sql(schema, t)).await;
+            unlinked += count(super::bodies::signed_without_row_sql(schema, t)).await;
+        }
+        (signed, unlinked)
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1489_sqlite() {
+        use crate::store::Backend as _;
+        let t = tag();
+        let old = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        old.run_migrations_through(205).await.unwrap();
+        super::bodies::i1489_seed_v60(&old, &t).await;
+        let mut before = 0;
+        for tb in crate::federation::group_plane::GroupPlaneTable::ALL {
+            before += old.test_count(&super::bodies::signed_sql("", tb)).await;
+        }
+        assert_eq!(
+            old.test_count(&super::bodies::plane_rows_sql("")).await,
+            0,
+            "{t}: no group-plane row before the upgrade"
+        );
+        old.run_migrations().await.unwrap();
+        let (signed, unlinked) = i1489_counts(
+            |q| {
+                let old = &old;
+                async move { old.test_count(&q).await }
+            },
+            "",
+        )
+        .await;
+        assert_eq!(signed, before, "{t}: the upgrade keeps every record");
+        let plane = old.test_count(&super::bodies::plane_rows_sql("")).await;
+        super::bodies::i1489_after_upgrade(&old, &t, before, plane, unlinked).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1489_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let t = tag();
+        let old = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        old.run_migrations_through(205).await.unwrap();
+        super::bodies::i1489_seed_v60(&old, &t).await;
+        let s = "cirislens.";
+        let mut before = 0;
+        for tb in crate::federation::group_plane::GroupPlaneTable::ALL {
+            before += old.test_count(&super::bodies::signed_sql(s, tb)).await;
+        }
+        assert_eq!(
+            old.test_count(&super::bodies::plane_rows_sql(s)).await,
+            0,
+            "{t}: no group-plane row before the upgrade"
+        );
+        old.run_migrations().await.unwrap();
+        let (signed, unlinked) = i1489_counts(
+            |q| {
+                let old = &old;
+                async move { old.test_count(&q).await }
+            },
+            s,
+        )
+        .await;
+        assert_eq!(signed, before, "{t}: the upgrade keeps every record");
+        let plane = old.test_count(&super::bodies::plane_rows_sql(s)).await;
+        super::bodies::i1489_after_upgrade(&old, &t, before, plane, unlinked).await;
+        eprintln!("i1489_postgres: RAN");
     }
 
     #[cfg(feature = "sqlite")]

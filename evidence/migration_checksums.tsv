@@ -385,3 +385,5 @@ sqlite	205	operational_planes_retired	13140767683504831096
 postgres	205	operational_planes_retired	17305905053151682264
 sqlite	206	group_records_as_rows	5026263842404379036
 postgres	206	group_records_as_rows	13150367149320374377
+sqlite	207	group_framed_kinds_retired	11727828499257783361
+postgres	207	group_framed_kinds_retired	12864703682880945832

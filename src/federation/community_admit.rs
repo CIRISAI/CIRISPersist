@@ -75,8 +75,6 @@ pub(crate) struct PlannedCommunity {
 pub(crate) struct CommunityInsert {
     /// The record, its `persist_row_hash` stamped.
     pub(crate) community: SignedCommunity,
-    /// The signed-wire-index locator (#507b).
-    pub(crate) wire_index_key: String,
 }
 
 /// What the executor's insert found.
@@ -97,16 +95,12 @@ pub(crate) struct PlannedCommunityRevocation {
     pub(crate) revocation: SignedCommunityMembershipRevocation,
     /// The CEG §7.8 removal event, written in the same transaction.
     pub(crate) removal_event: HardCaseEvent,
-    /// The signed-wire-index locator (#507b).
-    pub(crate) wire_index_key: String,
 }
 
 /// An admitted community-membership widening, exactly as stored.
 pub(crate) struct PlannedCommunityWidening {
     /// The signed row, its `persist_row_hash` stamped.
     pub(crate) widening: SignedCommunityMembershipWidening,
-    /// The signed-wire-index locator (#507b).
-    pub(crate) wire_index_key: String,
 }
 
 /// An admitted community-membership listing, exactly as stored.
@@ -174,17 +168,6 @@ pub(crate) async fn put_community_planned<D>(
 where
     D: CommunityStore,
 {
-    // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-    // before any verification (`replication_policy::settle_if_held`).
-    if crate::federation::replication_policy::settle_if_held(
-        dir,
-        crate::federation::replication_policy::EnvelopeKind::Community,
-        &community,
-    )
-    .await?
-    {
-        return Ok(CommunityWrite::Unchanged);
-    }
     // Test-only (PR #921 review, F3): a rival write that won the race lands
     // here, after any read the caller made and before this write's own gates
     // and reads.
@@ -209,11 +192,12 @@ where
         super::group_plane::GroupKind::Community,
         &community.community.community_key_id,
     );
+    let head = super::group_plane::GroupSigned::Community(community.clone());
     if let OccupiedRoute::Settled(written) =
         group_amendment::apply_occupied_community(dir, &community, occupied).await?
     {
         // v61 (CIRISPersist#991) — the head's `group:roster:v1` row.
-        super::group_plane::sync_group_row(dir, link).await?;
+        super::group_plane::sync_group_row_offered(dir, link, Some(&head)).await?;
         return Ok(written);
     }
     let insert = community_insert(community)?;
@@ -227,7 +211,7 @@ where
     match dir.store_planned_community(insert).await? {
         StoredCommunity::Inserted => {
             // v61 (CIRISPersist#991) — the record's `group:roster:v1` row.
-            super::group_plane::sync_group_row(dir, link).await?;
+            super::group_plane::sync_group_row_offered(dir, link, Some(&head)).await?;
             Ok(CommunityWrite::Inserted)
         }
         // v38.2.0 (#758) — the insert found the id taken: identical content is
@@ -252,18 +236,12 @@ where
     group_amendment::replicated_community_outcome(stored)
 }
 
-/// The row as inserted: its hash stamped, its wire-index locator derived.
+/// The row as inserted: its hash stamped. v61 (CIRISPersist#991): no
+/// framed wire-index locator; the record rides as its `group:roster:v1` row.
 fn community_insert(mut community: SignedCommunity) -> Result<CommunityInsert, Error> {
     community.community.persist_row_hash =
         super::types::compute_persist_row_hash(&community.community)?;
-    let wire_index_key = super::wire_index::record_key(&[(
-        "community_key_id",
-        &community.community.community_key_id,
-    )]);
-    Ok(CommunityInsert {
-        community,
-        wire_index_key,
-    })
+    Ok(CommunityInsert { community })
 }
 
 /// **The decision** for a community record, on both doors (#931: the door,
@@ -336,17 +314,6 @@ pub(crate) async fn put_community_membership_revocation_planned<D>(
 where
     D: CommunityStore,
 {
-    // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-    // before any verification (`replication_policy::settle_if_held`).
-    if crate::federation::replication_policy::settle_if_held(
-        dir,
-        crate::federation::replication_policy::EnvelopeKind::CommunityMembershipRevocation,
-        &revocation,
-    )
-    .await?
-    {
-        return Ok(());
-    }
     // v57.0.0 (CIRISPersist#934 step 2) — the ONE clock read of this door, and
     // the row's signed instant.
     let instants = PlanInstants {
@@ -355,10 +322,9 @@ where
     };
     let planned = plan_put_community_membership_revocation(dir, revocation, instants).await?;
     // v61 (CIRISPersist#991) — the removal's (or resignation's) row.
-    let link =
-        super::group_plane::GroupSigned::CommunityRevocation(planned.revocation.clone()).link();
+    let offered = super::group_plane::GroupSigned::CommunityRevocation(planned.revocation.clone());
     dir.store_planned_community_revocation(planned).await?;
-    super::group_plane::sync_group_row(dir, link).await?;
+    super::group_plane::sync_group_row_offered(dir, offered.link(), Some(&offered)).await?;
     Ok(())
 }
 
@@ -430,18 +396,9 @@ where
         &row.removed_identity_key_id,
         row.effective_at,
     );
-    let effective_at_rfc3339 = row.effective_at.to_rfc3339();
-    let wire_index_key = super::wire_index::record_key(&[
-        ("community_key_id", &row.community_key_id),
-        ("removed_identity_key_id", &row.removed_identity_key_id),
-        // v48.0.0 (#860) — a re-added member can be removed again: the instant
-        // is part of the row's identity.
-        ("effective_at", &effective_at_rfc3339),
-    ]);
     Ok(PlannedCommunityRevocation {
         revocation,
         removal_event,
-        wire_index_key,
     })
 }
 
@@ -454,17 +411,6 @@ pub(crate) async fn put_community_membership_widening_planned<D>(
 where
     D: CommunityStore,
 {
-    // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-    // before any verification (`replication_policy::settle_if_held`).
-    if crate::federation::replication_policy::settle_if_held(
-        dir,
-        crate::federation::replication_policy::EnvelopeKind::CommunityMembershipWidening,
-        &widening,
-    )
-    .await?
-    {
-        return Ok(());
-    }
     // v57.0.0 (CIRISPersist#934 step 2) — the ONE clock read of this door, and
     // the row's signed instant.
     let instants = PlanInstants {
@@ -473,9 +419,9 @@ where
     };
     let planned = plan_put_community_membership_widening(dir, widening, instants).await?;
     // v61 (CIRISPersist#991) — the widening's row.
-    let link = super::group_plane::GroupSigned::CommunityWidening(planned.widening.clone()).link();
+    let offered = super::group_plane::GroupSigned::CommunityWidening(planned.widening.clone());
     dir.store_planned_community_widening(planned).await?;
-    super::group_plane::sync_group_row(dir, link).await?;
+    super::group_plane::sync_group_row_offered(dir, offered.link(), Some(&offered)).await?;
     Ok(())
 }
 
@@ -542,16 +488,7 @@ where
     let mut widening = widening;
     let row = &mut widening.community_membership_widening;
     row.persist_row_hash = super::types::compute_persist_row_hash(&*row)?;
-    let effective_at_rfc3339 = row.effective_at.to_rfc3339();
-    let wire_index_key = super::wire_index::record_key(&[
-        ("community_key_id", &row.community_key_id),
-        ("member_key_id", &row.member_key_id),
-        ("effective_at", &effective_at_rfc3339),
-    ]);
-    Ok(PlannedCommunityWidening {
-        widening,
-        wire_index_key,
-    })
+    Ok(PlannedCommunityWidening { widening })
 }
 
 /// The door: every backend's `put_community_membership_listing` is this call.

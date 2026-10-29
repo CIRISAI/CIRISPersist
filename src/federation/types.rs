@@ -4906,7 +4906,7 @@ fn truncate_rfc3339_to_microseconds(s: &str) -> Option<String> {
 /// a column holds or what a signature covers. The rows keep whatever precision
 /// their backend keeps; only the identity derived from them stops varying with
 /// it.
-fn truncate_instants_to_microseconds(value: &mut serde_json::Value) {
+pub(crate) fn truncate_instants_to_microseconds(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(s) => {
             if let Some(truncated) = truncate_rfc3339_to_microseconds(s) {

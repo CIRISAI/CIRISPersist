@@ -27514,16 +27514,68 @@ pub(crate) mod r2_test_support {
         // v59.0.0 (sealed-transport floor) — a key is its `key:record:v1`
         // row (an Attestation ref under a row id; 634/640 resolve it); the
         // framed `Key` kind is never indexed.
-        for kind in ["Attestation", "LocationProof", "Family", "Community"] {
+        // v61 (CIRISPersist#991) — the family and the community are their
+        // `group:roster:v1` rows (Attestation refs under row ids, resolved
+        // below); the framed `Family` / `Community` kinds are never indexed.
+        for kind in ["Attestation", "LocationProof"] {
             assert!(
                 mine.iter().any(|(k, _, _)| *k == kind),
                 "[{tag}] no {kind} ref for the seeded fixture; got {mine:?}"
             );
         }
         assert!(
-            !mine.iter().any(|(k, _, _)| *k == "Key"),
-            "[{tag}] a retired framed Key ref is indexed; got {mine:?}"
+            !mine
+                .iter()
+                .any(|(k, _, _)| ["Key", "Family", "Community"].contains(k)),
+            "[{tag}] a retired framed ref is indexed; got {mine:?}"
         );
+        let family = dir
+            .list_signed_families_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|f| f.family.family.family_key_id == fam)
+            .expect("the family is held")
+            .family;
+        let community = dir
+            .list_signed_communities_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.community.community.community_key_id == comm)
+            .expect("the community is held")
+            .community;
+        for record in [
+            crate::federation::group_plane::GroupSigned::Family(family),
+            crate::federation::group_plane::GroupSigned::Community(community),
+        ] {
+            let row = dir
+                .list_attestations_since(None, u32::MAX)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|s| s.attestation)
+                .find(|r| {
+                    crate::federation::group_plane::group_signed_of_row(r)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|g| {
+                            g.group_key_id() == record.group_key_id() && g.member_key_id().is_none()
+                        })
+                })
+                .unwrap_or_else(|| {
+                    panic!("[{tag}] {}'s record row is held", record.group_key_id())
+                });
+            let hash = crate::federation::wire_index::content_hash_of(&row).unwrap();
+            assert!(
+                dir.lookup_signed_record_by_content_hash("Attestation", &hash)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "[{tag}] {}'s nanosecond-signed record row resolves by hash",
+                record.group_key_id()
+            );
+        }
 
         for (kind, content_hash, record_key) in &mine {
             let served = dir

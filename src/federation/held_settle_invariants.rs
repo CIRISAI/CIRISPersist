@@ -213,14 +213,19 @@ pub(crate) mod bodies {
         // under their row ids, settled by the key-plane door (I975+). v59.0.0
         // (sealed-transport floor) — their framed `Key` / `Revocation` entries
         // are no longer indexed.
-        for kind in ["Attestation", "LocationProof", "Family", "Community"] {
+        // v61 (CIRISPersist#991) — the family and the community are
+        // `group:roster:v1` rows: Attestation-kind entries; their framed
+        // `Family` / `Community` entries are no longer indexed.
+        for kind in ["Attestation", "LocationProof"] {
             assert!(
                 mine.iter().any(|(k, _)| k == kind),
                 "[{tag}] I230: no {kind} ref seeded; got {mine:?}"
             );
         }
         assert!(
-            !mine.iter().any(|(k, _)| k == "Key" || k == "Revocation"),
+            !mine
+                .iter()
+                .any(|(k, _)| ["Key", "Revocation", "Family", "Community"].contains(&k.as_str())),
             "[{tag}] I230: a retired framed kind is indexed; got {mine:?}"
         );
 
@@ -436,28 +441,14 @@ mod from_disk {
     /// Each replicated kind → the door every backend implements for it.
     const DOORS: &[(EnvelopeKind, &str)] = &[
         (EnvelopeKind::Attestation, "put_attestation_with_origin"),
-        (EnvelopeKind::Family, "put_family"),
-        (EnvelopeKind::Community, "put_community"),
-        (
-            EnvelopeKind::FamilyMembershipRevocation,
-            "put_family_membership_revocation",
-        ),
-        (
-            EnvelopeKind::CommunityMembershipRevocation,
-            "put_community_membership_revocation",
-        ),
+        // v61 (CIRISPersist#991) — the six group kinds left this list: their
+        // framed carriage is retired (`RETIRED_FRAMED`) and their objects
+        // ride as group-plane rows, settled at the attestation door
+        // (`SETTLE_EXEMPT` says so for each).
         (EnvelopeKind::LocationProof, "put_location_proof"),
         (
             EnvelopeKind::TransportDestination,
             "put_signed_transport_destination",
-        ),
-        (
-            EnvelopeKind::CommunityMembershipWidening,
-            "put_community_membership_widening",
-        ),
-        (
-            EnvelopeKind::FamilyMembershipWidening,
-            "put_family_membership_widening",
         ),
         (
             EnvelopeKind::CommunityMembershipListing,
@@ -467,21 +458,10 @@ mod from_disk {
 
     /// v57.0.0 (CIRISPersist#934 step 2) — the replicated kinds whose door is
     /// a shared one in `federation::community_admit`: `(kind, shared door)`.
-    const COMMUNITY_SHARED: &[(EnvelopeKind, &str)] = &[
-        (EnvelopeKind::Community, "put_community_planned"),
-        (
-            EnvelopeKind::CommunityMembershipRevocation,
-            "put_community_membership_revocation_planned",
-        ),
-        (
-            EnvelopeKind::CommunityMembershipWidening,
-            "put_community_membership_widening_planned",
-        ),
-        (
-            EnvelopeKind::CommunityMembershipListing,
-            "put_community_membership_listing_planned",
-        ),
-    ];
+    const COMMUNITY_SHARED: &[(EnvelopeKind, &str)] = &[(
+        EnvelopeKind::CommunityMembershipListing,
+        "put_community_membership_listing_planned",
+    )];
 
     /// The body of `async fn NAME(` in `src`, comments and blank lines
     /// stripped, one statement-ish line per entry.

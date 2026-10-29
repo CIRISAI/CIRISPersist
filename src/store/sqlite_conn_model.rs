@@ -754,7 +754,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ),
     ("rehome_legacy_key_plane", ConnClass::Write),
     // v61 (CIRISPersist#991) — the group plane's executor.
+    ("group_plane_present", ConnClass::Read),
     ("read_group_object", ConnClass::Read),
+    ("unlinked_group_objects", ConnClass::Read),
     ("link_group_plane_row", ConnClass::Write),
     ("drop_group_projection_row", ConnClass::Write),
     ("read_group_plane", ConnClass::Read),
@@ -773,6 +775,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ),
     // The test-only raw-SQL seam the projection witnesses tamper with.
     ("test_execute", ConnClass::Write),
+    ("test_count", ConnClass::Read),
     // v57.0.0 (CIRISPersist#934 step 2) — the community plane's executor
     // (`CommunityStore`). The doors that held these statements
     // (`put_community_at_door`, the three roster doors) are calls into the

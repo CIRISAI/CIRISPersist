@@ -282,6 +282,19 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// `OrgMemberships` / `Organizations` are REMOVED (their tables went at
 /// V205). A consumer built against 10 sends ops this host no longer decodes.
 ///
+/// v12 (v61, CIRISPersist#991, CC 3.1.3) — a BREAK: a group's record and its
+/// widening and revocation planes are rows on the attestation plane
+/// (`group:roster:v1`, `membership:{widening,removal,resignation}:v1`), and
+/// their six framed kinds joined `RETIRED_FRAMED`. The ops
+/// `ListSignedFamiliesSince`, `ListSignedCommunitiesSince`,
+/// `ListSignedFamilyMembershipRevocationsSince`,
+/// `ListSignedFamilyMembershipWideningsSince`,
+/// `ListSignedCommunityMembershipRevocationsSince`,
+/// `ListSignedCommunityMembershipWideningsSince` and
+/// `ApplyReplicatedCommunity` and their results are REMOVED: the rows ride
+/// `ApplyReplicatedAttestation` and the attestation cursor. A consumer built
+/// against 11 sends ops this host no longer decodes.
+///
 /// Consumers MUST check the field at capsule-receive time:
 ///
 /// ```ignore
@@ -294,7 +307,7 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 ///     "persist directory_capsule ABI version mismatch — pin floor too low"
 /// );
 /// ```
-pub const DIRECTORY_ABI_VERSION: u32 = 11;
+pub const DIRECTORY_ABI_VERSION: u32 = 12;
 
 /// A `FederationDirectory` operation, serialized by the consumer and
 /// dispatched inside persist's `.so`.
@@ -763,62 +776,12 @@ pub enum DirectoryOp {
         /// The granting node whose live peer set is asked for.
         node_key_id: String,
     },
-    /// [`FederationDirectory::list_signed_families_since`] (v21.0.0,
-    /// CIRISPersist#504 FLOOR) — bulk-list the full `SignedFamily` wrappers
-    /// (row + V110 authority signature) since a cursor, for the edge
-    /// advertise/serve responder. Result rides `SignedFamilies`. APPEND-ONLY.
-    ListSignedFamiliesSince {
-        /// Cursor: rows with `founded_at > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
-    /// [`FederationDirectory::list_signed_communities_since`] (v21.0.0,
-    /// CIRISPersist#504 FLOOR). Structural mirror of
-    /// [`DirectoryOp::ListSignedFamiliesSince`]. Result rides `SignedCommunities`.
-    /// APPEND-ONLY.
-    ListSignedCommunitiesSince {
-        /// Cursor: rows with `founded_at > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
     /// [`FederationDirectory::list_signed_location_proofs_since`] (v21.0.0,
     /// CIRISPersist#504 FLOOR). Structural mirror of
-    /// [`DirectoryOp::ListSignedFamiliesSince`]. Result rides `SignedLocationProofs`.
+    /// the other signed cursors. Result rides `SignedLocationProofs`.
     /// APPEND-ONLY.
     ListSignedLocationProofsSince {
         /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
-    /// [`FederationDirectory::list_signed_family_membership_revocations_since`]
-    /// (v21.0.0, CIRISPersist#504 FLOOR). Structural mirror of
-    /// [`DirectoryOp::ListSignedFamiliesSince`]. Result rides
-    /// `SignedFamilyMembershipRevocations`. APPEND-ONLY.
-    ListSignedFamilyMembershipRevocationsSince {
-        /// Cursor: rows with `removed_at > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
-    /// [`FederationDirectory::list_signed_community_membership_revocations_since`]
-    /// (v21.0.0, CIRISPersist#504 FLOOR). Structural mirror of
-    /// [`DirectoryOp::ListSignedFamiliesSince`]. Result rides
-    /// `SignedCommunityMembershipRevocations`. APPEND-ONLY.
-    ListSignedCommunityMembershipRevocationsSince {
-        /// Cursor: rows with `removed_at > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
-    /// v48.0.0 (CIRISPersist#860) —
-    /// [`FederationDirectory::list_signed_community_membership_widenings_since`],
-    /// the mirror of [`DirectoryOp::ListSignedCommunityMembershipRevocationsSince`].
-    /// Result rides `SignedCommunityMembershipWidenings`. APPEND-ONLY.
-    ListSignedCommunityMembershipWideningsSince {
-        /// Cursor (None ⇒ from start).
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
@@ -990,16 +953,6 @@ pub enum DirectoryOp {
         /// The identity the TRANSPORT authenticated — never the row's claim.
         authenticated_peer_key_id: String,
     },
-    /// v49.0.0 (CIRISPersist#910) —
-    /// [`FederationDirectory::list_signed_family_membership_widenings_since`],
-    /// the family twin of [`DirectoryOp::ListSignedCommunityMembershipWideningsSince`].
-    /// Result rides `SignedFamilyMembershipWidenings`. APPEND-ONLY (Growth).
-    ListSignedFamilyMembershipWideningsSince {
-        /// Cursor (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
     /// v49.0.0 (CIRISPersist#912) —
     /// [`FederationDirectory::list_signed_community_membership_listings_since`],
     /// the 19th kind's serve read. Result rides
@@ -1030,16 +983,6 @@ pub enum DirectoryOp {
         attestation: SignedAttestation,
         /// The identity the TRANSPORT authenticated — never the row's claim.
         authenticated_peer_key_id: String,
-    },
-    /// v50.0.0 (CIRISPersist#925/#931) —
-    /// [`FederationDirectory::apply_replicated_community`], the REPLICATED
-    /// community entry: a legacy infrastructure record is admitted as data,
-    /// where [`DirectoryOp::PutCommunity`] (the local door) runs the full CC
-    /// 3.2 gate. A replication bridge sends this. Result rides
-    /// `ReplicatedCommunityOutcome`. APPEND-ONLY (Growth).
-    ApplyReplicatedCommunity {
-        /// The signed community row received from a peer.
-        community: SignedCommunity,
     },
     /// v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6) —
     /// [`FederationDirectory::put_lineage_head_cosign`], the witness plane's
@@ -1209,27 +1152,9 @@ pub enum DirectoryOpResult {
     /// `list_consent_peers` (v21.0.0, #502 E7) — the revocation-folded
     /// `consent_peer_set` peer list, sorted + deduped. APPEND-ONLY.
     ConsentPeers(Vec<String>),
-    /// `list_signed_families_since` (v21.0.0, CIRISPersist#504 FLOOR) — the
-    /// full signed-family wrappers (row + V110 authority signature) for the
-    /// edge advertise/serve responder. APPEND-ONLY.
-    SignedFamilies(Vec<crate::federation::ServedFamily>),
-    /// `list_signed_communities_since` (v21.0.0, CIRISPersist#504 FLOOR).
-    /// APPEND-ONLY.
-    SignedCommunities(Vec<crate::federation::ServedCommunity>),
     /// `list_signed_location_proofs_since` (v21.0.0, CIRISPersist#504 FLOOR).
     /// APPEND-ONLY.
     SignedLocationProofs(Vec<crate::federation::ServedLocationProof>),
-    /// `list_signed_family_membership_revocations_since` (v21.0.0,
-    /// CIRISPersist#504 FLOOR). APPEND-ONLY.
-    SignedFamilyMembershipRevocations(Vec<crate::federation::ServedFamilyMembershipRevocation>),
-    /// `list_signed_community_membership_revocations_since` (v21.0.0,
-    /// CIRISPersist#504 FLOOR). APPEND-ONLY.
-    SignedCommunityMembershipRevocations(
-        Vec<crate::federation::ServedCommunityMembershipRevocation>,
-    ),
-    /// v48.0.0 (CIRISPersist#860) — `list_signed_community_membership_widenings_since`.
-    /// APPEND-ONLY.
-    SignedCommunityMembershipWidenings(Vec<crate::federation::ServedCommunityMembershipWidening>),
     /// `list_signed_transport_destinations_since` (v21.1.0,
     /// CIRISPersist#507c). APPEND-ONLY.
     SignedTransportDestinationsSince(Vec<crate::federation::ServedTransportDestination>),
@@ -1302,9 +1227,6 @@ pub enum DirectoryOpResult {
     /// [`DirectoryOp::EvictKnownWireHashes`] (CIRISPersist#785) — evicted,
     /// remaining, and how far over bound the floor left it. APPEND-ONLY.
     KnownHashEviction(crate::federation::KnownHashEviction),
-    /// v49.0.0 (CIRISPersist#910) — `list_signed_family_membership_widenings_since`.
-    /// APPEND-ONLY (Growth).
-    SignedFamilyMembershipWidenings(Vec<crate::federation::ServedFamilyMembershipWidening>),
     /// v49.0.0 (CIRISPersist#912) — `list_signed_community_membership_listings_since`.
     /// APPEND-ONLY (Growth).
     SignedCommunityMembershipListings(Vec<crate::federation::ServedCommunityMembershipListing>),
@@ -1315,10 +1237,6 @@ pub enum DirectoryOpResult {
     ReplicatedAttestationOutcome(
         crate::federation::attestation_apply::ReplicatedAttestationOutcome,
     ),
-    /// v50.0.0 (CIRISPersist#931) — `apply_replicated_community`: the typed
-    /// community-plane outcome. A `Refused` carries its reason here, never
-    /// flattened to [`Self::Err`]. APPEND-ONLY (Growth).
-    ReplicatedCommunityOutcome(crate::federation::ReplicatedCommunityOutcome),
     /// v50.0.0 (CIRISPersist#928) — `withdraws_admission_depth`: `None` when
     /// nothing was recorded (a pre-V157 row reads as the 16-hop walk).
     /// APPEND-ONLY (Growth).
@@ -1866,48 +1784,9 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
-        DirectoryOp::ListSignedFamiliesSince { since, limit } => {
-            match dir.list_signed_families_since(since, limit).await {
-                Ok(v) => DirectoryOpResult::SignedFamilies(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
-        DirectoryOp::ListSignedCommunitiesSince { since, limit } => {
-            match dir.list_signed_communities_since(since, limit).await {
-                Ok(v) => DirectoryOpResult::SignedCommunities(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
         DirectoryOp::ListSignedLocationProofsSince { since, limit } => {
             match dir.list_signed_location_proofs_since(since, limit).await {
                 Ok(v) => DirectoryOpResult::SignedLocationProofs(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
-        DirectoryOp::ListSignedFamilyMembershipRevocationsSince { since, limit } => {
-            match dir
-                .list_signed_family_membership_revocations_since(since, limit)
-                .await
-            {
-                Ok(v) => DirectoryOpResult::SignedFamilyMembershipRevocations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
-        DirectoryOp::ListSignedCommunityMembershipRevocationsSince { since, limit } => {
-            match dir
-                .list_signed_community_membership_revocations_since(since, limit)
-                .await
-            {
-                Ok(v) => DirectoryOpResult::SignedCommunityMembershipRevocations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
-        DirectoryOp::ListSignedCommunityMembershipWideningsSince { since, limit } => {
-            match dir
-                .list_signed_community_membership_widenings_since(since, limit)
-                .await
-            {
-                Ok(v) => DirectoryOpResult::SignedCommunityMembershipWidenings(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -1990,15 +1869,6 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
-        DirectoryOp::ListSignedFamilyMembershipWideningsSince { since, limit } => {
-            match dir
-                .list_signed_family_membership_widenings_since(since, limit)
-                .await
-            {
-                Ok(v) => DirectoryOpResult::SignedFamilyMembershipWidenings(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
         DirectoryOp::ListSignedCommunityMembershipListingsSince { since, limit } => {
             match dir
                 .list_signed_community_membership_listings_since(since, limit)
@@ -2024,12 +1894,6 @@ pub async fn dispatch_directory_op(
             Ok(o) => DirectoryOpResult::ReplicatedAttestationOutcome(o),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
-        DirectoryOp::ApplyReplicatedCommunity { community } => {
-            match dir.apply_replicated_community(community).await {
-                Ok(o) => DirectoryOpResult::ReplicatedCommunityOutcome(o),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
         DirectoryOp::PutLineageHeadCosign { cosign } => {
             match dir.put_lineage_head_cosign(cosign).await {
                 Ok(o) => DirectoryOpResult::LineageCosignOutcome(o),
@@ -2709,23 +2573,6 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::WireHashes(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v50.0.0 (CIRISPersist#931) — the replicated community entry, proxied.
-    async fn apply_replicated_community(
-        &self,
-        community: SignedCommunity,
-    ) -> Result<crate::federation::ReplicatedCommunityOutcome, Error> {
-        match self
-            .run_op(&DirectoryOp::ApplyReplicatedCommunity { community })
-            .await?
-        {
-            DirectoryOpResult::ReplicatedCommunityOutcome(o) => Ok(o),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -3665,46 +3512,8 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
-    /// v21.0.0 (CIRISPersist#504 FLOOR) — the signed-only family bulk read
-    /// via the capsule, for the edge advertise/serve responder.
-    async fn list_signed_families_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedFamily>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedFamiliesSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedFamilies(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v21.0.0 (CIRISPersist#504 FLOOR) — structural mirror of
-    /// [`Self::list_signed_families_since`].
-    async fn list_signed_communities_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedCommunity>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedCommunitiesSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedCommunities(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v21.0.0 (CIRISPersist#504 FLOOR) — structural mirror of
-    /// [`Self::list_signed_families_since`].
+    /// v21.0.0 (CIRISPersist#504 FLOOR) — the signed location-proof bulk
+    /// read via the capsule.
     async fn list_signed_location_proofs_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -3715,81 +3524,6 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::SignedLocationProofs(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v21.0.0 (CIRISPersist#504 FLOOR) — structural mirror of
-    /// [`Self::list_signed_families_since`].
-    async fn list_signed_family_membership_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedFamilyMembershipRevocation>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedFamilyMembershipRevocationsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedFamilyMembershipRevocations(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v21.0.0 (CIRISPersist#504 FLOOR) — structural mirror of
-    /// [`Self::list_signed_families_since`].
-    async fn list_signed_community_membership_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedCommunityMembershipRevocation>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedCommunityMembershipRevocationsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedCommunityMembershipRevocations(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v48.0.0 (CIRISPersist#860) — the widening mirror of the above.
-    async fn list_signed_community_membership_widenings_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedCommunityMembershipWidening>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedCommunityMembershipWideningsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedCommunityMembershipWidenings(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v49.0.0 (CIRISPersist#910) — the family widening since-read, proxied
-    /// like the room's: a capsule consumer folds from the signed since-reads.
-    async fn list_signed_family_membership_widenings_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedFamilyMembershipWidening>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedFamilyMembershipWideningsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedFamilyMembershipWidenings(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -4438,69 +4172,6 @@ mod tests {
         }
     }
 
-    /// v50.0.0 (CIRISPersist#931) — the capsule carries BOTH community doors:
-    /// `PutCommunity` (local) refuses a human-signed legacy `founder_only`
-    /// infrastructure record; `ApplyReplicatedCommunity` admits it as data
-    /// (`Inserted`), and a re-apply is `Unchanged`.
-    #[test]
-    fn apply_replicated_community_op_is_the_replicated_door() {
-        use crate::federation::tier_ingest::test_support as ts;
-        let rt = test_runtime();
-        let (dir, directory) = test_directory();
-        rt.block_on(ts::register_hybrid_key_as(
-            dir.as_ref(),
-            "capsule-human",
-            "capsule-human",
-            crate::federation::types::identity_type::USER,
-        ));
-        let community = ts::sign_community(
-            "capsule-human",
-            crate::federation::types::Community {
-                prev_head_digest: String::new(),
-                charter_digest: String::new(),
-                community_key_id: "capsule-legacy-root".into(),
-                community_name: "legacy".into(),
-                members: vec![crate::federation::types::CommunityMember {
-                    key_id: "capsule-human".into(),
-                    joined_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-                    role: Some("founder".into()),
-                }],
-                founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-                consensus_protocol: "founder_only".into(),
-                policy_blob: Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
-                persist_row_hash: String::new(),
-            },
-        );
-        match run_op(
-            &rt,
-            &directory,
-            &DirectoryOp::PutCommunity {
-                community: community.clone(),
-            },
-        ) {
-            DirectoryOpResult::Err(e) => assert!(
-                e.contains("hard_case:community_consensus_protocol_violation"),
-                "{e}"
-            ),
-            other => panic!("the local door must refuse: {other:?}"),
-        }
-        for want in [
-            crate::federation::ReplicatedCommunityOutcome::Inserted,
-            crate::federation::ReplicatedCommunityOutcome::Unchanged,
-        ] {
-            match run_op(
-                &rt,
-                &directory,
-                &DirectoryOp::ApplyReplicatedCommunity {
-                    community: community.clone(),
-                },
-            ) {
-                DirectoryOpResult::ReplicatedCommunityOutcome(o) => assert_eq!(o, want),
-                other => panic!("the replicated door: {other:?}"),
-            }
-        }
-    }
-
     fn test_runtime() -> Arc<tokio::runtime::Runtime> {
         Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -4907,10 +4578,15 @@ mod tests {
     /// puts in the vtable a consumer reads at runtime. A single assertion
     /// comparing them to each other would hold trivially while both drifted.
     #[test]
-    fn abi_version_pinned_at_11() {
+    fn abi_version_pinned_at_12() {
         assert_eq!(
-            DIRECTORY_ABI_VERSION, 11,
-            "v60.0.0 (CIRISPersist#1036): the operational kinds retired — ListOrgMembershipsSince \
+            DIRECTORY_ABI_VERSION, 12,
+            "v61 (CIRISPersist#991): the six group kinds retired — the signed group cursors \
+             and ApplyReplicatedCommunity and their results are removed from the op and result \
+             wire; the rows ride ApplyReplicatedAttestation, so a consumer built against 11 \
+             sends ops this host no longer decodes; AttestationRefusalReason gains \
+             GroupPlaneRefused. Previous move: \
+             v60.0.0 (CIRISPersist#1036): the operational kinds retired — ListOrgMembershipsSince \
              / ListOrganizationsSince and their results are removed from the op and result \
              wire, so a consumer built against 10 sends ops this host no longer decodes. \
              Previous move: v59.0.0 (CIRISPersist#1064): AttestationRefusalReason gained SelfRosterPending \
@@ -4944,7 +4620,7 @@ mod tests {
              built for"
         );
         assert_eq!(
-            PERSIST_DIRECTORY_VTABLE.abi_version, 11,
+            PERSIST_DIRECTORY_VTABLE.abi_version, 12,
             "the shipped vtable must advertise what consumers pin against"
         );
     }
@@ -5020,7 +4696,7 @@ mod tests {
         // `ListOrganizationsSince` removed; DIRECTORY_ABI_VERSION 10 → 11.
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "b8c73d71ef70c97a2ede3c0b3aed9c387ec1b1ce6f99391e12d4af82e9703c57",
+            "a6269f16fa2ab24ccb0604867fe562f62500baee2d5d1f0e1ab84d3c7820727c",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -5066,9 +4742,12 @@ mod tests {
         // results removed (a BREAK, with the op gate's bump to 9).
         // v60.0.0 (CIRISPersist#1036) — `OrgMemberships` / `Organizations`
         // removed (a BREAK, with the op gate's bump to 11).
+        // v61 (CIRISPersist#991) — the six signed group results and
+        // `ReplicatedCommunityOutcome` removed (a BREAK, with the op gate's
+        // bump to 12).
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "0043d184699c08d81551475dc116633616df366abbae8b5dc021c0ae2d79f5bf",
+            "78b7b0e1cd1d14e36852675a7cdfc8d14a936b9d9de0f0a1957f418ee86e5345",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );

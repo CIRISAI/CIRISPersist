@@ -16337,6 +16337,60 @@
     "witness": "I1201 (memory, sqlite, postgres)"
    },
    {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-planes-as-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/group_plane.rs#plan_group_row",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-991",
+    "tsv_comment_before": [
+     "",
+     "# v61 (CIRISPersist#991 planes 2 and 3) — the group records and the roster planes",
+     "# as rows: group:roster:v1, membership:{widening,removal,resignation}:v1."
+    ],
+    "witness": "I1484, I1485 (sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-planes-as-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/group_plane.rs#apply_group_plane_row",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-991",
+    "witness": "I1486 (sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-planes-as-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/group_plane.rs#rehome_group_records",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-991",
+    "witness": "I1489 (sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-cosigned-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/tier_ingest.rs#verify_roster_cosignatures",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-991",
+    "tsv_comment_before": [
+     "# v61 (CIRISPersist#991) — cosigned rows: the co-signatures ride as additional_scrubs,",
+     "# counted by the one predicate; a retraction is a cosigned withdraws."
+    ],
+    "witness": "I1484, I1485, I1486 (sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-cosigned-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/group_plane.rs#check_cosigned_withdraws",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-991",
+    "witness": "I1487 (sqlite, postgres)"
+   },
+   {
     "decimal_id": "3.3.1",
     "claim_id": "CLM-nsproc-tier-consent",
     "repo": "CIRISPersist",
