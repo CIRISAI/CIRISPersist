@@ -10738,7 +10738,7 @@ impl PyEngine {
     //    gate + verdict routing shipped in v8.2.0 (#228) on the
     //    FederationDirectory; these four methods make CC 6.1.1 drivable
     //    over PyO3. The crypto (Merkle, bound-hybrid gate, equivocation
-    //    classifier) stays frozen in `ciris_verify_core::holonomic` —
+    //    classifier) stays frozen in `ciris_verify_core::substrate` —
     //    persist calls it, never re-rolls it. ──
 
     /// v16 (CIRISPersist#431) — pure §19.1 root builder: the WW-scheme
@@ -10757,7 +10757,7 @@ impl PyEngine {
             let leaf_bytes_b64_json = leaf_bytes_b64_json.to_owned();
             py.detach(move || {
                 let leaves = decode_b64_leaves(&leaf_bytes_b64_json)?;
-                let root = ciris_verify_core::holonomic::compute_merkle_root(&leaves);
+                let root = ciris_verify_core::substrate::compute_merkle_root(&leaves);
                 Ok(crate::witness::encode_root_hex(&root))
             })
         })
@@ -17295,9 +17295,9 @@ impl PyEngine {
         let sources: Vec<(String, String)> = serde_json::from_str(sources_json)
             .map_err(|e| PyValueError::new_err(format!("decode sources_json: {e}")))?;
         let consent_state = match consent {
-            "active" => ciris_verify_core::holonomic::ConsentState::Active,
-            "withdrawn" => ciris_verify_core::holonomic::ConsentState::Withdrawn,
-            "unknown" => ciris_verify_core::holonomic::ConsentState::Unknown,
+            "active" => ciris_verify_core::substrate::ConsentState::Active,
+            "withdrawn" => ciris_verify_core::substrate::ConsentState::Withdrawn,
+            "unknown" => ciris_verify_core::substrate::ConsentState::Unknown,
             other => {
                 return Err(PyValueError::new_err(format!(
                     "unknown consent {other:?} — one of active|withdrawn|unknown"

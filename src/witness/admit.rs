@@ -7,14 +7,14 @@
 //! invalid ML-DSA-65 half is REJECTED at this gate — nothing is written
 //! (verify-before-mutation, AV-9).
 //!
-//! persist calls [`ciris_verify_core::holonomic::verify_witness`] (the
+//! persist calls [`ciris_verify_core::substrate::verify_witness`] (the
 //! hybrid gate + the WW-2 namespace guard + the optional leaf/root
 //! recompute). It does NOT re-roll the Merkle / preimage / signature
 //! check.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use ciris_verify_core::holonomic::{
+use ciris_verify_core::substrate::{
     self, compute_merkle_root, verify_witness, BoundHybridSig, HolonomicError, WholenessWitness,
 };
 
@@ -89,7 +89,7 @@ impl WitnessAdmitError {
 
 /// Map a verify-core [`HolonomicError`] onto the persist gate's error
 /// shape, preserving the §19.0 classical-only → `hybrid_required` class.
-fn map_holonomic(err: HolonomicError) -> WitnessAdmitError {
+fn map_substrate_error(err: HolonomicError) -> WitnessAdmitError {
     match err {
         HolonomicError::PqcHalfMissingOrInvalid => WitnessAdmitError::HybridRequired,
         HolonomicError::ClassicalSignatureInvalid => {
@@ -261,7 +261,7 @@ pub fn admit_witness(
         &pqc_pubkey,
         disclosed_leaves,
     )
-    .map_err(map_holonomic)?;
+    .map_err(map_substrate_error)?;
 
     // Admitted. Build the corpus row (no in-band `verified` flag, F-5).
     Ok(StoredWitness {
@@ -280,7 +280,7 @@ pub fn admit_witness(
 
 /// Re-export so callers do not have to reach into verify-core for the
 /// bound-hybrid signer helper shape.
-pub use holonomic::Preimage as WitnessPreimageBuilder;
+pub use substrate::Preimage as WitnessPreimageBuilder;
 
 #[cfg(test)]
 mod tests {

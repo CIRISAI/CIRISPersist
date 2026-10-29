@@ -2558,7 +2558,7 @@ impl Engine {
     /// **consent-driven retention decision** (N5). Resolve the subject's
     /// consent stance over the content (§8.1.11.1), run it through the
     /// FROZEN verify-core
-    /// [`retention_decision`](ciris_verify_core::holonomic::retention_decision),
+    /// [`retention_decision`](ciris_verify_core::substrate::retention_decision),
     /// and route the verdict:
     ///
     /// - `ConsentState::Revoked` (→ `Withdrawn` → `EvictEligible`) →
@@ -2928,7 +2928,7 @@ impl Engine {
         &self,
         aggregate_content_id: &str,
         sources: &[(String, String)],
-        consent: ciris_verify_core::holonomic::ConsentState,
+        consent: ciris_verify_core::substrate::ConsentState,
         under_capacity_pressure: bool,
         target_tier: Option<crate::fountain::FountainTier>,
     ) -> Result<u64, crate::store::Error> {

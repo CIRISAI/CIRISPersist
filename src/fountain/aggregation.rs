@@ -27,17 +27,17 @@
 //! # v8.4.0 — the §19.7 CONFORM step (closes the #230 residual)
 //! v8.3.0 stored `aggregation_meta` **opaque** because the §19.7 wire shape
 //! was not yet frozen. CEG RC14 / CIRISRegistry#89 froze §19.7.1/.1.1/.3 and
-//! CIRISVerify v5.10.0 ships the `holonomic::aggregation` verifiers. persist
-//! now CONSUMES them (the second-impl conformance role):
+//! CIRISVerify v5.10.0 ships the `aggregation` verifiers (in `substrate` since
+//! verify 22). persist now CONSUMES them (the second-impl conformance role):
 //!
 //!   * **Store-path admission gate (§19.7.1, §10.1.5.1.1 PQC-mandatory).**
 //!     `put_aggregated_tier` parses the §19.7.1 wire fields persist receives
 //!     ALONGSIDE the opaque bytes ([`AggregationMetaVerifyInputsV1`]) into the
-//!     verify-core wire [`ciris_verify_core::holonomic::AggregationMetaV1`],
+//!     verify-core wire [`ciris_verify_core::substrate::AggregationMetaV1`],
 //!     resolves the aggregator hybrid pubkeys off the composite manifest
 //!     envelope (the aggregator IS the composite's producer; same convention
 //!     as [`super::admit::check_admission_via_envelope`]), and calls
-//!     [`ciris_verify_core::holonomic::verify_aggregation_meta`]. A
+//!     [`ciris_verify_core::substrate::verify_aggregation_meta`]. A
 //!     missing/invalid ML-DSA-65 half is REJECTED **before** any write
 //!     (verify-before-mutation; never store-then-quarantine). The
 //!     `aggregation_meta` STORAGE column stays opaque BYTEA/BLOB — the V086
@@ -46,22 +46,22 @@
 //!   * **Descent integrity (§19.7.1.1).** `descend_aggregated_sources`
 //!     re-derives the committed `member_commitment` from the caller-supplied
 //!     source member set via
-//!     [`ciris_verify_core::holonomic::verify_member_commitment`] BEFORE
+//!     [`ciris_verify_core::substrate::verify_member_commitment`] BEFORE
 //!     descending — a forged member set cannot drive eviction. The descent
 //!     order is the canonical
-//!     [`ciris_verify_core::holonomic::descend_order`].
+//!     [`ciris_verify_core::substrate::descend_order`].
 //!   * **EjectionVerdict alignment (§19.7.3).** persist's internal verdict
 //!     enum is removed; persist re-exports and drives
-//!     [`ciris_verify_core::holonomic::ejection_verdict`] directly
+//!     [`ciris_verify_core::substrate::ejection_verdict`] directly
 //!     (`Withdrawn → EjectHardDelete`, capacity pressure → `EjectToTier`,
 //!     else `Keep`). This is the canonical superset of the v8.2.0
 //!     `retention_decision` path (they agree: revocation → hard-delete).
 
 use serde::{Deserialize, Serialize};
 
-pub use ciris_verify_core::holonomic::aggregation::descend_order;
+pub use ciris_verify_core::substrate::aggregation::descend_order;
 // v10.1.0 (CIRISVerify#194) restored root re-exports for the #191 v3 fns.
-pub use ciris_verify_core::holonomic::{
+pub use ciris_verify_core::substrate::{
     ejection_verdict, mass_commitment, passes_dominance_gate, passes_multiplicity_gate,
     verify_aggregation_meta, verify_mass_commitment, verify_member_commitment,
     AggregationMetaVerification, EjectionVerdict,
@@ -113,7 +113,7 @@ pub fn member_commitment(
     source_member_ids: &[String],
 ) -> Result<[u8; 32], crate::federation::Error> {
     check_distinct_sources(source_member_ids.iter().map(String::as_str))?;
-    Ok(ciris_verify_core::holonomic::member_commitment(
+    Ok(ciris_verify_core::substrate::member_commitment(
         source_member_ids,
     ))
 }
@@ -188,7 +188,7 @@ pub fn aggregate_corpus_kind(source_corpus_kind: &str) -> String {
 /// These are **admission-only verification inputs** — persist does NOT
 /// persist them (the storage column [`AggregationMetaV1::aggregation_meta`]
 /// stays opaque BYTEA/BLOB; the V086 schema is unchanged). They reconstruct
-/// the verify-core wire [`ciris_verify_core::holonomic::AggregationMetaV1`]
+/// the verify-core wire [`ciris_verify_core::substrate::AggregationMetaV1`]
 /// whose §19.7.1 canonical preimage the aggregator signed. The aggregator
 /// hybrid pubkeys are NOT carried here — they are resolved off the composite
 /// manifest envelope (`pubkey_ed25519` / `pubkey_ml_dsa_65`), bound into the
@@ -217,7 +217,7 @@ pub struct AggregationMetaVerifyInputsV1 {
     /// appends `u32(n_eff)` — reproduces byte-for-byte). `#[serde(default)]`
     /// so pre-#167 stored/wire inputs (no `n_eff`) still parse; a v1 tier
     /// defaults to `0`, which is fine (not in its preimage, and it fails
-    /// [`ciris_verify_core::holonomic::passes_dominance_gate`] closed).
+    /// [`ciris_verify_core::substrate::passes_dominance_gate`] closed).
     #[serde(default)]
     pub n_eff: u32,
     /// §19.7.1.3 (CIRISVerify#191 / CC 6.1.2.1.2 R9) — the signed
@@ -229,14 +229,14 @@ pub struct AggregationMetaVerifyInputsV1 {
     /// equal mass* honestly yield `n_eff == 1000`, yet the composite blur IS the
     /// data subject. **Signed only when `version >= 3`**; a v1/v2 tier lacks the
     /// surface and **fails closed** at
-    /// [`ciris_verify_core::holonomic::passes_multiplicity_gate`] (flag-day cut,
+    /// [`ciris_verify_core::substrate::passes_multiplicity_gate`] (flag-day cut,
     /// no deprecation window). `#[serde(default)]` so pre-v3 wire inputs parse.
     #[serde(default)]
     pub max_source_multiplicity: u32,
     /// §19.7.1.3 (CIRISVerify#191) — Merkle root over the per-member masses —
     /// base16 (hex) of the raw 32 bytes. Makes both `n_eff` AND the clustering
     /// **auditable**: an auditor holding the members + their masses recomputes
-    /// this root ([`ciris_verify_core::holonomic::verify_mass_commitment`]) and
+    /// this root ([`ciris_verify_core::substrate::verify_mass_commitment`]) and
     /// can *prove* a lying `n_eff`/multiplicity from held evidence — converting
     /// "slashable in principle" into "mechanically provable". **Signed only when
     /// `version >= 3`**; empty for a pre-v3 tier (not in its preimage).
@@ -261,7 +261,7 @@ impl AggregationMetaVerifyInputsV1 {
     /// not 32 bytes of hex (a malformed commitment).
     pub fn to_verify_meta(
         &self,
-    ) -> Result<ciris_verify_core::holonomic::AggregationMetaV1, AggregationMetaError> {
+    ) -> Result<ciris_verify_core::substrate::AggregationMetaV1, AggregationMetaError> {
         let mc = decode_member_commitment_hex(&self.member_commitment_hex)?;
         // #435 (CIRISVerify#191) — the v3 mass commitment. Absent/empty on a
         // pre-v3 tier (not in its preimage), where the all-zero root is
@@ -272,7 +272,7 @@ impl AggregationMetaVerifyInputsV1 {
         } else {
             decode_mass_commitment_hex(&self.mass_commitment_hex)?
         };
-        Ok(ciris_verify_core::holonomic::AggregationMetaV1 {
+        Ok(ciris_verify_core::substrate::AggregationMetaV1 {
             version: self.version,
             content_id: self.content_id.clone(),
             corpus_kind: self.corpus_kind.clone(),
@@ -682,7 +682,7 @@ pub async fn descend_aggregated_sources_on_backend<B: crate::store::Backend>(
     backend: &B,
     aggregate_content_id: &str,
     sources: &[(String, String)],
-    consent: ciris_verify_core::holonomic::ConsentState,
+    consent: ciris_verify_core::substrate::ConsentState,
     under_capacity_pressure: bool,
     target_tier: Option<super::eviction::FountainTier>,
 ) -> Result<u64, crate::store::Error> {
@@ -700,7 +700,7 @@ pub async fn descend_aggregated_sources_on_backend<B: crate::store::Backend>(
             ))
         })?;
     let member_ids: Vec<String> = sources.iter().map(|(id, _)| id.clone()).collect();
-    let verify_meta = ciris_verify_core::holonomic::AggregationMetaV1 {
+    let verify_meta = ciris_verify_core::substrate::AggregationMetaV1 {
         version: 1,
         content_id: aggregate_content_id.to_owned(),
         corpus_kind: record.source_corpus_kind.clone(),
@@ -812,7 +812,7 @@ pub async fn evict_aggregated_tier_on_backend<B: crate::store::Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ciris_verify_core::holonomic::ConsentState;
+    use ciris_verify_core::substrate::ConsentState;
 
     #[test]
     fn aggregate_corpus_kind_prefixes_and_nests() {
@@ -838,7 +838,7 @@ mod tests {
     #[test]
     fn multiplicity_gate_rejects_the_900_of_1000_fold() {
         let meta =
-            |version: u32, multiplicity: u32| ciris_verify_core::holonomic::AggregationMetaV1 {
+            |version: u32, multiplicity: u32| ciris_verify_core::substrate::AggregationMetaV1 {
                 version,
                 content_id: "c".into(),
                 corpus_kind: "trace".into(),

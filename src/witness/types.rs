@@ -3,7 +3,7 @@
 //!
 //! persist is the **store + the WW-2 leaf-walk owner**. The Merkle
 //! construction, the PQC gate, and the equivocation classifier are
-//! frozen in `ciris_verify_core::holonomic` (cross-impl-proven in
+//! frozen in `ciris_verify_core::substrate` (cross-impl-proven in
 //! CIRISVerify v5.9.0) — persist CALLS them, never re-rolls them.
 //!
 //! What lives here:
@@ -77,7 +77,7 @@ impl WitnessLeaf {
 
 /// A verified WholenessWitness as persisted to `wholeness_witness_corpus`.
 ///
-/// Mirrors [`ciris_verify_core::holonomic::WholenessWitness`] (the signed
+/// Mirrors [`ciris_verify_core::substrate::WholenessWitness`] (the signed
 /// scalars + the Merkle root) plus the bound-hybrid signature halves and
 /// the producer key ids persist needs to RE-verify on read / re-compare.
 /// The Merkle root is stored as lowercase hex (64 chars).
@@ -112,19 +112,19 @@ pub struct StoredWitness {
 
 impl StoredWitness {
     /// Decode the stored hex root back to the 32-byte
-    /// [`ciris_verify_core::holonomic::wholeness_witness::Hash`]. Errors
+    /// [`ciris_verify_core::substrate::wholeness_witness::Hash`]. Errors
     /// if the column is not 64 hex chars (substrate corruption).
     pub fn merkle_root_bytes(&self) -> Result<[u8; 32], crate::witness::WitnessAdmitError> {
         decode_root_hex(&self.merkle_root_hex)
     }
 
-    /// Reconstruct the verify-core [`WholenessWitness`](ciris_verify_core::holonomic::WholenessWitness)
+    /// Reconstruct the verify-core [`WholenessWitness`](ciris_verify_core::substrate::WholenessWitness)
     /// shape this row was admitted as — the comparison input.
     pub fn as_verify_witness(
         &self,
-    ) -> Result<ciris_verify_core::holonomic::WholenessWitness, crate::witness::WitnessAdmitError>
+    ) -> Result<ciris_verify_core::substrate::WholenessWitness, crate::witness::WitnessAdmitError>
     {
-        Ok(ciris_verify_core::holonomic::WholenessWitness {
+        Ok(ciris_verify_core::substrate::WholenessWitness {
             peer_id: self.peer_id.clone(),
             epoch_id: self.epoch_id,
             claim_namespaces: self.claim_namespaces.clone(),
@@ -138,7 +138,7 @@ impl StoredWitness {
 
 /// The PyO3 wire shape of a WholenessWitness (CIRISPersist#431 — the
 /// CC 6.1.1 Engine projection). Mirrors the verify-core
-/// [`WholenessWitness`](ciris_verify_core::holonomic::WholenessWitness)
+/// [`WholenessWitness`](ciris_verify_core::substrate::WholenessWitness)
 /// scalars with the Merkle root carried as lowercase hex (the JSON-safe
 /// form of the 32-byte `Hash`), plus the producer's ML-DSA-65 key id
 /// (provenance — a [`StoredWitness`] column, not a signed scalar, so it
@@ -176,13 +176,13 @@ fn default_witness_version() -> u16 {
 
 impl WitnessWire {
     /// Decode the wire shape into the verify-core
-    /// [`WholenessWitness`](ciris_verify_core::holonomic::WholenessWitness)
+    /// [`WholenessWitness`](ciris_verify_core::substrate::WholenessWitness)
     /// the ingest gate verifies. Errors on a non-64-hex-char root.
     pub fn to_verify_witness(
         &self,
-    ) -> Result<ciris_verify_core::holonomic::WholenessWitness, crate::witness::WitnessAdmitError>
+    ) -> Result<ciris_verify_core::substrate::WholenessWitness, crate::witness::WitnessAdmitError>
     {
-        Ok(ciris_verify_core::holonomic::WholenessWitness {
+        Ok(ciris_verify_core::substrate::WholenessWitness {
             peer_id: self.peer_id.clone(),
             epoch_id: self.epoch_id,
             claim_namespaces: self.claim_namespaces.clone(),

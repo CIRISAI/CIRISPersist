@@ -69,7 +69,7 @@ Signed attestations are the only state: the cirisnode classes and Goals become `
 - Producers: sign a licence as a cosigned `licensure:{community_key_id}:v1` row, call `PartnerRecord::canonicalize_sets` before signing, and pass a term on every term-bearing `delegates_to`.
 - Migrations: V202 (`hard_case_events.emitter_key_id`), V203 (drops eight cirisnode tables; ledgers gain `attestation_id`), V204 (`goals` rebuilt, `scope_kind` → `scale`), V205 (drops the organisation tables).
 - Telemetry: the `backend` label set is `{sqlite, postgres}`.
-## [59.1.1] - 2026-10-28
+## [59.1.1] - 2026-10-27
 
 ### Fixed
 

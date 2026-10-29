@@ -31,7 +31,7 @@ use ciris_persist::fountain::{
 };
 use ciris_persist::store::{Backend, Error as StoreError};
 use ciris_persist::verify::PythonJsonDumpsCanonicalizer;
-use ciris_verify_core::holonomic::{ConsentState, EjectionVerdict};
+use ciris_verify_core::substrate::{ConsentState, EjectionVerdict};
 
 /// Build the §19.7.1 verification inputs (the wire fields + a valid
 /// bound-hybrid signature) for an aggregation tier. The aggregator IS the
@@ -87,7 +87,7 @@ async fn signed_verify_inputs_v3(
         .map(|id| (id.clone(), 1_000_000u64))
         .collect();
     let mass_root = ciris_persist::fountain::aggregation::mass_commitment(&masses);
-    let meta = ciris_verify_core::holonomic::AggregationMetaV1 {
+    let meta = ciris_verify_core::substrate::AggregationMetaV1 {
         version,
         content_id: "content-root-agg".to_owned(),
         corpus_kind: "trace".to_owned(),
@@ -992,8 +992,8 @@ async fn i1152_member_commitment_unique<B: Backend>(backend: &B, suffix: &str) {
     padded_ids.push(ids[2].clone());
     // The defect: verify-core's root does not see the padding.
     assert_eq!(
-        ciris_verify_core::holonomic::member_commitment(&ids),
-        ciris_verify_core::holonomic::member_commitment(&padded_ids),
+        ciris_verify_core::substrate::member_commitment(&ids),
+        ciris_verify_core::substrate::member_commitment(&padded_ids),
         "I1152: the premise — the unchecked root is blind to a repeated id"
     );
 
@@ -1013,7 +1013,7 @@ async fn i1152_member_commitment_unique<B: Backend>(backend: &B, suffix: &str) {
     };
     malformed(member_commitment(&padded_ids).expect_err("I1152: the builder refuses padding"));
     let root = member_commitment(&ids).expect("I1152: a distinct list builds");
-    assert_eq!(root, ciris_verify_core::holonomic::member_commitment(&ids));
+    assert_eq!(root, ciris_verify_core::substrate::member_commitment(&ids));
 
     // The fold over the distinct list.
     let fold_cid = format!("i1152-fold-{suffix}");

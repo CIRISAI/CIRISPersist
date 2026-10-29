@@ -9186,7 +9186,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
 
     async fn put_wholeness_witness(
         &self,
-        witness: &ciris_verify_core::holonomic::WholenessWitness,
+        witness: &ciris_verify_core::substrate::WholenessWitness,
         sig_ed25519_b64: &str,
         sig_ml_dsa_65_b64: Option<&str>,
         pqc_key_id: &str,

@@ -1603,7 +1603,7 @@ surface is dominated by two classes: **harvest-now-decrypt-later (HNDL)
 forge-later** against a corpus that outlives the classical primitive, and
 **reconciliation / divergence-router abuse** where a forged or stale witness
 tries to drive the merge it is only supposed to *detect*. The §19 verifiers
-themselves live in `ciris_verify_core::holonomic`;
+themselves live in `ciris_verify_core::substrate`;
 persist **calls** them (`verify_witness`, `compare_witnesses`,
 `verify_aggregation_meta`, `verify_member_commitment`, `ejection_verdict`,
 `compute_merkle_root`) and re-rolls no Merkle / preimage / signature logic.
@@ -1770,7 +1770,7 @@ never store-then-quarantine). Persist reconstructs the verify-core wire
 signature (`AggregationMetaVerifyInputsV1`), resolves the aggregator hybrid
 pubkeys off the composite manifest envelope (`pubkey_ed25519` /
 `pubkey_ml_dsa_65`, bound into the verify), and calls
-`ciris_verify_core::holonomic::verify_aggregation_meta`. A **missing/invalid
+`ciris_verify_core::substrate::verify_aggregation_meta`. A **missing/invalid
 ML-DSA-65 half is REJECTED** (`aggregation_meta_hybrid_required`, the same
 store-path PQC mandate as AV-59, §10.1.5.1.1); a tampered meta
 (sig ≠ §19.7.1 preimage) rejects (`aggregation_meta_invalid`); both leave
@@ -1838,7 +1838,7 @@ tier/keep-count path (`evict_fountain_content_to_tier`) is the *only* consumer
 of `retention_priority` (and of any future swarm rarity reweight), so a high
 rarity score **cannot reach — let alone resurrect — a revoked content**.
 `evict_fountain_content_by_consent` + `fountain::resolve_retention_action`
-drive `ciris_verify_core::holonomic::retention_decision` / `ejection_verdict`:
+drive `ciris_verify_core::substrate::retention_decision` / `ejection_verdict`:
 a `Withdrawn` subject (→ `EjectHardDelete`) routes to the hard-delete path
 regardless of `is_rare`. **Revocation overrides rarity — by construction, not
 by comparison** (revocation is a content-level dominating signal, never a

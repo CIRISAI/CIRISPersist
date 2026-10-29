@@ -75,8 +75,10 @@ classifiers = [
 # Floor moves to v20.1.0 (`<21`) in lockstep with the seven Rust pins; the
 # floor is the minor that ships the wheel-identity refusals (CIRISVerify#307)
 # the tag job's signer relies on.
+# v61.0.0 (CIRISVerify v22.0.0 re-pin) — verify MAJOR 20→22. Floor moves to
+# v22.0.0 (`<23`) in lockstep with the seven Rust pins.
 dependencies = [
-    "ciris-verify>=20.2.0,<21",
+    "ciris-verify>=22.0.0,<23",
 ]
 dynamic = ["version"]
 

@@ -5,13 +5,13 @@
 //! bytes, so the FIRST conformant implementation (CIRISVerify v5.10.0) emits
 //! the canonical vectors and a SECOND reproduces them byte-for-byte. CIRISPersist
 //! is that second impl: this test loads the vectors copied into persist's tree
-//! (`tests/vectors/holonomic_v19_7/`) and asserts persist — THROUGH the
+//! (`tests/vectors/substrate_v19_7/`) and asserts persist — THROUGH the
 //! verify-core API exactly as persist integrates it (`signing_preimage`,
 //! `member_commitment`, `descend_order`, `verify_aggregation_meta`) — reproduces
 //! each one. Passing lifts §19.7 from RC-grade to 1.0.
 //!
 //! The vectors are byte-identical copies of
-//! `ciris-verify-core/tests/vectors/holonomic_v19_7/` so persist's conformance
+//! `ciris-verify-core/tests/vectors/substrate_v19_7/` so persist's conformance
 //! proof is self-contained (it does not reach into the verify-core checkout).
 
 #![cfg(feature = "sqlite")]
@@ -19,13 +19,13 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use ciris_keyring::{MlDsa65SoftwareSigner, PqcSigner};
-use ciris_verify_core::holonomic::aggregation::descend_order;
-use ciris_verify_core::holonomic::{
+use ciris_verify_core::substrate::aggregation::descend_order;
+use ciris_verify_core::substrate::{
     member_commitment, verify_aggregation_meta, AggregationMetaV1, AggregationMetaVerification,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 
-const VECTORS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/holonomic_v19_7");
+const VECTORS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/substrate_v19_7");
 
 fn load(rel: &str) -> serde_json::Value {
     let path = format!("{VECTORS}/{rel}");
@@ -65,11 +65,11 @@ fn domain_separator_matches_vector() {
     let expected_hex = v["agg_meta_v1_hex"].as_str().unwrap();
     let expected_len = v["agg_meta_v1_len"].as_u64().unwrap() as usize;
     assert_eq!(
-        ciris_verify_core::holonomic::DOMAIN_AGG_META.len(),
+        ciris_verify_core::substrate::DOMAIN_AGG_META.len(),
         expected_len
     );
     assert_eq!(
-        hex_lower(ciris_verify_core::holonomic::DOMAIN_AGG_META),
+        hex_lower(ciris_verify_core::substrate::DOMAIN_AGG_META),
         expected_hex,
         "AGG-META-v1 domain separator reproduces the vector byte-for-byte"
     );
