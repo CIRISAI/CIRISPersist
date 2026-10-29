@@ -81,7 +81,10 @@ pub(crate) mod bodies {
             "dimension": format!("consent:state:{stance}:v1"),
             crate::federation::envelope::paths::ASSERTED_AT: asserted.to_rfc3339(),
         });
-        env["scope"] = scope;
+        // A `null` scope is a row with no scope member (absent, never `null`).
+        if !scope.is_null() {
+            env["scope"] = scope;
+        }
         if let (Some(obj), Some(extra)) = (env.as_object_mut(), extras.as_object()) {
             for (k, v) in extra {
                 obj.insert(k.clone(), v.clone());

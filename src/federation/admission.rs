@@ -2928,6 +2928,8 @@ pub async fn check_promotion_admission(
     // Pure function of the row (no directory read, no crypto), and a REFUSAL,
     // so it leads with the other free arms.
     check_row_column_binding(row)?;
+    // CIRISPersist#1098 F4/F5 — the promoted row's envelope shape.
+    check_envelope_member_shapes(row)?;
     // v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot, beside the
     // binding. Uncounted: the local door counted this row when it was written.
     crate::federation::row_type::check_row_type(row)?;
@@ -7084,6 +7086,116 @@ pub fn check_instant_binding(
             now.to_rfc3339(),
             max_skew.num_seconds(),
         )));
+    }
+    Ok(())
+}
+
+/// CC 2.6.1.1.1 — the signed `witnesses` member: a lineage charter's
+/// witness directory, an array of key records. It rides the envelope as an
+/// extra member (CC 2.6.1.7: `signed:envelope-extra`).
+pub const WITNESSES_MEMBER: &str = "witnesses";
+
+/// CIRISPersist#1098 F4 and F5 (CC 2.6.1.1.1 and 2.6.1.7, rc12) — two shape
+/// rules over the signed envelope's own members, asked at every door a row
+/// enters by (put and replication, the mint, the promotion).
+///
+/// - **F4.** An optional member written as an explicit JSON `null` is refused
+///   `federation_malformed_row` / `envelope_member_null`, naming the member,
+///   at the envelope's top level and inside the `row` mirror. CC writes a
+///   default as `null` to mean absent; on the wire the member is absent.
+/// - **F5.** `witnesses` is a set-kind member: sorted by each element's JCS
+///   string and carrying no repeat, refused `federation_set_semantics_unsorted`
+///   naming the member otherwise. A member that is not an array is
+///   `envelope_member_invalid`.
+///
+/// Nothing is re-sorted or normalised: the signed bytes are the producer's,
+/// so a relay cannot repair them.
+///
+/// The key plane's `revocation_envelope` binds absent optionals as explicit
+/// `null` inside its own signed object (CC 2.6.1.1.1 names it as the one
+/// exception); it is a nested member and this check does not read inside it.
+pub(crate) fn check_envelope_member_shapes(row: &super::Attestation) -> Result<(), Error> {
+    use crate::federation::envelope::paths;
+    let null_member = |members: &serde_json::Map<String, serde_json::Value>| {
+        members
+            .iter()
+            .find(|(_, v)| v.is_null())
+            .map(|(k, _)| k.clone())
+    };
+    let Some(members) = row.attestation_envelope.as_object() else {
+        return Ok(());
+    };
+    let nulled = null_member(members).or_else(|| {
+        members
+            .get(paths::ROW)
+            .and_then(serde_json::Value::as_object)
+            .and_then(null_member)
+            .map(|k| format!("{}.{k}", paths::ROW))
+    });
+    if let Some(member) = nulled {
+        return Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_MEMBER_NULL,
+            format!(
+                "attestation {}: signed envelope member `{member}` is an explicit JSON null; an \
+                 optional member that is not carried is absent, never null (CC 2.6.1.1.1)",
+                row.attestation_id,
+            ),
+        ));
+    }
+    let Some(witnesses) = members.get(WITNESSES_MEMBER) else {
+        return Ok(());
+    };
+    let Some(elements) = witnesses.as_array() else {
+        return Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_MEMBER_INVALID,
+            format!(
+                "attestation {}: signed envelope member `{WITNESSES_MEMBER}` is not an array of \
+                 key records (CC 2.1, CC 3.2 T6)",
+                row.attestation_id,
+            ),
+        ));
+    };
+    let mut keys = Vec::with_capacity(elements.len());
+    for element in elements {
+        let jcs = crate::verify::canonical::ceg_produce_canonicalize(element).map_err(|e| {
+            Error::malformed_row(
+                "attestation",
+                super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                format!(
+                    "attestation {}: a `{WITNESSES_MEMBER}` element does not canonicalize: {e}",
+                    row.attestation_id,
+                ),
+            )
+        })?;
+        keys.push(String::from_utf8(jcs).map_err(|e| {
+            Error::malformed_row(
+                "attestation",
+                super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                format!(
+                    "attestation {}: a `{WITNESSES_MEMBER}` element is not UTF-8: {e}",
+                    row.attestation_id,
+                ),
+            )
+        })?);
+    }
+    for (n, pair) in keys.windows(2).enumerate() {
+        let order = super::operational::jcs_string_order(&pair[0], &pair[1]);
+        if order != std::cmp::Ordering::Less {
+            let why = if order == std::cmp::Ordering::Equal {
+                "repeats element"
+            } else {
+                "is out of order after element"
+            };
+            return Err(Error::SetSemanticsUnsorted(format!(
+                "attestation {}: `{WITNESSES_MEMBER}` element {} {why} {n} — a set-semantics \
+                 array is sorted by each element's JCS string and carries no repeat (CC \
+                 2.6.1.1.1, CC 2.6.1.7)",
+                row.attestation_id,
+                n + 1,
+            )));
+        }
     }
     Ok(())
 }

@@ -1794,7 +1794,7 @@ mod tests {
         // v60.1.0 slice B: +1 (CIRISPersist#1120), CLM-identity-amendment-row.
         // v60.1.0 CC ids: +2, CLM-takedown-reversal (4.5.3, #1113) and
         // CLM-scope-infra-relay (4.4.3.4.3, #1119).
-        const EXPECTED: usize = 349;
+        const EXPECTED: usize = 352;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

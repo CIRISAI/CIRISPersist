@@ -17064,6 +17064,31 @@
     "decimal_id": "2.6.1.7",
     "claim_id": "CLM-signed-object",
     "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_envelope_member_shapes",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s0",
+    "witness": "I1478, I1479 (sqlite, postgres): envelope_member_null on an explicit-null member; witnesses[] sorted and unique, else federation_set_semantics_unsorted (CIRISPersist#1098 F4, F5)"
+   },
+   {
+    "decimal_id": "3.1.5",
+    "claim_id": "CLM-trace-family",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_trace_dimension_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s0"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-steward-binding-by-custody",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#is_steward_bound",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s0"
+   },
+   {
+    "decimal_id": "2.6.1.7",
+    "claim_id": "CLM-signed-object",
+    "repo": "CIRISPersist",
     "path#symbol": "src/federation/mod.rs#validate_subject_key_ids",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v60-1114",

@@ -364,6 +364,7 @@ fn assemble_any_row_type(
     // store call one layer away. Also catches an `input` whose envelope was
     // stamped for a DIFFERENT signer than the `key_id` assembling it.
     super::admission::check_row_column_binding(&row)?;
+    super::admission::check_envelope_member_shapes(&row)?;
     let emitted = EmittedAttestation {
         attestation_id: row.attestation_id.clone(),
         attesting_key_id: key_id,

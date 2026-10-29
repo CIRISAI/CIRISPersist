@@ -12,6 +12,7 @@
 #   manifests/governance_policy_vectors.json   -> src/federation/namespace/governance_policy_vectors.json
 #   manifests/csd4_chain.json                  -> src/federation/namespace/csd4_chain.json
 #   manifests/topology_vocabulary.json         -> src/federation/namespace/topology_vocabulary.json
+#   manifests/signed_object_vectors.json       -> src/federation/namespace/signed_object_vectors.json  (v61.0.0)
 #   formal/self_roster/traces/*.json           -> tests/fixtures/self_roster/*.json (the six traces)
 #
 # (pins: registry.rs and cc_manifests.rs; the from-disk witness I1302 checks
@@ -63,7 +64,8 @@ compare() {  # <path in CC at the tag> <local path>
   fi
 }
 for f in namespace_registry.json namespace_match_vectors.json governance_policy.json \
-         governance_policy_vectors.json csd4_chain.json topology_vocabulary.json; do
+         governance_policy_vectors.json csd4_chain.json topology_vocabulary.json \
+         signed_object_vectors.json; do
   compare "manifests/$f" "$dir/$f"
 done
 for f in "$root"/tests/fixtures/self_roster/*.json; do

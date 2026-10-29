@@ -12,9 +12,13 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 - CIRISVerify 22 is required: `ciris-keyring`, `ciris-verify-core` and `ciris-crypto` are pinned at tag v22.0.0, and the wheel declares `ciris-verify>=22.0.0,<23`. A host that pins verify itself must move to 22 with persist.
 - `ciris_verify_core::holonomic` is `ciris_verify_core::substrate` in verify 22, with no alias. A consumer that names verify's module directly must rename the path; persist's own re-export (`witness::admit::WitnessPreimageBuilder`) keeps its name.
 - `federation::genesis::bundle::authorization_digest` returns the same 32 bytes for every bundle; a bundle it cannot project is refused `Error::GenesisBundleInvalid` in every case (a canonicalization failure was `Error::InvalidArgument`).
+- New refusals: an optional signed envelope member written as an explicit JSON `null` (top level or inside the `row` mirror) is refused `federation_malformed_row` / `envelope_member_null` (Python `ValueError`); a `witnesses` member out of JCS-string order or carrying a repeat is refused `federation_set_semantics_unsorted`, and one that is not an array `envelope_member_invalid`. Producers omit an optional member instead of writing `null`, and write `witnesses[]` sorted and unique.
+- `malformed_row::ALL` gains `envelope_member_null`, appended at the end; existing positions do not move.
+- `membership:proposal` and `membership:acceptance` rows omit `role` when no role is offered; they wrote `"role": null` before. A row from a peer that still writes the `null` is refused `envelope_member_null`, so every node that exchanges membership rows moves to this release together.
 
 ### Changed
 
+- A bare `scope` token is read as the one-element set it denotes by every scope reader, and the stored envelope keeps the producer's bytes. CC's 13 signed-object vectors (CC 2.6.1.7) are vendored and replayed through the attestation door on both backends.
 - The genesis bundle's authorization digest is CIRISVerify's `genesis_bundle::authorization_digest`; persist's own projection is removed and the threshold policy (`max(carried M, strict majority of the node's own roster)`) stays in persist. A byte-identity test pins the digest against verify's seven genesis-bundle vectors.
 
 ### Fixed

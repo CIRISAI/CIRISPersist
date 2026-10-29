@@ -382,6 +382,9 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 # carry their own federation_malformed_row reasons.
 2.6.1.7	CLM-signed-object	CIRISPersist	src/federation/tier_ingest.rs#check_content_hash	ciris-persist@60.1.0
 2.6.1.7	CLM-signed-object	CIRISPersist	src/federation/admission.rs#check_row_mirror_members_closed	ciris-persist@60.1.0
+2.6.1.7	CLM-signed-object	CIRISPersist	src/federation/admission.rs#check_envelope_member_shapes	ciris-persist@60.1.0
+3.1.5	CLM-trace-family	CIRISPersist	src/federation/admission.rs#check_trace_dimension_admission	ciris-persist@60.1.0
+3.2	CLM-steward-binding-by-custody	CIRISPersist	src/federation/admission.rs#is_steward_bound	ciris-persist@60.1.0
 2.6.1.7	CLM-signed-object	CIRISPersist	src/federation/mod.rs#validate_subject_key_ids	ciris-persist@60.1.0
 # v60.0.0 S6 (CIRISPersist#1036 items 1-5, #1049, #1062, #1048; CC rc9) — an organisation
 # is an affiliation; organization / org_membership / partner_record retire onto its rows (V205).

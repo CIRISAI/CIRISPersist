@@ -105,7 +105,15 @@ pub mod bodies {
         member: &str,
         value: serde_json::Value,
     ) -> Attestation {
-        row.attestation_envelope[member] = value;
+        // A JSON `null` drops the member: an optional member is absent, never
+        // `null` (CC 2.6.1.1.1, `envelope_member_null`).
+        if value.is_null() {
+            if let Some(members) = row.attestation_envelope.as_object_mut() {
+                members.remove(member);
+            }
+        } else {
+            row.attestation_envelope[member] = value;
+        }
         ts::reseal(&mut row);
         row
     }

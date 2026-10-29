@@ -200,17 +200,21 @@ pub(crate) mod bodies {
         asserted_at: DateTime<Utc>,
         ttl: Option<Duration>,
     ) -> Attestation {
+        let mut env = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "dimension": PROPOSAL_DIMENSION,
+            "group_kind": group_kind(scope),
+            target_key(scope): group,
+        });
+        // Absent when no role is offered (CC 2.6.1.7: never `null`).
+        if let Some(role) = role {
+            env["role"] = role.into();
+        }
         row(
             proposer,
             proposer,
             scope,
-            serde_json::json!({
-                "id": uuid::Uuid::new_v4().to_string(),
-                "dimension": PROPOSAL_DIMENSION,
-                "group_kind": group_kind(scope),
-                target_key(scope): group,
-                "role": role,
-            }),
+            env,
             asserted_at,
             ttl.map(|t| asserted_at + t),
             vec![invitee.to_owned()],
@@ -239,11 +243,9 @@ pub(crate) mod bodies {
             "proposal_hash": p.original_content_hash,
         });
         if accept {
-            env["role"] = p
-                .attestation_envelope
-                .get("role")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
+            if let Some(role) = p.attestation_envelope.get("role").filter(|v| !v.is_null()) {
+                env["role"] = role.clone();
+            }
         }
         row(
             signer,

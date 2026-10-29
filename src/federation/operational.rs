@@ -221,7 +221,7 @@ impl PartnerRecord {
 /// CC 2.6.1.1.1 rule 1: strings order by their UTF-16 code units, the order
 /// JCS (RFC 8785 §3.2.3) sorts members by. It differs from Rust's byte order
 /// only above U+FFFF against U+E000..=U+FFFF.
-fn jcs_string_order(a: &str, b: &str) -> std::cmp::Ordering {
+pub(crate) fn jcs_string_order(a: &str, b: &str) -> std::cmp::Ordering {
     a.encode_utf16().cmp(b.encode_utf16())
 }
 

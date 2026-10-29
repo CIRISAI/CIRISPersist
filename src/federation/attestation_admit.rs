@@ -774,6 +774,9 @@ where
     // reported (refused once `row_type::ROW_TYPE_ENFORCEMENT` flips). Pure
     // ⇒ AV-76 TIER 1, backend-symmetric.
     crate::federation::row_type::admit_row_type(&row)?;
+    // CIRISPersist#1098 F4/F5 (CC 2.6.1.1.1, rc12) — no explicit-null member,
+    // and `witnesses[]` sorted and unique. Pure ⇒ AV-76 TIER 1.
+    crate::federation::admission::check_envelope_member_shapes(&row)?;
 
     // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
     // admission-gate VALUE validation. Rejects out-of-closed-set values

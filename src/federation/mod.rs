@@ -689,6 +689,11 @@ pub mod governance_policy;
 // get their own malformed_row reasons, on every backend.
 #[cfg(test)]
 mod malformed_reasons_1114_invariants;
+// CIRISPersist#1098 (CC 2.6.1.1.1 and 2.6.1.7, rc12) — I1478–I1481: the
+// explicit-null member, `witnesses[]` as a set, the bare scope token, and
+// CC's 13 signed-object vectors, on every backend.
+#[cfg(test)]
+mod signed_object_1098_invariants;
 // v60.1.0 (docs/V61_TASK_PLAN.md §2 slice B) — the consumer asks, I1360+.
 #[cfg(test)]
 mod v601_asks_invariants;
@@ -12131,6 +12136,10 @@ pub mod malformed_row {
     /// element is neither a canonical lowercase key_id nor the tagged
     /// `canonical:sha256:<hex64>` form. Was a `federation_invalid_argument`.
     pub const SUBJECT_KEY_ID_MALFORMED: &str = "subject_key_id_malformed";
+    /// CIRISPersist#1098 F4 (CC 2.6.1.1.1 and 2.6.1.7, rc12) — an optional
+    /// signed envelope member written as an explicit JSON `null`. An optional
+    /// member that is not carried is absent.
+    pub const ENVELOPE_MEMBER_NULL: &str = "envelope_member_null";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -12153,6 +12162,8 @@ pub mod malformed_row {
         CONTENT_HASH_MISMATCH,
         ENVELOPE_ROW_MEMBER_UNKNOWN,
         SUBJECT_KEY_ID_MALFORMED,
+        // Appended, never inserted: adopters key on the position.
+        ENVELOPE_MEMBER_NULL,
     ];
 }
 

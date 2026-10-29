@@ -2565,7 +2565,9 @@ pub struct Revocation {
     /// `key_id` carries its keystore label in cleartext, so a revoker may
     /// name the subject by digest alone. When present it must name a key
     /// this node holds whose digest is [`Self::revoked_key_sha256_ed25519_raw`]
-    /// — one subject is never named two ways. Absent is bound as JSON `null`.
+    /// — one subject is never named two ways. Absent, the row object omits the
+    /// member, and the signed `revocation_envelope` binds it as JSON `null`
+    /// (the key plane's own contract, CC 2.6.1.1.1's one exception).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_key_id: Option<String>,
     /// v52.0.0 (#784) — **the SUBJECT**: SHA-256 of the revoked key's RAW

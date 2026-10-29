@@ -710,6 +710,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // about the caller's row (its type, a carrier's shape), immediately after
     // the binding on all three backends.
     ("admit_row_type", Class::Gate),
+    // CIRISPersist#1098 F4/F5 (CC 2.6.1.1.1, rc12) — a fact about the caller's
+    // envelope (an explicit-null member, `witnesses[]` out of set order).
+    ("check_envelope_member_shapes", Class::Gate),
     ("check_single_node_owner_admission", Class::Gate),
     // v50.0.0 (CIRISPersist#924, CC 5.4.6) — a minor's owner-binding is
     // refused at `cohort_scope: federation`.

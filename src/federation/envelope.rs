@@ -1313,10 +1313,12 @@ pub fn envelope_vocabulary_sha256() -> String {
 /// the ones who chose otherwise, and it should learn that loudly.
 /// `history_on_join` is **NOT adopted in v49.0.0 — a decision, not drift**: no
 /// consumer reads it, no door would enforce it, and a vocabulary key with no
-/// admission behind it is a promise the substrate does not keep (the room's
-/// DEK epochs already decide what a joiner can read — `from_join` is what
-/// persist enforces today). It joins in the cut that gives it a door, with its
-/// own re-pin.
+/// admission behind it is a promise the substrate does not keep. What a
+/// joiner can read is decided by the tier: for self and family, admission
+/// always runs the re-key walk over every earlier key; for a community, the
+/// joiner receives the current epoch's key and no earlier epoch's (CC 4.4.3.4.1
+/// as of rc12). It joins in the cut that gives it a door, with its own
+/// re-pin.
 /// v51.0.0 (CIRISPersist#937/#938, CC 3.2 T4a/T6 rc6) — RE-PINNED. The
 /// charter's `attach_window_secs`, `witness_cadence_secs` and `witness_quorum`
 /// and the acceptance edge's `attached_head_digest` joined `universal_paths`:

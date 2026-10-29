@@ -2,7 +2,7 @@
 //! registry, pinned at the CIRISConstitution `v1.0-rc9` tag.**
 //!
 //! [`registry`](super::registry) carries the namespace registry and its match
-//! vectors; this module carries the other four CC `manifests/` files persist
+//! vectors; this module carries the other five CC `manifests/` files persist
 //! reads, copied byte for byte with `git show v1.0-rc9:manifests/<file>` at
 //! [`VENDORED_CC_COMMIT`](super::registry::VENDORED_CC_COMMIT) (`5d50c6bb`):
 //!
@@ -12,14 +12,15 @@
 //! | `governance_policy_vectors.json` | 4.5.13, 732 decision vectors | the `two_path` replay (test) |
 //! | `csd4_chain.json` | the CSD/4 chain as data | `scripts/csd4_coverage.py` (report) |
 //! | `topology_vocabulary.json` | the CSD/4 atom vocabulary | `scripts/csd4_coverage.py`, the chain's own vocabulary pin |
+//! | `signed_object_vectors.json` | 2.6.1.7, the 13 signed-object vectors | the signed-object replay (test, CIRISPersist#1098) |
 //!
 //! Until v60 the four were test fixtures under `tests/fixtures/` (v59 / v60
 //! S0), copied from the untagged `rc9` branch; their bytes are the tag's. Only
-//! the policy table is compiled in: the other three have no runtime reader,
+//! the policy table is compiled in: the other four have no runtime reader,
 //! so they live here as data with their pins and are read from disk by the
 //! report script and the witnesses.
 //!
-//! JSON carries no comments, so this doc is the four files' header. Do not
+//! JSON carries no comments, so this doc is the five files' header. Do not
 //! hand-edit them: re-copy from the tag CC names, move each pin below and
 //! [`VENDORED_CC_COMMIT`](super::registry::VENDORED_CC_COMMIT) in the same
 //! commit, and run `scripts/check_vendored_cc.sh <tag>`.
@@ -55,7 +56,13 @@ pub const VENDORED_CSD4_CHAIN_FILE_SHA256: &str =
 pub const VENDORED_TOPOLOGY_VOCABULARY_FILE_SHA256: &str =
     "b0b220507d08424a8ced6f5390fc2a01a9987123530b0cf620be2d34bfc69afc";
 
-/// The four files, `(file under src/federation/namespace/, pinned sha256)`,
+/// SHA-256 of the vendored `signed_object_vectors.json` FILE bytes (CC 2.6.1.7:
+/// the 13 signed-object vectors the replay runs through the attestation door,
+/// CIRISPersist#1098).
+pub const VENDORED_SIGNED_OBJECT_VECTORS_FILE_SHA256: &str =
+    "d79cd49e8a509b4e147ef62f3c00dfd934e6e3af01fc75efc5d32d6991fd95dc";
+
+/// The five files, `(file under src/federation/namespace/, pinned sha256)`,
 /// in the order `scripts/check_vendored_cc.sh` compares them.
 pub const VENDORED_CC_MANIFEST_FILES: &[(&str, &str)] = &[
     (
@@ -70,6 +77,10 @@ pub const VENDORED_CC_MANIFEST_FILES: &[(&str, &str)] = &[
     (
         "topology_vocabulary.json",
         VENDORED_TOPOLOGY_VOCABULARY_FILE_SHA256,
+    ),
+    (
+        "signed_object_vectors.json",
+        VENDORED_SIGNED_OBJECT_VECTORS_FILE_SHA256,
     ),
 ];
 
@@ -155,7 +166,7 @@ mod tests {
     }
 
     /// **I1300** — the vendored bytes are the pinned bytes: every CC file
-    /// persist vendors (the registry, its vectors, the four manifests here and
+    /// persist vendors (the registry, its vectors, the five manifests here and
     /// the six self-roster traces) hashes to its constant, and the compiled-in
     /// policy table is the file on disk.
     #[test]
@@ -163,8 +174,8 @@ mod tests {
         let all = every_pinned_file();
         assert_eq!(
             all.len(),
-            12,
-            "two registry files, four manifests, six traces"
+            13,
+            "two registry files, five manifests, six traces"
         );
         for (_, local, pin) in &all {
             let bytes = std::fs::read(local).unwrap_or_else(|e| panic!("{local:?}: {e}"));
@@ -224,16 +235,15 @@ mod tests {
     /// `federation_set_semantics_unsorted`, `federation_malformed_row` and the
     /// reasons `aggregate_source_duplicate`, `envelope_member_missing`,
     /// `typed_diverges_from_envelope` and `envelope_member_null`; persist emits
-    /// each spelling but `envelope_member_null` (CC 2.6.1.1.1 finding F4,
-    /// CIRISPersist#1098, which docs/V60_TASK_PLAN.md §2 keeps out of v60).
+    /// each (`envelope_member_null` since CIRISPersist#1098 F4).
     /// Two reasons persist emits are named by NO CC text at the pin
     /// (`key_id_fingerprint_mismatch`, CIRISPersist#1103;
     /// `carrier_without_roster_quorum`, CIRISPersist#1104), nor the three CC
     /// rc10 appended after the tag (`content_hash_mismatch`,
     /// `envelope_row_member_unknown`, `subject_key_id_malformed`,
-    /// CIRISPersist#1114, pinned here until the next re-pin). Both lists are
-    /// latches: a re-vendor that names one, or a persist cut that emits
-    /// `envelope_member_null`, reds this test until the line moves.
+    /// CIRISPersist#1114, pinned here until the next re-pin). The second list
+    /// is a latch: a re-vendor that names one reds this test until the line
+    /// moves.
     #[test]
     fn i1308_the_refusal_tokens_at_the_pin() {
         use crate::federation::malformed_row;
@@ -256,9 +266,9 @@ mod tests {
             assert!(named.contains_key(reason), "rc9 names {reason}");
             assert!(malformed_row::ALL.contains(&reason));
         }
-        // Named at rc9, not emitted (#1098 F4; out of v60).
-        assert!(named.contains_key("envelope_member_null"));
-        assert!(!malformed_row::ALL.contains(&"envelope_member_null"));
+        // Named at rc9, emitted since #1098 F4.
+        assert!(named.contains_key(malformed_row::ENVELOPE_MEMBER_NULL));
+        assert!(malformed_row::ALL.contains(&malformed_row::ENVELOPE_MEMBER_NULL));
         // Emitted, named by no CC text at the pin. The last three are CC rc10
         // tokens (2.6.1.7 at `99bf187`, CIRISPersist#1114), after the tag.
         for reason in [

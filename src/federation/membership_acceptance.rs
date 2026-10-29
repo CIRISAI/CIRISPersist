@@ -936,10 +936,11 @@ pub fn proposal_input(
         group_kind_for_scope(scope).unwrap_or("community").into(),
     );
     extra.insert(target_key.into(), group.into());
-    extra.insert(
-        "role".into(),
-        role.map_or(serde_json::Value::Null, Into::into),
-    );
+    // CC 2.6.1.7 (rc12): `role` is OPTIONAL and absent when no role is
+    // offered; an explicit `null` is refused `envelope_member_null`.
+    if let Some(role) = role {
+        extra.insert("role".into(), role.into());
+    }
     let envelope = super::envelope::EnvelopeCore {
         dimension: Some(PROPOSAL_DIMENSION.to_owned()),
         extra,
@@ -995,15 +996,16 @@ pub fn reply_input(proposal: &Attestation, accept: bool) -> super::types::EmitAt
         "proposal_hash".into(),
         proposal.original_content_hash.clone().into(),
     );
+    // The acceptance restates the offered role, and carries none when none
+    // was offered (absent, never `null`).
     if accept {
-        extra.insert(
-            "role".into(),
-            proposal
-                .attestation_envelope
-                .get("role")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-        );
+        if let Some(role) = proposal
+            .attestation_envelope
+            .get("role")
+            .filter(|v| !v.is_null())
+        {
+            extra.insert("role".into(), role.clone());
+        }
     }
     let envelope = super::envelope::EnvelopeCore {
         dimension: Some(
@@ -1089,19 +1091,23 @@ pub mod test_support {
         role: Option<&str>,
         at: DateTime<Utc>,
     ) -> Attestation {
+        let mut envelope = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "dimension": PROPOSAL_DIMENSION,
+            // v54.0.0 (#1034) — the production mapping (`affiliations`
+            // is a room: `community`), not the raw scope.
+            "group_kind": super::group_kind_for_scope(scope).unwrap_or("community"),
+            target_key(scope): group,
+        });
+        // Absent when no role is offered, as the production emitter writes it.
+        if let Some(role) = role {
+            envelope["role"] = role.into();
+        }
         sealed(
             proposer,
             proposer,
             scope,
-            serde_json::json!({
-                "id": uuid::Uuid::new_v4().to_string(),
-                "dimension": PROPOSAL_DIMENSION,
-                // v54.0.0 (#1034) — the production mapping (`affiliations`
-                // is a room: `community`), not the raw scope.
-                "group_kind": super::group_kind_for_scope(scope).unwrap_or("community"),
-                target_key(scope): group,
-                "role": role,
-            }),
+            envelope,
             at,
             Some(at + Duration::seconds(super::MEMBERSHIP_PROPOSAL_MAX_TTL_SECS)),
             vec![member.to_owned()],
@@ -1112,25 +1118,22 @@ pub mod test_support {
     #[must_use]
     pub fn acceptance_row(member: &str, p: &Attestation, at: DateTime<Utc>) -> Attestation {
         let scope = p.cohort_scope.clone();
-        sealed(
-            member,
-            member,
-            &scope,
-            serde_json::json!({
-                "id": uuid::Uuid::new_v4().to_string(),
-                "dimension": ACCEPTANCE_DIMENSION,
-                // v54.0.0 (#1034) — the production mapping (`affiliations`
-                // is a room: `community`), not the raw scope.
-                "group_kind": super::group_kind_for_scope(&scope).unwrap_or("community"),
-                target_key(&scope): p.attestation_envelope.get(target_key(&scope)).cloned(),
-                "references_attestation_id": p.attestation_id,
-                "proposal_hash": p.original_content_hash,
-                "role": p.attestation_envelope.get("role").cloned(),
-            }),
-            at,
-            None,
-            vec![],
-        )
+        let mut envelope = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "dimension": ACCEPTANCE_DIMENSION,
+            // v54.0.0 (#1034) — the production mapping (`affiliations`
+            // is a room: `community`), not the raw scope.
+            "group_kind": super::group_kind_for_scope(&scope).unwrap_or("community"),
+            target_key(&scope): p.attestation_envelope.get(target_key(&scope)).cloned(),
+            "references_attestation_id": p.attestation_id,
+            "proposal_hash": p.original_content_hash,
+        });
+        // The acceptance restates the offered role, and carries none when none
+        // was offered.
+        if let Some(role) = p.attestation_envelope.get("role").filter(|v| !v.is_null()) {
+            envelope["role"] = role.clone();
+        }
+        sealed(member, member, &scope, envelope, at, None, vec![])
     }
 
     async fn founder_of<D: FederationDirectory + ?Sized>(
