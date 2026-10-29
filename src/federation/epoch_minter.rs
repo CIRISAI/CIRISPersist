@@ -41,8 +41,13 @@ fn check_named(minter_key_id: &str) -> Result<(), BlobError> {
 ///    depends on.
 ///
 /// Two candidate sets means the multi-minter state #848 made the key
-/// three-part for: step 2 declines, step 3 applies, and naming the minter
-/// is the only way through. Never picks the first of several.
+/// three-part for. Step 2 then narrows to the candidates that ARE the author
+/// or act for it ([`principals_of`](super::self_collective::principals_of)
+/// names the author): in a pair room every member node mints its own epoch
+/// and wraps it to every member, the viewer's own node included, so the
+/// viewer is granted by two minters and only one of them sealed for this
+/// author. One survivor is the minter; none or several, and step 3 applies.
+/// Never picks the first of several.
 pub async fn resolve<B>(
     backend: &B,
     named: Option<&str>,
@@ -52,7 +57,7 @@ pub async fn resolve<B>(
     author_key_id: &str,
 ) -> Result<String, BlobError>
 where
-    B: BlobStorage + Sync + ?Sized,
+    B: BlobStorage + FederationDirectory + Sync + ?Sized,
 {
     if let Some(named) = named {
         check_named(named)?;
@@ -63,6 +68,23 @@ where
         .await?;
     if let [only] = candidates.as_slice() {
         return Ok(only.clone());
+    }
+    let mut sealers_for_author = Vec::new();
+    for candidate in &candidates {
+        let acts_for_author = candidate == author_key_id
+            || super::self_collective::principals_of(backend, candidate)
+                .await
+                .map_err(|e| {
+                    BlobError::Backend(format!("epoch minter: principals of {candidate}: {e}"))
+                })?
+                .iter()
+                .any(|p| p == author_key_id);
+        if acts_for_author {
+            sealers_for_author.push(candidate);
+        }
+    }
+    if let [only] = sealers_for_author.as_slice() {
+        return Ok((*only).clone());
     }
     Ok(author_key_id.to_owned())
 }

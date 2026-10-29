@@ -1,0 +1,20 @@
+# Mutation scope: `principals_of`, the self-collective's principal fold
+# (v59.1.1). The PR #889 clause asked whether a row existed and not whether
+# the occurrence was revoked. A peer-replicated occurrence row the occurrence
+# never agreed to (#932 H1) dropped the owner that the live owner binding
+# names, and pair-room invitations never reached the invitee's node.
+# I1470-I1472 and I141 (the #889 case) kill all 7 mutants (0 missed, measured
+# 2026-10-27). I121-I124 run too and killed none; they stay in for the fold's
+# active-principal leg, which cargo-mutants generates no operator for.
+# The second link (live chat): `may_receive_group_plane` read only
+# `active_identities_for_occurrence`, so a split-home invitee's node never got
+# the room's record and membership planes; it now reads `principals_of` (I1473,
+# asserted inside I1470 and I1471).
+# The third link (chat turns 3+): `epoch_minter::resolve` fell back to the
+# author when two minters granted the reader (a pair room: both nodes mint
+# epoch 0); it now keeps the minter that acts for the author (I128, I1475).
+# Grammar: docs/MUTATION_TESTING.md.
+tests: test(/i147[0-2]|i398|occurrence_principal_invariants::run::|membership_acceptance|epoch_minter_invariants::run::/)
+src/federation/self_collective.rs principals_of
+src/federation/replication_audience.rs may_receive_group_plane
+src/federation/epoch_minter.rs resolve

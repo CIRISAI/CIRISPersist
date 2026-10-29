@@ -826,8 +826,9 @@ where
 ///   revocation, the removed member): yes;
 /// - else no.
 ///
-/// Node-of here is a principal binding (`active_identities_for_occurrence` or
-/// the key itself), not the per-node content allow list: a group's roster is
+/// Node-of here is a principal binding
+/// ([`principals_of`](super::self_collective::principals_of), or the key
+/// itself), not the per-node content allow list: a group's roster is
 /// not content, and a member's node must be able to judge it.
 pub async fn may_receive_group_plane<D>(
     dir: &D,
@@ -842,8 +843,14 @@ where
     if is_public_group(dir, group).await? {
         return Ok(Verdict::Yes(Reason::Public));
     }
-    let mut principals: HashSet<String> = dir
-        .active_identities_for_occurrence(recipient)
+    // v59.1.1 — the SAME principal fold as the proposal branch and the send
+    // set: `principals_of` (active occurrences, the node's owner unless an
+    // effective revocation says otherwise, a user key itself). Reading only
+    // `active_identities_for_occurrence` here dropped a split-home node whose
+    // login occurrence row was never agreed (#932 H1): the invitation reached
+    // it, but the group's record and membership planes never did, so the
+    // joiner never learned it was seated (CIRISServer live chat).
+    let mut principals: HashSet<String> = super::self_collective::principals_of(dir, recipient)
         .await?
         .into_iter()
         .collect();

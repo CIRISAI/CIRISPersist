@@ -363,6 +363,88 @@ pub(crate) mod bodies {
             .unwrap();
         minters.sort();
         assert_eq!(minters.len(), 2, "I128: two minters now grant this node");
+        // v59.1.1 — of two minters, the one that acts for the author is the
+        // sealer: `other` is nobody's occurrence, node A is alice's.
+        assert_eq!(
+            crate::federation::epoch_minter::resolve(
+                b.as_ref(),
+                None,
+                &l.comm,
+                0,
+                &l.node_b,
+                &l.alice,
+            )
+            .await
+            .unwrap(),
+            l.node_a,
+            "I128: of two minters, the one that acts for the author is derived"
+        );
+        // I1475 — the pair-room shape: the VIEWER's own node minted the same
+        // epoch and wrapped it to itself. It acts for bob, not for alice, so
+        // a row alice authored still derives node A.
+        b.as_ref()
+            .community_dek_put_member_grant(
+                &l.comm,
+                &l.node_b,
+                0,
+                &l.node_b,
+                crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2,
+                "b3du",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            b.community_dek_minters_granting(&l.comm, 0, &l.node_b)
+                .await
+                .unwrap()
+                .len(),
+            3,
+            "I1475: the viewer's own node is a third minter granting it"
+        );
+        assert_eq!(
+            crate::federation::epoch_minter::resolve(
+                b.as_ref(),
+                None,
+                &l.comm,
+                0,
+                &l.node_b,
+                &l.alice,
+            )
+            .await
+            .unwrap(),
+            l.node_a,
+            "I1475: the viewer's own epoch is not the author's sealer"
+        );
+        // No candidate acts for the author: falls back, never guesses.
+        assert_eq!(
+            crate::federation::epoch_minter::resolve(
+                b.as_ref(),
+                None,
+                &l.comm,
+                0,
+                &l.node_b,
+                &third,
+            )
+            .await
+            .unwrap(),
+            third,
+            "I128: no minter acts for the author, so it falls back to the author"
+        );
+        // Two candidates act for the author: still no guess.
+        b.as_ref()
+            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: l.alice.clone(),
+                occurrence_key_id: other.clone(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: None,
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap();
         assert_eq!(
             crate::federation::epoch_minter::resolve(
                 b.as_ref(),
@@ -375,7 +457,7 @@ pub(crate) mod bodies {
             .await
             .unwrap(),
             l.alice,
-            "I128: ambiguous derivation falls back to the author, never guesses"
+            "I128: two minters act for the author, so it falls back to the author"
         );
         assert_eq!(
             crate::federation::epoch_minter::resolve(

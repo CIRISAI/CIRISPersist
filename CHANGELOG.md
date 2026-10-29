@@ -7,6 +7,81 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [59.1.1] - 2026-10-27
+
+### Fixed — a node's owner is dropped only by a REVOCATION, not by an unagreed occurrence row (pair-room invitations, live chat)
+
+- **The shape** (reproduced by CIRISServer on v59.1.0; live run CIRISAgent
+  40585063240). The creator of a pair room holds the invitee's announced
+  owner binding `delegates_to(invitee → invitee_node)`, so
+  `owner_of(invitee_node) = invitee`. It also holds the invitee's
+  login-ceremony occurrence row `{identity: invitee, occurrence: invitee_node}`,
+  which was replicated to it and is signed by the identity only. By #932 (H1)
+  that row resolves nothing: the occurrence never agreed to it, so
+  `active_identities_for_occurrence(invitee_node)` is empty.
+  `self_collective::principals_of` then dropped the owner too. PR #889's
+  clause ("a revoked occurrence does not get its owner back through the owner
+  binding") tested whether any held occurrence row named the owner, not
+  whether the occurrence had been revoked. The node's principals came out
+  empty, and `may_receive(invitee_node, membership:proposal:v1)` was
+  `No(NotInAudience)`, so the invitation never reached the invitee.
+- **The fix.** The owner binding no longer lifts `k` once a held
+  identity-occurrence revocation naming `(owner, k)` is effective. If `k` was
+  re-established after that by an agreed occurrence, the active fold still
+  carries the owner. A unilateral row
+  that never resolved is not evidence either way, so the live owner binding
+  lifts the node to its owner. #889's case is unchanged: a revoked device with
+  a live owner binding still has no principal. The same fold serves
+  `speaks_for`, the send set, the hold path and the read gate.
+- **Witnesses** (`replication_audience_invariants`, sqlite and postgres):
+  - **I1470**, the Server shape: `principals_of(invitee_node) = [invitee]`
+    and the proposal reaches the node with `Yes(RefersTo)`. It was red on
+    v59.1.0 with `left: []`.
+  - **I1471**, the #889 case kept: a revoked occurrence (agreed or unagreed)
+    beside a live owner binding has no principal and does not receive the
+    invitation.
+  - **I1472**, the owner is kept in five cases: an agreed, active
+    occurrence; a KEM-less node; an unagreed row whose only revocation is of
+    another device; an unagreed row whose revocation is future-dated; and an
+    occurrence that was revoked and then agreed again after the revocation.
+  - **I141** and **I392** stay green.
+
+### Fixed — a pair-room blob binds to the author's sealer when two minters grant the reader (live chat, turns 3+)
+
+- **The shape** (CIRISServer local mesh, build 12). In a pair room both member
+  nodes mint their own epoch 0 and wrap it to every member, the reader's own
+  node included. A blob adopted after the `key_grant` set arrived names no
+  minter, so `epoch_minter::resolve` derives it from the sets that granted the
+  reader. Two sets granted it, so the derivation declined and fell back to the
+  author: a person key that holds no DEK. The binding then pointed at a key
+  with no wraps, and every later turn read `not_granted` on both sides.
+- **The fix.** Of several granting minters, `resolve` keeps those that ARE
+  the author or act for it (`principals_of` names the author: an agreed
+  occurrence or the owner binding). One survivor is the minter. With none or
+  several, the author fallback is unchanged and nothing is guessed.
+- **Witnesses** (`epoch_minter_invariants`, sqlite and postgres):
+  - **I128**, extended: of two minters, the one that acts for the author is
+    derived. With no candidate acting for the author, or two, it falls back to
+    the author. The case is red without the fix.
+  - **I1475**, the pair-room shape: the reader's own node minted the same
+    epoch and wrapped it to itself, and a row the peer authored still derives
+    the peer's node.
+
+### Security — five advisories published after v59.1.0 (deny.toml, Cargo.lock)
+
+- tokio 1.54.1 (RUSTSEC-2026-0386), ctutils 0.4.6 (RUSTSEC-2026-0385),
+  rustls-webpki 0.103.16 (RUSTSEC-2026-0382, distrusted intermediates) and
+  webpki-roots 1.0.11 (RUSTSEC-2026-0381, distrusted emSign roots) are
+  updated in the lockfile.
+- crypto-bigint 0.5.5 (RUSTSEC-2026-0387) is ignored, as in v60.0.0: it is
+  transitive only via CIRISVerify's p256/k256 and persist's own code calls
+  neither curve; #1127 tracks the verify bump that clears it.
+
+### Adoption
+
+- No break. No signature, wire or schema change. Server and Edge re-pin
+  59.1.1 and the invitation reaches the invitee's node.
+
 ## [59.1.0] - 2026-10-20
 
 ### Changed — the production genesis bundle is the v4 amend (CIRISPersist#1106, CC 5.3.4)

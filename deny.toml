@@ -93,6 +93,12 @@ ignore = [
     # fix and cargo picks it up. Was blocking pre-push cargo-deny → forcing
     # `--no-verify` bypasses (which let a rustfmt slip reach CI on #323).
     "RUSTSEC-2026-0190",  # anyhow downcast_mut unsound — transitive via candle NER stack
+    # v59.1.1 — crypto-bigint 0.5.5 (RUSTSEC-2026-0387, secret-dependent branches)
+    # is fixed only in 0.7.6, which elliptic-curve 0.13 cannot take; it is
+    # transitive only via p256 0.13 and k256 0.13 in ciris-crypto / ciris-keyring
+    # (CIRISVerify); persist's own src/ calls neither curve (CIRISPersist#1127
+    # tracks the verify bump). Same ignore as v60.0.0.
+    "RUSTSEC-2026-0387",  # crypto-bigint 0.5 timing — p256/k256 via CIRISVerify, no persist use
     # v58.0.0 — two advisories published after v57.0.0, neither upgradable from
     # persist. `zip` < 9 keeps SUID/SGID bits on EXTRACTION; it is transitive
     # only via candle-core (model-weight loading) and ciris-verify-core, both

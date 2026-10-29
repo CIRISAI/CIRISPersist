@@ -50,12 +50,25 @@ where
             // not active now ⇒ the owner is not k's principal. A node the
             // owner never bound as an occurrence (KEM-less) keeps its owner:
             // ownership is then the only fact, and it is a live one.
-            let ever_bound = dir
-                .list_identity_occurrences_by_occurrence_key(k)
+            //
+            // v59.1.1 — the clause asks for the REVOCATION, not for a row.
+            // A held `{identity: owner, occurrence: k}` row the occurrence
+            // never agreed to (#932 H1: the owner's login-ceremony row,
+            // replicated, signed by the identity alone) resolves nothing in
+            // `active_identities_for_occurrence` — it is no evidence either
+            // way, not a revocation. Testing "a row exists" dropped the owner
+            // of every such node, and a pair-room invitation addressed to it
+            // was NotInAudience on the creator. Only an effective revocation
+            // naming `(owner, k)` stops the owner binding from lifting `k`; an
+            // occurrence re-established after it (agreed, asserted later) is
+            // already in `out` through the active fold.
+            let now = chrono::Utc::now();
+            let revoked = dir
+                .list_identity_occurrence_revocations_for(&owner)
                 .await?
                 .iter()
-                .any(|o| o.identity_key_id == owner);
-            if !ever_bound || out.contains(&owner) {
+                .any(|r| r.occurrence_key_id == k && r.effective_at <= now);
+            if !revoked {
                 out.push(owner);
             }
         }
