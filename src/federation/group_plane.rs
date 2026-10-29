@@ -390,22 +390,6 @@ impl GroupRowLink {
             effective_at: Some(effective_at),
         }
     }
-
-    /// The link as one sortable string (the rebuild's row order).
-    #[must_use]
-    pub fn sort_key(&self) -> String {
-        format!(
-            "{}\u{1f}{}\u{1f}{}",
-            self.group_key_id,
-            self.member_key_id.as_deref().unwrap_or(""),
-            self.effective_at
-                .map(|t| {
-                    super::admission::truncate_to_substrate_resolution(t)
-                        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
-                })
-                .unwrap_or_default()
-        )
-    }
 }
 
 impl GroupSigned {
@@ -902,7 +886,7 @@ pub fn render_group_projection(signed: &GroupSigned, attestation_id: Option<&str
 }
 
 /// The from-rows rebuild of one group table: every row of the table's
-/// families and kind, read back and rendered, in primary-key order; and the
+/// families and kind, read back and rendered, in rendering order; and the
 /// live table's signed rows rendered the same way. A signed record held
 /// without its row, a row whose record is not held, or one member that
 /// differs is a red.
@@ -912,34 +896,24 @@ pub fn group_projection_rebuild(
     live: Vec<(GroupSigned, Option<String>)>,
     rows: &[Attestation],
 ) -> super::silo_projection::ProjectionRebuild {
-    let mut live: Vec<(String, String)> = live
+    // Each rendering leads with the record's own key members, so the sort is
+    // a total order that needs no second key.
+    let mut live: Vec<String> = live
         .into_iter()
         .filter(|(s, _)| s.table() == table)
-        .map(|(s, a)| {
-            (
-                s.link().sort_key(),
-                render_group_projection(&s, a.as_deref()),
-            )
-        })
+        .map(|(s, a)| render_group_projection(&s, a.as_deref()))
         .collect();
-    let mut rebuilt: Vec<(String, String)> = rows
+    let mut rebuilt: Vec<String> = rows
         .iter()
         .filter_map(|row| {
             let signed = group_signed_of_row(row).ok().flatten()?;
-            (signed.table() == table).then(|| {
-                (
-                    signed.link().sort_key(),
-                    render_group_projection(&signed, Some(&row.attestation_id)),
-                )
-            })
+            (signed.table() == table)
+                .then(|| render_group_projection(&signed, Some(&row.attestation_id)))
         })
         .collect();
     live.sort();
     rebuilt.sort();
-    super::silo_projection::ProjectionRebuild {
-        live: live.into_iter().map(|(_, r)| r).collect(),
-        rebuilt: rebuilt.into_iter().map(|(_, r)| r).collect(),
-    }
+    super::silo_projection::ProjectionRebuild { live, rebuilt }
 }
 
 /// v61 (CIRISPersist#991) — what a backend does for the group plane.
@@ -1539,6 +1513,58 @@ mod tests {
     fn every_table_is_one_projection() {
         for t in GroupPlaneTable::ALL {
             assert_eq!(GroupPlaneTable::of_projection(t.projection()), Some(t));
+        }
+    }
+
+    /// The wire names CC cites (posted on CIRISPersist#991): the envelope
+    /// member each family's object rides under, the kind spelling and its
+    /// cohort target, and the table names the projections are read from.
+    #[test]
+    fn the_wire_names_are_pinned() {
+        assert_eq!(GroupPlaneFamily::Roster.member(), "group_record");
+        assert_eq!(GroupPlaneFamily::Widening.member(), "widening");
+        assert_eq!(GroupPlaneFamily::Removal.member(), "revocation");
+        assert_eq!(GroupPlaneFamily::Resignation.member(), "revocation");
+        assert_eq!(GroupKind::Family.as_str(), "family");
+        assert_eq!(GroupKind::Community.as_str(), "community");
+        assert_eq!(GroupKind::Family.target_member(), "family_key_id");
+        assert_eq!(GroupKind::Community.target_member(), "community_key_id");
+        assert_eq!(GroupKind::of_str("family"), Some(GroupKind::Family));
+        assert_eq!(GroupKind::of_str("community"), Some(GroupKind::Community));
+        assert_eq!(GroupKind::of_str("self"), None);
+        for (t, name) in [
+            (GroupPlaneTable::Families, "federation_families"),
+            (GroupPlaneTable::Communities, "federation_communities"),
+            (
+                GroupPlaneTable::FamilyRevocations,
+                "federation_family_membership_revocations",
+            ),
+            (
+                GroupPlaneTable::CommunityRevocations,
+                "federation_community_membership_revocations",
+            ),
+            (
+                GroupPlaneTable::FamilyWidenings,
+                "federation_family_membership_widenings",
+            ),
+            (
+                GroupPlaneTable::CommunityWidenings,
+                "federation_community_membership_widenings",
+            ),
+        ] {
+            assert_eq!(t.as_str(), name);
+            assert_eq!(t.projection().as_str(), name);
+        }
+        // Every family's id domain is its own: one object never names two
+        // rows of different families.
+        let domains: std::collections::BTreeSet<&[u8]> = GroupPlaneFamily::ALL
+            .iter()
+            .map(|f| f.id_domain())
+            .collect();
+        assert_eq!(domains.len(), GroupPlaneFamily::ALL.len());
+        for f in GroupPlaneFamily::ALL {
+            let d = std::str::from_utf8(f.id_domain()).unwrap();
+            assert_eq!(d, format!("ciris:{}:", f.dimension()));
         }
     }
 }
