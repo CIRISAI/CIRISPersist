@@ -41181,11 +41181,14 @@ mod tests {
             "federation apply keyed on a moderator-less community must refuse, got {err:?}"
         );
         assert_eq!(err.kind(), "federation_community_no_moderator");
+        // v61 (CIRISPersist#991): the community's own record row is the only
+        // row about it.
         assert!(backend
             .all_attestations_for(&comm_no)
             .await
             .unwrap()
-            .is_empty());
+            .iter()
+            .all(crate::federation::group_plane::is_group_plane_row));
 
         // (2) Same shape onto the MODERATORED community → ADMITTED + stored.
         backend
@@ -41200,7 +41203,13 @@ mod tests {
             .await
             .expect("moderatored community continues to federate");
         assert_eq!(
-            backend.all_attestations_for(&comm_ok).await.unwrap().len(),
+            backend
+                .all_attestations_for(&comm_ok)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| !crate::federation::group_plane::is_group_plane_row(r))
+                .count(),
             1
         );
 

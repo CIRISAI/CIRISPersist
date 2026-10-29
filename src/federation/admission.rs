@@ -278,6 +278,8 @@ pub mod dimension_rejected_reason {
         REGISTERED_FAMILY_HELD_SHUT_REASON,
         LEDGER_BINDING_REASON,
         crate::federation::invariant::INVARIANT_SELF_EMISSION_REASON,
+        // v61 (CIRISPersist#991) — a group-plane dimension outside its door.
+        crate::federation::group_plane::GROUP_PLANE_ROW_SHAPE_REASON,
     ];
 
     /// The tokens a later re-offer of the same row can turn into an
