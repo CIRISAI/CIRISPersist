@@ -7,6 +7,24 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
 ## [Unreleased]
 
+### Adoption
+
+- CIRISVerify 22 is required: `ciris-keyring`, `ciris-verify-core` and `ciris-crypto` are pinned at tag v22.0.0, and the wheel declares `ciris-verify>=22.0.0,<23`. A host that pins verify itself must move to 22 with persist.
+- `ciris_verify_core::holonomic` is `ciris_verify_core::substrate` in verify 22, with no alias. A consumer that names verify's module directly must rename the path; persist's own re-export (`witness::admit::WitnessPreimageBuilder`) keeps its name.
+- `federation::genesis::bundle::authorization_digest` returns the same 32 bytes for every bundle; a bundle it cannot project is refused `Error::GenesisBundleInvalid` in every case (a canonicalization failure was `Error::InvalidArgument`).
+
+### Changed
+
+- The genesis bundle's authorization digest is CIRISVerify's `genesis_bundle::authorization_digest`; persist's own projection is removed and the threshold policy (`max(carried M, strict majority of the node's own roster)`) stays in persist. A byte-identity test pins the digest against verify's seven genesis-bundle vectors.
+
+### Fixed
+
+- A node identity whose software-tier key a pre-20.3.0 keyring archived as `*.superseded-pre-v8` (leaving no live key) reopens with the same key instead of failing to boot; verify 22 restores the archived files on open.
+
+### Security
+
+- RUSTSEC-2026-0387 cleared: verify 22 moves k256/p256 to 0.14, the tree carries crypto-bigint 0.7, and the advisory ignore is removed.
+
 ## [60.1.0] - 2026-10-27
 
 ### Adoption
