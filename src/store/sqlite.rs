@@ -27587,6 +27587,29 @@ impl crate::federation::group_plane::GroupPlaneStore for SqliteBackend {
         Ok(linked.is_some())
     }
 
+    async fn drop_group_projection_row(
+        &self,
+        link: crate::federation::group_plane::GroupRowLink,
+        attestation_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let table = link.table.as_str();
+        let (pk, mut binds) = sqlite_group_link_where(&link);
+        let n = binds.len();
+        binds.push(SqlValue::Text(attestation_id.to_owned()));
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE {pk} AND attestation_id = ?{}",
+                    n + 1
+                ),
+                params_from_iter(binds.iter()),
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("drop group projection row: {e}")))
+    }
+
     async fn read_group_plane(
         &self,
         table: crate::federation::group_plane::GroupPlaneTable,

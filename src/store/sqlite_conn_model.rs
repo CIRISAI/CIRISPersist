@@ -756,6 +756,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v61 (CIRISPersist#991) — the group plane's executor.
     ("read_group_object", ConnClass::Read),
     ("link_group_plane_row", ConnClass::Write),
+    ("drop_group_projection_row", ConnClass::Write),
     ("read_group_plane", ConnClass::Read),
     ("store_planned_revocation", ConnClass::Write),
     ("index_stored_key_row", ConnClass::Read),

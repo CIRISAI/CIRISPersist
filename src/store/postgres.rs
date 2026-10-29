@@ -510,6 +510,36 @@ impl crate::federation::group_plane::GroupPlaneStore for PostgresBackend {
         Ok(true)
     }
 
+    async fn drop_group_projection_row(
+        &self,
+        link: crate::federation::group_plane::GroupRowLink,
+        attestation_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        let (pk, binds) = pg_group_link_where(&link, 2);
+        let mut refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&attestation_id];
+        refs.extend(
+            binds
+                .iter()
+                .map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)),
+        );
+        client
+            .execute(
+                &format!(
+                    "DELETE FROM cirislens.{} WHERE {pk} AND attestation_id = $1",
+                    link.table.as_str()
+                ),
+                &refs,
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("drop group projection row: {e}")))?;
+        Ok(())
+    }
+
     async fn read_group_plane(
         &self,
         table: crate::federation::group_plane::GroupPlaneTable,

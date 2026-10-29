@@ -859,15 +859,11 @@ pub const REGISTERED_FAMILIES_HELD_SHUT: &[(&str, &str)] = &[
     // `key_grant:` was held here by the rc7 re-vendor (A0) until v55 slice B
     // built its door: the per-recipient row with CC 3.3.2's sealer rule,
     // `key_grant::check_key_grant_row_admission` (CIRISPersist#989).
-    // CC 3.1.3.2 rc7: three new `membership:{stage}` leaves — widening and
+    // CC 3.1.3.2 rc7: three `membership:{stage}` leaves — widening and
     // removal "cosigned under the group's consensus_protocol", resignation
-    // "the leaving member". rc6's closed vocabulary refused all three;
-    // `membership_acceptance` gates only proposal / acceptance / decline, so
-    // the re-vendor would admit these from any signer. The cosigned-row doors
-    // are CIRISPersist#991's.
-    ("membership:widening:", "CIRISPersist#991"),
-    ("membership:removal:", "CIRISPersist#991"),
-    ("membership:resignation:", "CIRISPersist#991"),
+    // "the leaving member" — were held here from the rc7 re-vendor until v61
+    // built their door (CIRISPersist#991): `group_plane::apply_group_plane_row`
+    // takes each row to the typed door of the object it carries.
     // CC 3.1.5 rc8 (the Retirement Standard, CC 7.5.5) — five families, each
     // reserved to a named emitter (the agent, its custodian, a seated Wise
     // Authority, the steward). Unregistered open vocabulary at rc7, so any
@@ -10553,6 +10549,14 @@ pub async fn check_withdraws_admission_at(
     // not a withdrawal of holders". The retired `holds_bytes` carve-out that
     // let a moderation key withdraw a third party's claim is gone with the
     // carrier; a holder's own retraction falls through to rule 1 below.
+    // v61 (CIRISPersist#991, CC 2.4.1.1) — a group-plane row (a cosigned
+    // roster event) is retracted by a cosigned `withdraws` under the same
+    // protocol; rules 1-4 do not decide it.
+    if let Some(rule) =
+        crate::federation::group_plane::check_cosigned_withdraws(directory, row, &target).await?
+    {
+        return Ok(Some(rule));
+    }
     super::custody_ack::check_custody_withdraws_signer(row, &target)?;
     // v25.x (CIRISPersist#578, CIRISConstitution rc3 CC 3.2) — **the recovery
     // gate, in BOTH directions.**
@@ -18487,6 +18491,7 @@ pub async fn check_reserved_prefix_admission(
     if let Some(dim) = envelope_dimension(&row.attestation_envelope) {
         check_namespace_family_registered(dim)?;
         check_registered_family_not_held(dim)?;
+        crate::federation::group_plane::check_generic_row_dimension(at, dim)?;
     }
     // v58.0.0 (CC 3.1.7 R4 rc8) — the family's declared polarity, read from
     // the same registry row as the gate above, at the same door.
@@ -21871,6 +21876,11 @@ mod tests {
             "membership:proposal:v1",
             "membership:acceptance:v1",
             "membership:decline:v1",
+            // v61 (#991) built the group-plane door.
+            "membership:widening:v1",
+            "membership:removal:v1",
+            "membership:resignation:v1",
+            "group:roster:v1",
             "key:record:v1",
             "custody:ack:v1",
             "key_granted:v1",

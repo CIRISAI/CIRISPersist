@@ -244,6 +244,13 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_revocation_bound_lowers", Class::Gate),
     ("revocation_row", Class::Plumbing),
     ("apply_key_plane_row", Class::Delegates),
+    // v61 (CIRISPersist#991) — the group-plane door: the canonical-row check,
+    // then the typed door of the object the row carries (its own gates).
+    ("apply_group_plane_row", Class::Delegates),
+    // The projection follows an admitted cosigned retraction: removes the
+    // retracted roster event's projection row. The authority was the
+    // withdraws gate's; this fails only on storage.
+    ("after_withdraws", Class::Plumbing),
     ("occurrence_withdrawal_of", Class::Plumbing),
     ("put_identity_occurrence_revocation_local", Class::Plumbing),
     ("rehome_legacy_key_plane", Class::Plumbing),

@@ -944,6 +944,14 @@ pub(crate) trait GroupPlaneStore: super::FederationDirectory {
         row: Option<Attestation>,
     ) -> Result<bool, Error>;
 
+    /// Remove the projection row `link` names when it points at
+    /// `attestation_id` (a retracted roster event). Writes nothing otherwise.
+    async fn drop_group_projection_row(
+        &self,
+        link: GroupRowLink,
+        attestation_id: &str,
+    ) -> Result<(), Error>;
+
     /// Every SIGNED projection row of `table` (`authority_key_id` set), as
     /// the signed object it stores and the `attestation_id` it names; and
     /// every row on the attestation plane of the table's families.
@@ -1004,6 +1012,351 @@ where
     Ok(GroupRowSync::Linked)
 }
 
+/// Which door a group-plane row arrived through: a community record's door
+/// decides on it whether the CC 3.2 infrastructure gate runs (#931).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupRowDoor {
+    /// The local write path (`put_attestation`, authored here).
+    Local,
+    /// The replicated path (`apply_replicated_attestation`, a sync).
+    Replicated,
+}
+
+/// What [`apply_group_plane_row`] did with a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupPlaneApplied {
+    /// The object landed (its row with it).
+    Changed,
+    /// This node already holds exactly this row.
+    Unchanged,
+    /// Well-formed, not applied; the held state is untouched. The token is
+    /// the typed door's own refusal reason.
+    Refused(&'static str),
+}
+
+/// v61 (CIRISPersist#991) — **a group-plane row's signature rule, at a
+/// receiver**: the row is exactly the row its own object plans to, and the
+/// object's base scrub and every co-signature verify over the object's own
+/// signed bytes against this node's registered keys (the typed door's
+/// verification, ahead of any write). `Ok(false)` for a row that is not the
+/// group plane's.
+///
+/// # Errors
+///
+/// [`canonical_object_of_row`]'s refusals; the typed verification's.
+pub(crate) async fn verify_plane_row<F>(directory: &F, row: &Attestation) -> Result<bool, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    let Some(signed) = canonical_object_of_row(row)? else {
+        return Ok(false);
+    };
+    use super::tier_ingest as ti;
+    match &signed {
+        GroupSigned::Family(s) => ti::verify_family_admission(directory, s).await?,
+        GroupSigned::Community(s) => ti::verify_community_admission(directory, s).await?,
+        GroupSigned::FamilyRevocation(s) => {
+            ti::verify_family_membership_revocation_admission(directory, s).await?;
+        }
+        GroupSigned::CommunityRevocation(s) => {
+            ti::verify_community_membership_revocation_admission(directory, s).await?;
+        }
+        GroupSigned::FamilyWidening(s) => {
+            ti::verify_family_membership_widening_admission(directory, s).await?;
+        }
+        GroupSigned::CommunityWidening(s) => {
+            ti::verify_community_membership_widening_admission(directory, s).await?;
+        }
+    }
+    Ok(true)
+}
+
+/// v61 (CIRISPersist#991) — **the group-plane door on the attestation
+/// plane**: where a `group:roster:v1` or `membership:{widening,removal,
+/// resignation}:v1` row arriving through `put_attestation` or
+/// `apply_replicated_attestation` goes, ahead of the generic plan. The row
+/// is re-derived from the object it carries (one byte off is a refusal), and
+/// the object goes through the SAME typed door a local `put_*` runs: its
+/// authorship, the roster authority under the group's `consensus_protocol`
+/// at the row's signed instant, the founder gates. That door stores the
+/// object and syncs its row, which is this row.
+///
+/// # Errors
+///
+/// [`canonical_object_of_row`]'s refusals; the typed door's.
+pub(crate) async fn apply_group_plane_row<D>(
+    dir: &D,
+    row: &Attestation,
+    door: GroupRowDoor,
+) -> Result<GroupPlaneApplied, Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    // A byte-identical re-offer of a held row settles ahead of every verify
+    // (the #672 rule): one signed object, one id, one row.
+    if let Some(held) = dir.get_attestation(&row.attestation_id).await? {
+        if held.persist_row_hash == super::types::compute_persist_row_hash(row)? {
+            return Ok(GroupPlaneApplied::Unchanged);
+        }
+    }
+    let Some(signed) = canonical_object_of_row(row)? else {
+        return Err(Error::InvalidArgument(format!(
+            "row {} is not a group-plane row",
+            row.attestation_id
+        )));
+    };
+    match signed {
+        GroupSigned::Family(s) => dir.put_family(s).await?,
+        GroupSigned::Community(s) => match door {
+            GroupRowDoor::Local => dir.put_community(s).await?,
+            GroupRowDoor::Replicated => {
+                use super::group_amendment::ReplicatedCommunityOutcome as O;
+                match dir.apply_replicated_community(s).await? {
+                    O::Inserted | O::Superseded | O::Unchanged => {}
+                    O::Refused { reason } => {
+                        return Ok(GroupPlaneApplied::Refused(match reason {
+                            super::group_amendment::ReplicatedCommunityRefusal::ConflictingRecord => {
+                                "conflicting_record"
+                            }
+                            super::group_amendment::ReplicatedCommunityRefusal::DegradesConformance => {
+                                "degrades_conformance"
+                            }
+                        }));
+                    }
+                }
+            }
+        },
+        GroupSigned::FamilyRevocation(s) => dir.put_family_membership_revocation(s).await?,
+        GroupSigned::CommunityRevocation(s) => dir.put_community_membership_revocation(s).await?,
+        GroupSigned::FamilyWidening(s) => dir.put_family_membership_widening(s).await?,
+        GroupSigned::CommunityWidening(s) => dir.put_community_membership_widening(s).await?,
+    }
+    // The typed door stored the object and synced its row from the stored
+    // bytes: this row, unless the store kept a different object under the
+    // same key (a re-offer of a held roster event signed differently, or an
+    // older version of a superseded record).
+    Ok(
+        if dir.get_attestation(&row.attestation_id).await?.is_some() {
+            GroupPlaneApplied::Changed
+        } else {
+            GroupPlaneApplied::Refused("held_object_differs")
+        },
+    )
+}
+
+/// v61 (CIRISPersist#991) — the reason a row naming a group-plane dimension
+/// outside the group-plane door carries ([`check_generic_row_dimension`]).
+pub const GROUP_PLANE_ROW_SHAPE_REASON: &str = "group_plane_row_shape";
+
+/// v61 (CIRISPersist#991) — **a group-plane dimension is admitted only as a
+/// minted `scores` row through its door.** The generic attestation plan asks
+/// this of every row's `dimension`: a `delegates_to` or any other type naming
+/// `group:roster:v1` or a `membership:{widening,removal,resignation}:v1`
+/// dimension is refused (the latch these dimensions were held behind until
+/// the door existed). A structural retraction (`withdraws`, `recants`) may
+/// name its target's dimension; its authority is
+/// [`check_cosigned_withdraws`]'s.
+///
+/// # Errors
+///
+/// [`Error::DimensionRejected`] with [`GROUP_PLANE_ROW_SHAPE_REASON`].
+pub fn check_generic_row_dimension(attestation_type: &str, dimension: &str) -> Result<(), Error> {
+    if GroupPlaneFamily::of_dimension(dimension).is_none()
+        || attestation_type == attestation_type::WITHDRAWS
+        || attestation_type == attestation_type::RECANTS
+    {
+        return Ok(());
+    }
+    Err(Error::DimensionRejected {
+        dimension: dimension.to_owned(),
+        reason: GROUP_PLANE_ROW_SHAPE_REASON,
+    })
+}
+
+/// v61 (CIRISPersist#991, CC 2.4, CC 3.1.3) — the refusal of a `withdraws`
+/// naming a `group:roster:v1` row: a record changes by a supersede (its next
+/// version, under its protocol) and ends by dissolution, so its retraction
+/// has no projection to move. Refused by name, never admitted inert.
+pub const GROUP_RECORD_WITHDRAWS_REFUSED: &str = "group_record_withdraws_refused";
+
+/// v61 (CIRISPersist#991; CC 2.4.1.1, CC 3.1.3.2) — **the retraction of a
+/// cosigned row is a cosigned `withdraws` under the same protocol.** `None`
+/// when `target` is not a group-plane row (the other rules decide).
+///
+/// - A resignation is the leaving member's alone ([`ConsensusSource::Signer`]):
+///   only its signer withdraws it (rule 1).
+/// - A widening or a removal is the group's ([`ConsensusSource::Group`]): the
+///   `withdraws` row's base scrub and its `additional_scrubs[]`, counted by
+///   the ONE predicate ([`super::reverse_quorum::count_distinct_roster_scrubs`])
+///   over the group's active roster, must satisfy the group's
+///   `consensus_protocol` ([`super::consensus::evaluate`], in the direction
+///   the retraction moves the roster). CC 2.4.1.1 rules 1 and 2 do not apply:
+///   the author alone does not retract the group's decision. Recorded as rule
+///   1 when the base signer is the target's, else 4 (an authority other than
+///   the producer).
+/// - A group's record is refused ([`GROUP_RECORD_WITHDRAWS_REFUSED`]).
+///
+/// # Errors
+///
+/// [`Error::RosterAuthorityUnauthorized`] (`roster_consensus_insufficient`)
+/// when the counted signers do not meet the protocol;
+/// [`Error::WithdrawsNotAdmitted`] for a resignation withdrawn by another key;
+/// [`Error::InvalidArgument`] for a group record.
+pub(crate) async fn check_cosigned_withdraws(
+    directory: &dyn super::FederationDirectory,
+    row: &Attestation,
+    target: &Attestation,
+) -> Result<Option<u8>, Error> {
+    let Some(family) = GroupPlaneFamily::of_row(target) else {
+        return Ok(None);
+    };
+    let Some(signed) = group_signed_of_row(target)? else {
+        return Ok(None);
+    };
+    let issuer = row.attesting_key_id.as_str();
+    let rule = if issuer == target.attesting_key_id {
+        1
+    } else {
+        4
+    };
+    match (family, consensus_source_for(family.dimension())) {
+        (GroupPlaneFamily::Roster, _) => Err(Error::InvalidArgument(format!(
+            "{GROUP_RECORD_WITHDRAWS_REFUSED}: withdraws names the group record row {} of {} —              a record changes by a supersede under its protocol and ends by dissolution              (CIRISPersist#991)",
+            target.attestation_id,
+            signed.group_key_id()
+        ))),
+        (_, Some(ConsensusSource::Signer)) => {
+            if issuer == target.attesting_key_id {
+                Ok(Some(1))
+            } else {
+                Err(Error::WithdrawsNotAdmitted {
+                    issuer: issuer.to_owned(),
+                    target_attestation_id: target.attestation_id.clone(),
+                    beyond_delegation_depth_cap: false,
+                })
+            }
+        }
+        (_, _) => {
+            let group = signed.group_key_id();
+            let (protocol, policy_blob, roster): (String, Option<serde_json::Value>, Vec<_>) =
+                match signed.kind() {
+                    GroupKind::Family => {
+                        let Some(f) = directory.lookup_family(group).await? else {
+                            return Err(unknown_group(group));
+                        };
+                        let roster = directory
+                            .active_family_members(group)
+                            .await?
+                            .into_iter()
+                            .map(|m| (m.key_id, m.role))
+                            .collect();
+                        (f.consensus_protocol, None, roster)
+                    }
+                    GroupKind::Community => {
+                        let Some(c) = directory.lookup_community(group).await? else {
+                            return Err(unknown_group(group));
+                        };
+                        let roster = directory
+                            .active_community_members(group)
+                            .await?
+                            .into_iter()
+                            .map(|m| (m.key_id, m.role))
+                            .collect();
+                        (c.consensus_protocol, c.policy_blob, roster)
+                    }
+                };
+            let ids: Vec<String> = roster.iter().map(|(k, _)| k.clone()).collect();
+            let seats: Vec<super::consensus::Seat> = roster
+                .into_iter()
+                .map(|(key_id, role)| super::consensus::Seat {
+                    key_id,
+                    role,
+                    node_bearing: false,
+                })
+                .collect();
+            let scrubs: Vec<ScrubSig> = std::iter::once(ScrubSig {
+                scrub_key_id: row.scrub_key_id.clone(),
+                scrub_signature_classical: row.scrub_signature_classical.clone(),
+                scrub_signature_pqc: row.scrub_signature_pqc.clone(),
+                cosigned_at: None,
+            })
+            .chain(row.additional_scrubs.iter().cloned())
+            .collect();
+            let counted = super::reverse_quorum::count_distinct_roster_scrubs(
+                directory,
+                &row.attestation_envelope,
+                &scrubs,
+                &ids,
+            )
+            .await;
+            // Retracting a widening takes a member off; retracting a removal
+            // puts one back.
+            let direction = if family == GroupPlaneFamily::Widening {
+                super::consensus::Direction::Remove
+            } else {
+                super::consensus::Direction::Add
+            };
+            let verdict = super::consensus::evaluate(&super::consensus::Ballot {
+                protocol: &protocol,
+                subkind: None,
+                policy_blob: policy_blob.as_ref(),
+                roster: &seats,
+                signers: &counted,
+                direction,
+            });
+            if verdict.admits() {
+                Ok(Some(rule))
+            } else {
+                Err(Error::RosterAuthorityUnauthorized {
+                    group_key_id: group.to_owned(),
+                    offered_authority_key_id: issuer.to_owned(),
+                    rule: super::ROSTER_CONSENSUS_INSUFFICIENT,
+                })
+            }
+        }
+    }
+}
+
+fn unknown_group(group: &str) -> Error {
+    Error::InvalidArgument(format!(
+        "withdraws names a roster event of {group}, a group this node does not hold"
+    ))
+}
+
+/// v61 (CIRISPersist#991) — **the projection follows a retraction**: once a
+/// cosigned `withdraws` of a widening, removal or resignation row is stored,
+/// the roster event it retracts leaves its table (the fold then reads the
+/// roster as if the event had not happened). The row stays on the plane,
+/// withdrawn; the rebuild skips a withdrawn row the same way.
+///
+/// # Errors
+///
+/// The executor's.
+pub(crate) async fn after_withdraws<D>(dir: &D, row: &Attestation) -> Result<(), Error>
+where
+    D: GroupPlaneStore + ?Sized,
+{
+    if row.attestation_type != attestation_type::WITHDRAWS {
+        return Ok(());
+    }
+    let Some(target_id) =
+        super::precedence::references_attestation_id_from_envelope(&row.attestation_envelope)
+    else {
+        return Ok(());
+    };
+    let Some(target) = dir.get_attestation(target_id).await? else {
+        return Ok(());
+    };
+    if GroupPlaneFamily::of_row(&target).is_none_or(|f| f == GroupPlaneFamily::Roster) {
+        return Ok(());
+    }
+    if let Some(signed) = group_signed_of_row(&target)? {
+        dir.drop_group_projection_row(signed.link(), &target.attestation_id)
+            .await?;
+    }
+    Ok(())
+}
+
 /// The projection gate for one group table (`check_projection_rebuild`'s
 /// group arm).
 ///
@@ -1018,7 +1371,19 @@ where
     D: GroupPlaneStore + ?Sized,
 {
     let read = dir.read_group_plane(table).await?;
-    Ok(group_projection_rebuild(table, read.live, &read.rows))
+    // A roster event retracted by an admitted `withdraws` is not projected.
+    let mut rows = Vec::with_capacity(read.rows.len());
+    for row in read.rows {
+        let withdrawn = dir
+            .list_attestations_referencing(&row.attestation_id)
+            .await?
+            .iter()
+            .any(|w| w.attestation_type == attestation_type::WITHDRAWS);
+        if !withdrawn {
+            rows.push(row);
+        }
+    }
+    Ok(group_projection_rebuild(table, read.live, &rows))
 }
 
 #[cfg(test)]

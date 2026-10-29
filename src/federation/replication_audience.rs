@@ -748,6 +748,21 @@ where
     // Every stage also reaches the group's membership-plane audience
     // ([`may_receive_group_plane`]: member nodes and live invitees' nodes by
     // principal binding, not the per-node content allow list).
+    // v61 (CIRISPersist#991, CC 6.1.5.3) — a group's record and its roster
+    // events (`group:roster:v1`, `membership:{widening,removal,resignation}:v1`)
+    // are the group's membership plane: they reach its membership-plane
+    // audience, the member the row names included, never the per-node
+    // content allow list.
+    if let Ok(Some(signed)) = super::group_plane::group_signed_of_row(row) {
+        return may_receive_group_plane(
+            dir,
+            recipient,
+            &row.cohort_scope,
+            signed.group_key_id(),
+            signed.member_key_id(),
+        )
+        .await;
+    }
     if !key_set {
         if let Some((stage, group)) = super::membership_acceptance::membership_group_of(row) {
             let mut mine: HashSet<String> = super::self_collective::principals_of(dir, recipient)

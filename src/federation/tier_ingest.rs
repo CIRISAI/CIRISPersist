@@ -176,6 +176,12 @@ where
     if super::key_plane::verify_plane_row(directory, row).await? {
         return Ok(());
     }
+    // v61 (CIRISPersist#991) — a group-plane row is minted from the signed
+    // object it carries, under the same rule; its co-signatures are the
+    // object's, over the object's own bytes.
+    if super::group_plane::verify_plane_row(directory, row).await? {
+        return Ok(());
+    }
     // v59.0.0 (CIRISPersist#1099) — a self-roster proposal row is minted from
     // the signed object it carries, under the same rule.
     if super::self_roster::verify_proposal_row(directory, row).await? {
@@ -765,17 +771,47 @@ where
             )));
         }
     }
-    for c in cosignatures {
-        verify_envelope_hybrid_signature(
-            directory,
-            &c.authority_key_id,
-            envelope,
-            &c.scrub_signature_classical,
-            c.scrub_signature_pqc.as_deref(),
-        )
-        .await?;
+    // v61 (CIRISPersist#991, CC 2.4) — the co-signatures are counted by the
+    // ONE predicate every cosigned family uses
+    // (`reverse_quorum::count_distinct_roster_scrubs`): each is a scrub over
+    // the object's own signed bytes, counted once, hybrid-verified against
+    // this node's registered keys. A roster row admits only when every one
+    // counts; the first that does not is refused by its own verification
+    // error (an unknown co-signer stays the retryable ordering gap).
+    let scrubs: Vec<super::types::ScrubSig> = cosignatures
+        .iter()
+        .map(|c| super::types::ScrubSig {
+            scrub_key_id: c.authority_key_id.clone(),
+            scrub_signature_classical: c.scrub_signature_classical.clone(),
+            scrub_signature_pqc: c.scrub_signature_pqc.clone(),
+            cosigned_at: None,
+        })
+        .collect();
+    let signers: Vec<String> = cosignatures
+        .iter()
+        .map(|c| c.authority_key_id.clone())
+        .collect();
+    let counted =
+        super::reverse_quorum::count_distinct_roster_scrubs(directory, envelope, &scrubs, &signers)
+            .await;
+    if counted.len() == cosignatures.len() {
+        return Ok(());
     }
-    Ok(())
+    for c in cosignatures {
+        if !counted.contains(&c.authority_key_id) {
+            verify_envelope_hybrid_signature(
+                directory,
+                &c.authority_key_id,
+                envelope,
+                &c.scrub_signature_classical,
+                c.scrub_signature_pqc.as_deref(),
+            )
+            .await?;
+        }
+    }
+    Err(Error::InvalidArgument(format!(
+        "{row_kind}: a co-signature did not count"
+    )))
 }
 
 /// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated

@@ -179,7 +179,7 @@ pub(crate) enum StoredAttestation {
 /// Storage only — every refusal is [`plan_put_attestation`]'s.
 #[async_trait::async_trait]
 pub(crate) trait AttestationStore:
-    FederationDirectory + super::renditions::HeldBlobScope + Sized
+    FederationDirectory + super::renditions::HeldBlobScope + super::group_plane::GroupPlaneStore + Sized
 {
     /// Snapshot the per-instance admission state.
     fn admission_cx(&self) -> AdmissionCx<'_>;
@@ -399,6 +399,26 @@ where
             ))),
         };
     }
+    // v61 (CIRISPersist#991, CC 3.1.3) — a group-plane row goes to the typed
+    // door of the object it carries: the object's own signatures, the roster
+    // authority under the group's protocol.
+    if super::group_plane::is_group_plane_row(&attestation.attestation) {
+        use super::group_plane::{GroupPlaneApplied, GroupRowDoor};
+        let door = match origin {
+            WriteOrigin::Authored => GroupRowDoor::Local,
+            WriteOrigin::Wire | WriteOrigin::Sync { .. } => GroupRowDoor::Replicated,
+        };
+        return match super::group_plane::apply_group_plane_row(dir, &attestation.attestation, door)
+            .await?
+        {
+            GroupPlaneApplied::Changed => Ok(AttestationOutcome::Inserted),
+            GroupPlaneApplied::Unchanged => Ok(AttestationOutcome::AlreadyHeld),
+            GroupPlaneApplied::Refused(reason) => Err(Error::Conflict(format!(
+                "group-plane row {} not applied: {reason}",
+                attestation.attestation.attestation_id
+            ))),
+        };
+    }
     // v53.0.0 (#963) — a row that changes an owner's cohort allow list for
     // one of its nodes (a `consent:replication` grant FOR the node, or the
     // owner's retraction of one): read before the row moves, acted on only
@@ -423,6 +443,11 @@ where
     // v59.0.0 (CIRISPersist#1106) — a quorum re-bind, applied after it is
     // stored.
     let rebind_row = super::transport_rebind::is_rebind_row(&attestation.attestation)
+        .then(|| attestation.attestation.clone());
+    // v61 (CIRISPersist#991) — a `withdraws` that may retract a roster event,
+    // acted on once the store holds it.
+    let withdraws_row = (attestation.attestation.attestation_type
+        == super::types::attestation_type::WITHDRAWS)
         .then(|| attestation.attestation.clone());
     let roster_row = (super::self_roster::is_proposal_row(&attestation.attestation)
         || super::self_roster::answer_identity(&attestation.attestation).is_some())
@@ -458,6 +483,9 @@ where
         Ok(outcome)
     }
     .await;
+    if let (Ok(AttestationOutcome::Inserted), Some(row)) = (&outcome, &withdraws_row) {
+        super::group_plane::after_withdraws(dir, row).await?;
+    }
     if let (Ok(AttestationOutcome::Inserted), Some((owner, node))) = (&outcome, consent_change) {
         super::rewrap_after_admission(dir, &owner, &node).await;
     }

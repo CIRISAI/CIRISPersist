@@ -115,6 +115,12 @@ pub enum AttestationRefusalReason {
     /// terminal reasons (a refused proposal, a family door's refusal).
     /// APPENDED.
     SelfRosterPending,
+    /// v61 (CIRISPersist#991) — a group-plane row (`group:roster:v1`,
+    /// `membership:{widening,removal,resignation}:v1`) whose typed door did
+    /// not apply its object (a conflicting record, a weakening supersede, a
+    /// held object that differs); the door's own reason is logged with the
+    /// row id. APPENDED.
+    GroupPlaneRefused,
 }
 
 impl AttestationRefusalReason {
@@ -131,6 +137,7 @@ impl AttestationRefusalReason {
             Self::StoreConflict => "store_conflict",
             Self::KeyPlaneRefused => "key_plane_refused",
             Self::SelfRosterPending => "self_roster_pending",
+            Self::GroupPlaneRefused => "group_plane_refused",
         }
     }
 
@@ -163,6 +170,7 @@ impl AttestationRefusalReason {
         Self::StoreConflict,
         Self::KeyPlaneRefused,
         Self::SelfRosterPending,
+        Self::GroupPlaneRefused,
     ];
 }
 
@@ -395,6 +403,30 @@ where
                 }
             }
         });
+    }
+    // v61 (CIRISPersist#991, CC 3.1.3) — a group-plane row is applied by the
+    // typed door of the object it carries, ahead of the generic plan: a
+    // record's newer version is a new row that replaces its older one.
+    if super::group_plane::is_group_plane_row(incoming) {
+        use super::group_plane::GroupPlaneApplied;
+        return Ok(
+            match super::group_plane::apply_group_plane_row(
+                dir,
+                incoming,
+                super::group_plane::GroupRowDoor::Replicated,
+            )
+            .await?
+            {
+                GroupPlaneApplied::Changed => Outcome::Inserted,
+                GroupPlaneApplied::Unchanged => Outcome::Unchanged,
+                GroupPlaneApplied::Refused(reason) => {
+                    tracing::info!(attestation_id = %attestation_id, reason, "group-plane row refused");
+                    Outcome::Refused {
+                        reason: AttestationRefusalReason::GroupPlaneRefused,
+                    }
+                }
+            },
+        );
     }
     // v50.0.0 (CIRISPersist#916) — an owner-binding is the moment a minter
     // learns a member has a device; read before the row is moved.
