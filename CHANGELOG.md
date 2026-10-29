@@ -46,6 +46,27 @@ threat-model citations because this crate's audit story is the point.
     occurrence that was revoked and then agreed again after the revocation.
   - **I141** and **I392** stay green.
 
+### Fixed — a pair-room blob binds to the author's sealer when two minters grant the reader (live chat, turns 3+)
+
+- **The shape** (CIRISServer local mesh, build 12). In a pair room both member
+  nodes mint their own epoch 0 and wrap it to every member, the reader's own
+  node included. A blob adopted after the `key_grant` set arrived names no
+  minter, so `epoch_minter::resolve` derives it from the sets that granted the
+  reader. Two sets granted it, so the derivation declined and fell back to the
+  author: a person key that holds no DEK. The binding then pointed at a key
+  with no wraps, and every later turn read `not_granted` on both sides.
+- **The fix.** Of several granting minters, `resolve` keeps those that ARE
+  the author or act for it (`principals_of` names the author: an agreed
+  occurrence or the owner binding). One survivor is the minter. With none or
+  several, the author fallback is unchanged and nothing is guessed.
+- **Witnesses** (`epoch_minter_invariants`, sqlite and postgres):
+  - **I128**, extended: of two minters, the one that acts for the author is
+    derived. With no candidate acting for the author, or two, it falls back to
+    the author. The case is red without the fix.
+  - **I1475**, the pair-room shape: the reader's own node minted the same
+    epoch and wrapped it to itself, and a row the peer authored still derives
+    the peer's node.
+
 ### Security — five advisories published after v59.1.0 (deny.toml, Cargo.lock)
 
 - tokio 1.54.1 (RUSTSEC-2026-0386), ctutils 0.4.6 (RUSTSEC-2026-0385),

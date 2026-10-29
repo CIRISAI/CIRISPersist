@@ -66,7 +66,7 @@ async fn resolve_adopt<B>(
     provenance: &BlobProvenance,
 ) -> Result<(StorageFloor, Option<EpochBinding>), BlobError>
 where
-    B: BlobStorage + Sync + ?Sized,
+    B: BlobStorage + FederationDirectory + Sync + ?Sized,
 {
     check_envelope_shape(envelope)?;
     resolve_provenance(backend, our_key_id, provenance).await
@@ -92,7 +92,7 @@ async fn resolve_provenance<B>(
     provenance: &BlobProvenance,
 ) -> Result<(StorageFloor, Option<EpochBinding>), BlobError>
 where
-    B: BlobStorage + Sync + ?Sized,
+    B: BlobStorage + FederationDirectory + Sync + ?Sized,
 {
     let binding = match provenance.tier {
         CryptoTier::Plaintext => {

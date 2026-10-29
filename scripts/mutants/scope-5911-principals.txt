@@ -10,7 +10,11 @@
 # `active_identities_for_occurrence`, so a split-home invitee's node never got
 # the room's record and membership planes; it now reads `principals_of` (I1473,
 # asserted inside I1470 and I1471).
+# The third link (chat turns 3+): `epoch_minter::resolve` fell back to the
+# author when two minters granted the reader (a pair room: both nodes mint
+# epoch 0); it now keeps the minter that acts for the author (I128, I1475).
 # Grammar: docs/MUTATION_TESTING.md.
-tests: test(/i147[0-2]|i398|occurrence_principal_invariants::run::|membership_acceptance/)
+tests: test(/i147[0-2]|i398|occurrence_principal_invariants::run::|membership_acceptance|epoch_minter_invariants::run::/)
 src/federation/self_collective.rs principals_of
 src/federation/replication_audience.rs may_receive_group_plane
+src/federation/epoch_minter.rs resolve
