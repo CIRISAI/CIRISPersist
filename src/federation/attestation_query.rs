@@ -45,6 +45,7 @@
 use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use super::{Attestation, Error};
 use crate::ceg::list::federation::AttestationCursor;
@@ -75,7 +76,7 @@ pub const FOLD_PAGE: NonZeroU32 = if cfg!(test) {
 };
 
 /// What the query asks of the envelope's top-level `dimension`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DimensionFilter {
     /// Any dimension, and none.
     #[default]
@@ -106,7 +107,8 @@ pub enum DimensionFilter {
 /// `(attested_key_id, cohort_scope, asserted_at DESC)`; a `by` query filters
 /// the attester's ordered walk (no index leads with the attester and the
 /// scope), bounded by the page like an exclusion.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeFilter {
     /// The stored `cohort_scope` (`self` / `family` / `community` /
     /// `affiliations` / `species` / `biosphere` / `federation`).
@@ -116,7 +118,7 @@ pub struct ScopeFilter {
 }
 
 /// Which storage tier the rows come from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum QueryTier {
     /// The signed, replicated tier — every read the directory serves.
     #[default]
@@ -137,7 +139,7 @@ impl QueryTier {
 }
 
 /// A sort direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
     /// Ascending (oldest first).
     Asc,
@@ -146,7 +148,7 @@ pub enum Direction {
 }
 
 /// The order rows come in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueryOrder {
     /// By the row's SIGNED `asserted_at` (never receipt time), ties broken by
     /// `attestation_id` (byte order), so the order — and every page cut from
@@ -187,7 +189,14 @@ impl QueryOrder {
 /// `AttestationQuery::by(k, limit).types(&["withdraws", "supersedes",
 /// "recants"])` paged on `next`, joined on the envelope's
 /// `references_attestation_id`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **Wire.** v59.1.2 (CIRISPersist#1162): the query crosses the directory
+/// capsule inside `DirectoryOp::ExecuteAttestationQuery`, and its rows come
+/// back as [`QueryRows`]. A changed field here, or in a type it carries, is a
+/// payload break outside the op digests' sight, so it bumps
+/// `DIRECTORY_ABI_VERSION`. An unknown field is refused, never dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttestationQuery {
     /// Rows `by` authored (`attesting_key_id`).
     pub by: Option<String>,
@@ -535,7 +544,8 @@ impl AttestationQuery {
 /// What a backend's executor returns: at most [`AttestationQuery::fetch`]
 /// rows in the query's order, the envelope bytes it decoded (the per-door
 /// telemetry's definition) and which backend ran it.
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryRows {
     /// The rows, in order, at most `limit + 1`.
     pub rows: Vec<Attestation>,
