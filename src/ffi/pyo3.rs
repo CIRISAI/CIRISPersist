@@ -36341,7 +36341,10 @@ async fn boot_audit_self_verify(backend: &BackendDispatch) -> Result<BootAuditSu
             .get()
             .await
             .map_err(|e| format!("pool: {e}"))?
-            .query("SELECT DISTINCT tenant_id FROM cirislens_audit_log", &[])
+            // v59.1.2 — the Postgres table is `cirislens.audit_log` (V014);
+            // `cirislens_audit_log` is the SQLite spelling, so every Postgres
+            // boot logged "list tenants: db error" and checked nothing.
+            .query("SELECT DISTINCT tenant_id FROM cirislens.audit_log", &[])
             .await
             .map_err(|e| format!("list tenants: {e}"))?
             .iter()
@@ -36670,6 +36673,50 @@ mod tests {
                 let text = e.value(py).to_string();
                 assert!(text.starts_with(kind), "{kind}: {text}");
             }
+        });
+    }
+
+    /// v59.1.2 — the boot audit self-check reads the Postgres table by its
+    /// Postgres name. It queried `cirislens_audit_log` (the SQLite spelling)
+    /// on Postgres, so every Postgres boot logged "list tenants: db error"
+    /// and verified nothing. On a migrated database with one audited tenant
+    /// it must list that tenant and walk its chain.
+    #[cfg(all(feature = "postgres", feature = "cirisaudit"))]
+    #[test]
+    fn boot_audit_self_check_reads_the_postgres_table() {
+        use crate::store::Backend;
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("boot-audit-pg: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+            return;
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let pg = Arc::new(PostgresBackend::connect(&dsn).await.unwrap());
+            pg.run_migrations().await.unwrap();
+            pg.get_client()
+                .await
+                .unwrap()
+                .execute(
+                    "INSERT INTO cirislens.audit_log (\
+                        entry_id, sequence_number, tenant_id, actor_id, action_type, \
+                        subject_kind, subject_id, payload, prev_hash, entry_hash, \
+                        recorded_at, signature, signing_key_id, signature_verified, \
+                        persist_row_hash\
+                     ) VALUES (gen_random_uuid(), 1, 'boot-audit-pg', 'actor', 'system_event', \
+                        'task', 's', '{}'::jsonb, '\\x00'::bytea, '\\x01'::bytea, now(), \
+                        'sig', 'actor', TRUE, 'h')",
+                    &[],
+                )
+                .await
+                .unwrap();
+            let summary = boot_audit_self_verify(&BackendDispatch::Postgres(pg))
+                .await
+                .expect("the self-check lists tenants on Postgres");
+            assert_eq!(summary.tenants_checked, 1, "the audited tenant is listed");
+            assert_eq!(summary.breaks.len(), usize::from(!summary.all_ok));
         });
     }
 
