@@ -77,6 +77,10 @@ mod bounded_planes_invariants;
 // classified; no production caller of the demoted wide reads.
 #[cfg(test)]
 mod bounded_reads_table;
+// v59.1.2 (CIRISPersist#1162) — the capsule proxy-parity gate blanks its
+// from-disk scan with the same comment/string blanker.
+#[cfg(test)]
+pub(crate) use bounded_reads_table::gates::blank_comments_and_strings;
 pub mod canonical_at_rest;
 pub mod capacity;
 // v50.0.0 (CIRISPersist#926) — the `ciris-canonical` community row: admitted

@@ -292,7 +292,7 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
 ];
 
 #[cfg(test)]
-mod gates {
+pub(super) mod gates {
     use super::{Bound, LIST_READ_BOUNDS};
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
@@ -304,7 +304,7 @@ mod gates {
     /// `src` with comments and string-literal contents blanked (newlines
     /// kept, so line structure survives). Char literals are left alone; a
     /// lifetime's `'` is not a quote.
-    pub(super) fn blank_comments_and_strings(src: &str) -> String {
+    pub(crate) fn blank_comments_and_strings(src: &str) -> String {
         let b: Vec<char> = src.chars().collect();
         let mut out = String::with_capacity(src.len());
         let mut i = 0;
