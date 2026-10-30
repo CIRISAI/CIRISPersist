@@ -52,6 +52,10 @@ pub(crate) struct TestHooks {
     /// the witness learns the door reached it, runs a rival writer, then
     /// resumes the door. One-shot per arm.
     pauses: Mutex<BTreeMap<&'static str, std::sync::Arc<Pause>>>,
+    /// v59.1.2 — a named point every caller of a door WAITS at until `n` of
+    /// them are there: concurrent callers all reach the point together, so a
+    /// door holding a pooled client across it starves a pool sized `n`.
+    barriers: Mutex<BTreeMap<&'static str, std::sync::Arc<tokio::sync::Barrier>>>,
 }
 
 /// v54.0.0 (Codex on PR #1050) — one armed pause: the door signals
@@ -158,6 +162,28 @@ impl TestHooks {
         if let Some(p) = armed {
             p.reached.notify_one();
             let _ = tokio::time::timeout(PAUSE_CEILING, p.resume.notified()).await;
+        }
+    }
+
+    /// v59.1.2 — arm a barrier for `n` callers at `point`.
+    pub(crate) fn arm_barrier(&self, point: &'static str, n: usize) {
+        self.barriers
+            .lock()
+            .expect("test hooks")
+            .insert(point, std::sync::Arc::new(tokio::sync::Barrier::new(n)));
+    }
+
+    /// Called by the backend at `point`: when armed, wait for the other
+    /// callers, at most [`PAUSE_CEILING`].
+    pub(crate) async fn barrier_if_armed(&self, point: &'static str) {
+        let armed = self
+            .barriers
+            .lock()
+            .expect("test hooks")
+            .get(point)
+            .cloned();
+        if let Some(b) = armed {
+            let _ = tokio::time::timeout(PAUSE_CEILING, b.wait()).await;
         }
     }
 

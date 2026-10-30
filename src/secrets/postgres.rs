@@ -135,11 +135,9 @@ impl PostgresBackend {
         success: bool,
         error: Option<&str>,
     ) -> Result<(), SecretsError> {
-        let client = self
-            .pool()
-            .get()
+        let client = crate::store::postgres::checkout(self.pool())
             .await
-            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+            .map_err(SecretsError::from)?;
         client
             .execute(
                 "INSERT INTO cirislens_secrets.access_log (\
@@ -174,11 +172,9 @@ impl PostgresBackend {
     /// rotate_master_key first); >1 = invariant violation (V043 makes
     /// this DB-unrepresentable), surfaces as Internal.
     async fn active_master_key(&self) -> Result<MasterKey, SecretsError> {
-        let client = self
-            .pool()
-            .get()
+        let client = crate::store::postgres::checkout(self.pool())
             .await
-            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+            .map_err(SecretsError::from)?;
         let rows = client
             .query(
                 "SELECT key_ref, key_kind, descriptor \
@@ -301,11 +297,9 @@ impl SecretsService for PostgresBackend {
         let secret_key = crypto::derive_secret_key(&master.bytes, &salt)?;
         let ciphertext = crypto::encrypt(&secret_key, &nonce, value.as_bytes())?;
 
-        let client = self
-            .pool()
-            .get()
+        let client = crate::store::postgres::checkout(self.pool())
             .await
-            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+            .map_err(SecretsError::from)?;
         let result = client
             .execute(
                 "INSERT INTO cirislens_secrets.secrets (\
@@ -328,6 +322,7 @@ impl SecretsService for PostgresBackend {
 
         let success = result.is_ok();
         let err_msg = result.as_ref().err().map(|e| e.to_string());
+        drop(client); // v59.1.2 — the helper checks out its own client.
         let _ = self
             .secrets_audit(
                 AuditRecord::new(AccessOp::Store, &accessor)
@@ -346,11 +341,9 @@ impl SecretsService for PostgresBackend {
         key: &str,
         accessor: String,
     ) -> Result<Option<String>, SecretsError> {
-        let client = self
-            .pool()
-            .get()
+        let client = crate::store::postgres::checkout(self.pool())
             .await
-            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+            .map_err(SecretsError::from)?;
         let row_opt = client
             .query_opt(
                 "SELECT secret_uuid, encrypted_value, encryption_key_ref, salt, nonce \
@@ -401,6 +394,7 @@ impl SecretsService for PostgresBackend {
                     .await;
             }
         }
+        drop(client); // v59.1.2 — the helper checks out its own client.
         let _ = self.secrets_audit(audit, true, None).await;
         Ok(plaintext)
     }
@@ -414,11 +408,9 @@ impl SecretsService for PostgresBackend {
     ) -> Result<Option<SecretRecallResult>, SecretsError> {
         let parsed_uuid = Uuid::parse_str(uuid)
             .map_err(|e| SecretsError::InvalidArgument(format!("uuid parse: {e}")))?;
-        let client = self
-            .pool()
-            .get()
+        let client = crate::store::postgres::checkout(self.pool())
             .await
-            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+            .map_err(SecretsError::from)?;
         let row_opt = client
             .query_opt(
                 "SELECT encrypted_value, encryption_key_ref, salt, nonce \
@@ -479,6 +471,7 @@ impl SecretsService for PostgresBackend {
                 }
             }
         };
+        drop(client); // v59.1.2 — the helper checks out its own client.
         let _ = self
             .secrets_audit(
                 AuditRecord::new(AccessOp::Recall, &accessor)
@@ -497,11 +490,9 @@ impl SecretsService for PostgresBackend {
         filter: SecretsListFilter,
     ) -> Result<Vec<SecretReference>, SecretsError> {
         let lim = i64::try_from(limit.min(10_000)).unwrap_or(1000);
-        let client = self
-            .pool()
-            .get()
+        let client = crate::store::postgres::checkout(self.pool())
             .await
-            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+            .map_err(SecretsError::from)?;
         let mut where_parts: Vec<String> = Vec::new();
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
         if let Some(s) = filter.sensitivity {
@@ -565,11 +556,9 @@ impl SecretsService for PostgresBackend {
     async fn forget_secret(&self, uuid: &str, accessor: String) -> Result<bool, SecretsError> {
         let parsed_uuid = Uuid::parse_str(uuid)
             .map_err(|e| SecretsError::InvalidArgument(format!("uuid parse: {e}")))?;
-        let client = self
-            .pool()
-            .get()
+        let client = crate::store::postgres::checkout(self.pool())
             .await
-            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+            .map_err(SecretsError::from)?;
         let n = client
             .execute(
                 "DELETE FROM cirislens_secrets.secrets WHERE secret_uuid = $1",
@@ -577,6 +566,7 @@ impl SecretsService for PostgresBackend {
             )
             .await
             .map_err(|e| SecretsError::Backend(format!("forget_secret: {e}")))?;
+        drop(client); // v59.1.2 — the helper checks out its own client.
         let _ = self
             .secrets_audit(
                 AuditRecord::new(AccessOp::Forget, accessor).with_secret(parsed_uuid),
@@ -653,11 +643,9 @@ impl SecretsService for PostgresBackend {
     }
 
     async fn get_filter_config(&self) -> Result<FilterConfig, SecretsError> {
-        let client = self
-            .pool()
-            .get()
+        let client = crate::store::postgres::checkout(self.pool())
             .await
-            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+            .map_err(SecretsError::from)?;
         let row_opt = client
             .query_opt(
                 "SELECT config_id, config_value, version, updated_at, updated_by \
@@ -689,11 +677,9 @@ impl SecretsService for PostgresBackend {
         updates: FilterUpdateRequest,
         accessor: String,
     ) -> Result<FilterUpdateResult, SecretsError> {
-        let client = self
-            .pool()
-            .get()
+        let client = crate::store::postgres::checkout(self.pool())
             .await
-            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+            .map_err(SecretsError::from)?;
         let row = client
             .query_one(
                 "INSERT INTO cirislens_secrets.filter_config (\
@@ -716,11 +702,9 @@ impl SecretsService for PostgresBackend {
     }
 
     async fn get_service_stats(&self) -> Result<SecretsServiceStats, SecretsError> {
-        let client = self
-            .pool()
-            .get()
+        let client = crate::store::postgres::checkout(self.pool())
             .await
-            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+            .map_err(SecretsError::from)?;
         let row = client
             .query_one(
                 "SELECT \
@@ -749,6 +733,7 @@ impl SecretsService for PostgresBackend {
         // v1.10.1 (#87 review M4) — `hardware_key_active` reflects the
         // active key's `key_kind` instead of a hard-coded false, so
         // ops can see whether `migrate_to_hardware_key` took effect.
+        drop(client); // v59.1.2 — the helper checks out its own client.
         let active = self.active_master_key().await;
         let encryption_enabled = active.is_ok();
         let hardware_key_active = active
@@ -770,11 +755,9 @@ impl SecretsService for PostgresBackend {
 
     async fn is_healthy(&self) -> Result<bool, SecretsError> {
         // Quick connectivity + active-key check.
-        let _ = self
-            .pool()
-            .get()
+        let _ = crate::store::postgres::checkout(self.pool())
             .await
-            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+            .map_err(SecretsError::from)?;
         Ok(self.active_master_key().await.is_ok())
     }
 
@@ -784,11 +767,9 @@ impl SecretsService for PostgresBackend {
         limit: usize,
     ) -> Result<Vec<AccessLogEntry>, SecretsError> {
         let lim = i64::try_from(limit.min(10_000)).unwrap_or(1000);
-        let client = self
-            .pool()
-            .get()
+        let client = crate::store::postgres::checkout(self.pool())
             .await
-            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+            .map_err(SecretsError::from)?;
         let rows = match secret_uuid {
             Some(u) => {
                 let parsed = Uuid::parse_str(u)
@@ -855,11 +836,9 @@ impl SecretsService for PostgresBackend {
             ))
         })?;
 
-        let mut client = self
-            .pool()
-            .get()
+        let mut client = crate::store::postgres::checkout(self.pool())
             .await
-            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+            .map_err(SecretsError::from)?;
 
         // Load every secret up front — a plain read, no lock held.
         // Each row is self-describing (`encryption_key_ref` per row),
@@ -992,6 +971,7 @@ impl SecretsService for PostgresBackend {
         } else {
             Some(format!("{} failures", failures.len()))
         };
+        drop(client); // v59.1.2 — the helper checks out its own client.
         let _ = self
             .secrets_audit(
                 AuditRecord::new(AccessOp::Reencrypt, accessor),
@@ -1039,11 +1019,9 @@ impl SecretsService for PostgresBackend {
         // and both activate, the second tx to commit hits the unique
         // violation — the loser then re-reads and converges on the
         // winner's key (first-use bootstraps converge, by design).
-        let mut client = self
-            .pool()
-            .get()
+        let mut client = crate::store::postgres::checkout(self.pool())
             .await
-            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+            .map_err(SecretsError::from)?;
         let tx = client
             .transaction()
             .await
@@ -1097,6 +1075,7 @@ impl SecretsService for PostgresBackend {
                 Ok(_) => {}
                 Err(e) if is_unique_violation(&e) => {
                     let _ = tx.rollback().await;
+                    drop(client); // v59.1.2 — the helper checks out its own client.
                     return self
                         .converge_on_bootstrap_winner(&new_key_ref, accessor)
                         .await;
@@ -1114,6 +1093,7 @@ impl SecretsService for PostgresBackend {
         // same way.
         match tx.commit().await {
             Ok(()) => {
+                drop(client); // v59.1.2 — the helper checks out its own client.
                 let _ = self
                     .secrets_audit(AuditRecord::new(AccessOp::Rotate, accessor), true, None)
                     .await;
@@ -1127,6 +1107,7 @@ impl SecretsService for PostgresBackend {
                     "rotate_master_key: concurrent first-use bootstrap — \
                      converging on the winning master key"
                 );
+                drop(client); // v59.1.2 — the helper checks out its own client.
                 let winner = self.active_master_key().await?;
                 let _ = self
                     .secrets_audit(AuditRecord::new(AccessOp::Rotate, accessor), true, None)
@@ -1162,11 +1143,9 @@ impl SecretsService for PostgresBackend {
                 .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
 
         let new_key_ref = Uuid::new_v4().to_string();
-        let client = self
-            .pool()
-            .get()
+        let client = crate::store::postgres::checkout(self.pool())
             .await
-            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+            .map_err(SecretsError::from)?;
         // Record the new key as `hardware`, not yet active —
         // `reencrypt_all` activates it (and deactivates the prior one)
         // once every secret is re-encrypted, same staging as
@@ -1229,11 +1208,9 @@ impl SecretsService for PostgresBackend {
         let ciphertext = crypto::encrypt(&secret_key, &nonce, plaintext.as_bytes())?;
         let sensitivity_tag = sensitivity_str(sensitivity).to_owned();
 
-        let client = self
-            .pool()
-            .get()
+        let client = crate::store::postgres::checkout(self.pool())
             .await
-            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+            .map_err(SecretsError::from)?;
 
         // Atomic claim: INSERT, suppressing on content_hmac conflict.
         // RETURNING fires only on a successful insert; the empty-row
@@ -1339,6 +1316,7 @@ impl SecretsService for PostgresBackend {
         if let Some(uuid) = audit_uuid {
             record = record.with_secret(uuid);
         }
+        drop(client); // v59.1.2 — the helper checks out its own client.
         let _ = self
             .secrets_audit(record, success, err_msg.as_deref())
             .await;
@@ -1379,11 +1357,9 @@ impl SecretsService for PostgresBackend {
         let ciphertext = crypto::encrypt(&secret_key, &nonce, payload.value.as_bytes())?;
         let sensitivity_tag = sensitivity_str(payload.sensitivity).to_owned();
 
-        let client = self
-            .pool()
-            .get()
+        let client = crate::store::postgres::checkout(self.pool())
             .await
-            .map_err(|e| SecretsError::Backend(format!("pool: {e}")))?;
+            .map_err(SecretsError::from)?;
 
         // ── Atomic insert with full metadata ────────────────────────
         // ON CONFLICT (content_hmac) DO NOTHING — race-safe across
@@ -1561,6 +1537,7 @@ impl SecretsService for PostgresBackend {
         if let Some(uuid) = audit_uuid {
             record = record.with_secret(uuid);
         }
+        drop(client); // v59.1.2 — the helper checks out its own client.
         let _ = self
             .secrets_audit(record, success, err_msg.as_deref())
             .await;
@@ -1573,6 +1550,115 @@ impl SecretsService for PostgresBackend {
 mod tests {
     use super::*;
     use crate::store::postgres::PostgresBackend;
+
+    /// v59.1.2 (I1482, the secrets doors) — each door used to hold its pooled
+    /// client across the access-log write (and `get_service_stats` across the
+    /// master-key read), which checks out a second. On a one-connection pool
+    /// that second checkout starves; the access-log write is `let _ =`, so the
+    /// door still returned Ok and the audit row was SILENTLY lost. Run on a
+    /// one-connection pool whose checkout gives up after 3 s: every door
+    /// finishes AND writes its access-log row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1482_secrets_doors_write_their_access_log_on_one_connection() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("i1482-secrets: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+            return;
+        };
+        let wait = std::time::Duration::from_secs(3);
+        let b = PostgresBackend::connect_with_pool_for_test(&dsn, 1, wait)
+            .await
+            .unwrap();
+        crate::store::backend::Backend::run_migrations(&b)
+            .await
+            .unwrap();
+        assert_eq!(b.pool_max_size_for_test(), 1, "the witness's own premise");
+        let bound = std::time::Duration::from_secs(60);
+        async fn logged(b: &PostgresBackend, op: &str) -> i64 {
+            let c = b.get_client().await.unwrap();
+            c.query_one(
+                "SELECT COUNT(*)::bigint FROM cirislens_secrets.access_log \
+                 WHERE operation = $1 AND success",
+                &[&op],
+            )
+            .await
+            .unwrap()
+            .get(0)
+        }
+
+        tokio::time::timeout(bound, b.rotate_master_key(None, "i1482".into()))
+            .await
+            .expect("rotate: no hang")
+            .expect("rotate");
+        assert_eq!(logged(&b, "rotate").await, 1, "I1482 rotate wrote its row");
+
+        tokio::time::timeout(
+            bound,
+            b.store_secret("i1482-k".into(), "i1482-v".into(), "i1482".into()),
+        )
+        .await
+        .expect("store: no hang")
+        .expect("store");
+        assert_eq!(logged(&b, "store").await, 1, "I1482 store wrote its row");
+
+        let got = tokio::time::timeout(bound, b.retrieve_secret("i1482-k", "i1482".into()))
+            .await
+            .expect("retrieve: no hang")
+            .expect("retrieve");
+        assert_eq!(got.as_deref(), Some("i1482-v"));
+        assert_eq!(
+            logged(&b, "retrieve").await,
+            1,
+            "I1482 retrieve wrote its row"
+        );
+
+        let stats = tokio::time::timeout(bound, b.get_service_stats())
+            .await
+            .expect("stats: no hang")
+            .expect("stats");
+        assert!(
+            stats.encryption_enabled,
+            "I1482 get_service_stats read the active key (it held its client across that read)"
+        );
+
+        let claimed = tokio::time::timeout(
+            bound,
+            b.try_claim_secret(
+                "i1482-plain",
+                "i1482 claim",
+                Sensitivity::High,
+                vec![],
+                "i1482".into(),
+            ),
+        )
+        .await
+        .expect("claim: no hang")
+        .expect("claim");
+        let uuid = match claimed {
+            crate::ClaimResult::Stored(r) | crate::ClaimResult::AlreadyClaimed(r) => r.uuid,
+        };
+        assert_eq!(
+            logged(&b, "store").await,
+            2,
+            "I1482 try_claim wrote its row"
+        );
+
+        let recalled = tokio::time::timeout(
+            bound,
+            b.recall_secret(&uuid, "i1482".into(), "i1482".into(), true),
+        )
+        .await
+        .expect("recall: no hang")
+        .expect("recall");
+        assert!(recalled.is_some());
+        assert_eq!(logged(&b, "recall").await, 1, "I1482 recall wrote its row");
+
+        let gone = tokio::time::timeout(bound, b.forget_secret(&uuid, "i1482".into()))
+            .await
+            .expect("forget: no hang")
+            .expect("forget");
+        assert!(gone);
+        assert_eq!(logged(&b, "forget").await, 1, "I1482 forget wrote its row");
+    }
 
     fn pg_dsn() -> Option<String> {
         crate::test_pg::dsn()

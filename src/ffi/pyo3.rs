@@ -192,10 +192,19 @@ mod persist_errors {
         NodeIdentityRequired,
         super::persist_errors::PersistError
     );
+    // v59.1.2 — no pooled Postgres connection was freed within the pool's
+    // wait timeout. A `RuntimeError` subclass: it is carved out of the
+    // backend arms, which raised `RuntimeError`, so `except RuntimeError`
+    // still catches it; the message leads with the kind token.
+    pyo3::create_exception!(
+        ciris_persist,
+        PoolExhausted,
+        pyo3::exceptions::PyRuntimeError
+    );
 }
 pub use persist_errors::{
     Conflict, EngineClosed, EngineConfigMismatch, EngineUsedAcrossFork, NodeIdentityRequired,
-    NotFound, Permanent, PersistError, Transient,
+    NotFound, Permanent, PersistError, PoolExhausted, Transient,
 };
 
 /// v1.0.0-scaffold helper — map a stable substrate error `kind()` token
@@ -33580,6 +33589,7 @@ fn audit_err_to_py(e: crate::audit::Error) -> PyErr {
         | crate::audit::Error::Signature(_)
         | crate::audit::Error::Conflict(_)
         | crate::audit::Error::NotFound(_) => PyValueError::new_err(kind),
+        crate::audit::Error::PoolExhausted { .. } => PoolExhausted::new_err(e.to_string()),
         crate::audit::Error::Backend(_)
         | crate::audit::Error::NotImplemented(_)
         | crate::audit::Error::Internal(_)
@@ -33664,6 +33674,7 @@ fn fountain_store_err_to_py(e: crate::store::Error) -> PyErr {
         | Error::Backend(_)
         | Error::Migration { .. }
         | Error::MigrationLockTimeout { .. } => PyRuntimeError::new_err(format!("{e}")),
+        Error::PoolExhausted { .. } => PoolExhausted::new_err(format!("{e}")),
         // v57.0.0 (CIRISPersist#988 item 2) — the erasure doors' typed
         // attester refusal (no fountain door raises it).
         Error::HardCaseAttesterUnavailable(inner) => {
@@ -33798,6 +33809,7 @@ fn secrets_err_to_py(e: crate::secrets::SecretsError) -> PyErr {
         SecretsError::InvalidArgument(_)
         | SecretsError::NotAuthorized(_)
         | SecretsError::NotFound(_) => PyValueError::new_err(e.to_string()),
+        SecretsError::PoolExhausted { .. } => PoolExhausted::new_err(e.to_string()),
         SecretsError::Crypto(_)
         | SecretsError::Backend(_)
         | SecretsError::Internal(_)
@@ -34495,6 +34507,7 @@ fn erasure_err_to_py(e: crate::store::Error) -> PyErr {
         crate::store::Error::HardCaseAttesterUnavailable(inner) => {
             NodeIdentityRequired::new_err(format!("{}: {inner}", inner.kind()))
         }
+        e @ crate::store::Error::PoolExhausted { .. } => PoolExhausted::new_err(format!("{e}")),
         other => PyRuntimeError::new_err(format!("{other}")),
     }
 }
@@ -34887,6 +34900,9 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         }
         // Server-fault → RuntimeError (5xx).
         crate::federation::Error::Backend(_) => PyRuntimeError::new_err(kind),
+        // v59.1.2 — carved out of `Backend`: a RuntimeError subclass, the
+        // kind and the wait in the message.
+        crate::federation::Error::PoolExhausted { .. } => PoolExhausted::new_err(e.to_string()),
         // v11.8.1 (CIRISPersist#329) — the directory-ops proxy was asked
         // for a method with no DirectoryOp. This is a persist-side contract
         // gap (add the op), not caller-fault; RuntimeError (5xx).
@@ -36631,6 +36647,31 @@ async fn build_audit_chain_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v59.1.2 — a starved pool reaches Python as `PoolExhausted`, a
+    /// `RuntimeError` subclass (the type the backend arm it was carved from
+    /// raised, so `except RuntimeError` still catches it), its message
+    /// leading with the kind token.
+    #[test]
+    fn pool_exhausted_is_a_runtime_error_carrying_its_kind() {
+        Python::initialize();
+        let waited = std::time::Duration::from_secs(30);
+        let errs = [
+            federation_err_to_py(crate::federation::Error::PoolExhausted { waited }),
+            erasure_err_to_py(crate::store::Error::PoolExhausted { waited }),
+        ];
+        Python::attach(|py| {
+            for (e, kind) in errs
+                .iter()
+                .zip(["federation_pool_exhausted", "store_pool_exhausted"])
+            {
+                assert!(e.is_instance_of::<PoolExhausted>(py), "{kind}");
+                assert!(e.is_instance_of::<PyRuntimeError>(py), "{kind}");
+                let text = e.value(py).to_string();
+                assert!(text.starts_with(kind), "{kind}: {text}");
+            }
+        });
+    }
 
     /// v55.0.0 (CIRISPersist#989, operator ruling 2026-10-12) — **a blob
     /// invalid-argument refusal shows Python its token.** The error is the
@@ -39544,6 +39585,8 @@ pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         "NodeIdentityRequired",
         py.get_type::<NodeIdentityRequired>(),
     )?;
+    // v59.1.2 — a starved Postgres pool (a RuntimeError subclass).
+    m.add("PoolExhausted", py.get_type::<PoolExhausted>())?;
     // v1.10.1 (CIRISPersist#88) — handle-free process-singleton
     // reset; the deterministic teardown door for consumer test
     // suites and the cohabitation epic.

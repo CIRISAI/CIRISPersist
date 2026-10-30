@@ -36,6 +36,7 @@ from .ciris_persist import (
     NotFound,
     Permanent,
     PersistError,
+    PoolExhausted,
     ReconsiderDosGuard,
     SUPPORTED_SCHEMA_VERSIONS,
     ScoringFactorStream,
@@ -62,6 +63,8 @@ __all__ = [
     "NotFound",
     "Permanent",
     "PersistError",
+    # v59.1.2 — a starved Postgres pool (a RuntimeError subclass).
+    "PoolExhausted",
     "SUPPORTED_SCHEMA_VERSIONS",
     "Transient",
     "__version__",
