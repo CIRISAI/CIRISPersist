@@ -7,6 +7,137 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [59.1.2] - 2026-10-30
+
+### Fixed — a capsule consumer's `AttestationQuery` reads reach the host's backend (#1162)
+
+- **The shape** (field log, every phone and agent-embedded node). Edge gets
+  its directory through `directory_ops_capsule` on the pyo3
+  `init_edge_runtime` path, so every directory call crosses the capsule proxy.
+  v56.0.0 (#1001) moved the attestation folds onto the typed bounded read
+  `execute_attestation_query`, but the proxy answered it with
+  `Error::Unsupported` ("directory ops proxy: method
+  execute_attestation_query has no DirectoryOp"). The owner walk, `owner_of`
+  and edge's chat reader all failed.
+- **The fix.** `DirectoryOp::ExecuteAttestationQuery { query }` and
+  `DirectoryOpResult::AttestationQueryRows` are APPENDED to the wire, and the
+  proxy forwards the query. The host runs only the statement. Routing that op
+  alone did not fix `owner_of` on a phone: the witness then failed on the
+  next three stubs the owner walk reaches. Those are routed too, each an
+  appended op with its result: `list_composers_referencing_any` (the
+  retraction read, result `AttestationRows`),
+  `list_identity_occurrence_history_by_occurrence` (`OccurrenceHistory`) and
+  `list_identity_occurrences_by_occurrence_key` (`IdentityOccurrences`). The
+  last two are `self_of_at`'s reads. The page cut,
+  the cursor and the per-door count stay in the consumer's
+  `query_attestations`, so a read is counted once, against the backend that
+  ran it. `AttestationQuery` and what it carries, plus `QueryRows` and
+  `StoreBackend`, now derive serde. `AttestationQuery`, `ScopeFilter` and
+  `QueryRows` refuse unknown fields: a narrowing that an older host dropped
+  would run a wider read than the one asked for.
+- **Witnesses** (`ffi::directory_capsule`):
+  - **`i1162_attestation_query_through_the_proxy_{sqlite,pg}`**: the owner
+    walk's two queries (`to(node).types([delegates_to])` and its
+    withdraws/recants read) run through the proxy over a real backend. Rows,
+    bytes, backend and the served page equal a direct call, a cursor crosses,
+    and `owner_of` resolves through the capsule.
+  - **`i1162_attestation_query_serde_round_trips_every_field`**: every query
+    field survives the capsule JSON. An unknown field and a zero page are
+    refused.
+  - **I1162, proxy parity**: a from-disk scan of the trait and the proxy
+    impl. Every method the proxy answers `Unsupported`, through its own stub
+    or an inherited default, must be on an allowlist with a reason, and every
+    allowlisted method must still answer `Unsupported`.
+    `list_attestations_by_dimension_citing` is allowlisted, not routed: Edge
+    confirms no production edge path calls it.
+
+### Fixed — a Postgres pool is never smaller than 16, starvation is a typed error, and no door holds a client across a second checkout
+
+- **The shape** (field, v59.1.1 on 1-vCPU Postgres nodes).
+  `PostgresBackend::connect` left deadpool's `PoolConfig` at its default:
+  `2 × CPUs`, which is 2 on one vCPU, and no timeouts, so a checkout waited
+  forever. Doors that held a pooled client across an await that checked out
+  another wedged the node. Both connections sat idle in `ClientRead`, and
+  `setup/root`, `setup/status` and agent memory init never returned. The
+  likely culprit is the audit write: `record_entry` kept its client past the
+  commit, then the Merkle hook (armed whenever a signer is installed) and
+  the trust-grant projection each took another.
+- **The fix.**
+  - `pool_config`: `max_size` is `max(2 × CPUs, 16)` unless the caller sets
+    one.
+  - `PostgresBackend::checkout` bounds the whole checkout, including a new
+    connection's create, at 30 s. deadpool's own wait, create and recycle
+    timeouts stay off on purpose. deadpool runs them on a tokio timer on
+    the thread that polls `pool.get()`. Edge polls persist's pool from its
+    own tokio copy (#705), where that timer panics ("no reactor running"),
+    and across two `.so` files a panic is an abort. So the bound runs its
+    timer on persist's runtime: inline on a persist thread, otherwise
+    spawned on the runtime captured when the backend was built.
+  - A starved pool is `PoolExhausted { waited }` on the store, federation,
+    audit and secrets error types (kinds `store_pool_exhausted`,
+    `federation_pool_exhausted`, `audit_pool_exhausted`,
+    `secrets_pool_exhausted`). In Python it is `ciris_persist.PoolExhausted`,
+    a `RuntimeError` subclass: the backend arm it was carved from raised
+    `RuntimeError`, so `except RuntimeError` still catches it. Exhaustion is
+    not retried: one wait, not four.
+  - Each nested door now drops its client before the helper that takes its
+    own:
+    - audit: `record_entry`, `try_claim_event`;
+    - store: `store_pqc_completion`, `store_planned_community_widening` and
+      `_listing`, `put_family_membership_widening`, `put_identity_occurrence`
+      (and its re-wrap) and `_local`, `lookup_signed_record_by_content_hash`,
+      `list_signed_accord_quorum_evidence_since`,
+      `community_dek_evict_epoch_objects` (which also took a second client
+      while holding the first), `put_stream_sth`;
+    - secrets: `store_secret`, `retrieve_secret`, `recall_secret`,
+      `forget_secret`, `get_service_stats`, `reencrypt_all`,
+      `rotate_master_key`, `try_claim_secret`, `store_detected_secret`.
+  - The secrets access-log write is `let _ =`. On a starved pool those doors
+    returned Ok and lost the audit row without a trace.
+- **Witnesses** (postgres):
+  - **I1480**: the sizing function at 0, 1, 2, 7, 8 and 12 CPUs, and with
+    an explicit size. deadpool's own timers are pinned OFF.
+  - **I320c**: a starved pool polled from a thread with no persist runtime
+    is `PoolExhausted` within the wait. With deadpool's timers it was a
+    panic, and I320 went red.
+  - **I1481**: on a held pool of one, a second checkout is `PoolExhausted`
+    within one wait. Checked for the store, a federation door, `checkout`,
+    and the audit and secrets conversions.
+  - **I1482**: the occurrence door, the wire-index point read and the
+    secrets doors finish on a one-connection pool with a 3 s wait. The
+    secrets witness counts each access-log row.
+  - **I1483**: two concurrent `record_entry` writers with a signer, on a
+    pool of two, held together after the commit by a test barrier, plus
+    `try_claim_event` on one connection.
+  - Each of those drop points was removed by hand, and its witness went red.
+    The other doors' drops have no witness of their own.
+  - Mutation scope `scripts/mutants/scope-5912-pool.txt`: 2 mutants. One is
+    caught. The other, `checkout` returning a default `Object`, is unviable.
+    0 missed.
+
+### Fixed — the boot audit self-check reads `cirislens.audit_log` on Postgres
+
+- `boot_audit_self_verify` listed tenants from `cirislens_audit_log`, which
+  is the SQLite table name. On Postgres the table is `cirislens.audit_log`
+  (V014), so every Postgres boot logged "list tenants: db error" and
+  verified no chain. Witness: `boot_audit_self_check_reads_the_postgres_table`
+  lists the one audited tenant. It was red on the old name.
+
+### Adoption
+
+- A pin bump for Edge. `DIRECTORY_ABI_VERSION` stays 10: four appended ops
+  and four appended results are growth, and no existing variant changed. Both enum-body digests
+  are re-pinned for that growth. Both sides must be on 59.1.2: Edge's crate
+  pin (the proxy) and the persist wheel the host loads (the dispatch). A
+  59.1.2 proxy against a 59.1.1 host gets `federation_backend` (the host
+  cannot decode the new op), not `Unsupported`. Other methods the proxy still
+  answers `Unsupported` (for example `lookup_family`, `lookup_community`,
+  `get_attestation`) are listed with their reasons in the I1162 allowlist.
+- Pool fix: no API break. Hosts that catch `RuntimeError` keep working. A
+  host that wants to tell starvation apart catches `PoolExhausted`, or keys
+  on the `*_pool_exhausted` kind. A pool built with `from_pool` keeps the
+  caller's configuration.
+
 ## [59.1.1] - 2026-10-27
 
 ### Fixed — a node's owner is dropped only by a REVOCATION, not by an unagreed occurrence row (pair-room invitations, live chat)
