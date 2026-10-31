@@ -328,9 +328,7 @@ impl AuditService for PostgresBackend {
 
         let entry_uuid = parse_entry_id(&entry.entry_id)?;
 
-        let mut client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(Error::from)?;
+        let mut client = self.checkout().await.map_err(Error::from)?;
         let tx = client
             .transaction()
             .await
@@ -532,9 +530,7 @@ impl AuditService for PostgresBackend {
              LIMIT ${p_limit}"
         );
 
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(Error::from)?;
+        let client = self.checkout().await.map_err(Error::from)?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref() as _).collect();
         let rows = client
@@ -569,9 +565,7 @@ impl AuditService for PostgresBackend {
             return Err(Error::InvalidArgument("from_sequence must be >= 1".into()));
         }
 
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(Error::from)?;
+        let client = self.checkout().await.map_err(Error::from)?;
 
         let to_seq_resolved: i64 = match to_sequence {
             Some(n) => {
@@ -782,9 +776,7 @@ impl AuditService for PostgresBackend {
         let entry_uuid = parse_entry_id(&entry.entry_id)?;
         let content_hash_vec = content_hash.to_vec();
 
-        let mut client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(Error::from)?;
+        let mut client = self.checkout().await.map_err(Error::from)?;
 
         // Fast path: optimistic claim outside of a transaction.
         // PG ON CONFLICT (content_hash) DO NOTHING gives us the
@@ -1020,9 +1012,7 @@ impl AuditService for PostgresBackend {
         // in a follow-up migration.
         let needle = serde_json::json!({"correlation_id": correlation_id});
 
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(Error::from)?;
+        let client = self.checkout().await.map_err(Error::from)?;
         let rows = client
             .query(
                 "SELECT entry_id, sequence_number, tenant_id, actor_id, \
@@ -1060,9 +1050,7 @@ impl AuditService for PostgresBackend {
         if tenant_id.is_empty() {
             return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
         }
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(Error::from)?;
+        let client = self.checkout().await.map_err(Error::from)?;
         let row_opt = client
             .query_opt(
                 "SELECT sequence_number, entry_hash \
@@ -1127,9 +1115,7 @@ impl AuditService for PostgresBackend {
         tenant_id: &str,
         chain_event_id: i64,
     ) -> Result<Option<uuid::Uuid>, Error> {
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(Error::from)?;
+        let client = self.checkout().await.map_err(Error::from)?;
         // Lookup is tenant-scoped: audit_log.sequence_number is
         // UNIQUE(tenant_id, sequence_number), so chain_event_id alone
         // is NOT unique across tenants. V045 adds
@@ -1161,9 +1147,7 @@ impl AuditService for PostgresBackend {
         &self,
         grant_id: uuid::Uuid,
     ) -> Result<Option<crate::federation::trust_grant::TrustGrantRow>, Error> {
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(Error::from)?;
+        let client = self.checkout().await.map_err(Error::from)?;
         let row_opt = client
             .query_opt(
                 "SELECT grant_id, grantee_key, granter_key, purpose, scope, \
@@ -1189,9 +1173,7 @@ impl AuditService for PostgresBackend {
         include_revoked: bool,
         include_expired: bool,
     ) -> Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error> {
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(Error::from)?;
+        let client = self.checkout().await.map_err(Error::from)?;
         // Per FSD §3.3, wildcard scopes are valid and MUST be surfaced
         // alongside exact-match rows — the caller (NodeCore's
         // resolve_trust) decides whether a wildcard satisfies the
@@ -1227,9 +1209,7 @@ impl AuditService for PostgresBackend {
         &self,
         filter: crate::federation::trust_grant::TrustGrantFilter,
     ) -> Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error> {
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(Error::from)?;
+        let client = self.checkout().await.map_err(Error::from)?;
         // Build the WHERE clause dynamically. params lifetimes here
         // are tricky — pre-stage each binding as a typed local so we
         // can push trait-object references into one Vec.
@@ -1296,9 +1276,7 @@ impl AuditService for PostgresBackend {
         if tenant_id.is_empty() {
             return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
         }
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(Error::from)?;
+        let client = self.checkout().await.map_err(Error::from)?;
         let row_opt = client
             .query_opt(
                 "SELECT canonical_bytes FROM cirislens.merkle_leaves \
@@ -1327,9 +1305,7 @@ impl AuditService for PostgresBackend {
             return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
         }
         // Resolve chain_event_id → leaf_index first.
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(Error::from)?;
+        let client = self.checkout().await.map_err(Error::from)?;
         let row_opt = client
             .query_opt(
                 "SELECT leaf_index FROM cirislens.merkle_leaves \
@@ -1415,9 +1391,7 @@ impl AuditService for PostgresBackend {
                 "local_pubkey must be non-empty".into(),
             ));
         }
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(Error::from)?;
+        let client = self.checkout().await.map_err(Error::from)?;
         let rows = client
             .query(
                 "SELECT key_id, pubkey_ed25519_base64, trust_type, \

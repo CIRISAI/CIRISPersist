@@ -26,7 +26,8 @@
 //! - **I1480** (v59.1.2) — the pool itself: a default pool is never smaller
 //!   than [`POOL_MAX_SIZE_FLOOR`](crate::store::postgres::POOL_MAX_SIZE_FLOOR)
 //!   whatever the CPU count (deadpool's own default was 2 on a 1-vCPU node),
-//!   and every timeout is set.
+//!   and deadpool's own timers stay off (they panic on a thread without
+//!   persist's reactor; I320).
 //! - **I1481** (v59.1.2) — a starved pool is a TYPED error inside its wait,
 //!   never a hang: the store, federation, audit and secrets arms each carry
 //!   it as `PoolExhausted`.
@@ -216,19 +217,16 @@ async fn i602_the_cycle_recheck_completes_on_one_connection() {
 /// caller's explicit size, which is kept as given.
 #[test]
 fn i1480_a_default_pool_is_floored_and_bounded() {
-    use crate::store::postgres::{
-        pool_config, POOL_CREATE_TIMEOUT, POOL_MAX_SIZE_FLOOR, POOL_RECYCLE_TIMEOUT,
-    };
-    let wait = std::time::Duration::from_secs(7);
+    use crate::store::postgres::{pool_config, POOL_MAX_SIZE_FLOOR};
     for cpus in [0, 1, 2, 7, 8] {
         assert_eq!(
-            pool_config(None, cpus, wait).max_size,
+            pool_config(None, cpus).max_size,
             POOL_MAX_SIZE_FLOOR,
             "I1480 {cpus} CPU(s): the floor, not deadpool's 2 x CPUs"
         );
     }
     assert_eq!(
-        pool_config(None, 12, wait).max_size,
+        pool_config(None, 12).max_size,
         24,
         "I1480 above the floor the CPU-derived size stands"
     );
@@ -237,14 +235,18 @@ fn i1480_a_default_pool_is_floored_and_bounded() {
         "I1480 the floor the field fix chose"
     );
     assert_eq!(
-        pool_config(Some(1), 1, wait).max_size,
+        pool_config(Some(1), 1).max_size,
         1,
         "I1480 an explicit size is the caller's"
     );
-    let t = pool_config(None, 1, wait).timeouts;
-    assert_eq!(t.wait, Some(wait), "I1480 checkout waits a bounded time");
-    assert_eq!(t.create, Some(POOL_CREATE_TIMEOUT));
-    assert_eq!(t.recycle, Some(POOL_RECYCLE_TIMEOUT));
+    // No deadpool timer: it would panic on a thread without persist's
+    // reactor (I320). The wait bound is `PostgresBackend::checkout`'s (I1481).
+    let t = pool_config(None, 1).timeouts;
+    assert_eq!(
+        (t.wait, t.create, t.recycle),
+        (None, None, None),
+        "I1480 deadpool's own timers stay off"
+    );
     assert_eq!(
         crate::store::postgres::POOL_WAIT_TIMEOUT,
         std::time::Duration::from_secs(30)
@@ -283,9 +285,7 @@ async fn i1481_a_starved_pool_is_a_typed_error_not_a_hang() {
         "I1481 a federation door keeps the type: {e:?}"
     );
     assert_eq!(e.kind(), "federation_pool_exhausted");
-    let c = crate::store::postgres::checkout(b.pool())
-        .await
-        .expect_err("I1481 checkout");
+    let c = b.checkout().await.expect_err("I1481 checkout");
     #[cfg(feature = "cirisaudit")]
     {
         let a = crate::audit::Error::from(crate::store::postgres::CheckoutError::Exhausted {

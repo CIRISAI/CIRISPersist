@@ -135,9 +135,7 @@ impl PostgresBackend {
         success: bool,
         error: Option<&str>,
     ) -> Result<(), SecretsError> {
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(SecretsError::from)?;
+        let client = self.checkout().await.map_err(SecretsError::from)?;
         client
             .execute(
                 "INSERT INTO cirislens_secrets.access_log (\
@@ -172,9 +170,7 @@ impl PostgresBackend {
     /// rotate_master_key first); >1 = invariant violation (V043 makes
     /// this DB-unrepresentable), surfaces as Internal.
     async fn active_master_key(&self) -> Result<MasterKey, SecretsError> {
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(SecretsError::from)?;
+        let client = self.checkout().await.map_err(SecretsError::from)?;
         let rows = client
             .query(
                 "SELECT key_ref, key_kind, descriptor \
@@ -297,9 +293,7 @@ impl SecretsService for PostgresBackend {
         let secret_key = crypto::derive_secret_key(&master.bytes, &salt)?;
         let ciphertext = crypto::encrypt(&secret_key, &nonce, value.as_bytes())?;
 
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(SecretsError::from)?;
+        let client = self.checkout().await.map_err(SecretsError::from)?;
         let result = client
             .execute(
                 "INSERT INTO cirislens_secrets.secrets (\
@@ -341,9 +335,7 @@ impl SecretsService for PostgresBackend {
         key: &str,
         accessor: String,
     ) -> Result<Option<String>, SecretsError> {
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(SecretsError::from)?;
+        let client = self.checkout().await.map_err(SecretsError::from)?;
         let row_opt = client
             .query_opt(
                 "SELECT secret_uuid, encrypted_value, encryption_key_ref, salt, nonce \
@@ -408,9 +400,7 @@ impl SecretsService for PostgresBackend {
     ) -> Result<Option<SecretRecallResult>, SecretsError> {
         let parsed_uuid = Uuid::parse_str(uuid)
             .map_err(|e| SecretsError::InvalidArgument(format!("uuid parse: {e}")))?;
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(SecretsError::from)?;
+        let client = self.checkout().await.map_err(SecretsError::from)?;
         let row_opt = client
             .query_opt(
                 "SELECT encrypted_value, encryption_key_ref, salt, nonce \
@@ -490,9 +480,7 @@ impl SecretsService for PostgresBackend {
         filter: SecretsListFilter,
     ) -> Result<Vec<SecretReference>, SecretsError> {
         let lim = i64::try_from(limit.min(10_000)).unwrap_or(1000);
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(SecretsError::from)?;
+        let client = self.checkout().await.map_err(SecretsError::from)?;
         let mut where_parts: Vec<String> = Vec::new();
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
         if let Some(s) = filter.sensitivity {
@@ -556,9 +544,7 @@ impl SecretsService for PostgresBackend {
     async fn forget_secret(&self, uuid: &str, accessor: String) -> Result<bool, SecretsError> {
         let parsed_uuid = Uuid::parse_str(uuid)
             .map_err(|e| SecretsError::InvalidArgument(format!("uuid parse: {e}")))?;
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(SecretsError::from)?;
+        let client = self.checkout().await.map_err(SecretsError::from)?;
         let n = client
             .execute(
                 "DELETE FROM cirislens_secrets.secrets WHERE secret_uuid = $1",
@@ -643,9 +629,7 @@ impl SecretsService for PostgresBackend {
     }
 
     async fn get_filter_config(&self) -> Result<FilterConfig, SecretsError> {
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(SecretsError::from)?;
+        let client = self.checkout().await.map_err(SecretsError::from)?;
         let row_opt = client
             .query_opt(
                 "SELECT config_id, config_value, version, updated_at, updated_by \
@@ -677,9 +661,7 @@ impl SecretsService for PostgresBackend {
         updates: FilterUpdateRequest,
         accessor: String,
     ) -> Result<FilterUpdateResult, SecretsError> {
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(SecretsError::from)?;
+        let client = self.checkout().await.map_err(SecretsError::from)?;
         let row = client
             .query_one(
                 "INSERT INTO cirislens_secrets.filter_config (\
@@ -702,9 +684,7 @@ impl SecretsService for PostgresBackend {
     }
 
     async fn get_service_stats(&self) -> Result<SecretsServiceStats, SecretsError> {
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(SecretsError::from)?;
+        let client = self.checkout().await.map_err(SecretsError::from)?;
         let row = client
             .query_one(
                 "SELECT \
@@ -755,9 +735,7 @@ impl SecretsService for PostgresBackend {
 
     async fn is_healthy(&self) -> Result<bool, SecretsError> {
         // Quick connectivity + active-key check.
-        let _ = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(SecretsError::from)?;
+        let _ = self.checkout().await.map_err(SecretsError::from)?;
         Ok(self.active_master_key().await.is_ok())
     }
 
@@ -767,9 +745,7 @@ impl SecretsService for PostgresBackend {
         limit: usize,
     ) -> Result<Vec<AccessLogEntry>, SecretsError> {
         let lim = i64::try_from(limit.min(10_000)).unwrap_or(1000);
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(SecretsError::from)?;
+        let client = self.checkout().await.map_err(SecretsError::from)?;
         let rows = match secret_uuid {
             Some(u) => {
                 let parsed = Uuid::parse_str(u)
@@ -836,9 +812,7 @@ impl SecretsService for PostgresBackend {
             ))
         })?;
 
-        let mut client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(SecretsError::from)?;
+        let mut client = self.checkout().await.map_err(SecretsError::from)?;
 
         // Load every secret up front — a plain read, no lock held.
         // Each row is self-describing (`encryption_key_ref` per row),
@@ -1019,9 +993,7 @@ impl SecretsService for PostgresBackend {
         // and both activate, the second tx to commit hits the unique
         // violation — the loser then re-reads and converges on the
         // winner's key (first-use bootstraps converge, by design).
-        let mut client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(SecretsError::from)?;
+        let mut client = self.checkout().await.map_err(SecretsError::from)?;
         let tx = client
             .transaction()
             .await
@@ -1143,9 +1115,7 @@ impl SecretsService for PostgresBackend {
                 .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
 
         let new_key_ref = Uuid::new_v4().to_string();
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(SecretsError::from)?;
+        let client = self.checkout().await.map_err(SecretsError::from)?;
         // Record the new key as `hardware`, not yet active —
         // `reencrypt_all` activates it (and deactivates the prior one)
         // once every secret is re-encrypted, same staging as
@@ -1208,9 +1178,7 @@ impl SecretsService for PostgresBackend {
         let ciphertext = crypto::encrypt(&secret_key, &nonce, plaintext.as_bytes())?;
         let sensitivity_tag = sensitivity_str(sensitivity).to_owned();
 
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(SecretsError::from)?;
+        let client = self.checkout().await.map_err(SecretsError::from)?;
 
         // Atomic claim: INSERT, suppressing on content_hmac conflict.
         // RETURNING fires only on a successful insert; the empty-row
@@ -1357,9 +1325,7 @@ impl SecretsService for PostgresBackend {
         let ciphertext = crypto::encrypt(&secret_key, &nonce, payload.value.as_bytes())?;
         let sensitivity_tag = sensitivity_str(payload.sensitivity).to_owned();
 
-        let client = crate::store::postgres::checkout(self.pool())
-            .await
-            .map_err(SecretsError::from)?;
+        let client = self.checkout().await.map_err(SecretsError::from)?;
 
         // ── Atomic insert with full metadata ────────────────────────
         // ON CONFLICT (content_hmac) DO NOTHING — race-safe across

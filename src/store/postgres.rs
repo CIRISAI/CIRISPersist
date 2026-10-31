@@ -1603,30 +1603,25 @@ fn env_u64(var: &str, default: u64) -> u64 {
 pub(crate) const POOL_MAX_SIZE_FLOOR: usize = 16;
 /// v59.1.2 — how long a checkout waits for a free connection before it is
 /// [`Error::PoolExhausted`]. Generous for real load; finite, so starvation
-/// is a typed error an operator can see instead of a hang.
+/// is a typed error an operator can see instead of a hang. It bounds the
+/// whole checkout, a new connection's create included.
 pub(crate) const POOL_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-/// v59.1.2 — how long opening a new pooled connection may take.
-pub(crate) const POOL_CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// v59.1.2 — how long recycling a returned connection may take.
-pub(crate) const POOL_RECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// v59.1.2 — the pool configuration [`PostgresBackend::connect`] builds:
 /// the caller's `max_size` when given, else deadpool's `2 × cpus` raised to
-/// [`POOL_MAX_SIZE_FLOOR`]; and every timeout set, `wait` included.
-pub(crate) fn pool_config(
-    max_size: Option<usize>,
-    cpus: usize,
-    wait: std::time::Duration,
-) -> deadpool_postgres::PoolConfig {
-    let mut config = deadpool_postgres::PoolConfig::new(
+/// [`POOL_MAX_SIZE_FLOOR`].
+///
+/// **No deadpool timeouts, on purpose.** deadpool applies its wait, create
+/// and recycle timeouts with a tokio timer on the thread that polls
+/// `pool.get()`. Edge polls persist's pool from its own tokio copy (#705),
+/// where persist's tokio has no reactor, and the timer panics there: an
+/// abort across the two `.so`s (I320 went red on it). The wait bound lives in
+/// [`PostgresBackend::checkout`] instead, which runs the timer on persist's
+/// runtime when the polling thread has none.
+pub(crate) fn pool_config(max_size: Option<usize>, cpus: usize) -> deadpool_postgres::PoolConfig {
+    deadpool_postgres::PoolConfig::new(
         max_size.unwrap_or_else(|| cpus.saturating_mul(2).max(POOL_MAX_SIZE_FLOOR)),
-    );
-    config.timeouts = deadpool_postgres::Timeouts {
-        wait: Some(wait),
-        create: Some(POOL_CREATE_TIMEOUT),
-        recycle: Some(POOL_RECYCLE_TIMEOUT),
-    };
-    config
+    )
 }
 
 /// The CPU count the pool's default size derives from (1 when unknown).
@@ -1637,28 +1632,14 @@ fn available_cpus() -> usize {
 /// v59.1.2 — why a pooled checkout failed.
 #[derive(Debug)]
 pub(crate) enum CheckoutError {
-    /// No connection was freed within the pool's wait timeout.
+    /// No connection was checked out within the backend's checkout wait.
     Exhausted {
-        /// The wait the pool was configured with.
+        /// The wait the backend was built with.
         waited: std::time::Duration,
     },
-    /// Any other failure: a create or recycle timeout, a connect error, a
-    /// closed pool. deadpool's own text.
+    /// Any other failure: a connect error, a closed pool. deadpool's own
+    /// text.
     Failed(String),
-}
-
-/// v59.1.2 — check out one pooled connection. The one place a starved pool
-/// becomes [`CheckoutError::Exhausted`]; the audit and secrets doors map it
-/// into their own typed `PoolExhausted`.
-pub(crate) async fn checkout(pool: &Pool) -> Result<deadpool_postgres::Object, CheckoutError> {
-    pool.get().await.map_err(|e| match e {
-        deadpool_postgres::PoolError::Timeout(deadpool_postgres::TimeoutType::Wait) => {
-            CheckoutError::Exhausted {
-                waited: pool.timeouts().wait.unwrap_or_default(),
-            }
-        }
-        other => CheckoutError::Failed(other.to_string()),
-    })
 }
 
 #[cfg(feature = "cirisaudit")]
@@ -1816,6 +1797,12 @@ pub struct PostgresBackend {
     /// ([`crate::federation::admission::delegation_cycle_gated`]): held from
     /// the cycle check through the insert of every gated write.
     delegation_write_lock: tokio::sync::Mutex<()>,
+    /// v59.1.2 — how long [`Self::checkout`] waits for a connection.
+    checkout_wait: std::time::Duration,
+    /// v59.1.2 — persist's runtime, captured where the backend was built:
+    /// the checkout's timer runs there when the polling thread has none of
+    /// persist's (Edge's thread, #705).
+    persist_rt: Option<tokio::runtime::Handle>,
     /// v54.0.0 (Codex on PR #1050) — the per-record stripe a
     /// `signed_wire_index` re-index holds from its read of the stored bytes
     /// through the replacement ([`crate::store::record_locks`]).
@@ -2418,7 +2405,7 @@ impl PostgresBackend {
         cfg.manager = Some(mgr_config);
         // v59.1.2 — never deadpool's bare default: a CPU-derived size with no
         // timeouts wedged 1-vCPU nodes for good (see `pool_config`).
-        cfg.pool = Some(pool_config(max_size, available_cpus(), wait));
+        cfg.pool = Some(pool_config(max_size, available_cpus()));
 
         // THREAT_MODEL.md AV-18: TLS for the Postgres connection
         // pool, gated on the `tls` feature. Sovereign-mode
@@ -2474,6 +2461,8 @@ impl PostgresBackend {
                 crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
             ),
             minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
+            checkout_wait: wait,
+            persist_rt: tokio::runtime::Handle::try_current().ok(),
             key_plane_rehomed: std::sync::atomic::AtomicBool::new(false),
             pre_purge_schema: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
@@ -2535,6 +2524,8 @@ impl PostgresBackend {
                 crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
             ),
             minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
+            checkout_wait: POOL_WAIT_TIMEOUT,
+            persist_rt: tokio::runtime::Handle::try_current().ok(),
             key_plane_rehomed: std::sync::atomic::AtomicBool::new(false),
             pre_purge_schema: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
@@ -2736,6 +2727,43 @@ impl PostgresBackend {
         &self.pool
     }
 
+    /// v59.1.2 — check out one pooled connection, waiting at most the
+    /// backend's checkout wait ([`POOL_WAIT_TIMEOUT`] unless a test set
+    /// one). The one place a starved pool becomes
+    /// [`CheckoutError::Exhausted`]; [`Self::get_client`] and the audit and
+    /// secrets doors map it into their own typed `PoolExhausted`.
+    ///
+    /// The timer runs where persist's tokio has a reactor: inline on a
+    /// persist runtime thread, else on the runtime captured at construction,
+    /// raced against the checkout polled here (a waker, no reactor needed:
+    /// the #705 shape, where Edge polls this pool from its own tokio copy).
+    pub(crate) async fn checkout(&self) -> Result<deadpool_postgres::Object, CheckoutError> {
+        let wait = self.checkout_wait;
+        let got = match (tokio::runtime::Handle::try_current(), &self.persist_rt) {
+            (Ok(_), _) => tokio::time::timeout(wait, self.pool.get()).await.ok(),
+            (Err(_), Some(rt)) => {
+                // The `Sleep` is built INSIDE the task: constructing it here
+                // would ask this thread for a timer it does not have.
+                let mut timer = rt.spawn(async move { tokio::time::sleep(wait).await });
+                tokio::select! {
+                    biased;
+                    r = self.pool.get() => {
+                        timer.abort();
+                        Some(r)
+                    }
+                    _ = &mut timer => None,
+                }
+            }
+            // No persist runtime anywhere: nothing can run a timer.
+            (Err(_), None) => Some(self.pool.get().await),
+        };
+        match got {
+            None => Err(CheckoutError::Exhausted { waited: wait }),
+            Some(Ok(client)) => Ok(client),
+            Some(Err(e)) => Err(CheckoutError::Failed(e.to_string())),
+        }
+    }
+
     /// Acquire a pooled connection, with a **bounded retry on transient
     /// acquisition failure** (CIRISPersist#200 follow-on).
     ///
@@ -2754,7 +2782,7 @@ impl PostgresBackend {
         const MAX_ATTEMPTS: u32 = 4;
         let mut last_err = None;
         for attempt in 1..=MAX_ATTEMPTS {
-            match checkout(&self.pool).await {
+            match self.checkout().await {
                 Ok(client) => return Ok(client),
                 Err(CheckoutError::Exhausted { waited }) => {
                     return Err(Error::PoolExhausted { waited });
