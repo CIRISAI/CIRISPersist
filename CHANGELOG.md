@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [59.1.2] - 2026-10-30
+## [59.1.2] - UNRELEASED
 
 ### Fixed — a capsule consumer's `AttestationQuery` reads reach the host's backend (#1162)
 
