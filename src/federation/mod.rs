@@ -77,6 +77,10 @@ mod bounded_planes_invariants;
 // classified; no production caller of the demoted wide reads.
 #[cfg(test)]
 mod bounded_reads_table;
+// v59.1.2 (CIRISPersist#1162) — the capsule proxy-parity gate blanks its
+// from-disk scan with the same comment/string blanker.
+#[cfg(test)]
+pub(crate) use bounded_reads_table::gates::blank_comments_and_strings;
 pub mod canonical_at_rest;
 pub mod capacity;
 // v50.0.0 (CIRISPersist#926) — the `ciris-canonical` community row: admitted
@@ -12058,6 +12062,16 @@ pub enum Error {
     #[error("backend: {0}")]
     Backend(String),
 
+    /// v59.1.2 — no pooled connection was freed within the pool's wait
+    /// timeout (`waited`): the pool is starved. Before v59.1.2 the checkout
+    /// had no timeout and waited forever. Python `ciris_persist.PoolExhausted`
+    /// (a `RuntimeError`, the type the backend arm it was carved from had).
+    #[error("federation_pool_exhausted: no pooled connection freed within {waited:?}")]
+    PoolExhausted {
+        /// The wait the pool was configured with.
+        waited: std::time::Duration,
+    },
+
     /// v11.8.1 (CIRISPersist#329). The consumer-side
     /// [`crate::ffi::directory_capsule::build_ops_directory`] proxy was
     /// asked for a `FederationDirectory` method that has no corresponding
@@ -12408,6 +12422,7 @@ impl Error {
             Error::FederationTierUnverified { .. } => "federation_federation_tier_unverified",
             Error::WitnessAdmit(e) => e.kind(),
             Error::Backend(_) => "federation_backend",
+            Error::PoolExhausted { .. } => "federation_pool_exhausted",
             Error::Unsupported { .. } => "federation_ops_proxy_unsupported",
             Error::PurgeRefused { token, .. } => token,
         }

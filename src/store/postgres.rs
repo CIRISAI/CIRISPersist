@@ -87,7 +87,19 @@ impl PostgresBackend {
         dsn: &str,
         max_size: usize,
     ) -> Result<Self, Error> {
-        Self::connect_sized(dsn, Some(max_size)).await
+        Self::connect_sized(dsn, Some(max_size), POOL_WAIT_TIMEOUT).await
+    }
+
+    /// v59.1.2 — [`Self::connect_with_max_size_for_test`] with a short
+    /// checkout wait, so a starved pool answers
+    /// [`Error::PoolExhausted`] inside a test's budget.
+    #[cfg(test)]
+    pub(crate) async fn connect_with_pool_for_test(
+        dsn: &str,
+        max_size: usize,
+        wait: std::time::Duration,
+    ) -> Result<Self, Error> {
+        Self::connect_sized(dsn, Some(max_size), wait).await
     }
 
     /// The pool's configured `max_size` (the one-connection witnesses assert
@@ -146,7 +158,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT attestation_id FROM cirislens.federation_attestations \
@@ -177,7 +189,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         if !pg_key_plane_present(&**client).await? {
             return Ok(Default::default());
         }
@@ -254,7 +266,7 @@ impl PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -406,7 +418,7 @@ impl PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v58.0.0 (CIRISPersist#991) — the record and its `key:record:v1` row,
         // one transaction.
         let tx = client
@@ -566,7 +578,7 @@ impl crate::federation::key_plane::KeyPlaneStore for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -753,7 +765,7 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v36.0.0 (#668) — THIS node's serve position (V130).
         let admitted_at = self
             .next_plane_position(&client, "federation_communities")
@@ -857,7 +869,7 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // SecReview F5 — INSERT + hard_case + epoch bump in ONE transaction:
         // a bump failure after the INSERT must NOT leave a durable un-rotated
         // revocation.
@@ -990,7 +1002,7 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -1025,6 +1037,8 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         tx.commit()
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
+        // v59.1.2 — the re-index checks out its own client.
+        drop(client);
         if inserted == 1 {
             self.index_stored_record("CommunityMembershipWidening", &wire_index_key)
                 .await?;
@@ -1047,7 +1061,7 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -1080,6 +1094,8 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         tx.commit()
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
+        // v59.1.2 — the re-index checks out its own client.
+        drop(client);
         if inserted == 1 {
             self.index_stored_record("CommunityMembershipListing", &wire_index_key)
                 .await?;
@@ -1580,6 +1596,72 @@ fn env_u64(var: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// v59.1.2 — the floor under a default pool's `max_size`. deadpool's own
+/// default is `2 × CPUs`: a pool of 2 on a 1-vCPU node, where two doors that
+/// each hold a client and want a second wait on each other forever (the field
+/// wedge: `setup/root`, `setup/status` and agent memory init never returned).
+pub(crate) const POOL_MAX_SIZE_FLOOR: usize = 16;
+/// v59.1.2 — how long a checkout waits for a free connection before it is
+/// [`Error::PoolExhausted`]. Generous for real load; finite, so starvation
+/// is a typed error an operator can see instead of a hang. It bounds the
+/// whole checkout, a new connection's create included.
+pub(crate) const POOL_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// v59.1.2 — the pool configuration [`PostgresBackend::connect`] builds:
+/// the caller's `max_size` when given, else deadpool's `2 × cpus` raised to
+/// [`POOL_MAX_SIZE_FLOOR`].
+///
+/// **No deadpool timeouts, on purpose.** deadpool applies its wait, create
+/// and recycle timeouts with a tokio timer on the thread that polls
+/// `pool.get()`. Edge polls persist's pool from its own tokio copy (#705),
+/// where persist's tokio has no reactor, and the timer panics there: an
+/// abort across the two `.so`s (I320 went red on it). The wait bound lives in
+/// [`PostgresBackend::checkout`] instead, which runs the timer on persist's
+/// runtime when the polling thread has none.
+pub(crate) fn pool_config(max_size: Option<usize>, cpus: usize) -> deadpool_postgres::PoolConfig {
+    deadpool_postgres::PoolConfig::new(
+        max_size.unwrap_or_else(|| cpus.saturating_mul(2).max(POOL_MAX_SIZE_FLOOR)),
+    )
+}
+
+/// The CPU count the pool's default size derives from (1 when unknown).
+fn available_cpus() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
+/// v59.1.2 — why a pooled checkout failed.
+#[derive(Debug)]
+pub(crate) enum CheckoutError {
+    /// No connection was checked out within the backend's checkout wait.
+    Exhausted {
+        /// The wait the backend was built with.
+        waited: std::time::Duration,
+    },
+    /// Any other failure: a connect error, a closed pool. deadpool's own
+    /// text.
+    Failed(String),
+}
+
+#[cfg(feature = "cirisaudit")]
+impl From<CheckoutError> for crate::audit::Error {
+    fn from(e: CheckoutError) -> Self {
+        match e {
+            CheckoutError::Exhausted { waited } => Self::PoolExhausted { waited },
+            CheckoutError::Failed(e) => Self::Backend(format!("pool: {e}")),
+        }
+    }
+}
+
+#[cfg(feature = "secrets")]
+impl From<CheckoutError> for crate::secrets::SecretsError {
+    fn from(e: CheckoutError) -> Self {
+        match e {
+            CheckoutError::Exhausted { waited } => Self::PoolExhausted { waited },
+            CheckoutError::Failed(e) => Self::Backend(format!("pool: {e}")),
+        }
+    }
+}
+
 /// v52.0.2 (CIRISServer#705) — the pool every [`PostgresBackend::connect`]
 /// builds: deadpool's connector wrapped in
 /// [`PersistRuntimeConnect`](super::postgres_runtime_connect::PersistRuntimeConnect),
@@ -1715,6 +1797,12 @@ pub struct PostgresBackend {
     /// ([`crate::federation::admission::delegation_cycle_gated`]): held from
     /// the cycle check through the insert of every gated write.
     delegation_write_lock: tokio::sync::Mutex<()>,
+    /// v59.1.2 — how long [`Self::checkout`] waits for a connection.
+    checkout_wait: std::time::Duration,
+    /// v59.1.2 — persist's runtime, captured where the backend was built:
+    /// the checkout's timer runs there when the polling thread has none of
+    /// persist's (Edge's thread, #705).
+    persist_rt: Option<tokio::runtime::Handle>,
     /// v54.0.0 (Codex on PR #1050) — the per-record stripe a
     /// `signed_wire_index` re-index holds from its read of the stored bytes
     /// through the replacement ([`crate::store::record_locks`]).
@@ -2118,11 +2206,7 @@ impl PostgresBackend {
         &self,
         node_key_id: Option<&str>,
     ) -> Result<usize, Error> {
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let mut client = self.get_client().await?;
         let tx = client.transaction().await.map_err(|e| Error::Migration {
             sqlstate: None,
             detail: format!("postgres minter-sentinel resolution (#848): begin: {e}"),
@@ -2228,11 +2312,7 @@ impl PostgresBackend {
     async fn backfill_trace_dedup_shard_keys(&self) -> Result<(), Error> {
         const BATCH: i64 = 5_000;
         loop {
-            let mut client = self
-                .pool
-                .get()
-                .await
-                .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+            let mut client = self.get_client().await?;
             let rows = client
                 .query(
                     "SELECT event_id, ts, agent_id_hash, trace_id, thought_id, \
@@ -2286,12 +2366,17 @@ impl PostgresBackend {
     /// - `postgres://user:pass@host:5432/dbname`
     /// - `host=db user=lens password=… dbname=cirislens`
     pub async fn connect(dsn: &str) -> Result<Self, Error> {
-        Self::connect_sized(dsn, None).await
+        Self::connect_sized(dsn, None, POOL_WAIT_TIMEOUT).await
     }
 
     /// [`Self::connect`], with the pool's `max_size` set when `Some` (else
-    /// deadpool's default).
-    async fn connect_sized(dsn: &str, max_size: Option<usize>) -> Result<Self, Error> {
+    /// [`pool_config`]'s floored default) and a checkout that waits at most
+    /// `wait` for a free connection.
+    async fn connect_sized(
+        dsn: &str,
+        max_size: Option<usize>,
+        wait: std::time::Duration,
+    ) -> Result<Self, Error> {
         #[cfg(feature = "tls")]
         ensure_rustls_provider();
         let pg_config: tokio_postgres::Config = dsn
@@ -2318,9 +2403,9 @@ impl PostgresBackend {
             .map(|b| String::from_utf8_lossy(b).into_owned());
         cfg.dbname = pg_config.get_dbname().map(str::to_owned);
         cfg.manager = Some(mgr_config);
-        if let Some(n) = max_size {
-            cfg.pool = Some(deadpool_postgres::PoolConfig::new(n));
-        }
+        // v59.1.2 — never deadpool's bare default: a CPU-derived size with no
+        // timeouts wedged 1-vCPU nodes for good (see `pool_config`).
+        cfg.pool = Some(pool_config(max_size, available_cpus()));
 
         // THREAT_MODEL.md AV-18: TLS for the Postgres connection
         // pool, gated on the `tls` feature. Sovereign-mode
@@ -2376,6 +2461,8 @@ impl PostgresBackend {
                 crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
             ),
             minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
+            checkout_wait: wait,
+            persist_rt: tokio::runtime::Handle::try_current().ok(),
             key_plane_rehomed: std::sync::atomic::AtomicBool::new(false),
             pre_purge_schema: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
@@ -2437,6 +2524,8 @@ impl PostgresBackend {
                 crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
             ),
             minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
+            checkout_wait: POOL_WAIT_TIMEOUT,
+            persist_rt: tokio::runtime::Handle::try_current().ok(),
             key_plane_rehomed: std::sync::atomic::AtomicBool::new(false),
             pre_purge_schema: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
@@ -2638,6 +2727,43 @@ impl PostgresBackend {
         &self.pool
     }
 
+    /// v59.1.2 — check out one pooled connection, waiting at most the
+    /// backend's checkout wait ([`POOL_WAIT_TIMEOUT`] unless a test set
+    /// one). The one place a starved pool becomes
+    /// [`CheckoutError::Exhausted`]; [`Self::get_client`] and the audit and
+    /// secrets doors map it into their own typed `PoolExhausted`.
+    ///
+    /// The timer runs where persist's tokio has a reactor: inline on a
+    /// persist runtime thread, else on the runtime captured at construction,
+    /// raced against the checkout polled here (a waker, no reactor needed:
+    /// the #705 shape, where Edge polls this pool from its own tokio copy).
+    pub(crate) async fn checkout(&self) -> Result<deadpool_postgres::Object, CheckoutError> {
+        let wait = self.checkout_wait;
+        let got = match (tokio::runtime::Handle::try_current(), &self.persist_rt) {
+            (Ok(_), _) => tokio::time::timeout(wait, self.pool.get()).await.ok(),
+            (Err(_), Some(rt)) => {
+                // The `Sleep` is built INSIDE the task: constructing it here
+                // would ask this thread for a timer it does not have.
+                let mut timer = rt.spawn(async move { tokio::time::sleep(wait).await });
+                tokio::select! {
+                    biased;
+                    r = self.pool.get() => {
+                        timer.abort();
+                        Some(r)
+                    }
+                    _ = &mut timer => None,
+                }
+            }
+            // No persist runtime anywhere: nothing can run a timer.
+            (Err(_), None) => Some(self.pool.get().await),
+        };
+        match got {
+            None => Err(CheckoutError::Exhausted { waited: wait }),
+            Some(Ok(client)) => Ok(client),
+            Some(Err(e)) => Err(CheckoutError::Failed(e.to_string())),
+        }
+    }
+
     /// Acquire a pooled connection, with a **bounded retry on transient
     /// acquisition failure** (CIRISPersist#200 follow-on).
     ///
@@ -2648,13 +2774,20 @@ impl PostgresBackend {
     /// that had no reproducible failing test). The happy path takes one
     /// iteration (no added cost); a hard-down DB still surfaces the real error
     /// after a short, bounded backoff (50 + 100 + 150 ms).
+    ///
+    /// v59.1.2 — a pool that stayed exhausted for its whole wait is NOT
+    /// retried: it is [`Error::PoolExhausted`] at once (a retry would only
+    /// multiply the wait by the attempt count).
     pub(crate) async fn get_client(&self) -> Result<deadpool_postgres::Object, Error> {
         const MAX_ATTEMPTS: u32 = 4;
         let mut last_err = None;
         for attempt in 1..=MAX_ATTEMPTS {
-            match self.pool.get().await {
+            match self.checkout().await {
                 Ok(client) => return Ok(client),
-                Err(e) => {
+                Err(CheckoutError::Exhausted { waited }) => {
+                    return Err(Error::PoolExhausted { waited });
+                }
+                Err(CheckoutError::Failed(e)) => {
                     last_err = Some(e);
                     if attempt < MAX_ATTEMPTS {
                         tokio::time::sleep(std::time::Duration::from_millis(
@@ -2692,7 +2825,7 @@ impl PostgresBackend {
             let client = self
                 .get_client()
                 .await
-                .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+                .map_err(crate::store::Error::into_federation)?;
             if !pg_key_plane_present(&**client).await? {
                 return Ok(());
             }
@@ -2880,7 +3013,7 @@ impl PostgresBackend {
                     let mut client = self
                         .get_client()
                         .await
-                        .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+                        .map_err(crate::store::Error::into_federation)?;
                     let tx = client.transaction().await.map_err(|e| {
                         crate::federation::Error::Backend(format!(
                             "signed_wire_index transaction: {e}"
@@ -4001,11 +4134,7 @@ impl Backend for PostgresBackend {
         .await
         .map_err(|e| Error::Backend(format!("erasure plan: {e}")))?;
         let refused_count = refused.len() as u64;
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let mut client = self.get_client().await?;
         let tx = client
             .transaction()
             .await
@@ -4214,11 +4343,7 @@ impl Backend for PostgresBackend {
         .await
         .map_err(|e| Error::Backend(format!("erasure plan: {e}")))?;
         let refused_count = refused.len() as u64;
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let mut client = self.get_client().await?;
         let tx = client
             .transaction()
             .await
@@ -4343,11 +4468,7 @@ impl Backend for PostgresBackend {
         limit: i64,
         agent_id_hash: Option<&str>,
     ) -> Result<Vec<(i64, TraceEventRow)>, Error> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let client = self.get_client().await?;
 
         // Branch on filter so the no-filter case skips the optional
         // WHERE-clause bind. Same shape Postgres planners optimize
@@ -5459,7 +5580,7 @@ impl PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         for sr in records {
             let mut row = sr.record.clone();
             crate::federation::register::validate_registration_pubkey(&row)?;
@@ -5570,7 +5691,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .execute(
                 "UPDATE cirislens.federation_keys SET identity_type = $2 WHERE key_id = $1",
@@ -5598,7 +5719,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .query(
                 "SELECT trace_count FROM cirislens.trace_events_factor_rollup_1h \
@@ -5625,7 +5746,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .execute(
                 "DELETE FROM cirislens.purge_tombstones \
@@ -5650,7 +5771,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .execute(
                 "UPDATE cirislens.federation_attestations SET asserted_at = $2 \
@@ -5676,7 +5797,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let env: Option<String> = envelope.map(serde_json::Value::to_string);
         client
             .execute(
@@ -5701,7 +5822,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .execute(
                 "UPDATE cirislens.federation_keys SET additional_scrubs = '[]' WHERE key_id = $1",
@@ -5731,7 +5852,7 @@ impl PostgresBackend {
             let mut client = self
                 .get_client()
                 .await
-                .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+                .map_err(crate::store::Error::into_federation)?;
             // v58.0.0 (CIRISPersist#991) — the repair and its key-plane row,
             // one transaction.
             let tx = client.transaction().await.map_err(|e| {
@@ -5878,7 +5999,7 @@ impl PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v58.0.0 (CIRISPersist#991) — the write and its key-plane row, one
         // transaction.
         let tx = client.transaction().await.map_err(|e| {
@@ -6083,7 +6204,7 @@ impl PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v58.0.0 (CIRISPersist#991) — the write and its key-plane row, one
         // transaction.
         let tx = client.transaction().await.map_err(|e| {
@@ -6344,7 +6465,7 @@ impl PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let mutated_at = self.next_key_serve_position(&client).await?;
         let tx = client.transaction().await.map_err(|e| {
             crate::federation::Error::Backend(format!(
@@ -6457,7 +6578,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
@@ -6547,7 +6668,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         // V121: `attestation_id` is TEXT (genesis rows carry symbolic ids), so
         // the scan pages on the PK in its own order.
@@ -6579,7 +6700,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .query(
                 "SELECT DISTINCT trace_id FROM cirislens.trace_llm_calls WHERE model = $1 \
@@ -6602,7 +6723,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .query(
                 "SELECT DISTINCT trace_id FROM cirislens.trace_events WHERE signing_key_id = $1 \
@@ -6628,7 +6749,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let ids: Vec<&str> = trace_ids.iter().map(String::as_str).collect();
         let row = client
             .query_one(
@@ -6670,7 +6791,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -6782,7 +6903,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .query_opt(
                 &format!("{PG_PURGE_EXECUTION_SELECT} WHERE notice_id = $1"),
@@ -6802,7 +6923,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .query(
                 "SELECT notice_id, plane, record_ref, ordinal, derived_from \
@@ -6832,7 +6953,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_one(
                 "SELECT MIN(notice_id) FROM cirislens.purge_tombstones \
@@ -6852,7 +6973,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .query(
                 "SELECT DISTINCT notice_id FROM cirislens.purge_tombstones \
@@ -6877,7 +6998,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let since_at = since.as_ref().map(|(t, _)| *t);
         let since_id = since.as_ref().map(|(_, id)| id.clone());
         let limit = i64::from(limit);
@@ -6906,7 +7027,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // The door's own gate, in the statement: only a row a purge tombstone
         // names, and never the accountability record (Codex on PR #1057: a
         // tombstone is void for it). The V106 / V121 cascades follow as on the
@@ -6937,10 +7058,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         trace_id: &str,
     ) -> Result<(u64, u64), crate::federation::Error> {
         let mut client = self
-            .pool
-            .get()
+            .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(format!("pool: {e}")))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -7090,7 +7210,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let n = client
             .execute(
                 "UPDATE cirislens.purge_executions SET finalized_at = $2 \
@@ -7114,7 +7234,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(format!("pg pool: {e}")))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_opt(
                 "SELECT depth FROM cirislens.federation_withdraws_admission_depths \
@@ -7142,7 +7262,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(format!("pg pool: {e}")))?;
+            .map_err(crate::store::Error::into_federation)?;
         let ids: Vec<&str> = attestation_ids.iter().map(String::as_str).collect();
         let rows = client
             .query(
@@ -7254,7 +7374,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT key_id, registration_envelope, original_content_hash, \
@@ -7314,7 +7434,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT rendition_sha256, original_sha256, format, size, width, height, \
@@ -7423,7 +7543,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v58.0.0 (CIRISPersist#991) — the write and its key-plane row, one
         // transaction.
         let tx = client
@@ -7514,7 +7634,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
@@ -7539,7 +7659,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
@@ -7569,7 +7689,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
@@ -7612,7 +7732,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v36.0.0 (CIRISPersist#707) — `consent_role` IS in the served
         // `KeyRecord` bytes, so this rewrite must move the serve position or a
         // consumer past the cursor never learns the role changed.
@@ -7664,7 +7784,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Idempotency: an existing tombstone with matching superseded_by +
         // authority digest is a no-op; a differing one Conflicts (mirrors the
         // SQLite SELECT-then-INSERT).
@@ -7724,7 +7844,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_opt(
                 "SELECT key_id, withdrawn_at, authority_decision_digest, superseded_by, \
@@ -7747,7 +7867,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT key_id, withdrawn_at, authority_decision_digest, superseded_by, \
@@ -7785,7 +7905,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let existing = client
             .query_opt(
                 "SELECT superseded_by, authority_decision_digest \
@@ -7894,7 +8014,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_opt(
                 "SELECT role, key_id, withdrawn_at, authority_decision_digest, superseded_by, \
@@ -8015,7 +8135,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 // weight::float8 AS weight — tokio-postgres has no
@@ -8060,7 +8180,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         pg_execute_attestation_query(&**client, q).await
     }
 
@@ -8103,7 +8223,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref() as _).collect();
         let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
@@ -8141,7 +8261,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(&sql, &[&dimension, &evidence_ref])
             .await
@@ -8183,7 +8303,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(&sql, &[&attesting_key_id, &dimension, &evidence_ref])
             .await
@@ -8231,7 +8351,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref() as _).collect();
         let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
@@ -8265,7 +8385,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT DISTINCT author_key_id, peer_key_id FROM cirislens.consent_peer_set_for \
@@ -8297,7 +8417,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT DISTINCT peer_key_id FROM cirislens.consent_peer_set \
@@ -8327,7 +8447,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT fa.attestation_id::text, fa.attesting_key_id, fa.attested_key_id, \
@@ -8379,7 +8499,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT fa.attestation_id::text, fa.attesting_key_id, fa.attested_key_id, \
@@ -8437,7 +8557,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let rows = client
             .query(
@@ -8489,7 +8609,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let unplaced = crate::federation::admission::postgres_envelope_names_no_cohort_target(
             "a.attestation_envelope",
@@ -8566,7 +8686,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let rows = client
             .query(
@@ -8628,9 +8748,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     ) -> Result<Vec<String>, crate::federation::Error> {
         let after = after_content_hash.unwrap_or("");
         let lim = i64::from(limit);
-        let client = self.pool().get().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("list_wire_hashes_since pool: {e}"))
-        })?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT content_hash FROM cirislens.signed_wire_index \
@@ -8667,9 +8788,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // v59.0.0 — a peer's advertisement of a framed key-plane hash is
         // refused: that carriage is retired.
         crate::federation::replication_policy::refuse_retired_framed(kind)?;
-        let client = self.pool().get().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("insert_known_wire_hash pool: {e}"))
-        })?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
         // Upsert, because the same hash arrives on EVERY wrap of edge's
         // re-sweep. `last_advertised_at` is bumped on each sighting — that
         // movement is what makes the eviction floor meaningful, and a plain
@@ -8705,9 +8827,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         kind: &str,
         content_hash: &str,
     ) -> Result<bool, crate::federation::Error> {
-        let client = self.pool().get().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("known_wire_hash_contains pool: {e}"))
-        })?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_opt(
                 "SELECT 1 FROM cirislens.known_wire_hashes \
@@ -8731,9 +8854,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     ) -> Result<Vec<crate::federation::KnownWireHash>, crate::federation::Error> {
         let after = after_content_hash.unwrap_or("");
         let lim = i64::from(limit);
-        let client = self.pool().get().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("list_known_wire_hashes_since pool: {e}"))
-        })?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT kind, content_hash, last_advertised_at, advertised_by \
@@ -8777,9 +8901,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         cutoff: chrono::DateTime<chrono::Utc>,
         bound: u64,
     ) -> Result<crate::federation::KnownHashEviction, crate::federation::Error> {
-        let client = self.pool().get().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("evict_known_wire_hashes pool: {e}"))
-        })?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
         // Only entries NOT advertised since the caller's cutoff. Persist never
         // computes that instant — edge owns the wrap period and hands over the
         // resulting timestamp, so there is exactly one owner of the number and
@@ -8821,9 +8946,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     ) -> Result<Vec<String>, crate::federation::Error> {
         let lim = i64::try_from(limit).unwrap_or(i64::MAX);
         let off = i64::try_from(offset).unwrap_or(0);
-        let client = self.pool().get().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("list_expired_attestation_ids pool: {e}"))
-        })?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT attestation_id FROM cirislens.federation_attestations \
@@ -8855,9 +8981,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     ) -> Result<(), crate::federation::Error> {
         let record_key =
             crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]);
-        let mut client = self.pool().get().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("purge_attestation_projections pool: {e}"))
-        })?;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
         // One transaction: every projection leaves together.
         let tx = client.transaction().await.map_err(|e| {
             crate::federation::Error::Backend(format!("purge_attestation_projections tx: {e}"))
@@ -8921,9 +9048,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         chunk_sha256: &[u8; 32],
     ) -> Result<Vec<[u8; 32]>, crate::federation::Error> {
         // v53.1.0 (#979) — V176 (chunk → manifest) and V160 (child → root).
-        let client = self.pool.get().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("dag_manifests_of_chunk pool: {e}"))
-        })?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
         let sha = chunk_sha256.to_vec();
         let rows = client
             .query(
@@ -8961,7 +9089,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v47.2.0 (#862) — the pointer shape has no evidence_ref: prefilter on any mention.
         let like = format!("%{content_sha256}%");
         let needle =
@@ -9029,7 +9157,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT revocation_id::text, revoked_key_id, revoking_key_id, reason, \
@@ -9095,7 +9223,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v58.0.0 (CIRISPersist#991) — the occurrence and its
         // `identity:occurrence:v1` row, one transaction.
         let tx = client.transaction().await.map_err(|e| {
@@ -9176,23 +9304,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         tx.commit().await.map_err(|e| {
             crate::federation::Error::Backend(format!("put_identity_occurrence commit: {e}"))
         })?;
-        // #446 — materialize the embedded binding into the
-        // `transport_destinations` read model (local derived row on the
-        // occurrence's own (epoch=0, asserted_at) clock — see project_route).
-        // ONLY when the occurrence write actually applied: projecting on a
-        // stale no-op could seed the read model with a binding older than
-        // the stored occurrence.
-        if occurrence_applied > 0 {
-            if let Some(tb) = &row.transport_binding {
-                let route = tb.project_route(&row.occurrence_key_id, row.asserted_at)?;
-                crate::federation::FederationDirectory::put_transport_destination(self, &route)
-                    .await?;
-            }
-            // v58.0.0 (CIRISPersist#991) — the pair's `identity:occurrence:v1`
-            // row is the wire-index entry (the Attestation kind).
-            // A schema before V198 (a test's `run_migrations_through`) has no
-            // pointer: no row to index.
-            let occurrence_row_id: Option<String> = if !pg_key_plane_present(&**client).await? {
+        // v58.0.0 (CIRISPersist#991) — the pair's `identity:occurrence:v1`
+        // row is the wire-index entry (the Attestation kind).
+        // A schema before V198 (a test's `run_migrations_through`) has no
+        // pointer: no row to index.
+        // v59.1.2 — read on THIS client, then release it before the route
+        // projection, the re-index and the re-wrap, each of which checks out
+        // its own (held across them, two concurrent puts wedged a pool of
+        // two).
+        let occurrence_row_id: Option<String> =
+            if occurrence_applied == 0 || !pg_key_plane_present(&**client).await? {
                 None
             } else {
                 match client
@@ -9209,7 +9330,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     None => None,
                 }
             };
-            drop(client);
+        drop(client);
+        // #446 — materialize the embedded binding into the
+        // `transport_destinations` read model (local derived row on the
+        // occurrence's own (epoch=0, asserted_at) clock — see project_route).
+        // ONLY when the occurrence write actually applied: projecting on a
+        // stale no-op could seed the read model with a binding older than
+        // the stored occurrence.
+        if occurrence_applied > 0 {
+            if let Some(tb) = &row.transport_binding {
+                let route = tb.project_route(&row.occurrence_key_id, row.asserted_at)?;
+                crate::federation::FederationDirectory::put_transport_destination(self, &route)
+                    .await?;
+            }
             self.index_plane_row(occurrence_row_id.as_deref()).await?;
         }
         // v50.0.0 (CIRISPersist#916) — a member's device occurrence arriving
@@ -9252,7 +9385,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v36.0.0 (#668) — serve position (V130); the local upsert stamps and
         // re-stamps it like the signed door (unsigned rows only — the
         // `WHERE signature IS NULL` guard is unchanged).
@@ -9304,6 +9437,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("put_identity_occurrence_local: {e}"))
             })?;
+        // v59.1.2 — the route projection checks out its own client.
+        drop(client);
         // #446 — the trusted-local path projects too (accepted write; the
         // invariant is "every stored occurrence carrying a binding has its
         // route materialized").
@@ -9321,7 +9456,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT identity_key_id, occurrence_key_id, device_class, \
@@ -9348,7 +9483,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // #418 replication read: only signed-put rows carry the signature
         // container; trusted-local rows (NULL sig cols) are omitted.
         let rows = client
@@ -9386,7 +9521,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT identity_key_id, occurrence_key_id, device_class, \
@@ -9417,7 +9552,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT identity_key_id, occurrence_key_id, asserted_at, valid_until, \
@@ -9457,7 +9592,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT identity_key_id, occurrence_key_id, device_class, \
@@ -9528,7 +9663,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v36.0.0 (#668) — attaching the authority signature is what makes
         // the row VISIBLE to the signed serve cursor; the serve position is
         // re-stamped here, because admission to the signed stream is this
@@ -9589,7 +9724,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v36.0.0 (#668) — THIS node's serve position (V130).
         let admitted_at = self
             .next_plane_position(&client, "federation_families")
@@ -9665,7 +9800,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let next: i32 = match cohort {
             Cohort::Family => {
                 // v31.0.0 (CIRISPersist#651) — the snapshot is the SIGNED
@@ -9959,7 +10094,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT version, snapshot, change_authorization, superseded_at \
@@ -10044,7 +10179,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT family_key_id, family_name, members, founded_at, \
@@ -10068,7 +10203,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let containment = serde_json::json!([{ "key_id": member_identity_key_id }]);
         let rows = client
             .query(
@@ -10131,7 +10266,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let n = client
             .execute(
                 "INSERT INTO cirislens.federation_lineage_head_cosigns \
@@ -10166,7 +10301,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT lineage_key_id, head_digest_sha256_hex, witness_key_id, head_asserted_at, \
@@ -10206,7 +10341,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_opt(
                 "SELECT * FROM cirislens.federation_communities WHERE community_key_id = $1 \
@@ -10227,7 +10362,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT community_key_id, community_name, members, founded_at, \
@@ -10251,7 +10386,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let containment = serde_json::json!([{ "key_id": member_identity_key_id }]);
         let rows = client
             .query(
@@ -10288,7 +10423,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             let c = self
                 .get_client()
                 .await
-                .map_err(|e| Error::Backend(e.to_string()))?;
+                .map_err(crate::store::Error::into_federation)?;
             let last: Option<chrono::DateTime<chrono::Utc>> = c
                 .query_one("SELECT MAX(created_at) FROM cirislens.accord_proposal", &[])
                 .await
@@ -10304,7 +10439,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v54.1.0 (#1047) — single use: a proposer-minted nonce names one
         // proposal per family. The check and the insert are one transaction
         // under an advisory lock, so two processes sharing the database
@@ -10400,7 +10535,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
@@ -10421,7 +10556,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
@@ -10447,7 +10582,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Answered from the V124 `accord_proposal(payload_sha256)` index.
         let rows = client
             .query(
@@ -10485,7 +10620,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             let c = self
                 .get_client()
                 .await
-                .map_err(|e| Error::Backend(e.to_string()))?;
+                .map_err(crate::store::Error::into_federation)?;
             let last: Option<chrono::DateTime<chrono::Utc>> = c
                 .query_one(
                     "SELECT MAX(server_arrival_at) FROM cirislens.accord_participation",
@@ -10505,7 +10640,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // M6 dedup by (proposal_digest, pinned_pubkey): idempotent if
         // identical, conflict if a different vote.
         let existing: Option<String> = client
@@ -10603,7 +10738,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT participation_json, pinned_pubkey, server_arrival_at, persist_row_hash \
@@ -10630,7 +10765,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Immutable (M2).
         let existing: Option<String> = client
             .query_opt(
@@ -10684,7 +10819,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT decision_json, persist_row_hash, decided_at \
@@ -10704,7 +10839,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .execute(
                 "INSERT INTO cirislens.accord_active_halt (family_key_id, active_halt_id, set_at) \
@@ -10726,7 +10861,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT family_key_id, active_halt_id, set_at FROM cirislens.accord_active_halt \
@@ -10746,7 +10881,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .execute(
                 "DELETE FROM cirislens.accord_active_halt \
@@ -10772,7 +10907,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v36.0.0 (#668) — THIS node's serve position (V130).
         let admitted_at = self
             .next_plane_position(&client, "federation_identity_occurrence_revocations")
@@ -10828,7 +10963,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let backend = |e: tokio_postgres::Error| {
             crate::federation::Error::Backend(format!("self-roster receipt: {e}"))
         };
@@ -10868,7 +11003,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT attestation_id, identity_key_id, received_at, settled_at, outcome \
@@ -10890,7 +11025,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT attestation_id, identity_key_id, received_at, settled_at, outcome \
@@ -10913,7 +11048,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .execute(
                 "UPDATE cirislens.federation_self_roster_proposals \
@@ -10979,7 +11114,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v36.0.0 (#668) — THIS node's serve position (V130).
         let admitted_at = self
             .next_plane_position(&client, "federation_family_membership_revocations")
@@ -11117,7 +11252,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -11152,6 +11287,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         tx.commit()
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
+        // v59.1.2 — the re-index checks out its own client.
+        drop(client);
         if inserted == 1 {
             let effective_at_rfc3339 = row.effective_at.to_rfc3339();
             let wire_index_key = crate::federation::wire_index::record_key(&[
@@ -11181,7 +11318,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT identity_key_id, occurrence_key_id, revoked_at, effective_at, \
@@ -11208,7 +11345,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT family_key_id, removed_identity_key_id, removed_at, effective_at, \
@@ -11236,7 +11373,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT community_key_id, removed_identity_key_id, removed_at, effective_at, \
@@ -11263,7 +11400,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT family_key_id, member_key_id, joined_at, effective_at, role, \
@@ -11290,7 +11427,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT community_key_id, member_key_id, joined_at, effective_at, role, \
@@ -11317,7 +11454,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT community_key_id, member_key_id, effective_at, listed, \
@@ -11344,7 +11481,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let be = |e: tokio_postgres::Error| {
             crate::federation::Error::Backend(format!("community_roster_signers: {e}"))
         };
@@ -11419,7 +11556,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let be = |e: tokio_postgres::Error| {
             crate::federation::Error::Backend(format!("family_roster_signers: {e}"))
         };
@@ -11515,7 +11652,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             let probe = self
                 .get_client()
                 .await
-                .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+                .map_err(crate::store::Error::into_federation)?;
             let held = probe
                 .query_opt(
                     "SELECT 1 FROM cirislens.federation_location_proofs \
@@ -11551,7 +11688,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v36.0.0 (#668) — THIS node's serve position (V130).
         let admitted_at = self
             .next_plane_position(&client, "federation_location_proofs")
@@ -11610,7 +11747,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let subject = proof.location_proof.subject_key_id.clone();
         let asserted_at = proof.location_proof.asserted_at;
         let held = client
@@ -11724,7 +11861,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
@@ -11755,7 +11892,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Single-statement atomic election: insert fresh, or steal iff the
         // incumbent's heartbeat is stale. A live incumbent fails the DO
         // UPDATE WHERE → 0 rows → RETURNING empty → we lost. Two racers:
@@ -11799,7 +11936,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Refresh only if WE are still the current owner — match on
         // (instance, lease_version, pid). If the lease was stolen the
         // version/pid moved on → 0 rows → None (demotion signal).
@@ -11830,7 +11967,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_opt(
                 "SELECT instance_name, owner_pid, owner_hostname, acquired_at, \
@@ -11852,7 +11989,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Ownership-checked + idempotent: only delete our own current
         // lease. A no-op if it was already stolen (never delete a sibling's).
         client
@@ -11877,7 +12014,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // #443 route-table put: keyed on (occ, kind) — `destination` is
         // payload — and GUARDED monotonic on (epoch, asserted_at)
         // lexicographic. A stale assertion is a silent no-op.
@@ -12013,7 +12150,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Classify against the current row (retired rows INCLUDED — the
         // tombstone must keep winning) ...
         let existing = client
@@ -12172,7 +12309,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // #443 — live routes only: retired tombstones are excluded from
         // every list_* read (they still gossip via the signed read).
         let rows = client
@@ -12199,7 +12336,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // #443 replication read: only signed-put rows carry the signature
         // container; trusted-local rows (NULL sig cols) are omitted.
         // RETIRED rows are INCLUDED — tombstones must gossip.
@@ -12234,7 +12371,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // #443 — live routes only, ordered by the route key (deterministic
         // restore; one row per (occ, kind) is structural).
         let rows = client
@@ -12261,7 +12398,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // #443 — live routes only.
         let rows = client
             .query(
@@ -12291,7 +12428,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let n = client
             .execute(
                 "DELETE FROM cirislens.transport_destinations \
@@ -12329,7 +12466,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Monotonic-max merge: `fresh_as_of` only ever advances. A fresh
         // insert always applies (no conflict target); against an existing
         // row the SQL guard is the single source of truth — mirrors the
@@ -12377,7 +12514,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_opt(
                 "SELECT target_key_id, target_kind, fresh_as_of, signer_form, attesting_key_id, \
@@ -12421,7 +12558,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let mut sql = String::from(
             "SELECT event_id, kind, target_key_id, subject_key_id, detail, emitted_at \
              FROM cirislens.hard_case_events",
@@ -12493,7 +12630,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -12550,7 +12687,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT peer_id, epoch_id, observed_at_unix_ms, claim_namespaces, merkle_root, \
@@ -12619,7 +12756,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_one(
                 "SELECT MAX(epoch_id) AS max_epoch FROM cirislens.wholeness_witness_corpus \
@@ -12643,7 +12780,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT DISTINCT peer_id FROM cirislens.wholeness_witness_corpus \
@@ -12666,7 +12803,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Subject-side revocations only: a `withdraws` admitted under rule
         // 2/3/4 (rule 1 is the producer's own revoke), or a
         // `consent:state:revoked` stance. NOT tier-filtered — the §10.1.3
@@ -12717,7 +12854,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT community_key_id, community_name, members, founded_at, \
@@ -12790,7 +12927,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v36.0.0 (#668) — THIS node's serve position (V130).
         let admitted_at = self
             .next_plane_position(&client, "federation_organizations")
@@ -12878,7 +13015,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v36.0.0 (#668) — THIS node's serve position (V130).
         let admitted_at = self
             .next_plane_position(&client, "federation_org_memberships")
@@ -12975,7 +13112,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v36.0.0 (#668) — THIS node's serve position (V130).
         let admitted_at = self
             .next_plane_position(&client, "federation_partner_records")
@@ -13034,7 +13171,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT * FROM cirislens.federation_organizations WHERE org_id = $1 \
@@ -13055,7 +13192,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT * FROM cirislens.federation_org_memberships WHERE org_id = $1 \
@@ -13076,7 +13213,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT * FROM cirislens.federation_partner_records WHERE license_id = $1 \
@@ -13103,7 +13240,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let since_id = since.as_ref().map(|(_, id)| id.clone());
@@ -13138,7 +13275,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let since_id = since.as_ref().map(|(_, id)| id.clone());
@@ -13173,7 +13310,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let since_id = since.as_ref().map(|(_, id)| id.clone());
@@ -13208,7 +13345,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let since_id = since.as_ref().map(|(_, id)| id.clone());
@@ -13250,7 +13387,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let since_id = since.as_ref().map(|(_, id)| id.clone());
@@ -13286,7 +13423,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let since_id = since.as_ref().map(|(_, id)| id.clone());
@@ -13322,7 +13459,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         // Row-unique tie-break: (subject_key_id, persist_row_hash) — the PK
         // carries an instant, which stays out of the resume token.
@@ -13368,7 +13505,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         // v49.0.0 (#910.1) — the resume id is the three-part PK.
@@ -13419,7 +13556,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         // v48.0.0 (#860) — the resume id is the three-part PK.
@@ -13470,7 +13607,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let (since_a, since_b, since_c) = match since.as_ref() {
@@ -13520,7 +13657,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let (since_a, since_b, since_c) = match since.as_ref() {
@@ -13570,7 +13707,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let (since_a, since_b, since_c) = match since.as_ref() {
@@ -13630,7 +13767,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit_i = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let since_id = since.as_ref().map(|(_, id)| id.clone());
@@ -13681,6 +13818,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 .map_err(|e| crate::federation::Error::Backend(format!("evidence_at: {e}")))?;
             page.push((pg_row_to_stored_proposal(row)?, evidence_at));
         }
+        // v59.1.2 — assembly reads each proposal's participations through
+        // the directory (its own clients).
+        drop(client);
         crate::federation::accord_carriage::assemble_evidence_page(self, page).await
     }
 
@@ -13701,7 +13841,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let (since_a, since_b) = match since.as_ref() {
@@ -13755,7 +13895,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT attestation_type, COUNT(*)::int8, MIN(asserted_at), MAX(asserted_at) \
@@ -13800,7 +13940,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let since_id = since.as_ref().map(|(_, id)| id.clone());
@@ -13884,7 +14024,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT record_key FROM cirislens.signed_wire_index \
@@ -13900,6 +14040,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         };
         let record_key: String =
             row.safe_get_with("record_key", crate::federation::Error::Backend)?;
+        // v59.1.2 — the reload reads through the directory (its own clients).
+        drop(client);
         let bytes =
             crate::federation::wire_index::reload_record_bytes(self, kind, &record_key).await?;
         let Some(bytes) = bytes else {
@@ -13923,7 +14065,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         for (kind, hash, record_key) in &triples {
             pg_upsert_wire_index(&**client, kind, hash, record_key).await?;
         }
@@ -13966,7 +14108,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v58.0.0 (CIRISPersist#991) — the write and its key-plane row, one
         // transaction.
         let tx = client.transaction().await.map_err(|e| {
@@ -14044,7 +14186,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Parse attestation_id to uuid::Uuid before binding — the driver
         // refuses to serialize a &str against a `uuid`-typed param (see
         // put_revocation / the 1693 comment). Invalid → no such row.
@@ -14127,7 +14269,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let admitted_at = self
             .next_plane_position(&client, "federation_attestations")
             .await?;
@@ -14231,10 +14373,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(|e| Error::Backend(format!("list_scores admission: {e}")))?;
         let client = self
-            .pool
-            .get()
+            .get_client()
             .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+            .map_err(crate::store::Error::into_federation)?;
         let (mut where_parts, mut params) = pg_scores_shared_predicates(&filter, &scope);
         // lifecycle: exclude rows retracted by a still-hiding composer.
         let hide: &[&str] = match filter.lifecycle {
@@ -14326,10 +14467,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(|e| Error::Backend(format!("resolve_scores admission: {e}")))?;
         let client = self
-            .pool
-            .get()
+            .get_client()
             .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+            .map_err(crate::store::Error::into_federation)?;
         let (mut where_parts, mut params) = pg_scores_shared_predicates(&filter, &scope);
         where_parts.push("fa.attestation_type = 'scores'".to_string());
         let where_sql = format!("WHERE {}", where_parts.join(" AND "));
@@ -14400,10 +14540,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )));
         }
         let client = self
-            .pool
-            .get()
+            .get_client()
             .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+            .map_err(crate::store::Error::into_federation)?;
         // #455 — owner-scope LOG walk: NO caller gate, NO lifecycle folding,
         // federation-tier (the replicable set) only, byte-faithful rows.
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
@@ -14613,7 +14752,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT key_id, registration_envelope, scrub_signature_classical \
@@ -14650,7 +14789,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT attestation_id::text AS attestation_id, \
@@ -14696,7 +14835,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let trust_type_str = grant.trust_type.as_str();
         let trust_relationship_str = grant.trust_relationship.as_str();
         // PG TEXT[] binds from `&Vec<String>` via postgres-types' built-in.
@@ -14774,7 +14913,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let stored = client
             .query_opt(
                 "SELECT trusted_by FROM cirislens.federation_keys \
@@ -14821,7 +14960,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT key_id, trust_type, trust_relationship, trust_domains, \
@@ -14842,7 +14981,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Build the parametric WHERE clause. Owned-string holders
         // keep references alive for the tokio_postgres ToSql binding.
         let mut where_parts: Vec<String> = vec!["trusted_by IS NOT NULL".to_owned()];
@@ -14888,7 +15027,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let new_hash = crate::federation::types::compute_persist_row_hash(&goal)?;
         let canonical_text = crate::federation::canonicalize_goal_text(&goal.goal_text);
         let scope_kind = goal.scope.scope_kind_str();
@@ -14987,7 +15126,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT goal_id, declared_by_key_id, declared_at, goal_text, \
@@ -15008,7 +15147,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let mut where_parts: Vec<String> = Vec::new();
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
         if !filter.include_retired {
@@ -15060,7 +15199,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Idempotent: WHERE retired_at IS NULL gates double-retire.
         // Existence is established via a separate SELECT so a missing
         // row surfaces as InvalidArgument and not a silent no-op.
@@ -15171,7 +15310,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -15380,7 +15519,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -15563,7 +15702,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT key_id, alias, trust, notes, policy_blob, \
@@ -15665,7 +15804,7 @@ async fn pg_update_peer_field(
     let mut client = backend
         .get_client()
         .await
-        .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        .map_err(crate::store::Error::into_federation)?;
     let tx = client
         .transaction()
         .await
@@ -18156,6 +18295,9 @@ impl crate::federation::BlobStorage for PostgresBackend {
             )?;
             sha_hexes.insert(hex::encode(v));
         }
+        // v59.1.2 — the retractions below write through the directory, and the
+        // delete takes a fresh client: none may wait on this one.
+        drop(client);
         if sha_hexes.is_empty() {
             return Ok(0);
         }
@@ -20482,6 +20624,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let chunk_hashes = pg_load_stream_chunk_hashes(&client, &stream_id).await?;
+        // v59.1.2 — the signature checks below resolve keys through the
+        // directory (their own clients): release this one, and take a fresh
+        // one for the insert.
+        drop(client);
 
         // Steps 3–4: recompute the RFC 6962 root from persist's own
         // chunks and assert it equals the STH's claimed root (the
@@ -20516,6 +20662,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
             })?;
 
         // Idempotent/equivocation: only insert when absent.
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let inserted = client
             .execute(
                 "INSERT INTO cirislens.federation_stream_sth (\
@@ -21771,7 +21921,7 @@ impl crate::federation::BlackholeRules for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT identity_hash, until, reason, added_at, hits, persist_row_hash \
@@ -21801,7 +21951,7 @@ impl crate::federation::BlackholeRules for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client.transaction().await.map_err(|e| {
             crate::federation::Error::Backend(format!("blackhole_upsert begin tx: {e}"))
         })?;
@@ -21864,7 +22014,7 @@ impl crate::federation::BlackholeRules for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let identity_vec = identity_hash.to_vec();
         client
             .execute(
@@ -21884,7 +22034,7 @@ impl crate::federation::BlackholeRules for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let identity_vec = identity_hash.to_vec();
         // Single-statement UPDATE; no transaction wrap. When no row
         // exists the rows-affected count is 0 — silent no-op.
@@ -21907,7 +22057,7 @@ impl crate::federation::BlackholeRules for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let n = client
             .execute(
                 "DELETE FROM cirislens.blackhole_rules \
@@ -22906,7 +23056,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .query_opt(
                 "SELECT identity_type FROM cirislens.federation_keys WHERE key_id = $1",
@@ -22929,7 +23079,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let exists = client
             .query_opt(
                 // v20.0.0 (#495 C2) — path from the ONE constant.
@@ -22962,7 +23112,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .execute(
                 "INSERT INTO cirislens.federation_withdraws_admission_depths \
@@ -22984,7 +23134,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v36.0.0 (#668/#707-class) — the hybrid-completion write rewrites
         // THREE served columns; the serve position moves with them.
         let admitted_at = self
@@ -23014,6 +23164,9 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                 completion.attestation_id
             )));
         }
+        // v59.1.2 — the re-index checks out its own client (the boot PQC
+        // sweep reaches this door).
+        drop(client);
         // v31.0.0 (CIRISPersist#657) — re-index; see the sqlite twin. The
         // hybrid-completion write moves three serialized columns, so it moves
         // the wire content hash. Postgres rounds `pqc_completed_at` to
@@ -23045,7 +23198,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -23087,7 +23240,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -23107,7 +23260,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // The partial index makes the common case (nothing left) one probe.
         let any = client
             .query_opt(
@@ -23167,7 +23320,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .query_opt(
                 "SELECT agent_id_hash FROM cirislens.trace_events WHERE trace_id = $1 \
@@ -23189,7 +23342,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // The full erasure also reaches the rows NAMING the subject, so a row
         // an earlier run left (its trace already gone) is found again.
         let subject = signing_key_id
@@ -23225,7 +23378,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -23255,7 +23408,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
             let client = self
                 .get_client()
                 .await
-                .map_err(|e| Error::Backend(e.to_string()))?;
+                .map_err(crate::store::Error::into_federation)?;
             client
                 .query(
                     "SELECT detection_id::text, trace_id, body_sha256, detector, severity, \
@@ -23313,7 +23466,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
             let mut client = self
                 .get_client()
                 .await
-                .map_err(|e| Error::Backend(e.to_string()))?;
+                .map_err(crate::store::Error::into_federation)?;
             let tx = client
                 .transaction()
                 .await
@@ -23367,28 +23520,28 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                 let client = self
                     .get_client()
                     .await
-                    .map_err(|e| Error::Backend(e.to_string()))?;
+                    .map_err(crate::store::Error::into_federation)?;
                 return pg_key_projection_rebuild(&**client).await;
             }
             SiloProjection::FederationRevocations => {
                 let client = self
                     .get_client()
                     .await
-                    .map_err(|e| Error::Backend(e.to_string()))?;
+                    .map_err(crate::store::Error::into_federation)?;
                 return pg_revocation_projection_rebuild(&**client).await;
             }
             SiloProjection::IdentityOccurrences => {
                 let client = self
                     .get_client()
                     .await
-                    .map_err(|e| Error::Backend(e.to_string()))?;
+                    .map_err(crate::store::Error::into_federation)?;
                 return pg_occurrence_projection_rebuild(&**client).await;
             }
         };
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -23466,7 +23619,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -23558,7 +23711,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // `attestation_subjects` follows via `ON DELETE CASCADE` (V106). The
         // re-bake's compare-and-delete is ONE statement (#665 review).
         let n =
@@ -23601,7 +23754,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = &planned.row;
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!(

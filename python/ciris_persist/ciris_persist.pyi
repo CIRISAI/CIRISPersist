@@ -96,6 +96,14 @@ class EngineUsedAcrossFork(PersistError):
     ``fork()`` and used in the child. A tokio runtime does not survive
     a fork; construct ``Engine`` after all forking is done."""
 
+class PoolExhausted(RuntimeError):
+    """v59.1.2 — no pooled Postgres connection was freed within the pool's
+    wait timeout (30 s by default). Before v59.1.2 the checkout waited
+    forever. A ``RuntimeError`` subclass, so ``except RuntimeError`` still
+    catches it. The message leads with the kind (``federation_pool_exhausted``
+    / ``store_pool_exhausted`` / ``audit_pool_exhausted`` /
+    ``secrets_pool_exhausted``)."""
+
 class NodeIdentityRequired(PersistError):
     """v57.0.0 (CIRISPersist#988) — an act that must record a
     ``hard_case:{kind}`` row (an erasure, a peer removal) was refused before

@@ -416,6 +416,9 @@ fn map_secrets_error(e: SecretsError) -> Response {
         SecretsError::NotFound(_) => StatusCode::NOT_FOUND,
         SecretsError::Crypto(_) => StatusCode::INTERNAL_SERVER_ERROR,
         SecretsError::Backend(_) => StatusCode::SERVICE_UNAVAILABLE,
+        // v59.1.2 — a starved pool: transient, as the backend arm it was
+        // carved from.
+        SecretsError::PoolExhausted { .. } => StatusCode::SERVICE_UNAVAILABLE,
         SecretsError::HardwareKeyUnavailable(_) => StatusCode::NOT_IMPLEMENTED,
         SecretsError::RotationConflict(_) => StatusCode::CONFLICT,
         SecretsError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,

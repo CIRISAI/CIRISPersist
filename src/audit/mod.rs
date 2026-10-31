@@ -89,6 +89,16 @@ pub enum Error {
     #[error("backend: {0}")]
     Backend(String),
 
+    /// v59.1.2 — no pooled connection was freed within the pool's wait
+    /// timeout (`waited`): the pool is starved. Before v59.1.2 the checkout
+    /// had no timeout and waited forever. Python `ciris_persist.PoolExhausted`
+    /// (a `RuntimeError`, the type the backend arm it was carved from had).
+    #[error("audit_pool_exhausted: no pooled connection freed within {waited:?}")]
+    PoolExhausted {
+        /// The wait the pool was configured with.
+        waited: std::time::Duration,
+    },
+
     /// Trait method declared but backend doesn't implement it.
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
@@ -129,6 +139,7 @@ impl Error {
             Error::Conflict(_) => "audit_conflict",
             Error::NotFound(_) => "audit_not_found",
             Error::Backend(_) => "audit_backend",
+            Error::PoolExhausted { .. } => "audit_pool_exhausted",
             Error::NotImplemented(_) => "audit_not_implemented",
             Error::Internal(_) => "audit_internal",
             Error::Merkle(_) => "audit_merkle",

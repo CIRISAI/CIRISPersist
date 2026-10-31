@@ -1,0 +1,17 @@
+# Mutation scope: the Postgres pool's size floor and its typed starvation
+# error (v59.1.2). On v59.1.1, `PostgresBackend::connect` left deadpool's
+# default: 2 x CPUs (2 on a 1-vCPU node) and no timeouts. Doors that held a
+# pooled client across a second checkout wedged the node for good.
+# `pool_config` floors the size at 16 and sets every timeout; `checkout`
+# turns a wait timeout into `CheckoutError::Exhausted`. The drop points that
+# un-nest the doors are statement deletions, which cargo-mutants generates
+# no operator for. Each one witnessed was removed by hand and its witness
+# went red (I1482, I1483).
+# cargo-mutants generates 2 mutants here: `pool_config` -> Default is
+# caught (by I1480, I1481, I1482 and I1483, which all build a pool with it);
+# `checkout` -> Ok(Default) is unviable (a pooled Object has no Default).
+# 0 missed (measured 2026-10-30).
+# Grammar: docs/MUTATION_TESTING.md.
+tests: test(/i148[0-3]/)
+src/store/postgres.rs pool_config
+src/store/postgres.rs checkout
