@@ -787,13 +787,52 @@ pub(crate) fn lifecycle_predicate(
             format!("{outer}.attestation_id::text"),
         ),
     };
+    // v61 (CIRISPersist#1157 / #1155, CC rc14 3.1.9.4) — **the convergent
+    // rank, read-time.** A distinct composer of the same type from the same
+    // attester on the same target, placed in the SAME audience (cohort scope
+    // and cohort target), outranks this one when its signed instant is later,
+    // or equal with the lower `attestation_id` bytewise: the loser is hidden,
+    // both stay stored, and every node converges on one winner whichever row
+    // it held first. Placements of one row into DIFFERENT audiences never
+    // compete (they carry the prior's instant), so each room keeps its own.
+    let (rank_ref, outer_ref, null_eq, older) = match dialect {
+        Dialect::Sqlite => (
+            format!("json_extract(r.attestation_envelope, '$.{path}')"),
+            format!("json_extract({outer}.attestation_envelope, '$.{path}')"),
+            format!("r.cohort_target IS {outer}.cohort_target"),
+            format!(
+                "(r.asserted_at > {outer}.asserted_at \
+                  OR (r.asserted_at = {outer}.asserted_at \
+                      AND r.attestation_id < {outer}.attestation_id))"
+            ),
+        ),
+        Dialect::Postgres => (
+            format!("r.attestation_envelope::jsonb->>'{path}'"),
+            format!("{outer}.attestation_envelope::jsonb->>'{path}'"),
+            format!("r.cohort_target IS NOT DISTINCT FROM {outer}.cohort_target"),
+            format!(
+                "(r.asserted_at > {outer}.asserted_at \
+                  OR (r.asserted_at = {outer}.asserted_at \
+                      AND r.attestation_id::text COLLATE \"C\" \
+                          < {outer}.attestation_id::text COLLATE \"C\"))"
+            ),
+        ),
+    };
     Some((
         format!(
             "NOT EXISTS (SELECT 1 FROM {table} c \
                WHERE (c.attesting_key_id = {outer}.attesting_key_id \
                       OR c.withdraws_admission_rule IS NOT NULL) \
                  AND c.attestation_type IN ({list}) \
-                 AND {target} = {id})"
+                 AND {target} = {id}) \
+             AND NOT EXISTS (SELECT 1 FROM {table} r \
+               WHERE r.attestation_type = {outer}.attestation_type \
+                 AND r.attestation_type IN ({list}) \
+                 AND r.attesting_key_id = {outer}.attesting_key_id \
+                 AND {rank_ref} = {outer_ref} \
+                 AND r.cohort_scope = {outer}.cohort_scope \
+                 AND {null_eq} \
+                 AND {older})"
         ),
         hide.iter().map(|t| (*t).to_owned()).collect(),
     ))

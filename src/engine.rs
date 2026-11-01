@@ -16996,7 +16996,23 @@ mod tests {
             .await
             .expect("the widening verifies at ingest");
 
+        // v61 (CIRISPersist#1155) — a placement is idempotent PER AUDIENCE:
+        // the same prior placed again at Species is the same placement, SAID
+        // so; placed at Federation it is a second, live placement.
         let again = engine
+            .widen_audience(
+                &id,
+                &producer_ci(&prior, crate::federation::Audience::Species),
+                None,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(again, MeshCrossingOutcome::AlreadyWidened { .. }),
+            "the same prior placed in the same audience is deduplicated and SAID so: {again:?}"
+        );
+        let elsewhere = engine
             .widen_audience(
                 &id,
                 &producer_ci(&prior, crate::federation::Audience::Federation),
@@ -17006,8 +17022,8 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(again, MeshCrossingOutcome::AlreadyWidened { .. }),
-            "a second supersedes of the same prior is deduplicated and SAID so: {again:?}"
+            matches!(elsewhere, MeshCrossingOutcome::Crossed(_)),
+            "a placement into another audience is a new row: {elsewhere:?}"
         );
     }
 

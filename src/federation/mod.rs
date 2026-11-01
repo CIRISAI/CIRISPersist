@@ -198,6 +198,10 @@ pub(crate) mod community_trust_consent_invariants;
 #[cfg(test)]
 pub mod consent_sweep_principals_invariants;
 // v60.0.0 (CIRISPersist#934 step 4, #1105) — I1192–I1201.
+/// v61 S2 (CIRISPersist#1155 / #1157) — I1506–I1508: composers idempotent on
+/// their id, distinct ones ranked read-time within one audience.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod composer_rank_invariants;
 #[cfg(test)]
 mod consent_sweep_plan_invariants;
 /// v53.1.0 (CIRISPersist#979) — I480–I487: a chunk of a withdrawn file is
@@ -8108,6 +8112,29 @@ pub trait FederationDirectory: Send + Sync {
         )
         .await?;
         let row = signed.attestation.clone();
+        // v61 (CIRISPersist#1155 / #1157) — a placement is idempotent PER
+        // AUDIENCE. The put door no longer swallows a second `supersedes` from
+        // the same attester on the same prior (idempotence keys on the row's
+        // id, CC rc14 3.1.9.4), so the door asks the one question a placement
+        // needs: is this prior already placed, by this attester, in THIS
+        // audience (cohort scope and cohort target)? Then it is the same
+        // placement. A placement into a DIFFERENT room is a new one, and both
+        // stay live (#1155: one row shared into two rooms).
+        let target = admission::envelope_cohort_target(&row.attestation_envelope)?;
+        for c in self
+            .list_attestations_referencing(&prior.attestation_id)
+            .await?
+        {
+            if c.attestation_type == types::attestation_type::SUPERSEDES
+                && c.attesting_key_id == row.attesting_key_id
+                && c.cohort_scope == row.cohort_scope
+                && admission::envelope_cohort_target(&c.attestation_envelope)? == target
+            {
+                return Ok(crossing::MeshCrossingOutcome::AlreadyWidened {
+                    prior_attestation_id: prior.attestation_id,
+                });
+            }
+        }
         // v41.0.0 (#804) — this node just signed this row; it is not a peer of
         // itself. Before this, every widening charged the OWNER's peer bucket,
         // which is what cut chat off at ~250 messages.

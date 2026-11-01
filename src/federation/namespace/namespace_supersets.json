@@ -15901,6 +15901,14 @@
     "manifest_round": "v61-s2-1063"
    },
    {
+    "decimal_id": "3.1.9.4",
+    "claim_id": "CLM-composer-convergent-rank",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/attestation_query.rs#lifecycle_predicate",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1157"
+   },
+   {
     "decimal_id": "4.5.13",
     "claim_id": "CLM-one-voice-room",
     "repo": "CIRISPersist",

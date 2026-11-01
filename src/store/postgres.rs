@@ -22182,30 +22182,25 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
 
     async fn composer_replay_held(
         &self,
-        attestation_type: &str,
-        attesting_key_id: &str,
-        references_attestation_id: &str,
+        attestation_id: &str,
+        original_content_hash: &str,
     ) -> Result<bool, crate::federation::Error> {
         let client = self
             .get_client()
             .await
             .map_err(crate::store::Error::into_federation)?;
+        // v61 (CIRISPersist#1157) — the SAME row, by id and signed content
+        // (BYTEA here; a hash that is not hex names no held row).
+        let Ok(och) = hex::decode(original_content_hash) else {
+            return Ok(false);
+        };
         let exists = client
             .query_opt(
-                // v20.0.0 (#495 C2) — path from the ONE constant.
-                &format!(
-                    "SELECT 1 AS one FROM cirislens.federation_attestations \
-                     WHERE attestation_type = $1 \
-                       AND attesting_key_id = $2 \
-                       AND attestation_envelope::jsonb->>'{}' = $3 \
-                     LIMIT 1",
-                    crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID
-                ),
-                &[
-                    &attestation_type,
-                    &attesting_key_id,
-                    &references_attestation_id,
-                ],
+                "SELECT 1 AS one FROM cirislens.federation_attestations \
+                 WHERE attestation_id::text = $1 \
+                   AND original_content_hash = $2 \
+                 LIMIT 1",
+                &[&attestation_id, &och],
             )
             .await
             .map_err(|e| {

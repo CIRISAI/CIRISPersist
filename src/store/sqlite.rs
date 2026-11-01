@@ -19507,35 +19507,24 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
 
     async fn composer_replay_held(
         &self,
-        attestation_type: &str,
-        attesting_key_id: &str,
-        references_attestation_id: &str,
+        attestation_id: &str,
+        original_content_hash: &str,
     ) -> Result<bool, crate::federation::Error> {
-        let attestation_type_owned = attestation_type.to_owned();
-        let attesting_owned = attesting_key_id.to_owned();
-        let ref_id_owned = references_attestation_id.to_owned();
+        // v61 (CIRISPersist#1157) — the SAME row, by id and signed content
+        // (a BLOB here; a hash that is not hex names no held row).
+        let id = attestation_id.to_owned();
+        let Ok(och) = hex::decode(original_content_hash) else {
+            return Ok(false);
+        };
         self.read(move |conn| -> Result<bool, rusqlite::Error> {
-            let mut stmt = conn.prepare(
-                "SELECT attestation_envelope FROM federation_attestations \
-                 WHERE attestation_type = ?1 AND attesting_key_id = ?2",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![attestation_type_owned, attesting_owned],
-                |r| r.get::<_, String>(0),
-            )?;
-            for env_text in rows {
-                let env_text = env_text?;
-                let env: serde_json::Value = match serde_json::from_str(&env_text) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let existing_ref =
-                    crate::federation::precedence::references_attestation_id_from_envelope(&env);
-                if existing_ref == Some(ref_id_owned.as_str()) {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+            conn.query_row(
+                "SELECT 1 FROM federation_attestations \
+                 WHERE attestation_id = ?1 AND original_content_hash = ?2",
+                rusqlite::params![id, och],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|r| r.is_some())
         })
         .await
         .map_err(|e| {

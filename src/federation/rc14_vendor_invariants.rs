@@ -38,13 +38,6 @@ enum NotYet {
 /// `(CC section, anchor in part 3 at the tag, ticket, when, persist-side check)`.
 const NOT_BUILT: &[(&str, &str, &str, &str, NotYet)] = &[
     (
-        "3.1.9.4",
-        "The ranking applies among rows placed in **one audience**",
-        "CIRISPersist#1157, CIRISPersist#1155",
-        "v61 S2/S3",
-        NotYet::NoEvidenceRow("CLM-composer-convergent-rank"),
-    ),
-    (
         "3.2",
         "the owner re-signs the binding at that group's scope",
         "CIRISPersist#1140",

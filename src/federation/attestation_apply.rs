@@ -1071,7 +1071,7 @@ mod tests {
     /// silent no-op; the apply names it rather than reporting an insert that
     /// never happened.
     #[tokio::test]
-    async fn apply_composer_replay_is_deduplicated() {
+    async fn apply_composer_distinct_same_triple_row_is_stored() {
         let author = "att-apply-dedup-author";
         let dir = test_backend_with_author(author).await;
 
@@ -1109,23 +1109,24 @@ mod tests {
             ReplicatedAttestationOutcome::Inserted
         );
 
-        // The replay: same triple, DIFFERENT id — §6.1 says idempotent no-op.
-        let replay_id = uuid::Uuid::new_v4().to_string();
-        let replay = withdraws(&replay_id);
+        // v61 (CIRISPersist#1157, CC rc14 3.1.9.4) — same triple, DIFFERENT
+        // id: a distinct row, stored (the rank is read-time), never a replay.
+        let second_id = uuid::Uuid::new_v4().to_string();
+        let second = withdraws(&second_id);
         assert_eq!(
             dir.apply_replicated_attestation(SignedAttestation {
-                attestation: replay
+                attestation: second
             })
             .await
-            .expect("replay"),
-            ReplicatedAttestationOutcome::Deduplicated
+            .expect("second"),
+            ReplicatedAttestationOutcome::Inserted
         );
         assert!(
-            dir.get_attestation(&replay_id)
+            dir.get_attestation(&second_id)
                 .await
                 .expect("get")
-                .is_none(),
-            "Deduplicated must mean no row was written under the replay id"
+                .is_some(),
+            "a distinct same-triple composer is stored"
         );
     }
 }
