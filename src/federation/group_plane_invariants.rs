@@ -577,7 +577,7 @@ pub(crate) mod bodies {
         for n in ["ann", "ben", "cat", "dan"] {
             user(dd, &format!("{n}-{tag}")).await;
         }
-        let (fam, [ann, ben, _cat, dan]) = family_with_history(d, tag).await;
+        let (fam, [ann, ben, cat, dan]) = family_with_history(d, tag).await;
         let widening = one(
             d,
             &fam,
@@ -631,14 +631,42 @@ pub(crate) mod bodies {
             "{tag}: the retracted widening seats nobody"
         );
         all_linked(d, GroupPlaneTable::FamilyWidenings, tag).await;
-        // The group's record is never withdrawn, cosigned or not.
-        let e = put_row(dd, withdraws_of(&ann, &[&ben], &record))
-            .await
-            .expect_err("a group record is not withdrawn");
-        assert!(
-            e.to_string().contains(gp::GROUP_RECORD_WITHDRAWS_REFUSED),
-            "{tag}: record withdraws: {e}"
+        // The group's record is never withdrawn, cosigned or not: a withdraws
+        // of it means dissolution, which is refused by name until S2 (#1143).
+        // Its own signer alone, a quorum, and the whole roster are all
+        // refused, store nothing and leave the roster where it was.
+        let before = sorted_active(dd, &fam).await;
+        for cosigners in [
+            &[][..],
+            &[ben.as_str()][..],
+            &[ben.as_str(), cat.as_str()][..],
+        ] {
+            let dissolve = withdraws_of(&ann, cosigners, &record);
+            let e = put_row(dd, dissolve.clone())
+                .await
+                .expect_err("a group record is not withdrawn");
+            let msg = e.to_string();
+            assert!(
+                matches!(e, Error::InvalidArgument(_))
+                    && msg.contains(gp::GROUP_RECORD_WITHDRAWS_REFUSED)
+                    && msg.contains("dissolution"),
+                "{tag}: record withdraws with {} cosigner(s): {e}",
+                cosigners.len()
+            );
+            assert!(
+                dd.get_attestation(&dissolve.attestation_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{tag}: a refused dissolution stores nothing"
+            );
+        }
+        assert_eq!(
+            sorted_active(dd, &fam).await,
+            before,
+            "{tag}: a refused dissolution leaves the roster"
         );
+        all_linked(d, GroupPlaneTable::Families, tag).await;
         // A resignation is its signer's alone.
         let mut leave = ts::sign_family_membership_revocation(
             &ben,

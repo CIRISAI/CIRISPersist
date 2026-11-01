@@ -1148,6 +1148,11 @@ pub fn check_generic_row_dimension(attestation_type: &str, dimension: &str) -> R
 /// naming a `group:roster:v1` row: a record changes by a supersede (its next
 /// version, under its protocol) and ends by dissolution, so its retraction
 /// has no projection to move. Refused by name, never admitted inert.
+///
+/// A `withdraws` aimed at a group's record MEANS dissolution. Dissolution is
+/// v61 S2's (CIRISPersist#1143), so until then the refusal says so: however
+/// many roster signatures the row carries, nothing is stored and the roster
+/// does not move.
 pub const GROUP_RECORD_WITHDRAWS_REFUSED: &str = "group_record_withdraws_refused";
 
 /// v61 (CIRISPersist#991; CC 2.4.1.1, CC 3.1.3.2) — **the retraction of a
@@ -1192,7 +1197,10 @@ pub(crate) async fn check_cosigned_withdraws(
     };
     match (family, consensus_source_for(family.dimension())) {
         (GroupPlaneFamily::Roster, _) => Err(Error::InvalidArgument(format!(
-            "{GROUP_RECORD_WITHDRAWS_REFUSED}: withdraws names the group record row {} of {} —              a record changes by a supersede under its protocol and ends by dissolution              (CIRISPersist#991)",
+            "{GROUP_RECORD_WITHDRAWS_REFUSED}: withdraws names the group record row {} of {}: \
+             withdrawing a group's record is its dissolution, which is not admitted yet \
+             (dissolution arrives in v61 S2 with CIRISPersist#1143); a record changes by a \
+             supersede under its protocol",
             target.attestation_id,
             signed.group_key_id()
         ))),
