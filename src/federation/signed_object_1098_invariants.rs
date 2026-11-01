@@ -1,4 +1,4 @@
-//! CIRISPersist#1098 (CC 2.6.1.1.1 and 2.6.1.7) — **I1478–I1481: the
+//! CIRISPersist#1098 (CC 2.6.1.1.1 and 2.6.1.7) — **I1478, I1479, I1493, I1494: the
 //! signed-object cleanup**, on every backend, through `put_attestation`.
 //!
 //! - **I1478 (F4, `envelope_member_null`)** — an optional envelope member
@@ -9,11 +9,11 @@
 //!   each element's JCS string and carrying no repeat admits; an out-of-order
 //!   pair and a repeat are refused `federation_set_semantics_unsorted`; a
 //!   `witnesses` that is not an array is `envelope_member_invalid`.
-//! - **I1480 (F2, a bare scope token)** — `"scope": "retain"` admits as the
+//! - **I1493 (F2, a bare scope token)** — `"scope": "retain"` admits as the
 //!   one-element set `["retain"]` denotes: every scope reader answers the same
 //!   for both forms, and the stored envelope keeps the bare token (signed
 //!   bytes are never normalised).
-//! - **I1481 (the 13 vectors)** — CC's `signed_object_vectors.json` at the
+//! - **I1494 (the 13 vectors)** — CC's `signed_object_vectors.json` at the
 //!   vendored tag, replayed: each admit vector's signed row (and each recipe's
 //!   reconstructed one) admits with its published content hash, and each
 //!   refuse vector is refused with the persist token its CC refusal names.
@@ -172,24 +172,24 @@ pub(crate) mod bodies {
         .expect("I1479: a sorted, unique set admits");
     }
 
-    /// **I1480** — a bare scope token admits as the one-element array it
+    /// **I1493** — a bare scope token admits as the one-element array it
     /// denotes, and the stored bytes keep the bare token.
-    pub(crate) async fn i1480_a_bare_scope_token(d: &dyn FederationDirectory, tag: &str) {
+    pub(crate) async fn i1493_a_bare_scope_token(d: &dyn FederationDirectory, tag: &str) {
         use crate::federation::admission::delegation_scope_set;
         use crate::federation::consent::named_scopes;
-        let a = format!("i1480-{tag}");
+        let a = format!("i1493-{tag}");
         ts::register_hybrid_key_as(d, &a, &a, it::USER).await;
         let bare = sealed_with(&a, serde_json::json!({ "scope": "retain" }));
         let array = sealed_with(&a, serde_json::json!({ "scope": ["retain"] }));
         assert_eq!(
             named_scopes(&bare),
             named_scopes(&array),
-            "I1480 consent reader"
+            "I1493 consent reader"
         );
         assert_eq!(
             delegation_scope_set(&bare.attestation_envelope),
             delegation_scope_set(&array.attestation_envelope),
-            "I1480 delegation reader"
+            "I1493 delegation reader"
         );
         assert!(
             crate::federation::trust_root::scope_contains(&bare.attestation_envelope, "retain")
@@ -197,31 +197,31 @@ pub(crate) mod bodies {
                     &array.attestation_envelope,
                     "retain"
                 ),
-            "I1480 scope_contains"
+            "I1493 scope_contains"
         );
         let (bare_id, bare_hash) = (
             bare.attestation_id.clone(),
             bare.original_content_hash.clone(),
         );
-        put(d, bare).await.expect("I1480: a bare token admits");
-        put(d, array).await.expect("I1480: the array admits");
+        put(d, bare).await.expect("I1493: a bare token admits");
+        put(d, array).await.expect("I1493: the array admits");
         let stored = d
             .get_attestation(&bare_id)
             .await
             .expect("read")
-            .expect("I1480: the bare-token row is held");
+            .expect("I1493: the bare-token row is held");
         assert_eq!(
             stored.attestation_envelope["scope"],
             serde_json::json!("retain"),
-            "I1480: the stored envelope keeps the bare token"
+            "I1493: the stored envelope keeps the bare token"
         );
         assert_eq!(
             stored.original_content_hash, bare_hash,
-            "I1480: the signed bytes are the producer's"
+            "I1493: the signed bytes are the producer's"
         );
     }
 
-    // ─── I1481 — CC's 13 signed-object vectors ─────────────────────────────
+    // ─── I1494 — CC's 13 signed-object vectors ─────────────────────────────
 
     const VECTORS: &str = include_str!("namespace/signed_object_vectors.json");
 
@@ -309,7 +309,7 @@ pub(crate) mod bodies {
             prev_head_digest: String::new(),
             charter_digest: String::new(),
             community_key_id: community_key_id.to_owned(),
-            community_name: "I1481 ward".into(),
+            community_name: "I1494 ward".into(),
             members: vec![crate::federation::types::CommunityMember {
                 key_id: member.key_id.clone(),
                 joined_at: from,
@@ -331,7 +331,7 @@ pub(crate) mod bodies {
         }];
         d.put_community(signed)
             .await
-            .unwrap_or_else(|e| panic!("I1481: hold community {community_key_id}: {e}"));
+            .unwrap_or_else(|e| panic!("I1494: hold community {community_key_id}: {e}"));
     }
 
     fn instant(v: &serde_json::Value) -> chrono::DateTime<chrono::Utc> {
@@ -431,7 +431,7 @@ pub(crate) mod bodies {
 
     /// Vectors persist answers differently from CC, each with the token persist
     /// emits and the ruling that keeps it. A latch both ways: a vector that
-    /// starts agreeing, or a new disagreement, reds I1481.
+    /// starts agreeing, or a new disagreement, reds I1494.
     ///
     /// - `scores_subject_and_scope`: persist KEEPS refusing (AV-84,
     ///   CIRISPersist#592, a security property). CC agreed its vector was wrong
@@ -489,7 +489,7 @@ pub(crate) mod bodies {
             r if r.starts_with("subject_key_ids element malformed") => {
                 malformed_row::SUBJECT_KEY_ID_MALFORMED
             }
-            other => panic!("I1481: no persist token is mapped for CC refusal {other:?}"),
+            other => panic!("I1494: no persist token is mapped for CC refusal {other:?}"),
         }
     }
 
@@ -501,10 +501,10 @@ pub(crate) mod bodies {
         }
     }
 
-    /// **I1481** — the 13 vectors. Each runs on a fresh store from
+    /// **I1494** — the 13 vectors. Each runs on a fresh store from
     /// `fresh()`, because two vectors share an attestation id over different
     /// bytes.
-    pub(crate) async fn i1481_the_signed_object_vectors<D, F, Fut>(fresh: F)
+    pub(crate) async fn i1494_the_signed_object_vectors<D, F, Fut>(fresh: F)
     where
         D: FederationDirectory,
         F: Fn() -> Fut,
@@ -531,7 +531,7 @@ pub(crate) mod bodies {
                     if name == "withdraws" {
                         put(&d, published_row(&minimal["row"]))
                             .await
-                            .expect("I1481 withdraws: the row it withdraws is held");
+                            .expect("I1494 withdraws: the row it withdraws is held");
                     }
                     let row = published_row(&v["row"]);
                     if let Some(c) = row.attestation_envelope["community_id"].as_str() {
@@ -541,7 +541,7 @@ pub(crate) mod bodies {
                         ts::sign_envelope_with(&a.ed, &a.mldsa, &row.attestation_envelope);
                     assert_eq!(
                         sc, row.scrub_signature_classical,
-                        "I1481 {name}: persist's canonical bytes sign to the published Ed25519 \
+                        "I1494 {name}: persist's canonical bytes sign to the published Ed25519 \
                          signature"
                     );
                     (None, row)
@@ -554,7 +554,7 @@ pub(crate) mod bodies {
                     assert_eq!(
                         row.original_content_hash,
                         v["original_content_hash"].as_str().expect("hash"),
-                        "I1481 {name}: the reconstructed bytes are CC's"
+                        "I1494 {name}: the reconstructed bytes are CC's"
                     );
                     let expected = v
                         .get("refusal")
@@ -570,7 +570,7 @@ pub(crate) mod bodies {
                     };
                     (Some(persist_token_for(cc)), row)
                 }
-                other => panic!("I1481 {name}: unknown vector kind {other:?}"),
+                other => panic!("I1494 {name}: unknown vector kind {other:?}"),
             };
             let actual = put(&d, row)
                 .await
@@ -578,7 +578,7 @@ pub(crate) mod bodies {
                 .map(|e| format!("{}: {e}", token_of(&e)));
             outcomes.push((name.to_owned(), expected, actual));
         }
-        assert_eq!(outcomes.len(), 13, "I1481: every vector ran");
+        assert_eq!(outcomes.len(), 13, "I1494: every vector ran");
         let token = |actual: &Option<String>| {
             actual
                 .as_deref()
@@ -602,7 +602,7 @@ pub(crate) mod bodies {
                 _ => {}
             }
         }
-        assert!(disagree.is_empty(), "I1481: {disagree:#?}");
+        assert!(disagree.is_empty(), "I1494: {disagree:#?}");
     }
 }
 
@@ -651,15 +651,15 @@ mod tests {
 
     on_every_backend!(i1478, bodies::i1478_envelope_member_null);
     on_every_backend!(i1479, bodies::i1479_witnesses_is_a_set);
-    on_every_backend!(i1480, bodies::i1480_a_bare_scope_token);
+    on_every_backend!(i1493, bodies::i1493_a_bare_scope_token);
 
-    mod i1481 {
+    mod i1494 {
         use super::*;
 
         #[cfg(feature = "sqlite")]
         #[tokio::test(flavor = "multi_thread")]
         async fn sqlite() {
-            bodies::i1481_the_signed_object_vectors(|| async {
+            bodies::i1494_the_signed_object_vectors(|| async {
                 use crate::store::Backend as _;
                 let b = crate::store::sqlite::SqliteBackend::open_in_memory()
                     .await
@@ -677,7 +677,7 @@ mod tests {
                 eprintln!("1098 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
                 return;
             }
-            bodies::i1481_the_signed_object_vectors(|| async {
+            bodies::i1494_the_signed_object_vectors(|| async {
                 use crate::store::Backend as _;
                 let dsn = crate::test_pg::empty_dsn().expect("dsn");
                 let b = crate::store::postgres::PostgresBackend::connect(&dsn)
@@ -687,7 +687,7 @@ mod tests {
                 b
             })
             .await;
-            eprintln!("i1481: RAN");
+            eprintln!("i1494: RAN");
         }
     }
 }

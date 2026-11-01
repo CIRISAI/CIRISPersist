@@ -700,7 +700,7 @@ pub mod governance_policy;
 // get their own malformed_row reasons, on every backend.
 #[cfg(test)]
 mod malformed_reasons_1114_invariants;
-// CIRISPersist#1098 (CC 2.6.1.1.1 and 2.6.1.7, rc12) — I1478–I1481: the
+// CIRISPersist#1098 (CC 2.6.1.1.1 and 2.6.1.7, rc12) — I1478, I1479, I1493 and I1494: the
 // explicit-null member, `witnesses[]` as a set, the bare scope token, and
 // CC's 13 signed-object vectors, on every backend.
 #[cfg(test)]
