@@ -7876,14 +7876,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(())
     }
 
-    async fn put_community_membership_listing(
-        &self,
-        listing: crate::federation::SignedCommunityMembershipListing,
-    ) -> Result<(), crate::federation::Error> {
-        crate::federation::community_admit::put_community_membership_listing_planned(self, listing)
-            .await
-    }
-
     async fn list_identity_occurrence_revocations_for(
         &self,
         identity_key_id: &str,
@@ -7997,30 +7989,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "list_community_membership_widenings_for: {e}"
-            ))
-        })
-    }
-
-    async fn list_community_membership_listings_for(
-        &self,
-        community_key_id: &str,
-    ) -> Result<Vec<crate::federation::CommunityMembershipListing>, crate::federation::Error> {
-        let key = community_key_id.to_owned();
-        self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
-            let mut stmt = conn.prepare(
-                "SELECT community_key_id, member_key_id, effective_at, listed, \
-                        persist_row_hash \
-                     FROM federation_community_membership_listings \
-                     WHERE community_key_id = ?1 \
-                     ORDER BY member_key_id ASC, effective_at ASC",
-            )?;
-            let rows = stmt.query_map([&key], sqlite_row_to_community_membership_listing)?;
-            rows.collect()
-        })
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "list_community_membership_listings_for: {e}"
             ))
         })
     }
@@ -9671,54 +9639,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "list_signed_family_membership_widenings_since: {e}"
-            ))
-        })
-    }
-
-    async fn list_signed_community_membership_listings_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedCommunityMembershipListing>, crate::federation::Error>
-    {
-        // v49.0.0 (#912) — V156's `admitted_at` is NOT NULL from the first
-        // row, so the position needs no legacy fallback.
-        let since_at = since.as_ref().map(|(t, _)| t.to_rfc3339());
-        let (since_a, since_b, since_c) = match since.as_ref() {
-            Some((_, id)) => {
-                let [a, b, c] = crate::federation::types::split_resume_id::<3>(id);
-                (Some(a.to_owned()), Some(b.to_owned()), Some(c.to_owned()))
-            }
-            None => (None, None, None),
-        };
-        self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
-            let mut stmt = conn.prepare(
-                "SELECT * FROM federation_community_membership_listings \
-                 WHERE (?1 IS NULL OR admitted_at > ?1 OR (admitted_at = ?1 AND \
-                        (community_key_id > ?2 OR (community_key_id = ?2 \
-                         AND (member_key_id > ?3 OR (member_key_id = ?3 \
-                         AND effective_at > ?4)))))) \
-                   AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
-                 ORDER BY admitted_at ASC, community_key_id ASC, member_key_id ASC, \
-                          effective_at ASC \
-                 LIMIT ?5",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![since_at, since_a, since_b, since_c, limit],
-                |row| {
-                    let pos: String = row.get("admitted_at")?;
-                    Ok(crate::federation::ServedCommunityMembershipListing {
-                        listing: sqlite_row_to_signed_community_membership_listing(row)?,
-                        admitted_at: parse_rfc3339(&pos),
-                    })
-                },
-            )?;
-            rows.collect()
-        })
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "list_signed_community_membership_listings_since: {e}"
             ))
         })
     }
@@ -22797,34 +22717,6 @@ fn sqlite_row_to_community_membership_widening(
     })
 }
 
-fn sqlite_row_to_community_membership_listing(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<crate::federation::CommunityMembershipListing> {
-    let effective_at: String = row.get("effective_at")?;
-    Ok(crate::federation::CommunityMembershipListing {
-        community_key_id: row.get("community_key_id")?,
-        member_key_id: row.get("member_key_id")?,
-        effective_at: parse_rfc3339(&effective_at),
-        listed: row.get("listed")?,
-        persist_row_hash: row.get("persist_row_hash")?,
-    })
-}
-
-fn sqlite_row_to_signed_community_membership_listing(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<crate::federation::SignedCommunityMembershipListing> {
-    let authority_key_id: String = row.get("authority_key_id")?;
-    let scrub_signature_classical: String = row.get("scrub_signature_classical")?;
-    let scrub_signature_pqc: Option<String> = row.get("scrub_signature_pqc")?;
-    let community_membership_listing = sqlite_row_to_community_membership_listing(row)?;
-    Ok(crate::federation::SignedCommunityMembershipListing {
-        community_membership_listing,
-        authority_key_id,
-        scrub_signature_classical,
-        scrub_signature_pqc,
-    })
-}
-
 fn sqlite_row_to_family_membership_widening(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<crate::federation::FamilyMembershipWidening> {
@@ -28652,66 +28544,6 @@ impl crate::federation::community_admit::CommunityStore for SqliteBackend {
                 "insert community_membership_widening: {other}"
             )),
         })?;
-        Ok(())
-    }
-
-    async fn store_planned_community_listing(
-        &self,
-        planned: crate::federation::community_admit::PlannedCommunityListing,
-    ) -> Result<(), crate::federation::Error> {
-        let crate::federation::community_admit::PlannedCommunityListing {
-            listing,
-            wire_index_key,
-        } = planned;
-        let row = listing.community_membership_listing;
-        let authority_key_id = listing.authority_key_id;
-        let scrub_signature_classical = listing.scrub_signature_classical;
-        let scrub_signature_pqc = listing.scrub_signature_pqc;
-        let inserted = self
-            .write(move |conn| -> Result<bool, rusqlite::Error> {
-                let admitted_at = sqlite_next_plane_position(
-                    conn,
-                    "federation_community_membership_listings",
-                    "admitted_at",
-                )?;
-                let n = conn.execute(
-                    "INSERT INTO federation_community_membership_listings (\
-                    community_key_id, member_key_id, effective_at, listed, \
-                    persist_row_hash, authority_key_id, scrub_signature_classical, \
-                    scrub_signature_pqc, admitted_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
-                 ON CONFLICT (community_key_id, member_key_id, effective_at) DO NOTHING",
-                    rusqlite::params![
-                        row.community_key_id,
-                        row.member_key_id,
-                        row.effective_at.to_rfc3339(),
-                        row.listed,
-                        row.persist_row_hash,
-                        authority_key_id,
-                        scrub_signature_classical,
-                        scrub_signature_pqc,
-                        admitted_at.to_rfc3339(),
-                    ],
-                )?;
-                Ok(n == 1)
-            })
-            .await
-            .map_err(|e| match e {
-                rusqlite::Error::SqliteFailure(ref f, _)
-                    if f.code == rusqlite::ErrorCode::ConstraintViolation =>
-                {
-                    crate::federation::Error::InvalidArgument(format!(
-                        "constraint violated on community_membership_listing insert: {e}"
-                    ))
-                }
-                other => crate::federation::Error::Backend(format!(
-                    "insert community_membership_listing: {other}"
-                )),
-            })?;
-        if inserted {
-            self.index_stored_record("CommunityMembershipListing", &wire_index_key)
-                .await?;
-        }
         Ok(())
     }
 

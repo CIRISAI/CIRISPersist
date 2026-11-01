@@ -382,8 +382,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_community_membership_revocations_for", ConnClass::Read),
     ("list_community_membership_widenings_for", ConnClass::Read),
     ("list_family_membership_widenings_for", ConnClass::Read),
-    // v49.0.0 (#912) — the listing plane's per-room read.
-    ("list_community_membership_listings_for", ConnClass::Read),
     ("read_consent_peer_rows", ConnClass::Read),
     // v44.6.0 (#857, V147) — the consent_peer_set_for projection read; same class as its twin.
     ("list_key_registration_history", ConnClass::Read),
@@ -442,10 +440,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ),
     (
         "list_signed_family_membership_widenings_since",
-        ConnClass::Read,
-    ),
-    (
-        "list_signed_community_membership_listings_since",
         ConnClass::Read,
     ),
     ("list_signed_identity_occurrences_for", ConnClass::Read),
@@ -783,7 +777,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("store_planned_community", ConnClass::Write),
     ("store_planned_community_revocation", ConnClass::Write),
     ("store_planned_community_widening", ConnClass::Write),
-    ("store_planned_community_listing", ConnClass::Write),
     ("store_blob_local", ConnClass::Write),
     ("stream_consistency_proof", ConnClass::Read),
     ("stream_inclusion_proof", ConnClass::Read),

@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 96 delegations, generated. Every one: fault first, then delegate.
+// 93 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -458,17 +458,6 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_communities_for_member(member_identity_key_id)
             .await
     }
-    async fn list_community_membership_listings_for(
-        &self,
-        community_key_id: &str,
-    ) -> Result<Vec<CommunityMembershipListing>, Error> {
-        if let Some(e) = self.faulted("list_community_membership_listings_for") {
-            return Err(e);
-        }
-        self.inner
-            .list_community_membership_listings_for(community_key_id)
-            .await
-    }
     async fn list_community_membership_revocations_for(
         &self,
         community_key_id: &str,
@@ -698,18 +687,6 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_signed_accord_quorum_evidence_since(since, limit)
             .await
     }
-    async fn list_signed_community_membership_listings_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedCommunityMembershipListing>, Error> {
-        if let Some(e) = self.faulted("list_signed_community_membership_listings_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_community_membership_listings_since(since, limit)
-            .await
-    }
     async fn list_signed_location_proofs_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -885,15 +862,6 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.put_community(community).await
-    }
-    async fn put_community_membership_listing(
-        &self,
-        listing: SignedCommunityMembershipListing,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_community_membership_listing") {
-            return Err(e);
-        }
-        self.inner.put_community_membership_listing(listing).await
     }
     async fn put_community_membership_revocation(
         &self,

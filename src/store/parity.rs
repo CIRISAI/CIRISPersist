@@ -425,11 +425,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("apply_replicated_community_planned", Class::Plan),
     ("put_community_membership_revocation_planned", Class::Plan),
     ("put_community_membership_widening_planned", Class::Plan),
-    ("put_community_membership_listing_planned", Class::Plan),
     ("plan_put_community", Class::Delegates),
     ("plan_put_community_membership_revocation", Class::Delegates),
     ("plan_put_community_membership_widening", Class::Delegates),
-    ("plan_put_community_membership_listing", Class::Delegates),
     // (The three roster executors are each a shared door's tail call, which
     // the scan does not record for Plumbing.)
     ("store_planned_community", Class::Plumbing),
@@ -1032,12 +1030,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
         Class::Delegates,
     ),
     ("pg_row_to_community_membership_widening", Class::Delegates),
-    // v49.0.0 (#912) — the listing plane's row mappers.
-    ("pg_row_to_community_membership_listing", Class::Delegates),
-    (
-        "pg_row_to_signed_community_membership_listing",
-        Class::Delegates,
-    ),
     // v49.0.0 (#910) — the family widening plane's row mappers.
     ("pg_row_to_family_membership_widening", Class::Delegates),
     (
@@ -1167,14 +1159,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ),
     ("sqlite_row_to_family_membership_widening", Class::Delegates),
     (
-        "sqlite_row_to_community_membership_listing",
-        Class::Delegates,
-    ),
-    (
-        "sqlite_row_to_signed_community_membership_listing",
-        Class::Delegates,
-    ),
-    (
         "sqlite_row_to_signed_family_membership_widening",
         Class::Delegates,
     ),
@@ -1246,8 +1230,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_family_roster_authority", Class::Gate),
     ("verify_family_membership_widening_admission", Class::Gate),
     ("reject_future_dated_family_widening", Class::Gate),
-    // v49.0.0 (#912) — the one listing door every backend runs.
-    ("check_community_membership_listing", Class::Gate),
     // v53.1.2 (#984 row 16) — the withdrawal check every backend's
     // `withdraw_location_proof` runs after the admission gate.
     ("check_location_proof_withdrawal", Class::Gate),
@@ -1402,7 +1384,7 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 24] = [
+    const SHARED_PLANS: [(&str, &str); 23] = [
         // v60.0.0 (CIRISPersist#934 step 4) — the consent writes, the #1105
         // family-scoped holdings read (its family gate), and the key-grant
         // projection (its row-shape gates).
@@ -1473,10 +1455,6 @@ mod tests {
             "src/federation/community_admit.rs",
             "put_community_membership_widening_planned",
         ),
-        (
-            "src/federation/community_admit.rs",
-            "put_community_membership_listing_planned",
-        ),
     ];
 
     /// v60.0.0 (CIRISPersist#934 step 4) — **the shared selections**: the
@@ -1527,7 +1505,7 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 37] = [
+    const SHARED_DOORS: [(&str, &str, &str); 36] = [
         // v60.0.0 (CIRISPersist#934 step 4) — the consent writes.
         (
             "FederationDirectory",
@@ -1705,11 +1683,6 @@ mod tests {
             "FederationDirectory",
             "put_community_membership_widening",
             "put_community_membership_widening_planned",
-        ),
-        (
-            "FederationDirectory",
-            "put_community_membership_listing",
-            "put_community_membership_listing_planned",
         ),
     ];
 
@@ -3036,15 +3009,10 @@ mod tests {
             "check_infrastructure_founder_count_unchanged",
             Reads::FoldAt,
         ),
-        (
-            "plan_put_community_membership_listing",
-            "check_community_membership_listing",
-            Reads::ReceivedAt,
-        ),
     ];
 
     /// The plan fns [`PLAN_INSTANTS`] covers: `(file, fn)`.
-    const INSTANT_PLANS: [(&str, &str); 19] = [
+    const INSTANT_PLANS: [(&str, &str); 18] = [
         // v60.0.0 (CIRISPersist#934 step 4) — the consent planners and the
         // reaper's selection: none reads the clock (the trust grant's
         // `trusted_at` is the door's one `received_at`).
@@ -3090,10 +3058,6 @@ mod tests {
         (
             "src/federation/community_admit.rs",
             "plan_put_community_membership_widening",
-        ),
-        (
-            "src/federation/community_admit.rs",
-            "plan_put_community_membership_listing",
         ),
     ];
 

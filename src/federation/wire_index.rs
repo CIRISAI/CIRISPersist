@@ -229,6 +229,10 @@ pub(crate) async fn entry_as_stored(
 /// tables (V205): their index rows were dropped with them, and a kind this
 /// function does not name is refused below.
 ///
+/// v61 (CIRISPersist#991) — the member listing (`CommunityMembershipListing`)
+/// retired the same way, with no successor: V209 drops its table and its
+/// index rows, and the kind is refused below.
+///
 /// The `_since(None, u32::MAX)` full-scan arms (`Family`/`Community`/
 /// `LocationProof`/`*MembershipRevocation`) are O(n) in table size — acceptable for a point-read
 /// fallback/backfill path (not a per-request hot path); the 3 primary
@@ -320,27 +324,6 @@ pub async fn reload_record_bytes(
                 Some(r) => {
                     Some(serde_json::to_vec(&r.proof).map_err(|e| to_bytes(e, "LocationProof"))?)
                 }
-                None => None,
-            }
-        }
-        "CommunityMembershipListing" => {
-            // v49.0.0 (#912) — the listing plane, keyed like the widening.
-            let community_key_id = record_key_field(record_key_json, "community_key_id")?;
-            let member_key_id = record_key_field(record_key_json, "member_key_id")?;
-            let effective_at = record_key_field(record_key_json, "effective_at")?;
-            let rows = dir
-                .list_signed_community_membership_listings_since(None, u32::MAX)
-                .await?;
-            match rows.into_iter().find(|l| {
-                let row = &l.listing.community_membership_listing;
-                row.community_key_id == community_key_id
-                    && row.member_key_id == member_key_id
-                    && row.effective_at.to_rfc3339() == effective_at
-            }) {
-                Some(l) => Some(
-                    serde_json::to_vec(&l.listing)
-                        .map_err(|e| to_bytes(e, "CommunityMembershipListing"))?,
-                ),
                 None => None,
             }
         }
@@ -509,20 +492,6 @@ pub async fn all_kind_hash_keys(
             ),
         ]);
         out.push(("LocationProof", content_hash_of(p)?, rk));
-    }
-    for r in dir
-        .list_signed_community_membership_listings_since(None, u32::MAX)
-        .await?
-    {
-        let v = &r.listing;
-        let row = &v.community_membership_listing;
-        let effective_at = row.effective_at.to_rfc3339();
-        let rk = record_key(&[
-            ("community_key_id", &row.community_key_id),
-            ("member_key_id", &row.member_key_id),
-            ("effective_at", &effective_at),
-        ]);
-        out.push(("CommunityMembershipListing", content_hash_of(v)?, rk));
     }
     Ok(out)
 }

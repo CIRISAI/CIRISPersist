@@ -110,16 +110,6 @@ pub mod paths {
     /// consented payload must be deleted (persist-owned lifecycle
     /// processor — the breach signal). Hoisted from `extra`, byte-invariant.
     pub const DELETION_WINDOW: &str = "deletion_window";
-    /// v49.0.0 (CIRISPersist#912, FSD `ROOM_ROSTER_AUTHORITY.md` §11) — CC 2's
-    /// per-membership PUBLIC-LISTING opt-in, the CEG 0.10 sibling of
-    /// [`DELIVERY_MODE`]. One admissible value,
-    /// [`crate::federation::listing::LISTED_PUBLIC`]; absent means the CC 2
-    /// default — a PRIVATE roster, producer- and self-queryable, never globally
-    /// enumerable. Producers MUST omit it unless the membership's subject opted
-    /// in, and the substrate does not solicit it: the one row that carries it,
-    /// a [`crate::federation::types::CommunityMembershipListing`], is admitted
-    /// only when its signer IS the member (`envelope_listed_not_self_asserted`).
-    pub const LISTED: &str = "listed";
     /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §3) — the multimedia
     /// Source struct (CC 3.3.13): `digest`, REQUIRED `size`, `format`,
     /// `codec`, layout hints, `placeholder`, `name`, `content_digest`,
@@ -463,14 +453,6 @@ pub struct EnvelopeCore {
     /// breach signal — see [`super::deletion_window`]). Byte-invariant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_window: Option<String>,
-    /// [`paths::LISTED`] — v49.0.0 (#912). Typed here (was an unknown
-    /// extension riding `extra`) so the vocabulary describes it. Its
-    /// ADMISSION — value `public` only, signed by the membership's own
-    /// subject — is the listing plane's door
-    /// ([`crate::federation::listing::check_community_membership_listing`]),
-    /// not this parse. Byte-invariant: `None` ⇒ no key ⇒ identical JCS bytes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub listed: Option<String>,
     /// v45.0.0 (CIRISPersist#871) — [`paths::MEDIA`]: the multimedia Source
     /// struct, kept as JSON here (byte-preserving) and validated at the door.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -944,7 +926,6 @@ fn fully_populated_core() -> EnvelopeCore {
         consent_supersedes: Some("prior-consent-1".into()),
         delivery_mode: Some("mandatory".into()),
         deletion_window: Some("2027-01-01T00:00:00Z".into()),
-        listed: Some("public".into()),
         media: Some(
             serde_json::json!({"digest": "ab".repeat(32), "size": 4096, "format": "image/jpeg"}),
         ),
@@ -999,7 +980,6 @@ mod tests {
             (paths::CONSENT_SUPERSEDES, true),
             (paths::DELIVERY_MODE, true),
             (paths::DELETION_WINDOW, true),
-            (paths::LISTED, true),
             (paths::ASSERTED_AT, true),
             (paths::EXPIRES_AT, true),
             (paths::WIDENED_AT, true),
@@ -1149,16 +1129,6 @@ pub fn envelope_vocabulary_json() -> serde_json::Value {
             // would break them a third time for no new capability.
             paths::DELIVERY_MODE,
             paths::DELETION_WINDOW,
-            // v49.0.0 (CIRISPersist#912) — the per-membership public-listing
-            // opt-in, `delivery_mode`'s CEG 0.10 sibling, three majors late
-            // for the same reason #658's two were: it was never a typed
-            // field, so nothing made its absence visible. Added DELIBERATELY,
-            // re-pinning `ENVELOPE_VOCABULARY_SHA256`: a consumer that has not
-            // adopted it renders every member as private, including the ones
-            // who chose otherwise — the quiet failure. Its third sibling,
-            // `history_on_join`, is NOT added: a recorded decision, see the
-            // re-pin log on `ENVELOPE_VOCABULARY_SHA256`.
-            paths::LISTED,
             // v45.0.0 (CIRISPersist#871) — the multimedia Source struct (CC
             // 3.3.13). Re-pins `ENVELOPE_VOCABULARY_SHA256`, deliberately: a
             // descriptor's REQUIRED `size` is what a peer's puller budgets by
@@ -1302,7 +1272,7 @@ pub fn envelope_vocabulary_sha256() -> String {
 /// vocabulary lists [`paths::MEDIA`], the multimedia Source struct.
 /// v49.0.0 (CIRISPersist#912) — **RE-PINNED** from
 /// `4d7054a6e05306e7b37d30ab2d25c43625a4f382021f39191f55a2c1f833589b`:
-/// [`paths::LISTED`] joined `universal_paths`. All three CEG 0.10
+/// `listed` joined `universal_paths`. All three CEG 0.10
 /// recipient-receive fields (`namespace_supersets.json`'s `recipient_receive`
 /// wire fields) arrived in CC together; `delivery_mode` was adopted in v31.0.0
 /// because it was already typed, and `listed` and `history_on_join` were
@@ -1328,8 +1298,13 @@ pub fn envelope_vocabulary_sha256() -> String {
 /// charter's `recovery_commitments` joined `universal_paths` (it decides who
 /// may rotate a holder's seat without a quorum). Previous pin:
 /// `c9558c98bf871e97c2e73c428894e2dc642fcffec4de92da06ab5a9fa69ddca2`.
+/// v61 (CIRISPersist#991, the steward's final ruling: no outward member
+/// listing) — **RE-PINNED** from
+/// `8064aafe07646acefad93f51fbf7e79cb8ac421bd49318c5aad50ded142295b1`:
+/// `listed` leaves `universal_paths` and `EnvelopeCore`, with the listing
+/// plane it was typed for. Persist no longer emits it.
 pub const ENVELOPE_VOCABULARY_SHA256: &str =
-    "8064aafe07646acefad93f51fbf7e79cb8ac421bd49318c5aad50ded142295b1";
+    "4c5a5e8a019bc8c9c895a5b91693438aafe9066237305d07e04dd31d36596eff";
 
 #[cfg(test)]
 mod vocab_tests {

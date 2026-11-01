@@ -87,10 +87,6 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         Bound::Schema("the communities one member is active in now"),
     ),
     (
-        "list_community_membership_listings_for",
-        Bound::Open("one community's full listing history: grows with membership churn"),
-    ),
-    (
         "list_community_membership_revocations_for",
         Bound::Open("one community's full revocation history: grows with membership churn"),
     ),
@@ -226,7 +222,6 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
     ("list_scores", Bound::Paged),
     ("list_signed_accord_quorum_evidence_since", Bound::Paged),
     ("list_signed_communities_since", Bound::Paged),
-    ("list_signed_community_membership_listings_since", Bound::Paged),
     ("list_signed_community_membership_revocations_since", Bound::Paged),
     ("list_signed_community_membership_widenings_since", Bound::Paged),
     ("list_signed_families_since", Bound::Paged),

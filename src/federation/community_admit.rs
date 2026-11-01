@@ -16,8 +16,6 @@
 //! - `put_community_membership_revocation` and
 //!   `put_community_membership_widening`, the roster planes: authorship, the
 //!   future-skew bound, the #908 roster authority, the #925 founder gates;
-//! - `put_community_membership_listing`: authorship and the #912 listing
-//!   door.
 //!
 //! # The shape
 //!
@@ -25,8 +23,7 @@
 //! community door is [`apply_replicated_community_planned`] over the same body): the held-row settle,
 //! the one clock read, the plan, then the executor. The plans
 //! ([`plan_put_community`], [`plan_put_community_membership_revocation`],
-//! [`plan_put_community_membership_widening`],
-//! [`plan_put_community_membership_listing`]) hold every admission gate and
+//! [`plan_put_community_membership_widening`]) hold every admission gate and
 //! read the directory through the trait only. They read no clock: the door
 //! passes [`PlanInstants`]. [`CommunityStore`] is what a backend implements:
 //! the row mapping, the SQL, the transaction, the wire index. It decides
@@ -60,8 +57,8 @@ use super::group_amendment::{
 };
 use super::hard_case::HardCaseEvent;
 use super::types::{
-    CommunityMember, SignedCommunity, SignedCommunityMembershipListing,
-    SignedCommunityMembershipRevocation, SignedCommunityMembershipWidening,
+    CommunityMember, SignedCommunity, SignedCommunityMembershipRevocation,
+    SignedCommunityMembershipWidening,
 };
 use super::{Error, FederationDirectory};
 
@@ -103,14 +100,6 @@ pub(crate) struct PlannedCommunityWidening {
     pub(crate) widening: SignedCommunityMembershipWidening,
 }
 
-/// An admitted community-membership listing, exactly as stored.
-pub(crate) struct PlannedCommunityListing {
-    /// The signed row, its `persist_row_hash` stamped.
-    pub(crate) listing: SignedCommunityMembershipListing,
-    /// The signed-wire-index locator (#507b).
-    pub(crate) wire_index_key: String,
-}
-
 /// The community-plane executor: what a backend does for the shared plans.
 /// Storage only: every refusal is a plan's. (A missing room or member key on
 /// memory is its stand-in for the SQL backends' foreign keys.)
@@ -140,13 +129,6 @@ pub(crate) trait CommunityStore:
     async fn store_planned_community_widening(
         &self,
         planned: PlannedCommunityWidening,
-    ) -> Result<(), Error>;
-
-    /// Store a planned listing, idempotent on its three-part key, then the
-    /// wire index.
-    async fn store_planned_community_listing(
-        &self,
-        planned: PlannedCommunityListing,
     ) -> Result<(), Error>;
 
     /// Test-only (PR #921 review, F3): apply the rival community write armed
@@ -489,61 +471,4 @@ where
     let row = &mut widening.community_membership_widening;
     row.persist_row_hash = super::types::compute_persist_row_hash(&*row)?;
     Ok(PlannedCommunityWidening { widening })
-}
-
-/// The door: every backend's `put_community_membership_listing` is this call.
-pub(crate) async fn put_community_membership_listing_planned<D>(
-    dir: &D,
-    listing: SignedCommunityMembershipListing,
-) -> Result<(), Error>
-where
-    D: CommunityStore,
-{
-    // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-    // before any verification (`replication_policy::settle_if_held`).
-    if crate::federation::replication_policy::settle_if_held(
-        dir,
-        crate::federation::replication_policy::EnvelopeKind::CommunityMembershipListing,
-        &listing,
-    )
-    .await?
-    {
-        return Ok(());
-    }
-    // v57.0.0 (CIRISPersist#934 step 2) — the ONE clock read of this door, and
-    // the row's signed instant.
-    let instants = PlanInstants {
-        fold_at: listing.community_membership_listing.effective_at,
-        received_at: chrono::Utc::now(),
-    };
-    let planned = plan_put_community_membership_listing(dir, listing, instants).await?;
-    dir.store_planned_community_listing(planned).await
-}
-
-/// **The decision** for a community-membership listing (CIRISPersist#912):
-/// the one listing door, then the row as stored. Membership is the fold's
-/// question, not this door's.
-pub(crate) async fn plan_put_community_membership_listing<D>(
-    dir: &D,
-    listing: SignedCommunityMembershipListing,
-    instants: PlanInstants,
-) -> Result<PlannedCommunityListing, Error>
-where
-    D: FederationDirectory,
-{
-    let received_at = instants.received_at;
-    super::listing::check_community_membership_listing(dir, &listing, received_at).await?;
-    let mut listing = listing;
-    let row = &mut listing.community_membership_listing;
-    row.persist_row_hash = super::types::compute_persist_row_hash(&*row)?;
-    let effective_at_rfc3339 = row.effective_at.to_rfc3339();
-    let wire_index_key = super::wire_index::record_key(&[
-        ("community_key_id", &row.community_key_id),
-        ("member_key_id", &row.member_key_id),
-        ("effective_at", &effective_at_rfc3339),
-    ]);
-    Ok(PlannedCommunityListing {
-        listing,
-        wire_index_key,
-    })
 }

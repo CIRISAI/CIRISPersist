@@ -43,6 +43,15 @@
 //! give every one its row, checked by a from-disk count (no signed projection
 //! row names no row; the plane holds one row per signed object), every
 //! projection rebuilds byte-equal, and a second rehome links nothing.
+//!
+//! I1497 — the member listing retires with no successor (the steward's ruling:
+//! no outward member listing). A v60 node (through V208) holds a private
+//! room's listing rows (two members listed `public`) and a peer's
+//! advertisement of a listing hash. After V209, by a from-disk count, the
+//! table is gone and so is the advertisement. A non-member's node receives
+//! none of the room's planes, whichever member a row names (the listed ones
+//! included), while a member's still does. The envelope vocabulary no longer
+//! names `listed`.
 
 /// The backend-agnostic witness bodies; `run` instantiates them per backend.
 #[cfg(test)]
@@ -116,7 +125,7 @@ pub(crate) mod bodies {
             .unwrap_or_else(|e| panic!("{tag}: {} rebuild: {e}", table.as_str()));
     }
 
-    async fn user(d: &dyn FederationDirectory, k: &str) {
+    pub(crate) async fn user(d: &dyn FederationDirectory, k: &str) {
         ts::register_hybrid_key_as(d, k, k, identity_type::USER).await;
     }
 
@@ -744,7 +753,7 @@ pub(crate) mod bodies {
 
     /// A room `room-{tag}` of ann (founder), ben and cat under `quorum:2/3`,
     /// dan widened and cat removed by ann + ben, through the local doors.
-    async fn room_with_history<D>(d: &D, tag: &str) -> String
+    pub(crate) async fn room_with_history<D>(d: &D, tag: &str) -> String
     where
         D: FederationDirectory,
     {
@@ -937,6 +946,77 @@ pub(crate) mod bodies {
                 without_row: 1,
             },
             "{tag}: the rehome is once; the Ed25519-only record stays counted"
+        );
+    }
+
+    /// I1497, before the upgrade: the SQL that gives a v60 node's room
+    /// `room` two listing rows (ben and dan listed `public`, as V156 stored
+    /// them) and a peer's advertisement of a listing hash, on `schema`.
+    pub(crate) fn i1497_seed_listing_sql(schema: &str, room: &str, tag: &str) -> String {
+        format!(
+            "INSERT INTO {schema}federation_community_membership_listings \
+                (community_key_id, member_key_id, effective_at, listed, persist_row_hash, \
+                 authority_key_id, scrub_signature_classical, admitted_at) \
+             VALUES ('{room}', 'ben-{tag}', '2026-04-01T00:00:00Z', 'public', 'h-ben', \
+                     'ben-{tag}', 'c2ln', '2026-04-01T00:00:00Z'), \
+                    ('{room}', 'dan-{tag}', '2026-04-02T00:00:00Z', 'public', 'h-dan', \
+                     'dan-{tag}', 'c2ln', '2026-04-02T00:00:00Z'); \
+             INSERT INTO {schema}known_wire_hashes \
+                (kind, content_hash, last_advertised_at, advertised_by) \
+             VALUES ('CommunityMembershipListing', '{}', \
+                     '2026-04-02T00:00:00.000000+00:00', 'a-peer');",
+            "ef".repeat(32)
+        )
+    }
+
+    /// I1497, the from-disk count of a v60 node's listing rows.
+    pub(crate) fn i1497_listing_rows_sql(schema: &str) -> String {
+        format!("SELECT count(*) FROM {schema}federation_community_membership_listings")
+    }
+
+    /// I1497, the from-disk count of the kind's advertisements.
+    pub(crate) fn i1497_listing_adverts_sql(schema: &str) -> String {
+        format!(
+            "SELECT count(*) FROM {schema}known_wire_hashes \
+              WHERE kind = 'CommunityMembershipListing'"
+        )
+    }
+
+    /// I1497, after V209: the room the listings named serves no non-member,
+    /// whichever member a row names; a member is still served.
+    pub(crate) async fn i1497_no_non_member_view<D>(d: &D, room: &str, tag: &str)
+    where
+        D: FederationDirectory,
+    {
+        use crate::federation::replication_audience::may_receive_group_plane;
+        use crate::federation::types::cohort_scope;
+        let eve = format!("eve-{tag}");
+        user(d, &eve).await;
+        let [ann, ben, dan] = ["ann", "ben", "dan"].map(|n| format!("{n}-{tag}"));
+        for named in [None, Some(ben.as_str()), Some(dan.as_str())] {
+            let v = may_receive_group_plane(d, &eve, cohort_scope::COMMUNITY, room, named)
+                .await
+                .expect("the audience gate answers");
+            assert!(
+                !v.allowed(),
+                "{tag}: I1497 a non-member receives the room's plane (row naming {named:?}): {v:?}"
+            );
+        }
+        assert!(
+            may_receive_group_plane(d, &ann, cohort_scope::COMMUNITY, room, None)
+                .await
+                .expect("the audience gate answers")
+                .allowed(),
+            "{tag}: I1497 a member is still served (the gate is not shut for everyone)"
+        );
+        let vocab = crate::federation::envelope::envelope_vocabulary_json();
+        assert!(
+            !vocab["universal_paths"]
+                .as_array()
+                .expect("universal_paths")
+                .iter()
+                .any(|p| p == "listed"),
+            "{tag}: I1497 the envelope vocabulary still names `listed`"
         );
     }
 
@@ -1526,6 +1606,102 @@ mod run {
         old.test_execute(&super::bodies::i1489_clear_sql(s)).await;
         super::bodies::i1489_relinked(&old, &t, cleared).await;
         eprintln!("i1489_postgres: RAN");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1497_sqlite() {
+        use crate::store::Backend as _;
+        let t = tag();
+        let old = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        old.run_migrations_through(208).await.unwrap();
+        for n in ["ann", "ben", "cat", "dan"] {
+            super::bodies::user(&old, &format!("{n}-{t}")).await;
+        }
+        let room = super::bodies::room_with_history(&old, &t).await;
+        old.test_execute(&super::bodies::i1497_seed_listing_sql("", &room, &t))
+            .await;
+        assert_eq!(
+            old.test_count(&super::bodies::i1497_listing_rows_sql(""))
+                .await,
+            2,
+            "{t}: the v60 node holds two listing rows"
+        );
+        assert_eq!(
+            old.test_count(&super::bodies::i1497_listing_adverts_sql(""))
+                .await,
+            1
+        );
+        old.run_migrations().await.unwrap();
+        assert_eq!(
+            old.test_count(
+                "SELECT count(*) FROM sqlite_master \
+                  WHERE name = 'federation_community_membership_listings'"
+            )
+            .await,
+            0,
+            "{t}: I1497 V209 drops the listing table"
+        );
+        assert_eq!(
+            old.test_count(&super::bodies::i1497_listing_adverts_sql(""))
+                .await,
+            0,
+            "{t}: I1497 V209 deletes the kind's advertisements"
+        );
+        super::bodies::i1497_no_non_member_view(&old, &room, &t).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1497_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let t = tag();
+        let s = "cirislens.";
+        let old = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        old.run_migrations_through(208).await.unwrap();
+        for n in ["ann", "ben", "cat", "dan"] {
+            super::bodies::user(&old, &format!("{n}-{t}")).await;
+        }
+        let room = super::bodies::room_with_history(&old, &t).await;
+        old.test_execute(&super::bodies::i1497_seed_listing_sql(s, &room, &t))
+            .await;
+        assert_eq!(
+            old.test_count(&super::bodies::i1497_listing_rows_sql(s))
+                .await,
+            2,
+            "{t}: the v60 node holds two listing rows"
+        );
+        assert_eq!(
+            old.test_count(&super::bodies::i1497_listing_adverts_sql(s))
+                .await,
+            1
+        );
+        old.run_migrations().await.unwrap();
+        assert_eq!(
+            old.test_count(
+                "SELECT count(*) FROM information_schema.tables \
+                  WHERE table_schema = 'cirislens' \
+                    AND table_name = 'federation_community_membership_listings'"
+            )
+            .await,
+            0,
+            "{t}: I1497 V209 drops the listing table"
+        );
+        assert_eq!(
+            old.test_count(&super::bodies::i1497_listing_adverts_sql(s))
+                .await,
+            0,
+            "{t}: I1497 V209 deletes the kind's advertisements"
+        );
+        super::bodies::i1497_no_non_member_view(&old, &room, &t).await;
+        eprintln!("i1497_postgres: RAN");
     }
 
     #[cfg(feature = "sqlite")]

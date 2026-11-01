@@ -135,7 +135,7 @@ and CIRISServer pins the hash. The order is hashed, so a new kind is always
 | 16 | `KeyGrant` | `key_grant:*` rows (see below) | retired (v61, #991) — the rows ride the `Attestation` kind |
 | 17 | `CommunityMembershipWidening` | `federation_community_membership_widenings` (the rows' projection) | retired (v61, #991) — travels as its `membership:widening:v1` row |
 | 18 | `FamilyMembershipWidening` | `federation_family_membership_widenings` (the rows' projection) | retired (v61, #991) — travels as its `membership:widening:v1` row |
-| 19 | `CommunityMembershipListing` | `federation_community_membership_listings` | live |
+| 19 | `CommunityMembershipListing` | — | retired (v61, #991) with no successor: there is no outward member listing; V209 dropped the table |
 
 An inbound framed object of a retired kind (`RETIRED_FRAMED`) is refused with
 `federation_envelope_kind_retired`, whose detail names the kind in snake_case.
@@ -263,6 +263,12 @@ One row of `federation_family_membership_widenings`:
 `FSD/ROOM_ROSTER_AUTHORITY.md` §10 is the design.
 
 ### 19 — `CommunityMembershipListing` (#912)
+
+**Retired in v61 (CIRISPersist#991), with no successor.** The steward's final
+ruling is that there is no outward member listing, and CC removes `listed`.
+The kind is in `RETIRED_FRAMED` at its hashed position. Its doors, reads,
+capsule op and types are removed. `listed` left `universal_paths` (the vocabulary hash
+was re-pinned), and V209 dropped the table. The text below records the v49–v60 design.
 
 | signer | binding | projections |
 |---|---|---|

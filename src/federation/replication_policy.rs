@@ -152,6 +152,10 @@ pub enum EnvelopeKind {
     /// Self-owned ([`SignerBinding::SelfOwn`]): the only admissible signer is
     /// the membership's subject. A forged listing would disclose a member who
     /// did not choose it.
+    ///
+    /// v61 (CIRISPersist#991): RETIRED ([`RETIRED_FRAMED`]) with no successor;
+    /// there is no outward member listing. V209 drops the table. Kept at its
+    /// hashed position.
     CommunityMembershipListing,
 }
 
@@ -203,7 +207,11 @@ pub const ENVELOPE_KIND_RETIRED: &str = "federation_envelope_kind_retired";
 /// v55.0.0 a wrap is one `key_grant:{axis}:v1` `scores` row per recipient,
 /// carried as an `Attestation`; the kind only named the plane those rows
 /// project into. V208 deletes its index and advertisement entries.
-pub const RETIRED_FRAMED: [EnvelopeKind; 14] = [
+///
+/// v61 (CIRISPersist#991) — [`EnvelopeKind::CommunityMembershipListing`]
+/// joins with NO successor: the steward's final ruling is that there is no
+/// outward member listing (CC removes `listed`). V209 drops its table.
+pub const RETIRED_FRAMED: [EnvelopeKind; 15] = [
     EnvelopeKind::Key,
     EnvelopeKind::Revocation,
     EnvelopeKind::IdentityOccurrence,
@@ -218,6 +226,7 @@ pub const RETIRED_FRAMED: [EnvelopeKind; 14] = [
     EnvelopeKind::CommunityMembershipWidening,
     EnvelopeKind::FamilyMembershipWidening,
     EnvelopeKind::KeyGrant,
+    EnvelopeKind::CommunityMembershipListing,
 ];
 
 /// v59.0.0 — refuse a wire-kind token (`EnvelopeKind::as_str()`) naming a
@@ -683,6 +692,11 @@ where
 /// each with the reason. Every other [`EnvelopeKind`] door calls it first
 /// (gated from disk by I235).
 pub const SETTLE_EXEMPT: &[(EnvelopeKind, &str)] = &[
+    (
+        EnvelopeKind::CommunityMembershipListing,
+        "v61 (CIRISPersist#991): retired with no successor (the steward's ruling: no outward \
+         member listing); RETIRED_FRAMED, no door, and V209 dropped its table",
+    ),
     (
         EnvelopeKind::AccordQuorumEvidence,
         "an aggregate whose content hash moves as votes land; absent from the wire index by \

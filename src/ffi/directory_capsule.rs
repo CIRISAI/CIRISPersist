@@ -294,6 +294,10 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// `ApplyReplicatedCommunity` and their results are REMOVED: the rows ride
 /// `ApplyReplicatedAttestation` and the attestation cursor. A consumer built
 /// against 11 sends ops this host no longer decodes.
+/// The same break retires the member listing with no successor (the
+/// steward's ruling: no outward member listing): the op
+/// `ListSignedCommunityMembershipListingsSince` and its result
+/// `SignedCommunityMembershipListings` are REMOVED.
 ///
 /// Consumers MUST check the field at capsule-receive time:
 ///
@@ -953,16 +957,6 @@ pub enum DirectoryOp {
         /// The identity the TRANSPORT authenticated — never the row's claim.
         authenticated_peer_key_id: String,
     },
-    /// v49.0.0 (CIRISPersist#912) —
-    /// [`FederationDirectory::list_signed_community_membership_listings_since`],
-    /// the 19th kind's serve read. Result rides
-    /// `SignedCommunityMembershipListings`. APPEND-ONLY (Growth).
-    ListSignedCommunityMembershipListingsSince {
-        /// Cursor (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
     /// v50.0.0 (CIRISPersist#917) —
     /// [`FederationDirectory::apply_replicated_attestation`], the typed
     /// unattributed door. The far side runs the whole plan-then-write body
@@ -1269,9 +1263,6 @@ pub enum DirectoryOpResult {
     /// [`DirectoryOp::EvictKnownWireHashes`] (CIRISPersist#785) — evicted,
     /// remaining, and how far over bound the floor left it. APPEND-ONLY.
     KnownHashEviction(crate::federation::KnownHashEviction),
-    /// v49.0.0 (CIRISPersist#912) — `list_signed_community_membership_listings_since`.
-    /// APPEND-ONLY (Growth).
-    SignedCommunityMembershipListings(Vec<crate::federation::ServedCommunityMembershipListing>),
     /// v50.0.0 (CIRISPersist#917) — `apply_replicated_attestation` and
     /// `put_attestation_synced`: the typed Attestation-plane outcome. A
     /// `Refused` is a policy outcome carried HERE with its reason, never
@@ -1923,15 +1914,6 @@ pub async fn dispatch_directory_op(
         DirectoryOp::EvictKnownWireHashes { cutoff, bound } => {
             match dir.evict_known_wire_hashes(cutoff, bound).await {
                 Ok(v) => DirectoryOpResult::KnownHashEviction(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
-        DirectoryOp::ListSignedCommunityMembershipListingsSince { since, limit } => {
-            match dir
-                .list_signed_community_membership_listings_since(since, limit)
-                .await
-            {
-                Ok(v) => DirectoryOpResult::SignedCommunityMembershipListings(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -3453,15 +3435,6 @@ impl FederationDirectory for OpsDirectory {
             method: "put_family_membership_widening",
         })
     }
-    async fn put_community_membership_listing(
-        &self,
-        listing: crate::federation::SignedCommunityMembershipListing,
-    ) -> Result<(), Error> {
-        let _ = listing;
-        Err(Error::Unsupported {
-            method: "put_community_membership_listing",
-        })
-    }
     async fn list_identity_occurrence_revocations_for(
         &self,
         identity_key_id: &str,
@@ -3704,25 +3677,6 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::ReplicatedAttestationOutcome(o) => Ok(o),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v49.0.0 (CIRISPersist#912) — the listing since-read, proxied like the
-    /// widening planes': a capsule consumer converges the 19th kind from it.
-    async fn list_signed_community_membership_listings_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedCommunityMembershipListing>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedCommunityMembershipListingsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedCommunityMembershipListings(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -4033,15 +3987,6 @@ impl FederationDirectory for OpsDirectory {
         let _ = family_key_id;
         Err(Error::Unsupported {
             method: "list_family_membership_widenings_for",
-        })
-    }
-    async fn list_community_membership_listings_for(
-        &self,
-        community_key_id: &str,
-    ) -> Result<Vec<crate::federation::CommunityMembershipListing>, Error> {
-        let _ = community_key_id;
-        Err(Error::Unsupported {
-            method: "list_community_membership_listings_for",
         })
     }
     async fn list_location_proofs_for(
@@ -4836,9 +4781,11 @@ mod tests {
         // `ListIdentityOccurrenceHistoryByOccurrence` and
         // `ListIdentityOccurrencesByOccurrenceKey` APPENDED; v61's ABI is 12
         // for #991's removals, not for this.
+        // v61 (CIRISPersist#991) — `ListSignedCommunityMembershipListingsSince`
+        // removed with the member listing (a BREAK, inside ABI 12).
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "e0d1e1ca15b8ed373b038c13e0c3ea24d897f8798ddd54c8f4ddae48a13b5061",
+            "d78ffc44212864622c15230a9eb0228626aaa4631b4305890823d1cfd7258230",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -4890,9 +4837,11 @@ mod tests {
         // v59.1.2 (CIRISPersist#1162), merged forward — GROWTH:
         // `AttestationQueryRows`, `AttestationRows`, `OccurrenceHistory` and
         // `IdentityOccurrences` APPENDED.
+        // v61 (CIRISPersist#991) — `SignedCommunityMembershipListings` removed
+        // with the member listing (a BREAK, inside ABI 12).
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "7425561cdf8f37fd5b1e3ec65a96ee5518c61793bf5a5dc43ad20636e481779c",
+            "072218ce981010c91c962f75e2939a33814e2f179d9da3a178a4f2dbb0ef951b",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );
@@ -6341,12 +6290,10 @@ mod tests {
         ("put_community_membership_revocation", PRE_1162),
         ("put_community_membership_widening", PRE_1162),
         ("put_family_membership_widening", PRE_1162),
-        ("put_community_membership_listing", PRE_1162),
         ("list_family_membership_revocations_for", PRE_1162),
         ("list_community_membership_revocations_for", PRE_1162),
         ("list_community_membership_widenings_for", PRE_1162),
         ("list_family_membership_widenings_for", PRE_1162),
-        ("list_community_membership_listings_for", PRE_1162),
         ("list_location_proofs_for", PRE_1162),
         ("withdraw_location_proof", PRE_1162),
         ("communities_containing", PRE_1162),
