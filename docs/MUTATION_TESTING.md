@@ -169,6 +169,7 @@ scope's header comment names the issues and invariants it covers.
 | `scope-601-fixes` | the plaintext DAG caller-input checks, idempotent DEK re-supply, the purge path without a `LocalSigner`, the resumed takedown and the bytes floor's in-transaction tombstone read, the signed receipt instant, and the delivery-receipt length rule | I1400–I1409, I1411, I754, I780–I783, I786, I788–I790, I153, I513 | weekly, 4 shards |
 | `scope-601-asks` | the accord threshold and its roster read, the key-grant and `DimensionRejected` retryability predicates, the `identity_amendment:v1` gate, and the takedown reversal (fold, withheld read, finalize skip, re-ack candidates, the reversal's authority) | I1360–I1367, I742, I655, I790, I773, I972, I1218 | weekly, 4 shards |
 | `scope-5911-principals` | the principal fold: `principals_of` drops a node's owner only on an effective occurrence revocation, `may_receive_group_plane` reads that fold, and `epoch_minter::resolve` keeps the one granting minter that acts for the author | I1470–I1473, I1475, I128, I141, I121–I124 | nightly |
+| `scope-5912-pool` | the Postgres pool: `pool_config` floors a default pool at 16, and `checkout` turns a wait past the bound into the typed `PoolExhausted` | I1480–I1483 | nightly |
 
 The scope file names carry the work item that introduced them; the name is
 what CI and the allow-list key on, so it does not change.

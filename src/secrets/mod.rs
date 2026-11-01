@@ -144,6 +144,16 @@ pub enum SecretsError {
     #[error("backend: {0}")]
     Backend(String),
 
+    /// v59.1.2 — no pooled connection was freed within the pool's wait
+    /// timeout (`waited`): the pool is starved. Before v59.1.2 the checkout
+    /// had no timeout and waited forever. Python `ciris_persist.PoolExhausted`
+    /// (a `RuntimeError`, the type the backend arm it was carved from had).
+    #[error("secrets_pool_exhausted: no pooled connection freed within {waited:?}")]
+    PoolExhausted {
+        /// The wait the pool was configured with.
+        waited: std::time::Duration,
+    },
+
     /// `migrate_to_hardware_key` could not reach hardware-backed
     /// secure storage — the host has no TPM / Keystore / Secure
     /// Enclave (or it is unusable), so there is no hardware root to
@@ -174,6 +184,7 @@ impl SecretsError {
             SecretsError::NotFound(_) => "secrets_not_found",
             SecretsError::Crypto(_) => "secrets_crypto",
             SecretsError::Backend(_) => "secrets_backend",
+            SecretsError::PoolExhausted { .. } => "secrets_pool_exhausted",
             SecretsError::HardwareKeyUnavailable(_) => "secrets_hw_unavailable",
             SecretsError::RotationConflict(_) => "secrets_rotation_conflict",
             SecretsError::Internal(_) => "secrets_internal",

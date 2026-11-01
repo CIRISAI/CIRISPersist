@@ -108,6 +108,9 @@ jobs:
           # narrowing several granting minters to the author's sealer.
           # 14 mutants, one shard (600 s + 168 s x 14 = 2952 s), nightly.
           - {scope: scope-5911-principals, shard: '', id: 5911-principals, weekly: false}
+          # The Postgres pool (v59.1.2): `pool_config`'s size floor and
+          # `checkout`'s typed starvation. 2 mutants, one shard, nightly.
+          - {scope: scope-5912-pool, shard: '', id: 5912-pool, weekly: false}
           # The group plane (CIRISPersist#991 planes 2 and 3): 162 mutants, six
           # shards of <= 27 at the measured 168 s per mutant
           # (600 s + 168 s x 27 = 5136 s each), weekly.

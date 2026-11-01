@@ -163,6 +163,55 @@ mod tests {
         rt.shutdown_background();
     }
 
+    /// v59.1.2 (I320c) — the checkout's wait bound holds on a thread with no
+    /// persist runtime. deadpool's own wait timer panicked there ("no reactor
+    /// running"), so the bound runs its timer on persist's runtime: a starved
+    /// pool polled from a foreign thread is `PoolExhausted` within the wait,
+    /// not a panic and not a hang.
+    #[test]
+    fn i320c_a_starved_pool_is_typed_on_a_thread_without_persist_runtime() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("persist runtime");
+        let wait = std::time::Duration::from_secs(2);
+        let backend = Arc::new(
+            rt.block_on(
+                crate::store::postgres::PostgresBackend::connect_with_pool_for_test(&dsn, 1, wait),
+            )
+            .expect("connect"),
+        );
+        let held = rt
+            .block_on(backend.get_client())
+            .expect("the only connection");
+        let b = backend.clone();
+        let started = std::time::Instant::now();
+        let joined = std::thread::spawn(move || {
+            block_on_no_runtime(async move { b.get_client().await.map(|_| ()) })
+        })
+        .join();
+        match joined {
+            Ok(Err(crate::store::Error::PoolExhausted { waited })) => assert_eq!(waited, wait),
+            other => panic!(
+                "I320c: a typed exhaustion, not {:?}",
+                other.map(|r| r.err())
+            ),
+        }
+        assert!(
+            started.elapsed() < wait * 3,
+            "I320c: {:?}",
+            started.elapsed()
+        );
+        drop(held);
+        drop(backend);
+        rt.shutdown_background();
+    }
+
     /// I320b — a connect that PANICS on persist's runtime comes back to a
     /// thread without one as an ERROR. Across two `.so`s an unwind there is
     /// the abort; a `JoinError` must never be re-raised.
