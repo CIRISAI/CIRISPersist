@@ -3022,7 +3022,16 @@ pub(crate) fn refuse_tombstoned_at_write(
     notices: Vec<String>,
     floor: &TombstoneFloor,
 ) -> Result<(), TombstonedAtWrite> {
-    match standing_notice(notices, &floor.reversed) {
+    refuse_standing_notice(sha256, standing_notice(notices, &floor.reversed))?;
+    Ok(())
+}
+
+/// v61 (CIRISPersist#934, S4a) — the refusal [`refuse_tombstoned_at_write`]
+/// decides: a standing notice names the address. A shared plan every byte
+/// write's executor re-asks inside its transaction.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+fn refuse_standing_notice(sha256: &[u8], notice: Option<String>) -> Result<(), TombstonedAtWrite> {
+    match notice {
         None => Ok(()),
         Some(notice_id) => Err(TombstonedAtWrite {
             sha256_hex: hex::encode(sha256),

@@ -63,6 +63,11 @@ mod attestation_apply_invariants;
 /// v25.1.0 (CIRISPersist#582) — the backend-generic signed-ATTESTATION emit
 /// recipe (distinct from [`emit`], the trust-grant/audit-entry API).
 pub mod attestation_emit;
+/// v61 (CIRISPersist#934, S4a) — the blob plane's gated doors (the chunk
+/// floor, the stream plane's records, the blob writes), decided once, with
+/// the per-backend `BlobFloorStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod blob_admit;
 /// v57.0.0 (CIRISPersist#934 step 2) — the community and roster doors,
 /// decided once: `plan_put_community`, the three roster plans, and the
 /// per-backend `CommunityStore` executor.

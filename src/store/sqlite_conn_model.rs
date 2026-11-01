@@ -239,6 +239,14 @@ pub(crate) enum ConnClass {
 /// and are `Write`.
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
+    // v61 (CIRISPersist#934, S4a) — the blob plane's executor.
+    ("store_planned_chunk_batch", ConnClass::Write),
+    ("read_stream_chunk_hashes", ConnClass::Read),
+    ("store_stream_sth", ConnClass::Write),
+    ("store_delivery_receipt", ConnClass::Write),
+    ("store_holding_claim", ConnClass::Write),
+    ("store_stream_dek", ConnClass::Write),
+    ("store_stream_dek_grants", ConnClass::Write),
     // v61 (CIRISPersist#934, S4a) — the directory executor and the trust
     // revocation's two steps.
     ("store_planned_peer_record", ConnClass::Write),
@@ -530,10 +538,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v53.0.0 (CIRISPersist#969) — the stream-epoch DEK (V168).
     ("stream_key_state", ConnClass::Read),
     ("stream_dek_list", ConnClass::Read),
-    ("stream_dek_insert", ConnClass::Write),
     ("stream_dek_close", ConnClass::Write),
     ("evict_selected_room_epochs", ConnClass::Write),
-    ("stream_dek_put_grants", ConnClass::Write),
     ("stream_dek_grants", ConnClass::Read),
     ("stream_dek_grants_for_recipient", ConnClass::Read),
     ("stream_dek_key_grant_watermark", ConnClass::Read),
@@ -552,7 +558,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // transaction for a run of chunks. `put_blob_chunk_floor` is its batch of
     // one and touches no connection; `put_blob_chunk_with_scope`,
     // `adopt_sealed_chunk_at` and `adopt_sealed_chunks_at` delegate to them.
-    ("put_blob_chunks_floor", ConnClass::Write),
     // #957 — one item's append, a free fn over the writer's savepoint.
     ("sqlite_append_chunk_item", ConnClass::HelperWrite),
     ("repair_minter_sentinel", ConnClass::Write),
@@ -614,10 +619,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_dag_manifest_over_held", ConnClass::Write),
     ("put_blob_with_scope", ConnClass::Write),
     // v55.0.0 (CIRISPersist#989) — announce a holding claim for a held row.
-    ("put_holding_claim", ConnClass::Write),
     ("put_calibration_bundle", ConnClass::Write),
     ("put_family_membership_widening", ConnClass::Write),
-    ("put_delivery_receipt", ConnClass::Write),
     ("put_edge_detection_event", ConnClass::Write),
     ("put_family", ConnClass::Write),
     ("put_family_local", ConnClass::Write),
@@ -631,7 +634,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("trust_direction_held_among", ConnClass::Read),
     ("put_scope_blob", ConnClass::Write),
     ("put_signed_transport_destination", ConnClass::Write),
-    ("put_stream_sth", ConnClass::Write),
     ("put_transport_destination", ConnClass::Write),
     ("read", ConnClass::Door),
     ("read_classifications", ConnClass::Read),

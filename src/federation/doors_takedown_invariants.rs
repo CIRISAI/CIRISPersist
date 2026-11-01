@@ -2898,15 +2898,20 @@ mod run {
                     "I797 {backend}: the scan reached {door} ({checked:?})"
                 );
             }
-            let floor = &src[src
-                .find("async fn put_blob_chunks_floor(")
-                .expect("the chunk floor")..];
-            let floor = &floor[..floor.find("\n    }\n").expect("its end")];
-            assert!(
-                floor.contains("steward_purge::refuse_tombstoned_bytes("),
-                "I797 {backend}: the chunk floor asks the tombstone for every item"
-            );
         }
+        // v61 (CIRISPersist#934, S4a) — the chunk floor is one shared plan:
+        // its per-item writers are exempt above because it asks first.
+        let plan = production(
+            &std::fs::read_to_string(format!("{root}/src/federation/blob_admit.rs")).unwrap(),
+        );
+        let floor = &plan[plan
+            .find("async fn chunk_floor_planned<")
+            .expect("the chunk floor")..];
+        let floor = &floor[..floor.find("\n}\n").expect("its end")];
+        assert!(
+            floor.contains("steward_purge::refuse_tombstoned_bytes("),
+            "I797: the chunk floor asks the tombstone for every item"
+        );
     }
 
     #[test]

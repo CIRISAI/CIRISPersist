@@ -128,6 +128,26 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v61 (CIRISPersist#934, S4a) — the blob plane: the chunk floor and the stream plane's records.
+    ("put_blob_chunk_planned", Class::Plan),
+    ("adopt_sealed_chunk_planned", Class::Plan),
+    ("adopt_sealed_chunks_planned", Class::Plan),
+    ("put_stream_sth_planned", Class::Plan),
+    ("put_delivery_receipt_planned", Class::Plan),
+    ("put_holding_claim_planned", Class::Plan),
+    ("stream_dek_insert_planned", Class::Plan),
+    ("stream_dek_put_grants_planned", Class::Plan),
+    // The stream claim's verdict (#837 / I41, #954), re-asked by the chunk executor inside its transaction against the row it just read.
+    ("stream_claim_verdict", Class::Plan),
+    // The chunk floor's shared body: the three chunk doors' plans run it.
+    ("chunk_floor_planned", Class::Delegates),
+    ("refuse_held_stream", Class::Gate),
+    // The blob executors (storage only; compared across backends as the `BlobFloorStore` trait): each reports what it found under the key for the plan to judge.
+    ("store_planned_chunk_batch", Class::Plumbing),
+    ("read_stream_chunk_hashes", Class::Plumbing),
+    ("store_stream_sth", Class::Plumbing),
+    ("store_delivery_receipt", Class::Plumbing),
+    ("store_holding_claim", Class::Plumbing),
     // v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash sighting, the purge record write and the trust revocation.
     ("add_peer_record_planned", Class::Plan),
     ("insert_known_wire_hash_planned", Class::Plan),
@@ -559,7 +579,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // wrapper Delegates to it (so both doors read `refuse_tombstoned_at_write`);
     // the in-transaction read, postgres's advisory lock and sqlite's error
     // carrier are Plumbing.
-    ("refuse_tombstoned_at_write", Class::Gate),
+    // v61 (CIRISPersist#934, S4a) — the shared in-transaction decision is a
+    // PLAN every byte-write executor re-asks (`steward_purge`); its refusal
+    // is the Gate.
+    ("refuse_tombstoned_at_write", Class::Plan),
+    ("refuse_standing_notice", Class::Gate),
     ("sqlite_refuse_tombstoned_at_write", Class::Delegates),
     ("pg_refuse_tombstoned_at_write", Class::Delegates),
     ("sqlite_tombstone_at_write", Class::Plumbing),
@@ -1122,10 +1146,8 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("project_route", Class::Plumbing),
     // #846 — the chunk floor's one body; the write door and the adopt door
     // both run its sequence.
-    ("put_blob_chunk_floor", Class::Delegates),
     // v52.0.0 (CIRISPersist#957) — the chunk floor, batched: the single floor
     // is its batch of one, and it runs every gate the single floor ran.
-    ("put_blob_chunks_floor", Class::Delegates),
     // #957 — Gate: refuses an empty batch, more than MAX_CHUNKS_PER_BATCH
     // items, or more than MAX_BATCH_BYTES. A statement about the input.
     ("check_chunk_batch_bounds", Class::Gate),
@@ -1419,7 +1441,9 @@ mod tests {
     /// The traits whose impls are compared, and where each trait's **default**
     /// bodies live. A backend that does not override a defaulted method runs
     /// the default, so the default's gate sequence is what it contributes.
-    const TRAITS: [(&str, &str); 14] = [
+    const TRAITS: [(&str, &str); 15] = [
+        // v61 (CIRISPersist#934, S4a) — the blob plane: the chunk floor and the stream plane's records.
+        ("BlobFloorStore", "src/federation/blob_admit.rs"),
         // v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash sighting, the purge record write and the trust revocation.
         ("DirectoryStore", "src/federation/directory_admit.rs"),
         // v61 (CIRISPersist#934, S4a) — the Backend trait's erasure and fountain doors, and the gated directory reads.
@@ -1450,7 +1474,30 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 44] = [
+    const SHARED_PLANS: [(&str, &str); 54] = [
+        // v61 (CIRISPersist#934, S4a) — the blob plane: the chunk floor and the stream plane's records.
+        ("src/federation/blob_admit.rs", "put_blob_chunk_planned"),
+        ("src/federation/blob_admit.rs", "adopt_sealed_chunk_planned"),
+        (
+            "src/federation/blob_admit.rs",
+            "adopt_sealed_chunks_planned",
+        ),
+        ("src/federation/blob_admit.rs", "put_stream_sth_planned"),
+        (
+            "src/federation/blob_admit.rs",
+            "put_delivery_receipt_planned",
+        ),
+        ("src/federation/blob_admit.rs", "put_holding_claim_planned"),
+        ("src/federation/blob_admit.rs", "stream_dek_insert_planned"),
+        (
+            "src/federation/blob_admit.rs",
+            "stream_dek_put_grants_planned",
+        ),
+        ("src/federation/blob_admit.rs", "stream_claim_verdict"),
+        (
+            "src/federation/steward_purge.rs",
+            "refuse_tombstoned_at_write",
+        ),
         // v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash sighting, the purge record write and the trust revocation.
         (
             "src/federation/directory_admit.rs",
@@ -1640,7 +1687,44 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 57] = [
+    const SHARED_DOORS: [(&str, &str, &str); 65] = [
+        // v61 (CIRISPersist#934, S4a) — the blob plane: the chunk floor and the stream plane's records.
+        (
+            "BlobStorage",
+            "put_blob_chunk_with_scope",
+            "put_blob_chunk_planned",
+        ),
+        (
+            "BlobStorage",
+            "adopt_sealed_chunk_at",
+            "adopt_sealed_chunk_planned",
+        ),
+        (
+            "BlobStorage",
+            "adopt_sealed_chunks_at",
+            "adopt_sealed_chunks_planned",
+        ),
+        ("BlobStorage", "put_stream_sth", "put_stream_sth_planned"),
+        (
+            "BlobStorage",
+            "put_delivery_receipt",
+            "put_delivery_receipt_planned",
+        ),
+        (
+            "BlobStorage",
+            "put_holding_claim",
+            "put_holding_claim_planned",
+        ),
+        (
+            "BlobStorage",
+            "stream_dek_insert",
+            "stream_dek_insert_planned",
+        ),
+        (
+            "BlobStorage",
+            "stream_dek_put_grants",
+            "stream_dek_put_grants_planned",
+        ),
         // v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash sighting, the purge record write and the trust revocation.
         (
             "FederationDirectory",
