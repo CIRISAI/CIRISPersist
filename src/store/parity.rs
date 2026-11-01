@@ -128,6 +128,28 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v61 (CIRISPersist#934, S4a) — the blob plane: the byte writes.
+    ("put_blob_planned", Class::Plan),
+    ("store_blob_local_planned", Class::Plan),
+    ("adopt_sealed_blob_planned", Class::Plan),
+    ("put_blob_chunks_planned", Class::Plan),
+    ("put_dag_manifest_over_held_planned", Class::Plan),
+    ("seal_stream_planned", Class::Plan),
+    // The DAG finalize's held-chunk verdict, re-asked by the executor inside its transaction for each named chunk.
+    ("held_dag_chunk_verdict", Class::Plan),
+    // The byte writes' tombstone pre-read (same-file helper of every byte plan).
+    ("tombstone_floor", Class::Delegates),
+    // A single-row body's refusals (over the cap, a hash that is not its address, a ChunkDag body), and the stored-size claim and seal-body checks.
+    ("plan_blob_body", Class::Gate),
+    ("check_claim_size", Class::Gate),
+    ("fits", Class::Gate),
+    // The byte executors (storage only; compared across backends as the `BlobWriteStore` trait).
+    ("store_planned_blob", Class::Plumbing),
+    ("store_planned_announcement", Class::Plumbing),
+    ("store_planned_dag_over_held", Class::Plumbing),
+    ("store_planned_seal", Class::Plumbing),
+    ("sqlite_insert_dag_links", Class::Plumbing),
+    ("pg_insert_dag_links", Class::Plumbing),
     // v61 (CIRISPersist#934, S4a) — the blob plane: the chunk floor and the stream plane's records.
     ("put_blob_chunk_planned", Class::Plan),
     ("adopt_sealed_chunk_planned", Class::Plan),
@@ -560,7 +582,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // minter, no refusal of the caller's input here.
     ("community_dek_blob_epoch", Class::Delegates),
     ("acquire_migration_lock", Class::Delegates),
-    ("admission_gate", Class::Plumbing),
+    ("blob_admission_gate", Class::Plumbing),
     // v47.3.0 (#901) — the one key-admission door predicate (structure for
     // every evidence-carrying row, + freshness for an accord_holder).
     ("admit_key_record", Class::Gate),
@@ -589,7 +611,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("sqlite_tombstone_at_write", Class::Plumbing),
     ("pg_tombstone_at_write", Class::Plumbing),
     ("pg_lock_bytes_tombstones", Class::Plumbing),
-    ("sqlite_purged_at_write", Class::Plumbing),
     ("pg_lock_bytes_tombstones_exclusive", Class::Plumbing),
     // #832 — `build_transaction()…start()`: the REPEATABLE READ transaction
     // `stream_chunks` opens so the listing and the STH are one snapshot.
@@ -1318,7 +1339,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("verify_family_membership_revocation_admission", Class::Gate),
     ("verify_federation_tier_ingest", Class::Gate),
     ("verify_for_admission", Class::Gate),
-    ("verify_inline_hash", Class::Gate),
     ("verify_location_proof_admission", Class::Gate),
     ("verify_receipt_signature", Class::Gate),
     ("verify_revocation_admission", Class::Gate),
@@ -1441,7 +1461,9 @@ mod tests {
     /// The traits whose impls are compared, and where each trait's **default**
     /// bodies live. A backend that does not override a defaulted method runs
     /// the default, so the default's gate sequence is what it contributes.
-    const TRAITS: [(&str, &str); 15] = [
+    const TRAITS: [(&str, &str); 16] = [
+        // v61 (CIRISPersist#934, S4a) — the blob plane: the byte writes.
+        ("BlobWriteStore", "src/federation/blob_admit.rs"),
         // v61 (CIRISPersist#934, S4a) — the blob plane: the chunk floor and the stream plane's records.
         ("BlobFloorStore", "src/federation/blob_admit.rs"),
         // v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash sighting, the purge record write and the trust revocation.
@@ -1474,7 +1496,18 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 54] = [
+    const SHARED_PLANS: [(&str, &str); 61] = [
+        // v61 (CIRISPersist#934, S4a) — the blob plane: the byte writes.
+        ("src/federation/blob_admit.rs", "put_blob_planned"),
+        ("src/federation/blob_admit.rs", "store_blob_local_planned"),
+        ("src/federation/blob_admit.rs", "adopt_sealed_blob_planned"),
+        ("src/federation/blob_admit.rs", "put_blob_chunks_planned"),
+        (
+            "src/federation/blob_admit.rs",
+            "put_dag_manifest_over_held_planned",
+        ),
+        ("src/federation/blob_admit.rs", "seal_stream_planned"),
+        ("src/federation/blob_admit.rs", "held_dag_chunk_verdict"),
         // v61 (CIRISPersist#934, S4a) — the blob plane: the chunk floor and the stream plane's records.
         ("src/federation/blob_admit.rs", "put_blob_chunk_planned"),
         ("src/federation/blob_admit.rs", "adopt_sealed_chunk_planned"),
@@ -1687,7 +1720,30 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 65] = [
+    const SHARED_DOORS: [(&str, &str, &str); 71] = [
+        // v61 (CIRISPersist#934, S4a) — the blob plane: the byte writes.
+        ("BlobStorage", "put_blob_with_scope", "put_blob_planned"),
+        (
+            "BlobStorage",
+            "store_blob_local",
+            "store_blob_local_planned",
+        ),
+        (
+            "BlobStorage",
+            "adopt_sealed_blob_at",
+            "adopt_sealed_blob_planned",
+        ),
+        ("BlobStorage", "put_blob_chunks", "put_blob_chunks_planned"),
+        (
+            "BlobStorage",
+            "put_dag_manifest_over_held",
+            "put_dag_manifest_over_held_planned",
+        ),
+        (
+            "BlobStorage",
+            "seal_stream_with_scope",
+            "seal_stream_planned",
+        ),
         // v61 (CIRISPersist#934, S4a) — the blob plane: the chunk floor and the stream plane's records.
         (
             "BlobStorage",

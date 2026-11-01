@@ -239,6 +239,13 @@ pub(crate) enum ConnClass {
 /// and are `Write`.
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
+    // v61 (CIRISPersist#934, S4a) — the byte writes' executor.
+    ("store_planned_blob", ConnClass::Write),
+    ("store_planned_announcement", ConnClass::Write),
+    ("store_planned_dag", ConnClass::Write),
+    ("store_planned_dag_over_held", ConnClass::Write),
+    ("store_planned_seal", ConnClass::Write),
+    ("sqlite_insert_dag_links", ConnClass::HelperWrite),
     // v61 (CIRISPersist#934, S4a) — the blob plane's executor.
     ("store_planned_chunk_batch", ConnClass::Write),
     ("read_stream_chunk_hashes", ConnClass::Read),
@@ -277,7 +284,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("store_planned_witness", ConnClass::Write),
     // #846 (§6.1) — the adopt floor: row + declared binding + holder claim in
     // one transaction.
-    ("adopt_sealed_blob_at", ConnClass::Write),
     ("aggregate_audit_chain", ConnClass::Read),
     ("aggregate_llm_costs", ConnClass::Read),
     ("aggregate_scoring_factors_rollup_batch", ConnClass::Read),
@@ -561,7 +567,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // #957 — one item's append, a free fn over the writer's savepoint.
     ("sqlite_append_chunk_item", ConnClass::HelperWrite),
     ("repair_minter_sentinel", ConnClass::Write),
-    ("seal_stream_with_scope", ConnClass::Write),
     // v51.3.0 (#947) — the sealed-DAG promotion: one write transaction.
     ("promote_adopted_manifest_to_dag", ConnClass::Write),
     // v52.0.0 (CIRISPersist#954) — the nested manifest's relation and the
@@ -614,10 +619,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("test_seam_set_attestation_type", ConnClass::Write),
     ("test_seam_drop_purge_tombstone", ConnClass::Write),
     ("test_seam_factor_rollup_trace_counts", ConnClass::Read),
-    ("put_blob_chunks", ConnClass::Write),
     // v55.0.0 (CIRISPersist#952) — the incremental plaintext DAG finalize.
-    ("put_dag_manifest_over_held", ConnClass::Write),
-    ("put_blob_with_scope", ConnClass::Write),
     // v55.0.0 (CIRISPersist#989) — announce a holding claim for a held row.
     ("put_calibration_bundle", ConnClass::Write),
     ("put_family_membership_widening", ConnClass::Write),
@@ -787,7 +789,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("store_planned_community", ConnClass::Write),
     ("store_planned_community_revocation", ConnClass::Write),
     ("store_planned_community_widening", ConnClass::Write),
-    ("store_blob_local", ConnClass::Write),
     ("stream_consistency_proof", ConnClass::Read),
     ("stream_inclusion_proof", ConnClass::Read),
     ("supersede_group_row", ConnClass::Write),

@@ -687,3 +687,575 @@ pub(crate) async fn stream_dek_put_grants_planned<D: BlobFloorStore>(
     dir.store_stream_dek_grants(stream_id, epoch, sealer_key_id, cohort_scope, wraps)
         .await
 }
+
+// ── the blob writes ─────────────────────────────────────────────────────
+
+/// The blob writes' executor (the bytes doors). Storage only.
+#[async_trait::async_trait]
+pub(crate) trait BlobWriteStore: BlobFloorStore {
+    /// The blob-admission gate the host installed, if any.
+    fn blob_admission_gate(&self) -> Option<super::AdmissionGate>;
+
+    /// In ONE transaction: re-ask the tombstone (#1070), insert the row
+    /// (first write wins on the address), the plaintext room association
+    /// when [`PlannedBlob::associate`], the binding AS DECLARED when there is
+    /// one, and the holding claim when there is one; after the commit, index
+    /// the claim.
+    async fn store_planned_blob(&self, planned: PlannedBlob) -> Result<(), BlobError>;
+
+    /// §11.5 / I28 — an announcement never stores. In ONE transaction:
+    /// re-ask that the row is held (and bound, for a community-DEK token),
+    /// name the announcer as the author of a row the cascade could not
+    /// attribute, insert the holding claim; after the commit, index it.
+    /// `false`: not held, nothing written.
+    async fn store_planned_announcement(
+        &self,
+        planned: PlannedAnnouncement,
+    ) -> Result<bool, BlobError>;
+
+    /// In ONE transaction: re-ask the tombstone of every prepared row, insert
+    /// them (chunks first, the manifest last) and the manifest's chunk
+    /// relation.
+    async fn store_planned_dag(&self, planned: PlannedDag) -> Result<(), BlobError>;
+
+    /// In ONE transaction: ask [`held_dag_chunk_verdict`] of every chunk the
+    /// manifest names as stored, re-ask the manifest's and every chunk's
+    /// tombstone, then insert the manifest row and its chunk relation.
+    async fn store_planned_dag_over_held(&self, planned: PlannedDag) -> Result<(), BlobError>;
+
+    /// In ONE transaction: refuse an abandoned stream, refuse a stream that
+    /// moved under the seal, insert the root (and its binding, current and
+    /// enabled), the v3 children, the chunk relation; stamp the stream
+    /// sealed.
+    async fn store_planned_seal(&self, planned: PlannedSeal) -> Result<SealWrite, BlobError>;
+}
+
+/// One `federation_blobs` row a write door admitted.
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedBlobRow {
+    /// The address.
+    pub(crate) sha256: [u8; 32],
+    /// `storage_kind`.
+    pub(crate) storage_kind: String,
+    /// `bytes_inline`.
+    pub(crate) bytes_inline: Option<Vec<u8>>,
+    /// `external_ref`.
+    pub(crate) external_ref: Option<String>,
+    /// `size_bytes`.
+    pub(crate) size_bytes: i64,
+    /// `media_type`.
+    pub(crate) media_type: Option<String>,
+    /// `cohort_scope`.
+    pub(crate) cohort_scope: String,
+    /// `crypto_tier`.
+    pub(crate) tier: String,
+    /// `author_key_id`.
+    pub(crate) author_key_id: Option<String>,
+    /// `group_key_id` (V177).
+    pub(crate) group_key_id: Option<String>,
+}
+
+/// A blob write the plan admitted (`put_blob_with_scope` at the plaintext
+/// tier, `store_blob_local`, `adopt_sealed_blob_at`).
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedBlob {
+    /// The row.
+    pub(crate) row: PlannedBlobRow,
+    /// v54.0.0 (#995 row 4, V184) — record THIS write's room (a plaintext
+    /// row keeps every room); the adopt floor records none.
+    pub(crate) associate: bool,
+    /// The binding AS DECLARED (#846 §3, the adopt floor's): the epoch the
+    /// author sealed under, with no key-state check.
+    pub(crate) binding: Option<EpochBinding>,
+    /// The holding claim, in the same transaction as the row.
+    pub(crate) claim: Option<super::holding_claim::PreparedHoldingClaim>,
+    /// The in-transaction tombstone look's inputs.
+    pub(crate) tombstones: TombstoneFloor,
+    /// The door, for an error's text.
+    pub(crate) door: &'static str,
+}
+
+/// A sealed-tier holding announcement the plan admitted.
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedAnnouncement {
+    /// The announced address.
+    pub(crate) sha256: [u8; 32],
+    /// The announcer, named as the author of a row the cascade could not
+    /// attribute.
+    pub(crate) author_key_id: String,
+    /// A community-DEK token: the row must also be bound (an evicted binding
+    /// is an eviction RECORD, not a bound row).
+    pub(crate) needs_binding: bool,
+    /// The claim.
+    pub(crate) claim: super::holding_claim::PreparedHoldingClaim,
+}
+
+/// A chunk DAG the plan admitted: its prepared rows (chunks first, the
+/// manifest last) and the manifest's chunk relation.
+#[derive(Debug)]
+pub(crate) struct PlannedDag {
+    /// The rows to insert (for a finalize over held chunks, the manifest's
+    /// alone).
+    pub(crate) rows: Vec<blobs::PreparedBlobRow>,
+    /// The chunks the manifest names, `(sha, size)`, that must already be
+    /// held (a finalize over held chunks; empty otherwise).
+    pub(crate) held_chunks: Vec<([u8; 32], u64)>,
+    /// `(seq, chunk sha)` for `federation_dag_chunks`.
+    pub(crate) links: Vec<(i64, Vec<u8>)>,
+    /// The relation's `stream_id`.
+    pub(crate) link_stream: String,
+    /// The in-transaction tombstone look's inputs.
+    pub(crate) tombstones: TombstoneFloor,
+}
+
+impl PlannedDag {
+    /// The manifest row's address (the last prepared row).
+    #[must_use]
+    pub(crate) fn manifest_sha(&self) -> Option<[u8; 32]> {
+        self.rows.last().map(|r| r.sha256)
+    }
+}
+
+/// A stream seal the plan admitted.
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedSeal {
+    /// The stream.
+    pub(crate) stream_id: String,
+    /// The root manifest row.
+    pub(crate) spec: blobs::ManifestRowSpec,
+    /// Its `size_bytes`.
+    pub(crate) size_bytes: i64,
+    /// The chunk count the manifest was built over.
+    pub(crate) expected_chunks: i64,
+    /// `media_type`.
+    pub(crate) media_type: Option<String>,
+    /// `cohort_scope`.
+    pub(crate) cohort_scope: String,
+    /// `crypto_tier`.
+    pub(crate) tier: String,
+    /// The binding (current and enabled, the minter's own state).
+    pub(crate) binding: Option<EpochBinding>,
+}
+
+/// What the seal's transaction found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SealWrite {
+    /// Sealed.
+    Sealed,
+    /// #954 — the stream was abandoned.
+    Abandoned,
+    /// §12.3 — the stream holds this many chunks, not the manifest's.
+    StreamMoved(i64),
+    /// The binding's epoch is no longer the minter's current enabled one.
+    EpochMoved,
+}
+
+/// v55.0.0 (#1007) / v60.1.0 (#1070) — a byte write's tombstone pre-read
+/// (every address it stores), the floor its transaction re-asks with, and
+/// the witnesses' seam between the two.
+async fn tombstone_floor<D: BlobFloorStore>(
+    dir: &D,
+    shas: &[[u8; 32]],
+) -> Result<TombstoneFloor, BlobError> {
+    let mut reversed = ReversedTakedowns::default();
+    for sha in shas {
+        reversed.absorb(steward_purge::refuse_tombstoned_bytes(dir, sha).await?);
+    }
+    let floor = TombstoneFloor::new(dir.tombstone_plane_present(), reversed);
+    #[cfg(test)]
+    dir.pause_after_tombstone_precheck().await;
+    Ok(floor)
+}
+
+/// A single-row body's stored columns: `(storage_kind, bytes_inline,
+/// external_ref, size_bytes)`.
+type BodyColumns = (String, Option<Vec<u8>>, Option<String>, i64);
+
+/// A single-row body's checks: inline within the cap and hashing to its
+/// address; a ChunkDag body is refused (it only goes through
+/// `put_blob_chunks`, which writes its rows together).
+fn plan_blob_body(
+    door: &'static str,
+    sha256: &[u8; 32],
+    body: &super::BlobBody,
+    cap: usize,
+) -> Result<BodyColumns, BlobError> {
+    let (inline, external) = match body {
+        super::BlobBody::Inline(bytes) => {
+            if bytes.len() > cap {
+                return Err(BlobError::InlineSizeExceeded {
+                    size: bytes.len(),
+                    cap,
+                });
+            }
+            blobs::verify_inline_hash(sha256, bytes)?;
+            (Some(bytes.clone()), None)
+        }
+        super::BlobBody::External(e) => (None, Some(e.uri.clone())),
+        super::BlobBody::ChunkDag(_) => {
+            return Err(BlobError::InvalidArgument(format!(
+                "{door} does not accept a ChunkDag body — use put_blob_chunks"
+            )))
+        }
+    };
+    let size = i64::try_from(body.size_bytes())
+        .map_err(|_| BlobError::InvalidArgument("size_bytes exceeds i64".into()))?;
+    Ok((body.storage_kind().to_owned(), inline, external, size))
+}
+
+/// AV-89 (v45.0.0, #871) — the claim's declared size is the length of the
+/// bytes this door stores.
+fn check_claim_size(declared: u64, stored: u64, what: &str) -> Result<(), BlobError> {
+    if declared == stored {
+        Ok(())
+    } else {
+        Err(BlobError::InvalidArgument(format!(
+            "holding claim declares size {declared} but the {what} bytes are {stored} \
+             (CC 5.3.2.5 / AV-89: a holder announces exactly what it holds)"
+        )))
+    }
+}
+
+/// The door: every backend's `put_blob_with_scope`. Admission order (v3.4.0,
+/// #123): scope, tombstone, empty attester, trust threshold, body, claim
+/// size, claim scope and rebuild (#989, CC 3.1.3.3), audience; then one
+/// transaction that stores (plaintext) or announces (sealed tiers).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn put_blob_planned<D: BlobWriteStore>(
+    dir: &D,
+    author_key_id: Option<&str>,
+    sha256: &[u8; 32],
+    body: super::BlobBody,
+    media_type: Option<&str>,
+    attestation: super::PutBlobAttestation,
+    cohort_scope: &str,
+    floor: StorageFloor,
+    group_key_id: Option<&str>,
+) -> Result<(), BlobError> {
+    use super::types::cohort_scope::CryptoTier;
+    floor.check_scope(cohort_scope)?;
+    let tombstones = tombstone_floor(dir, &[*sha256]).await?;
+    if attestation.attesting_key_id.is_empty() {
+        return Err(BlobError::InvalidArgument(
+            "attesting_key_id is empty".into(),
+        ));
+    }
+    if let Some(gate) = dir.blob_admission_gate() {
+        gate.check_blob(&attestation.attesting_key_id).await?;
+    }
+    let (storage_kind, bytes_inline, external_ref, size_bytes) =
+        plan_blob_body("put_blob", sha256, &body, dir.inline_bytes_cap())?;
+    check_claim_size(attestation.size, body.size_bytes(), "stored")?;
+    // v55.0.0 (#989, CC 3.1.3.3 rule 1) — the claim is placed at the content's
+    // scope: this write's for plaintext; for a sealed-tier token, read off the
+    // row a cascade already stored, and an absent row is NotHeld (§11.5 / I28).
+    let plaintext = floor.tier() == CryptoTier::Plaintext;
+    let claim_scope = if plaintext {
+        super::holding_claim::ClaimScope::of_content(floor.tier(), cohort_scope, group_key_id)?
+    } else {
+        super::holding_claim::content_claim_scope(dir, sha256)
+            .await?
+            .ok_or_else(|| BlobError::NotHeld {
+                sha256_hex: hex::encode(sha256),
+            })?
+    };
+    let claim =
+        super::holding_claim::prepare_holding_claim_row(sha256, &attestation, &claim_scope)?;
+    super::holding_claim::check_holding_claim_audience(dir, &claim.row).await?;
+    // §20.5 (PR #852 review) — the ROW's author is the supplied one (a proxy
+    // write's peer); absent that, the claim's attester.
+    let author = author_key_id
+        .map(str::to_owned)
+        .unwrap_or_else(|| attestation.attesting_key_id.clone());
+    if !plaintext {
+        let held = dir
+            .store_planned_announcement(PlannedAnnouncement {
+                sha256: *sha256,
+                author_key_id: author,
+                needs_binding: floor.tier() == CryptoTier::CommunityDek,
+                claim,
+            })
+            .await?;
+        return if held {
+            Ok(())
+        } else {
+            Err(BlobError::NotHeld {
+                sha256_hex: hex::encode(sha256),
+            })
+        };
+    }
+    dir.store_planned_blob(PlannedBlob {
+        row: PlannedBlobRow {
+            sha256: *sha256,
+            storage_kind,
+            bytes_inline,
+            external_ref,
+            size_bytes,
+            media_type: media_type.map(str::to_owned),
+            cohort_scope: cohort_scope.to_owned(),
+            tier: floor.tier().as_str().to_owned(),
+            author_key_id: Some(author),
+            group_key_id: group_key_id.map(str::to_owned),
+        },
+        associate: true,
+        binding: None,
+        claim: Some(claim),
+        tombstones,
+        door: "put_blob",
+    })
+    .await
+}
+
+/// The door: every backend's `store_blob_local`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn store_blob_local_planned<D: BlobWriteStore>(
+    dir: &D,
+    sha256: &[u8; 32],
+    body: super::BlobBody,
+    media_type: Option<&str>,
+    cohort_scope: &str,
+    floor: StorageFloor,
+    author_key_id: Option<&str>,
+    group_key_id: Option<&str>,
+) -> Result<(), BlobError> {
+    floor.check_scope(cohort_scope)?;
+    let tombstones = tombstone_floor(dir, &[*sha256]).await?;
+    let (storage_kind, bytes_inline, external_ref, size_bytes) =
+        plan_blob_body("store_blob_local", sha256, &body, dir.inline_bytes_cap())?;
+    let tier = floor.tier();
+    dir.store_planned_blob(PlannedBlob {
+        row: PlannedBlobRow {
+            sha256: *sha256,
+            storage_kind,
+            bytes_inline,
+            external_ref,
+            size_bytes,
+            media_type: media_type.map(str::to_owned),
+            cohort_scope: cohort_scope.to_owned(),
+            tier: tier.as_str().to_owned(),
+            author_key_id: author_key_id.map(str::to_owned),
+            group_key_id: group_key_id.map(str::to_owned),
+        },
+        associate: tier == super::types::cohort_scope::CryptoTier::Plaintext,
+        binding: None,
+        claim: None,
+        tombstones,
+        door: "store_blob_local",
+    })
+    .await
+}
+
+/// The door: every backend's `adopt_sealed_blob_at` (#846 §6.1). The
+/// address is the SHA-256 of the CIPHERTEXT, computed here from the bytes
+/// stored, never trusted from the sender; the row, the binding and the
+/// author are recorded AS DECLARED.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn adopt_sealed_blob_planned<D: BlobWriteStore>(
+    dir: &D,
+    envelope_bytes: Vec<u8>,
+    media_type: Option<&str>,
+    cohort_scope: &str,
+    author_key_id: &str,
+    floor: StorageFloor,
+    binding: Option<EpochBinding>,
+    group_key_id: Option<&str>,
+    announce: Option<super::PutBlobAttestation>,
+) -> Result<[u8; 32], BlobError> {
+    use sha2::Digest as _;
+    floor.check_scope(cohort_scope)?;
+    let cap = dir.inline_bytes_cap();
+    if envelope_bytes.len() > cap {
+        return Err(BlobError::InlineSizeExceeded {
+            size: envelope_bytes.len(),
+            cap,
+        });
+    }
+    let sha256: [u8; 32] = sha2::Sha256::digest(&envelope_bytes).into();
+    let tombstones = tombstone_floor(dir, &[sha256]).await?;
+    let size_bytes = i64::try_from(envelope_bytes.len()).map_err(|_| {
+        BlobError::InvalidArgument("adopt_sealed_blob_at: size_bytes exceeds i64".into())
+    })?;
+    if let Some(a) = &announce {
+        check_claim_size(a.size, envelope_bytes.len() as u64, "adopted")?;
+    }
+    // v55.0.0 (#989, CC 3.1.3.3 rule 1) — the group a sealed room row names
+    // is its binding's community: a group that disagrees is refused.
+    if let (Some(b), Some(g)) = (&binding, group_key_id) {
+        if b.community_key_id != g {
+            return Err(BlobError::InvalidArgument(format!(
+                "adopt_sealed_blob_at: group {g:?} is not the binding's community {:?}",
+                b.community_key_id
+            )));
+        }
+    }
+    let group = group_key_id
+        .map(str::to_owned)
+        .or_else(|| binding.as_ref().map(|b| b.community_key_id.clone()));
+    // The holding claim on the same terms as `put_blob`'s: at the content's
+    // scope, the holder in the cohort.
+    let claim = match announce.as_ref() {
+        Some(a) => {
+            let claim_scope = super::holding_claim::ClaimScope::of_content(
+                floor.tier(),
+                cohort_scope,
+                group.as_deref(),
+            )?;
+            let p = super::holding_claim::prepare_holding_claim_row(&sha256, a, &claim_scope)?;
+            super::holding_claim::check_holding_claim_audience(dir, &p.row).await?;
+            Some(p)
+        }
+        None => None,
+    };
+    dir.store_planned_blob(PlannedBlob {
+        row: PlannedBlobRow {
+            sha256,
+            storage_kind: "inline".to_owned(),
+            bytes_inline: Some(envelope_bytes),
+            external_ref: None,
+            size_bytes,
+            media_type: media_type.map(str::to_owned),
+            cohort_scope: cohort_scope.to_owned(),
+            tier: floor.tier().as_str().to_owned(),
+            author_key_id: Some(author_key_id.to_owned()),
+            group_key_id: group,
+        },
+        associate: false,
+        binding,
+        claim,
+        tombstones,
+        door: "adopt_sealed_blob_at",
+    })
+    .await?;
+    Ok(sha256)
+}
+
+/// The door: every backend's `put_blob_chunks`. Validation and row
+/// preparation (chunks first, the manifest last); no chunk and not the
+/// manifest when taken down.
+pub(crate) async fn put_blob_chunks_planned<D: BlobWriteStore>(
+    dir: &D,
+    manifest: super::ChunkManifest,
+    chunks: Vec<([u8; 32], super::BlobBody)>,
+) -> Result<(), BlobError> {
+    let rows = blobs::prepare_chunk_rows(&manifest, &chunks, dir.inline_bytes_cap())?;
+    let shas: Vec<[u8; 32]> = rows.iter().map(|r| r.sha256).collect();
+    let tombstones = tombstone_floor(dir, &shas).await?;
+    // Codex r2 on #1065 — the manifest's chunk relation, in the same
+    // transaction.
+    let (links, link_stream) = blobs::manifest_chunk_links(&manifest);
+    dir.store_planned_dag(PlannedDag {
+        rows,
+        held_chunks: Vec::new(),
+        links,
+        link_stream,
+        tombstones,
+    })
+    .await
+}
+
+/// The door: every backend's `put_dag_manifest_over_held` (v55.0.0, #952):
+/// the incremental plaintext DAG's finalize. Every chunk the manifest names
+/// is read in the transaction that writes the manifest row, so the row lands
+/// only over a whole DAG.
+pub(crate) async fn put_dag_manifest_over_held_planned<D: BlobWriteStore>(
+    dir: &D,
+    manifest: super::ChunkManifest,
+) -> Result<[u8; 32], BlobError> {
+    let row = blobs::prepare_manifest_row(&manifest, dir.inline_bytes_cap())?;
+    let sha = row.sha256;
+    // Neither the manifest nor a withheld chunk becomes a DAG.
+    let shas: Vec<[u8; 32]> = std::iter::once(row.sha256)
+        .chain(manifest.chunks.iter().map(|c| c.sha))
+        .collect();
+    let tombstones = tombstone_floor(dir, &shas).await?;
+    let held_chunks = manifest
+        .chunks
+        .iter()
+        .map(|c| (c.sha, u64::from(c.size)))
+        .collect();
+    let (links, link_stream) = blobs::manifest_chunk_links(&manifest);
+    dir.store_planned_dag_over_held(PlannedDag {
+        rows: vec![row],
+        held_chunks,
+        links,
+        link_stream,
+        tombstones,
+    })
+    .await?;
+    Ok(sha)
+}
+
+/// **The finalize's held-chunk verdict**, asked by the executor inside its
+/// transaction for each chunk the manifest names, as stored.
+pub(crate) fn held_dag_chunk_verdict(
+    idx: usize,
+    chunk_sha: &[u8; 32],
+    size: u64,
+    held: Option<(String, String, i64)>,
+) -> Result<(), BlobError> {
+    blobs::check_held_dag_chunk(idx, chunk_sha, size, held)?;
+    Ok(())
+}
+
+/// The door: every backend's `seal_stream_with_scope`. The root and every v3
+/// child within the cap and hashing to its address, before the transaction.
+pub(crate) async fn seal_stream_planned<D: BlobWriteStore>(
+    dir: &D,
+    stream_id: &str,
+    spec: blobs::ManifestRowSpec,
+    media_type: Option<&str>,
+    cohort_scope: &str,
+    floor: StorageFloor,
+    binding: Option<EpochBinding>,
+) -> Result<(), BlobError> {
+    floor.check_scope(cohort_scope)?;
+    let cap = dir.inline_bytes_cap();
+    let fits = |sha: &[u8; 32], body: &[u8]| -> Result<(), BlobError> {
+        if body.len() > cap {
+            return Err(BlobError::InlineSizeExceeded {
+                size: body.len(),
+                cap,
+            });
+        }
+        blobs::verify_inline_hash(sha, body)
+    };
+    fits(&spec.sha256, &spec.body)?;
+    let size_bytes = i64::try_from(spec.size_bytes).map_err(|_| {
+        BlobError::InvalidArgument("seal_stream_with_scope: size_bytes exceeds i64".into())
+    })?;
+    for c in &spec.children {
+        fits(&c.sha256, &c.body)?;
+    }
+    let expected_chunks = i64::try_from(spec.expected_chunk_count).unwrap_or(i64::MAX);
+    let expected_count = spec.expected_chunk_count;
+    let written = dir
+        .store_planned_seal(PlannedSeal {
+            stream_id: stream_id.to_owned(),
+            spec,
+            size_bytes,
+            expected_chunks,
+            media_type: media_type.map(str::to_owned),
+            cohort_scope: cohort_scope.to_owned(),
+            tier: floor.tier().as_str().to_owned(),
+            binding: binding.clone(),
+        })
+        .await?;
+    match written {
+        SealWrite::Sealed => Ok(()),
+        SealWrite::Abandoned => Err(blobs::stream_abandoned_refusal(stream_id)),
+        // §12.3 — the manifest describes a stream that no longer exists:
+        // refused, never truncated.
+        SealWrite::StreamMoved(count) => Err(BlobError::InvalidArgument(format!(
+            "seal_stream_with_scope: stream {stream_id} has {count} chunk(s) but the manifest \
+             was built over {expected_count}; the stream moved under the seal — list it again \
+             (BLOB_ENCRYPTION_AT_REST.md §12.3)"
+        ))),
+        SealWrite::EpochMoved => {
+            let b = binding.expect("EpochMoved only arises with a binding");
+            Err(BlobError::EpochNotCurrent {
+                community_key_id: b.community_key_id,
+                epoch: b.epoch,
+            })
+        }
+    }
+}

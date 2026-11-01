@@ -660,6 +660,8 @@ mod tests {
             check(rel, "async fn adopt_sealed_chunks_at(", "\n    }\n");
             // v61 (CIRISPersist#934, S4a) — the chunk floor's transaction.
             check(rel, "async fn store_planned_chunk_batch(", "\n    }\n");
+            // ...and the byte write's transaction (the adopt floor's row).
+            check(rel, "async fn store_planned_blob(", "\n    }\n");
         }
         // v61 (CIRISPersist#934, S4a) — the chunk floor and the two adopt
         // doors are one shared plan each.
@@ -667,6 +669,7 @@ mod tests {
             "async fn chunk_floor_planned<",
             "async fn adopt_sealed_chunk_planned<",
             "async fn adopt_sealed_chunks_planned<",
+            "async fn adopt_sealed_blob_planned<",
         ] {
             check("src/federation/blob_admit.rs", plan, "\n}\n");
         }
@@ -681,8 +684,8 @@ mod tests {
             "\n}\n",
         );
         assert_eq!(
-            inspected, 22,
-            "I45: expected 6 orchestration + 3 Engine + 8 backend floor + 3 plan + 2 per-item \
+            inspected, 25,
+            "I45: expected 6 orchestration + 3 Engine + 10 backend floor + 4 plan + 2 per-item \
              bodies, inspected {inspected} — a door this gate cannot find is a door it cannot hold"
         );
         assert!(

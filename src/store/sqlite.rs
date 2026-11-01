@@ -9960,259 +9960,19 @@ impl crate::federation::BlobStorage for SqliteBackend {
         floor: crate::federation::StorageFloor,
         group_key_id: Option<&str>,
     ) -> Result<(), crate::federation::BlobError> {
-        floor.check_scope(cohort_scope)?;
-        // v55.0.0 (#1007) — taken-down bytes never come back.
-        let reversed =
-            crate::federation::steward_purge::refuse_tombstoned_bytes(self, sha256).await?;
-        // v60.1.0 (#1070) — the in-transaction second look's inputs (the
-        // switch, and #1113's reversals the pre-read found), and the
-        // witnesses' seam between the pre-read and the write.
-        let tombstones = crate::federation::steward_purge::TombstoneFloor::new(
-            self.bytes_tombstone_plane(),
-            reversed,
-        );
-        #[cfg(test)]
-        self.test_hooks()
-            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
-            .await;
-        let scope = cohort_scope.to_owned();
-        let tier = floor.tier().as_str().to_owned();
-        let group = group_key_id.map(str::to_owned);
-        // v3.4.0 (CIRISPersist#123) — admission ordering:
-        //   1. empty-string → InvalidArgument
-        //   2. trust-threshold → TrustBelowThreshold
-        //   3. inline-size → InlineSizeExceeded
-        //   4. hash-mismatch → HashMismatch
-        //   5. DB FK → AttestationEmissionFailed
-        if attestation.attesting_key_id.is_empty() {
-            return Err(crate::federation::BlobError::InvalidArgument(
-                "attesting_key_id is empty".into(),
-            ));
-        }
-        if let Some(gate) = self.admission_gate() {
-            gate.check_blob(&attestation.attesting_key_id).await?;
-        }
-        // v4.1 (Cut B) — a ChunkDag body is a multi-row manifest; it
-        // only ever goes through put_blob_chunks (which inserts the
-        // chunk rows + the manifest row atomically).
-        if matches!(body, crate::federation::BlobBody::ChunkDag(_)) {
-            return Err(crate::federation::BlobError::InvalidArgument(
-                "put_blob does not accept a ChunkDag body — use put_blob_chunks".into(),
-            ));
-        }
-        let cap = self.inline_bytes_cap();
-        if let crate::federation::BlobBody::Inline(ref bytes) = body {
-            if bytes.len() > cap {
-                return Err(crate::federation::BlobError::InlineSizeExceeded {
-                    size: bytes.len(),
-                    cap,
-                });
-            }
-            crate::federation::blobs::verify_inline_hash(sha256, bytes)?;
-        }
-
-        let storage_kind = body.storage_kind().to_owned();
-        let size_bytes_i64 = i64::try_from(body.size_bytes()).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "size_bytes exceeds i64 — federation_blobs.size_bytes is INTEGER".into(),
-            )
-        })?;
-        let (bytes_inline_opt, external_ref_opt) = match &body {
-            crate::federation::BlobBody::Inline(b) => (Some(b.clone()), None),
-            crate::federation::BlobBody::External(e) => (None, Some(e.uri.clone())),
-            // Rejected above; matched here only for exhaustiveness.
-            crate::federation::BlobBody::ChunkDag(_) => {
-                return Err(crate::federation::BlobError::InvalidArgument(
-                    "put_blob does not accept a ChunkDag body — use put_blob_chunks".into(),
-                ))
-            }
-        };
-
-        // 2. Compose the holding claim.
-        //
-        // v45.0.0 (CIRISPersist#871, AV-89) — the claim's declared size must be
-        // the length of the bytes this door stores. Checked BEFORE the rebuild
-        // so the refusal names the size, not a hash: a holder that announces
-        // one length and holds another is refused here, never advertised.
-        if attestation.size != body.size_bytes() {
-            return Err(crate::federation::BlobError::InvalidArgument(format!(
-                "holding claim declares size {} but the stored bytes are {} \
-                 (CC 5.3.2.5 / AV-89: a holder announces exactly what it holds)",
-                attestation.size,
-                body.size_bytes()
-            )));
-        }
-        // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — the claim is placed
-        // at the content's scope, derived from THIS write (its tier, cohort and
-        // group), and rebuilt through the ONE builder; the caller's hash must
-        // cover the rebuilt bytes (#656), and at a bounded scope the holder
-        // must be in the cohort (rule 2) — both before anything is written.
-        //
-        // A sealed-tier token ANNOUNCES a row a cascade already stored, so its
-        // scope is read off that row (`content_claim_scope`: the binding's
-        // room, the recorded group) and an absent row is `NotHeld` before any
-        // other question (§11.5 / I28); a plaintext write's scope is this
-        // write's.
-        let claim_scope =
-            if floor.tier() == crate::federation::types::cohort_scope::CryptoTier::Plaintext {
-                crate::federation::holding_claim::ClaimScope::of_content(
-                    floor.tier(),
-                    cohort_scope,
-                    group_key_id,
-                )?
-            } else {
-                crate::federation::holding_claim::content_claim_scope(self, sha256)
-                    .await?
-                    .ok_or_else(|| crate::federation::BlobError::NotHeld {
-                        sha256_hex: hex::encode(sha256),
-                    })?
-            };
-        let prepared = crate::federation::holding_claim::prepare_holding_claim_row(
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::blob_admit::put_blob_planned(
+            self,
+            author_key_id,
             sha256,
-            &attestation,
-            &claim_scope,
-        )?;
-        crate::federation::holding_claim::check_holding_claim_audience(self, &prepared.row).await?;
-        let attestation_row = prepared.row;
-        let original_content_hash = prepared.original_content_hash;
-        let attestation_envelope_text = prepared.envelope_text;
-
-        let sha_vec = sha256.to_vec();
-        // #870 — kept OUTSIDE the write closure for the post-write index hook.
-        let claim_to_index = (
-            attestation_row.attestation_id.clone(),
-            attestation_row.tier.clone(),
-        );
-        // §20.5 (PR #852 review) — the ROW's author is the supplied one (a
-        // proxy write's peer); absent that, the claim's attester, which for a
-        // local write is this node. The claim is always the holder's.
-        let row_author = author_key_id
-            .map(str::to_owned)
-            .unwrap_or_else(|| attestation.attesting_key_id.clone());
-        let media_type_owned = media_type.map(str::to_owned);
-        // v3.4.0 (CIRISPersist#123) — V053 last_accessed_at column has
-        // a literal-default sentinel on SQLite (datetime functions are
-        // not allowed in ALTER … ADD COLUMN DEFAULT). Write the real
-        // wall-clock here so a fresh blob's last_accessed_at matches
-        // its first_seen_at instead of the 1970 epoch placeholder.
-        let now_iso = chrono::Utc::now().to_rfc3339();
-        let announce_only =
-            floor.tier() != crate::federation::types::cohort_scope::CryptoTier::Plaintext;
-        let needs_binding =
-            floor.tier() == crate::federation::types::cohort_scope::CryptoTier::CommunityDek;
-
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
-            if announce_only {
-                // §11.5 / I28 — AN ANNOUNCEMENT NEVER STORES: a sealed-tier
-                // token announces a row a cascade already stored and bound.
-                // Absent (evicted under the writer) ⇒ QueryReturnedNoRows,
-                // mapped to NotHeld below. The connection mutex is sqlite's
-                // serialization boundary (§11.4).
-                // #833 — an evicted binding is an eviction RECORD, not a
-                // bound row; the announcement treats it as absent.
-                let held: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM federation_blobs WHERE sha256 = ?1) \
-                        AND (?2 OR EXISTS(SELECT 1 FROM federation_community_blob_epoch \
-                                           WHERE at_rest_sha256 = ?1 AND evicted_at IS NULL))",
-                    rusqlite::params![sha_vec, !needs_binding],
-                    |r| r.get(0),
-                )?;
-                if !held {
-                    return Err(rusqlite::Error::QueryReturnedNoRows);
-                }
-                // #846 (§5) — a sealed row is stored by a cascade and announced
-                // here; the announce names the writer, so a row the cascade
-                // could not attribute (NULL) takes the announcer's key. An
-                // author already recorded is never overwritten.
-                tx.execute(
-                    "UPDATE federation_blobs SET author_key_id = ?2 \
-                      WHERE sha256 = ?1 AND author_key_id IS NULL",
-                    rusqlite::params![sha_vec, row_author],
-                )?;
-            } else {
-                // v60.1.0 (#1070) — the tombstone again, under the write.
-                sqlite_refuse_tombstoned_at_write(&tx, &sha_vec, &tombstones)?;
-                // #846 (§5) — the row records its AUTHOR: the attesting key of
-                // the holder claim, which for a local write is the writer's
-                // derived key (I23) and for a proxy write the peer's.
-                tx.execute(
-                    "INSERT INTO federation_blobs (\
-                        sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                        last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id, \
-                        group_key_id\
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11) \
-                     ON CONFLICT (sha256) DO NOTHING",
-                    rusqlite::params![
-                        sha_vec,
-                        storage_kind,
-                        bytes_inline_opt,
-                        external_ref_opt,
-                        size_bytes_i64,
-                        media_type_owned,
-                        now_iso,
-                        scope,
-                        tier,
-                        row_author,
-                        group,
-                    ],
-                )?;
-                // v54.0.0 (#995 row 4, V184) — THIS write's room, whether or
-                // not the row above was new: shared plaintext keeps every room.
-                tx.execute(
-                    "INSERT INTO federation_blob_associations (sha256, cohort_scope, group_key_id) \
-                     VALUES (?1, ?2, COALESCE(?3, '')) ON CONFLICT DO NOTHING",
-                    rusqlite::params![sha_vec, scope, group],
-                )?;
-            }
-            // v55.0.0 (CIRISPersist#989) — the holding claim, in the same
-            // transaction as the write, through the one insert the three claim
-            // doors share.
-            sqlite_insert_holding_claim(
-                &tx,
-                &attestation_row,
-                &attestation_envelope_text,
-                &original_content_hash,
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
+            body,
+            media_type,
+            attestation,
+            cohort_scope,
+            floor,
+            group_key_id,
+        )
         .await
-        .map_err(|e| {
-            if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
-                return crate::federation::BlobError::NotHeld {
-                    sha256_hex: hex::encode(sha256),
-                };
-            }
-            if let Some(purged) = sqlite_purged_at_write(&e) {
-                return purged;
-            }
-            let msg = e.to_string();
-            if msg.contains("FOREIGN KEY") {
-                crate::federation::BlobError::AttestationEmissionFailed(format!(
-                    "FK violation on the holding claim: {msg}"
-                ))
-            } else if msg.contains("UNIQUE constraint failed") {
-                crate::federation::BlobError::AttestationEmissionFailed(format!(
-                    "attestation_id collision: {msg}"
-                ))
-            } else {
-                crate::federation::BlobError::Backend(format!("put_blob tx: {msg}"))
-            }
-        })?;
-        // v44.8.1 (CIRISPersist#870) — the index moves WITH the row (#610). The
-        // holder claim just written is a federation-tier attestation like every
-        // one `put_attestation` writes, and gets its `signed_wire_index` entry
-        // now — not at the next boot's rebuild. Without it the claim was
-        // ADVERTISED (the summary reads the row) and UNFETCHABLE (the packer
-        // resolves a want through the index), so no peer ever learned a holder
-        // and every blob-backed body read `not_fetched`. Same hook, same
-        // posture as `put_attestation`: the primary write is durable; an index
-        // failure is logged loudly by the hook and repaired by the rebuild.
-        self.index_holder_claim(&claim_to_index.0, &claim_to_index.1)
-            .await?;
-
-        Ok(())
     }
 
     async fn put_holding_claim(
@@ -10289,124 +10049,17 @@ impl crate::federation::BlobStorage for SqliteBackend {
         author_key_id: Option<&str>,
         group_key_id: Option<&str>,
     ) -> Result<(), crate::federation::BlobError> {
-        floor.check_scope(cohort_scope)?;
-        // v55.0.0 (#1007) — taken-down bytes never come back.
-        let reversed =
-            crate::federation::steward_purge::refuse_tombstoned_bytes(self, sha256).await?;
-        // v60.1.0 (#1070) — the in-transaction second look's inputs (the
-        // switch, and #1113's reversals the pre-read found), and the
-        // witnesses' seam between the pre-read and the write.
-        let tombstones = crate::federation::steward_purge::TombstoneFloor::new(
-            self.bytes_tombstone_plane(),
-            reversed,
-        );
-        #[cfg(test)]
-        self.test_hooks()
-            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
-            .await;
-        let scope = cohort_scope.to_owned();
-        let tier = floor.tier().as_str().to_owned();
-        let author = author_key_id.map(str::to_owned);
-        let group = group_key_id.map(str::to_owned);
-        let cap = self.inline_bytes_cap();
-        if let crate::federation::BlobBody::Inline(ref bytes) = body {
-            if bytes.len() > cap {
-                return Err(crate::federation::BlobError::InlineSizeExceeded {
-                    size: bytes.len(),
-                    cap,
-                });
-            }
-            crate::federation::blobs::verify_inline_hash(sha256, bytes)?;
-        }
-
-        // v4.1 (Cut B) — ChunkDag is a multi-row manifest; routed through
-        // put_blob_chunks, never store_blob_local.
-        if matches!(body, crate::federation::BlobBody::ChunkDag(_)) {
-            return Err(crate::federation::BlobError::InvalidArgument(
-                "store_blob_local does not accept a ChunkDag body — use put_blob_chunks".into(),
-            ));
-        }
-        let storage_kind = body.storage_kind().to_owned();
-        let size_bytes_i64 = i64::try_from(body.size_bytes()).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "size_bytes exceeds i64 — federation_blobs.size_bytes is INTEGER".into(),
-            )
-        })?;
-        let (bytes_inline_opt, external_ref_opt) = match &body {
-            crate::federation::BlobBody::Inline(b) => (Some(b.clone()), None),
-            crate::federation::BlobBody::External(e) => (None, Some(e.uri.clone())),
-            crate::federation::BlobBody::ChunkDag(_) => {
-                return Err(crate::federation::BlobError::InvalidArgument(
-                    "store_blob_local does not accept a ChunkDag body — use put_blob_chunks".into(),
-                ))
-            }
-        };
-        let sha_vec = sha256.to_vec();
-        let media_type_owned = media_type.map(str::to_owned);
-        // V053 last_accessed_at literal-default sentinel — write the
-        // real wall-clock so a fresh blob matches its first_seen_at.
-        let now_iso = chrono::Utc::now().to_rfc3339();
-
-        // v54.0.0 (Codex round 3 on PR #1050) — the row and its V184
-        // association are ONE transaction. `write` holds the connection lock,
-        // which serializes but does not make the two statements atomic: each
-        // autocommitted, and a failed association statement left the row with
-        // its room unrecorded (I611).
-        #[cfg(test)]
-        let inject_association_fault = self
-            .test_hooks()
-            .fail_if_armed("store_blob_local_association")
-            .is_err();
-        #[cfg(not(test))]
-        let inject_association_fault = false;
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
-            // v60.1.0 (#1070) — the tombstone again, under the write.
-            sqlite_refuse_tombstoned_at_write(&tx, &sha_vec, &tombstones)?;
-            tx.execute(
-                // #984 (V177) — the group the write named, on the row.
-                "INSERT INTO federation_blobs (\
-                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                    last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id, \
-                    group_key_id\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11) \
-                 ON CONFLICT (sha256) DO NOTHING",
-                rusqlite::params![
-                    sha_vec,
-                    storage_kind,
-                    bytes_inline_opt,
-                    external_ref_opt,
-                    size_bytes_i64,
-                    media_type_owned,
-                    now_iso,
-                    scope,
-                    tier,
-                    author,
-                    group,
-                ],
-            )?;
-            // v54.0.0 (#995 row 4, V184) — a plaintext row keeps every room.
-            if tier == crate::federation::types::cohort_scope::CryptoTier::Plaintext.as_str() {
-                if inject_association_fault {
-                    return Err(rusqlite::Error::InvalidParameterName(
-                        "store_blob_local association: injected fault".into(),
-                    ));
-                }
-                tx.execute(
-                    "INSERT INTO federation_blob_associations (sha256, cohort_scope, group_key_id) \
-                     VALUES (?1, ?2, COALESCE(?3, '')) ON CONFLICT DO NOTHING",
-                    rusqlite::params![sha_vec, scope, group],
-                )?;
-            }
-            tx.commit()
-        })
+        crate::federation::blob_admit::store_blob_local_planned(
+            self,
+            sha256,
+            body,
+            media_type,
+            cohort_scope,
+            floor,
+            author_key_id,
+            group_key_id,
+        )
         .await
-        .map_err(|e| {
-            sqlite_purged_at_write(&e).unwrap_or_else(|| {
-                crate::federation::BlobError::Backend(format!("store_blob_local: {e}"))
-            })
-        })?;
-        Ok(())
     }
 
     // v4.14.0 (CIRISPersist#152) — at-rest self/family DEK cascade grants.
@@ -12615,76 +12268,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         manifest: crate::federation::ChunkManifest,
         chunks: Vec<([u8; 32], crate::federation::BlobBody)>,
     ) -> Result<(), crate::federation::BlobError> {
-        let cap = self.inline_bytes_cap();
-        // Validation + row preparation (chunks first, manifest last).
-        let rows = crate::federation::blobs::prepare_chunk_rows(&manifest, &chunks, cap)?;
-        // v55.0.0 (#1007) — taken-down bytes never come back: no chunk, and
-        // not the manifest.
-        let mut reversed = crate::federation::steward_purge::ReversedTakedowns::default();
-        for row in &rows {
-            reversed.absorb(
-                crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256)
-                    .await?,
-            );
-        }
-        // v60.1.0 (#1070) — the in-transaction second look's inputs (the
-        // switch, and #1113's reversals the pre-read found), and the
-        // witnesses' seam between the pre-read and the write.
-        let tombstones = crate::federation::steward_purge::TombstoneFloor::new(
-            self.bytes_tombstone_plane(),
-            reversed,
-        );
-        #[cfg(test)]
-        self.test_hooks()
-            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
-            .await;
-
-        let now_iso = chrono::Utc::now().to_rfc3339();
-        // Codex r2 on #1065 — the manifest's chunk relation, in the same
-        // transaction (the manifest row is the last prepared row).
-        let manifest_sha = rows.last().map(|r| r.sha256.to_vec());
-        let (links, link_stream) = crate::federation::blobs::manifest_chunk_links(&manifest);
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
-            for row in &rows {
-                let sha_vec = row.sha256.to_vec();
-                // v60.1.0 (#1070) — the tombstone again, under the write.
-                sqlite_refuse_tombstoned_at_write(&tx, &sha_vec, &tombstones)?;
-                tx.execute(
-                    "INSERT INTO federation_blobs (\
-                        sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                        last_accessed_at, access_count\
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0) \
-                     ON CONFLICT (sha256) DO NOTHING",
-                    rusqlite::params![
-                        sha_vec,
-                        row.storage_kind,
-                        row.bytes_inline,
-                        row.external_ref,
-                        row.size_bytes,
-                        now_iso,
-                    ],
-                )?;
-            }
-            if let Some(m) = &manifest_sha {
-                for (seq, chunk) in &links {
-                    tx.execute(
-                        "INSERT INTO federation_dag_chunks (manifest_sha256, seq, chunk_sha256, stream_id) \
-                         VALUES (?1, ?2, ?3, ?4) ON CONFLICT (manifest_sha256, seq) DO NOTHING",
-                        rusqlite::params![m, seq, chunk, link_stream],
-                    )?;
-                }
-            }
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| {
-            sqlite_purged_at_write(&e).unwrap_or_else(|| {
-                crate::federation::BlobError::Backend(format!("put_blob_chunks tx: {e}"))
-            })
-        })?;
-        Ok(())
+        crate::federation::blob_admit::put_blob_chunks_planned(self, manifest, chunks).await
     }
 
     // v55.0.0 (CIRISPersist#952) — the incremental plaintext DAG's finalize:
@@ -12694,97 +12278,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         &self,
         manifest: crate::federation::ChunkManifest,
     ) -> Result<[u8; 32], crate::federation::BlobError> {
-        let row =
-            crate::federation::blobs::prepare_manifest_row(&manifest, self.inline_bytes_cap())?;
-        // v55.0.0 (#1007) — taken-down bytes never come back: neither the
-        // manifest nor a withheld chunk becomes a DAG.
-        let mut reversed =
-            crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256).await?;
-        for c in &manifest.chunks {
-            reversed.absorb(
-                crate::federation::steward_purge::refuse_tombstoned_bytes(self, &c.sha).await?,
-            );
-        }
-        // v60.1.0 (#1070) — the in-transaction second look's inputs (the
-        // switch, and #1113's reversals the pre-read found), and the
-        // witnesses' seam between the pre-read and the write.
-        let tombstones = crate::federation::steward_purge::TombstoneFloor::new(
-            self.bytes_tombstone_plane(),
-            reversed,
-        );
-        #[cfg(test)]
-        self.test_hooks()
-            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
-            .await;
-        let chunks: Vec<([u8; 32], u64)> = manifest
-            .chunks
-            .iter()
-            .map(|c| (c.sha, u64::from(c.size)))
-            .collect();
-        let now_iso = chrono::Utc::now().to_rfc3339();
-        let sha = row.sha256;
-        // Codex r2 on #1065 — the manifest's chunk relation, with the row.
-        let (links, link_stream) = crate::federation::blobs::manifest_chunk_links(&manifest);
-        let outcome = self
-            .write(
-                move |conn| -> Result<Result<(), crate::federation::BlobError>, rusqlite::Error> {
-                    let tx = conn.transaction()?;
-                    for (idx, (chunk_sha, size)) in chunks.iter().enumerate() {
-                        let held: Option<(String, String, i64)> = tx
-                            .query_row(
-                                "SELECT storage_kind, crypto_tier, size_bytes \
-                                 FROM federation_blobs WHERE sha256 = ?1",
-                                rusqlite::params![chunk_sha.to_vec()],
-                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                            )
-                            .optional()?;
-                        if let Err(e) = crate::federation::blobs::check_held_dag_chunk(
-                            idx, chunk_sha, *size, held,
-                        ) {
-                            return Ok(Err(e));
-                        }
-                    }
-                    // v60.1.0 (#1070) — the tombstones again, under the write:
-                    // the manifest's own and every chunk's.
-                    for sha in std::iter::once(&row.sha256).chain(chunks.iter().map(|(c, _)| c)) {
-                        if let Err(t) = crate::federation::steward_purge::refuse_tombstoned_at_write(
-                            sha,
-                            sqlite_tombstone_at_write(&tx, sha, &tombstones)?,
-                            &tombstones,
-                        ) {
-                            return Ok(Err(t.into()));
-                        }
-                    }
-                    tx.execute(
-                        "INSERT INTO federation_blobs (\
-                            sha256, storage_kind, bytes_inline, external_ref, size_bytes, \
-                            media_type, last_accessed_at, access_count\
-                         ) VALUES (?1, ?2, ?3, NULL, ?4, NULL, ?5, 0) \
-                         ON CONFLICT (sha256) DO NOTHING",
-                        rusqlite::params![
-                            row.sha256.to_vec(),
-                            row.storage_kind,
-                            row.bytes_inline,
-                            row.size_bytes,
-                            now_iso,
-                        ],
-                    )?;
-                    for (seq, chunk) in &links {
-                        tx.execute(
-                            "INSERT INTO federation_dag_chunks (manifest_sha256, seq, chunk_sha256, stream_id) \
-                         VALUES (?1, ?2, ?3, ?4) ON CONFLICT (manifest_sha256, seq) DO NOTHING",
-                            rusqlite::params![row.sha256.to_vec(), seq, chunk, link_stream],
-                        )?;
-                    }
-                    tx.commit()?;
-                    Ok(Ok(()))
-                },
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("put_dag_manifest_over_held: {e}"))
-            })?;
-        outcome.map(|()| sha)
+        crate::federation::blob_admit::put_dag_manifest_over_held_planned(self, manifest).await
     }
 
     async fn put_blob_chunk_with_scope(
@@ -12879,208 +12373,16 @@ impl crate::federation::BlobStorage for SqliteBackend {
         floor: crate::federation::StorageFloor,
         binding: Option<crate::federation::EpochBinding>,
     ) -> Result<(), crate::federation::BlobError> {
-        floor.check_scope(cohort_scope)?;
-        let cap = self.inline_bytes_cap();
-        if spec.body.len() > cap {
-            return Err(crate::federation::BlobError::InlineSizeExceeded {
-                size: spec.body.len(),
-                cap,
-            });
-        }
-        crate::federation::blobs::verify_inline_hash(&spec.sha256, &spec.body)?;
-        let size_i64 = i64::try_from(spec.size_bytes).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "seal_stream_with_scope: size_bytes exceeds i64".into(),
-            )
-        })?;
-        let expected = i64::try_from(spec.expected_chunk_count).unwrap_or(i64::MAX);
-        let now_iso = chrono::Utc::now().to_rfc3339();
-        let stream_id_owned = stream_id.to_string();
-        let scope = cohort_scope.to_owned();
-        let tier = floor.tier().as_str().to_owned();
-        let media = media_type.map(str::to_owned);
-        let bind = binding.clone();
-        // #984 (V177) — the group the seal named, on the root and each child.
-        let group = spec.group_key_id.clone();
-        for c in &spec.children {
-            if c.body.len() > cap {
-                return Err(crate::federation::BlobError::InlineSizeExceeded {
-                    size: c.body.len(),
-                    cap,
-                });
-            }
-            crate::federation::blobs::verify_inline_hash(&c.sha256, &c.body)?;
-        }
-        let children: Vec<(i64, Vec<u8>, Vec<u8>, i64)> = spec
-            .children
-            .iter()
-            .map(|c| {
-                (
-                    i64::try_from(c.index).unwrap_or(i64::MAX),
-                    c.sha256.to_vec(),
-                    c.body.clone(),
-                    i64::try_from(c.body.len()).unwrap_or(i64::MAX),
-                )
-            })
-            .collect();
-        enum Sealed {
-            Ok,
-            StreamMoved(i64),
-            EpochMoved,
-            Abandoned,
-        }
-        let outcome = self.write(move |conn| -> Result<Sealed, rusqlite::Error> {
-            let tx = conn.transaction()?;
-            // #954 — an abandoned stream is never sealed.
-            let abandoned: bool = tx
-                .query_row(
-                    "SELECT abandoned_at IS NOT NULL FROM federation_streams WHERE stream_id = ?1",
-                    rusqlite::params![stream_id_owned],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .unwrap_or(false);
-            if abandoned {
-                return Ok(Sealed::Abandoned);
-            }
-            // §12.3 — the door listed N chunks and sealed a manifest over
-            // them; if the stream has moved since, this manifest describes
-            // a stream that no longer exists. Refuse, never truncate.
-            let count: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM federation_stream_chunks WHERE stream_id = ?1",
-                rusqlite::params![stream_id_owned],
-                |r| r.get(0),
-            )?;
-            if count != expected {
-                return Ok(Sealed::StreamMoved(count));
-            }
-            let sha_vec = spec.sha256.to_vec();
-            tx.execute(
-                // #846 (§5) — the manifest's author is the stream's owner: the
-                // first attributed writer (I41), read from the stream row in
-                // this transaction. NULL for an unclaimed stream.
-                "INSERT INTO federation_blobs (\
-                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                    last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id, \
-                    group_key_id\
-                 ) VALUES (?1, 'chunk_dag', ?2, NULL, ?3, ?4, ?5, 0, ?6, ?7, \
-                           (SELECT owner_key_id FROM federation_streams WHERE stream_id = ?8), \
-                           ?9) \
-                 ON CONFLICT (sha256) DO NOTHING",
-                rusqlite::params![
-                    sha_vec,
-                    spec.body,
-                    size_i64,
-                    media,
-                    now_iso,
-                    scope,
-                    tier,
-                    stream_id_owned,
-                    group
-                ],
-            )?;
-            if let Some(b) = &bind {
-                let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
-                // #848 — the manifest binds `(community, minter, epoch)`,
-                // current-and-enabled against the MINTER's own state.
-                let n = tx.execute(
-                    "INSERT INTO federation_community_blob_epoch \
-                        (at_rest_sha256, community_key_id, minter_key_id, epoch) \
-                     SELECT ?1, ?2, ?3, ?4 \
-                      WHERE EXISTS (SELECT 1 FROM federation_community_dek \
-                                     WHERE community_key_id = ?2 AND minter_key_id = ?3 AND epoch = ?4 \
-                                       AND key_state = 'enabled') \
-                       AND ?4 = COALESCE((SELECT epoch FROM federation_community_dek_epoch \
-                                           WHERE community_key_id = ?2 AND minter_key_id = ?3), 0) \
-                     ON CONFLICT (at_rest_sha256) DO NOTHING",
-                    rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
-                )?;
-                let already: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM federation_community_blob_epoch \
-                                    WHERE at_rest_sha256 = ?1 AND community_key_id = ?2 \
-                                      AND minter_key_id = ?3 AND epoch = ?4)",
-                    rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
-                    |r| r.get(0),
-                )?;
-                if n == 0 && !already {
-                    return Ok(Sealed::EpochMoved);
-                }
-            }
-            // #954 — a v3 root's children: inline rows at the DAG's tier and
-            // cohort, authored by the stream's owner, bound to the root's
-            // epoch at a community, and related to the root. One transaction
-            // with the root, so a root never exists without its children.
-            for (index, child_sha, body, len) in &children {
-                tx.execute(
-                    "INSERT INTO federation_blobs (\
-                        sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                        last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id, \
-                        group_key_id\
-                     ) VALUES (?1, 'inline', ?2, NULL, ?3, NULL, ?4, 0, ?5, ?6, \
-                               (SELECT owner_key_id FROM federation_streams WHERE stream_id = ?7), \
-                               ?8) \
-                     ON CONFLICT (sha256) DO NOTHING",
-                    rusqlite::params![
-                        child_sha,
-                        body,
-                        len,
-                        now_iso,
-                        scope,
-                        tier,
-                        stream_id_owned,
-                        group
-                    ],
-                )?;
-                if let Some(b) = &bind {
-                    let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
-                    tx.execute(
-                        "INSERT INTO federation_community_blob_epoch \
-                            (at_rest_sha256, community_key_id, minter_key_id, epoch) \
-                         VALUES (?1, ?2, ?3, ?4) ON CONFLICT (at_rest_sha256) DO NOTHING",
-                        rusqlite::params![child_sha, b.community_key_id, b.minter_key_id, ep],
-                    )?;
-                }
-                tx.execute(
-                    "INSERT INTO federation_manifest_children (root_sha256, child_index, child_sha256) \
-                     VALUES (?1, ?2, ?3) ON CONFLICT (root_sha256, child_index) DO NOTHING",
-                    rusqlite::params![sha_vec, index, child_sha],
-                )?;
-            }
-            // v53.1.0 (#979) — the manifest's chunks, from the stream's own
-            // rows (whose count was checked above), in this transaction.
-            sqlite_link_dag_chunks(&tx, &sha_vec, &stream_id_owned)?;
-            tx.execute(
-                "UPDATE federation_stream_chunks SET sealed_at = ?2 WHERE stream_id = ?1",
-                rusqlite::params![stream_id_owned, now_iso],
-            )?;
-            tx.commit()?;
-            Ok(Sealed::Ok)
-        })
+        crate::federation::blob_admit::seal_stream_planned(
+            self,
+            stream_id,
+            spec,
+            media_type,
+            cohort_scope,
+            floor,
+            binding,
+        )
         .await
-        .map_err(|e| {
-            crate::federation::BlobError::Backend(format!("seal_stream_with_scope tx: {e}"))
-        })?;
-        match outcome {
-            Sealed::Ok => Ok(()),
-            Sealed::StreamMoved(count) => {
-                Err(crate::federation::BlobError::InvalidArgument(format!(
-                "seal_stream_with_scope: stream {stream_id} has {count} chunk(s) but the manifest \
-                 was built over {}; the stream moved under the seal — list it again \
-                 (BLOB_ENCRYPTION_AT_REST.md §12.3)",
-                spec.expected_chunk_count
-            )))
-            }
-            Sealed::EpochMoved => {
-                let b = binding.expect("EpochMoved only arises with a binding");
-                Err(crate::federation::BlobError::EpochNotCurrent {
-                    community_key_id: b.community_key_id,
-                    epoch: b.epoch,
-                })
-            }
-            Sealed::Abandoned => Err(crate::federation::blobs::stream_abandoned_refusal(
-                stream_id,
-            )),
-        }
     }
 
     async fn manifest_children(
@@ -13733,178 +13035,18 @@ impl crate::federation::BlobStorage for SqliteBackend {
         group_key_id: Option<&str>,
         announce: Option<crate::federation::PutBlobAttestation>,
     ) -> Result<[u8; 32], crate::federation::BlobError> {
-        use sha2::Digest as _;
-        floor.check_scope(cohort_scope)?;
-        let cap = self.inline_bytes_cap();
-        if envelope_bytes.len() > cap {
-            return Err(crate::federation::BlobError::InlineSizeExceeded {
-                size: envelope_bytes.len(),
-                cap,
-            });
-        }
-        // The address is the SHA-256 of the CIPHERTEXT, computed here from
-        // the bytes that are stored — never trusted from the sender.
-        let sha256: [u8; 32] = sha2::Sha256::digest(&envelope_bytes).into();
-        // v55.0.0 (#1007) — taken-down bytes never come back.
-        let reversed =
-            crate::federation::steward_purge::refuse_tombstoned_bytes(self, &sha256).await?;
-        // v60.1.0 (#1070) — the in-transaction second look's inputs (the
-        // switch, and #1113's reversals the pre-read found), and the
-        // witnesses' seam between the pre-read and the write.
-        let tombstones = crate::federation::steward_purge::TombstoneFloor::new(
-            self.bytes_tombstone_plane(),
-            reversed,
-        );
-        #[cfg(test)]
-        self.test_hooks()
-            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
-            .await;
-        let size_i64 = i64::try_from(envelope_bytes.len()).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "adopt_sealed_blob_at: size_bytes exceeds i64".into(),
-            )
-        })?;
-        // v45.0.0 (CIRISPersist#871, AV-89) — the announce's declared size must
-        // be the length of the sealed bytes this door stores.
-        if let Some(a) = &announce {
-            if a.size != envelope_bytes.len() as u64 {
-                return Err(crate::federation::BlobError::InvalidArgument(format!(
-                    "holding claim declares size {} but the adopted bytes are {} \
-                     (CC 5.3.2.5 / AV-89: a holder announces exactly what it holds)",
-                    a.size,
-                    envelope_bytes.len()
-                )));
-            }
-        }
-        // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — the group a sealed
-        // room row names is its binding's community: a group that disagrees
-        // with the binding is a contradiction the floor refuses.
-        if let (Some(b), Some(g)) = (&binding, group_key_id) {
-            if b.community_key_id != g {
-                return Err(crate::federation::BlobError::InvalidArgument(format!(
-                    "adopt_sealed_blob_at: group {g:?} is not the binding's community {:?}",
-                    b.community_key_id
-                )));
-            }
-        }
-        let group = group_key_id
-            .map(str::to_owned)
-            .or_else(|| binding.as_ref().map(|b| b.community_key_id.clone()));
-        // The holding claim is admitted on the same terms as `put_blob`'s, at
-        // the content's scope, with the holder in the cohort.
-        let prepared = match announce.as_ref() {
-            Some(a) => {
-                let claim_scope = crate::federation::holding_claim::ClaimScope::of_content(
-                    floor.tier(),
-                    cohort_scope,
-                    group.as_deref(),
-                )?;
-                let p = crate::federation::holding_claim::prepare_holding_claim_row(
-                    &sha256,
-                    a,
-                    &claim_scope,
-                )?;
-                crate::federation::holding_claim::check_holding_claim_audience(self, &p.row)
-                    .await?;
-                Some(p)
-            }
-            None => None,
-        };
-        // #870 — kept OUTSIDE the write closure for the post-write index hook.
-        let claim_to_index = prepared
-            .as_ref()
-            .map(|p| (p.row.attestation_id.clone(), p.row.tier.clone()));
-        let sha_vec = sha256.to_vec();
-        let scope = cohort_scope.to_owned();
-        let tier = floor.tier().as_str().to_owned();
-        let author = author_key_id.to_owned();
-        let media = media_type.map(str::to_owned);
-        let now_iso = chrono::Utc::now().to_rfc3339();
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
-            // v60.1.0 (#1070) — the tombstone again, under the write.
-            sqlite_refuse_tombstoned_at_write(&tx, &sha_vec, &tombstones)?;
-            // 1. The row, verbatim bytes, tier from the token, cohort and
-            //    author AS DECLARED. First-write-wins on the address.
-            // v55.0.0 — and the group the provenance names (V177), as the
-            // sealing cascades record it.
-            tx.execute(
-                "INSERT INTO federation_blobs (\
-                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                    last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id, \
-                    group_key_id\
-                 ) VALUES (?1, 'inline', ?2, NULL, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9) \
-                 ON CONFLICT (sha256) DO NOTHING",
-                rusqlite::params![
-                    sha_vec,
-                    envelope_bytes,
-                    size_i64,
-                    media,
-                    now_iso,
-                    scope,
-                    tier,
-                    author,
-                    group
-                ],
-            )?;
-            // 2. The binding AS DECLARED (§3): the epoch the author sealed
-            //    under, which may be past and may be one this node holds no
-            //    key state for. No `enabled` check, no current-epoch check.
-            if let Some(b) = &binding {
-                let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
-                // #848 — the minter is the AUTHOR, as declared (§11).
-                tx.execute(
-                    "INSERT INTO federation_community_blob_epoch \
-                        (at_rest_sha256, community_key_id, minter_key_id, epoch) \
-                     VALUES (?1, ?2, ?3, ?4) \
-                     ON CONFLICT (at_rest_sha256) DO NOTHING",
-                    rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
-                )?;
-            }
-            // 3. The holder claim, signed by THIS node (§6.1 (4)), in the
-            //    same transaction as the row it announces.
-            if let Some(p) = &prepared {
-                sqlite_insert_holding_claim(
-                    &tx,
-                    &p.row,
-                    &p.envelope_text,
-                    &p.original_content_hash,
-                )?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
+        crate::federation::blob_admit::adopt_sealed_blob_planned(
+            self,
+            envelope_bytes,
+            media_type,
+            cohort_scope,
+            author_key_id,
+            floor,
+            binding,
+            group_key_id,
+            announce,
+        )
         .await
-        .map_err(|e| {
-            if let Some(purged) = sqlite_purged_at_write(&e) {
-                return purged;
-            }
-            let msg = e.to_string();
-            if msg.contains("FOREIGN KEY") {
-                crate::federation::BlobError::AttestationEmissionFailed(format!(
-                    "FK violation on the holding claim: {msg}"
-                ))
-            } else if msg.contains("UNIQUE constraint failed") {
-                crate::federation::BlobError::AttestationEmissionFailed(format!(
-                    "attestation_id collision: {msg}"
-                ))
-            } else {
-                crate::federation::BlobError::Backend(format!("adopt_sealed_blob_at tx: {msg}"))
-            }
-        })?;
-        // v44.8.1 (CIRISPersist#870) — the index moves WITH the row (#610). The
-        // holder claim just written is a federation-tier attestation like every
-        // one `put_attestation` writes, and gets its `signed_wire_index` entry
-        // now — not at the next boot's rebuild. Without it the claim was
-        // ADVERTISED (the summary reads the row) and UNFETCHABLE (the packer
-        // resolves a want through the index), so no peer ever learned a holder
-        // and every blob-backed body read `not_fetched`. Same hook, same
-        // posture as `put_attestation`: the primary write is durable; an index
-        // failure is logged loudly by the hook and repaired by the rebuild.
-        if let Some((id, tier)) = &claim_to_index {
-            self.index_holder_claim(id, tier).await?;
-        }
-        Ok(sha256)
     }
 
     async fn blob_associations(
@@ -26291,6 +25433,434 @@ impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
         .await
         .map_err(|e| crate::federation::BlobError::Backend(format!("stream_dek_put_grants: {e}")))
     }
+}
+
+impl SqliteBackend {
+    /// v61 (CIRISPersist#934) — a holding-claim write's error, as the claim
+    /// doors have always mapped it: a takedown that committed under the
+    /// write, an FK or UNIQUE violation on the claim, else the store's.
+    fn blob_write_error(door: &str, e: &rusqlite::Error) -> crate::federation::BlobError {
+        if let Some(purged) = sqlite_purged_at_write(e) {
+            return purged;
+        }
+        let msg = e.to_string();
+        if msg.contains("FOREIGN KEY") {
+            crate::federation::BlobError::AttestationEmissionFailed(format!(
+                "FK violation on the holding claim: {msg}"
+            ))
+        } else if msg.contains("UNIQUE constraint failed") {
+            crate::federation::BlobError::AttestationEmissionFailed(format!(
+                "attestation_id collision: {msg}"
+            ))
+        } else {
+            crate::federation::BlobError::Backend(format!("{door} tx: {msg}"))
+        }
+    }
+}
+
+/// v61 (CIRISPersist#934) — the blob writes' half of the blob plane's
+/// executor on sqlite.
+#[async_trait::async_trait]
+impl crate::federation::blob_admit::BlobWriteStore for SqliteBackend {
+    fn blob_admission_gate(&self) -> Option<crate::federation::AdmissionGate> {
+        self.admission_gate()
+    }
+
+    async fn store_planned_blob(
+        &self,
+        planned: crate::federation::blob_admit::PlannedBlob,
+    ) -> Result<(), crate::federation::BlobError> {
+        let door = planned.door;
+        let to_index = planned
+            .claim
+            .as_ref()
+            .map(|c| (c.row.attestation_id.clone(), c.row.tier.clone()));
+        // v54.0.0 (Codex round 3 on PR #1050) — the row and its V184
+        // association are ONE transaction (I611).
+        #[cfg(test)]
+        let inject_association_fault = self
+            .test_hooks()
+            .fail_if_armed("store_blob_local_association")
+            .is_err();
+        #[cfg(not(test))]
+        let inject_association_fault = false;
+        // V053's last_accessed_at sentinel: the real wall clock, so a fresh
+        // blob's last_accessed_at matches its first_seen_at.
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            let r = &planned.row;
+            let sha_vec = r.sha256.to_vec();
+            let tx = conn.transaction()?;
+            // v60.1.0 (#1070) — the tombstone again, under the write.
+            sqlite_refuse_tombstoned_at_write(&tx, &sha_vec, &planned.tombstones)?;
+            // #846 (§5) / #984 (V177) — the row records its author and group;
+            // first write wins on the address.
+            tx.execute(
+                "INSERT INTO federation_blobs (\
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                    last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id, \
+                    group_key_id\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT (sha256) DO NOTHING",
+                rusqlite::params![
+                    sha_vec,
+                    r.storage_kind,
+                    r.bytes_inline,
+                    r.external_ref,
+                    r.size_bytes,
+                    r.media_type,
+                    now_iso,
+                    r.cohort_scope,
+                    r.tier,
+                    r.author_key_id,
+                    r.group_key_id,
+                ],
+            )?;
+            if planned.associate {
+                if inject_association_fault {
+                    return Err(rusqlite::Error::InvalidParameterName(
+                        "store_blob_local association: injected fault".into(),
+                    ));
+                }
+                tx.execute(
+                    "INSERT INTO federation_blob_associations (sha256, cohort_scope, group_key_id) \
+                     VALUES (?1, ?2, COALESCE(?3, '')) ON CONFLICT DO NOTHING",
+                    rusqlite::params![sha_vec, r.cohort_scope, r.group_key_id],
+                )?;
+            }
+            if let Some(b) = &planned.binding {
+                let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+                // #848 — the minter is the AUTHOR, as declared (§11).
+                tx.execute(
+                    "INSERT INTO federation_community_blob_epoch \
+                        (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT (at_rest_sha256) DO NOTHING",
+                    rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
+                )?;
+            }
+            if let Some(c) = &planned.claim {
+                sqlite_insert_holding_claim(
+                    &tx,
+                    &c.row,
+                    &c.envelope_text,
+                    &c.original_content_hash,
+                )?;
+            }
+            tx.commit()
+        })
+        .await
+        .map_err(|e| Self::blob_write_error(door, &e))?;
+        // #870 — the index moves WITH the row.
+        if let Some((id, tier)) = &to_index {
+            self.index_holder_claim(id, tier).await?;
+        }
+        Ok(())
+    }
+
+    async fn store_planned_announcement(
+        &self,
+        planned: crate::federation::blob_admit::PlannedAnnouncement,
+    ) -> Result<bool, crate::federation::BlobError> {
+        let (claim_id, claim_tier) = (
+            planned.claim.row.attestation_id.clone(),
+            planned.claim.row.tier.clone(),
+        );
+        let held = self
+            .write(move |conn| -> Result<bool, rusqlite::Error> {
+                let sha_vec = planned.sha256.to_vec();
+                let tx = conn.transaction()?;
+                // §11.5 / I28 — a sealed-tier token announces a row a cascade
+                // already stored and bound; #833 — an evicted binding is an
+                // eviction RECORD, not a bound row. The connection mutex is
+                // sqlite's serialization boundary (§11.4).
+                let held: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM federation_blobs WHERE sha256 = ?1) \
+                        AND (?2 OR EXISTS(SELECT 1 FROM federation_community_blob_epoch \
+                                           WHERE at_rest_sha256 = ?1 AND evicted_at IS NULL))",
+                    rusqlite::params![sha_vec, !planned.needs_binding],
+                    |r| r.get(0),
+                )?;
+                if !held {
+                    return Ok(false);
+                }
+                // #846 (§5) — a row the cascade could not attribute takes the
+                // announcer's key; a recorded author is never overwritten.
+                tx.execute(
+                    "UPDATE federation_blobs SET author_key_id = ?2 \
+                      WHERE sha256 = ?1 AND author_key_id IS NULL",
+                    rusqlite::params![sha_vec, planned.author_key_id],
+                )?;
+                sqlite_insert_holding_claim(
+                    &tx,
+                    &planned.claim.row,
+                    &planned.claim.envelope_text,
+                    &planned.claim.original_content_hash,
+                )?;
+                tx.commit()?;
+                Ok(true)
+            })
+            .await
+            .map_err(|e| Self::blob_write_error("put_blob", &e))?;
+        if held {
+            self.index_holder_claim(&claim_id, &claim_tier).await?;
+        }
+        Ok(held)
+    }
+
+    async fn store_planned_dag(
+        &self,
+        planned: crate::federation::blob_admit::PlannedDag,
+    ) -> Result<(), crate::federation::BlobError> {
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            let tx = conn.transaction()?;
+            for row in &planned.rows {
+                let sha_vec = row.sha256.to_vec();
+                // v60.1.0 (#1070) — the tombstone again, under the write.
+                sqlite_refuse_tombstoned_at_write(&tx, &sha_vec, &planned.tombstones)?;
+                tx.execute(
+                    "INSERT INTO federation_blobs (\
+                        sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                        last_accessed_at, access_count\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0) \
+                     ON CONFLICT (sha256) DO NOTHING",
+                    rusqlite::params![
+                        sha_vec,
+                        row.storage_kind,
+                        row.bytes_inline,
+                        row.external_ref,
+                        row.size_bytes,
+                        now_iso,
+                    ],
+                )?;
+            }
+            sqlite_insert_dag_links(&tx, &planned)?;
+            tx.commit()
+        })
+        .await
+        .map_err(|e| {
+            sqlite_purged_at_write(&e).unwrap_or_else(|| {
+                crate::federation::BlobError::Backend(format!("put_blob_chunks tx: {e}"))
+            })
+        })
+    }
+
+    async fn store_planned_dag_over_held(
+        &self,
+        planned: crate::federation::blob_admit::PlannedDag,
+    ) -> Result<(), crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let db =
+            |e: rusqlite::Error| BlobError::Backend(format!("put_dag_manifest_over_held: {e}"));
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        self.write(move |conn| -> Result<(), BlobError> {
+            let tx = conn.transaction().map_err(db)?;
+            for (idx, (chunk_sha, size)) in planned.held_chunks.iter().enumerate() {
+                let held: Option<(String, String, i64)> = tx
+                    .query_row(
+                        "SELECT storage_kind, crypto_tier, size_bytes \
+                         FROM federation_blobs WHERE sha256 = ?1",
+                        rusqlite::params![chunk_sha.to_vec()],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()
+                    .map_err(db)?;
+                crate::federation::blob_admit::held_dag_chunk_verdict(idx, chunk_sha, *size, held)?;
+            }
+            // v60.1.0 (#1070) — the tombstones again, under the write: the
+            // manifest's own and every chunk's.
+            for sha in planned
+                .rows
+                .iter()
+                .map(|r| &r.sha256)
+                .chain(planned.held_chunks.iter().map(|(c, _)| c))
+            {
+                crate::federation::steward_purge::refuse_tombstoned_at_write(
+                    sha,
+                    sqlite_tombstone_at_write(&tx, sha, &planned.tombstones).map_err(db)?,
+                    &planned.tombstones,
+                )?;
+            }
+            for row in &planned.rows {
+                tx.execute(
+                    "INSERT INTO federation_blobs (\
+                        sha256, storage_kind, bytes_inline, external_ref, size_bytes, \
+                        media_type, last_accessed_at, access_count\
+                     ) VALUES (?1, ?2, ?3, NULL, ?4, NULL, ?5, 0) \
+                     ON CONFLICT (sha256) DO NOTHING",
+                    rusqlite::params![
+                        row.sha256.to_vec(),
+                        row.storage_kind,
+                        row.bytes_inline,
+                        row.size_bytes,
+                        now_iso,
+                    ],
+                )
+                .map_err(db)?;
+            }
+            sqlite_insert_dag_links(&tx, &planned).map_err(db)?;
+            tx.commit().map_err(db)
+        })
+        .await
+    }
+
+    async fn store_planned_seal(
+        &self,
+        planned: crate::federation::blob_admit::PlannedSeal,
+    ) -> Result<crate::federation::blob_admit::SealWrite, crate::federation::BlobError> {
+        use crate::federation::blob_admit::SealWrite;
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        self.write(move |conn| -> Result<SealWrite, rusqlite::Error> {
+            let p = &planned;
+            let tx = conn.transaction()?;
+            // #954 — an abandoned stream is never sealed.
+            let abandoned: bool = tx
+                .query_row(
+                    "SELECT abandoned_at IS NOT NULL FROM federation_streams WHERE stream_id = ?1",
+                    rusqlite::params![p.stream_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if abandoned {
+                return Ok(SealWrite::Abandoned);
+            }
+            // §12.3 — the stream must still hold the chunks the manifest was
+            // built over.
+            let count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM federation_stream_chunks WHERE stream_id = ?1",
+                rusqlite::params![p.stream_id],
+                |r| r.get(0),
+            )?;
+            if count != p.expected_chunks {
+                return Ok(SealWrite::StreamMoved(count));
+            }
+            let sha_vec = p.spec.sha256.to_vec();
+            let group = &p.spec.group_key_id;
+            // #846 (§5) — the manifest's author is the stream's owner, read in
+            // this transaction (NULL for an unclaimed stream).
+            tx.execute(
+                "INSERT INTO federation_blobs (\
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                    last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id, \
+                    group_key_id\
+                 ) VALUES (?1, 'chunk_dag', ?2, NULL, ?3, ?4, ?5, 0, ?6, ?7, \
+                           (SELECT owner_key_id FROM federation_streams WHERE stream_id = ?8), \
+                           ?9) \
+                 ON CONFLICT (sha256) DO NOTHING",
+                rusqlite::params![
+                    sha_vec,
+                    p.spec.body,
+                    p.size_bytes,
+                    p.media_type,
+                    now_iso,
+                    p.cohort_scope,
+                    p.tier,
+                    p.stream_id,
+                    group
+                ],
+            )?;
+            if let Some(b) = &p.binding {
+                let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+                // #848 — current-and-enabled against the MINTER's own state.
+                let n = tx.execute(
+                    "INSERT INTO federation_community_blob_epoch \
+                        (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                     SELECT ?1, ?2, ?3, ?4 \
+                      WHERE EXISTS (SELECT 1 FROM federation_community_dek \
+                                     WHERE community_key_id = ?2 AND minter_key_id = ?3 AND epoch = ?4 \
+                                       AND key_state = 'enabled') \
+                       AND ?4 = COALESCE((SELECT epoch FROM federation_community_dek_epoch \
+                                           WHERE community_key_id = ?2 AND minter_key_id = ?3), 0) \
+                     ON CONFLICT (at_rest_sha256) DO NOTHING",
+                    rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
+                )?;
+                let already: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM federation_community_blob_epoch \
+                                    WHERE at_rest_sha256 = ?1 AND community_key_id = ?2 \
+                                      AND minter_key_id = ?3 AND epoch = ?4)",
+                    rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
+                    |r| r.get(0),
+                )?;
+                if n == 0 && !already {
+                    return Ok(SealWrite::EpochMoved);
+                }
+            }
+            // #954 — a v3 root's children, one transaction with the root.
+            for c in &p.spec.children {
+                let child_sha = c.sha256.to_vec();
+                tx.execute(
+                    "INSERT INTO federation_blobs (\
+                        sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                        last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id, \
+                        group_key_id\
+                     ) VALUES (?1, 'inline', ?2, NULL, ?3, NULL, ?4, 0, ?5, ?6, \
+                               (SELECT owner_key_id FROM federation_streams WHERE stream_id = ?7), \
+                               ?8) \
+                     ON CONFLICT (sha256) DO NOTHING",
+                    rusqlite::params![
+                        child_sha,
+                        c.body,
+                        i64::try_from(c.body.len()).unwrap_or(i64::MAX),
+                        now_iso,
+                        p.cohort_scope,
+                        p.tier,
+                        p.stream_id,
+                        group
+                    ],
+                )?;
+                if let Some(b) = &p.binding {
+                    let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+                    tx.execute(
+                        "INSERT INTO federation_community_blob_epoch \
+                            (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                         VALUES (?1, ?2, ?3, ?4) ON CONFLICT (at_rest_sha256) DO NOTHING",
+                        rusqlite::params![child_sha, b.community_key_id, b.minter_key_id, ep],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT INTO federation_manifest_children (root_sha256, child_index, child_sha256) \
+                     VALUES (?1, ?2, ?3) ON CONFLICT (root_sha256, child_index) DO NOTHING",
+                    rusqlite::params![
+                        sha_vec,
+                        i64::try_from(c.index).unwrap_or(i64::MAX),
+                        child_sha
+                    ],
+                )?;
+            }
+            // v53.1.0 (#979) — the manifest's chunks, from the stream's own rows.
+            sqlite_link_dag_chunks(&tx, &sha_vec, &p.stream_id)?;
+            tx.execute(
+                "UPDATE federation_stream_chunks SET sealed_at = ?2 WHERE stream_id = ?1",
+                rusqlite::params![p.stream_id, now_iso],
+            )?;
+            tx.commit()?;
+            Ok(SealWrite::Sealed)
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("seal_stream_with_scope tx: {e}"))
+        })
+    }
+}
+
+/// v61 (CIRISPersist#934) — Codex r2 on #1065: a DAG manifest's chunk
+/// relation, written in its row's transaction.
+fn sqlite_insert_dag_links(
+    tx: &rusqlite::Transaction<'_>,
+    planned: &crate::federation::blob_admit::PlannedDag,
+) -> Result<(), rusqlite::Error> {
+    if let Some(m) = planned.manifest_sha() {
+        for (seq, chunk) in &planned.links {
+            tx.execute(
+                "INSERT INTO federation_dag_chunks (manifest_sha256, seq, chunk_sha256, stream_id) \
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT (manifest_sha256, seq) DO NOTHING",
+                rusqlite::params![m.to_vec(), seq, chunk, planned.link_stream],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// v61 (CIRISPersist#934) — the accord evidence executor on sqlite.

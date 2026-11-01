@@ -2833,19 +2833,35 @@ mod run {
         const EXEMPT: &[(&str, &str)] = &[
             (
                 "sqlite_append_chunk_item",
-                "the chunk floor's per-item writer; put_blob_chunks_floor asks before it",
+                "the chunk floor's per-item writer; its plan (chunk_floor_planned) asks before it",
             ),
             (
                 "pg_append_chunk_item",
-                "the chunk floor's per-item writer; put_blob_chunks_floor asks before it",
+                "the chunk floor's per-item writer; its plan (chunk_floor_planned) asks before it",
             ),
             (
                 "seal_stream",
                 "writes a manifest this node computes over chunks the chunk floor admitted",
             ),
             (
-                "seal_stream_with_scope",
+                "store_planned_seal",
                 "writes a manifest this node computes over chunks the chunk floor admitted",
+            ),
+            // v61 (CIRISPersist#934, S4a) — the byte writes' executors: each
+            // door's shared plan asks the tombstone (`tombstone_floor`) before
+            // it hands the executor a row; the plans are held below.
+            (
+                "store_planned_blob",
+                "the byte doors' executor; put_blob_planned / store_blob_local_planned / \
+                 adopt_sealed_blob_planned ask before it",
+            ),
+            (
+                "store_planned_dag",
+                "put_blob_chunks' executor; put_blob_chunks_planned asks before it",
+            ),
+            (
+                "store_planned_dag_over_held",
+                "the DAG finalize's executor; put_dag_manifest_over_held_planned asks before it",
             ),
         ];
         let root = env!("CARGO_MANIFEST_DIR");
@@ -2887,11 +2903,9 @@ mod run {
                 checked.insert(name);
             }
             for door in [
-                "put_blob_with_scope",
-                "store_blob_local",
-                "put_blob_chunks",
-                "put_dag_manifest_over_held",
-                "adopt_sealed_blob_at",
+                "store_planned_blob",
+                "store_planned_dag",
+                "store_planned_dag_over_held",
             ] {
                 assert!(
                     checked.contains(door),
@@ -2912,6 +2926,31 @@ mod run {
             floor.contains("steward_purge::refuse_tombstoned_bytes("),
             "I797: the chunk floor asks the tombstone for every item"
         );
+        // ...and every byte write's plan asks before its executor writes.
+        let ask = &plan[plan
+            .find("async fn tombstone_floor<")
+            .expect("the byte writes' pre-read")..];
+        let ask = &ask[..ask.find("\n}\n").expect("its end")];
+        assert!(
+            ask.contains("steward_purge::refuse_tombstoned_bytes("),
+            "I797: the byte writes' pre-read asks the tombstone"
+        );
+        for door in [
+            "put_blob_planned<",
+            "store_blob_local_planned<",
+            "adopt_sealed_blob_planned<",
+            "put_blob_chunks_planned<",
+            "put_dag_manifest_over_held_planned<",
+        ] {
+            let body = &plan[plan
+                .find(&format!("async fn {door}"))
+                .unwrap_or_else(|| panic!("I797: {door} is not in blob_admit.rs"))..];
+            let body = &body[..body.find("\n}\n").expect("its end")];
+            assert!(
+                body.contains("tombstone_floor(dir,"),
+                "I797: {door} writes bytes without asking the tombstone first"
+            );
+        }
     }
 
     #[test]
