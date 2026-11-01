@@ -54,6 +54,7 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 - Under every other protocol a self-signed admission is refused (`roster_consensus_insufficient`). This is a widening whose only signer is the member it seats or re-roles, including a seated member re-roling themselves.
 - `consensus::Ballot` gains `subject: Option<&str>`, the one member a change names. A Rust consumer that builds a `Ballot` literal adds it.
 - `public_room::live_standing_proposal(directory, community_key_id)` is new (CIRISPersist#1063; CC 3.2 "replicated on join, visible to everyone on request"). It is the read a member's node answers a non-member's request with. It returns a public `open:self_admit` room's live standing proposal: signed by a founder active now, not expired, not withdrawn or superseded by its proposer, the latest by signed instant. The row is servable to the requester's node, because a public room is a public group to `may_receive`, and that node admits it on its replicated door. A host serves it on request; nothing pushes it.
+- Under a `reverse_quorum` protocol a membership WIDENING is reversible, as a removal already was (CIRISPersist#1100 item 2(i)). It uses the same objection fold, action reference, `m`, window and dismissals. An add's reversal must also reach the two-path count minimum of a community (2), so one objector never takes a member off. A roster that held an objected-to widening now folds without that member once enough objections land.
 
 ### Changed
 

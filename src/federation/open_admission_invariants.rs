@@ -24,6 +24,11 @@
 //!   door, the requester accepts on their own node, and the member's node
 //!   admits the acceptance and the requester's own widening. A withdrawn
 //!   proposal is no longer live; a private room has none.
+//! - **I1505** (CIRISPersist#1100 item 2(i)) — under `reverse_quorum` a
+//!   WIDENING is reversible by the same objection fold as a removal: `m`
+//!   distinct in-window objectors take the added member back off; one
+//!   objector does not, even where `m` is 1 (the two-path count minimum, one
+//!   voice never decides who is in a room).
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -362,6 +367,142 @@ pub(crate) mod bodies {
         .expect("I1502: the founder's widening admits under quorum:1/1");
     }
 
+    /// An objection by `objector` against the widening of `member` into
+    /// `cid` (the action is the widening row's hash, its actor the signer).
+    async fn object_to_widening(
+        d: &dyn FederationDirectory,
+        cid: &str,
+        actor: &str,
+        objector: &str,
+        member: &str,
+        effective_at: DateTime<Utc>,
+    ) {
+        use crate::federation::cohort::Cohort;
+        use crate::federation::reverse_quorum::{
+            objection_envelope, record_objection_against, ActionRef, ObjectionOutcome,
+        };
+        let row_hash = d
+            .list_community_membership_widenings_for(cid)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|w| w.member_key_id == member && w.effective_at == effective_at)
+            .expect("the widening is stored")
+            .persist_row_hash;
+        let mut o = ts::bare_attestation(
+            &uuid::Uuid::new_v4().to_string(),
+            objector,
+            actor,
+            &objection_envelope(Cohort::Community, cid, &row_hash, "not this one"),
+        );
+        o.attestation_type = crate::federation::types::attestation_type::SCORES.into();
+        o.weight = None;
+        o.asserted_at = effective_at + Duration::seconds(30);
+        o.scrub_timestamp = o.asserted_at;
+        ts::seal_row_in_place(objector, &mut o);
+        let outcome = record_objection_against(
+            d,
+            &o,
+            ActionRef {
+                actor_key_id: actor,
+                action_id: &row_hash,
+                asserted_at: effective_at,
+            },
+        )
+        .await
+        .expect("I1505: the objection door");
+        assert!(
+            matches!(outcome, ObjectionOutcome::Admitted),
+            "I1505: {objector}'s objection: {outcome:?}"
+        );
+    }
+
+    /// Found `cid` under `protocol` with `founders`, and add `joiner` (the
+    /// proposal, the acceptance, the widening signed by `signers`).
+    async fn reverse_room_with_joiner(
+        d: &dyn FederationDirectory,
+        cid: &str,
+        protocol: &str,
+        founders: &[&str],
+        signers: &[&str],
+        joiner: &str,
+        at: DateTime<Utc>,
+    ) -> DateTime<Utc> {
+        found_community(d, cid, protocol, founders, &[])
+            .await
+            .unwrap();
+        let p = proposal(
+            founders[0],
+            COMMUNITY,
+            cid,
+            joiner,
+            None,
+            at,
+            Some(Duration::days(7)),
+        );
+        put(d, &p).await.unwrap();
+        put(
+            d,
+            &reply(joiner, joiner, &p, true, at + Duration::seconds(1)),
+        )
+        .await
+        .unwrap();
+        let effective = ms(at + Duration::seconds(2));
+        widen_community(d, cid, signers, joiner, None, effective)
+            .await
+            .expect("the widening under reverse_quorum");
+        assert!(active(d, cid, joiner).await, "the joiner is in");
+        effective
+    }
+
+    /// **I1505** — the reverse path for adds.
+    pub(crate) async fn i1505_a_widening_is_reversible_under_reverse_quorum(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        let k = |n: &str| format!("i1505-{n}-{s}");
+        let (a, b, c, e, j, j1) = (k("a"), k("b"), k("c"), k("e"), k("j"), k("j1"));
+        let (room, low) = (k("room"), k("low"));
+        reg(d, &[&a, &b, &c, &e, &j, &j1, &room, &low]).await;
+        let at = Utc::now() - Duration::minutes(30);
+        // m = 2 of four founders: an add needs a strict majority forward (3).
+        let eff = reverse_room_with_joiner(
+            d,
+            &room,
+            "reverse_quorum:2/4:86400",
+            &[&a, &b, &c, &e],
+            &[&a, &b, &c],
+            &j,
+            at,
+        )
+        .await;
+        object_to_widening(d, &room, &a, &e, &j, eff).await;
+        assert!(active(d, &room, &j).await, "I1505: one objection of m = 2");
+        object_to_widening(d, &room, &a, &c, &j, eff).await;
+        assert!(
+            !active(d, &room, &j).await,
+            "I1505: m distinct in-window objectors reverse the add"
+        );
+        // m = 1: a removal would reverse on one voice; an add does not.
+        let eff = reverse_room_with_joiner(
+            d,
+            &low,
+            "reverse_quorum:1/3:86400",
+            &[&a, &b, &c],
+            &[&a, &b],
+            &j1,
+            at,
+        )
+        .await;
+        object_to_widening(d, &low, &a, &c, &j1, eff).await;
+        assert!(
+            active(d, &low, &j1).await,
+            "I1505: one voice never takes a member off (the count minimum is 2)"
+        );
+        object_to_widening(d, &low, &a, &b, &j1, eff).await;
+        assert!(!active(d, &low, &j1).await, "I1505: two voices do");
+    }
+
     async fn remove(
         d: &dyn FederationDirectory,
         cid: &str,
@@ -586,6 +727,7 @@ mod runners {
                 case!(i1501_open_self_admit_only_on_a_public_room);
                 case!(i1502_the_joiner_admits_themselves);
                 case!(i1503_removal_takes_two_voices);
+                case!(i1505_a_widening_is_reversible_under_reverse_quorum);
 
                 #[tokio::test]
                 async fn i1504_a_standing_proposal_is_served_on_request() {

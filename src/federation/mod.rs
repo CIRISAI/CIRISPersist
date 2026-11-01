@@ -1511,7 +1511,8 @@ pub struct RosterEvent {
     /// Founders from whom a live (at `effective_at`) `moderate` chain reaches a
     /// signer. The fold honours one only while it is an active founder.
     pub moderator_roots: std::collections::BTreeSet<String>,
-    /// A `reverse_quorum` removal the objection fold has reversed.
+    /// A `reverse_quorum` removal or (v61, CIRISPersist#1100 item 2(i))
+    /// widening the objection fold has reversed.
     pub reversed: bool,
 }
 
@@ -1946,7 +1947,7 @@ where
             .find(|s| s.member_key_id == member && s.effective_at == at)
     }
     let mut events = Vec::with_capacity(stored.len());
-    let mut reverse_candidates: Vec<(usize, String, String)> = Vec::new();
+    let mut reverse_candidates: Vec<(usize, String, String, bool)> = Vec::new();
     for ev in stored {
         let list = if ev.is_add {
             &signers.widening_signers
@@ -1958,9 +1959,12 @@ where
         // Moderator standing is filled in a second pass (below): it needs
         // each root's authority intervals, which come from these events.
         let moderator_roots = std::collections::BTreeSet::new();
-        if !ev.is_add && reverse {
+        // v61 (CIRISPersist#1100 item 2(i)) — a WIDENING is reversible
+        // too: the reverse path for adds is the same objection fold, a
+        // condition change, never a second machine.
+        if reverse {
             if let Some(actor) = row_signer.and_then(|x| x.authority_key_id.clone()) {
-                reverse_candidates.push((events.len(), actor, ev.row_hash.clone()));
+                reverse_candidates.push((events.len(), actor, ev.row_hash.clone(), ev.is_add));
             }
         }
         events.push(RosterEvent {
@@ -2025,7 +2029,7 @@ where
     } else {
         None
     };
-    for (idx, actor, row_hash) in reverse_candidates {
+    for (idx, actor, row_hash, is_add) in reverse_candidates {
         let fold = Box::pin(reverse_quorum::resolve_reverse_quorum_with(
             directory.as_dyn_directory(),
             cohort,
@@ -2041,7 +2045,14 @@ where
             now,
         ))
         .await?;
-        events[idx].reversed = fold.standing == reverse_quorum::ReverseQuorumStanding::Reversed;
+        // An add's reversal also clears the two-path count minimum of a
+        // community (`two_path::FloorClass::Voters`, the table's `min_count`
+        // 2): one voice never decides who is in a room (CC 4.5.13), in
+        // either direction. A removal's reversal keeps the #574 threshold.
+        let reaches_floor =
+            !is_add || fold.distinct_objectors >= two_path::FloorClass::Voters.min_count();
+        events[idx].reversed =
+            fold.standing == reverse_quorum::ReverseQuorumStanding::Reversed && reaches_floor;
     }
     Ok(events)
 }
