@@ -754,6 +754,13 @@ where
     // audience, the member the row names included, never the per-node
     // content allow list.
     if let Ok(Some(signed)) = super::group_plane::group_signed_of_row(row) {
+        // v61 (CIRISPersist#1148) — a group's RECORD names its own audience:
+        // a public record reaches everyone, and a member it seats is in its
+        // audience before any node holds it (a founder's node receives the
+        // founding record it co-signed; the put-time gate asks this).
+        if let Some(v) = record_names_its_audience(dir, recipient, &signed).await? {
+            return Ok(v);
+        }
         return may_receive_group_plane(
             dir,
             recipient,
@@ -827,6 +834,73 @@ where
         a if a.contains(recipient) => Ok(Verdict::Yes(Reason::Cohort)),
         _ => Ok(Verdict::No(Reason::NotInAudience)),
     }
+}
+
+/// v61 (CIRISPersist#1148) — the audience a group RECORD names by itself:
+/// `Some(Yes(Public))` for a public community record, `Some(Yes(Cohort))`
+/// when a member it lists is one of `recipient`'s principals, else `None`
+/// (the stored group's membership plane decides). Not a plane row: `None`.
+async fn record_names_its_audience<D>(
+    dir: &D,
+    recipient: &str,
+    signed: &super::group_plane::GroupSigned,
+) -> Result<Option<Verdict>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    use super::group_plane::GroupSigned;
+    let members: Vec<&str> = match signed {
+        GroupSigned::Community(c) => {
+            if super::public_room::is_public_community(&c.community) {
+                return Ok(Some(Verdict::Yes(Reason::Public)));
+            }
+            c.community
+                .members
+                .iter()
+                .map(|m| m.key_id.as_str())
+                .collect()
+        }
+        GroupSigned::Family(f) => f.family.members.iter().map(|m| m.key_id.as_str()).collect(),
+        _ => return Ok(None),
+    };
+    let mut principals: HashSet<String> = super::self_collective::principals_of(dir, recipient)
+        .await?
+        .into_iter()
+        .collect();
+    principals.insert(recipient.to_owned());
+    Ok(members
+        .iter()
+        .any(|m| principals.contains(*m))
+        .then_some(Verdict::Yes(Reason::Cohort)))
+}
+
+/// v61 (CIRISPersist#1148) — may `recipient` receive the community RECORD
+/// `community` (the typed replicated door's question): what the record names
+/// by itself, else the stored group's membership-plane audience.
+///
+/// # Errors
+///
+/// Directory reads.
+pub async fn may_receive_community_record<D>(
+    dir: &D,
+    recipient: &str,
+    community: &super::types::SignedCommunity,
+) -> Result<Verdict, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let signed = super::group_plane::GroupSigned::Community(community.clone());
+    if let Some(v) = record_names_its_audience(dir, recipient, &signed).await? {
+        return Ok(v);
+    }
+    may_receive_group_plane(
+        dir,
+        recipient,
+        cs::COMMUNITY,
+        &community.community.community_key_id,
+        None,
+    )
+    .await
 }
 
 /// **The membership-plane audience of a group (CIRISEdge#761, CC 5.4.6).**

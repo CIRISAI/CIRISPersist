@@ -1092,6 +1092,9 @@ where
                             super::group_amendment::ReplicatedCommunityRefusal::DegradesConformance => {
                                 "degrades_conformance"
                             }
+                            super::group_amendment::ReplicatedCommunityRefusal::NotInAudience => {
+                                "not_in_audience"
+                            }
                         }));
                     }
                 }

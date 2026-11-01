@@ -202,6 +202,9 @@ pub mod consent_sweep_principals_invariants;
 /// their id, distinct ones ranked read-time within one audience.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod composer_rank_invariants;
+/// v61 S2 (CIRISPersist#1148) — I1509: a replicated write needs the audience.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod put_audience_invariants;
 #[cfg(test)]
 mod consent_sweep_plan_invariants;
 /// v53.1.0 (CIRISPersist#979) — I480–I487: a chunk of a withdrawn file is

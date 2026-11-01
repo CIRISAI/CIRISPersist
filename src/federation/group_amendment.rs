@@ -75,6 +75,11 @@ pub enum ReplicatedCommunityRefusal {
     /// stored infrastructure record with a non-conformant one (a weakening
     /// supersede, CC 3.2).
     DegradesConformance,
+    /// v61 (CIRISPersist#1148) — THIS node is not in the record's audience
+    /// (`replication_audience::may_receive_community_record` for its own
+    /// key): a replicated door stores only what this node may receive.
+    /// APPENDED.
+    NotInAudience,
 }
 
 /// v50.0.0 (PR #921 review, Codex F3) — what a community write DID, as the
