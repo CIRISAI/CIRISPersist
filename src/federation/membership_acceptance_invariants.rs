@@ -91,6 +91,19 @@ pub(crate) mod bodies {
         found_room(d, cid, protocol, founders, unsigned, Some(blob)).await
     }
 
+    /// v61 S2 (CIRISPersist#1143) — [`found_community`] carrying `policy_blob`
+    /// (an affiliation with its config).
+    pub(crate) async fn found_room_with_blob<D: FederationDirectory + ?Sized>(
+        d: &D,
+        cid: &str,
+        protocol: &str,
+        founders: &[&str],
+        unsigned: &[&str],
+        policy_blob: Option<serde_json::Value>,
+    ) -> Result<(), Error> {
+        found_room(d, cid, protocol, founders, unsigned, policy_blob).await
+    }
+
     async fn found_room<D: FederationDirectory + ?Sized>(
         d: &D,
         cid: &str,

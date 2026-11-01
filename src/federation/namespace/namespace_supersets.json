@@ -15909,6 +15909,14 @@
     "manifest_round": "v61-s2-1157"
    },
    {
+    "decimal_id": "4.4.3.2.8",
+    "claim_id": "CLM-affiliation-one-voice-countersign",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/affiliation_config.rs#check_one_voice_countersign",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1143"
+   },
+   {
     "decimal_id": "4.5.13",
     "claim_id": "CLM-one-voice-room",
     "repo": "CIRISPersist",

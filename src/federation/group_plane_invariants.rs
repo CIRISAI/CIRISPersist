@@ -640,10 +640,12 @@ pub(crate) mod bodies {
             "{tag}: the retracted widening seats nobody"
         );
         all_linked(d, GroupPlaneTable::FamilyWidenings, tag).await;
-        // The group's record is never withdrawn, cosigned or not: a withdraws
-        // of it means dissolution, which is refused by name until S2 (#1143).
-        // Its own signer alone, a quorum, and the whole roster are all
-        // refused, store nothing and leave the roster where it was.
+        // A FAMILY's record is never withdrawn, cosigned or not: its
+        // dissolution is its own terminal amendment (#956), so a withdraws of
+        // its record is refused by name (v61 S2, #1143: a community's record
+        // withdraws IS its dissolution, I1514). Its own signer alone, a
+        // quorum, and the whole roster are all refused, store nothing and
+        // leave the roster where it was.
         let before = sorted_active(dd, &fam).await;
         for cosigners in [
             &[][..],

@@ -301,13 +301,10 @@ fn evaluate_open_self_admit(b: &Ballot<'_>, got: &[&Seat]) -> Verdict {
                     ))
                 };
             }
-            Some(_) => {}
-            None => {
-                return insufficient(format!(
-                    "{}: a change naming no one joiner admits no one",
-                    cp::OPEN_SELF_ADMIT
-                ))
-            }
+            // v61 S2 (CIRISPersist#1143) — a change naming no one member (a
+            // dissolution, a whole-roster change) admits no joiner by itself:
+            // it takes the two-voice floor like a removal.
+            Some(_) | None => {}
         }
     }
     let voices = got
@@ -559,17 +556,21 @@ mod tests {
         // A seated member's self-promotion is a role change: two voices.
         assert!(!eval_about(p, pubk, &r, &["b"], "b", Add).admits());
         assert!(eval_about(p, pubk, &r, &["a", "c"], "b", Add).admits());
-        // A whole-roster change admits no joiner by itself.
-        assert!(!evaluate(&Ballot {
-            protocol: p,
-            subkind: pubk,
-            policy_blob: None,
-            roster: &r,
-            signers: &signers(&["a", "b", "c"]),
-            direction: Add,
-            subject: None,
-        })
-        .admits());
+        // A whole-group change (a dissolution) takes the two-voice floor.
+        let whole = |s: &[&str]| {
+            evaluate(&Ballot {
+                protocol: p,
+                subkind: pubk,
+                policy_blob: None,
+                roster: &r,
+                signers: &signers(s),
+                direction: Add,
+                subject: None,
+            })
+            .admits()
+        };
+        assert!(!whole(&["a"]), "one voice never dissolves a room");
+        assert!(whole(&["a", "b"]), "two voices do");
         // Off a public group the protocol cannot be evaluated.
         assert!(matches!(
             eval_about(p, None, &r, &["j"], "j", Add),

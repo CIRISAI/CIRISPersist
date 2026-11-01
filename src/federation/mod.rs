@@ -198,6 +198,10 @@ pub(crate) mod community_trust_consent_invariants;
 #[cfg(test)]
 pub mod consent_sweep_principals_invariants;
 // v60.0.0 (CIRISPersist#934 step 4, #1105) — I1192–I1201.
+/// v61 S2 (CIRISPersist#1143) — I1513–I1514: the affiliation floor and
+/// dissolution.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod affiliation_floor_invariants;
 /// v61 S2 (CIRISPersist#1155 / #1157) — I1506–I1508: composers idempotent on
 /// their id, distinct ones ranked read-time within one audience.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -2246,6 +2250,17 @@ pub async fn authorized_community_roster_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v61 S2 (CIRISPersist#1143; CC rc14 4.4.3.2.8) — seats lapse at the
+    // dissolution: from its instant the room seats nobody.
+    if Box::pin(group_plane::community_dissolved_at(
+        directory,
+        &community.community_key_id,
+    ))
+    .await?
+    .is_some_and(|at| at <= as_of)
+    {
+        return Ok(Vec::new());
+    }
     // Boxed: the replay nests the moderator walk and the reverse-quorum
     // fold; a caller's future must not inline all of it (2 MiB worker stacks).
     let nodes = Box::pin(community_node_bearing_seats(directory, community)).await?;
@@ -2362,6 +2377,25 @@ where
     let Some(community) = directory.lookup_community(community_key_id).await? else {
         return Ok(());
     };
+    // v61 S2 (CIRISPersist#1143) — a dissolved room admits no seat and no
+    // removal: no new seat or grant is issued, and the DEK rotates no more.
+    Box::pin(group_plane::refuse_if_community_dissolved(
+        directory,
+        community_key_id,
+    ))
+    .await?;
+    // v61 S2 (CIRISPersist#1143; CC rc14 4.4.3.2.8) — an act against a member
+    // of a one-voice affiliation needs a countersign from outside the seat.
+    if is_revocation && !signers.contains(&incoming.key_id) {
+        Box::pin(affiliation_config::check_one_voice_countersign(
+            directory,
+            &community,
+            primary,
+            signers,
+            effective_at,
+        ))
+        .await?;
+    }
     // v50.0.0 (CIRISPersist#926, HIGH-3 ruling) — a trust-root community's
     // founder seats move ONLY through the record (a founders' amendment); the
     // planes admit and remove members only, whoever signs.
