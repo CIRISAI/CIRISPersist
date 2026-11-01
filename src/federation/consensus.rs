@@ -88,7 +88,21 @@ pub struct Ballot<'a> {
     pub signers: &'a BTreeSet<String>,
     /// Which way the change moves the roster.
     pub direction: Direction,
+    /// v61 (CIRISPersist#1123) — the ONE member the change seats or
+    /// removes, when it names exactly one (a widening or a revocation row);
+    /// `None` for a whole-roster change (a membership-change envelope).
+    /// [`consensus_protocol::OPEN_SELF_ADMIT`](cp::OPEN_SELF_ADMIT) reads it:
+    /// the joiner's own signature is the group's side of their admission, and
+    /// the member a removal names is never one of its voices.
+    pub subject: Option<&'a str>,
 }
+
+/// v61 (CIRISPersist#1123; CC 4.5.13 "never fewer than two voices in a
+/// community") — under `open:self_admit` anyone admits themselves, so the
+/// guarantee that no single vote decides who is in a room attaches to
+/// REMOVAL: at least this many distinct eligible members, the removed member
+/// not among them, sign a removal.
+pub const OPEN_SELF_ADMIT_REMOVAL_FLOOR: usize = 2;
 
 /// The evaluator's answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +172,22 @@ pub fn evaluate(b: &Ballot<'_>) -> Verdict {
     let elig = eligible(b);
     let got = counted(&elig, b.signers);
     let n = elig.len();
+    if b.protocol == cp::OPEN_SELF_ADMIT {
+        return evaluate_open_self_admit(b, &got);
+    }
+    // v61 (CIRISPersist#1123; CC 4.4.3.4.2) — a self-signed admission is
+    // `open:self_admit`'s alone: under every other protocol a key does not
+    // seat (or re-role) itself, whatever seat it already holds.
+    if b.direction == Direction::Add
+        && b.subject
+            .is_some_and(|k| b.signers.len() == 1 && b.signers.contains(k))
+    {
+        return insufficient(format!(
+            "a self-signed admission is admitted only under {}; {:?} needs the group's side",
+            cp::OPEN_SELF_ADMIT,
+            b.protocol
+        ));
+    }
     if got.is_empty() {
         return insufficient(format!(
             "no signer is an eligible member ({n} eligible under {:?})",
@@ -239,6 +269,60 @@ pub fn evaluate(b: &Ballot<'_>) -> Verdict {
         return eval_expr(b, &elig, &got, expr, 0);
     }
     unevaluable(format!("{p:?} is not a canonical consensus_protocol form"))
+}
+
+/// v61 (CIRISPersist#1123; CC 4.4.3.4.2's `open:self_admit` arm, CC
+/// 4.5.13's floor) — open admission, on a `public` group only:
+///
+/// - **a widening that seats one NEW key** is admitted on that key's own
+///   signature (the joiner's acceptance of the standing proposal is the
+///   growth gate's, as under every protocol);
+/// - **a role change** of a seated member, and **a removal**, need at least
+///   [`OPEN_SELF_ADMIT_REMOVAL_FLOOR`] distinct eligible signers, the member
+///   the change names not counted: one voice never decides who is in a room;
+/// - a whole-roster change (no single subject) gains no one by itself.
+fn evaluate_open_self_admit(b: &Ballot<'_>, got: &[&Seat]) -> Verdict {
+    if b.subkind != Some(super::public_room::COHORT_SUBKIND_PUBLIC) {
+        return unevaluable(format!(
+            "{} is admissible only on a public group (CC 4.4.3.2)",
+            cp::OPEN_SELF_ADMIT
+        ));
+    }
+    let seated = |k: &str| b.roster.iter().any(|s| s.key_id == k);
+    if b.direction == Direction::Add {
+        match b.subject {
+            Some(k) if !seated(k) => {
+                return if b.signers.contains(k) {
+                    Verdict::Admit
+                } else {
+                    insufficient(format!(
+                        "{}: the joiner {k} did not sign their own admission",
+                        cp::OPEN_SELF_ADMIT
+                    ))
+                };
+            }
+            Some(_) => {}
+            None => {
+                return insufficient(format!(
+                    "{}: a change naming no one joiner admits no one",
+                    cp::OPEN_SELF_ADMIT
+                ))
+            }
+        }
+    }
+    let voices = got
+        .iter()
+        .filter(|s| Some(s.key_id.as_str()) != b.subject)
+        .count();
+    if voices >= OPEN_SELF_ADMIT_REMOVAL_FLOOR {
+        Verdict::Admit
+    } else {
+        insufficient(format!(
+            "{}: {voices} distinct voice(s) besides the member named; one vote never \
+             decides who is in a room (at least {OPEN_SELF_ADMIT_REMOVAL_FLOOR})",
+            cp::OPEN_SELF_ADMIT
+        ))
+    }
 }
 
 fn parse_quorum_tail(tail: &str) -> Option<(u32, u32)> {
@@ -430,7 +514,89 @@ mod tests {
             roster,
             signers: &signers(s),
             direction: d,
+            subject: None,
         })
+    }
+
+    fn eval_about(
+        p: &str,
+        sub: Option<&str>,
+        roster: &[Seat],
+        s: &[&str],
+        subject: &str,
+        d: Direction,
+    ) -> Verdict {
+        evaluate(&Ballot {
+            protocol: p,
+            subkind: sub,
+            policy_blob: None,
+            roster,
+            signers: &signers(s),
+            direction: d,
+            subject: Some(subject),
+        })
+    }
+
+    /// v61 (CIRISPersist#1123) — `open:self_admit`: a new key admits itself;
+    /// a removal or a role change needs two voices besides the member named;
+    /// the protocol is unevaluable outside a public group.
+    #[test]
+    fn open_self_admit_admits_the_joiner_and_floors_removal_at_two() {
+        use Direction::{Add, Remove};
+        let p = cp::OPEN_SELF_ADMIT;
+        let pubk = Some("public");
+        let r = seats(&[("a", Some("founder")), ("b", None), ("c", None)]);
+        // The joiner's own signature is the group's side.
+        assert!(eval_about(p, pubk, &r, &["j"], "j", Add).admits());
+        // Somebody else's signature is not the joiner's consent.
+        assert!(!eval_about(p, pubk, &r, &["a"], "j", Add).admits());
+        // One voice never excludes; two do; the member named is no voice.
+        assert!(!eval_about(p, pubk, &r, &["a"], "c", Remove).admits());
+        assert!(!eval_about(p, pubk, &r, &["a", "c"], "c", Remove).admits());
+        assert!(eval_about(p, pubk, &r, &["a", "b"], "c", Remove).admits());
+        // A non-member's signature is no voice.
+        assert!(!eval_about(p, pubk, &r, &["a", "x"], "c", Remove).admits());
+        // A seated member's self-promotion is a role change: two voices.
+        assert!(!eval_about(p, pubk, &r, &["b"], "b", Add).admits());
+        assert!(eval_about(p, pubk, &r, &["a", "c"], "b", Add).admits());
+        // A whole-roster change admits no joiner by itself.
+        assert!(!evaluate(&Ballot {
+            protocol: p,
+            subkind: pubk,
+            policy_blob: None,
+            roster: &r,
+            signers: &signers(&["a", "b", "c"]),
+            direction: Add,
+            subject: None,
+        })
+        .admits());
+        // Off a public group the protocol cannot be evaluated.
+        assert!(matches!(
+            eval_about(p, None, &r, &["j"], "j", Add),
+            Verdict::Unevaluable { .. }
+        ));
+    }
+
+    /// v61 (CIRISPersist#1123; CC 4.4.3.4.2) — every protocol but
+    /// `open:self_admit` refuses a self-signed admission, even from a seat.
+    #[test]
+    fn a_self_signed_admission_is_refused_by_every_other_protocol() {
+        let r = seats(&[("a", Some("founder")), ("b", None)]);
+        for p in [cp::FOUNDER_ONLY, cp::MAJORITY, cp::UNANIMOUS, "quorum:1/2"] {
+            assert!(
+                !eval_about(p, None, &r, &["a"], "a", Direction::Add).admits(),
+                "{p}: a founder re-seating itself alone"
+            );
+            assert!(
+                !eval_about(p, None, &r, &["j"], "j", Direction::Add).admits(),
+                "{p}: a stranger seating itself"
+            );
+        }
+        // The same signer seating someone else still admits where it did.
+        assert!(eval_about(cp::FOUNDER_ONLY, None, &r, &["a"], "j", Direction::Add).admits());
+        // A removal by the removed member is not an admission (resignation is
+        // the fold's own rule).
+        assert!(eval_about(cp::FOUNDER_ONLY, None, &r, &["a"], "a", Direction::Remove).admits());
     }
 
     #[test]
@@ -533,6 +699,7 @@ mod tests {
             roster: &r,
             signers: &signers(&["a", "c", "d"]),
             direction: Direction::Add,
+            subject: None,
         });
         assert!(
             !v.admits(),
@@ -563,6 +730,7 @@ mod tests {
             roster: &r,
             signers: &signers(&["install"]),
             direction: Direction::Add,
+            subject: None,
         };
         let elig: Vec<&str> = eligible(&b).iter().map(|s| s.key_id.as_str()).collect();
         assert_eq!(

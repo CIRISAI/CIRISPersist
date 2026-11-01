@@ -76,6 +76,21 @@ pub(crate) mod bodies {
         found_room(d, cid, protocol, founders, unsigned, Some(blob)).await
     }
 
+    /// v61 (CIRISPersist#1123) — [`found_community`] as a `public` room
+    /// (`policy_blob.cohort_subkind: public`).
+    pub(crate) async fn found_public_room<D: FederationDirectory + ?Sized>(
+        d: &D,
+        cid: &str,
+        protocol: &str,
+        founders: &[&str],
+        unsigned: &[&str],
+    ) -> Result<(), Error> {
+        let blob = serde_json::json!({
+            "cohort_subkind": crate::federation::public_room::COHORT_SUBKIND_PUBLIC
+        });
+        found_room(d, cid, protocol, founders, unsigned, Some(blob)).await
+    }
+
     async fn found_room<D: FederationDirectory + ?Sized>(
         d: &D,
         cid: &str,
@@ -345,7 +360,7 @@ pub(crate) mod bodies {
             format!("i210-x-{s}"),
         );
         reg(d, &[&cid, &founder, &k, &stranger]).await;
-        found_community(d, &cid, "founder_only", &[&founder], &[])
+        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .expect("I210: the founder founds the room");
         let p = proposal(
@@ -431,7 +446,7 @@ pub(crate) mod bodies {
             format!("i211-x-{s}"),
         );
         reg(d, &[&cid, &founder, &k, &stranger]).await;
-        found_community(d, &cid, "founder_only", &[&founder], &[])
+        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let p = proposal(
@@ -490,7 +505,7 @@ pub(crate) mod bodies {
             format!("i1495-k-{s}"),
         );
         reg(d, &[&cid, &founder, &k]).await;
-        found_community(d, &cid, "founder_only", &[&founder], &[])
+        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let now = Utc::now();
@@ -555,7 +570,7 @@ pub(crate) mod bodies {
             format!("i212-j-{s}"),
         );
         reg(d, &[&cid, &fid, &founder, &k, &j]).await;
-        found_community(d, &cid, "founder_only", &[&founder], &[])
+        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let now = Utc::now();
@@ -590,17 +605,16 @@ pub(crate) mod bodies {
         )
         .await
         .expect("I212: a role change needs no acceptance");
-        // under founder_only only a founder invites: K (a plain member) cannot
-        let e = put(
+        // v61 (CIRISPersist#1123) — `founder_only` is refused above the
+        // family, so the room is `quorum:1/1`, under which any member invites:
+        // K (a plain member) may. The founders-only proposer rule on a room is
+        // `open:self_admit`'s (I1502); on a family it is witnessed below.
+        put(
             d,
             &proposal(&k, COMMUNITY, &cid, &j, None, now, Some(Duration::days(7))),
         )
         .await
-        .expect_err("I212: a non-founder's proposal under founder_only");
-        assert!(
-            matches!(e, Error::InvalidArgument(ref m) if m.contains("founder_only")),
-            "I212: {e:?}"
-        );
+        .expect("I212: a member's proposal under quorum:1/1");
         // the family plane, the same rule
         found_family(d, &fid, "founder_only", &[&founder], &[])
             .await
@@ -667,7 +681,7 @@ pub(crate) mod bodies {
             format!("i213-k-{s}"),
         );
         reg(d, &[&cid, &founder, &k]).await;
-        found_community(d, &cid, "founder_only", &[&founder], &[])
+        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let now = Utc::now();
@@ -761,7 +775,7 @@ pub(crate) mod bodies {
             format!("i214-m-{s}"),
         );
         reg(d, &[&cid, &founder, &k, &j, &m]).await;
-        found_community(d, &cid, "founder_only", &[&founder], &[])
+        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let t0 = Utc::now() - Duration::days(20);
@@ -855,7 +869,7 @@ pub(crate) mod bodies {
             format!("i215-k-{s}"),
         );
         reg(d, &[&cid, &founder, &k]).await;
-        found_community(d, &cid, "founder_only", &[&founder], &[])
+        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let now = Utc::now();
@@ -979,7 +993,7 @@ pub(crate) mod bodies {
             format!("i217-k-{s}"),
         );
         reg(d, &[&cid, &founder, &k]).await;
-        found_community(d, &cid, "founder_only", &[&founder], &[])
+        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let mut c = d.lookup_community(&cid).await.unwrap().unwrap();
@@ -1047,7 +1061,7 @@ pub(crate) mod bodies {
         for n in [a, b] {
             reg(n, &[&cid, &founder, &k]).await;
         }
-        found_community(a, &cid, "founder_only", &[&founder], &[])
+        found_community(a, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let now = Utc::now();

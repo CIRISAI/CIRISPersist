@@ -335,7 +335,16 @@ pub(crate) mod dyn_bodies {
         (k, alias)
     }
 
-    fn room(id: &str, founder: &str, member: Option<&str>, policy: serde_json::Value) -> Community {
+    /// v61 (CIRISPersist#1123) — the protocol is the fixture's choice:
+    /// `founder_only` is refused above the family, and open admission is
+    /// `open:self_admit`.
+    fn room(
+        id: &str,
+        founder: &str,
+        member: Option<&str>,
+        policy: serde_json::Value,
+        protocol: &str,
+    ) -> Community {
         let mut members = vec![CommunityMember {
             key_id: founder.to_owned(),
             joined_at: Utc::now() - Duration::days(1),
@@ -355,8 +364,7 @@ pub(crate) mod dyn_bodies {
             community_name: "Public Co-op".into(),
             members,
             founded_at: Utc::now() - Duration::days(1),
-            consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
-                .to_owned(),
+            consensus_protocol: protocol.to_owned(),
             policy_blob: Some(policy),
             persist_row_hash: String::new(),
         }
@@ -379,10 +387,16 @@ pub(crate) mod dyn_bodies {
     }
 
     fn open_policy() -> serde_json::Value {
-        serde_json::json!({"cohort_subkind": COHORT_SUBKIND_PUBLIC, "admission": ADMISSION_OPEN})
+        serde_json::json!({"cohort_subkind": COHORT_SUBKIND_PUBLIC})
     }
 
-    /// **I712** — `admission: open` and the `public` boundary.
+    const OPEN: &str = crate::federation::types::consensus_protocol::OPEN_SELF_ADMIT;
+    const CLOSED: &str = crate::federation::types::consensus_protocol::UNANIMOUS;
+
+    /// **I712** — open admission (`open:self_admit`, v61) and the
+    /// `public` boundary: the protocol only on a public room; a record that
+    /// still carries an `admission` member is refused by name (CC rc14 3.2:
+    /// there is no admission field).
     pub(crate) async fn i712_open_admission_only_on_a_public_room(
         d: &dyn FederationDirectory,
         tag: &str,
@@ -394,7 +408,8 @@ pub(crate) mod dyn_bodies {
                 &format!("i712-priv-{tag}"),
                 &founder,
                 None,
-                serde_json::json!({"admission": ADMISSION_OPEN}),
+                serde_json::json!({}),
+                OPEN,
             ),
         )
         .await
@@ -404,23 +419,25 @@ pub(crate) mod dyn_bodies {
             crate::federation::public_room::PUBLIC_RULE_OPEN_ADMISSION_NOT_PUBLIC,
             "I712 {e}"
         );
-        let bad =
-            serde_json::json!({"cohort_subkind": COHORT_SUBKIND_PUBLIC, "admission": "anyone"});
-        let e = put_room(d, room(&format!("i712-bad-{tag}"), &founder, None, bad))
-            .await
-            .unwrap_err();
+        let retired = serde_json::json!({"cohort_subkind": COHORT_SUBKIND_PUBLIC, "admission": ADMISSION_OPEN});
+        let e = put_room(
+            d,
+            room(&format!("i712-bad-{tag}"), &founder, None, retired, OPEN),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             rule_of(&e),
-            crate::federation::public_room::PUBLIC_RULE_ADMISSION_MALFORMED,
+            crate::federation::public_room::PUBLIC_RULE_ADMISSION_MEMBER_RETIRED,
             "I712 {e}"
         );
         let id = format!("i712-pub-{tag}");
-        put_room(d, room(&id, &founder, None, open_policy()))
+        put_room(d, room(&id, &founder, None, open_policy(), OPEN))
             .await
             .expect("I712 an open public room is admitted");
         // A later version that leaves the `public` side is refused, before
         // anything about the amendment itself is asked.
-        let mut private = room(&id, &founder, None, serde_json::json!({}));
+        let mut private = room(&id, &founder, None, serde_json::json!({}), CLOSED);
         private.prev_head_digest = d
             .lookup_community(&id)
             .await
@@ -447,7 +464,7 @@ pub(crate) mod dyn_bodies {
         let (stranger, _) = key(d, "i713s", tag).await;
         let (joiner, _) = key(d, "i713j", tag).await;
         let id = format!("i713-pub-{tag}");
-        put_room(d, room(&id, &founder, None, open_policy()))
+        put_room(d, room(&id, &founder, None, open_policy(), OPEN))
             .await
             .unwrap();
         let shut = format!("i713-shut-{tag}");
@@ -458,6 +475,7 @@ pub(crate) mod dyn_bodies {
                 &founder,
                 None,
                 serde_json::json!({"cohort_subkind": COHORT_SUBKIND_PUBLIC}),
+                CLOSED,
             ),
         )
         .await
@@ -527,13 +545,16 @@ pub(crate) mod dyn_bodies {
         let (founder, _) = key(d, "i775f", tag).await;
         let (outsider, _) = key(d, "i775o", tag).await;
         let id = format!("i775-pub-{tag}");
-        put_room(d, room(&id, &founder, None, open_policy()))
+        put_room(d, room(&id, &founder, None, open_policy(), OPEN))
             .await
             .unwrap();
         let private = format!("i775-priv-{tag}");
-        put_room(d, room(&private, &founder, None, serde_json::json!({})))
-            .await
-            .unwrap();
+        put_room(
+            d,
+            room(&private, &founder, None, serde_json::json!({}), CLOSED),
+        )
+        .await
+        .unwrap();
         assert!(
             is_public_group(d, &id).await.unwrap(),
             "I775 a public room is public"
@@ -620,7 +641,7 @@ pub(crate) mod dyn_bodies {
                 .is_none(),
             "I724 nothing stored"
         );
-        put_room(d, room(&id, &founder, None, open_policy()))
+        put_room(d, room(&id, &founder, None, open_policy(), OPEN))
             .await
             .unwrap();
         d.put_attestation(SignedAttestation {
@@ -647,7 +668,7 @@ pub(crate) mod dyn_bodies {
     ) {
         let (founder, _) = key(d, "i776f", tag).await;
         let id = format!("i776-pub-{tag}");
-        put_room(d, room(&id, &founder, None, open_policy()))
+        put_room(d, room(&id, &founder, None, open_policy(), OPEN))
             .await
             .unwrap();
         let now = Utc::now();
@@ -723,13 +744,19 @@ pub(crate) mod dyn_bodies {
         let (founder, founder_alias) = key(d, "i714f", tag).await;
         let (other, other_alias) = key(d, "i714o", tag).await;
         let pubroom = format!("i714-pub-{tag}");
-        put_room(d, room(&pubroom, &founder, Some(&other), open_policy()))
-            .await
-            .unwrap();
+        put_room(
+            d,
+            room(&pubroom, &founder, Some(&other), open_policy(), OPEN),
+        )
+        .await
+        .unwrap();
         let private = format!("i714-priv-{tag}");
-        put_room(d, room(&private, &founder, None, serde_json::json!({})))
-            .await
-            .unwrap();
+        put_room(
+            d,
+            room(&private, &founder, None, serde_json::json!({}), CLOSED),
+        )
+        .await
+        .unwrap();
         let good = |room: &str| {
             serde_json::json!({
                 "community_key_id": room, "cohort_subkind": COHORT_SUBKIND_PUBLIC,

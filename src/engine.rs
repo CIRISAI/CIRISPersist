@@ -18963,7 +18963,7 @@ mod tests {
                 role: Some("founder".into()),
             }],
             founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-            consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
+            consensus_protocol: "quorum:1/1".into(),
             policy_blob: None,
             persist_row_hash: String::new(),
         };
@@ -20211,7 +20211,7 @@ mod tests {
                         role: Some("founder".into()),
                     }],
                     founded_at: joined,
-                    consensus_protocol: types::consensus_protocol::FOUNDER_ONLY.into(),
+                    consensus_protocol: "quorum:1/1".into(),
                     policy_blob: None,
                     persist_row_hash: String::new(),
                 },
@@ -20236,9 +20236,16 @@ mod tests {
                 .expect("lookup_group")
                 .expect("group exists");
             assert_eq!(g.cohort, cohort);
+            // v61 (CIRISPersist#1123) — the family keeps founder_only;
+            // the community, refused it above the family, is quorum:1/1.
+            let want = if cohort == crate::federation::cohort::Cohort::Family {
+                types::consensus_protocol::FOUNDER_ONLY
+            } else {
+                "quorum:1/1"
+            };
             assert_eq!(
                 g.consensus_protocol.as_deref(),
-                Some(types::consensus_protocol::FOUNDER_ONLY),
+                Some(want),
                 "{tag} lookup_group carries consensus_protocol"
             );
             assert!(g.name.is_some(), "{tag} lookup_group carries name");
@@ -21053,28 +21060,28 @@ mod tests {
             );
         };
 
-        // founder_only, 3 members (1 founder): a plain member alone is refused;
-        // ONE founder signature admits (a strict majority would need 2).
-        let (room, ks) = setup("fo", 3, 1, 1, "founder_only").await;
-        let grown = ks[..4].to_vec();
-        let msg = refused(
-            attempt(
-                room.clone(),
-                grown.clone(),
-                1,
-                "founder_only",
-                vec![ks[1].clone()],
-            )
-            .await,
-            "founder_only: a plain member alone",
+        // v61 (CIRISPersist#1123; CC 4.5.13) — `founder_only` is refused
+        // for a community above the family, at the record door, before any
+        // quorum is asked. (Its evaluator arm is unit-witnessed in
+        // `consensus::tests`; a family and an affiliation keep it.)
+        let fo_room = format!("pd-fo-room-{s}");
+        let fo_keys: Vec<String> = (0..3).map(|i| k("fo", i)).collect();
+        for key in &fo_keys {
+            ts::register_hybrid_key_as(d, key, key, identity_type::USER).await;
+        }
+        let e = d
+            .put_community(community(&fo_room, &fo_keys, 1, "founder_only"))
+            .await
+            .expect_err("founder_only above the family");
+        assert!(
+            matches!(
+                e,
+                crate::federation::Error::CommunityConsensusProtocolViolation { rule, .. }
+                    if rule == crate::federation::admission::FOUNDER_ONLY_ABOVE_FAMILY
+            ),
+            "founder_only: {e}"
         );
-        assert!(msg.contains("founder_only"), "{msg}");
-        assert_eq!(live_len(room.clone()).await, 3);
-        refused_add(
-            attempt(room.clone(), grown, 1, "founder_only", vec![ks[0].clone()]).await,
-            "founder_only: one founder has the quorum, and a supersede still cannot add",
-        );
-        assert_eq!(live_len(room).await, 3);
+        assert!(d.lookup_community(&fo_room).await.unwrap().is_none());
 
         // unanimous, 3: two of three refused (a strict majority would admit);
         // all three admit.
@@ -21374,7 +21381,7 @@ mod tests {
                         })
                         .collect(),
                     founded_at: joined,
-                    consensus_protocol: "founder_only".into(),
+                    consensus_protocol: "quorum:1/1".into(),
                     policy_blob: None,
                     persist_row_hash: String::new(),
                 },

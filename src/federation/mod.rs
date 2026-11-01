@@ -245,6 +245,10 @@ pub mod moderation_walk_asof_invariants;
 /// (I202–I209).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod nested_manifest_invariants;
+/// v61 S2 (CIRISPersist#1123) — I1500–I1503: one voice never decides who
+/// is in a room.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod open_admission_invariants;
 /// v53.1.2 (CIRISPersist#984 row 12) — who may retract what (I516).
 #[cfg(test)]
 mod retraction_invariants;
@@ -1538,9 +1542,14 @@ pub fn roster_event_standing(
     // moderator whose appointment was live at this event's instant and was
     // issued while its root held authority (operator ruling 2026-09-25: no
     // ending is retroactive, and the root need not still be a member).
+    // v61 (CIRISPersist#1123; CC 4.5.13) — under `open:self_admit` a
+    // named moderator's standing does not remove anyone alone: the two-voice
+    // floor is the removal's guarantee, and a moderator is one voice.
+    let moderator_may_act = !e.moderator_roots.is_empty()
+        && (e.is_add || rules.protocol != types::consensus_protocol::OPEN_SELF_ADMIT);
     let standing_without_protocol = e.signers.is_empty()
         || (!e.is_add && e.signers.contains(&e.member.key_id))
-        || !e.moderator_roots.is_empty();
+        || moderator_may_act;
     let admitted = if standing_without_protocol {
         Ok(())
     } else {
@@ -1564,6 +1573,7 @@ pub fn roster_event_standing(
             } else {
                 consensus::Direction::Remove
             },
+            subject: Some(e.member.key_id.as_str()),
         }) {
             consensus::Verdict::Admit => Ok(()),
             consensus::Verdict::Unevaluable { reason } => {
@@ -7409,6 +7419,7 @@ pub trait FederationDirectory: Send + Sync {
                 roster: &roster,
                 signers: &signers,
                 direction,
+                subject: None,
             }) {
                 consensus::Verdict::Admit => {}
                 consensus::Verdict::Insufficient { detail } => {

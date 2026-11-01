@@ -151,14 +151,14 @@ pub(crate) mod bodies {
         let e = m::found_community(
             d,
             &format!("i339-x-{s}"),
-            "founder_only",
+            "quorum:1/1",
             &[&founder],
             &[BLESSED],
         )
         .await
         .expect_err("I339: an unsigned node at an ordinary community's founding");
         assert_eq!(m::rule_of(&e), RULE_FOUNDING_MEMBER_UNSIGNED, "I339: {e}");
-        m::found_community(d, &cid, "founder_only", &[&founder], &[])
+        m::found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let e = m::widen_community(d, &cid, &[&founder], BLESSED, None, now)

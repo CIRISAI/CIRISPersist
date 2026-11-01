@@ -15893,6 +15893,22 @@
     "manifest_round": "cc-rc7-536b8cb-1053"
    },
    {
+    "decimal_id": "4.5.13",
+    "claim_id": "CLM-one-voice-room",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_founder_only_above_family",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1123"
+   },
+   {
+    "decimal_id": "4.5.13",
+    "claim_id": "CLM-one-voice-room",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/consensus.rs#evaluate_open_self_admit",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1123"
+   },
+   {
     "decimal_id": "3.1.9.4",
     "claim_id": "CLM-nsproc-class-dual-scope-gate-watchlist-id",
     "repo": "CIRISPersist",

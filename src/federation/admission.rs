@@ -4282,6 +4282,7 @@ async fn community_quorum_cosigned_at(
         roster: &seats,
         signers: &signers,
         direction: super::consensus::Direction::Add,
+        subject: None,
     })
     .admits())
 }
@@ -8008,6 +8009,20 @@ pub fn check_consensus_protocol_form(consensus_protocol: &str) -> Result<(), Err
             consensus_protocol: consensus_protocol.to_string(),
         })
     }
+}
+
+/// v61 (CIRISPersist#1123; CC 4.4.3.2) — a FAMILY's `consensus_protocol`:
+/// [`check_consensus_protocol_form`], and never `open:self_admit`, which is a
+/// `public` group's protocol and a family is never public. Refused as
+/// [`Error::ConsensusProtocolMalformed`] (it is not a family's form).
+pub fn check_family_consensus_protocol_form(consensus_protocol: &str) -> Result<(), Error> {
+    check_consensus_protocol_form(consensus_protocol)?;
+    if consensus_protocol == crate::federation::types::consensus_protocol::OPEN_SELF_ADMIT {
+        return Err(Error::ConsensusProtocolMalformed {
+            consensus_protocol: consensus_protocol.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// v13.3.0 (CIRISPersist#386) — the REAL family invariant, enforced at
@@ -15304,6 +15319,46 @@ pub fn infrastructure_quorum(protocol: &str) -> Option<(u32, u32)> {
     (n >= 1 && m >= 1 && m <= n && (n < 2 || m >= 2)).then_some((m, n))
 }
 
+/// v61 (CIRISPersist#1123; CC 4.5.13, 4.4.3.4.2) — rule: a community
+/// above the family names `founder_only`. One voice never decides who is in a
+/// room: `founder_only` is a family's protocol (and a publication's subscriber
+/// list's, and a room's own listing's), and an affiliation's only under the
+/// one-voice countersign rule (CC 4.4.3.2.8, CIRISPersist#1143).
+pub const FOUNDER_ONLY_ABOVE_FAMILY: &str = "founder_only_above_family";
+
+/// v61 (CIRISPersist#1123; CC 4.5.13) — **`founder_only` is refused for a
+/// community above the family**, with the token an `infrastructure` community
+/// already gets (`federation_community_consensus_protocol_violation`) and the
+/// rule [`FOUNDER_ONLY_ABOVE_FAMILY`]. A declared affiliation keeps it: its
+/// acts against a member are gated by the one-voice countersign door
+/// instead (CC 4.4.3.2.8).
+///
+/// Runs at the record doors only (a NEW or CHANGED record at `put_community`,
+/// the supersede door, and a replicated version that would move a stored room
+/// onto `founder_only`). A room already stored under `founder_only` stays
+/// readable and folds as before; its next version must name another protocol.
+///
+/// # Errors
+///
+/// [`Error::CommunityConsensusProtocolViolation`]; a malformed declared cohort
+/// ([`Error::AffiliationConfigInvalid`]).
+pub fn check_founder_only_above_family(community: &super::Community) -> Result<(), Error> {
+    if community.consensus_protocol != super::types::consensus_protocol::FOUNDER_ONLY {
+        return Ok(());
+    }
+    if super::affiliation_config::declared_cohort(community)? == super::cohort::Cohort::Affiliations
+    {
+        return Ok(());
+    }
+    Err(Error::CommunityConsensusProtocolViolation {
+        community_key_id: community.community_key_id.clone(),
+        rule: FOUNDER_ONLY_ABOVE_FAMILY,
+        detail: "founder_only is a family's protocol; a community above the family is \
+                 admitted under a protocol no single vote satisfies (CC 4.5.13)"
+            .into(),
+    })
+}
+
 fn is_infrastructure_labeled(community: &super::Community) -> bool {
     super::community_subkind(community) == Some(COHORT_SUBKIND_INFRASTRUCTURE)
 }
@@ -15487,6 +15542,7 @@ pub async fn check_infrastructure_community_conformance(
         });
     }
     check_infrastructure_consensus_protocol(community)?;
+    check_founder_only_above_family(community)?;
     check_infrastructure_founders_not_node(directory, community, at).await?;
     // v55.0.0 (CIRISPersist#1053, CC 3.2 `public`) — `admission: open` only on
     // a public room, and no version crosses the `public` boundary.
@@ -15527,7 +15583,13 @@ pub async fn check_replicated_supersede_does_not_degrade(
         // through the replicated door either: the offered version stays on the
         // public side with a well-formed admission.
         if super::public_room::is_public_community(&stored) {
-            return super::public_room::check_public_room_conformance(directory, offered).await;
+            super::public_room::check_public_room_conformance(directory, offered).await?;
+        }
+        // v61 (CIRISPersist#1123) — nor onto `founder_only`: a room stored
+        // under another protocol is never moved onto one voice by a peer. A
+        // room already stored under it still syncs its versions as data.
+        if stored.consensus_protocol != super::types::consensus_protocol::FOUNDER_ONLY {
+            check_founder_only_above_family(offered)?;
         }
         return Ok(());
     }
@@ -15564,8 +15626,11 @@ pub async fn check_infrastructure_record_admission(
         }
     }
     if !is_infrastructure_labeled(community) {
+        // v61 (CIRISPersist#1123) — no NEW or CHANGED room record names
+        // `founder_only` above the family.
+        check_founder_only_above_family(community)?;
         // v55.0.0 (CIRISPersist#1053, CC 3.2 `public`) — every NEW or CHANGED
-        // room record, infrastructure or not, keeps `admission: open` on the
+        // room record, infrastructure or not, keeps open admission on the
         // public side and does not cross the `public` boundary.
         return super::public_room::check_public_room_conformance(directory, community).await;
     }
@@ -15728,8 +15793,11 @@ pub async fn check_no_moderator_federate_admission(
     }
     // Authority set from the in-flight roster (mirrors community_authority_set:
     // founders always; every member too under a non-`founder_only` protocol).
-    let founder_only =
-        community.consensus_protocol == crate::federation::types::consensus_protocol::FOUNDER_ONLY;
+    // v61 (CIRISPersist#1123) — founders alone under `open:self_admit`
+    // too: joining a public room confers membership, never its authority.
+    let founder_only = crate::federation::types::consensus_protocol::founders_hold_authority(
+        &community.consensus_protocol,
+    );
     // v48.0.0 (CIRISPersist#860) — the roster is the fold (a widened founder
     // is a moderator; a revoked one is not).
     for m in &crate::federation::effective_roster(directory, community).await? {
@@ -16495,8 +16563,11 @@ pub async fn community_authority_set_for(
     directory: &dyn super::FederationDirectory,
     community: &super::Community,
 ) -> Result<std::collections::HashSet<String>, Error> {
-    let founder_only =
-        community.consensus_protocol == crate::federation::types::consensus_protocol::FOUNDER_ONLY;
+    // v61 (CIRISPersist#1123) — founders alone under `open:self_admit`
+    // too: joining a public room confers membership, never its authority.
+    let founder_only = crate::federation::types::consensus_protocol::founders_hold_authority(
+        &community.consensus_protocol,
+    );
     let mut out = std::collections::HashSet::new();
     for m in &crate::federation::effective_roster(directory, community).await? {
         let is_founder = m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER);
@@ -27515,7 +27586,7 @@ pub(crate) mod r2_test_support {
                     role: Some("founder".to_owned()),
                 }],
                 founded_at: now,
-                consensus_protocol: "founder_only".to_owned(),
+                consensus_protocol: "quorum:1/1".into(),
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },
@@ -28832,7 +28903,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
     };
     use super::*;
     use crate::federation::tier_ingest::test_support::sign_community;
-    use crate::federation::types::{attestation_type, consensus_protocol, identity_type};
+    use crate::federation::types::{attestation_type, identity_type};
     use crate::federation::types::{Community, CommunityMember};
     use crate::federation::{Attestation, FederationDirectory};
     use chrono::Utc;
@@ -28884,7 +28955,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
                     role: Some(MEMBER_ROLE_FOUNDER.to_owned()),
                 }],
                 founded_at: now,
-                consensus_protocol: consensus_protocol::FOUNDER_ONLY.to_owned(),
+                consensus_protocol: "quorum:1/1".into(),
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },

@@ -120,7 +120,7 @@ pub(crate) mod bodies {
                 })
                 .collect(),
             founded_at: ago(3),
-            consensus_protocol: "founder_only".into(),
+            consensus_protocol: "quorum:1/1".into(),
             policy_blob: None,
             persist_row_hash: String::new(),
             prev_head_digest: String::new(),
@@ -513,7 +513,7 @@ pub(crate) mod bodies {
         ma::reg(d, &[&cid, &founder, &k]).await;
         nodes(d, &[&knode]).await;
         claim(d, &k, &knode, device_class::PHONE).await;
-        ma::found_community(d, &cid, "founder_only", &[&founder], &[])
+        ma::found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         assert!(
@@ -757,7 +757,7 @@ pub(crate) mod bodies {
         claim(d, &k, &kphone, device_class::PHONE).await;
         claim(d, &k, &kserver, device_class::SERVER).await;
         claim(d, &stranger, &snode, device_class::PHONE).await;
-        ma::found_community(d, &cid, "founder_only", &[&founder], &[])
+        ma::found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let p = ma::proposal(
@@ -819,7 +819,7 @@ pub(crate) mod bodies {
     ) -> Attestation {
         use crate::federation::membership_acceptance_invariants::bodies as ma;
         ma::reg(d, &[cid, creator]).await;
-        ma::found_community(d, cid, "founder_only", &[creator], &[])
+        ma::found_community(d, cid, "quorum:1/1", &[creator], &[])
             .await
             .unwrap();
         let p = ma::proposal(
@@ -1060,7 +1060,7 @@ pub(crate) mod bodies {
         nodes(d, &[&fnode, &snode]).await;
         claim(d, &founder, &fnode, device_class::SERVER).await;
         claim(d, &stranger, &snode, device_class::PHONE).await;
-        ma::found_community(d, &cid, "founder_only", &[&founder], &[])
+        ma::found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         // A server-class node that denies the room as CONTENT still gets the
@@ -1196,7 +1196,7 @@ pub(crate) mod bodies {
         }
         claim(a, &founder, &fnode, device_class::LAPTOP).await;
         claim(b, &k, &knode, device_class::PHONE).await;
-        ma::found_community(a, &cid, "founder_only", &[&founder], &[])
+        ma::found_community(a, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let now = Utc::now();

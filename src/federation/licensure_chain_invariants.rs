@@ -1159,10 +1159,13 @@ pub mod bodies {
             &format!("[{tag}] I604: founder F issues while a founder"),
         )
         .await;
-        // G supersedes the record without F.
+        // G supersedes the record without F. v61 (CIRISPersist#1123): the
+        // legacy founder_only room's next version leaves founder_only, which
+        // the supersede door refuses above the family.
         let held = dir.lookup_community(&room).await.unwrap().expect("held");
         let mut next = held.clone();
         next.members.retain(|m| m.key_id != f);
+        next.consensus_protocol = "quorum:1/1".to_owned();
         next.prev_head_digest = held.persist_row_hash.clone();
         next.persist_row_hash = String::new();
         dir.supersede_community(

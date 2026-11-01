@@ -9650,7 +9650,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         mut row: crate::federation::types::Family,
     ) -> Result<(), crate::federation::Error> {
-        crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        crate::federation::admission::check_family_consensus_protocol_form(
+            &row.consensus_protocol,
+        )?;
         // v13.3.0 (CIRISPersist#386) — the real invariant (replaces the dropped
         // family_key_id FK): every member key_id must be a registered key.
         crate::federation::admission::validate_family_members(self, &row).await?;
@@ -37491,8 +37493,7 @@ mod tests {
                         community_name: "fixture room".into(),
                         members: vec![],
                         founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-                        consensus_protocol:
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.to_owned(),
+                        consensus_protocol: "quorum:1/1".into(),
                         policy_blob: None,
                         persist_row_hash: String::new(),
                     },
@@ -37728,8 +37729,7 @@ mod tests {
                         community_name: "fixture room".into(),
                         members: vec![],
                         founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-                        consensus_protocol:
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.to_owned(),
+                        consensus_protocol: "quorum:1/1".into(),
                         policy_blob: None,
                         persist_row_hash: String::new(),
                     },
@@ -41122,8 +41122,7 @@ mod tests {
                         role: Some(MEMBER_ROLE_FOUNDER.into()),
                     }],
                     founded_at: now,
-                    consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
-                        .into(),
+                    consensus_protocol: "quorum:1/1".into(),
                     policy_blob: None,
                     persist_row_hash: String::new(),
                 },
@@ -41555,7 +41554,9 @@ mod tests {
                     consensus_protocol:
                         crate::federation::tier_ingest::test_support::fixture_protocol(
                             policy.as_ref(),
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                            // v61 (CIRISPersist#1123): founder_only is
+                            // refused above the family.
+                            "quorum:1/1",
                         ),
                     policy_blob: policy,
                     persist_row_hash: String::new(),
@@ -41907,8 +41908,7 @@ mod tests {
                             role: Some("founder".into()),
                         }],
                         founded_at: now,
-                        consensus_protocol:
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
+                        consensus_protocol: "quorum:1/1".into(),
                         policy_blob: None,
                         persist_row_hash: String::new(),
                     },
@@ -49914,8 +49914,7 @@ mod tests {
                         // founder_only protocol.
                         members: vec![member(&u0, Some(MEMBER_ROLE_FOUNDER)), member(&u1, None)],
                         founded_at: now,
-                        consensus_protocol:
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
+                        consensus_protocol: "quorum:1/1".into(),
                         policy_blob: None,
                         persist_row_hash: String::new(),
                     },
@@ -50022,8 +50021,7 @@ mod tests {
                         community_name: "mods".into(),
                         members: vec![member(&founder, Some(MEMBER_ROLE_FOUNDER))],
                         founded_at: now,
-                        consensus_protocol:
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
+                        consensus_protocol: "quorum:1/1".into(),
                         policy_blob: None,
                         persist_row_hash: String::new(),
                     },
@@ -50891,8 +50889,7 @@ mod tests {
                         community_name: "fixture room".into(),
                         members: vec![],
                         founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-                        consensus_protocol:
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.to_owned(),
+                        consensus_protocol: "quorum:1/1".into(),
                         policy_blob: None,
                         persist_row_hash: String::new(),
                     },

@@ -1798,7 +1798,9 @@ mod tests {
         // at the group-plane row builder, its door and the rehome (3);
         // CLM-cosigned-rows at the one co-signature count and the cosigned
         // withdraws (2).
-        const EXPECTED: usize = 357;
+        // v61 slice S2: +2 (CIRISPersist#1123): CLM-one-voice-room at the
+        // founder_only gate and the open:self_admit evaluator.
+        const EXPECTED: usize = 359;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

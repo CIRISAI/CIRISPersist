@@ -1059,6 +1059,7 @@ where
         roster: &seats,
         signers: &signers,
         direction: super::consensus::Direction::Add,
+        subject: None,
     });
     if !verdict.admits() {
         return Err(Error::RosterAuthorityUnauthorized {
@@ -3913,6 +3914,7 @@ where
         roster: &seats,
         signers: &signers,
         direction: super::consensus::Direction::Add,
+        subject: None,
     });
     match verdict {
         super::consensus::Verdict::Admit => Ok(Ok(signers)),

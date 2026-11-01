@@ -859,12 +859,22 @@ pub mod bodies {
                 "{p}: {err}"
             );
             assert!(d.lookup_community(&room).await.unwrap().is_none(), "{p}");
-            // Not infrastructure: the same protocol is admitted.
+            // Not infrastructure: the same protocol is admitted — except
+            // `founder_only`, which v61 refuses for every community above
+            // the family (CIRISPersist#1123, CC 4.5.13).
             let mut plain = infra_room(&format!("{room}-plain"), p, vec![seat(&human, "founder")]);
             plain.policy_blob = None;
-            d.put_community(ts::sign_community(&human, plain))
-                .await
-                .unwrap_or_else(|e| panic!("{tag}: {p} outside infrastructure: {e}"));
+            let put = d.put_community(ts::sign_community(&human, plain)).await;
+            if *p == crate::federation::types::consensus_protocol::FOUNDER_ONLY {
+                let err = put.expect_err("founder_only above the family");
+                assert_eq!(
+                    violation_rule(&err),
+                    crate::federation::admission::FOUNDER_ONLY_ABOVE_FAMILY,
+                    "{tag}: {err}"
+                );
+            } else {
+                put.unwrap_or_else(|e| panic!("{tag}: {p} outside infrastructure: {e}"));
+            }
         }
         let room = format!("root-ok-{tag}");
         authorized_room_key(d, &room).await;

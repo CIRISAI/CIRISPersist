@@ -391,3 +391,5 @@ sqlite	208	key_grant_framed_kind_retired	8249230999664313878
 postgres	208	key_grant_framed_kind_retired	11496856942977225529
 sqlite	209	member_listing_retired	7998963604060186327
 postgres	209	member_listing_retired	18104963459087279404
+sqlite	210	consensus_protocol_open_self_admit	16223465226918879351
+postgres	210	consensus_protocol_open_self_admit	4228489100167825188

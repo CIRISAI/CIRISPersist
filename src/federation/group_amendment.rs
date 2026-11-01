@@ -223,7 +223,7 @@ where
     if !admit_amendment(dir, &offer, &stored).await? {
         return Ok(OccupiedRoute::Settled(CommunityWrite::Unchanged));
     }
-    super::check_consensus_protocol_form(&f.consensus_protocol)?;
+    super::admission::check_family_consensus_protocol_form(&f.consensus_protocol)?;
     super::admission::validate_family_members(dir, f).await?;
     // v53.0.0 (CC 3.2 T6, consequence (i)) — a family version carries no
     // signed instant, so it is judged at admission.
@@ -675,7 +675,7 @@ pub(crate) async fn supersede_family_signed<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    super::check_consensus_protocol_form(&new.family.consensus_protocol)?;
+    super::admission::check_family_consensus_protocol_form(&new.family.consensus_protocol)?;
     super::verify_family_admission(dir, &new).await?;
     // v52.0.0 (#956) — a dissolved family admits no change, on either door.
     super::family_dissolution::refuse_if_held_family_dissolved(dir, &new.family.family_key_id)

@@ -6265,7 +6265,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         mut row: crate::federation::types::Family,
     ) -> Result<(), crate::federation::Error> {
-        crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        crate::federation::admission::check_family_consensus_protocol_form(
+            &row.consensus_protocol,
+        )?;
         // v13.3.0 (CIRISPersist#386) — the real invariant (replaces the dropped
         // family_key_id FK): every member key_id must be a registered key.
         crate::federation::admission::validate_family_members(self, &row).await?;
@@ -38149,13 +38151,7 @@ mod tests {
             .put_community(
                 crate::federation::tier_ingest::test_support::sign_community(
                     "solo-coop",
-                    fed_community(
-                        "solo-coop",
-                        "Solo Co-op",
-                        vec![],
-                        crate::federation::types::consensus_protocol::FOUNDER_ONLY,
-                        None,
-                    ),
+                    fed_community("solo-coop", "Solo Co-op", vec![], "quorum:1/1", None),
                 ),
             )
             .await
@@ -38506,8 +38502,7 @@ mod tests {
                         community_name: "fixture room".into(),
                         members: vec![],
                         founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-                        consensus_protocol:
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.to_owned(),
+                        consensus_protocol: "quorum:1/1".into(),
                         policy_blob: None,
                         persist_row_hash: String::new(),
                     },
@@ -47986,13 +47981,7 @@ mod tests {
             .put_community(
                 crate::federation::tier_ingest::test_support::sign_community(
                     community_id,
-                    fed_community(
-                        community_id,
-                        "ob-test",
-                        members,
-                        crate::federation::types::consensus_protocol::FOUNDER_ONLY,
-                        policy,
-                    ),
+                    fed_community(community_id, "ob-test", members, "quorum:1/1", policy),
                 ),
             )
             .await
@@ -48081,7 +48070,7 @@ mod tests {
     #[tokio::test]
     async fn no_moderator_federate_apply_broadened_keying_sqlite() {
         use crate::federation::admission::MEMBER_ROLE_FOUNDER;
-        use crate::federation::types::{consensus_protocol, identity_type};
+        use crate::federation::types::identity_type;
         use crate::federation::FederationDirectory;
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
@@ -48117,7 +48106,7 @@ mod tests {
                         role: Some(MEMBER_ROLE_FOUNDER.into()),
                     }],
                     founded_at: "2026-06-04T00:00:00Z".parse().unwrap(),
-                    consensus_protocol: consensus_protocol::FOUNDER_ONLY.into(),
+                    consensus_protocol: "quorum:1/1".into(),
                     policy_blob: None,
                     persist_row_hash: String::new(),
                 },
@@ -52846,7 +52835,7 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
                         "acm-comm",
                         "acm",
                         vec!["acm-0", "acm-1", "acm-2"],
-                        crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                        "quorum:1/1",
                         None,
                     ),
                 ),
@@ -53071,13 +53060,8 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
                 .await
                 .unwrap();
         }
-        let mut community = fed_community(
-            "mod-comm",
-            "mods",
-            vec!["mod-founder"],
-            crate::federation::types::consensus_protocol::FOUNDER_ONLY,
-            None,
-        );
+        let mut community =
+            fed_community("mod-comm", "mods", vec!["mod-founder"], "quorum:1/1", None);
         community.members[0].role = Some(MEMBER_ROLE_FOUNDER.into());
         backend
             .put_community(

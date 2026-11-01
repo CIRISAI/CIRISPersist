@@ -1275,13 +1275,21 @@ pub(crate) async fn check_cosigned_withdraws(
             } else {
                 super::consensus::Direction::Add
             };
+            // v61 (CIRISPersist#1123) — the group's subkind (a public
+            // room's `open:self_admit` is evaluable only there) and the member
+            // the retracted row names.
+            let subkind = policy_blob
+                .as_ref()
+                .and_then(|b| b.get("cohort_subkind"))
+                .and_then(serde_json::Value::as_str);
             let verdict = super::consensus::evaluate(&super::consensus::Ballot {
                 protocol: &protocol,
-                subkind: None,
+                subkind,
                 policy_blob: policy_blob.as_ref(),
                 roster: &seats,
                 signers: &counted,
                 direction,
+                subject: Some(target.attested_key_id.as_str()),
             });
             if verdict.admits() {
                 Ok(Some(rule))
@@ -1551,7 +1559,7 @@ mod tests {
                 community_name: "room".into(),
                 members: Vec::new(),
                 founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-                consensus_protocol: "founder_only".into(),
+                consensus_protocol: "quorum:1/1".into(),
                 policy_blob: None,
                 prev_head_digest: String::new(),
                 charter_digest: "bb".repeat(32),
