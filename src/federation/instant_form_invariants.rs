@@ -275,9 +275,26 @@ pub(crate) mod bodies {
             ),
             "I-IFP-1: a `+00:00` instant is refused envelope_member_invalid: {refused:?}"
         );
+        // The pass, called directly once so its counts are read: the own row
+        // re-stated, the peer row set aside, the withdraws kept in force.
+        let pass = first.engine.settle_instant_forms().await.unwrap();
+        assert_eq!(
+            (
+                pass.violations,
+                pass.healed,
+                pass.set_aside,
+                pass.kept_in_force,
+                pass.already_healed,
+                pass.heal_refused,
+                pass.own_left,
+            ),
+            (3, 1, 1, 1, 0, 0, 0),
+            "I-IFP-1: the first pass: {pass:?}"
+        );
+        assert!(pass.scanned >= 5, "I-IFP-1: every row is read: {pass:?}");
         drop(first);
 
-        // ── The upgrade: the next open runs the pass. ──────────────────────
+        // ── The next open runs the pass again, and finds it done. ─────────
         let second = open().await;
         assert!(
             second
@@ -336,12 +353,13 @@ pub(crate) mod bodies {
         let again = second.engine.settle_instant_forms().await.unwrap();
         assert_eq!(
             (
+                again.violations,
                 again.healed,
                 again.set_aside,
                 again.already_healed,
                 again.kept_in_force
             ),
-            (0, 0, 1, 1),
+            (2, 0, 0, 1, 1),
             "I-IFP-1: a second pass does nothing: {again:?}"
         );
         drop(second);
@@ -465,6 +483,13 @@ pub(crate) mod bodies {
         ] {
             assert_eq!(disposition(&r, "me", now), Disposition::OwnLeft);
         }
+        // The expiry boundary: a row expiring at `now` is not live; one a
+        // second later is.
+        let mut at_now = row("me", s, "identity_binding:v1");
+        at_now.expires_at = Some(now);
+        assert_eq!(disposition(&at_now, "me", now), Disposition::OwnLeft);
+        at_now.expires_at = Some(now + chrono::Duration::seconds(1));
+        assert_eq!(disposition(&at_now, "me", now), Disposition::Heal);
     }
 }
 
@@ -552,5 +577,126 @@ mod tests {
             }
         };
         bodies::i_ifp_1_open_settles_a_v60_node(open, &t).await;
+    }
+}
+
+/// v61 (CC 2.6.2) — the preimage and door witnesses the mutation scope
+/// measures: the v2 domains' bytes, the two-domain trust verifier, the local
+/// door's predicate and the key record's expiry binding.
+#[cfg(test)]
+mod preimages {
+    use crate::federation::admission::{
+        local_write_instant_form_violation, trust_grant_signing_bytes,
+        trust_grant_signing_bytes_v1, trust_revocation_signing_bytes,
+        trust_revocation_signing_bytes_v1, verify_envelope_binds_subject,
+    };
+    use chrono::{DateTime, Utc};
+
+    fn t(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    fn text(b: Vec<u8>) -> String {
+        String::from_utf8(b).unwrap()
+    }
+
+    /// I-IFP-4 — **the v2 trust preimages**: the domain is named, the instant
+    /// is `.sssZ`, v1 is a different byte string, and a sub-millisecond
+    /// instant is refused rather than truncated into agreeing.
+    #[test]
+    fn i_ifp_4_the_v2_trust_preimages() {
+        let grant = crate::federation::TrustGrant {
+            key: "k".into(),
+            trust_type: crate::federation::TrustType::Temporary,
+            trust_relationship: crate::federation::TrustRelationship::Direct,
+            trust_domains: None,
+            trusted_by: "g".into(),
+            expires_at: Some(t("2026-11-01T12:00:00.123Z")),
+        };
+        let v2 = text(trust_grant_signing_bytes(&grant).unwrap());
+        assert_eq!(
+            v2,
+            r#"{"domain":"ciris.trust.grant.v2","grant":{"expires_at":"2026-11-01T12:00:00.123Z","key":"k","trust_relationship":"direct","trust_type":"temporary","trusted_by":"g"}}"#
+        );
+        let v1 = text(trust_grant_signing_bytes_v1(&grant).unwrap());
+        assert!(v1.contains("ciris.trust.grant.v1") && v1 != v2);
+        let mut fine = grant.clone();
+        fine.expires_at = Some(t("2026-11-01T12:00:00.123456Z"));
+        assert!(
+            trust_grant_signing_bytes(&fine).is_err(),
+            "sub-millisecond refused"
+        );
+
+        let at = t("2026-11-01T12:00:00.120Z");
+        assert_eq!(
+            text(trust_revocation_signing_bytes("k", "g", &at).unwrap()),
+            r#"{"domain":"ciris.trust.revocation.v2","key":"k","revoked_at":"2026-11-01T12:00:00.120Z","revoked_by":"g"}"#
+        );
+        assert_eq!(
+            text(trust_revocation_signing_bytes_v1("k", "g", &at).unwrap()),
+            r#"{"domain":"ciris.trust.revocation.v1","key":"k","revoked_at":"2026-11-01T12:00:00.120000Z","revoked_by":"g"}"#
+        );
+        assert!(trust_revocation_signing_bytes("k", "g", &t("2026-11-01T12:00:00.1201Z")).is_err());
+    }
+
+    /// I-IFP-5 — **the trace scrub preimage**: v2 names its domain and writes
+    /// `.sssZ`; v1 is the pre-v61 shape.
+    #[test]
+    fn i_ifp_5_the_v2_scrub_preimage() {
+        let at = t("2026-11-01T12:00:00.123456Z");
+        let v2 = text(crate::ingest::scrub_preimage(
+            "p", "o", true, "generic", None, "s", at,
+        ));
+        assert_eq!(
+            v2,
+            r#"{"domain":"ciris.scrub_envelope.v2","ner_ran":true,"original_content_hash":"o","post_content_sha256":"p","scrub_key_id":"s","scrub_timestamp":"2026-11-01T12:00:00.123Z","scrubber_model_digest":null,"trace_level":"generic"}"#
+        );
+        let v1 = text(crate::ingest::scrub_preimage_v1(
+            "p", "o", true, "generic", None, "s", at,
+        ));
+        assert!(!v1.contains("domain") && v1.contains("+00:00"), "{v1}");
+    }
+
+    /// I-IFP-6 — **the local door's predicate** reads the caller's instants
+    /// and leaves `expires_at`, which the door stamps itself.
+    #[test]
+    fn i_ifp_6_the_local_door_predicate() {
+        let offset = serde_json::json!({ "asserted_at": "2026-11-01T12:00:00+00:00" });
+        assert_eq!(
+            local_write_instant_form_violation(&offset).map(|v| v.member),
+            Some("asserted_at".to_owned())
+        );
+        let stamped = serde_json::json!({
+            "asserted_at": "2026-11-01T12:00:00.000Z",
+            "expires_at": "2031-01-01T00:00:00.000000+00:00",
+        });
+        assert_eq!(local_write_instant_form_violation(&stamped), None);
+    }
+
+    /// I-IFP-7 — **the key record's expiry binds `.sssZ` as bytes**: the same
+    /// instant spelled `+00:00` is refused naming the form, and a column finer
+    /// than a millisecond is refused.
+    #[test]
+    fn i_ifp_7_the_key_record_expiry() {
+        use crate::federation::operational::test_support::{signed_canonical_record, Identity};
+        let until = t("2027-02-02T00:00:00.000Z");
+        let mut rec = signed_canonical_record(
+            "k1",
+            "node",
+            "ED",
+            None,
+            serde_json::json!({}),
+            &[&Identity::new("s1")],
+        );
+        rec.valid_until = Some(until);
+        rec.registration_envelope["valid_until"] = serde_json::json!("2027-02-02T00:00:00.000Z");
+        verify_envelope_binds_subject(&rec).expect("the canonical expiry binds");
+        rec.registration_envelope["valid_until"] = serde_json::json!("2027-02-02T00:00:00+00:00");
+        let why = verify_envelope_binds_subject(&rec).unwrap_err();
+        assert!(why.contains("CC 2.6.2"), "{why}");
+        rec.registration_envelope["valid_until"] = serde_json::json!("2027-02-02T00:00:00.000Z");
+        rec.valid_until = Some(until + chrono::Duration::microseconds(1));
+        let why = verify_envelope_binds_subject(&rec).unwrap_err();
+        assert!(why.contains("sub-millisecond"), "{why}");
     }
 }
