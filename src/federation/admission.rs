@@ -2509,6 +2509,18 @@ fn names_its_key_grant_recipient(row: &super::Attestation) -> bool {
     super::key_grant::is_key_grant_row(row) && row.subject_key_ids.is_empty()
 }
 
+/// v61 (CIRISPersist#1140; CC 2.4.1.2, rc14 3.2) — AV-84's `attested_party`
+/// arm reads the row type: it applies to a `scores` row, never to a
+/// `delegates_to`, whose `attested_key_id` is the delegate BY DEFINITION, not
+/// a third party the row speaks about. This is what lets an owner re-sign a
+/// node's owner-binding at the scope of a group the node joins (CC 3.2: "a
+/// second owner-signed row alongside the `self` one … every one of the seven
+/// scopes is therefore an admissible audience"). Subjects stay governed by the
+/// `named_subject` arm, unchanged.
+fn names_its_delegate(row: &super::Attestation) -> bool {
+    row.attestation_type == attestation_type::DELEGATES_TO
+}
+
 /// The ONE standing comparison, parameterised over party resolution: refuse
 /// iff any named party RESOLVES differently from the producer. The string
 /// form ([`check_promotion_cohort_standing`], resolution = identity fn) and
@@ -2529,6 +2541,7 @@ fn cohort_standing_core(
         })
     };
     if row.attested_key_id != producer
+        && !names_its_delegate(row)
         && resolve(&row.attested_key_id) != producer_identity
         && !names_its_key_grant_recipient(row)
     {
@@ -2598,6 +2611,7 @@ pub async fn check_cohort_standing_resolved(
         })
     };
     if row.attested_key_id != producer
+        && !names_its_delegate(row)
         && !names_its_key_grant_recipient(row)
         && admission_identity_for_writer(directory, &row.attested_key_id).await?
             != producer_identity
@@ -12237,6 +12251,14 @@ pub async fn check_owner_binding_affiliation_admission(
     let Some(named) = envelope_cohort_target(&row.attestation_envelope)? else {
         return Ok(());
     };
+    // v61 (CIRISPersist#1140, CC rc14 3.2) — a NODE's owner-binding naming a
+    // group is the owner re-signing it at that group's scope so the group's
+    // members can see who owns the node: an audience, not an organisation on
+    // the bond (CC 3.2 names that for an `agent` key held on an
+    // organisation's behalf).
+    if binding_is_group_audience(directory, row).await? {
+        return Ok(());
+    }
     let refuse = |reason: &'static str, detail: String| {
         Err(Error::InvalidArgument(format!(
             "{OWNER_BINDING_AFFILIATION_REFUSED}: {reason}: owner-binding {} by {} over {} names \
@@ -12283,6 +12305,17 @@ pub async fn check_owner_binding_affiliation_admission(
     Ok(())
 }
 
+/// v61 (CIRISPersist#1140, CC rc14 3.2) — is `row` (an owner-binding naming a
+/// group) the owner's re-signing of a NODE's binding at that group's scope,
+/// rather than an organisation's bond? True when the bound key is
+/// node-bearing ([`super::is_node_bearing_key`]).
+async fn binding_is_group_audience(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<bool, Error> {
+    Box::pin(super::is_node_bearing_key(directory, &row.attested_key_id)).await
+}
+
 /// v60.0.0 (CIRISPersist#1062, CLM-org-on-the-bond) — **the affiliation named
 /// on `key`'s live owner-binding**, for slashing / quarantine propagation and
 /// for the record: the community the binding in force now names
@@ -12302,6 +12335,11 @@ pub async fn affiliation_of_binding(
     // affiliations): the smallest id, so every node names the same one.
     let mut named = Vec::new();
     for b in &bindings {
+        // v61 (CIRISPersist#1140) — a node binding re-signed at a group's
+        // scope names an audience, never an organisation on the bond.
+        if binding_is_group_audience(directory, b).await? {
+            continue;
+        }
         if let Some(c) = envelope_cohort_target(&b.attestation_envelope)? {
             named.push(c.to_owned());
         }

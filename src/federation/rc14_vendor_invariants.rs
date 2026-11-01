@@ -38,13 +38,6 @@ enum NotYet {
 /// `(CC section, anchor in part 3 at the tag, ticket, when, persist-side check)`.
 const NOT_BUILT: &[(&str, &str, &str, &str, NotYet)] = &[
     (
-        "3.2",
-        "the owner re-signs the binding at that group's scope",
-        "CIRISPersist#1140",
-        "v61 S2/S3",
-        NotYet::TextOnly,
-    ),
-    (
         "3.1.3",
         "census_share_pair_incomplete",
         "CIRISPersist#1121",

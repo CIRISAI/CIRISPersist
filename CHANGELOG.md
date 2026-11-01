@@ -63,6 +63,11 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
   Key-plane rows are exempt, the local doors are unchanged, and a directory with no node key keeps the pre-v61 behaviour. `AttestationRefusalReason` and `ReplicatedCommunityRefusal` each gain `NotInAudience`, appended (inside the ABI 12 break); a consumer that matches either exhaustively adds the arm. A group's record now names its own audience in `may_receive`: a public record reaches every peer, and a member it lists is in its audience before any node holds the record (`replication_audience::may_receive_community_record` is new).
 - `may_receive` admits an owner's contact grant at an infrastructure relay, and only there (CIRISPersist#1165; Eric 2026-10-30, CIRISConstitution#196). The rule is decided before "a node receives only its own allow list". It covers a `consent:replication` grant FOR a machine, whose subjects are nodes, signed by that machine's owner or a live roster key of that owner. That grant reaches an UNOWNED key standing on the `Canonical` serve rung as this node resolves it (`infra:serve` from a root this node trusts), with the new `replication_audience::Reason::Relay`, appended. A consumer that matches `Reason` exhaustively adds the arm. A directory with no node key resolves no relay. The canonical then holds who-consented-to-whom for contacts that cross it, as CIRISConstitution#196 states.
+- The owner-binding audience (CIRISPersist#1140; CC rc14 3.2, 2.4.1.2):
+  - AV-84's `attested_party` arm no longer applies to a `delegates_to` row, whose attested key is the delegate by definition. `named_subject` is unchanged.
+  - An owner may re-sign a node's owner-binding at any group's scope as a second owner-signed row alongside the `self` one, and every scope is an admissible audience. `owner_of` folds every live binding to the one owner.
+  - The organisation-on-the-bond gate (CIRISPersist#1062) applies only to a binding of a non-node key. A NODE's binding naming a group is an audience, not an organisation's bond, and `affiliation_of_binding` ignores it.
+  - A bounded-scope `delegates_to` whose attested key is a third party was refused `federation_cohort_standing_refused` / `attested_party`; it is now admitted.
 
 ### Changed
 
