@@ -202,17 +202,11 @@ pub mod consent_sweep_principals_invariants;
 /// their id, distinct ones ranked read-time within one audience.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod composer_rank_invariants;
-/// v61 S2 (CIRISPersist#1148) — I1509: a replicated write needs the audience.
-#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-pub(crate) mod put_audience_invariants;
+#[cfg(test)]
+mod consent_sweep_plan_invariants;
 /// v61 S2 (CIRISPersist#1165) — I1510: a contact grant reaches the relay.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod contact_relay_invariants;
-/// v61 S2 (CIRISPersist#1140) — I1511: the owner-binding audience.
-#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-pub(crate) mod owner_binding_audience_invariants;
-#[cfg(test)]
-mod consent_sweep_plan_invariants;
 /// v53.1.0 (CIRISPersist#979) — I480–I487: a chunk of a withdrawn file is
 /// judged by its file.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -262,9 +256,18 @@ pub(crate) mod nested_manifest_invariants;
 /// is in a room.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod open_admission_invariants;
+/// v61 S2 (CIRISPersist#1140) — I1511: the owner-binding audience.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod owner_binding_audience_invariants;
+/// v61 S2 (CIRISPersist#1148) — I1509: a replicated write needs the audience.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod put_audience_invariants;
 /// v53.1.2 (CIRISPersist#984 row 12) — who may retract what (I516).
 #[cfg(test)]
 mod retraction_invariants;
+/// v61 S2 (CIRISPersist#1161) — I1512: room moderation in CC's shape.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod room_moderation_invariants;
 // v53.0.0 (CIRISPersist#969) — I310–I319: one DEK per (stream, epoch).
 /// v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — affiliations: the declared
 /// cohort and the typed config record (I592–I594).

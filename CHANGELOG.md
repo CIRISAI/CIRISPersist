@@ -68,6 +68,7 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
   - An owner may re-sign a node's owner-binding at any group's scope as a second owner-signed row alongside the `self` one, and every scope is an admissible audience. `owner_of` folds every live binding to the one owner.
   - The organisation-on-the-bond gate (CIRISPersist#1062) applies only to a binding of a non-node key. A NODE's binding naming a group is an audience, not an organisation's bond, and `affiliation_of_binding` ignores it.
   - A bounded-scope `delegates_to` whose attested key is a third party was refused `federation_cohort_standing_refused` / `attested_party`; it is now admitted.
+- Room moderation in CC's 2026-11-01 shape is admitted at `community` scope as v61 stands (CIRISPersist#1161, I1512). A flag or `moderation:*` act names the flagged row by `references_attestation_id`, its `attested_key_id` is the moderator, and the author is not in `subject_key_ids`. AV-84's `named_subject` arm is unchanged, held for the pending `subject_outside_audience` rule. Server and Edge re-shape their flag rows to this shape.
 
 ### Changed
 
