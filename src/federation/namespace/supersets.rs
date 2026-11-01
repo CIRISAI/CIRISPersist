@@ -1799,8 +1799,9 @@ mod tests {
         // CLM-cosigned-rows at the one co-signature count and the cosigned
         // withdraws (2).
         // v61 slice S2: +2 (CIRISPersist#1123): CLM-one-voice-room at the
-        // founder_only gate and the open:self_admit evaluator.
-        const EXPECTED: usize = 359;
+        // founder_only gate and the open:self_admit evaluator; +1
+        // (CIRISPersist#1063): CLM-public-community at the on-request read.
+        const EXPECTED: usize = 360;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

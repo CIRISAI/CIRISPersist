@@ -325,6 +325,92 @@ pub async fn check_community_listing_admission(
     ))
 }
 
+/// v61 (CIRISPersist#1063; CC 3.2 "replicated on join, visible to
+/// everyone on request") — **a public room's live standing proposal, for a
+/// requester who is not a member.** The founder's standing
+/// `membership:proposal:v1` is placed at the room's `community` scope, so
+/// nothing pushes it to a node whose owner has not joined; a non-member asks a
+/// member's node, and this is the read that node answers with. The row it
+/// returns is servable to any peer: a public room is a public group to the
+/// replication audience ([`super::replication_audience::may_receive`]), and the
+/// requester's node admits it on its replicated door like any public room row.
+///
+/// Among the standing proposals (no invitee, [`super::membership_acceptance::is_standing_proposal`])
+/// held here for `community_key_id`: signed by a founder ACTIVE now, not
+/// expired at the read instant, never withdrawn or superseded by its
+/// proposer; the latest by signed instant, ties by row hash. `None` unless
+/// the room is a `public` room under `open:self_admit` (CC 3.2: "a record
+/// with any other protocol is invite-only").
+///
+/// # Errors
+///
+/// Directory errors.
+pub async fn live_standing_proposal<D>(
+    directory: &D,
+    community_key_id: &str,
+) -> Result<Option<Attestation>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let Some(room) = directory.lookup_community(community_key_id).await? else {
+        return Ok(None);
+    };
+    if !is_public_community(&room) || !is_open_admission(&room) {
+        return Ok(None);
+    }
+    let founders: std::collections::BTreeSet<String> = directory
+        .active_community_members(community_key_id)
+        .await?
+        .into_iter()
+        .filter(|m| m.role.as_deref() == Some(super::admission::MEMBER_ROLE_FOUNDER))
+        .map(|m| m.key_id)
+        .collect();
+    let now = chrono::Utc::now();
+    let mut live: Vec<Attestation> = Vec::new();
+    for row in directory
+        .list_targeted_by_dimension_prefix(
+            &[cs::COMMUNITY],
+            community_key_id,
+            super::membership_acceptance::PROPOSAL_DIMENSION,
+        )
+        .await?
+    {
+        if !super::membership_acceptance::is_standing_proposal(&row)
+            || row.expires_at.is_none_or(|e| e <= now)
+        {
+            continue;
+        }
+        let proposer =
+            super::admission::admission_identity_for_writer(directory, &row.attesting_key_id)
+                .await?;
+        if !founders.contains(&proposer) && !founders.contains(&row.attesting_key_id) {
+            continue;
+        }
+        let mut retired = false;
+        for c in directory
+            .list_attestations_referencing(&row.attestation_id)
+            .await?
+        {
+            if matches!(
+                c.attestation_type.as_str(),
+                attestation_type::WITHDRAWS | attestation_type::SUPERSEDES
+            ) && super::admission::admission_identity_for_writer(directory, &c.attesting_key_id)
+                .await?
+                == proposer
+            {
+                retired = true;
+                break;
+            }
+        }
+        if !retired {
+            live.push(row);
+        }
+    }
+    Ok(live.into_iter().max_by(|a, b| {
+        (a.asserted_at, &a.persist_row_hash).cmp(&(b.asserted_at, &b.persist_row_hash))
+    }))
+}
+
 /// **The room's one live listing** (CC 3.2: "one live row per community"):
 /// among the federation-scoped `community:listing:v1` rows held here naming
 /// `community_key_id`, the latest by signed instant (ties by row hash) that is

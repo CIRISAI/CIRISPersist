@@ -15893,6 +15893,14 @@
     "manifest_round": "cc-rc7-536b8cb-1053"
    },
    {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-public-community",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/public_room.rs#live_standing_proposal",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1063"
+   },
+   {
     "decimal_id": "4.5.13",
     "claim_id": "CLM-one-voice-room",
     "repo": "CIRISPersist",

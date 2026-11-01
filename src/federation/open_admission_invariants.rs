@@ -17,6 +17,13 @@
 //!   other protocol refuses a self-signed admission.
 //! - **I1503** — a removal under `open:self_admit` takes two distinct voices
 //!   besides the member removed: one voice is refused, two are admitted.
+//! - **I1504** (CIRISPersist#1063) — a public room's live standing proposal
+//!   is served on request to a non-member: the member's node reads it
+//!   ([`public_room::live_standing_proposal`](crate::federation::public_room::live_standing_proposal)),
+//!   the requester's node is in its audience and admits it on the replicated
+//!   door, the requester accepts on their own node, and the member's node
+//!   admits the acceptance and the requester's own widening. A withdrawn
+//!   proposal is no longer live; a private room has none.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -426,6 +433,135 @@ pub(crate) mod bodies {
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod two_node {
+    use crate::federation::membership_acceptance_invariants::bodies::{
+        found_community, found_public_room, proposal, put, reg, reply, widen_community,
+    };
+    use crate::federation::public_room::live_standing_proposal;
+    use crate::federation::replication_audience::may_receive;
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::types::cohort_scope::COMMUNITY;
+    use crate::federation::types::consensus_protocol::OPEN_SELF_ADMIT;
+    use crate::federation::types::{attestation_type, SignedAttestation};
+    use crate::federation::FederationDirectory;
+    use chrono::{Duration, Utc};
+
+    /// **I1504** — a public room's standing proposal, on request.
+    pub(crate) async fn i1504_a_standing_proposal_is_served_on_request(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        let (founder, joiner, cid, private) = (
+            format!("i1504-f-{s}"),
+            format!("i1504-j-{s}"),
+            format!("i1504-pub-{s}"),
+            format!("i1504-priv-{s}"),
+        );
+        for n in [a, b] {
+            reg(n, &[&founder, &joiner, &cid, &private]).await;
+        }
+        found_public_room(a, &cid, OPEN_SELF_ADMIT, &[&founder], &[])
+            .await
+            .unwrap();
+        let at = Utc::now() - Duration::hours(1);
+        assert!(
+            live_standing_proposal(a, &cid).await.unwrap().is_none(),
+            "I1504: control — no proposal yet"
+        );
+        let mut p = proposal(
+            &founder,
+            COMMUNITY,
+            &cid,
+            "",
+            None,
+            at,
+            Some(Duration::days(7)),
+        );
+        p.subject_key_ids.clear();
+        ts::seal_row_in_place(&founder, &mut p);
+        put(a, &p).await.unwrap();
+        // The member's node answers the request with the live proposal ...
+        let served = live_standing_proposal(a, &cid)
+            .await
+            .unwrap()
+            .expect("I1504: the live standing proposal");
+        assert_eq!(served.attestation_id, p.attestation_id, "I1504");
+        // ... which the requester's node may receive ...
+        assert!(
+            may_receive(a, &joiner, &served).await.unwrap().allowed(),
+            "I1504: a non-member's node is in a public room's audience"
+        );
+        // ... and admits on its replicated door, holding the room's record.
+        let room = a
+            .list_signed_communities_since(None, 1000)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.community.community.community_key_id == cid)
+            .expect("A serves the room");
+        b.put_community(room.community)
+            .await
+            .expect("I1504: B takes the room");
+        b.apply_replicated_attestation(SignedAttestation {
+            attestation: served.clone(),
+        })
+        .await
+        .expect("I1504: the requester's node stores the proposal");
+        // The requester accepts on their own node; the member's node admits
+        // the acceptance and the requester's own widening.
+        let acc = reply(&joiner, &joiner, &served, true, at + Duration::seconds(1));
+        put(b, &acc).await.expect("I1504: the acceptance on B");
+        a.apply_replicated_attestation(SignedAttestation {
+            attestation: b
+                .get_attestation(&acc.attestation_id)
+                .await
+                .unwrap()
+                .unwrap(),
+        })
+        .await
+        .expect("I1504: A admits the acceptance");
+        widen_community(
+            a,
+            &cid,
+            &[&joiner],
+            &joiner,
+            None,
+            at + Duration::seconds(2),
+        )
+        .await
+        .expect("I1504: the joiner's own widening");
+        assert!(a
+            .active_community_members(&cid)
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.key_id == joiner));
+        // A withdrawn standing proposal is no longer live.
+        let mut w = ts::bare_attestation(
+            &uuid::Uuid::new_v4().to_string(),
+            &founder,
+            &founder,
+            &serde_json::json!({ "references_attestation_id": p.attestation_id }),
+        );
+        w.attestation_type = attestation_type::WITHDRAWS.into();
+        w.cohort_scope = COMMUNITY.into();
+        w.attestation_envelope["community_key_id"] = serde_json::json!(cid);
+        ts::seal_row_in_place(&founder, &mut w);
+        put(a, &w).await.expect("I1504: the founder withdraws it");
+        assert!(
+            live_standing_proposal(a, &cid).await.unwrap().is_none(),
+            "I1504: withdrawn, not live"
+        );
+        // A private room has no standing proposal to serve.
+        found_community(a, &private, "quorum:1/1", &[&founder], &[])
+            .await
+            .unwrap();
+        assert!(live_standing_proposal(a, &private).await.unwrap().is_none());
+    }
+}
+
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
@@ -450,6 +586,18 @@ mod runners {
                 case!(i1501_open_self_admit_only_on_a_public_room);
                 case!(i1502_the_joiner_admits_themselves);
                 case!(i1503_removal_takes_two_voices);
+
+                #[tokio::test]
+                async fn i1504_a_standing_proposal_is_served_on_request() {
+                    let Some(a) = $fresh.await else { return };
+                    let Some(b) = $fresh.await else { return };
+                    super::super::two_node::i1504_a_standing_proposal_is_served_on_request(
+                        &a as &dyn FederationDirectory,
+                        &b as &dyn FederationDirectory,
+                        &suffix(),
+                    )
+                    .await
+                }
             }
         };
     }
