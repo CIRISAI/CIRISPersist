@@ -1,0 +1,101 @@
+name: slice gate (mutation scopes on demand)
+
+# v61 — a slice's mutation scopes run on the runners instead of the build box.
+# `gh workflow run slice-gate.yml --ref <branch> -f scopes="scope-a scope-b" -f shards=4`
+# runs each named scope on the given ref, sharded, with the same steps as the
+# nightly mutants.yml. The lanes themselves run on the slice's draft PR (ci.yml).
+
+on:
+  workflow_dispatch:
+    inputs:
+      scopes:
+        description: "Space-separated scope names under scripts/mutants/ (without .txt)"
+        required: true
+      shards:
+        description: "Shards per scope"
+        required: false
+        default: "4"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: '10'
+  CARGO_HTTP_MULTIPLEXING: 'false'
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+  # No RUSTFLAGS: -D warnings here would make most mutants unviable.
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          SCOPES: ${{ inputs.scopes }}
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          n = int(os.environ["SHARDS"])
+          rows = []
+          for s in os.environ["SCOPES"].split():
+              for i in range(n):
+                  rows.append({"scope": s, "shard": f"{i}/{n}" if n > 1 else "", "id": f"{s}-{i}-of-{n}"})
+          print("matrix=" + json.dumps({"include": rows}))
+          EOF
+
+  mutants:
+    name: mutants (${{ matrix.scope }}${{ matrix.shard && format(' {0}', matrix.shard) || '' }})
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    services:
+      postgres:
+        image: ghcr.io/cirisai/postgres:16
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          POSTGRES_USER: ciris
+          POSTGRES_PASSWORD: ciris
+          POSTGRES_DB: ciris_persist_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ciris"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-mutants@27.1.0
+      - name: psql client for pg_test_db.sh
+        run: command -v psql || (sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client)
+      - name: mutation scopes are well-formed (from disk)
+        run: python3 scripts/mutants_scopes_check.py --self-test && python3 scripts/mutants_scopes_check.py
+      - name: mutation matrix and verdict
+        env:
+          CIRIS_PERSIST_PG_ADMIN_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
+          MUTANTS_BUDGET_SECS: '7200'
+          MUTANTS_JOBS: '1'
+          MUTANTS_SHARD: ${{ matrix.shard }}
+          SCOPE: scripts/mutants/${{ matrix.scope }}.txt
+        run: scripts/mutants.sh cargo-mutants "$SCOPE"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mutants-${{ matrix.id }}
+          path: target/certify-logs/mutants/
+          retention-days: 30
