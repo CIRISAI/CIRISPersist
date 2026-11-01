@@ -1060,6 +1060,11 @@ impl Engine {
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
         engine.sweep_dag_chunk_links_at_boot().await;
+        // v61 (CC 2.6.2) — settle stored rows whose signed instants are
+        // not in the canonical form: re-sign this node's own, keep in force
+        // what takes something away, set aside the rest. Never boot-fatal.
+        engine.settle_instant_forms_at_boot().await;
+
         // v31.0.0 (CIRISPersist#650) — the in-place v31 migration. Here rather
         // than in `Backend::run_migrations` because a re-stamp is a re-SIGN and
         // `Backend` has no signer; this is the first point at which the backend
@@ -1144,6 +1149,11 @@ impl Engine {
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
         engine.sweep_dag_chunk_links_at_boot().await;
+        // v61 (CC 2.6.2) — settle stored rows whose signed instants are
+        // not in the canonical form: re-sign this node's own, keep in force
+        // what takes something away, set aside the rest. Never boot-fatal.
+        engine.settle_instant_forms_at_boot().await;
+
         // v31.0.0 (CIRISPersist#650) — same hook as `with_signer`. A
         // pre-genesis node usually has nothing to migrate (no identity ⇒ no
         // authorship), and the routine returns early in that case; but a node
@@ -1212,6 +1222,11 @@ impl Engine {
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
         engine.sweep_dag_chunk_links_at_boot().await;
+        // v61 (CC 2.6.2) — settle stored rows whose signed instants are
+        // not in the canonical form: re-sign this node's own, keep in force
+        // what takes something away, set aside the rest. Never boot-fatal.
+        engine.settle_instant_forms_at_boot().await;
+
         Ok(engine)
     }
 
@@ -1283,6 +1298,11 @@ impl Engine {
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
         engine.sweep_dag_chunk_links_at_boot().await;
+        // v61 (CC 2.6.2) — settle stored rows whose signed instants are
+        // not in the canonical form: re-sign this node's own, keep in force
+        // what takes something away, set aside the rest. Never boot-fatal.
+        engine.settle_instant_forms_at_boot().await;
+
         Ok(engine)
     }
 
@@ -3241,6 +3261,11 @@ impl Engine {
             None => None,
         };
 
+        // v61 (CC 2.6.2) — the expiry is a signed instant: `.sssZ`, at the
+        // millisecond, and the record carries the same truncated instant.
+        let valid_until =
+            valid_until.map(crate::federation::admission::truncate_to_substrate_resolution);
+
         // v31.0.0 (CIRISPersist#659, one plane wider) — **BIND THE SUBJECT
         // BEFORE THE BYTES ARE FORMED.** This row is not verified here (the
         // §5.6.8.15 gate is for PEER registration, see below) but it is
@@ -3267,11 +3292,13 @@ impl Engine {
             identity_type,
             &pubkey_ed25519_base64,
             pqc_pubkey_b64.as_deref(),
-            // v38.7.0 (verify v14.0.0) — the expiry is BOUND now. A
-            // self-registration has no expiry to bind; a caller that grows
-            // one must pass it here, or the envelope will not satisfy
-            // verify's checker.
-            None,
+            // v38.7.0 (verify v14.0.0) — the expiry is BOUND. v61: the
+            // caller's `valid_until` (stored on the record below) is bound
+            // here in the CC 2.6.2 form; binding `None` beside a stored expiry
+            // made the row fail its own subject binding at every peer.
+            valid_until
+                .map(crate::federation::admission::render_signed_instant)
+                .as_deref(),
         )
         .map_err(crate::federation::Error::InvalidArgument)?;
 
@@ -3512,7 +3539,12 @@ impl Engine {
         }
 
         let mut registration_envelope = existing.registration_envelope.clone();
-        let valid_until_text = existing.valid_until.map(|t| t.to_rfc3339());
+        // v61 (CC 2.6.2) — the expiry binds as `.sssZ`, at the
+        // millisecond; the record carries the same truncated instant.
+        let valid_until = existing
+            .valid_until
+            .map(crate::federation::admission::truncate_to_substrate_resolution);
+        let valid_until_text = valid_until.map(crate::federation::admission::render_signed_instant);
         crate::federation::admission::bind_subject_into_envelope(
             &mut registration_envelope,
             &key_id,
@@ -3558,6 +3590,7 @@ impl Engine {
             scrub_timestamp: now,
             pqc_completed_at,
             persist_row_hash: String::new(),
+            valid_until,
             ..existing
         };
         self.rebind_key_record(crate::federation::SignedKeyRecord { record })
@@ -6957,6 +6990,75 @@ impl Engine {
     /// (Self::emit_pending_key_grants): best effort, logged, never an abort —
     /// a node that cannot emit right now must still boot, and every write
     /// door retries the dirty axis on its own path.
+    /// v61 (CC 2.6.2; the steward's strict ruling) — the open-time pass
+    /// over stored attestation rows whose signed instants are not
+    /// `.sssZ` ([`crate::federation::instant_form`]). Idempotent, logged,
+    /// never an abort: a node that cannot finish the pass still boots, and
+    /// the next open resumes it.
+    pub async fn settle_instant_forms(
+        &self,
+    ) -> Result<crate::federation::instant_form::InstantFormPass, crate::federation::Error> {
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        {
+            use crate::federation::instant_form::{run_pass, EngineStore};
+            let self_key_id = self.local_derived_key_id().await.map_err(|e| {
+                crate::federation::Error::Backend(format!("instant form pass: key id: {e}"))
+            })?;
+            let now = chrono::Utc::now();
+            match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => {
+                    run_pass(
+                        &EngineStore {
+                            engine: self,
+                            backend: b.as_ref(),
+                        },
+                        &self_key_id,
+                        now,
+                    )
+                    .await
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => {
+                    run_pass(
+                        &EngineStore {
+                            engine: self,
+                            backend: b.as_ref(),
+                        },
+                        &self_key_id,
+                        now,
+                    )
+                    .await
+                }
+            }
+        }
+        #[cfg(not(any(feature = "postgres", feature = "sqlite")))]
+        {
+            Ok(crate::federation::instant_form::InstantFormPass::default())
+        }
+    }
+
+    async fn settle_instant_forms_at_boot(&self) {
+        match self.settle_instant_forms().await {
+            Ok(pass) if pass.violations == 0 => {}
+            Ok(pass) => tracing::info!(
+                scanned = pass.scanned,
+                violations = pass.violations,
+                healed = pass.healed,
+                already_healed = pass.already_healed,
+                heal_refused = pass.heal_refused,
+                own_left = pass.own_left,
+                kept_in_force = pass.kept_in_force,
+                set_aside = pass.set_aside,
+                "CC 2.6.2 instant-form pass at open"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "CC 2.6.2 instant-form pass could not run at open; the next open retries"
+            ),
+        }
+    }
+
     /// v54.0.0 (CIRISPersist#994) — the boot leg of
     /// [`Self::backfill_dag_chunk_links`]: best effort, logged, never an
     /// abort, capped per boot.
@@ -18048,7 +18150,7 @@ mod tests {
             serde_json::json!({
                 "grants": "transfer",
                 "attestation_prefixes": ["trace:"],
-                "valid_until": "2020-01-01T00:00:00Z",
+                "valid_until": "2020-01-01T00:00:00.000Z",
             }),
         )
         .await;
@@ -19220,7 +19322,9 @@ mod tests {
         );
 
         // (2) The aperture: a conforming CC 3.4.12 binding ADMITS end-to-end.
-        let valid_until = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+        let valid_until = crate::federation::admission::render_signed_instant(
+            chrono::Utc::now() + chrono::Duration::days(30),
+        );
         engine
             .steward_bind_incapacity(
                 &s_signer,
@@ -22621,7 +22725,7 @@ mod tests {
             .expect("engine");
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let occ = format!("occ-{suffix}");
-        self_login_seed_key(&engine, &occ, identity_type::AGENT).await;
+        self_login_seed_key(&engine, &occ, identity_type::NODE).await;
         let dir = engine.federation_directory();
         let now = chrono::Utc::now();
 

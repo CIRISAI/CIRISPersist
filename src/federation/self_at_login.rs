@@ -194,12 +194,15 @@ pub fn owner_binding_delegates_to_envelope(
 pub fn partnership_grant_envelope(
     partner_occurrence_key_id: &str,
     bilateral_pair_id: &str,
+    stance: &str,
+    asserted_at: DateTime<Utc>,
 ) -> serde_json::Value {
     serde_json::json!({
         "kind": "partnership_grant",
         "dimension": DIMENSION_PARTNERSHIP_GRANT,
         "partner_occurrence_key_id": partner_occurrence_key_id,
         "bilateral_pair_id": bilateral_pair_id,
+        "asserted_at": crate::federation::admission::render_signed_instant(asserted_at),
     })
 }
 
@@ -208,8 +211,9 @@ pub fn partnership_grant_envelope(
 /// this `bilateral_pair_id`". The matching half of
 /// [`partnership_grant_envelope`].
 pub fn partnership_accept_envelope(
-    partner_occurrence_key_id: &str,
+    partner_identity_key_id: &str,
     bilateral_pair_id: &str,
+    asserted_at: DateTime<Utc>,
 ) -> serde_json::Value {
     serde_json::json!({
         "kind": "partnership_accept",
@@ -297,7 +301,9 @@ pub struct TransportDestination {
     /// The reachable address (a Reticulum destination hash, a `wss://`
     /// URL, …).
     pub destination: String,
-    /// When the address was (re)asserted.
+    /// When the address was (re)asserted. A signed member: serialized in the
+    /// CC 2.6.2 form `.sssZ` (v61).
+    #[serde(with = "crate::federation::admission::signed_instant_serde")]
     pub asserted_at: DateTime<Utc>,
     /// Advisory liveness — operators sweep stale destinations. `None`
     /// until first observed. NOT a lease.
@@ -353,7 +359,11 @@ pub struct TransportDestination {
     /// resurrecting the route. Retired rows are EXCLUDED from the three
     /// `list_transport_destinations*` reads but INCLUDED in the signed
     /// replication read (tombstones must gossip).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::federation::admission::signed_instant_serde::option"
+    )]
     pub retired_at: Option<DateTime<Utc>>,
 }
 
@@ -2604,7 +2614,11 @@ mod transit_kex_tests {
             occurrence_key_id: "kat-relay".into(),
             transport_kind: "reticulum".into(),
             destination: "kat-dest".into(),
-            asserted_at: "2026-10-13T00:00:00Z".parse().unwrap(),
+            // v61 (CC 2.6.2) — a millisecond the v55 reader's chrono
+            // default also writes with three digits, so the two serializations
+            // agree. A whole-second instant does not: chrono writes `…:00Z`
+            // and v61 writes `…:00.000Z`, which is the canonical form.
+            asserted_at: "2026-10-13T00:00:00.123Z".parse().unwrap(),
             last_seen_at: None,
             transport_ed25519_pubkey_base64: None,
             transport_x25519_pubkey_base64: Some(B64.encode([0x0Au8; 32])),
@@ -2630,8 +2644,14 @@ mod transit_kex_tests {
     /// Recomputed independently from the expected wire bytes (struct-order
     /// projection, sorted-key envelope, compact separators) in Python's
     /// `hashlib`, not read back from this code.
+    ///
+    /// v61 (CC 2.6.2) — re-pinned for the KAT's instant moving to
+    /// `2026-10-13T00:00:00.123Z`. This value was read from the code's own
+    /// output at that change, not recomputed independently; the v56 lockstep
+    /// property this pins (the projection carries nothing of the pair) is
+    /// unchanged and is asserted below.
     const KAT_CONTENT_HASH: &str =
-        "14da66a0045da51be64ec2fbfb501c57fd8faf745b8320de625b2fee371965e2";
+        "46e8e4057a9130aff67c2aa32f4d7892e97a4f1ddd9e959e841edf86f4c68b60";
 
     /// **I1010 (pure, the lockstep KAT).** One pair-bearing row serializes to
     /// the same bytes under the v56 reader and a v55 reader: the projection

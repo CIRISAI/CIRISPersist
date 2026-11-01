@@ -692,6 +692,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("attesting_identity_type", ConnClass::Read),
     ("composer_replay_held", ConnClass::Read),
     ("delete_attestation", ConnClass::Write),
+    // v61 (CC 2.6.2) — the open-time pass's compare-and-delete + ledger row.
+    ("set_aside_form_refused", ConnClass::Write),
     ("repair_withdraws_depth", ConnClass::Write),
     // v59.0.0 (#1099) — the V199 self-roster receipts.
     ("note_self_roster_proposal", ConnClass::Write),

@@ -1204,8 +1204,12 @@ pub mod test_support {
     /// signing bytes, so the door's authority gate verifies against the
     /// pubkeys [`register_hybrid_key`] registered for `trusted_by`.
     pub fn signed_trust_grant(
-        grant: crate::federation::TrustGrant,
+        mut grant: crate::federation::TrustGrant,
     ) -> crate::federation::SignedTrustGrant {
+        // v61 (CC 2.6.2) — the v2 preimage carries milliseconds.
+        grant.expires_at = grant
+            .expires_at
+            .map(crate::federation::admission::truncate_to_substrate_resolution);
         let bytes = crate::federation::admission::trust_grant_signing_bytes(&grant)
             .expect("trust grant canonicalizes");
         let sig = threshold_sign(&grant.trusted_by, &bytes);
@@ -1549,7 +1553,7 @@ pub mod test_support {
             "dimension": "consent:state:revoked:v1",
             "score": 1.0,
             "confidence": 0.9,
-            crate::federation::envelope::paths::ASSERTED_AT: asserted.to_rfc3339(),
+            crate::federation::envelope::paths::ASSERTED_AT: crate::federation::admission::render_signed_instant(asserted),
         });
         if let (Some(obj), Some(more)) = (envelope.as_object_mut(), extra.as_object()) {
             for (k, v) in more {
@@ -2935,7 +2939,7 @@ pub mod test_support {
         register_identity_key(dir, &lapsed_node, "node,infra:serve").await;
         for (scope, valid_until) in [
             // The lapsed serve grant.
-            (ds::INFRA_SERVE, Some("2020-01-01T00:00:00Z")),
+            (ds::INFRA_SERVE, Some("2020-01-01T00:00:00.000Z")),
             // The refresh: live, and deliberately NOT bearing infra:serve, so
             // ownership resolves while no live grant carries serve standing.
             (ds::INFRA_NETWORK_PRESENCE, None),

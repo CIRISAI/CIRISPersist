@@ -326,7 +326,7 @@ pub mod bodies {
                 &r,
                 serde_json::json!({
                     "scope": [DELEGATION_SCOPE_LICENSE],
-                    DELEGATION_VALID_FROM_FIELD: "last spring",
+                    DELEGATION_VALID_FROM_FIELD: 20260401,
                     DELEGATION_VALID_UNTIL_FIELD: instant(now + day * 30),
                 }),
             )
@@ -334,6 +334,31 @@ pub mod bodies {
             rule::TERM_UNREADABLE,
             &format!("[{tag}] I1231(5) an unreadable delegation_valid_from"),
         );
+        // v61 (CC 2.6.2) — a string that is not `.sssZ` is refused by the
+        // envelope shape gate first, naming the member.
+        match put_raw(
+            d,
+            &granter,
+            &r,
+            serde_json::json!({
+                "scope": [DELEGATION_SCOPE_LICENSE],
+                DELEGATION_VALID_FROM_FIELD: "last spring",
+                DELEGATION_VALID_UNTIL_FIELD: instant(now + day * 30),
+            }),
+        )
+        .await
+        {
+            Err(Error::MalformedRow {
+                reason, message, ..
+            }) => {
+                assert_eq!(
+                    reason,
+                    crate::federation::malformed_row::ENVELOPE_MEMBER_INVALID
+                );
+                assert!(message.contains(DELEGATION_VALID_FROM_FIELD), "{message}");
+            }
+            other => panic!("[{tag}] I1231(5b) expected envelope_member_invalid, got {other:?}"),
+        }
 
         // (6) Not term-bearing: the term stays optional, and a start-only term
         // is open-ended. Kills: gating every `delegates_to`.
@@ -691,7 +716,7 @@ mod lens {
     }
 
     fn at(t: chrono::DateTime<Utc>) -> serde_json::Value {
-        serde_json::Value::String(t.to_rfc3339())
+        serde_json::Value::String(crate::federation::admission::render_signed_instant(t))
     }
 
     #[test]

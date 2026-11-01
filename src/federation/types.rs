@@ -4446,7 +4446,8 @@ impl SignedTouchClaim {
         serde_json::json!({
             "target_key_id": self.target_key_id,
             "target_kind": self.target_kind,
-            "fresh_as_of": self.fresh_as_of.to_rfc3339(),
+            // CC 2.6.2: `.sssZ` (v61 S3).
+            "fresh_as_of": crate::federation::admission::render_signed_instant(self.fresh_as_of),
             "signer_form": self.signer_form.as_str(),
             "attesting_key_id": self.attesting_key_id,
             "cohort_scope": self.cohort_scope,

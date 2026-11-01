@@ -443,6 +443,11 @@ pub mod claim_signing_invariants;
     any(feature = "postgres", feature = "sqlite")
 ))]
 pub mod key_rebind_invariants;
+// v61 (CC 2.6.2) — the open-time pass over non-canonical signed instants.
+pub mod instant_form;
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub(crate) mod instant_form_invariants;
+
 // v54.1.0 (#1042) — the ordering-gap witnesses drive the key plan too.
 #[cfg(all(
     any(test, feature = "test-anchor"),

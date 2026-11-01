@@ -20201,6 +20201,41 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         Ok(n > 0)
     }
 
+    async fn set_aside_form_refused(
+        &self,
+        row: &crate::federation::Attestation,
+        member: &str,
+        value: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, crate::federation::Error> {
+        let id = row.attestation_id.clone();
+        let attester = row.attesting_key_id.clone();
+        let hash = row.persist_row_hash.clone();
+        let (member, value) = (member.to_owned(), value.to_owned());
+        let at = at.to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
+        self.write(move |conn| -> Result<bool, rusqlite::Error> {
+            let tx = conn.transaction()?;
+            let gone = tx.execute(
+                "DELETE FROM federation_attestations \
+                 WHERE attestation_id = ?1 AND persist_row_hash = ?2",
+                rusqlite::params![id, hash],
+            )?;
+            if gone == 0 {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO federation_attestations_form_refused \
+                 (attestation_id, attesting_key_id, persist_row_hash, refused_member, \
+                  refused_value, refused_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![id, attester, hash, member, value, at],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("set_aside_form_refused: {e}")))
+    }
+
     async fn store_planned_attestation(
         &self,
         planned: crate::federation::attestation_admit::PlannedAttestation,
@@ -32053,7 +32088,10 @@ mod tests {
         );
         assert_eq!(mine[0].detail["cohort_key_id"], fam);
         assert_eq!(mine[0].subject_key_id.as_deref(), Some(member.as_str()));
-        assert_eq!(mine[0].detail["effective_at"], effective.to_rfc3339());
+        assert_eq!(
+            mine[0].detail["effective_at"],
+            crate::federation::admission::render_signed_instant(effective)
+        );
     }
 
     /// Clause 2 (#146 Ask 5, CEG §5.6.8.7) — consent_record admission:
@@ -48460,7 +48498,8 @@ mod tests {
         };
 
         // LIVE binding (future valid_until) → S is a live anchor of A.
-        let future = (Utc::now() + Duration::days(30)).to_rfc3339();
+        let future =
+            crate::federation::admission::render_signed_instant(Utc::now() + Duration::days(30));
         backend
             .put_attestation(SignedAttestation {
                 attestation: binding("si-live", &future),
@@ -48496,7 +48535,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let lapsed = (Utc::now() - Duration::days(1)).to_rfc3339();
+        let lapsed =
+            crate::federation::admission::render_signed_instant(Utc::now() - Duration::days(1));
         let mut b = topo_attestation(
             "si-S",
             "si-B",

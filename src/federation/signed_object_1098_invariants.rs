@@ -459,20 +459,6 @@ pub(crate) mod bodies {
     ///   (CIRISPersist#1161).
     /// - `refuse_row_type`: the allowlist stays Report-only until the Enforce
     ///   flip's data preconditions are met (CIRISPersist#1150).
-    /// - `refuse_timestamp_form`: CC 2.6.2 says a producer MUST write `Z` with
-    ///   exactly three fractional digits. Admission keeps accepting other RFC
-    ///   3339 forms until the steward rules on the upgrade path, because
-    ///   refusing them would refuse replicated rows from every older peer.
-    ///   Persist's own signed-instant emitters, as of this cut (the producer
-    ///   fix is S3):
-    ///   - CC's form (`render_signed_instant`, Millis + `Z`): the attestation
-    ///     emit paths that stamp `asserted_at` / `expires_at`.
-    ///   - `+00:00` (chrono's `to_rfc3339()`): `hard_case::membership_removed_event`
-    ///     (`effective_at`), `mesh_config::mesh_config_envelope` (`valid_until`),
-    ///     `ingest::scrub_preimage` (`scrub_timestamp`) and
-    ///     `admission::revocation_binding` (the key plane's `scrub_timestamp`).
-    ///   - `Z` with six digits: `admission::trust_revocation_signing_bytes`
-    ///     (`revoked_at`); `Z` with none: `transform::round_timestamp`.
     const DIVERGENCES: &[(&str, &str, &str)] = &[
         (
             "scores_subject_and_scope",
@@ -487,12 +473,6 @@ pub(crate) mod bodies {
             "admitted",
             "the row-type allowlist is Report-only until the Enforce flip's preconditions are \
              met (CIRISPersist#1150)",
-        ),
-        (
-            "refuse_timestamp_form",
-            "admitted",
-            "admission accepts any RFC 3339 form until the steward's upgrade-path ruling; \
-             persist's producers move to CC 2.6.2's form in S3",
         ),
     ];
 

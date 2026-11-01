@@ -260,6 +260,9 @@ pub(crate) mod test_support {
         signer_form: SignerForm,
         cohort_scope: &str,
     ) -> SignedTouchClaim {
+        // v61 (CC 2.6.2) — the signed form carries milliseconds.
+        let fresh_as_of =
+            crate::federation::admission::truncate_to_substrate_resolution(fresh_as_of);
         let unsigned = SignedTouchClaim {
             target_key_id: target_key_id.to_owned(),
             target_kind: target_kind.to_owned(),

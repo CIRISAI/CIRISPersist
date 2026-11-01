@@ -250,7 +250,7 @@ pub mod test_support {
         let mut envelope = serde_json::json!({
             "dimension": stance_dimension,
             "scope": scopes,
-            crate::federation::envelope::paths::ASSERTED_AT: asserted_at.to_rfc3339(),
+            crate::federation::envelope::paths::ASSERTED_AT: crate::federation::admission::render_signed_instant(asserted_at),
         });
         if let Some(target) = supersedes {
             envelope[crate::federation::envelope::paths::CONSENT_SUPERSEDES] = target;
@@ -306,7 +306,7 @@ pub mod test_support {
         let envelope = serde_json::json!({
             crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID: target_attestation_id,
             crate::federation::envelope::paths::WITHDRAWAL_REASON: "consent-plane retraction",
-            crate::federation::envelope::paths::ASSERTED_AT: asserted_at.to_rfc3339(),
+            crate::federation::envelope::paths::ASSERTED_AT: crate::federation::admission::render_signed_instant(asserted_at),
         });
         let (och, sc, sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(subject, &envelope);
@@ -1901,9 +1901,12 @@ pub mod test_support {
         let lease = |r: &mut Attestation, from: chrono::DateTime<chrono::Utc>, secs: i64| {
             r.attestation_envelope["community_id"] = serde_json::json!(format!("room-{run}"));
             r.attestation_envelope["session_id"] = serde_json::json!("s-1");
-            r.attestation_envelope["claimed_at"] = serde_json::json!(from.to_rfc3339());
+            r.attestation_envelope["claimed_at"] =
+                serde_json::json!(crate::federation::admission::render_signed_instant(from));
             r.attestation_envelope["valid_until"] =
-                serde_json::json!((from + chrono::Duration::seconds(secs)).to_rfc3339());
+                serde_json::json!(crate::federation::admission::render_signed_instant(
+                    from + chrono::Duration::seconds(secs)
+                ));
             ts::reseal(r);
         };
         let now = chrono::Utc::now();
@@ -1938,7 +1941,8 @@ pub mod test_support {
         {
             let id = uuid::Uuid::new_v4().to_string();
             let mut r = scores_row(&id, &occurrence, &occurrence, "session:claim:v1");
-            r.attestation_envelope["claimed_at"] = serde_json::json!(now.to_rfc3339());
+            r.attestation_envelope["claimed_at"] =
+                serde_json::json!(crate::federation::admission::render_signed_instant(now));
             ts::reseal(&mut r);
             let err = dir
                 .put_attestation(SignedAttestation { attestation: r })
@@ -1967,8 +1971,10 @@ pub mod test_support {
                 );
                 r.attestation_envelope["community_id"] = serde_json::json!(format!("room-{run}"));
                 r.attestation_envelope["session_id"] = serde_json::json!(session);
-                r.attestation_envelope["claimed_at"] = serde_json::json!(from.to_rfc3339());
-                r.attestation_envelope["valid_until"] = serde_json::json!(until.to_rfc3339());
+                r.attestation_envelope["claimed_at"] =
+                    serde_json::json!(crate::federation::admission::render_signed_instant(from));
+                r.attestation_envelope["valid_until"] =
+                    serde_json::json!(crate::federation::admission::render_signed_instant(until));
                 ts::reseal(&mut r);
                 dir.put_attestation(SignedAttestation { attestation: r })
             };

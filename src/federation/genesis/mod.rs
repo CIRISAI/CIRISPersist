@@ -1614,6 +1614,13 @@ pub fn bundle_delegation_plane_v31_shaped(bundle: &GenesisBundle) -> Result<(), 
             crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
         )
         .map_err(|e| e.to_string())?;
+        // v61 (CC 2.6.2) — and its signed instants are `.sssZ`.
+        if let Some(v) = crate::federation::admission::signed_instant_form_violation(row) {
+            return Err(format!(
+                "attestation {}: `{}` = {:?} is not in the CC 2.6.2 form",
+                row.attestation_id, v.member, v.value
+            ));
+        }
     }
     Ok(())
 }
@@ -1627,7 +1634,9 @@ pub fn bundle_delegation_plane_v31_shaped(bundle: &GenesisBundle) -> Result<(), 
 /// property it exists to prove never changed.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) fn is_v31_binding_refusal(msg: &str) -> bool {
-    msg.contains("CIRISPersist#643") || msg.contains("CIRISPersist#598")
+    msg.contains("CIRISPersist#643")
+        || msg.contains("CIRISPersist#598")
+        || msg.contains("CC 2.6.2 form")
 }
 
 /// v30.6.0 (CIRISPersist#622) — the THREE-BACKEND genesis witness.
@@ -2665,11 +2674,12 @@ pub(crate) async fn assert_refused_replacement_keeps_the_row(
     let future = {
         use chrono::round::DurationRound as _;
         (chrono::Utc::now() + chrono::Duration::days(3650))
-            .duration_trunc(chrono::Duration::microseconds(1))
-            .expect("truncate to microseconds")
+            .duration_trunc(chrono::Duration::milliseconds(1))
+            .expect("truncate to milliseconds")
     };
     ahead.asserted_at = future;
-    ahead.attestation_envelope["asserted_at"] = serde_json::json!(future.to_rfc3339());
+    ahead.attestation_envelope["asserted_at"] =
+        serde_json::json!(crate::federation::admission::render_signed_instant(future));
     let ahead = super::SignedAttestation { attestation: ahead };
 
     let shape = crate::federation::migration::classify_shape(

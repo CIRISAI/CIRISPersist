@@ -243,6 +243,21 @@ pub(crate) trait AttestationStore:
         only_if_hash: Option<&str>,
     ) -> Result<bool, Error>;
 
+    /// v61 (CC 2.6.2) — remove `row` from `federation_attestations` and
+    /// record it in the V211 ledger `federation_attestations_form_refused`
+    /// (its id, attester, row hash, the member that failed, its value and
+    /// `at`; no row body), in one transaction: a compare-and-delete on the
+    /// row's `persist_row_hash`, then the ledger row. A row whose hash moved,
+    /// or that is gone, is left alone: `false`. The caller removes the row's
+    /// projections first ([`FederationDirectory::purge_attestation_projections`]).
+    async fn set_aside_form_refused(
+        &self,
+        row: &Attestation,
+        member: &str,
+        value: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, Error>;
+
     /// v57.0.0 (CIRISPersist#988 item 2) — store a planned `hard_case` row:
     /// the row (insert-if-absent on its id, so a re-recorded event is a no-op)
     /// and, when the row landed, its `hard_case_events` projection, in one
@@ -1470,6 +1485,24 @@ where
     // door too (`FSD/MEDIA_SOURCE.md` §6). A local row never carries a
     // holder claim, so only the struct is checked here.
     crate::federation::media_source::check_media_source(&envelope_value)?;
+    // v61 (CC 2.6.2) — a signed instant is `.sssZ` at the local door too:
+    // a row written in another form could never be promoted. `expires_at` is
+    // the door's own to stamp from the typed column (#598), so it is not read
+    // from the caller here.
+    if let Some(v) =
+        crate::federation::admission::local_write_instant_form_violation(&envelope_value)
+    {
+        return Err(Error::malformed_row(
+            "attestation",
+            crate::federation::malformed_row::ENVELOPE_MEMBER_INVALID,
+            format!(
+                "local attestation: `{}` = {:?} is not in the CC 2.6.2 form \
+                 YYYY-MM-DDTHH:MM:SS.sssZ",
+                v.member, v.value
+            ),
+        ));
+    }
+
     crate::federation::admission::check_trace_dimension_admission(
         input.dimension(),
         &input.attesting_key_id,

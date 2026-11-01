@@ -22889,6 +22889,52 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         Ok(n > 0)
     }
 
+    async fn set_aside_form_refused(
+        &self,
+        row: &crate::federation::Attestation,
+        member: &str,
+        value: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, crate::federation::Error> {
+        let err = |e: tokio_postgres::Error| {
+            crate::federation::Error::Backend(format!("set_aside_form_refused: {e}"))
+        };
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let tx = client.transaction().await.map_err(err)?;
+        let gone = tx
+            .execute(
+                "DELETE FROM cirislens.federation_attestations \
+                 WHERE attestation_id = $1 AND persist_row_hash = $2",
+                &[&row.attestation_id, &row.persist_row_hash],
+            )
+            .await
+            .map_err(err)?;
+        if gone == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO cirislens.federation_attestations_form_refused \
+             (attestation_id, attesting_key_id, persist_row_hash, refused_member, \
+              refused_value, refused_at) VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (attestation_id) DO NOTHING",
+            &[
+                &row.attestation_id,
+                &row.attesting_key_id,
+                &row.persist_row_hash,
+                &member,
+                &value,
+                &at,
+            ],
+        )
+        .await
+        .map_err(err)?;
+        tx.commit().await.map_err(err)?;
+        Ok(true)
+    }
+
     async fn store_planned_attestation(
         &self,
         planned: crate::federation::attestation_admit::PlannedAttestation,
@@ -42739,7 +42785,10 @@ mod tests {
         );
         assert_eq!(mine[0].detail["cohort_key_id"], fam);
         assert_eq!(mine[0].subject_key_id.as_deref(), Some(member.as_str()));
-        assert_eq!(mine[0].detail["effective_at"], effective.to_rfc3339());
+        assert_eq!(
+            mine[0].detail["effective_at"],
+            crate::federation::admission::render_signed_instant(effective)
+        );
     }
 
     /// Clause 2 (#146 Ask 5, CEG §5.6.8.7) — consent_record admission on

@@ -1194,7 +1194,9 @@ pub fn mesh_config_envelope(
         field::GROUNDS: grounds,
     });
     if let Some(vu) = valid_until {
-        env[field::VALID_UNTIL] = serde_json::Value::String(vu.to_rfc3339());
+        // CC 2.6.2: a signed instant is `.sssZ` (v61 S3).
+        env[field::VALID_UNTIL] =
+            serde_json::Value::String(crate::federation::admission::render_signed_instant(vu));
     }
     if let Some(r) = ratifies {
         env[field::RATIFIES] = serde_json::Value::String(r.to_owned());
@@ -3982,7 +3984,10 @@ mod tests {
         let now = Utc::now();
         let base = MeshConfigBaseline::owner_defaults();
         let relief_at = now - Duration::hours(1);
-        let expires = now + Duration::hours(24);
+        // v61 (CC 2.6.2) — the signed expiry carries milliseconds.
+        let expires = crate::federation::admission::truncate_to_substrate_resolution(
+            now + Duration::hours(24),
+        );
 
         // ── 1. The OWNER's root relieves the node it subscribes to. Bounded
         //       emergency relief, which is what CC 4.2.1 gives a single holder.

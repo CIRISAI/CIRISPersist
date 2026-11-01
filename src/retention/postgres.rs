@@ -232,7 +232,7 @@ async fn table_usage_pg(
             .query_one(
                 &format!(
                     "SELECT pg_total_relation_size('{}')::BIGINT AS sz",
-                    qualified
+                    qualified.replace('\'', "''")
                 ),
                 &[],
             )

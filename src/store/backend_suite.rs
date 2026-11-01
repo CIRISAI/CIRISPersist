@@ -3859,7 +3859,7 @@ mod tests {
         row.attestation_envelope = serde_json::json!({
             "id": "bare-rev", "dimension": "consent:state:revoked:v1",
             "score": 1.0, "confidence": 0.9,
-            crate::federation::envelope::paths::ASSERTED_AT: row.asserted_at.to_rfc3339(),
+            crate::federation::envelope::paths::ASSERTED_AT: crate::federation::admission::render_signed_instant(row.asserted_at),
         });
         row.subject_key_ids = vec!["subject-key".into()];
         row.tier = crate::federation::types::attestation_tier::LOCAL.into();
@@ -5647,7 +5647,8 @@ mod tests {
         use chrono::{Duration, Utc};
         let backend = test_backend();
         bootstrap_incapacity(&backend, "ai").await;
-        let future = (Utc::now() + Duration::days(30)).to_rfc3339();
+        let future =
+            crate::federation::admission::render_signed_instant(Utc::now() + Duration::days(30));
 
         // (0) presumption of capacity — an adult with NO incapacity attested is
         // self-sovereign (the CC 3.2 un-stewardable default reasserts).
@@ -5723,7 +5724,8 @@ mod tests {
         assert_forbidden(&e, "missing_valid_until");
 
         // (3) valid_until beyond the T2 review cadence (90d) → rejected.
-        let far = (Utc::now() + Duration::days(200)).to_rfc3339();
+        let far =
+            crate::federation::admission::render_signed_instant(Utc::now() + Duration::days(200));
         let e = backend
             .put_attestation(SignedAttestation {
                 attestation: fix_incapacity_binding(
@@ -5822,7 +5824,8 @@ mod tests {
         use chrono::{Duration, Utc};
         let backend = test_backend();
         bootstrap_incapacity(&backend, "t1").await;
-        let soon = (Utc::now() + Duration::days(2)).to_rfc3339();
+        let soon =
+            crate::federation::admission::render_signed_instant(Utc::now() + Duration::days(2));
         put_capacity(
             &backend,
             "t1c",
@@ -5883,7 +5886,8 @@ mod tests {
         use chrono::{Duration, Utc};
         let backend = test_backend();
         bootstrap_incapacity(&backend, "pd").await;
-        let future = (Utc::now() + Duration::days(10)).to_rfc3339();
+        let future =
+            crate::federation::admission::render_signed_instant(Utc::now() + Duration::days(10));
         put_capacity(
             &backend,
             "pdc",
@@ -5926,7 +5930,8 @@ mod tests {
         use chrono::{Duration, Utc};
         let backend = test_backend();
         bootstrap_incapacity(&backend, "cf").await;
-        let future = (Utc::now() + Duration::days(10)).to_rfc3339();
+        let future =
+            crate::federation::admission::render_signed_instant(Utc::now() + Duration::days(10));
         put_capacity(
             &backend,
             "cfc",
