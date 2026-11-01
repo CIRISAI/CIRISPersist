@@ -7001,131 +7001,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
         authority_signature: Option<serde_json::Value>,
     ) -> Result<(), crate::federation::Error> {
-        use crate::federation::Error;
-        // v31.1.0 (CIRISPersist#662, PR #667 round-5) — `created_at` is half the
-        // evidence cursor (`max(created_at, max(server_arrival_at))`), so it is
-        // an allocated position, not a wall-clock read.
-        //
-        // THIS SITE WAS MISSED while memory and postgres got it, and the gap
-        // was not benign on the one path where the participation allocator has
-        // nothing to work with: a consumer advances its cursor to a
-        // ZERO-PARTICIPATION proposal at T, the clock steps back, and a later
-        // proposal plus its first votes all land at or below T. There is no
-        // post-T participation for `MAX(server_arrival_at)` to rescue the
-        // bundle with, so the quorum-bearing evidence is never served — the
-        // permanent skip this whole change exists to remove, reintroduced on
-        // one backend.
-        let created_at = {
-            let last: Option<String> = self
-                .read(move |conn| {
-                    conn.query_row("SELECT MAX(created_at) FROM accord_proposal", [], |r| {
-                        r.get(0)
-                    })
-                    .optional()
-                })
-                .await
-                .map_err(|e| Error::Backend(format!("last accord created_at: {e}")))?
-                .flatten();
-            crate::federation::types::monotonic_admission_instant(
-                chrono::Utc::now(),
-                last.as_deref().map(parse_rfc3339),
-            )
-        };
-        let prep = crate::federation::accord_quorum::prepare_proposal(
-            &proposal,
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::accord_admit::put_accord_proposal_planned(
+            self,
+            proposal,
             authority_signature,
-            created_at,
-        )?;
-        let proposal_json = serde_json::to_string(&prep.proposal_json)
-            .map_err(|e| Error::Backend(format!("proposal_json encode: {e}")))?;
-        let auth_sig = match &prep.authority_signature {
-            Some(v) => Some(
-                serde_json::to_string(v)
-                    .map_err(|e| Error::Backend(format!("authority_signature encode: {e}")))?,
-            ),
-            None => None,
-        };
-        let reused = self
-            .write(move |conn| -> Result<Option<String>, rusqlite::Error> {
-                // v54.1.0 (#1047; Codex round 3 on PR #1057) — single use,
-                // ENFORCED BY THE DATABASE: the V189 claim's PRIMARY KEY
-                // `(family_key_id, nonce)`, inserted in the proposal's own
-                // transaction. A SELECT-then-INSERT is not enough: two
-                // backends on one file hold two connections and both pass the
-                // SELECT. The claim's INSERT takes the write lock first, so a
-                // second writer waits and then reads the first one's claim.
-                // IMMEDIATE: the write lock is taken BEFORE the held-digest
-                // read, so a second backend on the file waits on the busy
-                // timeout instead of failing a read-to-write lock upgrade
-                // ("database is locked").
-                let tx =
-                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                // Codex round 4 on PR #1057 — a HELD digest is an idempotent
-                // replay, accepted before the claim is asked: a legacy
-                // proposal V189 did not give the claim to (it shared its pair
-                // with an earlier one) is held evidence, and its replay must
-                // not abort the delivery its participations ride on.
-                let held: bool = tx
-                    .query_row(
-                        "SELECT 1 FROM accord_proposal WHERE proposal_digest = ?1",
-                        [&prep.proposal_digest],
-                        |_| Ok(true),
-                    )
-                    .optional()?
-                    .unwrap_or(false);
-                if held {
-                    return Ok(None);
-                }
-                tx.execute(
-                    "INSERT INTO accord_proposal_nonce_claim \
-                        (family_key_id, nonce, proposal_digest) VALUES (?1, ?2, ?3) \
-                     ON CONFLICT (family_key_id, nonce) DO NOTHING",
-                    rusqlite::params![prep.family_key_id, prep.nonce, prep.proposal_digest],
-                )?;
-                let owner: String = tx.query_row(
-                    "SELECT proposal_digest FROM accord_proposal_nonce_claim \
-                     WHERE family_key_id = ?1 AND nonce = ?2",
-                    rusqlite::params![prep.family_key_id, prep.nonce],
-                    |r| r.get(0),
-                )?;
-                if owner != prep.proposal_digest {
-                    return Ok(Some(owner));
-                }
-                // ON CONFLICT DO NOTHING — the digest is content-derived, so a
-                // re-PUT of the same proposal is idempotent and a different
-                // proposal cannot collide.
-                tx.execute(
-                    "INSERT INTO accord_proposal (\
-                    proposal_digest, family_key_id, action, nonce, window_until, \
-                    prior_family_digest, payload_sha256, proposal_json, \
-                    authority_signature, persist_row_hash, created_at\
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
-                 ON CONFLICT(proposal_digest) DO NOTHING",
-                    rusqlite::params![
-                        prep.proposal_digest,
-                        prep.family_key_id,
-                        prep.action,
-                        prep.nonce,
-                        prep.window_until.to_rfc3339(),
-                        prep.prior_family_digest,
-                        prep.payload_sha256,
-                        proposal_json,
-                        auth_sig,
-                        prep.persist_row_hash,
-                        prep.created_at.to_rfc3339(),
-                    ],
-                )?;
-                tx.commit()?;
-                Ok(None)
-            })
-            .await
-            .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))?;
-        match reused {
-            Some(other) => Err(crate::federation::accord_quorum::nonce_reused(
-                &proposal, &other,
-            )),
-            None => Ok(()),
-        }
+        )
+        .await
     }
 
     async fn get_accord_proposal(
@@ -7215,93 +7097,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
         standing_roster: &[ciris_verify_core::threshold::ThresholdMember],
     ) -> Result<(), crate::federation::Error> {
-        use crate::federation::Error;
-        // The proposal MUST exist (verify-before-mutation needs it to verify
-        // the participation binding).
-        let stored = self
-            .get_accord_proposal(&participation.proposal_digest)
-            .await?
-            .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "accord participation references unknown proposal {:?}",
-                    participation.proposal_digest
-                ))
-            })?;
-        // The other half of the evidence cursor; same rule.
-        let arrival = {
-            let last: Option<String> = self
-                .read(move |conn| {
-                    conn.query_row(
-                        "SELECT MAX(server_arrival_at) FROM accord_participation",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                })
-                .await
-                .map_err(|e| Error::Backend(format!("last server_arrival_at: {e}")))?
-                .flatten();
-            crate::federation::types::monotonic_admission_instant(
-                chrono::Utc::now(),
-                last.as_deref().map(parse_rfc3339),
-            )
-        };
-        let prep = crate::federation::accord_quorum::verify_and_prepare_participation(
-            &stored.proposal,
-            &participation,
+        crate::federation::accord_admit::put_accord_participation_planned(
+            self,
+            participation,
             standing_roster,
-            arrival,
-        )?;
-        let participation_json = serde_json::to_string(&prep.participation_json)
-            .map_err(|e| Error::Backend(format!("participation_json encode: {e}")))?;
-        let outcome = self
-            .write(move |conn| -> Result<&'static str, rusqlite::Error> {
-                // M6 durable dedup by (proposal_digest, pinned_pubkey): a second
-                // participation by the same pinned holder is idempotent if
-                // byte-identical, else a conflict (one vote per holder).
-                let existing: Option<String> = conn
-                    .query_row(
-                        "SELECT persist_row_hash FROM accord_participation \
-                     WHERE proposal_digest = ?1 AND pinned_pubkey = ?2",
-                        rusqlite::params![prep.proposal_digest, prep.pinned_pubkey],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                if let Some(h) = existing {
-                    return Ok(if h == prep.persist_row_hash {
-                        "noop"
-                    } else {
-                        "conflict"
-                    });
-                }
-                conn.execute(
-                    "INSERT INTO accord_participation (\
-                    proposal_digest, member_id, pinned_pubkey, vote, window_until, \
-                    signed_at, server_arrival_at, participation_json, persist_row_hash\
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                    rusqlite::params![
-                        prep.proposal_digest,
-                        prep.member_id,
-                        prep.pinned_pubkey,
-                        prep.vote,
-                        prep.window_until.to_rfc3339(),
-                        prep.signed_at.to_rfc3339(),
-                        prep.server_arrival_at.to_rfc3339(),
-                        participation_json,
-                        prep.persist_row_hash,
-                    ],
-                )?;
-                Ok("inserted")
-            })
-            .await
-            .map_err(|e| Error::Backend(format!("insert accord_participation: {e}")))?;
-        if outcome == "conflict" {
-            return Err(Error::Conflict(format!(
-                "accord participation: holder (pinned pubkey) already voted differently on proposal {:?} (M6 — one vote per holder)",
-                participation.proposal_digest
-            )));
-        }
-        Ok(())
+        )
+        .await
     }
 
     async fn list_accord_participations(
@@ -7332,62 +7133,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         decision: ciris_verify_core::accord_live_quorum::AccordDecision,
     ) -> Result<(), crate::federation::Error> {
-        use crate::federation::Error;
-        let prep =
-            crate::federation::accord_quorum::prepare_decision(&decision, chrono::Utc::now())?;
-        let live_set = serde_json::to_string(&prep.live_set)
-            .map_err(|e| Error::Backend(format!("live_set encode: {e}")))?;
-        let decision_json = serde_json::to_string(&prep.decision_json)
-            .map_err(|e| Error::Backend(format!("decision_json encode: {e}")))?;
-        let digest_for_err = prep.proposal_digest.clone();
-        let outcome = self
-            .write(move |conn| -> Result<&'static str, rusqlite::Error> {
-                // Immutable (M2): identical re-PUT is a no-op, a differing one is
-                // a conflict.
-                let existing: Option<String> = conn
-                    .query_row(
-                        "SELECT persist_row_hash FROM accord_decision WHERE proposal_digest = ?1",
-                        [&prep.proposal_digest],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                if let Some(h) = existing {
-                    return Ok(if h == prep.persist_row_hash {
-                        "noop"
-                    } else {
-                        "conflict"
-                    });
-                }
-                conn.execute(
-                    "INSERT INTO accord_decision (\
-                    proposal_digest, family_key_id, authorized, yes, no, abstain, \
-                    live_set, window_until, decision_json, \
-                    persist_row_hash, decided_at\
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-                    rusqlite::params![
-                        prep.proposal_digest,
-                        prep.family_key_id,
-                        prep.authorized as i64,
-                        prep.yes,
-                        prep.no,
-                        prep.abstain,
-                        live_set,
-                        prep.window_until.to_rfc3339(),
-                        decision_json,
-                        prep.persist_row_hash,
-                        prep.decided_at.to_rfc3339(),
-                    ],
-                )?;
-                Ok("inserted")
-            })
-            .await
-            .map_err(|e| Error::Backend(format!("insert accord_decision: {e}")))?;
-        if outcome == "conflict" {
-            return Err(Error::Conflict(format!(
-                "accord decision for proposal {digest_for_err:?} already recorded with different content (M2 — immutable)"
-            )));
-        }
-        Ok(())
+        crate::federation::accord_admit::put_accord_decision_planned(self, decision).await
     }
 
     async fn get_accord_decision(
@@ -8143,231 +7889,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         proof: crate::federation::SignedLocationProof,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::LocationProof,
-            &proof,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
-        // other admission step.
-        crate::federation::verify_location_proof_admission(self, &proof).await?;
-        // v53.1.2 (CIRISPersist#984 row 19) — a held PK re-offered as a
-        // WITHDRAWAL (the attester's re-signed row, as a peer serves it) is the
-        // withdraw door's case: the local and the replicated path run the one
-        // predicate. Any other re-offer keeps its path (the PK refuses it).
-        if proof.location_proof.withdrawn_at.is_some() {
-            let (s, a) = (
-                proof.location_proof.subject_key_id.clone(),
-                proof.location_proof.asserted_at.to_rfc3339(),
-            );
-            let held = self
-                .read(move |conn| -> Result<Option<i64>, rusqlite::Error> {
-                    conn.query_row(
-                        "SELECT 1 FROM federation_location_proofs \
-                          WHERE subject_key_id = ?1 AND asserted_at = ?2",
-                        rusqlite::params![s, a],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                })
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!("put_location_proof held: {e}"))
-                })?
-                .is_some();
-            if held {
-                return crate::federation::FederationDirectory::withdraw_location_proof(
-                    self, proof,
-                )
-                .await;
-            }
-        }
-        let mut row = proof.location_proof;
-        crate::federation::location::validate_location_cell(&row.cell_id, row.cell_resolution)?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
-        // signature the gate above already verified (was verified-then-
-        // discarded).
-        let authority_key_id = proof.authority_key_id;
-        let scrub_signature_classical = proof.scrub_signature_classical;
-        let scrub_signature_pqc = proof.scrub_signature_pqc;
-        // v21.1.0 (CIRISPersist#507b) — computed before the INSERT closure
-        // moves everything.
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("subject_key_id", &row.subject_key_id),
-            // v31.0.0 (CIRISPersist#646) — the microsecond-floor spelling; see
-            // `wire_index::locator_instant`.
-            (
-                "asserted_at",
-                &crate::federation::wire_index::locator_instant(&row.asserted_at),
-            ),
-        ]);
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            // v36.0.0 (#668) — THIS node's serve position (V130).
-            let admitted_at =
-                sqlite_next_plane_position(conn, "federation_location_proofs", POS_ASSERTED)?;
-            conn.execute(
-                "INSERT INTO federation_location_proofs (\
-                    subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
-                    attestation_evidence, withdrawn_at, persist_row_hash, \
-                    authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                    admitted_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                rusqlite::params![
-                    row.subject_key_id,
-                    row.cell_id,
-                    row.cell_resolution as i64,
-                    row.asserted_at.to_rfc3339(),
-                    row.valid_until.map(|t| t.to_rfc3339()),
-                    row.attestation_evidence,
-                    row.withdrawn_at.map(|t| t.to_rfc3339()),
-                    row.persist_row_hash,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                    admitted_at.to_rfc3339(),
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(map_revocation_sqlite_err("location_proof"))?;
-        self.index_stored_record("LocationProof", &wire_index_key)
-            .await?;
-        Ok(())
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::evidence_admit::put_location_proof_planned(self, proof).await
     }
 
     async fn withdraw_location_proof(
         &self,
         proof: crate::federation::SignedLocationProof,
     ) -> Result<(), crate::federation::Error> {
-        use crate::federation::location::{
-            check_location_proof_withdrawal, LocationProofWithdrawal,
-        };
-        // #984 row 16 — the signature and standing legs, exactly as a put.
-        crate::federation::verify_location_proof_admission(self, &proof).await?;
-        let subject = proof.location_proof.subject_key_id.clone();
-        let asserted = proof.location_proof.asserted_at.to_rfc3339();
-        let (s, a) = (subject.clone(), asserted.clone());
-        let held = self
-            .read(
-                move |conn| -> Result<
-                    Option<crate::federation::SignedLocationProof>,
-                    rusqlite::Error,
-                > {
-                    conn.query_row(
-                        "SELECT * FROM federation_location_proofs \
-                          WHERE subject_key_id = ?1 AND asserted_at = ?2",
-                        rusqlite::params![s, a],
-                        sqlite_row_to_signed_location_proof,
-                    )
-                    .optional()
-                },
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("withdraw_location_proof read: {e}"))
-            })?;
-        let Some(held) = held else {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "location_proof_withdraw_not_held: no proof by {subject} at {asserted} is held here"
-            )));
-        };
-        match check_location_proof_withdrawal(&held, &proof)? {
-            LocationProofWithdrawal::AlreadyWithdrawn => return Ok(()),
-            LocationProofWithdrawal::Apply => {}
-        }
-        #[cfg(test)]
-        self.test_rival_location_proof_withdrawal().await?;
-        let mut row = proof.location_proof;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let withdrawn_at = row.withdrawn_at.map(|t| t.to_rfc3339());
-        let persist_row_hash = row.persist_row_hash;
-        let authority_key_id = proof.authority_key_id;
-        let scrub_signature_classical = proof.scrub_signature_classical;
-        let scrub_signature_pqc = proof.scrub_signature_pqc;
-        let (s, a) = (subject.clone(), asserted.clone());
-        let written = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                // The row moves to a fresh serve position (V130) so a peer
-                // past its cursor is served the withdrawal.
-                let admitted_at =
-                    sqlite_next_plane_position(conn, "federation_location_proofs", POS_ASSERTED)?;
-                // v53.1.3 (Codex on #985 P2, #986) — a COMPARE-AND-SET: the
-                // decision above was made from a read, and a rival withdrawal
-                // can land between that read and this write. The guard makes
-                // the loser write nothing; it re-reads below.
-                conn.execute(
-                    "UPDATE federation_location_proofs \
-                        SET withdrawn_at = ?3, persist_row_hash = ?4, authority_key_id = ?5, \
-                            scrub_signature_classical = ?6, scrub_signature_pqc = ?7, \
-                            admitted_at = ?8 \
-                      WHERE subject_key_id = ?1 AND asserted_at = ?2 AND withdrawn_at IS NULL",
-                    rusqlite::params![
-                        s,
-                        a,
-                        withdrawn_at,
-                        persist_row_hash,
-                        authority_key_id,
-                        scrub_signature_classical,
-                        scrub_signature_pqc,
-                        admitted_at.to_rfc3339(),
-                    ],
-                )
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("withdraw_location_proof: {e}"))
-            })?;
-        if written == 0 {
-            // Lost the race: the row is withdrawn by the rival (already
-            // withdrawn, the first instant stands), or gone.
-            let (s, a) = (subject.clone(), asserted.clone());
-            let now_held = self
-                .read(
-                    move |conn| -> Result<Option<Option<String>>, rusqlite::Error> {
-                        conn.query_row(
-                            "SELECT withdrawn_at FROM federation_location_proofs \
-                              WHERE subject_key_id = ?1 AND asserted_at = ?2",
-                            rusqlite::params![s, a],
-                            |r| r.get(0),
-                        )
-                        .optional()
-                    },
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!(
-                        "withdraw_location_proof re-read: {e}"
-                    ))
-                })?;
-            return match now_held {
-                Some(Some(_)) => Ok(()),
-                _ => Err(crate::federation::Error::Backend(format!(
-                    "withdraw_location_proof: the held proof by {subject} at {asserted} changed \
-                     under the write and is not withdrawn"
-                ))),
-            };
-        }
-        // v53.1.3 (Codex on #985 P1, #986) — the row's bytes changed, so the
-        // signed wire index must learn the new content hash exactly as the
-        // put path teaches it (after the durable write; loud, never fatal).
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("subject_key_id", &subject),
-            (
-                "asserted_at",
-                &crate::federation::wire_index::locator_instant(&row.asserted_at),
-            ),
-        ]);
-        self.index_stored_record("LocationProof", &wire_index_key)
-            .await?;
-        Ok(())
+        crate::federation::evidence_admit::withdraw_location_proof_planned(self, proof).await
     }
 
     async fn list_location_proofs_for(
@@ -8993,67 +8523,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         claim: &crate::federation::types::SignedTouchClaim,
     ) -> Result<crate::federation::TouchApplyOutcome, crate::federation::Error> {
-        use crate::federation::TouchApplyOutcome as Outcome;
-        // v21.6.0 (#519 item 2a-iii) — verify-before-mutation: the full
-        // hybrid admission gate, THEN the future-skew guard, THEN the
-        // monotonic-max merge. Mirrors put_signed_transport_destination.
-        crate::federation::admission::verify_signed_touch_claim(self, claim).await?;
-        crate::federation::admission::verify_touch_claim_admission(
-            claim,
-            chrono::Utc::now(),
-            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
-        )?;
-        let target_key_id = claim.target_key_id.clone();
-        let target_kind = claim.target_kind.clone();
-        let fresh_as_of = claim.fresh_as_of.to_rfc3339();
-        let signer_form = claim.signer_form.as_str().to_owned();
-        let attesting_key_id = claim.attesting_key_id.clone();
-        let envelope_json = serde_json::to_string(&claim.signed_envelope)
-            .map_err(|e| crate::federation::Error::Backend(format!("signed_envelope: {e}")))?;
-        let signature_json = serde_json::to_string(&claim.signature)
-            .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
-        let cohort_scope = claim.cohort_scope.clone();
-        self.write(move |conn| -> Result<Outcome, rusqlite::Error> {
-            // Monotonic-max merge: `fresh_as_of` only ever advances. A
-            // fresh insert always applies (no conflict target); against an
-            // existing row the SQL guard is the single source of truth —
-            // mirrors the put_transport_destination ON-CONFLICT guard
-            // EXACTLY, collapsed to the freshness floor's single-field
-            // monotonic comparator (no epoch tuple, no signed-wins-shared-
-            // key special case — every touch-claim row is signed by
-            // construction).
-            let changed = conn.execute(
-                "INSERT INTO freshness_floor \
-                    (target_key_id, target_kind, fresh_as_of, signer_form, attesting_key_id, \
-                     signed_envelope, signature, cohort_scope) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-                 ON CONFLICT(target_key_id, target_kind) \
-                 DO UPDATE SET fresh_as_of = excluded.fresh_as_of, \
-                    signer_form = excluded.signer_form, \
-                    attesting_key_id = excluded.attesting_key_id, \
-                    signed_envelope = excluded.signed_envelope, \
-                    signature = excluded.signature, \
-                    cohort_scope = excluded.cohort_scope \
-                 WHERE excluded.fresh_as_of > freshness_floor.fresh_as_of",
-                rusqlite::params![
-                    target_key_id,
-                    target_kind,
-                    fresh_as_of,
-                    signer_form,
-                    attesting_key_id,
-                    envelope_json,
-                    signature_json,
-                    cohort_scope,
-                ],
-            )?;
-            Ok(if changed > 0 {
-                Outcome::Advanced
-            } else {
-                Outcome::NotFresher
-            })
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("put_touch_claim: {e}")))
+        crate::federation::evidence_admit::put_touch_claim_planned(self, claim).await
     }
 
     async fn lookup_freshness_floor(
@@ -9161,10 +8631,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         ml_dsa_65_pubkey_b64: Option<&str>,
         disclosed_leaves: Option<&[Vec<u8>]>,
     ) -> Result<(), crate::federation::Error> {
-        // Verify-BEFORE-persist (N3 / RC8 / AV-9): full hybrid-PQC gate +
-        // WW-2 namespace guard + optional leaf/root recompute. On any
-        // failure NOTHING is written.
-        let stored = crate::witness::admit_witness(
+        crate::federation::evidence_admit::put_wholeness_witness_planned(
+            self,
             witness,
             sig_ed25519_b64,
             sig_ml_dsa_65_b64,
@@ -9172,54 +8640,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ed25519_pubkey_b64,
             ml_dsa_65_pubkey_b64,
             disclosed_leaves,
-        )?;
-        let claim_namespaces_text =
-            serde_json::to_string(&stored.claim_namespaces).map_err(|e| {
-                crate::federation::Error::Backend(format!("serialize claim_namespaces: {e}"))
-            })?;
-        let admitted_at = chrono::Utc::now().to_rfc3339();
-        let k = crate::witness::WITNESS_CORPUS_K as i64;
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
-            // Idempotent on (peer_id, epoch_id, observed_at_unix_ms).
-            tx.execute(
-                "INSERT INTO wholeness_witness_corpus \
-                 (peer_id, epoch_id, observed_at_unix_ms, claim_namespaces, merkle_root, \
-                  leaf_count, witness_version, signature, signature_ml_dsa_65, pqc_key_id, \
-                  admitted_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
-                 ON CONFLICT (peer_id, epoch_id, observed_at_unix_ms) DO NOTHING",
-                rusqlite::params![
-                    stored.peer_id,
-                    stored.epoch_id as i64,
-                    stored.observed_at_unix_ms as i64,
-                    claim_namespaces_text,
-                    stored.merkle_root_hex,
-                    i64::from(stored.leaf_count),
-                    i64::from(stored.witness_version),
-                    stored.signature,
-                    stored.signature_ml_dsa_65,
-                    stored.pqc_key_id,
-                    admitted_at,
-                ],
-            )?;
-            // Prune to the last-K by observed_at (keep newest); delete the
-            // oldest rows beyond the cap.
-            tx.execute(
-                "DELETE FROM wholeness_witness_corpus \
-                 WHERE peer_id = ?1 AND observed_at_unix_ms IN ( \
-                   SELECT observed_at_unix_ms FROM ( \
-                     SELECT observed_at_unix_ms, ROW_NUMBER() OVER ( \
-                       ORDER BY observed_at_unix_ms DESC, epoch_id DESC) AS rn \
-                     FROM wholeness_witness_corpus WHERE peer_id = ?1 \
-                   ) WHERE rn > ?2 )",
-                rusqlite::params![stored.peer_id, k],
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
+        )
         .await
-        .map_err(|e| crate::federation::Error::Backend(format!("put_wholeness_witness: {e}")))
     }
 
     async fn list_wholeness_witnesses_for_peer(
@@ -27729,6 +27151,446 @@ impl crate::federation::sweep_plan::RoomEvictionStore for SqliteBackend {
         .map_err(|e| {
             crate::federation::BlobError::Backend(format!("stream_dek_evict_room_chunks: {e}"))
         })
+    }
+}
+
+/// v61 (CIRISPersist#934) — the accord evidence executor on sqlite.
+/// Storage only: the decisions are `federation::accord_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::accord_admit::AccordStore for SqliteBackend {
+    async fn last_accord_proposal_created_at(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::Error> {
+        let last: Option<String> = self
+            .read(move |conn| {
+                conn.query_row("SELECT MAX(created_at) FROM accord_proposal", [], |r| {
+                    r.get(0)
+                })
+                .optional()
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("last accord created_at: {e}")))?
+            .flatten();
+        Ok(last.as_deref().map(parse_rfc3339))
+    }
+
+    async fn last_accord_participation_arrival(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::Error> {
+        let last: Option<String> = self
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT MAX(server_arrival_at) FROM accord_participation",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("last server_arrival_at: {e}")))?
+            .flatten();
+        Ok(last.as_deref().map(parse_rfc3339))
+    }
+
+    async fn store_planned_accord_proposal(
+        &self,
+        prep: crate::federation::accord_quorum::PreparedProposal,
+    ) -> Result<Option<String>, crate::federation::Error> {
+        use crate::federation::Error;
+        let proposal_json = serde_json::to_string(&prep.proposal_json)
+            .map_err(|e| Error::Backend(format!("proposal_json encode: {e}")))?;
+        let auth_sig = prep
+            .authority_signature
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| Error::Backend(format!("authority_signature encode: {e}")))?;
+        self.write(move |conn| -> Result<Option<String>, rusqlite::Error> {
+            // v54.1.0 (#1047; Codex round 3 on PR #1057) — single use,
+            // ENFORCED BY THE DATABASE: the V189 claim's PRIMARY KEY
+            // `(family_key_id, nonce)`, inserted in the proposal's own
+            // transaction. IMMEDIATE: the write lock is taken BEFORE the
+            // held-digest read, so a second backend on the file waits on the
+            // busy timeout instead of failing a read-to-write lock upgrade.
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            // Codex round 4 on PR #1057 — a HELD digest is an idempotent
+            // replay, accepted before the claim is asked.
+            let held: bool = tx
+                .query_row(
+                    "SELECT 1 FROM accord_proposal WHERE proposal_digest = ?1",
+                    [&prep.proposal_digest],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if held {
+                return Ok(None);
+            }
+            tx.execute(
+                "INSERT INTO accord_proposal_nonce_claim \
+                    (family_key_id, nonce, proposal_digest) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (family_key_id, nonce) DO NOTHING",
+                rusqlite::params![prep.family_key_id, prep.nonce, prep.proposal_digest],
+            )?;
+            let owner: String = tx.query_row(
+                "SELECT proposal_digest FROM accord_proposal_nonce_claim \
+                 WHERE family_key_id = ?1 AND nonce = ?2",
+                rusqlite::params![prep.family_key_id, prep.nonce],
+                |r| r.get(0),
+            )?;
+            if owner != prep.proposal_digest {
+                return Ok(Some(owner));
+            }
+            tx.execute(
+                "INSERT INTO accord_proposal (\
+                    proposal_digest, family_key_id, action, nonce, window_until, \
+                    prior_family_digest, payload_sha256, proposal_json, \
+                    authority_signature, persist_row_hash, created_at\
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
+                 ON CONFLICT(proposal_digest) DO NOTHING",
+                rusqlite::params![
+                    prep.proposal_digest,
+                    prep.family_key_id,
+                    prep.action,
+                    prep.nonce,
+                    prep.window_until.to_rfc3339(),
+                    prep.prior_family_digest,
+                    prep.payload_sha256,
+                    proposal_json,
+                    auth_sig,
+                    prep.persist_row_hash,
+                    prep.created_at.to_rfc3339(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(None)
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))
+    }
+
+    async fn store_planned_accord_participation(
+        &self,
+        prep: crate::federation::accord_quorum::PreparedParticipation,
+    ) -> Result<crate::federation::accord_admit::HeldRow, crate::federation::Error> {
+        use crate::federation::accord_admit::HeldRow;
+        let participation_json = serde_json::to_string(&prep.participation_json).map_err(|e| {
+            crate::federation::Error::Backend(format!("participation_json encode: {e}"))
+        })?;
+        self.write(move |conn| -> Result<HeldRow, rusqlite::Error> {
+            // One connection writes: the dedup read and the insert cannot
+            // interleave with another writer on this backend.
+            let held: Option<String> = conn
+                .query_row(
+                    "SELECT persist_row_hash FROM accord_participation \
+                     WHERE proposal_digest = ?1 AND pinned_pubkey = ?2",
+                    rusqlite::params![prep.proposal_digest, prep.pinned_pubkey],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if held.is_some() {
+                return Ok(HeldRow::of_held(held.as_deref(), &prep.persist_row_hash));
+            }
+            conn.execute(
+                "INSERT INTO accord_participation (\
+                    proposal_digest, member_id, pinned_pubkey, vote, window_until, \
+                    signed_at, server_arrival_at, participation_json, persist_row_hash\
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                rusqlite::params![
+                    prep.proposal_digest,
+                    prep.member_id,
+                    prep.pinned_pubkey,
+                    prep.vote,
+                    prep.window_until.to_rfc3339(),
+                    prep.signed_at.to_rfc3339(),
+                    prep.server_arrival_at.to_rfc3339(),
+                    participation_json,
+                    prep.persist_row_hash,
+                ],
+            )?;
+            Ok(HeldRow::Inserted)
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("insert accord_participation: {e}")))
+    }
+
+    async fn store_planned_accord_decision(
+        &self,
+        prep: crate::federation::accord_quorum::PreparedDecision,
+    ) -> Result<crate::federation::accord_admit::HeldRow, crate::federation::Error> {
+        use crate::federation::accord_admit::HeldRow;
+        use crate::federation::Error;
+        let live_set = serde_json::to_string(&prep.live_set)
+            .map_err(|e| Error::Backend(format!("live_set encode: {e}")))?;
+        let decision_json = serde_json::to_string(&prep.decision_json)
+            .map_err(|e| Error::Backend(format!("decision_json encode: {e}")))?;
+        self.write(move |conn| -> Result<HeldRow, rusqlite::Error> {
+            let held: Option<String> = conn
+                .query_row(
+                    "SELECT persist_row_hash FROM accord_decision WHERE proposal_digest = ?1",
+                    [&prep.proposal_digest],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if held.is_some() {
+                return Ok(HeldRow::of_held(held.as_deref(), &prep.persist_row_hash));
+            }
+            conn.execute(
+                "INSERT INTO accord_decision (\
+                    proposal_digest, family_key_id, authorized, yes, no, abstain, \
+                    live_set, window_until, decision_json, \
+                    persist_row_hash, decided_at\
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                rusqlite::params![
+                    prep.proposal_digest,
+                    prep.family_key_id,
+                    i64::from(prep.authorized),
+                    prep.yes,
+                    prep.no,
+                    prep.abstain,
+                    live_set,
+                    prep.window_until.to_rfc3339(),
+                    decision_json,
+                    prep.persist_row_hash,
+                    prep.decided_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(HeldRow::Inserted)
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("insert accord_decision: {e}")))
+    }
+}
+
+/// v61 (CIRISPersist#934) — the location proof, touch claim and wholeness
+/// witness executor on sqlite. Storage only: the decisions are
+/// `federation::evidence_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::evidence_admit::EvidenceStore for SqliteBackend {
+    async fn held_location_proof(
+        &self,
+        subject_key_id: &str,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<crate::federation::SignedLocationProof>, crate::federation::Error> {
+        let (s, a) = (subject_key_id.to_owned(), asserted_at.to_rfc3339());
+        self.read(
+            move |conn| -> Result<Option<crate::federation::SignedLocationProof>, rusqlite::Error> {
+                conn.query_row(
+                    "SELECT * FROM federation_location_proofs \
+                      WHERE subject_key_id = ?1 AND asserted_at = ?2",
+                    rusqlite::params![s, a],
+                    sqlite_row_to_signed_location_proof,
+                )
+                .optional()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("held location proof: {e}")))
+    }
+
+    async fn store_planned_location_proof(
+        &self,
+        planned: crate::federation::evidence_admit::PlannedLocationProof,
+    ) -> Result<(), crate::federation::Error> {
+        let crate::federation::evidence_admit::PlannedLocationProof {
+            proof,
+            wire_index_key,
+        } = planned;
+        let row = proof.location_proof;
+        let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = (
+            proof.authority_key_id,
+            proof.scrub_signature_classical,
+            proof.scrub_signature_pqc,
+        );
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            // v36.0.0 (#668) — THIS node's serve position (V130).
+            let admitted_at =
+                sqlite_next_plane_position(conn, "federation_location_proofs", POS_ASSERTED)?;
+            conn.execute(
+                "INSERT INTO federation_location_proofs (\
+                    subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
+                    attestation_evidence, withdrawn_at, persist_row_hash, \
+                    authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
+                    admitted_at\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    row.subject_key_id,
+                    row.cell_id,
+                    i64::from(row.cell_resolution),
+                    row.asserted_at.to_rfc3339(),
+                    row.valid_until.map(|t| t.to_rfc3339()),
+                    row.attestation_evidence,
+                    row.withdrawn_at.map(|t| t.to_rfc3339()),
+                    row.persist_row_hash,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                    admitted_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(map_revocation_sqlite_err("location_proof"))?;
+        self.index_stored_record("LocationProof", &wire_index_key)
+            .await
+    }
+
+    async fn store_planned_location_proof_withdrawal(
+        &self,
+        planned: crate::federation::evidence_admit::PlannedLocationProof,
+    ) -> Result<bool, crate::federation::Error> {
+        let crate::federation::evidence_admit::PlannedLocationProof {
+            proof,
+            wire_index_key,
+        } = planned;
+        let row = proof.location_proof;
+        let s = row.subject_key_id;
+        let a = row.asserted_at.to_rfc3339();
+        let withdrawn_at = row.withdrawn_at.map(|t| t.to_rfc3339());
+        let persist_row_hash = row.persist_row_hash;
+        let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = (
+            proof.authority_key_id,
+            proof.scrub_signature_classical,
+            proof.scrub_signature_pqc,
+        );
+        let written = self
+            .write(move |conn| -> Result<usize, rusqlite::Error> {
+                // The row moves to a fresh serve position (V130) so a peer
+                // past its cursor is served the withdrawal.
+                let admitted_at =
+                    sqlite_next_plane_position(conn, "federation_location_proofs", POS_ASSERTED)?;
+                // v53.1.3 (#986) — a COMPARE-AND-SET: a rival withdrawal can
+                // land between the plan's read and this write; the loser
+                // writes nothing.
+                conn.execute(
+                    "UPDATE federation_location_proofs \
+                        SET withdrawn_at = ?3, persist_row_hash = ?4, authority_key_id = ?5, \
+                            scrub_signature_classical = ?6, scrub_signature_pqc = ?7, \
+                            admitted_at = ?8 \
+                      WHERE subject_key_id = ?1 AND asserted_at = ?2 AND withdrawn_at IS NULL",
+                    rusqlite::params![
+                        s,
+                        a,
+                        withdrawn_at,
+                        persist_row_hash,
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                        admitted_at.to_rfc3339(),
+                    ],
+                )
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("withdraw_location_proof: {e}"))
+            })?;
+        if written == 0 {
+            return Ok(false);
+        }
+        // v53.1.3 (#986) — the row's bytes changed, so the signed wire index
+        // learns the new content hash exactly as the put path teaches it.
+        self.index_stored_record("LocationProof", &wire_index_key)
+            .await?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    async fn rival_location_proof_withdrawal(&self) -> Result<(), crate::federation::Error> {
+        self.test_rival_location_proof_withdrawal().await
+    }
+
+    async fn store_planned_touch_claim(
+        &self,
+        planned: crate::federation::evidence_admit::PlannedTouchClaim<'_>,
+    ) -> Result<bool, crate::federation::Error> {
+        let claim = planned.claim;
+        let target_key_id = claim.target_key_id.clone();
+        let target_kind = claim.target_kind.clone();
+        let fresh_as_of = claim.fresh_as_of.to_rfc3339();
+        let signer_form = claim.signer_form.as_str().to_owned();
+        let attesting_key_id = claim.attesting_key_id.clone();
+        let cohort_scope = claim.cohort_scope.clone();
+        let (envelope_json, signature_json) = (planned.envelope_json, planned.signature_json);
+        let changed = self
+            .write(move |conn| -> Result<usize, rusqlite::Error> {
+                // Monotonic-max merge: `fresh_as_of` only ever advances; the
+                // SQL guard is the single source of truth against a held row.
+                conn.execute(
+                    "INSERT INTO freshness_floor \
+                        (target_key_id, target_kind, fresh_as_of, signer_form, attesting_key_id, \
+                         signed_envelope, signature, cohort_scope) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                     ON CONFLICT(target_key_id, target_kind) \
+                     DO UPDATE SET fresh_as_of = excluded.fresh_as_of, \
+                        signer_form = excluded.signer_form, \
+                        attesting_key_id = excluded.attesting_key_id, \
+                        signed_envelope = excluded.signed_envelope, \
+                        signature = excluded.signature, \
+                        cohort_scope = excluded.cohort_scope \
+                     WHERE excluded.fresh_as_of > freshness_floor.fresh_as_of",
+                    rusqlite::params![
+                        target_key_id,
+                        target_kind,
+                        fresh_as_of,
+                        signer_form,
+                        attesting_key_id,
+                        envelope_json,
+                        signature_json,
+                        cohort_scope,
+                    ],
+                )
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("put_touch_claim: {e}")))?;
+        Ok(changed > 0)
+    }
+
+    async fn store_planned_witness(
+        &self,
+        planned: crate::federation::evidence_admit::PlannedWitness,
+    ) -> Result<(), crate::federation::Error> {
+        let claim_namespaces = planned.claim_namespaces.to_string();
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            let w = &planned.stored;
+            let tx = conn.transaction()?;
+            // Idempotent on (peer_id, epoch_id, observed_at_unix_ms).
+            tx.execute(
+                "INSERT INTO wholeness_witness_corpus \
+                 (peer_id, epoch_id, observed_at_unix_ms, claim_namespaces, merkle_root, \
+                  leaf_count, witness_version, signature, signature_ml_dsa_65, pqc_key_id, \
+                  admitted_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
+                 ON CONFLICT (peer_id, epoch_id, observed_at_unix_ms) DO NOTHING",
+                rusqlite::params![
+                    w.peer_id,
+                    planned.epoch_id,
+                    planned.observed_at_unix_ms,
+                    claim_namespaces,
+                    w.merkle_root_hex,
+                    i64::from(w.leaf_count),
+                    i64::from(w.witness_version),
+                    w.signature,
+                    w.signature_ml_dsa_65,
+                    w.pqc_key_id,
+                    planned.admitted_at.to_rfc3339(),
+                ],
+            )?;
+            // Prune to the newest K by observed_at.
+            tx.execute(
+                "DELETE FROM wholeness_witness_corpus \
+                 WHERE peer_id = ?1 AND observed_at_unix_ms IN ( \
+                   SELECT observed_at_unix_ms FROM ( \
+                     SELECT observed_at_unix_ms, ROW_NUMBER() OVER ( \
+                       ORDER BY observed_at_unix_ms DESC, epoch_id DESC) AS rn \
+                     FROM wholeness_witness_corpus WHERE peer_id = ?1 \
+                   ) WHERE rn > ?2 )",
+                rusqlite::params![w.peer_id, planned.keep],
+            )?;
+            tx.commit()
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("put_wholeness_witness: {e}")))
     }
 }
 

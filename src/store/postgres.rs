@@ -854,6 +854,468 @@ impl crate::federation::sweep_plan::RoomEvictionStore for PostgresBackend {
     }
 }
 
+/// v61 (CIRISPersist#934) — the accord evidence executor on postgres.
+/// Storage only: the decisions are `federation::accord_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::accord_admit::AccordStore for PostgresBackend {
+    async fn last_accord_proposal_created_at(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::Error> {
+        let c = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        c.query_one("SELECT MAX(created_at) FROM cirislens.accord_proposal", &[])
+            .await
+            .and_then(|r| r.try_get(0))
+            .map_err(|e| crate::federation::Error::Backend(format!("last accord created_at: {e}")))
+    }
+
+    async fn last_accord_participation_arrival(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::Error> {
+        let c = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        c.query_one(
+            "SELECT MAX(server_arrival_at) FROM cirislens.accord_participation",
+            &[],
+        )
+        .await
+        .and_then(|r| r.try_get(0))
+        .map_err(|e| crate::federation::Error::Backend(format!("last server_arrival_at: {e}")))
+    }
+
+    async fn store_planned_accord_proposal(
+        &self,
+        prep: crate::federation::accord_quorum::PreparedProposal,
+    ) -> Result<Option<String>, crate::federation::Error> {
+        use crate::federation::Error;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // v54.1.0 (#1047) — the check and the insert are one transaction
+        // under an advisory lock, so two processes sharing the database
+        // cannot both admit a different proposal under one nonce.
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("accord_proposal transaction: {e}")))?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&crate::federation::accord_quorum::ACCORD_PROPOSAL_NONCE_LOCK_KEY],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("accord_proposal nonce lock: {e}")))?;
+        // Codex round 4 on PR #1057 — a HELD digest is an idempotent replay,
+        // accepted before the claim is asked.
+        let held = tx
+            .query_opt(
+                "SELECT 1 FROM cirislens.accord_proposal WHERE proposal_digest = $1",
+                &[&prep.proposal_digest],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("accord_proposal held read: {e}")))?
+            .is_some();
+        if !held {
+            // Codex round 3 on PR #1057 — the V189 claim's PRIMARY KEY makes
+            // the pair the database's invariant, not only this door's lock.
+            tx.execute(
+                "INSERT INTO cirislens.accord_proposal_nonce_claim \
+                    (family_key_id, nonce, proposal_digest) VALUES ($1, $2, $3) \
+                 ON CONFLICT (family_key_id, nonce) DO NOTHING",
+                &[&prep.family_key_id, &prep.nonce, &prep.proposal_digest],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("accord_proposal nonce claim: {e}")))?;
+            let owner: String = tx
+                .query_one(
+                    "SELECT proposal_digest FROM cirislens.accord_proposal_nonce_claim \
+                     WHERE family_key_id = $1 AND nonce = $2",
+                    &[&prep.family_key_id, &prep.nonce],
+                )
+                .await
+                .and_then(|r| r.try_get(0))
+                .map_err(|e| Error::Backend(format!("accord_proposal nonce read: {e}")))?;
+            if owner != prep.proposal_digest {
+                return Ok(Some(owner));
+            }
+            tx.execute(
+                "INSERT INTO cirislens.accord_proposal (\
+                        proposal_digest, family_key_id, action, nonce, window_until, \
+                        prior_family_digest, payload_sha256, proposal_json, \
+                        authority_signature, persist_row_hash, created_at\
+                     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+                     ON CONFLICT (proposal_digest) DO NOTHING",
+                &[
+                    &prep.proposal_digest,
+                    &prep.family_key_id,
+                    &prep.action,
+                    &prep.nonce,
+                    &prep.window_until,
+                    &prep.prior_family_digest,
+                    &prep.payload_sha256,
+                    &prep.proposal_json,
+                    &prep.authority_signature,
+                    &prep.persist_row_hash,
+                    &prep.created_at,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("accord_proposal commit: {e}")))?;
+        Ok(None)
+    }
+
+    async fn store_planned_accord_participation(
+        &self,
+        prep: crate::federation::accord_quorum::PreparedParticipation,
+    ) -> Result<crate::federation::accord_admit::HeldRow, crate::federation::Error> {
+        use crate::federation::accord_admit::HeldRow;
+        use crate::federation::Error;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // v36.0.0 (CIRISPersist#719) — no transaction: the insert absorbs a
+        // concurrent insert (`ON CONFLICT DO NOTHING`) and a zero-row result
+        // re-reads the winner, so the verdict is always the held row's hash.
+        let inserted = client
+            .execute(
+                "INSERT INTO cirislens.accord_participation (\
+                    proposal_digest, member_id, pinned_pubkey, vote, window_until, \
+                    signed_at, server_arrival_at, participation_json, persist_row_hash\
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
+                 ON CONFLICT (proposal_digest, pinned_pubkey) DO NOTHING",
+                &[
+                    &prep.proposal_digest,
+                    &prep.member_id,
+                    &prep.pinned_pubkey,
+                    &prep.vote,
+                    &prep.window_until,
+                    &prep.signed_at,
+                    &prep.server_arrival_at,
+                    &prep.participation_json,
+                    &prep.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("insert accord_participation: {e}")))?;
+        if inserted > 0 {
+            return Ok(HeldRow::Inserted);
+        }
+        let held: Option<String> = client
+            .query_opt(
+                "SELECT persist_row_hash FROM cirislens.accord_participation \
+                 WHERE proposal_digest = $1 AND pinned_pubkey = $2",
+                &[&prep.proposal_digest, &prep.pinned_pubkey],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("accord_participation held read: {e}")))?
+            .map(|r| r.safe_get_with("persist_row_hash", Error::Backend))
+            .transpose()?;
+        match held {
+            Some(h) => Ok(HeldRow::of_held(Some(&h), &prep.persist_row_hash)),
+            // DO NOTHING fired but the row is gone: only a concurrent delete
+            // explains it, and this plane is append-only.
+            None => Err(Error::Backend(
+                "accord_participation: insert conflicted but no row is present — the \
+                 append-only invariant does not hold on this table"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    async fn store_planned_accord_decision(
+        &self,
+        prep: crate::federation::accord_quorum::PreparedDecision,
+    ) -> Result<crate::federation::accord_admit::HeldRow, crate::federation::Error> {
+        use crate::federation::accord_admit::HeldRow;
+        use crate::federation::Error;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let held: Option<String> = client
+            .query_opt(
+                "SELECT persist_row_hash FROM cirislens.accord_decision WHERE proposal_digest = $1",
+                &[&prep.proposal_digest],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("accord_decision immutability check: {e}")))?
+            .map(|r| r.safe_get_with("persist_row_hash", Error::Backend))
+            .transpose()?;
+        if held.is_some() {
+            return Ok(HeldRow::of_held(held.as_deref(), &prep.persist_row_hash));
+        }
+        client
+            .execute(
+                "INSERT INTO cirislens.accord_decision (\
+                    proposal_digest, family_key_id, authorized, yes, no, abstain, \
+                    live_set, window_until, decision_json, \
+                    persist_row_hash, decided_at\
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                &[
+                    &prep.proposal_digest,
+                    &prep.family_key_id,
+                    &prep.authorized,
+                    &prep.yes,
+                    &prep.no,
+                    &prep.abstain,
+                    &prep.live_set,
+                    &prep.window_until,
+                    &prep.decision_json,
+                    &prep.persist_row_hash,
+                    &prep.decided_at,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("insert accord_decision: {e}")))?;
+        Ok(HeldRow::Inserted)
+    }
+}
+
+/// v61 (CIRISPersist#934) — the location proof, touch claim and wholeness
+/// witness executor on postgres. Storage only: the decisions are
+/// `federation::evidence_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::evidence_admit::EvidenceStore for PostgresBackend {
+    async fn held_location_proof(
+        &self,
+        subject_key_id: &str,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<crate::federation::SignedLocationProof>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        client
+            .query_opt(
+                "SELECT * FROM cirislens.federation_location_proofs \
+                  WHERE subject_key_id = $1 AND asserted_at = $2",
+                &[&subject_key_id, &asserted_at],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("held location proof: {e}")))?
+            .map(pg_row_to_signed_location_proof)
+            .transpose()
+    }
+
+    async fn store_planned_location_proof(
+        &self,
+        planned: crate::federation::evidence_admit::PlannedLocationProof,
+    ) -> Result<(), crate::federation::Error> {
+        let crate::federation::evidence_admit::PlannedLocationProof {
+            proof,
+            wire_index_key,
+        } = planned;
+        let row = &proof.location_proof;
+        let resolution = i16::from(row.cell_resolution);
+        {
+            let client = self
+                .get_client()
+                .await
+                .map_err(crate::store::Error::into_federation)?;
+            // v36.0.0 (#668) — THIS node's serve position (V130).
+            let admitted_at = self
+                .next_plane_position(&client, "federation_location_proofs")
+                .await?;
+            client
+                .execute(
+                    "INSERT INTO cirislens.federation_location_proofs (\
+                        subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
+                        attestation_evidence, withdrawn_at, persist_row_hash, \
+                        authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
+                        admitted_at\
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                    &[
+                        &row.subject_key_id,
+                        &row.cell_id,
+                        &resolution,
+                        &row.asserted_at,
+                        &row.valid_until,
+                        &row.attestation_evidence,
+                        &row.withdrawn_at,
+                        &row.persist_row_hash,
+                        &proof.authority_key_id,
+                        &proof.scrub_signature_classical,
+                        &proof.scrub_signature_pqc,
+                        &admitted_at,
+                    ],
+                )
+                .await
+                .map_err(map_revocation_pg_err("location_proof"))?;
+        }
+        // The pooled client is released before the re-index takes its own.
+        self.index_stored_record("LocationProof", &wire_index_key)
+            .await
+    }
+
+    async fn store_planned_location_proof_withdrawal(
+        &self,
+        planned: crate::federation::evidence_admit::PlannedLocationProof,
+    ) -> Result<bool, crate::federation::Error> {
+        let crate::federation::evidence_admit::PlannedLocationProof {
+            proof,
+            wire_index_key,
+        } = planned;
+        let row = &proof.location_proof;
+        let written = {
+            let client = self
+                .get_client()
+                .await
+                .map_err(crate::store::Error::into_federation)?;
+            // The row moves to a fresh serve position (V130) so a peer past
+            // its cursor is served the withdrawal.
+            let admitted_at = self
+                .next_plane_position(&client, "federation_location_proofs")
+                .await?;
+            // v53.1.3 (#986) — a COMPARE-AND-SET: a rival withdrawal can land
+            // between the plan's read and this write; the loser writes
+            // nothing.
+            client
+                .execute(
+                    "UPDATE cirislens.federation_location_proofs \
+                        SET withdrawn_at = $3, persist_row_hash = $4, authority_key_id = $5, \
+                            scrub_signature_classical = $6, scrub_signature_pqc = $7, \
+                            admitted_at = $8 \
+                      WHERE subject_key_id = $1 AND asserted_at = $2 AND withdrawn_at IS NULL",
+                    &[
+                        &row.subject_key_id,
+                        &row.asserted_at,
+                        &row.withdrawn_at,
+                        &row.persist_row_hash,
+                        &proof.authority_key_id,
+                        &proof.scrub_signature_classical,
+                        &proof.scrub_signature_pqc,
+                        &admitted_at,
+                    ],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("withdraw_location_proof: {e}"))
+                })?
+        };
+        if written == 0 {
+            return Ok(false);
+        }
+        // v53.1.3 (#986) — the row's bytes changed, so the signed wire index
+        // learns the new content hash, the pooled client released first.
+        self.index_stored_record("LocationProof", &wire_index_key)
+            .await?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    async fn rival_location_proof_withdrawal(&self) -> Result<(), crate::federation::Error> {
+        self.test_rival_location_proof_withdrawal().await
+    }
+
+    async fn store_planned_touch_claim(
+        &self,
+        planned: crate::federation::evidence_admit::PlannedTouchClaim<'_>,
+    ) -> Result<bool, crate::federation::Error> {
+        let claim = planned.claim;
+        let signer_form = claim.signer_form.as_str();
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // Monotonic-max merge: `fresh_as_of` only ever advances; the SQL
+        // guard is the single source of truth against a held row.
+        let n = client
+            .execute(
+                "INSERT INTO cirislens.freshness_floor \
+                    (target_key_id, target_kind, fresh_as_of, signer_form, attesting_key_id, \
+                     signed_envelope, signature, cohort_scope) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 ON CONFLICT (target_key_id, target_kind) \
+                 DO UPDATE SET fresh_as_of = EXCLUDED.fresh_as_of, \
+                    signer_form = EXCLUDED.signer_form, \
+                    attesting_key_id = EXCLUDED.attesting_key_id, \
+                    signed_envelope = EXCLUDED.signed_envelope, \
+                    signature = EXCLUDED.signature, \
+                    cohort_scope = EXCLUDED.cohort_scope \
+                 WHERE EXCLUDED.fresh_as_of > cirislens.freshness_floor.fresh_as_of",
+                &[
+                    &claim.target_key_id,
+                    &claim.target_kind,
+                    &claim.fresh_as_of,
+                    &signer_form,
+                    &claim.attesting_key_id,
+                    &planned.envelope_json,
+                    &planned.signature_json,
+                    &claim.cohort_scope,
+                ],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("put_touch_claim: {e}")))?;
+        Ok(n > 0)
+    }
+
+    async fn store_planned_witness(
+        &self,
+        planned: crate::federation::evidence_admit::PlannedWitness,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        let w = &planned.stored;
+        let leaf_count = i64::from(w.leaf_count);
+        let witness_version = i32::from(w.witness_version);
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("begin witness tx: {e}")))?;
+        // Idempotent on (peer_id, epoch_id, observed_at_unix_ms); `admitted_at`
+        // keeps the column's database default.
+        tx.execute(
+            "INSERT INTO cirislens.wholeness_witness_corpus \
+             (peer_id, epoch_id, observed_at_unix_ms, claim_namespaces, merkle_root, \
+              leaf_count, witness_version, signature, signature_ml_dsa_65, pqc_key_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+             ON CONFLICT (peer_id, epoch_id, observed_at_unix_ms) DO NOTHING",
+            &[
+                &w.peer_id,
+                &planned.epoch_id,
+                &planned.observed_at_unix_ms,
+                &planned.claim_namespaces,
+                &w.merkle_root_hex,
+                &leaf_count,
+                &witness_version,
+                &w.signature,
+                &w.signature_ml_dsa_65,
+                &w.pqc_key_id,
+            ],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("insert wholeness_witness_corpus: {e}")))?;
+        // Prune to the newest K by observed_at.
+        tx.execute(
+            "DELETE FROM cirislens.wholeness_witness_corpus \
+             WHERE peer_id = $1 AND (epoch_id, observed_at_unix_ms) IN ( \
+               SELECT epoch_id, observed_at_unix_ms FROM ( \
+                 SELECT epoch_id, observed_at_unix_ms, ROW_NUMBER() OVER ( \
+                   ORDER BY observed_at_unix_ms DESC, epoch_id DESC) AS rn \
+                 FROM cirislens.wholeness_witness_corpus WHERE peer_id = $1 \
+               ) ranked WHERE ranked.rn > $2 )",
+            &[&w.peer_id, &planned.keep],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("prune wholeness_witness_corpus: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("commit witness tx: {e}")))
+    }
+}
+
 /// v60.0.0 (CIRISPersist#934 step 4) — the consent plane's executor on
 /// postgres. Storage only: the decisions are `federation::consent_admit`'s.
 #[async_trait::async_trait]
@@ -10370,116 +10832,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
         authority_signature: Option<serde_json::Value>,
     ) -> Result<(), crate::federation::Error> {
-        use crate::federation::Error;
-        // v31.1.0 (CIRISPersist#662, PR #667 round-4) — `created_at` is half the
-        // evidence cursor, so it is an allocated position rather than a
-        // wall-clock read; see `monotonic_admission_instant`.
-        let created_at = {
-            let c = self
-                .get_client()
-                .await
-                .map_err(crate::store::Error::into_federation)?;
-            let last: Option<chrono::DateTime<chrono::Utc>> = c
-                .query_one("SELECT MAX(created_at) FROM cirislens.accord_proposal", &[])
-                .await
-                .map_err(|e| Error::Backend(format!("last accord created_at: {e}")))?
-                .get(0);
-            crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last)
-        };
-        let prep = crate::federation::accord_quorum::prepare_proposal(
-            &proposal,
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::accord_admit::put_accord_proposal_planned(
+            self,
+            proposal,
             authority_signature,
-            created_at,
-        )?;
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        // v54.1.0 (#1047) — single use: a proposer-minted nonce names one
-        // proposal per family. The check and the insert are one transaction
-        // under an advisory lock, so two processes sharing the database
-        // cannot both admit a different proposal under one nonce.
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| Error::Backend(format!("accord_proposal transaction: {e}")))?;
-        tx.execute(
-            "SELECT pg_advisory_xact_lock($1)",
-            &[&crate::federation::accord_quorum::ACCORD_PROPOSAL_NONCE_LOCK_KEY],
         )
         .await
-        .map_err(|e| Error::Backend(format!("accord_proposal nonce lock: {e}")))?;
-        // Codex round 4 on PR #1057 — a HELD digest is an idempotent replay,
-        // accepted before the claim is asked: a legacy proposal V189 did not
-        // give the claim to is held evidence, and its replay must not abort
-        // the delivery its participations ride on.
-        let held = tx
-            .query_opt(
-                "SELECT 1 FROM cirislens.accord_proposal WHERE proposal_digest = $1",
-                &[&prep.proposal_digest],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("accord_proposal held read: {e}")))?
-            .is_some();
-        if held {
-            tx.commit()
-                .await
-                .map_err(|e| Error::Backend(format!("accord_proposal commit: {e}")))?;
-            return Ok(());
-        }
-        // Codex round 3 on PR #1057 — and the V189 claim's PRIMARY KEY makes
-        // the pair the database's invariant on both dialects, not only this
-        // door's lock.
-        tx.execute(
-            "INSERT INTO cirislens.accord_proposal_nonce_claim \
-                (family_key_id, nonce, proposal_digest) VALUES ($1, $2, $3) \
-             ON CONFLICT (family_key_id, nonce) DO NOTHING",
-            &[&prep.family_key_id, &prep.nonce, &prep.proposal_digest],
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("accord_proposal nonce claim: {e}")))?;
-        let owner: String = tx
-            .query_one(
-                "SELECT proposal_digest FROM cirislens.accord_proposal_nonce_claim \
-                 WHERE family_key_id = $1 AND nonce = $2",
-                &[&prep.family_key_id, &prep.nonce],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("accord_proposal nonce read: {e}")))?
-            .try_get(0)
-            .map_err(|e| Error::Backend(format!("accord_proposal nonce read: {e}")))?;
-        if owner != prep.proposal_digest {
-            return Err(crate::federation::accord_quorum::nonce_reused(
-                &proposal, &owner,
-            ));
-        }
-        tx.execute(
-            "INSERT INTO cirislens.accord_proposal (\
-                    proposal_digest, family_key_id, action, nonce, window_until, \
-                    prior_family_digest, payload_sha256, proposal_json, \
-                    authority_signature, persist_row_hash, created_at\
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
-                 ON CONFLICT (proposal_digest) DO NOTHING",
-            &[
-                &prep.proposal_digest,
-                &prep.family_key_id,
-                &prep.action,
-                &prep.nonce,
-                &prep.window_until,
-                &prep.prior_family_digest,
-                &prep.payload_sha256,
-                &prep.proposal_json,
-                &prep.authority_signature,
-                &prep.persist_row_hash,
-                &prep.created_at,
-            ],
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))?;
-        tx.commit()
-            .await
-            .map_err(|e| Error::Backend(format!("accord_proposal commit: {e}")))?;
-        Ok(())
     }
 
     async fn get_accord_proposal(
@@ -10560,129 +10919,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
         standing_roster: &[ciris_verify_core::threshold::ThresholdMember],
     ) -> Result<(), crate::federation::Error> {
-        use crate::federation::Error;
-        let stored = self
-            .get_accord_proposal(&participation.proposal_digest)
-            .await?
-            .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "accord participation references unknown proposal {:?}",
-                    participation.proposal_digest
-                ))
-            })?;
-        // The other half of the evidence cursor; same rule.
-        let arrival = {
-            let c = self
-                .get_client()
-                .await
-                .map_err(crate::store::Error::into_federation)?;
-            let last: Option<chrono::DateTime<chrono::Utc>> = c
-                .query_one(
-                    "SELECT MAX(server_arrival_at) FROM cirislens.accord_participation",
-                    &[],
-                )
-                .await
-                .map_err(|e| Error::Backend(format!("last server_arrival_at: {e}")))?
-                .get(0);
-            crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last)
-        };
-        let prep = crate::federation::accord_quorum::verify_and_prepare_participation(
-            &stored.proposal,
-            &participation,
+        crate::federation::accord_admit::put_accord_participation_planned(
+            self,
+            participation,
             standing_roster,
-            arrival,
-        )?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        // M6 dedup by (proposal_digest, pinned_pubkey): idempotent if
-        // identical, conflict if a different vote.
-        let existing: Option<String> = client
-            .query_opt(
-                "SELECT persist_row_hash FROM cirislens.accord_participation \
-                 WHERE proposal_digest = $1 AND pinned_pubkey = $2",
-                &[&prep.proposal_digest, &prep.pinned_pubkey],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("accord_participation dedup check: {e}")))?
-            .map(|r| r.safe_get_with("persist_row_hash", Error::Backend))
-            .transpose()?;
-        if let Some(h) = existing {
-            if h == prep.persist_row_hash {
-                return Ok(());
-            }
-            return Err(Error::Conflict(format!(
-                "accord participation: holder (pinned pubkey) already voted differently on proposal {:?} (M6 — one vote per holder)",
-                participation.proposal_digest
-            )));
-        }
-        // v36.0.0 (CIRISPersist#719) — the dedup SELECT above runs on a POOLED
-        // connection with NO transaction, so it is a check-then-act window:
-        // two carriers offering overlapping bundles both saw no row, and the
-        // loser hit the (proposal_digest, pinned_pubkey) PK and surfaced
-        // `Error::Backend("duplicate key ...")` where this contract says
-        // idempotent no-op. Integrity always held — the PK is the backstop —
-        // but the ERROR PATH lied, and it is reachable today by two peers
-        // relaying the same accord evidence to one node.
-        //
-        // `ON CONFLICT DO NOTHING` alone would be WRONG: it silently accepts a
-        // DIFFERING concurrent vote, which is exactly what M6 exists to refuse.
-        // So the insert absorbs the race and a zero-row result re-reads to
-        // decide — identical ⇒ the no-op this contract promises, different ⇒
-        // the same Conflict the pre-check would have raised.
-        let inserted = client
-            .execute(
-                "INSERT INTO cirislens.accord_participation (\
-                    proposal_digest, member_id, pinned_pubkey, vote, window_until, \
-                    signed_at, server_arrival_at, participation_json, persist_row_hash\
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
-                 ON CONFLICT (proposal_digest, pinned_pubkey) DO NOTHING",
-                &[
-                    &prep.proposal_digest,
-                    &prep.member_id,
-                    &prep.pinned_pubkey,
-                    &prep.vote,
-                    &prep.window_until,
-                    &prep.signed_at,
-                    &prep.server_arrival_at,
-                    &prep.participation_json,
-                    &prep.persist_row_hash,
-                ],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("insert accord_participation: {e}")))?;
-        if inserted == 0 {
-            let raced: Option<String> = client
-                .query_opt(
-                    "SELECT persist_row_hash FROM cirislens.accord_participation \
-                     WHERE proposal_digest = $1 AND pinned_pubkey = $2",
-                    &[&prep.proposal_digest, &prep.pinned_pubkey],
-                )
-                .await
-                .map_err(|e| Error::Backend(format!("accord_participation race re-read: {e}")))?
-                .map(|r| r.safe_get_with("persist_row_hash", Error::Backend))
-                .transpose()?;
-            match raced {
-                Some(h) if h == prep.persist_row_hash => return Ok(()),
-                Some(_) => {
-                    return Err(Error::Conflict(format!(
-                        "accord participation: holder (pinned pubkey) already voted differently on proposal {:?} (M6 — one vote per holder, decided on the concurrent-insert path)",
-                        participation.proposal_digest
-                    )))
-                }
-                // DO NOTHING fired but the row is gone: only a concurrent
-                // delete explains it, and this plane is append-only.
-                None => {
-                    return Err(Error::Backend(
-                        "accord_participation: insert conflicted but no row is present — the \
-                         append-only invariant does not hold on this table"
-                            .to_owned(),
-                    ))
-                }
-            }
-        }
-        Ok(())
+        )
+        .await
     }
 
     async fn list_accord_participations(
@@ -10714,56 +10956,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         decision: ciris_verify_core::accord_live_quorum::AccordDecision,
     ) -> Result<(), crate::federation::Error> {
-        use crate::federation::Error;
-        let prep =
-            crate::federation::accord_quorum::prepare_decision(&decision, chrono::Utc::now())?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        // Immutable (M2).
-        let existing: Option<String> = client
-            .query_opt(
-                "SELECT persist_row_hash FROM cirislens.accord_decision WHERE proposal_digest = $1",
-                &[&prep.proposal_digest],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("accord_decision immutability check: {e}")))?
-            .map(|r| r.safe_get_with("persist_row_hash", Error::Backend))
-            .transpose()?;
-        if let Some(h) = existing {
-            if h == prep.persist_row_hash {
-                return Ok(());
-            }
-            return Err(Error::Conflict(format!(
-                "accord decision for proposal {:?} already recorded with different content (M2 — immutable)",
-                prep.proposal_digest
-            )));
-        }
-        client
-            .execute(
-                "INSERT INTO cirislens.accord_decision (\
-                    proposal_digest, family_key_id, authorized, yes, no, abstain, \
-                    live_set, window_until, decision_json, \
-                    persist_row_hash, decided_at\
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-                &[
-                    &prep.proposal_digest,
-                    &prep.family_key_id,
-                    &prep.authorized,
-                    &prep.yes,
-                    &prep.no,
-                    &prep.abstain,
-                    &prep.live_set,
-                    &prep.window_until,
-                    &prep.decision_json,
-                    &prep.persist_row_hash,
-                    &prep.decided_at,
-                ],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("insert accord_decision: {e}")))?;
-        Ok(())
+        crate::federation::accord_admit::put_accord_decision_planned(self, decision).await
     }
 
     async fn get_accord_decision(
@@ -11536,228 +11729,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         proof: crate::federation::SignedLocationProof,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::LocationProof,
-            &proof,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
-        // other admission step.
-        crate::federation::verify_location_proof_admission(self, &proof).await?;
-        // v53.1.2 (CIRISPersist#984 row 19) — a held PK re-offered as a
-        // WITHDRAWAL (the attester's re-signed row, as a peer serves it) is the
-        // withdraw door's case: the local and the replicated path run the one
-        // predicate. Any other re-offer keeps its path (the PK refuses it).
-        if proof.location_proof.withdrawn_at.is_some() {
-            let probe = self
-                .get_client()
-                .await
-                .map_err(crate::store::Error::into_federation)?;
-            let held = probe
-                .query_opt(
-                    "SELECT 1 FROM cirislens.federation_location_proofs \
-                      WHERE subject_key_id = $1 AND asserted_at = $2",
-                    &[
-                        &proof.location_proof.subject_key_id,
-                        &proof.location_proof.asserted_at,
-                    ],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!("put_location_proof held: {e}"))
-                })?
-                .is_some();
-            drop(probe);
-            if held {
-                return crate::federation::FederationDirectory::withdraw_location_proof(
-                    self, proof,
-                )
-                .await;
-            }
-        }
-        let mut row = proof.location_proof;
-        crate::federation::location::validate_location_cell(&row.cell_id, row.cell_resolution)?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let resolution = i16::from(row.cell_resolution);
-        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
-        // signature the gate above already verified (was verified-then-
-        // discarded).
-        let authority_key_id = proof.authority_key_id;
-        let scrub_signature_classical = proof.scrub_signature_classical;
-        let scrub_signature_pqc = proof.scrub_signature_pqc;
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        // v36.0.0 (#668) — THIS node's serve position (V130).
-        let admitted_at = self
-            .next_plane_position(&client, "federation_location_proofs")
-            .await?;
-        client
-            .execute(
-                "INSERT INTO cirislens.federation_location_proofs (\
-                    subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
-                    attestation_evidence, withdrawn_at, persist_row_hash, \
-                    authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                    admitted_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-                &[
-                    &row.subject_key_id,
-                    &row.cell_id,
-                    &resolution,
-                    &row.asserted_at,
-                    &row.valid_until,
-                    &row.attestation_evidence,
-                    &row.withdrawn_at,
-                    &row.persist_row_hash,
-                    &authority_key_id,
-                    &scrub_signature_classical,
-                    &scrub_signature_pqc,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(map_revocation_pg_err("location_proof"))?;
-        // v21.1.0 (CIRISPersist#507b) — computed after the INSERT succeeds.
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("subject_key_id", &row.subject_key_id),
-            // v31.0.0 (CIRISPersist#646) — the microsecond-floor spelling.
-            // `to_rfc3339()` here wrote a locator postgres could never match
-            // back, because the reloaded `asserted_at` comes out rounded.
-            (
-                "asserted_at",
-                &crate::federation::wire_index::locator_instant(&row.asserted_at),
-            ),
-        ]);
-        drop(client);
-        self.index_stored_record("LocationProof", &wire_index_key)
-            .await?;
-        Ok(())
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::evidence_admit::put_location_proof_planned(self, proof).await
     }
 
     async fn withdraw_location_proof(
         &self,
         proof: crate::federation::SignedLocationProof,
     ) -> Result<(), crate::federation::Error> {
-        use crate::federation::location::{
-            check_location_proof_withdrawal, LocationProofWithdrawal,
-        };
-        // #984 row 16 — the signature and standing legs, exactly as a put.
-        crate::federation::verify_location_proof_admission(self, &proof).await?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        let subject = proof.location_proof.subject_key_id.clone();
-        let asserted_at = proof.location_proof.asserted_at;
-        let held = client
-            .query_opt(
-                "SELECT * FROM cirislens.federation_location_proofs \
-                  WHERE subject_key_id = $1 AND asserted_at = $2",
-                &[&subject, &asserted_at],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("withdraw_location_proof read: {e}"))
-            })?
-            .map(pg_row_to_signed_location_proof)
-            .transpose()?;
-        let Some(held) = held else {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "location_proof_withdraw_not_held: no proof by {subject} at {asserted_at} is held \
-                 here"
-            )));
-        };
-        match check_location_proof_withdrawal(&held, &proof)? {
-            LocationProofWithdrawal::AlreadyWithdrawn => return Ok(()),
-            LocationProofWithdrawal::Apply => {}
-        }
-        #[cfg(test)]
-        self.test_rival_location_proof_withdrawal().await?;
-        let mut row = proof.location_proof;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        // The row moves to a fresh serve position (V130) so a peer past its
-        // cursor is served the withdrawal.
-        let admitted_at = self
-            .next_plane_position(&client, "federation_location_proofs")
-            .await?;
-        // v53.1.3 (Codex on #985 P2, #986) — a COMPARE-AND-SET: the decision
-        // above was made from a read, and a rival withdrawal can land between
-        // that read and this write. The guard makes the loser write nothing;
-        // it re-reads below.
-        let written = client
-            .execute(
-                "UPDATE cirislens.federation_location_proofs \
-                    SET withdrawn_at = $3, persist_row_hash = $4, authority_key_id = $5, \
-                        scrub_signature_classical = $6, scrub_signature_pqc = $7, \
-                        admitted_at = $8 \
-                  WHERE subject_key_id = $1 AND asserted_at = $2 AND withdrawn_at IS NULL",
-                &[
-                    &subject,
-                    &asserted_at,
-                    &row.withdrawn_at,
-                    &row.persist_row_hash,
-                    &proof.authority_key_id,
-                    &proof.scrub_signature_classical,
-                    &proof.scrub_signature_pqc,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("withdraw_location_proof: {e}"))
-            })?;
-        if written == 0 {
-            // Lost the race: the row is withdrawn by the rival (already
-            // withdrawn, the first instant stands), or gone.
-            let now_held = client
-                .query_opt(
-                    "SELECT withdrawn_at FROM cirislens.federation_location_proofs \
-                      WHERE subject_key_id = $1 AND asserted_at = $2",
-                    &[&subject, &asserted_at],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!(
-                        "withdraw_location_proof re-read: {e}"
-                    ))
-                })?
-                .map(|r| {
-                    r.safe_get_with::<Option<chrono::DateTime<chrono::Utc>>, _, _, _>(
-                        "withdrawn_at",
-                        crate::federation::Error::Backend,
-                    )
-                })
-                .transpose()?;
-            return match now_held {
-                Some(Some(_)) => Ok(()),
-                _ => Err(crate::federation::Error::Backend(format!(
-                    "withdraw_location_proof: the held proof by {subject} at {asserted_at} \
-                     changed under the write and is not withdrawn"
-                ))),
-            };
-        }
-        // v53.1.3 (Codex on #985 P1, #986) — the row's bytes changed, so the
-        // signed wire index must learn the new content hash exactly as the
-        // put path teaches it: after the durable write, the pooled client
-        // released first (see `index_stored_record`).
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("subject_key_id", &subject),
-            (
-                "asserted_at",
-                &crate::federation::wire_index::locator_instant(&asserted_at),
-            ),
-        ]);
-        drop(client);
-        self.index_stored_record("LocationProof", &wire_index_key)
-            .await?;
-        Ok(())
+        crate::federation::evidence_admit::withdraw_location_proof_planned(self, proof).await
     }
 
     async fn list_location_proofs_for(
@@ -12354,62 +12334,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         claim: &crate::federation::types::SignedTouchClaim,
     ) -> Result<crate::federation::TouchApplyOutcome, crate::federation::Error> {
-        use crate::federation::TouchApplyOutcome as Outcome;
-        // v21.6.0 (#519 item 2a-iii) — verify-before-mutation: the full
-        // hybrid admission gate, THEN the future-skew guard, THEN the
-        // monotonic-max merge. Mirrors put_signed_transport_destination.
-        crate::federation::admission::verify_signed_touch_claim(self, claim).await?;
-        crate::federation::admission::verify_touch_claim_admission(
-            claim,
-            chrono::Utc::now(),
-            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
-        )?;
-        let envelope_json = serde_json::to_string(&claim.signed_envelope)
-            .map_err(|e| crate::federation::Error::Backend(format!("signed_envelope: {e}")))?;
-        let signature_json = serde_json::to_string(&claim.signature)
-            .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
-        let signer_form = claim.signer_form.as_str();
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        // Monotonic-max merge: `fresh_as_of` only ever advances. A fresh
-        // insert always applies (no conflict target); against an existing
-        // row the SQL guard is the single source of truth — mirrors the
-        // put_transport_destination ON-CONFLICT guard EXACTLY, collapsed to
-        // the freshness floor's single-field monotonic comparator.
-        let n = client
-            .execute(
-                "INSERT INTO cirislens.freshness_floor \
-                    (target_key_id, target_kind, fresh_as_of, signer_form, attesting_key_id, \
-                     signed_envelope, signature, cohort_scope) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-                 ON CONFLICT (target_key_id, target_kind) \
-                 DO UPDATE SET fresh_as_of = EXCLUDED.fresh_as_of, \
-                    signer_form = EXCLUDED.signer_form, \
-                    attesting_key_id = EXCLUDED.attesting_key_id, \
-                    signed_envelope = EXCLUDED.signed_envelope, \
-                    signature = EXCLUDED.signature, \
-                    cohort_scope = EXCLUDED.cohort_scope \
-                 WHERE EXCLUDED.fresh_as_of > cirislens.freshness_floor.fresh_as_of",
-                &[
-                    &claim.target_key_id,
-                    &claim.target_kind,
-                    &claim.fresh_as_of,
-                    &signer_form,
-                    &claim.attesting_key_id,
-                    &envelope_json,
-                    &signature_json,
-                    &claim.cohort_scope,
-                ],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("put_touch_claim: {e}")))?;
-        Ok(if n > 0 {
-            Outcome::Advanced
-        } else {
-            Outcome::NotFresher
-        })
+        crate::federation::evidence_admit::put_touch_claim_planned(self, claim).await
     }
 
     async fn lookup_freshness_floor(
@@ -12509,10 +12434,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         ml_dsa_65_pubkey_b64: Option<&str>,
         disclosed_leaves: Option<&[Vec<u8>]>,
     ) -> Result<(), crate::federation::Error> {
-        // Verify-BEFORE-persist (N3 / RC8 / AV-9): full hybrid-PQC gate +
-        // WW-2 namespace guard + optional leaf/root recompute. On any
-        // failure NOTHING is written.
-        let stored = crate::witness::admit_witness(
+        crate::federation::evidence_admit::put_wholeness_witness_planned(
+            self,
             witness,
             sig_ed25519_b64,
             sig_ml_dsa_65_b64,
@@ -12520,75 +12443,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             ed25519_pubkey_b64,
             ml_dsa_65_pubkey_b64,
             disclosed_leaves,
-        )?;
-        let claim_namespaces_json = serde_json::Value::Array(
-            stored
-                .claim_namespaces
-                .iter()
-                .map(|n| serde_json::Value::String(n.clone()))
-                .collect(),
-        );
-        let epoch_id = i64::try_from(stored.epoch_id).map_err(|_| {
-            crate::federation::Error::Backend("witness epoch_id exceeds i64".into())
-        })?;
-        let observed = i64::try_from(stored.observed_at_unix_ms).map_err(|_| {
-            crate::federation::Error::Backend("witness observed_at_unix_ms exceeds i64".into())
-        })?;
-        let leaf_count = i64::from(stored.leaf_count);
-        let witness_version = i32::from(stored.witness_version);
-        let k = crate::witness::WITNESS_CORPUS_K as i64;
-
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("begin witness tx: {e}")))?;
-        // Idempotent on (peer_id, epoch_id, observed_at_unix_ms).
-        tx.execute(
-            "INSERT INTO cirislens.wholeness_witness_corpus \
-             (peer_id, epoch_id, observed_at_unix_ms, claim_namespaces, merkle_root, \
-              leaf_count, witness_version, signature, signature_ml_dsa_65, pqc_key_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
-             ON CONFLICT (peer_id, epoch_id, observed_at_unix_ms) DO NOTHING",
-            &[
-                &stored.peer_id,
-                &epoch_id,
-                &observed,
-                &claim_namespaces_json,
-                &stored.merkle_root_hex,
-                &leaf_count,
-                &witness_version,
-                &stored.signature,
-                &stored.signature_ml_dsa_65,
-                &stored.pqc_key_id,
-            ],
         )
         .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("insert wholeness_witness_corpus: {e}"))
-        })?;
-        // Prune to the last-K by observed_at (keep newest).
-        tx.execute(
-            "DELETE FROM cirislens.wholeness_witness_corpus \
-             WHERE peer_id = $1 AND (epoch_id, observed_at_unix_ms) IN ( \
-               SELECT epoch_id, observed_at_unix_ms FROM ( \
-                 SELECT epoch_id, observed_at_unix_ms, ROW_NUMBER() OVER ( \
-                   ORDER BY observed_at_unix_ms DESC, epoch_id DESC) AS rn \
-                 FROM cirislens.wholeness_witness_corpus WHERE peer_id = $1 \
-               ) ranked WHERE ranked.rn > $2 )",
-            &[&stored.peer_id, &k],
-        )
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("prune wholeness_witness_corpus: {e}"))
-        })?;
-        tx.commit()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("commit witness tx: {e}")))?;
-        Ok(())
     }
 
     async fn list_wholeness_witnesses_for_peer(

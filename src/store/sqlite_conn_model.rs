@@ -239,6 +239,19 @@ pub(crate) enum ConnClass {
 /// and are `Write`.
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
+    // v61 (CIRISPersist#934, S4a) — the accord and evidence executors:
+    // the cursor maxima and the held-proof read are reads; every store is a
+    // write (one `self.write`, its transaction inside).
+    ("last_accord_proposal_created_at", ConnClass::Read),
+    ("last_accord_participation_arrival", ConnClass::Read),
+    ("held_location_proof", ConnClass::Read),
+    ("store_planned_accord_proposal", ConnClass::Write),
+    ("store_planned_accord_participation", ConnClass::Write),
+    ("store_planned_accord_decision", ConnClass::Write),
+    ("store_planned_location_proof", ConnClass::Write),
+    ("store_planned_location_proof_withdrawal", ConnClass::Write),
+    ("store_planned_touch_claim", ConnClass::Write),
+    ("store_planned_witness", ConnClass::Write),
     ("add_peer_record", ConnClass::Write),
     // #846 (§6.1) — the adopt floor: row + declared binding + holder claim in
     // one transaction.
@@ -500,9 +513,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("peer_metadata_for", ConnClass::Read),
     ("pinned_blob_bytes", ConnClass::Read),
     ("purge_attestation_projections", ConnClass::Write),
-    ("put_accord_decision", ConnClass::Write),
-    ("put_accord_participation", ConnClass::Write),
-    ("put_accord_proposal", ConnClass::Write),
     ("put_aggregated_tier", ConnClass::Write),
     ("put_at_rest_grant", ConnClass::Write),
     ("put_at_rest_grants", ConnClass::Write),
@@ -612,17 +622,13 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_identity_occurrence_local", ConnClass::Write),
     ("put_identity_occurrence_revocation_local", ConnClass::Write),
     ("put_installed_storage_budget", ConnClass::Write),
-    ("put_location_proof", ConnClass::Write),
-    ("withdraw_location_proof", ConnClass::Write),
     // v50.0.0 (#928, V157) — the recorded admission depth of a `withdraws`.
     ("withdraws_admission_depth", ConnClass::Read),
     ("trust_direction_held_among", ConnClass::Read),
     ("put_scope_blob", ConnClass::Write),
     ("put_signed_transport_destination", ConnClass::Write),
     ("put_stream_sth", ConnClass::Write),
-    ("put_touch_claim", ConnClass::Write),
     ("put_transport_destination", ConnClass::Write),
-    ("put_wholeness_witness", ConnClass::Write),
     ("read", ConnClass::Door),
     ("read_classifications", ConnClass::Read),
     ("read_features", ConnClass::Read),

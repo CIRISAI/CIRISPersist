@@ -32,6 +32,11 @@
 //! and the registry-side `docs/FEDERATION_CLIENT.md` for the consumer
 //! complement.
 
+/// v61 (CIRISPersist#934, S4a) — the accord evidence doors, decided
+/// once: the proposal, participation and decision plans and the per-backend
+/// `AccordStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod accord_admit;
 pub mod accord_carriage;
 pub mod accord_quorum;
 /// v53.0.0 (CC 4.2.6) — an accord holder's recovery under a pre-committed key.
@@ -66,6 +71,11 @@ pub(crate) mod community_admit;
 /// the consent-role and trust-grant plans, the consent read folds, and the
 /// per-backend `ConsentStore` executor.
 pub(crate) mod consent_admit;
+/// v61 (CIRISPersist#934, S4a) — the location proof, touch claim and
+/// wholeness witness doors, decided once, with the per-backend
+/// `EvidenceStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod evidence_admit;
 /// v60.0.0 (CIRISPersist#934 step 4) — the sweeps' selections, decided once:
 /// the PQC sweep's page, the reaper's page, the known-hash eviction report and
 /// the room retention leg, with the per-backend `SweepStore` /

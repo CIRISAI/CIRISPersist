@@ -128,6 +128,24 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v61 (CIRISPersist#934, S4a) — the accord evidence doors and the location proof, touch claim and wholeness witness doors.
+    ("put_accord_proposal_planned", Class::Plan),
+    ("put_accord_participation_planned", Class::Plan),
+    ("put_accord_decision_planned", Class::Plan),
+    ("put_location_proof_planned", Class::Plan),
+    ("withdraw_location_proof_planned", Class::Plan),
+    ("put_touch_claim_planned", Class::Plan),
+    ("put_wholeness_witness_planned", Class::Plan),
+    // The executors (storage only; compared across backends as the `AccordStore` / `EvidenceStore` traits): each fails only on the store's terms, and reports what it found for the plan to judge (`HeldRow`, a held proof, an advanced floor).
+    ("last_accord_proposal_created_at", Class::Plumbing),
+    ("last_accord_participation_arrival", Class::Plumbing),
+    ("store_planned_accord_proposal", Class::Plumbing),
+    ("store_planned_accord_participation", Class::Plumbing),
+    ("store_planned_accord_decision", Class::Plumbing),
+    ("held_location_proof", Class::Plumbing),
+    ("store_planned_location_proof_withdrawal", Class::Plumbing),
+    ("rival_location_proof_withdrawal", Class::Plumbing),
+    ("store_planned_touch_claim", Class::Plumbing),
     // v58.0.0 (CIRISPersist#991) — the key plane. The revocation door is one
     // shared plan; every key-plane write keeps its row with it in the same
     // transaction (storage, Plumbing: the row is a pure function of the record
@@ -639,7 +657,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // write (`store::test_hooks::arm_rival_location_proof_withdrawal`); never
     // armed outside a test, so it adds nothing to the door's production
     // sequence.
-    ("test_rival_location_proof_withdrawal", Class::Plumbing),
     // v50.0.0 (CIRISPersist#926) — Gate: refuses a trust-root-grade community
     // row (the reserved `ciris-canonical` id, or one declaring
     // `infrastructure_constraint`) whose shape, founders or chain fails — the
@@ -1361,7 +1378,10 @@ mod tests {
     /// The traits whose impls are compared, and where each trait's **default**
     /// bodies live. A backend that does not override a defaulted method runs
     /// the default, so the default's gate sequence is what it contributes.
-    const TRAITS: [(&str, &str); 9] = [
+    const TRAITS: [(&str, &str); 11] = [
+        // v61 (CIRISPersist#934, S4a) — the accord evidence doors and the location proof, touch claim and wholeness witness doors.
+        ("AccordStore", "src/federation/accord_admit.rs"),
+        ("EvidenceStore", "src/federation/evidence_admit.rs"),
         ("FederationDirectory", "src/federation/mod.rs"),
         ("BlobStorage", "src/federation/blobs.rs"),
         ("Backend", "src/store/backend.rs"),
@@ -1384,7 +1404,36 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 23] = [
+    const SHARED_PLANS: [(&str, &str); 30] = [
+        // v61 (CIRISPersist#934, S4a) — the accord evidence doors and the location proof, touch claim and wholeness witness doors.
+        (
+            "src/federation/accord_admit.rs",
+            "put_accord_proposal_planned",
+        ),
+        (
+            "src/federation/accord_admit.rs",
+            "put_accord_participation_planned",
+        ),
+        (
+            "src/federation/accord_admit.rs",
+            "put_accord_decision_planned",
+        ),
+        (
+            "src/federation/evidence_admit.rs",
+            "put_location_proof_planned",
+        ),
+        (
+            "src/federation/evidence_admit.rs",
+            "withdraw_location_proof_planned",
+        ),
+        (
+            "src/federation/evidence_admit.rs",
+            "put_touch_claim_planned",
+        ),
+        (
+            "src/federation/evidence_admit.rs",
+            "put_wholeness_witness_planned",
+        ),
         // v60.0.0 (CIRISPersist#934 step 4) — the consent writes, the #1105
         // family-scoped holdings read (its family gate), and the key-grant
         // projection (its row-shape gates).
@@ -1505,7 +1554,43 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 36] = [
+    const SHARED_DOORS: [(&str, &str, &str); 43] = [
+        // v61 (CIRISPersist#934, S4a) — the accord evidence doors and the location proof, touch claim and wholeness witness doors.
+        (
+            "FederationDirectory",
+            "put_accord_proposal",
+            "put_accord_proposal_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_accord_participation",
+            "put_accord_participation_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_accord_decision",
+            "put_accord_decision_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_location_proof",
+            "put_location_proof_planned",
+        ),
+        (
+            "FederationDirectory",
+            "withdraw_location_proof",
+            "withdraw_location_proof_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_touch_claim",
+            "put_touch_claim_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_wholeness_witness",
+            "put_wholeness_witness_planned",
+        ),
         // v60.0.0 (CIRISPersist#934 step 4) — the consent writes.
         (
             "FederationDirectory",
