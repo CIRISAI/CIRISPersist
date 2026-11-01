@@ -128,8 +128,7 @@ impl TicketService for PostgresBackend {
         validate_ticket(&ticket)?;
         let status_str = ticket.status.as_sql_str().to_owned();
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         // UPSERT on ticket_id. All columns except `created_at` and
@@ -191,8 +190,7 @@ impl TicketService for PostgresBackend {
             return Err(Error::InvalidArgument("ticket_id required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row_opt = client
@@ -301,8 +299,7 @@ impl TicketService for PostgresBackend {
         );
 
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -343,8 +340,7 @@ impl TicketService for PostgresBackend {
             .to_owned();
         let now = chrono::Utc::now();
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         // First: confirm the ticket exists (so we can return
@@ -395,8 +391,7 @@ impl TicketService for PostgresBackend {
         let status_str = new_status.as_sql_str().to_owned();
         let now = chrono::Utc::now();
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         // Dynamically build the SET clause so callers that don't
@@ -631,7 +626,7 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let res = client
             .execute(
                 "INSERT INTO cirislens.tickets (\

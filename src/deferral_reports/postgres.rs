@@ -88,8 +88,7 @@ impl DeferralReportService for PostgresBackend {
     ) -> Result<ClaimResult<DeferralReport>, Error> {
         validate_report(&report)?;
         let mut client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let tx = client
@@ -152,8 +151,7 @@ impl DeferralReportService for PostgresBackend {
             return Err(Error::InvalidArgument("message_id required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row_opt = client
@@ -211,8 +209,7 @@ impl DeferralReportService for PostgresBackend {
              LIMIT ${p_limit}"
         );
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -238,8 +235,7 @@ impl DeferralReportService for PostgresBackend {
             return Err(Error::InvalidArgument("message_id required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let changed = client

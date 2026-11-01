@@ -734,7 +734,7 @@ impl crate::federation::sweep_plan::SweepStore for PostgresBackend {
         &self,
         selection: crate::federation::sweep_plan::ExpiredSelection,
     ) -> Result<Vec<String>, crate::federation::Error> {
-        let client = self.pool().get().await.map_err(|e| {
+        let client = self.checkout().await.map_err(|e| {
             crate::federation::Error::Backend(format!("list_expired_attestation_ids pool: {e}"))
         })?;
         let rows = pg_query_statement(
@@ -754,7 +754,7 @@ impl crate::federation::sweep_plan::SweepStore for PostgresBackend {
         &self,
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<(u64, u64), crate::federation::Error> {
-        let client = self.pool().get().await.map_err(|e| {
+        let client = self.checkout().await.map_err(|e| {
             crate::federation::Error::Backend(format!("evict_known_wire_hashes pool: {e}"))
         })?;
         let evicted = client
@@ -3329,7 +3329,7 @@ impl crate::federation::key_plane::KeyPlaneStore for PostgresBackend {
         &self,
         read: crate::federation::key_plane::KeyPlaneHoldingsRead,
     ) -> Result<Vec<String>, crate::federation::Error> {
-        let client = self.pool().get().await.map_err(|e| {
+        let client = self.checkout().await.map_err(|e| {
             crate::federation::Error::Backend(format!("list_key_plane_wire_hashes_since pool: {e}"))
         })?;
         let rows = pg_query_statement(
@@ -3622,7 +3622,7 @@ impl PostgresBackend {
         manifest: &[u8; 32],
         add: Option<(u64, [u8; 32], &str)>,
     ) {
-        let client = self.pool.get().await.expect("pool");
+        let client = self.checkout().await.expect("pool");
         match add {
             None => {
                 client
@@ -3650,7 +3650,7 @@ impl PostgresBackend {
     /// no longer holds exactly its manifest's chunks).
     #[cfg(test)]
     pub(crate) async fn test_drop_stream_chunk_row(&self, stream_id: &str, seq: u64) {
-        let client = self.pool.get().await.expect("pool");
+        let client = self.checkout().await.expect("pool");
         client
             .execute(
                 "DELETE FROM cirislens.federation_stream_chunks WHERE stream_id = $1 AND seq = $2",
@@ -3670,7 +3670,7 @@ impl PostgresBackend {
         from_seq: u64,
         new_seq: u64,
     ) {
-        let client = self.pool.get().await.expect("pool");
+        let client = self.checkout().await.expect("pool");
         let n = client
             .execute(
                 "INSERT INTO cirislens.federation_stream_chunks \
@@ -4507,6 +4507,48 @@ fn available_cpus() -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
 }
 
+/// v61 (CIRISPersist#1166) — **the one pooled checkout**: `pool`'s next
+/// connection, waiting at most `wait`. Every Postgres checkout in the crate
+/// runs through here ([`PostgresBackend::checkout`], or this function for a
+/// holder of the bare pool such as the audit Merkle store); a bare
+/// `pool.get()` anywhere else is refused from disk
+/// (`store::pool_checkout_gate`), because it waits without a bound and a
+/// starved pool hangs it instead of answering [`CheckoutError::Exhausted`].
+///
+/// The timer runs where persist's tokio has a reactor: inline on a runtime
+/// thread, else on `persist_rt`, raced against the checkout polled here (a
+/// waker, no reactor needed: the #705 shape, where Edge polls this pool from
+/// its own tokio copy).
+pub(crate) async fn checkout_bounded(
+    pool: &Pool,
+    wait: std::time::Duration,
+    persist_rt: Option<&tokio::runtime::Handle>,
+) -> Result<deadpool_postgres::Object, CheckoutError> {
+    let got = match (tokio::runtime::Handle::try_current(), persist_rt) {
+        (Ok(_), _) => tokio::time::timeout(wait, pool.get()).await.ok(),
+        (Err(_), Some(rt)) => {
+            // The `Sleep` is built INSIDE the task: constructing it here would
+            // ask this thread for a timer it does not have.
+            let mut timer = rt.spawn(async move { tokio::time::sleep(wait).await });
+            tokio::select! {
+                biased;
+                r = pool.get() => {
+                    timer.abort();
+                    Some(r)
+                }
+                _ = &mut timer => None,
+            }
+        }
+        // No persist runtime anywhere: nothing can run a timer.
+        (Err(_), None) => Some(pool.get().await),
+    };
+    match got {
+        None => Err(CheckoutError::Exhausted { waited: wait }),
+        Some(Ok(client)) => Ok(client),
+        Some(Err(e)) => Err(CheckoutError::Failed(e.to_string())),
+    }
+}
+
 /// v59.1.2 — why a pooled checkout failed.
 #[derive(Debug)]
 pub(crate) enum CheckoutError {
@@ -4518,6 +4560,20 @@ pub(crate) enum CheckoutError {
     /// Any other failure: a connect error, a closed pool. deadpool's own
     /// text.
     Failed(String),
+}
+
+/// v61 (CIRISPersist#1166) — the text a family without a typed
+/// `PoolExhausted` arm carries: an exhausted pool names itself and its wait.
+impl std::fmt::Display for CheckoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exhausted { waited } => write!(
+                f,
+                "pool exhausted: no connection was free within {waited:?}"
+            ),
+            Self::Failed(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 #[cfg(feature = "cirisaudit")]
@@ -5660,6 +5716,13 @@ impl PostgresBackend {
         &self.pool
     }
 
+    /// v61 (CIRISPersist#1166) — how long this backend's checkout waits for
+    /// a connection before the pool is exhausted (for a holder of the bare
+    /// pool that checks out through [`checkout_bounded`]).
+    pub(crate) fn checkout_wait(&self) -> std::time::Duration {
+        self.checkout_wait
+    }
+
     /// v59.1.2 — check out one pooled connection, waiting at most the
     /// backend's checkout wait ([`POOL_WAIT_TIMEOUT`] unless a test set
     /// one). The one place a starved pool becomes
@@ -5671,30 +5734,7 @@ impl PostgresBackend {
     /// raced against the checkout polled here (a waker, no reactor needed:
     /// the #705 shape, where Edge polls this pool from its own tokio copy).
     pub(crate) async fn checkout(&self) -> Result<deadpool_postgres::Object, CheckoutError> {
-        let wait = self.checkout_wait;
-        let got = match (tokio::runtime::Handle::try_current(), &self.persist_rt) {
-            (Ok(_), _) => tokio::time::timeout(wait, self.pool.get()).await.ok(),
-            (Err(_), Some(rt)) => {
-                // The `Sleep` is built INSIDE the task: constructing it here
-                // would ask this thread for a timer it does not have.
-                let mut timer = rt.spawn(async move { tokio::time::sleep(wait).await });
-                tokio::select! {
-                    biased;
-                    r = self.pool.get() => {
-                        timer.abort();
-                        Some(r)
-                    }
-                    _ = &mut timer => None,
-                }
-            }
-            // No persist runtime anywhere: nothing can run a timer.
-            (Err(_), None) => Some(self.pool.get().await),
-        };
-        match got {
-            None => Err(CheckoutError::Exhausted { waited: wait }),
-            Some(Ok(client)) => Ok(client),
-            Some(Err(e)) => Err(CheckoutError::Failed(e.to_string())),
-        }
+        checkout_bounded(&self.pool, self.checkout_wait, self.persist_rt.as_ref()).await
     }
 
     /// Acquire a pooled connection, with a **bounded retry on transient
@@ -18339,8 +18379,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
     ) -> Result<Vec<(u64, [u8; 32])>, crate::federation::BlobError> {
         use crate::federation::BlobError;
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| BlobError::Backend(format!("dag_chunks_of_manifest pool: {e}")))?;
         let sha = manifest_sha.to_vec();
@@ -18371,8 +18410,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
     ) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
         use crate::federation::BlobError;
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| BlobError::Backend(format!("list_unlinked_chunk_dags pool: {e}")))?;
         let after = after.map(|a| a.to_vec()).unwrap_or_default();
@@ -18406,8 +18444,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
     ) -> Result<bool, crate::federation::BlobError> {
         use crate::federation::BlobError;
         let mut client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| BlobError::Backend(format!("link_dag_chunks_if_exact pool: {e}")))?;
         let mut want: Vec<(i64, Vec<u8>)> = chunks
@@ -18471,8 +18508,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
     ) -> Result<Option<[u8; 32]>, crate::federation::BlobError> {
         use crate::federation::BlobError;
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| BlobError::Backend(format!("dag_link_backfill_cursor pool: {e}")))?;
         let row = client
@@ -18496,10 +18532,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
         after: Option<[u8; 32]>,
     ) -> Result<(), crate::federation::BlobError> {
         use crate::federation::BlobError;
-        let client =
-            self.pool.get().await.map_err(|e| {
-                BlobError::Backend(format!("set_dag_link_backfill_cursor pool: {e}"))
-            })?;
+        let client = self
+            .checkout()
+            .await
+            .map_err(|e| BlobError::Backend(format!("set_dag_link_backfill_cursor pool: {e}")))?;
         let after = after.map(|a| a.to_vec());
         client
             .execute(
@@ -18701,8 +18737,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
     ) -> Result<Vec<(String, Option<String>)>, crate::federation::BlobError> {
         use crate::federation::BlobError;
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| BlobError::Backend(format!("blob_associations pool: {e}")))?;
         let rows = client
@@ -19923,8 +19958,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         initial_next_attempt_after: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::outbound::QueueId, crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let body_sha256_vec: Vec<u8> = body_sha256.to_vec();
@@ -19966,8 +20000,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         claimed_by: &str,
     ) -> Result<Vec<crate::outbound::OutboundRow>, crate::outbound::Error> {
         let mut client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let tx = client
@@ -20022,8 +20055,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         transport: &str,
     ) -> Result<(), crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let now = chrono::Utc::now();
@@ -20066,8 +20098,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         next_attempt_after: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::outbound::OutboundFailureOutcome, crate::outbound::Error> {
         let mut client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let tx = client
@@ -20166,8 +20197,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         queue_id: &crate::outbound::QueueId,
     ) -> Result<(), crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let now = chrono::Utc::now();
@@ -20192,8 +20222,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         in_reply_to_sha256: &[u8; 32],
     ) -> Result<Option<crate::outbound::OutboundRow>, crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let hash_vec: Vec<u8> = in_reply_to_sha256.to_vec();
@@ -20226,8 +20255,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         ack_envelope_bytes: &[u8],
     ) -> Result<(), crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let now = chrono::Utc::now();
@@ -20252,8 +20280,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
 
     async fn sweep_ack_timeouts(&self) -> Result<i64, crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let now = chrono::Utc::now();
@@ -20307,8 +20334,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
 
     async fn sweep_ttl_expired(&self) -> Result<i64, crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let now = chrono::Utc::now();
@@ -20330,8 +20356,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
 
     async fn sweep_expired_claims(&self) -> Result<i64, crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let now = chrono::Utc::now();
@@ -20353,8 +20378,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         queue_id: &crate::outbound::QueueId,
     ) -> Result<Option<crate::outbound::OutboundRow>, crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let row_opt = client
@@ -20385,8 +20409,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         limit: i64,
     ) -> Result<Vec<crate::outbound::OutboundRow>, crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         // Build the WHERE clause dynamically. Bind each filter param;
@@ -20452,8 +20475,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         crate::outbound::Error,
     > {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let rows = client
@@ -20477,8 +20499,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         queue_id: &crate::outbound::QueueId,
     ) -> Result<(), crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let now = chrono::Utc::now();
@@ -20501,8 +20522,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         queue_id: &crate::outbound::QueueId,
     ) -> Result<(), crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let now = chrono::Utc::now();
@@ -24787,8 +24807,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         }
 
         let mut client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -24925,8 +24944,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         scope: crate::scope::CallerScope,
     ) -> Result<Option<crate::read::TraceSummary>, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -24990,8 +25008,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         };
 
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -25134,8 +25151,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             )));
         }
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -25366,8 +25382,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             )));
         }
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -25462,8 +25477,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::LlmCostAggregate, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -25650,8 +25664,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         }
 
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -25749,8 +25762,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         scope: crate::scope::CallerScope,
     ) -> Result<crate::read::CorpusShape, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -26000,8 +26012,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         scope: crate::scope::CallerScope,
     ) -> Result<crate::read::ScrubAggregate, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -26082,8 +26093,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             )));
         }
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -26208,8 +26218,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             )));
         }
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -26452,8 +26461,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             )));
         }
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -26557,8 +26565,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             )));
         }
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -26660,8 +26667,7 @@ impl crate::read::ReadEngine for PostgresBackend {
     ) -> Result<Vec<crate::read::DivergenceRow>, crate::read::Error> {
         use crate::read::DeviationMetric;
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -26793,8 +26799,7 @@ impl crate::read::ReadEngine for PostgresBackend {
     ) -> Result<Vec<crate::read::TemporalDriftRow>, crate::read::Error> {
         use crate::read::DeviationMetric;
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -26919,8 +26924,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         _scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::HashChainGap>, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -26970,8 +26974,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::OverrideRateRow>, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -27242,8 +27245,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
         let (where_sql, params) = build_scope_filter_where(&filter, &scope)?;
@@ -27269,8 +27271,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
         let (where_sql, params) = build_scope_filter_where(&filter, &scope)?;
@@ -27305,8 +27306,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
         let (where_sql, params) = build_scope_filter_where(&filter, &scope)?;
@@ -27334,8 +27334,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         scope: crate::scope::CallerScope,
     ) -> Result<crate::read::AuditChainAggregate, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
         let (where_sql, params) = build_scope_filter_where(&filter, &scope)?;
@@ -27656,8 +27655,7 @@ impl PostgresBackend {
     /// not have it) and stays valid with or without TimescaleDB installed.
     async fn factor_rollup_present(&self) -> Result<bool, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
         // `to_regclass` is NULL when the relation is absent; it does not
@@ -27701,8 +27699,7 @@ impl PostgresBackend {
         since: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), crate::read::Error> {
         let mut client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -27853,8 +27850,7 @@ impl PostgresBackend {
         self.refresh_factor_rollup(None).await?;
 
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -27933,8 +27929,7 @@ impl PostgresBackend {
         // scope for the drift sub-call below.
         use crate::read::ReadEngine as _;
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -28263,8 +28258,7 @@ impl PostgresBackend {
         scope: &crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
         // agent_id_hash = ANY($1); scope predicate rebases to $2+.
@@ -31911,7 +31905,7 @@ mod tests {
             let decoy =
                 crate::federation::genesis::seed_decoy_attestation(&backend, "postgres").await;
             let target = crate::federation::genesis::genesis_delegation_ids()[0];
-            let client = backend.pool().get().await.expect("client");
+            let client = backend.checkout().await.expect("client");
             let n = client
                 .execute(
                     "UPDATE cirislens.federation_attestations SET attestation_id = $1 \
@@ -31953,7 +31947,7 @@ mod tests {
                 .await
                 .expect("a fresh node seeds the baked plane");
 
-            let client = backend.pool().get().await.expect("client");
+            let client = backend.checkout().await.expect("client");
             for id in crate::federation::genesis::genesis_delegation_ids() {
                 let prior = crate::federation::genesis::prior_ceremony_row(id);
                 let envelope = serde_json::to_string(&prior.attestation_envelope).unwrap();
@@ -32023,7 +32017,7 @@ mod tests {
             let och = hex::decode(&prior.original_content_hash).unwrap();
             let empty = "[]".to_string();
             {
-                let client = backend.pool().get().await.expect("client");
+                let client = backend.checkout().await.expect("client");
                 let n = client
                     .execute(
                         "UPDATE cirislens.federation_attestations SET \
@@ -32158,7 +32152,7 @@ mod tests {
                 .await
                 .expect("a fresh node seeds the baked plane");
             {
-                let client = backend.pool().get().await.expect("client");
+                let client = backend.checkout().await.expect("client");
                 for id in crate::federation::genesis::genesis_delegation_ids() {
                     let prior = crate::federation::genesis::prior_ceremony_row(id);
                     let envelope = serde_json::to_string(&prior.attestation_envelope).unwrap();
@@ -32224,7 +32218,7 @@ mod tests {
                 .attestation
                 .attestation_id;
             {
-                let client = backend.pool().get().await.expect("client");
+                let client = backend.checkout().await.expect("client");
                 let empty = "[]".to_string();
                 let n = client
                     .execute(
@@ -34507,7 +34501,7 @@ mod tests {
         )
         .await;
 
-        let client = backend.pool.get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let row = client
             .query_one(
                 "SELECT event_id FROM cirislens.trace_events \
@@ -35020,7 +35014,7 @@ mod tests {
         .await;
         // Add a second gpt-4o + a claude row by directly inserting
         // additional LLM calls referencing the same trace.
-        let client = backend.pool.get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let parent_event_id: i64 = client
             .query_one(
                 "SELECT event_id FROM cirislens.trace_events \
@@ -37896,7 +37890,7 @@ mod tests {
         backend.insert_trace_events_batch(&rows).await.unwrap();
         refresh_factor_rollup(&backend).await;
 
-        let client = backend.pool.get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let row = client
             .query_one(
                 "SELECT csdma_sum, csdma_n, k_eff_sum, k_eff_n, \
@@ -38572,7 +38566,7 @@ mod tests {
 
         // UPDATE the (trace_id, thought_id) rows we just inserted so
         // every row carries the pipeline JSONB.
-        let client = backend.pool.get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let n = client
             .execute(
                 "UPDATE cirislens.trace_events \
@@ -43191,12 +43185,7 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
-        let client = backend
-            .pool()
-            .get()
-            .await
-            .map_err(|e| e.to_string())
-            .unwrap();
+        let client = backend.checkout().await.map_err(|e| e.to_string()).unwrap();
         let key_id = format!("pg-ah-direct-§102-{}", uuid_like());
         let err = client
             .execute(
@@ -44648,7 +44637,7 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let row = client
             .query_one(
                 "SELECT column_name FROM information_schema.columns \
@@ -44736,7 +44725,7 @@ mod tests {
         let _ = backend.get_blob(&sha).await.unwrap();
         // has_blob also bumps.
         assert!(backend.has_blob(&sha).await.unwrap());
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let row = client
             .query_one(
                 "SELECT access_count FROM cirislens.federation_blobs WHERE sha256 = $1",
@@ -48312,7 +48301,7 @@ mod tests {
     }
 
     async fn pg_truncate_scope_blobs(backend: &PostgresBackend) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .execute("DELETE FROM cirislens.federation_scope_blobs", &[])
             .await
@@ -48425,7 +48414,7 @@ mod tests {
             .await
             .unwrap();
         let read_la = || async {
-            let client = backend.pool().get().await.unwrap();
+            let client = backend.checkout().await.unwrap();
             let row = client
                 .query_one(
                     "SELECT last_accessed_at FROM cirislens.federation_scope_blobs \
@@ -50395,7 +50384,7 @@ mod tests {
         limit: i64,
         scope: crate::scope::CallerScope,
     ) -> crate::read::TraceListPage {
-        let client = backend.pool.get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let (mut where_parts, mut params) = pg_trace_filter_parts(&filter).unwrap();
         let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
             &scope,

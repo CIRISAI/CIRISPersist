@@ -55,6 +55,10 @@ pub(crate) mod postgres_runtime_connect;
 // v54.0.0 (Codex round 2 on PR #1050) — every door on a one-connection pool.
 #[cfg(all(test, feature = "postgres"))]
 mod one_connection_pool_invariants;
+/// v61 (CIRISPersist#1166) — from disk: every Postgres checkout is the
+/// bounded one.
+#[cfg(test)]
+mod pool_checkout_gate;
 /// v54.0.0 (Codex on PR #1050) — the striped per-record lock a wire-index
 /// re-index holds from its read through its replacement.
 pub(crate) mod record_locks;

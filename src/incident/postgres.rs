@@ -179,8 +179,7 @@ impl IncidentService for PostgresBackend {
         validate_correlation_keys(&incident.correlation_keys)?;
 
         let mut client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let tx = client
@@ -303,8 +302,7 @@ impl IncidentService for PostgresBackend {
         let id = parse_incident_id(&transition.incident_id)?;
 
         let mut client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let tx = client
@@ -473,8 +471,7 @@ impl IncidentService for PostgresBackend {
         );
 
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -505,8 +502,7 @@ impl IncidentService for PostgresBackend {
             return Err(Error::InvalidArgument("key must be non-empty".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let rows = client

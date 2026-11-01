@@ -639,7 +639,7 @@ mod postgres_tests {
     }
 
     async fn pg_seed_plain_federation_key(backend: &PostgresBackend, pubkey: &str) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .execute(
                 "INSERT INTO cirislens.federation_keys (\
@@ -665,7 +665,7 @@ mod postgres_tests {
         trusted_by: Option<&str>,
         expires_at: Option<chrono::DateTime<chrono::Utc>>,
     ) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let domains_owned: Vec<String> = trust_domains
             .map(|d| d.iter().map(|s| (*s).to_owned()).collect())
             .unwrap_or_default();
@@ -714,7 +714,7 @@ mod postgres_tests {
     // a process). Backfill claims the 0xC0-range to keep the two
     // modules disjoint.
     async fn pg_cleanup(backend: &PostgresBackend, tenant: &str, pubkeys: &[&str]) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         for sql in [
             "DELETE FROM cirislens.federation_trust_grants WHERE tenant_id = $1",
             "DELETE FROM cirislens.merkle_sth_log WHERE tenant_id = $1",

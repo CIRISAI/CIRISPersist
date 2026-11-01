@@ -3039,10 +3039,10 @@ impl Engine {
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(b) => {
-                let client =
-                    b.pool().get().await.map_err(|e| {
-                        crate::federation::BlobError::Backend(format!("pool get: {e}"))
-                    })?;
+                let client = b
+                    .checkout()
+                    .await
+                    .map_err(|e| crate::federation::BlobError::Backend(format!("pool get: {e}")))?;
                 let row = client
                     .query_one(
                         "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT AS total \
@@ -14212,7 +14212,7 @@ mod tests {
         let tenant_a = format!("tnt-A-{}", uuid::Uuid::new_v4().simple());
         let tenant_b = format!("tnt-B-{}", uuid::Uuid::new_v4().simple());
         let base_ts = chrono::Utc::now();
-        let client = pg.pool().get().await.unwrap();
+        let client = pg.checkout().await.unwrap();
         let id_a1 = uuid::Uuid::new_v4();
         let id_a2 = uuid::Uuid::new_v4();
         let id_b = uuid::Uuid::new_v4();
@@ -15068,7 +15068,7 @@ mod tests {
         // Pin the stored hash equals the CEG produce-gate canonical
         // hash — same invariant the SQLite test checks.
         let attestation_type = "scores".to_owned();
-        let client = pg.pool().get().await.expect("pg client");
+        let client = pg.checkout().await.expect("pg client");
         let row = client
             .query_one(
                 "SELECT encode(original_content_hash, 'hex'), scrub_key_id \
@@ -22714,7 +22714,7 @@ mod tests {
         let key_id = signer.derived_key_id();
         let (ed_pk, mldsa_pk) = crate::federation::tier_ingest::test_support::hybrid_pubkeys(label);
         let pg = engine.postgres_backend().expect("postgres");
-        let client = pg.pool().get().await.expect("pool get");
+        let client = pg.checkout().await.expect("pool get");
         client
             .execute(
                 "INSERT INTO cirislens.federation_keys (\
@@ -22737,7 +22737,7 @@ mod tests {
     #[cfg(feature = "postgres")]
     async fn pg_seed_key(engine: &Engine, key_id: &str, identity_type: &str) {
         let pg = engine.postgres_backend().expect("postgres");
-        let client = pg.pool().get().await.expect("pool get");
+        let client = pg.checkout().await.expect("pool get");
         client
             .execute(
                 "INSERT INTO cirislens.federation_keys (\

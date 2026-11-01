@@ -915,6 +915,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("get_accord_proposal", Class::Delegates),
     ("get_attestation", Class::Delegates),
     ("get_client", Class::Delegates),
+    // v61 (CIRISPersist#1166) — the bounded pooled checkout every door now
+    // takes (no gate: it fails only when the pool is starved or down).
+    ("checkout", Class::Plumbing),
     // v44.8.1 (#870) — the blob doors' post-write index hook for the holder
     // claim; same-file helper over `index_stored_record`, followed like it.
     ("index_holder_claim", Class::Delegates),

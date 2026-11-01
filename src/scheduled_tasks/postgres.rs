@@ -121,8 +121,7 @@ impl ScheduledTaskService for PostgresBackend {
         validate_scheduled_task(&task)?;
         let status_str = task.status.as_sql_str().to_owned();
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         // UPSERT on id. All columns except `created_at` overwrite on
@@ -192,8 +191,7 @@ impl ScheduledTaskService for PostgresBackend {
             )));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         // Hits the `scheduled_tasks_due` partial index
@@ -273,8 +271,7 @@ impl ScheduledTaskService for PostgresBackend {
         );
 
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -689,7 +686,7 @@ mod tests {
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
         // No need to seed — the EXPLAIN check works against an empty table.
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let rows = client
             .query(
                 "EXPLAIN SELECT id FROM cirislens.scheduled_tasks \

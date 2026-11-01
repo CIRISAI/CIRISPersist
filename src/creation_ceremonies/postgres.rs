@@ -141,8 +141,7 @@ impl CreationCeremonyService for PostgresBackend {
         validate_ceremony(&ceremony)?;
         let status_str = ceremony.ceremony_status.as_sql_str();
         let mut client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let tx = client
@@ -205,8 +204,7 @@ impl CreationCeremonyService for PostgresBackend {
             return Err(Error::InvalidArgument("ceremony_id required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row_opt = client
@@ -279,8 +277,7 @@ impl CreationCeremonyService for PostgresBackend {
              LIMIT ${p_limit}"
         );
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -306,8 +303,7 @@ impl CreationCeremonyService for PostgresBackend {
         }
         let status_str = new_status.as_sql_str();
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let changed = client
@@ -550,7 +546,7 @@ mod tests {
         // Bypass the typed enum to write an arbitrary status string
         // directly — verify the CHECK constraint kicks in at the
         // database layer.
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let now = Utc::now();
         let cid = format!("ceremony-bad-{}", Uuid::new_v4().simple());
         let res = client

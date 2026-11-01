@@ -129,8 +129,7 @@ impl ThoughtService for PostgresBackend {
         let status_str = thought.status.as_sql_str().to_owned();
         let thought_type_str = thought.thought_type.0.clone();
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         client
@@ -185,8 +184,7 @@ impl ThoughtService for PostgresBackend {
             return Err(Error::InvalidArgument("thought_id required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row_opt = client
@@ -283,8 +281,7 @@ impl ThoughtService for PostgresBackend {
         );
 
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -319,8 +316,7 @@ impl ThoughtService for PostgresBackend {
         let status_str = new_status.as_sql_str().to_owned();
         let now = chrono::Utc::now();
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let changed = client
@@ -342,8 +338,7 @@ impl ThoughtService for PostgresBackend {
             return Err(Error::InvalidArgument("thought_id required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         // Recursive CTE walks the parent_thought_id chain from the
@@ -391,8 +386,7 @@ impl ThoughtService for PostgresBackend {
             return Err(Error::InvalidArgument("thought_id required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let changed = client

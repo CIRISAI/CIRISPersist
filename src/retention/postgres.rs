@@ -51,8 +51,7 @@ pub async fn storage_summary_pg_with(
     with_table_bytes: bool,
 ) -> Result<StorageSummary, RetentionError> {
     let client = backend
-        .pool()
-        .get()
+        .checkout()
         .await
         .map_err(|e| RetentionError::Backend(format!("pool: {e}")))?;
 
@@ -355,8 +354,7 @@ async fn prune_observation_table_pg(
     };
     let sql = plan.render(crate::federation::attestation_query::Dialect::Postgres);
     let client = backend
-        .pool()
-        .get()
+        .checkout()
         .await
         .map_err(|e| RetentionError::Backend(format!("pool: {e}")))?;
     let deleted = client
@@ -386,8 +384,7 @@ pub async fn delete_traces_older_than_pg(
     let limit_i64 = i64::try_from(max_rows)
         .map_err(|_| RetentionError::InvalidArgument(format!("max_rows {max_rows} > i64::MAX")))?;
     let client = backend
-        .pool()
-        .get()
+        .checkout()
         .await
         .map_err(|e| RetentionError::Backend(format!("pool: {e}")))?;
     let deleted = client
@@ -443,8 +440,7 @@ pub async fn archive_audit_range_pg(
     }
 
     let mut client = backend
-        .pool()
-        .get()
+        .checkout()
         .await
         .map_err(|e| RetentionError::Backend(format!("pool: {e}")))?;
     let tx = client
@@ -618,8 +614,7 @@ pub async fn lookup_audit_archive_pg(
     archive_id: uuid::Uuid,
 ) -> Result<Option<Vec<u8>>, RetentionError> {
     let client = backend
-        .pool()
-        .get()
+        .checkout()
         .await
         .map_err(|e| RetentionError::Backend(format!("pool: {e}")))?;
     let row_opt = client
