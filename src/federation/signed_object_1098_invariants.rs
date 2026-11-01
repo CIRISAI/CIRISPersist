@@ -453,8 +453,10 @@ pub(crate) mod bodies {
     ///   `subject_key_ids`, and CC 2.1 (rc14) admits a targeted row naming
     ///   "the party it is about in `subject_key_ids`". Persist refuses any
     ///   foreign subject at a targeted scope (subject-naming is the
-    ///   revocability-authority surface). Measured at the rc14 re-vendor; the
-    ///   line stays until the steward rules which reading holds.
+    ///   revocability-authority surface). Measured at the rc14 re-vendor. Ruled
+    ///   for v61 S1: the arm stays (a security property); it is decided in S2
+    ///   with the community-scope moderation carve-out on the same AV-84 doors
+    ///   (CIRISPersist#1161).
     /// - `refuse_row_type`: the allowlist stays Report-only until the Enforce
     ///   flip's data preconditions are met (CIRISPersist#1150).
     /// - `refuse_timestamp_form`: CC 2.6.2 says a producer MUST write `Z` with
@@ -477,7 +479,8 @@ pub(crate) mod bodies {
             "federation_cohort_standing_refused",
             "persist refuses a targeted-cohort row whose subject_key_ids names a party other \
              than its producer (AV-84 named_subject, CIRISPersist#592); CC 2.1 at rc14 admits \
-             it, and the rc13 re-mint (6054a03) moved only attested_key_id",
+             it, and the rc13 re-mint (6054a03) moved only attested_key_id; decided in S2 with \
+             CIRISPersist#1161",
         ),
         (
             "refuse_row_type",

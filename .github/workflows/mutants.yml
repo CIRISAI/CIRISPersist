@@ -120,6 +120,10 @@ jobs:
           - {scope: scope-s1-group-plane, shard: '3/6', id: s1-group-plane-3-of-6, weekly: true}
           - {scope: scope-s1-group-plane, shard: '4/6', id: s1-group-plane-4-of-6, weekly: true}
           - {scope: scope-s1-group-plane, shard: '5/6', id: s1-group-plane-5-of-6, weekly: true}
+          # The S1 retirements (KeyGrant, the member listing, the group
+          # record's withdraws): 10 mutants, one shard
+          # (600 s + 168 s x 10 = 2280 s), nightly.
+          - {scope: scope-s1-retire, shard: '', id: s1-retire, weekly: false}
     services:
       postgres:
         image: ghcr.io/cirisai/postgres:16
