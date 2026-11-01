@@ -490,7 +490,10 @@ mod tests {
 
     /// **I1303** — the vendored table parses, its pin is the table's, and
     /// every two-path row CC built is inside its corridor as persist checks
-    /// it; the three rows under their own rule are not two-path policies.
+    /// it; the four rows under their own rule are not two-path policies (rc14
+    /// appended `affiliation_member_action`, a `cosign` row: a one-voice
+    /// affiliation acts against a member only with an outside countersign,
+    /// CC 4.4.3.2.8; its door is CIRISPersist#1143).
     #[test]
     fn i1303_every_two_path_row_of_the_vendored_table_is_in_its_corridor() {
         let t = table().expect("the compiled-in table");
@@ -548,7 +551,12 @@ mod tests {
         );
         assert_eq!(
             other,
-            ["moderation_action", "accord_halt", "custodian_replace"]
+            [
+                "moderation_action",
+                "accord_halt",
+                "custodian_replace",
+                "affiliation_member_action"
+            ]
         );
         // A door may decide only a standing-base row: the community rows'
         // expected-active base is not built.

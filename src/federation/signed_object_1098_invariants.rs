@@ -1,5 +1,6 @@
 //! CIRISPersist#1098 (CC 2.6.1.1.1 and 2.6.1.7) — **I1478, I1479, I1493, I1494: the
-//! signed-object cleanup**, on every backend, through `put_attestation`.
+//! signed-object cleanup**, and I1496 and I1498 from the CC re-vendors, on
+//! every backend, through `put_attestation`.
 //!
 //! - **I1478 (F4, `envelope_member_null`)** — an optional envelope member
 //!   written as an explicit JSON `null`, at the top level or inside the `row`
@@ -19,6 +20,18 @@
 //!   refuse vector is refused with the persist token its CC refusal names.
 //!   The three vectors persist answers differently are recorded in
 //!   `DIVERGENCES` with the ruling that keeps each, a latch both ways.
+//! - **I1496 (rc12, `observation:access_assumption` at `+1.0` only)** — the
+//!   leaf the rc12 registry adds admits a score of `1.0` and refuses any other
+//!   with `score_outside_declared_polarity` (CC 3.1.9.4; its first-person rule
+//!   is CIRISPersist#1115). Carried from the rc12 side branch, where it was
+//!   I1482 (v59.1.2 shipped I1480–I1483).
+//! - **I1498 (rc13, `listed` retired)** — CC removed `listed` from CC 2.1, the
+//!   defaults table and the signed object, and persist no longer types it
+//!   (#991). At admission it is an unknown envelope member like any other
+//!   `signed:envelope-extra`: carried untyped, a value of any type admits (a
+//!   non-boolean was ill-typed while it was a typed member), the stored bytes
+//!   keep it as signed, and only the general rule refuses it, as
+//!   `envelope_member_null` when written `null`.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -433,11 +446,15 @@ pub(crate) mod bodies {
     /// emits and the ruling that keeps it. A latch both ways: a vector that
     /// starts agreeing, or a new disagreement, reds I1494.
     ///
-    /// - `scores_subject_and_scope`: persist KEEPS refusing (AV-84,
-    ///   CIRISPersist#592, a security property). CC agreed its vector was wrong
-    ///   and re-minted it on rc13 (`6054a03`: the signer in `attested_key_id`,
-    ///   the third party only in `subject_key_ids`); when persist vendors the
-    ///   rc13 tag this line flips to agreement and leaves the table.
+    /// - `scores_subject_and_scope`: persist KEEPS refusing, now on the
+    ///   `named_subject` arm (AV-84, CIRISPersist#592). CC re-minted the vector
+    ///   on rc13 (`6054a03`): the producer is in `attested_key_id`, so the
+    ///   `attested_party` arm no longer fires, but the third party stays in
+    ///   `subject_key_ids`, and CC 2.1 (rc14) admits a targeted row naming
+    ///   "the party it is about in `subject_key_ids`". Persist refuses any
+    ///   foreign subject at a targeted scope (subject-naming is the
+    ///   revocability-authority surface). Measured at the rc14 re-vendor; the
+    ///   line stays until the steward rules which reading holds.
     /// - `refuse_row_type`: the allowlist stays Report-only until the Enforce
     ///   flip's data preconditions are met (CIRISPersist#1150).
     /// - `refuse_timestamp_form`: CC 2.6.2 says a producer MUST write `Z` with
@@ -458,8 +475,9 @@ pub(crate) mod bodies {
         (
             "scores_subject_and_scope",
             "federation_cohort_standing_refused",
-            "persist keeps refusing a targeted-cohort row that names a party other than its \
-             producer (AV-84, CIRISPersist#592); CC re-minted the vector on rc13 (6054a03)",
+            "persist refuses a targeted-cohort row whose subject_key_ids names a party other \
+             than its producer (AV-84 named_subject, CIRISPersist#592); CC 2.1 at rc14 admits \
+             it, and the rc13 re-mint (6054a03) moved only attested_key_id",
         ),
         (
             "refuse_row_type",
@@ -499,6 +517,73 @@ pub(crate) mod bodies {
             Error::MalformedRow { reason, .. } => reason,
             other => other.kind(),
         }
+    }
+
+    /// **I1496** — `observation:access_assumption:v1` is `+1.0` only.
+    pub(crate) async fn i1496_access_assumption_is_plus_one_only(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let a = format!("i1496-{tag}");
+        ts::register_hybrid_key_as(d, &a, &a, it::USER).await;
+        let row = |score: f64| {
+            let mut r = sealed_with(&a, serde_json::json!({ "score": score }));
+            r.attestation_envelope["dimension"] =
+                serde_json::json!("observation:access_assumption:v1");
+            r.subject_key_ids = vec![a.clone()];
+            ts::seal_row_in_place(&a, &mut r);
+            r
+        };
+        for score in [0.5, -1.0, 0.0] {
+            let e = put(d, row(score))
+                .await
+                .expect_err("I1496: a score other than +1.0 is refused");
+            assert!(
+                e.to_string().contains("score_outside_declared_polarity"),
+                "I1496 score {score}: {e}"
+            );
+        }
+        put(d, row(1.0))
+            .await
+            .expect("I1496: +1.0 admits on the vendored registry");
+    }
+
+    /// **I1498** — `listed` is an unknown envelope member at admission.
+    pub(crate) async fn i1498_listed_is_an_unknown_member(d: &dyn FederationDirectory, tag: &str) {
+        let a = format!("i1498-{tag}");
+        ts::register_hybrid_key_as(d, &a, &a, it::USER).await;
+        for value in [
+            serde_json::json!(true),
+            serde_json::json!("public"),
+            serde_json::json!({ "members": [] }),
+        ] {
+            let r = sealed_with(&a, serde_json::json!({ "listed": value }));
+            let (id, hash) = (r.attestation_id.clone(), r.original_content_hash.clone());
+            put(d, r)
+                .await
+                .unwrap_or_else(|e| panic!("I1498: `listed: {value}` admits untyped: {e}"));
+            let stored = d
+                .get_attestation(&id)
+                .await
+                .expect("read")
+                .expect("I1498: the row is held");
+            assert_eq!(
+                stored.attestation_envelope["listed"], value,
+                "I1498: the stored envelope keeps `listed` as signed"
+            );
+            assert_eq!(
+                stored.original_content_hash, hash,
+                "I1498: the producer's bytes"
+            );
+        }
+        let nulled = sealed_with(&a, serde_json::json!({ "listed": null }));
+        let e = put(d, nulled)
+            .await
+            .expect_err("I1498: `listed: null` meets the general null rule");
+        assert_eq!(
+            malformed_reason(e, "I1498 null"),
+            malformed_row::ENVELOPE_MEMBER_NULL
+        );
     }
 
     /// **I1494** — the 13 vectors. Each runs on a fresh store from
@@ -652,6 +737,8 @@ mod tests {
     on_every_backend!(i1478, bodies::i1478_envelope_member_null);
     on_every_backend!(i1479, bodies::i1479_witnesses_is_a_set);
     on_every_backend!(i1493, bodies::i1493_a_bare_scope_token);
+    on_every_backend!(i1496, bodies::i1496_access_assumption_is_plus_one_only);
+    on_every_backend!(i1498, bodies::i1498_listed_is_an_unknown_member);
 
     mod i1494 {
         use super::*;

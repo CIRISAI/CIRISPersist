@@ -621,6 +621,10 @@ mod accord_roster_invariants;
 /// v53.0.0 (CC 3.2 T6) — I440–I449, the head moves with the record.
 #[cfg(test)]
 mod lineage_head_invariants;
+/// v61 S1 (step 5) — I1499, the CC v1.0-rc14 re-vendor: the rc14 text
+/// persist does not build in this slice, each latched with its ticket.
+#[cfg(test)]
+mod rc14_vendor_invariants;
 /// v55.0.0 (CIRISPersist#753) — I700–I709, the CC rc7 re-vendor: the held
 /// families, the ledger owner rule, settlement admission.
 #[cfg(test)]
@@ -12118,19 +12122,19 @@ pub mod malformed_row {
     /// occurrence, not cosigned by a strict majority of the self's current
     /// live roster: a legacy revocation does not bypass the two-path door.
     pub const CARRIER_WITHOUT_ROSTER_QUORUM: &str = "carrier_without_roster_quorum";
-    /// v60.0.0 (CIRISPersist#988 item 4, CC 3.1.9.7) — a `goal:*` row (a
-    /// declaration or an amendment) whose `meta_goal_alignment` is missing or
-    /// ill-formed: a dimension outside the seven M-1 dimensions, an empty
-    /// rationale, an unknown member, an empty deliberation pointer.
+    /// v60.0.0 (CIRISPersist#988 item 4; CC 3.1.9.7, registered at rc12) — a
+    /// `goal:*` row (a declaration or an amendment) whose `meta_goal_alignment` is
+    /// missing or ill-formed: a dimension outside the seven M-1 dimensions, an
+    /// empty rationale, an unknown member, an empty deliberation pointer.
     pub const GOAL_META_ALIGNMENT: &str = "goal_meta_alignment_malformed";
-    /// v60.0.0 (CIRISPersist#988 item 4) — any other ill-formed goal body: a
-    /// dimension that is not a clean `goal:{scale}:v1` leaf, an empty
-    /// `goal_text`, a `cohort` scale without its `cohort_id` (or a `cohort_id`
-    /// on another scale), a score outside `[-1, 1]`.
+    /// v60.0.0 (CIRISPersist#988 item 4; CC 3.1.9.7, registered at rc12) — any
+    /// other ill-formed goal body: a dimension that is not a clean
+    /// `goal:{scale}:v1` leaf, an empty `goal_text`, a `cohort` scale without its
+    /// `cohort_id` (or a `cohort_id` on another scale), a score outside `[-1, 1]`.
     pub const GOAL_BODY: &str = "goal_body_malformed";
-    /// v60.0.0 (CIRISPersist#988 item 4) — a v59 typed `Goal` (it carries
-    /// `goal_id` / `declared_by_key_id` / `declared_at` / `scope` /
-    /// `retired_at`) offered at a goal door that takes a body.
+    /// v60.0.0 (CIRISPersist#988 item 4; CC 3.1.9.7, registered at rc12) — a v59
+    /// typed `Goal` (it carries `goal_id` / `declared_by_key_id` / `declared_at` /
+    /// `scope` / `retired_at`) offered at a goal door that takes a body.
     pub const GOAL_TYPED_OBJECT_RETIRED: &str = "goal_typed_object_retired";
     /// v60.0.0 (CIRISPersist#1114; CC 2.6.1.7, rc10 `99bf187`) — the row's
     /// `original_content_hash` is not the SHA-256 of JCS(its envelope). Was a

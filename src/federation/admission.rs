@@ -21476,6 +21476,13 @@ mod tests {
         // stream), which no identity type expresses. The gate is
         // `key_grant::check_key_grant_row_admission` (CIRISPersist#989).
         "key_grant:",
+        // rc12 re-vendor (CC 3.1.5) — "the agent's occurrence key about its
+        // identity key; admitted only citing an admitted
+        // deferral:response:approved by a seated WA": the rule asks whether the
+        // cited answer's signer held a WA seat at its instant, which no identity
+        // type expresses. The gate is
+        // `identity_amendment::check_identity_amendment_admission` (#1120).
+        "identity_amendment",
     ];
 
     /// Manifest-reserved families persist has **no gate for yet** — a different
@@ -21510,6 +21517,28 @@ mod tests {
         ("key:revocation", "CIRISPersist#991"),
         ("identity:occurrence", "CIRISPersist#991"),
         ("group:roster", "CIRISPersist#991"),
+        // rc12 re-vendor (CC 3.1.3) — the mesh census and the community tally:
+        // serve seats aggregate, tally members recompute, shares are addressed
+        // to one seat or member. The doors are #1121 (after v60).
+        ("census:share:", "CIRISPersist#1121"),
+        ("census:partial:", "CIRISPersist#1121"),
+        ("census:composite:", "CIRISPersist#1121"),
+        ("census:expected_active", "CIRISPersist#1121"),
+        ("census:member:share", "CIRISPersist#1121"),
+        ("census:member:partial", "CIRISPersist#1121"),
+        ("ballot:tally:", "CIRISPersist#1121"),
+        // rc12 re-vendor (CC 3.1.9.4) — first-person observation, `+1.0` only.
+        // The polarity is gated by the class; the first-person rule is #1115.
+        ("observation:access_assumption", "CIRISPersist#1115"),
+        // rc12 re-vendor (CC 3.1.9.3) — the deferring agent's occurrence key,
+        // and a seated WA's answer. Persist reads the approved answer for the
+        // identity amendment; neither row's own emitter rule is gated. CC
+        // staged both on CIRISAgent#1316.
+        ("deferral:request", "CIRISAgent#1316"),
+        ("deferral:response:", "CIRISAgent#1316"),
+        // rc12 re-vendor (CC 3.1.4) — self: attester == subject == the
+        // period's fresh rendezvous key. Persist has no emitter and no gate.
+        ("rendezvous:route", "CIRISPersist#1149"),
     ];
 
     /// **CC 3.1.7 R2(a) — the mint gate.** Every family persist declares itself

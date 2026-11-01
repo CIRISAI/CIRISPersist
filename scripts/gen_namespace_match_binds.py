@@ -30,7 +30,9 @@ def main(argv):
         sys.stderr.write(__doc__)
         return 2
     repo, commit = argv[0], argv[1]
-    full = subprocess.check_output(["git", "-C", repo, "rev-parse", commit], text=True).strip()
+    # `^{commit}`: an annotated tag names its tag OBJECT; the pin is the commit.
+    full = subprocess.check_output([
+        "git", "-C", repo, "rev-parse", commit + "^{commit}"], text=True).strip()
     for rel, local in (("manifests/namespace_registry.json", REGISTRY),
                        ("manifests/namespace_match_vectors.json", VECTORS)):
         upstream = subprocess.check_output(["git", "-C", repo, "show", "%s:%s" % (full, rel)])

@@ -520,6 +520,7 @@ pub const PINNING_FAMILIES: &[&str] = &[
     "identity:occurrence_revocation",
     "key:revocation",
     "lawful_order:release",
+    "observation:access_assumption",
     "preserve_request",
     "prohibited:{category}",
     "revocation:{entity_type}:{reason}",
@@ -1664,7 +1665,7 @@ mod tests {
         );
         // The literal is not empty, so the census is a finding and not a
         // formality — and it is not everything, so it discriminates.
-        assert_eq!(PINNING_FAMILIES.len(), 16);
+        assert_eq!(PINNING_FAMILIES.len(), 17);
     }
 
     /// **CC 3.4.5's acceptance criterion, stated as it was written**: feasible
@@ -1704,8 +1705,13 @@ mod tests {
 
     /// **The measurement behind `RetainedCell::open_contradictions`'s doc.**
     ///
-    /// Retaining the contradiction count pins 150 of the registry's 176
-    /// families; withholding it pins 16. (149 of 174 / 15 until the v60.0.0
+    /// Retaining the contradiction count pins 163 of the registry's 189
+    /// families; withholding it pins 17. (162 of 188 / 17 until the rc14
+    /// re-vendor: its one new family, the `signed` evidence family, joins the
+    /// retained side. 150 of 176 / 16 until the rc12
+    /// re-vendor: its twelve new families all join the retained side, and the
+    /// `+1.0 only` `observation:access_assumption` joins the withheld side
+    /// too. 149 of 174 / 15 until the v60.0.0
     /// rc9 re-vendor: of its two new families the `-1 only`
     /// `identity:occurrence_revocation` joins both sides and the
     /// `positive-only` `transport:canonical_rebind` pins on neither. 143 of
@@ -1742,11 +1748,11 @@ mod tests {
         let withheld = pinned_families(false).len();
         assert_eq!(
             (retained, withheld),
-            (150, 16),
+            (163, 17),
             "the contradiction-count contrast moved (retained={retained}, \
              withheld={withheld})"
         );
-        assert_eq!(vendored_family_polarities().len(), 176);
+        assert_eq!(vendored_family_polarities().len(), 189);
     }
 
     /// **The signed fold's escape hatch is a zero-confidence row — and that is

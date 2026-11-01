@@ -38,14 +38,14 @@ pub(super) const REGISTRY_JSON: &str = include_str!("namespace_registry.json");
 
 /// The CC version [`REGISTRY_JSON`] was generated from. Bump in lockstep when
 /// re-vendoring (the drift gate asserts the file's `_meta.cc_version` matches).
-pub const VENDORED_CC_VERSION: &str = "1.0-rc9";
+pub const VENDORED_CC_VERSION: &str = "1.0-rc14";
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "afd1948e5e6fb280b67388485bd82c97c86e56ad1dde6377382bab2efdf2a0ad";
+    "7af252ad3275d9e56aaa2a6c2e64504d90b2e3b0cbeadd09a79218390518c850";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
-pub const VENDORED_N_FAMILIES: usize = 176;
+pub const VENDORED_N_FAMILIES: usize = 189;
 
 /// v50.0.0 (CIRISPersist#924, CIRISConstitution#112) — the manifest's
 /// `_meta.registry_sha256`: the hash of the GRAMMAR (families + `_meta` minus
@@ -55,31 +55,31 @@ pub const VENDORED_N_FAMILIES: usize = 176;
 /// vendored bytes the way `tools/build_cc_namespace.py` does.
 ///
 /// Vendored byte-for-byte from CIRISConstitution commit [`VENDORED_CC_COMMIT`]
-/// (CC 1.0-rc9; see [`VENDORED_CC_COMMIT`] for the tag), together with
+/// (CC 1.0-rc14; see [`VENDORED_CC_COMMIT`] for the tag), together with
 /// `namespace_match_vectors.json` from the same commit. JSON carries no
 /// comments, so this doc is the vendored files' header.
 pub const VENDORED_REGISTRY_SHA256: &str =
-    "feeb06a02026b220055a3a521e799aaf6615c958a44b667d834b31d8f965c601";
+    "df79a1dde30a380380da83f0d776737e580705b6305741f037a5a78c2bef9898";
 
 /// The CIRISConstitution commit every vendored CC manifest was copied from: the
-/// commit the `v1.0-rc9` tag names (`5d50c6bb`, tag object `a1c2bea5`), copied
-/// from the tag with `git show v1.0-rc9:manifests/<file>`, never a branch tip
+/// commit the `v1.0-rc14` tag names (`b4da527`; rc14 contains rc13), copied
+/// from the tag with `git show v1.0-rc14:manifests/<file>`, never a branch tip
 /// (CIRISPersist#753). The files are also pinned by their own SHA-256
 /// ([`VENDORED_REGISTRY_FILE_SHA256`], [`VENDORED_VECTORS_FILE_SHA256`], and the
-/// four in [`super::cc_manifests`]), and `scripts/check_vendored_cc.sh v1.0-rc9`
+/// files in [`super::cc_manifests`]), and `scripts/check_vendored_cc.sh v1.0-rc14`
 /// byte-compares all of them against the tag before a persist release that
-/// names rc9 is tagged.
-pub const VENDORED_CC_COMMIT: &str = "5d50c6bb160ecbee99a66e1700597c029846e6b6";
+/// names rc14 is tagged.
+pub const VENDORED_CC_COMMIT: &str = "b4da5272413c6b056baa597e537d4aabdcee6902";
 
 /// SHA-256 of the vendored `namespace_registry.json` FILE bytes (the whole file,
 /// unlike [`VENDORED_REGISTRY_SHA256`], which is CC's hash of the grammar).
 /// What `scripts/check_vendored_cc.sh` compares against the tag.
 pub const VENDORED_REGISTRY_FILE_SHA256: &str =
-    "be0b1c86ef8080d5c3e6dcee4a85fb35bb77d234af0dfb53000c4368f9aa5cb5";
+    "755dfea4dbd123dc5e5a09ff547b9c1a4f9bf15c4f395f03313274552ab28128";
 
 /// SHA-256 of the vendored `namespace_match_vectors.json` FILE bytes.
 pub const VENDORED_VECTORS_FILE_SHA256: &str =
-    "a1a6ce5f1f40420cd9af724b3265889edd3e112bd377ba1d0fddd3a1ce1db85e";
+    "f4a60c96ed742db7732302876cf1937b7f9f9f46c53e0a780ec4e2eb530848c7";
 
 /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the case class of one dimension
 /// SEGMENT, read from the manifest rather than inferred from `{...}` in prose.
@@ -1108,6 +1108,26 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     // its open vocabulary (proposal, assent, raised).
     "identity:occurrence_revocation",
     "transport:canonical_rebind",
+    // rc12 (CIRISConstitution v1.0-rc12 @ d6f7088f) — twelve families added,
+    // none retired: the six census families and the ballot tally (CC 3.1.3,
+    // CIRISPersist#1121), the deferral request and response (CC 3.1.9.3), the
+    // identity amendment (CC 3.1.5), `observation:access_assumption` (CC
+    // 3.1.9.4, `+1.0` only) and the rendezvous route (CC 3.1.4).
+    "ballot:tally:{poll_id}",
+    "census:composite:{class}",
+    "census:expected_active",
+    "census:member:partial",
+    "census:member:share",
+    "census:partial:{class}",
+    "census:share:{class}",
+    "deferral:request",
+    "deferral:response:{outcome}",
+    "identity_amendment",
+    "observation:access_assumption",
+    "rendezvous:route",
+    // rc14 (CIRISConstitution v1.0-rc14 @ b4da527, which contains rc13) — one
+    // family added, none retired: the evidence family (CIRISPersist#1152).
+    "evidence:{suite}:{kind}:{cell}:{prefix}",
 ];
 
 /// Families CC has **deliberately retired** — present in an earlier vendored cut,

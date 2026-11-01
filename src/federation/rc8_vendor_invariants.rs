@@ -108,12 +108,14 @@ mod pure {
             );
         }
         assert_eq!(class("per-leaf"), &PolarityClass::PerLeaf);
-        // The aliases fold the three prose labels onto a class.
+        // The aliases fold the prose labels onto a class. rc12 retired the
+        // third alias: `attestation:registry_consensus` names its class,
+        // `boolean-via-score`, directly.
         assert_eq!(pc.class_name("see CC 3.4.1"), "+1.0 only");
         assert_eq!(pc.class_name("per-leaf (CC 3.3.1)"), "per-leaf");
         assert_eq!(
-            pc.class_name("boolean-via-score; Indeterminate allowed → RESTRICTED"),
-            "boolean-via-score"
+            family_polarity_class("attestation:registry_consensus").map(|(n, _)| n),
+            Some("boolean-via-score")
         );
         // A per-leaf parent constrains nothing itself.
         assert_eq!(
