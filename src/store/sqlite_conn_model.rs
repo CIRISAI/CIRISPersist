@@ -239,6 +239,13 @@ pub(crate) enum ConnClass {
 /// and are `Write`.
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
+    // v61 (CIRISPersist#934, S4a) — the directory executor and the trust
+    // revocation's two steps.
+    ("store_planned_peer_record", ConnClass::Write),
+    ("store_known_wire_hash", ConnClass::Write),
+    ("store_purge_execution", ConnClass::Write),
+    ("trust_granter", ConnClass::Read),
+    ("store_trust_revocation", ConnClass::Write),
     // v61 (CIRISPersist#934, S4a) — the Backend doors' and the gated reads'
     // executors.
     ("store_planned_trace_erasure", ConnClass::Write),
@@ -260,7 +267,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("store_planned_location_proof_withdrawal", ConnClass::Write),
     ("store_planned_touch_claim", ConnClass::Write),
     ("store_planned_witness", ConnClass::Write),
-    ("add_peer_record", ConnClass::Write),
     // #846 (§6.1) — the adopt floor: row + declared binding + holder claim in
     // one transaction.
     ("adopt_sealed_blob_at", ConnClass::Write),
@@ -360,7 +366,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("hash_chain_gaps", ConnClass::Read),
     ("heartbeat_shared_instance", ConnClass::Write),
     ("index_stored_record", ConnClass::Write),
-    ("insert_known_wire_hash", ConnClass::Write),
     ("insert_trace_events_batch", ConnClass::Write),
     ("insert_trace_llm_calls_batch", ConnClass::Write),
     ("known_wire_hash_contains", ConnClass::Read),
@@ -591,7 +596,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("purge_trace_ids_for_llm_model", ConnClass::Read),
     ("purge_trace_ids_signed_by", ConnClass::Read),
     ("purge_trace_row_counts", ConnClass::Read),
-    ("purge_put_execution", ConnClass::Write),
     ("purge_execution", ConnClass::Read),
     ("purge_tombstones_of", ConnClass::Read),
     ("purge_tombstoned", ConnClass::Read),
@@ -651,7 +655,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("repair_v070_checksum", ConnClass::Write),
     ("replay_abandoned", ConnClass::Write),
     ("revocations_for_subject", ConnClass::Read),
-    ("revoke_trust", ConnClass::Write),
     // #845 (I55) — the nine documented steps, in one transaction: a free fn
     // handed the writer's connection from inside `repair_portable_defaults_with`.
     ("rewrite_portable_defaults_in_tx", ConnClass::HelperWrite),

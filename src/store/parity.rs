@@ -128,6 +128,16 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash sighting, the purge record write and the trust revocation.
+    ("add_peer_record_planned", Class::Plan),
+    ("insert_known_wire_hash_planned", Class::Plan),
+    ("purge_put_execution_planned", Class::Plan),
+    ("revoke_trust_planned", Class::Plan),
+    // The peer add's held-row verdict, re-asked by the executor inside its transaction (the `recheck_cycle_under_lock` shape).
+    ("peer_record_held_verdict", Class::Plan),
+    ("refuse_held_peer_conflict", Class::Gate),
+    // The stored granter read the revocation's ownership check compares against (a read; the refusal is the plan's).
+    ("trust_granter", Class::Plumbing),
     // v61 (CIRISPersist#934, S4a) — the Backend trait's erasure and fountain doors, and the gated directory reads.
     ("delete_traces_for_agent_planned", Class::Plan),
     ("delete_traces_for_agent_id_hash_planned", Class::Plan),
@@ -1409,7 +1419,9 @@ mod tests {
     /// The traits whose impls are compared, and where each trait's **default**
     /// bodies live. A backend that does not override a defaulted method runs
     /// the default, so the default's gate sequence is what it contributes.
-    const TRAITS: [(&str, &str); 13] = [
+    const TRAITS: [(&str, &str); 14] = [
+        // v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash sighting, the purge record write and the trust revocation.
+        ("DirectoryStore", "src/federation/directory_admit.rs"),
         // v61 (CIRISPersist#934, S4a) — the Backend trait's erasure and fountain doors, and the gated directory reads.
         ("BackendStore", "src/store/backend_plan.rs"),
         ("ReadPlanStore", "src/federation/read_plan.rs"),
@@ -1438,7 +1450,25 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 39] = [
+    const SHARED_PLANS: [(&str, &str); 44] = [
+        // v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash sighting, the purge record write and the trust revocation.
+        (
+            "src/federation/directory_admit.rs",
+            "add_peer_record_planned",
+        ),
+        (
+            "src/federation/directory_admit.rs",
+            "insert_known_wire_hash_planned",
+        ),
+        (
+            "src/federation/directory_admit.rs",
+            "purge_put_execution_planned",
+        ),
+        (
+            "src/federation/directory_admit.rs",
+            "peer_record_held_verdict",
+        ),
+        ("src/federation/consent_admit.rs", "revoke_trust_planned"),
         // v61 (CIRISPersist#934, S4a) — the Backend trait's erasure and fountain doors, and the gated directory reads.
         (
             "src/store/backend_plan.rs",
@@ -1610,7 +1640,33 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 52] = [
+    const SHARED_DOORS: [(&str, &str, &str); 57] = [
+        // v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash sighting, the purge record write and the trust revocation.
+        (
+            "FederationDirectory",
+            "add_peer_record",
+            "add_peer_record_planned",
+        ),
+        (
+            "FederationDirectory",
+            "insert_known_wire_hash",
+            "insert_known_wire_hash_planned",
+        ),
+        (
+            "FederationDirectory",
+            "purge_put_execution",
+            "purge_put_execution_planned",
+        ),
+        (
+            "FederationDirectory",
+            "revoke_trust",
+            "revoke_trust_planned",
+        ),
+        (
+            "DirectoryStore",
+            "store_planned_peer_record",
+            "peer_record_held_verdict",
+        ),
         // v61 (CIRISPersist#934, S4a) — the Backend trait's erasure and fountain doors, and the gated directory reads.
         (
             "Backend",

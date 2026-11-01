@@ -71,6 +71,11 @@ pub(crate) mod community_admit;
 /// the consent-role and trust-grant plans, the consent read folds, and the
 /// per-backend `ConsentStore` executor.
 pub(crate) mod consent_admit;
+/// v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash
+/// sighting and the purge record write, decided once, with the per-backend
+/// `DirectoryStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod directory_admit;
 /// v61 (CIRISPersist#934, S4a) — the location proof, touch claim and
 /// wholeness witness doors, decided once, with the per-backend
 /// `EvidenceStore` executor.

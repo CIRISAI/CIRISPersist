@@ -1383,6 +1383,305 @@ impl PostgresBackend {
     }
 }
 
+/// v61 (CIRISPersist#934) — the directory executor on postgres (the peer add,
+/// the known-hash sighting, the purge write). Storage only: the decisions are
+/// `federation::directory_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::directory_admit::DirectoryStore for PostgresBackend {
+    async fn store_planned_peer_record(
+        &self,
+        planned: crate::federation::directory_admit::PlannedPeerRecord,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::directory_admit::{HeldPeerMeta, PeerMetaWrite};
+        use crate::federation::Error;
+        let (key, meta) = (&planned.key, &planned.meta);
+        let roles_param: Option<&Vec<String>> = None;
+        // v13.0.0 (CIRISPersist#365) — wire None ⇔ stored 'unregistered'.
+        let consent_role_stored =
+            crate::federation::types::consent_role::stored_from_wire(key.consent_role.as_deref());
+        // v31.0.0 (#644) — registration_envelope is TEXT since V122.
+        let registration_envelope_text =
+            pg_envelope_text(&key.registration_envelope, "registration_envelope")?;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
+        // v31.4.0 (CIRISPersist#682) — THIS node's admission position (V126),
+        // read through `tx`, so the MAX and the INSERT are one snapshot.
+        let admitted_at = self.next_key_serve_position(&tx).await?;
+        tx.execute(
+            "INSERT INTO cirislens.federation_keys (\
+                key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                attestation_evidence, consent_role, admitted_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
+                       $17, $18, $19, $20) \
+             ON CONFLICT (key_id) DO NOTHING",
+            &[
+                &key.key_id,
+                &key.pubkey_ed25519_base64,
+                &key.pubkey_ml_dsa_65_base64,
+                &key.algorithm,
+                &key.identity_type,
+                &key.identity_ref,
+                &key.valid_from,
+                &key.valid_until,
+                &registration_envelope_text,
+                &planned.original_content_hash,
+                &key.scrub_signature_classical,
+                &key.scrub_signature_pqc,
+                &key.scrub_key_id,
+                &key.scrub_timestamp,
+                &key.pqc_completed_at,
+                &key.persist_row_hash,
+                &roles_param,
+                &key.attestation_evidence,
+                &consent_role_stored,
+                &admitted_at,
+            ],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("add_peer_record federation_keys: {e}")))?;
+        let held_pubkey: Option<String> = tx
+            .query_opt(
+                "SELECT pubkey_ed25519_base64 FROM cirislens.federation_keys WHERE key_id = $1",
+                &[&key.key_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("add_peer_record held pubkey: {e}")))?
+            .map(|r| r.safe_get_with(0, Error::Backend))
+            .transpose()?;
+        let held_meta = match tx
+            .query_opt(
+                "SELECT transport_identity, removed_at \
+                 FROM cirislens.federation_peer_metadata WHERE key_id = $1",
+                &[&key.key_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("add_peer_record held peer_metadata: {e}")))?
+        {
+            Some(row) => Some(HeldPeerMeta {
+                transport_identity: row.safe_get_with(0, Error::Backend)?,
+                removed: row
+                    .safe_get_with::<Option<chrono::DateTime<chrono::Utc>>, _, _, _>(
+                        1,
+                        Error::Backend,
+                    )?
+                    .is_some(),
+            }),
+            None => None,
+        };
+        let write = crate::federation::directory_admit::peer_record_held_verdict(
+            &planned,
+            held_pubkey.as_deref(),
+            held_meta.as_ref(),
+        )?;
+        let sql = match write {
+            PeerMetaWrite::Keep => None,
+            PeerMetaWrite::ReAdd => Some(
+                "UPDATE cirislens.federation_peer_metadata SET \
+                    alias = NULL, trust = 'untrusted', notes = NULL, \
+                    policy_blob = NULL, transport_identity = $2, \
+                    removed_at = NULL, inserted_at = $3, updated_at = $3, \
+                    persist_row_hash = $4 \
+                 WHERE key_id = $1",
+            ),
+            PeerMetaWrite::Insert => Some(
+                "INSERT INTO cirislens.federation_peer_metadata (\
+                    key_id, alias, trust, notes, policy_blob, \
+                    transport_identity, removed_at, inserted_at, updated_at, persist_row_hash\
+                 ) VALUES ($1, NULL, 'untrusted', NULL, NULL, $2, NULL, $3, $3, $4)",
+            ),
+        };
+        if let Some(sql) = sql {
+            tx.execute(
+                sql,
+                &[
+                    &key.key_id,
+                    &meta.transport_identity,
+                    &meta.inserted_at,
+                    &meta.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("add_peer_record peer_metadata: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("commit tx: {e}")))
+    }
+
+    async fn store_known_wire_hash(
+        &self,
+        kind: &str,
+        content_hash: &str,
+        advertised_by: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // Upsert: the same hash arrives on every wrap of edge's re-sweep, and
+        // the bump is what makes the eviction floor meaningful (#776).
+        // MONOTONIC: execution order is not observation order, so an older
+        // sighting applied late must not move the column back.
+        client
+            .execute(
+                "INSERT INTO cirislens.known_wire_hashes \
+                     (kind, content_hash, last_advertised_at, advertised_by) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (kind, content_hash) DO UPDATE SET \
+                     last_advertised_at = EXCLUDED.last_advertised_at, \
+                     advertised_by = EXCLUDED.advertised_by \
+                 WHERE EXCLUDED.last_advertised_at \
+                       > cirislens.known_wire_hashes.last_advertised_at",
+                &[&kind, &content_hash, &now, &advertised_by],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("insert_known_wire_hash: {e}"))
+            })?;
+        Ok(())
+    }
+
+    async fn store_purge_execution(
+        &self,
+        execution: &crate::federation::steward_purge::PurgeExecution,
+        tombstones: &[crate::federation::steward_purge::PurgeTombstone],
+    ) -> Result<crate::federation::steward_purge::PurgePutOutcome, crate::federation::Error> {
+        // Codex on PR #1057 — the header and every tombstone are ONE
+        // transaction: run on the bare client, each statement autocommitted,
+        // and a failure or a process loss between them left a durable header
+        // holding part of its `record_count`.
+        #[cfg(test)]
+        let inject_tombstone_fault = self
+            .test_hooks()
+            .fail_if_armed("purge_put_execution_tombstones")
+            .is_err();
+        #[cfg(not(test))]
+        let inject_tombstone_fault = false;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
+        // v60.1.0 (CIRISPersist#1070 item 3) — a bytes-plane tombstone is
+        // written under the EXCLUSIVE lock a byte write holds shared from its
+        // in-transaction tombstone read to its commit (sorted, as the writers
+        // take theirs): a write already past that read commits first and the
+        // finalize that follows this commit deletes its bytes; a later write
+        // reads this tombstone and refuses.
+        pg_lock_bytes_tombstones_exclusive(&tx, tombstones).await?;
+        let e = execution;
+        let record_count = i64::try_from(e.record_count).unwrap_or(i64::MAX);
+        let n = tx
+            .execute(
+                "INSERT INTO cirislens.purge_executions (notice_id, selection_digest, \
+                    claimant_key_id, record_count, notice_jcs, cosignatures_json, executed_by, \
+                    origin, executed_at, admitted_at, finalized_at, legal_basis) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp(), NULL, $10) \
+                 ON CONFLICT (notice_id) DO NOTHING",
+                &[
+                    &e.notice_id,
+                    &e.selection_digest,
+                    &e.claimant_key_id,
+                    &record_count,
+                    &e.notice_jcs,
+                    &e.cosignatures_json,
+                    &e.executed_by,
+                    &e.origin,
+                    &e.executed_at,
+                    &e.legal_basis,
+                ],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge_put_execution: {e}")))?;
+        if inject_tombstone_fault {
+            return Err(crate::federation::Error::Backend(
+                "purge_put_execution tombstones: injected fault".into(),
+            ));
+        }
+        let stmt = tx
+            .prepare(
+                "INSERT INTO cirislens.purge_tombstones \
+                    (notice_id, plane, record_ref, ordinal, derived_from) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (notice_id, plane, record_ref) DO NOTHING",
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge tombstone: {e}")))?;
+        let mut inserted = Vec::with_capacity(tombstones.len());
+        for t in tombstones {
+            let ordinal = i64::try_from(t.ordinal).unwrap_or(i64::MAX);
+            let k = tx
+                .execute(
+                    &stmt,
+                    &[
+                        &t.notice_id,
+                        &t.plane.as_str(),
+                        &t.record_ref,
+                        &ordinal,
+                        &t.derived_from,
+                    ],
+                )
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("purge tombstone: {e}")))?;
+            inserted.push(k > 0);
+        }
+        // Codex round 4 sweep on PR #1057 — a newly tombstoned attestation
+        // leaves the signed-wire index at once, so the node stops ADVERTISING a
+        // hash it no longer serves (the rebuild re-indexes from the
+        // tombstone-filtered serve read).
+        for (t, fresh) in tombstones.iter().zip(&inserted) {
+            if *fresh && t.plane == crate::federation::steward_purge::PurgePlane::Attestation {
+                let rk =
+                    crate::federation::wire_index::record_key(&[("attestation_id", &t.record_ref)]);
+                tx.execute(
+                    "DELETE FROM cirislens.signed_wire_index \
+                     WHERE kind = 'Attestation' AND record_key = $1",
+                    &[&rk],
+                )
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("purge wire index: {e}")))?;
+                // v57.0.0 (CIRISPersist#988 item 3; lead ruling 5) — a
+                // tombstoned detection row's projection is the V080
+                // tombstone at its execution's instant, in this write. Only
+                // a live projection row moves: the earliest-admitted
+                // execution's instant stands (the rebuild's rule).
+                tx.execute(
+                    "UPDATE cirislens_derived.detection_events \
+                     SET trace_id = NULL, body_sha256 = NULL, canonical_bytes = NULL, \
+                         erased_at = (SELECT executed_at FROM cirislens.purge_executions \
+                                       WHERE notice_id = $2) \
+                     WHERE attestation_id = $1 AND erased_at IS NULL",
+                    &[&t.record_ref, &t.notice_id],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("purge detection projection: {e}"))
+                })?;
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("commit: {e}")))?;
+        Ok(crate::federation::steward_purge::PurgePutOutcome {
+            header_inserted: n > 0,
+            tombstones_inserted: inserted,
+        })
+    }
+}
+
 /// v61 (CIRISPersist#934) — the accord evidence executor on postgres.
 /// Storage only: the decisions are `federation::accord_admit`'s.
 #[async_trait::async_trait]
@@ -1849,6 +2148,49 @@ impl crate::federation::evidence_admit::EvidenceStore for PostgresBackend {
 /// postgres. Storage only: the decisions are `federation::consent_admit`'s.
 #[async_trait::async_trait]
 impl crate::federation::consent_admit::ConsentStore for PostgresBackend {
+    async fn trust_granter(&self, key: &str) -> Result<Option<String>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        client
+            .query_opt(
+                "SELECT trusted_by FROM cirislens.federation_keys \
+                 WHERE key_id = $1 AND trusted_by IS NOT NULL",
+                &[&key],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("revoke_trust granter read: {e}"))
+            })?
+            .map(|r| r.safe_get_with(0, crate::federation::Error::Backend))
+            .transpose()
+    }
+
+    async fn store_trust_revocation(
+        &self,
+        key: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // Idempotent: only an unexpired grant moves.
+        client
+            .execute(
+                "UPDATE cirislens.federation_keys \
+                 SET expires_at = $2 \
+                 WHERE key_id = $1 \
+                   AND trusted_by IS NOT NULL \
+                   AND (expires_at IS NULL OR expires_at > $2)",
+                &[&key, &at],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("revoke_trust: {e}")))?;
+        Ok(())
+    }
+
     async fn store_planned_consent_role(
         &self,
         planned: crate::federation::consent_admit::PlannedConsentRole,
@@ -7409,130 +7751,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         execution: &crate::federation::steward_purge::PurgeExecution,
         tombstones: &[crate::federation::steward_purge::PurgeTombstone],
     ) -> Result<crate::federation::steward_purge::PurgePutOutcome, crate::federation::Error> {
-        crate::federation::steward_purge::check_purge_put_set(execution, tombstones)?;
-        // Codex on PR #1057 — the header and every tombstone are ONE
-        // transaction: run on the bare client, each statement autocommitted,
-        // and a failure or a process loss between them left a durable header
-        // holding part of its `record_count`.
-        #[cfg(test)]
-        let inject_tombstone_fault = self
-            .test_hooks()
-            .fail_if_armed("purge_put_execution_tombstones")
-            .is_err();
-        #[cfg(not(test))]
-        let inject_tombstone_fault = false;
-        let mut client = self
-            .get_client()
+        crate::federation::directory_admit::purge_put_execution_planned(self, execution, tombstones)
             .await
-            .map_err(crate::store::Error::into_federation)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
-        // v60.1.0 (CIRISPersist#1070 item 3) — a bytes-plane tombstone is
-        // written under the EXCLUSIVE lock a byte write holds shared from its
-        // in-transaction tombstone read to its commit (sorted, as the writers
-        // take theirs): a write already past that read commits first and the
-        // finalize that follows this commit deletes its bytes; a later write
-        // reads this tombstone and refuses.
-        pg_lock_bytes_tombstones_exclusive(&tx, tombstones).await?;
-        let e = execution;
-        let record_count = i64::try_from(e.record_count).unwrap_or(i64::MAX);
-        let n = tx
-            .execute(
-                "INSERT INTO cirislens.purge_executions (notice_id, selection_digest, \
-                    claimant_key_id, record_count, notice_jcs, cosignatures_json, executed_by, \
-                    origin, executed_at, admitted_at, finalized_at, legal_basis) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp(), NULL, $10) \
-                 ON CONFLICT (notice_id) DO NOTHING",
-                &[
-                    &e.notice_id,
-                    &e.selection_digest,
-                    &e.claimant_key_id,
-                    &record_count,
-                    &e.notice_jcs,
-                    &e.cosignatures_json,
-                    &e.executed_by,
-                    &e.origin,
-                    &e.executed_at,
-                    &e.legal_basis,
-                ],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("purge_put_execution: {e}")))?;
-        if inject_tombstone_fault {
-            return Err(crate::federation::Error::Backend(
-                "purge_put_execution tombstones: injected fault".into(),
-            ));
-        }
-        let stmt = tx
-            .prepare(
-                "INSERT INTO cirislens.purge_tombstones \
-                    (notice_id, plane, record_ref, ordinal, derived_from) \
-                 VALUES ($1, $2, $3, $4, $5) \
-                 ON CONFLICT (notice_id, plane, record_ref) DO NOTHING",
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("purge tombstone: {e}")))?;
-        let mut inserted = Vec::with_capacity(tombstones.len());
-        for t in tombstones {
-            let ordinal = i64::try_from(t.ordinal).unwrap_or(i64::MAX);
-            let k = tx
-                .execute(
-                    &stmt,
-                    &[
-                        &t.notice_id,
-                        &t.plane.as_str(),
-                        &t.record_ref,
-                        &ordinal,
-                        &t.derived_from,
-                    ],
-                )
-                .await
-                .map_err(|e| crate::federation::Error::Backend(format!("purge tombstone: {e}")))?;
-            inserted.push(k > 0);
-        }
-        // Codex round 4 sweep on PR #1057 — a newly tombstoned attestation
-        // leaves the signed-wire index at once, so the node stops ADVERTISING a
-        // hash it no longer serves (the rebuild re-indexes from the
-        // tombstone-filtered serve read).
-        for (t, fresh) in tombstones.iter().zip(&inserted) {
-            if *fresh && t.plane == crate::federation::steward_purge::PurgePlane::Attestation {
-                let rk =
-                    crate::federation::wire_index::record_key(&[("attestation_id", &t.record_ref)]);
-                tx.execute(
-                    "DELETE FROM cirislens.signed_wire_index \
-                     WHERE kind = 'Attestation' AND record_key = $1",
-                    &[&rk],
-                )
-                .await
-                .map_err(|e| crate::federation::Error::Backend(format!("purge wire index: {e}")))?;
-                // v57.0.0 (CIRISPersist#988 item 3; lead ruling 5) — a
-                // tombstoned detection row's projection is the V080
-                // tombstone at its execution's instant, in this write. Only
-                // a live projection row moves: the earliest-admitted
-                // execution's instant stands (the rebuild's rule).
-                tx.execute(
-                    "UPDATE cirislens_derived.detection_events \
-                     SET trace_id = NULL, body_sha256 = NULL, canonical_bytes = NULL, \
-                         erased_at = (SELECT executed_at FROM cirislens.purge_executions \
-                                       WHERE notice_id = $2) \
-                     WHERE attestation_id = $1 AND erased_at IS NULL",
-                    &[&t.record_ref, &t.notice_id],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!("purge detection projection: {e}"))
-                })?;
-            }
-        }
-        tx.commit()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("commit: {e}")))?;
-        Ok(crate::federation::steward_purge::PurgePutOutcome {
-            header_inserted: n > 0,
-            tombstones_inserted: inserted,
-        })
     }
 
     async fn purge_execution(
@@ -9137,44 +9357,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         advertised_by: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), crate::federation::Error> {
-        crate::federation::wire_index::validate_content_hash(
-            "insert_known_wire_hash",
+        crate::federation::directory_admit::insert_known_wire_hash_planned(
+            self,
+            kind,
             content_hash,
-        )?;
-        // v59.0.0 — a peer's advertisement of a framed key-plane hash is
-        // refused: that carriage is retired.
-        crate::federation::replication_policy::refuse_retired_framed(kind)?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        // Upsert, because the same hash arrives on EVERY wrap of edge's
-        // re-sweep. `last_advertised_at` is bumped on each sighting — that
-        // movement is what makes the eviction floor meaningful, and a plain
-        // DO NOTHING would freeze it at first-seen and reproduce #776.
-        //
-        // The bump is MONOTONIC because execution order is not observation
-        // order: a caller that stamps `now` and hands the write to a delayed
-        // task can apply an OLDER sighting after a newer one and move the
-        // column BACKWARDS, so the next sweep evicts a hash that was in fact
-        // recently advertised — invisibly, until the re-sweep wraps.
-        client
-            .execute(
-                "INSERT INTO cirislens.known_wire_hashes \
-                     (kind, content_hash, last_advertised_at, advertised_by) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (kind, content_hash) DO UPDATE SET \
-                     last_advertised_at = EXCLUDED.last_advertised_at, \
-                     advertised_by = EXCLUDED.advertised_by \
-                 WHERE EXCLUDED.last_advertised_at \
-                       > cirislens.known_wire_hashes.last_advertised_at",
-                &[&kind, &content_hash, &now, &advertised_by],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("insert_known_wire_hash: {e}"))
-            })?;
-        Ok(())
+            advertised_by,
+            now,
+        )
+        .await
     }
 
     /// CIRISPersist#785 — is this hash known to exist?
@@ -13574,57 +13764,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         revocation: crate::federation::SignedTrustRevocation,
     ) -> Result<(), crate::federation::Error> {
-        if revocation.key.is_empty() {
-            return Err(crate::federation::Error::InvalidArgument(
-                "key must be non-empty".into(),
-            ));
-        }
-        // v38.0.0 (#721) — signature proof first; then ownership against the
-        // STORED granter (only the granter withdraws its own grant). The row
-        // keeps the original trusted_by for forensic continuity, and the
-        // revoker is no longer discarded — it is PROVEN.
-        crate::federation::admission::check_trust_revocation_authority(self, &revocation).await?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        let stored = client
-            .query_opt(
-                "SELECT trusted_by FROM cirislens.federation_keys \
-                 WHERE key_id = $1 AND trusted_by IS NOT NULL",
-                &[&revocation.key],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("revoke_trust granter read: {e}"))
-            })?;
-        if let Some(row) = stored {
-            let granter: String = row
-                .try_get(0)
-                .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-            if granter != revocation.revoked_by {
-                return Err(crate::federation::Error::InvalidArgument(format!(
-                    "trust on {} was granted by {granter:?}; {:?} may not revoke it — only \
-                     the granter withdraws its own grant (CIRISPersist#721)",
-                    revocation.key, revocation.revoked_by
-                )));
-            }
-        }
-        // Idempotent: only set expires_at if the row isn't already
-        // expired. UPDATE returning zero rows is fine (idempotent
-        // no-op); only backend errors propagate.
-        client
-            .execute(
-                "UPDATE cirislens.federation_keys \
-                 SET expires_at = NOW() \
-                 WHERE key_id = $1 \
-                   AND trusted_by IS NOT NULL \
-                   AND (expires_at IS NULL OR expires_at > NOW())",
-                &[&revocation.key],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("revoke_trust: {e}")))?;
-        Ok(())
+        crate::federation::consent_admit::revoke_trust_planned(self, revocation).await
     }
 
     async fn lookup_trust(
@@ -13819,248 +13959,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         identity_type: &str,
         transport_identity: Option<String>,
     ) -> Result<(), crate::federation::Error> {
-        if key_id.is_empty() {
-            return Err(crate::federation::Error::InvalidArgument(
-                "key_id must be non-empty".into(),
-            ));
-        }
-        if pubkey_ed25519_base64.is_empty() {
-            return Err(crate::federation::Error::InvalidArgument(
-                "pubkey_ed25519_base64 must be non-empty".into(),
-            ));
-        }
-        if identity_type.is_empty() {
-            return Err(crate::federation::Error::InvalidArgument(
-                "identity_type must be non-empty".into(),
-            ));
-        }
-
-        // v31.0.0 (CIRISPersist#656) — THE FIFTH `federation_keys` ADMISSION
-        // PATH. This door writes a caller-supplied `identity_type` and ran no
-        // role gate at all, so `add_peer_record(k, pk, "canonical", None)` made
-        // `is_canonical_effective` answer true for an attacker-named key.
-        // BEFORE any lock or DB work: the gates read the directory, which locks
-        // itself. One gate, three backends.
-        crate::federation::admission::check_peer_record_admission(self, key_id, identity_type)
-            .await?;
-
-        // Build the federation_keys row + its persist_row_hash up
-        // front (same shape as put_public_key but without the
-        // SignedKeyRecord scrub envelope — peer-add is operator-
-        // authorized at the UniFFI layer, not via a peer-supplied
-        // signed registration envelope).
-        let now = chrono::Utc::now();
-        let mut key = crate::federation::KeyRecord {
-            key_id: key_id.to_owned(),
-            pubkey_ed25519_base64: pubkey_ed25519_base64.to_owned(),
-            pubkey_ml_dsa_65_base64: None,
-            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
-            identity_type: identity_type.to_owned(),
-            identity_ref: key_id.to_owned(),
-            valid_from: now,
-            valid_until: None,
-            registration_envelope: serde_json::json!({"peer_added_by_operator": true}),
-            // 32 bytes of zeros — placeholder sha; no signed envelope.
-            original_content_hash: "00".repeat(32),
-            scrub_signature_classical: String::new(),
-            scrub_signature_pqc: None,
-            scrub_key_id: key_id.to_owned(),
-            scrub_timestamp: now,
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            capability_roles: Vec::new(),
-            attestation_evidence: None,
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        };
-        key.persist_row_hash = crate::federation::types::compute_persist_row_hash(&key)?;
-
-        let mut meta = crate::federation::PeerMetadataRow {
-            key_id: key_id.to_owned(),
-            alias: None,
-            trust: crate::federation::TrustClass::Untrusted,
-            notes: None,
-            policy_blob: None,
-            transport_identity: transport_identity.clone(),
-            removed_at: None,
-            inserted_at: now,
-            updated_at: now,
-            persist_row_hash: String::new(),
-        };
-        meta.persist_row_hash = crate::federation::types::compute_persist_row_hash(&meta)?;
-
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
-
-        // The federation_keys row — ON CONFLICT (key_id) DO NOTHING
-        // (matches put_public_key semantics; conflict-with-different-
-        // content is detected by re-reading the existing pubkey
-        // below).
-        let original_content_hash = hex::decode(&key.original_content_hash).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!(
-                "original_content_hash hex decode: {e}"
-            ))
-        })?;
-        let roles_param: Option<&Vec<String>> = None;
-        // v13.0.0 (CIRISPersist#365) — wire None ⇔ stored 'unregistered'.
-        let consent_role_stored =
-            crate::federation::types::consent_role::stored_from_wire(key.consent_role.as_deref())
-                .to_owned();
-        // v31.0.0 (#644) — registration_envelope is TEXT since V122.
-        let registration_envelope_text =
-            pg_envelope_text(&key.registration_envelope, "registration_envelope")?;
-        // v31.4.0 (CIRISPersist#682) — THIS node's admission position (V126).
-        // An operator-added peer is a `federation_keys` row like any other and
-        // is served by the same cursor, so it is stamped by the same allocator.
-        // Read through `tx`, so the MAX and the INSERT are the same snapshot.
-        let admitted_at = self.next_key_serve_position(&tx).await?;
-        tx.execute(
-            "INSERT INTO cirislens.federation_keys (\
-                key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
-                identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
-                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                attestation_evidence, consent_role, admitted_at\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
-             ON CONFLICT (key_id) DO NOTHING",
-            &[
-                &key.key_id,
-                &key.pubkey_ed25519_base64,
-                &key.pubkey_ml_dsa_65_base64,
-                &key.algorithm,
-                &key.identity_type,
-                &key.identity_ref,
-                &key.valid_from,
-                &key.valid_until,
-                &registration_envelope_text,
-                &original_content_hash,
-                &key.scrub_signature_classical,
-                &key.scrub_signature_pqc,
-                &key.scrub_key_id,
-                &key.scrub_timestamp,
-                &key.pqc_completed_at,
-                &key.persist_row_hash,
-                &roles_param,
-                &key.attestation_evidence,
-                &consent_role_stored,
-                &admitted_at,
-            ],
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::directory_admit::add_peer_record_planned(
+            self,
+            key_id,
+            pubkey_ed25519_base64,
+            identity_type,
+            transport_identity,
         )
         .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("add_peer_record federation_keys: {e}"))
-        })?;
-
-        // Conflict detection on federation_keys: if pubkey differs,
-        // the operator is trying to re-add a peer with a different
-        // pubkey under the same key_id → reject.
-        let existing_pubkey: Option<String> = tx
-            .query_opt(
-                "SELECT pubkey_ed25519_base64 FROM cirislens.federation_keys WHERE key_id = $1",
-                &[&key.key_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "add_peer_record federation_keys conflict check: {e}"
-                ))
-            })?
-            .map(|r| r.safe_get_with(0, crate::federation::Error::Backend))
-            .transpose()?;
-        if let Some(existing) = existing_pubkey {
-            if existing != key.pubkey_ed25519_base64 {
-                return Err(crate::federation::Error::Conflict(format!(
-                    "key_id {} already exists with different pubkey",
-                    key.key_id
-                )));
-            }
-        }
-
-        // The federation_peer_metadata row.
-        // - Soft-removed re-add: clear removed_at + repopulate;
-        // - Live row with matching transport: idempotent no-op;
-        // - Live row with different transport: Conflict.
-        let existing_meta: Option<tokio_postgres::Row> = tx
-            .query_opt(
-                "SELECT transport_identity, removed_at \
-                 FROM cirislens.federation_peer_metadata WHERE key_id = $1",
-                &[&key.key_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "add_peer_record peer_metadata existence: {e}"
-                ))
-            })?;
-        match existing_meta {
-            Some(row) => {
-                let existing_transport: Option<String> =
-                    row.safe_get_with(0, crate::federation::Error::Backend)?;
-                let existing_removed_at: Option<chrono::DateTime<chrono::Utc>> =
-                    row.safe_get_with(1, crate::federation::Error::Backend)?;
-                if existing_removed_at.is_some() {
-                    // Re-add: replace with the new row.
-                    tx.execute(
-                        "UPDATE cirislens.federation_peer_metadata SET \
-                            alias = NULL, trust = 'untrusted', notes = NULL, \
-                            policy_blob = NULL, transport_identity = $2, \
-                            removed_at = NULL, inserted_at = $3, updated_at = $3, \
-                            persist_row_hash = $4 \
-                         WHERE key_id = $1",
-                        &[
-                            &key.key_id,
-                            &meta.transport_identity,
-                            &now,
-                            &meta.persist_row_hash,
-                        ],
-                    )
-                    .await
-                    .map_err(|e| {
-                        crate::federation::Error::Backend(format!(
-                            "add_peer_record peer_metadata re-add: {e}"
-                        ))
-                    })?;
-                } else if existing_transport == transport_identity {
-                    // Idempotent no-op.
-                } else {
-                    return Err(crate::federation::Error::Conflict(format!(
-                        "peer_metadata row for key_id {} already exists with different transport_identity",
-                        key.key_id
-                    )));
-                }
-            }
-            None => {
-                tx.execute(
-                    "INSERT INTO cirislens.federation_peer_metadata (\
-                        key_id, alias, trust, notes, policy_blob, \
-                        transport_identity, removed_at, inserted_at, updated_at, persist_row_hash\
-                     ) VALUES ($1, NULL, 'untrusted', NULL, NULL, $2, NULL, $3, $3, $4)",
-                    &[
-                        &key.key_id,
-                        &meta.transport_identity,
-                        &now,
-                        &meta.persist_row_hash,
-                    ],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!(
-                        "add_peer_record peer_metadata insert: {e}"
-                    ))
-                })?;
-            }
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
-        Ok(())
     }
 
     async fn remove_peer_record(
