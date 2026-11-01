@@ -24730,6 +24730,41 @@ impl PyEngine {
         })
     }
 
+    /// v61 (CIRISPersist#1101; CC 5.4.6, `CLM-serve-seat-announced`) —
+    /// **is `node_key_id`'s owner announced?** `True` while a live owner
+    /// binding for the node is carried at `cohort_scope: federation` (directly,
+    /// or by its granter's live widening). Judged now: a later announcement
+    /// satisfies it and a withdrawn one does not. A node holding a serve seat in
+    /// an infrastructure community serves only while this is `True`; persist's
+    /// seating doors refuse `serve_seat_owner_unannounced` otherwise.
+    fn serve_seat_owner_announced(&self, py: Python<'_>, node_key_id: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let node = node_key_id.to_owned();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::admission::serve_seat_owner_announced(&*backend, &node)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::admission::serve_seat_owner_announced(&*backend, &node)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
     /// CIRISPersist#299 — the OUTBOUND steward-binding reader: the nodes
     /// `steward_user_key_id` owns (exact inverse of `steward_bindings_of_json` —
     /// `n ∈ nodes_stewarded_by(U)` ⟺ `U ∈ steward_bindings_of(n)`). Returns a JSON

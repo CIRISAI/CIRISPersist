@@ -11551,6 +11551,11 @@ pub(crate) enum DelegationEdgeFilter {
     /// Only CC 1.13.3.3 / CC 3.2 owner-binding edges
     /// ([`is_owner_binding_envelope`]) — the ownership projection.
     OwnerBindingOnly,
+    /// v61 (CIRISPersist#1101, CC 5.4.6) — only owner-binding edges that
+    /// are ANNOUNCED: carried at `cohort_scope: federation`, or re-signed at
+    /// federation by the same granter as a live widening `supersedes`
+    /// (`widen_audience`, what CC calls announcing).
+    AnnouncedOwnerBindingOnly,
 }
 
 /// **THE live incoming-`delegates_to` walk — one predicate, one impl**
@@ -11670,6 +11675,33 @@ pub(crate) async fn live_delegation_granter_instants<F: super::FederationDirecto
     // into [`retracted_edge_ids`], which the scoped-delegation BFS shares — the
     // same defect, one plane over, so the same predicate.)
     let withdrawn = retracted_edge_ids(&rows);
+    // v61 (CIRISPersist#1101, CC 5.4.6) — the edges a live widening at
+    // federation announces: a `supersedes` by the edge's own granter at
+    // `cohort_scope: federation` naming it, not itself retracted.
+    let announced_by_widening: std::collections::HashSet<String> =
+        if filter == DelegationEdgeFilter::AnnouncedOwnerBindingOnly {
+            let granter_of: std::collections::HashMap<&str, &str> = rows
+                .iter()
+                .filter(|r| r.attestation_type == attestation_type::DELEGATES_TO)
+                .map(|r| (r.attestation_id.as_str(), r.attesting_key_id.as_str()))
+                .collect();
+            rows.iter()
+                .filter(|w| {
+                    w.attestation_type == attestation_type::SUPERSEDES
+                        && w.cohort_scope == super::types::cohort_scope::FEDERATION
+                        && !withdrawn.contains(w.attestation_id.as_str())
+                })
+                .filter_map(|w| {
+                    let target = super::precedence::references_attestation_id_from_envelope(
+                        &w.attestation_envelope,
+                    )?;
+                    (granter_of.get(target) == Some(&w.attesting_key_id.as_str()))
+                        .then(|| target.to_owned())
+                })
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
 
     for r in rows {
         // (1) shape.
@@ -11683,8 +11715,18 @@ pub(crate) async fn live_delegation_granter_instants<F: super::FederationDirecto
         // parent per CC 4.5.13). Must match `check_single_node_owner_admission`
         // exactly so the gate and the `owner_of` resolver agree on what an
         // owner-binding IS.
-        if filter == DelegationEdgeFilter::OwnerBindingOnly
-            && !is_owner_binding_envelope(&r.attestation_envelope)
+        if matches!(
+            filter,
+            DelegationEdgeFilter::OwnerBindingOnly
+                | DelegationEdgeFilter::AnnouncedOwnerBindingOnly
+        ) && !is_owner_binding_envelope(&r.attestation_envelope)
+        {
+            continue;
+        }
+        // (1b) v61 (CIRISPersist#1101) — announced, for that filter.
+        if filter == DelegationEdgeFilter::AnnouncedOwnerBindingOnly
+            && r.cohort_scope != super::types::cohort_scope::FEDERATION
+            && !announced_by_widening.contains(&r.attestation_id)
         {
             continue;
         }
@@ -12124,6 +12166,33 @@ pub async fn nodes_stewarded_by(
 /// unrepaired at the three steward-binding sites; the walk now lives in one
 /// place, so `owner_of(node) ⊆ steward_bindings_of(node)` holds by construction
 /// rather than by two functions being edited in step.
+/// v61 (CIRISPersist#1101; CC 5.4.6, `CLM-serve-seat-announced`) — the
+/// refusal a serve seat in an infrastructure community carries when its node
+/// has no live announced owner binding.
+pub const SERVE_SEAT_OWNER_UNANNOUNCED: &str = "serve_seat_owner_unannounced";
+
+/// v61 (CIRISPersist#1101; CC 5.4.6, steward ruling 2026-10-21) — **is
+/// `node_key_id`'s owner announced?** True while a live owner binding
+/// (`delegates_to(owner → node)`, [`is_owner_binding_envelope`]) is carried at
+/// `cohort_scope: federation`, directly or by its granter's live widening
+/// `supersedes`. Judged at evaluation time, not at a seating instant: a later
+/// announcement satisfies it, and withdrawing the announcement un-satisfies
+/// it. The walk is the one live-delegation fold
+/// ([`live_delegation_granter_instants`]), filtered, never a second copy. A
+/// named human is then responsible for the node and can be found.
+pub async fn serve_seat_owner_announced<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    node_key_id: &str,
+) -> Result<bool, Error> {
+    Ok(!live_delegation_granter_instants(
+        directory,
+        node_key_id,
+        DelegationEdgeFilter::AnnouncedOwnerBindingOnly,
+    )
+    .await?
+    .is_empty())
+}
+
 async fn live_owner_binding_granters<F: super::FederationDirectory + ?Sized>(
     directory: &F,
     node: &str,

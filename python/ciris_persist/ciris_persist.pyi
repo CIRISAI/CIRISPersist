@@ -1536,6 +1536,9 @@ class Engine:
     def serve_blob_to_peer_json(self, sha256_hex: str, requesting_peer_key_id: str) -> str:
         """(derived) deontic — v6.8.0 (CIRISPersist#149) — serve blob bytes to a federation PEER, with the proactive disk-pressure gate on the proxy-SERVE path. At the stop tier..."""
 
+    def serve_seat_owner_announced(self, node_key_id: str) -> bool:
+        """(derived) deontic — v61 (CIRISPersist#1101; CC 5.4.6, CLM-serve-seat-announced) — is node_key_id's owner announced? True while a live owner binding for the node is..."""
+
     def service_token_revocation_check(self, token_hash: str) -> str | None:
         """v1.5.23 — point-lookup the revocation record for a service token hash.
 

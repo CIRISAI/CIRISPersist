@@ -64,11 +64,14 @@ pub const RULE_SUPERSEDE_CANNOT_ADD: &str = "membership_supersede_cannot_add";
 /// acceptance of one whose room is no longer open at the growth.
 pub const RULE_OPEN_PROPOSAL_NOT_OPEN: &str = "membership_open_proposal_not_open";
 
-/// The two retryable rules: rows arrive out of order and persist holds no
-/// deferral queue, so the caller re-submits.
+/// The retryable rules: rows arrive out of order and persist holds no
+/// deferral queue, so the caller re-submits. v61 (CIRISPersist#1101): an
+/// unannounced serve seat too, once the owner announces.
 #[must_use]
 pub fn is_retryable_rule(rule: &str) -> bool {
-    rule == RULE_ACCEPTANCE_UNRESOLVED || rule == RULE_PROPOSAL_UNRESOLVED
+    rule == RULE_ACCEPTANCE_UNRESOLVED
+        || rule == RULE_PROPOSAL_UNRESOLVED
+        || rule == super::admission::SERVE_SEAT_OWNER_UNANNOUNCED
 }
 
 fn refuse(group: &str, member: &str, rule: &'static str) -> Error {
@@ -554,10 +557,14 @@ where
 /// needs no acceptance in `community` at `at` iff the community is
 /// `infrastructure`, the key is node-bearing at `at` (#925's predicate), and
 /// its own key record carries the accord's m-of-n scrub. The founders' quorum
-/// is the caller's roster-authority check and is not weakened here. The owner
-/// binding is NOT read: it is `self`-scope on the node and no other node can
-/// see it; the claim is enforced where the node operates. A person in the
-/// same community, and a node anywhere else, still needs what they needed.
+/// is the caller's roster-authority check and is not weakened here. A person
+/// in the same community, and a node anywhere else, still needs what they
+/// needed.
+///
+/// v61 (CIRISPersist#1101) — the announced-owner leg is the growth
+/// gate's ([`check_growth_accepted`]), not this predicate's: the founding
+/// record a genesis bundle carries seats its serve node before any owner
+/// binding exists (the steward's ruling: nothing in genesis carries one).
 pub async fn node_seated_without_acceptance<F>(
     dir: &F,
     community: &super::types::Community,
@@ -599,6 +606,17 @@ where
     if membership_plane(scope) == Some(cohort_scope::TargetPlane::Room) {
         if let Some(c) = dir.lookup_community(group).await? {
             if node_seated_without_acceptance(dir, &c, member, growth_instant).await? {
+                // v61 (CIRISPersist#1101; CC 5.4.6, `CLM-serve-seat-announced`)
+                // — a serve seat needs an announced owner: a live owner
+                // binding at `cohort_scope: federation`, judged now. A later
+                // announcement satisfies it, so the refusal is retryable.
+                if !super::admission::serve_seat_owner_announced(dir, member).await? {
+                    return Err(refuse(
+                        group,
+                        member,
+                        super::admission::SERVE_SEAT_OWNER_UNANNOUNCED,
+                    ));
+                }
                 return Ok(());
             }
         }

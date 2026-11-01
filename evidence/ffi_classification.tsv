@@ -22,7 +22,7 @@
 # CC asked for this file because 53 testimonial rows living only in a gated TSV
 # is itself a testimonial-class state: the class should not exemplify its own wrong.
 #
-# Counts at this revision: empirical=196 deontic=182 procedural=42 testimonial=42 structural=40 ontological=33 epistemic=32 axiotic=21 nomological=17 pragmatic=6 axiomatic=3
+# Counts at this revision: empirical=196 deontic=182 procedural=42 testimonial=42 structural=40 ontological=33 epistemic=28 axiotic=21 nomological=17 pragmatic=6 axiomatic=3
 #
 class	binding	class_count	owner	symbol	frame
 axiomatic	binding	3	MODULE	namespace_manifest_version	
@@ -195,6 +195,7 @@ deontic	binding	182	Engine	secrets_update_filter_config
 deontic	binding	182	Engine	self_roster_standing	
 deontic	binding	182	Engine	self_roster_vote_envelope	
 deontic	binding	182	Engine	serve_blob_to_peer_json	
+deontic	binding	182	Engine	serve_seat_owner_announced	
 deontic	binding	182	Engine	service_token_revocation_check	
 deontic	binding	182	Engine	service_token_revocation_record	
 deontic	binding	182	Engine	set_active_halt	
@@ -426,34 +427,34 @@ empirical	descriptive	196	Engine	wa_cert_get_by_kid
 empirical	descriptive	196	Engine	wa_cert_get_by_oauth	
 empirical	descriptive	196	Engine	wa_cert_list_by_role	
 empirical	descriptive	196	Engine	wa_cert_update_last_login	
-epistemic	descriptive	32	Engine	age_band_fine_json	
-epistemic	descriptive	32	Engine	age_band_json	
-epistemic	descriptive	32	Engine	blob_custody_json	
-epistemic	descriptive	32	Engine	cache_budget_bytes	
-epistemic	descriptive	32	Engine	cache_usage_bytes	
-epistemic	descriptive	32	Engine	capacity_state_json	
-epistemic	descriptive	32	Engine	chunks_of_manifest_json	
-epistemic	descriptive	32	Engine	corpus_shape	
-epistemic	descriptive	32	Engine	cross_agent_divergence	
-epistemic	descriptive	32	Engine	custody_view_json	
-epistemic	descriptive	32	Engine	dag_contains_chunk	
-epistemic	descriptive	32	Engine	describe_crossing	
-epistemic	descriptive	32	Engine	disk_pressure_state	
-epistemic	descriptive	32	Engine	durability_deficit_json	
-epistemic	descriptive	32	Engine	get_repository_statistics	
-epistemic	descriptive	32	Engine	lineage_head_json	
-epistemic	descriptive	32	Engine	list_purge_bundles_since_json	
-epistemic	descriptive	32	Engine	list_signed_accord_quorum_evidence_since	
-epistemic	descriptive	32	Engine	list_signed_identity_occurrences_for_json	
-epistemic	descriptive	32	Engine	list_signed_location_proofs_since	
-epistemic	descriptive	32	Engine	list_signed_transport_destinations_since	
-epistemic	descriptive	32	Engine	node_state_json	
-epistemic	descriptive	32	Engine	peer_quota_observation_json	
-epistemic	descriptive	32	Engine	secrets_is_healthy	
-epistemic	descriptive	32	Engine	secrets_test_encryption	
-epistemic	descriptive	32	Engine	temporal_drift	
-epistemic	descriptive	32	Engine	verify_trace	
-epistemic	descriptive	32	ScoringFactorStream	summary	
+epistemic	descriptive	28	Engine	age_band_fine_json	
+epistemic	descriptive	28	Engine	age_band_json	
+epistemic	descriptive	28	Engine	blob_custody_json	
+epistemic	descriptive	28	Engine	cache_budget_bytes	
+epistemic	descriptive	28	Engine	cache_usage_bytes	
+epistemic	descriptive	28	Engine	capacity_state_json	
+epistemic	descriptive	28	Engine	chunks_of_manifest_json	
+epistemic	descriptive	28	Engine	corpus_shape	
+epistemic	descriptive	28	Engine	cross_agent_divergence	
+epistemic	descriptive	28	Engine	custody_view_json	
+epistemic	descriptive	28	Engine	dag_contains_chunk	
+epistemic	descriptive	28	Engine	describe_crossing	
+epistemic	descriptive	28	Engine	disk_pressure_state	
+epistemic	descriptive	28	Engine	durability_deficit_json	
+epistemic	descriptive	28	Engine	get_repository_statistics	
+epistemic	descriptive	28	Engine	lineage_head_json	
+epistemic	descriptive	28	Engine	list_purge_bundles_since_json	
+epistemic	descriptive	28	Engine	list_signed_accord_quorum_evidence_since	
+epistemic	descriptive	28	Engine	list_signed_identity_occurrences_for_json	
+epistemic	descriptive	28	Engine	list_signed_location_proofs_since	
+epistemic	descriptive	28	Engine	list_signed_transport_destinations_since	
+epistemic	descriptive	28	Engine	node_state_json	
+epistemic	descriptive	28	Engine	peer_quota_observation_json	
+epistemic	descriptive	28	Engine	secrets_is_healthy	
+epistemic	descriptive	28	Engine	secrets_test_encryption	
+epistemic	descriptive	28	Engine	temporal_drift	
+epistemic	descriptive	28	Engine	verify_trace	
+epistemic	descriptive	28	ScoringFactorStream	summary	
 nomological	descriptive	17	Engine	audit_canonicalize_for_hash	
 nomological	descriptive	17	Engine	audit_canonicalize_for_signing	
 nomological	descriptive	17	Engine	canonicalize_envelope	
