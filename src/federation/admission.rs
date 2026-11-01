@@ -12256,7 +12256,7 @@ pub async fn check_owner_binding_affiliation_admission(
     // members can see who owns the node: an audience, not an organisation on
     // the bond (CC 3.2 names that for an `agent` key held on an
     // organisation's behalf).
-    if binding_is_group_audience(directory, row).await? {
+    if binding_is_group_audience(row) {
         return Ok(());
     }
     let refuse = |reason: &'static str, detail: String| {
@@ -12306,14 +12306,14 @@ pub async fn check_owner_binding_affiliation_admission(
 }
 
 /// v61 (CIRISPersist#1140, CC rc14 3.2) — is `row` (an owner-binding naming a
-/// group) the owner's re-signing of a NODE's binding at that group's scope,
-/// rather than an organisation's bond? True when the bound key is
-/// node-bearing ([`super::is_node_bearing_key`]).
-async fn binding_is_group_audience(
-    directory: &dyn super::FederationDirectory,
-    row: &super::Attestation,
-) -> Result<bool, Error> {
-    Box::pin(super::is_node_bearing_key(directory, &row.attested_key_id)).await
+/// group) the owner's re-signing of the binding AT that group's scope — an
+/// audience, "placed under the audience rule of its tier" — rather than an
+/// organisation's bond? True when the row is PLACED at a targeted scope
+/// (`family` / `community` / `affiliations`): the group it names is then the
+/// audience it is placed in. An organisation's bond names the affiliation in
+/// `community_id` from a non-targeted placement (CIRISPersist#1062, I1219).
+fn binding_is_group_audience(row: &super::Attestation) -> bool {
+    crate::federation::types::cohort_scope::is_targeted(&row.cohort_scope)
 }
 
 /// v60.0.0 (CIRISPersist#1062, CLM-org-on-the-bond) — **the affiliation named
@@ -12337,7 +12337,7 @@ pub async fn affiliation_of_binding(
     for b in &bindings {
         // v61 (CIRISPersist#1140) — a node binding re-signed at a group's
         // scope names an audience, never an organisation on the bond.
-        if binding_is_group_audience(directory, b).await? {
+        if binding_is_group_audience(b) {
             continue;
         }
         if let Some(c) = envelope_cohort_target(&b.attestation_envelope)? {
