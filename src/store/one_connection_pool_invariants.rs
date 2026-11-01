@@ -324,7 +324,8 @@ async fn i1482_occurrence_doors_complete_on_one_connection() {
     let tag = suffix();
     let (identity, occ) = (format!("i1482-id-{tag}"), format!("i1482-occ-{tag}"));
     ts::register_hybrid_key(d, &identity).await;
-    ts::register_hybrid_key(d, &occ).await;
+    // v61 (CIRISPersist#1122) — a node: an agent's occurrence projects no route.
+    ts::register_hybrid_key_as(d, &occ, &occ, crate::federation::types::identity_type::NODE).await;
     let b64 = base64::engine::general_purpose::STANDARD;
     let row = crate::federation::IdentityOccurrence {
         identity_key_id: identity.clone(),

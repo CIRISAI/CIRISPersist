@@ -9283,8 +9283,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         if occurrence_applied > 0 {
             if let Some(tb) = &row.transport_binding {
                 let route = tb.project_route(&row.occurrence_key_id, row.asserted_at)?;
-                crate::federation::FederationDirectory::put_transport_destination(self, &route)
-                    .await?;
+                crate::federation::transport_routes::project_occurrence_route(self, &route).await?;
             }
             self.index_plane_row(occurrence_row_id.as_deref()).await?;
         }
@@ -9387,7 +9386,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // route materialized").
         if let Some(tb) = &row.transport_binding {
             let route = tb.project_route(&row.occurrence_key_id, row.asserted_at)?;
-            crate::federation::FederationDirectory::put_transport_destination(self, &route).await?;
+            crate::federation::transport_routes::project_occurrence_route(self, &route).await?;
         }
         Ok(())
     }
@@ -11917,6 +11916,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         destination: &crate::federation::TransportDestination,
     ) -> Result<(), crate::federation::Error> {
+        // v61 (CIRISPersist#1122) — an agent announces no route.
+        crate::federation::transport_routes::check_route_key_not_agent(self, destination).await?;
         let client = self
             .get_client()
             .await
@@ -12208,7 +12209,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         })
     }
 
-    async fn list_transport_destinations_for(
+    async fn list_transport_destinations_for_unfolded(
         &self,
         occurrence_key_id: &str,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
@@ -12271,7 +12272,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
-    async fn list_all_transport_destinations(
+    async fn list_all_transport_destinations_unfolded(
         &self,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
         let client = self
@@ -12297,7 +12298,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.iter().map(pg_row_to_transport_destination).collect()
     }
 
-    async fn list_transport_destinations_by_destination(
+    async fn list_transport_destinations_by_destination_unfolded(
         &self,
         destination: &str,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {

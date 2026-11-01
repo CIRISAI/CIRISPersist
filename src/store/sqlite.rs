@@ -5854,8 +5854,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             })?;
         if occurrence_applied > 0 {
             if let Some(route) = &projected_route {
-                crate::federation::FederationDirectory::put_transport_destination(self, route)
-                    .await?;
+                crate::federation::transport_routes::project_occurrence_route(self, route).await?;
             }
             // v58.0.0 (CIRISPersist#991) — the pair's `identity:occurrence:v1`
             // row is a wire-index entry too (the Attestation kind).
@@ -5996,7 +5995,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             crate::federation::Error::Backend(format!("put_identity_occurrence_local: {e}"))
         })?;
         if let Some(route) = &projected_route {
-            crate::federation::FederationDirectory::put_transport_destination(self, route).await?;
+            crate::federation::transport_routes::project_occurrence_route(self, route).await?;
         }
         Ok(())
     }
@@ -8539,6 +8538,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         destination: &crate::federation::TransportDestination,
     ) -> Result<(), crate::federation::Error> {
+        // v61 (CIRISPersist#1122) — an agent announces no route.
+        crate::federation::transport_routes::check_route_key_not_agent(self, destination).await?;
         let d = destination.clone();
         let asserted = d.asserted_at.to_rfc3339();
         let last_seen = d.last_seen_at.map(|t| t.to_rfc3339());
@@ -8852,7 +8853,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(outcome)
     }
 
-    async fn list_transport_destinations_for(
+    async fn list_transport_destinations_for_unfolded(
         &self,
         occurrence_key_id: &str,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
@@ -8911,7 +8912,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
-    async fn list_all_transport_destinations(
+    async fn list_all_transport_destinations_unfolded(
         &self,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
         self.read(
@@ -8936,7 +8937,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
-    async fn list_transport_destinations_by_destination(
+    async fn list_transport_destinations_by_destination_unfolded(
         &self,
         destination: &str,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {

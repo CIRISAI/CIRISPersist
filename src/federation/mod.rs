@@ -448,6 +448,11 @@ pub mod instant_form;
 #[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
 pub(crate) mod instant_form_invariants;
 
+// v61 (CIRISPersist#1122) — one destination, one live key; agents announce no route.
+pub mod transport_routes;
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub(crate) mod transport_routes_invariants;
+
 // v54.1.0 (#1042) — the ordering-gap witnesses drive the key plan too.
 #[cfg(all(
     any(test, feature = "test-anchor"),
@@ -8588,7 +8593,24 @@ pub trait FederationDirectory: Send + Sync {
     /// `transport_kind` since #443, RETIRED (tombstoned) rows excluded.
     /// Empty when none. Liveness filtering (on `last_seen_at` age) is
     /// caller-side. Default impl errors; the three backends override.
+    ///
+    /// v61 (CIRISPersist#1122) — one destination, one live key: a route a
+    /// newer route on its destination by a tied key displaces is not returned
+    /// ([`transport_routes::fold_one_live_key`] over
+    /// [`Self::list_transport_destinations_for_unfolded`]).
     async fn list_transport_destinations_for(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        let rows = self
+            .list_transport_destinations_for_unfolded(occurrence_key_id)
+            .await?;
+        transport_routes::fold_one_live_key(self, rows).await
+    }
+
+    /// The backend's stored live routes of `occurrence_key_id`, before the
+    /// one-live-key fold. Default impl errors; backends override.
+    async fn list_transport_destinations_for_unfolded(
         &self,
         occurrence_key_id: &str,
     ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
@@ -8609,7 +8631,19 @@ pub trait FederationDirectory: Send + Sync {
     /// by `(occurrence_key_id, transport_kind)` — the route key, so the
     /// restore order is deterministic and "which is current" is structural
     /// (one row per key). Default impl errors; backends override.
+    ///
+    /// v61 (CIRISPersist#1122) — folded one live key per destination
+    /// ([`transport_routes::fold_one_live_key`]).
     async fn list_all_transport_destinations(
+        &self,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        let rows = self.list_all_transport_destinations_unfolded().await?;
+        transport_routes::fold_one_live_key(self, rows).await
+    }
+
+    /// Every stored live route, before the one-live-key fold. Default impl
+    /// errors; backends override.
+    async fn list_all_transport_destinations_unfolded(
         &self,
     ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
         Err(Error::Backend(
@@ -8625,7 +8659,23 @@ pub trait FederationDirectory: Send + Sync {
     /// binding over an [`Advisory`](self_at_login::BindingProvenance::Advisory)
     /// one — the AV-42 spoof is resolved by preference, never a substrate reject.
     /// #443: RETIRED rows excluded. Default impl errors; backends override.
+    ///
+    /// v61 (CIRISPersist#1122) — a claimant a newer route by a TIED key
+    /// (one live owner) displaces is not returned; untied claimants still
+    /// coexist ([`transport_routes::fold_one_live_key`]).
     async fn list_transport_destinations_by_destination(
+        &self,
+        destination: &str,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        let rows = self
+            .list_transport_destinations_by_destination_unfolded(destination)
+            .await?;
+        transport_routes::fold_one_live_key(self, rows).await
+    }
+
+    /// Every stored live claimant of `destination`, before the one-live-key
+    /// fold. Default impl errors; backends override.
+    async fn list_transport_destinations_by_destination_unfolded(
         &self,
         destination: &str,
     ) -> Result<Vec<self_at_login::TransportDestination>, Error> {

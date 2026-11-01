@@ -1090,7 +1090,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("sqlite_append_chunk_item", Class::Delegates),
     ("pg_append_chunk_item", Class::Delegates),
     ("put_family_local", Class::Delegates),
-    ("put_transport_destination", Class::Delegates),
+    // v61 (CIRISPersist#1122) — the occurrence write projects its route
+    // through one shared step, which skips an agent's and otherwise runs the
+    // local route door (its gates).
+    ("project_occurrence_route", Class::Delegates),
     ("query", Class::Plumbing),
     ("query_map", Class::Plumbing),
     ("query_one", Class::Plumbing),

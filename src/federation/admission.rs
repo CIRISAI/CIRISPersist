@@ -6619,6 +6619,9 @@ pub async fn verify_signed_transport_destination(
 
     let row = &signed.transport_destination;
     let env = &signed.signed_envelope;
+    // v61 (CIRISPersist#1122, steward ruling 2026-10-24) — an agent
+    // announces no route; it is reached through its node's binding.
+    crate::federation::transport_routes::check_route_key_not_agent(directory, row).await?;
 
     // (1) Authoritative fields FROM the signed envelope; the typed projection
     // must equal them (the signature covers only the envelope).

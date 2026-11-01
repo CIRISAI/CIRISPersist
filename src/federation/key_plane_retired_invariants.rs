@@ -81,6 +81,9 @@ pub(crate) mod bodies {
         pub kept: String,
         pub revoked: String,
         pub subject: String,
+        /// v61 (CIRISPersist#1122) — the node key the route rides: an
+        /// agent key announces no route.
+        pub route_node: String,
     }
 
     /// The doors a V195 store still has: keys, two signed occurrences of a
@@ -92,7 +95,9 @@ pub(crate) mod bodies {
             kept: format!("v57-kept-{tag}"),
             revoked: format!("v57-gone-{tag}"),
             subject: format!("v57-k-{tag}"),
+            route_node: format!("v57-node-{tag}"),
         };
+        ts::register_identity_key(d, &s.route_node, identity_type::NODE).await;
         ts::register_identity_key(d, &s.identity, identity_type::USER).await;
         ts::register_identity_key(d, &s.subject, identity_type::USER).await;
         for k in [&s.kept, &s.revoked] {
@@ -107,7 +112,7 @@ pub(crate) mod bodies {
             .expect("I1144: a v57 occurrence");
         }
         d.put_transport_destination(&crate::federation::self_at_login::test_support::route(
-            &s.kept,
+            &s.route_node,
             "reticulum",
             &format!("dest-{tag}"),
             1,
@@ -395,7 +400,7 @@ pub(crate) mod bodies {
         );
         // The route survives.
         assert!(
-            !d.list_transport_destinations_for(&s.kept)
+            !d.list_transport_destinations_for(&s.route_node)
                 .await
                 .unwrap()
                 .is_empty(),

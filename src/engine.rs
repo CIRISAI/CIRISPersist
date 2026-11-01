@@ -1065,6 +1065,8 @@ impl Engine {
         // what takes something away, set aside the rest. Never boot-fatal.
         engine.settle_instant_forms_at_boot().await;
 
+        // v61 (CIRISPersist#1122) — routes an agent key published are removed.
+        engine.sweep_agent_routes_at_boot().await;
         // v31.0.0 (CIRISPersist#650) — the in-place v31 migration. Here rather
         // than in `Backend::run_migrations` because a re-stamp is a re-SIGN and
         // `Backend` has no signer; this is the first point at which the backend
@@ -1154,6 +1156,8 @@ impl Engine {
         // what takes something away, set aside the rest. Never boot-fatal.
         engine.settle_instant_forms_at_boot().await;
 
+        // v61 (CIRISPersist#1122) — routes an agent key published are removed.
+        engine.sweep_agent_routes_at_boot().await;
         // v31.0.0 (CIRISPersist#650) — same hook as `with_signer`. A
         // pre-genesis node usually has nothing to migrate (no identity ⇒ no
         // authorship), and the routine returns early in that case; but a node
@@ -1227,6 +1231,8 @@ impl Engine {
         // what takes something away, set aside the rest. Never boot-fatal.
         engine.settle_instant_forms_at_boot().await;
 
+        // v61 (CIRISPersist#1122) — routes an agent key published are removed.
+        engine.sweep_agent_routes_at_boot().await;
         Ok(engine)
     }
 
@@ -1303,6 +1309,8 @@ impl Engine {
         // what takes something away, set aside the rest. Never boot-fatal.
         engine.settle_instant_forms_at_boot().await;
 
+        // v61 (CIRISPersist#1122) — routes an agent key published are removed.
+        engine.sweep_agent_routes_at_boot().await;
         Ok(engine)
     }
 
@@ -7038,6 +7046,25 @@ impl Engine {
         }
     }
 
+    /// v61 (CIRISPersist#1122) — the boot leg of
+    /// [`transport_routes::sweep_agent_routes`](crate::federation::transport_routes::sweep_agent_routes):
+    /// a route an agent key published before v61 is deleted. Logged, never an
+    /// abort.
+    async fn sweep_agent_routes_at_boot(&self) {
+        let dir = self.federation_directory();
+        match crate::federation::transport_routes::sweep_agent_routes(dir.as_ref()).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                removed = n,
+                "agent-key transport routes removed at open (CIRISPersist#1122)"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "agent-key route sweep could not run at open; the next open retries (#1122)"
+            ),
+        }
+    }
+
     async fn settle_instant_forms_at_boot(&self) {
         match self.settle_instant_forms().await {
             Ok(pass) if pass.violations == 0 => {}
@@ -8738,6 +8765,16 @@ impl Engine {
         // supersedes the old one across the mesh.
         let mut transport_rows = 0usize;
         for occ in [&input.app, &input.agent] {
+            // v61 (CIRISPersist#1122, steward ruling 2026-10-24) — an agent
+            // announces no route; it is reached through its node's binding.
+            if crate::federation::transport_routes::is_agent_key(
+                directory.as_ref(),
+                &occ.occurrence_key_id,
+            )
+            .await?
+            {
+                continue;
+            }
             let existing = directory
                 .list_transport_destinations_for(&occ.occurrence_key_id)
                 .await?;
@@ -22566,8 +22603,14 @@ mod tests {
             .expect("scope array");
         assert_eq!(scope.len(), 4);
 
-        // (6) A transport_destination per occurrence.
-        assert_eq!(outcome.transport_destinations_registered, 2);
+        // (6) A transport_destination per occurrence that announces one:
+        // v61 (CIRISPersist#1122) an agent occurrence announces none.
+        assert_eq!(outcome.transport_destinations_registered, 1);
+        assert!(dir
+            .list_transport_destinations_for(&agent_key)
+            .await
+            .expect("agent dests")
+            .is_empty());
         let app_dests = dir
             .list_transport_destinations_for(&app_key)
             .await
