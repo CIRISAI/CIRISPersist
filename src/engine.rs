@@ -3274,6 +3274,34 @@ impl Engine {
         let valid_until =
             valid_until.map(crate::federation::admission::truncate_to_substrate_resolution);
 
+        // v61 (CIRISPersist#1146) — a RESTART re-registers the same key.
+        // When the held row already states this registration (same pubkeys,
+        // identity, roles and expiry), the call is a no-op success and the held
+        // row is kept byte for byte: re-signing a fresh envelope would move its
+        // `persist_row_hash` and everything that cites it. Any difference is a
+        // real change and still goes to the put, which refuses it `Conflict`
+        // (a key change goes through the rebind door, #864). The replicated
+        // put keeps its exact-hash rule; this applies to self-registration only.
+        if let Some(held) = self
+            .federation_directory()
+            .lookup_public_key(&key_id)
+            .await?
+        {
+            if crate::federation::register::self_registration_unchanged(
+                &held,
+                &crate::federation::register::SelfRegistration {
+                    pubkey_ed25519_base64: &pubkey_ed25519_base64,
+                    pubkey_ml_dsa_65_base64: pqc_pubkey_b64.as_deref(),
+                    identity_type,
+                    identity_ref,
+                    roles: &roles,
+                    valid_until,
+                },
+            ) {
+                return Ok(key_id);
+            }
+        }
+
         // v31.0.0 (CIRISPersist#659, one plane wider) — **BIND THE SUBJECT
         // BEFORE THE BYTES ARE FORMED.** This row is not verified here (the
         // §5.6.8.15 gate is for PEER registration, see below) but it is

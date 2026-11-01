@@ -453,6 +453,9 @@ pub mod transport_routes;
 #[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
 pub(crate) mod transport_routes_invariants;
 
+// v61 (CIRISPersist#1146) — a restart re-registering the same key.
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub mod self_registration_restart_invariants;
 // v54.1.0 (#1042) — the ordering-gap witnesses drive the key plan too.
 #[cfg(all(
     any(test, feature = "test-anchor"),

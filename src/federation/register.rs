@@ -1796,6 +1796,44 @@ impl From<RevocationBoundRefusal> for Error {
 /// mirror it exactly.
 pub const REVOKED_AFTER_ENVELOPE_FIELD: &str = "revoked_after";
 
+/// v61 (CIRISPersist#1146) — what a self-registration states, compared
+/// against the held row by [`self_registration_unchanged`].
+#[derive(Debug, Clone, Copy)]
+pub struct SelfRegistration<'a> {
+    /// The node's Ed25519 public key, base64.
+    pub pubkey_ed25519_base64: &'a str,
+    /// The node's ML-DSA-65 public key, base64, when it has one.
+    pub pubkey_ml_dsa_65_base64: Option<&'a str>,
+    /// `identity_type` as registered.
+    pub identity_type: &'a str,
+    /// `identity_ref` as registered.
+    pub identity_ref: &'a str,
+    /// The capability roles, compared as a set.
+    pub roles: &'a [String],
+    /// The expiry, already at the millisecond.
+    pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// v61 (CIRISPersist#1146) — **is a self-registration a restart?** True
+/// when the held row for the node's own `key_id` states the same pubkeys
+/// (Ed25519 and PQC), `identity_type`, `identity_ref`, roles (as a set) and
+/// expiry. The one decision for every backend; `Engine::register_self_federation_key`
+/// answers a restart with the held row, unchanged. Anything else differs and
+/// reaches the put, which refuses it `Conflict`.
+#[must_use]
+pub fn self_registration_unchanged(
+    held: &super::types::KeyRecord,
+    offered: &SelfRegistration<'_>,
+) -> bool {
+    let as_set = |r: &[String]| r.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+    held.pubkey_ed25519_base64 == offered.pubkey_ed25519_base64
+        && held.pubkey_ml_dsa_65_base64.as_deref() == offered.pubkey_ml_dsa_65_base64
+        && held.identity_type == offered.identity_type
+        && held.identity_ref == offered.identity_ref
+        && as_set(&held.capability_roles) == as_set(offered.roles)
+        && held.valid_until == offered.valid_until
+}
+
 /// v25.1.0 (CIRISPersist#570 ask 4) — **the history-bound gate.** Run at the
 /// top of every backend's `put_revocation`, before the row is hashed and
 /// before INSERT (verify-before-mutation, AV-9), so a refused bound leaves no
