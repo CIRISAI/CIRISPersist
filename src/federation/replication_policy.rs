@@ -133,6 +133,10 @@ pub enum EnvelopeKind {
     /// itself; the typed attestation doors project it. The kind stays in this
     /// appended, position-pinned vocabulary as the name of the plane the rows
     /// project into.
+    ///
+    /// v61 (CIRISPersist#991): RETIRED ([`RETIRED_FRAMED`]); a peer's
+    /// advertisement of a `KeyGrant` hash is refused. Kept at its hashed
+    /// position.
     KeyGrant,
     /// v48.0.0 (CIRISPersist#860) — `federation_community_membership_widenings`:
     /// the addition plane, the mirror of the revocation (E4); the 17th kind, APPENDED. A forged
@@ -194,7 +198,12 @@ pub const ENVELOPE_KIND_RETIRED: &str = "federation_envelope_kind_retired";
 /// the six framed kinds join. Their tables stay as the rows' projections.
 /// The manifest ([`REPLICATION_POLICY_HASH`]) does not move: this list is
 /// not in it.
-pub const RETIRED_FRAMED: [EnvelopeKind; 13] = [
+///
+/// v61 (CIRISPersist#991, CC 3.3.2) — [`EnvelopeKind::KeyGrant`] joins: since
+/// v55.0.0 a wrap is one `key_grant:{axis}:v1` `scores` row per recipient,
+/// carried as an `Attestation`; the kind only named the plane those rows
+/// project into. V208 deletes its index and advertisement entries.
+pub const RETIRED_FRAMED: [EnvelopeKind; 14] = [
     EnvelopeKind::Key,
     EnvelopeKind::Revocation,
     EnvelopeKind::IdentityOccurrence,
@@ -208,6 +217,7 @@ pub const RETIRED_FRAMED: [EnvelopeKind; 13] = [
     EnvelopeKind::CommunityMembershipRevocation,
     EnvelopeKind::CommunityMembershipWidening,
     EnvelopeKind::FamilyMembershipWidening,
+    EnvelopeKind::KeyGrant,
 ];
 
 /// v59.0.0 — refuse a wire-kind token (`EnvelopeKind::as_str()`) naming a
@@ -681,7 +691,9 @@ pub const SETTLE_EXEMPT: &[(EnvelopeKind, &str)] = &[
     (
         EnvelopeKind::KeyGrant,
         "rides the attestation store; a re-delivered row must still reach the apply door, which \
-         projects a pending row once its bytes name the author (I65 step 4)",
+         projects a pending row once its bytes name the author (I65 step 4). v61 \
+         (CIRISPersist#991): the framed kind is retired (RETIRED_FRAMED); the rows are \
+         Attestation entries",
     ),
     (
         EnvelopeKind::Key,

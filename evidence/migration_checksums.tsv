@@ -387,3 +387,5 @@ sqlite	206	group_records_as_rows	5026263842404379036
 postgres	206	group_records_as_rows	13150367149320374377
 sqlite	207	group_framed_kinds_retired	11727828499257783361
 postgres	207	group_framed_kinds_retired	12864703682880945832
+sqlite	208	key_grant_framed_kind_retired	8249230999664313878
+postgres	208	key_grant_framed_kind_retired	11496856942977225529

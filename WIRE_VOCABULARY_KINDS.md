@@ -121,20 +121,20 @@ and CIRISServer pins the hash. The order is hashed, so a new kind is always
 | 2 | `Attestation` | `federation_attestations` — the whole claim namespace rides here | live |
 | 3 | `Revocation` | `federation_revocations` | retired — travels as its row |
 | 4 | `IdentityOccurrence` | `federation_identity_occurrences` | retired — travels as its row |
-| 5 | `Family` | `federation_families` | live |
-| 6 | `Community` | `federation_communities` | live |
+| 5 | `Family` | `federation_families` (the rows' projection) | retired (v61, #991) — travels as its `group:roster:v1` row |
+| 6 | `Community` | `federation_communities` (the rows' projection) | retired (v61, #991) — travels as its `group:roster:v1` row |
 | 7 | `IdentityOccurrenceRevocation` | `federation_identity_occurrence_revocations` | retired — travels as its row |
-| 8 | `FamilyMembershipRevocation` | `federation_family_membership_revocations` | live |
-| 9 | `CommunityMembershipRevocation` | `federation_community_membership_revocations` (insert rotates the DEK epoch) | live |
+| 8 | `FamilyMembershipRevocation` | `federation_family_membership_revocations` (the rows' projection) | retired (v61, #991) — travels as its `membership:removal:v1` / `membership:resignation:v1` row |
+| 9 | `CommunityMembershipRevocation` | `federation_community_membership_revocations` (the rows' projection; insert rotates the DEK epoch) | retired (v61, #991) — travels as its `membership:removal:v1` / `membership:resignation:v1` row |
 | 10 | `LocationProof` | `federation_location_proofs` | live |
 | 11 | `Organization` | — | retired (CC 3.3.9): an organisation is an affiliation's community record |
 | 12 | `OrgMembership` | — | retired (CC 3.3.9): a member is a `membership:{stage}` seat plus a hierarchy edge |
 | 13 | `PartnerRecord` | — | retired (CC 3.3.9): a partner is a `licensure:{community_key_id}:v1` row on the `Attestation` kind |
 | 14 | `TransportDestination` | `federation_transport_destinations` | live |
 | 15 | `AccordQuorumEvidence` | `accord_proposal` + its `accord_participation` set, as one bundle | live |
-| 16 | `KeyGrant` | `key_grant:*` rows (see below) | live |
-| 17 | `CommunityMembershipWidening` | `federation_community_membership_widenings` | live |
-| 18 | `FamilyMembershipWidening` | `federation_family_membership_widenings` | live |
+| 16 | `KeyGrant` | `key_grant:*` rows (see below) | retired (v61, #991) — the rows ride the `Attestation` kind |
+| 17 | `CommunityMembershipWidening` | `federation_community_membership_widenings` (the rows' projection) | retired (v61, #991) — travels as its `membership:widening:v1` row |
+| 18 | `FamilyMembershipWidening` | `federation_family_membership_widenings` (the rows' projection) | retired (v61, #991) — travels as its `membership:widening:v1` row |
 | 19 | `CommunityMembershipListing` | `federation_community_membership_listings` | live |
 
 An inbound framed object of a retired kind (`RETIRED_FRAMED`) is refused with
@@ -155,6 +155,11 @@ Every `KindPolicy` carries an `audience` (`ServeAudience`):
 
 A key grant is one `scores` row per recipient. The `KeyGrant` kind is the
 plane these rows project into.
+
+v61 (CIRISPersist#991): the kind is in `RETIRED_FRAMED`, at its hashed
+position. A peer's advertisement of a `KeyGrant` hash is refused
+`federation_envelope_kind_retired: key_grant`, and V208 deletes any index or
+advertisement entry that names it. The rows below ride the `Attestation` kind.
 
 - **Wire shape.** A `SignedKeyGrantRow` (`{"attestation": {…}}`, the
   `SignedAttestation` shape) is a `scores` row with envelope `dimension`

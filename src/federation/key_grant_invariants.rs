@@ -2789,6 +2789,12 @@ mod tests {
             "appended, never inserted"
         );
         assert_eq!(EnvelopeKind::KeyGrant.as_str(), "KeyGrant");
+        // v61 (CIRISPersist#991): the framed kind is retired; the rows ride
+        // the attestation kind. Its position above does not move.
+        assert!(
+            crate::federation::replication_policy::RETIRED_FRAMED.contains(&EnvelopeKind::KeyGrant),
+            "KeyGrant is a retired framed kind"
+        );
         let p = policy_for(EnvelopeKind::KeyGrant);
         assert_eq!(p.signer, SignerSource::RegisteredSigner);
         assert_eq!(p.binding, SignerBinding::SelfOwn);
