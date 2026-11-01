@@ -7079,17 +7079,20 @@ impl Engine {
     /// a route an agent key published before v61 is deleted. Logged, never an
     /// abort.
     async fn sweep_agent_routes_at_boot(&self) {
-        let dir = self.federation_directory();
-        match crate::federation::transport_routes::sweep_agent_routes(dir.as_ref()).await {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(
-                removed = n,
-                "agent-key transport routes removed at open (CIRISPersist#1122)"
-            ),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "agent-key route sweep could not run at open; the next open retries (#1122)"
-            ),
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        {
+            let dir = self.federation_directory();
+            match crate::federation::transport_routes::sweep_agent_routes(dir.as_ref()).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    removed = n,
+                    "agent-key transport routes removed at open (CIRISPersist#1122)"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "agent-key route sweep could not run at open; the next open retries (#1122)"
+                ),
+            }
         }
     }
 

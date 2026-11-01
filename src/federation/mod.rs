@@ -90,7 +90,9 @@ mod bounded_planes_invariants;
 mod bounded_reads_table;
 // v59.1.2 (CIRISPersist#1162) — the capsule proxy-parity gate blanks its
 // from-disk scan with the same comment/string blanker.
+// Unused on a no-backend axis, where that gate's module is not built.
 #[cfg(test)]
+#[allow(unused_imports)]
 pub(crate) use bounded_reads_table::gates::blank_comments_and_strings;
 pub mod canonical_at_rest;
 pub mod capacity;

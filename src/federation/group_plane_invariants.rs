@@ -1441,6 +1441,8 @@ mod run {
         uuid::Uuid::new_v4().simple().to_string()[..8].to_owned()
     }
 
+    // Invoked once per backend below; a no-backend axis builds neither.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     macro_rules! runners {
         ($modname:ident, $fresh:expr) => {
             mod $modname {
