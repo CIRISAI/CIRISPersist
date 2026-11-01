@@ -8607,7 +8607,11 @@ impl Engine {
             })?;
 
         // (3) Partner: bilateral grant (user) + accept (agent), sharing
-        // one bilateral_pair_id. Local-tier, self-cohort.
+        // one bilateral_pair_id. Local-tier, self-cohort. v61
+        // (CIRISPersist#1126): each half is a `consent_record` naming the
+        // other party, at one instant.
+        let partnered_at =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
         let grant_id = directory
             .attestation_upsert_local(LocalAttestationInput {
                 attestation_id: None,
@@ -8620,6 +8624,7 @@ impl Engine {
                     partnership_grant_envelope(
                         &input.agent.occurrence_key_id,
                         &input.bilateral_pair_id,
+                        partnered_at,
                     ),
                 )?,
                 subject_key_ids: Vec::new(),
@@ -8637,7 +8642,11 @@ impl Engine {
                 weight: None,
                 expires_at: None,
                 attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                    partnership_accept_envelope(&input.identity_key_id, &input.bilateral_pair_id),
+                    partnership_accept_envelope(
+                        &input.identity_key_id,
+                        &input.bilateral_pair_id,
+                        partnered_at,
+                    ),
                 )?,
                 subject_key_ids: Vec::new(),
                 cohort_scope: cohort_scope::SELF.to_owned(),

@@ -280,6 +280,8 @@ pub mod dimension_rejected_reason {
         crate::federation::invariant::INVARIANT_SELF_EMISSION_REASON,
         // v61 (CIRISPersist#991) — a group-plane dimension outside its door.
         crate::federation::group_plane::GROUP_PLANE_ROW_SHAPE_REASON,
+        // v61 (CIRISPersist#1126) — a bare-`scores` partnership half.
+        crate::federation::self_at_login::PARTNERSHIP_SHAPE_RETIRED_REASON,
     ];
 
     /// The tokens a later re-offer of the same row can turn into an
@@ -18776,6 +18778,8 @@ pub async fn check_reserved_prefix_admission(
         check_registered_family_not_held(dim)?;
         crate::federation::group_plane::check_generic_row_dimension(at, dim)?;
     }
+    // v61 (CIRISPersist#1126) — a partnership half is a `consent_record`.
+    crate::federation::self_at_login::check_partnership_shape(at, &row.attestation_envelope)?;
     // v58.0.0 (CC 3.1.7 R4 rc8) — the family's declared polarity, read from
     // the same registry row as the gate above, at the same door.
     check_score_within_declared_polarity(row)?;

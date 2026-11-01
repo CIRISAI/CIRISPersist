@@ -1503,6 +1503,11 @@ where
         ));
     }
 
+    // v61 (CIRISPersist#1126) — a partnership half is a `consent_record`.
+    crate::federation::self_at_login::check_partnership_shape(
+        &input.attestation_type,
+        &envelope_value,
+    )?;
     crate::federation::admission::check_trace_dimension_admission(
         input.dimension(),
         &input.attesting_key_id,
