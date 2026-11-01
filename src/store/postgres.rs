@@ -854,6 +854,535 @@ impl crate::federation::sweep_plan::RoomEvictionStore for PostgresBackend {
     }
 }
 
+/// v61 (CIRISPersist#934) — the `Backend` doors' executor on postgres: one
+/// erasure transaction, one content transaction. Storage only: the decisions
+/// are `store::backend_plan`'s.
+#[async_trait::async_trait]
+impl super::backend_plan::BackendStore for PostgresBackend {
+    async fn store_planned_trace_erasure(
+        &self,
+        planned: &super::backend_plan::PlannedTraceErasure,
+    ) -> Result<super::backend_plan::ErasedTraces, Error> {
+        let mut erased = super::backend_plan::ErasedTraces::default();
+        let agent = planned.agent_id_hash.as_str();
+        let key = planned.signature_key_id();
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("begin erasure tx: {e}")))?;
+        let strings = |rows: Vec<tokio_postgres::Row>| -> Result<Vec<String>, Error> {
+            rows.into_iter()
+                .map(|row| row.safe_get_with::<String, _, _, _>(0, Error::Backend))
+                .collect()
+        };
+        // The scope's traces: one signing key's (the per-key DSAR), or every
+        // key's (Art. 17). The LLM-call cascade and the tombstone key off
+        // these.
+        let trace_ids = strings(
+            match key {
+                Some(k) => {
+                    tx.query(
+                        "SELECT DISTINCT trace_id FROM cirislens.trace_events \
+                         WHERE agent_id_hash = $1 AND signing_key_id = $2",
+                        &[&agent, &k],
+                    )
+                    .await
+                }
+                None => {
+                    tx.query(
+                        "SELECT DISTINCT trace_id FROM cirislens.trace_events \
+                         WHERE agent_id_hash = $1",
+                        &[&agent],
+                    )
+                    .await
+                }
+            }
+            .map_err(|e| Error::Backend(format!("collect trace_ids: {e}")))?,
+        )?;
+        // v57.0.0 (#988 item 3) — a pre-v57 silo row takes the V080 tombstone
+        // in place; v58.0.0 (#1094 item 2) — a ROW-BACKED one is hard-deleted
+        // only under its producer's rule-1 `withdraws` (the citations), and
+        // leaves no projection row.
+        erased.legacy_tombstoned =
+            pg_tombstone_detection_events(&tx, &trace_ids, planned.received_at)
+                .await
+                .map_err(|e| Error::Backend(format!("tombstone detection_events: {e}")))?;
+        pg_store_erasure_withdraws(&tx, &planned.plan.new_withdraws)
+            .await
+            .map_err(|e| Error::Backend(format!("erasure withdraws: {e}")))?;
+        let erased_rows = pg_erase_cited_rows(&tx, &planned.plan.citations)
+            .await
+            .map_err(|e| Error::Backend(format!("erase detection rows: {e}")))?;
+        erased.detection_rows_erased = erased_rows.len() as u64;
+        if !trace_ids.is_empty() {
+            erased.trace_llm_calls = tx
+                .execute(
+                    "DELETE FROM cirislens.trace_llm_calls WHERE trace_id = ANY($1::text[])",
+                    &[&trace_ids],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("delete trace_llm_calls: {e}")))?;
+        }
+        // v54.1.0 (Codex round 4 sweep on PR #1057) — on a full erasure the
+        // agent's thoughts, read before its rows go: their signature rows are
+        // removed once no remaining event cites them.
+        let thought_ids = if key.is_none() {
+            strings(
+                tx.query(
+                    "SELECT DISTINCT thought_id FROM cirislens.trace_events \
+                     WHERE agent_id_hash = $1",
+                    &[&agent],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("collect thought_ids: {e}")))?,
+            )?
+        } else {
+            Vec::new()
+        };
+        erased.trace_events = match key {
+            Some(k) => {
+                tx.execute(
+                    "DELETE FROM cirislens.trace_events \
+                     WHERE agent_id_hash = $1 AND signing_key_id = $2",
+                    &[&agent, &k],
+                )
+                .await
+            }
+            None => {
+                tx.execute(
+                    "DELETE FROM cirislens.trace_events WHERE agent_id_hash = $1",
+                    &[&agent],
+                )
+                .await
+            }
+        }
+        .map_err(|e| Error::Backend(format!("delete trace_events: {e}")))?;
+        if key.is_none() {
+            pg_drop_orphaned_thought_signatures(&tx, &thought_ids)
+                .await
+                .map_err(|e| Error::Backend(format!("drop orphaned thought signatures: {e}")))?;
+        }
+        if planned.includes_federation_key() {
+            // The single key_id matching (agent_id_hash, key): the agent's
+            // other registered keys stay.
+            let target_key_ids = strings(
+                tx.query(
+                    "SELECT key_id FROM cirislens.federation_keys \
+                     WHERE identity_type = 'agent' AND identity_ref = $1 AND key_id = $2",
+                    &[&agent, &key],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("collect target_key_ids: {e}")))?,
+            )?;
+            if !target_key_ids.is_empty() {
+                erased.federation_revocations = tx
+                    .execute(
+                        "DELETE FROM cirislens.federation_revocations \
+                         WHERE revoked_key_id = ANY($1::text[]) \
+                            OR revoked_key_sha256_ed25519_raw IN \
+                               (SELECT encode(sha256(decode(k.pubkey_ed25519_base64, 'base64')), 'hex') \
+                                  FROM cirislens.federation_keys k WHERE k.key_id = ANY($1::text[])) \
+                            OR revoking_key_id = ANY($1::text[]) \
+                            OR scrub_key_id    = ANY($1::text[])",
+                        &[&target_key_ids],
+                    )
+                    .await
+                    .map_err(|e| Error::Backend(format!("delete federation_revocations: {e}")))?;
+                erased.federation_attestations = tx
+                    .execute(
+                        "DELETE FROM cirislens.federation_attestations \
+                         WHERE attesting_key_id = ANY($1::text[]) \
+                            OR attested_key_id  = ANY($1::text[]) \
+                            OR scrub_key_id     = ANY($1::text[])",
+                        &[&target_key_ids],
+                    )
+                    .await
+                    .map_err(|e| Error::Backend(format!("delete federation_attestations: {e}")))?;
+                erased.federation_keys = tx
+                    .execute(
+                        "DELETE FROM cirislens.federation_keys WHERE key_id = ANY($1::text[])",
+                        &[&target_key_ids],
+                    )
+                    .await
+                    .map_err(|e| Error::Backend(format!("delete federation_keys: {e}")))?;
+            }
+        }
+        if let Some(event) = planned.audit_event(&erased) {
+            pg_record_erasure(
+                &tx,
+                &planned.attester,
+                &event,
+                &erased_rows,
+                planned.received_at,
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("trace_erasure audit: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("commit erasure tx: {e}")))?;
+        Ok(erased)
+    }
+
+    async fn store_planned_fountain_content(
+        &self,
+        planned: super::backend_plan::PlannedFountainContent<'_>,
+    ) -> Result<(), Error> {
+        let manifest = planned.manifest;
+        let manifest_version = i32::from(manifest.manifest_version);
+        let n_source = i64::from(manifest.n_source);
+        let k_repair = i64::from(manifest.k_repair);
+        let symbol_size = i64::from(manifest.symbol_size);
+        let min_viable = i64::from(manifest.min_viable_symbols);
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("begin fountain tx: {e}")))?;
+        // The manifest: idempotent on the (content_id, corpus_kind) PK. Never
+        // evicted. `admitted_at` keeps the column's database default.
+        tx.execute(
+            "INSERT INTO cirislens.content_manifest \
+             (content_id, corpus_kind, manifest_version, n_source, k_repair, \
+              symbol_size, original_content_length, min_viable_symbols, \
+              symbol_hashes, envelope, signature, signature_ml_dsa_65, pqc_key_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+             ON CONFLICT (content_id, corpus_kind) DO NOTHING",
+            &[
+                &manifest.content_id,
+                &manifest.corpus_kind,
+                &manifest_version,
+                &n_source,
+                &k_repair,
+                &symbol_size,
+                &planned.original_content_length,
+                &min_viable,
+                &planned.symbol_hashes,
+                &manifest.envelope,
+                &manifest.signature,
+                &manifest.signature_ml_dsa_65,
+                &manifest.pqc_key_id,
+            ],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("insert content_manifest: {e}")))?;
+        // Symbols: upsert by (content_id, symbol_id).
+        for sym in planned.symbols {
+            let symbol_id = i64::from(sym.symbol_id);
+            let retention_priority = i16::from(sym.retention_priority);
+            tx.execute(
+                "INSERT INTO cirislens.content_symbols \
+                 (content_id, symbol_id, retention_priority, symbol_bytes) \
+                 VALUES ($1,$2,$3,$4) \
+                 ON CONFLICT (content_id, symbol_id) DO UPDATE SET \
+                   retention_priority = EXCLUDED.retention_priority, \
+                   symbol_bytes = EXCLUDED.symbol_bytes",
+                &[
+                    &sym.content_id,
+                    &symbol_id,
+                    &retention_priority,
+                    &sym.symbol_bytes,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("insert content_symbols: {e}")))?;
+        }
+        // An aggregated tier's provenance row (opaque aggregation_meta).
+        if let Some(a) = &planned.aggregation {
+            let agg_meta: &[u8] = &a.agg.aggregation_meta;
+            tx.execute(
+                "INSERT INTO cirislens.content_aggregation \
+                 (aggregate_content_id, source_corpus_kind, aggregation_level, fan_in, \
+                  member_commitment, aggregation_meta, aggregated_at_unix_ms) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7) \
+                 ON CONFLICT (aggregate_content_id) DO NOTHING",
+                &[
+                    &a.agg.aggregate_content_id,
+                    &a.agg.source_corpus_kind,
+                    &a.aggregation_level,
+                    &a.fan_in,
+                    &a.agg.member_commitment,
+                    &agg_meta,
+                    &a.aggregated_at_unix_ms,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("insert content_aggregation: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("commit fountain tx: {e}")))
+    }
+}
+
+/// v61 (CIRISPersist#934) — the gated directory reads' executor on postgres.
+/// Storage only: the decisions are `federation::read_plan`'s.
+#[async_trait::async_trait]
+impl crate::federation::read_plan::ReadPlanStore for PostgresBackend {
+    async fn read_scores_page(
+        &self,
+        filter: &crate::read::AttestationFilter,
+        scope: &crate::scope::CallerScope,
+        cursor: Option<&crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let (mut where_parts, mut params) = pg_scores_shared_predicates(filter, scope);
+        // lifecycle: exclude rows retracted by a still-hiding composer (the
+        // one predicate, CIRISPersist#720).
+        if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
+            filter.lifecycle,
+            crate::federation::attestation_query::Dialect::Postgres,
+            "fa",
+            params.len() + 1,
+        ) {
+            for t in types {
+                params.push(Box::new(t));
+            }
+            where_parts.push(sql);
+        }
+        if let Some(c) = cursor {
+            params.push(Box::new(c.last_asserted_at));
+            let p_at = params.len();
+            params.push(Box::new(c.last_attestation_id.clone()));
+            let p_id = params.len();
+            where_parts.push(format!(
+                "(fa.asserted_at, fa.attestation_id::text) < (${p_at}, ${p_id})"
+            ));
+        }
+        params.push(Box::new(limit));
+        let sql = format!(
+            "SELECT DISTINCT {PG_SCORES_FA_COLS} \
+             FROM cirislens.attestation_subjects s \
+             JOIN cirislens.federation_attestations fa ON fa.attestation_id = s.attestation_id \
+             WHERE {} \
+             ORDER BY asserted_at DESC, attestation_id DESC \
+             LIMIT ${}",
+            where_parts.join(" AND "),
+            params.len()
+        );
+        Ok(self
+            .query_attestations("list_scores", &sql, &params)
+            .await?
+            .0)
+    }
+
+    async fn read_score_candidates(
+        &self,
+        filter: &crate::read::AttestationFilter,
+        scope: &crate::scope::CallerScope,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let (mut where_parts, mut params) = pg_scores_shared_predicates(filter, scope);
+        where_parts.push("fa.attestation_type = 'scores'".to_string());
+        params.push(Box::new(crate::federation::scores::RESOLVE_CANDIDATE_CAP));
+        let sql = format!(
+            "SELECT DISTINCT {PG_SCORES_FA_COLS} \
+             FROM cirislens.attestation_subjects s \
+             JOIN cirislens.federation_attestations fa ON fa.attestation_id = s.attestation_id \
+             WHERE {} \
+             ORDER BY asserted_at DESC, attestation_id DESC \
+             LIMIT ${}",
+            where_parts.join(" AND "),
+            params.len()
+        );
+        Ok(self
+            .query_attestations("resolve_scores", &sql, &params)
+            .await?
+            .0)
+    }
+
+    async fn read_score_composers(
+        &self,
+        attesters: &[String],
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let sql = format!(
+            "SELECT {PG_SCORES_FA_COLS} FROM cirislens.federation_attestations fa \
+             WHERE fa.attestation_type IN ('supersedes','withdraws','recants') \
+               AND fa.attesting_key_id = ANY($1)"
+        );
+        let params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            vec![Box::new(attesters.to_vec())];
+        Ok(self
+            .query_attestations("resolve_scores composers", &sql, &params)
+            .await?
+            .0)
+    }
+
+    async fn read_attestation_log_page(
+        &self,
+        subject_key_id: Option<&str>,
+        cursor: Option<&crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::federation::attestation_query::QueryRows, crate::federation::Error> {
+        // #455 — NO caller gate, NO lifecycle folding, federation tier only.
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        let mut where_parts: Vec<String> = vec!["fa.tier = 'federation'".to_string()];
+        // v53.0.0 (#975) — the replicable set excludes an unregistered type
+        // under enforcement.
+        where_parts.extend(crate::federation::row_type::serve_filter_sql(
+            "fa.attestation_type",
+            crate::federation::row_type::SqlDialect::Postgres,
+        ));
+        let (from, distinct) = if let Some(subj) = subject_key_id {
+            params.push(Box::new(subj.to_string()));
+            where_parts.push(format!("s.subject_key_id = ${}", params.len()));
+            (
+                "cirislens.attestation_subjects s \
+                 JOIN cirislens.federation_attestations fa ON fa.attestation_id = s.attestation_id",
+                "DISTINCT ",
+            )
+        } else {
+            ("cirislens.federation_attestations fa", "")
+        };
+        if let Some(c) = cursor {
+            params.push(Box::new(c.last_asserted_at));
+            let p_at = params.len();
+            params.push(Box::new(c.last_attestation_id.clone()));
+            let p_id = params.len();
+            where_parts.push(format!(
+                "(fa.asserted_at, fa.attestation_id::text) < (${p_at}, ${p_id})"
+            ));
+        }
+        params.push(Box::new(limit));
+        let sql = format!(
+            "SELECT {distinct}{PG_SCORES_FA_COLS} FROM {from} \
+             WHERE {} \
+             ORDER BY asserted_at DESC, attestation_id DESC \
+             LIMIT ${}",
+            where_parts.join(" AND "),
+            params.len()
+        );
+        let (rows, bytes) = self
+            .query_attestations("list_attestation_log", &sql, &params)
+            .await?;
+        Ok(crate::federation::attestation_query::QueryRows {
+            rows,
+            bytes,
+            backend: crate::observe::StoreBackend::Postgres,
+        })
+    }
+
+    async fn read_key_registration_history(
+        &self,
+        key_id: &str,
+    ) -> Result<
+        Vec<crate::federation::read_plan::StoredKeyRegistrationHistory>,
+        crate::federation::Error,
+    > {
+        let col = |e: tokio_postgres::Error| {
+            crate::federation::Error::Backend(format!("list_key_registration_history: {e}"))
+        };
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let rows = client
+            .query(
+                "SELECT key_id, registration_envelope, original_content_hash, \
+                        scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                        scrub_timestamp, replaced_at, replaced_by_hash, \
+                        replaced_row_hash, replacement_kind \
+                 FROM cirislens.federation_key_registration_history \
+                 WHERE key_id = $1 ORDER BY history_id ASC",
+                &[&key_id],
+            )
+            .await
+            .map_err(col)?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(crate::federation::read_plan::StoredKeyRegistrationHistory {
+                    key_id: r.try_get("key_id").map_err(col)?,
+                    registration_envelope: r.try_get("registration_envelope").map_err(col)?,
+                    original_content_hash: r.try_get("original_content_hash").map_err(col)?,
+                    scrub_signature_classical: r
+                        .try_get("scrub_signature_classical")
+                        .map_err(col)?,
+                    scrub_signature_pqc: r.try_get("scrub_signature_pqc").map_err(col)?,
+                    scrub_key_id: r.try_get("scrub_key_id").map_err(col)?,
+                    scrub_timestamp: r.try_get("scrub_timestamp").map_err(col)?,
+                    replaced_at: r.try_get("replaced_at").map_err(col)?,
+                    replaced_by_hash: r.try_get("replaced_by_hash").map_err(col)?,
+                    replaced_row_hash: r.try_get("replaced_row_hash").map_err(col)?,
+                    replacement_kind: r.try_get("replacement_kind").map_err(col)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn read_renditions(
+        &self,
+        original_sha256: [u8; 32],
+    ) -> Result<Vec<crate::federation::renditions::Rendition>, crate::federation::Error> {
+        let col = |e: tokio_postgres::Error| {
+            crate::federation::Error::Backend(format!("list_derived_hex: {e}"))
+        };
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let rows = client
+            .query(
+                "SELECT rendition_sha256, original_sha256, format, size, width, height, \
+                        role, source_attestation_id, cohort_scope \
+                 FROM cirislens.blob_renditions WHERE original_sha256 = $1 \
+                 ORDER BY rendition_sha256 ASC",
+                &[&original_sha256.to_vec()],
+            )
+            .await
+            .map_err(col)?;
+        rows.into_iter()
+            .map(|r| {
+                let size: i64 = r.try_get("size").map_err(col)?;
+                let width: Option<i32> = r.try_get("width").map_err(col)?;
+                let height: Option<i32> = r.try_get("height").map_err(col)?;
+                Ok(crate::federation::renditions::Rendition {
+                    rendition_sha256_hex: hex::encode(
+                        r.try_get::<_, Vec<u8>>("rendition_sha256").map_err(col)?,
+                    ),
+                    original_sha256_hex: hex::encode(
+                        r.try_get::<_, Vec<u8>>("original_sha256").map_err(col)?,
+                    ),
+                    format: r.try_get("format").map_err(col)?,
+                    size: u64::try_from(size).unwrap_or(0),
+                    width: width.and_then(|w| u32::try_from(w).ok()),
+                    height: height.and_then(|h| u32::try_from(h).ok()),
+                    role: r.try_get("role").map_err(col)?,
+                    source_attestation_id: r.try_get("source_attestation_id").map_err(col)?,
+                    cohort_scope: r.try_get("cohort_scope").map_err(col)?,
+                })
+            })
+            .collect()
+    }
+}
+
+impl PostgresBackend {
+    /// v61 (CIRISPersist#934) — run one attestation SELECT and map its rows,
+    /// with the envelope bytes decoded (`op` names it in the error).
+    async fn query_attestations(
+        &self,
+        op: &'static str,
+        sql: &str,
+        params: &[Box<dyn tokio_postgres::types::ToSql + Sync + Send>],
+    ) -> Result<(Vec<crate::federation::Attestation>, u64), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client
+            .query(sql, &params_ref[..])
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("{op}: {e}")))?;
+        let bytes = pg_envelope_bytes(&rows);
+        let items = rows
+            .into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((items, bytes))
+    }
+}
+
 /// v61 (CIRISPersist#934) — the accord evidence executor on postgres.
 /// Storage only: the decisions are `federation::accord_admit`'s.
 #[async_trait::async_trait]
@@ -5563,370 +6092,21 @@ impl Backend for PostgresBackend {
         signature_key_id: &str,
         include_federation_key: bool,
     ) -> Result<super::types::DeleteSummary, Error> {
-        // v57.0.0 (CIRISPersist#988 item 2) — the audit row's attester, read
-        // before the transaction (the plan inside it reads nothing). Held as
-        // a Result: a door that deletes nothing records nothing and needs no
-        // attester; one that deletes is refused, rolled back, without one.
-        // An act: refused, typed, before anything moves when this node cannot
-        // attest its audit row (CIRISPersist#988 ruling: a host must hold a
-        // node key before any erasure is recorded).
-        let attester = crate::federation::attestation_admit::hard_case_attester(self)
-            .await
-            .map_err(Error::from_hard_case_attester)?;
-        // v57.0.0 (#988 item 3) — a pre-v57 detection this node can attest
-        // to its detector is moved onto the plane first, so the erasure
-        // below takes it the row way (hard delete) and the table stays its
-        // rows' rebuild.
-        {
-            use crate::federation::attestation_admit::AttestationStore as _;
-            self.rehome_legacy_detection_events(chrono::Utc::now())
-                .await
-                .map_err(|e| Error::Backend(format!("rehome before erasure: {e}")))?;
-        }
-        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — the row-backed
-        // detections this erasure reaches: each erased under its PRODUCER's
-        // rule-1 `withdraws` (planned here when not already held), or refused
-        // with a reason (read before the transaction).
-        let received_at = chrono::Utc::now();
-        let crate::federation::subject_erasure::ErasurePlan {
-            citations,
-            new_withdraws,
-            refused,
-        } = crate::federation::subject_erasure::plan_store_erasure(
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        super::backend_plan::delete_traces_for_agent_planned(
             self,
             agent_id_hash,
-            Some(signature_key_id),
-            received_at,
+            signature_key_id,
+            include_federation_key,
         )
         .await
-        .map_err(|e| Error::Backend(format!("erasure plan: {e}")))?;
-        let refused_count = refused.len() as u64;
-        let mut client = self.get_client().await?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
-
-        // Per-key DSAR scope: both agent_id_hash AND signing_key_id
-        // must match. trace_llm_calls cascade walks the matching set
-        // via the trace_id bridge (V001 schema: LLM call rows have
-        // no signing_key_id column).
-        // Step 1: collect matching trace_ids.
-        let trace_ids: Vec<String> = tx
-            .query(
-                "SELECT DISTINCT trace_id FROM cirislens.trace_events \
-                 WHERE agent_id_hash = $1 AND signing_key_id = $2",
-                &[&agent_id_hash, &signature_key_id],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("collect trace_ids: {e}")))?
-            .into_iter()
-            .map(|row| row.safe_get_with::<String, _, _, _>(0, Error::Backend))
-            .collect::<Result<_, _>>()?;
-
-        // v57.0.0 (CIRISPersist#988 item 3) — a pre-v57 silo row takes the
-        // V080 tombstone in place. v58.0.0 (CIRISPersist#1094 item 2) — a
-        // ROW-BACKED one is hard-deleted only under its producer's `withdraws`
-        // (the citations), and leaves no projection row.
-        let legacy_tombstoned = pg_tombstone_detection_events(&tx, &trace_ids, received_at)
-            .await
-            .map_err(|e| Error::Backend(format!("tombstone detection_events: {e}")))?;
-        pg_store_erasure_withdraws(&tx, &new_withdraws)
-            .await
-            .map_err(|e| Error::Backend(format!("erasure withdraws: {e}")))?;
-        let erased_rows = pg_erase_cited_rows(&tx, &citations)
-            .await
-            .map_err(|e| Error::Backend(format!("erase detection rows: {e}")))?;
-        let detection_events_tombstoned = legacy_tombstoned + erased_rows.len() as u64;
-
-        // Step 2: delete LLM call rows joined by the matching
-        // trace_ids. Cross-key traces (agent rotated keys, signed
-        // under multiple keys) only cascade for this DSAR's key.
-        let trace_llm_calls_deleted = if trace_ids.is_empty() {
-            0u64
-        } else {
-            tx.execute(
-                "DELETE FROM cirislens.trace_llm_calls \
-                 WHERE trace_id = ANY($1::text[])",
-                &[&trace_ids],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("delete trace_llm_calls: {e}")))?
-        };
-
-        // Step 3: delete trace_events rows. Same key-scope filter as
-        // step 1 — both must agree, else step 2 could cascade
-        // delete LLM calls for trace_events rows step 3 leaves alive.
-        let trace_events_deleted = tx
-            .execute(
-                "DELETE FROM cirislens.trace_events \
-                 WHERE agent_id_hash = $1 AND signing_key_id = $2",
-                &[&agent_id_hash, &signature_key_id],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("delete trace_events: {e}")))?;
-
-        // Step 4 (optional): federation key cascade. Find target key_ids,
-        // delete cascading attestation/revocation rows, then the keys.
-        let mut federation_keys_deleted = 0u64;
-        let mut federation_attestations_deleted = 0u64;
-        let mut federation_revocations_deleted = 0u64;
-
-        if include_federation_key {
-            // Per-key federation_keys cascade: the single key_id
-            // matching (agent_id_hash, signature_key_id). The agent's
-            // other registered keys stay alive.
-            let target_key_ids: Vec<String> = tx
-                .query(
-                    "SELECT key_id FROM cirislens.federation_keys \
-                     WHERE identity_type = 'agent' AND identity_ref = $1 AND key_id = $2",
-                    &[&agent_id_hash, &signature_key_id],
-                )
-                .await
-                .map_err(|e| Error::Backend(format!("collect target_key_ids: {e}")))?
-                .into_iter()
-                .map(|row| row.safe_get_with::<String, _, _, _>(0, Error::Backend))
-                .collect::<Result<_, _>>()?;
-
-            if !target_key_ids.is_empty() {
-                federation_revocations_deleted = tx
-                    .execute(
-                        "DELETE FROM cirislens.federation_revocations \
-                         WHERE revoked_key_id = ANY($1::text[]) \
-                            OR revoked_key_sha256_ed25519_raw IN \
-                               (SELECT encode(sha256(decode(k.pubkey_ed25519_base64, 'base64')), 'hex') \
-                                  FROM cirislens.federation_keys k WHERE k.key_id = ANY($1::text[])) \
-                            OR revoking_key_id = ANY($1::text[]) \
-                            OR scrub_key_id    = ANY($1::text[])",
-                        &[&target_key_ids],
-                    )
-                    .await
-                    .map_err(|e| Error::Backend(format!("delete federation_revocations: {e}")))?;
-
-                federation_attestations_deleted = tx
-                    .execute(
-                        "DELETE FROM cirislens.federation_attestations \
-                         WHERE attesting_key_id = ANY($1::text[]) \
-                            OR attested_key_id  = ANY($1::text[]) \
-                            OR scrub_key_id     = ANY($1::text[])",
-                        &[&target_key_ids],
-                    )
-                    .await
-                    .map_err(|e| Error::Backend(format!("delete federation_attestations: {e}")))?;
-
-                federation_keys_deleted = tx
-                    .execute(
-                        "DELETE FROM cirislens.federation_keys \
-                         WHERE key_id = ANY($1::text[])",
-                        &[&target_key_ids],
-                    )
-                    .await
-                    .map_err(|e| Error::Backend(format!("delete federation_keys: {e}")))?;
-            }
-        }
-
-        // v38.0.0 (#721) — ANNOUNCED inside the transaction, exactly like
-        // the Art.-17 sibling: this door deletes strictly MORE (three
-        // federation planes the erasure sibling never touches) and was the
-        // one of the pair that said nothing.
-        if trace_events_deleted > 0
-            || trace_llm_calls_deleted > 0
-            || federation_keys_deleted > 0
-            || federation_attestations_deleted > 0
-            || federation_revocations_deleted > 0
-            || detection_events_tombstoned > 0
-        {
-            // v58.0.0 (#1094 item 2, CC 4.5.3) — subject-free.
-            let event = crate::federation::hard_case::trace_erasure_event(
-                &crate::federation::hard_case::TraceErasureCounts {
-                    op: crate::federation::hard_case::trace_erasure_op::ONE_KEY,
-                    trace_events: trace_events_deleted,
-                    trace_llm_calls: trace_llm_calls_deleted,
-                    detection_events_tombstoned,
-                    detection_rows_erased: erased_rows.len() as u64,
-                    detection_rows_refused: refused_count,
-                    federation_keys: federation_keys_deleted,
-                    federation_attestations: federation_attestations_deleted,
-                    federation_revocations: federation_revocations_deleted,
-                },
-                received_at,
-            );
-            pg_record_erasure(&tx, &attester, &event, &erased_rows, received_at)
-                .await
-                .map_err(|e| Error::Backend(format!("dsar announcement: {e}")))?;
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| Error::Backend(format!("commit dsar tx: {e}")))?;
-
-        Ok(super::types::DeleteSummary {
-            trace_events_deleted,
-            trace_llm_calls_deleted,
-            federation_keys_deleted,
-            federation_attestations_deleted,
-            federation_revocations_deleted,
-            detection_rows_refused: refused,
-            deleted_at: chrono::Utc::now(),
-        })
     }
 
     async fn delete_traces_for_agent_id_hash(
         &self,
         agent_id_hash: &str,
     ) -> Result<super::types::ErasureSummary, Error> {
-        // v57.0.0 (CIRISPersist#988 item 2) — the audit row's attester, read
-        // before the transaction (see `delete_traces_for_agent`).
-        // An act: refused, typed, before anything moves when this node cannot
-        // attest its audit row (CIRISPersist#988 ruling: a host must hold a
-        // node key before any erasure is recorded).
-        let attester = crate::federation::attestation_admit::hard_case_attester(self)
-            .await
-            .map_err(Error::from_hard_case_attester)?;
-        // v57.0.0 (#988 item 3) — a pre-v57 detection this node can attest
-        // to its detector is moved onto the plane first, so the erasure
-        // below takes it the row way (hard delete) and the table stays its
-        // rows' rebuild.
-        {
-            use crate::federation::attestation_admit::AttestationStore as _;
-            self.rehome_legacy_detection_events(chrono::Utc::now())
-                .await
-                .map_err(|e| Error::Backend(format!("rehome before erasure: {e}")))?;
-        }
-        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — each reached row
-        // erased under its producer's rule-1 `withdraws`, or refused with a
-        // reason; read before the transaction.
-        let erased_at = chrono::Utc::now();
-        let crate::federation::subject_erasure::ErasurePlan {
-            citations,
-            new_withdraws,
-            refused,
-        } = crate::federation::subject_erasure::plan_store_erasure(
-            self,
-            agent_id_hash,
-            None,
-            erased_at,
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("erasure plan: {e}")))?;
-        let refused_count = refused.len() as u64;
-        let mut client = self.get_client().await?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| Error::Backend(format!("begin erasure tx: {e}")))?;
-
-        // Step 1: collect the agent's trace_ids across ALL signing keys
-        // (full Art. 17 erasure — not key-scoped). Both the trace_llm_calls
-        // cascade and the detection_events tombstone key off these.
-        let trace_ids: Vec<String> = tx
-            .query(
-                "SELECT DISTINCT trace_id FROM cirislens.trace_events \
-                 WHERE agent_id_hash = $1",
-                &[&agent_id_hash],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("collect trace_ids: {e}")))?
-            .into_iter()
-            .map(|row| row.safe_get_with::<String, _, _, _>(0, Error::Backend))
-            .collect::<Result<_, _>>()?;
-
-        // Step 2: TOMBSTONE the derived detection_events for those traces
-        // (V080) — NULL the PII linkage, stamp erased_at. NOT a delete.
-        // Only rows not already tombstoned are counted (idempotent
-        // re-run touches nothing). Done BEFORE the trace_events delete so
-        // the trace_id set is still resolvable here for symmetry; the
-        // tombstone reads its own table by trace_id so ordering is moot,
-        // but keeping it inside the txn is what guarantees atomicity.
-        let legacy_tombstoned = pg_tombstone_detection_events(&tx, &trace_ids, erased_at)
-            .await
-            .map_err(|e| Error::Backend(format!("tombstone detection_events: {e}")))?;
-        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — a ROW-BACKED
-        // detection is erased by its producer's rule-1 `withdraws`: each cited row is
-        // HARD-DELETED here (its projection row leaves by cascade), never
-        // rewritten, and its tombstone — citing the withdraws — is written
-        // below, so the row cannot be re-admitted and a peer holding a replica
-        // receives it.
-        pg_store_erasure_withdraws(&tx, &new_withdraws)
-            .await
-            .map_err(|e| Error::Backend(format!("erasure withdraws: {e}")))?;
-        let erased_rows = pg_erase_cited_rows(&tx, &citations)
-            .await
-            .map_err(|e| Error::Backend(format!("erase detection rows: {e}")))?;
-        let detection_events_tombstoned = legacy_tombstoned + erased_rows.len() as u64;
-
-        // Step 3: hard-delete the LLM call rows joined by trace_id.
-        let trace_llm_calls = if trace_ids.is_empty() {
-            0u64
-        } else {
-            tx.execute(
-                "DELETE FROM cirislens.trace_llm_calls \
-                 WHERE trace_id = ANY($1::text[])",
-                &[&trace_ids],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("delete trace_llm_calls: {e}")))?
-        };
-
-        // v54.1.0 (Codex round 4 sweep on PR #1057) — the agent's thoughts,
-        // read before its rows go: their signature rows are removed once no
-        // remaining event cites them (the steward purge's own rule, one
-        // helper).
-        let thought_ids: Vec<String> = tx
-            .query(
-                "SELECT DISTINCT thought_id FROM cirislens.trace_events WHERE agent_id_hash = $1",
-                &[&agent_id_hash],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("collect thought_ids: {e}")))?
-            .into_iter()
-            .map(|row| row.safe_get_with::<String, _, _, _>(0, Error::Backend))
-            .collect::<Result<_, _>>()?;
-
-        // Step 4: hard-delete the trace_events rows for the agent.
-        let trace_events = tx
-            .execute(
-                "DELETE FROM cirislens.trace_events WHERE agent_id_hash = $1",
-                &[&agent_id_hash],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("delete trace_events: {e}")))?;
-        pg_drop_orphaned_thought_signatures(&tx, &thought_ids)
-            .await
-            .map_err(|e| Error::Backend(format!("drop orphaned thought signatures: {e}")))?;
-
-        // Step 5: emit the `hard_case:trace_erasure` audit row INSIDE the
-        // txn (atomic with the erasure). Emit only when something was
-        // erased, so an idempotent re-run stays a clean no-op.
-        if trace_events > 0 || trace_llm_calls > 0 || detection_events_tombstoned > 0 {
-            let event = crate::federation::hard_case::trace_erasure_event(
-                &crate::federation::hard_case::TraceErasureCounts {
-                    op: crate::federation::hard_case::trace_erasure_op::FULL,
-                    trace_events,
-                    trace_llm_calls,
-                    detection_events_tombstoned,
-                    detection_rows_erased: erased_rows.len() as u64,
-                    detection_rows_refused: refused_count,
-                    ..Default::default()
-                },
-                erased_at,
-            );
-            pg_record_erasure(&tx, &attester, &event, &erased_rows, erased_at)
-                .await
-                .map_err(|e| Error::Backend(format!("emit trace_erasure audit: {e}")))?;
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| Error::Backend(format!("commit erasure tx: {e}")))?;
-
-        Ok(super::types::ErasureSummary {
-            trace_events,
-            trace_llm_calls,
-            detection_events_tombstoned,
-            detection_rows_refused: refused,
-            erased_at,
-        })
+        super::backend_plan::delete_traces_for_agent_id_hash_planned(self, agent_id_hash).await
     }
 
     async fn fetch_trace_events_page(
@@ -6017,89 +6197,7 @@ impl Backend for PostgresBackend {
         manifest: &crate::fountain::FountainManifestV1,
         symbols: &[crate::fountain::FountainSymbolV1],
     ) -> Result<(), Error> {
-        // Verify-before-mutation (AV-9): the full admission gate runs
-        // first; on any failure NOTHING is written.
-        crate::fountain::check_admission_via_envelope(
-            manifest,
-            symbols,
-            &crate::verify::PythonJsonDumpsCanonicalizer,
-        )?;
-
-        let symbol_hashes_json = serde_json::Value::Array(
-            manifest
-                .symbol_hashes
-                .iter()
-                .map(|h| serde_json::Value::String(h.clone()))
-                .collect(),
-        );
-        let manifest_version = i32::from(manifest.manifest_version);
-        let n_source = i64::from(manifest.n_source);
-        let k_repair = i64::from(manifest.k_repair);
-        let symbol_size = i64::from(manifest.symbol_size);
-        let original_content_length = i64::try_from(manifest.original_content_length)
-            .map_err(|_| Error::Backend("original_content_length exceeds i64".into()))?;
-        let min_viable = i64::from(manifest.min_viable_symbols);
-
-        let mut client = self.get_client().await?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| Error::Backend(format!("begin fountain tx: {e}")))?;
-
-        // Manifest: idempotent insert (ON CONFLICT DO NOTHING on the
-        // (content_id, corpus_kind) PK). Never evicted.
-        tx.execute(
-            "INSERT INTO cirislens.content_manifest \
-             (content_id, corpus_kind, manifest_version, n_source, k_repair, \
-              symbol_size, original_content_length, min_viable_symbols, \
-              symbol_hashes, envelope, signature, signature_ml_dsa_65, pqc_key_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
-             ON CONFLICT (content_id, corpus_kind) DO NOTHING",
-            &[
-                &manifest.content_id,
-                &manifest.corpus_kind,
-                &manifest_version,
-                &n_source,
-                &k_repair,
-                &symbol_size,
-                &original_content_length,
-                &min_viable,
-                &symbol_hashes_json,
-                &manifest.envelope,
-                &manifest.signature,
-                &manifest.signature_ml_dsa_65,
-                &manifest.pqc_key_id,
-            ],
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("insert content_manifest: {e}")))?;
-
-        // Symbols: upsert by (content_id, symbol_id).
-        for sym in symbols {
-            let symbol_id = i64::from(sym.symbol_id);
-            let retention_priority = i16::from(sym.retention_priority);
-            tx.execute(
-                "INSERT INTO cirislens.content_symbols \
-                 (content_id, symbol_id, retention_priority, symbol_bytes) \
-                 VALUES ($1,$2,$3,$4) \
-                 ON CONFLICT (content_id, symbol_id) DO UPDATE SET \
-                   retention_priority = EXCLUDED.retention_priority, \
-                   symbol_bytes = EXCLUDED.symbol_bytes",
-                &[
-                    &sym.content_id,
-                    &symbol_id,
-                    &retention_priority,
-                    &sym.symbol_bytes,
-                ],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("insert content_symbols: {e}")))?;
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| Error::Backend(format!("commit fountain tx: {e}")))?;
-        Ok(())
+        super::backend_plan::put_fountain_content_planned(self, manifest, symbols).await
     }
 
     async fn evict_fountain_content_to_tier(
@@ -6373,121 +6471,14 @@ impl Backend for PostgresBackend {
         agg: &crate::fountain::AggregationMetaV1,
         aggregated_at_unix_ms: i64,
     ) -> Result<(), Error> {
-        // Verify-before-mutation (AV-9): BOTH gates run BEFORE any write; on
-        // any failure NOTHING is persisted (neither the composite nor the
-        // aggregation row).
-        //   (i)  the composite goes through the EXISTING #225 fountain admit
-        //        gate — classical-only composite manifest REJECTED (hard cut).
-        //   (ii) v8.4.0 §19.7.1 PQC-mandatory store-path gate (§10.1.5.1.1):
-        //        verify the aggregation_meta bound-hybrid signature against the
-        //        aggregator pubkeys on the composite envelope; a missing/invalid
-        //        ML-DSA-65 half is rejected. The STORAGE aggregation_meta column
-        //        stays OPAQUE — the verification inputs are admission-only.
-        crate::fountain::check_admission_via_envelope(
+        super::backend_plan::put_aggregated_tier_planned(
+            self,
             manifest,
             symbols,
-            &crate::verify::PythonJsonDumpsCanonicalizer,
-        )?;
-        agg.verify_for_admission(manifest)?;
-
-        let symbol_hashes_json = serde_json::Value::Array(
-            manifest
-                .symbol_hashes
-                .iter()
-                .map(|h| serde_json::Value::String(h.clone()))
-                .collect(),
-        );
-        let manifest_version = i32::from(manifest.manifest_version);
-        let n_source = i64::from(manifest.n_source);
-        let k_repair = i64::from(manifest.k_repair);
-        let symbol_size = i64::from(manifest.symbol_size);
-        let original_content_length = i64::try_from(manifest.original_content_length)
-            .map_err(|_| Error::Backend("original_content_length exceeds i64".into()))?;
-        let min_viable = i64::from(manifest.min_viable_symbols);
-        let aggregation_level = i64::try_from(agg.aggregation_level)
-            .map_err(|_| Error::Backend("aggregation_level exceeds i64".into()))?;
-        let fan_in =
-            i64::try_from(agg.fan_in).map_err(|_| Error::Backend("fan_in exceeds i64".into()))?;
-        let agg_meta: &[u8] = &agg.aggregation_meta;
-
-        let mut client = self.get_client().await?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| Error::Backend(format!("begin aggregation tx: {e}")))?;
-
-        // (a) The composite manifest (idempotent) + its symbols.
-        tx.execute(
-            "INSERT INTO cirislens.content_manifest \
-             (content_id, corpus_kind, manifest_version, n_source, k_repair, \
-              symbol_size, original_content_length, min_viable_symbols, \
-              symbol_hashes, envelope, signature, signature_ml_dsa_65, pqc_key_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
-             ON CONFLICT (content_id, corpus_kind) DO NOTHING",
-            &[
-                &manifest.content_id,
-                &manifest.corpus_kind,
-                &manifest_version,
-                &n_source,
-                &k_repair,
-                &symbol_size,
-                &original_content_length,
-                &min_viable,
-                &symbol_hashes_json,
-                &manifest.envelope,
-                &manifest.signature,
-                &manifest.signature_ml_dsa_65,
-                &manifest.pqc_key_id,
-            ],
+            agg,
+            aggregated_at_unix_ms,
         )
         .await
-        .map_err(|e| Error::Backend(format!("insert composite content_manifest: {e}")))?;
-
-        for sym in symbols {
-            let symbol_id = i64::from(sym.symbol_id);
-            let retention_priority = i16::from(sym.retention_priority);
-            tx.execute(
-                "INSERT INTO cirislens.content_symbols \
-                 (content_id, symbol_id, retention_priority, symbol_bytes) \
-                 VALUES ($1,$2,$3,$4) \
-                 ON CONFLICT (content_id, symbol_id) DO UPDATE SET \
-                   retention_priority = EXCLUDED.retention_priority, \
-                   symbol_bytes = EXCLUDED.symbol_bytes",
-                &[
-                    &sym.content_id,
-                    &symbol_id,
-                    &retention_priority,
-                    &sym.symbol_bytes,
-                ],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("insert composite content_symbols: {e}")))?;
-        }
-
-        // (b) The aggregation provenance row (opaque aggregation_meta).
-        tx.execute(
-            "INSERT INTO cirislens.content_aggregation \
-             (aggregate_content_id, source_corpus_kind, aggregation_level, fan_in, \
-              member_commitment, aggregation_meta, aggregated_at_unix_ms) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7) \
-             ON CONFLICT (aggregate_content_id) DO NOTHING",
-            &[
-                &agg.aggregate_content_id,
-                &agg.source_corpus_kind,
-                &aggregation_level,
-                &fan_in,
-                &agg.member_commitment,
-                &agg_meta,
-                &aggregated_at_unix_ms,
-            ],
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("insert content_aggregation: {e}")))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| Error::Backend(format!("commit aggregation tx: {e}")))?;
-        Ok(())
     }
 
     async fn get_aggregation(
@@ -8062,56 +8053,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         key_id: &str,
     ) -> Result<Vec<crate::federation::types::KeyRegistrationHistoryRow>, crate::federation::Error>
     {
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        let rows = client
-            .query(
-                "SELECT key_id, registration_envelope, original_content_hash, \
-                        scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                        scrub_timestamp, replaced_at, replaced_by_hash, \
-                        replaced_row_hash, replacement_kind \
-                 FROM cirislens.federation_key_registration_history \
-                 WHERE key_id = $1 ORDER BY history_id ASC",
-                &[&key_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_key_registration_history: {e}"))
-            })?;
-        let col = |e: tokio_postgres::Error| {
-            crate::federation::Error::Backend(format!("list_key_registration_history: {e}"))
-        };
-        rows.into_iter()
-            .map(|r| {
-                let envelope: String = r.try_get("registration_envelope").map_err(col)?;
-                let hash: Vec<u8> = r.try_get("original_content_hash").map_err(col)?;
-                let kind: String = r.try_get("replacement_kind").map_err(col)?;
-                Ok(crate::federation::types::KeyRegistrationHistoryRow {
-                    key_id: r.try_get("key_id").map_err(col)?,
-                    registration_envelope: serde_json::from_str(&envelope).map_err(|e| {
-                        crate::federation::Error::Backend(format!("history envelope: {e}"))
-                    })?,
-                    original_content_hash: hex::encode(hash),
-                    scrub_signature_classical: r
-                        .try_get("scrub_signature_classical")
-                        .map_err(col)?,
-                    scrub_signature_pqc: r.try_get("scrub_signature_pqc").map_err(col)?,
-                    scrub_key_id: r.try_get("scrub_key_id").map_err(col)?,
-                    scrub_timestamp: r.try_get("scrub_timestamp").map_err(col)?,
-                    replaced_at: r.try_get("replaced_at").map_err(col)?,
-                    replaced_by_hash: r.try_get("replaced_by_hash").map_err(col)?,
-                    replaced_row_hash: r.try_get("replaced_row_hash").map_err(col)?,
-                    replacement: crate::federation::types::KeyReplacementKind::from_token(&kind)
-                        .ok_or_else(|| {
-                            crate::federation::Error::Backend(format!(
-                                "history replacement_kind {kind:?}"
-                            ))
-                        })?,
-                })
-            })
-            .collect()
+        crate::federation::read_plan::list_key_registration_history_planned(self, key_id).await
     }
 
     /// v45.0.0 (CIRISPersist#871, FSD §5) — the rendition index read: a plain
@@ -8121,46 +8063,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         original_sha256_hex: &str,
     ) -> Result<Vec<crate::federation::renditions::Rendition>, crate::federation::Error> {
-        let original = crate::federation::renditions::decode_sha256_hex(original_sha256_hex)?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        let rows = client
-            .query(
-                "SELECT rendition_sha256, original_sha256, format, size, width, height, \
-                        role, source_attestation_id, cohort_scope \
-                 FROM cirislens.blob_renditions WHERE original_sha256 = $1 \
-                 ORDER BY rendition_sha256 ASC",
-                &[&original.to_vec()],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("list_derived_hex: {e}")))?;
-        let col = |e: tokio_postgres::Error| {
-            crate::federation::Error::Backend(format!("list_derived_hex: {e}"))
-        };
-        rows.into_iter()
-            .map(|r| {
-                let size: i64 = r.try_get("size").map_err(col)?;
-                let width: Option<i32> = r.try_get("width").map_err(col)?;
-                let height: Option<i32> = r.try_get("height").map_err(col)?;
-                Ok(crate::federation::renditions::Rendition {
-                    rendition_sha256_hex: hex::encode(
-                        r.try_get::<_, Vec<u8>>("rendition_sha256").map_err(col)?,
-                    ),
-                    original_sha256_hex: hex::encode(
-                        r.try_get::<_, Vec<u8>>("original_sha256").map_err(col)?,
-                    ),
-                    format: r.try_get("format").map_err(col)?,
-                    size: u64::try_from(size).unwrap_or(0),
-                    width: width.and_then(|w| u32::try_from(w).ok()),
-                    height: height.and_then(|h| u32::try_from(h).ok()),
-                    role: r.try_get("role").map_err(col)?,
-                    source_attestation_id: r.try_get("source_attestation_id").map_err(col)?,
-                    cohort_scope: r.try_get("cohort_scope").map_err(col)?,
-                })
-            })
-            .collect()
+        crate::federation::read_plan::list_derived_hex_planned(self, original_sha256_hex).await
     }
 
     // v19.1.0 (#490) — the authenticated re-anchor (see sqlite impl for the
@@ -13470,86 +13373,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         cursor: Option<crate::read::AttestationCursor>,
         limit: i64,
     ) -> Result<crate::read::ScoresPage, crate::federation::Error> {
-        use crate::federation::Error;
-        // #552 (CC 3.4.5) — the scores-plane read log. FIRST statement in the
-        // door, ahead of every refusal, so a read rejected for a bad limit or
-        // cursor is logged exactly like one that is served.
-        crate::federation::scores_read_audit::log_scores_read(
-            crate::federation::scores_read_audit::ScoresReadSite::ListScores,
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::read_plan::list_scores_planned(
+            self,
             caller_occurrence_key_id,
-            &filter,
-        );
-        if !(1..=10_000).contains(&limit) {
-            return Err(Error::InvalidArgument(format!(
-                "limit must be in [1, 10000], got {limit}"
-            )));
-        }
-        let scope = crate::scope::caller_scope_from_directory(self, caller_occurrence_key_id)
-            .await
-            .map_err(|e| Error::Backend(format!("list_scores admission: {e}")))?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        let (mut where_parts, mut params) = pg_scores_shared_predicates(&filter, &scope);
-        // lifecycle: exclude rows retracted by a still-hiding composer (the
-        // one predicate, CIRISPersist#720).
-        if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
-            filter.lifecycle,
-            crate::federation::attestation_query::Dialect::Postgres,
-            "fa",
-            params.len() + 1,
-        ) {
-            for t in types {
-                params.push(Box::new(t));
-            }
-            where_parts.push(sql);
-        }
-        if let Some(c) = &cursor {
-            if c.version != "v1" {
-                return Err(Error::InvalidArgument(format!(
-                    "AttestationCursor version {} unsupported; v1 only",
-                    c.version
-                )));
-            }
-            params.push(Box::new(c.last_asserted_at));
-            let p_at = params.len();
-            params.push(Box::new(c.last_attestation_id.clone()));
-            let p_id = params.len();
-            where_parts.push(format!(
-                "(fa.asserted_at, fa.attestation_id::text) < (${p_at}, ${p_id})"
-            ));
-        }
-        let where_sql = format!("WHERE {}", where_parts.join(" AND "));
-        params.push(Box::new(limit));
-        let p_limit = params.len();
-        let sql = format!(
-            "SELECT DISTINCT {PG_SCORES_FA_COLS} \
-             FROM cirislens.attestation_subjects s \
-             JOIN cirislens.federation_attestations fa ON fa.attestation_id = s.attestation_id \
-             {where_sql} \
-             ORDER BY asserted_at DESC, attestation_id DESC \
-             LIMIT ${p_limit}"
-        );
-        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as _).collect();
-        let rows = client
-            .query(&sql, &params_ref[..])
-            .await
-            .map_err(|e| Error::Backend(format!("list_scores: {e}")))?;
-        let items: Result<Vec<crate::federation::Attestation>, crate::federation::Error> =
-            rows.into_iter().map(pg_row_to_attestation).collect();
-        let items = items?;
-        let next_cursor = if items.len() == limit as usize {
-            let last = &items[items.len() - 1];
-            Some(crate::read::AttestationCursor::from_trailing(
-                last.asserted_at,
-                last.attestation_id.clone(),
-            ))
-        } else {
-            None
-        };
-        Ok(crate::read::ScoresPage { items, next_cursor })
+            filter,
+            cursor,
+            limit,
+        )
+        .await
     }
 
     async fn resolve_scores(
@@ -13559,75 +13391,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         policy: String,
         trace: bool,
     ) -> Result<crate::read::ComposedVerdict, crate::federation::Error> {
-        use crate::federation::Error;
-        // #552 (CC 3.4.5) — the scores-plane read log; see `list_scores`.
-        crate::federation::scores_read_audit::log_scores_read(
-            crate::federation::scores_read_audit::ScoresReadSite::ResolveScores,
+        crate::federation::read_plan::resolve_scores_planned(
+            self,
             caller_occurrence_key_id,
-            &filter,
-        );
-        let scope = crate::scope::caller_scope_from_directory(self, caller_occurrence_key_id)
-            .await
-            .map_err(|e| Error::Backend(format!("resolve_scores admission: {e}")))?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        let (mut where_parts, mut params) = pg_scores_shared_predicates(&filter, &scope);
-        where_parts.push("fa.attestation_type = 'scores'".to_string());
-        let where_sql = format!("WHERE {}", where_parts.join(" AND "));
-        // #456 — BOUNDED candidate fetch (see sqlite): cap at the newest
-        // RESOLVE_CANDIDATE_CAP rows; ancient superseded rows can't change a
-        // live verdict, and the admission path must not be O(history).
-        params.push(Box::new(crate::federation::scores::RESOLVE_CANDIDATE_CAP));
-        let p_cap = params.len();
-        let sql = format!(
-            "SELECT DISTINCT {PG_SCORES_FA_COLS} \
-             FROM cirislens.attestation_subjects s \
-             JOIN cirislens.federation_attestations fa ON fa.attestation_id = s.attestation_id \
-             {where_sql} \
-             ORDER BY asserted_at DESC, attestation_id DESC \
-             LIMIT ${p_cap}"
-        );
-        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as _).collect();
-        let rows = client
-            .query(&sql, &params_ref[..])
-            .await
-            .map_err(|e| Error::Backend(format!("resolve_scores: {e}")))?;
-        let data: Vec<crate::federation::Attestation> = rows
-            .into_iter()
-            .map(pg_row_to_attestation)
-            .collect::<Result<Vec<_>, _>>()?;
-        // Composers (retractions) from the same attesters, regardless of their
-        // own subject/scope — a retraction applies for everyone.
-        let mut attesters: Vec<String> = data.iter().map(|a| a.attesting_key_id.clone()).collect();
-        attesters.sort();
-        attesters.dedup();
-        let composers: Vec<crate::federation::Attestation> = if attesters.is_empty() {
-            Vec::new()
-        } else {
-            let csql = format!(
-                "SELECT {PG_SCORES_FA_COLS} FROM cirislens.federation_attestations fa \
-                 WHERE fa.attestation_type IN ('supersedes','withdraws','recants') \
-                   AND fa.attesting_key_id = ANY($1)"
-            );
-            let crows = client
-                .query(&csql, &[&attesters])
-                .await
-                .map_err(|e| Error::Backend(format!("resolve_scores composers: {e}")))?;
-            crows
-                .into_iter()
-                .map(pg_row_to_attestation)
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        Ok(crate::federation::scores::compose_verdict(
-            data,
-            composers,
-            &policy,
+            filter,
+            policy,
             trace,
-            chrono::Utc::now(),
-        ))
+        )
+        .await
     }
 
     async fn list_attestation_log(
@@ -13636,102 +13407,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         cursor: Option<crate::read::AttestationCursor>,
         limit: i64,
     ) -> Result<crate::read::ScoresPage, crate::federation::Error> {
-        use crate::federation::Error;
-        if !(1..=10_000).contains(&limit) {
-            return Err(Error::InvalidArgument(format!(
-                "limit must be in [1, 10000], got {limit}"
-            )));
-        }
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        // #455 — owner-scope LOG walk: NO caller gate, NO lifecycle folding,
-        // federation-tier (the replicable set) only, byte-faithful rows.
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
-        let mut where_parts: Vec<String> = vec!["fa.tier = 'federation'".to_string()];
-        // v53.0.0 (#975) — the replicable set excludes an unregistered type
-        // under enforcement.
-        where_parts.extend(crate::federation::row_type::serve_filter_sql(
-            "fa.attestation_type",
-            crate::federation::row_type::SqlDialect::Postgres,
-        ));
-        let from = if let Some(subj) = subject_key_id {
-            params.push(Box::new(subj.to_string()));
-            where_parts.push(format!("s.subject_key_id = ${}", params.len()));
-            "cirislens.attestation_subjects s \
-             JOIN cirislens.federation_attestations fa ON fa.attestation_id = s.attestation_id"
-        } else {
-            "cirislens.federation_attestations fa"
-        };
-        if let Some(c) = &cursor {
-            if c.version != "v1" {
-                return Err(Error::InvalidArgument(format!(
-                    "AttestationCursor version {} unsupported; v1 only",
-                    c.version
-                )));
-            }
-            params.push(Box::new(c.last_asserted_at));
-            let p_at = params.len();
-            params.push(Box::new(c.last_attestation_id.clone()));
-            let p_id = params.len();
-            where_parts.push(format!(
-                "(fa.asserted_at, fa.attestation_id::text) < (${p_at}, ${p_id})"
-            ));
-        }
-        params.push(Box::new(limit));
-        let p_limit = params.len();
-        let distinct = if subject_key_id.is_some() {
-            "DISTINCT "
-        } else {
-            ""
-        };
-        let sql = format!(
-            "SELECT {distinct}{PG_SCORES_FA_COLS} FROM {from} \
-             WHERE {} \
-             ORDER BY asserted_at DESC, attestation_id DESC \
-             LIMIT ${p_limit}",
-            where_parts.join(" AND ")
-        );
-        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as _).collect();
-        let rows = client
-            .query(&sql, &params_ref[..])
-            .await
-            .map_err(|e| Error::Backend(format!("list_attestation_log: {e}")))?;
-        let bytes = pg_envelope_bytes(&rows);
-        let items: Vec<crate::federation::Attestation> = rows
-            .into_iter()
-            .map(pg_row_to_attestation)
-            .collect::<Result<Vec<_>, _>>()?;
-        let next_cursor = if items.len() == limit as usize {
-            let last = &items[items.len() - 1];
-            Some(crate::read::AttestationCursor::from_trailing(
-                last.asserted_at,
-                last.attestation_id.clone(),
-            ))
-        } else {
-            None
-        };
-        // Release the pooled client before the quarantine consult below —
-        // `filter_withheld_rows` re-enters this backend and takes its own.
-        drop(client);
-
-        // v25.1.0 (CIRISPersist#570 ask 5) — THE SERVE CONSULT. See the
-        // sqlite twin for the full rationale, including why `next_cursor` is
-        // computed BEFORE the filter (a fully-withheld page must still advance
-        // the walk) and why pages may come back short.
-        let items =
-            crate::federation::quarantine::filter_withheld_rows(self, items, chrono::Utc::now())
-                .await?;
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Postgres,
-            crate::observe::Door::ListAttestationLog,
-            subject_key_id.unwrap_or("*"),
-            &items,
-            bytes,
-        );
-        Ok(crate::read::ScoresPage { items, next_cursor })
+        crate::federation::read_plan::list_attestation_log_planned(
+            self,
+            subject_key_id,
+            cursor,
+            limit,
+        )
+        .await
     }
 
     async fn record_announced_peer(

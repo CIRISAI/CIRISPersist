@@ -9,6 +9,11 @@
 //! contract.
 
 pub mod backend;
+/// v61 (CIRISPersist#934, S4a) — the `Backend` trait's gated doors (the two
+/// trace erasures, the two fountain writes), decided once, with the
+/// per-backend `BackendStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod backend_plan;
 /// v60.0.0 (CIRISPersist#1002) — the tests the retired memory backend carried, on SQLite.
 #[cfg(all(test, feature = "sqlite"))]
 mod backend_suite;

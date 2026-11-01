@@ -128,6 +128,37 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v61 (CIRISPersist#934, S4a) — the Backend trait's erasure and fountain doors, and the gated directory reads.
+    ("delete_traces_for_agent_planned", Class::Plan),
+    ("delete_traces_for_agent_id_hash_planned", Class::Plan),
+    ("put_fountain_content_planned", Class::Plan),
+    ("put_aggregated_tier_planned", Class::Plan),
+    ("list_scores_planned", Class::Plan),
+    ("resolve_scores_planned", Class::Plan),
+    ("list_attestation_log_planned", Class::Plan),
+    ("list_key_registration_history_planned", Class::Plan),
+    ("list_derived_hex_planned", Class::Plan),
+    // The erasure doors' shared planner (same-file helper of both plans): the attester gate and the erasure plan.
+    ("plan_trace_erasure", Class::Delegates),
+    // The paged reads' bound and cursor-version refusals (caller input).
+    ("check_page_limit", Class::Gate),
+    ("check_cursor_version", Class::Gate),
+    // The fountain columns' width check: a u64 length that does not fit the stored i64 column, the substrate's terms (it was `try_from`, Plumbing, on postgres).
+    ("plan_fountain_content", Class::Plumbing),
+    // The executors (storage only; compared across backends as the `BackendStore` / `ReadPlanStore` traits): the SQL for a typed read or write the plan already decided.
+    ("store_planned_trace_erasure", Class::Plumbing),
+    ("read_scores_page", Class::Plumbing),
+    ("read_score_candidates", Class::Plumbing),
+    ("read_score_composers", Class::Plumbing),
+    ("read_attestation_log_page", Class::Plumbing),
+    ("read_key_registration_history", Class::Plumbing),
+    ("query_attestations", Class::Plumbing),
+    // The erasure executors' string-column collector (a row decode).
+    ("strings", Class::Plumbing),
+    // The erasure's audit event for what moved (`None` when nothing did):
+    // the plan's shared rule, built inside the executor's transaction from its
+    // counts; it refuses nothing.
+    ("audit_event", Class::Plumbing),
     // v61 (CIRISPersist#934, S4a) — the accord evidence doors and the location proof, touch claim and wholeness witness doors.
     ("put_accord_proposal_planned", Class::Plan),
     ("put_accord_participation_planned", Class::Plan),
@@ -1378,7 +1409,10 @@ mod tests {
     /// The traits whose impls are compared, and where each trait's **default**
     /// bodies live. A backend that does not override a defaulted method runs
     /// the default, so the default's gate sequence is what it contributes.
-    const TRAITS: [(&str, &str); 11] = [
+    const TRAITS: [(&str, &str); 13] = [
+        // v61 (CIRISPersist#934, S4a) — the Backend trait's erasure and fountain doors, and the gated directory reads.
+        ("BackendStore", "src/store/backend_plan.rs"),
+        ("ReadPlanStore", "src/federation/read_plan.rs"),
         // v61 (CIRISPersist#934, S4a) — the accord evidence doors and the location proof, touch claim and wholeness witness doors.
         ("AccordStore", "src/federation/accord_admit.rs"),
         ("EvidenceStore", "src/federation/evidence_admit.rs"),
@@ -1404,7 +1438,29 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 30] = [
+    const SHARED_PLANS: [(&str, &str); 39] = [
+        // v61 (CIRISPersist#934, S4a) — the Backend trait's erasure and fountain doors, and the gated directory reads.
+        (
+            "src/store/backend_plan.rs",
+            "delete_traces_for_agent_planned",
+        ),
+        (
+            "src/store/backend_plan.rs",
+            "delete_traces_for_agent_id_hash_planned",
+        ),
+        ("src/store/backend_plan.rs", "put_fountain_content_planned"),
+        ("src/store/backend_plan.rs", "put_aggregated_tier_planned"),
+        ("src/federation/read_plan.rs", "list_scores_planned"),
+        ("src/federation/read_plan.rs", "resolve_scores_planned"),
+        (
+            "src/federation/read_plan.rs",
+            "list_attestation_log_planned",
+        ),
+        (
+            "src/federation/read_plan.rs",
+            "list_key_registration_history_planned",
+        ),
+        ("src/federation/read_plan.rs", "list_derived_hex_planned"),
         // v61 (CIRISPersist#934, S4a) — the accord evidence doors and the location proof, touch claim and wholeness witness doors.
         (
             "src/federation/accord_admit.rs",
@@ -1554,7 +1610,49 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 43] = [
+    const SHARED_DOORS: [(&str, &str, &str); 52] = [
+        // v61 (CIRISPersist#934, S4a) — the Backend trait's erasure and fountain doors, and the gated directory reads.
+        (
+            "Backend",
+            "delete_traces_for_agent",
+            "delete_traces_for_agent_planned",
+        ),
+        (
+            "Backend",
+            "delete_traces_for_agent_id_hash",
+            "delete_traces_for_agent_id_hash_planned",
+        ),
+        (
+            "Backend",
+            "put_fountain_content",
+            "put_fountain_content_planned",
+        ),
+        (
+            "Backend",
+            "put_aggregated_tier",
+            "put_aggregated_tier_planned",
+        ),
+        ("FederationDirectory", "list_scores", "list_scores_planned"),
+        (
+            "FederationDirectory",
+            "resolve_scores",
+            "resolve_scores_planned",
+        ),
+        (
+            "FederationDirectory",
+            "list_attestation_log",
+            "list_attestation_log_planned",
+        ),
+        (
+            "FederationDirectory",
+            "list_key_registration_history",
+            "list_key_registration_history_planned",
+        ),
+        (
+            "FederationDirectory",
+            "list_derived_hex",
+            "list_derived_hex_planned",
+        ),
         // v61 (CIRISPersist#934, S4a) — the accord evidence doors and the location proof, touch claim and wholeness witness doors.
         (
             "FederationDirectory",

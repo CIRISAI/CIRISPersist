@@ -42,7 +42,12 @@ const PORTED: &[(&str, &str, &[&str])] = &[
     (
         "scores-read-log",
         "log_scores_read",
-        &["list_scores", "resolve_scores"],
+        &[
+            "list_scores",
+            "resolve_scores",
+            "list_scores_planned",
+            "resolve_scores_planned",
+        ],
     ),
 ];
 

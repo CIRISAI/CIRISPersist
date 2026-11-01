@@ -239,6 +239,14 @@ pub(crate) enum ConnClass {
 /// and are `Write`.
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
+    // v61 (CIRISPersist#934, S4a) — the Backend doors' and the gated reads'
+    // executors.
+    ("store_planned_trace_erasure", ConnClass::Write),
+    ("store_planned_fountain_content", ConnClass::Write),
+    ("read_attestation_log_page", ConnClass::Read),
+    ("read_key_registration_history", ConnClass::Read),
+    ("read_renditions", ConnClass::Read),
+    ("read_attestations", ConnClass::Read),
     // v61 (CIRISPersist#934, S4a) — the accord and evidence executors:
     // the cursor maxima and the held-proof read are reads; every store is a
     // write (one `self.write`, its transaction inside).
@@ -318,8 +326,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("count_traces", ConnClass::Read),
     ("cross_agent_divergence", ConnClass::Read),
     ("delete_blob", ConnClass::Write),
-    ("delete_traces_for_agent", ConnClass::Write),
-    ("delete_traces_for_agent_id_hash", ConnClass::Write),
     ("enqueue_outbound", ConnClass::Write),
     ("enter_mesh", ConnClass::Write),
     ("evict_fountain_content_hard_delete", ConnClass::Write),
@@ -369,7 +375,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_at_rest_blobs_for_recipients", ConnClass::Read),
     ("list_at_rest_grant_recipients", ConnClass::Read),
     ("list_at_rest_grants", ConnClass::Read),
-    ("list_attestation_log", ConnClass::Read),
     ("list_attestations", ConnClass::Read),
     // v47.2.0 (#853) — composers naming a target, by `references_attestation_id`.
     ("list_attestations_referencing", ConnClass::Read),
@@ -397,10 +402,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_family_membership_widenings_for", ConnClass::Read),
     ("read_consent_peer_rows", ConnClass::Read),
     // v44.6.0 (#857, V147) — the consent_peer_set_for projection read; same class as its twin.
-    ("list_key_registration_history", ConnClass::Read),
     // v45.0.0 (#871) — the rendition index read and the puller's budget
     // read; plain SELECTs on the reader path.
-    ("list_derived_hex", ConnClass::Read),
     // v46.0.0 (#876) — the derivation input is a plain SELECT on the reader
     // path; the repair is a single guarded UPDATE on the writer's.
     ("community_dek_minters_granting", ConnClass::Read),
@@ -435,7 +438,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_outbound", ConnClass::Read),
     ("list_revocations", ConnClass::Read),
     ("list_scope_blob_symbols", ConnClass::Write),
-    ("list_scores", ConnClass::Read),
     ("list_signed_accord_quorum_evidence_since", ConnClass::Read),
     ("list_signed_communities_since", ConnClass::Read),
     (
@@ -513,7 +515,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("peer_metadata_for", ConnClass::Read),
     ("pinned_blob_bytes", ConnClass::Read),
     ("purge_attestation_projections", ConnClass::Write),
-    ("put_aggregated_tier", ConnClass::Write),
     ("put_at_rest_grant", ConnClass::Write),
     ("put_at_rest_grants", ConnClass::Write),
     // #848 §13–§14 (V146, PR #850 review) — the emission ledger and the
@@ -617,7 +618,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_family", ConnClass::Write),
     ("put_family_local", ConnClass::Write),
     ("put_family_membership_revocation", ConnClass::Write),
-    ("put_fountain_content", ConnClass::Write),
     ("put_identity_occurrence", ConnClass::Write),
     ("put_identity_occurrence_local", ConnClass::Write),
     ("put_identity_occurrence_revocation_local", ConnClass::Write),
@@ -650,7 +650,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // schema-history table, run before refinery validates it.
     ("repair_v070_checksum", ConnClass::Write),
     ("replay_abandoned", ConnClass::Write),
-    ("resolve_scores", ConnClass::Read),
     ("revocations_for_subject", ConnClass::Read),
     ("revoke_trust", ConnClass::Write),
     // #845 (I55) — the nine documented steps, in one transaction: a free fn

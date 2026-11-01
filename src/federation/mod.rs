@@ -76,6 +76,11 @@ pub(crate) mod consent_admit;
 /// `EvidenceStore` executor.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) mod evidence_admit;
+/// v61 (CIRISPersist#934, S4a) — the gated directory reads (the scores
+/// reads, the attestation log, the key history, the rendition index), decided
+/// once, with the per-backend `ReadPlanStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod read_plan;
 /// v60.0.0 (CIRISPersist#934 step 4) — the sweeps' selections, decided once:
 /// the PQC sweep's page, the reaper's page, the known-hash eviction report and
 /// the room retention leg, with the per-backend `SweepStore` /
