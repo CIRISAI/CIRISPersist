@@ -78,3 +78,23 @@ M11 is the FK migration itself, not a code mutant; I163 covers it. M9 (the predi
 - A `community` identity type (a room is not a person, and not a key; the planes reference the group table).
 - Retroactive epoch grants to a re-added member (the minter's re-wrap decision).
 - Edge's `widen_community` and Server's #594 routes.
+
+## 7. v61 — the framed group kinds become rows (CIRISPersist#991)
+
+From v61 the group records and the membership planes above are `scores` rows on the attestation plane (CC 3.1.3, CC 3.1.3.2), and each table in this FSD is the rows' projection. The framed wire kinds are in `RETIRED_FRAMED`: they keep their positions in `EnvelopeKind::ALL`, so `REPLICATION_POLICY_HASH` does not move, and an inbound object of one is refused `federation_envelope_kind_retired`. Persist mints each row from the signed object the local `put_*` door verified (`group_plane::plan_group_row`), so producers do not change. A receiver re-derives the row from the object it carries and refuses a row that differs by one byte (`federation_malformed_row`).
+
+| retired kind (position in `ALL`) | the row now | attester → attested | placement | envelope member | projection table |
+|---|---|---|---|---|---|
+| `Family` (4) | `group:roster:v1` | the record's signer → the family | `cohort_scope` `family`, `group_kind` `family`, `family_key_id` | `group_record` (+ `prev_head_digest`, `charter_digest` when the record has them) | `federation_families` |
+| `Community` (5) | `group:roster:v1` | the record's signer → the community | `cohort_scope` `community`, `group_kind` `community`, `community_key_id` | `group_record` (+ `prev_head_digest`, `charter_digest`) | `federation_communities` |
+| `FamilyMembershipRevocation` (7) | `membership:removal:v1`; `membership:resignation:v1` when the removed member signs | the revocation's signer → the member removed | `cohort_scope` `family` | `revocation` | `federation_family_membership_revocations` |
+| `CommunityMembershipRevocation` (8) | `membership:removal:v1`; `membership:resignation:v1` when the removed member signs | the revocation's signer → the member removed | `cohort_scope` `community` | `revocation` | `federation_community_membership_revocations` |
+| `CommunityMembershipWidening` (16) | `membership:widening:v1` | the widening's signer → the member added | `cohort_scope` `community` | `widening` | `federation_community_membership_widenings` |
+| `FamilyMembershipWidening` (17) | `membership:widening:v1` | the widening's signer → the member added | `cohort_scope` `family` | `widening` | `federation_family_membership_widenings` |
+
+How the rows behave:
+
+- **Signatures.** The row's base scrub is the object's authority scrub, over the object's own signed bytes. Its co-signatures ride as `additional_scrubs[]`. The quorum is counted by the one predicate, `reverse_quorum::count_distinct_roster_scrubs`, under the group's `consensus_protocol`.
+- **Carriage.** The rows replicate through `ApplyReplicatedAttestation` and the attestation cursor, through the group's audience (`replication_audience::may_receive_group_plane`). The six `ListSigned*Since` capsule ops and `ApplyReplicatedCommunity` were removed at `DIRECTORY_ABI_VERSION` 12.
+- **Retraction.** A widening or a removal is withdrawn by a `withdraws` cosigned under the group's `consensus_protocol`; one signature short is refused `roster_consensus_insufficient`. A resignation can be withdrawn only by its signer. A `withdraws` of a `group:roster:v1` row would be the group's dissolution, which v61 does not admit: it is refused `group_record_withdraws_refused` with any number of co-signatures. Dissolution arrives with CIRISPersist#1143.
+- **Upgrade.** At open, `rehome_group_records` mints the missing row for every signed v60 projection row, once; Ed25519-only rows are counted and left as they are. I1489 checks the rehome by a from-disk count on both backends. V207 deletes the retired kinds' `signed_wire_index` and `known_wire_hashes` entries.
