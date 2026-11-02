@@ -239,6 +239,9 @@ pub(crate) enum ConnClass {
 /// and are `Write`.
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
+    // v61 (CIRISPersist#934, S4b) — the identity-occurrence executor.
+    ("store_planned_occurrence", ConnClass::Write),
+    ("store_planned_local_occurrence", ConnClass::Write),
     // v61 (CIRISPersist#934, S4b) — the transport-destination executor.
     ("store_planned_destination", ConnClass::Write),
     ("store_planned_signed_destination", ConnClass::Write),
@@ -630,8 +633,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_family", ConnClass::Write),
     ("put_family_local", ConnClass::Write),
     ("put_family_membership_revocation", ConnClass::Write),
-    ("put_identity_occurrence", ConnClass::Write),
-    ("put_identity_occurrence_local", ConnClass::Write),
     ("put_identity_occurrence_revocation_local", ConnClass::Write),
     ("put_installed_storage_budget", ConnClass::Write),
     // v50.0.0 (#928, V157) — the recorded admission depth of a `withdraws`.

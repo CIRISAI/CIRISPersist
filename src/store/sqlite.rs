@@ -4977,288 +4977,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         occurrence: crate::federation::SignedIdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
-        // v14.0.0 (CIRISPersist#418) — verify the hybrid signature over the exact
-        // producer envelope, the signer's authority, and §5.6.8.8.2 C4 key
-        // separation BEFORE any write. ONE gate for HTTP + wire; fail-secure.
-        crate::federation::admission::verify_signed_identity_occurrence(self, &occurrence).await?;
-        // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — a roster change lands by
-        // the two-path door or is held as a proposal.
-        crate::federation::self_roster::gate_occurrence(self, &occurrence).await?;
-        self.rehome_legacy_key_plane().await?;
-
-        let crate::federation::SignedIdentityOccurrence {
-            identity_occurrence: mut row,
-            attesting_key_id,
-            signed_envelope,
-            signature,
-        } = occurrence;
-        // v50.0.0 (CIRISPersist#916) — who, through what, for the re-wrap below.
-        let rewrap_for = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
-        crate::federation::check_device_class(&row.device_class)?;
-        crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let (enc_x25519, enc_ml_kem) = match &row.encryption_pubkeys {
-            Some(k) => (
-                Some(k.x25519_base64.clone()),
-                Some(k.ml_kem_768_base64.clone()),
-            ),
-            None => (None, None),
-        };
-        let signed_envelope_json = serde_json::to_string(&signed_envelope)
-            .map_err(|e| crate::federation::Error::Backend(format!("signed_envelope: {e}")))?;
-        let signature_json = serde_json::to_string(&signature)
-            .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
-        let transport_binding_json = match &row.transport_binding {
-            Some(tb) => Some(serde_json::to_string(tb).map_err(|e| {
-                crate::federation::Error::Backend(format!("transport_binding: {e}"))
-            })?),
-            None => None,
-        };
-        // #446 — materialize the embedded binding into the
-        // `transport_destinations` read model (computed before `row` moves
-        // into the write closure; applied AFTER the write, and ONLY when the
-        // occurrence write actually applied — projecting on a stale no-op
-        // could seed the read model with a binding older than the stored
-        // occurrence).
-        let projected_route = row
-            .transport_binding
-            .as_ref()
-            .map(|tb| tb.project_route(&row.occurrence_key_id, row.asserted_at))
-            .transpose()?;
-        let pair = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
-        let occurrence_applied = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                // Last-signed-wins: UPSERT only when the incoming `asserted_at` is
-                // strictly newer (RFC-3339 UTC sorts lexically == chronologically).
-                // A stale/equal replay is a safe no-op — a poisoned or older signed
-                // row can never overwrite the current one (#418 anti-first-writer).
-                // v36.0.0 (#668) — THIS node's serve position (V130). One
-                // allocation covers both arms: the INSERT stamps it, and the
-                // last-signed-wins DO UPDATE re-stamps it (`excluded.admitted_at`)
-                // because a supersede rewrites the served bytes and must move the
-                // row forward in the stream.
-                let tx = conn.transaction()?;
-                let admitted_at = sqlite_next_plane_position(
-                    &tx,
-                    "federation_identity_occurrences",
-                    POS_ASSERTED,
-                )?;
-                let applied = tx.execute(
-                    "INSERT INTO federation_identity_occurrences (\
-                    identity_key_id, occurrence_key_id, device_class, \
-                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
-                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, \
-                    attesting_key_id, signed_envelope, signature, transport_binding, \
-                    admitted_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
-                 ON CONFLICT(identity_key_id, occurrence_key_id) DO UPDATE SET \
-                    device_class = excluded.device_class, \
-                    hardware_attestation = excluded.hardware_attestation, \
-                    asserted_at = excluded.asserted_at, \
-                    valid_until = excluded.valid_until, \
-                    persist_row_hash = excluded.persist_row_hash, \
-                    pubkey_x25519_base64 = excluded.pubkey_x25519_base64, \
-                    pubkey_ml_kem_768_base64 = excluded.pubkey_ml_kem_768_base64, \
-                    attesting_key_id = excluded.attesting_key_id, \
-                    signed_envelope = excluded.signed_envelope, \
-                    signature = excluded.signature, \
-                    transport_binding = excluded.transport_binding, \
-                    admitted_at = excluded.admitted_at \
-                 WHERE excluded.asserted_at > federation_identity_occurrences.asserted_at",
-                    rusqlite::params![
-                        row.identity_key_id,
-                        row.occurrence_key_id,
-                        row.device_class,
-                        row.hardware_attestation,
-                        row.asserted_at.to_rfc3339(),
-                        row.valid_until.map(|t| t.to_rfc3339()),
-                        row.persist_row_hash,
-                        enc_x25519,
-                        enc_ml_kem,
-                        attesting_key_id,
-                        signed_envelope_json,
-                        signature_json,
-                        transport_binding_json,
-                        admitted_at.to_rfc3339(),
-                    ],
-                )?;
-                // v52.0.0 (#930) — the assertion is history whether or not
-                // the current-state upsert took it (an older verified
-                // assertion still bounded a binding).
-                sqlite_append_occurrence_history(
-                    &tx,
-                    &row.identity_key_id,
-                    &row.occurrence_key_id,
-                    &row.asserted_at,
-                    row.valid_until.as_ref(),
-                    Some(attesting_key_id.as_str()),
-                    Some(signed_envelope_json.as_str()),
-                    Some(signature_json.as_str()),
-                )?;
-                // v58.0.0 (CIRISPersist#991) — the pair's
-                // `identity:occurrence:v1` row follows the current signed
-                // occurrence, in this transaction.
-                sqlite_sync_occurrence_row(&tx, &row.identity_key_id, &row.occurrence_key_id)?;
-                tx.commit()?;
-                Ok(applied)
-            })
-            .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("FOREIGN KEY") {
-                    crate::federation::Error::InvalidArgument(format!(
-                        "FK constraint violated on identity_occurrence insert: {msg}"
-                    ))
-                } else {
-                    crate::federation::Error::Backend(format!("insert identity_occurrence: {msg}"))
-                }
-            })?;
-        if occurrence_applied > 0 {
-            if let Some(route) = &projected_route {
-                crate::federation::transport_routes::project_occurrence_route(self, route).await?;
-            }
-            // v58.0.0 (CIRISPersist#991) — the pair's `identity:occurrence:v1`
-            // row is a wire-index entry too (the Attestation kind).
-            let occurrence_row_id: Option<String> = self
-                .read(move |conn| {
-                    // A schema before V198 (a test's `run_migrations_through`)
-                    // has no pointer: no row to index.
-                    if !sqlite_key_plane_present(conn)? {
-                        return Ok(None);
-                    }
-                    conn.query_row(
-                        "SELECT attestation_id FROM federation_identity_occurrences \
-                          WHERE identity_key_id = ?1 AND occurrence_key_id = ?2",
-                        rusqlite::params![pair.0, pair.1],
-                        |r| r.get::<_, Option<String>>(0),
-                    )
-                    .optional()
-                })
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!("occurrence row pointer: {e}"))
-                })?
-                .flatten();
-            self.index_plane_row(occurrence_row_id.as_deref()).await?;
-        }
-        // v50.0.0 (CIRISPersist#916) — a member's device occurrence arriving
-        // (typically after its owner-binding): this node re-wraps its own
-        // epochs to it. The row stands whatever the re-wrap does.
-        if rewrap_for.0 != rewrap_for.1 {
-            crate::federation::rewrap_after_admission(self, &rewrap_for.0, &rewrap_for.1).await;
-        }
-        Ok(())
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::occurrence_admit::put_identity_occurrence_planned(self, occurrence).await
     }
 
     async fn put_identity_occurrence_local(
         &self,
         occurrence: crate::federation::IdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
-        // #418 — trusted-local (grandfathered) write: NO signature gate, signed
-        // columns NULL. Used only by engine-internal self-writes; never reached
-        // from the replication apply.
-        //
-        // v21.17.1 (CIRISPersist#541) — but its UPSERT rewrote three
-        // envelope-covered columns (`transport_binding`, `pubkey_x25519_base64`,
-        // `pubkey_ml_kem_768_base64`) with NO guard, while the signed columns
-        // survived by omission from the SET. So a later local self-write on a key
-        // that already carries a SIGNED occurrence (e.g. engine.rs's login/DEK
-        // co-admit, which writes `transport_binding: None`) NULLed the binding on
-        // a signed row and kept the signature — `list_signed_identity_occurrences_for`
-        // then replicated a row whose typed columns diverge from its own envelope,
-        // and every peer refused it (`diverges("transport_destination")`), the
-        // same fail-closed blackout as the transport_destination defect. Fixed
-        // structurally: the DO UPDATE now carries `WHERE signature IS NULL`, so a
-        // SIGNED occurrence is authoritative and NEVER mutated by the local writer
-        // (the #446 de-projection updaters' "narrow on purpose" invariant). Unsigned
-        // rows behave exactly as before.
-        let mut row = occurrence;
-        crate::federation::check_device_class(&row.device_class)?;
-        crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let (enc_x25519, enc_ml_kem) = match &row.encryption_pubkeys {
-            Some(k) => (
-                Some(k.x25519_base64.clone()),
-                Some(k.ml_kem_768_base64.clone()),
-            ),
-            None => (None, None),
-        };
-        let transport_binding_json = match &row.transport_binding {
-            Some(tb) => Some(serde_json::to_string(tb).map_err(|e| {
-                crate::federation::Error::Backend(format!("transport_binding: {e}"))
-            })?),
-            None => None,
-        };
-        // #446 — the trusted-local path projects too: it is an ACCEPTED write
-        // (engine-internal self-write), and the invariant is "every stored
-        // occurrence carrying a binding has its route materialized".
-        let projected_route = row
-            .transport_binding
-            .as_ref()
-            .map(|tb| tb.project_route(&row.occurrence_key_id, row.asserted_at))
-            .transpose()?;
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            // v36.0.0 (#668) — serve position (V130); the local upsert stamps
-            // and re-stamps it like the signed door (unsigned rows only —
-            // the `WHERE signature IS NULL` guard is unchanged).
-            let tx = conn.transaction()?;
-            let admitted_at =
-                sqlite_next_plane_position(&tx, "federation_identity_occurrences", POS_ASSERTED)?;
-            tx.execute(
-                "INSERT INTO federation_identity_occurrences (\
-                    identity_key_id, occurrence_key_id, device_class, \
-                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
-                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding, \
-                    admitted_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
-                 ON CONFLICT(identity_key_id, occurrence_key_id) DO UPDATE SET \
-                    device_class = excluded.device_class, \
-                    hardware_attestation = excluded.hardware_attestation, \
-                    asserted_at = excluded.asserted_at, \
-                    valid_until = excluded.valid_until, \
-                    persist_row_hash = excluded.persist_row_hash, \
-                    pubkey_x25519_base64 = excluded.pubkey_x25519_base64, \
-                    pubkey_ml_kem_768_base64 = excluded.pubkey_ml_kem_768_base64, \
-                    transport_binding = excluded.transport_binding, \
-                    admitted_at = excluded.admitted_at \
-                 WHERE federation_identity_occurrences.signature IS NULL",
-                rusqlite::params![
-                    row.identity_key_id,
-                    row.occurrence_key_id,
-                    row.device_class,
-                    row.hardware_attestation,
-                    row.asserted_at.to_rfc3339(),
-                    row.valid_until.map(|t| t.to_rfc3339()),
-                    row.persist_row_hash,
-                    enc_x25519,
-                    enc_ml_kem,
-                    transport_binding_json,
-                    admitted_at.to_rfc3339(),
-                ],
-            )?;
-            // v52.0.0 (#930) — a trusted-local assertion is history too (it
-            // bounds an interval; it is never agreement).
-            sqlite_append_occurrence_history(
-                &tx,
-                &row.identity_key_id,
-                &row.occurrence_key_id,
-                &row.asserted_at,
-                row.valid_until.as_ref(),
-                None,
-                None,
-                None,
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("put_identity_occurrence_local: {e}"))
-        })?;
-        if let Some(route) = &projected_route {
-            crate::federation::transport_routes::project_occurrence_route(self, route).await?;
-        }
-        Ok(())
+        crate::federation::occurrence_admit::put_identity_occurrence_local_planned(self, occurrence)
+            .await
     }
 
     async fn list_identity_occurrences_for(
@@ -25833,6 +25561,222 @@ impl crate::federation::transport_admit::TransportStore for SqliteBackend {
     }
 }
 
+/// v61 (CIRISPersist#934, S4b) — the identity-occurrence executor on sqlite.
+/// Storage only: the decisions are `federation::occurrence_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::occurrence_admit::OccurrenceStore for SqliteBackend {
+    async fn rehome_key_plane_before_write(&self) -> Result<(), crate::federation::Error> {
+        self.rehome_legacy_key_plane().await
+    }
+
+    async fn store_planned_occurrence(
+        &self,
+        planned: crate::federation::occurrence_admit::PlannedOccurrence,
+    ) -> Result<crate::federation::occurrence_admit::OccurrenceWrite, crate::federation::Error>
+    {
+        let crate::federation::occurrence_admit::PlannedOccurrence {
+            row,
+            enc_x25519,
+            enc_ml_kem,
+            transport_binding_json,
+            signed,
+        } = planned;
+        let signed = signed.ok_or_else(|| {
+            crate::federation::Error::Backend("store_planned_occurrence: no signature".into())
+        })?;
+        let attesting_key_id = signed.attesting_key_id;
+        let signed_envelope_json = serde_json::to_string(&signed.signed_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("signed_envelope: {e}")))?;
+        let signature_json = signed.signature_json;
+        let pair = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
+        let applied =
+            self.write(move |conn| -> Result<usize, rusqlite::Error> {
+                // Last-signed-wins: UPSERT only when the incoming `asserted_at` is
+                // strictly newer (RFC-3339 UTC sorts lexically == chronologically).
+                // A stale/equal replay is a safe no-op (#418 anti-first-writer).
+                // v36.0.0 (#668) — THIS node's serve position (V130): the INSERT
+                // stamps it and a supersede re-stamps it.
+                let tx = conn.transaction()?;
+                let admitted_at = sqlite_next_plane_position(
+                    &tx,
+                    "federation_identity_occurrences",
+                    POS_ASSERTED,
+                )?;
+                let applied = tx.execute(
+                    "INSERT INTO federation_identity_occurrences (\
+                    identity_key_id, occurrence_key_id, device_class, \
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, \
+                    attesting_key_id, signed_envelope, signature, transport_binding, \
+                    admitted_at\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+                 ON CONFLICT(identity_key_id, occurrence_key_id) DO UPDATE SET \
+                    device_class = excluded.device_class, \
+                    hardware_attestation = excluded.hardware_attestation, \
+                    asserted_at = excluded.asserted_at, \
+                    valid_until = excluded.valid_until, \
+                    persist_row_hash = excluded.persist_row_hash, \
+                    pubkey_x25519_base64 = excluded.pubkey_x25519_base64, \
+                    pubkey_ml_kem_768_base64 = excluded.pubkey_ml_kem_768_base64, \
+                    attesting_key_id = excluded.attesting_key_id, \
+                    signed_envelope = excluded.signed_envelope, \
+                    signature = excluded.signature, \
+                    transport_binding = excluded.transport_binding, \
+                    admitted_at = excluded.admitted_at \
+                 WHERE excluded.asserted_at > federation_identity_occurrences.asserted_at",
+                    rusqlite::params![
+                        row.identity_key_id,
+                        row.occurrence_key_id,
+                        row.device_class,
+                        row.hardware_attestation,
+                        row.asserted_at.to_rfc3339(),
+                        row.valid_until.map(|t| t.to_rfc3339()),
+                        row.persist_row_hash,
+                        enc_x25519,
+                        enc_ml_kem,
+                        attesting_key_id,
+                        signed_envelope_json,
+                        signature_json,
+                        transport_binding_json,
+                        admitted_at.to_rfc3339(),
+                    ],
+                )?;
+                // v52.0.0 (#930) — the assertion is history whether or not the
+                // current-state upsert took it.
+                sqlite_append_occurrence_history(
+                    &tx,
+                    &row.identity_key_id,
+                    &row.occurrence_key_id,
+                    &row.asserted_at,
+                    row.valid_until.as_ref(),
+                    Some(attesting_key_id.as_str()),
+                    Some(signed_envelope_json.as_str()),
+                    Some(signature_json.as_str()),
+                )?;
+                // v58.0.0 (#991) — the pair's `identity:occurrence:v1` row
+                // follows the current signed occurrence, in this transaction.
+                sqlite_sync_occurrence_row(&tx, &row.identity_key_id, &row.occurrence_key_id)?;
+                tx.commit()?;
+                Ok(applied)
+            })
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("FOREIGN KEY") {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "FK constraint violated on identity_occurrence insert: {msg}"
+                    ))
+                } else {
+                    crate::federation::Error::Backend(format!("insert identity_occurrence: {msg}"))
+                }
+            })? > 0;
+        if !applied {
+            return Ok(crate::federation::occurrence_admit::OccurrenceWrite {
+                applied,
+                row_id: None,
+            });
+        }
+        let row_id: Option<String> = self
+            .read(move |conn| {
+                // A schema before V198 (a test's `run_migrations_through`) has
+                // no pointer: no row to index.
+                if !sqlite_key_plane_present(conn)? {
+                    return Ok(None);
+                }
+                conn.query_row(
+                    "SELECT attestation_id FROM federation_identity_occurrences \
+                      WHERE identity_key_id = ?1 AND occurrence_key_id = ?2",
+                    rusqlite::params![pair.0, pair.1],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("occurrence row pointer: {e}")))?
+            .flatten();
+        Ok(crate::federation::occurrence_admit::OccurrenceWrite { applied, row_id })
+    }
+
+    async fn store_planned_local_occurrence(
+        &self,
+        planned: crate::federation::occurrence_admit::PlannedOccurrence,
+    ) -> Result<(), crate::federation::Error> {
+        // #418 / v21.17.1 (#541) — the trusted-local upsert never mutates a
+        // SIGNED occurrence (`WHERE signature IS NULL`): a local self-write
+        // NULLing an envelope-covered column on a signed row replicated a row
+        // diverging from its own envelope.
+        let crate::federation::occurrence_admit::PlannedOccurrence {
+            row,
+            enc_x25519,
+            enc_ml_kem,
+            transport_binding_json,
+            ..
+        } = planned;
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            // v36.0.0 (#668) — serve position (V130), unsigned rows only.
+            let tx = conn.transaction()?;
+            let admitted_at =
+                sqlite_next_plane_position(&tx, "federation_identity_occurrences", POS_ASSERTED)?;
+            tx.execute(
+                "INSERT INTO federation_identity_occurrences (\
+                    identity_key_id, occurrence_key_id, device_class, \
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding, \
+                    admitted_at\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT(identity_key_id, occurrence_key_id) DO UPDATE SET \
+                    device_class = excluded.device_class, \
+                    hardware_attestation = excluded.hardware_attestation, \
+                    asserted_at = excluded.asserted_at, \
+                    valid_until = excluded.valid_until, \
+                    persist_row_hash = excluded.persist_row_hash, \
+                    pubkey_x25519_base64 = excluded.pubkey_x25519_base64, \
+                    pubkey_ml_kem_768_base64 = excluded.pubkey_ml_kem_768_base64, \
+                    transport_binding = excluded.transport_binding, \
+                    admitted_at = excluded.admitted_at \
+                 WHERE federation_identity_occurrences.signature IS NULL",
+                rusqlite::params![
+                    row.identity_key_id,
+                    row.occurrence_key_id,
+                    row.device_class,
+                    row.hardware_attestation,
+                    row.asserted_at.to_rfc3339(),
+                    row.valid_until.map(|t| t.to_rfc3339()),
+                    row.persist_row_hash,
+                    enc_x25519,
+                    enc_ml_kem,
+                    transport_binding_json,
+                    admitted_at.to_rfc3339(),
+                ],
+            )?;
+            // v52.0.0 (#930) — a trusted-local assertion is history too.
+            sqlite_append_occurrence_history(
+                &tx,
+                &row.identity_key_id,
+                &row.occurrence_key_id,
+                &row.asserted_at,
+                row.valid_until.as_ref(),
+                None,
+                None,
+                None,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("put_identity_occurrence_local: {e}"))
+        })
+    }
+
+    async fn index_occurrence_row(
+        &self,
+        row_id: Option<&str>,
+    ) -> Result<(), crate::federation::Error> {
+        self.index_plane_row(row_id).await
+    }
+}
+
 /// v61 (CIRISPersist#934) — the accord evidence executor on sqlite.
 /// Storage only: the decisions are `federation::accord_admit`'s.
 #[async_trait::async_trait]
@@ -40068,10 +40012,11 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_put_attestation_structural_dedup_silent_noop_on_replay() {
-        // CEG 0.2 §6.1 — a second `withdraws` with the same triple
-        // `(references_attestation_id, attestation_type,
-        // attesting_key_id)` is a silent no-op. The audit chain has
-        // ONE row, not two.
+        // v61 (CIRISPersist#1157, CC rc14 3.1.9.4) — a composer is
+        // idempotent on the ROW: a second `withdraws` with the same triple
+        // `(references_attestation_id, attestation_type, attesting_key_id)`
+        // under a different id is a DISTINCT row, stored and ranked at read
+        // time; an exact re-put of the first is the silent no-op.
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         for k in ["registry-steward", "k-a"] {
@@ -40102,31 +40047,36 @@ mod tests {
         w2.asserted_at = "2026-05-02T00:00:00Z".parse().unwrap();
         crate::federation::tier_ingest::test_support::reseal(&mut w2);
         backend
-            .put_attestation(SignedAttestation { attestation: w1 })
+            .put_attestation(SignedAttestation {
+                attestation: w1.clone(),
+            })
             .await
             .unwrap();
         backend
             .put_attestation(SignedAttestation { attestation: w2 })
             .await
             .unwrap();
+        backend
+            .put_attestation(SignedAttestation { attestation: w1 })
+            .await
+            .expect("an exact re-put of a held composer is the silent no-op");
         let rows = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(
             &backend,
             "registry-steward",
         )
         .await
         .unwrap();
-        let withdraws_rows: Vec<_> = rows
+        let mut withdraws_ids: Vec<_> = rows
             .iter()
             .filter(|r| r.attestation_type == crate::federation::types::attestation_type::WITHDRAWS)
+            .map(|r| r.attestation_id.as_str())
             .collect();
+        withdraws_ids.sort_unstable();
         assert_eq!(
-            withdraws_rows.len(),
-            1,
-            "second withdraws with same triple should be a silent no-op"
+            withdraws_ids,
+            vec!["w-1", "w-2"],
+            "the distinct same-triple withdraws is stored; the exact re-put adds nothing"
         );
-        // First write wins on attestation_id (the second was silently
-        // discarded).
-        assert_eq!(withdraws_rows[0].attestation_id, "w-1");
     }
 
     #[tokio::test]
