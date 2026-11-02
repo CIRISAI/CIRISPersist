@@ -17,7 +17,7 @@
 //!
 //! # Drift control
 //!
-//! CC publishes `manifests/namespace_match_vectors.json` — 1244 dimensions (rc14) with
+//! CC publishes `manifests/namespace_match_vectors.json` — 1244 dimensions (rc15) with
 //! the family each resolves to and the refusal each earns — and requires every
 //! consumer to replay them against its own matcher, "so a matcher that drifts
 //! from this one fails a build, not a card". The file is vendored byte-for-byte
@@ -1020,7 +1020,7 @@ mod tests {
         assert_eq!(
             vs.len(),
             1244,
-            "the rc14 vectors file (v1.0-rc14) carries 1244 dimension vectors (rc12: 1236; \
+            "the rc15 vectors file (v1.0-rc15) carries 1244 dimension vectors (rc14: 1244, rc12: 1236; \
              the evidence family adds eight)"
         );
         let oracle: serde_json::Value = serde_json::from_str(BINDS_JSON).unwrap();

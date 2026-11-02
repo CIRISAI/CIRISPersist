@@ -24,7 +24,7 @@ were not checked: `cosign` is not on PATH here.
 The fourth asset, `csd4-topology_vocabulary.json` (sha256 `871c5dfa…`), is not
 copied here: the vocabulary is the Constitution's, vendored at the CC tag in
 `src/federation/namespace/topology_vocabulary.json`. The release asset is
-byte-identical to CC `v1.0-rc12`'s vocabulary. Persist now vendors `v1.0-rc14`,
+byte-identical to CC `v1.0-rc12`'s vocabulary. Persist now vendors `v1.0-rc15`,
 whose vocabulary is v6 (`c37f6f96…`), and no tagged CIRISServer release carries
 a CSD/4 v6 catalogue yet, so these fixtures stay at `v0.5.234`. I1301
 (`namespace::cc_manifests`) asserts that `topology_vocabulary.pin` names the

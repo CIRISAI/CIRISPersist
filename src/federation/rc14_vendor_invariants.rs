@@ -1,16 +1,18 @@
-//! v61 S1 (step 5) — **I1499: the CC v1.0-rc14 text persist does not
-//! build in this slice**, each named with its ticket.
+//! v61 S1 (step 5) — **I1499: the CC text persist does not build in this
+//! slice**, each named with its ticket. Written at the rc14 re-vendor
+//! (`b4da527`, which contains rc13); the rc15 re-vendor (`ace6b74`) adds the
+//! audience rule's claim (CC 2.1, CIRISPersist#1161).
 //!
-//! The rc14 re-vendor (`b4da527`, which contains rc13) brings text whose
-//! doors are later work: v61 S2/S3, or v62. Persist vendors the bytes and
+//! The re-vendors bring text whose doors are later work: v61 S2/S3, or v62. Persist vendors the bytes and
 //! builds none of it here. A divergence that only lives in prose rots, so
 //! every one is a row of [`NOT_BUILT`], and I1499 holds it as a latch both
 //! ways:
 //!
-//! - **CC side.** Each row's anchor is a phrase of CC's
-//!   `constitution/part_3_the_namespace.md` at the tag. When a
-//!   CIRISConstitution checkout is present, the tag's file must hash to
-//!   [`VENDORED_SOURCE_SHA256`] and carry every anchor. Without the checkout
+//! - **CC side.** Each row's anchor is a phrase of the CC part its section
+//!   lives in (`part_2_the_grammar.md` for 2.x, `part_3_the_namespace.md` for
+//!   3.x) at the tag. When a CIRISConstitution checkout is present, part 3
+//!   must hash to [`VENDORED_SOURCE_SHA256`] and every anchor must be in its
+//!   part. Without the checkout
 //!   it skips, saying so, like I1302.
 //! - **Persist side.** A row that names a CC claim id: `evidence/cc_impl.tsv`
 //!   carries no row for it. The cut that builds the door adds its evidence
@@ -35,7 +37,8 @@ enum NotYet {
     TextOnly,
 }
 
-/// `(CC section, anchor in part 3 at the tag, ticket, when, persist-side check)`.
+/// `(CC section, anchor in that section's part at the tag, ticket, when,
+/// persist-side check)`.
 const NOT_BUILT: &[(&str, &str, &str, &str, NotYet)] = &[
     (
         "3.1.3",
@@ -114,7 +117,7 @@ mod tests {
     /// that cut.
     #[test]
     fn i1499_the_rc14_text_not_built_here_is_not_built() {
-        assert_eq!(VENDORED_CC_VERSION, "1.0-rc14", "the table is rc14's");
+        assert_eq!(VENDORED_CC_VERSION, "1.0-rc15", "the table is read at rc15");
         let tsv = std::fs::read_to_string(root().join("evidence/cc_impl.tsv")).expect("cc_impl");
         let claims: Vec<&str> = tsv
             .lines()
@@ -178,8 +181,8 @@ mod tests {
 
     /// **I1499 (CC side)** — every anchor is the tag's text: with a
     /// CIRISConstitution checkout carrying `v<VENDORED_CC_VERSION>`, its part 3
-    /// hashes to [`VENDORED_SOURCE_SHA256`] and carries every anchor. Skips,
-    /// saying so, without the checkout or the tag.
+    /// hashes to [`VENDORED_SOURCE_SHA256`] and every anchor is in its
+    /// section's part. Skips, saying so, without the checkout or the tag.
     #[test]
     fn i1499_every_anchor_is_the_tags_text_when_cc_is_present() {
         let tag = format!("v{VENDORED_CC_VERSION}");
@@ -189,32 +192,41 @@ mod tests {
             );
             return;
         };
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args([
-                "show",
-                &format!("{tag}:constitution/part_3_the_namespace.md"),
-            ])
-            .output()
-            .expect("git runs");
-        if !out.status.success() {
+        let show = |part: &str| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["show", &format!("{tag}:constitution/{part}")])
+                .output()
+                .expect("git runs");
+            out.status.success().then_some(out.stdout)
+        };
+        let Some(part3) = show("part_3_the_namespace.md") else {
             eprintln!("I1499: {repo:?} carries no {tag} part 3 — SKIPPED (fetch the tags)");
             return;
-        }
+        };
         assert_eq!(
-            hex::encode(Sha256::digest(&out.stdout)),
+            hex::encode(Sha256::digest(&part3)),
             VENDORED_SOURCE_SHA256,
             "part 3 at {tag} is not the source the registry was generated from"
         );
-        let text = String::from_utf8(out.stdout).expect("utf-8");
+        let part2 = show("part_2_the_grammar.md").expect("the tag carries part 2");
         for (section, anchor, ticket, _, _) in NOT_BUILT {
+            let text = match section.split('.').next() {
+                Some("2") => &part2,
+                Some("3") => &part3,
+                other => panic!("I1499: no CC part is mapped for section {section} ({other:?})"),
+            };
+            let text = std::str::from_utf8(text).expect("utf-8");
             assert!(
                 text.contains(anchor),
                 "I1499: CC {section} at {tag} no longer says {anchor:?} ({ticket}): the \
                  divergence moved; re-read the text and the line"
             );
         }
-        eprintln!("I1499: {} anchors in {tag} part 3: RAN", NOT_BUILT.len());
+        eprintln!(
+            "I1499: {} anchors in {tag} parts 2 and 3: RAN",
+            NOT_BUILT.len()
+        );
     }
 }

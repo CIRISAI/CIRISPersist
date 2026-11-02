@@ -14,7 +14,7 @@
 //!   one-element set `["retain"]` denotes: every scope reader answers the same
 //!   for both forms, and the stored envelope keeps the bare token (signed
 //!   bytes are never normalised).
-//! - **I1494 (the 13 vectors)** — CC's `signed_object_vectors.json` at the
+//! - **I1494 (the 14 vectors)** — CC's `signed_object_vectors.json` at the
 //!   vendored tag, replayed: each admit vector's signed row (and each recipe's
 //!   reconstructed one) admits with its published content hash, and each
 //!   refuse vector is refused with the persist token its CC refusal names.
@@ -234,7 +234,7 @@ pub(crate) mod bodies {
         );
     }
 
-    // ─── I1494 — CC's 13 signed-object vectors ─────────────────────────────
+    // ─── I1494 — CC's 14 signed-object vectors ─────────────────────────────
 
     const VECTORS: &str = include_str!("namespace/signed_object_vectors.json");
 
@@ -309,10 +309,12 @@ pub(crate) mod bodies {
     /// The community a vector's row is scoped to, held here with `member`
     /// seated from before the vectors' instants, so the cohort-standing gate
     /// has a roster to read.
+    /// Hold the community `community_key_id` with `members` seated from
+    /// before the vectors' instants, each cosigning the founding record.
     async fn hold_community(
         d: &dyn FederationDirectory,
         community_key_id: &str,
-        member: &VectorKey,
+        members: &[&VectorKey],
     ) {
         let from = "2026-10-01T00:00:00Z"
             .parse::<chrono::DateTime<chrono::Utc>>()
@@ -323,25 +325,33 @@ pub(crate) mod bodies {
             charter_digest: String::new(),
             community_key_id: community_key_id.to_owned(),
             community_name: "I1494 ward".into(),
-            members: vec![crate::federation::types::CommunityMember {
-                key_id: member.key_id.clone(),
-                joined_at: from,
-                role: None,
-            }],
+            members: members
+                .iter()
+                .map(|m| crate::federation::types::CommunityMember {
+                    key_id: m.key_id.clone(),
+                    joined_at: from,
+                    role: None,
+                })
+                .collect(),
             founded_at: from,
             consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY.into(),
             policy_blob: None,
             persist_row_hash: String::new(),
         };
         let mut signed = ts::sign_community(community_key_id, community);
-        // The member's founding cosignature, by the vector key's own pen.
+        // Each member's founding cosignature, by the vector key's own pen.
         let envelope = signed.community.signing_envelope();
-        let (_, classical, pqc) = ts::sign_envelope_with(&member.ed, &member.mldsa, &envelope);
-        signed.cosignatures = vec![crate::federation::types::RosterCosignature {
-            authority_key_id: member.key_id.clone(),
-            scrub_signature_classical: classical,
-            scrub_signature_pqc: pqc,
-        }];
+        signed.cosignatures = members
+            .iter()
+            .map(|m| {
+                let (_, classical, pqc) = ts::sign_envelope_with(&m.ed, &m.mldsa, &envelope);
+                crate::federation::types::RosterCosignature {
+                    authority_key_id: m.key_id.clone(),
+                    scrub_signature_classical: classical,
+                    scrub_signature_pqc: pqc,
+                }
+            })
+            .collect();
         d.put_community(signed)
             .await
             .unwrap_or_else(|e| panic!("I1494: hold community {community_key_id}: {e}"));
@@ -392,6 +402,13 @@ pub(crate) mod bodies {
             .and_then(serde_json::Value::as_str)
             .and_then(|t| t.parse().ok())
             .unwrap_or_else(ms_now);
+        // The typed `expires_at` twins the signed member (rc15's
+        // `refuse_subject_outside_audience` carries one; a row whose column
+        // and envelope disagree is `typed_diverges_from_envelope`).
+        r.expires_at = envelope
+            .get("expires_at")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|t| t.parse().ok());
         r.scrub_timestamp = r.asserted_at;
         r.pqc_completed_at = Some(r.asserted_at);
         let (och, sc, sp) = ts::sign_envelope_with(&signer.ed, &signer.mldsa, envelope);
@@ -450,8 +467,10 @@ pub(crate) mod bodies {
     ///   `named_subject` arm (AV-84, CIRISPersist#592). CC re-minted the vector
     ///   on rc13 (`6054a03`): the producer is in `attested_key_id`, so the
     ///   `attested_party` arm no longer fires, but the third party stays in
-    ///   `subject_key_ids`, and CC 2.1 (rc14) admits a targeted row naming
-    ///   "the party it is about in `subject_key_ids`". Persist refuses any
+    ///   `subject_key_ids`, and CC 2.1 admits a targeted row naming "the party
+    ///   it is about in `subject_key_ids`" when that party is within the row's
+    ///   audience (rc15: the vector seats alice and bob at `asserted_at`, and
+    ///   its twin `refuse_subject_outside_audience` seats alice alone). Persist refuses any
     ///   foreign subject at a targeted scope (subject-naming is the
     ///   revocability-authority surface). Measured at the rc14 re-vendor. Ruled
     ///   for v61 S1: the arm stays (a security property); it is decided in S2
@@ -464,7 +483,7 @@ pub(crate) mod bodies {
             "scores_subject_and_scope",
             "federation_cohort_standing_refused",
             "persist refuses a targeted-cohort row whose subject_key_ids names a party other \
-             than its producer (AV-84 named_subject, CIRISPersist#592); CC 2.1 at rc14 admits \
+             than its producer (AV-84 named_subject, CIRISPersist#592); CC 2.1 at rc15 admits \
              it, and the rc13 re-mint (6054a03) moved only attested_key_id; decided in S2 with \
              CIRISPersist#1161",
         ),
@@ -487,6 +506,10 @@ pub(crate) mod bodies {
             r if r.starts_with("cohort_scope not in the closed set") => {
                 "federation_cohort_scope_rejected"
             }
+            // rc15 (CC 2.1, CLM-subject-within-audience) — the audience rule's
+            // token. Persist does not emit it until CIRISPersist#1161 (v61
+            // S2) replaces AV-84's named_subject arm.
+            "subject_outside_audience" => "subject_outside_audience",
             r if r.starts_with("subject_key_ids element malformed") => {
                 malformed_row::SUBJECT_KEY_ID_MALFORMED
             }
@@ -569,7 +592,7 @@ pub(crate) mod bodies {
         );
     }
 
-    /// **I1494** — the 13 vectors. Each runs on a fresh store from
+    /// **I1494** — the 14 vectors. Each runs on a fresh store from
     /// `fresh()`, because two vectors share an attestation id over different
     /// bytes.
     pub(crate) async fn i1494_the_signed_object_vectors<D, F, Fut>(fresh: F)
@@ -582,11 +605,31 @@ pub(crate) mod bodies {
         let a = vector_key(&doc["keys"]["A"]);
         let b = vector_key(&doc["keys"]["B"]);
         let vectors = doc["vectors"].as_array().expect("vectors");
-        assert_eq!(vectors.len(), 13, "CC publishes 13 signed-object vectors");
+        assert_eq!(
+            vectors.len(),
+            14,
+            "CC publishes 14 signed-object vectors (rc15)"
+        );
         let minimal = vectors
             .iter()
             .find(|v| v["name"] == "scores_minimal")
             .expect("scores_minimal");
+        // rc15 (CC 2.1) — the members a vector seats in its cohort at
+        // `asserted_at` (`audience.members_at_asserted_at`); a vector that
+        // states no audience seats its signer alone, as before.
+        let audience = |v: &serde_json::Value| -> Vec<&VectorKey> {
+            match v["audience"]["members_at_asserted_at"].as_array() {
+                None => vec![&a],
+                Some(ids) => ids
+                    .iter()
+                    .map(|id| match id.as_str() {
+                        Some(k) if k == a.key_id => &a,
+                        Some(k) if k == b.key_id => &b,
+                        other => panic!("I1494: audience member {other:?} is no vector key"),
+                    })
+                    .collect(),
+            }
+        };
         // (vector, what CC expects, what persist did) — `None` is "admitted".
         let mut outcomes: Vec<(String, Option<&'static str>, Option<String>)> = Vec::new();
         for v in vectors {
@@ -603,7 +646,7 @@ pub(crate) mod bodies {
                     }
                     let row = published_row(&v["row"]);
                     if let Some(c) = row.attestation_envelope["community_id"].as_str() {
-                        hold_community(&d, c, &a).await;
+                        hold_community(&d, c, &audience(v)).await;
                     }
                     let (_, sc, _) =
                         ts::sign_envelope_with(&a.ed, &a.mldsa, &row.attestation_envelope);
@@ -636,6 +679,14 @@ pub(crate) mod bodies {
                         Some(published) => published_row(published),
                         None => row_for(&v["envelope"], &a),
                     };
+                    // rc15: a refuse vector that states its audience is
+                    // replayed against that audience (refuse_subject_outside_
+                    // audience: bob is NOT seated).
+                    if v.get("audience").is_some() {
+                        if let Some(c) = row.attestation_envelope["community_id"].as_str() {
+                            hold_community(&d, c, &audience(v)).await;
+                        }
+                    }
                     (Some(persist_token_for(cc)), row)
                 }
                 other => panic!("I1494 {name}: unknown vector kind {other:?}"),
@@ -646,7 +697,7 @@ pub(crate) mod bodies {
                 .map(|e| format!("{}: {e}", token_of(&e)));
             outcomes.push((name.to_owned(), expected, actual));
         }
-        assert_eq!(outcomes.len(), 13, "I1494: every vector ran");
+        assert_eq!(outcomes.len(), 14, "I1494: every vector ran");
         let token = |actual: &Option<String>| {
             actual
                 .as_deref()

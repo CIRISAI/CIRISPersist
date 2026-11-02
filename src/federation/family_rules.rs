@@ -234,7 +234,7 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
         gap: RowRuleGap::NoRuleOnTheRow,
         minted_by_persist: false,
         cc_ask: "none outstanding: CC rc12 registers the row with this rule \
-                 (cadd5a9, CIRISConstitution#188); vendored at the v1.0-rc14 tag",
+                 (cadd5a9, CIRISConstitution#188); vendored at the v1.0-rc15 tag",
     },
     // v38.7.0 (CIRISPersist#782) — the session-claim plane. CC has not ruled
     // on `session:` yet, so persist states a rule the row does not carry and
