@@ -41476,10 +41476,11 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_put_attestation_structural_dedup_silent_noop_on_replay() {
-        // CEG 0.2 §6.1 — a second `withdraws` with the same triple
-        // `(references_attestation_id, attestation_type,
-        // attesting_key_id)` is a silent no-op. The audit chain has
-        // ONE row, not two.
+        // v61 (CIRISPersist#1157, CC rc14 3.1.9.4) — a composer is
+        // idempotent on the ROW: a second `withdraws` with the same triple
+        // `(references_attestation_id, attestation_type, attesting_key_id)`
+        // under a different id is a DISTINCT row, stored and ranked at read
+        // time; an exact re-put of the first is the silent no-op.
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         for k in ["registry-steward", "k-a"] {
@@ -41510,31 +41511,36 @@ mod tests {
         w2.asserted_at = "2026-05-02T00:00:00Z".parse().unwrap();
         crate::federation::tier_ingest::test_support::reseal(&mut w2);
         backend
-            .put_attestation(SignedAttestation { attestation: w1 })
+            .put_attestation(SignedAttestation {
+                attestation: w1.clone(),
+            })
             .await
             .unwrap();
         backend
             .put_attestation(SignedAttestation { attestation: w2 })
             .await
             .unwrap();
+        backend
+            .put_attestation(SignedAttestation { attestation: w1 })
+            .await
+            .expect("an exact re-put of a held composer is the silent no-op");
         let rows = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(
             &backend,
             "registry-steward",
         )
         .await
         .unwrap();
-        let withdraws_rows: Vec<_> = rows
+        let mut withdraws_ids: Vec<_> = rows
             .iter()
             .filter(|r| r.attestation_type == crate::federation::types::attestation_type::WITHDRAWS)
+            .map(|r| r.attestation_id.as_str())
             .collect();
+        withdraws_ids.sort_unstable();
         assert_eq!(
-            withdraws_rows.len(),
-            1,
-            "second withdraws with same triple should be a silent no-op"
+            withdraws_ids,
+            vec!["w-1", "w-2"],
+            "the distinct same-triple withdraws is stored; the exact re-put adds nothing"
         );
-        // First write wins on attestation_id (the second was silently
-        // discarded).
-        assert_eq!(withdraws_rows[0].attestation_id, "w-1");
     }
 
     #[tokio::test]

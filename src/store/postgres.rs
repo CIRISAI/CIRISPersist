@@ -43566,16 +43566,27 @@ mod tests {
         w2.asserted_at += chrono::Duration::seconds(60);
         crate::federation::tier_ingest::test_support::reseal(&mut w2);
         w2.scrub_timestamp = w2.asserted_at;
+        // v61 (CIRISPersist#1157, CC rc14 3.1.9.4) — a composer is
+        // idempotent on the ROW: the same triple under a different id is a
+        // distinct row (stored, ranked at read time); an exact re-put of the
+        // first is the silent no-op.
+        let w2_id = w2.attestation_id.clone();
         backend
-            .put_attestation(crate::federation::SignedAttestation { attestation: w1 })
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: w1.clone(),
+            })
             .await
             .unwrap();
         backend
             .put_attestation(crate::federation::SignedAttestation { attestation: w2 })
             .await
             .unwrap();
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: w1 })
+            .await
+            .expect("an exact re-put of a held composer is the silent no-op");
         let rows = backend.all_attestations_by(&steward).await.unwrap();
-        let withdraws_for_upstream: Vec<_> = rows
+        let mut withdraws_for_upstream: Vec<_> = rows
             .iter()
             .filter(|r| {
                 r.attestation_type == crate::federation::types::attestation_type::WITHDRAWS
@@ -43583,13 +43594,15 @@ mod tests {
                         &r.attestation_envelope,
                     ) == Some(upstream.as_str())
             })
+            .map(|r| r.attestation_id.clone())
             .collect();
+        withdraws_for_upstream.sort_unstable();
+        let mut want = vec![w1_id, w2_id];
+        want.sort_unstable();
         assert_eq!(
-            withdraws_for_upstream.len(),
-            1,
-            "duplicate triple should be silent no-op"
+            withdraws_for_upstream, want,
+            "the distinct same-triple withdraws is stored; the exact re-put adds nothing"
         );
-        assert_eq!(withdraws_for_upstream[0].attestation_id, w1_id);
     }
 
     #[tokio::test]

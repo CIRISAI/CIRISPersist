@@ -193,6 +193,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // `held_owner`'s reads (Plumbing: a held-state lookup that fails only on
     // the store's terms) and its axis decode (`sha_of`, Gate: a malformed
     // hex digest on the caller's axis is refused).
+    // v61 (CIRISPersist#1148) — the host's declared node key (an infallible
+    // read of configuration; `None` keeps the pre-v61 behaviour, the host
+    // gating, which is why it is not the fail-open direction for a node that
+    // has declared itself).
+    ("node_key_id", Class::Plumbing),
     ("blob_provenance", Class::Plumbing),
     ("stream_key_state", Class::Plumbing),
     ("sha_of", Class::Gate),
@@ -647,6 +652,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_trust_root_at_door", Class::Gate),
     ("check_consensus_protocol_form", Class::Gate),
     ("check_family_consensus_protocol_form", Class::Gate),
+    // v61 (CIRISPersist#1148) — the typed replicated record door's audience
+    // precondition: it refuses a record this node may not receive.
+    ("may_receive_community_record", Class::Gate),
     ("check_content_hash_hex", Class::Gate),
     ("check_delegated_duty_scores_admission", Class::Gate),
     // v60.0.0 (CIRISPersist#803) — the `takedown_notice:{basis}:v1` row's
