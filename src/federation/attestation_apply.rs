@@ -121,6 +121,14 @@ pub enum AttestationRefusalReason {
     /// held object that differs); the door's own reason is logged with the
     /// row id. APPENDED.
     GroupPlaneRefused,
+    /// v61 (CIRISPersist#1148) — THIS node is not in the row's audience
+    /// ([`super::replication_audience::may_receive`] for this node's own key,
+    /// [`super::FederationDirectory::node_key_id`]): a replicated door stores
+    /// only what this node may receive, so a canonical that joins no private
+    /// community holds no trace of one, whichever peer pushes it. RETRYABLE:
+    /// the audience can widen (the node's owner joins, the membership plane
+    /// arrives), and a re-offer then lands. APPENDED.
+    NotInAudience,
 }
 
 impl AttestationRefusalReason {
@@ -138,6 +146,7 @@ impl AttestationRefusalReason {
             Self::KeyPlaneRefused => "key_plane_refused",
             Self::SelfRosterPending => "self_roster_pending",
             Self::GroupPlaneRefused => "group_plane_refused",
+            Self::NotInAudience => "not_in_audience",
         }
     }
 
@@ -147,7 +156,10 @@ impl AttestationRefusalReason {
     /// the terminal reasons. Beside `steward_purge::is_retryable`.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
-        matches!(self, Self::SelfRosterPending | Self::StoreConflict)
+        matches!(
+            self,
+            Self::SelfRosterPending | Self::StoreConflict | Self::NotInAudience
+        )
     }
 
     /// The reason a self-roster door's [`Error::SelfRosterNotLanded`] maps to:
@@ -171,6 +183,7 @@ impl AttestationRefusalReason {
         Self::KeyPlaneRefused,
         Self::SelfRosterPending,
         Self::GroupPlaneRefused,
+        Self::NotInAudience,
     ];
 }
 
@@ -360,6 +373,29 @@ fn envelope_content_hash(envelope: &serde_json::Value) -> Result<String, Error> 
 /// doors by construction — before #917 the synced door ran a binary
 /// `persist_row_hash` verdict instead and booked a decoration-only
 /// re-delivery as `Error::Conflict` while this body booked it as a duplicate.
+/// v61 (CIRISPersist#1148) — may THIS node store a replicated `row`? `true`
+/// for a key-plane row (every node verifies against the key plane), and on a
+/// directory that has not declared its node key (it cannot ask); else
+/// [`super::replication_audience::may_receive`] for the node's own key.
+///
+/// # Errors
+///
+/// Directory reads.
+pub(crate) async fn replicated_row_in_audience<D>(dir: &D, row: &Attestation) -> Result<bool, Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    if super::key_plane::is_key_plane_row(row) {
+        return Ok(true);
+    }
+    let Some(me) = dir.node_key_id() else {
+        return Ok(true);
+    };
+    Ok(super::replication_audience::may_receive(dir, &me, row)
+        .await?
+        .allowed())
+}
+
 pub(crate) async fn apply_planned<D>(
     dir: &D,
     attestation: super::SignedAttestation,
@@ -373,6 +409,23 @@ where
     use ReplicatedAttestationPlan as Plan;
     let incoming = &attestation.attestation;
     let attestation_id = incoming.attestation_id.clone();
+    // v61 (CIRISPersist#1148) — **the put-time audience precondition.** A
+    // replicated row this node may not receive is refused before any door
+    // runs, by name: the same `may_receive` the serve side asks, for this
+    // node's own key (a group-plane row through its membership-plane
+    // audience). The key plane is exempt: a key's record, revocation and
+    // occurrence are what every node verifies signatures against. A directory
+    // that has not been told who it is cannot ask the question, and keeps the
+    // pre-v61 behaviour (the host gates); an Engine always declares its key.
+    if !Box::pin(replicated_row_in_audience(dir, incoming)).await? {
+        tracing::info!(
+            attestation_id = %attestation_id,
+            "replicated row refused: this node is not in its audience"
+        );
+        return Ok(Outcome::Refused {
+            reason: AttestationRefusalReason::NotInAudience,
+        });
+    }
     // v58.0.0 (CIRISPersist#991, CC 3.1.3) — a key-plane row is applied by its
     // family's door, ahead of the generic plan: a key's newer claim is a new
     // row that replaces its older one, which the generic same-id plan would
@@ -1071,7 +1124,7 @@ mod tests {
     /// silent no-op; the apply names it rather than reporting an insert that
     /// never happened.
     #[tokio::test]
-    async fn apply_composer_replay_is_deduplicated() {
+    async fn apply_composer_distinct_same_triple_row_is_stored() {
         let author = "att-apply-dedup-author";
         let dir = test_backend_with_author(author).await;
 
@@ -1109,23 +1162,24 @@ mod tests {
             ReplicatedAttestationOutcome::Inserted
         );
 
-        // The replay: same triple, DIFFERENT id — §6.1 says idempotent no-op.
-        let replay_id = uuid::Uuid::new_v4().to_string();
-        let replay = withdraws(&replay_id);
+        // v61 (CIRISPersist#1157, CC rc14 3.1.9.4) — same triple, DIFFERENT
+        // id: a distinct row, stored (the rank is read-time), never a replay.
+        let second_id = uuid::Uuid::new_v4().to_string();
+        let second = withdraws(&second_id);
         assert_eq!(
             dir.apply_replicated_attestation(SignedAttestation {
-                attestation: replay
+                attestation: second
             })
             .await
-            .expect("replay"),
-            ReplicatedAttestationOutcome::Deduplicated
+            .expect("second"),
+            ReplicatedAttestationOutcome::Inserted
         );
         assert!(
-            dir.get_attestation(&replay_id)
+            dir.get_attestation(&second_id)
                 .await
                 .expect("get")
-                .is_none(),
-            "Deduplicated must mean no row was written under the replay id"
+                .is_some(),
+            "a distinct same-triple composer is stored"
         );
     }
 }

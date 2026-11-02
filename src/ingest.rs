@@ -396,6 +396,13 @@ pub struct ScrubEnvelope {
 /// itself. The signed input stays a fixed size regardless of trace size, which
 /// is the #398 failure that stopped a hardware token mid-ceremony when a
 /// widened preimage reached 83 KB.
+///
+/// v61 (CC 2.6.2) — the `ciris.scrub_envelope.v2` domain: a `domain`
+/// member names the preimage, and `scrub_timestamp` is written `.sssZ` (the
+/// signer truncates it to the millisecond first; this function truncates
+/// again, so the bytes always name an instant the form can carry). The v1
+/// preimage ([`scrub_preimage_v1`]: no `domain`, `to_rfc3339()`) still
+/// verifies as v1; persist signs only v2.
 #[must_use]
 pub fn scrub_preimage(
     post_content_sha256: &str,
@@ -409,6 +416,40 @@ pub fn scrub_preimage(
     // JCS via serde_json's ordered map: keys serialize lexicographically, which
     // is what both sides canonicalize to.
     let v = serde_json::json!({
+        "domain": SCRUB_PREIMAGE_DOMAIN_V2,
+        "post_content_sha256": post_content_sha256,
+        "original_content_hash": original_content_hash,
+        "ner_ran": ner_ran,
+        "trace_level": trace_level,
+        "scrubber_model_digest": scrubber_model_digest,
+        "scrub_key_id": scrub_key_id,
+        "scrub_timestamp": crate::federation::admission::render_signed_instant(scrub_timestamp),
+    });
+    // The house canonicalizer, not a second JCS implementation — #398's lesson
+    // is that a preimage with two implementations is a preimage with two
+    // answers. `ceg_produce_canonicalize` is what every other signed shape in
+    // this crate goes through.
+    crate::verify::canonical::ceg_produce_canonicalize(&v).unwrap_or_default()
+}
+
+/// v61 — the `domain` member of the v2 scrub preimage ([`scrub_preimage`]).
+pub const SCRUB_PREIMAGE_DOMAIN_V2: &str = "ciris.scrub_envelope.v2";
+
+/// The v32.0.0 (CIRISPersist#690) scrub preimage: no `domain` member and
+/// `scrub_timestamp` written by `to_rfc3339()` (`+00:00`, chrono's fractional
+/// digits). Persist no longer signs it; a verifier of a pre-v61 envelope
+/// rebuilds it with this.
+#[must_use]
+pub fn scrub_preimage_v1(
+    post_content_sha256: &str,
+    original_content_hash: &str,
+    ner_ran: bool,
+    trace_level: &str,
+    scrubber_model_digest: Option<&str>,
+    scrub_key_id: &str,
+    scrub_timestamp: chrono::DateTime<chrono::Utc>,
+) -> Vec<u8> {
+    let v = serde_json::json!({
         "post_content_sha256": post_content_sha256,
         "original_content_hash": original_content_hash,
         "ner_ran": ner_ran,
@@ -417,10 +458,6 @@ pub fn scrub_preimage(
         "scrub_key_id": scrub_key_id,
         "scrub_timestamp": scrub_timestamp.to_rfc3339(),
     });
-    // The house canonicalizer, not a second JCS implementation — #398's lesson
-    // is that a preimage with two implementations is a preimage with two
-    // answers. `ceg_produce_canonicalize` is what every other signed shape in
-    // this crate goes through.
     crate::verify::canonical::ceg_produce_canonicalize(&v).unwrap_or_default()
 }
 
@@ -1271,7 +1308,10 @@ where
         outcome: &crate::scrub::ScrubOutcome,
     ) -> Result<Vec<ScrubEnvelope>, IngestError> {
         use sha2::{Digest as _, Sha256};
-        let now = chrono::Utc::now();
+        // v61 (CC 2.6.2) — the signed instant is at the millisecond, so
+        // the envelope's `scrub_timestamp` is the instant the bytes name.
+        let now =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
         let key_id = self.signer_key_id.to_owned();
         let mut envelopes = Vec::with_capacity(pre_hashes.len());
         let mut idx = 0usize;

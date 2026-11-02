@@ -180,6 +180,19 @@ pub fn ts_column_for(table: &str) -> Option<&'static str> {
     }
 }
 
+/// v61 (CIRISPersist#1156) — [`ts_column_for`] for the SQLite catalogue
+/// walk. SQLite flattens persist's schema into the table name, so the bare
+/// PG spellings (`audit_log`, `detection_events`) are never persist's on
+/// SQLite: on an embedded node they are the host's own tables, in a schema
+/// persist does not own, and are counted with no instant.
+#[must_use]
+pub fn ts_column_for_sqlite(table: &str) -> Option<&'static str> {
+    match table {
+        "audit_log" | "detection_events" => None,
+        other => ts_column_for(other),
+    }
+}
+
 /// v2.7.0 (CIRISPersist#107) — one table's usage breakdown.
 ///
 /// `bytes` is the on-disk size of the table including indexes/TOAST
@@ -994,7 +1007,7 @@ mod tests {
 
         // Verify live rows + chain unbroken via PG client.
         let pg = engine.postgres_backend().expect("pg backend");
-        let client = pg.pool().get().await.unwrap();
+        let client = pg.checkout().await.unwrap();
         let live_seqs_rows = client
             .query(
                 "SELECT sequence_number FROM cirislens.audit_log \
@@ -1157,6 +1170,171 @@ mod tests {
             summary.total_disk_bytes > 0,
             "#767: whole-DB bytes still reported"
         );
+    }
+
+    /// v61 (CIRISPersist#1156) — **a table persist does not own never
+    /// fails the summary.** An embedded node's database is the host's: an old
+    /// agent home carries its own `audit_log (id, ts)`, which `ts_column_for`
+    /// mapped to `recorded_at`, and the one failing `MIN(recorded_at)` failed
+    /// the whole aggregate every minute. The foreign table is counted with no
+    /// instant, a table whose name needs quoting is counted too, and persist's
+    /// own `cirislens_audit_log` keeps its bounds.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn storage_summary_counts_a_foreign_table_with_no_instant_1156_sqlite() {
+        use crate::engine::Engine;
+        use crate::signing::LocalSigner;
+        use ed25519_dalek::SigningKey;
+        use std::sync::Arc;
+
+        let signer = Arc::new(LocalSigner::from_parts(
+            SigningKey::from_bytes(&[0x56; 32]),
+            "test-summary-1156".into(),
+            None,
+            None,
+        ));
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let sq = engine.sqlite_backend().expect("sqlite backend");
+        {
+            let conn = sq.conn_handle();
+            let guard = conn.lock();
+            guard
+                .execute_batch(
+                    "CREATE TABLE audit_log (id INTEGER PRIMARY KEY, ts TEXT); \
+                     INSERT INTO audit_log (ts) VALUES ('yesterday'), ('today'); \
+                     CREATE TABLE \"host \"\"odd\"\" name\" (x INTEGER); \
+                     INSERT INTO \"host \"\"odd\"\" name\" (x) VALUES (1);",
+                )
+                .expect("host tables");
+        }
+        let summary = crate::retention::sqlite::storage_summary_sqlite(sq)
+            .await
+            .expect("#1156: a foreign table must not fail the summary");
+        let foreign = summary
+            .tables
+            .get("audit_log")
+            .expect("the host table is counted");
+        assert_eq!(foreign.rows, 2, "#1156: the host table's rows are counted");
+        assert_eq!(
+            (foreign.oldest_ts, foreign.newest_ts),
+            (None, None),
+            "#1156: a table persist does not own carries no instant"
+        );
+        let odd = summary
+            .tables
+            .get("host \"odd\" name")
+            .expect("#1156: a table whose name needs quoting is counted");
+        assert_eq!(odd.rows, 1);
+        #[cfg(feature = "cirisaudit")]
+        assert!(
+            summary.tables.contains_key("cirislens_audit_log"),
+            "persist's own audit table is still walked"
+        );
+        assert_eq!(super::ts_column_for_sqlite("audit_log"), None);
+        assert_eq!(
+            super::ts_column_for_sqlite("cirislens_audit_log"),
+            Some("recorded_at"),
+            "persist's own spelling keeps its column"
+        );
+    }
+
+    /// v61 (CIRISPersist#1156) — the PG walk: a host table in a schema
+    /// persist does not own is keyed by its qualified name, carries no
+    /// instant, and does not displace persist's own table of the same bare
+    /// name.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn storage_summary_counts_a_foreign_schema_table_1156_postgres() {
+        use crate::engine::Engine;
+        use crate::signing::LocalSigner;
+        use ed25519_dalek::SigningKey;
+        use std::sync::Arc;
+
+        let Some(dsn) = crate::test_pg::dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let signer = Arc::new(LocalSigner::from_parts(
+            SigningKey::from_bytes(&[0x57; 32]),
+            "test-summary-1156-pg".into(),
+            None,
+            None,
+        ));
+        let engine = Engine::with_signer(signer, &dsn)
+            .await
+            .expect("construct PG engine");
+        let pg = engine.postgres_backend().expect("pg backend");
+        let schema = format!("host_1156_{}", uuid::Uuid::new_v4().simple());
+        {
+            let client = pg.checkout().await.unwrap();
+            client
+                .batch_execute(&format!(
+                    "CREATE SCHEMA {schema}; \
+                     CREATE TABLE {schema}.audit_log (id INTEGER, ts TEXT); \
+                     INSERT INTO {schema}.audit_log VALUES (1, 'yesterday'), (2, 'today'); \
+                     CREATE TABLE {schema}.federation_attestations (asserted_at TEXT); \
+                     INSERT INTO {schema}.federation_attestations VALUES ('not an instant');"
+                ))
+                .await
+                .expect("host schema");
+        }
+        let summary = crate::retention::postgres::storage_summary_pg(pg).await;
+        {
+            let client = pg.checkout().await.unwrap();
+            client
+                .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+                .await
+                .expect("drop host schema");
+        }
+        let summary = summary.expect("#1156: a foreign table must not fail the summary");
+        let foreign = summary
+            .tables
+            .get(&format!("{schema}.audit_log"))
+            .expect("#1156: the host table is keyed by its qualified name");
+        assert_eq!(foreign.rows, 2);
+        assert_eq!((foreign.oldest_ts, foreign.newest_ts), (None, None));
+        let shadow = summary
+            .tables
+            .get(&format!("{schema}.federation_attestations"))
+            .expect("#1156: a host table sharing a persist name is its own entry");
+        assert_eq!(shadow.rows, 1);
+        assert_eq!(shadow.oldest_ts, None, "#1156: a text column is no instant");
+        assert!(
+            summary.tables.contains_key("federation_attestations"),
+            "#1156: persist's own table keeps its bare key"
+        );
+    }
+
+    /// v61 (CIRISPersist#1156) — [`postgres::PERSIST_SCHEMAS`] is every
+    /// schema persist's PG migrations create, read from disk, so a new schema
+    /// cannot be counted as a host's.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn persist_schemas_are_every_schema_the_migrations_create_1156() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/postgres/lens");
+        let mut created = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(dir).expect("migrations dir") {
+            let path = entry.expect("entry").path();
+            let sql = std::fs::read_to_string(&path).expect("read migration");
+            for line in sql.lines() {
+                let code = line.split("--").next().unwrap_or("");
+                if let Some(rest) = code.trim().strip_prefix("CREATE SCHEMA IF NOT EXISTS ") {
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    created.insert(name);
+                }
+            }
+        }
+        let declared: std::collections::BTreeSet<String> = super::postgres::PERSIST_SCHEMAS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert_eq!(declared, created);
     }
 
     /// v38.7.0 (CIRISPersist#776/#770) — **an ASSERTION is not a stale

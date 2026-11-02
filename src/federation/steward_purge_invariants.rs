@@ -436,8 +436,13 @@ pub(crate) mod bodies {
         env["jurisdiction"] = serde_json::json!("ZZ");
         env["evidence_refs"] =
             serde_json::json!([format!("evidence/purges/2026-10-09-{digest}.tsv")]);
-        env["asserted_at"] = serde_json::json!((now - chrono::Duration::seconds(60)).to_rfc3339());
-        env["expires_at"] = serde_json::json!((now + chrono::Duration::days(1)).to_rfc3339());
+        env["asserted_at"] =
+            serde_json::json!(crate::federation::admission::render_signed_instant(
+                now - chrono::Duration::seconds(60)
+            ));
+        env["expires_at"] = serde_json::json!(crate::federation::admission::render_signed_instant(
+            now + chrono::Duration::days(1)
+        ));
         sign(env, signers)
     }
 
@@ -3268,6 +3273,10 @@ pub(crate) mod bodies {
                 .await;
         }
         a.set_node(NODE_A);
+        // v61 (CIRISPersist#1148) — a replicated row reaches only its
+        // audience: a hard_case row is placed at `self`, so the node that
+        // receives it is in A's self cohort — here A's own second store.
+        b.set_node(NODE_A);
 
         // ── A records the event: a local-tier row, deferred signature ──────
         let event = HardCaseEvent {

@@ -65,13 +65,15 @@ async fn merkle_hook_pg(
     // tokio worker would panic; spawn_blocking moves the work to
     // a blocking thread.
     let handle = tokio::runtime::Handle::current();
-    let pool = backend.pool().clone();
     let tenant_id = entry.tenant_id.clone();
     let leaf = AuditLeaf::with_chain_event_id(entry.clone(), chain_event_id);
     let log_id = log_id_for_tenant(&tenant_id);
 
-    let store: Arc<dyn TransparencyStore<AuditLeaf>> =
-        Arc::new(PgMerkleStore::from_pool(pool, handle, tenant_id.clone()));
+    let store: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(PgMerkleStore::from_backend(
+        backend,
+        handle,
+        tenant_id.clone(),
+    ));
     let log = TransparencyLog::<AuditLeaf>::for_log(log_id.clone(), store.clone());
 
     // 1. Append the leaf + compute tree_size + merkle_root on a
@@ -179,8 +181,7 @@ async fn project_trust_grant_pg(
     let expires_at = payload.expires_at;
 
     let client = backend
-        .pool()
-        .get()
+        .checkout()
         .await
         .map_err(|e| Error::TrustGrant(format!("pool: {e}")))?;
     client
@@ -1095,11 +1096,10 @@ impl AuditService for PostgresBackend {
         // sync `latest_sth()` via spawn_blocking (the store uses
         // `runtime.block_on` internally — calling it directly on a
         // tokio worker would panic).
-        let pool = self.pool().clone();
         let handle = tokio::runtime::Handle::current();
         let tenant_owned = tenant_id.to_owned();
         let store: Arc<dyn TransparencyStore<AuditLeaf>> =
-            Arc::new(PgMerkleStore::from_pool(pool, handle, tenant_owned));
+            Arc::new(PgMerkleStore::from_backend(self, handle, tenant_owned));
         let jh: tokio::task::JoinHandle<
             Result<Option<SignedTreeHead>, ciris_verify_core::transparency::TransparencyError>,
         > = tokio::task::spawn_blocking(move || store.latest_sth());
@@ -1329,11 +1329,13 @@ impl AuditService for PostgresBackend {
         // Build a tenant-scoped store and delegate inclusion_proof on
         // a blocking worker (the store is sync-trait + uses block_on
         // internally). Same shape as `current_sth`.
-        let pool = self.pool().clone();
         let handle = tokio::runtime::Handle::current();
         let tenant_owned = tenant_id.to_owned();
-        let store: Arc<dyn TransparencyStore<AuditLeaf>> =
-            Arc::new(PgMerkleStore::from_pool(pool, handle, tenant_owned.clone()));
+        let store: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(PgMerkleStore::from_backend(
+            self,
+            handle,
+            tenant_owned.clone(),
+        ));
         let log_id = log_id_for_tenant(&tenant_owned);
         let jh: tokio::task::JoinHandle<
             Result<
@@ -1358,11 +1360,13 @@ impl AuditService for PostgresBackend {
         if tenant_id.is_empty() {
             return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
         }
-        let pool = self.pool().clone();
         let handle = tokio::runtime::Handle::current();
         let tenant_owned = tenant_id.to_owned();
-        let store: Arc<dyn TransparencyStore<AuditLeaf>> =
-            Arc::new(PgMerkleStore::from_pool(pool, handle, tenant_owned.clone()));
+        let store: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(PgMerkleStore::from_backend(
+            self,
+            handle,
+            tenant_owned.clone(),
+        ));
         let log_id = log_id_for_tenant(&tenant_owned);
         let jh: tokio::task::JoinHandle<
             Result<
@@ -1740,7 +1744,7 @@ mod tests {
 
         // 11. Tamper detection: directly UPDATE a payload, then
         // verify_chain surfaces an EntryHashMismatch break.
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .execute(
                 "UPDATE cirislens.audit_log SET payload = $1 \
@@ -2036,7 +2040,7 @@ mod tests {
     }
 
     async fn pg_count_merkle_rows(backend: &PostgresBackend, tenant: &str) -> (i64, i64) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let leaves: i64 = client
             .query_one(
                 "SELECT COUNT(*)::BIGINT FROM cirislens.merkle_leaves WHERE tenant_id = $1",
@@ -2057,7 +2061,7 @@ mod tests {
     }
 
     async fn pg_cleanup_tenant_merkle(backend: &PostgresBackend, tenant: &str) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
 
         // v3.5.2 (CIRISPersist#128) — diagnostic instrumentation:
         // when this DELETE fires "relation does not exist", we want
@@ -2208,7 +2212,7 @@ mod tests {
         assert_eq!((l3, s3), (3, 3));
 
         // tree_size monotonicity in STH log.
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let rows = client
             .query(
                 "SELECT tree_size FROM cirislens.merkle_sth_log \
@@ -2315,7 +2319,7 @@ mod tests {
     /// Seed `cirislens.federation_keys` so FK targets exist for the
     /// projection's INSERT. Idempotent — uses ON CONFLICT DO NOTHING.
     async fn pg_seed_federation_key(backend: &PostgresBackend, key_id: &str) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .execute(
                 "INSERT INTO cirislens.federation_keys (\
@@ -2333,7 +2337,7 @@ mod tests {
     }
 
     async fn pg_cleanup_trust_grants(backend: &PostgresBackend, tenant: &str) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .execute(
                 "DELETE FROM cirislens.federation_trust_grants WHERE tenant_id = $1",
@@ -2384,7 +2388,7 @@ mod tests {
     }
 
     async fn pg_count_grants(backend: &PostgresBackend, tenant: &str) -> i64 {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .query_one(
                 "SELECT COUNT(*)::BIGINT FROM cirislens.federation_trust_grants WHERE tenant_id = $1",
@@ -2456,7 +2460,7 @@ mod tests {
         );
         backend.record_entry(entry.clone()).await.unwrap();
 
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let row = client
             .query_one(
                 "SELECT grantee_key, granter_key, purpose, scope, \
@@ -2523,7 +2527,7 @@ mod tests {
         );
         backend.record_entry(e1.clone()).await.unwrap();
 
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let original_grant_id: uuid::Uuid = client
             .query_one(
                 "SELECT grant_id FROM cirislens.federation_trust_grants \
@@ -2624,7 +2628,7 @@ mod tests {
         );
         backend.record_entry(e2.clone()).await.unwrap();
 
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let row = client
             .query_one(
                 "SELECT revoked_at, revoked_by \
@@ -2699,7 +2703,7 @@ mod tests {
         );
         backend.record_entry(b1.clone()).await.unwrap();
 
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         // One row total — UPSERT collapses both emits.
         let total: i64 = client
             .query_one(

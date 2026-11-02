@@ -2443,6 +2443,30 @@ impl PyEngine {
             }
         }
 
+        // v61 (CC 2.6.2, CIRISPersist#1122) — the open legs every Rust
+        // constructor runs (`Engine::settle_at_open`): the instant-form pass
+        // and the agent-route sweep. Every host opens persist here, through
+        // the shared constructor, which runs no boot legs; without this the
+        // V211 DDL ran in the field and the pass never did. Logged, never
+        // fatal. The counts are also `settle_instant_forms_json()`.
+        {
+            let open_engine = crate::Engine::from_shared_with_local(
+                match &backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        crate::engine::BackendDispatch::Postgres(pg.clone())
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        crate::engine::BackendDispatch::Sqlite(sq.clone())
+                    }
+                },
+                signer.clone(),
+                local_signer.clone(),
+            );
+            py.detach(|| runtime.block_on(open_engine.settle_at_open()));
+        }
+
         // v0.3.2 (CIRISPersist#11) — Auto-sweep on init when a local
         // PQC key is configured. Drains hybrid-pending rows authored
         // before the per-write cold-path was wired (or rows where the
@@ -6829,6 +6853,30 @@ impl PyEngine {
                     })
                     .transpose()
             })
+        })
+    }
+
+    /// v61 (CC 2.6.2) — **run the open-time instant-form pass now and return
+    /// its counts** as JSON: `{scanned, violations, healed, already_healed,
+    /// heal_refused, own_left, kept_in_force, set_aside}`. The pass already
+    /// runs at `Engine(...)` (logged at `tracing::info` when it finds
+    /// anything); this lets an operator read the counts after the open.
+    /// Idempotent: a second call re-states nothing (`healed` 0, the earlier
+    /// re-statements counted `already_healed`). FFI mirror of
+    /// [`Engine::settle_instant_forms`](crate::engine::Engine::settle_instant_forms).
+    fn settle_instant_forms_json(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let engine = crate::Engine::from_shared_with_local(
+                self.engine_dispatch(),
+                self.signer.clone(),
+                self.local_signer.clone(),
+            );
+            let pass = py
+                .detach(|| self.runtime.block_on(engine.settle_instant_forms()))
+                .map_err(federation_err_to_py)?;
+            serde_json::to_string(&pass)
+                .map_err(|e| PyRuntimeError::new_err(format!("InstantFormPass JSON encode: {e}")))
         })
     }
 
@@ -24730,6 +24778,41 @@ impl PyEngine {
         })
     }
 
+    /// v61 (CIRISPersist#1101; CC 5.4.6, `CLM-serve-seat-announced`) —
+    /// **is `node_key_id`'s owner announced?** `True` while a live owner
+    /// binding for the node is carried at `cohort_scope: federation` (directly,
+    /// or by its granter's live widening). Judged now: a later announcement
+    /// satisfies it and a withdrawn one does not. A node holding a serve seat in
+    /// an infrastructure community serves only while this is `True`; persist's
+    /// seating doors refuse `serve_seat_owner_unannounced` otherwise.
+    fn serve_seat_owner_announced(&self, py: Python<'_>, node_key_id: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let node = node_key_id.to_owned();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::admission::serve_seat_owner_announced(&*backend, &node)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::admission::serve_seat_owner_announced(&*backend, &node)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
     /// CIRISPersist#299 — the OUTBOUND steward-binding reader: the nodes
     /// `steward_user_key_id` owns (exact inverse of `steward_bindings_of_json` —
     /// `n ∈ nodes_stewarded_by(U)` ⟺ `U ∈ steward_bindings_of(n)`). Returns a JSON
@@ -34902,8 +34985,7 @@ async fn boot_audit_self_verify(backend: &BackendDispatch) -> Result<BootAuditSu
     let tenant_ids: Vec<String> = match backend {
         #[cfg(feature = "postgres")]
         BackendDispatch::Postgres(pg) => pg
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| format!("pool: {e}"))?
             // v59.1.2 — the Postgres table is `cirislens.audit_log` (V014);
@@ -35020,7 +35102,7 @@ async fn build_audit_chain_proof(
     let located: Option<(String, i64)> = match backend {
         #[cfg(feature = "postgres")]
         BackendDispatch::Postgres(pg) => {
-            let client = pg.pool().get().await.map_err(|e| format!("pool: {e}"))?;
+            let client = pg.checkout().await.map_err(|e| format!("pool: {e}"))?;
             let rows = client
                 .query(
                     "SELECT tenant_id, sequence_number \
@@ -35083,7 +35165,7 @@ async fn build_audit_chain_proof(
     let entries: Vec<AuditChainEntry> = match backend {
         #[cfg(feature = "postgres")]
         BackendDispatch::Postgres(pg) => {
-            let client = pg.pool().get().await.map_err(|e| format!("pool: {e}"))?;
+            let client = pg.checkout().await.map_err(|e| format!("pool: {e}"))?;
             let rows = client
                 .query(
                     "SELECT sequence_number, tenant_id, action_type, recorded_at, \
@@ -38870,3 +38952,7 @@ mod verify_trace_canon_parity_class {
         );
     }
 }
+
+/// v61 (CC 2.6.2) — I-IFP-10: the Python open settles stored instant forms.
+#[cfg(test)]
+mod instant_form_open_tests;

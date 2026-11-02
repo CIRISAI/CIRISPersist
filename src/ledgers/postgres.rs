@@ -94,8 +94,7 @@ impl LedgerService for PostgresBackend {
             .map_err(|e| Error::Internal(e.to_string()))?;
         let now = chrono::Utc::now();
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let inserted = client
@@ -174,8 +173,7 @@ impl LedgerService for PostgresBackend {
         let seq_i = validate::seq_as_i64(seq, "seq")?;
         let now = chrono::Utc::now();
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         // Guarded forward move: only a strictly-later head (or the first)
@@ -251,8 +249,7 @@ impl LedgerService for PostgresBackend {
     async fn get_ledger(&self, ledger_id: &str) -> Result<Option<LedgerHeadRow>, Error> {
         validate::non_empty(ledger_id, "ledger_id")?;
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row = client
@@ -275,8 +272,7 @@ impl LedgerService for PostgresBackend {
         validate::non_empty(unit, "unit")?;
         validate::non_empty(standard_version, "standard_version")?;
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row = client
@@ -298,8 +294,7 @@ impl LedgerService for PostgresBackend {
     ) -> Result<Vec<LedgerHeadRow>, Error> {
         validate::non_empty(owner_key_id, "owner_key_id")?;
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let rows = client
@@ -322,8 +317,7 @@ impl LedgerService for PostgresBackend {
         let seq_i = validate::seq_as_i64(checkpoint.seq, "seq")?;
         let now = chrono::Utc::now();
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let registered = client
@@ -398,8 +392,7 @@ impl LedgerService for PostgresBackend {
     ) -> Result<Option<LedgerCheckpointRow>, Error> {
         validate::non_empty(ledger_id, "ledger_id")?;
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row = client
@@ -443,8 +436,7 @@ impl LedgerService for PostgresBackend {
         let to_i = validate::seq_as_i64(range.to_seq, "to_seq")?;
         let now = chrono::Utc::now();
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let registered = client
@@ -512,8 +504,7 @@ impl LedgerService for PostgresBackend {
     async fn list_entry_ranges(&self, ledger_id: &str) -> Result<Vec<LedgerEntryRangeRow>, Error> {
         validate::non_empty(ledger_id, "ledger_id")?;
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let rows = client
@@ -547,8 +538,7 @@ impl LedgerService for PostgresBackend {
             .map_err(|e| Error::Internal(format!("evidence encode: {e}")))?;
         let now = chrono::Utc::now();
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         // The id is a content hash: ON CONFLICT DO NOTHING alone is the
@@ -577,8 +567,7 @@ impl LedgerService for PostgresBackend {
     async fn list_fork_evidence(&self, ledger_id: &str) -> Result<Vec<ForkEvidenceRow>, Error> {
         validate::non_empty(ledger_id, "ledger_id")?;
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let rows = client
@@ -681,7 +670,7 @@ mod tests {
         let owner = unique("owner");
         // Forge a row occupying the triple under a different ledger_id.
         let forged = unique("ledger-forged");
-        let client = svc.pool().get().await.unwrap();
+        let client = svc.checkout().await.unwrap();
         client
             .execute(
                 "INSERT INTO cirislens.ledger_heads (\

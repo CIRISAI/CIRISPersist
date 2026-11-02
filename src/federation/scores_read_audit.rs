@@ -43,8 +43,8 @@
 //!
 //! Two things.
 //!
-//! **1. A read log at all four sites** — `list_scores` and `resolve_scores` on
-//! each of sqlite / postgres. [`log_scores_read`] records the caller
+//! **1. A read log at both sites** — `list_scores` and `resolve_scores`, one
+//! shared plan each that every backend runs (v61, CIRISPersist#934). [`log_scores_read`] records the caller
 //! key id (or the literal [`UNAUTHENTICATED_CALLER`]), the subject filter, the
 //! dimension filter, whether a `confidence_floor` was supplied, and the
 //! timestamp. It is what makes trace audit *possible* at the substrate: the
@@ -1307,7 +1307,7 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    //  The four-site census, read FROM DISK
+    //  The site census, read FROM DISK
     //
     //  Mirrors `store::parity`, the `check_capacity_consent_admission`
     //  discipline: read the backend sources as text so the postgres
@@ -1320,10 +1320,10 @@ mod tests {
     //  whatever is on disk WHILE IT RUNS and so fails toward a pass.
     // ─────────────────────────────────────────────────────────────────
 
-    const SITES: [(&str, &str); 2] = [
-        ("sqlite", "src/store/sqlite.rs"),
-        ("postgres", "src/store/postgres.rs"),
-    ];
+    /// v61 (CIRISPersist#934, S4a) — both scores reads are one shared plan
+    /// each; every backend's door is exactly that plan (`store::parity`'s
+    /// `SHARED_DOORS`), so the plan file is the one site to scan.
+    const SITES: [(&str, &str); 1] = [("shared plan", "src/federation/read_plan.rs")];
 
     /// Blank the CONTENT of comments and string literals, preserving byte
     /// length and line structure, so a commented-out call cannot read as live
@@ -1447,7 +1447,7 @@ mod tests {
         stripped[i..=j].to_owned()
     }
 
-    /// **Every one of the four sites emits the read log, before its gate.**
+    /// **Both scores-read plans emit the read log, before their gate.**
     #[test]
     fn every_scores_read_site_logs() {
         let mut checked = 0usize;
@@ -1457,8 +1457,8 @@ mod tests {
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
             let stripped = strip(&text);
             for (method, variant) in [
-                ("list_scores", "ScoresReadSite::ListScores"),
-                ("resolve_scores", "ScoresReadSite::ResolveScores"),
+                ("list_scores_planned", "ScoresReadSite::ListScores"),
+                ("resolve_scores_planned", "ScoresReadSite::ResolveScores"),
             ] {
                 let tag = format!("{backend}::{method}");
                 let body = method_body(&stripped, method, &tag);
@@ -1493,7 +1493,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 4, "the scan must cover all four sites");
+        assert_eq!(checked, 2, "the scan must cover both plans");
     }
 
     #[test]

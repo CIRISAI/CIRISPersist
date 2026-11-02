@@ -88,8 +88,7 @@ impl KeyEscrowService for PostgresBackend {
     async fn create_escrow(&self, row: &KeyEscrowRow) -> Result<bool, Error> {
         validate_row(row)?;
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let inserted = client
@@ -167,8 +166,7 @@ impl KeyEscrowService for PostgresBackend {
             return Err(Error::InvalidArgument("escrow_id required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row = client
@@ -198,8 +196,7 @@ impl KeyEscrowService for PostgresBackend {
             return Err(Error::InvalidArgument("escrow_id required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         // Guarded transition: only an ACTIVE row moves. Zero rows re-reads
@@ -249,8 +246,7 @@ impl PostgresBackend {
             return Err(Error::InvalidArgument(format!("{column} required")));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let rows = client

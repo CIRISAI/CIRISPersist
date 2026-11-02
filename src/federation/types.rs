@@ -2850,8 +2850,29 @@ pub mod consensus_protocol {
     /// mistaken for a smaller number.
     pub const REVERSE_QUORUM_PREFIX: &str = "reverse_quorum:";
 
+    /// v61 (CIRISPersist#1123; CC 4.4.3.2, 4.4.3.4.2, 4.5.13) — **open
+    /// admission**, the one protocol of a `public` group: the group's side of a
+    /// widening that seats one new key is that key's OWN signature (the joiner
+    /// still accepts the founder's standing proposal, CC 3.1.3.2), and a
+    /// removal runs under the CC 4.5.13 floor, never one vote
+    /// ([`crate::federation::consensus::OPEN_SELF_ADMIT_REMOVAL_FLOOR`]).
+    /// Admissible only on a `public` community; a family or a private room
+    /// that names it is refused.
+    pub const OPEN_SELF_ADMIT: &str = "open:self_admit";
+
+    /// v61 (CIRISPersist#1123) — do the group's FOUNDERS alone hold its
+    /// authority (sign on its behalf, propose, appoint)? Under `founder_only`
+    /// by definition; under [`OPEN_SELF_ADMIT`] because joining confers
+    /// membership, never authority: a room anyone may join must not hand
+    /// everyone who joins its voice.
+    #[must_use]
+    pub fn founders_hold_authority(s: &str) -> bool {
+        matches!(s, FOUNDER_ONLY | OPEN_SELF_ADMIT)
+    }
+
     /// True iff `s` parses into one of the canonical-kinds shapes:
-    /// the three bare forms (`founder_only`, `unanimous`, `majority`),
+    /// the three bare forms (`founder_only`, `unanimous`, `majority`), the
+    /// open form [`OPEN_SELF_ADMIT`] (exactly that string),
     /// one of the three prefixed forms with a non-empty tail
     /// (`quorum:{m}/{n}` where m, n parse as integers; `weighted:rubric`;
     /// `custom:id`), or the v24.3.0 objection form
@@ -2859,7 +2880,7 @@ pub mod consensus_protocol {
     /// strings, unprefixed names not in the bare set, and `quorum:` strings
     /// whose tail is not `{int}/{int}`.
     pub fn is_canonical_form(s: &str) -> bool {
-        if matches!(s, FOUNDER_ONLY | UNANIMOUS | MAJORITY) {
+        if matches!(s, FOUNDER_ONLY | UNANIMOUS | MAJORITY | OPEN_SELF_ADMIT) {
             return true;
         }
         if s.starts_with(REVERSE_QUORUM_PREFIX) {
@@ -4446,7 +4467,8 @@ impl SignedTouchClaim {
         serde_json::json!({
             "target_key_id": self.target_key_id,
             "target_kind": self.target_kind,
-            "fresh_as_of": self.fresh_as_of.to_rfc3339(),
+            // CC 2.6.2: `.sssZ` (v61 S3).
+            "fresh_as_of": crate::federation::admission::render_signed_instant(self.fresh_as_of),
             "signer_form": self.signer_form.as_str(),
             "attesting_key_id": self.attesting_key_id,
             "cohort_scope": self.cohort_scope,

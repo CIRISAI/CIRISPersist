@@ -56,6 +56,10 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         Bound::Open("every route of every occurrence: the boot reload, grows with the federation"),
     ),
     (
+        "list_all_transport_destinations_unfolded",
+        Bound::Open("every stored route before the one-live-key fold (#1122): grows with the federation"),
+    ),
+    (
         "list_announced_peers",
         Bound::Open("every live announced-peer bookmark: grows with the federation"),
     ),
@@ -250,8 +254,16 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         Bound::Schema("the claimants of ONE destination hash (competing claims, one per claimant)"),
     ),
     (
+        "list_transport_destinations_by_destination_unfolded",
+        Bound::Schema("the stored claimants of ONE destination hash, before the #1122 fold"),
+    ),
+    (
         "list_transport_destinations_for",
         Bound::Schema("one occurrence's LIVE routes: at most one per transport kind (#443)"),
+    ),
+    (
+        "list_transport_destinations_for_unfolded",
+        Bound::Schema("one occurrence's stored live routes, before the #1122 fold"),
     ),
     (
         "list_trusted_keys",

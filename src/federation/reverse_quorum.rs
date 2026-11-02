@@ -4093,6 +4093,15 @@ pub(crate) mod test_support {
             for k in [&objector, &x].into_iter().chain(overrulers.iter()) {
                 members.push(member(k, "member"));
             }
+            // v61 (CIRISPersist#1148) — a directory that declares its node key
+            // stores a replicated record only when it is in the record's
+            // audience: the declaring host is seated as a plain member.
+            if let Some(host) = dir.node_key_id() {
+                if dir.lookup_public_key(&host).await.unwrap().is_none() {
+                    register_user_key(dir, &host).await;
+                }
+                members.push(member(&host, "member"));
+            }
             let planted = dir
                 .apply_replicated_community(ts::sign_community(
                     &human,

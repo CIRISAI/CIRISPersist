@@ -25,8 +25,9 @@
     "src/store/sqlite.rs": 2
   },
   "scores-read-log": {
-    "src/store/postgres.rs": 2,
-    "src/store/sqlite.rs": 2
+    "src/federation/read_plan.rs": 2,
+    "src/store/postgres.rs": 0,
+    "src/store/sqlite.rs": 0
   },
   "i14-storage-floor-blobs": {
     "src/federation/blobs.rs": 0

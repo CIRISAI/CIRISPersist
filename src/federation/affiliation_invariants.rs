@@ -68,7 +68,7 @@ pub mod bodies {
                 })
                 .collect(),
             founded_at: at("2026-01-01T00:00:00Z"),
-            consensus_protocol: consensus_protocol::FOUNDER_ONLY.to_owned(),
+            consensus_protocol: "quorum:1/1".into(),
             policy_blob,
             persist_row_hash: String::new(),
         }

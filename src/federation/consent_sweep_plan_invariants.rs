@@ -885,7 +885,7 @@ mod prune_postgres {
             .await;
         }
         {
-            let c = b.pool().get().await.unwrap();
+            let c = b.checkout().await.unwrap();
             for i in 0..4u32 {
                 c.execute(
                     "INSERT INTO cirislens.announced_peers \
@@ -932,7 +932,7 @@ mod prune_postgres {
                 .unwrap(),
             2
         );
-        let c = b.pool().get().await.unwrap();
+        let c = b.checkout().await.unwrap();
         let left: Vec<String> = c
             .query(
                 "SELECT key_id FROM cirislens.announced_peers WHERE key_id LIKE 'i1200-%' ORDER BY 1",

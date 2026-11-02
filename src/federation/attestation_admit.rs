@@ -188,13 +188,16 @@ pub(crate) trait AttestationStore:
     /// such key.
     async fn attesting_identity_type(&self, key_id: &str) -> Result<Option<String>, Error>;
 
-    /// Is a structural composer with this `(attestation_type,
-    /// attesting_key_id, references_attestation_id)` triple held (any tier)?
+    /// v61 (CIRISPersist#1157, CC rc14 3.1.9.4) — is THIS composer held
+    /// already: a row under `attestation_id` asserting the same signed content
+    /// (`original_content_hash`), any tier? Idempotence keys on the row, never
+    /// on its `(type, attester, reference)` triple: a DISTINCT same-type row
+    /// from the same attester on the same target is not a replay, it is
+    /// stored and ranked at read time ([`super::attestation_query::lifecycle_predicate`]).
     async fn composer_replay_held(
         &self,
-        attestation_type: &str,
-        attesting_key_id: &str,
-        references_attestation_id: &str,
+        attestation_id: &str,
+        original_content_hash: &str,
     ) -> Result<bool, Error>;
 
     /// Record `depth` for `attestation_id` in the V157 depth table when the
@@ -241,6 +244,21 @@ pub(crate) trait AttestationStore:
         &self,
         attestation_id: &str,
         only_if_hash: Option<&str>,
+    ) -> Result<bool, Error>;
+
+    /// v61 (CC 2.6.2) — remove `row` from `federation_attestations` and
+    /// record it in the V211 ledger `federation_attestations_form_refused`
+    /// (its id, attester, row hash, the member that failed, its value and
+    /// `at`; no row body), in one transaction: a compare-and-delete on the
+    /// row's `persist_row_hash`, then the ledger row. A row whose hash moved,
+    /// or that is gone, is left alone: `false`. The caller removes the row's
+    /// projections first ([`FederationDirectory::purge_attestation_projections`]).
+    async fn set_aside_form_refused(
+        &self,
+        row: &Attestation,
+        member: &str,
+        value: &str,
+        at: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, Error>;
 
     /// v57.0.0 (CIRISPersist#988 item 2) — store a planned `hard_case` row:
@@ -1048,8 +1066,12 @@ where
         if let Some(ref_id) = crate::federation::precedence::references_attestation_id_from_envelope(
             &row.attestation_envelope,
         ) {
+            // v61 (CIRISPersist#1157) — the replay is the SAME row (id and
+            // signed content); a distinct row naming the same target under
+            // the same type and attester is admitted and ranked at read time.
+            let _ = ref_id;
             if dir
-                .composer_replay_held(&row.attestation_type, &row.attesting_key_id, ref_id)
+                .composer_replay_held(&row.attestation_id, &row.original_content_hash)
                 .await?
             {
                 // v50.0.0 (review H2, final check) — an identical re-put of a
@@ -1470,6 +1492,29 @@ where
     // door too (`FSD/MEDIA_SOURCE.md` §6). A local row never carries a
     // holder claim, so only the struct is checked here.
     crate::federation::media_source::check_media_source(&envelope_value)?;
+    // v61 (CC 2.6.2) — a signed instant is `.sssZ` at the local door too:
+    // a row written in another form could never be promoted. `expires_at` is
+    // the door's own to stamp from the typed column (#598), so it is not read
+    // from the caller here.
+    if let Some(v) =
+        crate::federation::admission::local_write_instant_form_violation(&envelope_value)
+    {
+        return Err(Error::malformed_row(
+            "attestation",
+            crate::federation::malformed_row::ENVELOPE_MEMBER_INVALID,
+            format!(
+                "local attestation: `{}` = {:?} is not in the CC 2.6.2 form \
+                 YYYY-MM-DDTHH:MM:SS.sssZ",
+                v.member, v.value
+            ),
+        ));
+    }
+
+    // v61 (CIRISPersist#1126) — a partnership half is a `consent_record`.
+    crate::federation::self_at_login::check_partnership_shape(
+        &input.attestation_type,
+        &envelope_value,
+    )?;
     crate::federation::admission::check_trace_dimension_admission(
         input.dimension(),
         &input.attesting_key_id,

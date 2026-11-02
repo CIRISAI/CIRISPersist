@@ -1424,7 +1424,14 @@ pub(crate) mod test_support {
         let live_peer = format!("lb-live-{suffix}");
         let root = format!("lb-root-{suffix}");
         register_hybrid_key(dir, &node).await;
-        register_hybrid_key(dir, &live_peer).await;
+        // v61 (CIRISPersist#1122) — a node: an agent key announces no route.
+        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+            dir,
+            &live_peer,
+            &live_peer,
+            crate::federation::types::identity_type::NODE,
+        )
+        .await;
         register_hybrid_key(dir, &root).await;
 
         // ── (1) THE 234-ROW CASE. Grants naming a peer this node holds

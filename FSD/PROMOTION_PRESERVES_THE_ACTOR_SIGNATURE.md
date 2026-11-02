@@ -336,9 +336,7 @@ pub enum MeshCrossingOutcome { Crossed(MeshCrossing), AlreadyInMesh { .. }, Alre
 
 ### 5.5 Timestamp conformance (CC 2.6.2)
 
-`stamp_signed_instants`, `stamp_and_canonicalize` and `cosigned_at` write `to_rfc3339_opts(SecondsFormat::Millis, true)` → `.sssZ`, truncated at millisecond resolution (`SIGNED_INSTANT_RESOLUTION_NANOS`). The ingest CHECK stays at microseconds (`CONSENT_INSTANT_RESOLUTION_NANOS`), and `check_instant_binding` parses tolerantly: rows signed with the older `+00:00` form cannot be re-rendered (every preimage field must be recoverable from the stored row), so refusing them would refuse valid signatures.
-
-**Limit:** without an epoch marker on the row, persist cannot refuse a `+00:00` form on new rows only; what is enforced is that every instant persist mints renders `.sssZ`.
+`stamp_signed_instants`, `stamp_and_canonicalize` and `cosigned_at` write `.sssZ` through `render_signed_instant`, truncated at millisecond resolution (`SIGNED_INSTANT_RESOLUTION_NANOS`). Only that form verifies: every door refuses another form `envelope_member_invalid`, and the rows a node already holds are settled at open. The predicate, the doors, the open-time pass and the preimage classes are in `FSD/SIGNED_INSTANT_FORM.md`.
 
 ---
 
@@ -381,7 +379,7 @@ All on both backends. The postgres leg must be confirmed **executing** (timing),
 ## 8. Compatibility
 
 1. **There is no `promote_attestation`.** A caller that flips tier uses `enter_mesh`; a caller that widens uses `widen_audience`. The two ship together: a tier-only crossing with no widening path would strand every caller that needs to widen.
-2. **Timestamp form.** New rows sign `.sssZ` instants. Stored rows keep verifying (tolerant parse). An external party byte-comparing persist's `asserted_at` against the older `+00:00` form sees a difference — which CC 2.6.2 requires it to refuse anyway.
+2. **Timestamp form.** Rows sign `.sssZ` instants, and a row in another form is refused (`FSD/SIGNED_INSTANT_FORM.md`).
 
 ---
 

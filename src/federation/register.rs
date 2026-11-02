@@ -1718,7 +1718,9 @@ pub enum RevocationBoundRefusal {
     /// Both carry a bound and they disagree. Whatever was intended, one of
     /// them is not what was signed.
     TypedBoundDiverges,
-    /// The envelope's `revoked_after` is not an RFC-3339 timestamp.
+    /// The envelope's `revoked_after` is not an RFC-3339 timestamp in the CC
+    /// 2.6.2 form `YYYY-MM-DDTHH:MM:SS.sssZ` (v61: any other spelling of
+    /// an instant is refused, not normalised).
     BoundNotRfc3339,
     /// The bound is AFTER [`Revocation::effective_at`](super::types::Revocation::effective_at)
     /// — "this key is de-admitted from Monday, but everything it said through
@@ -1794,6 +1796,44 @@ impl From<RevocationBoundRefusal> for Error {
 /// mirror it exactly.
 pub const REVOKED_AFTER_ENVELOPE_FIELD: &str = "revoked_after";
 
+/// v61 (CIRISPersist#1146) — what a self-registration states, compared
+/// against the held row by [`self_registration_unchanged`].
+#[derive(Debug, Clone, Copy)]
+pub struct SelfRegistration<'a> {
+    /// The node's Ed25519 public key, base64.
+    pub pubkey_ed25519_base64: &'a str,
+    /// The node's ML-DSA-65 public key, base64, when it has one.
+    pub pubkey_ml_dsa_65_base64: Option<&'a str>,
+    /// `identity_type` as registered.
+    pub identity_type: &'a str,
+    /// `identity_ref` as registered.
+    pub identity_ref: &'a str,
+    /// The capability roles, compared as a set.
+    pub roles: &'a [String],
+    /// The expiry, already at the millisecond.
+    pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// v61 (CIRISPersist#1146) — **is a self-registration a restart?** True
+/// when the held row for the node's own `key_id` states the same pubkeys
+/// (Ed25519 and PQC), `identity_type`, `identity_ref`, roles (as a set) and
+/// expiry. The one decision for every backend; `Engine::register_self_federation_key`
+/// answers a restart with the held row, unchanged. Anything else differs and
+/// reaches the put, which refuses it `Conflict`.
+#[must_use]
+pub fn self_registration_unchanged(
+    held: &super::types::KeyRecord,
+    offered: &SelfRegistration<'_>,
+) -> bool {
+    let as_set = |r: &[String]| r.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+    held.pubkey_ed25519_base64 == offered.pubkey_ed25519_base64
+        && held.pubkey_ml_dsa_65_base64.as_deref() == offered.pubkey_ml_dsa_65_base64
+        && held.identity_type == offered.identity_type
+        && held.identity_ref == offered.identity_ref
+        && as_set(&held.capability_roles) == as_set(offered.roles)
+        && held.valid_until == offered.valid_until
+}
+
 /// v25.1.0 (CIRISPersist#570 ask 4) — **the history-bound gate.** Run at the
 /// top of every backend's `put_revocation`, before the row is hashed and
 /// before INSERT (verify-before-mutation, AV-9), so a refused bound leaves no
@@ -1816,6 +1856,9 @@ pub fn check_revocation_bound(
         None | Some(serde_json::Value::Null) => None,
         Some(v) => {
             let s = v.as_str().ok_or(RevocationBoundRefusal::BoundNotRfc3339)?;
+            // v61 (CC 2.6.2, strict) — only `.sssZ` verifies.
+            crate::verify::canonical_validation::validate_canonical_datetime(s)
+                .map_err(|_| RevocationBoundRefusal::BoundNotRfc3339)?;
             let parsed = chrono::DateTime::parse_from_rfc3339(s)
                 .map_err(|_| RevocationBoundRefusal::BoundNotRfc3339)?
                 .with_timezone(&chrono::Utc);
@@ -2521,7 +2564,9 @@ mod bound_tests {
         let revoked_after = bound.map(ts);
         let mut envelope = serde_json::json!({ "revoked_key_id": key });
         if let Some(b) = bound {
-            envelope[REVOKED_AFTER_ENVELOPE_FIELD] = serde_json::json!(b);
+            // v61 (CC 2.6.2) — the producer writes the bound `.sssZ`.
+            envelope[REVOKED_AFTER_ENVELOPE_FIELD] =
+                serde_json::json!(crate::federation::admission::render_signed_instant(ts(b)));
         }
         super::super::types::Revocation {
             revocation_id: id.to_owned(),
@@ -2595,20 +2640,22 @@ mod bound_tests {
     fn a_sub_microsecond_bound_is_refused_659() {
         // Coherent in every other respect: mirrored exactly, and at-or-before
         // `effective_at`. Only the resolution is wrong.
+        // v61 (CC 2.6.2) — a bound finer than the millisecond is not in
+        // the signed form at all, so it is refused for its form.
         let ns = "2026-08-01T00:00:00.000000500Z";
         let mut r = rev("r-1", "k-bad", "2026-08-02T10:00:00Z", Some(ns));
+        r.revocation_envelope[REVOKED_AFTER_ENVELOPE_FIELD] = serde_json::json!(ns);
         r.revoked_after = Some(ts(ns));
         assert_eq!(
             check_revocation_bound(&r),
-            Err(RevocationBoundRefusal::BoundSubMicrosecond),
-            "postgres TIMESTAMPTZ cannot hold this, so admitting it makes the fold \
-             backend-dependent"
+            Err(RevocationBoundRefusal::BoundNotRfc3339),
+            "a bound finer than `.sssZ` cannot be signed"
         );
-        // The SAME bound truncated to the floor admits — so the refusal is
-        // about the resolution and nothing else.
-        let micro = "2026-08-01T00:00:00.000000Z";
-        let mut ok = rev("r-1", "k-bad", "2026-08-02T10:00:00Z", Some(micro));
-        ok.revoked_after = Some(ts(micro));
+        // The SAME bound at the millisecond admits — so the refusal is about
+        // the resolution and nothing else.
+        let milli = "2026-08-01T00:00:00.000Z";
+        let mut ok = rev("r-1", "k-bad", "2026-08-02T10:00:00Z", Some(milli));
+        ok.revoked_after = Some(ts(milli));
         assert_eq!(check_revocation_bound(&ok), Ok(()));
     }
 
@@ -2625,7 +2672,7 @@ mod bound_tests {
         // signed.
         let mut r = rev("r-1", "k-bad", "2026-08-02T10:00:00Z", None);
         r.revocation_envelope[REVOKED_AFTER_ENVELOPE_FIELD] =
-            serde_json::json!("2026-08-01T00:00:00Z");
+            serde_json::json!("2026-08-01T00:00:00.000Z");
         assert_eq!(
             check_revocation_bound(&r),
             Err(RevocationBoundRefusal::TypedBoundAbsent)
@@ -2872,10 +2919,11 @@ pub(crate) mod bound_test_support {
         let mut envelope = serde_json::json!({
             "revoked_key_id": revoked,
             "revoking_key_id": revoker,
-            "effective_at": effective_at.to_rfc3339(),
+            "effective_at": crate::federation::admission::render_signed_instant(effective_at),
         });
         if let Some(b) = envelope_bound {
-            envelope[REVOKED_AFTER_ENVELOPE_FIELD] = serde_json::json!(b.to_rfc3339());
+            envelope[REVOKED_AFTER_ENVELOPE_FIELD] =
+                serde_json::json!(crate::federation::admission::render_signed_instant(b));
         }
         // v31.0.0 (#659) — sealed through the ONE shared producer, which binds
         // the six identifying columns and deliberately does NOT touch

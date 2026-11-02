@@ -200,6 +200,8 @@ fn i551_every_emitted_label_is_catalogued_and_every_catalogued_one_emitted() {
 const SHARED_FOLD_DOORS: &[(&str, &str)] = &[
     ("ListLiveConsentGrantsBy", "federation/consent_admit.rs"),
     ("ListLiveConsentGrantsFor", "federation/consent_admit.rs"),
+    // v61 (CIRISPersist#934, S4a) — the owner-scope log's serve consult.
+    ("ListAttestationLog", "federation/read_plan.rs"),
 ];
 
 /// v60.0.0 — each shared-fold door is recorded in its fold's file.

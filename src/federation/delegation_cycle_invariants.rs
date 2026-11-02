@@ -371,7 +371,9 @@ pub mod bodies {
                     .expect("an object envelope")
                     .insert(
                         "delegation_valid_from".to_owned(),
-                        serde_json::json!(opens.to_rfc3339()),
+                        serde_json::json!(crate::federation::admission::render_signed_instant(
+                            opens
+                        )),
                     );
             }
         };
@@ -508,7 +510,10 @@ pub mod bodies {
             r.attestation_envelope
                 .as_object_mut()
                 .expect("an object envelope")
-                .insert(field.to_owned(), serde_json::json!(at.to_rfc3339()));
+                .insert(
+                    field.to_owned(),
+                    serde_json::json!(crate::federation::admission::render_signed_instant(at)),
+                );
         };
         let now = chrono::Utc::now();
         let (m, n) = (k("m"), k("n"));

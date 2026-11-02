@@ -1593,7 +1593,7 @@ mod tests {
                 role: None,
             }],
             founded_at: chrono::Utc::now(),
-            consensus_protocol: "founder_only".into(),
+            consensus_protocol: "quorum:1/1".into(),
             policy_blob: policy,
             persist_row_hash: String::new(),
         }

@@ -239,10 +239,57 @@ pub(crate) enum ConnClass {
 /// and are `Write`.
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
-    ("add_peer_record", ConnClass::Write),
+    // v61 (CIRISPersist#934, S4b) — the identity-occurrence executor.
+    ("store_planned_occurrence", ConnClass::Write),
+    ("store_planned_local_occurrence", ConnClass::Write),
+    // v61 (CIRISPersist#934, S4b) — the transport-destination executor.
+    ("store_planned_destination", ConnClass::Write),
+    ("store_planned_signed_destination", ConnClass::Write),
+    // v61 (CIRISPersist#934, S4a) — the byte writes' executor.
+    ("store_planned_blob", ConnClass::Write),
+    ("store_planned_announcement", ConnClass::Write),
+    ("store_planned_dag", ConnClass::Write),
+    ("store_planned_dag_over_held", ConnClass::Write),
+    ("store_planned_seal", ConnClass::Write),
+    ("sqlite_insert_dag_links", ConnClass::HelperWrite),
+    // v61 (CIRISPersist#934, S4a) — the blob plane's executor.
+    ("store_planned_chunk_batch", ConnClass::Write),
+    ("read_stream_chunk_hashes", ConnClass::Read),
+    ("store_stream_sth", ConnClass::Write),
+    ("store_delivery_receipt", ConnClass::Write),
+    ("store_holding_claim", ConnClass::Write),
+    ("store_stream_dek", ConnClass::Write),
+    ("store_stream_dek_grants", ConnClass::Write),
+    // v61 (CIRISPersist#934, S4a) — the directory executor and the trust
+    // revocation's two steps.
+    ("store_planned_peer_record", ConnClass::Write),
+    ("store_known_wire_hash", ConnClass::Write),
+    ("store_purge_execution", ConnClass::Write),
+    ("trust_granter", ConnClass::Read),
+    ("store_trust_revocation", ConnClass::Write),
+    // v61 (CIRISPersist#934, S4a) — the Backend doors' and the gated reads'
+    // executors.
+    ("store_planned_trace_erasure", ConnClass::Write),
+    ("store_planned_fountain_content", ConnClass::Write),
+    ("read_attestation_log_page", ConnClass::Read),
+    ("read_key_registration_history", ConnClass::Read),
+    ("read_renditions", ConnClass::Read),
+    ("read_attestations", ConnClass::Read),
+    // v61 (CIRISPersist#934, S4a) — the accord and evidence executors:
+    // the cursor maxima and the held-proof read are reads; every store is a
+    // write (one `self.write`, its transaction inside).
+    ("last_accord_proposal_created_at", ConnClass::Read),
+    ("last_accord_participation_arrival", ConnClass::Read),
+    ("held_location_proof", ConnClass::Read),
+    ("store_planned_accord_proposal", ConnClass::Write),
+    ("store_planned_accord_participation", ConnClass::Write),
+    ("store_planned_accord_decision", ConnClass::Write),
+    ("store_planned_location_proof", ConnClass::Write),
+    ("store_planned_location_proof_withdrawal", ConnClass::Write),
+    ("store_planned_touch_claim", ConnClass::Write),
+    ("store_planned_witness", ConnClass::Write),
     // #846 (§6.1) — the adopt floor: row + declared binding + holder claim in
     // one transaction.
-    ("adopt_sealed_blob_at", ConnClass::Write),
     ("aggregate_audit_chain", ConnClass::Read),
     ("aggregate_llm_costs", ConnClass::Read),
     ("aggregate_scoring_factors_rollup_batch", ConnClass::Read),
@@ -305,8 +352,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("count_traces", ConnClass::Read),
     ("cross_agent_divergence", ConnClass::Read),
     ("delete_blob", ConnClass::Write),
-    ("delete_traces_for_agent", ConnClass::Write),
-    ("delete_traces_for_agent_id_hash", ConnClass::Write),
     ("enqueue_outbound", ConnClass::Write),
     ("enter_mesh", ConnClass::Write),
     ("evict_fountain_content_hard_delete", ConnClass::Write),
@@ -341,7 +386,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("hash_chain_gaps", ConnClass::Read),
     ("heartbeat_shared_instance", ConnClass::Write),
     ("index_stored_record", ConnClass::Write),
-    ("insert_known_wire_hash", ConnClass::Write),
     ("insert_trace_events_batch", ConnClass::Write),
     ("insert_trace_llm_calls_batch", ConnClass::Write),
     ("known_wire_hash_contains", ConnClass::Read),
@@ -351,12 +395,11 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_accord_proposals_by_anchor", ConnClass::Read),
     ("list_accord_proposals_by_payload", ConnClass::Read),
     ("list_aggregations_at_level", ConnClass::Read),
-    ("list_all_transport_destinations", ConnClass::Read),
+    ("list_all_transport_destinations_unfolded", ConnClass::Read),
     ("list_announced_peers", ConnClass::Read),
     ("list_at_rest_blobs_for_recipients", ConnClass::Read),
     ("list_at_rest_grant_recipients", ConnClass::Read),
     ("list_at_rest_grants", ConnClass::Read),
-    ("list_attestation_log", ConnClass::Read),
     ("list_attestations", ConnClass::Read),
     // v47.2.0 (#853) — composers naming a target, by `references_attestation_id`.
     ("list_attestations_referencing", ConnClass::Read),
@@ -384,10 +427,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_family_membership_widenings_for", ConnClass::Read),
     ("read_consent_peer_rows", ConnClass::Read),
     // v44.6.0 (#857, V147) — the consent_peer_set_for projection read; same class as its twin.
-    ("list_key_registration_history", ConnClass::Read),
     // v45.0.0 (#871) — the rendition index read and the puller's budget
     // read; plain SELECTs on the reader path.
-    ("list_derived_hex", ConnClass::Read),
     // v46.0.0 (#876) — the derivation input is a plain SELECT on the reader
     // path; the repair is a single guarded UPDATE on the writer's.
     ("community_dek_minters_granting", ConnClass::Read),
@@ -422,7 +463,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_outbound", ConnClass::Read),
     ("list_revocations", ConnClass::Read),
     ("list_scope_blob_symbols", ConnClass::Write),
-    ("list_scores", ConnClass::Read),
     ("list_signed_accord_quorum_evidence_since", ConnClass::Read),
     ("list_signed_communities_since", ConnClass::Read),
     (
@@ -449,10 +489,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_tasks", ConnClass::Read),
     ("list_trace_summaries", ConnClass::Read),
     (
-        "list_transport_destinations_by_destination",
+        "list_transport_destinations_by_destination_unfolded",
         ConnClass::Read,
     ),
-    ("list_transport_destinations_for", ConnClass::Read),
+    ("list_transport_destinations_for_unfolded", ConnClass::Read),
     ("list_trusted_keys", ConnClass::Read),
     ("list_wholeness_witnesses_for_peer", ConnClass::Read),
     ("list_widening_candidates", ConnClass::Read),
@@ -500,10 +540,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("peer_metadata_for", ConnClass::Read),
     ("pinned_blob_bytes", ConnClass::Read),
     ("purge_attestation_projections", ConnClass::Write),
-    ("put_accord_decision", ConnClass::Write),
-    ("put_accord_participation", ConnClass::Write),
-    ("put_accord_proposal", ConnClass::Write),
-    ("put_aggregated_tier", ConnClass::Write),
     ("put_at_rest_grant", ConnClass::Write),
     ("put_at_rest_grants", ConnClass::Write),
     // #848 §13–§14 (V146, PR #850 review) — the emission ledger and the
@@ -514,10 +550,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v53.0.0 (CIRISPersist#969) — the stream-epoch DEK (V168).
     ("stream_key_state", ConnClass::Read),
     ("stream_dek_list", ConnClass::Read),
-    ("stream_dek_insert", ConnClass::Write),
     ("stream_dek_close", ConnClass::Write),
     ("evict_selected_room_epochs", ConnClass::Write),
-    ("stream_dek_put_grants", ConnClass::Write),
     ("stream_dek_grants", ConnClass::Read),
     ("stream_dek_grants_for_recipient", ConnClass::Read),
     ("stream_dek_key_grant_watermark", ConnClass::Read),
@@ -536,11 +570,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // transaction for a run of chunks. `put_blob_chunk_floor` is its batch of
     // one and touches no connection; `put_blob_chunk_with_scope`,
     // `adopt_sealed_chunk_at` and `adopt_sealed_chunks_at` delegate to them.
-    ("put_blob_chunks_floor", ConnClass::Write),
     // #957 — one item's append, a free fn over the writer's savepoint.
     ("sqlite_append_chunk_item", ConnClass::HelperWrite),
     ("repair_minter_sentinel", ConnClass::Write),
-    ("seal_stream_with_scope", ConnClass::Write),
     // v51.3.0 (#947) — the sealed-DAG promotion: one write transaction.
     ("promote_adopted_manifest_to_dag", ConnClass::Write),
     // v52.0.0 (CIRISPersist#954) — the nested manifest's relation and the
@@ -580,7 +612,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("purge_trace_ids_for_llm_model", ConnClass::Read),
     ("purge_trace_ids_signed_by", ConnClass::Read),
     ("purge_trace_row_counts", ConnClass::Read),
-    ("purge_put_execution", ConnClass::Write),
     ("purge_execution", ConnClass::Read),
     ("purge_tombstones_of", ConnClass::Read),
     ("purge_tombstoned", ConnClass::Read),
@@ -594,35 +625,20 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("test_seam_set_attestation_type", ConnClass::Write),
     ("test_seam_drop_purge_tombstone", ConnClass::Write),
     ("test_seam_factor_rollup_trace_counts", ConnClass::Read),
-    ("put_blob_chunks", ConnClass::Write),
     // v55.0.0 (CIRISPersist#952) — the incremental plaintext DAG finalize.
-    ("put_dag_manifest_over_held", ConnClass::Write),
-    ("put_blob_with_scope", ConnClass::Write),
     // v55.0.0 (CIRISPersist#989) — announce a holding claim for a held row.
-    ("put_holding_claim", ConnClass::Write),
     ("put_calibration_bundle", ConnClass::Write),
     ("put_family_membership_widening", ConnClass::Write),
-    ("put_delivery_receipt", ConnClass::Write),
     ("put_edge_detection_event", ConnClass::Write),
     ("put_family", ConnClass::Write),
     ("put_family_local", ConnClass::Write),
     ("put_family_membership_revocation", ConnClass::Write),
-    ("put_fountain_content", ConnClass::Write),
-    ("put_identity_occurrence", ConnClass::Write),
-    ("put_identity_occurrence_local", ConnClass::Write),
     ("put_identity_occurrence_revocation_local", ConnClass::Write),
     ("put_installed_storage_budget", ConnClass::Write),
-    ("put_location_proof", ConnClass::Write),
-    ("withdraw_location_proof", ConnClass::Write),
     // v50.0.0 (#928, V157) — the recorded admission depth of a `withdraws`.
     ("withdraws_admission_depth", ConnClass::Read),
     ("trust_direction_held_among", ConnClass::Read),
     ("put_scope_blob", ConnClass::Write),
-    ("put_signed_transport_destination", ConnClass::Write),
-    ("put_stream_sth", ConnClass::Write),
-    ("put_touch_claim", ConnClass::Write),
-    ("put_transport_destination", ConnClass::Write),
-    ("put_wholeness_witness", ConnClass::Write),
     ("read", ConnClass::Door),
     ("read_classifications", ConnClass::Read),
     ("read_features", ConnClass::Read),
@@ -644,9 +660,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // schema-history table, run before refinery validates it.
     ("repair_v070_checksum", ConnClass::Write),
     ("replay_abandoned", ConnClass::Write),
-    ("resolve_scores", ConnClass::Read),
     ("revocations_for_subject", ConnClass::Read),
-    ("revoke_trust", ConnClass::Write),
     // #845 (I55) — the nine documented steps, in one transaction: a free fn
     // handed the writer's connection from inside `repair_portable_defaults_with`.
     ("rewrite_portable_defaults_in_tx", ConnClass::HelperWrite),
@@ -692,12 +706,17 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("attesting_identity_type", ConnClass::Read),
     ("composer_replay_held", ConnClass::Read),
     ("delete_attestation", ConnClass::Write),
+    // v61 (CC 2.6.2) — the open-time pass's compare-and-delete + ledger row.
+    ("set_aside_form_refused", ConnClass::Write),
     ("repair_withdraws_depth", ConnClass::Write),
     // v59.0.0 (#1099) — the V199 self-roster receipts.
     ("note_self_roster_proposal", ConnClass::Write),
     // v59.0.0 (sealed-transport floor) — the eager key-plane rehome at open.
     ("rehome_key_plane_at_open", ConnClass::Read),
     ("legacy_community_trust_grants_at_open", ConnClass::Read),
+    // v61 (the canonical's read storm) — ANALYZE once on a never-analyzed
+    // store, then `PRAGMA optimize`: both write sqlite_stat1, on the writer.
+    ("plan_statistics_at_open", ConnClass::Write),
     ("list_open_self_roster_proposals", ConnClass::Read),
     ("list_settled_self_roster_proposals", ConnClass::Read),
     ("settle_self_roster_proposal", ConnClass::Write),
@@ -777,7 +796,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("store_planned_community", ConnClass::Write),
     ("store_planned_community_revocation", ConnClass::Write),
     ("store_planned_community_widening", ConnClass::Write),
-    ("store_blob_local", ConnClass::Write),
     ("stream_consistency_proof", ConnClass::Read),
     ("stream_inclusion_proof", ConnClass::Read),
     ("supersede_group_row", ConnClass::Write),

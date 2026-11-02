@@ -1,0 +1,35 @@
+# Mutation scope: v61 slice S4a — the identical doors onto shared plans
+# (CIRISPersist#934, docs/V61_TASK_PLAN.md §3 S4) and the bounded checkout
+# (CIRISPersist#1166).
+#
+# - The plans, whole files: `accord_admit` (the accord evidence doors),
+#   `evidence_admit` (location proof, touch claim, wholeness witness),
+#   `read_plan` (the scores reads, the attestation log, the key history,
+#   the rendition index), `directory_admit` (the peer add and its held-row
+#   verdict, the known-hash sighting, the purge write), `blob_admit` (the
+#   chunk floor and its stream-claim verdict, the stream plane's records, the
+#   byte writes and the DAG finalize's held-chunk verdict), and
+#   `store/backend_plan` (the two trace erasures and their audit event, the
+#   two fountain writes); `revoke_trust_planned` in `consent_admit`; the
+#   in-transaction tombstone re-ask in `steward_purge`.
+# - #1166: `checkout_bounded` and `CheckoutError`'s text in the Postgres
+#   backend, the Merkle store's backend-bound constructor.
+# - Witnesses: the doors' standing witnesses on both backends (the filter
+#   below), the from-disk gates that hold the doors to their plans
+#   (store::parity, I45, I797, I119, I114, I378, the scores read-log census),
+#   I1570 and the #1166 gate.
+#
+# Grammar: docs/MUTATION_TESTING.md "Scope files".
+tests: test(/accord|location_proof|touch_claim|wholeness|witness_corpus|erasure|dsar|delete_traces|fountain|aggregat|scores|attestation_log|registration_history|derived_hex|rendition|peer_record|add_peer|known_wire|wire_hash|purge_put|revoke_trust|trust_revocation|chunk|stream_sth|delivery_receipt|holding_claim|stream_dek|adopt_sealed|seal_stream|dag_manifest|put_blob|store_blob_local|tombstone|one_connection_pool|pool_checkout_gate|^store::parity::|blob_surface_gates::|doors_takedown_invariants::|media_source_invariants::|holder_claim_index_invariants::|row_type_invariants::|scores_read_audit::/)
+features: postgres,sqlite,server,cirisaudit
+
+src/federation/accord_admit.rs
+src/federation/evidence_admit.rs
+src/federation/read_plan.rs
+src/federation/directory_admit.rs
+src/federation/blob_admit.rs
+src/store/backend_plan.rs
+src/federation/consent_admit.rs revoke_trust_planned
+src/federation/steward_purge.rs refuse_tombstoned_at_write refuse_standing_notice
+src/store/postgres.rs checkout_bounded fmt
+src/audit/merkle_store.rs from_backend

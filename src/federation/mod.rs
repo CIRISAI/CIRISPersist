@@ -32,6 +32,11 @@
 //! and the registry-side `docs/FEDERATION_CLIENT.md` for the consumer
 //! complement.
 
+/// v61 (CIRISPersist#934, S4a) — the accord evidence doors, decided
+/// once: the proposal, participation and decision plans and the per-backend
+/// `AccordStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod accord_admit;
 pub mod accord_carriage;
 pub mod accord_quorum;
 /// v53.0.0 (CC 4.2.6) — an accord holder's recovery under a pre-committed key.
@@ -58,6 +63,11 @@ mod attestation_apply_invariants;
 /// v25.1.0 (CIRISPersist#582) — the backend-generic signed-ATTESTATION emit
 /// recipe (distinct from [`emit`], the trust-grant/audit-entry API).
 pub mod attestation_emit;
+/// v61 (CIRISPersist#934, S4a) — the blob plane's gated doors (the chunk
+/// floor, the stream plane's records, the blob writes), decided once, with
+/// the per-backend `BlobFloorStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod blob_admit;
 /// v57.0.0 (CIRISPersist#934 step 2) — the community and roster doors,
 /// decided once: `plan_put_community`, the three roster plans, and the
 /// per-backend `CommunityStore` executor.
@@ -66,11 +76,34 @@ pub(crate) mod community_admit;
 /// the consent-role and trust-grant plans, the consent read folds, and the
 /// per-backend `ConsentStore` executor.
 pub(crate) mod consent_admit;
+/// v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash
+/// sighting and the purge record write, decided once, with the per-backend
+/// `DirectoryStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod directory_admit;
+/// v61 (CIRISPersist#934, S4a) — the location proof, touch claim and
+/// wholeness witness doors, decided once, with the per-backend
+/// `EvidenceStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod evidence_admit;
+/// v61 (CIRISPersist#934, S4b) — the identity-occurrence writes, decided
+/// once, with the per-backend `OccurrenceStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod occurrence_admit;
+/// v61 (CIRISPersist#934, S4a) — the gated directory reads (the scores
+/// reads, the attestation log, the key history, the rendition index), decided
+/// once, with the per-backend `ReadPlanStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod read_plan;
 /// v60.0.0 (CIRISPersist#934 step 4) — the sweeps' selections, decided once:
 /// the PQC sweep's page, the reaper's page, the known-hash eviction report and
 /// the room retention leg, with the per-backend `SweepStore` /
 /// `RoomEvictionStore` executors.
 pub(crate) mod sweep_plan;
+/// v61 (CIRISPersist#934, S4b) — the transport-destination writes, decided
+/// once, with the per-backend `TransportStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod transport_admit;
 // v56.0.0 (CIRISPersist#1001) — the typed bounded attestation read.
 pub mod attestation_query;
 #[cfg(test)]
@@ -200,8 +233,19 @@ pub(crate) mod community_trust_consent_invariants;
 #[cfg(test)]
 pub mod consent_sweep_principals_invariants;
 // v60.0.0 (CIRISPersist#934 step 4, #1105) — I1192–I1201.
+/// v61 S2 (CIRISPersist#1143) — I1513–I1514: the affiliation floor and
+/// dissolution.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod affiliation_floor_invariants;
+/// v61 S2 (CIRISPersist#1155 / #1157) — I1506–I1508: composers idempotent on
+/// their id, distinct ones ranked read-time within one audience.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod composer_rank_invariants;
 #[cfg(test)]
 mod consent_sweep_plan_invariants;
+/// v61 S2 (CIRISPersist#1165) — I1510: a contact grant reaches the relay.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod contact_relay_invariants;
 /// v53.1.0 (CIRISPersist#979) — I480–I487: a chunk of a withdrawn file is
 /// judged by its file.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -247,9 +291,22 @@ pub mod moderation_walk_asof_invariants;
 /// (I202–I209).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod nested_manifest_invariants;
+/// v61 S2 (CIRISPersist#1123) — I1500–I1503: one voice never decides who
+/// is in a room.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod open_admission_invariants;
+/// v61 S2 (CIRISPersist#1140) — I1511: the owner-binding audience.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod owner_binding_audience_invariants;
+/// v61 S2 (CIRISPersist#1148) — I1509: a replicated write needs the audience.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod put_audience_invariants;
 /// v53.1.2 (CIRISPersist#984 row 12) — who may retract what (I516).
 #[cfg(test)]
 mod retraction_invariants;
+/// v61 S2 (CIRISPersist#1161) — I1512: room moderation in CC's shape.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod room_moderation_invariants;
 // v53.0.0 (CIRISPersist#969) — I310–I319: one DEK per (stream, epoch).
 /// v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — affiliations: the declared
 /// cohort and the typed config record (I592–I594).
@@ -445,6 +502,19 @@ pub mod claim_signing_invariants;
     any(feature = "postgres", feature = "sqlite")
 ))]
 pub mod key_rebind_invariants;
+// v61 (CC 2.6.2) — the open-time pass over non-canonical signed instants.
+pub mod instant_form;
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub(crate) mod instant_form_invariants;
+
+// v61 (CIRISPersist#1122) — one destination, one live key; agents announce no route.
+pub mod transport_routes;
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub(crate) mod transport_routes_invariants;
+
+// v61 (CIRISPersist#1146) — a restart re-registering the same key.
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub mod self_registration_restart_invariants;
 // v54.1.0 (#1042) — the ordering-gap witnesses drive the key plan too.
 #[cfg(all(
     any(test, feature = "test-anchor"),
@@ -1509,7 +1579,8 @@ pub struct RosterEvent {
     /// Founders from whom a live (at `effective_at`) `moderate` chain reaches a
     /// signer. The fold honours one only while it is an active founder.
     pub moderator_roots: std::collections::BTreeSet<String>,
-    /// A `reverse_quorum` removal the objection fold has reversed.
+    /// A `reverse_quorum` removal or (v61, CIRISPersist#1100 item 2(i))
+    /// widening the objection fold has reversed.
     pub reversed: bool,
 }
 
@@ -1540,9 +1611,14 @@ pub fn roster_event_standing(
     // moderator whose appointment was live at this event's instant and was
     // issued while its root held authority (operator ruling 2026-09-25: no
     // ending is retroactive, and the root need not still be a member).
+    // v61 (CIRISPersist#1123; CC 4.5.13) — under `open:self_admit` a
+    // named moderator's standing does not remove anyone alone: the two-voice
+    // floor is the removal's guarantee, and a moderator is one voice.
+    let moderator_may_act = !e.moderator_roots.is_empty()
+        && (e.is_add || rules.protocol != types::consensus_protocol::OPEN_SELF_ADMIT);
     let standing_without_protocol = e.signers.is_empty()
         || (!e.is_add && e.signers.contains(&e.member.key_id))
-        || !e.moderator_roots.is_empty();
+        || moderator_may_act;
     let admitted = if standing_without_protocol {
         Ok(())
     } else {
@@ -1566,6 +1642,7 @@ pub fn roster_event_standing(
             } else {
                 consensus::Direction::Remove
             },
+            subject: Some(e.member.key_id.as_str()),
         }) {
             consensus::Verdict::Admit => Ok(()),
             consensus::Verdict::Unevaluable { reason } => {
@@ -1938,7 +2015,7 @@ where
             .find(|s| s.member_key_id == member && s.effective_at == at)
     }
     let mut events = Vec::with_capacity(stored.len());
-    let mut reverse_candidates: Vec<(usize, String, String)> = Vec::new();
+    let mut reverse_candidates: Vec<(usize, String, String, bool)> = Vec::new();
     for ev in stored {
         let list = if ev.is_add {
             &signers.widening_signers
@@ -1950,9 +2027,12 @@ where
         // Moderator standing is filled in a second pass (below): it needs
         // each root's authority intervals, which come from these events.
         let moderator_roots = std::collections::BTreeSet::new();
-        if !ev.is_add && reverse {
+        // v61 (CIRISPersist#1100 item 2(i)) — a WIDENING is reversible
+        // too: the reverse path for adds is the same objection fold, a
+        // condition change, never a second machine.
+        if reverse {
             if let Some(actor) = row_signer.and_then(|x| x.authority_key_id.clone()) {
-                reverse_candidates.push((events.len(), actor, ev.row_hash.clone()));
+                reverse_candidates.push((events.len(), actor, ev.row_hash.clone(), ev.is_add));
             }
         }
         events.push(RosterEvent {
@@ -2017,7 +2097,7 @@ where
     } else {
         None
     };
-    for (idx, actor, row_hash) in reverse_candidates {
+    for (idx, actor, row_hash, is_add) in reverse_candidates {
         let fold = Box::pin(reverse_quorum::resolve_reverse_quorum_with(
             directory.as_dyn_directory(),
             cohort,
@@ -2033,9 +2113,24 @@ where
             now,
         ))
         .await?;
-        events[idx].reversed = fold.standing == reverse_quorum::ReverseQuorumStanding::Reversed;
+        // An add's reversal also clears the two-path count minimum of a
+        // community (`two_path::FloorClass::Voters`, the table's `min_count`
+        // 2): one voice never decides who is in a room (CC 4.5.13), in
+        // either direction. A removal's reversal keeps the #574 threshold.
+        events[idx].reversed = roster_reversal_stands(is_add, &fold);
     }
     Ok(events)
+}
+
+/// v61 (CIRISPersist#1100 item 2(i)) — does the objection `fold` reverse a
+/// roster event? A removal: when the fold says `Reversed` (the #574
+/// threshold). A WIDENING: also only when its objectors reach the two-path
+/// count minimum of a community (`two_path::FloorClass::Voters`, 2), so one
+/// voice never takes a member off.
+#[must_use]
+pub fn roster_reversal_stands(is_add: bool, fold: &reverse_quorum::ReverseQuorumFold) -> bool {
+    fold.standing == reverse_quorum::ReverseQuorumStanding::Reversed
+        && (!is_add || fold.distinct_objectors >= two_path::FloorClass::Voters.min_count())
 }
 
 /// v49.0.0 (CIRISPersist#908) — every stored roster event of `community`,
@@ -2211,6 +2306,17 @@ pub async fn authorized_community_roster_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v61 S2 (CIRISPersist#1143; CC rc14 4.4.3.2.8) — seats lapse at the
+    // dissolution: from its instant the room seats nobody.
+    if Box::pin(group_plane::community_dissolved_at(
+        directory,
+        &community.community_key_id,
+    ))
+    .await?
+    .is_some_and(|at| at <= as_of)
+    {
+        return Ok(Vec::new());
+    }
     // Boxed: the replay nests the moderator walk and the reverse-quorum
     // fold; a caller's future must not inline all of it (2 MiB worker stacks).
     let nodes = Box::pin(community_node_bearing_seats(directory, community)).await?;
@@ -2327,6 +2433,25 @@ where
     let Some(community) = directory.lookup_community(community_key_id).await? else {
         return Ok(());
     };
+    // v61 S2 (CIRISPersist#1143) — a dissolved room admits no seat and no
+    // removal: no new seat or grant is issued, and the DEK rotates no more.
+    Box::pin(group_plane::refuse_if_community_dissolved(
+        directory,
+        community_key_id,
+    ))
+    .await?;
+    // v61 S2 (CIRISPersist#1143; CC rc14 4.4.3.2.8) — an act against a member
+    // of a one-voice affiliation needs a countersign from outside the seat.
+    if is_revocation && !signers.contains(&incoming.key_id) {
+        Box::pin(affiliation_config::check_one_voice_countersign(
+            directory,
+            &community,
+            primary,
+            signers,
+            effective_at,
+        ))
+        .await?;
+    }
     // v50.0.0 (CIRISPersist#926, HIGH-3 ruling) — a trust-root community's
     // founder seats move ONLY through the record (a founders' amendment); the
     // planes admit and remove members only, whoever signs.
@@ -7411,6 +7536,7 @@ pub trait FederationDirectory: Send + Sync {
                 roster: &roster,
                 signers: &signers,
                 direction,
+                subject: None,
             }) {
                 consensus::Verdict::Admit => {}
                 consensus::Verdict::Insufficient { detail } => {
@@ -8088,6 +8214,24 @@ pub trait FederationDirectory: Send + Sync {
         )
         .await?;
         let row = signed.attestation.clone();
+        // v61 (CIRISPersist#1155 / #1157) — a placement is idempotent PER
+        // AUDIENCE. The put door no longer swallows a second `supersedes` from
+        // the same attester on the same prior (idempotence keys on the row's
+        // id, CC rc14 3.1.9.4), so the door asks the one question a placement
+        // needs: is this prior already placed, by this attester, in THIS
+        // audience (cohort scope and cohort target)? Then it is the same
+        // placement. A placement into a DIFFERENT room is a new one, and both
+        // stay live (#1155: one row shared into two rooms).
+        for c in self
+            .list_attestations_referencing(&prior.attestation_id)
+            .await?
+        {
+            if crossing::same_placement(&c, &row)? {
+                return Ok(crossing::MeshCrossingOutcome::AlreadyWidened {
+                    prior_attestation_id: prior.attestation_id,
+                });
+            }
+        }
         // v41.0.0 (#804) — this node just signed this row; it is not a peer of
         // itself. Before this, every widening charged the OWNER's peer bucket,
         // which is what cut chat off at ~250 messages.
@@ -8585,7 +8729,24 @@ pub trait FederationDirectory: Send + Sync {
     /// `transport_kind` since #443, RETIRED (tombstoned) rows excluded.
     /// Empty when none. Liveness filtering (on `last_seen_at` age) is
     /// caller-side. Default impl errors; the three backends override.
+    ///
+    /// v61 (CIRISPersist#1122) — one destination, one live key: a route a
+    /// newer route on its destination by a tied key displaces is not returned
+    /// ([`transport_routes::fold_one_live_key`] over
+    /// [`Self::list_transport_destinations_for_unfolded`]).
     async fn list_transport_destinations_for(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        let rows = self
+            .list_transport_destinations_for_unfolded(occurrence_key_id)
+            .await?;
+        transport_routes::fold_one_live_key(self, rows).await
+    }
+
+    /// The backend's stored live routes of `occurrence_key_id`, before the
+    /// one-live-key fold. Default impl errors; backends override.
+    async fn list_transport_destinations_for_unfolded(
         &self,
         occurrence_key_id: &str,
     ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
@@ -8606,7 +8767,19 @@ pub trait FederationDirectory: Send + Sync {
     /// by `(occurrence_key_id, transport_kind)` — the route key, so the
     /// restore order is deterministic and "which is current" is structural
     /// (one row per key). Default impl errors; backends override.
+    ///
+    /// v61 (CIRISPersist#1122) — folded one live key per destination
+    /// ([`transport_routes::fold_one_live_key`]).
     async fn list_all_transport_destinations(
+        &self,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        let rows = self.list_all_transport_destinations_unfolded().await?;
+        transport_routes::fold_one_live_key(self, rows).await
+    }
+
+    /// Every stored live route, before the one-live-key fold. Default impl
+    /// errors; backends override.
+    async fn list_all_transport_destinations_unfolded(
         &self,
     ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
         Err(Error::Backend(
@@ -8622,7 +8795,23 @@ pub trait FederationDirectory: Send + Sync {
     /// binding over an [`Advisory`](self_at_login::BindingProvenance::Advisory)
     /// one — the AV-42 spoof is resolved by preference, never a substrate reject.
     /// #443: RETIRED rows excluded. Default impl errors; backends override.
+    ///
+    /// v61 (CIRISPersist#1122) — a claimant a newer route by a TIED key
+    /// (one live owner) displaces is not returned; untied claimants still
+    /// coexist ([`transport_routes::fold_one_live_key`]).
     async fn list_transport_destinations_by_destination(
+        &self,
+        destination: &str,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        let rows = self
+            .list_transport_destinations_by_destination_unfolded(destination)
+            .await?;
+        transport_routes::fold_one_live_key(self, rows).await
+    }
+
+    /// Every stored live claimant of `destination`, before the one-live-key
+    /// fold. Default impl errors; backends override.
+    async fn list_transport_destinations_by_destination_unfolded(
         &self,
         destination: &str,
     ) -> Result<Vec<self_at_login::TransportDestination>, Error> {

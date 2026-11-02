@@ -14,14 +14,16 @@
 //!    there is no authority to check, and the label cannot be used to drop a
 //!    private room's DEK because a record never crosses the `public`
 //!    boundary ([`check_public_room_conformance`]).
-//! 2. **Open admission.** A record MAY declare `admission: open`; it is
-//!    admissible only on a `public` room (CC 3.2, verbatim: "an encrypted
+//! 2. **Open admission.** A record MAY declare `consensus_protocol:
+//!    open:self_admit` (v61, CIRISPersist#1123, CC rc14 3.2: "there is no
+//!    `admission` field"; `admission: open` is only its shorthand in prose); it
+//!    is admissible only on a `public` room (CC 3.2, verbatim: "an encrypted
 //!    roster that anyone may join is a contradiction, and is refused"). The
 //!    founder's standing `membership:proposal:v1` then names no invitee —
 //!    `subject_key_ids` is resolved at acceptance — and the requester's own
 //!    `membership:acceptance:v1` naming it is their consent; the widening
-//!    that seats them is admitted under the room's `consensus_protocol` as
-//!    now (`membership_acceptance`).
+//!    that seats them is the joiner's own signature (`membership_acceptance`,
+//!    [`super::consensus`]). A removal takes two voices (CC 4.5.13).
 //! 3. **Discovery.** `community:listing:v1` is the room's own `scores` row at
 //!    `federation`, by its founder or a current `moderate`-holder, carrying
 //!    the name, description, `cohort_subkind`, admission policy, named
@@ -36,10 +38,14 @@ use super::{Attestation, Community, Error, FederationDirectory};
 /// The `cohort_subkind` CC 3.2 codifies for a public room.
 pub const COHORT_SUBKIND_PUBLIC: &str = "public";
 
-/// The community-record member that declares the admission policy (CC 3.2).
+/// The `community:listing:v1` envelope member that states the room's
+/// admission policy (CC 3.2). v61 (CIRISPersist#1123): a community
+/// RECORD no longer carries it — open admission is the record's
+/// `consensus_protocol: open:self_admit` — and a record whose `policy_blob`
+/// names it is refused ([`PUBLIC_RULE_ADMISSION_MEMBER_RETIRED`]).
 pub const ADMISSION_MEMBER: &str = "admission";
 
-/// The one admission value CC 3.2 names: anyone may join on their own
+/// The one admission value a listing states: anyone may join on their own
 /// acceptance of the founder's standing proposal.
 pub const ADMISSION_OPEN: &str = "open";
 
@@ -53,10 +59,11 @@ pub const LISTING_FAMILY_STEM: &str = "community:listing:";
 /// room that is not `public` (CC 3.2).
 pub const PUBLIC_RULE_OPEN_ADMISSION_NOT_PUBLIC: &str = "open_admission_not_public";
 
-/// [`Error::CommunityConsensusProtocolViolation`] rule: an `admission` member
-/// that is not the string `open` (CC 3.2 names one value; absent is
-/// invite-only).
-pub const PUBLIC_RULE_ADMISSION_MALFORMED: &str = "admission_malformed";
+/// v61 (CIRISPersist#1123; CC rc14 3.2, "there is no `admission`
+/// field") — [`Error::CommunityConsensusProtocolViolation`] rule: a community
+/// record whose `policy_blob` carries an `admission` member. Open admission is
+/// `consensus_protocol: open:self_admit`.
+pub const PUBLIC_RULE_ADMISSION_MEMBER_RETIRED: &str = "admission_member_retired";
 
 /// [`Error::CommunityConsensusProtocolViolation`] rule: a version of a room
 /// that changes whether it is `public`. A room's tier is a property of every
@@ -87,15 +94,11 @@ pub fn is_public_community(community: &Community) -> bool {
     super::community_subkind(community) == Some(COHORT_SUBKIND_PUBLIC)
 }
 
-/// Does `community` declare `admission: open`?
+/// Does `community` admit openly — `consensus_protocol: open:self_admit`
+/// (v61, CIRISPersist#1123)?
 #[must_use]
 pub fn is_open_admission(community: &Community) -> bool {
-    community
-        .policy_blob
-        .as_ref()
-        .and_then(|b| b.get(ADMISSION_MEMBER))
-        .and_then(serde_json::Value::as_str)
-        == Some(ADMISSION_OPEN)
+    community.consensus_protocol == super::types::consensus_protocol::OPEN_SELF_ADMIT
 }
 
 fn violation(community: &Community, rule: &'static str, detail: String) -> Error {
@@ -109,9 +112,9 @@ fn violation(community: &Community, rule: &'static str, detail: String) -> Error
 /// **CC 3.2 `public` conformance of a community record**, at every record
 /// door (it runs inside `admission::check_infrastructure_community_conformance`):
 ///
-/// - an `admission` member, when present, is the string `open`
-///   ([`PUBLIC_RULE_ADMISSION_MALFORMED`]);
-/// - `admission: open` only on a `public` room
+/// - no `admission` member in the `policy_blob`
+///   ([`PUBLIC_RULE_ADMISSION_MEMBER_RETIRED`], v61);
+/// - `consensus_protocol: open:self_admit` only on a `public` room
 ///   ([`PUBLIC_RULE_OPEN_ADMISSION_NOT_PUBLIC`]);
 /// - a version that supersedes a STORED record keeps the stored record's side
 ///   of the `public` boundary ([`PUBLIC_RULE_SUBKIND_CROSSES_PUBLIC`]).
@@ -129,27 +132,27 @@ pub async fn check_public_room_conformance(
         .as_ref()
         .and_then(|b| b.get(ADMISSION_MEMBER))
     {
-        if admission.as_str() != Some(ADMISSION_OPEN) {
-            return Err(violation(
-                community,
-                PUBLIC_RULE_ADMISSION_MALFORMED,
-                format!(
-                    "`{ADMISSION_MEMBER}` is {admission}; CC 3.2 names one value, \
-                     `{ADMISSION_OPEN}` — a record without it is invite-only"
-                ),
-            ));
-        }
-        if !is_public_community(community) {
-            return Err(violation(
-                community,
-                PUBLIC_RULE_OPEN_ADMISSION_NOT_PUBLIC,
-                format!(
-                    "`admission: open` is admissible only on a `public` community; this one is \
-                     {:?} — an encrypted roster that anyone may join is a contradiction (CC 3.2)",
-                    super::community_subkind(community)
-                ),
-            ));
-        }
+        return Err(violation(
+            community,
+            PUBLIC_RULE_ADMISSION_MEMBER_RETIRED,
+            format!(
+                "the record carries `{ADMISSION_MEMBER}: {admission}`; there is no admission \
+                 field (CC 3.2) — open admission is `consensus_protocol: {}`",
+                super::types::consensus_protocol::OPEN_SELF_ADMIT
+            ),
+        ));
+    }
+    if is_open_admission(community) && !is_public_community(community) {
+        return Err(violation(
+            community,
+            PUBLIC_RULE_OPEN_ADMISSION_NOT_PUBLIC,
+            format!(
+                "`{}` is admissible only on a `public` community; this one is {:?} — an \
+                 encrypted roster that anyone may join is a contradiction (CC 3.2)",
+                super::types::consensus_protocol::OPEN_SELF_ADMIT,
+                super::community_subkind(community)
+            ),
+        ));
     }
     if let Some(stored) = directory
         .lookup_community(&community.community_key_id)
@@ -274,11 +277,9 @@ pub async fn check_community_listing_admission(
         ));
     }
     let subkind_agrees = env_str(row, "cohort_subkind") == Some(COHORT_SUBKIND_PUBLIC);
-    let room_admission = room
-        .policy_blob
-        .as_ref()
-        .and_then(|b| b.get(ADMISSION_MEMBER))
-        .and_then(serde_json::Value::as_str);
+    // v61 (CIRISPersist#1123) — the listing states `admission: open`
+    // exactly when the room's protocol is `open:self_admit`.
+    let room_admission = is_open_admission(&room).then_some(ADMISSION_OPEN);
     let admission_agrees = env_str(row, ADMISSION_MEMBER) == room_admission;
     if !subkind_agrees || !admission_agrees {
         return Err(listing_refusal(
@@ -322,6 +323,92 @@ pub async fn check_community_listing_admission(
             row.attesting_key_id
         ),
     ))
+}
+
+/// v61 (CIRISPersist#1063; CC 3.2 "replicated on join, visible to
+/// everyone on request") — **a public room's live standing proposal, for a
+/// requester who is not a member.** The founder's standing
+/// `membership:proposal:v1` is placed at the room's `community` scope, so
+/// nothing pushes it to a node whose owner has not joined; a non-member asks a
+/// member's node, and this is the read that node answers with. The row it
+/// returns is servable to any peer: a public room is a public group to the
+/// replication audience ([`super::replication_audience::may_receive`]), and the
+/// requester's node admits it on its replicated door like any public room row.
+///
+/// Among the standing proposals (no invitee, [`super::membership_acceptance::is_standing_proposal`])
+/// held here for `community_key_id`: signed by a founder ACTIVE now, not
+/// expired at the read instant, never withdrawn or superseded by its
+/// proposer; the latest by signed instant, ties by row hash. `None` unless
+/// the room is a `public` room under `open:self_admit` (CC 3.2: "a record
+/// with any other protocol is invite-only").
+///
+/// # Errors
+///
+/// Directory errors.
+pub async fn live_standing_proposal<D>(
+    directory: &D,
+    community_key_id: &str,
+) -> Result<Option<Attestation>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let Some(room) = directory.lookup_community(community_key_id).await? else {
+        return Ok(None);
+    };
+    if !is_public_community(&room) || !is_open_admission(&room) {
+        return Ok(None);
+    }
+    let founders: std::collections::BTreeSet<String> = directory
+        .active_community_members(community_key_id)
+        .await?
+        .into_iter()
+        .filter(|m| m.role.as_deref() == Some(super::admission::MEMBER_ROLE_FOUNDER))
+        .map(|m| m.key_id)
+        .collect();
+    let now = chrono::Utc::now();
+    let mut live: Vec<Attestation> = Vec::new();
+    for row in directory
+        .list_targeted_by_dimension_prefix(
+            &[cs::COMMUNITY],
+            community_key_id,
+            super::membership_acceptance::PROPOSAL_DIMENSION,
+        )
+        .await?
+    {
+        if !super::membership_acceptance::is_standing_proposal(&row)
+            || row.expires_at.is_none_or(|e| e <= now)
+        {
+            continue;
+        }
+        let proposer =
+            super::admission::admission_identity_for_writer(directory, &row.attesting_key_id)
+                .await?;
+        if !founders.contains(&proposer) && !founders.contains(&row.attesting_key_id) {
+            continue;
+        }
+        let mut retired = false;
+        for c in directory
+            .list_attestations_referencing(&row.attestation_id)
+            .await?
+        {
+            if matches!(
+                c.attestation_type.as_str(),
+                attestation_type::WITHDRAWS | attestation_type::SUPERSEDES
+            ) && super::admission::admission_identity_for_writer(directory, &c.attesting_key_id)
+                .await?
+                == proposer
+            {
+                retired = true;
+                break;
+            }
+        }
+        if !retired {
+            live.push(row);
+        }
+    }
+    Ok(live.into_iter().max_by(|a, b| {
+        (a.asserted_at, &a.persist_row_hash).cmp(&(b.asserted_at, &b.persist_row_hash))
+    }))
 }
 
 /// **The room's one live listing** (CC 3.2: "one live row per community"):

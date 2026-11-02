@@ -81,7 +81,7 @@ pub mod bodies {
         let signer = record_signer
             .map(str::to_owned)
             .unwrap_or_else(|| keys[0].clone());
-        d.put_community(ts::sign_community(
+        let community = ts::sign_community(
             &signer,
             Community {
                 prev_head_digest: String::new(),
@@ -102,9 +102,32 @@ pub mod bodies {
                 policy_blob,
                 persist_row_hash: String::new(),
             },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("{tag}: room: {e}"));
+        );
+        // v61 (CIRISPersist#1123) — the local door refuses `founder_only`
+        // above the family. A room under it is a LEGACY room (stored before
+        // v61, as the field holds one), which a peer still delivers: the
+        // replicated door admits it as data, and every fold reads it as
+        // before. An affiliation keeps `founder_only` on the local door.
+        let legacy = protocol == consensus_protocol::FOUNDER_ONLY
+            && crate::federation::affiliation_config::declared_cohort(&community.community)
+                .is_ok_and(|c| c != crate::federation::cohort::Cohort::Affiliations);
+        if legacy {
+            let outcome = d
+                .apply_replicated_community(community)
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: legacy room: {e}"));
+            assert!(
+                matches!(
+                    outcome,
+                    crate::federation::ReplicatedCommunityOutcome::Inserted
+                ),
+                "{tag}: legacy room: {outcome:?}"
+            );
+        } else {
+            d.put_community(community)
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: room: {e}"));
+        }
         (room, keys)
     }
 
@@ -213,7 +236,7 @@ pub mod bodies {
     /// **I170 — admission is the roster.** A `founder_only` room, so the
     /// founder's single signature is the protocol (CC 4.4.3.4.2).
     pub async fn i170_admission_is_the_roster(d: &dyn FederationDirectory, tag: &str) {
-        let (room, alice, _bob) = make_room(d, tag, consensus_protocol::FOUNDER_ONLY).await;
+        let (room, alice, _bob) = make_room(d, tag, "quorum:1/1").await;
         let carol = format!("{tag}-carol");
         user(d, &carol).await;
         assert!(!admitted(d, &carol, &room).await, "{tag} I170: control");
@@ -417,7 +440,7 @@ pub mod bodies {
         let (r, _k) = make_group(
             d,
             &format!("{tag}-rs"),
-            consensus_protocol::FOUNDER_ONLY,
+            "quorum:1/1",
             &["a", "b"],
             1,
             None,
@@ -940,7 +963,7 @@ pub mod bodies {
 
     /// The store-half setup: a room, bob removed by alice.
     pub async fn i173_setup(d: &dyn FederationDirectory, tag: &str) -> (String, String) {
-        let (room, alice, bob) = make_room(d, tag, consensus_protocol::FOUNDER_ONLY).await;
+        let (room, alice, bob) = make_room(d, tag, "quorum:1/1").await;
         revoke(
             d,
             &alice,

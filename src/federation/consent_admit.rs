@@ -108,6 +108,14 @@ pub(crate) trait ConsentStore: Send + Sync {
     /// memory backend's trust map). `false` when the key has no row.
     async fn store_planned_trust_grant(&self, row: TrustRow) -> Result<bool, Error>;
 
+    /// v61 (CIRISPersist#934, S4a) — the STORED granter of `key`'s live
+    /// trust grant (`trusted_by`), if any.
+    async fn trust_granter(&self, key: &str) -> Result<Option<String>, Error>;
+
+    /// v61 (CIRISPersist#934, S4a) — expire `key`'s trust grant at `at`,
+    /// unless it already expired by then (an idempotent no-op).
+    async fn store_trust_revocation(&self, key: &str, at: DateTime<Utc>) -> Result<(), Error>;
+
     /// Every projection row the read pins, as stored: unordered, duplicates
     /// kept (the fold sorts and dedups).
     async fn read_consent_peer_rows(
@@ -256,6 +264,34 @@ where
             "federation_keys row {key} does not exist — call put_public_key first"
         )))
     }
+}
+
+/// v61 (CIRISPersist#934, S4a) — the door: every backend's `revoke_trust`.
+/// The #721 signature proof first, then ownership against the STORED granter
+/// (only the granter withdraws its own grant), then the expiry stamped with
+/// the door's one clock read (`NOW()` on postgres before v61).
+pub(crate) async fn revoke_trust_planned<D>(
+    dir: &D,
+    revocation: types::SignedTrustRevocation,
+) -> Result<(), Error>
+where
+    D: ConsentStore + FederationDirectory,
+{
+    if revocation.key.is_empty() {
+        return Err(Error::InvalidArgument("key must be non-empty".into()));
+    }
+    super::admission::check_trust_revocation_authority(dir, &revocation).await?;
+    if let Some(granter) = dir.trust_granter(&revocation.key).await? {
+        if granter != revocation.revoked_by {
+            return Err(Error::InvalidArgument(format!(
+                "trust on {} was granted by {granter:?}; {:?} may not revoke it — only the \
+                 granter withdraws its own grant (CIRISPersist#721)",
+                revocation.key, revocation.revoked_by
+            )));
+        }
+    }
+    dir.store_trust_revocation(&revocation.key, Utc::now())
+        .await
 }
 
 // ── reads ──────────────────────────────────────────────────────────────

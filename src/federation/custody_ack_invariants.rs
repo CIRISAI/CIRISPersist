@@ -2465,9 +2465,13 @@ mod storm_v61_pg {
         params: &Params<'_>,
     ) -> (Vec<(String, Option<String>)>, i64) {
         fn walk(n: &serde_json::Value, out: &mut Vec<(String, Option<String>)>) {
+            // A scan with no index carries its relation in the second slot.
             out.push((
                 n["Node Type"].as_str().unwrap_or("?").to_owned(),
-                n["Index Name"].as_str().map(str::to_owned),
+                n["Index Name"]
+                    .as_str()
+                    .or_else(|| n["Relation Name"].as_str())
+                    .map(str::to_owned),
             ));
             for c in n["Plans"].as_array().into_iter().flatten() {
                 walk(c, out);
@@ -2498,9 +2502,12 @@ mod storm_v61_pg {
         })
     }
 
+    /// A table scan of `federation_attestations`, or V004's single-column
+    /// attester walk. (`list_scores` may scan its own subject table when no
+    /// subject is pinned, as on sqlite; that is not the history walk.)
     fn walks_history(nodes: &[(String, Option<String>)]) -> bool {
         nodes.iter().any(|(t, i)| {
-            t == "Seq Scan"
+            (t == "Seq Scan" && i.as_deref() == Some("federation_attestations"))
                 || matches!(
                     i.as_deref(),
                     Some("federation_attestations_attesting")
@@ -2585,6 +2592,25 @@ mod storm_v61_pg {
             .await
             .unwrap();
         assert_eq!(inserted as i64, OTHER_BLOBS * 2, "the history landed");
+        // The scores plane's subject rows for that history, as the write
+        // path keeps them (one per subject), so `list_scores` below plans
+        // over a subject table the size of the history.
+        let subjects = client
+            .execute(
+                "INSERT INTO cirislens.attestation_subjects \
+                    (subject_key_id, dimension, asserted_at, attestation_id, tier, cohort_scope) \
+                 SELECT fa.attested_key_id, fa.dimension, fa.asserted_at, fa.attestation_id, \
+                        fa.tier, fa.cohort_scope \
+                 FROM cirislens.federation_attestations fa \
+                 ON CONFLICT (subject_key_id, attestation_id) DO NOTHING",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(
+            subjects as i64 >= OTHER_BLOBS * 2,
+            "the subject rows landed"
+        );
 
         let hex = hex::encode(target);
         let dim = CUSTODY_ACK_DIMENSION;
@@ -2752,6 +2778,30 @@ mod storm_v61_pg {
                         OTHER_BLOBS * 2 + 2
                     ));
                 }
+
+                // `list_scores` under the same Live view, through the
+                // builder the read-plan executor issues: its lifecycle
+                // subqueries reach a reference index (the sqlite twin's
+                // `v61_storm_list_scores_live_subquery_seeks`). With no
+                // subject pinned the scores plane joins its whole subject
+                // table (sqlite: a covering scan of it), so the page is
+                // O(subjects) on both backends; that shape predates this
+                // fix and is reported here, not refused.
+                let (sql, params) = crate::store::postgres::pg_list_scores_sql(
+                    &filter,
+                    cur,
+                    LISTING_PAGE,
+                    &crate::scope::CallerScope::Unauthenticated,
+                );
+                let refs: Params<'_> = params.iter().map(|p| p.as_ref() as _).collect();
+                let (nodes, bufs) = plan(&client, &sql, &refs).await;
+                eprintln!("v61 pg [{stats}] list_scores Live {tag}: {nodes:?}, {bufs} buffers");
+                assert!(
+                    reaches(&nodes, "federation_attestations_reference_seek")
+                        || reaches(&nodes, "federation_attestations_reference_live"),
+                    "[{stats}] list_scores {tag}: the lifecycle subquery reaches a reference \
+                     index: {nodes:?}"
+                );
             }
         }
         assert!(

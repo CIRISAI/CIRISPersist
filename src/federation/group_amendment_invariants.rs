@@ -381,13 +381,15 @@ pub mod bodies {
 
         // (2b) A genuine proof attached to a record it does not describe
         //      (verify-A-store-B): the quorum signed `unanimous`, the record
-        //      says `founder_only`. Refused, and B keeps its record.
+        //      says `majority`. Refused, and B keeps its record. (v61:
+        //      `majority`, not `founder_only`, which a community above the
+        //      family is refused before the proof is read, CIRISPersist#1123.)
         let mut mismatched = kind.record(
             &id,
             &keys,
             &Content {
                 name: v2.name,
-                protocol: consensus_protocol::FOUNDER_ONLY,
+                protocol: consensus_protocol::MAJORITY,
             },
         );
         *mismatched.proof_mut() = served_v2.proof().cloned();
