@@ -17144,6 +17144,16 @@ pub const MEMBER_ROLE_FOUNDER: &str = "founder";
 /// error's `on_behalf_of` field carries the target descriptor for audit
 /// (the model no longer has a principal field).
 ///
+///
+/// v61 S2 (CIRISPersist#1160; CC 4.5.5) — the gate asks about the signer's
+/// IDENTITY. A device or occurrence key is first resolved through
+/// [`admission_identity_for_writer`] (the active occurrence binding, or a
+/// node's single live owner). A federation-identity moderator acting through
+/// one of its live occurrence keys therefore holds its duty, and the
+/// delegation walk reaches either the key or its identity. The resolution
+/// never widens to another identity's keys: a key bound to nobody resolves
+/// to itself.
+///
 /// [`MODERATION_DUTY`]: DelegationWalkPolicy::MODERATION_DUTY
 pub async fn check_moderation_admission(
     directory: &dyn super::FederationDirectory,
@@ -17152,13 +17162,17 @@ pub async fn check_moderation_admission(
     duty: &str,
     target_descriptor: &str,
 ) -> Result<(), Error> {
-    // (a) as-self: signer itself holds the duty over the target.
-    if duty_holders.contains(signer) {
+    let signer_identity = admission_identity_for_writer(directory, signer).await?;
+    // (a) as-self: the signer, or the identity it acts for, holds the duty
+    //     over the target.
+    if duty_holders.contains(signer) || duty_holders.contains(&signer_identity) {
         return Ok(());
     }
-    // (b) delegated: an steward-bound duty-holder root reaches signer via a
-    //     live duty-scoped chain (§11.10 attenuation + sub_delegation).
-    let target: std::collections::HashSet<String> = std::iter::once(signer.to_owned()).collect();
+    // (b) delegated: an steward-bound duty-holder root reaches the signer
+    //     (or its identity) via a live duty-scoped chain (§11.10 attenuation
+    //     + sub_delegation).
+    let target: std::collections::HashSet<String> =
+        [signer.to_owned(), signer_identity].into_iter().collect();
     for root in duty_holders {
         if !is_steward_bound(directory, root).await? {
             continue;
