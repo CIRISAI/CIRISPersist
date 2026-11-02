@@ -2069,12 +2069,20 @@ where
         // community (`two_path::FloorClass::Voters`, the table's `min_count`
         // 2): one voice never decides who is in a room (CC 4.5.13), in
         // either direction. A removal's reversal keeps the #574 threshold.
-        let reaches_floor =
-            !is_add || fold.distinct_objectors >= two_path::FloorClass::Voters.min_count();
-        events[idx].reversed =
-            fold.standing == reverse_quorum::ReverseQuorumStanding::Reversed && reaches_floor;
+        events[idx].reversed = roster_reversal_stands(is_add, &fold);
     }
     Ok(events)
+}
+
+/// v61 (CIRISPersist#1100 item 2(i)) — does the objection `fold` reverse a
+/// roster event? A removal: when the fold says `Reversed` (the #574
+/// threshold). A WIDENING: also only when its objectors reach the two-path
+/// count minimum of a community (`two_path::FloorClass::Voters`, 2), so one
+/// voice never takes a member off.
+#[must_use]
+pub fn roster_reversal_stands(is_add: bool, fold: &reverse_quorum::ReverseQuorumFold) -> bool {
+    fold.standing == reverse_quorum::ReverseQuorumStanding::Reversed
+        && (!is_add || fold.distinct_objectors >= two_path::FloorClass::Voters.min_count())
 }
 
 /// v49.0.0 (CIRISPersist#908) — every stored roster event of `community`,
@@ -8166,16 +8174,11 @@ pub trait FederationDirectory: Send + Sync {
         // audience (cohort scope and cohort target)? Then it is the same
         // placement. A placement into a DIFFERENT room is a new one, and both
         // stay live (#1155: one row shared into two rooms).
-        let target = admission::envelope_cohort_target(&row.attestation_envelope)?;
         for c in self
             .list_attestations_referencing(&prior.attestation_id)
             .await?
         {
-            if c.attestation_type == types::attestation_type::SUPERSEDES
-                && c.attesting_key_id == row.attesting_key_id
-                && c.cohort_scope == row.cohort_scope
-                && admission::envelope_cohort_target(&c.attestation_envelope)? == target
-            {
+            if crossing::same_placement(&c, &row)? {
                 return Ok(crossing::MeshCrossingOutcome::AlreadyWidened {
                     prior_attestation_id: prior.attestation_id,
                 });

@@ -124,6 +124,16 @@ jobs:
           # record's withdraws): 10 mutants, one shard
           # (600 s + 168 s x 10 = 2280 s), nightly.
           - {scope: scope-s1-retire, shard: '', id: s1-retire, weekly: false}
+          # v61 S2 — rooms on the new rows and the field blockers (#1123,
+          # #1063, #1100 2(i), #1157/#1155, #1148, #1165, #1140, #1143):
+          # 154 mutants, six shards of <= 26 at the measured 168 s per mutant
+          # (600 s + 168 s x 26 = 4968 s each), weekly.
+          - {scope: scope-s2-rooms, shard: '0/6', id: s2-rooms-0-of-6, weekly: true}
+          - {scope: scope-s2-rooms, shard: '1/6', id: s2-rooms-1-of-6, weekly: true}
+          - {scope: scope-s2-rooms, shard: '2/6', id: s2-rooms-2-of-6, weekly: true}
+          - {scope: scope-s2-rooms, shard: '3/6', id: s2-rooms-3-of-6, weekly: true}
+          - {scope: scope-s2-rooms, shard: '4/6', id: s2-rooms-4-of-6, weekly: true}
+          - {scope: scope-s2-rooms, shard: '5/6', id: s2-rooms-5-of-6, weekly: true}
     services:
       postgres:
         image: ghcr.io/cirisai/postgres:16

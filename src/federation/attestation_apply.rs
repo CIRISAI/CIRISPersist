@@ -373,6 +373,29 @@ fn envelope_content_hash(envelope: &serde_json::Value) -> Result<String, Error> 
 /// doors by construction — before #917 the synced door ran a binary
 /// `persist_row_hash` verdict instead and booked a decoration-only
 /// re-delivery as `Error::Conflict` while this body booked it as a duplicate.
+/// v61 (CIRISPersist#1148) — may THIS node store a replicated `row`? `true`
+/// for a key-plane row (every node verifies against the key plane), and on a
+/// directory that has not declared its node key (it cannot ask); else
+/// [`super::replication_audience::may_receive`] for the node's own key.
+///
+/// # Errors
+///
+/// Directory reads.
+pub(crate) async fn replicated_row_in_audience<D>(dir: &D, row: &Attestation) -> Result<bool, Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    if super::key_plane::is_key_plane_row(row) {
+        return Ok(true);
+    }
+    let Some(me) = dir.node_key_id() else {
+        return Ok(true);
+    };
+    Ok(super::replication_audience::may_receive(dir, &me, row)
+        .await?
+        .allowed())
+}
+
 pub(crate) async fn apply_planned<D>(
     dir: &D,
     attestation: super::SignedAttestation,
@@ -394,22 +417,14 @@ where
     // occurrence are what every node verifies signatures against. A directory
     // that has not been told who it is cannot ask the question, and keeps the
     // pre-v61 behaviour (the host gates); an Engine always declares its key.
-    if !super::key_plane::is_key_plane_row(incoming) {
-        if let Some(me) = dir.node_key_id() {
-            let verdict =
-                Box::pin(super::replication_audience::may_receive(dir, &me, incoming)).await?;
-            if !verdict.allowed() {
-                tracing::info!(
-                    attestation_id = %attestation_id,
-                    node = %me,
-                    ?verdict,
-                    "replicated row refused: this node is not in its audience"
-                );
-                return Ok(Outcome::Refused {
-                    reason: AttestationRefusalReason::NotInAudience,
-                });
-            }
-        }
+    if !Box::pin(replicated_row_in_audience(dir, incoming)).await? {
+        tracing::info!(
+            attestation_id = %attestation_id,
+            "replicated row refused: this node is not in its audience"
+        );
+        return Ok(Outcome::Refused {
+            reason: AttestationRefusalReason::NotInAudience,
+        });
     }
     // v58.0.0 (CIRISPersist#991, CC 3.1.3) — a key-plane row is applied by its
     // family's door, ahead of the generic plan: a key's newer claim is a new

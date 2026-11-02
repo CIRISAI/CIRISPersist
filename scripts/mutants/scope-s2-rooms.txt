@@ -1,0 +1,44 @@
+# Mutation scope: v61 slice S2 — rooms on the new rows and the field
+# blockers (docs/V61_TASK_PLAN.md §3 S2).
+#
+# - CIRISPersist#1123 (CC 4.5.13): `founder_only` refused above the family
+#   (`check_founder_only_above_family`), `open:self_admit` (the form, the
+#   evaluator arm, the self-signed-admission refusal, the founders-only
+#   authority, the public-room conformance, the moderator floor in
+#   `roster_event_standing`). Witnesses I1500–I1503, `consensus::tests`,
+#   I712/I713 (`holding_claim_invariants`), the rc5 infrastructure case.
+# - CIRISPersist#1063: `live_standing_proposal` (I1504).
+# - CIRISPersist#1100 item 2(i): `roster_reversal_stands` (I1505).
+# - CIRISPersist#1157 / #1155: the row-keyed replay (both backends'
+#   `composer_replay_held`), the read-time rank (`lifecycle_predicate`), the
+#   per-audience placement (`same_placement`). I1506–I1508, I1320, I1340,
+#   the attestation_apply unit tests.
+# - CIRISPersist#1148: `replicated_row_in_audience`, the record's own
+#   audience, the typed community door (I1509).
+# - CIRISPersist#1165: `contact_grant_relay_over_roster` (I1510).
+# - CIRISPersist#1140: `names_its_delegate`, `binding_is_group_audience`
+#   (I1511).
+# - CIRISPersist#1143: `check_one_voice_countersign`, `community_dissolved_at`,
+#   `refuse_if_community_dissolved` (I1513, I1514).
+# - Not in scope: the one-line call sites of these predicates inside the
+#   large doors (`may_receive`, `apply_planned`, `widen_audience`,
+#   `check_community_roster_authority`, `prepare_roster_events`): a mutant
+#   of those functions is a mutant of every door they serve, and deleting a
+#   call is caught by the witness that names its predicate.
+#
+# Grammar: docs/MUTATION_TESTING.md "Scope files".
+tests: test(/i150[0-9]|i151[0-4]|consensus::tests|i712_|i713_|i1320|i1340|attestation_apply::tests|infrastructure_protocol_must_be_quorum|widen_audience_writes_a_supersedes/)
+
+src/federation/consensus.rs evaluate evaluate_open_self_admit
+src/federation/types.rs founders_hold_authority is_canonical_form
+src/federation/admission.rs check_founder_only_above_family check_family_consensus_protocol_form names_its_delegate binding_is_group_audience
+src/federation/public_room.rs is_open_admission check_public_room_conformance live_standing_proposal
+src/federation/mod.rs roster_event_standing roster_reversal_stands
+src/federation/crossing.rs same_placement
+src/federation/attestation_query.rs lifecycle_predicate
+src/federation/attestation_apply.rs replicated_row_in_audience
+src/federation/replication_audience.rs contact_grant_relay_over_roster record_names_its_audience may_receive_community_record
+src/federation/affiliation_config.rs check_one_voice_countersign
+src/federation/group_plane.rs community_dissolved_at refuse_if_community_dissolved
+src/store/sqlite.rs composer_replay_held
+src/store/postgres.rs composer_replay_held
