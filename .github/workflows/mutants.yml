@@ -124,6 +124,20 @@ jobs:
           # record's withdraws): 10 mutants, one shard
           # (600 s + 168 s x 10 = 2280 s), nightly.
           - {scope: scope-s1-retire, shard: '', id: s1-retire, weekly: false}
+          # v61 S4a (CIRISPersist#934, #1166): the shared plans the identical
+          # doors moved onto, the bounded checkout. 161 mutants, nine shards
+          # of <= 18; the witness filter is the doors' own suites on both
+          # backends (~330 s per mutant, ESTIMATED from the local filter run),
+          # so 600 s + 330 s x 18 = 6540 s each, weekly.
+          - {scope: scope-s4a-plans, shard: '0/9', id: s4a-plans-0-of-9, weekly: true}
+          - {scope: scope-s4a-plans, shard: '1/9', id: s4a-plans-1-of-9, weekly: true}
+          - {scope: scope-s4a-plans, shard: '2/9', id: s4a-plans-2-of-9, weekly: true}
+          - {scope: scope-s4a-plans, shard: '3/9', id: s4a-plans-3-of-9, weekly: true}
+          - {scope: scope-s4a-plans, shard: '4/9', id: s4a-plans-4-of-9, weekly: true}
+          - {scope: scope-s4a-plans, shard: '5/9', id: s4a-plans-5-of-9, weekly: true}
+          - {scope: scope-s4a-plans, shard: '6/9', id: s4a-plans-6-of-9, weekly: true}
+          - {scope: scope-s4a-plans, shard: '7/9', id: s4a-plans-7-of-9, weekly: true}
+          - {scope: scope-s4a-plans, shard: '8/9', id: s4a-plans-8-of-9, weekly: true}
     services:
       postgres:
         image: ghcr.io/cirisai/postgres:16
