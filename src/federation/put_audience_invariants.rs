@@ -8,7 +8,10 @@
 //! (`not_in_audience`) and leave nothing behind, through
 //! `apply_replicated_attestation`, `put_attestation_synced` and
 //! `apply_replicated_community`; on a MEMBER's node the same rows are
-//! admitted. A public room's record reaches a non-member.
+//! admitted. A public room's record reaches a non-member. A TAMPERED copy
+//! of the room's row is verified first and refused
+//! `federation_federation_tier_unverified` on the non-member's node, never
+//! `not_in_audience` (the verdict is not asked of unverified bytes).
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -110,6 +113,47 @@ pub(crate) mod bodies {
         let refused = ReplicatedAttestationOutcome::Refused {
             reason: AttestationRefusalReason::NotInAudience,
         };
+        // v61 S2 (the release blocker on 2c4cee2e) — a TAMPERED copy is
+        // verified before any audience verdict: an audience answer over
+        // unverified bytes is a verdict about attacker-chosen data. On the
+        // non-member's node a forged copy of the room's row is
+        // `federation_federation_tier_unverified`, never `not_in_audience`,
+        // through both replicated doors.
+        let mut forged = content.clone();
+        forged.attestation_envelope["score"] = serde_json::json!(-1.0);
+        for (door, e) in [
+            (
+                "apply_replicated_attestation",
+                outsider
+                    .apply_replicated_attestation(SignedAttestation {
+                        attestation: forged.clone(),
+                    })
+                    .await,
+            ),
+            (
+                "put_attestation_synced",
+                outsider
+                    .put_attestation_synced(
+                        SignedAttestation {
+                            attestation: forged.clone(),
+                        },
+                        &m,
+                    )
+                    .await,
+            ),
+        ] {
+            let e = e.expect_err("I1509: a tampered row is an error, not an outcome");
+            assert_eq!(
+                e.kind(),
+                "federation_federation_tier_unverified",
+                "I1509 {door}: a forged row is unverified, never an audience miss: {e}"
+            );
+        }
+        assert!(outsider
+            .get_attestation(&forged.attestation_id)
+            .await
+            .unwrap()
+            .is_none());
         // The non-member's node: every replicated door refuses, by name.
         for row in [&record, &content] {
             assert_eq!(

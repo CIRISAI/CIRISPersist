@@ -418,6 +418,19 @@ where
     // that has not been told who it is cannot ask the question, and keeps the
     // pre-v61 behaviour (the host gates); an Engine always declares its key.
     if !Box::pin(replicated_row_in_audience(dir, incoming)).await? {
+        // v61 S2 (the release blocker on 2c4cee2e) — **verification comes
+        // before the audience verdict.** An audience answer over unverified
+        // bytes is a verdict about attacker-chosen data, so a forged row is
+        // reported as unverified, never as an audience miss. The verify is
+        // asked only on this refusing branch. An in-audience row is verified
+        // by the admission's own crypto tier below, exactly once, and the
+        // reported outcome is the same as verifying first: a row that does
+        // not verify is `federation_federation_tier_unverified` either way.
+        // A group-plane row carries its object's signatures and is verified
+        // by its typed door, so it is not re-verified here.
+        if !super::group_plane::is_group_plane_row(incoming) {
+            super::verify_federation_tier_ingest(dir, incoming).await?;
+        }
         tracing::info!(
             attestation_id = %attestation_id,
             "replicated row refused: this node is not in its audience"
