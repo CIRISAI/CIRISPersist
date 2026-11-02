@@ -7,6 +7,13 @@
 //!   door, and a replicated version may not move a stored room onto it. A
 //!   family and an affiliation keep it; a legacy room a peer delivers is kept
 //!   as data and its next version must leave `founder_only`.
+//! - **I1518** (v61 S2) — such a stored room admits exactly ONE event, on the
+//!   local and the replicated door: the escape, a supersede whose only change
+//!   is `consensus_protocol` leaving `founder_only`, signed by a founder.
+//!   A proposal, a widening, a removal (a resignation excepted), a version
+//!   that keeps `founder_only`, an escape that changes members and an escape
+//!   no founder signed are refused `founder_only_above_family`; after the
+//!   escape a widening under `majority` is admitted.
 //! - **I1501** — `open:self_admit` is admissible only on a `public` room; a
 //!   family or a private room that names it is refused, and a record still
 //!   carrying the retired `admission` member is refused by name.
@@ -160,7 +167,11 @@ pub(crate) mod bodies {
             .await
             .expect_err("I1500: a legacy room's next version keeps founder_only");
         assert_eq!(rule(&e), FOUNDER_ONLY_ABOVE_FAMILY, "I1500: {e}");
-        next.consensus_protocol = "quorum:1/1".into();
+        // v61 S2 — the escape is the protocol change ALONE (I1518).
+        let next = next_version(d, &legacy, |c| {
+            c.consensus_protocol = crate::federation::types::consensus_protocol::MAJORITY.into();
+        })
+        .await;
         d.supersede_community(signed(&founder, next), None)
             .await
             .expect("I1500: the version that leaves founder_only is admitted");
@@ -193,6 +204,209 @@ pub(crate) mod bodies {
             "quorum:1/1",
             "I1500: the stored record stands"
         );
+    }
+
+    /// A legacy `founder_only` room `cid` founded by `founders` (all
+    /// founders, all signing), delivered by a peer and kept as data.
+    async fn legacy_founder_only_room(d: &dyn FederationDirectory, cid: &str, founders: &[&str]) {
+        let sc = legacy_founder_only_record(cid, founders);
+        assert_eq!(
+            d.apply_replicated_community(sc).await.expect("replicated"),
+            ReplicatedCommunityOutcome::Inserted,
+            "a legacy founder_only room is kept as data"
+        );
+    }
+
+    /// The signed legacy record [`legacy_founder_only_room`] delivers.
+    pub(crate) fn legacy_founder_only_record(cid: &str, founders: &[&str]) -> SignedCommunity {
+        let c = record(cid, founders, FOUNDER_ONLY);
+        let env = c.signing_envelope();
+        let mut sc = signed(founders[0], c);
+        sc.cosignatures = founders[1..]
+            .iter()
+            .map(|f| {
+                let (_h, classical, pqc) = ts::sign_envelope(f, &env);
+                crate::federation::types::RosterCosignature {
+                    authority_key_id: (*f).to_owned(),
+                    scrub_signature_classical: classical,
+                    scrub_signature_pqc: pqc,
+                }
+            })
+            .collect();
+        sc
+    }
+
+    /// The held record's next version: `edit` applied, chained to the head.
+    async fn next_version(
+        d: &dyn FederationDirectory,
+        cid: &str,
+        edit: impl FnOnce(&mut Community),
+    ) -> Community {
+        let held = d.lookup_community(cid).await.unwrap().expect("held");
+        let mut next = held.clone();
+        edit(&mut next);
+        next.prev_head_digest = held.persist_row_hash.clone();
+        next.persist_row_hash = String::new();
+        next
+    }
+
+    /// **I1518** (v61 S2) — `founder_only` above the family admits exactly
+    /// one event: the escape. A stored non-family, non-affiliation room under
+    /// `founder_only` takes a `group:roster:v1` supersede whose only change is
+    /// `consensus_protocol` leaving `founder_only`, signed by a founder (what
+    /// `founder_only` needs), on the local and the replicated door. Every
+    /// other membership event, and every other version, is refused
+    /// `founder_only_above_family`; a founder's own resignation is not.
+    pub(crate) async fn i1518_founder_only_admits_only_its_escape(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::types::consensus_protocol::MAJORITY;
+        let k = |n: &str| format!("i1518-{n}-{s}");
+        let (f1, f2, f3, joiner, stranger, cid, peer_room) = (
+            k("f1"),
+            k("f2"),
+            k("f3"),
+            k("j"),
+            k("x"),
+            k("room"),
+            k("peer-room"),
+        );
+        reg(d, &[&f1, &f2, &f3, &joiner, &stranger, &cid, &peer_room]).await;
+        legacy_founder_only_room(d, &cid, &[&f1, &f2, &f3]).await;
+        let at = Utc::now() - Duration::hours(1);
+        let refused = |e: &Error, what: &str| {
+            assert_eq!(rule(e), FOUNDER_ONLY_ABOVE_FAMILY, "I1518 {what}: {e}");
+        };
+        // Membership events: a proposal, a widening, a removal.
+        let p = proposal(
+            &f1,
+            COMMUNITY,
+            &cid,
+            &joiner,
+            None,
+            at,
+            Some(Duration::days(7)),
+        );
+        refused(
+            &put(d, &p).await.expect_err("I1518: a proposal"),
+            "proposal",
+        );
+        refused(
+            &widen_community(
+                d,
+                &cid,
+                &[&f1, &f2],
+                &joiner,
+                None,
+                at + Duration::seconds(1),
+            )
+            .await
+            .expect_err("I1518: a widening"),
+            "widening",
+        );
+        refused(
+            &remove(d, &cid, &[&f1, &f2], &f3, at + Duration::seconds(2))
+                .await
+                .expect_err("I1518: a removal"),
+            "removal",
+        );
+        assert!(active(d, &cid, &f3).await, "I1518: f3 still in");
+        // A founder's own resignation stands.
+        remove(d, &cid, &[&f3], &f3, at + Duration::seconds(3))
+            .await
+            .expect("I1518: a resignation");
+        assert!(!active(d, &cid, &f3).await, "I1518: f3 left");
+        // Versions that are not the escape.
+        let stays = next_version(d, &cid, |c| c.community_name = "renamed".into()).await;
+        refused(
+            &d.supersede_community(signed(&f1, stays.clone()), None)
+                .await
+                .expect_err("I1518: a version that keeps founder_only"),
+            "stays founder_only",
+        );
+        assert_eq!(
+            d.apply_replicated_community(signed(&f1, stays))
+                .await
+                .expect("a typed outcome"),
+            ReplicatedCommunityOutcome::Refused {
+                reason: ReplicatedCommunityRefusal::DegradesConformance
+            },
+            "I1518: the replicated door refuses it too"
+        );
+        let with_members = next_version(d, &cid, |c| {
+            c.consensus_protocol = MAJORITY.into();
+            c.members.retain(|m| m.key_id != f2);
+        })
+        .await;
+        refused(
+            &d.supersede_community(signed(&f1, with_members), None)
+                .await
+                .expect_err("I1518: an escape that also changes members"),
+            "escape + members",
+        );
+        let escape = next_version(d, &cid, |c| c.consensus_protocol = MAJORITY.into()).await;
+        // `sign_community` cosigns as every listed member; the under-signed
+        // escape carries the stranger's signature alone.
+        let mut under = signed(&stranger, escape.clone());
+        under.cosignatures.clear();
+        refused(
+            &d.supersede_community(under, None)
+                .await
+                .expect_err("I1518: an escape no founder signed"),
+            "under-signed escape",
+        );
+        assert_eq!(
+            d.lookup_community(&cid)
+                .await
+                .unwrap()
+                .unwrap()
+                .consensus_protocol,
+            FOUNDER_ONLY,
+            "I1518: nothing moved yet"
+        );
+        // The escape, exactly founder_only -> majority, signed by a founder.
+        d.supersede_community(signed(&f1, escape), None)
+            .await
+            .expect("I1518: the escape");
+        assert_eq!(
+            d.lookup_community(&cid)
+                .await
+                .unwrap()
+                .unwrap()
+                .consensus_protocol,
+            MAJORITY,
+            "I1518: the room is under majority"
+        );
+        // After it, a widening under majority (both remaining founders).
+        let p = proposal(
+            &f1,
+            COMMUNITY,
+            &cid,
+            &joiner,
+            None,
+            at,
+            Some(Duration::days(7)),
+        );
+        put(d, &p).await.expect("I1518: a proposal under majority");
+        put(
+            d,
+            &reply(&joiner, &joiner, &p, true, at + Duration::seconds(10)),
+        )
+        .await
+        .expect("I1518: the joiner accepts");
+        widen_community(
+            d,
+            &cid,
+            &[&f1, &f2],
+            &joiner,
+            None,
+            at + Duration::seconds(11),
+        )
+        .await
+        .expect("I1518: a widening under majority");
+        assert!(active(d, &cid, &joiner).await, "I1518: the joiner is in");
+        let _ = peer_room;
     }
 
     /// **I1501** — `open:self_admit` only on a public room.
@@ -688,6 +902,82 @@ pub(crate) mod two_node {
     use crate::federation::FederationDirectory;
     use chrono::{Duration, Utc};
 
+    /// **I1518b** (v61 S2) — the escape from `founder_only` on the
+    /// REPLICATED door: node A supersedes a legacy `founder_only` room to
+    /// `majority` under its quorum (one founder's signature), and node B,
+    /// holding the same legacy record, applies A's version (`Superseded`).
+    pub(crate) async fn i1518b_the_escape_replicates(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::types::consensus_protocol::{FOUNDER_ONLY, MAJORITY};
+        use crate::federation::ReplicatedCommunityOutcome;
+        let k = |n: &str| format!("i1518b-{n}-{s}");
+        let (f1, f2, cid) = (k("f1"), k("f2"), k("room"));
+        let legacy = super::bodies::legacy_founder_only_record(&cid, &[&f1, &f2]);
+        for d in [a, b] {
+            reg(d, &[&f1, &f2, &cid]).await;
+            assert_eq!(
+                d.apply_replicated_community(legacy.clone())
+                    .await
+                    .expect("replicated"),
+                ReplicatedCommunityOutcome::Inserted,
+                "I1518b: the legacy room on both nodes"
+            );
+        }
+        let held = a.lookup_community(&cid).await.unwrap().expect("held");
+        assert_eq!(held.consensus_protocol, FOUNDER_ONLY);
+        let mut next = held.clone();
+        next.consensus_protocol = MAJORITY.into();
+        next.prev_head_digest = held.persist_row_hash.clone();
+        next.persist_row_hash = String::new();
+        let members: Vec<String> = held.members.iter().map(|m| m.key_id.clone()).collect();
+        let change = a
+            .build_membership_change_envelope(
+                crate::federation::cohort::Cohort::Community,
+                &cid,
+                &members,
+                false,
+                Some(MAJORITY),
+            )
+            .await
+            .expect("I1518b: the change envelope");
+        let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
+        a.supersede_community_with_quorum(
+            ts::sign_community(&f1, next),
+            change,
+            vec![ts::threshold_sign(&f1, &bytes)],
+        )
+        .await
+        .expect("I1518b: the escape on node A");
+        let served = a
+            .list_signed_communities_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.community.community.community_key_id == cid)
+            .expect("A serves the room")
+            .community;
+        assert_eq!(served.community.consensus_protocol, MAJORITY);
+        assert_eq!(
+            b.apply_replicated_community(served)
+                .await
+                .expect("a typed outcome"),
+            ReplicatedCommunityOutcome::Superseded,
+            "I1518b: node B applies the escape"
+        );
+        assert_eq!(
+            b.lookup_community(&cid)
+                .await
+                .unwrap()
+                .unwrap()
+                .consensus_protocol,
+            MAJORITY,
+            "I1518b: B's room is under majority"
+        );
+    }
+
     /// **I1504** — a public room's standing proposal, on request.
     pub(crate) async fn i1504_a_standing_proposal_is_served_on_request(
         a: &dyn FederationDirectory,
@@ -829,7 +1119,20 @@ mod runners {
                 case!(i1502_the_joiner_admits_themselves);
                 case!(i1503_removal_takes_two_voices);
                 case!(i1515_removal_window_under_open_self_admit);
+                case!(i1518_founder_only_admits_only_its_escape);
                 case!(i1505_a_widening_is_reversible_under_reverse_quorum);
+
+                #[tokio::test]
+                async fn i1518b_the_escape_replicates() {
+                    let Some(a) = $fresh.await else { return };
+                    let Some(b) = $fresh.await else { return };
+                    super::super::two_node::i1518b_the_escape_replicates(
+                        &a as &dyn FederationDirectory,
+                        &b as &dyn FederationDirectory,
+                        &suffix(),
+                    )
+                    .await
+                }
 
                 #[tokio::test]
                 async fn i1504_a_standing_proposal_is_served_on_request() {

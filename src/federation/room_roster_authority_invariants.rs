@@ -297,7 +297,11 @@ pub mod bodies {
         }
         let eve = newcomer("eve");
 
-        // founder_only: a plain member refused, a founder admitted.
+        // v61 S2 (CIRISPersist#1123) — a legacy room stored under
+        // founder_only admits no widening and no removal, a founder's
+        // included: its one event is the escape (I1518). (The evaluator's
+        // founder_only arm stays witnessed on families and in
+        // `consensus::tests`.)
         let (r, k) = make_group(
             d,
             &format!("{tag}-fo"),
@@ -308,24 +312,25 @@ pub mod bodies {
             None,
         )
         .await;
-        refused(
+        let founder_only = |res: Result<(), Error>, what: &str| match res {
+            Err(Error::CommunityConsensusProtocolViolation { rule, .. }) => assert_eq!(
+                rule,
+                crate::federation::admission::FOUNDER_ONLY_ABOVE_FAMILY,
+                "{tag} I171 {what}"
+            ),
+            other => panic!("{tag} I171 {what}: {other:?}"),
+        };
+        founder_only(
             widen_by(d, &[&k[1]], widening(&r, &newcomer("x1"), t(1), None)).await,
-            INSUFFICIENT,
             "founder_only: a plain member",
         );
-        widen_by(d, &[&k[0]], widening(&r, &newcomer("x1"), t(2), None))
-            .await
-            .unwrap_or_else(|e| panic!("{tag} founder_only admits a founder: {e}"));
-        // A stranger: retryable, and no row is stored.
-        refused(
-            widen_by(d, &[&eve], widening(&r, &eve, t(3), None)).await,
-            NOT_ESTABLISHED,
-            "a stranger widens itself",
+        founder_only(
+            widen_by(d, &[&k[0]], widening(&r, &newcomer("x1"), t(2), None)).await,
+            "founder_only: a founder",
         );
-        refused(
-            revoke_by(d, &[&eve], revocation(&r, &k[1], t(3))).await,
-            NOT_ESTABLISHED,
-            "a stranger removes a member",
+        founder_only(
+            revoke_by(d, &[&k[0]], revocation(&r, &k[1], t(3))).await,
+            "founder_only: a founder removes a member",
         );
         assert!(
             d.list_community_membership_revocations_for(&r)
@@ -346,6 +351,24 @@ pub mod bodies {
             None,
         )
         .await;
+        // A stranger: retryable, and no row is stored.
+        refused(
+            widen_by(d, &[&eve], widening(&r, &eve, t(3), None)).await,
+            NOT_ESTABLISHED,
+            "a stranger widens itself",
+        );
+        refused(
+            revoke_by(d, &[&eve], revocation(&r, &k[1], t(3))).await,
+            NOT_ESTABLISHED,
+            "a stranger removes a member",
+        );
+        assert!(
+            d.list_community_membership_revocations_for(&r)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{tag} I171: a refused removal stores no row (and rotates nothing)"
+        );
         refused(
             widen_by(d, &[&k[1]], widening(&r, &newcomer("x2"), t(1), None)).await,
             INSUFFICIENT,

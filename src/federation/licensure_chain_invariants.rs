@@ -1163,7 +1163,21 @@ pub mod bodies {
         .await;
         // G supersedes the record without F. v61 (CIRISPersist#1123): the
         // legacy founder_only room's next version leaves founder_only, which
-        // the supersede door refuses above the family.
+        // the supersede door refuses above the family. v61 S2: and that
+        // version is the escape ALONE (the protocol, nothing else), so the
+        // room first leaves founder_only and then drops F under its new
+        // protocol.
+        let held = dir.lookup_community(&room).await.unwrap().expect("held");
+        let mut escape = held.clone();
+        escape.consensus_protocol = "quorum:1/2".to_owned();
+        escape.prev_head_digest = held.persist_row_hash.clone();
+        escape.persist_row_hash = String::new();
+        dir.supersede_community(
+            crate::federation::tier_ingest::test_support::sign_community(&g, escape),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] I604: the escape from founder_only: {e}"));
         let held = dir.lookup_community(&room).await.unwrap().expect("held");
         let mut next = held.clone();
         next.members.retain(|m| m.key_id != f);

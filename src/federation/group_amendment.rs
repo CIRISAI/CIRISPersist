@@ -754,6 +754,9 @@ where
     super::affiliation_config::check_record_is(&new.community, cohort)?;
     super::affiliation_config::check_community_record(&new.community)?;
     super::verify_community_admission(dir, &new).await?;
+    // v61 S2 (CIRISPersist#1123) — a room stored under founder_only admits
+    // one new version, its escape.
+    super::admission::check_founder_only_escape(dir, &new, chrono::Utc::now()).await?;
     // v52.0.0 (#955, Q2) — an amendment never adds a member. The one
     // exception is a trust-root founders' amendment (#926 HIGH-3: its founder
     // seats move ONLY through the record): a founder it seats signed that very

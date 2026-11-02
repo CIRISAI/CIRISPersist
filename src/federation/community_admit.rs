@@ -267,6 +267,9 @@ where
         door == CommunityDoor::ReplicatedApply,
     )
     .await?;
+    // v61 S2 (CIRISPersist#1123) — a room stored under founder_only admits
+    // one new version, its escape, on both doors.
+    super::admission::check_founder_only_escape(dir, &community, received_at).await?;
     let row = &community.community;
     // v4.0 — the consensus_protocol canonical form.
     super::check_consensus_protocol_form(&row.consensus_protocol)?;
@@ -345,6 +348,23 @@ where
     // SecReview F4 — community removal is immediate for forward-secrecy; a
     // future-dated effective_at is refused BEFORE any write.
     super::community_dek::reject_future_dated_community_revocation(row.effective_at, received_at)?;
+    // v61 S2 (CIRISPersist#1123) — a room stored under founder_only admits
+    // no removal but a member's own resignation.
+    {
+        let self_leave = revocation.authority_key_id == row.removed_identity_key_id
+            || revocation
+                .cosignatures
+                .iter()
+                .any(|c| c.authority_key_id == row.removed_identity_key_id);
+        if !self_leave {
+            super::admission::refuse_membership_event_under_founder_only(
+                dir,
+                &row.community_key_id,
+                "removal",
+            )
+            .await?;
+        }
+    }
     // v61 S2 (CC 4.5.13) — under `open:self_admit`, the removal window, at
     // the local door only.
     if !super::group_plane::applying_replicated_group_row() {
@@ -498,6 +518,14 @@ where
     super::verify_community_membership_widening_admission(dir, &widening).await?;
     let row = &widening.community_membership_widening;
     super::community_dek::reject_future_dated_community_widening(row.effective_at, received_at)?;
+    // v61 S2 (CIRISPersist#1123) — a room stored under founder_only admits
+    // no widening.
+    super::admission::refuse_membership_event_under_founder_only(
+        dir,
+        &row.community_key_id,
+        "widening",
+    )
+    .await?;
     // v49.0.0 (CIRISPersist#908) — whose signature, not just whether: the
     // signer must have standing in the room at the row's instant.
     super::check_community_roster_authority(

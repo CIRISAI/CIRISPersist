@@ -1242,6 +1242,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v61 S2 (CC 4.5.13) — the open:self_admit removal window at the local
     // door: refuses a removal received outside 259 200 s of its signed instant.
     ("check_open_self_admit_removal_window", Class::Gate),
+    // v61 S2 (CIRISPersist#1123) — a room stored under founder_only: the
+    // record door admits only its escape, the roster doors no membership
+    // event (both refuse the caller's input).
+    ("check_founder_only_escape", Class::Gate),
+    ("refuse_membership_event_under_founder_only", Class::Gate),
     ("reload_record_bytes", Class::Plumbing),
     // #840 (I44) — the V070 checksum repair. PLUMBING, and the reason is
     // that it cannot refuse anything: one conditional UPDATE whose entire
@@ -3442,6 +3447,13 @@ mod tests {
         (
             "plan_put_community_membership_revocation",
             "reject_future_dated_community_revocation",
+            Reads::ReceivedAt,
+        ),
+        // v61 S2 (CIRISPersist#1123) — the founder_only escape: the founders
+        // under the old protocol, folded at receipt.
+        (
+            "plan_put_community",
+            "check_founder_only_escape",
             Reads::ReceivedAt,
         ),
         // v61 S2 — the open:self_admit removal window, bounded on receipt at

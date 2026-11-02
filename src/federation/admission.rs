@@ -15893,6 +15893,168 @@ pub fn check_founder_only_above_family(community: &super::Community) -> Result<(
     })
 }
 
+/// v61 S2 (CIRISPersist#1123; CC 4.5.13; the release lead's ruling) — a
+/// STORED community above the family whose `consensus_protocol` is
+/// `founder_only` (not a declared affiliation): a legacy room kept as data.
+/// `None` for any other room, or one this node does not hold.
+pub(crate) async fn stored_founder_only_room<F>(
+    directory: &F,
+    community_key_id: &str,
+) -> Result<Option<super::Community>, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    let Some(c) = directory.lookup_community(community_key_id).await? else {
+        return Ok(None);
+    };
+    if c.consensus_protocol != super::types::consensus_protocol::FOUNDER_ONLY
+        || super::affiliation_config::declared_cohort(&c)? == super::cohort::Cohort::Affiliations
+    {
+        return Ok(None);
+    }
+    Ok(Some(c))
+}
+
+fn founder_only_refused(community_key_id: &str, detail: String) -> Error {
+    Error::CommunityConsensusProtocolViolation {
+        community_key_id: community_key_id.to_owned(),
+        rule: FOUNDER_ONLY_ABOVE_FAMILY,
+        detail,
+    }
+}
+
+/// v61 S2 (CIRISPersist#1123) — **a stored `founder_only` room admits no
+/// membership event**: no proposal, acceptance, widening or removal (a
+/// member's own resignation is not asked here). The one event it admits is
+/// its escape ([`check_founder_only_escape`]). Refused
+/// [`Error::CommunityConsensusProtocolViolation`] /
+/// [`FOUNDER_ONLY_ABOVE_FAMILY`], on the local and the replicated door alike.
+///
+/// # Errors
+///
+/// The refusal; directory reads.
+pub(crate) async fn refuse_membership_event_under_founder_only<F>(
+    directory: &F,
+    community_key_id: &str,
+    event: &str,
+) -> Result<(), Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    if stored_founder_only_room(directory, community_key_id)
+        .await?
+        .is_some()
+    {
+        return Err(founder_only_refused(
+            community_key_id,
+            format!(
+                "a {event} in a room stored under founder_only: the room admits one event, the \
+                 supersede that moves consensus_protocol off founder_only (CC 4.5.13)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// v61 S2 (CIRISPersist#1123; CC 4.5.13) — **the escape.** When the offered
+/// record's room is stored under `founder_only` (above the family, not an
+/// affiliation), the offered version is admitted only if:
+///
+/// - its `consensus_protocol` is not `founder_only`;
+/// - nothing else changes (the version-chain fields `prev_head_digest` and
+///   `persist_row_hash` aside): the members stay as they are;
+/// - it is signed under the OLD protocol: at least one active founder of the
+///   stored room (by the authorized roster fold at `at`) is among its
+///   verified signers ([`count_distinct_roster_scrubs`](super::reverse_quorum::count_distinct_roster_scrubs)
+///   over the record's signing envelope).
+///
+/// An identical re-offer of the stored record settles. Anything else is
+/// refused [`FOUNDER_ONLY_ABOVE_FAMILY`], whatever the door.
+///
+/// # Errors
+///
+/// The refusal; directory reads.
+pub(crate) async fn check_founder_only_escape<F>(
+    directory: &F,
+    offered: &super::SignedCommunity,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    // The trust-root door decides a trust-root-grade record (the reserved
+    // canonical id's accord birth replaces a squat, #926).
+    if super::canonical_community::is_trust_root_grade(&offered.community) {
+        return Ok(());
+    }
+    let id = offered.community.community_key_id.as_str();
+    let Some(stored) = stored_founder_only_room(directory, id).await? else {
+        return Ok(());
+    };
+    if stored.persist_row_hash == super::types::compute_persist_row_hash(&offered.community)? {
+        return Ok(());
+    }
+    if offered.community.consensus_protocol == super::types::consensus_protocol::FOUNDER_ONLY {
+        return Err(founder_only_refused(
+            id,
+            "the room's next version keeps founder_only; its one admissible version moves \
+             consensus_protocol off it"
+                .into(),
+        ));
+    }
+    let mut unchanged = offered.community.clone();
+    unchanged.consensus_protocol = stored.consensus_protocol.clone();
+    unchanged.prev_head_digest = stored.prev_head_digest.clone();
+    unchanged.persist_row_hash = stored.persist_row_hash.clone();
+    if unchanged != stored {
+        return Err(founder_only_refused(
+            id,
+            "the escape from founder_only changes consensus_protocol alone; this version \
+             changes the record (its members) as well"
+                .into(),
+        ));
+    }
+    let founders: Vec<String> = Box::pin(super::authorized_community_roster_at(
+        directory, &stored, at,
+    ))
+    .await?
+    .into_iter()
+    .filter(|m| m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER))
+    .map(|m| m.key_id)
+    .collect();
+    let scrubs: Vec<super::types::ScrubSig> = std::iter::once(super::types::ScrubSig {
+        scrub_key_id: offered.authority_key_id.clone(),
+        scrub_signature_classical: offered.scrub_signature_classical.clone(),
+        scrub_signature_pqc: offered.scrub_signature_pqc.clone(),
+        cosigned_at: None,
+    })
+    .chain(offered.cosignatures.iter().map(|c| super::types::ScrubSig {
+        scrub_key_id: c.authority_key_id.clone(),
+        scrub_signature_classical: c.scrub_signature_classical.clone(),
+        scrub_signature_pqc: c.scrub_signature_pqc.clone(),
+        cosigned_at: None,
+    }))
+    .collect();
+    let counted = super::reverse_quorum::count_distinct_roster_scrubs(
+        directory,
+        &offered.community.signing_envelope(),
+        &scrubs,
+        &founders,
+    )
+    .await;
+    if counted.is_empty() {
+        return Err(founder_only_refused(
+            id,
+            format!(
+                "the escape from founder_only is signed under the old protocol: no active \
+                 founder of the room ({} held) signed it",
+                founders.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn is_infrastructure_labeled(community: &super::Community) -> bool {
     super::community_subkind(community) == Some(COHORT_SUBKIND_INFRASTRUCTURE)
 }

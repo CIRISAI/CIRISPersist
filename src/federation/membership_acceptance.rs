@@ -414,6 +414,21 @@ where
     };
     check_membership_row_shape(row)?;
     let group = group_of(row)?;
+    // v61 S2 (CIRISPersist#1123) — a room stored under founder_only admits
+    // no proposal and no acceptance (its one event is the escape).
+    if membership_plane(&row.cohort_scope) == Some(cohort_scope::TargetPlane::Room)
+        && matches!(kind, MembershipRow::Proposal | MembershipRow::Acceptance)
+    {
+        super::admission::refuse_membership_event_under_founder_only(
+            dir,
+            &group,
+            match kind {
+                MembershipRow::Proposal => "membership proposal",
+                _ => "membership acceptance",
+            },
+        )
+        .await?;
+    }
     // v52.0.0 (#956) — no invitation to, or reply about, a dissolved family.
     if row.cohort_scope == cohort_scope::FAMILY {
         super::family_dissolution::refuse_if_held_family_dissolved(dir, &group).await?;
