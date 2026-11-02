@@ -1269,7 +1269,7 @@ mod tests {
         let pg = engine.postgres_backend().expect("pg backend");
         let schema = format!("host_1156_{}", uuid::Uuid::new_v4().simple());
         {
-            let client = pg.pool().get().await.unwrap();
+            let client = pg.checkout().await.unwrap();
             client
                 .batch_execute(&format!(
                     "CREATE SCHEMA {schema}; \
@@ -1283,7 +1283,7 @@ mod tests {
         }
         let summary = crate::retention::postgres::storage_summary_pg(pg).await;
         {
-            let client = pg.pool().get().await.unwrap();
+            let client = pg.checkout().await.unwrap();
             client
                 .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
                 .await

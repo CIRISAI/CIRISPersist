@@ -128,6 +128,17 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v61 (CIRISPersist#1148) — the replicated community apply's put-time
+    // audience precondition: the verdict refuses a record this node may not
+    // receive (a Gate), asked about this node's own key (Plumbing: a read of
+    // the node's identity).
+    ("may_receive_community_record", Class::Gate),
+    ("node_key_id", Class::Plumbing),
+    // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
+    ("put_transport_destination_planned", Class::Plan),
+    ("put_signed_transport_destination_planned", Class::Plan),
+    // The epoch's width check into the stored i64 column (the substrate's terms).
+    ("stored_epoch", Class::Plumbing),
     // v61 (CIRISPersist#934, S4a) — the blob plane: the byte writes.
     ("put_blob_planned", Class::Plan),
     ("store_blob_local_planned", Class::Plan),
@@ -1474,7 +1485,9 @@ mod tests {
     /// The traits whose impls are compared, and where each trait's **default**
     /// bodies live. A backend that does not override a defaulted method runs
     /// the default, so the default's gate sequence is what it contributes.
-    const TRAITS: [(&str, &str); 16] = [
+    const TRAITS: [(&str, &str); 17] = [
+        // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
+        ("TransportStore", "src/federation/transport_admit.rs"),
         // v61 (CIRISPersist#934, S4a) — the blob plane: the byte writes.
         ("BlobWriteStore", "src/federation/blob_admit.rs"),
         // v61 (CIRISPersist#934, S4a) — the blob plane: the chunk floor and the stream plane's records.
@@ -1509,7 +1522,16 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 61] = [
+    const SHARED_PLANS: [(&str, &str); 63] = [
+        // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
+        (
+            "src/federation/transport_admit.rs",
+            "put_transport_destination_planned",
+        ),
+        (
+            "src/federation/transport_admit.rs",
+            "put_signed_transport_destination_planned",
+        ),
         // v61 (CIRISPersist#934, S4a) — the blob plane: the byte writes.
         ("src/federation/blob_admit.rs", "put_blob_planned"),
         ("src/federation/blob_admit.rs", "store_blob_local_planned"),
@@ -1733,7 +1755,18 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 71] = [
+    const SHARED_DOORS: [(&str, &str, &str); 73] = [
+        // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
+        (
+            "FederationDirectory",
+            "put_transport_destination",
+            "put_transport_destination_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_signed_transport_destination",
+            "put_signed_transport_destination_planned",
+        ),
         // v61 (CIRISPersist#934, S4a) — the blob plane: the byte writes.
         ("BlobStorage", "put_blob_with_scope", "put_blob_planned"),
         (

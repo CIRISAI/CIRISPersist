@@ -69,7 +69,7 @@ pub(crate) mod bodies {
         async fn rewrite_signed(&self, row: &Attestation) {
             let envelope = serde_json::to_string(&row.attestation_envelope).unwrap();
             let hash = hex::decode(&row.original_content_hash).unwrap();
-            let client = self.pool().get().await.unwrap();
+            let client = self.checkout().await.unwrap();
             let n = client
                 .execute(
                     "UPDATE cirislens.federation_attestations SET attestation_envelope = $2, \
@@ -89,7 +89,7 @@ pub(crate) mod bodies {
         }
 
         async fn form_refused_count(&self) -> i64 {
-            let client = self.pool().get().await.unwrap();
+            let client = self.checkout().await.unwrap();
             client
                 .query_one(
                     "SELECT count(*) FROM cirislens.federation_attestations_form_refused",

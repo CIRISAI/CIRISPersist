@@ -96,6 +96,10 @@ pub(crate) mod read_plan;
 /// the room retention leg, with the per-backend `SweepStore` /
 /// `RoomEvictionStore` executors.
 pub(crate) mod sweep_plan;
+/// v61 (CIRISPersist#934, S4b) — the transport-destination writes, decided
+/// once, with the per-backend `TransportStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod transport_admit;
 // v56.0.0 (CIRISPersist#1001) — the typed bounded attestation read.
 pub mod attestation_query;
 #[cfg(test)]
