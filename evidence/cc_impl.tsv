@@ -415,3 +415,8 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.1.5	CLM-identity-amendment-row	CIRISPersist	src/federation/identity_amendment.rs#check_identity_amendment_admission	ciris-persist@60.1.0
 4.5.3	CLM-takedown-reversal	CIRISPersist	src/federation/takedown_tombstone.rs#takedown_reversal	ciris-persist@60.1.0
 4.4.3.4.3	CLM-scope-infra-relay	CIRISPersist	src/federation/types.rs#delegation_scope::INFRA	ciris-persist@60.1.0
+
+# v61 slice S3 — a serve seat needs an announced owner (CIRISPersist#1101), and a
+# signed instant is `.sssZ` and nothing else verifies (CC 2.6.2, strict).
+5.3	CLM-serve-seat-announced	CIRISPersist	src/federation/admission.rs#serve_seat_owner_announced	ciris-persist@60.1.0
+2.6.2	CLM-canonicalization	CIRISPersist	src/federation/admission.rs#signed_instant_form_violation	ciris-persist@60.1.0

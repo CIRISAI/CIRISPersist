@@ -1798,7 +1798,10 @@ mod tests {
         // at the group-plane row builder, its door and the rehome (3);
         // CLM-cosigned-rows at the one co-signature count and the cosigned
         // withdraws (2).
-        const EXPECTED: usize = 357;
+        // v61 slice S3: +2 (CIRISPersist#1101, CC 2.6.2): CLM-serve-seat-announced
+        // (5.3) at the owner-announced predicate, CLM-canonicalization (2.6.2) at
+        // the signed-instant form predicate.
+        const EXPECTED: usize = 359;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \
