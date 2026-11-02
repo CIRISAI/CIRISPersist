@@ -755,6 +755,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // one predicate on the local and the replicated community door.
     ("check_trust_root_at_door", Class::Gate),
     ("check_consensus_protocol_form", Class::Gate),
+    ("check_family_consensus_protocol_form", Class::Gate),
     ("check_content_hash_hex", Class::Gate),
     ("check_delegated_duty_scores_admission", Class::Gate),
     // v60.0.0 (CIRISPersist#803) — the `takedown_notice:{basis}:v1` row's

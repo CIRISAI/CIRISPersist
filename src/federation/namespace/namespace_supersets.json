@@ -15893,6 +15893,46 @@
     "manifest_round": "cc-rc7-536b8cb-1053"
    },
    {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-public-community",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/public_room.rs#live_standing_proposal",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1063"
+   },
+   {
+    "decimal_id": "3.1.9.4",
+    "claim_id": "CLM-composer-convergent-rank",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/attestation_query.rs#lifecycle_predicate",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1157"
+   },
+   {
+    "decimal_id": "4.4.3.2.8",
+    "claim_id": "CLM-affiliation-one-voice-countersign",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/affiliation_config.rs#check_one_voice_countersign",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1143"
+   },
+   {
+    "decimal_id": "4.5.13",
+    "claim_id": "CLM-one-voice-room",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_founder_only_above_family",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1123"
+   },
+   {
+    "decimal_id": "4.5.13",
+    "claim_id": "CLM-one-voice-room",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/consensus.rs#evaluate_open_self_admit",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1123"
+   },
+   {
     "decimal_id": "3.1.9.4",
     "claim_id": "CLM-nsproc-class-dual-scope-gate-watchlist-id",
     "repo": "CIRISPersist",

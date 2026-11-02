@@ -76,6 +76,75 @@ pub const ROLE_TERM_CEILING_DAYS: u32 = 365;
 /// [`ROLE_TERM_CEILING_DAYS`] (CC 4.4.3.2.8 C; CIRISPersist#1032, #1034).
 pub const ROLE_TERM_CEILING_SECONDS: i64 = ROLE_TERM_CEILING_DAYS as i64 * 86_400;
 
+/// v61 S2 (CIRISPersist#1143; CC rc14 4.4.3.2.8, governance row
+/// `affiliation_member_action`) — the [`Error::RosterAuthorityUnauthorized`]
+/// rule: an act against a member of an affiliation with ONE deciding seat
+/// carries no countersign from a key outside that seat.
+pub const AFFILIATION_COUNTERSIGN_MISSING: &str = "affiliation_countersign_missing";
+
+/// v61 S2 (CIRISPersist#1143; CC rc14 4.4.3.2.8,
+/// `CLM-affiliation-one-voice-countersign`) — **one voice does not act
+/// against a member alone.** Where an affiliation has ONE deciding seat (its
+/// active founders, or its active members where it names no founder), an act
+/// against a member — here, a `membership:removal` — is admitted only when a
+/// key OUTSIDE the seat also signed it: a designated official
+/// ([`AffiliationConfig::designated_officials`]) who is not the seat. A body
+/// of two or more seats decides under its own protocol, which already
+/// carries the second voice. Not an affiliation: no rule.
+///
+/// The review-holder of an overseeing body (CC's second outside key) has no
+/// typed "overseeing body" in the config yet, and the "stands as a
+/// reconsideration proposal" path has no held state: both are follow-ups;
+/// this refuses instead.
+///
+/// # Errors
+///
+/// [`Error::RosterAuthorityUnauthorized`] with [`AFFILIATION_COUNTERSIGN_MISSING`];
+/// a malformed declared cohort or config; directory reads.
+pub async fn check_one_voice_countersign<F>(
+    dir: &F,
+    community: &Community,
+    primary: &str,
+    signers: &BTreeSet<String>,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if declared_cohort(community)? != Cohort::Affiliations {
+        return Ok(());
+    }
+    let roster = Box::pin(super::authorized_community_roster_at(dir, community, at)).await?;
+    let founders: BTreeSet<String> = roster
+        .iter()
+        .filter(|m| m.role.as_deref() == Some(super::admission::MEMBER_ROLE_FOUNDER))
+        .map(|m| m.key_id.clone())
+        .collect();
+    let seats: BTreeSet<String> = if founders.is_empty() {
+        roster.into_iter().map(|m| m.key_id).collect()
+    } else {
+        founders
+    };
+    if seats.len() != 1 {
+        return Ok(());
+    }
+    let outside: BTreeSet<String> = affiliation_config_of(community)?
+        .and_then(|c| c.designated_officials)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|o| o.key_id)
+        .filter(|k| !seats.contains(k))
+        .collect();
+    if signers.iter().any(|s| outside.contains(s)) {
+        return Ok(());
+    }
+    Err(Error::RosterAuthorityUnauthorized {
+        group_key_id: community.community_key_id.clone(),
+        offered_authority_key_id: primary.to_owned(),
+        rule: AFFILIATION_COUNTERSIGN_MISSING,
+    })
+}
+
 /// The refusal rules of [`Error::AffiliationConfigInvalid`]. Stable tokens;
 /// append-only.
 pub mod rule {

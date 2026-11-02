@@ -1092,6 +1092,9 @@ where
                             super::group_amendment::ReplicatedCommunityRefusal::DegradesConformance => {
                                 "degrades_conformance"
                             }
+                            super::group_amendment::ReplicatedCommunityRefusal::NotInAudience => {
+                                "not_in_audience"
+                            }
                         }));
                     }
                 }
@@ -1145,15 +1148,82 @@ pub fn check_generic_row_dimension(attestation_type: &str, dimension: &str) -> R
 }
 
 /// v61 (CIRISPersist#991, CC 2.4, CC 3.1.3) — the refusal of a `withdraws`
-/// naming a `group:roster:v1` row: a record changes by a supersede (its next
-/// version, under its protocol) and ends by dissolution, so its retraction
-/// has no projection to move. Refused by name, never admitted inert.
+/// naming a FAMILY's `group:roster:v1` row. A family dissolves by its own
+/// quorum-proved terminal amendment (`dissolved_at`, CIRISPersist#956), so a
+/// retraction of its record is refused by name, never admitted inert.
 ///
-/// A `withdraws` aimed at a group's record MEANS dissolution. Dissolution is
-/// v61 S2's (CIRISPersist#1143), so until then the refusal says so: however
-/// many roster signatures the row carries, nothing is stored and the roster
-/// does not move.
+/// v61 S2 (CIRISPersist#1143; CC rc14 4.4.3.2.8) — a COMMUNITY's (or an
+/// affiliation's) record is different: "dissolution of either kind is the
+/// `withdraws` of its record", cosigned under the group's protocol
+/// ([`community_dissolved_at`]).
 pub const GROUP_RECORD_WITHDRAWS_REFUSED: &str = "group_record_withdraws_refused";
+
+/// v61 S2 (CIRISPersist#1143; CC rc14 4.4.3.2.8, `CLM-affiliation-dissolution`)
+/// — **when the community `community_key_id` was dissolved**: the earliest
+/// signed instant of an ADMITTED cosigned `withdraws` of one of its
+/// `group:roster:v1` rows (the cosign gate stamps
+/// `withdraws_admission_rule`), or `None`. From that instant its seats lapse
+/// (the authorized roster is empty), no new seat, removal or version is
+/// admitted ([`Error::GroupDissolved`]), and the record and its custody rows
+/// stand. A directory that cannot list targeted rows answers `None`.
+///
+/// # Errors
+///
+/// Directory reads.
+pub async fn community_dissolved_at<D>(
+    dir: &D,
+    community_key_id: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    let rows = match dir
+        .list_targeted_by_dimension_prefix(
+            &[cohort_scope::COMMUNITY],
+            community_key_id,
+            GROUP_ROSTER_DIMENSION,
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(Error::Unsupported { .. }) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut at: Option<chrono::DateTime<chrono::Utc>> = None;
+    for r in rows {
+        match group_signed_of_row(&r)? {
+            Some(GroupSigned::Community(c)) if c.community.community_key_id == community_key_id => {
+            }
+            _ => continue,
+        }
+        for w in dir.list_attestations_referencing(&r.attestation_id).await? {
+            if w.attestation_type == attestation_type::WITHDRAWS
+                && w.withdraws_admission_rule.is_some()
+            {
+                at = Some(at.map_or(w.asserted_at, |a| a.min(w.asserted_at)));
+            }
+        }
+    }
+    Ok(at)
+}
+
+/// Refuse a change to a dissolved community ([`Error::GroupDissolved`]).
+///
+/// # Errors
+///
+/// [`Error::GroupDissolved`]; directory reads.
+pub async fn refuse_if_community_dissolved<D>(dir: &D, community_key_id: &str) -> Result<(), Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    match community_dissolved_at(dir, community_key_id).await? {
+        Some(dissolved_at) => Err(Error::GroupDissolved {
+            group_key_id: community_key_id.to_owned(),
+            dissolved_at,
+        }),
+        None => Ok(()),
+    }
+}
 
 /// v61 (CIRISPersist#991; CC 2.4.1.1, CC 3.1.3.2) — **the retraction of a
 /// cosigned row is a cosigned `withdraws` under the same protocol.** `None`
@@ -1196,14 +1266,16 @@ pub(crate) async fn check_cosigned_withdraws(
         4
     };
     match (family, consensus_source_for(family.dimension())) {
-        (GroupPlaneFamily::Roster, _) => Err(Error::InvalidArgument(format!(
-            "{GROUP_RECORD_WITHDRAWS_REFUSED}: withdraws names the group record row {} of {}: \
-             withdrawing a group's record is its dissolution, which is not admitted yet \
-             (dissolution arrives in v61 S2 with CIRISPersist#1143); a record changes by a \
-             supersede under its protocol",
-            target.attestation_id,
-            signed.group_key_id()
-        ))),
+        (GroupPlaneFamily::Roster, _) if signed.kind() == GroupKind::Family => {
+            Err(Error::InvalidArgument(format!(
+                "{GROUP_RECORD_WITHDRAWS_REFUSED}: withdraws names the family record row {} of {}: \
+                 a family's dissolution is its quorum-proved terminal amendment (dissolved_at, \
+                 CIRISPersist#956), never a withdraws; a record changes by a supersede under \
+                 its protocol",
+                target.attestation_id,
+                signed.group_key_id()
+            )))
+        }
         (_, Some(ConsensusSource::Signer)) => {
             if issuer == target.attesting_key_id {
                 Ok(Some(1))
@@ -1269,19 +1341,31 @@ pub(crate) async fn check_cosigned_withdraws(
             )
             .await;
             // Retracting a widening takes a member off; retracting a removal
-            // puts one back.
+            // puts one back. v61 S2 (CIRISPersist#1143) — withdrawing a
+            // community's record dissolves it: a whole-group change, judged
+            // in the strict direction (Add) and naming no one member.
             let direction = if family == GroupPlaneFamily::Widening {
                 super::consensus::Direction::Remove
             } else {
                 super::consensus::Direction::Add
             };
+            let subject =
+                (family != GroupPlaneFamily::Roster).then_some(target.attested_key_id.as_str());
+            // v61 (CIRISPersist#1123) — the group's subkind (a public
+            // room's `open:self_admit` is evaluable only there) and the member
+            // the retracted row names.
+            let subkind = policy_blob
+                .as_ref()
+                .and_then(|b| b.get("cohort_subkind"))
+                .and_then(serde_json::Value::as_str);
             let verdict = super::consensus::evaluate(&super::consensus::Ballot {
                 protocol: &protocol,
-                subkind: None,
+                subkind,
                 policy_blob: policy_blob.as_ref(),
                 roster: &seats,
                 signers: &counted,
                 direction,
+                subject,
             });
             if verdict.admits() {
                 Ok(Some(rule))
@@ -1551,7 +1635,7 @@ mod tests {
                 community_name: "room".into(),
                 members: Vec::new(),
                 founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-                consensus_protocol: "founder_only".into(),
+                consensus_protocol: "quorum:1/1".into(),
                 policy_blob: None,
                 prev_head_digest: String::new(),
                 charter_digest: "bb".repeat(32),

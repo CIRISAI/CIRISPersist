@@ -214,6 +214,19 @@ pub(crate) async fn apply_replicated_community_planned<D>(
 where
     D: CommunityStore,
 {
+    // v61 (CIRISPersist#1148) — the put-time audience precondition, as on the
+    // attestation plane: a record this node may not receive is refused by
+    // name before any door runs.
+    if let Some(me) = dir.node_key_id() {
+        if !super::replication_audience::may_receive_community_record(dir, &me, &community)
+            .await?
+            .allowed()
+        {
+            return Ok(ReplicatedCommunityOutcome::Refused {
+                reason: group_amendment::ReplicatedCommunityRefusal::NotInAudience,
+            });
+        }
+    }
     let stored = put_community_planned(dir, community, CommunityDoor::ReplicatedApply).await;
     group_amendment::replicated_community_outcome(stored)
 }

@@ -5525,7 +5525,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         mut row: crate::federation::types::Family,
     ) -> Result<(), crate::federation::Error> {
-        crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        crate::federation::admission::check_family_consensus_protocol_form(
+            &row.consensus_protocol,
+        )?;
         // v13.3.0 (CIRISPersist#386) — the real invariant (replaces the dropped
         // family_key_id FK): every member key_id must be a registered key.
         crate::federation::admission::validate_family_members(self, &row).await?;
@@ -16061,35 +16063,24 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
 
     async fn composer_replay_held(
         &self,
-        attestation_type: &str,
-        attesting_key_id: &str,
-        references_attestation_id: &str,
+        attestation_id: &str,
+        original_content_hash: &str,
     ) -> Result<bool, crate::federation::Error> {
-        let attestation_type_owned = attestation_type.to_owned();
-        let attesting_owned = attesting_key_id.to_owned();
-        let ref_id_owned = references_attestation_id.to_owned();
+        // v61 (CIRISPersist#1157) — the SAME row, by id and signed content
+        // (a BLOB here; a hash that is not hex names no held row).
+        let id = attestation_id.to_owned();
+        let Ok(och) = hex::decode(original_content_hash) else {
+            return Ok(false);
+        };
         self.read(move |conn| -> Result<bool, rusqlite::Error> {
-            let mut stmt = conn.prepare(
-                "SELECT attestation_envelope FROM federation_attestations \
-                 WHERE attestation_type = ?1 AND attesting_key_id = ?2",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![attestation_type_owned, attesting_owned],
-                |r| r.get::<_, String>(0),
-            )?;
-            for env_text in rows {
-                let env_text = env_text?;
-                let env: serde_json::Value = match serde_json::from_str(&env_text) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let existing_ref =
-                    crate::federation::precedence::references_attestation_id_from_envelope(&env);
-                if existing_ref == Some(ref_id_owned.as_str()) {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+            conn.query_row(
+                "SELECT 1 FROM federation_attestations \
+                 WHERE attestation_id = ?1 AND original_content_hash = ?2",
+                rusqlite::params![id, och],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|r| r.is_some())
         })
         .await
         .map_err(|e| {
@@ -36798,13 +36789,7 @@ mod tests {
             .put_community(
                 crate::federation::tier_ingest::test_support::sign_community(
                     "solo-coop",
-                    fed_community(
-                        "solo-coop",
-                        "Solo Co-op",
-                        vec![],
-                        crate::federation::types::consensus_protocol::FOUNDER_ONLY,
-                        None,
-                    ),
+                    fed_community("solo-coop", "Solo Co-op", vec![], "quorum:1/1", None),
                 ),
             )
             .await
@@ -37155,8 +37140,7 @@ mod tests {
                         community_name: "fixture room".into(),
                         members: vec![],
                         founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-                        consensus_protocol:
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.to_owned(),
+                        consensus_protocol: "quorum:1/1".into(),
                         policy_blob: None,
                         persist_row_hash: String::new(),
                     },
@@ -46635,13 +46619,7 @@ mod tests {
             .put_community(
                 crate::federation::tier_ingest::test_support::sign_community(
                     community_id,
-                    fed_community(
-                        community_id,
-                        "ob-test",
-                        members,
-                        crate::federation::types::consensus_protocol::FOUNDER_ONLY,
-                        policy,
-                    ),
+                    fed_community(community_id, "ob-test", members, "quorum:1/1", policy),
                 ),
             )
             .await
@@ -46730,7 +46708,7 @@ mod tests {
     #[tokio::test]
     async fn no_moderator_federate_apply_broadened_keying_sqlite() {
         use crate::federation::admission::MEMBER_ROLE_FOUNDER;
-        use crate::federation::types::{consensus_protocol, identity_type};
+        use crate::federation::types::identity_type;
         use crate::federation::FederationDirectory;
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
@@ -46766,7 +46744,7 @@ mod tests {
                         role: Some(MEMBER_ROLE_FOUNDER.into()),
                     }],
                     founded_at: "2026-06-04T00:00:00Z".parse().unwrap(),
-                    consensus_protocol: consensus_protocol::FOUNDER_ONLY.into(),
+                    consensus_protocol: "quorum:1/1".into(),
                     policy_blob: None,
                     persist_row_hash: String::new(),
                 },
@@ -51497,7 +51475,7 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
                         "acm-comm",
                         "acm",
                         vec!["acm-0", "acm-1", "acm-2"],
-                        crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                        "quorum:1/1",
                         None,
                     ),
                 ),
@@ -51722,13 +51700,8 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
                 .await
                 .unwrap();
         }
-        let mut community = fed_community(
-            "mod-comm",
-            "mods",
-            vec!["mod-founder"],
-            crate::federation::types::consensus_protocol::FOUNDER_ONLY,
-            None,
-        );
+        let mut community =
+            fed_community("mod-comm", "mods", vec!["mod-founder"], "quorum:1/1", None);
         community.members[0].role = Some(MEMBER_ROLE_FOUNDER.into());
         backend
             .put_community(

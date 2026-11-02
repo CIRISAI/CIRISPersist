@@ -9,8 +9,8 @@
 //!   only on the planned path: a fresh row and a non-composer row carrying a
 //!   `references_attestation_id` are read by the plan and the write door and
 //!   nothing else, a plan-free fresh row inserts without asking the store
-//!   what it did, and a composer replay is read back and named
-//!   `Deduplicated`. Each `&&` of the predicate and of the
+//!   what it did, and a composer is read back (v61, CIRISPersist#1157: a
+//!   distinct same-triple composer is stored, never `Deduplicated`). Each `&&` of the predicate and of the
 //!   read-back guard turned into `||` reads a row it must not.
 //! - **I1341** — the write's error arm: a duplicate id the plan could not
 //!   see is the typed `StoreConflict` refusal, and any other write error
@@ -163,27 +163,34 @@ async fn i1340(dir: Arc<dyn FederationDirectory>, tag: &str) {
         "{tag} I1340 a non-composer row with a references target is not read back"
     );
 
-    // The control: a composer replay IS read back — `Deduplicated` is the
-    // read-back's own verdict, so the outcome is the proof it ran.
-    let (outcome, _) = apply_counting(&*dir, withdraws(&fresh_id(), &author, &target_id)).await;
+    // The control: a composer IS read back (one read on top of the planned
+    // path's). v61 (CIRISPersist#1157, CC rc14 3.1.9.4): a DISTINCT row of
+    // the same `(type, attester, reference)` triple is no replay — it is
+    // stored and ranked read-time — so the read-back confirms an insert.
+    let (outcome, reads) = apply_counting(&*dir, withdraws(&fresh_id(), &author, &target_id)).await;
     assert_eq!(
         outcome,
         ReplicatedAttestationOutcome::Inserted,
         "{tag} I1340 first withdraws"
     );
-    let replay_id = fresh_id();
-    let (outcome, _) = apply_counting(&*dir, withdraws(&replay_id, &author, &target_id)).await;
+    assert_eq!(
+        reads,
+        planned + 1,
+        "{tag} I1340 a composer carrying a references target is read back"
+    );
+    let second_id = fresh_id();
+    let (outcome, _) = apply_counting(&*dir, withdraws(&second_id, &author, &target_id)).await;
     assert_eq!(
         outcome,
-        ReplicatedAttestationOutcome::Deduplicated,
-        "{tag} I1340 the composer replay"
+        ReplicatedAttestationOutcome::Inserted,
+        "{tag} I1340 a distinct same-triple composer is stored, not swallowed"
     );
     assert!(
-        dir.get_attestation(&replay_id)
+        dir.get_attestation(&second_id)
             .await
             .expect("get")
-            .is_none(),
-        "{tag} I1340 Deduplicated wrote nothing"
+            .is_some(),
+        "{tag} I1340 the distinct composer is held"
     );
 
     // Plan-free (this directory cannot answer `get_attestation`): no

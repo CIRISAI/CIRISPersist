@@ -3477,7 +3477,7 @@ pub(crate) mod bodies {
         plain.community_key_id = "gp-room".to_owned();
         plain.members.truncate(1);
         plain.policy_blob = None;
-        plain.consensus_protocol = "founder_only".to_owned();
+        plain.consensus_protocol = "quorum:1/1".to_owned();
         d.put_community(ts::sign_community("gp-owner", plain.clone()))
             .await
             .expect("a plain room admits");

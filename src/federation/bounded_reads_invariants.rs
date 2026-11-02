@@ -412,10 +412,10 @@ pub(crate) mod bodies {
             format!("i541-fam-{s}"),
         );
         mab::reg(d, &[&a, &b, &x, &y, &z, &w]).await;
-        mab::found_community(d, &room, "founder_only", &[&a, &b], &[])
+        mab::found_community(d, &room, "quorum:1/1", &[&a, &b], &[])
             .await
             .expect("room");
-        mab::found_community(d, &other, "founder_only", &[&a], &[])
+        mab::found_community(d, &other, "quorum:1/1", &[&a], &[])
             .await
             .expect("other room");
         mab::found_family(d, &fam, "founder_only", &[&a, &b], &[])

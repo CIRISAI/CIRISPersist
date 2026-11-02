@@ -3137,8 +3137,7 @@ mod tests {
                             role: Some("founder".into()),
                         }],
                         founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                        consensus_protocol:
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
+                        consensus_protocol: "quorum:1/1".into(),
                         policy_blob: None,
                         persist_row_hash: String::new(),
                     },
@@ -3938,7 +3937,7 @@ mod tests {
             check_no_moderator_federate_admission, check_no_moderator_federate_admission_by_id,
             check_no_moderator_federate_apply, MEMBER_ROLE_FOUNDER,
         };
-        use crate::federation::types::{consensus_protocol, identity_type};
+        use crate::federation::types::identity_type;
 
         // Build a community `cid` founded (founder_only) by `founder` of
         // identity_type `founder_it`, optionally infra-labeled. Registers the
@@ -3982,7 +3981,9 @@ mod tests {
                 founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
                 consensus_protocol: crate::federation::tier_ingest::test_support::fixture_protocol(
                     policy_blob.as_ref(),
-                    consensus_protocol::FOUNDER_ONLY,
+                    // v61 (CIRISPersist#1123): founder_only is refused
+                    // above the family; a one-founder room's protocol.
+                    "quorum:1/1",
                 ),
                 policy_blob,
                 persist_row_hash: String::new(),
@@ -4089,7 +4090,7 @@ mod tests {
         use crate::federation::admission::{
             check_no_moderator_federate_apply, no_moderator_federate_verdict, MEMBER_ROLE_FOUNDER,
         };
-        use crate::federation::types::{consensus_protocol, identity_type};
+        use crate::federation::types::identity_type;
 
         let b = test_backend();
 
@@ -4123,7 +4124,7 @@ mod tests {
                                 role: Some(MEMBER_ROLE_FOUNDER.into()),
                             }],
                             founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                            consensus_protocol: consensus_protocol::FOUNDER_ONLY.into(),
+                            consensus_protocol: "quorum:1/1".into(),
                             policy_blob: None,
                             persist_row_hash: String::new(),
                         },
@@ -6192,7 +6193,7 @@ mod tests {
                 role: None,
             }],
             founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-            consensus_protocol: "founder_only".into(),
+            consensus_protocol: "quorum:1/1".into(),
             policy_blob: None,
             persist_row_hash: String::new(),
         };
@@ -6371,7 +6372,7 @@ mod tests {
                             role: None,
                         }],
                         founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                        consensus_protocol: "founder_only".into(),
+                        consensus_protocol: "quorum:1/1".into(),
                         policy_blob: None,
                         persist_row_hash: String::new(),
                     },

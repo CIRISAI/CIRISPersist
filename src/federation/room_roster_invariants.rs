@@ -17,8 +17,8 @@ pub mod bodies {
     use crate::federation::operational::test_support as ops;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{
-        consensus_protocol, identity_type, Community, CommunityMember,
-        CommunityMembershipRevocation, FamilyMembershipRevocation,
+        identity_type, Community, CommunityMember, CommunityMembershipRevocation,
+        FamilyMembershipRevocation,
     };
     use crate::federation::FederationDirectory;
 
@@ -62,7 +62,7 @@ pub mod bodies {
                 community_name: "keyless room".into(),
                 members: roster,
                 founded_at: at("2026-01-01T00:00:00Z"),
-                consensus_protocol: consensus_protocol::FOUNDER_ONLY.to_owned(),
+                consensus_protocol: "quorum:1/1".into(),
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },
@@ -208,7 +208,7 @@ pub mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) -> (String, String, String) {
-        keyless_room_dir_with(d, tag, consensus_protocol::FOUNDER_ONLY).await
+        keyless_room_dir_with(d, tag, "quorum:1/1").await
     }
 
     /// [`keyless_room_dir`] under a chosen consensus protocol.
@@ -625,7 +625,7 @@ pub mod bodies {
                     role: Some(MEMBER_ROLE_FOUNDER.into()),
                 }],
                 founded_at: at("2026-01-01T00:00:00Z"),
-                consensus_protocol: consensus_protocol::FOUNDER_ONLY.to_owned(),
+                consensus_protocol: "quorum:1/1".into(),
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },

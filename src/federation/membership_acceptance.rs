@@ -522,7 +522,7 @@ where
         let Some(f) = dir.lookup_family(group).await? else {
             return Ok(());
         };
-        f.consensus_protocol != super::types::consensus_protocol::FOUNDER_ONLY
+        !super::types::consensus_protocol::founders_hold_authority(&f.consensus_protocol)
             || dir
                 .active_family_members(group)
                 .await?
@@ -532,7 +532,7 @@ where
         let Some(c) = dir.lookup_community(group).await? else {
             return Ok(());
         };
-        c.consensus_protocol != super::types::consensus_protocol::FOUNDER_ONLY
+        !super::types::consensus_protocol::founders_hold_authority(&c.consensus_protocol)
             || dir
                 .active_community_members(group)
                 .await?
@@ -543,7 +543,7 @@ where
         Ok(())
     } else {
         Err(Error::InvalidArgument(format!(
-            "{PROPOSAL_DIMENSION}: under founder_only only a founder of {group} proposes"
+            "{PROPOSAL_DIMENSION}: under founder_only or open:self_admit only a founder of {group} proposes"
         )))
     }
 }

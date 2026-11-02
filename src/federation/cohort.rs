@@ -326,7 +326,7 @@ pub mod test_support {
                         role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
                     }],
                     founded_at: now,
-                    consensus_protocol: types::consensus_protocol::FOUNDER_ONLY.into(),
+                    consensus_protocol: "quorum:1/1".into(),
                     policy_blob: None,
                     persist_row_hash: String::new(),
                 },

@@ -188,13 +188,16 @@ pub(crate) trait AttestationStore:
     /// such key.
     async fn attesting_identity_type(&self, key_id: &str) -> Result<Option<String>, Error>;
 
-    /// Is a structural composer with this `(attestation_type,
-    /// attesting_key_id, references_attestation_id)` triple held (any tier)?
+    /// v61 (CIRISPersist#1157, CC rc14 3.1.9.4) — is THIS composer held
+    /// already: a row under `attestation_id` asserting the same signed content
+    /// (`original_content_hash`), any tier? Idempotence keys on the row, never
+    /// on its `(type, attester, reference)` triple: a DISTINCT same-type row
+    /// from the same attester on the same target is not a replay, it is
+    /// stored and ranked at read time ([`super::attestation_query::lifecycle_predicate`]).
     async fn composer_replay_held(
         &self,
-        attestation_type: &str,
-        attesting_key_id: &str,
-        references_attestation_id: &str,
+        attestation_id: &str,
+        original_content_hash: &str,
     ) -> Result<bool, Error>;
 
     /// Record `depth` for `attestation_id` in the V157 depth table when the
@@ -1063,8 +1066,12 @@ where
         if let Some(ref_id) = crate::federation::precedence::references_attestation_id_from_envelope(
             &row.attestation_envelope,
         ) {
+            // v61 (CIRISPersist#1157) — the replay is the SAME row (id and
+            // signed content); a distinct row naming the same target under
+            // the same type and attester is admitted and ranked at read time.
+            let _ = ref_id;
             if dir
-                .composer_replay_held(&row.attestation_type, &row.attesting_key_id, ref_id)
+                .composer_replay_held(&row.attestation_id, &row.original_content_hash)
                 .await?
             {
                 // v50.0.0 (review H2, final check) — an identical re-put of a
