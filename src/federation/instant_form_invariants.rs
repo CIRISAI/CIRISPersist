@@ -700,3 +700,99 @@ mod preimages {
         assert!(why.contains("sub-millisecond"), "{why}");
     }
 }
+
+/// v61 — the pass's counters, over a store double: a row whose re-statement
+/// the emit door refuses, a row with no instant to re-state, and own rows the
+/// pass leaves where they are.
+#[cfg(test)]
+mod pass_counts {
+    use crate::federation::admission::InstantFormViolation;
+    use crate::federation::instant_form::{run_pass, InstantFormStore};
+    use crate::federation::types::attestation_type;
+    use crate::federation::{Attestation, EmitAttestationInput, Error};
+
+    struct Double {
+        rows: Vec<Attestation>,
+    }
+
+    impl InstantFormStore for Double {
+        async fn corpus_page(
+            &self,
+            after: Option<&str>,
+            _limit: u32,
+        ) -> Result<Vec<Attestation>, Error> {
+            Ok(if after.is_none() {
+                self.rows.clone()
+            } else {
+                Vec::new()
+            })
+        }
+        async fn own_composers_citing(
+            &self,
+            _ids: &[String],
+            _me: &str,
+        ) -> Result<Vec<Attestation>, Error> {
+            Ok(Vec::new())
+        }
+        async fn emit_own(&self, _input: EmitAttestationInput) -> Result<String, Error> {
+            Err(Error::InvalidArgument("the door refuses".into()))
+        }
+        async fn set_aside(
+            &self,
+            _row: &Attestation,
+            _v: &InstantFormViolation,
+        ) -> Result<bool, Error> {
+            Ok(true)
+        }
+    }
+
+    fn row(id: &str, ty: &str, valid_until: &str) -> Attestation {
+        let mut r = crate::federation::tier_ingest::test_support::bare_attestation(
+            id,
+            "me",
+            "me",
+            &serde_json::json!({}),
+        );
+        r.attestation_type = ty.to_owned();
+        r.attestation_envelope = serde_json::json!({
+            "dimension": "identity_binding:v1",
+            "valid_until": valid_until,
+        });
+        r
+    }
+
+    /// I-IFP-8 — **every counter counts.** Two re-statements the door
+    /// refuses (one by the emit door, one with no instant to re-state), two
+    /// own rows left (a composer and a local row), one canonical row.
+    #[tokio::test]
+    async fn i_ifp_8_the_pass_counts_every_disposition() {
+        let mut local = row("r5", attestation_type::SCORES, "2030-01-01T00:00:00+00:00");
+        local.tier = crate::federation::types::attestation_tier::LOCAL.to_owned();
+        let store = Double {
+            rows: vec![
+                row("r1", attestation_type::SCORES, "2030-01-01T00:00:00+00:00"),
+                row("r2", attestation_type::SCORES, "not an instant"),
+                row(
+                    "r3",
+                    attestation_type::WITHDRAWS,
+                    "2030-01-01T00:00:00+00:00",
+                ),
+                row("r4", attestation_type::SCORES, "2030-01-01T00:00:00.000Z"),
+                local,
+            ],
+        };
+        let pass = run_pass(&store, "me", chrono::Utc::now()).await.unwrap();
+        assert_eq!(
+            (
+                pass.scanned,
+                pass.violations,
+                pass.heal_refused,
+                pass.own_left,
+                pass.healed,
+                pass.set_aside
+            ),
+            (5, 4, 2, 2, 0, 0),
+            "I-IFP-8: {pass:?}"
+        );
+    }
+}

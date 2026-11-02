@@ -199,6 +199,53 @@ pub(crate) mod bodies {
             "I1122-C: the sweep is idempotent"
         );
     }
+
+    /// I1122-D — **an occurrence projects its route through one step**: a
+    /// node's occurrence carrying a transport binding lists its route; an
+    /// agent's projects none, and its occurrence still lands.
+    pub(crate) async fn i1122_d_an_agent_occurrence_projects_no_route<D>(d: &D, tag: &str)
+    where
+        D: FederationDirectory,
+    {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let identity = format!("{tag}-occid");
+        ts::register_identity_key(d, &identity, USER).await;
+        for (occ, ty, want) in [
+            (format!("{tag}-occnode"), NODE, 1usize),
+            (format!("{tag}-occagent"), AGENT, 0usize),
+        ] {
+            ts::register_identity_key(d, &occ, ty).await;
+            let row = crate::federation::IdentityOccurrence {
+                identity_key_id: identity.clone(),
+                occurrence_key_id: occ.clone(),
+                device_class: crate::federation::types::device_class::AGENT.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: None,
+                transport_binding: Some(crate::federation::types::OccurrenceTransportBinding {
+                    reticulum_x25519_pubkey_base64: b64.encode([0x21; 32]),
+                    reticulum_ed25519_pubkey_base64: b64.encode([0x22; 32]),
+                    destination_hash_base64: b64.encode([0x21; 16]),
+                    app_name: "ciris.federation".into(),
+                    aspects: vec!["announce".into()],
+                }),
+                persist_row_hash: String::new(),
+            };
+            d.put_identity_occurrence_local(row)
+                .await
+                .expect("I1122-D: the occurrence lands");
+            assert_eq!(
+                d.list_transport_destinations_for_unfolded(&occ)
+                    .await
+                    .unwrap()
+                    .len(),
+                want,
+                "I1122-D: {ty} occurrence routes"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -220,6 +267,15 @@ mod tests {
                     let Some(b) = $make.await else { return };
                     super::super::bodies::i1122_b_a_tied_newer_route_displaces(&b, &super::tag())
                         .await;
+                }
+                #[tokio::test]
+                async fn i1122_d_an_agent_occurrence_projects_no_route() {
+                    let Some(b) = $make.await else { return };
+                    super::super::bodies::i1122_d_an_agent_occurrence_projects_no_route(
+                        &b,
+                        &super::tag(),
+                    )
+                    .await;
                 }
                 #[tokio::test]
                 async fn i1122_c_the_sweep_removes_agent_routes() {
