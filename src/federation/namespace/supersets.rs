@@ -1803,7 +1803,10 @@ mod tests {
         // (CIRISPersist#1063): CLM-public-community at the on-request read;
         // +1 (CIRISPersist#1157): CLM-composer-convergent-rank at the rank;
         // +1 (CIRISPersist#1143): CLM-affiliation-one-voice-countersign.
-        const EXPECTED: usize = 362;
+        // v61 slice S3: +2 (CIRISPersist#1101, CC 2.6.2): CLM-serve-seat-announced
+        // (5.3) at the owner-announced predicate, CLM-canonicalization (2.6.2) at
+        // the signed-instant form predicate.
+        const EXPECTED: usize = 364;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \
