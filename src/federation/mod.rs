@@ -86,6 +86,14 @@ pub(crate) mod directory_admit;
 /// `EvidenceStore` executor.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) mod evidence_admit;
+/// v61 (CIRISPersist#934, S4b) — the family doors, decided once, with the
+/// per-backend `FamilyStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod family_admit;
+/// v61 (CIRISPersist#934, S4b) — the group supersede, decided once, with the
+/// per-backend `GroupSupersedeStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod group_supersede_admit;
 /// v61 (CIRISPersist#934, S4b) — the identity-occurrence writes, decided
 /// once, with the per-backend `OccurrenceStore` executor.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
@@ -243,9 +251,6 @@ pub(crate) mod affiliation_floor_invariants;
 pub(crate) mod composer_rank_invariants;
 #[cfg(test)]
 mod consent_sweep_plan_invariants;
-/// v61 S2 (CIRISPersist#1165) — I1510: a contact grant reaches the relay.
-#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-pub(crate) mod contact_relay_invariants;
 /// v53.1.0 (CIRISPersist#979) — I480–I487: a chunk of a withdrawn file is
 /// judged by its file.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -1171,6 +1176,14 @@ pub const ROSTER_CONSENSUS_UNEVALUABLE: &str = "roster_consensus_unevaluable";
 /// v49.0.0 (CIRISPersist#908) — substantive: the change would leave the group
 /// with other active members and no active founder.
 pub const ROSTER_LAST_FOUNDER: &str = "roster_last_founder";
+/// v61 S2 (CC 4.5.13) — substantive: under `open:self_admit` a removal
+/// reached the LOCAL door more than
+/// [`consensus::OPEN_SELF_ADMIT_REMOVAL_WINDOW_SECS`] from its signed
+/// `removed_at`. A roster cosignature carries no signed instant of its own,
+/// so no cosignature can show it was given inside the window; the local door
+/// bounds the removal on receipt instead. The replicated door does not: a
+/// peer's clock is no witness to when the voices signed.
+pub const ROSTER_REMOVAL_OUTSIDE_WINDOW: &str = "roster_removal_outside_window";
 
 /// v50.0.0 (CIRISPersist#916, FSD `SECOND_DEVICE.md` §3) — the device carries
 /// no live owner-binding here: nobody is responsible for it, so no member's

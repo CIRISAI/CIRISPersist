@@ -775,14 +775,30 @@ pub(crate) fn lifecycle_predicate(
         .collect::<Vec<_>>()
         .join(",");
     let path = crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID;
-    let (table, target, id) = match dialect {
+    // v61 (the canonical's read storm) — sqlite: the outer id is
+    // compared as `+outer.attestation_id`. A bare column carries TEXT
+    // affinity, which the comparison then applies to the expression side;
+    // V181's `reference_seek` indexes the expression with NO affinity, so the
+    // index was ineligible and the subquery was `SCAN c` once per outer row
+    // (one page of 256 at 3.9k rows: 15.2M full-scan steps). The unary plus
+    // strips the affinity. The seek is pinned to V212's partial
+    // `reference_live` (composer rows only): with statistics on a store with
+    // few composers, `reference_seek` (every row, nearly all NULL) is judged
+    // no better than a scan, and the pin alone then walks the whole index.
+    // The convergent-rank subquery below (`r`) is pinned to the same index:
+    // its `{rank_ref} = {outer_ref}` and `r.attestation_type` equalities are
+    // the index's two columns, and a non-composer outer row (reference NULL)
+    // seeks nothing.
+    let (table, pin, target, id) = match dialect {
         Dialect::Sqlite => (
             "federation_attestations",
+            " INDEXED BY federation_attestations_reference_live",
             format!("json_extract(c.attestation_envelope, '$.{path}')"),
-            format!("{outer}.attestation_id"),
+            format!("+{outer}.attestation_id"),
         ),
         Dialect::Postgres => (
             "cirislens.federation_attestations",
+            "",
             format!("c.attestation_envelope::jsonb->>'{path}'"),
             format!("{outer}.attestation_id::text"),
         ),
@@ -820,12 +836,12 @@ pub(crate) fn lifecycle_predicate(
     };
     Some((
         format!(
-            "NOT EXISTS (SELECT 1 FROM {table} c \
+            "NOT EXISTS (SELECT 1 FROM {table} c{pin} \
                WHERE (c.attesting_key_id = {outer}.attesting_key_id \
                       OR c.withdraws_admission_rule IS NOT NULL) \
                  AND c.attestation_type IN ({list}) \
                  AND {target} = {id}) \
-             AND NOT EXISTS (SELECT 1 FROM {table} r \
+             AND NOT EXISTS (SELECT 1 FROM {table} r{pin} \
                WHERE r.attestation_type = {outer}.attestation_type \
                  AND r.attestation_type IN ({list}) \
                  AND r.attesting_key_id = {outer}.attesting_key_id \

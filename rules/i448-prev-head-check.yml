@@ -1,19 +1,20 @@
-# I448 (lineage_head_invariants.rs): supersede_group_row runs the prev check on both arms.
+# I448 (lineage_head_invariants.rs): every backend's supersede executor asks the shared
+# held-head verdict (which runs the prev check) on both arms (v61, #934 S4b).
 id: i448-prev-head-check
 language: rust
 severity: hint
-message: "check_prev_head_names_held call site"
+message: "held_head_verdict call site"
 rule:
   kind: call_expression
   has:
     field: function
-    regex: '(^|::|\.)check_prev_head_names_held$'
+    regex: '(^|::|\.)held_head_verdict$'
   inside:
     kind: function_item
     stopBy: end
     has:
       field: name
-      regex: '^(supersede_group_row)$'
+      regex: '^(store_planned_supersede)$'
 files:
   - src/store/sqlite.rs
   - src/store/postgres.rs

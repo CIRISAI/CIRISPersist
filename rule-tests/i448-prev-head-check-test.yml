@@ -1,10 +1,12 @@
 id: i448-prev-head-check
 valid:
   - |
-    fn other() { check_prev_head_names_held(x); }
+    fn other() { held_head_verdict(&p, None); }
   - |
-    fn supersede_group_row() { // check_prev_head_names_held(x);
+    fn store_planned_supersede() { // held_head_verdict(&p, None);
     }
-invalid:
   - |
     async fn supersede_group_row(&self) { if a { check_prev_head_names_held(x)?; } }
+invalid:
+  - |
+    async fn store_planned_supersede(&self) { if a { held_head_verdict(&p, held).map_err(&refuse)?; } }

@@ -239,6 +239,13 @@ pub(crate) enum ConnClass {
 /// and are `Write`.
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
+    // v61 (CIRISPersist#934, S4b) — the group supersede executor.
+    ("store_planned_supersede", ConnClass::Write),
+    // v61 (CIRISPersist#934, S4b) — the family executor.
+    ("store_planned_family", ConnClass::Write),
+    ("store_family_signature", ConnClass::Write),
+    ("store_planned_family_revocation", ConnClass::Write),
+    ("store_planned_family_widening", ConnClass::Write),
     // v61 (CIRISPersist#934, S4b) — the identity-occurrence executor.
     ("store_planned_occurrence", ConnClass::Write),
     ("store_planned_local_occurrence", ConnClass::Write),
@@ -628,11 +635,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v55.0.0 (CIRISPersist#952) — the incremental plaintext DAG finalize.
     // v55.0.0 (CIRISPersist#989) — announce a holding claim for a held row.
     ("put_calibration_bundle", ConnClass::Write),
-    ("put_family_membership_widening", ConnClass::Write),
     ("put_edge_detection_event", ConnClass::Write),
-    ("put_family", ConnClass::Write),
-    ("put_family_local", ConnClass::Write),
-    ("put_family_membership_revocation", ConnClass::Write),
     ("put_identity_occurrence_revocation_local", ConnClass::Write),
     ("put_installed_storage_budget", ConnClass::Write),
     // v50.0.0 (#928, V157) — the recorded admission depth of a `withdraws`.
@@ -714,6 +717,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v59.0.0 (sealed-transport floor) — the eager key-plane rehome at open.
     ("rehome_key_plane_at_open", ConnClass::Read),
     ("legacy_community_trust_grants_at_open", ConnClass::Read),
+    // v61 (the canonical's read storm) — ANALYZE once on a never-analyzed
+    // store, then `PRAGMA optimize`: both write sqlite_stat1, on the writer.
+    ("plan_statistics_at_open", ConnClass::Write),
     ("list_open_self_roster_proposals", ConnClass::Read),
     ("list_settled_self_roster_proposals", ConnClass::Read),
     ("settle_self_roster_proposal", ConnClass::Write),
@@ -795,7 +801,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("store_planned_community_widening", ConnClass::Write),
     ("stream_consistency_proof", ConnClass::Read),
     ("stream_inclusion_proof", ConnClass::Read),
-    ("supersede_group_row", ConnClass::Write),
     ("sweep_ack_timeouts", ConnClass::Write),
     ("sweep_candidates", ConnClass::Read),
     ("sweep_expired_claims", ConnClass::Write),

@@ -128,6 +128,24 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v61 (CIRISPersist#934, S4b) — the group supersede, and the verdict its
+    // executor asks of the held head inside its transaction.
+    ("supersede_group_row_planned", Class::Plan),
+    ("held_head_verdict", Class::Plan),
+    // Gates: `self` is not versioned; a snapshot that is not the signed
+    // wrapper of the cohort's record is refused (#651).
+    ("check_supersede_cohort", Class::Gate),
+    ("decode_planned_head", Class::Gate),
+    ("store_planned_supersede", Class::Plumbing),
+    // v61 (CIRISPersist#934, S4b) — the family doors.
+    ("put_family_planned", Class::Plan),
+    ("put_family_local_planned", Class::Plan),
+    ("put_family_membership_revocation_planned", Class::Plan),
+    ("put_family_membership_widening_planned", Class::Plan),
+    // The family executor (storage only; compared across backends as the `FamilyStore` trait).
+    ("store_family_signature", Class::Plumbing),
+    ("store_planned_family_revocation", Class::Plumbing),
+    ("store_planned_family_widening", Class::Plumbing),
     // v61 (CIRISPersist#934, S4b) — the identity-occurrence writes.
     ("put_identity_occurrence_planned", Class::Plan),
     ("put_identity_occurrence_local_planned", Class::Plan),
@@ -139,11 +157,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("store_planned_local_occurrence", Class::Plumbing),
     ("index_occurrence_row", Class::Plumbing),
     // v61 (CIRISPersist#1148) — the replicated community apply's put-time
-    // audience precondition: the verdict refuses a record this node may not
-    // receive (a Gate), asked about this node's own key (Plumbing: a read of
-    // the node's identity).
-    ("may_receive_community_record", Class::Gate),
-    ("node_key_id", Class::Plumbing),
+    // audience precondition (`may_receive_community_record`, Gate) and the
+    // node key it asks about (`node_key_id`, Plumbing) are each classified
+    // once, below; the S2/S4b merge had listed both twice.
     // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
     ("put_transport_destination_planned", Class::Plan),
     ("put_signed_transport_destination_planned", Class::Plan),
@@ -438,10 +454,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("pg_row_to_hard_case_event", Class::Plumbing),
     ("sqlite_render_table", Class::Plumbing),
     ("pg_render_table", Class::Plumbing),
-    // v60.0.0 (CIRISPersist#720) — the lifecycle filter's one predicate: it
-    // renders a read's WHERE fragment and refuses nothing (`None` is "this
-    // view hides nothing", not a failure).
-    ("lifecycle_predicate", Class::Plumbing),
     ("execute_batch", Class::Plumbing),
     ("batch_execute", Class::Plumbing),
     // The two projections (rows → table): a derivation that answers `None`
@@ -760,11 +772,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // presented lineage head is absent, stale or unwitnessed under an armed
     // charter (`trust_root_head_stale`).
     ("check_attach_freshness", Class::Gate),
-    // v50.0.0 (PR #921 review) — Plumbing: the `cfg(test)` rival write a
-    // witness arms at a fixed point of a community write
-    // (`store::test_hooks::RivalPoint`); never armed outside a test, so it
-    // adds nothing to a door's production sequence.
-    ("test_rival_at", Class::Plumbing),
     // v53.1.3 (CIRISPersist#986) — Plumbing: the `cfg(test)` rival withdrawal
     // I524 arms between the withdraw door's held read and its compare-and-set
     // write (`store::test_hooks::arm_rival_location_proof_withdrawal`); never
@@ -1214,7 +1221,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // answer (cap, seq conflict, moved epoch).
     ("sqlite_append_chunk_item", Class::Delegates),
     ("pg_append_chunk_item", Class::Delegates),
-    ("put_family_local", Class::Delegates),
     // v61 (CIRISPersist#1122) — the occurrence write projects its route
     // through one shared step, which skips an agent's and otherwise runs the
     // local route door (its gates).
@@ -1233,6 +1239,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("recompute_and_assert_root", Class::Gate),
     ("references_attestation_id_from_envelope", Class::Plumbing),
     ("reject_future_dated_community_revocation", Class::Gate),
+    // v61 S2 (CC 4.5.13) — the open:self_admit removal window at the local
+    // door: refuses a removal received outside 259 200 s of its signed instant.
+    ("check_open_self_admit_removal_window", Class::Gate),
     ("reload_record_bytes", Class::Plumbing),
     // #840 (I44) — the V070 checksum repair. PLUMBING, and the reason is
     // that it cannot refuse anything: one conditional UPDATE whose entire
@@ -1494,7 +1503,14 @@ mod tests {
     /// The traits whose impls are compared, and where each trait's **default**
     /// bodies live. A backend that does not override a defaulted method runs
     /// the default, so the default's gate sequence is what it contributes.
-    const TRAITS: [(&str, &str); 18] = [
+    const TRAITS: [(&str, &str); 20] = [
+        // v61 (CIRISPersist#934, S4b) — the group supersede.
+        (
+            "GroupSupersedeStore",
+            "src/federation/group_supersede_admit.rs",
+        ),
+        // v61 (CIRISPersist#934, S4b) — the family doors.
+        ("FamilyStore", "src/federation/family_admit.rs"),
         // v61 (CIRISPersist#934, S4b) — the identity-occurrence writes.
         ("OccurrenceStore", "src/federation/occurrence_admit.rs"),
         // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
@@ -1533,7 +1549,27 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 65] = [
+    const SHARED_PLANS: [(&str, &str); 71] = [
+        // v61 (CIRISPersist#934, S4b) — the group supersede.
+        (
+            "src/federation/group_supersede_admit.rs",
+            "supersede_group_row_planned",
+        ),
+        (
+            "src/federation/group_supersede_admit.rs",
+            "held_head_verdict",
+        ),
+        // v61 (CIRISPersist#934, S4b) — the family doors.
+        ("src/federation/family_admit.rs", "put_family_planned"),
+        ("src/federation/family_admit.rs", "put_family_local_planned"),
+        (
+            "src/federation/family_admit.rs",
+            "put_family_membership_revocation_planned",
+        ),
+        (
+            "src/federation/family_admit.rs",
+            "put_family_membership_widening_planned",
+        ),
         // v61 (CIRISPersist#934, S4b) — the identity-occurrence writes.
         (
             "src/federation/occurrence_admit.rs",
@@ -1775,7 +1811,30 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 75] = [
+    const SHARED_DOORS: [(&str, &str, &str); 80] = [
+        // v61 (CIRISPersist#934, S4b) — the group supersede.
+        (
+            "FederationDirectory",
+            "supersede_group_row",
+            "supersede_group_row_planned",
+        ),
+        // v61 (CIRISPersist#934, S4b) — the family doors.
+        ("FederationDirectory", "put_family", "put_family_planned"),
+        (
+            "FederationDirectory",
+            "put_family_local",
+            "put_family_local_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_family_membership_revocation",
+            "put_family_membership_revocation_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_family_membership_widening",
+            "put_family_membership_widening_planned",
+        ),
         // v61 (CIRISPersist#934, S4b) — the identity-occurrence writes.
         (
             "FederationDirectory",
@@ -3433,6 +3492,13 @@ mod tests {
         (
             "plan_put_community_membership_revocation",
             "reject_future_dated_community_revocation",
+            Reads::ReceivedAt,
+        ),
+        // v61 S2 — the open:self_admit removal window, bounded on receipt at
+        // the local door (a roster cosignature carries no signed instant).
+        (
+            "plan_put_community_membership_revocation",
+            "check_open_self_admit_removal_window",
             Reads::ReceivedAt,
         ),
         (

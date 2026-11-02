@@ -345,6 +345,11 @@ where
     // SecReview F4 — community removal is immediate for forward-secrecy; a
     // future-dated effective_at is refused BEFORE any write.
     super::community_dek::reject_future_dated_community_revocation(row.effective_at, received_at)?;
+    // v61 S2 (CC 4.5.13) — under `open:self_admit`, the removal window, at
+    // the local door only.
+    if !super::group_plane::applying_replicated_group_row() {
+        check_open_self_admit_removal_window(dir, &revocation, received_at).await?;
+    }
     // v49.0.0 (CIRISPersist#908) — standing, before the epoch rotates: a
     // stranger's valid signature does not remove a member.
     super::check_community_roster_authority(
@@ -395,6 +400,61 @@ where
         revocation,
         removal_event,
     })
+}
+
+/// v61 S2 (CC 4.5.13; the release lead's ruling) — **the removal window
+/// under `open:self_admit`.** Each counted voice of a removal signs within
+/// [`OPEN_SELF_ADMIT_REMOVAL_WINDOW_SECS`](super::consensus::OPEN_SELF_ADMIT_REMOVAL_WINDOW_SECS)
+/// of the removal's asserted instant (`removed_at`). A
+/// [`RosterCosignature`](super::types::RosterCosignature) carries no signed
+/// instant of its own (every scrub covers the same `signing_envelope`), so
+/// no cosignature can show when it was given. The fallback is the ruling's: a
+/// bound on receipt, at the local door only. A removal more than the window
+/// from `received_at` is refused [`Error::RosterAuthorityUnauthorized`] /
+/// [`ROSTER_REMOVAL_OUTSIDE_WINDOW`](super::ROSTER_REMOVAL_OUTSIDE_WINDOW).
+/// The replicated door does not ask: a peer's receipt clock is no witness to
+/// when the voices signed, and refusing a removal another node admitted in
+/// time would fork the roster.
+///
+/// A resignation (the removed member among the signers) is a member's own
+/// act, not a counted removal, and is not bounded. Any other protocol, and a
+/// room this node does not hold, pass.
+async fn check_open_self_admit_removal_window<D>(
+    dir: &D,
+    revocation: &SignedCommunityMembershipRevocation,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let row = &revocation.community_membership_revocation;
+    let Some(community) = dir.lookup_community(&row.community_key_id).await? else {
+        return Ok(());
+    };
+    if community.consensus_protocol != super::types::consensus_protocol::OPEN_SELF_ADMIT {
+        return Ok(());
+    }
+    let signers =
+        super::roster_row_signer_set(&revocation.authority_key_id, &revocation.cosignatures);
+    if signers.contains(&row.removed_identity_key_id) {
+        return Ok(());
+    }
+    let window = chrono::Duration::seconds(super::consensus::OPEN_SELF_ADMIT_REMOVAL_WINDOW_SECS);
+    let skew = received_at - row.removed_at;
+    if skew > window || -skew > window {
+        tracing::debug!(
+            community_key_id = %row.community_key_id,
+            removed_at = %row.removed_at,
+            received_at = %received_at,
+            "open:self_admit removal outside its window"
+        );
+        return Err(Error::RosterAuthorityUnauthorized {
+            group_key_id: row.community_key_id.clone(),
+            offered_authority_key_id: revocation.authority_key_id.clone(),
+            rule: super::ROSTER_REMOVAL_OUTSIDE_WINDOW,
+        });
+    }
+    Ok(())
 }
 
 /// The door: every backend's `put_community_membership_widening` is this
