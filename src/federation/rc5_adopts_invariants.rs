@@ -2340,7 +2340,11 @@ mod runners {
                         async fn $name() {
                             let Some(d) = $fresh.await else { return };
                             let s = suffix();
-                            let host = format!("host-{s}");
+                            // v61 (CIRISPersist#1148) — the host declares its
+                            // key, and a replicated record reaches only its
+                            // audience: the host is the room's human member's
+                            // own node (its key is the member's).
+                            let host = format!("human-{}-{}", stringify!($name), s);
                             d.set_node_key_id(host.clone());
                             super::super::bodies::$name(
                                 &d as &dyn FederationDirectory,
@@ -2377,8 +2381,11 @@ mod runners {
                     };
                     let s = suffix();
                     // Both nodes know their own key — the production shape.
-                    a.set_node_key_id(format!("host-a-{s}"));
-                    b.set_node_key_id(format!("host-b-{s}"));
+                    // v61 (CIRISPersist#1148): a replicated record reaches
+                    // only its audience, so each node is the room's human
+                    // member's own (its key is the member's).
+                    a.set_node_key_id(format!("human-m6-{s}"));
+                    b.set_node_key_id(format!("human-m6-{s}"));
                     super::super::bodies::infrastructure_record_authored_elsewhere_is_data(
                         &a as &dyn FederationDirectory,
                         &b as &dyn FederationDirectory,
