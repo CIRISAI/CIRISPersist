@@ -239,6 +239,8 @@ pub(crate) enum ConnClass {
 /// and are `Write`.
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
+    // v61 (CIRISPersist#934, S4b) — the group supersede executor.
+    ("store_planned_supersede", ConnClass::Write),
     // v61 (CIRISPersist#934, S4b) — the family executor.
     ("store_planned_family", ConnClass::Write),
     ("store_family_signature", ConnClass::Write),
@@ -796,7 +798,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("store_planned_community_widening", ConnClass::Write),
     ("stream_consistency_proof", ConnClass::Read),
     ("stream_inclusion_proof", ConnClass::Read),
-    ("supersede_group_row", ConnClass::Write),
     ("sweep_ack_timeouts", ConnClass::Write),
     ("sweep_candidates", ConnClass::Read),
     ("sweep_expired_claims", ConnClass::Write),

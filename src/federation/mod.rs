@@ -90,6 +90,10 @@ pub(crate) mod evidence_admit;
 /// per-backend `FamilyStore` executor.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) mod family_admit;
+/// v61 (CIRISPersist#934, S4b) — the group supersede, decided once, with the
+/// per-backend `GroupSupersedeStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod group_supersede_admit;
 /// v61 (CIRISPersist#934, S4b) — the identity-occurrence writes, decided
 /// once, with the per-backend `OccurrenceStore` executor.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]

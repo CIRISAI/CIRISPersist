@@ -128,6 +128,15 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v61 (CIRISPersist#934, S4b) — the group supersede, and the verdict its
+    // executor asks of the held head inside its transaction.
+    ("supersede_group_row_planned", Class::Plan),
+    ("held_head_verdict", Class::Plan),
+    // Gates: `self` is not versioned; a snapshot that is not the signed
+    // wrapper of the cohort's record is refused (#651).
+    ("check_supersede_cohort", Class::Gate),
+    ("decode_planned_head", Class::Gate),
+    ("store_planned_supersede", Class::Plumbing),
     // v61 (CIRISPersist#934, S4b) — the family doors.
     ("put_family_planned", Class::Plan),
     ("put_family_local_planned", Class::Plan),
@@ -769,11 +778,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // presented lineage head is absent, stale or unwitnessed under an armed
     // charter (`trust_root_head_stale`).
     ("check_attach_freshness", Class::Gate),
-    // v50.0.0 (PR #921 review) — Plumbing: the `cfg(test)` rival write a
-    // witness arms at a fixed point of a community write
-    // (`store::test_hooks::RivalPoint`); never armed outside a test, so it
-    // adds nothing to a door's production sequence.
-    ("test_rival_at", Class::Plumbing),
     // v53.1.3 (CIRISPersist#986) — Plumbing: the `cfg(test)` rival withdrawal
     // I524 arms between the withdraw door's held read and its compare-and-set
     // write (`store::test_hooks::arm_rival_location_proof_withdrawal`); never
@@ -1502,7 +1506,12 @@ mod tests {
     /// The traits whose impls are compared, and where each trait's **default**
     /// bodies live. A backend that does not override a defaulted method runs
     /// the default, so the default's gate sequence is what it contributes.
-    const TRAITS: [(&str, &str); 19] = [
+    const TRAITS: [(&str, &str); 20] = [
+        // v61 (CIRISPersist#934, S4b) — the group supersede.
+        (
+            "GroupSupersedeStore",
+            "src/federation/group_supersede_admit.rs",
+        ),
         // v61 (CIRISPersist#934, S4b) — the family doors.
         ("FamilyStore", "src/federation/family_admit.rs"),
         // v61 (CIRISPersist#934, S4b) — the identity-occurrence writes.
@@ -1543,7 +1552,16 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 69] = [
+    const SHARED_PLANS: [(&str, &str); 71] = [
+        // v61 (CIRISPersist#934, S4b) — the group supersede.
+        (
+            "src/federation/group_supersede_admit.rs",
+            "supersede_group_row_planned",
+        ),
+        (
+            "src/federation/group_supersede_admit.rs",
+            "held_head_verdict",
+        ),
         // v61 (CIRISPersist#934, S4b) — the family doors.
         ("src/federation/family_admit.rs", "put_family_planned"),
         ("src/federation/family_admit.rs", "put_family_local_planned"),
@@ -1796,7 +1814,13 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 79] = [
+    const SHARED_DOORS: [(&str, &str, &str); 80] = [
+        // v61 (CIRISPersist#934, S4b) — the group supersede.
+        (
+            "FederationDirectory",
+            "supersede_group_row",
+            "supersede_group_row_planned",
+        ),
         // v61 (CIRISPersist#934, S4b) — the family doors.
         ("FederationDirectory", "put_family", "put_family_planned"),
         (

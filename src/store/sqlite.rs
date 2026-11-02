@@ -5187,357 +5187,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         new_snapshot: serde_json::Value,
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, crate::federation::Error> {
-        // v61 (CIRISPersist#991) — the new head as its signer signed it, for
-        // its `group:roster:v1` row.
-        let offered_head = match cohort {
-            crate::federation::cohort::Cohort::Family => {
-                serde_json::from_value::<crate::federation::SignedFamily>(new_snapshot.clone())
-                    .ok()
-                    .map(crate::federation::group_plane::GroupSigned::Family)
-            }
-            crate::federation::cohort::Cohort::Community
-            | crate::federation::cohort::Cohort::Affiliations => {
-                serde_json::from_value::<crate::federation::SignedCommunity>(new_snapshot.clone())
-                    .ok()
-                    .map(crate::federation::group_plane::GroupSigned::Community)
-            }
-            crate::federation::cohort::Cohort::SelfId => None,
-        };
-        // Test-only (PR #921 review, F3): a rival supersede of the same
-        // community lands here, before this one re-checks its prior.
-        #[cfg(test)]
-        if matches!(cohort, crate::federation::cohort::Cohort::Community) {
-            self.test_rival_at(crate::store::test_hooks::RivalPoint::BeforeSupersede)
-                .await?;
-        }
-        use crate::federation::cohort::Cohort;
-        use crate::federation::Error;
-        let now = chrono::Utc::now().to_rfc3339();
-        // v53.0.0 (CC 3.2 T6) — the prev-head check reads it in the closure.
-        let auth_for_prev = authorization.clone();
-        let auth_json = match authorization {
-            Some(v) => Some(
-                serde_json::to_string(&v)
-                    .map_err(|e| Error::Backend(format!("authorization serialize: {e}")))?,
-            ),
-            None => None,
-        };
-        // Map a "group does not exist" sentinel back to a typed error.
-        let not_found = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let nf = not_found.clone();
-        // v49.0.0 (#910.5) — the stale-proof refusal, carried out of the
-        // write closure (whose error type is rusqlite's).
-        type StaleSlot = std::sync::Arc<std::sync::Mutex<Option<Error>>>;
-        let stale: StaleSlot = Default::default();
-        // CC 4.4.3.2.8 / #308: `affiliations` records its version history under
-        // its own `cohort.as_str()` discriminator while sharing the
-        // `federation_communities` storage path below.
-        let cohort_str = match cohort {
-            Cohort::SelfId => {
-                return Err(Error::InvalidArgument(
-                    "supersede: the `self` cohort is not versioned (manage occurrences via \
-                     put_identity_occurrence / put_identity_occurrence_revocation)"
-                        .to_string(),
-                ))
-            }
-            Cohort::Family | Cohort::Community | Cohort::Affiliations => cohort.as_str(),
-        };
-
-        let group_key_id =
-            crate::federation::group_amendment::snapshot_group_key_id(cohort, &new_snapshot);
-        let new_version = match cohort {
-            Cohort::Family => {
-                // v31.0.0 (CIRISPersist#651) — the snapshot is the SIGNED
-                // wrapper. Decoding the bare record here is what silently
-                // stranded the caller's signature: the UPDATE below rewrites
-                // every field `signing_envelope()` covers.
-                let crate::federation::SignedFamily {
-                    family: mut new_fam,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                    supersede_proof,
-                    cosignatures,
-                } = serde_json::from_value(new_snapshot).map_err(|e| {
-                    Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
-                })?;
-                let proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
-                let cosignatures_json = serde_json::to_string(&cosignatures)
-                    .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
-                let stale = stale.clone();
-                new_fam.persist_row_hash =
-                    crate::federation::types::compute_persist_row_hash(&new_fam)?;
-                let members_json = serde_json::to_string(&new_fam.members)
-                    .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
-                self.write(move |conn| -> Result<u32, rusqlite::Error> {
-                    let tx = conn.transaction()?;
-                    let prior = tx
-                        .query_row(
-                            "SELECT version, family_key_id, family_name, members, founded_at, \
-                                    consensus_protocol, consensus_protocol_entrenched, \
-                                    dissolved_at, prev_head_digest, charter_digest, persist_row_hash \
-                             FROM federation_families WHERE family_key_id = ?1",
-                            [&new_fam.family_key_id],
-                            |r| Ok((r.get::<_, u32>("version")?, sqlite_row_to_family(r)?)),
-                        )
-                        .optional()?;
-                    let (prior_version, prior_fam) = match prior {
-                        Some(p) => p,
-                        None => {
-                            nf.store(true, std::sync::atomic::Ordering::SeqCst);
-                            return Err(rusqlite::Error::QueryReturnedNoRows);
-                        }
-                    };
-                    // v49.0.0 (#910.5) — a proof names the version it replaces;
-                    // checked inside the transaction that replaces it.
-                    if let Some(p) = &supersede_proof {
-                        crate::federation::group_amendment::check_proof_names_prior(
-                            cohort_str,
-                            &new_fam.family_key_id,
-                            p,
-                            &prior_fam.persist_row_hash,
-                        )
-                        .map_err(|e| {
-                            *stale.lock().expect("stale slot") = Some(e);
-                            rusqlite::Error::QueryReturnedNoRows
-                        })?;
-                    }
-                    // v53.0.0 (CC 3.2 T6) — the version names the head it
-                    // succeeds, judged inside the transaction that replaces it.
-                    crate::federation::group_amendment::check_prev_head_names_held(
-                        cohort_str,
-                        &new_fam.family_key_id,
-                        &new_fam.prev_head_digest,
-                        &prior_fam.persist_row_hash,
-                        auth_for_prev.as_ref(),
-                    )
-                    .map_err(|e| {
-                        *stale.lock().expect("stale slot") = Some(e);
-                        rusqlite::Error::QueryReturnedNoRows
-                    })?;
-                    let snapshot = serde_json::to_string(&prior_fam)
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                    tx.execute(
-                        "INSERT INTO federation_group_versions \
-                            (cohort, group_key_id, version, snapshot, change_authorization, \
-                             superseded_at, persist_row_hash) \
-                         VALUES ('family', ?1, ?2, ?3, ?4, ?5, ?6)",
-                        rusqlite::params![
-                            new_fam.family_key_id,
-                            prior_version,
-                            snapshot,
-                            auth_json,
-                            now,
-                            prior_fam.persist_row_hash,
-                        ],
-                    )?;
-                    let next = prior_version + 1;
-                    // v36.0.0 (#668/#707-class) — a supersede rewrites the
-                    // served bytes; the serve position moves with them.
-                    // Allocated inside the same transaction as the write.
-                    let admitted_at =
-                        sqlite_next_plane_position(&tx, "federation_families", POS_FOUNDED)?;
-                    tx.execute(
-                        "UPDATE federation_families SET \
-                            family_name = ?2, members = ?3, founded_at = ?4, \
-                            consensus_protocol = ?5, consensus_protocol_entrenched = ?6, \
-                            persist_row_hash = ?7, version = ?8, \
-                            authority_key_id = ?9, scrub_signature_classical = ?10, \
-                            scrub_signature_pqc = ?11, admitted_at = ?12, \
-                            supersede_proof = ?13, cosignatures = ?14, dissolved_at = ?15, \
-                            prev_head_digest = ?16, charter_digest = ?17 \
-                         WHERE family_key_id = ?1",
-                        rusqlite::params![
-                            new_fam.family_key_id,
-                            new_fam.family_name,
-                            members_json,
-                            new_fam.founded_at.to_rfc3339(),
-                            new_fam.consensus_protocol,
-                            new_fam.consensus_protocol_entrenched as i64,
-                            new_fam.persist_row_hash,
-                            next,
-                            // v31.0.0 (CIRISPersist#651) — the signature moves
-                            // with the record it authorizes. Updated in the
-                            // SAME statement, so a future edit cannot rewrite
-                            // the roster and forget the authorship.
-                            authority_key_id,
-                            scrub_signature_classical,
-                            scrub_signature_pqc,
-                            admitted_at.to_rfc3339(),
-                            proof_json,
-                            cosignatures_json,
-                            new_fam.dissolved_at.map(|t| t.to_rfc3339()),
-                            new_fam.prev_head_digest,
-                            new_fam.charter_digest,
-                        ],
-                    )?;
-                    tx.commit()?;
-                    Ok(next)
-                })
-                .await
-            }
-            Cohort::Community | Cohort::Affiliations => {
-                // v31.0.0 (CIRISPersist#651) — the SIGNED wrapper; see the
-                // family arm above.
-                let crate::federation::SignedCommunity {
-                    community: mut new_comm,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                    supersede_proof,
-                    cosignatures,
-                    lineage,
-                } = serde_json::from_value(new_snapshot).map_err(|e| {
-                    Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
-                })?;
-                let proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
-                // v50.0.0 (#926, V158) — the co-signatures travel with the
-                // authority signature they sit beside.
-                let cosignatures_json = serde_json::to_string(&cosignatures)
-                    .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
-                let lineage_json = serde_json::to_string(&lineage)
-                    .map_err(|e| Error::Backend(format!("lineage encode: {e}")))?;
-                let stale = stale.clone();
-                new_comm.persist_row_hash =
-                    crate::federation::types::compute_persist_row_hash(&new_comm)?;
-                let members_json = serde_json::to_string(&new_comm.members)
-                    .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
-                let policy_json = match &new_comm.policy_blob {
-                    Some(v) => Some(
-                        serde_json::to_string(v)
-                            .map_err(|e| Error::Backend(format!("policy_blob serialize: {e}")))?,
-                    ),
-                    None => None,
-                };
-                self.write(move |conn| -> Result<u32, rusqlite::Error> {
-                    let tx = conn.transaction()?;
-                    let prior = tx
-                        .query_row(
-                            "SELECT version, community_key_id, community_name, members, \
-                                    founded_at, consensus_protocol, policy_blob, prev_head_digest, charter_digest, persist_row_hash \
-                             FROM federation_communities WHERE community_key_id = ?1",
-                            [&new_comm.community_key_id],
-                            |r| Ok((r.get::<_, u32>("version")?, sqlite_row_to_community(r)?)),
-                        )
-                        .optional()?;
-                    let (prior_version, prior_comm) = match prior {
-                        Some(p) => p,
-                        None => {
-                            nf.store(true, std::sync::atomic::Ordering::SeqCst);
-                            return Err(rusqlite::Error::QueryReturnedNoRows);
-                        }
-                    };
-                    // v49.0.0 (#910.5) — see the family arm.
-                    if let Some(p) = &supersede_proof {
-                        crate::federation::group_amendment::check_proof_names_prior(
-                            cohort_str,
-                            &new_comm.community_key_id,
-                            p,
-                            &prior_comm.persist_row_hash,
-                        )
-                        .map_err(|e| {
-                            *stale.lock().expect("stale slot") = Some(e);
-                            rusqlite::Error::QueryReturnedNoRows
-                        })?;
-                    }
-                    // v53.0.0 (CC 3.2 T6) — see the family arm.
-                    crate::federation::group_amendment::check_prev_head_names_held(
-                        cohort_str,
-                        &new_comm.community_key_id,
-                        &new_comm.prev_head_digest,
-                        &prior_comm.persist_row_hash,
-                        auth_for_prev.as_ref(),
-                    )
-                    .map_err(|e| {
-                        *stale.lock().expect("stale slot") = Some(e);
-                        rusqlite::Error::QueryReturnedNoRows
-                    })?;
-                    let snapshot = serde_json::to_string(&prior_comm)
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                    tx.execute(
-                        "INSERT INTO federation_group_versions \
-                            (cohort, group_key_id, version, snapshot, change_authorization, \
-                             superseded_at, persist_row_hash) \
-                         VALUES (?7, ?1, ?2, ?3, ?4, ?5, ?6)",
-                        rusqlite::params![
-                            new_comm.community_key_id,
-                            prior_version,
-                            snapshot,
-                            auth_json,
-                            now,
-                            prior_comm.persist_row_hash,
-                            cohort_str,
-                        ],
-                    )?;
-                    let next = prior_version + 1;
-                    // v36.0.0 (#668/#707-class) — a supersede rewrites the
-                    // served bytes; the serve position moves with them.
-                    let admitted_at =
-                        sqlite_next_plane_position(&tx, "federation_communities", POS_FOUNDED)?;
-                    tx.execute(
-                        "UPDATE federation_communities SET \
-                            community_name = ?2, members = ?3, founded_at = ?4, \
-                            consensus_protocol = ?5, policy_blob = ?6, \
-                            persist_row_hash = ?7, version = ?8, \
-                            authority_key_id = ?9, scrub_signature_classical = ?10, \
-                            scrub_signature_pqc = ?11, admitted_at = ?12, \
-                            supersede_proof = ?13, cosignatures = ?14, lineage = ?15, \
-                            prev_head_digest = ?16, charter_digest = ?17 \
-                         WHERE community_key_id = ?1",
-                        rusqlite::params![
-                            new_comm.community_key_id,
-                            new_comm.community_name,
-                            members_json,
-                            new_comm.founded_at.to_rfc3339(),
-                            new_comm.consensus_protocol,
-                            policy_json,
-                            new_comm.persist_row_hash,
-                            next,
-                            // v31.0.0 (CIRISPersist#651) — see the family arm.
-                            authority_key_id,
-                            scrub_signature_classical,
-                            scrub_signature_pqc,
-                            admitted_at.to_rfc3339(),
-                            proof_json,
-                            cosignatures_json,
-                            lineage_json,
-                            new_comm.prev_head_digest,
-                            new_comm.charter_digest,
-                        ],
-                    )?;
-                    tx.commit()?;
-                    Ok(next)
-                })
-                .await
-            }
-            Cohort::SelfId => unreachable!("guarded above"),
-        }
-        .map_err(|e| {
-            if let Some(stale) = stale.lock().expect("stale slot").take() {
-                stale
-            } else if not_found.load(std::sync::atomic::Ordering::SeqCst) {
-                Error::InvalidArgument(format!(
-                    "supersede: unknown {cohort_str} group (nothing to supersede)"
-                ))
-            } else {
-                Error::Backend(format!("supersede {cohort_str}: {e}"))
-            }
-        })?;
-        // v61 (CIRISPersist#991) — the new head's `group:roster:v1` row
-        // replaces the prior head's.
-        crate::federation::group_plane::sync_group_row_offered(
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::group_supersede_admit::supersede_group_row_planned(
             self,
-            crate::federation::group_plane::GroupRowLink::record(
-                match cohort {
-                    Cohort::Family => crate::federation::group_plane::GroupKind::Family,
-                    _ => crate::federation::group_plane::GroupKind::Community,
-                },
-                &group_key_id,
-            ),
-            offered_head.as_ref(),
+            cohort,
+            new_snapshot,
+            authorization,
         )
-        .await?;
-        Ok(new_version)
+        .await
     }
 
     // #249 Cut G2 (§8) — full version chain: history rows + the live current.
@@ -25458,6 +25115,245 @@ impl crate::federation::occurrence_admit::OccurrenceStore for SqliteBackend {
         row_id: Option<&str>,
     ) -> Result<(), crate::federation::Error> {
         self.index_plane_row(row_id).await
+    }
+}
+
+/// v61 (CIRISPersist#934, S4b) — the group supersede executor on sqlite.
+/// Storage only: the decisions are `federation::group_supersede_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::group_supersede_admit::GroupSupersedeStore for SqliteBackend {
+    async fn store_planned_supersede(
+        &self,
+        planned: crate::federation::group_supersede_admit::PlannedSupersede,
+    ) -> Result<u32, crate::federation::Error> {
+        use crate::federation::group_supersede_admit::{held_head_verdict, PlannedHead};
+        use crate::federation::Error;
+        let now = chrono::Utc::now().to_rfc3339();
+        let cohort_str = planned.cohort_str;
+        let auth_json = match &planned.authorization {
+            Some(v) => Some(
+                serde_json::to_string(v)
+                    .map_err(|e| Error::Backend(format!("authorization serialize: {e}")))?,
+            ),
+            None => None,
+        };
+        // The verdict's refusal, carried out of the write closure (whose
+        // error type is rusqlite's).
+        type VerdictSlot = std::sync::Arc<std::sync::Mutex<Option<Error>>>;
+        let refused: VerdictSlot = Default::default();
+        let slot = refused.clone();
+        let refuse = move |e: Error| {
+            *slot.lock().expect("verdict slot") = Some(e);
+            rusqlite::Error::QueryReturnedNoRows
+        };
+        let written = match planned.head.clone() {
+            PlannedHead::Family(signed) => {
+                let crate::federation::SignedFamily {
+                    family: new_fam,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                    supersede_proof,
+                    cosignatures,
+                } = signed;
+                let proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
+                let cosignatures_json = serde_json::to_string(&cosignatures)
+                    .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
+                let members_json = serde_json::to_string(&new_fam.members)
+                    .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
+                self.write(move |conn| -> Result<u32, rusqlite::Error> {
+                    let tx = conn.transaction()?;
+                    let prior = tx
+                        .query_row(
+                            "SELECT version, family_key_id, family_name, members, founded_at, \
+                                    consensus_protocol, consensus_protocol_entrenched, \
+                                    dissolved_at, prev_head_digest, charter_digest, persist_row_hash \
+                             FROM federation_families WHERE family_key_id = ?1",
+                            [&new_fam.family_key_id],
+                            |r| Ok((r.get::<_, u32>("version")?, sqlite_row_to_family(r)?)),
+                        )
+                        .optional()?;
+                    // v61 (CIRISPersist#934) — the shared verdict, on the
+                    // row this transaction replaces.
+                    held_head_verdict(
+                        &planned,
+                        prior.as_ref().map(|(_, f)| f.persist_row_hash.as_str()),
+                    )
+                    .map_err(&refuse)?;
+                    let Some((prior_version, prior_fam)) = prior else {
+                        return Err(rusqlite::Error::QueryReturnedNoRows);
+                    };
+                    let snapshot = serde_json::to_string(&prior_fam)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                    tx.execute(
+                        "INSERT INTO federation_group_versions \
+                            (cohort, group_key_id, version, snapshot, change_authorization, \
+                             superseded_at, persist_row_hash) \
+                         VALUES ('family', ?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            new_fam.family_key_id,
+                            prior_version,
+                            snapshot,
+                            auth_json,
+                            now,
+                            prior_fam.persist_row_hash,
+                        ],
+                    )?;
+                    let next = prior_version + 1;
+                    // v36.0.0 (#668/#707-class) — a supersede rewrites the
+                    // served bytes; the serve position moves with them,
+                    // allocated inside the same transaction as the write.
+                    let admitted_at =
+                        sqlite_next_plane_position(&tx, "federation_families", POS_FOUNDED)?;
+                    tx.execute(
+                        "UPDATE federation_families SET \
+                            family_name = ?2, members = ?3, founded_at = ?4, \
+                            consensus_protocol = ?5, consensus_protocol_entrenched = ?6, \
+                            persist_row_hash = ?7, version = ?8, \
+                            authority_key_id = ?9, scrub_signature_classical = ?10, \
+                            scrub_signature_pqc = ?11, admitted_at = ?12, \
+                            supersede_proof = ?13, cosignatures = ?14, dissolved_at = ?15, \
+                            prev_head_digest = ?16, charter_digest = ?17 \
+                         WHERE family_key_id = ?1",
+                        rusqlite::params![
+                            new_fam.family_key_id,
+                            new_fam.family_name,
+                            members_json,
+                            new_fam.founded_at.to_rfc3339(),
+                            new_fam.consensus_protocol,
+                            i64::from(new_fam.consensus_protocol_entrenched),
+                            new_fam.persist_row_hash,
+                            next,
+                            // v31.0.0 (CIRISPersist#651) — the signature moves
+                            // with the record it authorizes, in the SAME
+                            // statement.
+                            authority_key_id,
+                            scrub_signature_classical,
+                            scrub_signature_pqc,
+                            admitted_at.to_rfc3339(),
+                            proof_json,
+                            cosignatures_json,
+                            new_fam.dissolved_at.map(|t| t.to_rfc3339()),
+                            new_fam.prev_head_digest,
+                            new_fam.charter_digest,
+                        ],
+                    )?;
+                    tx.commit()?;
+                    Ok(next)
+                })
+                .await
+            }
+            PlannedHead::Community(signed) => {
+                let crate::federation::SignedCommunity {
+                    community: new_comm,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                    supersede_proof,
+                    cosignatures,
+                    lineage,
+                } = signed;
+                let proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
+                // v50.0.0 (#926, V158) — the co-signatures travel with the
+                // authority signature they sit beside.
+                let cosignatures_json = serde_json::to_string(&cosignatures)
+                    .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
+                let lineage_json = serde_json::to_string(&lineage)
+                    .map_err(|e| Error::Backend(format!("lineage encode: {e}")))?;
+                let members_json = serde_json::to_string(&new_comm.members)
+                    .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
+                let policy_json = match &new_comm.policy_blob {
+                    Some(v) => Some(
+                        serde_json::to_string(v)
+                            .map_err(|e| Error::Backend(format!("policy_blob serialize: {e}")))?,
+                    ),
+                    None => None,
+                };
+                self.write(move |conn| -> Result<u32, rusqlite::Error> {
+                    let tx = conn.transaction()?;
+                    let prior = tx
+                        .query_row(
+                            "SELECT version, community_key_id, community_name, members, \
+                                    founded_at, consensus_protocol, policy_blob, prev_head_digest, charter_digest, persist_row_hash \
+                             FROM federation_communities WHERE community_key_id = ?1",
+                            [&new_comm.community_key_id],
+                            |r| Ok((r.get::<_, u32>("version")?, sqlite_row_to_community(r)?)),
+                        )
+                        .optional()?;
+                    // v61 (CIRISPersist#934) — the shared verdict.
+                    held_head_verdict(
+                        &planned,
+                        prior.as_ref().map(|(_, c)| c.persist_row_hash.as_str()),
+                    )
+                    .map_err(&refuse)?;
+                    let Some((prior_version, prior_comm)) = prior else {
+                        return Err(rusqlite::Error::QueryReturnedNoRows);
+                    };
+                    let snapshot = serde_json::to_string(&prior_comm)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                    tx.execute(
+                        "INSERT INTO federation_group_versions \
+                            (cohort, group_key_id, version, snapshot, change_authorization, \
+                             superseded_at, persist_row_hash) \
+                         VALUES (?7, ?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            new_comm.community_key_id,
+                            prior_version,
+                            snapshot,
+                            auth_json,
+                            now,
+                            prior_comm.persist_row_hash,
+                            cohort_str,
+                        ],
+                    )?;
+                    let next = prior_version + 1;
+                    // v36.0.0 (#668/#707-class) — see the family arm.
+                    let admitted_at =
+                        sqlite_next_plane_position(&tx, "federation_communities", POS_FOUNDED)?;
+                    tx.execute(
+                        "UPDATE federation_communities SET \
+                            community_name = ?2, members = ?3, founded_at = ?4, \
+                            consensus_protocol = ?5, policy_blob = ?6, \
+                            persist_row_hash = ?7, version = ?8, \
+                            authority_key_id = ?9, scrub_signature_classical = ?10, \
+                            scrub_signature_pqc = ?11, admitted_at = ?12, \
+                            supersede_proof = ?13, cosignatures = ?14, lineage = ?15, \
+                            prev_head_digest = ?16, charter_digest = ?17 \
+                         WHERE community_key_id = ?1",
+                        rusqlite::params![
+                            new_comm.community_key_id,
+                            new_comm.community_name,
+                            members_json,
+                            new_comm.founded_at.to_rfc3339(),
+                            new_comm.consensus_protocol,
+                            policy_json,
+                            new_comm.persist_row_hash,
+                            next,
+                            // v31.0.0 (CIRISPersist#651) — see the family arm.
+                            authority_key_id,
+                            scrub_signature_classical,
+                            scrub_signature_pqc,
+                            admitted_at.to_rfc3339(),
+                            proof_json,
+                            cosignatures_json,
+                            lineage_json,
+                            new_comm.prev_head_digest,
+                            new_comm.charter_digest,
+                        ],
+                    )?;
+                    tx.commit()?;
+                    Ok(next)
+                })
+                .await
+            }
+        };
+        written.map_err(|e| {
+            if let Some(r) = refused.lock().expect("verdict slot").take() {
+                r
+            } else {
+                Error::Backend(format!("supersede {cohort_str}: {e}"))
+            }
+        })
     }
 }
 
