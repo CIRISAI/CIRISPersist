@@ -164,7 +164,8 @@ pub(crate) mod bodies {
             Some(("community_key_id", &room)),
         );
         put(d, &rival).await.expect_err("I1511: a second owner");
-        // named_subject is unchanged: a delegates_to naming a foreign subject.
+        // v61 S2 (#1161) — a delegates_to naming a subject outside the room's
+        // audience is refused on the audience rule.
         let mut named = binding_at(
             &owner,
             &node,
@@ -178,11 +179,12 @@ pub(crate) mod bodies {
             matches!(
                 e,
                 Error::CohortStandingRefused {
-                    reason: crate::federation::admission::CohortStandingRefusal::NamedSubject,
+                    reason:
+                        crate::federation::admission::CohortStandingRefusal::SubjectOutsideAudience,
                     ..
                 }
             ),
-            "I1511: named_subject still refuses: {e:?}"
+            "I1511: subject_outside_audience refuses: {e:?}"
         );
     }
 }

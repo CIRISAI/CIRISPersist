@@ -2557,11 +2557,15 @@ pub enum CohortStandingRefusal {
     /// ABOUT somebody else, and placing it into a cohort plane publishes that
     /// claim to a cohort the producer cannot be shown to stand in.
     AttestedParty,
-    /// `subject_key_ids` names a key other than the producer. Subject-naming is
-    /// the revocability-authority surface (CEG 0.6 §4.2), so a row that names
-    /// a foreign subject is a row a foreign party has standing over — not a
-    /// self-declaration about the producer's own content's visibility.
-    NamedSubject,
+    /// v61 S2 (CIRISPersist#1161; CC rc15 2.1, `CLM-subject-within-audience`)
+    /// — `subject_key_ids` names a person OUTSIDE the row's audience: not the
+    /// producer, not a member of the targeted cohort by its authorized roster
+    /// fold at the row's `asserted_at`, and not on the closed delivered-key
+    /// list (a membership proposal's invitee, a `key_grant` recipient, the
+    /// owner's own node). Replaces AV-84's `named_subject`, which refused every
+    /// foreign subject; a row about a person reaches only an audience that
+    /// person is already in. Token `subject_outside_audience`, CC's.
+    SubjectOutsideAudience,
 }
 
 impl CohortStandingRefusal {
@@ -2570,7 +2574,7 @@ impl CohortStandingRefusal {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::AttestedParty => "attested_party",
-            Self::NamedSubject => "named_subject",
+            Self::SubjectOutsideAudience => "subject_outside_audience",
         }
     }
 
@@ -2579,12 +2583,12 @@ impl CohortStandingRefusal {
     pub const fn field(&self) -> &'static str {
         match self {
             Self::AttestedParty => "attested_key_id",
-            Self::NamedSubject => "subject_key_ids",
+            Self::SubjectOutsideAudience => "subject_key_ids",
         }
     }
 
     /// Every variant, in declaration order — the closed set.
-    pub const ALL: &'static [Self] = &[Self::AttestedParty, Self::NamedSubject];
+    pub const ALL: &'static [Self] = &[Self::AttestedParty, Self::SubjectOutsideAudience];
 }
 
 impl std::fmt::Display for CohortStandingRefusal {
@@ -2609,13 +2613,17 @@ fn names_its_key_grant_recipient(row: &super::Attestation) -> bool {
 /// v61 (CIRISPersist#1140; CC 2.4.1.2, rc14 3.2) — AV-84's `attested_party`
 /// arm reads the row type: it applies to a `scores` row, never to a
 /// `delegates_to`, whose `attested_key_id` is the delegate BY DEFINITION, not
-/// a third party the row speaks about. This is what lets an owner re-sign a
-/// node's owner-binding at the scope of a group the node joins (CC 3.2: "a
-/// second owner-signed row alongside the `self` one … every one of the seven
-/// scopes is therefore an admissible audience"). Subjects stay governed by the
-/// `named_subject` arm, unchanged.
-fn names_its_delegate(row: &super::Attestation) -> bool {
-    row.attestation_type == attestation_type::DELEGATES_TO
+/// a third party the row speaks about (an owner re-signs a node's
+/// owner-binding at the scope of a group the node joins, CC 3.2).
+///
+/// v61 S2 (CIRISPersist#1161) — it still applies to every other row type
+/// too, deliberately: a placement composer (`widen_audience`) carries its
+/// prior's `attested_key_id`, and exempting it would reopen #592 (B9 in
+/// `bootstrap_admission` places a stranger's row into a cohort plane through
+/// exactly that composer). Subjects are governed by the
+/// `subject_outside_audience` arm.
+fn attested_party_applies(row: &super::Attestation) -> bool {
+    row.attestation_type != attestation_type::DELEGATES_TO
 }
 
 /// The ONE standing comparison, parameterised over party resolution: refuse
@@ -2638,25 +2646,118 @@ fn cohort_standing_core(
         })
     };
     if row.attested_key_id != producer
-        && !names_its_delegate(row)
+        && attested_party_applies(row)
         && resolve(&row.attested_key_id) != producer_identity
         && !names_its_key_grant_recipient(row)
     {
         return refuse(CohortStandingRefusal::AttestedParty, &row.attested_key_id);
     }
-    // v52.0.0 (CIRISPersist#955) — AV-84's one exception: a membership
-    // proposal names its invitee (exactly one) in `subject_key_ids`.
+    // v52.0.0 (CIRISPersist#955) — a membership proposal names its invitee
+    // (exactly one) in `subject_key_ids`: the delivered-key list's first entry.
     if super::membership_acceptance::is_invitee_subject_list(row) {
         return Ok(());
     }
+    // v61 S2 (CIRISPersist#1161) — the pure form holds no roster, so it
+    // cannot show a foreign subject is inside the audience: it refuses, on
+    // the audience rule's token. The directory form
+    // ([`check_cohort_standing_resolved`]) admits a subject the roster fold
+    // seats.
     if let Some(foreign) = row
         .subject_key_ids
         .iter()
         .find(|s| s.as_str() != producer && resolve(s) != producer_identity)
     {
-        return refuse(CohortStandingRefusal::NamedSubject, foreign);
+        return refuse(CohortStandingRefusal::SubjectOutsideAudience, foreign);
     }
     Ok(())
+}
+
+/// v61 S2 (CIRISPersist#1161; CC rc15 2.1, `CLM-subject-within-audience`) —
+/// **is `subject` inside the row's audience?** In order:
+///
+/// - the closed delivered-key list: a `key_grant` row's recipient (its
+///   `attested_key_id`), and the producer's own node (a node whose single live
+///   owner is the producer's identity, [`owner_of`]). A membership proposal's
+///   invitee is admitted before this is asked ([`is_invitee_subject_list`](super::membership_acceptance::is_invitee_subject_list));
+/// - a member of the targeted cohort (the family or the room the envelope
+///   names) by its AUTHORIZED roster fold at the row's `asserted_at`, the
+///   subject's key or the identity it resolves to;
+/// - a canonical id (CC 4.2.2.2) reached from such a member: the member holds
+///   an admitted `identity:canonical_binding` to it, or a
+///   `consent_revocation`-scoped `delegates_to` chain reaches it (its rule-3
+///   proxy, CC 2.4.1.1), at the CC default depth.
+///
+/// A cohort this node does not hold seats nobody here.
+async fn subject_within_audience(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+    subject: &str,
+    subject_identity: &str,
+    producer_identity: &str,
+) -> Result<bool, Error> {
+    use crate::federation::types::cohort_scope as cs;
+    if super::key_grant::is_key_grant_row(row) && subject == row.attested_key_id {
+        return Ok(true);
+    }
+    if owner_of(directory, subject).await?.as_deref() == Some(producer_identity) {
+        return Ok(true);
+    }
+    let Some(target) = envelope_cohort_target(&row.attestation_envelope)? else {
+        return Ok(false);
+    };
+    let roster: Vec<String> = match cs::target_plane(&row.cohort_scope) {
+        Some(cs::TargetPlane::Family) => match directory.lookup_family(target).await {
+            Ok(Some(family)) => Box::pin(super::authorized_family_roster_at(
+                directory,
+                &family,
+                row.asserted_at,
+            ))
+            .await?
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect(),
+            Ok(None) | Err(Error::Unsupported { .. }) => return Ok(false),
+            Err(e) => return Err(e),
+        },
+        Some(cs::TargetPlane::Room) => match directory.lookup_community(target).await {
+            Ok(Some(community)) => Box::pin(super::authorized_community_roster_at(
+                directory,
+                &community,
+                row.asserted_at,
+            ))
+            .await?
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect(),
+            Ok(None) | Err(Error::Unsupported { .. }) => return Ok(false),
+            Err(e) => return Err(e),
+        },
+        None => return Ok(false),
+    };
+    if roster.iter().any(|k| k == subject || k == subject_identity) {
+        return Ok(true);
+    }
+    let wanted: std::collections::HashSet<String> = std::iter::once(subject.to_owned()).collect();
+    for member in &roster {
+        if canonical_binding_hashes_for(directory, member)
+            .await?
+            .contains(subject)
+        {
+            return Ok(true);
+        }
+        if Box::pin(consent_revocation_reach(
+            directory,
+            member,
+            &wanted,
+            super::topology::DEFAULT_DELEGATION_DEPTH,
+        ))
+        .await?
+        .hit_target
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// v38.2.0 (PR #759 review) — AV-84 with **occurrence→identity resolution**:
@@ -2708,7 +2809,7 @@ pub async fn check_cohort_standing_resolved(
         })
     };
     if row.attested_key_id != producer
-        && !names_its_delegate(row)
+        && attested_party_applies(row)
         && !names_its_key_grant_recipient(row)
         && admission_identity_for_writer(directory, &row.attested_key_id).await?
             != producer_identity
@@ -2720,11 +2821,27 @@ pub async fn check_cohort_standing_resolved(
     if super::membership_acceptance::is_invitee_subject_list(row) {
         return Ok(());
     }
+    // v61 S2 (CIRISPersist#1161; CC rc15 2.1) — a subject other than the
+    // producer is admitted when it is inside the row's audience
+    // ([`subject_within_audience`]); otherwise `subject_outside_audience`.
     for subject in &row.subject_key_ids {
-        if subject.as_str() != producer
-            && admission_identity_for_writer(directory, subject).await? != producer_identity
+        if subject.as_str() == producer {
+            continue;
+        }
+        let subject_identity = admission_identity_for_writer(directory, subject).await?;
+        if subject_identity == producer_identity {
+            continue;
+        }
+        if !subject_within_audience(
+            directory,
+            row,
+            subject,
+            &subject_identity,
+            &producer_identity,
+        )
+        .await?
         {
-            return refuse(CohortStandingRefusal::NamedSubject, subject);
+            return refuse(CohortStandingRefusal::SubjectOutsideAudience, subject);
         }
     }
     Ok(())
@@ -10431,8 +10548,17 @@ pub async fn resolve_withdraws_admission_rule_at(
     // which it holds standing ([`check_reconsideration_admission`]: the
     // licence subject arm and the authority's duty-holders), never
     // withdrawal. Same check, same refusal, widened in place.
+    // v61 S2 (CIRISPersist#1161) — and a cosigned act: its other signers'
+    // voices are not the subject's to take back. A node's tier-crossing
+    // co-scrub (stamped `cosigned_at`, CC 2.6.7) is custody, not a voice in
+    // the act, and does not make a row cosigned.
+    let cosigned_act = target
+        .additional_scrubs
+        .iter()
+        .any(|sc| sc.cosigned_at.is_none() && sc.scrub_key_id != target.attesting_key_id);
     let target_denies_subject_revocation = envelope_dimension(&target.attestation_envelope)
-        .is_some_and(|d| SUBJECT_WITHDRAWS_CARVE_OUT.iter().any(|p| d.starts_with(p)));
+        .is_some_and(|d| SUBJECT_WITHDRAWS_CARVE_OUT.iter().any(|p| d.starts_with(p)))
+        || cosigned_act;
     if target_denies_subject_revocation {
         return Err(Error::WithdrawsNotAdmitted {
             issuer: issuer.to_string(),
@@ -10627,8 +10753,23 @@ pub(crate) async fn owner_bindings_in_force_at(
 /// `detection:*` since v21.11.0; `licensure:*` and `revocation:*` since
 /// v60.0.0. The subject's contest path for all four is
 /// `reconsideration:{grounds}`.
-pub const SUBJECT_WITHDRAWS_CARVE_OUT: [&str; 4] =
-    ["capacity:", "detection:", "licensure:", "revocation:"];
+///
+/// v61 S2 (CIRISPersist#1161; CC rc15 standing rules) — a named person may
+/// withdraw a peer's row about them, but not a `moderation:*`, `hard_case:*`
+/// or `slashing:*` act, nor a legal-weight act (`takedown_notice:*`). A
+/// COSIGNED act ([`Attestation::additional_scrubs`](super::Attestation)
+/// non-empty) is not the subject's to withdraw either
+/// ([`resolve_withdraws_admission_rule_at`]).
+pub const SUBJECT_WITHDRAWS_CARVE_OUT: [&str; 8] = [
+    "capacity:",
+    "detection:",
+    "licensure:",
+    "revocation:",
+    "moderation:",
+    "hard_case:",
+    "slashing:",
+    "takedown_notice:",
+];
 
 /// v6.4.0 (CIRISPersist#146 Ask 2) — the `put_attestation` entry point
 /// for the broadened gate. A no-op (`Ok(None)`) for any
@@ -19999,7 +20140,7 @@ mod tests {
                     .expect_err("a foreign SUBJECT is a foreign party too");
             assert!(
                 matches!(&err, Error::CohortStandingRefused { reason, .. }
-                    if *reason == CohortStandingRefusal::NamedSubject),
+                    if *reason == CohortStandingRefusal::SubjectOutsideAudience),
                 "the subject arm names its own branch: {err:?}"
             );
 

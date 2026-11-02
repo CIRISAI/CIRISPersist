@@ -459,41 +459,59 @@ pub(crate) mod bodies {
         r
     }
 
+    /// rc15 (CC 2.1) — a vector's `audience.canonical_proxy`: each canonical
+    /// id's rule-3 proxy (CC 2.4.1.1), seated as the proxy's own
+    /// `consent_revocation`-scoped `delegates_to` to the canonical id (whose
+    /// key row the edge's FK needs).
+    async fn hold_canonical_proxies(
+        d: &dyn FederationDirectory,
+        v: &serde_json::Value,
+        keys: &[&VectorKey],
+    ) {
+        let Some(map) = v["audience"]["canonical_proxy"].as_object() else {
+            return;
+        };
+        for (canonical, proxy) in map {
+            let proxy = keys
+                .iter()
+                .find(|k| Some(k.key_id.as_str()) == proxy.as_str())
+                .unwrap_or_else(|| panic!("I1494: proxy {proxy} is no vector key"));
+            ts::register_hybrid_key_as(d, canonical, canonical, it::USER).await;
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut env = serde_json::json!({
+                "asserted_at": "2026-10-02T00:00:00.000Z",
+                "references_attestation_id": id,
+                "scope": "consent_revocation",
+            });
+            crate::federation::envelope::RowMirror {
+                attestation_id: id.clone(),
+                attesting_key_id: proxy.key_id.clone(),
+                attestation_type: attestation_type::DELEGATES_TO.to_owned(),
+                attested_key_id: canonical.clone(),
+                subject_key_ids: Vec::new(),
+                cohort_scope: "federation".to_owned(),
+                weight: None,
+            }
+            .insert_into(&mut env, &id)
+            .expect("an object");
+            put(d, row_for(&env, proxy))
+                .await
+                .unwrap_or_else(|e| panic!("I1494: {canonical}'s rule-3 proxy edge: {e}"));
+        }
+    }
+
     /// Vectors persist answers differently from CC, each with the token persist
     /// emits and the ruling that keeps it. A latch both ways: a vector that
     /// starts agreeing, or a new disagreement, reds I1494.
     ///
-    /// - `scores_subject_and_scope`: persist KEEPS refusing, now on the
-    ///   `named_subject` arm (AV-84, CIRISPersist#592). CC re-minted the vector
-    ///   on rc13 (`6054a03`): the producer is in `attested_key_id`, so the
-    ///   `attested_party` arm no longer fires, but the third party stays in
-    ///   `subject_key_ids`, and CC 2.1 admits a targeted row naming "the party
-    ///   it is about in `subject_key_ids`" when that party is within the row's
-    ///   audience (rc15: the vector seats alice and bob at `asserted_at`, and
-    ///   its twin `refuse_subject_outside_audience` seats alice alone). Persist refuses any
-    ///   foreign subject at a targeted scope (subject-naming is the
-    ///   revocability-authority surface). Measured at the rc14 re-vendor. Ruled
-    ///   for v61 S1: the arm stays (a security property); it is decided in S2
-    ///   with the community-scope moderation carve-out on the same AV-84 doors
-    ///   (CIRISPersist#1161).
     /// - `refuse_row_type`: the allowlist stays Report-only until the Enforce
     ///   flip's data preconditions are met (CIRISPersist#1150).
-    const DIVERGENCES: &[(&str, &str, &str)] = &[
-        (
-            "scores_subject_and_scope",
-            "federation_cohort_standing_refused",
-            "persist refuses a targeted-cohort row whose subject_key_ids names a party other \
-             than its producer (AV-84 named_subject, CIRISPersist#592); CC 2.1 at rc15 admits \
-             it, and the rc13 re-mint (6054a03) moved only attested_key_id; decided in S2 with \
-             CIRISPersist#1161",
-        ),
-        (
-            "refuse_row_type",
-            "admitted",
-            "the row-type allowlist is Report-only until the Enforce flip's preconditions are \
+    const DIVERGENCES: &[(&str, &str, &str)] = &[(
+        "refuse_row_type",
+        "admitted",
+        "the row-type allowlist is Report-only until the Enforce flip's preconditions are \
              met (CIRISPersist#1150)",
-        ),
-    ];
+    )];
 
     /// CC's refusal (a token or a description) → the token persist emits.
     fn persist_token_for(cc_refusal: &str) -> &'static str {
@@ -507,8 +525,8 @@ pub(crate) mod bodies {
                 "federation_cohort_scope_rejected"
             }
             // rc15 (CC 2.1, CLM-subject-within-audience) — the audience rule's
-            // token. Persist does not emit it until CIRISPersist#1161 (v61
-            // S2) replaces AV-84's named_subject arm.
+            // token, which persist emits since v61 S2 (CIRISPersist#1161) as
+            // the `CohortStandingRefused` reason.
             "subject_outside_audience" => "subject_outside_audience",
             r if r.starts_with("subject_key_ids element malformed") => {
                 malformed_row::SUBJECT_KEY_ID_MALFORMED
@@ -517,10 +535,12 @@ pub(crate) mod bodies {
         }
     }
 
-    /// The token a refusal carries: a malformed row's reason, else its kind.
+    /// The token a refusal carries: a malformed row's reason, a cohort
+    /// standing refusal's reason, else its kind.
     fn token_of(e: &Error) -> &'static str {
         match e {
             Error::MalformedRow { reason, .. } => reason,
+            Error::CohortStandingRefused { reason, .. } => reason.as_str(),
             other => other.kind(),
         }
     }
@@ -648,6 +668,7 @@ pub(crate) mod bodies {
                     if let Some(c) = row.attestation_envelope["community_id"].as_str() {
                         hold_community(&d, c, &audience(v)).await;
                     }
+                    hold_canonical_proxies(&d, v, &[&a, &b]).await;
                     let (_, sc, _) =
                         ts::sign_envelope_with(&a.ed, &a.mldsa, &row.attestation_envelope);
                     assert_eq!(
@@ -686,6 +707,7 @@ pub(crate) mod bodies {
                         if let Some(c) = row.attestation_envelope["community_id"].as_str() {
                             hold_community(&d, c, &audience(v)).await;
                         }
+                        hold_canonical_proxies(&d, v, &[&a, &b]).await;
                     }
                     (Some(persist_token_for(cc)), row)
                 }
