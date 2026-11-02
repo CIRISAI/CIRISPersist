@@ -522,6 +522,16 @@ mod from_disk {
                     );
                     continue;
                 }
+                // v61 (CIRISPersist#934, S4a) — the location proof door's
+                // decision is the shared evidence plan, read once below.
+                if *kind == EnvelopeKind::LocationProof {
+                    assert!(
+                        body.join(" ")
+                            .contains("evidence_admit::put_location_proof_planned("),
+                        "I235: {backend}::{door} is not the shared location proof door"
+                    );
+                    continue;
+                }
                 let settle = format!(
                     "crate::federation::replication_policy::EnvelopeKind::{}",
                     kind.as_str()
@@ -543,6 +553,32 @@ mod from_disk {
                 );
             }
         }
+        // v61 (CIRISPersist#934, S4a) — the shared location proof plan: its
+        // FIRST statement is the settle, under the LocationProof kind.
+        let evidence =
+            std::fs::read_to_string(format!("{root}/src/federation/evidence_admit.rs")).unwrap();
+        let start = evidence
+            .find("pub(crate) async fn put_location_proof_planned<")
+            .expect("I235: the shared location proof plan");
+        let plan = &evidence[start..];
+        let plan = &plan[plan.find("{\n").expect("its body") + 2..];
+        let plan: Vec<&str> = plan[..plan.find("\n}\n").unwrap_or(plan.len())]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or("").trim())
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert!(
+            plan[0].starts_with("if super::replication_policy::settle_if_held("),
+            "I235: the shared location proof plan's first statement must be the settle, got \
+             `{}`",
+            plan[0]
+        );
+        let joined = plan.join(" ");
+        let stmt = &joined[..joined.find('}').unwrap_or(joined.len())];
+        assert!(
+            stmt.contains("replication_policy::EnvelopeKind::LocationProof"),
+            "I235: the shared location proof plan settles under the wrong kind: {stmt}"
+        );
         // The shared attestation plan: it settles under the Attestation kind,
         // ahead of the per-peer quota.
         let admit =

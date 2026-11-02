@@ -12,8 +12,9 @@
 //!
 //! `put_touch_claim`'s future-skew bound is judged at the door's one clock
 //! read (`received_at`); `put_wholeness_witness` stamps `admitted_at` with it
-//! on sqlite (postgres keeps the column's database default). The location
-//! proof doors read no instant: the withdrawal is judged on the two records.
+//! on both backends (postgres took the column's database default before v61).
+//! The location proof doors read no instant: the withdrawal is judged on the
+//! two records.
 
 use chrono::{DateTime, Utc};
 

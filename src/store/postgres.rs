@@ -1041,13 +1041,14 @@ impl super::backend_plan::BackendStore for PostgresBackend {
             .await
             .map_err(|e| Error::Backend(format!("begin fountain tx: {e}")))?;
         // The manifest: idempotent on the (content_id, corpus_kind) PK. Never
-        // evicted. `admitted_at` keeps the column's database default.
+        // evicted. `admitted_at` is the door's receipt instant, as on sqlite.
         tx.execute(
             "INSERT INTO cirislens.content_manifest \
              (content_id, corpus_kind, manifest_version, n_source, k_repair, \
               symbol_size, original_content_length, min_viable_symbols, \
-              symbol_hashes, envelope, signature, signature_ml_dsa_65, pqc_key_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+              symbol_hashes, envelope, signature, signature_ml_dsa_65, pqc_key_id, \
+              admitted_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) \
              ON CONFLICT (content_id, corpus_kind) DO NOTHING",
             &[
                 &manifest.content_id,
@@ -1063,6 +1064,7 @@ impl super::backend_plan::BackendStore for PostgresBackend {
                 &manifest.signature,
                 &manifest.signature_ml_dsa_65,
                 &manifest.pqc_key_id,
+                &planned.admitted_at,
             ],
         )
         .await
@@ -2960,12 +2962,13 @@ impl crate::federation::evidence_admit::EvidenceStore for PostgresBackend {
             .await
             .map_err(|e| Error::Backend(format!("begin witness tx: {e}")))?;
         // Idempotent on (peer_id, epoch_id, observed_at_unix_ms); `admitted_at`
-        // keeps the column's database default.
+        // is the door's receipt instant, as on sqlite.
         tx.execute(
             "INSERT INTO cirislens.wholeness_witness_corpus \
              (peer_id, epoch_id, observed_at_unix_ms, claim_namespaces, merkle_root, \
-              leaf_count, witness_version, signature, signature_ml_dsa_65, pqc_key_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+              leaf_count, witness_version, signature, signature_ml_dsa_65, pqc_key_id, \
+              admitted_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
              ON CONFLICT (peer_id, epoch_id, observed_at_unix_ms) DO NOTHING",
             &[
                 &w.peer_id,
@@ -2978,6 +2981,7 @@ impl crate::federation::evidence_admit::EvidenceStore for PostgresBackend {
                 &w.signature,
                 &w.signature_ml_dsa_65,
                 &w.pqc_key_id,
+                &planned.admitted_at,
             ],
         )
         .await
@@ -5719,6 +5723,7 @@ impl PostgresBackend {
     /// v61 (CIRISPersist#1166) — how long this backend's checkout waits for
     /// a connection before the pool is exhausted (for a holder of the bare
     /// pool that checks out through [`checkout_bounded`]).
+    #[cfg(feature = "cirisaudit")]
     pub(crate) fn checkout_wait(&self) -> std::time::Duration {
         self.checkout_wait
     }

@@ -16,8 +16,8 @@
 //!
 //! An erasure's one clock read (`received_at`) is the rehome stamp, the
 //! erasure plan's instant, the tombstone and the audit row's instant. A
-//! fountain write stamps `admitted_at` with its one clock read on sqlite
-//! (postgres keeps the column's database default).
+//! fountain write stamps `admitted_at` with its one clock read on both
+//! backends (postgres took the column's database default before v61).
 
 use chrono::{DateTime, Utc};
 
