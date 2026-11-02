@@ -589,6 +589,43 @@ impl SqliteBackend {
         Ok(n)
     }
 
+    /// v61 (the canonical's read storm) — **planner statistics at open.**
+    /// Nothing ever ran ANALYZE, so every node planned on SQLite's heuristics
+    /// alone. When `sqlite_stat1` does not exist (a store never analyzed:
+    /// every node upgrading to v61, and every fresh store) this runs ANALYZE
+    /// ONCE, bounded by `analysis_limit` (rows sampled per index, so the cost
+    /// does not grow with the store), then `PRAGMA optimize` on every open,
+    /// which re-analyzes only what SQLite judges stale. Hygiene, not the fix:
+    /// the storm's statements are pinned with INDEXED BY, because statistics
+    /// did not move them (measured on a copy of the live store). A failure
+    /// here is logged and the open proceeds — statistics are advisory.
+    pub(crate) async fn plan_statistics_at_open(&self) {
+        let r = self
+            .write(|conn| -> Result<bool, rusqlite::Error> {
+                let analyzed: i64 = conn.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let first = analyzed == 0;
+                if first {
+                    conn.execute_batch(
+                        "PRAGMA analysis_limit = 1000; ANALYZE; PRAGMA analysis_limit = 0;",
+                    )?;
+                }
+                conn.execute_batch("PRAGMA optimize;")?;
+                Ok(first)
+            })
+            .await;
+        match r {
+            Ok(true) => tracing::info!("sqlite: first ANALYZE ran (analysis_limit 1000)"),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "sqlite: planner statistics at open failed; open proceeds")
+            }
+        }
+    }
+
     /// Test-only: apply migrations up to and including `version`, so a test
     /// can seed rows in the PRE-migration shape and then run the rest.
     #[cfg(any(test, feature = "test-anchor"))]
@@ -1632,6 +1669,8 @@ impl Backend for SqliteBackend {
         self.legacy_community_trust_grants_at_open()
             .await
             .map_err(|e| Error::Backend(format!("community_trust grandfather count: {e}")))?;
+        // v61 (the canonical's read storm) — planner statistics, last.
+        self.plan_statistics_at_open().await;
         Ok(())
     }
 
@@ -44720,6 +44759,21 @@ mod tests {
             );
             v61_storm_no_history_walk(&plan, &what);
         }
+    }
+
+    /// v61 — a fresh store is analyzed at open: `sqlite_stat1` exists and
+    /// carries rows (the schema history at least).
+    #[tokio::test]
+    async fn v61_storm_open_analyzes_a_fresh_store() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let n: i64 = backend
+            .read(|conn| {
+                conn.query_row("SELECT count(*) FROM sqlite_stat1", [], |r| r.get(0))
+                    .unwrap()
+            })
+            .await;
+        assert!(n > 0, "sqlite_stat1 carries rows after open: {n}");
     }
 
     /// The filter Server's equivocation detector pages with: valid now,

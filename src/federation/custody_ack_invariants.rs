@@ -2233,6 +2233,73 @@ mod storm_v61 {
         }
     }
 
+    /// v61 — a store that was never analyzed (every node upgrading to v61)
+    /// is analyzed once at the next open, bounded: the own-key slice of
+    /// 2,400 × 15 KB rows, its statistics dropped, re-opened.
+    #[tokio::test]
+    async fn v61_storm_first_open_analyzes_an_unanalyzed_store_once() {
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let d: &dyn FederationDirectory = &b;
+        let own = cab::device(d, "v61-storm-analyze-own-key-alpha-00000").await;
+        let first = cab::report(
+            d,
+            &own,
+            &sha("v61-analyze"),
+            CustodyState::Here,
+            cab::base(),
+        )
+        .await;
+        let conn = b.conn_handle();
+        assert_eq!(
+            copy_history(&conn.lock(), &first, SLICE, 15_000, None) as i64,
+            SLICE
+        );
+        conn.lock()
+            .execute_batch("DROP TABLE sqlite_stat1")
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        b.plan_statistics_at_open().await;
+        let elapsed = t0.elapsed();
+        let rows: i64 = conn
+            .lock()
+            .query_row(
+                "SELECT count(*) FROM sqlite_stat1 WHERE tbl = 'federation_attestations'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        eprintln!(
+            "v61 first ANALYZE over {} rows: {rows} federation_attestations stat rows, {elapsed:?}",
+            SLICE + 1
+        );
+        assert!(rows > 0, "federation_attestations is analyzed");
+        // Once: a second open finds sqlite_stat1 and only optimizes.
+        let before: String = conn
+            .lock()
+            .query_row(
+                "SELECT group_concat(idx || '=' || stat, ';') FROM sqlite_stat1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        b.plan_statistics_at_open().await;
+        let after: String = conn
+            .lock()
+            .query_row(
+                "SELECT group_concat(idx || '=' || stat, ';') FROM sqlite_stat1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "the second open does not re-analyze an unchanged store"
+        );
+    }
+
     /// The Live listing's page at a deep cursor: 42,000 visible rows, the
     /// cursor at the 20,000th newest, one page of 512. ~1 KB envelopes here
     /// (the canonical's are ~13 KB; in memory that would be ~550 MB): the
