@@ -775,21 +775,31 @@ pub(crate) fn lifecycle_predicate(
         .collect::<Vec<_>>()
         .join(",");
     let path = crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID;
+    // v61 (the canonical's read storm) — sqlite: the outer id is
+    // compared as `+outer.attestation_id`. A bare column carries TEXT
+    // affinity, which the comparison then applies to the expression side;
+    // V181's `reference_seek` indexes the expression with NO affinity, so the
+    // index was ineligible and the subquery was `SCAN c` once per outer row
+    // (one page of 256 at 3.9k rows: 15.2M full-scan steps). The unary plus
+    // strips the affinity. The seek is pinned to V212's partial
+    // `reference_live` (composer rows only): with statistics on a store with
+    // few composers, `reference_seek` (every row, nearly all NULL) is judged
+    // no better than a scan, and the pin alone then walks the whole index.
     let (table, target, id) = match dialect {
         Dialect::Sqlite => (
-            "federation_attestations",
+            "federation_attestations c INDEXED BY federation_attestations_reference_live",
             format!("json_extract(c.attestation_envelope, '$.{path}')"),
-            format!("{outer}.attestation_id"),
+            format!("+{outer}.attestation_id"),
         ),
         Dialect::Postgres => (
-            "cirislens.federation_attestations",
+            "cirislens.federation_attestations c",
             format!("c.attestation_envelope::jsonb->>'{path}'"),
             format!("{outer}.attestation_id::text"),
         ),
     };
     Some((
         format!(
-            "NOT EXISTS (SELECT 1 FROM {table} c \
+            "NOT EXISTS (SELECT 1 FROM {table} \
                WHERE (c.attesting_key_id = {outer}.attesting_key_id \
                       OR c.withdraws_admission_rule IS NOT NULL) \
                  AND c.attestation_type IN ({list}) \

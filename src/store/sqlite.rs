@@ -10117,45 +10117,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let scope = crate::scope::caller_scope_from_directory(self, caller_occurrence_key_id)
             .await
             .map_err(|e| Error::Backend(format!("list_scores admission: {e}")))?;
-        let (mut parts, mut binds) = sqlite_scores_shared_predicates(&filter, &scope);
-        // lifecycle: exclude rows retracted by a still-hiding composer (the
-        // one predicate, CIRISPersist#720; the composer-target path is the
-        // ONE envelope-path constant, #495 C2; an admitted retraction hides
-        // whoever authored it, #945).
-        if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
-            filter.lifecycle,
-            crate::federation::attestation_query::Dialect::Sqlite,
-            "fa",
-            binds.len() + 1,
-        ) {
-            binds.extend(types.into_iter().map(SqlValue::Text));
-            parts.push(sql);
-        }
-        if let Some(c) = &cursor {
-            if c.version != "v1" {
-                return Err(Error::InvalidArgument(format!(
-                    "AttestationCursor version {} unsupported; v1 only",
-                    c.version
-                )));
-            }
-            binds.push(SqlValue::Text(c.last_asserted_at.to_rfc3339()));
-            let p_at = binds.len();
-            binds.push(SqlValue::Text(c.last_attestation_id.clone()));
-            let p_id = binds.len();
-            parts.push(format!(
-                "(fa.asserted_at, fa.attestation_id) < (?{p_at}, ?{p_id})"
-            ));
-        }
-        let where_sql = format!("WHERE {}", parts.join(" AND "));
-        binds.push(SqlValue::Integer(limit));
-        let p_limit = binds.len();
-        let sql = format!(
-            "SELECT DISTINCT {SCORES_FA_COLS} \
-             FROM attestation_subjects s \
-             JOIN federation_attestations fa ON fa.attestation_id = s.attestation_id \
-             {where_sql} \
-             ORDER BY fa.asserted_at DESC, fa.attestation_id DESC LIMIT ?{p_limit}"
-        );
+        let (sql, binds) = sqlite_list_scores_sql(&filter, cursor.as_ref(), limit, &scope)?;
         // #456 — spawn_blocking: never run the query + row materialization
         // inline on the async executor while holding the global sqlite conn
         // mutex (a join-storm of admission reads would serialize the data
@@ -20828,9 +20790,18 @@ fn sqlite_attestations_referencing_sql() -> String {
 /// v61 — `list_attestations_by_dimension_citing`'s statement (`?1` the
 /// attester, `?2` the dimension, `?3` the cited blob), spelled once so the
 /// plan witness reads the statement the door runs.
-fn sqlite_by_dimension_citing_sql() -> String {
+///
+/// Pinned to V180's index with INDEXED BY. Unpinned, the planner took V004's
+/// `federation_attestations_attesting (attesting_key_id, asserted_at DESC)`
+/// because it also yields `ORDER BY asserted_at DESC` (the sort-avoidance
+/// heuristic; dropping the ORDER BY alone flips the plan), and walked the
+/// attester's whole history. `ORDER BY +asserted_at` flips it without
+/// statistics but not reliably with them, so the pin is the fix; it also
+/// fails loudly if the index is ever renamed.
+pub(crate) fn sqlite_by_dimension_citing_sql() -> String {
     format!(
         "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
+           INDEXED BY federation_attestations_attester_dimension_citation \
          WHERE attesting_key_id = ?1 AND dimension = ?2 \
            AND json_extract(attestation_envelope, '$.evidence_refs[0]') = ?3 \
            AND tier = 'federation' \
@@ -20842,7 +20813,7 @@ fn sqlite_by_dimension_citing_sql() -> String {
 /// as a JSON array, `?2..?4` the composer types, then the attested axis and
 /// the attesting axis, each when pinned, in that order), spelled once so the
 /// plan witness reads the statement the door runs.
-fn sqlite_composers_referencing_any_sql(attested: bool, attesting: bool) -> String {
+pub(crate) fn sqlite_composers_referencing_any_sql(attested: bool, attesting: bool) -> String {
     let mut axes = String::new();
     let mut next = 5;
     if attested {
@@ -20852,14 +20823,310 @@ fn sqlite_composers_referencing_any_sql(attested: bool, attesting: bool) -> Stri
     if attesting {
         axes.push_str(&format!(" AND attesting_key_id = ?{next}"));
     }
+    // v61 — each axis form pinned to the index that seeks all three of
+    // its columns (V107 attesting, V178 attested, V212's composer-only
+    // `reference_live` with no axis: V181's `reference_seek` is judged a
+    // scan once statistics see its NULL-heavy key). Unpinned,
+    // the ORDER BY made V004's single-column attester / subject index win
+    // (with or without sqlite_stat1, measured on a copy of the live store),
+    // and every call walked the key's history. The attesting form wins when
+    // both axes are pinned (the attested key is then a residual filter).
+    let pin = if attesting {
+        "federation_attestations_composer_ref"
+    } else if attested {
+        "federation_attestations_attested_composer_ref"
+    } else {
+        "federation_attestations_reference_live"
+    };
     format!(
-        "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
+        "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations INDEXED BY {pin} \
          WHERE tier = 'federation' \
            AND attestation_type IN (?2, ?3, ?4) \
            AND json_extract(attestation_envelope, '$.references_attestation_id') \
                IN (SELECT value FROM json_each(?1)){axes} \
          ORDER BY asserted_at DESC"
     )
+}
+
+/// v61 — `list_attestations`' statement and binds for `filter`, `cursor`,
+/// `limit` and `scope`, built once so the plan witnesses EXPLAIN the
+/// statement the door runs.
+pub(crate) fn sqlite_list_attestations_sql(
+    filter: &crate::read::AttestationFilter,
+    cursor: Option<&crate::read::AttestationCursor>,
+    limit: i64,
+    scope: &crate::scope::CallerScope,
+) -> Result<(String, Vec<SqlValue>), crate::read::Error> {
+    // v61 (the canonical's read storm) — with no attester, subject
+    // or dimension pinned, the keyset order is V212's
+    // `(asserted_at DESC, attestation_id DESC)`, pinned: the cursor's
+    // row-value bound seeks it and the walk stops at the LIMIT. Without
+    // it the page was a SCAN of every envelope plus a TEMP B-TREE sort of
+    // every qualifying row (with statistics: a skip-scan of V004's
+    // attester index, the sort unchanged). A pinned key keeps its own
+    // index.
+    let keyed = !filter.attesting_key_ids.is_empty()
+        || filter.attesting_key_id.is_some()
+        || !filter.attested_key_ids.is_empty()
+        || filter.attested_key_id.is_some()
+        || matches!(
+            filter.attester_filter,
+            Some(crate::read::AttesterSet::Explicit(_))
+        )
+        || filter.dimension_exact.is_some()
+        || !filter.dimension_prefixes.is_empty();
+    let from = if keyed {
+        "federation_attestations"
+    } else {
+        "federation_attestations INDEXED BY federation_attestations_asserted_seek"
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let mut binds: Vec<SqlValue> = Vec::new();
+    // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `IN (…)`, never looped.
+    {
+        let keys = crate::ceg::list::federation::merge_key_predicate(
+            filter.attesting_key_id.as_ref(),
+            &filter.attesting_key_ids,
+        );
+        if !keys.is_empty() {
+            let mut ph: Vec<String> = Vec::with_capacity(keys.len());
+            for k in keys {
+                binds.push(SqlValue::Text(k));
+                ph.push(format!("?{}", binds.len()));
+            }
+            parts.push(format!("attesting_key_id IN ({})", ph.join(", ")));
+        }
+    }
+    // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `IN (…)`, never looped.
+    {
+        let keys = crate::ceg::list::federation::merge_key_predicate(
+            filter.attested_key_id.as_ref(),
+            &filter.attested_key_ids,
+        );
+        if !keys.is_empty() {
+            let mut ph: Vec<String> = Vec::with_capacity(keys.len());
+            for k in keys {
+                binds.push(SqlValue::Text(k));
+                ph.push(format!("?{}", binds.len()));
+            }
+            parts.push(format!("attested_key_id IN ({})", ph.join(", ")));
+        }
+    }
+    if let Some(t) = &filter.attestation_type {
+        binds.push(SqlValue::Text(t.clone()));
+        parts.push(format!("attestation_type = ?{}", binds.len()));
+    }
+    if let Some(pqc) = filter.pqc_completed {
+        parts.push(if pqc {
+            "pqc_completed_at IS NOT NULL".to_owned()
+        } else {
+            "pqc_completed_at IS NULL".to_owned()
+        });
+    }
+    // v4.5 (CEG §10.1.5.4) — open-vocab dimension-prefix filter.
+    // v42.1.0 (#817, #818) — compiled as a half-open BYTE RANGE over V106's
+    // generated `dimension` column, never `LIKE`. Two reasons, either
+    // sufficient: SQLite's LIKE is case-INsensitive for ASCII, which
+    // over-matches a dimension CC 3.1.7 R3 defines as a case-sensitive byte
+    // string (#818); and SQLite declines its LIKE-to-range optimization
+    // whenever ESCAPE is present, which we always emitted, so V137's index
+    // would go unused (#817). Served by
+    // `federation_attestations_attester_dimension`.
+    if !filter.dimension_prefixes.is_empty() {
+        let mut ors: Vec<String> = Vec::new();
+        for p in &filter.dimension_prefixes {
+            match crate::ceg::list::federation::dimension_prefix_bounds(p) {
+                Some((lo, hi)) => {
+                    binds.push(SqlValue::Text(lo));
+                    let a = binds.len();
+                    binds.push(SqlValue::Text(hi));
+                    let b = binds.len();
+                    ors.push(format!("(dimension >= ?{a} AND dimension < ?{b})"));
+                }
+                None => {
+                    // No representable upper bound (empty prefix, all-0xFF,
+                    // or a non-UTF-8 successor). `=` on TEXT is a byte
+                    // compare, so this stays case-correct — it is only
+                    // unindexed. Never fall back to LIKE: that reopens #818.
+                    binds.push(SqlValue::Text(p.clone()));
+                    let a = binds.len();
+                    ors.push(format!(
+                        "substr(dimension, 1, {}) = ?{a}",
+                        p.chars().count()
+                    ));
+                }
+            }
+        }
+        parts.push(format!("({})", ors.join(" OR ")));
+    }
+    // v17.5.2 (#461) — EXACT dimension match. Was silently a no-op in
+    // list_attestations (only `dimension_prefixes` was ever applied; a
+    // caller-supplied `dimension_exact` — or a mistaken `{"dimension":…}`
+    // key — filtered nothing), forcing a fetch-then-fold-in-Python. Mirrors
+    // `list_scores`' `dimension_exact`; AND-composed with any prefix set.
+    // v42.1.0 (#817) — reads V106's generated column so the seek can use
+    // V137's index instead of json_extract-ing every row the attester wrote.
+    if let Some(d) = &filter.dimension_exact {
+        binds.push(SqlValue::Text(d.clone()));
+        parts.push(format!("dimension = ?{}", binds.len()));
+    }
+    // v4.5 — point-in-time validity.
+    if let Some(va) = filter.valid_at {
+        binds.push(SqlValue::Text(va.to_rfc3339()));
+        let p = binds.len();
+        parts.push(format!(
+            "(asserted_at <= ?{p} AND (expires_at IS NULL OR expires_at > ?{p}))"
+        ));
+    }
+    // v4.5 — confidence floor (NULL weight excluded when a floor is set).
+    if let Some(floor) = filter.confidence_floor {
+        binds.push(SqlValue::Real(floor));
+        parts.push(format!(
+            "(weight IS NOT NULL AND weight >= ?{})",
+            binds.len()
+        ));
+    }
+    // v4.5 — subject membership (subject_key_ids is a JSON array TEXT).
+    if let Some(subj) = &filter.subject_key_id {
+        binds.push(SqlValue::Text(subj.clone()));
+        parts.push(format!(
+            "EXISTS (SELECT 1 FROM json_each(subject_key_ids) WHERE value = ?{})",
+            binds.len()
+        ));
+    }
+    // v30.0.0 (CIRISPersist#596 item 2) — window / tier / attester_filter.
+    // This builder emitted nine axes and DROPPED these three, so a caller
+    // setting `window` got a bound that was never applied. Same emitter as
+    // `list_scores`, unaliased here because this query does not join.
+    // `tier: None` keeps this handle's historical meaning (no predicate) —
+    // see `sqlite_selection_axes` for why narrowing it silently would be
+    // worse than the inconsistency.
+    sqlite_selection_axes(filter, "", false, &mut parts, &mut binds);
+    // §4.3 scope gate — federation_attestations carries cohort_scope
+    // (V056) + attested_key_id (the row's target identity, V055). The
+    // gate compares the row's cohort_scope/attested_key_id against the
+    // reader's admission.
+    {
+        let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite_with_dimension(
+            scope,
+            "cohort_scope",
+            "attested_key_id",
+            Some("cohort_target"),
+            Some("dimension"),
+            binds.len(),
+        );
+        parts.push(frag);
+        binds.extend(sbinds);
+    }
+    // V4.4 §3 (PR #889 review) — a LOCAL-tier row is visible to its
+    // producing occurrence alone; the collective never reaches it.
+    {
+        let (frag, sbinds) = crate::store::scope_bind::local_tier_predicate_sqlite(
+            scope,
+            "tier",
+            "attesting_key_id",
+            binds.len(),
+        );
+        parts.push(frag);
+        binds.extend(sbinds);
+    }
+    // v49.0.0 (CIRISPersist#909) — the lifecycle view. `Live` is the
+    // documented default and hides rows retracted by a still-hiding
+    // composer from the same attester; this read took the filter and
+    // dropped the axis, so every drive listing showed withdrawn and
+    // replaced files. The same fold `list_scores` applies.
+    if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
+        filter.lifecycle,
+        crate::federation::attestation_query::Dialect::Sqlite,
+        "federation_attestations",
+        binds.len() + 1,
+    ) {
+        binds.extend(types.into_iter().map(SqlValue::Text));
+        parts.push(sql);
+    }
+    if let Some(c) = cursor {
+        if c.version != "v1" {
+            return Err(crate::read::Error::InvalidCursor(format!(
+                "AttestationCursor version {} unsupported; v1 only",
+                c.version
+            )));
+        }
+        binds.push(SqlValue::Text(c.last_asserted_at.to_rfc3339()));
+        let p_at = binds.len();
+        binds.push(SqlValue::Text(c.last_attestation_id.clone()));
+        let p_id = binds.len();
+        parts.push(format!(
+            "(asserted_at, attestation_id) < (?{p_at}, ?{p_id})"
+        ));
+    }
+    let where_sql = if parts.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", parts.join(" AND "))
+    };
+    binds.push(SqlValue::Integer(limit));
+    let p_limit = binds.len();
+    let sql = format!(
+            "SELECT attestation_id, attesting_key_id, attested_key_id, \
+                    attestation_type, weight, asserted_at, expires_at, \
+                    attestation_envelope, original_content_hash, \
+                    scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
+             FROM {from} {where_sql} \
+             ORDER BY asserted_at DESC, attestation_id DESC LIMIT ?{p_limit}"
+        );
+    Ok((sql, binds))
+}
+
+/// v61 — `list_scores`' statement and binds, built once so the plan
+/// witnesses EXPLAIN the statement the door runs.
+fn sqlite_list_scores_sql(
+    filter: &crate::read::AttestationFilter,
+    cursor: Option<&crate::read::AttestationCursor>,
+    limit: i64,
+    scope: &crate::scope::CallerScope,
+) -> Result<(String, Vec<SqlValue>), crate::federation::Error> {
+    use crate::federation::Error;
+    let (mut parts, mut binds) = sqlite_scores_shared_predicates(filter, scope);
+    // lifecycle: exclude rows retracted by a still-hiding composer (the
+    // one predicate, CIRISPersist#720; the composer-target path is the
+    // ONE envelope-path constant, #495 C2; an admitted retraction hides
+    // whoever authored it, #945).
+    if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
+        filter.lifecycle,
+        crate::federation::attestation_query::Dialect::Sqlite,
+        "fa",
+        binds.len() + 1,
+    ) {
+        binds.extend(types.into_iter().map(SqlValue::Text));
+        parts.push(sql);
+    }
+    if let Some(c) = cursor {
+        if c.version != "v1" {
+            return Err(Error::InvalidArgument(format!(
+                "AttestationCursor version {} unsupported; v1 only",
+                c.version
+            )));
+        }
+        binds.push(SqlValue::Text(c.last_asserted_at.to_rfc3339()));
+        let p_at = binds.len();
+        binds.push(SqlValue::Text(c.last_attestation_id.clone()));
+        let p_id = binds.len();
+        parts.push(format!(
+            "(fa.asserted_at, fa.attestation_id) < (?{p_at}, ?{p_id})"
+        ));
+    }
+    let where_sql = format!("WHERE {}", parts.join(" AND "));
+    binds.push(SqlValue::Integer(limit));
+    let p_limit = binds.len();
+    let sql = format!(
+        "SELECT DISTINCT {SCORES_FA_COLS} \
+             FROM attestation_subjects s \
+             JOIN federation_attestations fa ON fa.attestation_id = s.attestation_id \
+             {where_sql} \
+             ORDER BY fa.asserted_at DESC, fa.attestation_id DESC LIMIT ?{p_limit}"
+    );
+    Ok((sql, binds))
 }
 
 /// v53.1.5 — the #817/#818 dimension-prefix predicate over V106's generated
@@ -24859,201 +25126,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                 "limit must be in [1, 10000], got {limit}"
             )));
         }
-        let mut parts: Vec<String> = Vec::new();
-        let mut binds: Vec<SqlValue> = Vec::new();
-        // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `IN (…)`, never looped.
-        {
-            let keys = crate::ceg::list::federation::merge_key_predicate(
-                filter.attesting_key_id.as_ref(),
-                &filter.attesting_key_ids,
-            );
-            if !keys.is_empty() {
-                let mut ph: Vec<String> = Vec::with_capacity(keys.len());
-                for k in keys {
-                    binds.push(SqlValue::Text(k));
-                    ph.push(format!("?{}", binds.len()));
-                }
-                parts.push(format!("attesting_key_id IN ({})", ph.join(", ")));
-            }
-        }
-        // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `IN (…)`, never looped.
-        {
-            let keys = crate::ceg::list::federation::merge_key_predicate(
-                filter.attested_key_id.as_ref(),
-                &filter.attested_key_ids,
-            );
-            if !keys.is_empty() {
-                let mut ph: Vec<String> = Vec::with_capacity(keys.len());
-                for k in keys {
-                    binds.push(SqlValue::Text(k));
-                    ph.push(format!("?{}", binds.len()));
-                }
-                parts.push(format!("attested_key_id IN ({})", ph.join(", ")));
-            }
-        }
-        if let Some(t) = &filter.attestation_type {
-            binds.push(SqlValue::Text(t.clone()));
-            parts.push(format!("attestation_type = ?{}", binds.len()));
-        }
-        if let Some(pqc) = filter.pqc_completed {
-            parts.push(if pqc {
-                "pqc_completed_at IS NOT NULL".to_owned()
-            } else {
-                "pqc_completed_at IS NULL".to_owned()
-            });
-        }
-        // v4.5 (CEG §10.1.5.4) — open-vocab dimension-prefix filter.
-        // v42.1.0 (#817, #818) — compiled as a half-open BYTE RANGE over V106's
-        // generated `dimension` column, never `LIKE`. Two reasons, either
-        // sufficient: SQLite's LIKE is case-INsensitive for ASCII, which
-        // over-matches a dimension CC 3.1.7 R3 defines as a case-sensitive byte
-        // string (#818); and SQLite declines its LIKE-to-range optimization
-        // whenever ESCAPE is present, which we always emitted, so V137's index
-        // would go unused (#817). Served by
-        // `federation_attestations_attester_dimension`.
-        if !filter.dimension_prefixes.is_empty() {
-            let mut ors: Vec<String> = Vec::new();
-            for p in &filter.dimension_prefixes {
-                match crate::ceg::list::federation::dimension_prefix_bounds(p) {
-                    Some((lo, hi)) => {
-                        binds.push(SqlValue::Text(lo));
-                        let a = binds.len();
-                        binds.push(SqlValue::Text(hi));
-                        let b = binds.len();
-                        ors.push(format!("(dimension >= ?{a} AND dimension < ?{b})"));
-                    }
-                    None => {
-                        // No representable upper bound (empty prefix, all-0xFF,
-                        // or a non-UTF-8 successor). `=` on TEXT is a byte
-                        // compare, so this stays case-correct — it is only
-                        // unindexed. Never fall back to LIKE: that reopens #818.
-                        binds.push(SqlValue::Text(p.clone()));
-                        let a = binds.len();
-                        ors.push(format!(
-                            "substr(dimension, 1, {}) = ?{a}",
-                            p.chars().count()
-                        ));
-                    }
-                }
-            }
-            parts.push(format!("({})", ors.join(" OR ")));
-        }
-        // v17.5.2 (#461) — EXACT dimension match. Was silently a no-op in
-        // list_attestations (only `dimension_prefixes` was ever applied; a
-        // caller-supplied `dimension_exact` — or a mistaken `{"dimension":…}`
-        // key — filtered nothing), forcing a fetch-then-fold-in-Python. Mirrors
-        // `list_scores`' `dimension_exact`; AND-composed with any prefix set.
-        // v42.1.0 (#817) — reads V106's generated column so the seek can use
-        // V137's index instead of json_extract-ing every row the attester wrote.
-        if let Some(d) = &filter.dimension_exact {
-            binds.push(SqlValue::Text(d.clone()));
-            parts.push(format!("dimension = ?{}", binds.len()));
-        }
-        // v4.5 — point-in-time validity.
-        if let Some(va) = filter.valid_at {
-            binds.push(SqlValue::Text(va.to_rfc3339()));
-            let p = binds.len();
-            parts.push(format!(
-                "(asserted_at <= ?{p} AND (expires_at IS NULL OR expires_at > ?{p}))"
-            ));
-        }
-        // v4.5 — confidence floor (NULL weight excluded when a floor is set).
-        if let Some(floor) = filter.confidence_floor {
-            binds.push(SqlValue::Real(floor));
-            parts.push(format!(
-                "(weight IS NOT NULL AND weight >= ?{})",
-                binds.len()
-            ));
-        }
-        // v4.5 — subject membership (subject_key_ids is a JSON array TEXT).
-        if let Some(subj) = &filter.subject_key_id {
-            binds.push(SqlValue::Text(subj.clone()));
-            parts.push(format!(
-                "EXISTS (SELECT 1 FROM json_each(subject_key_ids) WHERE value = ?{})",
-                binds.len()
-            ));
-        }
-        // v30.0.0 (CIRISPersist#596 item 2) — window / tier / attester_filter.
-        // This builder emitted nine axes and DROPPED these three, so a caller
-        // setting `window` got a bound that was never applied. Same emitter as
-        // `list_scores`, unaliased here because this query does not join.
-        // `tier: None` keeps this handle's historical meaning (no predicate) —
-        // see `sqlite_selection_axes` for why narrowing it silently would be
-        // worse than the inconsistency.
-        sqlite_selection_axes(&filter, "", false, &mut parts, &mut binds);
-        // §4.3 scope gate — federation_attestations carries cohort_scope
-        // (V056) + attested_key_id (the row's target identity, V055). The
-        // gate compares the row's cohort_scope/attested_key_id against the
-        // reader's admission.
-        {
-            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite_with_dimension(
-                &scope,
-                "cohort_scope",
-                "attested_key_id",
-                Some("cohort_target"),
-                Some("dimension"),
-                binds.len(),
-            );
-            parts.push(frag);
-            binds.extend(sbinds);
-        }
-        // V4.4 §3 (PR #889 review) — a LOCAL-tier row is visible to its
-        // producing occurrence alone; the collective never reaches it.
-        {
-            let (frag, sbinds) = crate::store::scope_bind::local_tier_predicate_sqlite(
-                &scope,
-                "tier",
-                "attesting_key_id",
-                binds.len(),
-            );
-            parts.push(frag);
-            binds.extend(sbinds);
-        }
-        // v49.0.0 (CIRISPersist#909) — the lifecycle view. `Live` is the
-        // documented default and hides rows retracted by a still-hiding
-        // composer from the same attester; this read took the filter and
-        // dropped the axis, so every drive listing showed withdrawn and
-        // replaced files. The same fold `list_scores` applies.
-        if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
-            filter.lifecycle,
-            crate::federation::attestation_query::Dialect::Sqlite,
-            "federation_attestations",
-            binds.len() + 1,
-        ) {
-            binds.extend(types.into_iter().map(SqlValue::Text));
-            parts.push(sql);
-        }
-        if let Some(c) = &cursor {
-            if c.version != "v1" {
-                return Err(crate::read::Error::InvalidCursor(format!(
-                    "AttestationCursor version {} unsupported; v1 only",
-                    c.version
-                )));
-            }
-            binds.push(SqlValue::Text(c.last_asserted_at.to_rfc3339()));
-            let p_at = binds.len();
-            binds.push(SqlValue::Text(c.last_attestation_id.clone()));
-            let p_id = binds.len();
-            parts.push(format!(
-                "(asserted_at, attestation_id) < (?{p_at}, ?{p_id})"
-            ));
-        }
-        let where_sql = if parts.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", parts.join(" AND "))
-        };
-        binds.push(SqlValue::Integer(limit));
-        let p_limit = binds.len();
-        let sql = format!(
-            "SELECT attestation_id, attesting_key_id, attested_key_id, \
-                    attestation_type, weight, asserted_at, expires_at, \
-                    attestation_envelope, original_content_hash, \
-                    scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
-             FROM federation_attestations {where_sql} \
-             ORDER BY asserted_at DESC, attestation_id DESC LIMIT ?{p_limit}"
-        );
+        let (sql, binds) = sqlite_list_attestations_sql(&filter, cursor.as_ref(), limit, &scope)?;
         let limit_usize = limit as usize;
         let (read, bytes) = self
             .read_measured(
@@ -44456,10 +44529,15 @@ mod tests {
         )
         .await;
         eprintln!("I546 list_attestations_referencing plan: {plan:?}");
+        // v61 — V212's composer-only `reference_live` carries the same key
+        // over composer rows only; the planner may take either.
         assert!(
             plan.iter().any(|l| l.starts_with(
                 "SEARCH federation_attestations USING INDEX \
                  federation_attestations_reference_seek (<expr>=? AND attestation_type=?)"
+            ) || l.starts_with(
+                "SEARCH federation_attestations USING INDEX \
+                 federation_attestations_reference_live (<expr>=? AND attestation_type=?)"
             )),
             "the referencing read seeks (reference, type): {plan:?}"
         );
@@ -44594,8 +44672,8 @@ mod tests {
 
     /// v61 — `list_composers_referencing_any` on the attesting axis
     /// (custody_acks_of's second read) seeks V107's `composer_ref`, on the
-    /// attested axis V178's `attested_composer_ref`, with no axis V181's
-    /// `reference_seek`; never the pinned key's whole history.
+    /// attested axis V178's `attested_composer_ref`, with no axis
+    /// V212's `reference_live`; never the pinned key's whole history.
     #[tokio::test]
     async fn v61_storm_composers_referencing_any_seeks_the_composer_index() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
@@ -44622,7 +44700,7 @@ mod tests {
             (
                 false,
                 false,
-                "federation_attestations_reference_seek",
+                "federation_attestations_reference_live",
                 "(<expr>=? AND attestation_type=?)",
             ),
         ] {
@@ -44641,6 +44719,112 @@ mod tests {
                 "{what} seeks `{want}`: {plan:?}"
             );
             v61_storm_no_history_walk(&plan, &what);
+        }
+    }
+
+    /// The filter Server's equivocation detector pages with: valid now,
+    /// federation tier, the default (Live) lifecycle, no key pinned.
+    fn v61_storm_detector_filter() -> crate::read::AttestationFilter {
+        crate::read::AttestationFilter {
+            valid_at: Some(chrono::Utc::now()),
+            tier: Some(crate::read::Tier::Federation),
+            ..Default::default()
+        }
+    }
+
+    fn v61_storm_cursor() -> crate::read::AttestationCursor {
+        crate::read::AttestationCursor::from_trailing(chrono::Utc::now(), "x".into())
+    }
+
+    /// v61 — THE storm statement: `list_attestations` under the Live
+    /// view with no key pinned, page 1 and at a cursor. The lifecycle
+    /// subquery seeks V212's `reference_live` (never `SCAN c` per outer row)
+    /// and the outer walk seeks V212's `(asserted_at DESC, attestation_id
+    /// DESC)`, stopping at the LIMIT: no SCAN, no TEMP B-TREE.
+    #[tokio::test]
+    async fn v61_storm_list_attestations_live_plan_seeks() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for (tag, cursor) in [("page 1", None), ("at a cursor", Some(v61_storm_cursor()))] {
+            let (sql, binds) = sqlite_list_attestations_sql(
+                &v61_storm_detector_filter(),
+                cursor.as_ref(),
+                512,
+                &crate::scope::CallerScope::Unauthenticated,
+            )
+            .unwrap();
+            let plan = sqlite_plan(&backend, &sql, binds).await;
+            eprintln!("v61 list_attestations (Live, {tag}) plan: {plan:?}");
+            v61_storm_live_plan_ok(&plan, &format!("list_attestations {tag}"));
+            assert!(
+                plan.iter().any(|l| l.starts_with(
+                    "SEARCH federation_attestations USING INDEX federation_attestations_asserted_seek"
+                ) || l.starts_with(
+                    "SCAN federation_attestations USING INDEX federation_attestations_asserted_seek"
+                )),
+                "list_attestations {tag}: the outer walk is V212's keyset order: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|l| l.contains("TEMP B-TREE")),
+                "list_attestations {tag}: no sort of every qualifying row: {plan:?}"
+            );
+            if cursor.is_some() {
+                assert!(
+                    plan.iter().any(|l| l.starts_with(
+                        "SEARCH federation_attestations USING INDEX federation_attestations_asserted_seek"
+                    )),
+                    "list_attestations {tag}: the cursor seeks: {plan:?}"
+                );
+            }
+        }
+    }
+
+    /// The lifecycle subquery of a Live plan seeks `reference_live`.
+    fn v61_storm_live_plan_ok(plan: &[String], what: &str) {
+        assert!(
+            plan.iter().any(|l| l.contains(
+                "SEARCH c USING INDEX federation_attestations_reference_live (<expr>=? AND attestation_type=?)"
+            )),
+            "{what}: the lifecycle subquery seeks reference_live: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|l| l.ends_with("SCAN c") || l.contains("SCAN c ")),
+            "{what}: never a scan of the composers per outer row: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|l| l == "SCAN federation_attestations"),
+            "{what}: never a table scan: {plan:?}"
+        );
+    }
+
+    /// v61 — `list_scores` under the Live view shares the lifecycle
+    /// predicate: its subquery seeks `reference_live` too.
+    #[tokio::test]
+    async fn v61_storm_list_scores_live_subquery_seeks() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for (tag, filter) in [
+            ("detector filter", v61_storm_detector_filter()),
+            (
+                "by subject",
+                crate::read::AttestationFilter {
+                    subject_key_id: Some("subject".into()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let (sql, binds) = sqlite_list_scores_sql(
+                &filter,
+                Some(&v61_storm_cursor()),
+                256,
+                &crate::scope::CallerScope::Unauthenticated,
+            )
+            .unwrap();
+            let plan = sqlite_plan(&backend, &sql, binds).await;
+            eprintln!("v61 list_scores (Live, {tag}) plan: {plan:?}");
+            v61_storm_live_plan_ok(&plan, &format!("list_scores {tag}"));
         }
     }
 

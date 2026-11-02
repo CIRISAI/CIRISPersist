@@ -23560,6 +23560,210 @@ pub(crate) fn pg_composers_referencing_any_sql(attested: bool, attesting: bool) 
     )
 }
 
+/// v61 — `list_attestations`' statement and params, built once so the
+/// plan witnesses EXPLAIN the statement the door runs.
+#[allow(clippy::type_complexity)]
+pub(crate) fn pg_list_attestations_sql(
+    filter: &crate::read::AttestationFilter,
+    cursor: Option<&crate::read::AttestationCursor>,
+    limit: i64,
+    scope: &crate::scope::CallerScope,
+) -> Result<
+    (
+        String,
+        Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+    ),
+    crate::read::Error,
+> {
+    let mut where_parts: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+    // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `= ANY`, never looped.
+    {
+        let keys = crate::ceg::list::federation::merge_key_predicate(
+            filter.attesting_key_id.as_ref(),
+            &filter.attesting_key_ids,
+        );
+        if !keys.is_empty() {
+            params.push(Box::new(keys));
+            where_parts.push(format!("attesting_key_id = ANY(${})", params.len()));
+        }
+    }
+    // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `= ANY`, never looped.
+    {
+        let keys = crate::ceg::list::federation::merge_key_predicate(
+            filter.attested_key_id.as_ref(),
+            &filter.attested_key_ids,
+        );
+        if !keys.is_empty() {
+            params.push(Box::new(keys));
+            where_parts.push(format!("attested_key_id = ANY(${})", params.len()));
+        }
+    }
+    if let Some(t) = &filter.attestation_type {
+        params.push(Box::new(t.clone()));
+        where_parts.push(format!("attestation_type = ${}", params.len()));
+    }
+    if let Some(pqc) = filter.pqc_completed {
+        where_parts.push(if pqc {
+            "pqc_completed_at IS NOT NULL".to_owned()
+        } else {
+            "pqc_completed_at IS NULL".to_owned()
+        });
+    }
+    // v4.5 (CEG §10.1.5.4) — open-vocab dimension-prefix filter.
+    // v42.1.0 (#817, #818) — a half-open BYTE RANGE over V106's generated
+    // `dimension` column, matching the SQLite builder's shape exactly so the
+    // two dialects cannot answer this filter differently again.
+    //
+    // `COLLATE "C"` is LOAD-BEARING, not decoration. `>=`/`<` compare under
+    // the database collation, and ours (`en_US.utf8`) is linguistic, not
+    // byte order: measured on the test cluster, BOTH `'config:Z'` and
+    // `'config:-x'` fall OUTSIDE `['config:', 'config;')` under the default
+    // collation, though both are `config:`-prefixed rows. C collation is
+    // byte order, which is also what CC 3.1.7 R3 means by a dimension being
+    // a byte string. V137 indexes this same collated expression — the
+    // predicate and the index must agree or the planner cannot use it.
+    if !filter.dimension_prefixes.is_empty() {
+        let mut ors: Vec<String> = Vec::new();
+        for p in &filter.dimension_prefixes {
+            match crate::ceg::list::federation::dimension_prefix_bounds(p) {
+                Some((lo, hi)) => {
+                    params.push(Box::new(lo));
+                    let a = params.len();
+                    params.push(Box::new(hi));
+                    let b = params.len();
+                    ors.push(format!(
+                        "(dimension COLLATE \"C\" >= ${a} AND dimension COLLATE \"C\" < ${b})"
+                    ));
+                }
+                None => {
+                    // No representable upper bound. `=` is a byte compare
+                    // under a deterministic collation, so this is still
+                    // case-correct; it is only unindexed.
+                    params.push(Box::new(p.clone()));
+                    let a = params.len();
+                    ors.push(format!(
+                        "substr(dimension, 1, {}) = ${a}",
+                        p.chars().count()
+                    ));
+                }
+            }
+        }
+        where_parts.push(format!("({})", ors.join(" OR ")));
+    }
+    // v17.5.2 (#461) — EXACT dimension match. Was silently a no-op in
+    // list_attestations (only `dimension_prefixes` was ever applied; a
+    // caller-supplied `dimension_exact` — or a mistaken `{"dimension":…}`
+    // key — filtered nothing), forcing a fetch-then-fold-in-Python. Mirrors
+    // `list_scores`' `dimension_exact`; AND-composed with any prefix set.
+    // v42.1.0 (#817) — V106's generated column, `COLLATE "C"` so the one
+    // V137 index serves the exact shape as well as the range shape.
+    if let Some(d) = &filter.dimension_exact {
+        params.push(Box::new(d.clone()));
+        where_parts.push(format!("dimension COLLATE \"C\" = ${}", params.len()));
+    }
+    // v4.5 — point-in-time validity.
+    if let Some(va) = filter.valid_at {
+        params.push(Box::new(va));
+        let p = params.len();
+        where_parts.push(format!(
+            "(asserted_at <= ${p} AND (expires_at IS NULL OR expires_at > ${p}))"
+        ));
+    }
+    // v4.5 — confidence floor (NUMERIC weight compared via float8;
+    // NULL weight excluded when a floor is set).
+    if let Some(floor) = filter.confidence_floor {
+        params.push(Box::new(floor));
+        where_parts.push(format!(
+            "(weight IS NOT NULL AND weight::float8 >= ${})",
+            params.len()
+        ));
+    }
+    // v4.5 — subject membership (subject_key_ids JSONB array ? element).
+    if let Some(subj) = &filter.subject_key_id {
+        params.push(Box::new(subj.clone()));
+        where_parts.push(format!("(subject_key_ids ? ${})", params.len()));
+    }
+    // v30.0.0 (CIRISPersist#596 item 2) — window / tier / attester_filter,
+    // dropped by this builder on BOTH backends until now. Same emitter as
+    // `list_scores`; unaliased because this query does not join. `tier:
+    // None` keeps this handle's historical meaning (no predicate).
+    pg_selection_axes(filter, "", false, &mut where_parts, &mut params);
+    // §4.3 scope gate — federation_attestations carries cohort_scope
+    // (V056) + attested_key_id (target identity, V055).
+    {
+        let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg_with_dimension(
+            scope,
+            "cohort_scope",
+            "attested_key_id",
+            Some("cohort_target"),
+            Some("dimension"),
+            params.len(),
+        );
+        where_parts.push(frag);
+        params.extend(sparams);
+    }
+    // V4.4 §3 (PR #889 review) — a LOCAL-tier row is visible to its
+    // producing occurrence alone; the collective never reaches it.
+    {
+        let (frag, sparams) = crate::store::scope_bind::local_tier_predicate_pg(
+            scope,
+            "tier",
+            "attesting_key_id",
+            params.len(),
+        );
+        where_parts.push(frag);
+        params.extend(sparams);
+    }
+    // v49.0.0 (CIRISPersist#909) — the lifecycle view (see the sqlite
+    // twin): `Live` hides rows retracted by a still-hiding composer.
+    if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
+        filter.lifecycle,
+        crate::federation::attestation_query::Dialect::Postgres,
+        "federation_attestations",
+        params.len() + 1,
+    ) {
+        for t in types {
+            params.push(Box::new(t));
+        }
+        where_parts.push(sql);
+    }
+    if let Some(c) = cursor {
+        if c.version != "v1" {
+            return Err(crate::read::Error::InvalidCursor(format!(
+                "AttestationCursor version {} unsupported; v0.5.5 ships v1",
+                c.version
+            )));
+        }
+        params.push(Box::new(c.last_asserted_at));
+        let p_at = params.len();
+        params.push(Box::new(c.last_attestation_id.clone()));
+        let p_id = params.len();
+        where_parts.push(format!(
+            "(asserted_at, attestation_id::text) < (${p_at}, ${p_id})"
+        ));
+    }
+    let where_sql = if where_parts.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", where_parts.join(" AND "))
+    };
+    params.push(Box::new(limit));
+    let p_limit = params.len();
+    let sql = format!(
+            // weight::float8 AS weight — see list_attestations_for.
+            "SELECT attestation_id::text AS attestation_id, attesting_key_id, attested_key_id, \
+                    attestation_type, weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
+             FROM cirislens.federation_attestations \
+             {where_sql} \
+             ORDER BY asserted_at DESC, attestation_id DESC \
+             LIMIT ${p_limit}"
+        );
+    Ok((sql, params))
+}
+
 /// v53.1.5 — the #817/#818 dimension-prefix predicate over V106's stored
 /// column, `COLLATE "C"` so the byte range is what the V137 / V178 indexes
 /// serve; `substr` when no upper bound is representable. Pushes its params
@@ -27542,192 +27746,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
-        let mut where_parts: Vec<String> = Vec::new();
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
-        // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `= ANY`, never looped.
-        {
-            let keys = crate::ceg::list::federation::merge_key_predicate(
-                filter.attesting_key_id.as_ref(),
-                &filter.attesting_key_ids,
-            );
-            if !keys.is_empty() {
-                params.push(Box::new(keys));
-                where_parts.push(format!("attesting_key_id = ANY(${})", params.len()));
-            }
-        }
-        // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `= ANY`, never looped.
-        {
-            let keys = crate::ceg::list::federation::merge_key_predicate(
-                filter.attested_key_id.as_ref(),
-                &filter.attested_key_ids,
-            );
-            if !keys.is_empty() {
-                params.push(Box::new(keys));
-                where_parts.push(format!("attested_key_id = ANY(${})", params.len()));
-            }
-        }
-        if let Some(t) = &filter.attestation_type {
-            params.push(Box::new(t.clone()));
-            where_parts.push(format!("attestation_type = ${}", params.len()));
-        }
-        if let Some(pqc) = filter.pqc_completed {
-            where_parts.push(if pqc {
-                "pqc_completed_at IS NOT NULL".to_owned()
-            } else {
-                "pqc_completed_at IS NULL".to_owned()
-            });
-        }
-        // v4.5 (CEG §10.1.5.4) — open-vocab dimension-prefix filter.
-        // v42.1.0 (#817, #818) — a half-open BYTE RANGE over V106's generated
-        // `dimension` column, matching the SQLite builder's shape exactly so the
-        // two dialects cannot answer this filter differently again.
-        //
-        // `COLLATE "C"` is LOAD-BEARING, not decoration. `>=`/`<` compare under
-        // the database collation, and ours (`en_US.utf8`) is linguistic, not
-        // byte order: measured on the test cluster, BOTH `'config:Z'` and
-        // `'config:-x'` fall OUTSIDE `['config:', 'config;')` under the default
-        // collation, though both are `config:`-prefixed rows. C collation is
-        // byte order, which is also what CC 3.1.7 R3 means by a dimension being
-        // a byte string. V137 indexes this same collated expression — the
-        // predicate and the index must agree or the planner cannot use it.
-        if !filter.dimension_prefixes.is_empty() {
-            let mut ors: Vec<String> = Vec::new();
-            for p in &filter.dimension_prefixes {
-                match crate::ceg::list::federation::dimension_prefix_bounds(p) {
-                    Some((lo, hi)) => {
-                        params.push(Box::new(lo));
-                        let a = params.len();
-                        params.push(Box::new(hi));
-                        let b = params.len();
-                        ors.push(format!(
-                            "(dimension COLLATE \"C\" >= ${a} AND dimension COLLATE \"C\" < ${b})"
-                        ));
-                    }
-                    None => {
-                        // No representable upper bound. `=` is a byte compare
-                        // under a deterministic collation, so this is still
-                        // case-correct; it is only unindexed.
-                        params.push(Box::new(p.clone()));
-                        let a = params.len();
-                        ors.push(format!(
-                            "substr(dimension, 1, {}) = ${a}",
-                            p.chars().count()
-                        ));
-                    }
-                }
-            }
-            where_parts.push(format!("({})", ors.join(" OR ")));
-        }
-        // v17.5.2 (#461) — EXACT dimension match. Was silently a no-op in
-        // list_attestations (only `dimension_prefixes` was ever applied; a
-        // caller-supplied `dimension_exact` — or a mistaken `{"dimension":…}`
-        // key — filtered nothing), forcing a fetch-then-fold-in-Python. Mirrors
-        // `list_scores`' `dimension_exact`; AND-composed with any prefix set.
-        // v42.1.0 (#817) — V106's generated column, `COLLATE "C"` so the one
-        // V137 index serves the exact shape as well as the range shape.
-        if let Some(d) = &filter.dimension_exact {
-            params.push(Box::new(d.clone()));
-            where_parts.push(format!("dimension COLLATE \"C\" = ${}", params.len()));
-        }
-        // v4.5 — point-in-time validity.
-        if let Some(va) = filter.valid_at {
-            params.push(Box::new(va));
-            let p = params.len();
-            where_parts.push(format!(
-                "(asserted_at <= ${p} AND (expires_at IS NULL OR expires_at > ${p}))"
-            ));
-        }
-        // v4.5 — confidence floor (NUMERIC weight compared via float8;
-        // NULL weight excluded when a floor is set).
-        if let Some(floor) = filter.confidence_floor {
-            params.push(Box::new(floor));
-            where_parts.push(format!(
-                "(weight IS NOT NULL AND weight::float8 >= ${})",
-                params.len()
-            ));
-        }
-        // v4.5 — subject membership (subject_key_ids JSONB array ? element).
-        if let Some(subj) = &filter.subject_key_id {
-            params.push(Box::new(subj.clone()));
-            where_parts.push(format!("(subject_key_ids ? ${})", params.len()));
-        }
-        // v30.0.0 (CIRISPersist#596 item 2) — window / tier / attester_filter,
-        // dropped by this builder on BOTH backends until now. Same emitter as
-        // `list_scores`; unaliased because this query does not join. `tier:
-        // None` keeps this handle's historical meaning (no predicate).
-        pg_selection_axes(&filter, "", false, &mut where_parts, &mut params);
-        // §4.3 scope gate — federation_attestations carries cohort_scope
-        // (V056) + attested_key_id (target identity, V055).
-        {
-            let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg_with_dimension(
-                &scope,
-                "cohort_scope",
-                "attested_key_id",
-                Some("cohort_target"),
-                Some("dimension"),
-                params.len(),
-            );
-            where_parts.push(frag);
-            params.extend(sparams);
-        }
-        // V4.4 §3 (PR #889 review) — a LOCAL-tier row is visible to its
-        // producing occurrence alone; the collective never reaches it.
-        {
-            let (frag, sparams) = crate::store::scope_bind::local_tier_predicate_pg(
-                &scope,
-                "tier",
-                "attesting_key_id",
-                params.len(),
-            );
-            where_parts.push(frag);
-            params.extend(sparams);
-        }
-        // v49.0.0 (CIRISPersist#909) — the lifecycle view (see the sqlite
-        // twin): `Live` hides rows retracted by a still-hiding composer.
-        if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
-            filter.lifecycle,
-            crate::federation::attestation_query::Dialect::Postgres,
-            "federation_attestations",
-            params.len() + 1,
-        ) {
-            for t in types {
-                params.push(Box::new(t));
-            }
-            where_parts.push(sql);
-        }
-        if let Some(c) = &cursor {
-            if c.version != "v1" {
-                return Err(crate::read::Error::InvalidCursor(format!(
-                    "AttestationCursor version {} unsupported; v0.5.5 ships v1",
-                    c.version
-                )));
-            }
-            params.push(Box::new(c.last_asserted_at));
-            let p_at = params.len();
-            params.push(Box::new(c.last_attestation_id.clone()));
-            let p_id = params.len();
-            where_parts.push(format!(
-                "(asserted_at, attestation_id::text) < (${p_at}, ${p_id})"
-            ));
-        }
-        let where_sql = if where_parts.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", where_parts.join(" AND "))
-        };
-        params.push(Box::new(limit));
-        let p_limit = params.len();
-        let sql = format!(
-            // weight::float8 AS weight — see list_attestations_for.
-            "SELECT attestation_id::text AS attestation_id, attesting_key_id, attested_key_id, \
-                    attestation_type, weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
-                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
-             FROM cirislens.federation_attestations \
-             {where_sql} \
-             ORDER BY asserted_at DESC, attestation_id DESC \
-             LIMIT ${p_limit}"
-        );
+        let (sql, params) = pg_list_attestations_sql(&filter, cursor.as_ref(), limit, &scope)?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref() as _).collect();
         let rows = client

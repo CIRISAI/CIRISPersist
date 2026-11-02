@@ -41,6 +41,7 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 - `observation:access_assumption:v1` is registered at `+1.0` only (CC rc12): a row with any other score is refused `score_outside_declared_polarity`.
 - `listed` is no longer a member persist types. CC rc13 removed it from CC 2.1 and the signed object; at admission it is an unknown envelope member like any other `signed:envelope-extra`: carried untyped and kept in the signed bytes, so a non-boolean value is admitted. `"listed": null` is refused `envelope_member_null` like any other explicit null.
 - `membership:proposal` and `membership:acceptance` rows omit `role` when no role is offered; they wrote `"role": null` before. No cross-version break: `role: null` on those two families is still admitted and read as no role, the one exception to `envelope_member_null`, until it sunsets per CIRISPersist#1151.
+- No wire or API change for the read-storm fix. V212 builds one index on `federation_attestations` (both backends) at upgrade. The pinned statements name their indexes, so a store missing V107, V178, V180, V181 or V212 refuses these reads with `no such index` instead of planning around it.
 
 ### Changed
 
@@ -49,6 +50,12 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 - The genesis bundle's authorization digest is CIRISVerify's `genesis_bundle::authorization_digest`; persist's own projection is removed and the threshold policy (`max(carried M, strict majority of the node's own roster)`) stays in persist. A byte-identity test pins the digest against verify's seven genesis-bundle vectors.
 
 ### Fixed
+
+- The read storm on a canonical-shaped SQLite store: the unpinned attestation listing, the custody reads and the composer fold no longer read pages in proportion to the store or to one key's history.
+  - `list_attestations` and `list_scores` under the default `Live` view ran their lifecycle subquery as a full scan of `federation_attestations` for every candidate row. The correlated compare against a bare `attestation_id` column carried TEXT affinity, so V181's `federation_attestations_reference_seek` expression index was ineligible. The compare is now `= +outer.attestation_id`, and the subquery is pinned to `reference_seek` with `INDEXED BY`.
+  - `list_attestations` with no attester, subject or dimension pinned (CIRISServer's equivocation detector: valid now, federation tier, keyset cursor) had no index in `(asserted_at, attestation_id)` order. Each page scanned the table and sorted every qualifying row before its `LIMIT`. V212 adds `federation_attestations_asserted_seek (asserted_at DESC, attestation_id DESC)` on both backends, and the sqlite statement is pinned to it. A page of 512 at a cursor 20,000 rows deep in a 42,000-row store costs what page 1 costs.
+  - `list_attestations_by_dimension_citing` and every axis form of `list_composers_referencing_any` (attesting, attested, both, none) are pinned with `INDEXED BY` to V180's, V107's, V178's and V181's three-column indexes. Unpinned, SQLite preferred V004's single-column `federation_attestations_attesting` / `_attested` index because it also yields `ORDER BY asserted_at DESC`, with or without statistics, and every call walked the key's history. Against a 2,400-row own-key slice of 15 KB envelopes, `custody_acks_of` for one blob reads 31 pages. Unpinned, it read 10,202 pages against a smaller 2,002-row history.
+  - The trigger is any caller of these reads once a key's history, or the store, outgrows the page cache. On the canonical that was the attestation listing and the composer fold, not the durability pass alone.
 
 - A node identity whose software-tier key a pre-20.3.0 keyring archived as `*.superseded-pre-v8` (leaving no live key) reopens with the same key instead of failing to boot; verify 22 restores the archived files on open.
 
