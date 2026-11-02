@@ -1537,7 +1537,7 @@ class Engine:
         """(derived) deontic — v6.8.0 (CIRISPersist#149) — serve blob bytes to a federation PEER, with the proactive disk-pressure gate on the proxy-SERVE path. At the stop tier..."""
 
     def serve_seat_owner_announced(self, node_key_id: str) -> bool:
-        """(derived) deontic — v61 (CIRISPersist#1101; CC 5.4.6, CLM-serve-seat-announced) — is node_key_id's owner announced? True while a live owner binding for the node is..."""
+        """(derived) deontic — v61 (CIRISPersist#1101; CC 5.4.6, CLM-serve-seat-announced) — is node_key_id's owner announced? True while a live owner binding for the node is car..."""
 
     def service_token_revocation_check(self, token_hash: str) -> str | None:
         """v1.5.23 — point-lookup the revocation record for a service token hash.
@@ -3968,6 +3968,9 @@ class Engine:
         reference an existing row in ``cirislens.thoughts`` (PG:
         DEFERRABLE FK; SQLite: immediate FK).
         """
+
+    def settle_instant_forms_json(self) -> str:
+        """(derived) procedural — v61 (CC 2.6.2) — run the open-time instant-form pass now and return its counts as JSON: {scanned, violations, healed, already_healed, heal_refused,..."""
 
     def sweep_ack_timeouts(self) -> int:
         """(derived) procedural — v0.4.0 — Sweep ACK timeouts. Returns the count of rows touched (retried or abandoned)."""
