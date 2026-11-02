@@ -389,3 +389,118 @@ async fn i1482_the_wire_index_point_read_completes_on_one_connection() {
     .expect("I1482 the point read finishes");
     assert!(bytes.is_some(), "I1482 the indexed record reloads");
 }
+
+/// **I1570** (v61, CIRISPersist#1166) — every family of Postgres checkouts
+/// runs the bounded checkout: on a one-connection pool whose only connection
+/// is held, a door of each family answers an exhausted pool inside the
+/// checkout wait, never a hang. Before v61 these families called the pool's
+/// own `get()`, which waits without a bound (`store::pool_checkout_gate`
+/// now refuses that from disk). A family whose error has no typed
+/// `PoolExhausted` arm carries the exhaustion in its text.
+#[tokio::test(flavor = "multi_thread")]
+async fn i1570_every_checkout_family_answers_an_exhausted_pool_inside_the_wait() {
+    use crate::outbound::OutboundQueue as _;
+    use crate::read::ReadEngine as _;
+    let Some(b) = starved_backend("i1570", 1).await else {
+        return;
+    };
+    let held = b.checkout().await.expect("I1570 the only connection");
+    let mut answered = Vec::new();
+    // Each door must refuse inside the wait, and say why.
+    async fn refused<T, E: std::fmt::Display>(
+        family: &str,
+        answered: &mut Vec<String>,
+        door: impl std::future::Future<Output = Result<T, E>>,
+    ) {
+        let started = std::time::Instant::now();
+        let e = match within_bound(family, door).await {
+            Ok(_) => panic!("I1570 {family}: a door ran on a pool whose only connection is held"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            started.elapsed() < SHORT_WAIT * 2,
+            "I1570 {family}: answered after {:?}, past the checkout wait",
+            started.elapsed()
+        );
+        assert!(
+            e.to_lowercase().contains("exhausted"),
+            "I1570 {family}: the refusal does not name the exhausted pool: {e}"
+        );
+        answered.push(family.to_owned());
+    }
+    refused("outbound", &mut answered, b.sweep_ack_timeouts()).await;
+    refused(
+        "read",
+        &mut answered,
+        b.list_federation_keys(
+            crate::ceg::list::federation::FederationKeyFilter::default(),
+            None,
+            10,
+            crate::scope::CallerScope::Unauthenticated,
+        ),
+    )
+    .await;
+    #[cfg(feature = "cirislens_sequence")]
+    {
+        use crate::sequence::SequenceService as _;
+        refused(
+            "sequence",
+            &mut answered,
+            b.next_sequence("i1570-identity", "i1570-stream"),
+        )
+        .await;
+    }
+    #[cfg(feature = "cirislens_occurrence")]
+    {
+        use crate::occurrence::OccurrenceService as _;
+        refused(
+            "occurrence",
+            &mut answered,
+            b.register_occurrence("i1570-occ", "i1570-identity", 60, None),
+        )
+        .await;
+    }
+    #[cfg(feature = "cirislens_maintenance_locks")]
+    {
+        use crate::maintenance_locks::MaintenanceLockService as _;
+        refused(
+            "maintenance_locks",
+            &mut answered,
+            b.try_acquire_lock("i1570-lock", "i1570", 10, None),
+        )
+        .await;
+    }
+    #[cfg(feature = "cirisaudit")]
+    {
+        refused(
+            "retention",
+            &mut answered,
+            crate::retention::postgres::storage_summary_pg_with(&b, false),
+        )
+        .await;
+        // The audit Merkle store holds the bare pool and checks out through
+        // `checkout_bounded` on its own runtime.
+        let store = crate::audit::merkle_store::PgMerkleStore::from_backend(
+            &b,
+            tokio::runtime::Handle::current(),
+            "i1570",
+        );
+        let started = std::time::Instant::now();
+        let e = tokio::task::spawn_blocking(move || {
+            use ciris_verify_core::transparency::TransparencyStore;
+            TransparencyStore::<crate::audit::merkle_leaf::AuditLeaf>::tree_size(&store)
+        })
+        .await
+        .expect("I1570 merkle join")
+        .expect_err("I1570 merkle: a store read ran on a held pool")
+        .to_string();
+        assert!(
+            started.elapsed() < SHORT_WAIT * 2 && e.to_lowercase().contains("exhausted"),
+            "I1570 merkle: {e} after {:?}",
+            started.elapsed()
+        );
+        answered.push("merkle".to_owned());
+    }
+    drop(held);
+    eprintln!("I1570: bounded on {answered:?}");
+}

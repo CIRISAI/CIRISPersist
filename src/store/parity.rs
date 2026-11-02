@@ -128,6 +128,107 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v61 (CIRISPersist#934, S4a) — the blob plane: the byte writes.
+    ("put_blob_planned", Class::Plan),
+    ("store_blob_local_planned", Class::Plan),
+    ("adopt_sealed_blob_planned", Class::Plan),
+    ("put_blob_chunks_planned", Class::Plan),
+    ("put_dag_manifest_over_held_planned", Class::Plan),
+    ("seal_stream_planned", Class::Plan),
+    // The DAG finalize's held-chunk verdict, re-asked by the executor inside its transaction for each named chunk.
+    ("held_dag_chunk_verdict", Class::Plan),
+    // The byte writes' tombstone pre-read (same-file helper of every byte plan).
+    ("tombstone_floor", Class::Delegates),
+    // A single-row body's refusals (over the cap, a hash that is not its address, a ChunkDag body), and the stored-size claim and seal-body checks.
+    ("plan_blob_body", Class::Gate),
+    ("check_claim_size", Class::Gate),
+    ("fits", Class::Gate),
+    // The byte executors (storage only; compared across backends as the `BlobWriteStore` trait).
+    ("store_planned_blob", Class::Plumbing),
+    ("store_planned_announcement", Class::Plumbing),
+    ("store_planned_dag_over_held", Class::Plumbing),
+    ("store_planned_seal", Class::Plumbing),
+    ("sqlite_insert_dag_links", Class::Plumbing),
+    ("pg_insert_dag_links", Class::Plumbing),
+    // v61 (CIRISPersist#934, S4a) — the blob plane: the chunk floor and the stream plane's records.
+    ("put_blob_chunk_planned", Class::Plan),
+    ("adopt_sealed_chunk_planned", Class::Plan),
+    ("adopt_sealed_chunks_planned", Class::Plan),
+    ("put_stream_sth_planned", Class::Plan),
+    ("put_delivery_receipt_planned", Class::Plan),
+    ("put_holding_claim_planned", Class::Plan),
+    ("stream_dek_insert_planned", Class::Plan),
+    ("stream_dek_put_grants_planned", Class::Plan),
+    // The stream claim's verdict (#837 / I41, #954), re-asked by the chunk executor inside its transaction against the row it just read.
+    ("stream_claim_verdict", Class::Plan),
+    // The chunk floor's shared body: the three chunk doors' plans run it.
+    ("chunk_floor_planned", Class::Delegates),
+    ("refuse_held_stream", Class::Gate),
+    // The blob executors (storage only; compared across backends as the `BlobFloorStore` trait): each reports what it found under the key for the plan to judge.
+    ("store_planned_chunk_batch", Class::Plumbing),
+    ("read_stream_chunk_hashes", Class::Plumbing),
+    ("store_stream_sth", Class::Plumbing),
+    ("store_delivery_receipt", Class::Plumbing),
+    ("store_holding_claim", Class::Plumbing),
+    // v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash sighting, the purge record write and the trust revocation.
+    ("add_peer_record_planned", Class::Plan),
+    ("insert_known_wire_hash_planned", Class::Plan),
+    ("purge_put_execution_planned", Class::Plan),
+    ("revoke_trust_planned", Class::Plan),
+    // The peer add's held-row verdict, re-asked by the executor inside its transaction (the `recheck_cycle_under_lock` shape).
+    ("peer_record_held_verdict", Class::Plan),
+    ("refuse_held_peer_conflict", Class::Gate),
+    // The stored granter read the revocation's ownership check compares against (a read; the refusal is the plan's).
+    ("trust_granter", Class::Plumbing),
+    // v61 (CIRISPersist#934, S4a) — the Backend trait's erasure and fountain doors, and the gated directory reads.
+    ("delete_traces_for_agent_planned", Class::Plan),
+    ("delete_traces_for_agent_id_hash_planned", Class::Plan),
+    ("put_fountain_content_planned", Class::Plan),
+    ("put_aggregated_tier_planned", Class::Plan),
+    ("list_scores_planned", Class::Plan),
+    ("resolve_scores_planned", Class::Plan),
+    ("list_attestation_log_planned", Class::Plan),
+    ("list_key_registration_history_planned", Class::Plan),
+    ("list_derived_hex_planned", Class::Plan),
+    // The erasure doors' shared planner (same-file helper of both plans): the attester gate and the erasure plan.
+    ("plan_trace_erasure", Class::Delegates),
+    // The paged reads' bound and cursor-version refusals (caller input).
+    ("check_page_limit", Class::Gate),
+    ("check_cursor_version", Class::Gate),
+    // The fountain columns' width check: a u64 length that does not fit the stored i64 column, the substrate's terms (it was `try_from`, Plumbing, on postgres).
+    ("plan_fountain_content", Class::Plumbing),
+    // The executors (storage only; compared across backends as the `BackendStore` / `ReadPlanStore` traits): the SQL for a typed read or write the plan already decided.
+    ("store_planned_trace_erasure", Class::Plumbing),
+    ("read_scores_page", Class::Plumbing),
+    ("read_score_candidates", Class::Plumbing),
+    ("read_score_composers", Class::Plumbing),
+    ("read_attestation_log_page", Class::Plumbing),
+    ("read_key_registration_history", Class::Plumbing),
+    ("query_attestations", Class::Plumbing),
+    // The erasure executors' string-column collector (a row decode).
+    ("strings", Class::Plumbing),
+    // The erasure's audit event for what moved (`None` when nothing did):
+    // the plan's shared rule, built inside the executor's transaction from its
+    // counts; it refuses nothing.
+    ("audit_event", Class::Plumbing),
+    // v61 (CIRISPersist#934, S4a) — the accord evidence doors and the location proof, touch claim and wholeness witness doors.
+    ("put_accord_proposal_planned", Class::Plan),
+    ("put_accord_participation_planned", Class::Plan),
+    ("put_accord_decision_planned", Class::Plan),
+    ("put_location_proof_planned", Class::Plan),
+    ("withdraw_location_proof_planned", Class::Plan),
+    ("put_touch_claim_planned", Class::Plan),
+    ("put_wholeness_witness_planned", Class::Plan),
+    // The executors (storage only; compared across backends as the `AccordStore` / `EvidenceStore` traits): each fails only on the store's terms, and reports what it found for the plan to judge (`HeldRow`, a held proof, an advanced floor).
+    ("last_accord_proposal_created_at", Class::Plumbing),
+    ("last_accord_participation_arrival", Class::Plumbing),
+    ("store_planned_accord_proposal", Class::Plumbing),
+    ("store_planned_accord_participation", Class::Plumbing),
+    ("store_planned_accord_decision", Class::Plumbing),
+    ("held_location_proof", Class::Plumbing),
+    ("store_planned_location_proof_withdrawal", Class::Plumbing),
+    ("rival_location_proof_withdrawal", Class::Plumbing),
+    ("store_planned_touch_claim", Class::Plumbing),
     // v58.0.0 (CIRISPersist#991) — the key plane. The revocation door is one
     // shared plan; every key-plane write keeps its row with it in the same
     // transaction (storage, Plumbing: the row is a pure function of the record
@@ -481,7 +582,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // minter, no refusal of the caller's input here.
     ("community_dek_blob_epoch", Class::Delegates),
     ("acquire_migration_lock", Class::Delegates),
-    ("admission_gate", Class::Plumbing),
+    ("blob_admission_gate", Class::Plumbing),
     // v47.3.0 (#901) — the one key-admission door predicate (structure for
     // every evidence-carrying row, + freshness for an accord_holder).
     ("admit_key_record", Class::Gate),
@@ -500,13 +601,16 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // wrapper Delegates to it (so both doors read `refuse_tombstoned_at_write`);
     // the in-transaction read, postgres's advisory lock and sqlite's error
     // carrier are Plumbing.
-    ("refuse_tombstoned_at_write", Class::Gate),
+    // v61 (CIRISPersist#934, S4a) — the shared in-transaction decision is a
+    // PLAN every byte-write executor re-asks (`steward_purge`); its refusal
+    // is the Gate.
+    ("refuse_tombstoned_at_write", Class::Plan),
+    ("refuse_standing_notice", Class::Gate),
     ("sqlite_refuse_tombstoned_at_write", Class::Delegates),
     ("pg_refuse_tombstoned_at_write", Class::Delegates),
     ("sqlite_tombstone_at_write", Class::Plumbing),
     ("pg_tombstone_at_write", Class::Plumbing),
     ("pg_lock_bytes_tombstones", Class::Plumbing),
-    ("sqlite_purged_at_write", Class::Plumbing),
     ("pg_lock_bytes_tombstones_exclusive", Class::Plumbing),
     // #832 — `build_transaction()…start()`: the REPEATABLE READ transaction
     // `stream_chunks` opens so the listing and the STH are one snapshot.
@@ -639,7 +743,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // write (`store::test_hooks::arm_rival_location_proof_withdrawal`); never
     // armed outside a test, so it adds nothing to the door's production
     // sequence.
-    ("test_rival_location_proof_withdrawal", Class::Plumbing),
     // v50.0.0 (CIRISPersist#926) — Gate: refuses a trust-root-grade community
     // row (the reserved `ciris-canonical` id, or one declaring
     // `infrastructure_constraint`) whose shape, founders or chain fails — the
@@ -812,6 +915,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("get_accord_proposal", Class::Delegates),
     ("get_attestation", Class::Delegates),
     ("get_client", Class::Delegates),
+    // v61 (CIRISPersist#1166) — the bounded pooled checkout every door now
+    // takes (no gate: it fails only when the pool is starved or down).
+    ("checkout", Class::Plumbing),
     // v44.8.1 (#870) — the blob doors' post-write index hook for the holder
     // claim; same-file helper over `index_stored_record`, followed like it.
     ("index_holder_claim", Class::Delegates),
@@ -1064,10 +1170,8 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("project_route", Class::Plumbing),
     // #846 — the chunk floor's one body; the write door and the adopt door
     // both run its sequence.
-    ("put_blob_chunk_floor", Class::Delegates),
     // v52.0.0 (CIRISPersist#957) — the chunk floor, batched: the single floor
     // is its batch of one, and it runs every gate the single floor ran.
-    ("put_blob_chunks_floor", Class::Delegates),
     // #957 — Gate: refuses an empty batch, more than MAX_CHUNKS_PER_BATCH
     // items, or more than MAX_BATCH_BYTES. A statement about the input.
     ("check_chunk_batch_bounds", Class::Gate),
@@ -1238,7 +1342,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("verify_family_membership_revocation_admission", Class::Gate),
     ("verify_federation_tier_ingest", Class::Gate),
     ("verify_for_admission", Class::Gate),
-    ("verify_inline_hash", Class::Gate),
     ("verify_location_proof_admission", Class::Gate),
     ("verify_receipt_signature", Class::Gate),
     ("verify_revocation_admission", Class::Gate),
@@ -1361,7 +1464,19 @@ mod tests {
     /// The traits whose impls are compared, and where each trait's **default**
     /// bodies live. A backend that does not override a defaulted method runs
     /// the default, so the default's gate sequence is what it contributes.
-    const TRAITS: [(&str, &str); 9] = [
+    const TRAITS: [(&str, &str); 16] = [
+        // v61 (CIRISPersist#934, S4a) — the blob plane: the byte writes.
+        ("BlobWriteStore", "src/federation/blob_admit.rs"),
+        // v61 (CIRISPersist#934, S4a) — the blob plane: the chunk floor and the stream plane's records.
+        ("BlobFloorStore", "src/federation/blob_admit.rs"),
+        // v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash sighting, the purge record write and the trust revocation.
+        ("DirectoryStore", "src/federation/directory_admit.rs"),
+        // v61 (CIRISPersist#934, S4a) — the Backend trait's erasure and fountain doors, and the gated directory reads.
+        ("BackendStore", "src/store/backend_plan.rs"),
+        ("ReadPlanStore", "src/federation/read_plan.rs"),
+        // v61 (CIRISPersist#934, S4a) — the accord evidence doors and the location proof, touch claim and wholeness witness doors.
+        ("AccordStore", "src/federation/accord_admit.rs"),
+        ("EvidenceStore", "src/federation/evidence_admit.rs"),
         ("FederationDirectory", "src/federation/mod.rs"),
         ("BlobStorage", "src/federation/blobs.rs"),
         ("Backend", "src/store/backend.rs"),
@@ -1384,7 +1499,110 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 23] = [
+    const SHARED_PLANS: [(&str, &str); 61] = [
+        // v61 (CIRISPersist#934, S4a) — the blob plane: the byte writes.
+        ("src/federation/blob_admit.rs", "put_blob_planned"),
+        ("src/federation/blob_admit.rs", "store_blob_local_planned"),
+        ("src/federation/blob_admit.rs", "adopt_sealed_blob_planned"),
+        ("src/federation/blob_admit.rs", "put_blob_chunks_planned"),
+        (
+            "src/federation/blob_admit.rs",
+            "put_dag_manifest_over_held_planned",
+        ),
+        ("src/federation/blob_admit.rs", "seal_stream_planned"),
+        ("src/federation/blob_admit.rs", "held_dag_chunk_verdict"),
+        // v61 (CIRISPersist#934, S4a) — the blob plane: the chunk floor and the stream plane's records.
+        ("src/federation/blob_admit.rs", "put_blob_chunk_planned"),
+        ("src/federation/blob_admit.rs", "adopt_sealed_chunk_planned"),
+        (
+            "src/federation/blob_admit.rs",
+            "adopt_sealed_chunks_planned",
+        ),
+        ("src/federation/blob_admit.rs", "put_stream_sth_planned"),
+        (
+            "src/federation/blob_admit.rs",
+            "put_delivery_receipt_planned",
+        ),
+        ("src/federation/blob_admit.rs", "put_holding_claim_planned"),
+        ("src/federation/blob_admit.rs", "stream_dek_insert_planned"),
+        (
+            "src/federation/blob_admit.rs",
+            "stream_dek_put_grants_planned",
+        ),
+        ("src/federation/blob_admit.rs", "stream_claim_verdict"),
+        (
+            "src/federation/steward_purge.rs",
+            "refuse_tombstoned_at_write",
+        ),
+        // v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash sighting, the purge record write and the trust revocation.
+        (
+            "src/federation/directory_admit.rs",
+            "add_peer_record_planned",
+        ),
+        (
+            "src/federation/directory_admit.rs",
+            "insert_known_wire_hash_planned",
+        ),
+        (
+            "src/federation/directory_admit.rs",
+            "purge_put_execution_planned",
+        ),
+        (
+            "src/federation/directory_admit.rs",
+            "peer_record_held_verdict",
+        ),
+        ("src/federation/consent_admit.rs", "revoke_trust_planned"),
+        // v61 (CIRISPersist#934, S4a) — the Backend trait's erasure and fountain doors, and the gated directory reads.
+        (
+            "src/store/backend_plan.rs",
+            "delete_traces_for_agent_planned",
+        ),
+        (
+            "src/store/backend_plan.rs",
+            "delete_traces_for_agent_id_hash_planned",
+        ),
+        ("src/store/backend_plan.rs", "put_fountain_content_planned"),
+        ("src/store/backend_plan.rs", "put_aggregated_tier_planned"),
+        ("src/federation/read_plan.rs", "list_scores_planned"),
+        ("src/federation/read_plan.rs", "resolve_scores_planned"),
+        (
+            "src/federation/read_plan.rs",
+            "list_attestation_log_planned",
+        ),
+        (
+            "src/federation/read_plan.rs",
+            "list_key_registration_history_planned",
+        ),
+        ("src/federation/read_plan.rs", "list_derived_hex_planned"),
+        // v61 (CIRISPersist#934, S4a) — the accord evidence doors and the location proof, touch claim and wholeness witness doors.
+        (
+            "src/federation/accord_admit.rs",
+            "put_accord_proposal_planned",
+        ),
+        (
+            "src/federation/accord_admit.rs",
+            "put_accord_participation_planned",
+        ),
+        (
+            "src/federation/accord_admit.rs",
+            "put_accord_decision_planned",
+        ),
+        (
+            "src/federation/evidence_admit.rs",
+            "put_location_proof_planned",
+        ),
+        (
+            "src/federation/evidence_admit.rs",
+            "withdraw_location_proof_planned",
+        ),
+        (
+            "src/federation/evidence_admit.rs",
+            "put_touch_claim_planned",
+        ),
+        (
+            "src/federation/evidence_admit.rs",
+            "put_wholeness_witness_planned",
+        ),
         // v60.0.0 (CIRISPersist#934 step 4) — the consent writes, the #1105
         // family-scoped holdings read (its family gate), and the key-grant
         // projection (its row-shape gates).
@@ -1505,7 +1723,171 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 36] = [
+    const SHARED_DOORS: [(&str, &str, &str); 71] = [
+        // v61 (CIRISPersist#934, S4a) — the blob plane: the byte writes.
+        ("BlobStorage", "put_blob_with_scope", "put_blob_planned"),
+        (
+            "BlobStorage",
+            "store_blob_local",
+            "store_blob_local_planned",
+        ),
+        (
+            "BlobStorage",
+            "adopt_sealed_blob_at",
+            "adopt_sealed_blob_planned",
+        ),
+        ("BlobStorage", "put_blob_chunks", "put_blob_chunks_planned"),
+        (
+            "BlobStorage",
+            "put_dag_manifest_over_held",
+            "put_dag_manifest_over_held_planned",
+        ),
+        (
+            "BlobStorage",
+            "seal_stream_with_scope",
+            "seal_stream_planned",
+        ),
+        // v61 (CIRISPersist#934, S4a) — the blob plane: the chunk floor and the stream plane's records.
+        (
+            "BlobStorage",
+            "put_blob_chunk_with_scope",
+            "put_blob_chunk_planned",
+        ),
+        (
+            "BlobStorage",
+            "adopt_sealed_chunk_at",
+            "adopt_sealed_chunk_planned",
+        ),
+        (
+            "BlobStorage",
+            "adopt_sealed_chunks_at",
+            "adopt_sealed_chunks_planned",
+        ),
+        ("BlobStorage", "put_stream_sth", "put_stream_sth_planned"),
+        (
+            "BlobStorage",
+            "put_delivery_receipt",
+            "put_delivery_receipt_planned",
+        ),
+        (
+            "BlobStorage",
+            "put_holding_claim",
+            "put_holding_claim_planned",
+        ),
+        (
+            "BlobStorage",
+            "stream_dek_insert",
+            "stream_dek_insert_planned",
+        ),
+        (
+            "BlobStorage",
+            "stream_dek_put_grants",
+            "stream_dek_put_grants_planned",
+        ),
+        // v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash sighting, the purge record write and the trust revocation.
+        (
+            "FederationDirectory",
+            "add_peer_record",
+            "add_peer_record_planned",
+        ),
+        (
+            "FederationDirectory",
+            "insert_known_wire_hash",
+            "insert_known_wire_hash_planned",
+        ),
+        (
+            "FederationDirectory",
+            "purge_put_execution",
+            "purge_put_execution_planned",
+        ),
+        (
+            "FederationDirectory",
+            "revoke_trust",
+            "revoke_trust_planned",
+        ),
+        (
+            "DirectoryStore",
+            "store_planned_peer_record",
+            "peer_record_held_verdict",
+        ),
+        // v61 (CIRISPersist#934, S4a) — the Backend trait's erasure and fountain doors, and the gated directory reads.
+        (
+            "Backend",
+            "delete_traces_for_agent",
+            "delete_traces_for_agent_planned",
+        ),
+        (
+            "Backend",
+            "delete_traces_for_agent_id_hash",
+            "delete_traces_for_agent_id_hash_planned",
+        ),
+        (
+            "Backend",
+            "put_fountain_content",
+            "put_fountain_content_planned",
+        ),
+        (
+            "Backend",
+            "put_aggregated_tier",
+            "put_aggregated_tier_planned",
+        ),
+        ("FederationDirectory", "list_scores", "list_scores_planned"),
+        (
+            "FederationDirectory",
+            "resolve_scores",
+            "resolve_scores_planned",
+        ),
+        (
+            "FederationDirectory",
+            "list_attestation_log",
+            "list_attestation_log_planned",
+        ),
+        (
+            "FederationDirectory",
+            "list_key_registration_history",
+            "list_key_registration_history_planned",
+        ),
+        (
+            "FederationDirectory",
+            "list_derived_hex",
+            "list_derived_hex_planned",
+        ),
+        // v61 (CIRISPersist#934, S4a) — the accord evidence doors and the location proof, touch claim and wholeness witness doors.
+        (
+            "FederationDirectory",
+            "put_accord_proposal",
+            "put_accord_proposal_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_accord_participation",
+            "put_accord_participation_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_accord_decision",
+            "put_accord_decision_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_location_proof",
+            "put_location_proof_planned",
+        ),
+        (
+            "FederationDirectory",
+            "withdraw_location_proof",
+            "withdraw_location_proof_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_touch_claim",
+            "put_touch_claim_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_wholeness_witness",
+            "put_wholeness_witness_planned",
+        ),
         // v60.0.0 (CIRISPersist#934 step 4) — the consent writes.
         (
             "FederationDirectory",

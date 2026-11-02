@@ -146,8 +146,7 @@ impl CorrelationService for PostgresBackend {
         let rp_str = correlation.retention_policy.as_sql_str().to_owned();
         let metric_value_f32: Option<f32> = correlation.metric_value.map(|v| v as f32);
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         // ON CONFLICT DO NOTHING — first writer wins; idempotent
@@ -196,8 +195,7 @@ impl CorrelationService for PostgresBackend {
             return Err(Error::InvalidArgument("correlation_id required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row_opt = client
@@ -230,8 +228,7 @@ impl CorrelationService for PostgresBackend {
         let status_str = new_status.as_sql_str().to_owned();
         let now = chrono::Utc::now();
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let changed = client
@@ -334,8 +331,7 @@ impl CorrelationService for PostgresBackend {
         );
 
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -864,7 +860,7 @@ mod tests {
         // or extend the filter later). Validate the index supports
         // such walks via a raw query — this is the contract the
         // partial-index migration declares.
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let rows = client
             .query(
                 "SELECT COUNT(*)::BIGINT FROM cirislens.service_correlations \

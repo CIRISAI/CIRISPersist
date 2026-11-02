@@ -68,8 +68,7 @@ impl ServiceTokenRevocationService for PostgresBackend {
     async fn record_revocation(&self, revocation: RevokedServiceToken) -> Result<(), Error> {
         validate_revocation(&revocation)?;
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         // Idempotent upsert: first record wins, subsequent records
@@ -97,8 +96,7 @@ impl ServiceTokenRevocationService for PostgresBackend {
 
     async fn list_revocations(&self) -> Result<Vec<RevokedServiceToken>, Error> {
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let rows = client
@@ -123,8 +121,7 @@ impl ServiceTokenRevocationService for PostgresBackend {
             return Err(Error::InvalidArgument("token_hash required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row_opt = client

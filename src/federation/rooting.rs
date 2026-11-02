@@ -1466,7 +1466,7 @@ mod postgres_conformance {
     /// is unnecessary because DELETE of the whole set in one statement
     /// satisfies the deferred-or-immediate FK once all are gone.
     async fn pg_cleanup(backend: &PostgresBackend, key_ids: &[&str]) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         for id in key_ids {
             // attestations / revocations / detection events could
             // reference these; the conformance suite writes none, so
@@ -1643,7 +1643,7 @@ mod postgres_conformance {
         // b (signed by a), then UPDATE a's scrub_key_id to b.
         put(&backend, signed_record(&a, &a, primitive())).await;
         put(&backend, signed_record(&b, &a, primitive())).await;
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .execute(
                 "UPDATE cirislens.federation_keys SET scrub_key_id = $1 WHERE key_id = $2",
@@ -1663,7 +1663,7 @@ mod postgres_conformance {
         );
 
         // cleanup: break the cycle before delete (FK).
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .execute(
                 "UPDATE cirislens.federation_keys SET scrub_key_id = key_id \

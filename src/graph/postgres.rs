@@ -224,8 +224,7 @@ impl GraphService for PostgresBackend {
         }
         let attrs = encode_attributes(&node.attributes, bulk_import)?;
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
 
@@ -303,8 +302,7 @@ impl GraphService for PostgresBackend {
             .map_err(|e| Error::InvalidArgument(format!("edge_id parse: {e}")))?;
         let attrs = encode_attributes(&edge.attributes, bulk_import)?;
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         // v1.3.1 (CIRISPersist#49): honor caller-supplied
@@ -341,8 +339,7 @@ impl GraphService for PostgresBackend {
         hard: bool,
     ) -> Result<bool, Error> {
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         if hard {
@@ -386,8 +383,7 @@ impl GraphService for PostgresBackend {
 
     async fn get_node(&self, node_id: &str, scope: GraphScope) -> Result<Option<GraphNode>, Error> {
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row_opt = client
@@ -415,8 +411,7 @@ impl GraphService for PostgresBackend {
         relationship_filter: Option<&[String]>,
     ) -> Result<Vec<GraphEdge>, Error> {
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let where_dir = direction_clause(direction);
@@ -536,8 +531,7 @@ impl GraphService for PostgresBackend {
             ORDER BY depth ASC, n.node_id ASC"
         );
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let rows = client
@@ -644,8 +638,7 @@ impl GraphService for PostgresBackend {
         );
 
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -709,8 +702,7 @@ impl GraphService for PostgresBackend {
         let sql = format!("SELECT COUNT(*)::BIGINT FROM cirisgraph.nodes WHERE {where_sql}");
 
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -727,8 +719,7 @@ impl GraphService for PostgresBackend {
 
     async fn count_edges(&self, scope: GraphScope) -> Result<u64, Error> {
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let scope_str = scope.as_sql_str().to_string();
@@ -750,8 +741,7 @@ impl GraphService for PostgresBackend {
         scope: GraphScope,
     ) -> Result<std::collections::HashMap<String, u64>, Error> {
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let scope_str = scope.as_sql_str().to_string();

@@ -5562,7 +5562,7 @@ mod tests {
         // rows whose `scrub_key_id` FKs to A1 — so drop those referencing rows
         // in the SAME statement (FK-atomic), else deleting A1/B1/C1 fails and a
         // divergent test-key anchor survives to squat the real seed.
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let _ = client
             .execute(
                 "DELETE FROM cirislens.federation_keys \

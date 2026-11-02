@@ -1808,7 +1808,7 @@ mod tests {
     /// multiple tests share a binary; unlikely under nextest but
     /// cheap insurance) would shadow a freshly-rotated key.
     async fn reset_secrets_state(backend: &PostgresBackend) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .batch_execute(
                 "TRUNCATE cirislens_secrets.secrets, \
@@ -2084,7 +2084,7 @@ mod tests {
 
         // DB holds EXACTLY ONE active row — the V043 index guarantees
         // it; this confirms the rows agree with the index.
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let active: i64 = client
             .query_one(
                 "SELECT COUNT(*) FROM cirislens_secrets.master_key_meta \

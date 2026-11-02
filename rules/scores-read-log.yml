@@ -1,4 +1,5 @@
-# scores_read_audit.rs::every_scores_read_site_logs: list_scores and resolve_scores log once each.
+# scores_read_audit.rs::every_scores_read_site_logs: list_scores and resolve_scores log once each,
+# in their shared plans (v61, CIRISPersist#934); the backends hold none.
 id: scores-read-log
 language: rust
 severity: hint
@@ -13,7 +14,8 @@ rule:
     stopBy: end
     has:
       field: name
-      regex: '^(list_scores|resolve_scores)$'
+      regex: '^(list_scores|resolve_scores)(_planned)?$'
 files:
+  - src/federation/read_plan.rs
   - src/store/sqlite.rs
   - src/store/postgres.rs

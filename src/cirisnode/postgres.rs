@@ -59,8 +59,7 @@ fn target_kind_str(k: TargetRowKind) -> &'static str {
 
 impl PostgresBackend {
     async fn cirisnode_client(&self) -> Result<deadpool_postgres::Object, Error> {
-        self.pool()
-            .get()
+        self.checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))
     }

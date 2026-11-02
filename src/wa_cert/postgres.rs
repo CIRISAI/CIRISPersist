@@ -158,8 +158,7 @@ impl WaCertService for PostgresBackend {
         let role_str = cert.role.as_sql_str();
         let token_type_str = cert.token_type.as_sql_str();
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         client
@@ -230,8 +229,7 @@ impl WaCertService for PostgresBackend {
             return Err(Error::InvalidArgument("wa_id required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row_opt = client
@@ -252,8 +250,7 @@ impl WaCertService for PostgresBackend {
             return Err(Error::InvalidArgument("jwt_kid required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row_opt = client
@@ -281,8 +278,7 @@ impl WaCertService for PostgresBackend {
             return Err(Error::InvalidArgument("oauth_external_id required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row_opt = client
@@ -309,8 +305,7 @@ impl WaCertService for PostgresBackend {
         }
         let role_str = role.as_sql_str().to_owned();
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let rows = client
@@ -337,8 +332,7 @@ impl WaCertService for PostgresBackend {
             return Err(Error::InvalidArgument("wa_id required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let changed = client
@@ -360,8 +354,7 @@ impl WaCertService for PostgresBackend {
             return Err(Error::InvalidArgument("wa_id required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let changed = client
@@ -803,7 +796,7 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let res = client
             .execute(
                 "INSERT INTO cirislens.wa_cert (\
@@ -827,7 +820,7 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let res = client
             .execute(
                 "INSERT INTO cirislens.wa_cert (\

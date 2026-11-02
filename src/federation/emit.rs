@@ -893,7 +893,7 @@ mod postgres_tests {
     }
 
     async fn pg_seed_federation_key(backend: &PostgresBackend, key_id: &str) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .execute(
                 "INSERT INTO cirislens.federation_keys (\
@@ -911,7 +911,7 @@ mod postgres_tests {
     }
 
     async fn pg_cleanup(backend: &PostgresBackend, tenant: &str) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         for sql in [
             "DELETE FROM cirislens.federation_trust_grants WHERE tenant_id = $1",
             "DELETE FROM cirislens.merkle_sth_log WHERE tenant_id = $1",
@@ -985,7 +985,7 @@ mod postgres_tests {
         assert_eq!(page.items.len(), 1);
 
         // Merkle + STH rows exist.
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let leaves: i64 = client
             .query_one(
                 "SELECT COUNT(*)::BIGINT FROM cirislens.merkle_leaves WHERE tenant_id = $1",
@@ -1075,7 +1075,7 @@ mod postgres_tests {
         assert_eq!(r.chain_event_id, 2);
         assert_eq!(r.tree_size_at_emit, 2);
 
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let row = client
             .query_one(
                 "SELECT revoked_at, revoked_by \

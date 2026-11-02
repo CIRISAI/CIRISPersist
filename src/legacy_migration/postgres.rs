@@ -131,8 +131,7 @@ async fn migrate_nodes(
     let stop_at = options.stop_after_errors.unwrap_or(100);
 
     let client = backend
-        .pool()
-        .get()
+        .checkout()
         .await
         .map_err(|e| Error::Backend(format!("pool: {e}")))?;
 
@@ -379,8 +378,7 @@ async fn snapshot_present_nodes(
     backend: &PostgresBackend,
 ) -> Result<HashSet<(String, String)>, Error> {
     let client = backend
-        .pool()
-        .get()
+        .checkout()
         .await
         .map_err(|e| Error::Backend(format!("pool: {e}")))?;
     let rows = client
@@ -407,8 +405,7 @@ async fn snapshot_present_nodes(
 /// distinguish "wrote" vs "was already there").
 async fn snapshot_present_edge_ids(backend: &PostgresBackend) -> Result<HashSet<String>, Error> {
     let client = backend
-        .pool()
-        .get()
+        .checkout()
         .await
         .map_err(|e| Error::Backend(format!("pool: {e}")))?;
     let rows = client
@@ -439,8 +436,7 @@ async fn migrate_edges(
     let stop_at = options.stop_after_errors.unwrap_or(100);
 
     let client = backend
-        .pool()
-        .get()
+        .checkout()
         .await
         .map_err(|e| Error::Backend(format!("pool: {e}")))?;
     // created_at::text — same #72 rationale as the node read.
@@ -673,7 +669,7 @@ mod tests {
     /// is shared with other tests so we tag every row with a UUID
     /// suffix and clean up at end via the `test_cleanup` helper.
     async fn ensure_legacy_tables(backend: &PostgresBackend) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .batch_execute(
                 // 8-column shape mirrors CIRISAgent's pre-v2.9.0
@@ -710,7 +706,7 @@ mod tests {
     /// tests and don't know who else seeded data; per-prefix delete
     /// is the conservative cleanup.
     async fn cleanup_legacy(backend: &PostgresBackend, prefix: &str) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let _ = client
             .execute(
                 "DELETE FROM public.graph_edges WHERE edge_id LIKE $1",
@@ -744,7 +740,7 @@ mod tests {
         scope: &str,
         attrs: serde_json::Value,
     ) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .execute(
                 "INSERT INTO public.graph_nodes (\
@@ -764,7 +760,7 @@ mod tests {
         tgt: &str,
         scope: &str,
     ) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .execute(
                 "INSERT INTO public.graph_edges (\
@@ -1021,7 +1017,7 @@ mod tests {
         // Dedicated schema so the naive-timestamp DDL doesn't collide
         // with the shared `public.graph_nodes` (timestamptz) other
         // tests created. Also exercises the `legacy_schema` override.
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .batch_execute(
                 "DROP SCHEMA IF EXISTS legacy_naive_probe CASCADE;\
@@ -1102,7 +1098,7 @@ mod tests {
         );
 
         // Cleanup.
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let _ = client
             .batch_execute("DROP SCHEMA IF EXISTS legacy_naive_probe CASCADE;")
             .await;
@@ -1176,7 +1172,7 @@ mod tests {
         let canonical_uuid: Uuid = canonical
             .parse()
             .expect("canonical id must be a valid UUID");
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let found = client
             .query_one(
                 "SELECT COUNT(*)::BIGINT FROM cirisgraph.edges WHERE edge_id = $1",

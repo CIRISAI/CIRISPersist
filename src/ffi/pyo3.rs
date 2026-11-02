@@ -34902,8 +34902,7 @@ async fn boot_audit_self_verify(backend: &BackendDispatch) -> Result<BootAuditSu
     let tenant_ids: Vec<String> = match backend {
         #[cfg(feature = "postgres")]
         BackendDispatch::Postgres(pg) => pg
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| format!("pool: {e}"))?
             // v59.1.2 — the Postgres table is `cirislens.audit_log` (V014);
@@ -35020,7 +35019,7 @@ async fn build_audit_chain_proof(
     let located: Option<(String, i64)> = match backend {
         #[cfg(feature = "postgres")]
         BackendDispatch::Postgres(pg) => {
-            let client = pg.pool().get().await.map_err(|e| format!("pool: {e}"))?;
+            let client = pg.checkout().await.map_err(|e| format!("pool: {e}"))?;
             let rows = client
                 .query(
                     "SELECT tenant_id, sequence_number \
@@ -35083,7 +35082,7 @@ async fn build_audit_chain_proof(
     let entries: Vec<AuditChainEntry> = match backend {
         #[cfg(feature = "postgres")]
         BackendDispatch::Postgres(pg) => {
-            let client = pg.pool().get().await.map_err(|e| format!("pool: {e}"))?;
+            let client = pg.checkout().await.map_err(|e| format!("pool: {e}"))?;
             let rows = client
                 .query(
                     "SELECT sequence_number, tenant_id, action_type, recorded_at, \

@@ -205,6 +205,9 @@ mod pg_impl {
     /// tests don't need to change shape.
     pub struct PgMerkleStore {
         pool: Pool,
+        /// v61 (CIRISPersist#1166) — how long a checkout waits before the
+        /// pool is exhausted (the backend's, when built from one).
+        checkout_wait: std::time::Duration,
         runtime: Handle,
         tenant_id: String,
     }
@@ -223,11 +226,7 @@ mod pg_impl {
             runtime: Handle,
             tenant_id: impl Into<String>,
         ) -> Self {
-            Self {
-                pool: backend.pool().clone(),
-                runtime,
-                tenant_id: tenant_id.into(),
-            }
+            Self::from_backend(&backend, runtime, tenant_id)
         }
 
         /// Construct a tenant-scoped Postgres Merkle store from the
@@ -237,6 +236,22 @@ mod pg_impl {
         pub fn from_pool(pool: Pool, runtime: Handle, tenant_id: impl Into<String>) -> Self {
             Self {
                 pool,
+                checkout_wait: crate::store::postgres::POOL_WAIT_TIMEOUT,
+                runtime,
+                tenant_id: tenant_id.into(),
+            }
+        }
+
+        /// v61 (CIRISPersist#1166) — a tenant-scoped store over `backend`'s
+        /// pool that waits for a connection as long as `backend` does.
+        pub(crate) fn from_backend(
+            backend: &PostgresBackend,
+            runtime: Handle,
+            tenant_id: impl Into<String>,
+        ) -> Self {
+            Self {
+                pool: backend.pool().clone(),
+                checkout_wait: backend.checkout_wait(),
                 runtime,
                 tenant_id: tenant_id.into(),
             }
@@ -268,10 +283,10 @@ mod pg_impl {
             let chain_event_id = entry.chain_event_id;
             let tenant = self.tenant_id.clone();
             let pool = self.pool.clone();
+            let wait = self.checkout_wait;
 
             self.runtime.block_on(async move {
-                let mut client = pool
-                    .get()
+                let mut client = crate::store::postgres::checkout_bounded(&pool, wait, None)
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
                 let tx = client
@@ -323,11 +338,11 @@ mod pg_impl {
         fn get(&self, index: u64) -> Result<Option<AuditLeaf>, TransparencyError> {
             let tenant = self.tenant_id.clone();
             let pool = self.pool.clone();
+            let wait = self.checkout_wait;
             let leaf_idx = i64::try_from(index)
                 .map_err(|_| TransparencyError::Storage("index exceeds i64 range".into()))?;
             self.runtime.block_on(async move {
-                let client = pool
-                    .get()
+                let client = crate::store::postgres::checkout_bounded(&pool, wait, None)
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
                 let row_opt = client
@@ -354,11 +369,11 @@ mod pg_impl {
         fn leaf_hash(&self, index: u64) -> Result<Option<[u8; 32]>, TransparencyError> {
             let tenant = self.tenant_id.clone();
             let pool = self.pool.clone();
+            let wait = self.checkout_wait;
             let leaf_idx = i64::try_from(index)
                 .map_err(|_| TransparencyError::Storage("index exceeds i64 range".into()))?;
             self.runtime.block_on(async move {
-                let client = pool
-                    .get()
+                let client = crate::store::postgres::checkout_bounded(&pool, wait, None)
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
                 let row_opt = client
@@ -383,9 +398,9 @@ mod pg_impl {
         fn tree_size(&self) -> Result<u64, TransparencyError> {
             let tenant = self.tenant_id.clone();
             let pool = self.pool.clone();
+            let wait = self.checkout_wait;
             self.runtime.block_on(async move {
-                let client = pool
-                    .get()
+                let client = crate::store::postgres::checkout_bounded(&pool, wait, None)
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
                 let row = client
@@ -407,9 +422,9 @@ mod pg_impl {
         fn latest_sth(&self) -> Result<Option<SignedTreeHead>, TransparencyError> {
             let tenant = self.tenant_id.clone();
             let pool = self.pool.clone();
+            let wait = self.checkout_wait;
             self.runtime.block_on(async move {
-                let client = pool
-                    .get()
+                let client = crate::store::postgres::checkout_bounded(&pool, wait, None)
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
                 let row_opt = client
@@ -459,6 +474,7 @@ mod pg_impl {
         fn store_sth(&self, sth: &SignedTreeHead) -> Result<(), TransparencyError> {
             let tenant = self.tenant_id.clone();
             let pool = self.pool.clone();
+            let wait = self.checkout_wait;
             let tree_size = i64::try_from(sth.tree_size)
                 .map_err(|_| TransparencyError::Storage("tree_size exceeds i64 range".into()))?;
             let root_hash = sth.root_hash.to_vec();
@@ -467,8 +483,7 @@ mod pg_impl {
             let witnesses_str = serialize_witness_signatures(&sth.witness_signatures)?;
             let signer_key_id = hex::encode(&sth.signature.classical.public_key);
             self.runtime.block_on(async move {
-                let client = pool
-                    .get()
+                let client = crate::store::postgres::checkout_bounded(&pool, wait, None)
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
                 let witnesses_value: serde_json::Value = serde_json::from_str(&witnesses_str)
@@ -499,9 +514,9 @@ mod pg_impl {
         fn all_leaf_hashes(&self) -> Result<Vec<[u8; 32]>, TransparencyError> {
             let tenant = self.tenant_id.clone();
             let pool = self.pool.clone();
+            let wait = self.checkout_wait;
             self.runtime.block_on(async move {
-                let client = pool
-                    .get()
+                let client = crate::store::postgres::checkout_bounded(&pool, wait, None)
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
                 let rows = client
@@ -1191,7 +1206,7 @@ mod tests {
         }
 
         async fn clean_tenant(backend: &PostgresBackend, tenant: &str) {
-            let client = backend.pool().get().await.unwrap();
+            let client = backend.checkout().await.unwrap();
             client
                 .execute(
                     "DELETE FROM cirislens.merkle_sth_log WHERE tenant_id = $1",

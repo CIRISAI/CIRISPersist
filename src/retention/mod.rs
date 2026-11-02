@@ -994,7 +994,7 @@ mod tests {
 
         // Verify live rows + chain unbroken via PG client.
         let pg = engine.postgres_backend().expect("pg backend");
-        let client = pg.pool().get().await.unwrap();
+        let client = pg.checkout().await.unwrap();
         let live_seqs_rows = client
             .query(
                 "SELECT sequence_number FROM cirislens.audit_log \

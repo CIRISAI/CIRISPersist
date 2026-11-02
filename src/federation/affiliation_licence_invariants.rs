@@ -1775,7 +1775,7 @@ mod run {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
-        let client = b.pool().get().await.unwrap();
+        let client = b.checkout().await.unwrap();
         for t in [
             "federation_organizations",
             "federation_org_memberships",

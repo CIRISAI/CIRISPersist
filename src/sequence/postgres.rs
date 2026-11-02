@@ -46,8 +46,7 @@ impl SequenceService for PostgresBackend {
     async fn next_sequence(&self, identity: &str, stream: &str) -> Result<u64, Error> {
         validate_key(identity, stream)?;
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         // Atomic bump-and-return: a single statement increments the
@@ -76,8 +75,7 @@ impl SequenceService for PostgresBackend {
     async fn peek_sequence(&self, identity: &str, stream: &str) -> Result<u64, Error> {
         validate_key(identity, stream)?;
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row_opt = client

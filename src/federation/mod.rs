@@ -32,6 +32,11 @@
 //! and the registry-side `docs/FEDERATION_CLIENT.md` for the consumer
 //! complement.
 
+/// v61 (CIRISPersist#934, S4a) — the accord evidence doors, decided
+/// once: the proposal, participation and decision plans and the per-backend
+/// `AccordStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod accord_admit;
 pub mod accord_carriage;
 pub mod accord_quorum;
 /// v53.0.0 (CC 4.2.6) — an accord holder's recovery under a pre-committed key.
@@ -58,6 +63,11 @@ mod attestation_apply_invariants;
 /// v25.1.0 (CIRISPersist#582) — the backend-generic signed-ATTESTATION emit
 /// recipe (distinct from [`emit`], the trust-grant/audit-entry API).
 pub mod attestation_emit;
+/// v61 (CIRISPersist#934, S4a) — the blob plane's gated doors (the chunk
+/// floor, the stream plane's records, the blob writes), decided once, with
+/// the per-backend `BlobFloorStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod blob_admit;
 /// v57.0.0 (CIRISPersist#934 step 2) — the community and roster doors,
 /// decided once: `plan_put_community`, the three roster plans, and the
 /// per-backend `CommunityStore` executor.
@@ -66,6 +76,21 @@ pub(crate) mod community_admit;
 /// the consent-role and trust-grant plans, the consent read folds, and the
 /// per-backend `ConsentStore` executor.
 pub(crate) mod consent_admit;
+/// v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash
+/// sighting and the purge record write, decided once, with the per-backend
+/// `DirectoryStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod directory_admit;
+/// v61 (CIRISPersist#934, S4a) — the location proof, touch claim and
+/// wholeness witness doors, decided once, with the per-backend
+/// `EvidenceStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod evidence_admit;
+/// v61 (CIRISPersist#934, S4a) — the gated directory reads (the scores
+/// reads, the attestation log, the key history, the rendition index), decided
+/// once, with the per-backend `ReadPlanStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod read_plan;
 /// v60.0.0 (CIRISPersist#934 step 4) — the sweeps' selections, decided once:
 /// the PQC sweep's page, the reaper's page, the known-hash eviction report and
 /// the room retention leg, with the per-backend `SweepStore` /
