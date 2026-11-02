@@ -128,6 +128,16 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v61 (CIRISPersist#934, S4b) — the identity-occurrence writes.
+    ("put_identity_occurrence_planned", Class::Plan),
+    ("put_identity_occurrence_local_planned", Class::Plan),
+    // The occurrence plans' shared body (same-file helper): the device-class and encryption-key gates, the hash, the encodings, the projected route.
+    ("plan_occurrence", Class::Delegates),
+    // The occurrence executor (storage only; compared across backends as the `OccurrenceStore` trait).
+    ("rehome_key_plane_before_write", Class::Plumbing),
+    ("store_planned_occurrence", Class::Plumbing),
+    ("store_planned_local_occurrence", Class::Plumbing),
+    ("index_occurrence_row", Class::Plumbing),
     // v61 (CIRISPersist#1148) — the replicated community apply's put-time
     // audience precondition: the verdict refuses a record this node may not
     // receive (a Gate), asked about this node's own key (Plumbing: a read of
@@ -1185,7 +1195,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // permitted signer, neither side role-gated; refuses with `Conflict`.
     ("prepare_invalid_replace", Class::Gate),
     ("prepare_sealed_manifest_row", Class::Plumbing),
-    ("project_route", Class::Plumbing),
     // #846 — the chunk floor's one body; the write door and the adopt door
     // both run its sequence.
     // v52.0.0 (CIRISPersist#957) — the chunk floor, batched: the single floor
@@ -1485,7 +1494,9 @@ mod tests {
     /// The traits whose impls are compared, and where each trait's **default**
     /// bodies live. A backend that does not override a defaulted method runs
     /// the default, so the default's gate sequence is what it contributes.
-    const TRAITS: [(&str, &str); 17] = [
+    const TRAITS: [(&str, &str); 18] = [
+        // v61 (CIRISPersist#934, S4b) — the identity-occurrence writes.
+        ("OccurrenceStore", "src/federation/occurrence_admit.rs"),
         // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
         ("TransportStore", "src/federation/transport_admit.rs"),
         // v61 (CIRISPersist#934, S4a) — the blob plane: the byte writes.
@@ -1522,7 +1533,16 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 63] = [
+    const SHARED_PLANS: [(&str, &str); 65] = [
+        // v61 (CIRISPersist#934, S4b) — the identity-occurrence writes.
+        (
+            "src/federation/occurrence_admit.rs",
+            "put_identity_occurrence_planned",
+        ),
+        (
+            "src/federation/occurrence_admit.rs",
+            "put_identity_occurrence_local_planned",
+        ),
         // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
         (
             "src/federation/transport_admit.rs",
@@ -1755,7 +1775,18 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 73] = [
+    const SHARED_DOORS: [(&str, &str, &str); 75] = [
+        // v61 (CIRISPersist#934, S4b) — the identity-occurrence writes.
+        (
+            "FederationDirectory",
+            "put_identity_occurrence",
+            "put_identity_occurrence_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_identity_occurrence_local",
+            "put_identity_occurrence_local_planned",
+        ),
         // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
         (
             "FederationDirectory",

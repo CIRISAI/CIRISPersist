@@ -86,6 +86,10 @@ pub(crate) mod directory_admit;
 /// `EvidenceStore` executor.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) mod evidence_admit;
+/// v61 (CIRISPersist#934, S4b) — the identity-occurrence writes, decided
+/// once, with the per-backend `OccurrenceStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod occurrence_admit;
 /// v61 (CIRISPersist#934, S4a) — the gated directory reads (the scores
 /// reads, the attestation log, the key history, the rendition index), decided
 /// once, with the per-backend `ReadPlanStore` executor.

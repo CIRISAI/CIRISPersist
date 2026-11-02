@@ -2760,6 +2760,205 @@ impl crate::federation::transport_admit::TransportStore for PostgresBackend {
     }
 }
 
+/// v61 (CIRISPersist#934, S4b) — the identity-occurrence executor on
+/// postgres. Storage only: the decisions are `federation::occurrence_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::occurrence_admit::OccurrenceStore for PostgresBackend {
+    async fn rehome_key_plane_before_write(&self) -> Result<(), crate::federation::Error> {
+        self.rehome_legacy_key_plane().await
+    }
+
+    async fn store_planned_occurrence(
+        &self,
+        planned: crate::federation::occurrence_admit::PlannedOccurrence,
+    ) -> Result<crate::federation::occurrence_admit::OccurrenceWrite, crate::federation::Error>
+    {
+        let crate::federation::occurrence_admit::PlannedOccurrence {
+            row,
+            enc_x25519,
+            enc_ml_kem,
+            transport_binding_json,
+            signed,
+        } = planned;
+        let signed = signed.ok_or_else(|| {
+            crate::federation::Error::Backend("store_planned_occurrence: no signature".into())
+        })?;
+        let signed_envelope_text = pg_envelope_text(&signed.signed_envelope, "signed_envelope")?;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let tx = client.transaction().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("put_identity_occurrence tx: {e}"))
+        })?;
+        // v36.0.0 (#668) — THIS node's serve position (V130), read through
+        // `tx`; v52.0.0 (#930) — the history row in the same statement,
+        // whether or not the last-signed-wins upsert takes the record.
+        let admitted_at = self
+            .next_plane_position(&tx, "federation_identity_occurrences")
+            .await?;
+        let applied: i64 = tx
+            .query_one(
+                "WITH hist AS (\
+                    INSERT INTO cirislens.federation_identity_occurrence_history (\
+                        identity_key_id, occurrence_key_id, asserted_at, valid_until, \
+                        attesting_key_id, signed_envelope, signature\
+                    ) VALUES ($1, $2, $5, $6, $10, $11, $12) ON CONFLICT DO NOTHING\
+                 ), up AS (\
+                 INSERT INTO cirislens.federation_identity_occurrences (\
+                    identity_key_id, occurrence_key_id, device_class, \
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, \
+                    attesting_key_id, signed_envelope, signature, transport_binding, \
+                    admitted_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                 ON CONFLICT (identity_key_id, occurrence_key_id) DO UPDATE SET \
+                    device_class = EXCLUDED.device_class, \
+                    hardware_attestation = EXCLUDED.hardware_attestation, \
+                    asserted_at = EXCLUDED.asserted_at, \
+                    valid_until = EXCLUDED.valid_until, \
+                    persist_row_hash = EXCLUDED.persist_row_hash, \
+                    pubkey_x25519_base64 = EXCLUDED.pubkey_x25519_base64, \
+                    pubkey_ml_kem_768_base64 = EXCLUDED.pubkey_ml_kem_768_base64, \
+                    attesting_key_id = EXCLUDED.attesting_key_id, \
+                    signed_envelope = EXCLUDED.signed_envelope, \
+                    signature = EXCLUDED.signature, \
+                    transport_binding = EXCLUDED.transport_binding, \
+                    admitted_at = EXCLUDED.admitted_at \
+                 WHERE EXCLUDED.asserted_at > cirislens.federation_identity_occurrences.asserted_at \
+                 RETURNING 1) SELECT COUNT(*) FROM up",
+                &[
+                    &row.identity_key_id,
+                    &row.occurrence_key_id,
+                    &row.device_class,
+                    &row.hardware_attestation,
+                    &row.asserted_at,
+                    &row.valid_until,
+                    &row.persist_row_hash,
+                    &enc_x25519,
+                    &enc_ml_kem,
+                    &signed.attesting_key_id,
+                    &signed_envelope_text,
+                    &signed.signature_json,
+                    &transport_binding_json,
+                    &admitted_at,
+                ],
+            )
+            .await
+            .and_then(|r| r.try_get::<_, i64>(0))
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("foreign key") {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "FK constraint violated on identity_occurrence insert: {msg}"
+                    ))
+                } else {
+                    crate::federation::Error::Backend(format!("insert identity_occurrence: {msg}"))
+                }
+            })?;
+        // v58.0.0 (#991) — the pair's `identity:occurrence:v1` row follows the
+        // current signed occurrence, in this transaction.
+        pg_sync_occurrence_row(&tx, &row.identity_key_id, &row.occurrence_key_id).await?;
+        tx.commit().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("put_identity_occurrence commit: {e}"))
+        })?;
+        let row_id: Option<String> = if applied == 0 || !pg_key_plane_present(&**client).await? {
+            None
+        } else {
+            match client
+                .query_opt(
+                    "SELECT attestation_id FROM cirislens.federation_identity_occurrences \
+                      WHERE identity_key_id = $1 AND occurrence_key_id = $2",
+                    &[&row.identity_key_id, &row.occurrence_key_id],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("occurrence row pointer: {e}"))
+                })? {
+                Some(r) => r.safe_get_with(0, crate::federation::Error::Backend)?,
+                None => None,
+            }
+        };
+        Ok(crate::federation::occurrence_admit::OccurrenceWrite {
+            applied: applied > 0,
+            row_id,
+        })
+    }
+
+    async fn store_planned_local_occurrence(
+        &self,
+        planned: crate::federation::occurrence_admit::PlannedOccurrence,
+    ) -> Result<(), crate::federation::Error> {
+        // #418 / v21.17.1 (#541) — the trusted-local upsert never mutates a
+        // SIGNED occurrence (`WHERE signature IS NULL`).
+        let crate::federation::occurrence_admit::PlannedOccurrence {
+            row,
+            enc_x25519,
+            enc_ml_kem,
+            transport_binding_json,
+            ..
+        } = planned;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let admitted_at = self
+            .next_plane_position(&client, "federation_identity_occurrences")
+            .await?;
+        client
+            .execute(
+                "WITH hist AS (\
+                    INSERT INTO cirislens.federation_identity_occurrence_history (\
+                        identity_key_id, occurrence_key_id, asserted_at, valid_until, \
+                        attesting_key_id\
+                    ) VALUES ($1, $2, $5, $6, '') ON CONFLICT DO NOTHING\
+                 ) \
+                 INSERT INTO cirislens.federation_identity_occurrences (\
+                    identity_key_id, occurrence_key_id, device_class, \
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding, \
+                    admitted_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 ON CONFLICT (identity_key_id, occurrence_key_id) DO UPDATE SET \
+                    device_class = EXCLUDED.device_class, \
+                    hardware_attestation = EXCLUDED.hardware_attestation, \
+                    asserted_at = EXCLUDED.asserted_at, \
+                    valid_until = EXCLUDED.valid_until, \
+                    persist_row_hash = EXCLUDED.persist_row_hash, \
+                    pubkey_x25519_base64 = EXCLUDED.pubkey_x25519_base64, \
+                    pubkey_ml_kem_768_base64 = EXCLUDED.pubkey_ml_kem_768_base64, \
+                    transport_binding = EXCLUDED.transport_binding, \
+                    admitted_at = EXCLUDED.admitted_at \
+                 WHERE cirislens.federation_identity_occurrences.signature IS NULL",
+                &[
+                    &row.identity_key_id,
+                    &row.occurrence_key_id,
+                    &row.device_class,
+                    &row.hardware_attestation,
+                    &row.asserted_at,
+                    &row.valid_until,
+                    &row.persist_row_hash,
+                    &enc_x25519,
+                    &enc_ml_kem,
+                    &transport_binding_json,
+                    &admitted_at,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("put_identity_occurrence_local: {e}"))
+            })?;
+        Ok(())
+    }
+
+    async fn index_occurrence_row(
+        &self,
+        row_id: Option<&str>,
+    ) -> Result<(), crate::federation::Error> {
+        self.index_plane_row(row_id).await
+    }
+}
+
 /// v61 (CIRISPersist#934) — the accord evidence executor on postgres.
 /// Storage only: the decisions are `federation::accord_admit`'s.
 #[async_trait::async_trait]
@@ -10738,269 +10937,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         occurrence: crate::federation::SignedIdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
-        // v14.0.0 (CIRISPersist#418) — verify the hybrid signature over the exact
-        // producer envelope + signer authority + C4 BEFORE any write (one gate,
-        // HTTP + wire; fail-secure). Backend-symmetric with SQLite.
-        crate::federation::admission::verify_signed_identity_occurrence(self, &occurrence).await?;
-        // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — a roster change lands by
-        // the two-path door or is held as a proposal.
-        crate::federation::self_roster::gate_occurrence(self, &occurrence).await?;
-        self.rehome_legacy_key_plane().await?;
-        let crate::federation::SignedIdentityOccurrence {
-            identity_occurrence: mut row,
-            attesting_key_id,
-            signed_envelope,
-            signature,
-        } = occurrence;
-        // v50.0.0 (CIRISPersist#916) — who, through what, for the re-wrap below.
-        let rewrap_for = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
-        crate::federation::check_device_class(&row.device_class)?;
-        crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let (enc_x25519, enc_ml_kem) = match &row.encryption_pubkeys {
-            Some(k) => (
-                Some(k.x25519_base64.clone()),
-                Some(k.ml_kem_768_base64.clone()),
-            ),
-            None => (None, None),
-        };
-        // v31.0.0 (#644) — the V102 trio is TEXT since V122: serialize here,
-        // exactly as the SQLite leg does, so both backends store the same bytes.
-        let signed_envelope_text = pg_envelope_text(&signed_envelope, "signed_envelope")?;
-        let signature_json = serde_json::to_string(&signature)
-            .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
-        let transport_binding_json = match &row.transport_binding {
-            Some(tb) => Some(serde_json::to_string(tb).map_err(|e| {
-                crate::federation::Error::Backend(format!("transport_binding: {e}"))
-            })?),
-            None => None,
-        };
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        // v58.0.0 (CIRISPersist#991) — the occurrence and its
-        // `identity:occurrence:v1` row, one transaction.
-        let tx = client.transaction().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("put_identity_occurrence tx: {e}"))
-        })?;
-        // v36.0.0 (#668) — THIS node's serve position (V130). One allocation
-        // covers both arms: the INSERT stamps it, the last-signed-wins DO
-        // UPDATE re-stamps it (`EXCLUDED.admitted_at`) because a supersede
-        // rewrites the served bytes and must move the row forward.
-        let admitted_at = self
-            .next_plane_position(&tx, "federation_identity_occurrences")
-            .await?;
-        // Last-signed-wins: UPSERT only when strictly newer asserted_at; a
-        // stale/equal replay is a safe no-op (poisoned/older row can't win).
-        // v52.0.0 (#930) — ONE statement: the current-state upsert, and the
-        // assertion appended to the V161 history whether or not the upsert
-        // took it (an older verified assertion still bounded a binding).
-        let occurrence_applied: i64 = tx
-            .query_one(
-                "WITH hist AS (\
-                    INSERT INTO cirislens.federation_identity_occurrence_history (\
-                        identity_key_id, occurrence_key_id, asserted_at, valid_until, \
-                        attesting_key_id, signed_envelope, signature\
-                    ) VALUES ($1, $2, $5, $6, $10, $11, $12) ON CONFLICT DO NOTHING\
-                 ), up AS (\
-                 INSERT INTO cirislens.federation_identity_occurrences (\
-                    identity_key_id, occurrence_key_id, device_class, \
-                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
-                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, \
-                    attesting_key_id, signed_envelope, signature, transport_binding, \
-                    admitted_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
-                 ON CONFLICT (identity_key_id, occurrence_key_id) DO UPDATE SET \
-                    device_class = EXCLUDED.device_class, \
-                    hardware_attestation = EXCLUDED.hardware_attestation, \
-                    asserted_at = EXCLUDED.asserted_at, \
-                    valid_until = EXCLUDED.valid_until, \
-                    persist_row_hash = EXCLUDED.persist_row_hash, \
-                    pubkey_x25519_base64 = EXCLUDED.pubkey_x25519_base64, \
-                    pubkey_ml_kem_768_base64 = EXCLUDED.pubkey_ml_kem_768_base64, \
-                    attesting_key_id = EXCLUDED.attesting_key_id, \
-                    signed_envelope = EXCLUDED.signed_envelope, \
-                    signature = EXCLUDED.signature, \
-                    transport_binding = EXCLUDED.transport_binding, \
-                    admitted_at = EXCLUDED.admitted_at \
-                 WHERE EXCLUDED.asserted_at > cirislens.federation_identity_occurrences.asserted_at \
-                 RETURNING 1) SELECT COUNT(*) FROM up",
-                &[
-                    &row.identity_key_id,
-                    &row.occurrence_key_id,
-                    &row.device_class,
-                    &row.hardware_attestation,
-                    &row.asserted_at,
-                    &row.valid_until,
-                    &row.persist_row_hash,
-                    &enc_x25519,
-                    &enc_ml_kem,
-                    &attesting_key_id,
-                    &signed_envelope_text,
-                    &signature_json,
-                    &transport_binding_json,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .and_then(|r| r.try_get::<_, i64>(0))
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("foreign key") {
-                    crate::federation::Error::InvalidArgument(format!(
-                        "FK constraint violated on identity_occurrence insert: {msg}"
-                    ))
-                } else {
-                    crate::federation::Error::Backend(format!("insert identity_occurrence: {msg}"))
-                }
-            })?;
-        pg_sync_occurrence_row(&tx, &row.identity_key_id, &row.occurrence_key_id).await?;
-        tx.commit().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("put_identity_occurrence commit: {e}"))
-        })?;
-        // v58.0.0 (CIRISPersist#991) — the pair's `identity:occurrence:v1`
-        // row is the wire-index entry (the Attestation kind).
-        // A schema before V198 (a test's `run_migrations_through`) has no
-        // pointer: no row to index.
-        // v59.1.2 — read on THIS client, then release it before the route
-        // projection, the re-index and the re-wrap, each of which checks out
-        // its own (held across them, two concurrent puts wedged a pool of
-        // two).
-        let occurrence_row_id: Option<String> =
-            if occurrence_applied == 0 || !pg_key_plane_present(&**client).await? {
-                None
-            } else {
-                match client
-                    .query_opt(
-                        "SELECT attestation_id FROM cirislens.federation_identity_occurrences \
-                      WHERE identity_key_id = $1 AND occurrence_key_id = $2",
-                        &[&row.identity_key_id, &row.occurrence_key_id],
-                    )
-                    .await
-                    .map_err(|e| {
-                        crate::federation::Error::Backend(format!("occurrence row pointer: {e}"))
-                    })? {
-                    Some(r) => r.safe_get_with(0, crate::federation::Error::Backend)?,
-                    None => None,
-                }
-            };
-        drop(client);
-        // #446 — materialize the embedded binding into the
-        // `transport_destinations` read model (local derived row on the
-        // occurrence's own (epoch=0, asserted_at) clock — see project_route).
-        // ONLY when the occurrence write actually applied: projecting on a
-        // stale no-op could seed the read model with a binding older than
-        // the stored occurrence.
-        if occurrence_applied > 0 {
-            if let Some(tb) = &row.transport_binding {
-                let route = tb.project_route(&row.occurrence_key_id, row.asserted_at)?;
-                crate::federation::transport_routes::project_occurrence_route(self, &route).await?;
-            }
-            self.index_plane_row(occurrence_row_id.as_deref()).await?;
-        }
-        // v50.0.0 (CIRISPersist#916) — a member's device occurrence arriving
-        // (typically after its owner-binding): this node re-wraps its own
-        // epochs to it. The row stands whatever the re-wrap does.
-        if rewrap_for.0 != rewrap_for.1 {
-            crate::federation::rewrap_after_admission(self, &rewrap_for.0, &rewrap_for.1).await;
-        }
-        Ok(())
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::occurrence_admit::put_identity_occurrence_planned(self, occurrence).await
     }
 
     async fn put_identity_occurrence_local(
         &self,
         occurrence: crate::federation::IdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
-        // #418 — trusted-local (grandfathered) write; NO gate, signed cols NULL.
-        // v21.17.1 (CIRISPersist#541) — `WHERE signature IS NULL` on the DO UPDATE
-        // (parity with sqlite): a SIGNED occurrence is authoritative and is never
-        // mutated by the local writer, so a later local self-write cannot NULL its
-        // envelope-covered columns (transport_binding / both KEM pubkeys) while
-        // keeping the signature and make the row diverge from its own envelope.
-        let mut row = occurrence;
-        crate::federation::check_device_class(&row.device_class)?;
-        crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let (enc_x25519, enc_ml_kem) = match &row.encryption_pubkeys {
-            Some(k) => (
-                Some(k.x25519_base64.clone()),
-                Some(k.ml_kem_768_base64.clone()),
-            ),
-            None => (None, None),
-        };
-        // v31.0.0 (#644) — transport_binding is TEXT since V122.
-        let transport_binding_json = match &row.transport_binding {
-            Some(tb) => Some(serde_json::to_string(tb).map_err(|e| {
-                crate::federation::Error::Backend(format!("transport_binding: {e}"))
-            })?),
-            None => None,
-        };
-        let client = self
-            .get_client()
+        crate::federation::occurrence_admit::put_identity_occurrence_local_planned(self, occurrence)
             .await
-            .map_err(crate::store::Error::into_federation)?;
-        // v36.0.0 (#668) — serve position (V130); the local upsert stamps and
-        // re-stamps it like the signed door (unsigned rows only — the
-        // `WHERE signature IS NULL` guard is unchanged).
-        let admitted_at = self
-            .next_plane_position(&client, "federation_identity_occurrences")
-            .await?;
-        // v52.0.0 (#930) — ONE statement: the upsert and the history row (a
-        // trusted-local assertion bounds an interval; it is never agreement).
-        client
-            .execute(
-                "WITH hist AS (\
-                    INSERT INTO cirislens.federation_identity_occurrence_history (\
-                        identity_key_id, occurrence_key_id, asserted_at, valid_until, \
-                        attesting_key_id\
-                    ) VALUES ($1, $2, $5, $6, '') ON CONFLICT DO NOTHING\
-                 ) \
-                 INSERT INTO cirislens.federation_identity_occurrences (\
-                    identity_key_id, occurrence_key_id, device_class, \
-                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
-                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding, \
-                    admitted_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-                 ON CONFLICT (identity_key_id, occurrence_key_id) DO UPDATE SET \
-                    device_class = EXCLUDED.device_class, \
-                    hardware_attestation = EXCLUDED.hardware_attestation, \
-                    asserted_at = EXCLUDED.asserted_at, \
-                    valid_until = EXCLUDED.valid_until, \
-                    persist_row_hash = EXCLUDED.persist_row_hash, \
-                    pubkey_x25519_base64 = EXCLUDED.pubkey_x25519_base64, \
-                    pubkey_ml_kem_768_base64 = EXCLUDED.pubkey_ml_kem_768_base64, \
-                    transport_binding = EXCLUDED.transport_binding, \
-                    admitted_at = EXCLUDED.admitted_at \
-                 WHERE cirislens.federation_identity_occurrences.signature IS NULL",
-                &[
-                    &row.identity_key_id,
-                    &row.occurrence_key_id,
-                    &row.device_class,
-                    &row.hardware_attestation,
-                    &row.asserted_at,
-                    &row.valid_until,
-                    &row.persist_row_hash,
-                    &enc_x25519,
-                    &enc_ml_kem,
-                    &transport_binding_json,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("put_identity_occurrence_local: {e}"))
-            })?;
-        // v59.1.2 — the route projection checks out its own client.
-        drop(client);
-        // #446 — the trusted-local path projects too (accepted write; the
-        // invariant is "every stored occurrence carrying a binding has its
-        // route materialized").
-        if let Some(tb) = &row.transport_binding {
-            let route = tb.project_route(&row.occurrence_key_id, row.asserted_at)?;
-            crate::federation::transport_routes::project_occurrence_route(self, &route).await?;
-        }
-        Ok(())
     }
 
     async fn list_identity_occurrences_for(
