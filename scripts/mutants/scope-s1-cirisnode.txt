@@ -30,7 +30,7 @@ features: postgres,sqlite,server,cirisnode
 src/cirisnode/rows.rs
 src/cirisnode/takedown_handler.rs
 src/federation/ledger_projection.rs
-src/federation/takedown_tombstone.rs cc_basis_spelling notice_basis_of_dimension is_notice_row notice_row_shape check_takedown_notice_row_admission takedown_terms legacy_contribution_terms hold_notice_row content_binding
+src/federation/takedown_tombstone.rs notice_basis_of_dimension is_notice_row notice_row_shape check_takedown_notice_row_admission takedown_terms hold_notice_row content_binding
 src/federation/mod.rs validate_subject_key_ids
 src/store/sqlite.rs sqlite_project_ledger sqlite_ledger_projection_rebuild
 src/store/postgres.rs pg_project_ledger pg_ledger_projection_rebuild

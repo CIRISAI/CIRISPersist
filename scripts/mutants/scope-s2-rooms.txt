@@ -15,8 +15,8 @@
 #   the attestation_apply unit tests.
 # - CIRISPersist#1148: `replicated_row_in_audience`, the record's own
 #   audience, the typed community door (I1509).
-# - CIRISPersist#1140: `names_its_delegate`, `binding_is_group_audience`
-#   (I1511).
+# - CIRISPersist#1140: `binding_is_group_audience` (I1511).
+# - CIRISPersist#1161: `subject_within_audience` (I1516).
 # - CIRISPersist#1143: `check_one_voice_countersign`, `community_dissolved_at`,
 #   `refuse_if_community_dissolved` (I1513, I1514).
 # - Not in scope: the one-line call sites of these predicates inside the
@@ -26,11 +26,11 @@
 #   call is caught by the witness that names its predicate.
 #
 # Grammar: docs/MUTATION_TESTING.md "Scope files".
-tests: test(/i150[0-9]|i151[0-4]|consensus::tests|i712_|i713_|i1320|i1340|attestation_apply::tests|infrastructure_protocol_must_be_quorum|widen_audience_writes_a_supersedes/)
+tests: test(/i150[0-9]|i151[0-4]|i1516|consensus::tests|i712_|i713_|i1320|i1340|attestation_apply::tests|infrastructure_protocol_must_be_quorum|widen_audience_writes_a_supersedes/)
 
 src/federation/consensus.rs evaluate evaluate_open_self_admit
 src/federation/types.rs founders_hold_authority is_canonical_form
-src/federation/admission.rs check_founder_only_above_family check_family_consensus_protocol_form names_its_delegate binding_is_group_audience
+src/federation/admission.rs check_founder_only_above_family check_family_consensus_protocol_form binding_is_group_audience subject_within_audience
 src/federation/public_room.rs is_open_admission check_public_room_conformance live_standing_proposal
 src/federation/mod.rs roster_event_standing roster_reversal_stands
 src/federation/crossing.rs same_placement
