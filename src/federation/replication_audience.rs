@@ -671,11 +671,6 @@ pub enum Reason {
     Public,
     /// The recipient is in the row's cohort audience.
     Cohort,
-    /// v61 (CIRISPersist#1165) — the recipient is an unowned infrastructure
-    /// relay holding `infra:serve` from a root this node trusts, and the row
-    /// is an owner's CONTACT grant it relays (Eric 2026-10-30: "the canonical
-    /// relays the contact consent request"). APPENDED.
-    Relay,
     /// None of the above.
     NotInAudience,
     /// The row's placement could not be read (a split-brain target).
@@ -708,9 +703,7 @@ impl Verdict {
 ///    whose principals include its invitee; every stage reaches the group's
 ///    membership-plane audience ([`may_receive_group_plane`]);
 /// 4. an owner's grant FOR another node goes no further (a node receives
-///    only its own allow list) — except an owner's CONTACT grant, which
-///    reaches an unowned `infra:serve` relay this node trusts
-///    ([`Reason::Relay`], CIRISPersist#1165);
+///    only its own allow list);
 /// 5. the commons, or a public group;
 /// 6. the row's cohort [`audience_nodes`] contains the recipient;
 /// 7. else no.
@@ -807,16 +800,10 @@ where
     // CC 6.1.5.3 — "a node receives only its own allowlist": an owner's
     // grant FOR another node reaches that node (refers-to, above) and its
     // author, never a sibling, whatever scope it is placed at.
-    if super::admission::envelope_dimension(&row.attestation_envelope) == Some(GRANT_DIMENSION) {
-        if let Some(for_key) = super::consent_by_humans::for_key_id_of(&row.attestation_envelope) {
-            // v61 (CIRISPersist#1165) — the one exception, decided before the
-            // allow-list rule: an owner's contact grant reaches the relay that
-            // carries the contact's consent request, and only that relay.
-            if contact_grant_relay(dir, recipient, row, for_key).await? {
-                return Ok(Verdict::Yes(Reason::Relay));
-            }
-            return Ok(Verdict::No(Reason::NotInAudience));
-        }
+    if super::admission::envelope_dimension(&row.attestation_envelope) == Some(GRANT_DIMENSION)
+        && super::consent_by_humans::for_key_id_of(&row.attestation_envelope).is_some()
+    {
+        return Ok(Verdict::No(Reason::NotInAudience));
     }
     // `self` content is its author's principals': a person's row, or one a
     // node of theirs signed (CC 3.3.6 — the self-collective IS the person).
@@ -914,94 +901,6 @@ where
         None,
     )
     .await
-}
-
-/// v61 (CIRISPersist#1165; Eric 2026-10-30, CIRISConstitution#196) — **may an
-/// owner's contact grant reach `recipient` as its relay?** All of:
-///
-/// - `row` is a `consent:replication` grant FOR a machine (`for_key_id`) whose
-///   subjects are NODES: a contact grant (the owner consenting to a contact's
-///   node), not the owner's other consent rows;
-/// - its attester is the owner of the `for_key_id` machine, or a live roster
-///   key of that owner ([`super::self_roster::roster_now`]);
-/// - `recipient` is UNOWNED and stands on the [`Canonical`] serve rung as
-///   THIS node resolves it: `infra:serve` from a root this node trusts
-///   ([`super::trust_root::resolve_serve_tier`], resolver = this node's own
-///   key). Not every unowned server: a directory that has not been told who
-///   it is cannot resolve the rung and answers no.
-///
-/// Nowhere else. The relay serves the grant onward under Edge's rule 2 (to
-/// the subject, or the subject's owner's nodes). The canonical then holds
-/// who-consented-to-whom for contacts that cross it, which is inherent in
-/// "the canonical relays the request" (CIRISConstitution#196).
-///
-/// [`Canonical`]: super::trust_root::ServeTier::Canonical
-async fn contact_grant_relay<D>(
-    dir: &D,
-    recipient: &str,
-    row: &Attestation,
-    for_key: &str,
-) -> Result<bool, Error>
-where
-    D: FederationDirectory + ?Sized,
-{
-    let Some(me) = dir.node_key_id() else {
-        return Ok(false);
-    };
-    contact_grant_relay_over_roster(
-        dir,
-        &me,
-        recipient,
-        row,
-        for_key,
-        &super::admission::accord_holder_roster_key_ids(),
-    )
-    .await
-}
-
-/// [`contact_grant_relay`] with the serving node `me` and the accord roster
-/// explicit (the [`super::trust_root::resolve_serve_tier_over_roster`] split,
-/// for the same reason: the production roster's private halves live in the
-/// hardware ceremony, so a witness drives the `Canonical` rung over its own).
-pub(crate) async fn contact_grant_relay_over_roster<D>(
-    dir: &D,
-    me: &str,
-    recipient: &str,
-    row: &Attestation,
-    for_key: &str,
-    roster: &[String],
-) -> Result<bool, Error>
-where
-    D: FederationDirectory + ?Sized,
-{
-    use super::types::identity_type;
-    if row.subject_key_ids.is_empty() {
-        return Ok(false);
-    }
-    for subject in &row.subject_key_ids {
-        match dir.lookup_public_key(subject).await? {
-            Some(k) if identity_type::set_contains(&k.identity_type, identity_type::NODE) => {}
-            _ => return Ok(false),
-        }
-    }
-    let Some(owner) = super::admission::owner_of(dir, for_key).await? else {
-        return Ok(false);
-    };
-    if row.attesting_key_id != owner
-        && !super::self_roster::roster_now(dir, &owner)
-            .await?
-            .contains(&row.attesting_key_id)
-    {
-        return Ok(false);
-    }
-    if super::admission::owner_of(dir, recipient).await?.is_some() {
-        return Ok(false);
-    }
-    Ok(Box::pin(super::trust_root::resolve_serve_tier_over_roster(
-        dir, recipient, me, roster,
-    ))
-    .await?
-        == super::trust_root::ServeTier::Canonical)
 }
 
 /// **The membership-plane audience of a group (CIRISEdge#761, CC 5.4.6).**

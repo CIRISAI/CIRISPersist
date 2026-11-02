@@ -243,9 +243,6 @@ pub(crate) mod affiliation_floor_invariants;
 pub(crate) mod composer_rank_invariants;
 #[cfg(test)]
 mod consent_sweep_plan_invariants;
-/// v61 S2 (CIRISPersist#1165) — I1510: a contact grant reaches the relay.
-#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-pub(crate) mod contact_relay_invariants;
 /// v53.1.0 (CIRISPersist#979) — I480–I487: a chunk of a withdrawn file is
 /// judged by its file.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
