@@ -1,0 +1,23 @@
+# Mutation scope: v61 slice S4b — the last identical doors onto shared plans
+# (CIRISPersist#934, docs/V61_TASK_PLAN.md §3 S4).
+#
+# - The plans, whole files: `transport_admit` (the unsigned route put, the
+#   signed destination's admission and its held-row verdict, the transport
+#   rows' stored provenance decode), `occurrence_admit` (the identity
+#   occurrence writes), `family_admit` (put_family, put_family_local, the
+#   family revocation and widening), `group_supersede_admit` (the supersede:
+#   the cohort and snapshot refusals and the held-head verdict its executor
+#   asks inside the transaction).
+# - Witnesses: the doors' standing witnesses on both backends (the filter
+#   below), the from-disk gates that hold the doors to their plans
+#   (store::parity — including #934 step 5, no door reads identical —, I448,
+#   the ast-grep count parity).
+#
+# Grammar: docs/MUTATION_TESTING.md "Scope files".
+tests: test(/transport|destination|provenance|self_at_login|occurrence|family|roster|group_plane|group_amendment|hard_case|supersede|lineage_head|roster_head|rc5_adopts|cohort|amend|dissol|^store::parity::|ast_gate_parity::/)
+features: postgres,sqlite,server,cirisaudit
+
+src/federation/transport_admit.rs
+src/federation/occurrence_admit.rs
+src/federation/family_admit.rs
+src/federation/group_supersede_admit.rs

@@ -132,6 +132,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // executor asks of the held head inside its transaction.
     ("supersede_group_row_planned", Class::Plan),
     ("held_head_verdict", Class::Plan),
+    // v61 (CIRISPersist#934, S4b) — the transport row mappers' stored
+    // `binding_provenance` decode (its gate is `from_token`).
+    ("stored_binding_provenance", Class::Plan),
     // Gates: `self` is not versioned; a snapshot that is not the signed
     // wrapper of the cohort's record is refused (#651).
     ("check_supersede_cohort", Class::Gate),
@@ -1551,7 +1554,12 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 71] = [
+    const SHARED_PLANS: [(&str, &str); 72] = [
+        // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance.
+        (
+            "src/federation/transport_admit.rs",
+            "stored_binding_provenance",
+        ),
         // v61 (CIRISPersist#934, S4b) — the group supersede.
         (
             "src/federation/group_supersede_admit.rs",
@@ -1813,7 +1821,19 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 80] = [
+    const SHARED_DOORS: [(&str, &str, &str); 82] = [
+        // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance,
+        // decoded by the row mapper both doors read through.
+        (
+            "FederationDirectory",
+            "list_signed_transport_destinations_since",
+            "stored_binding_provenance",
+        ),
+        (
+            "TransportStore",
+            "store_planned_signed_destination",
+            "stored_binding_provenance",
+        ),
         // v61 (CIRISPersist#934, S4b) — the group supersede.
         (
             "FederationDirectory",
@@ -3768,14 +3788,16 @@ mod tests {
 
     /// v56.0.0 (CIRISPersist#934 step 1) — **the door report**: one line per
     /// door saying WHERE its decision lives, the question #934 asks of every
-    /// door. A report, not a gate: [`every_backend_runs_the_same_gates_in_the_same_order`]
-    /// and [`shared_doors_decide_nothing_in_a_backend`] are the gates. Run with
+    /// door. A report, not a gate: [`every_backend_runs_the_same_gates_in_the_same_order`],
+    /// [`shared_doors_decide_nothing_in_a_backend`] and (v61, #934 step 5)
+    /// [`no_backend_door_reads_identical`] are the gates. Run with
     /// `cargo test --lib store::parity::tests::door_report -- --ignored --nocapture`.
     ///
     /// - `shared` — every backend's door is a call into a shared plan and runs
     ///   no gate of its own (the #934 target shape);
     /// - `identical xN (k gates)` — the decision is written N times, byte-equal
-    ///   by this scan (the #670 state, the triplication #934 removes);
+    ///   by this scan (the #670 state, the triplication #934 removed; RED since
+    ///   v61 by [`no_backend_door_reads_identical`]);
     /// - `declared` — a [`DECLARED_DIVERGENCES`] row pins one backend's shape;
     /// - `gateless` — no backend runs a gate in this door.
     #[test]
@@ -3799,6 +3821,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// v61 (CIRISPersist#934 step 5) — **no backend door reads
+    /// `identical`.** Every door that wrote the same decision once per
+    /// backend has moved onto a shared plan (S4a, S4b), so the class the
+    /// [`door_report`] calls `identical` is now RED: a door that re-grows a
+    /// copied gate sequence in every backend fails here, naming the door and
+    /// its sequence, instead of reading as parity. The fix is a plan (a
+    /// [`SHARED_PLANS`] body the backends call), not a second copy.
+    #[test]
+    fn no_backend_door_reads_identical() {
+        let scan = scan();
+        let mut failures = Vec::new();
+        for ((trait_name, method), per_backend) in &scan.doors {
+            let seqs: Vec<(&str, &Vec<String>)> = BACKENDS
+                .iter()
+                .filter_map(|(b, _)| per_backend.get(*b).map(|(s, _)| (*b, s)))
+                .collect();
+            let verdict = door_verdict(trait_name, method, &seqs);
+            if verdict.starts_with("identical") {
+                let seq = seqs.first().map(|(_, s)| (*s).clone()).unwrap_or_default();
+                failures.push(format!(
+                    "{trait_name}::{method} reads {verdict}: {seq:?} is decided once per \
+                     backend; move it onto a shared plan (#934)"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// The one-word answer [`door_report`] prints for a door.

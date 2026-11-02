@@ -16742,7 +16742,8 @@ fn sqlite_row_to_transport_destination(
         last_seen_at,
         transport_ed25519_pubkey_base64: row.get(5)?,
         transport_x25519_pubkey_base64: row.get(6)?,
-        binding_provenance: crate::federation::self_at_login::BindingProvenance::from_token(
+        // v61 (CIRISPersist#934) — the decode's refusal is the shared plan's.
+        binding_provenance: crate::federation::transport_admit::stored_binding_provenance(
             provenance_token.as_deref(),
         )
         .map_err(|e| {

@@ -105,6 +105,7 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
   `wire_vocabulary::WIRE_VOCABULARY_HASH` does not move (`c6bd6aa4…`).
 - **The first open after the upgrade runs the instant-form pass** (V211, `Engine::settle_instant_forms`, above): it reads every stored attestation row once, so the first boot of an upgraded node with a large attestation table takes longer than later boots. It is idempotent and never boot-fatal.
 - No wire or API change for the read-storm fix. V212 builds one index on `federation_attestations` (both backends) at upgrade. The first SQLite open after upgrade runs `ANALYZE` once, sampling at most 1,000 rows per index; measured at about 4 ms on a 2,401-row store of 15 KB envelopes. A Postgres open runs `ANALYZE federation_attestations` once when the table has never been analyzed (a fresh restore before autovacuum's first pass); Postgres samples a bounded number of rows (`default_statistics_target`) whatever the table's size. The pinned statements name their indexes, so a store missing V107, V178, V180, V181 or V212 refuses these reads with `no such index` instead of planning around it.
+- The unheld-supersede refusal text is now uniform across backends: `supersede: unknown {cohort} group {key:?} (nothing to supersede)`, with the key and the cohort that was asked (SQLite omitted the key; Postgres said `community` for `affiliations`). Its kind is unchanged (`InvalidArgument`, Python `ValueError`). Match on the error kind, not the text (CIRISPersist#934 S4b).
 
 ### Changed
 

@@ -111,6 +111,18 @@ pub(crate) fn held_destination_verdict(
     DestinationVerdict::Write { fresh: false }
 }
 
+/// **A stored row's `binding_provenance`, read back** — every backend's
+/// transport row mapper asks this. An absent token (NULL, a pre-#413 row) is
+/// the back-compat `Rooted`; v52.0.0 — a present token that is neither
+/// `rooted` nor `advisory` refuses (malformed is a refusal, not absence).
+/// The backend maps the refusal into its row decoder's error.
+pub(crate) fn stored_binding_provenance(
+    token: Option<&str>,
+) -> Result<super::self_at_login::BindingProvenance, Error> {
+    let provenance = super::self_at_login::BindingProvenance::from_token(token)?;
+    Ok(provenance)
+}
+
 /// The transport executor. Storage only.
 #[async_trait::async_trait]
 pub(crate) trait TransportStore: FederationDirectory + Sized {
