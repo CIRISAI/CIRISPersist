@@ -103,6 +103,9 @@ ignore = [
     "RUSTSEC-2026-0367",  # zip SUID/SGID on extraction — candle / verify-core, persist never extracts
     "RUSTSEC-2026-0368",  # zip extract() symlink targets escape the destination — same: persist never extracts
     "RUSTSEC-2026-0369",  # zip extract() permissions applied through symlinks — same: persist never extracts
+    # v61.0.0 — zip 7.2.0 (candle-core) `extract()` aborts on a symlink entry with a huge declared size;
+    # candle only opens .npz model archives by entry (ZipArchive::new + by_name), never extract(); fixed in zip 9.
+    "RUSTSEC-2026-0429",  # zip extract() symlink-size abort — candle 7.x, persist and candle never extract
     "RUSTSEC-2026-0371",  # zbus_names unmaintained — ciris-keyring → secret-service
     "RUSTSEC-2026-0370",  # zvariant unmaintained — same zbus stack
     "RUSTSEC-2026-0372",  # zvariant_derive unmaintained — same zbus stack
