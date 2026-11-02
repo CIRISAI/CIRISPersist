@@ -608,9 +608,16 @@ def _qualified_defs(text: str) -> dict[tuple[str, str], str]:
                 end = nxt.start()
                 break
         else:
-            tail = re.search(r"^(?:class |# ---|[A-Za-z_])", text[m.end():], re.M)
+            # Search from the line AFTER the `def` line. `text[m.end():]` starts
+            # inside the parameter list, where `^` matches at offset 0: a last
+            # module-level def whose first parameter is a name (`reason: str`)
+            # was cut to `def name(` and then kept as a hand-written block, so
+            # `emit` wrote a stub that does not parse (PR #1169 core-1).
+            nl = text.find("\n", m.end())
+            start = len(text) if nl < 0 else nl + 1
+            tail = re.search(r"^(?:class |# ---|[A-Za-z_])", text[start:], re.M)
             if tail:
-                end = m.end() + tail.start()
+                end = start + tail.start()
         # A `class X:` header sits BETWEEN two same-indent defs, so the span
         # above would swallow it into the previous class's last method.
         nxt_cls = re.search(r"^class\s", text[m.end():end], re.M)
@@ -789,7 +796,29 @@ def module_attrs() -> list[str]:
     return sorted(set(out))
 
 
+def stub_parse_error(path: Path = PYI) -> str | None:
+    """The stub's Python syntax error, or None. Every other check here reads
+    the stub with regexes, which see `def name(` whether or not the file
+    parses; pytest's import of the stub on a runner was the first thing to
+    notice an unclosed paren (CIRISPersist PR #1169, core-1)."""
+    import ast
+    try:
+        ast.parse(path.read_text(), filename=str(path))
+    except SyntaxError as e:
+        return f"{path.name}:{e.lineno}:{e.offset}: {e.msg}"
+    return None
+
+
 def check() -> int:
+    bad = stub_parse_error()
+    if bad:
+        print(
+            f"::error title=pyi surface::{PYI.name} does not parse as Python ({bad}). "
+            "Every checker below reads it with regexes and would pass it; fix the stub "
+            "(`pyi_surface.py emit` regenerates the generated region).",
+            file=sys.stderr,
+        )
+        return 1
     syms = exported()
     pin = pinned()
     have, top = documented()

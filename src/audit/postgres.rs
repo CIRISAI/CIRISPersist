@@ -65,13 +65,15 @@ async fn merkle_hook_pg(
     // tokio worker would panic; spawn_blocking moves the work to
     // a blocking thread.
     let handle = tokio::runtime::Handle::current();
-    let pool = backend.pool().clone();
     let tenant_id = entry.tenant_id.clone();
     let leaf = AuditLeaf::with_chain_event_id(entry.clone(), chain_event_id);
     let log_id = log_id_for_tenant(&tenant_id);
 
-    let store: Arc<dyn TransparencyStore<AuditLeaf>> =
-        Arc::new(PgMerkleStore::from_pool(pool, handle, tenant_id.clone()));
+    let store: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(PgMerkleStore::from_backend(
+        backend,
+        handle,
+        tenant_id.clone(),
+    ));
     let log = TransparencyLog::<AuditLeaf>::for_log(log_id.clone(), store.clone());
 
     // 1. Append the leaf + compute tree_size + merkle_root on a
@@ -179,8 +181,7 @@ async fn project_trust_grant_pg(
     let expires_at = payload.expires_at;
 
     let client = backend
-        .pool()
-        .get()
+        .checkout()
         .await
         .map_err(|e| Error::TrustGrant(format!("pool: {e}")))?;
     client
@@ -328,11 +329,7 @@ impl AuditService for PostgresBackend {
 
         let entry_uuid = parse_entry_id(&entry.entry_id)?;
 
-        let mut client = self
-            .pool()
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let mut client = self.checkout().await.map_err(Error::from)?;
         let tx = client
             .transaction()
             .await
@@ -430,6 +427,15 @@ impl AuditService for PostgresBackend {
         tx.commit()
             .await
             .map_err(|e| Error::Backend(format!("commit: {e}")))?;
+        // v59.1.2 — release the client BEFORE the hooks: the Merkle append
+        // and the trust-grant projection each check out their own, and
+        // holding this one across them deadlocked two concurrent writers on
+        // a pool of two (a 1-vCPU node's whole pool).
+        drop(client);
+        #[cfg(test)]
+        self.test_hooks()
+            .barrier_if_armed("audit_record_entry_after_commit")
+            .await;
 
         // v1.5.0 Phase C — Merkle transparency hook. Runs only when a
         // local signer was installed via `set_merkle_signer`;
@@ -525,11 +531,7 @@ impl AuditService for PostgresBackend {
              LIMIT ${p_limit}"
         );
 
-        let client = self
-            .pool()
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let client = self.checkout().await.map_err(Error::from)?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref() as _).collect();
         let rows = client
@@ -564,11 +566,7 @@ impl AuditService for PostgresBackend {
             return Err(Error::InvalidArgument("from_sequence must be >= 1".into()));
         }
 
-        let client = self
-            .pool()
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let client = self.checkout().await.map_err(Error::from)?;
 
         let to_seq_resolved: i64 = match to_sequence {
             Some(n) => {
@@ -779,11 +777,7 @@ impl AuditService for PostgresBackend {
         let entry_uuid = parse_entry_id(&entry.entry_id)?;
         let content_hash_vec = content_hash.to_vec();
 
-        let mut client = self
-            .pool()
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let mut client = self.checkout().await.map_err(Error::from)?;
 
         // Fast path: optimistic claim outside of a transaction.
         // PG ON CONFLICT (content_hash) DO NOTHING gives us the
@@ -968,6 +962,8 @@ impl AuditService for PostgresBackend {
         tx.commit()
             .await
             .map_err(|e| Error::Backend(format!("commit: {e}")))?;
+        // v59.1.2 — release the client before the hooks (see `record_entry`).
+        drop(client);
 
         // v1.5.0 Phase C — Merkle hook on the newly-stored path only.
         // `AlreadyClaimed` returns a reference to a row inserted by a
@@ -1017,11 +1013,7 @@ impl AuditService for PostgresBackend {
         // in a follow-up migration.
         let needle = serde_json::json!({"correlation_id": correlation_id});
 
-        let client = self
-            .pool()
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let client = self.checkout().await.map_err(Error::from)?;
         let rows = client
             .query(
                 "SELECT entry_id, sequence_number, tenant_id, actor_id, \
@@ -1059,11 +1051,7 @@ impl AuditService for PostgresBackend {
         if tenant_id.is_empty() {
             return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
         }
-        let client = self
-            .pool()
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let client = self.checkout().await.map_err(Error::from)?;
         let row_opt = client
             .query_opt(
                 "SELECT sequence_number, entry_hash \
@@ -1108,11 +1096,10 @@ impl AuditService for PostgresBackend {
         // sync `latest_sth()` via spawn_blocking (the store uses
         // `runtime.block_on` internally — calling it directly on a
         // tokio worker would panic).
-        let pool = self.pool().clone();
         let handle = tokio::runtime::Handle::current();
         let tenant_owned = tenant_id.to_owned();
         let store: Arc<dyn TransparencyStore<AuditLeaf>> =
-            Arc::new(PgMerkleStore::from_pool(pool, handle, tenant_owned));
+            Arc::new(PgMerkleStore::from_backend(self, handle, tenant_owned));
         let jh: tokio::task::JoinHandle<
             Result<Option<SignedTreeHead>, ciris_verify_core::transparency::TransparencyError>,
         > = tokio::task::spawn_blocking(move || store.latest_sth());
@@ -1128,11 +1115,7 @@ impl AuditService for PostgresBackend {
         tenant_id: &str,
         chain_event_id: i64,
     ) -> Result<Option<uuid::Uuid>, Error> {
-        let client = self
-            .pool()
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let client = self.checkout().await.map_err(Error::from)?;
         // Lookup is tenant-scoped: audit_log.sequence_number is
         // UNIQUE(tenant_id, sequence_number), so chain_event_id alone
         // is NOT unique across tenants. V045 adds
@@ -1164,11 +1147,7 @@ impl AuditService for PostgresBackend {
         &self,
         grant_id: uuid::Uuid,
     ) -> Result<Option<crate::federation::trust_grant::TrustGrantRow>, Error> {
-        let client = self
-            .pool()
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let client = self.checkout().await.map_err(Error::from)?;
         let row_opt = client
             .query_opt(
                 "SELECT grant_id, grantee_key, granter_key, purpose, scope, \
@@ -1194,11 +1173,7 @@ impl AuditService for PostgresBackend {
         include_revoked: bool,
         include_expired: bool,
     ) -> Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error> {
-        let client = self
-            .pool()
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let client = self.checkout().await.map_err(Error::from)?;
         // Per FSD §3.3, wildcard scopes are valid and MUST be surfaced
         // alongside exact-match rows — the caller (NodeCore's
         // resolve_trust) decides whether a wildcard satisfies the
@@ -1234,11 +1209,7 @@ impl AuditService for PostgresBackend {
         &self,
         filter: crate::federation::trust_grant::TrustGrantFilter,
     ) -> Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error> {
-        let client = self
-            .pool()
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let client = self.checkout().await.map_err(Error::from)?;
         // Build the WHERE clause dynamically. params lifetimes here
         // are tricky — pre-stage each binding as a typed local so we
         // can push trait-object references into one Vec.
@@ -1305,11 +1276,7 @@ impl AuditService for PostgresBackend {
         if tenant_id.is_empty() {
             return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
         }
-        let client = self
-            .pool()
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let client = self.checkout().await.map_err(Error::from)?;
         let row_opt = client
             .query_opt(
                 "SELECT canonical_bytes FROM cirislens.merkle_leaves \
@@ -1338,11 +1305,7 @@ impl AuditService for PostgresBackend {
             return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
         }
         // Resolve chain_event_id → leaf_index first.
-        let client = self
-            .pool()
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let client = self.checkout().await.map_err(Error::from)?;
         let row_opt = client
             .query_opt(
                 "SELECT leaf_index FROM cirislens.merkle_leaves \
@@ -1366,11 +1329,13 @@ impl AuditService for PostgresBackend {
         // Build a tenant-scoped store and delegate inclusion_proof on
         // a blocking worker (the store is sync-trait + uses block_on
         // internally). Same shape as `current_sth`.
-        let pool = self.pool().clone();
         let handle = tokio::runtime::Handle::current();
         let tenant_owned = tenant_id.to_owned();
-        let store: Arc<dyn TransparencyStore<AuditLeaf>> =
-            Arc::new(PgMerkleStore::from_pool(pool, handle, tenant_owned.clone()));
+        let store: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(PgMerkleStore::from_backend(
+            self,
+            handle,
+            tenant_owned.clone(),
+        ));
         let log_id = log_id_for_tenant(&tenant_owned);
         let jh: tokio::task::JoinHandle<
             Result<
@@ -1395,11 +1360,13 @@ impl AuditService for PostgresBackend {
         if tenant_id.is_empty() {
             return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
         }
-        let pool = self.pool().clone();
         let handle = tokio::runtime::Handle::current();
         let tenant_owned = tenant_id.to_owned();
-        let store: Arc<dyn TransparencyStore<AuditLeaf>> =
-            Arc::new(PgMerkleStore::from_pool(pool, handle, tenant_owned.clone()));
+        let store: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(PgMerkleStore::from_backend(
+            self,
+            handle,
+            tenant_owned.clone(),
+        ));
         let log_id = log_id_for_tenant(&tenant_owned);
         let jh: tokio::task::JoinHandle<
             Result<
@@ -1428,11 +1395,7 @@ impl AuditService for PostgresBackend {
                 "local_pubkey must be non-empty".into(),
             ));
         }
-        let client = self
-            .pool()
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let client = self.checkout().await.map_err(Error::from)?;
         let rows = client
             .query(
                 "SELECT key_id, pubkey_ed25519_base64, trust_type, \
@@ -1781,7 +1744,7 @@ mod tests {
 
         // 11. Tamper detection: directly UPDATE a payload, then
         // verify_chain surfaces an EntryHashMismatch break.
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .execute(
                 "UPDATE cirislens.audit_log SET payload = $1 \
@@ -1973,8 +1936,111 @@ mod tests {
         ))
     }
 
+    /// v59.1.2 (I1483) — the field wedge, reproduced. `record_entry` held its
+    /// pooled client past the commit, and the Merkle hook (armed whenever a
+    /// signer is installed) then checked out another. Two writers on a pool
+    /// of two (a 1-vCPU node's whole pool) each held one and waited for a
+    /// third. A barrier after the commit makes both writers hold at once;
+    /// the pool's 3 s wait turns the deadlock into an error instead of a
+    /// hang. Both writers must land, with their Merkle leaves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn i1483_two_audit_writers_complete_on_a_pool_of_two() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("i1483: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+            return;
+        };
+        let backend =
+            PostgresBackend::connect_with_pool_for_test(&dsn, 2, std::time::Duration::from_secs(3))
+                .await
+                .unwrap();
+        backend.run_migrations().await.unwrap();
+        assert_eq!(
+            backend.pool_max_size_for_test(),
+            2,
+            "the witness's own premise"
+        );
+        backend.set_merkle_signer(Some(merkle_test_signer(0xB7)));
+        backend
+            .test_hooks()
+            .arm_barrier("audit_record_entry_after_commit", 2);
+        let key = SigningKey::from_bytes(&[0xB7; 32]);
+        let tag = Uuid::new_v4().simple().to_string();
+        let (ta, tb) = (format!("i1483-a-{tag}"), format!("i1483-b-{tag}"));
+        let ea = build_and_sign(&key, &ta, 1, GENESIS_PREV_HASH.to_vec(), "system_event");
+        let eb = build_and_sign(&key, &tb, 1, GENESIS_PREV_HASH.to_vec(), "system_event");
+        let (ra, rb) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            tokio::join!(backend.record_entry(ea), backend.record_entry(eb))
+        })
+        .await
+        .expect("I1483 the two writers did not finish within 60 s");
+        ra.expect("I1483 writer A");
+        rb.expect("I1483 writer B");
+        assert_eq!(
+            pg_count_merkle_rows(&backend, &ta).await,
+            (1, 1),
+            "I1483 A's leaf"
+        );
+        assert_eq!(
+            pg_count_merkle_rows(&backend, &tb).await,
+            (1, 1),
+            "I1483 B's leaf"
+        );
+    }
+
+    /// v59.1.2 (I1483) — `try_claim_event` carried the same nest (its client
+    /// across the Merkle hook): on a one-connection pool it must store and
+    /// append its leaf.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1483_try_claim_event_completes_on_one_connection() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("i1483: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+            return;
+        };
+        let backend =
+            PostgresBackend::connect_with_pool_for_test(&dsn, 1, std::time::Duration::from_secs(3))
+                .await
+                .unwrap();
+        backend.run_migrations().await.unwrap();
+        backend.set_merkle_signer(Some(merkle_test_signer(0xB8)));
+        let key = SigningKey::from_bytes(&[0xB8; 32]);
+        let tenant = format!("i1483-claim-{}", Uuid::new_v4().simple());
+        let e1 = build_and_sign(&key, &tenant, 1, GENESIS_PREV_HASH.to_vec(), "system_event");
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            backend.try_claim_event([0x5A; 32], e1, "i1483".into()),
+        )
+        .await
+        .expect("I1483 try_claim_event did not finish within 60 s")
+        .expect("I1483 try_claim_event");
+        assert!(matches!(out, ClaimResult::Stored(_)), "I1483 {out:?}");
+        assert_eq!(pg_count_merkle_rows(&backend, &tenant).await, (1, 1));
+        let e2 = build_and_sign(
+            &key,
+            &tenant,
+            2,
+            {
+                let c = backend.get_client().await.unwrap();
+                c.query_one(
+                    "SELECT entry_hash FROM cirislens.audit_log WHERE tenant_id = $1",
+                    &[&tenant],
+                )
+                .await
+                .unwrap()
+                .get::<_, Vec<u8>>(0)
+            },
+            "system_event",
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(60), backend.record_entry(e2))
+            .await
+            .expect("I1483 record_entry did not finish within 60 s")
+            .expect("I1483 record_entry on one connection");
+        assert_eq!(pg_count_merkle_rows(&backend, &tenant).await, (2, 2));
+    }
+
     async fn pg_count_merkle_rows(backend: &PostgresBackend, tenant: &str) -> (i64, i64) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let leaves: i64 = client
             .query_one(
                 "SELECT COUNT(*)::BIGINT FROM cirislens.merkle_leaves WHERE tenant_id = $1",
@@ -1995,7 +2061,7 @@ mod tests {
     }
 
     async fn pg_cleanup_tenant_merkle(backend: &PostgresBackend, tenant: &str) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
 
         // v3.5.2 (CIRISPersist#128) — diagnostic instrumentation:
         // when this DELETE fires "relation does not exist", we want
@@ -2146,7 +2212,7 @@ mod tests {
         assert_eq!((l3, s3), (3, 3));
 
         // tree_size monotonicity in STH log.
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let rows = client
             .query(
                 "SELECT tree_size FROM cirislens.merkle_sth_log \
@@ -2253,7 +2319,7 @@ mod tests {
     /// Seed `cirislens.federation_keys` so FK targets exist for the
     /// projection's INSERT. Idempotent — uses ON CONFLICT DO NOTHING.
     async fn pg_seed_federation_key(backend: &PostgresBackend, key_id: &str) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .execute(
                 "INSERT INTO cirislens.federation_keys (\
@@ -2271,7 +2337,7 @@ mod tests {
     }
 
     async fn pg_cleanup_trust_grants(backend: &PostgresBackend, tenant: &str) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .execute(
                 "DELETE FROM cirislens.federation_trust_grants WHERE tenant_id = $1",
@@ -2322,7 +2388,7 @@ mod tests {
     }
 
     async fn pg_count_grants(backend: &PostgresBackend, tenant: &str) -> i64 {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .query_one(
                 "SELECT COUNT(*)::BIGINT FROM cirislens.federation_trust_grants WHERE tenant_id = $1",
@@ -2394,7 +2460,7 @@ mod tests {
         );
         backend.record_entry(entry.clone()).await.unwrap();
 
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let row = client
             .query_one(
                 "SELECT grantee_key, granter_key, purpose, scope, \
@@ -2461,7 +2527,7 @@ mod tests {
         );
         backend.record_entry(e1.clone()).await.unwrap();
 
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let original_grant_id: uuid::Uuid = client
             .query_one(
                 "SELECT grant_id FROM cirislens.federation_trust_grants \
@@ -2562,7 +2628,7 @@ mod tests {
         );
         backend.record_entry(e2.clone()).await.unwrap();
 
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let row = client
             .query_one(
                 "SELECT revoked_at, revoked_by \
@@ -2637,7 +2703,7 @@ mod tests {
         );
         backend.record_entry(b1.clone()).await.unwrap();
 
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         // One row total — UPSERT collapses both emits.
         let total: i64 = client
             .query_one(

@@ -56,13 +56,25 @@ pub mod bodies {
         /// Does `d`'s content-hash point-read resolve this exact record? (The
         /// wire index must follow a supersede, or a peer that fetches by hash
         /// never sees the new version.)
+        /// v61 (CIRISPersist#991) — the record's `group:roster:v1` row is
+        /// held and resolves by its Attestation-kind content hash (the
+        /// framed `Family` / `Community` kinds are retired).
         async fn resolves_by_hash(&self, d: &dyn FederationDirectory) -> bool {
-            let (kind, bytes) = match self {
-                Signed::Family(f) => ("Family", serde_json::to_vec(f).unwrap()),
-                Signed::Community(c) => ("Community", serde_json::to_vec(c).unwrap()),
+            let signed = match self {
+                Signed::Family(f) => crate::federation::group_plane::GroupSigned::Family(f.clone()),
+                Signed::Community(c) => {
+                    crate::federation::group_plane::GroupSigned::Community(c.clone())
+                }
             };
+            let Some(row) = crate::federation::group_plane::plan_group_row(&signed).unwrap() else {
+                return false;
+            };
+            let Some(held) = d.get_attestation(&row.attestation_id).await.unwrap() else {
+                return false;
+            };
+            let bytes = serde_json::to_vec(&held).unwrap();
             let hash = crate::federation::wire_index::content_hash_of_bytes(&bytes);
-            d.lookup_signed_record_by_content_hash(kind, &hash)
+            d.lookup_signed_record_by_content_hash("Attestation", &hash)
                 .await
                 .unwrap()
                 == Some(bytes)
@@ -369,13 +381,15 @@ pub mod bodies {
 
         // (2b) A genuine proof attached to a record it does not describe
         //      (verify-A-store-B): the quorum signed `unanimous`, the record
-        //      says `founder_only`. Refused, and B keeps its record.
+        //      says `majority`. Refused, and B keeps its record. (v61:
+        //      `majority`, not `founder_only`, which a community above the
+        //      family is refused before the proof is read, CIRISPersist#1123.)
         let mut mismatched = kind.record(
             &id,
             &keys,
             &Content {
                 name: v2.name,
-                protocol: consensus_protocol::FOUNDER_ONLY,
+                protocol: consensus_protocol::MAJORITY,
             },
         );
         *mismatched.proof_mut() = served_v2.proof().cloned();

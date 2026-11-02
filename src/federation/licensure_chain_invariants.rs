@@ -166,7 +166,7 @@ pub mod bodies {
     }
 
     pub(crate) fn rfc3339(t: DateTime<Utc>) -> serde_json::Value {
-        serde_json::Value::String(t.to_rfc3339())
+        serde_json::Value::String(crate::federation::admission::render_signed_instant(t))
     }
 
     /// #1032 — **a term-bound officer lapses for licence authority, judged at
@@ -329,7 +329,9 @@ pub mod bodies {
             t_edge,
             &[(
                 DELEGATION_VALID_UNTIL_FIELD,
-                serde_json::json!("next tuesday"),
+                // v61 — a non-string: a string not `.sssZ` is refused by
+                // the CC 2.6.2 shape gate before the term gate reads it.
+                serde_json::json!(20_261_103),
             )],
         );
         match put(dir, &unreadable).await {
@@ -1159,10 +1161,27 @@ pub mod bodies {
             &format!("[{tag}] I604: founder F issues while a founder"),
         )
         .await;
-        // G supersedes the record without F.
+        // G supersedes the record without F. v61 (CIRISPersist#1123): the
+        // legacy founder_only room's next version leaves founder_only, which
+        // the supersede door refuses above the family. v61 S2: and that
+        // version is the escape ALONE (the protocol, nothing else), so the
+        // room first leaves founder_only and then drops F under its new
+        // protocol.
+        let held = dir.lookup_community(&room).await.unwrap().expect("held");
+        let mut escape = held.clone();
+        escape.consensus_protocol = "quorum:1/2".to_owned();
+        escape.prev_head_digest = held.persist_row_hash.clone();
+        escape.persist_row_hash = String::new();
+        dir.supersede_community(
+            crate::federation::tier_ingest::test_support::sign_community(&g, escape),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] I604: the escape from founder_only: {e}"));
         let held = dir.lookup_community(&room).await.unwrap().expect("held");
         let mut next = held.clone();
         next.members.retain(|m| m.key_id != f);
+        next.consensus_protocol = "quorum:1/1".to_owned();
         next.prev_head_digest = held.persist_row_hash.clone();
         next.persist_row_hash = String::new();
         dir.supersede_community(

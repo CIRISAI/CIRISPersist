@@ -99,7 +99,7 @@ pub(crate) mod bodies {
         let asserted = at("2026-09-01T00:00:00Z");
         let env = serde_json::json!({"id": id, "dimension": "capacity:sustained_coherence:v1",
             "score": 0.8, "confidence": 0.9,
-            crate::federation::envelope::paths::ASSERTED_AT: asserted.to_rfc3339()});
+            crate::federation::envelope::paths::ASSERTED_AT: crate::federation::admission::render_signed_instant(asserted)});
         let mut r = row(id, attester, subject, env, Vec::new(), asserted, None);
         r.weight = Some(0.8);
         ts::reseal(&mut r);

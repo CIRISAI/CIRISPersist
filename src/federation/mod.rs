@@ -32,6 +32,11 @@
 //! and the registry-side `docs/FEDERATION_CLIENT.md` for the consumer
 //! complement.
 
+/// v61 (CIRISPersist#934, S4a) — the accord evidence doors, decided
+/// once: the proposal, participation and decision plans and the per-backend
+/// `AccordStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod accord_admit;
 pub mod accord_carriage;
 pub mod accord_quorum;
 /// v53.0.0 (CC 4.2.6) — an accord holder's recovery under a pre-committed key.
@@ -58,6 +63,11 @@ mod attestation_apply_invariants;
 /// v25.1.0 (CIRISPersist#582) — the backend-generic signed-ATTESTATION emit
 /// recipe (distinct from [`emit`], the trust-grant/audit-entry API).
 pub mod attestation_emit;
+/// v61 (CIRISPersist#934, S4a) — the blob plane's gated doors (the chunk
+/// floor, the stream plane's records, the blob writes), decided once, with
+/// the per-backend `BlobFloorStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod blob_admit;
 /// v57.0.0 (CIRISPersist#934 step 2) — the community and roster doors,
 /// decided once: `plan_put_community`, the three roster plans, and the
 /// per-backend `CommunityStore` executor.
@@ -66,11 +76,42 @@ pub(crate) mod community_admit;
 /// the consent-role and trust-grant plans, the consent read folds, and the
 /// per-backend `ConsentStore` executor.
 pub(crate) mod consent_admit;
+/// v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash
+/// sighting and the purge record write, decided once, with the per-backend
+/// `DirectoryStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod directory_admit;
+/// v61 (CIRISPersist#934, S4a) — the location proof, touch claim and
+/// wholeness witness doors, decided once, with the per-backend
+/// `EvidenceStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod evidence_admit;
+/// v61 (CIRISPersist#934, S4b) — the family doors, decided once, with the
+/// per-backend `FamilyStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod family_admit;
+/// v61 (CIRISPersist#934, S4b) — the group supersede, decided once, with the
+/// per-backend `GroupSupersedeStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod group_supersede_admit;
+/// v61 (CIRISPersist#934, S4b) — the identity-occurrence writes, decided
+/// once, with the per-backend `OccurrenceStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod occurrence_admit;
+/// v61 (CIRISPersist#934, S4a) — the gated directory reads (the scores
+/// reads, the attestation log, the key history, the rendition index), decided
+/// once, with the per-backend `ReadPlanStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod read_plan;
 /// v60.0.0 (CIRISPersist#934 step 4) — the sweeps' selections, decided once:
 /// the PQC sweep's page, the reaper's page, the known-hash eviction report and
 /// the room retention leg, with the per-backend `SweepStore` /
 /// `RoomEvictionStore` executors.
 pub(crate) mod sweep_plan;
+/// v61 (CIRISPersist#934, S4b) — the transport-destination writes, decided
+/// once, with the per-backend `TransportStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod transport_admit;
 // v56.0.0 (CIRISPersist#1001) — the typed bounded attestation read.
 pub mod attestation_query;
 #[cfg(test)]
@@ -88,6 +129,12 @@ mod bounded_planes_invariants;
 // classified; no production caller of the demoted wide reads.
 #[cfg(test)]
 mod bounded_reads_table;
+// v59.1.2 (CIRISPersist#1162) — the capsule proxy-parity gate blanks its
+// from-disk scan with the same comment/string blanker. Its one reader is the
+// capsule's sqlite test module, so the re-export is gated like it: under a
+// feature set without sqlite it is an unused import (a `-D warnings` red).
+#[cfg(all(test, feature = "sqlite"))]
+pub(crate) use bounded_reads_table::gates::blank_comments_and_strings;
 pub mod canonical_at_rest;
 pub mod capacity;
 // v50.0.0 (CIRISPersist#926) — the `ciris-canonical` community row: admitted
@@ -194,6 +241,14 @@ pub(crate) mod community_trust_consent_invariants;
 #[cfg(test)]
 pub mod consent_sweep_principals_invariants;
 // v60.0.0 (CIRISPersist#934 step 4, #1105) — I1192–I1201.
+/// v61 S2 (CIRISPersist#1143) — I1513–I1514: the affiliation floor and
+/// dissolution.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod affiliation_floor_invariants;
+/// v61 S2 (CIRISPersist#1155 / #1157) — I1506–I1508: composers idempotent on
+/// their id, distinct ones ranked read-time within one audience.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod composer_rank_invariants;
 #[cfg(test)]
 mod consent_sweep_plan_invariants;
 /// v53.1.0 (CIRISPersist#979) — I480–I487: a chunk of a withdrawn file is
@@ -215,6 +270,10 @@ pub(crate) mod grant_supersede_invariants;
 /// v49.0.0 (CIRISPersist#910.5) — I178: a group amendment replicates.
 #[cfg(test)]
 pub mod group_amendment_invariants;
+/// v61 (CIRISPersist#991) — I1484/I1485: the group records and the
+/// roster planes are rows; the tables are their projections.
+#[cfg(test)]
+pub(crate) mod group_plane_invariants;
 /// v52.0.0 (CIRISPersist#672) — I230–I235: the held-record settle.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod held_settle_invariants;
@@ -222,9 +281,6 @@ pub(crate) mod held_settle_invariants;
 /// licence's signed instant by ONE function the gate and the fold share.
 #[cfg(test)]
 pub mod licensure_chain_invariants;
-/// v49.0.0 (CIRISPersist#912) — I183: the membership listing plane.
-#[cfg(test)]
-pub mod listing_invariants;
 /// v53.1.2 (CIRISPersist#984 row 16) — withdrawing a location proof (I519).
 #[cfg(test)]
 mod location_proof_withdraw_invariants;
@@ -240,9 +296,22 @@ pub mod moderation_walk_asof_invariants;
 /// (I202–I209).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod nested_manifest_invariants;
+/// v61 S2 (CIRISPersist#1123) — I1500–I1503: one voice never decides who
+/// is in a room.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod open_admission_invariants;
+/// v61 S2 (CIRISPersist#1140) — I1511: the owner-binding audience.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod owner_binding_audience_invariants;
+/// v61 S2 (CIRISPersist#1148) — I1509: a replicated write needs the audience.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod put_audience_invariants;
 /// v53.1.2 (CIRISPersist#984 row 12) — who may retract what (I516).
 #[cfg(test)]
 mod retraction_invariants;
+/// v61 S2 (CIRISPersist#1161) — I1512: room moderation in CC's shape.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod room_moderation_invariants;
 // v53.0.0 (CIRISPersist#969) — I310–I319: one DEK per (stream, epoch).
 /// v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — affiliations: the declared
 /// cohort and the typed config record (I592–I594).
@@ -386,6 +455,9 @@ pub mod goal;
 // v60.1.0 (CIRISPersist#1120, CC 3.1.5) — the identity_amendment:v1 gate.
 pub mod goal_projection;
 pub(crate) mod group_amendment;
+// v61 (CIRISPersist#991 planes 2 and 3; CC 3.1.3, 3.1.3.2) — the group
+// records and the membership planes as rows.
+pub mod group_plane;
 pub mod hardware_attestation;
 pub mod identity_aggregate;
 pub mod identity_amendment;
@@ -435,6 +507,19 @@ pub mod claim_signing_invariants;
     any(feature = "postgres", feature = "sqlite")
 ))]
 pub mod key_rebind_invariants;
+// v61 (CC 2.6.2) — the open-time pass over non-canonical signed instants.
+pub mod instant_form;
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub(crate) mod instant_form_invariants;
+
+// v61 (CIRISPersist#1122) — one destination, one live key; agents announce no route.
+pub mod transport_routes;
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub(crate) mod transport_routes_invariants;
+
+// v61 (CIRISPersist#1146) — a restart re-registering the same key.
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub mod self_registration_restart_invariants;
 // v54.1.0 (#1042) — the ordering-gap witnesses drive the key plan too.
 #[cfg(all(
     any(test, feature = "test-anchor"),
@@ -460,9 +545,6 @@ pub mod invariant;
 /// v42.0.0 (CIRISPersist#814 part 2) — the `licensure:{authority_id}` status
 /// fold: set-valued, with `revoked` absorbing.
 pub mod licensure;
-/// v49.0.0 (CIRISPersist#912) — the membership listing plane: CC 2's `listed`
-/// opt-in, its door and its one public roster view.
-pub mod listing;
 pub mod location;
 /// v31.0.0 (CIRISPersist#650) — the in-place v31 migration: re-stamp the FINAL
 /// folded CEG state from the owner root, then purge what is provably dead.
@@ -616,6 +698,10 @@ mod accord_roster_invariants;
 /// v53.0.0 (CC 3.2 T6) — I440–I449, the head moves with the record.
 #[cfg(test)]
 mod lineage_head_invariants;
+/// v61 S1 (step 5) — I1499, the CC v1.0-rc14 re-vendor: the rc14 text
+/// persist does not build in this slice, each latched with its ticket.
+#[cfg(test)]
+mod rc14_vendor_invariants;
 /// v55.0.0 (CIRISPersist#753) — I700–I709, the CC rc7 re-vendor: the held
 /// families, the ledger owner rule, settlement admission.
 #[cfg(test)]
@@ -689,6 +775,11 @@ pub mod governance_policy;
 // get their own malformed_row reasons, on every backend.
 #[cfg(test)]
 mod malformed_reasons_1114_invariants;
+// CIRISPersist#1098 (CC 2.6.1.1.1 and 2.6.1.7, rc12) — I1478, I1479, I1493 and I1494: the
+// explicit-null member, `witnesses[]` as a set, the bare scope token, and
+// CC's 13 signed-object vectors, on every backend.
+#[cfg(test)]
+mod signed_object_1098_invariants;
 // v60.1.0 (docs/V61_TASK_PLAN.md §2 slice B) — the consumer asks, I1360+.
 #[cfg(test)]
 mod v601_asks_invariants;
@@ -925,8 +1016,7 @@ pub use stream_sth::{
 };
 pub(crate) use tier_ingest::{attestation_reput_verdict, community_reput_verdict};
 pub use tier_ingest::{
-    verify_community_admission, verify_community_membership_listing_admission,
-    verify_community_membership_revocation_admission,
+    verify_community_admission, verify_community_membership_revocation_admission,
     verify_community_membership_widening_admission, verify_envelope_hybrid_signature,
     verify_family_admission, verify_family_membership_revocation_admission,
     verify_family_membership_widening_admission, verify_federation_tier_ingest,
@@ -954,9 +1044,6 @@ pub use types::{
     SignedLocationProof, SignedRevocation, SignedTouchClaim, SignedTrustGrant,
     SignedTrustRevocation, SignerForm, TrustClass, TrustFilter, TrustGrant, TrustRelationship,
     TrustRow, TrustType,
-};
-pub use types::{
-    CommunityMembershipListing, ServedCommunityMembershipListing, SignedCommunityMembershipListing,
 };
 pub use types::{
     FamilyMembershipWidening, ServedFamilyMembershipWidening, SignedFamilyMembershipWidening,
@@ -1089,6 +1176,14 @@ pub const ROSTER_CONSENSUS_UNEVALUABLE: &str = "roster_consensus_unevaluable";
 /// v49.0.0 (CIRISPersist#908) — substantive: the change would leave the group
 /// with other active members and no active founder.
 pub const ROSTER_LAST_FOUNDER: &str = "roster_last_founder";
+/// v61 S2 (CC 4.5.13) — substantive: under `open:self_admit` a removal
+/// reached the LOCAL door more than
+/// [`consensus::OPEN_SELF_ADMIT_REMOVAL_WINDOW_SECS`] from its signed
+/// `removed_at`. A roster cosignature carries no signed instant of its own,
+/// so no cosignature can show it was given inside the window; the local door
+/// bounds the removal on receipt instead. The replicated door does not: a
+/// peer's clock is no witness to when the voices signed.
+pub const ROSTER_REMOVAL_OUTSIDE_WINDOW: &str = "roster_removal_outside_window";
 
 /// v50.0.0 (CIRISPersist#916, FSD `SECOND_DEVICE.md` §3) — the device carries
 /// no live owner-binding here: nobody is responsible for it, so no member's
@@ -1497,7 +1592,8 @@ pub struct RosterEvent {
     /// Founders from whom a live (at `effective_at`) `moderate` chain reaches a
     /// signer. The fold honours one only while it is an active founder.
     pub moderator_roots: std::collections::BTreeSet<String>,
-    /// A `reverse_quorum` removal the objection fold has reversed.
+    /// A `reverse_quorum` removal or (v61, CIRISPersist#1100 item 2(i))
+    /// widening the objection fold has reversed.
     pub reversed: bool,
 }
 
@@ -1528,9 +1624,14 @@ pub fn roster_event_standing(
     // moderator whose appointment was live at this event's instant and was
     // issued while its root held authority (operator ruling 2026-09-25: no
     // ending is retroactive, and the root need not still be a member).
+    // v61 (CIRISPersist#1123; CC 4.5.13) — under `open:self_admit` a
+    // named moderator's standing does not remove anyone alone: the two-voice
+    // floor is the removal's guarantee, and a moderator is one voice.
+    let moderator_may_act = !e.moderator_roots.is_empty()
+        && (e.is_add || rules.protocol != types::consensus_protocol::OPEN_SELF_ADMIT);
     let standing_without_protocol = e.signers.is_empty()
         || (!e.is_add && e.signers.contains(&e.member.key_id))
-        || !e.moderator_roots.is_empty();
+        || moderator_may_act;
     let admitted = if standing_without_protocol {
         Ok(())
     } else {
@@ -1554,6 +1655,7 @@ pub fn roster_event_standing(
             } else {
                 consensus::Direction::Remove
             },
+            subject: Some(e.member.key_id.as_str()),
         }) {
             consensus::Verdict::Admit => Ok(()),
             consensus::Verdict::Unevaluable { reason } => {
@@ -1926,7 +2028,7 @@ where
             .find(|s| s.member_key_id == member && s.effective_at == at)
     }
     let mut events = Vec::with_capacity(stored.len());
-    let mut reverse_candidates: Vec<(usize, String, String)> = Vec::new();
+    let mut reverse_candidates: Vec<(usize, String, String, bool)> = Vec::new();
     for ev in stored {
         let list = if ev.is_add {
             &signers.widening_signers
@@ -1938,9 +2040,12 @@ where
         // Moderator standing is filled in a second pass (below): it needs
         // each root's authority intervals, which come from these events.
         let moderator_roots = std::collections::BTreeSet::new();
-        if !ev.is_add && reverse {
+        // v61 (CIRISPersist#1100 item 2(i)) — a WIDENING is reversible
+        // too: the reverse path for adds is the same objection fold, a
+        // condition change, never a second machine.
+        if reverse {
             if let Some(actor) = row_signer.and_then(|x| x.authority_key_id.clone()) {
-                reverse_candidates.push((events.len(), actor, ev.row_hash.clone()));
+                reverse_candidates.push((events.len(), actor, ev.row_hash.clone(), ev.is_add));
             }
         }
         events.push(RosterEvent {
@@ -2005,7 +2110,7 @@ where
     } else {
         None
     };
-    for (idx, actor, row_hash) in reverse_candidates {
+    for (idx, actor, row_hash, is_add) in reverse_candidates {
         let fold = Box::pin(reverse_quorum::resolve_reverse_quorum_with(
             directory.as_dyn_directory(),
             cohort,
@@ -2021,9 +2126,24 @@ where
             now,
         ))
         .await?;
-        events[idx].reversed = fold.standing == reverse_quorum::ReverseQuorumStanding::Reversed;
+        // An add's reversal also clears the two-path count minimum of a
+        // community (`two_path::FloorClass::Voters`, the table's `min_count`
+        // 2): one voice never decides who is in a room (CC 4.5.13), in
+        // either direction. A removal's reversal keeps the #574 threshold.
+        events[idx].reversed = roster_reversal_stands(is_add, &fold);
     }
     Ok(events)
+}
+
+/// v61 (CIRISPersist#1100 item 2(i)) — does the objection `fold` reverse a
+/// roster event? A removal: when the fold says `Reversed` (the #574
+/// threshold). A WIDENING: also only when its objectors reach the two-path
+/// count minimum of a community (`two_path::FloorClass::Voters`, 2), so one
+/// voice never takes a member off.
+#[must_use]
+pub fn roster_reversal_stands(is_add: bool, fold: &reverse_quorum::ReverseQuorumFold) -> bool {
+    fold.standing == reverse_quorum::ReverseQuorumStanding::Reversed
+        && (!is_add || fold.distinct_objectors >= two_path::FloorClass::Voters.min_count())
 }
 
 /// v49.0.0 (CIRISPersist#908) — every stored roster event of `community`,
@@ -2199,6 +2319,17 @@ pub async fn authorized_community_roster_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v61 S2 (CIRISPersist#1143; CC rc14 4.4.3.2.8) — seats lapse at the
+    // dissolution: from its instant the room seats nobody.
+    if Box::pin(group_plane::community_dissolved_at(
+        directory,
+        &community.community_key_id,
+    ))
+    .await?
+    .is_some_and(|at| at <= as_of)
+    {
+        return Ok(Vec::new());
+    }
     // Boxed: the replay nests the moderator walk and the reverse-quorum
     // fold; a caller's future must not inline all of it (2 MiB worker stacks).
     let nodes = Box::pin(community_node_bearing_seats(directory, community)).await?;
@@ -2315,6 +2446,25 @@ where
     let Some(community) = directory.lookup_community(community_key_id).await? else {
         return Ok(());
     };
+    // v61 S2 (CIRISPersist#1143) — a dissolved room admits no seat and no
+    // removal: no new seat or grant is issued, and the DEK rotates no more.
+    Box::pin(group_plane::refuse_if_community_dissolved(
+        directory,
+        community_key_id,
+    ))
+    .await?;
+    // v61 S2 (CIRISPersist#1143; CC rc14 4.4.3.2.8) — an act against a member
+    // of a one-voice affiliation needs a countersign from outside the seat.
+    if is_revocation && !signers.contains(&incoming.key_id) {
+        Box::pin(affiliation_config::check_one_voice_countersign(
+            directory,
+            &community,
+            primary,
+            signers,
+            effective_at,
+        ))
+        .await?;
+    }
     // v50.0.0 (CIRISPersist#926, HIGH-3 ruling) — a trust-root community's
     // founder seats move ONLY through the record (a founders' amendment); the
     // planes admit and remove members only, whoever signs.
@@ -5418,23 +5568,6 @@ pub trait FederationDirectory: Send + Sync {
         widening: SignedCommunityMembershipWidening,
     ) -> Result<(), Error>;
 
-    /// v49.0.0 (CIRISPersist#912, FSD `ROOM_ROSTER_AUTHORITY.md` §11) — record
-    /// one member's public-listing choice in one room (CC 2 `listed`). The
-    /// door is [`listing::check_community_membership_listing`]: the signature
-    /// verifies, the signer IS the member (else
-    /// [`Error::MembershipListingRefused`] `envelope_listed_not_self_asserted`),
-    /// the value is `public` or absent (`envelope_listed_bad_value`), the row
-    /// is not future-dated, the room exists (a family id is
-    /// `envelope_listed_scope_invalid`, an unknown id
-    /// [`Error::InvalidArgument`]). Membership is not checked — rows arrive
-    /// out of order; the fold decides. Idempotent on the `(community_key_id,
-    /// member_key_id, effective_at)` PK; forward-only (clearing is a later
-    /// row with `listed: None`).
-    async fn put_community_membership_listing(
-        &self,
-        listing: SignedCommunityMembershipListing,
-    ) -> Result<(), Error>;
-
     /// v4.8.0 — all identity-occurrence revocations for `identity_key_id`
     /// (no `effective_at` filter — full history). Keyed by the table's
     /// leading PK column.
@@ -5485,25 +5618,6 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         community_key_id: &str,
     ) -> Result<Vec<CommunityMembershipWidening>, Error>;
-
-    /// v49.0.0 (CIRISPersist#912) — every stored listing row for
-    /// `community_key_id` (full history, set and cleared, members or not;
-    /// [`listing::latest_listing_at`] folds them). A roster-holder's read:
-    /// never serve it to a non-member — [`Self::listed_members`] is the view
-    /// for them.
-    async fn list_community_membership_listings_for(
-        &self,
-        community_key_id: &str,
-    ) -> Result<Vec<CommunityMembershipListing>, Error>;
-
-    /// v49.0.0 (CIRISPersist#912) — **the publicly listed members of a room,
-    /// now**: [`listing::listed_community_members_at`] at `Utc::now()`. The
-    /// ONLY roster view a non-member may be served (CC 2's one crack in
-    /// "never globally enumerable"); the endpoint that serves it is the
-    /// host's to gate. [`Error::InvalidArgument`] for an unknown room.
-    async fn listed_members(&self, community_key_id: &str) -> Result<Vec<CommunityMember>, Error> {
-        listing::listed_community_members_at(self, community_key_id, chrono::Utc::now()).await
-    }
 
     /// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — the
     /// signer of the room's record and of every stored widening and
@@ -5585,22 +5699,44 @@ pub trait FederationDirectory: Send + Sync {
     /// here — serving it would hand the edge advertise/serve responder empty
     /// signature bytes, which fails hybrid-Strict verify downstream and
     /// reopens the exact keyless-declaration forgery class E4 closed.
+    ///
+    /// v61 (CIRISPersist#991) — a PROJECTION read of the signed rows the
+    /// group plane minted, no longer a replication surface: the kind's
+    /// framed carriage is retired (`RETIRED_FRAMED`) and the row rides the
+    /// attestation plane. Off the directory capsule (ABI 12). Default:
+    /// [`Error::Unsupported`]; the backends override.
     async fn list_signed_families_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<ServedFamily>, Error>;
+    ) -> Result<Vec<ServedFamily>, Error> {
+        let _ = (since, limit);
+        Err(Error::Unsupported {
+            method: "list_signed_families_since",
+        })
+    }
 
     /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
     /// [`SignedCommunity`] wrappers since a cursor. Structural mirror of
     /// [`Self::list_signed_families_since`]: pair-cursor on
     /// `(admitted_at, community_key_id)` (#668), signed-rows-only contract
     /// identical.
+    ///
+    /// v61 (CIRISPersist#991) — a PROJECTION read of the signed rows the
+    /// group plane minted, no longer a replication surface: the kind's
+    /// framed carriage is retired (`RETIRED_FRAMED`) and the row rides the
+    /// attestation plane. Off the directory capsule (ABI 12). Default:
+    /// [`Error::Unsupported`]; the backends override.
     async fn list_signed_communities_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<ServedCommunity>, Error>;
+    ) -> Result<Vec<ServedCommunity>, Error> {
+        let _ = (since, limit);
+        Err(Error::Unsupported {
+            method: "list_signed_communities_since",
+        })
+    }
 
     /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
     /// [`SignedLocationProof`] wrappers since a cursor. Structural mirror of
@@ -5621,22 +5757,44 @@ pub trait FederationDirectory: Send + Sync {
     /// pair-cursor (#668) whose resume id is the compound of
     /// `(family_key_id, removed_identity_key_id, effective_at)` (v49.0.0,
     /// #910.1); signed-rows-only contract identical.
+    ///
+    /// v61 (CIRISPersist#991) — a PROJECTION read of the signed rows the
+    /// group plane minted, no longer a replication surface: the kind's
+    /// framed carriage is retired (`RETIRED_FRAMED`) and the row rides the
+    /// attestation plane. Off the directory capsule (ABI 12). Default:
+    /// [`Error::Unsupported`]; the backends override.
     async fn list_signed_family_membership_revocations_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<ServedFamilyMembershipRevocation>, Error>;
+    ) -> Result<Vec<ServedFamilyMembershipRevocation>, Error> {
+        let _ = (since, limit);
+        Err(Error::Unsupported {
+            method: "list_signed_family_membership_revocations_since",
+        })
+    }
 
     /// v49.0.0 (CIRISPersist#910) — bulk-list the signed
     /// [`SignedFamilyMembershipWidening`] wrappers since a cursor: the family
     /// twin of [`Self::list_signed_community_membership_widenings_since`];
     /// resume id = the compound of `(family_key_id, member_key_id,
     /// effective_at)`.
+    ///
+    /// v61 (CIRISPersist#991) — a PROJECTION read of the signed rows the
+    /// group plane minted, no longer a replication surface: the kind's
+    /// framed carriage is retired (`RETIRED_FRAMED`) and the row rides the
+    /// attestation plane. Off the directory capsule (ABI 12). Default:
+    /// [`Error::Unsupported`]; the backends override.
     async fn list_signed_family_membership_widenings_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<ServedFamilyMembershipWidening>, Error>;
+    ) -> Result<Vec<ServedFamilyMembershipWidening>, Error> {
+        let _ = (since, limit);
+        Err(Error::Unsupported {
+            method: "list_signed_family_membership_widenings_since",
+        })
+    }
 
     /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
     /// [`SignedCommunityMembershipRevocation`] wrappers since a cursor.
@@ -5644,31 +5802,43 @@ pub trait FederationDirectory: Send + Sync {
     /// pair-cursor (#668) whose resume id is the compound of
     /// `(community_key_id, removed_identity_key_id)`; signed-rows-only
     /// contract identical.
+    ///
+    /// v61 (CIRISPersist#991) — a PROJECTION read of the signed rows the
+    /// group plane minted, no longer a replication surface: the kind's
+    /// framed carriage is retired (`RETIRED_FRAMED`) and the row rides the
+    /// attestation plane. Off the directory capsule (ABI 12). Default:
+    /// [`Error::Unsupported`]; the backends override.
     async fn list_signed_community_membership_revocations_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<ServedCommunityMembershipRevocation>, Error>;
+    ) -> Result<Vec<ServedCommunityMembershipRevocation>, Error> {
+        let _ = (since, limit);
+        Err(Error::Unsupported {
+            method: "list_signed_community_membership_revocations_since",
+        })
+    }
     /// v48.0.0 (CIRISPersist#860) — bulk-list the signed
     /// [`SignedCommunityMembershipWidening`] wrappers since a cursor: the
     /// structural mirror of
     /// [`Self::list_signed_community_membership_revocations_since`]; resume
     /// id = the compound of `(community_key_id, member_key_id, effective_at)`.
+    ///
+    /// v61 (CIRISPersist#991) — a PROJECTION read of the signed rows the
+    /// group plane minted, no longer a replication surface: the kind's
+    /// framed carriage is retired (`RETIRED_FRAMED`) and the row rides the
+    /// attestation plane. Off the directory capsule (ABI 12). Default:
+    /// [`Error::Unsupported`]; the backends override.
     async fn list_signed_community_membership_widenings_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
-    ) -> Result<Vec<ServedCommunityMembershipWidening>, Error>;
-
-    /// v49.0.0 (CIRISPersist#912) — bulk-list the signed
-    /// [`SignedCommunityMembershipListing`] wrappers since a cursor (the 19th
-    /// kind's serve read): pair cursor, resume id = the compound of
-    /// `(community_key_id, member_key_id, effective_at)`; signed rows only.
-    async fn list_signed_community_membership_listings_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedCommunityMembershipListing>, Error>;
+    ) -> Result<Vec<ServedCommunityMembershipWidening>, Error> {
+        let _ = (since, limit);
+        Err(Error::Unsupported {
+            method: "list_signed_community_membership_widenings_since",
+        })
+    }
 
     // ─── v21.1.0 (CIRISPersist#507c) — bulk signed-since reads for the 5
     //     PRIMARY signed planes (edge advertise/serve bridge; extends the
@@ -7379,6 +7549,7 @@ pub trait FederationDirectory: Send + Sync {
                 roster: &roster,
                 signers: &signers,
                 direction,
+                subject: None,
             }) {
                 consensus::Verdict::Admit => {}
                 consensus::Verdict::Insufficient { detail } => {
@@ -8056,6 +8227,24 @@ pub trait FederationDirectory: Send + Sync {
         )
         .await?;
         let row = signed.attestation.clone();
+        // v61 (CIRISPersist#1155 / #1157) — a placement is idempotent PER
+        // AUDIENCE. The put door no longer swallows a second `supersedes` from
+        // the same attester on the same prior (idempotence keys on the row's
+        // id, CC rc14 3.1.9.4), so the door asks the one question a placement
+        // needs: is this prior already placed, by this attester, in THIS
+        // audience (cohort scope and cohort target)? Then it is the same
+        // placement. A placement into a DIFFERENT room is a new one, and both
+        // stay live (#1155: one row shared into two rooms).
+        for c in self
+            .list_attestations_referencing(&prior.attestation_id)
+            .await?
+        {
+            if crossing::same_placement(&c, &row)? {
+                return Ok(crossing::MeshCrossingOutcome::AlreadyWidened {
+                    prior_attestation_id: prior.attestation_id,
+                });
+            }
+        }
         // v41.0.0 (#804) — this node just signed this row; it is not a peer of
         // itself. Before this, every widening charged the OWNER's peer bucket,
         // which is what cut chat off at ~250 messages.
@@ -8553,7 +8742,24 @@ pub trait FederationDirectory: Send + Sync {
     /// `transport_kind` since #443, RETIRED (tombstoned) rows excluded.
     /// Empty when none. Liveness filtering (on `last_seen_at` age) is
     /// caller-side. Default impl errors; the three backends override.
+    ///
+    /// v61 (CIRISPersist#1122) — one destination, one live key: a route a
+    /// newer route on its destination by a tied key displaces is not returned
+    /// ([`transport_routes::fold_one_live_key`] over
+    /// [`Self::list_transport_destinations_for_unfolded`]).
     async fn list_transport_destinations_for(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        let rows = self
+            .list_transport_destinations_for_unfolded(occurrence_key_id)
+            .await?;
+        transport_routes::fold_one_live_key(self, rows).await
+    }
+
+    /// The backend's stored live routes of `occurrence_key_id`, before the
+    /// one-live-key fold. Default impl errors; backends override.
+    async fn list_transport_destinations_for_unfolded(
         &self,
         occurrence_key_id: &str,
     ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
@@ -8574,7 +8780,19 @@ pub trait FederationDirectory: Send + Sync {
     /// by `(occurrence_key_id, transport_kind)` — the route key, so the
     /// restore order is deterministic and "which is current" is structural
     /// (one row per key). Default impl errors; backends override.
+    ///
+    /// v61 (CIRISPersist#1122) — folded one live key per destination
+    /// ([`transport_routes::fold_one_live_key`]).
     async fn list_all_transport_destinations(
+        &self,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        let rows = self.list_all_transport_destinations_unfolded().await?;
+        transport_routes::fold_one_live_key(self, rows).await
+    }
+
+    /// Every stored live route, before the one-live-key fold. Default impl
+    /// errors; backends override.
+    async fn list_all_transport_destinations_unfolded(
         &self,
     ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
         Err(Error::Backend(
@@ -8590,7 +8808,23 @@ pub trait FederationDirectory: Send + Sync {
     /// binding over an [`Advisory`](self_at_login::BindingProvenance::Advisory)
     /// one — the AV-42 spoof is resolved by preference, never a substrate reject.
     /// #443: RETIRED rows excluded. Default impl errors; backends override.
+    ///
+    /// v61 (CIRISPersist#1122) — a claimant a newer route by a TIED key
+    /// (one live owner) displaces is not returned; untied claimants still
+    /// coexist ([`transport_routes::fold_one_live_key`]).
     async fn list_transport_destinations_by_destination(
+        &self,
+        destination: &str,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        let rows = self
+            .list_transport_destinations_by_destination_unfolded(destination)
+            .await?;
+        transport_routes::fold_one_live_key(self, rows).await
+    }
+
+    /// Every stored live claimant of `destination`, before the one-live-key
+    /// fold. Default impl errors; backends override.
+    async fn list_transport_destinations_by_destination_unfolded(
         &self,
         destination: &str,
     ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
@@ -8743,7 +8977,7 @@ pub trait FederationDirectory: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     async fn put_wholeness_witness(
         &self,
-        witness: &ciris_verify_core::holonomic::WholenessWitness,
+        witness: &ciris_verify_core::substrate::WholenessWitness,
         sig_ed25519_b64: &str,
         sig_ml_dsa_65_b64: Option<&str>,
         pqc_key_id: &str,
@@ -9687,7 +9921,8 @@ pub enum Error {
     /// consumer, which receives the Display, reads the token too.
     #[error(
         "federation_envelope_kind_retired: {} — the framed {} carriage is retired; it \
-         replicates as its key-plane row (sealed-transport floor, operator ruling 2026-10-19)",
+         replicates as its row on the attestation plane (sealed-transport floor, operator \
+         ruling 2026-10-19; CIRISPersist#991)",
         replication_policy::retired_detail(*kind),
         replication_policy::retired_detail(*kind)
     )]
@@ -10426,30 +10661,6 @@ pub enum Error {
         /// The new device's occurrence key.
         occurrence_key_id: String,
         /// Which clause refused; one of the rule tokens above.
-        rule: &'static str,
-    },
-
-    /// v49.0.0 (CIRISPersist#912, FSD `ROOM_ROSTER_AUTHORITY.md` §11) — a
-    /// membership LISTING (CC 2 `listed`) whose signature verified but which
-    /// the listing door refuses. Nothing is stored. Stable `kind()` token
-    /// `federation_membership_listing_refused`.
-    ///
-    /// `rule` is one of [`listing::LISTED_RULE_NOT_SELF_ASSERTED`] (the signer
-    /// is not the member — the clause that keeps the field an opt-in rather
-    /// than a power), [`listing::LISTED_RULE_BAD_VALUE`] (a value other than
-    /// `public`) or [`listing::LISTED_RULE_SCOPE_INVALID`] (the id names a
-    /// family, whose membership is structurally invisible). None is retryable.
-    #[error(
-        "membership listing in {community_key_id:?} signed by {offered_authority_key_id:?} \
-         refused ({rule}): only the member may list their own membership, and only as \
-         `public` (CIRISPersist#912)"
-    )]
-    MembershipListingRefused {
-        /// The group the listing names.
-        community_key_id: String,
-        /// The signer (whose signature DID verify).
-        offered_authority_key_id: String,
-        /// Which clause refused; one of the `listing::LISTED_RULE_*` tokens.
         rule: &'static str,
     },
 
@@ -11957,6 +12168,16 @@ pub enum Error {
     #[error("backend: {0}")]
     Backend(String),
 
+    /// v59.1.2 — no pooled connection was freed within the pool's wait
+    /// timeout (`waited`): the pool is starved. Before v59.1.2 the checkout
+    /// had no timeout and waited forever. Python `ciris_persist.PoolExhausted`
+    /// (a `RuntimeError`, the type the backend arm it was carved from had).
+    #[error("federation_pool_exhausted: no pooled connection freed within {waited:?}")]
+    PoolExhausted {
+        /// The wait the pool was configured with.
+        waited: std::time::Duration,
+    },
+
     /// v11.8.1 (CIRISPersist#329). The consumer-side
     /// [`crate::ffi::directory_capsule::build_ops_directory`] proxy was
     /// asked for a `FederationDirectory` method that has no corresponding
@@ -12105,19 +12326,19 @@ pub mod malformed_row {
     /// occurrence, not cosigned by a strict majority of the self's current
     /// live roster: a legacy revocation does not bypass the two-path door.
     pub const CARRIER_WITHOUT_ROSTER_QUORUM: &str = "carrier_without_roster_quorum";
-    /// v60.0.0 (CIRISPersist#988 item 4, CC 3.1.9.7) — a `goal:*` row (a
-    /// declaration or an amendment) whose `meta_goal_alignment` is missing or
-    /// ill-formed: a dimension outside the seven M-1 dimensions, an empty
-    /// rationale, an unknown member, an empty deliberation pointer.
+    /// v60.0.0 (CIRISPersist#988 item 4; CC 3.1.9.7, registered at rc12) — a
+    /// `goal:*` row (a declaration or an amendment) whose `meta_goal_alignment` is
+    /// missing or ill-formed: a dimension outside the seven M-1 dimensions, an
+    /// empty rationale, an unknown member, an empty deliberation pointer.
     pub const GOAL_META_ALIGNMENT: &str = "goal_meta_alignment_malformed";
-    /// v60.0.0 (CIRISPersist#988 item 4) — any other ill-formed goal body: a
-    /// dimension that is not a clean `goal:{scale}:v1` leaf, an empty
-    /// `goal_text`, a `cohort` scale without its `cohort_id` (or a `cohort_id`
-    /// on another scale), a score outside `[-1, 1]`.
+    /// v60.0.0 (CIRISPersist#988 item 4; CC 3.1.9.7, registered at rc12) — any
+    /// other ill-formed goal body: a dimension that is not a clean
+    /// `goal:{scale}:v1` leaf, an empty `goal_text`, a `cohort` scale without its
+    /// `cohort_id` (or a `cohort_id` on another scale), a score outside `[-1, 1]`.
     pub const GOAL_BODY: &str = "goal_body_malformed";
-    /// v60.0.0 (CIRISPersist#988 item 4) — a v59 typed `Goal` (it carries
-    /// `goal_id` / `declared_by_key_id` / `declared_at` / `scope` /
-    /// `retired_at`) offered at a goal door that takes a body.
+    /// v60.0.0 (CIRISPersist#988 item 4; CC 3.1.9.7, registered at rc12) — a v59
+    /// typed `Goal` (it carries `goal_id` / `declared_by_key_id` / `declared_at` /
+    /// `scope` / `retired_at`) offered at a goal door that takes a body.
     pub const GOAL_TYPED_OBJECT_RETIRED: &str = "goal_typed_object_retired";
     /// v60.0.0 (CIRISPersist#1114; CC 2.6.1.7, rc10 `99bf187`) — the row's
     /// `original_content_hash` is not the SHA-256 of JCS(its envelope). Was a
@@ -12131,6 +12352,10 @@ pub mod malformed_row {
     /// element is neither a canonical lowercase key_id nor the tagged
     /// `canonical:sha256:<hex64>` form. Was a `federation_invalid_argument`.
     pub const SUBJECT_KEY_ID_MALFORMED: &str = "subject_key_id_malformed";
+    /// CIRISPersist#1098 F4 (CC 2.6.1.1.1 and 2.6.1.7, rc12) — an optional
+    /// signed envelope member written as an explicit JSON `null`. An optional
+    /// member that is not carried is absent.
+    pub const ENVELOPE_MEMBER_NULL: &str = "envelope_member_null";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -12153,6 +12378,8 @@ pub mod malformed_row {
         CONTENT_HASH_MISMATCH,
         ENVELOPE_ROW_MEMBER_UNKNOWN,
         SUBJECT_KEY_ID_MALFORMED,
+        // Appended, never inserted: adopters key on the position.
+        ENVELOPE_MEMBER_NULL,
     ];
 }
 
@@ -12242,7 +12469,6 @@ impl Error {
             Error::MembershipAcceptanceRefused { .. } => "federation_membership_acceptance_refused",
             Error::GroupDissolved { .. } => "federation_group_dissolved",
             Error::DeviceRekeyRefused { .. } => "federation_device_rekey_refused",
-            Error::MembershipListingRefused { .. } => "federation_membership_listing_refused",
             Error::AccordDimensionRequiresAccordHolder { .. } => {
                 "federation_accord_dimension_requires_accord_holder"
             }
@@ -12338,6 +12564,7 @@ impl Error {
             Error::FederationTierUnverified { .. } => "federation_federation_tier_unverified",
             Error::WitnessAdmit(e) => e.kind(),
             Error::Backend(_) => "federation_backend",
+            Error::PoolExhausted { .. } => "federation_pool_exhausted",
             Error::Unsupported { .. } => "federation_ops_proxy_unsupported",
             Error::PurgeRefused { token, .. } => token,
         }

@@ -282,6 +282,23 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// `OrgMemberships` / `Organizations` are REMOVED (their tables went at
 /// V205). A consumer built against 10 sends ops this host no longer decodes.
 ///
+/// v12 (v61, CIRISPersist#991, CC 3.1.3) — a BREAK: a group's record and its
+/// widening and revocation planes are rows on the attestation plane
+/// (`group:roster:v1`, `membership:{widening,removal,resignation}:v1`), and
+/// their six framed kinds joined `RETIRED_FRAMED`. The ops
+/// `ListSignedFamiliesSince`, `ListSignedCommunitiesSince`,
+/// `ListSignedFamilyMembershipRevocationsSince`,
+/// `ListSignedFamilyMembershipWideningsSince`,
+/// `ListSignedCommunityMembershipRevocationsSince`,
+/// `ListSignedCommunityMembershipWideningsSince` and
+/// `ApplyReplicatedCommunity` and their results are REMOVED: the rows ride
+/// `ApplyReplicatedAttestation` and the attestation cursor. A consumer built
+/// against 11 sends ops this host no longer decodes.
+/// The same break retires the member listing with no successor (the
+/// steward's ruling: no outward member listing): the op
+/// `ListSignedCommunityMembershipListingsSince` and its result
+/// `SignedCommunityMembershipListings` are REMOVED.
+///
 /// Consumers MUST check the field at capsule-receive time:
 ///
 /// ```ignore
@@ -294,7 +311,7 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 ///     "persist directory_capsule ABI version mismatch — pin floor too low"
 /// );
 /// ```
-pub const DIRECTORY_ABI_VERSION: u32 = 11;
+pub const DIRECTORY_ABI_VERSION: u32 = 12;
 
 /// A `FederationDirectory` operation, serialized by the consumer and
 /// dispatched inside persist's `.so`.
@@ -763,62 +780,12 @@ pub enum DirectoryOp {
         /// The granting node whose live peer set is asked for.
         node_key_id: String,
     },
-    /// [`FederationDirectory::list_signed_families_since`] (v21.0.0,
-    /// CIRISPersist#504 FLOOR) — bulk-list the full `SignedFamily` wrappers
-    /// (row + V110 authority signature) since a cursor, for the edge
-    /// advertise/serve responder. Result rides `SignedFamilies`. APPEND-ONLY.
-    ListSignedFamiliesSince {
-        /// Cursor: rows with `founded_at > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
-    /// [`FederationDirectory::list_signed_communities_since`] (v21.0.0,
-    /// CIRISPersist#504 FLOOR). Structural mirror of
-    /// [`DirectoryOp::ListSignedFamiliesSince`]. Result rides `SignedCommunities`.
-    /// APPEND-ONLY.
-    ListSignedCommunitiesSince {
-        /// Cursor: rows with `founded_at > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
     /// [`FederationDirectory::list_signed_location_proofs_since`] (v21.0.0,
     /// CIRISPersist#504 FLOOR). Structural mirror of
-    /// [`DirectoryOp::ListSignedFamiliesSince`]. Result rides `SignedLocationProofs`.
+    /// the other signed cursors. Result rides `SignedLocationProofs`.
     /// APPEND-ONLY.
     ListSignedLocationProofsSince {
         /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
-    /// [`FederationDirectory::list_signed_family_membership_revocations_since`]
-    /// (v21.0.0, CIRISPersist#504 FLOOR). Structural mirror of
-    /// [`DirectoryOp::ListSignedFamiliesSince`]. Result rides
-    /// `SignedFamilyMembershipRevocations`. APPEND-ONLY.
-    ListSignedFamilyMembershipRevocationsSince {
-        /// Cursor: rows with `removed_at > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
-    /// [`FederationDirectory::list_signed_community_membership_revocations_since`]
-    /// (v21.0.0, CIRISPersist#504 FLOOR). Structural mirror of
-    /// [`DirectoryOp::ListSignedFamiliesSince`]. Result rides
-    /// `SignedCommunityMembershipRevocations`. APPEND-ONLY.
-    ListSignedCommunityMembershipRevocationsSince {
-        /// Cursor: rows with `removed_at > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
-    /// v48.0.0 (CIRISPersist#860) —
-    /// [`FederationDirectory::list_signed_community_membership_widenings_since`],
-    /// the mirror of [`DirectoryOp::ListSignedCommunityMembershipRevocationsSince`].
-    /// Result rides `SignedCommunityMembershipWidenings`. APPEND-ONLY.
-    ListSignedCommunityMembershipWideningsSince {
-        /// Cursor (None ⇒ from start).
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
@@ -990,26 +957,6 @@ pub enum DirectoryOp {
         /// The identity the TRANSPORT authenticated — never the row's claim.
         authenticated_peer_key_id: String,
     },
-    /// v49.0.0 (CIRISPersist#910) —
-    /// [`FederationDirectory::list_signed_family_membership_widenings_since`],
-    /// the family twin of [`DirectoryOp::ListSignedCommunityMembershipWideningsSince`].
-    /// Result rides `SignedFamilyMembershipWidenings`. APPEND-ONLY (Growth).
-    ListSignedFamilyMembershipWideningsSince {
-        /// Cursor (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
-    /// v49.0.0 (CIRISPersist#912) —
-    /// [`FederationDirectory::list_signed_community_membership_listings_since`],
-    /// the 19th kind's serve read. Result rides
-    /// `SignedCommunityMembershipListings`. APPEND-ONLY (Growth).
-    ListSignedCommunityMembershipListingsSince {
-        /// Cursor (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
     /// v50.0.0 (CIRISPersist#917) —
     /// [`FederationDirectory::apply_replicated_attestation`], the typed
     /// unattributed door. The far side runs the whole plan-then-write body
@@ -1030,16 +977,6 @@ pub enum DirectoryOp {
         attestation: SignedAttestation,
         /// The identity the TRANSPORT authenticated — never the row's claim.
         authenticated_peer_key_id: String,
-    },
-    /// v50.0.0 (CIRISPersist#925/#931) —
-    /// [`FederationDirectory::apply_replicated_community`], the REPLICATED
-    /// community entry: a legacy infrastructure record is admitted as data,
-    /// where [`DirectoryOp::PutCommunity`] (the local door) runs the full CC
-    /// 3.2 gate. A replication bridge sends this. Result rides
-    /// `ReplicatedCommunityOutcome`. APPEND-ONLY (Growth).
-    ApplyReplicatedCommunity {
-        /// The signed community row received from a peer.
-        community: SignedCommunity,
     },
     /// v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6) —
     /// [`FederationDirectory::put_lineage_head_cosign`], the witness plane's
@@ -1089,6 +1026,48 @@ pub enum DirectoryOp {
         after_content_hash: Option<String>,
         /// Page size.
         limit: u32,
+    },
+    /// v59.1.2 (CIRISPersist#1162) —
+    /// [`FederationDirectory::execute_attestation_query`]: the typed bounded
+    /// read's storage half. Every `AttestationQuery` read a capsule consumer
+    /// makes (the owner walk, `owner_of`, a chat reader) runs through this;
+    /// the page cut, cursor and per-door count stay on the consumer's side
+    /// (`AttestationReads::query_attestations`), so the host runs the
+    /// statement only. Result rides `AttestationQueryRows`. APPEND-ONLY
+    /// (Growth).
+    ExecuteAttestationQuery {
+        /// The query, as the consumer built it.
+        query: crate::federation::attestation_query::AttestationQuery,
+    },
+    /// v59.1.2 (CIRISPersist#1162) —
+    /// [`FederationDirectory::list_composers_referencing_any`]: the
+    /// retraction fold's second read (`owner_of` reaches it through the
+    /// live-delegation fold). Result rides `AttestationRows`. APPEND-ONLY
+    /// (Growth).
+    ListComposersReferencingAny {
+        /// The targets the composers' `references_attestation_id` names.
+        target_attestation_ids: Vec<String>,
+        /// Only composers attested to this key, when given.
+        attested_key_id: Option<String>,
+        /// Only composers authored by this key, when given.
+        attesting_key_id: Option<String>,
+    },
+    /// v59.1.2 (CIRISPersist#1162) —
+    /// [`FederationDirectory::list_identity_occurrence_history_by_occurrence`]:
+    /// `owner_of` names each granter as the self it signed as at its
+    /// binding's instant (`self_of_at`), which reads this history. Result
+    /// rides `OccurrenceHistory`. APPEND-ONLY (Growth).
+    ListIdentityOccurrenceHistoryByOccurrence {
+        /// The occurrence key.
+        occurrence_key_id: String,
+    },
+    /// v59.1.2 (CIRISPersist#1162) —
+    /// [`FederationDirectory::list_identity_occurrences_by_occurrence_key`]:
+    /// `self_of_at` reads the occurrence's current rows beside its history.
+    /// Result rides `IdentityOccurrences`. APPEND-ONLY (Growth).
+    ListIdentityOccurrencesByOccurrenceKey {
+        /// The occurrence key.
+        occurrence_key_id: String,
     },
 }
 
@@ -1209,27 +1188,9 @@ pub enum DirectoryOpResult {
     /// `list_consent_peers` (v21.0.0, #502 E7) — the revocation-folded
     /// `consent_peer_set` peer list, sorted + deduped. APPEND-ONLY.
     ConsentPeers(Vec<String>),
-    /// `list_signed_families_since` (v21.0.0, CIRISPersist#504 FLOOR) — the
-    /// full signed-family wrappers (row + V110 authority signature) for the
-    /// edge advertise/serve responder. APPEND-ONLY.
-    SignedFamilies(Vec<crate::federation::ServedFamily>),
-    /// `list_signed_communities_since` (v21.0.0, CIRISPersist#504 FLOOR).
-    /// APPEND-ONLY.
-    SignedCommunities(Vec<crate::federation::ServedCommunity>),
     /// `list_signed_location_proofs_since` (v21.0.0, CIRISPersist#504 FLOOR).
     /// APPEND-ONLY.
     SignedLocationProofs(Vec<crate::federation::ServedLocationProof>),
-    /// `list_signed_family_membership_revocations_since` (v21.0.0,
-    /// CIRISPersist#504 FLOOR). APPEND-ONLY.
-    SignedFamilyMembershipRevocations(Vec<crate::federation::ServedFamilyMembershipRevocation>),
-    /// `list_signed_community_membership_revocations_since` (v21.0.0,
-    /// CIRISPersist#504 FLOOR). APPEND-ONLY.
-    SignedCommunityMembershipRevocations(
-        Vec<crate::federation::ServedCommunityMembershipRevocation>,
-    ),
-    /// v48.0.0 (CIRISPersist#860) — `list_signed_community_membership_widenings_since`.
-    /// APPEND-ONLY.
-    SignedCommunityMembershipWidenings(Vec<crate::federation::ServedCommunityMembershipWidening>),
     /// `list_signed_transport_destinations_since` (v21.1.0,
     /// CIRISPersist#507c). APPEND-ONLY.
     SignedTransportDestinationsSince(Vec<crate::federation::ServedTransportDestination>),
@@ -1302,12 +1263,6 @@ pub enum DirectoryOpResult {
     /// [`DirectoryOp::EvictKnownWireHashes`] (CIRISPersist#785) — evicted,
     /// remaining, and how far over bound the floor left it. APPEND-ONLY.
     KnownHashEviction(crate::federation::KnownHashEviction),
-    /// v49.0.0 (CIRISPersist#910) — `list_signed_family_membership_widenings_since`.
-    /// APPEND-ONLY (Growth).
-    SignedFamilyMembershipWidenings(Vec<crate::federation::ServedFamilyMembershipWidening>),
-    /// v49.0.0 (CIRISPersist#912) — `list_signed_community_membership_listings_since`.
-    /// APPEND-ONLY (Growth).
-    SignedCommunityMembershipListings(Vec<crate::federation::ServedCommunityMembershipListing>),
     /// v50.0.0 (CIRISPersist#917) — `apply_replicated_attestation` and
     /// `put_attestation_synced`: the typed Attestation-plane outcome. A
     /// `Refused` is a policy outcome carried HERE with its reason, never
@@ -1315,10 +1270,6 @@ pub enum DirectoryOpResult {
     ReplicatedAttestationOutcome(
         crate::federation::attestation_apply::ReplicatedAttestationOutcome,
     ),
-    /// v50.0.0 (CIRISPersist#931) — `apply_replicated_community`: the typed
-    /// community-plane outcome. A `Refused` carries its reason here, never
-    /// flattened to [`Self::Err`]. APPEND-ONLY (Growth).
-    ReplicatedCommunityOutcome(crate::federation::ReplicatedCommunityOutcome),
     /// v50.0.0 (CIRISPersist#928) — `withdraws_admission_depth`: `None` when
     /// nothing was recorded (a pre-V157 row reads as the 16-hop walk).
     /// APPEND-ONLY (Growth).
@@ -1326,6 +1277,21 @@ pub enum DirectoryOpResult {
     /// v51.0.0 (CIRISPersist#938) — `PutLineageHeadCosign`'s typed outcome.
     /// APPEND-ONLY (Growth).
     LineageCosignOutcome(crate::federation::lineage_witness::LineageCosignOutcome),
+    /// v59.1.2 (CIRISPersist#1162) — `execute_attestation_query`: the rows in
+    /// the query's order (at most `limit + 1`), the envelope bytes decoded and
+    /// the backend that ran it. APPEND-ONLY (Growth).
+    AttestationQueryRows(crate::federation::attestation_query::QueryRows),
+    /// v59.1.2 (CIRISPersist#1162) — a plain `Vec<Attestation>` read
+    /// (`list_composers_referencing_any`). Distinct from
+    /// [`Self::Attestations`], which carries `Served*` rows. APPEND-ONLY
+    /// (Growth).
+    AttestationRows(Vec<Attestation>),
+    /// v59.1.2 (CIRISPersist#1162) —
+    /// `list_identity_occurrence_history_by_occurrence`. APPEND-ONLY (Growth).
+    OccurrenceHistory(Vec<crate::federation::OccurrenceAssertion>),
+    /// v59.1.2 (CIRISPersist#1162) —
+    /// `list_identity_occurrences_by_occurrence_key`. APPEND-ONLY (Growth).
+    IdentityOccurrences(Vec<IdentityOccurrence>),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -1866,48 +1832,9 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
-        DirectoryOp::ListSignedFamiliesSince { since, limit } => {
-            match dir.list_signed_families_since(since, limit).await {
-                Ok(v) => DirectoryOpResult::SignedFamilies(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
-        DirectoryOp::ListSignedCommunitiesSince { since, limit } => {
-            match dir.list_signed_communities_since(since, limit).await {
-                Ok(v) => DirectoryOpResult::SignedCommunities(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
         DirectoryOp::ListSignedLocationProofsSince { since, limit } => {
             match dir.list_signed_location_proofs_since(since, limit).await {
                 Ok(v) => DirectoryOpResult::SignedLocationProofs(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
-        DirectoryOp::ListSignedFamilyMembershipRevocationsSince { since, limit } => {
-            match dir
-                .list_signed_family_membership_revocations_since(since, limit)
-                .await
-            {
-                Ok(v) => DirectoryOpResult::SignedFamilyMembershipRevocations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
-        DirectoryOp::ListSignedCommunityMembershipRevocationsSince { since, limit } => {
-            match dir
-                .list_signed_community_membership_revocations_since(since, limit)
-                .await
-            {
-                Ok(v) => DirectoryOpResult::SignedCommunityMembershipRevocations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
-        DirectoryOp::ListSignedCommunityMembershipWideningsSince { since, limit } => {
-            match dir
-                .list_signed_community_membership_widenings_since(since, limit)
-                .await
-            {
-                Ok(v) => DirectoryOpResult::SignedCommunityMembershipWidenings(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -1990,24 +1917,6 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
-        DirectoryOp::ListSignedFamilyMembershipWideningsSince { since, limit } => {
-            match dir
-                .list_signed_family_membership_widenings_since(since, limit)
-                .await
-            {
-                Ok(v) => DirectoryOpResult::SignedFamilyMembershipWidenings(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
-        DirectoryOp::ListSignedCommunityMembershipListingsSince { since, limit } => {
-            match dir
-                .list_signed_community_membership_listings_since(since, limit)
-                .await
-            {
-                Ok(v) => DirectoryOpResult::SignedCommunityMembershipListings(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
         DirectoryOp::ApplyReplicatedAttestation { attestation } => {
             match dir.apply_replicated_attestation(attestation).await {
                 Ok(o) => DirectoryOpResult::ReplicatedAttestationOutcome(o),
@@ -2024,12 +1933,6 @@ pub async fn dispatch_directory_op(
             Ok(o) => DirectoryOpResult::ReplicatedAttestationOutcome(o),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
-        DirectoryOp::ApplyReplicatedCommunity { community } => {
-            match dir.apply_replicated_community(community).await {
-                Ok(o) => DirectoryOpResult::ReplicatedCommunityOutcome(o),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
         DirectoryOp::PutLineageHeadCosign { cosign } => {
             match dir.put_lineage_head_cosign(cosign).await {
                 Ok(o) => DirectoryOpResult::LineageCosignOutcome(o),
@@ -2070,6 +1973,48 @@ pub async fn dispatch_directory_op(
             Ok(v) => DirectoryOpResult::WireHashes(v),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
+        // The storage half only: the consumer's `query_attestations` wrapper
+        // validates, cuts the page and records the read, so calling the
+        // wrapper here would count it twice.
+        DirectoryOp::ExecuteAttestationQuery { query } => {
+            match dir.execute_attestation_query(&query).await {
+                Ok(rows) => DirectoryOpResult::AttestationQueryRows(rows),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListComposersReferencingAny {
+            target_attestation_ids,
+            attested_key_id,
+            attesting_key_id,
+        } => match dir
+            .list_composers_referencing_any(
+                &target_attestation_ids,
+                attested_key_id.as_deref(),
+                attesting_key_id.as_deref(),
+            )
+            .await
+        {
+            Ok(v) => DirectoryOpResult::AttestationRows(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::ListIdentityOccurrenceHistoryByOccurrence { occurrence_key_id } => {
+            match dir
+                .list_identity_occurrence_history_by_occurrence(&occurrence_key_id)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::OccurrenceHistory(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListIdentityOccurrencesByOccurrenceKey { occurrence_key_id } => {
+            match dir
+                .list_identity_occurrences_by_occurrence_key(&occurrence_key_id)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::IdentityOccurrences(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
     }
 }
 
@@ -2716,23 +2661,6 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
-    /// v50.0.0 (CIRISPersist#931) — the replicated community entry, proxied.
-    async fn apply_replicated_community(
-        &self,
-        community: SignedCommunity,
-    ) -> Result<crate::federation::ReplicatedCommunityOutcome, Error> {
-        match self
-            .run_op(&DirectoryOp::ApplyReplicatedCommunity { community })
-            .await?
-        {
-            DirectoryOpResult::ReplicatedCommunityOutcome(o) => Ok(o),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
     /// v51.0.0 (CIRISPersist#938) — the lineage-head cosign door, proxied.
     async fn put_lineage_head_cosign(
         &self,
@@ -3192,16 +3120,24 @@ impl FederationDirectory for OpsDirectory {
             method: "attestation_insert_local",
         })
     }
-    // v56.0.0 (CIRISPersist#1001) — the typed bounded read, as the reads it
-    // replaces: not proxied across the capsule.
+    /// v59.1.2 (CIRISPersist#1162) — routed (was `Error::Unsupported`). Every
+    /// `AttestationQuery` read on a capsule consumer — the owner walk,
+    /// `owner_of`, edge's chat reader — reaches the host's backend here; the
+    /// stub made each one a refusal on every phone and agent-embedded node.
     async fn execute_attestation_query(
         &self,
         q: &crate::federation::attestation_query::AttestationQuery,
     ) -> Result<crate::federation::attestation_query::QueryRows, Error> {
-        let _ = q;
-        Err(Error::Unsupported {
-            method: "execute_attestation_query",
-        })
+        match self
+            .run_op(&DirectoryOp::ExecuteAttestationQuery { query: q.clone() })
+            .await?
+        {
+            DirectoryOpResult::AttestationQueryRows(rows) => Ok(rows),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     // v56.0.0 (CIRISPersist#1001) — required now (its default composed over a
     // retired read): not proxied across the capsule.
@@ -3231,9 +3167,22 @@ impl FederationDirectory for OpsDirectory {
         attested_key_id: Option<&str>,
         attesting_key_id: Option<&str>,
     ) -> Result<Vec<Attestation>, Error> {
-        Err(Error::Unsupported {
-            method: "list_composers_referencing_any",
-        })
+        // v59.1.2 (CIRISPersist#1162) — routed: `owner_of` reaches it through
+        // the live-delegation fold's retraction read.
+        match self
+            .run_op(&DirectoryOp::ListComposersReferencingAny {
+                target_attestation_ids: target_attestation_ids.to_vec(),
+                attested_key_id: attested_key_id.map(str::to_owned),
+                attesting_key_id: attesting_key_id.map(str::to_owned),
+            })
+            .await?
+        {
+            DirectoryOpResult::AttestationRows(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn attestations_binding_content(
         &self,
@@ -3296,29 +3245,45 @@ impl FederationDirectory for OpsDirectory {
             method: "list_identity_occurrences_for",
         })
     }
-    // CIRISPersist#851 (PR #852 round three) — not routed over the capsule
-    // (KeyGrant admission runs on the Engine's own backend, never here);
-    // `Unsupported` is an error, never an empty list — fail-closed.
+    // v59.1.2 (CIRISPersist#1162) — routed (was `Unsupported`, #851):
+    // `owner_of`'s `self_of_at` reads it, so a capsule consumer's owner walk
+    // needs it.
     async fn list_identity_occurrences_by_occurrence_key(
         &self,
         occurrence_key_id: &str,
     ) -> Result<Vec<IdentityOccurrence>, Error> {
-        let _ = occurrence_key_id;
-        Err(Error::Unsupported {
-            method: "list_identity_occurrences_by_occurrence_key",
-        })
+        match self
+            .run_op(&DirectoryOp::ListIdentityOccurrencesByOccurrenceKey {
+                occurrence_key_id: occurrence_key_id.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::IdentityOccurrences(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
-    // v52.0.0 (CIRISPersist#930) — not routed, like the current-state read
-    // above: the node-bearing fold runs on the Engine's own backend.
-    // `Unsupported` is an error, never an empty history — fail-closed.
+    // v59.1.2 (CIRISPersist#1162) — routed (was `Unsupported`, v52.0.0
+    // #930): `owner_of` folds every granter through `self_of_at`, which
+    // reads this history, so a capsule consumer's owner walk needs it.
     async fn list_identity_occurrence_history_by_occurrence(
         &self,
         occurrence_key_id: &str,
     ) -> Result<Vec<crate::federation::OccurrenceAssertion>, Error> {
-        let _ = occurrence_key_id;
-        Err(Error::Unsupported {
-            method: "list_identity_occurrence_history_by_occurrence",
-        })
+        match self
+            .run_op(&DirectoryOp::ListIdentityOccurrenceHistoryByOccurrence {
+                occurrence_key_id: occurrence_key_id.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::OccurrenceHistory(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn lookup_identity_for_occurrence(
         &self,
@@ -3468,15 +3433,6 @@ impl FederationDirectory for OpsDirectory {
         let _ = widening;
         Err(Error::Unsupported {
             method: "put_family_membership_widening",
-        })
-    }
-    async fn put_community_membership_listing(
-        &self,
-        listing: crate::federation::SignedCommunityMembershipListing,
-    ) -> Result<(), Error> {
-        let _ = listing;
-        Err(Error::Unsupported {
-            method: "put_community_membership_listing",
         })
     }
     async fn list_identity_occurrence_revocations_for(
@@ -3665,46 +3621,8 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
-    /// v21.0.0 (CIRISPersist#504 FLOOR) — the signed-only family bulk read
-    /// via the capsule, for the edge advertise/serve responder.
-    async fn list_signed_families_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedFamily>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedFamiliesSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedFamilies(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v21.0.0 (CIRISPersist#504 FLOOR) — structural mirror of
-    /// [`Self::list_signed_families_since`].
-    async fn list_signed_communities_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedCommunity>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedCommunitiesSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedCommunities(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v21.0.0 (CIRISPersist#504 FLOOR) — structural mirror of
-    /// [`Self::list_signed_families_since`].
+    /// v21.0.0 (CIRISPersist#504 FLOOR) — the signed location-proof bulk
+    /// read via the capsule.
     async fn list_signed_location_proofs_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -3715,81 +3633,6 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::SignedLocationProofs(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v21.0.0 (CIRISPersist#504 FLOOR) — structural mirror of
-    /// [`Self::list_signed_families_since`].
-    async fn list_signed_family_membership_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedFamilyMembershipRevocation>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedFamilyMembershipRevocationsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedFamilyMembershipRevocations(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v21.0.0 (CIRISPersist#504 FLOOR) — structural mirror of
-    /// [`Self::list_signed_families_since`].
-    async fn list_signed_community_membership_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedCommunityMembershipRevocation>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedCommunityMembershipRevocationsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedCommunityMembershipRevocations(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v48.0.0 (CIRISPersist#860) — the widening mirror of the above.
-    async fn list_signed_community_membership_widenings_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedCommunityMembershipWidening>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedCommunityMembershipWideningsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedCommunityMembershipWidenings(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v49.0.0 (CIRISPersist#910) — the family widening since-read, proxied
-    /// like the room's: a capsule consumer folds from the signed since-reads.
-    async fn list_signed_family_membership_widenings_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedFamilyMembershipWidening>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedFamilyMembershipWideningsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedFamilyMembershipWidenings(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -3834,25 +3677,6 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::ReplicatedAttestationOutcome(o) => Ok(o),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v49.0.0 (CIRISPersist#912) — the listing since-read, proxied like the
-    /// widening planes': a capsule consumer converges the 19th kind from it.
-    async fn list_signed_community_membership_listings_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedCommunityMembershipListing>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedCommunityMembershipListingsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedCommunityMembershipListings(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -4165,15 +3989,6 @@ impl FederationDirectory for OpsDirectory {
             method: "list_family_membership_widenings_for",
         })
     }
-    async fn list_community_membership_listings_for(
-        &self,
-        community_key_id: &str,
-    ) -> Result<Vec<crate::federation::CommunityMembershipListing>, Error> {
-        let _ = community_key_id;
-        Err(Error::Unsupported {
-            method: "list_community_membership_listings_for",
-        })
-    }
     async fn list_location_proofs_for(
         &self,
         subject_key_id: &str,
@@ -4361,6 +4176,7 @@ impl FederationDirectory for OpsDirectory {
 mod tests {
     use super::*;
     use crate::store::sqlite::SqliteBackend;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::mpsc;
 
     // ── shared helpers ─────────────────────────────────────────────
@@ -4435,69 +4251,6 @@ mod tests {
         ) {
             DirectoryOpResult::WireHashes(v) => assert_eq!(v, vec!["held-row".to_owned()]),
             other => panic!("{other:?}"),
-        }
-    }
-
-    /// v50.0.0 (CIRISPersist#931) — the capsule carries BOTH community doors:
-    /// `PutCommunity` (local) refuses a human-signed legacy `founder_only`
-    /// infrastructure record; `ApplyReplicatedCommunity` admits it as data
-    /// (`Inserted`), and a re-apply is `Unchanged`.
-    #[test]
-    fn apply_replicated_community_op_is_the_replicated_door() {
-        use crate::federation::tier_ingest::test_support as ts;
-        let rt = test_runtime();
-        let (dir, directory) = test_directory();
-        rt.block_on(ts::register_hybrid_key_as(
-            dir.as_ref(),
-            "capsule-human",
-            "capsule-human",
-            crate::federation::types::identity_type::USER,
-        ));
-        let community = ts::sign_community(
-            "capsule-human",
-            crate::federation::types::Community {
-                prev_head_digest: String::new(),
-                charter_digest: String::new(),
-                community_key_id: "capsule-legacy-root".into(),
-                community_name: "legacy".into(),
-                members: vec![crate::federation::types::CommunityMember {
-                    key_id: "capsule-human".into(),
-                    joined_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-                    role: Some("founder".into()),
-                }],
-                founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-                consensus_protocol: "founder_only".into(),
-                policy_blob: Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
-                persist_row_hash: String::new(),
-            },
-        );
-        match run_op(
-            &rt,
-            &directory,
-            &DirectoryOp::PutCommunity {
-                community: community.clone(),
-            },
-        ) {
-            DirectoryOpResult::Err(e) => assert!(
-                e.contains("hard_case:community_consensus_protocol_violation"),
-                "{e}"
-            ),
-            other => panic!("the local door must refuse: {other:?}"),
-        }
-        for want in [
-            crate::federation::ReplicatedCommunityOutcome::Inserted,
-            crate::federation::ReplicatedCommunityOutcome::Unchanged,
-        ] {
-            match run_op(
-                &rt,
-                &directory,
-                &DirectoryOp::ApplyReplicatedCommunity {
-                    community: community.clone(),
-                },
-            ) {
-                DirectoryOpResult::ReplicatedCommunityOutcome(o) => assert_eq!(o, want),
-                other => panic!("the replicated door: {other:?}"),
-            }
         }
     }
 
@@ -4907,10 +4660,15 @@ mod tests {
     /// puts in the vtable a consumer reads at runtime. A single assertion
     /// comparing them to each other would hold trivially while both drifted.
     #[test]
-    fn abi_version_pinned_at_11() {
+    fn abi_version_pinned_at_12() {
         assert_eq!(
-            DIRECTORY_ABI_VERSION, 11,
-            "v60.0.0 (CIRISPersist#1036): the operational kinds retired — ListOrgMembershipsSince \
+            DIRECTORY_ABI_VERSION, 12,
+            "v61 (CIRISPersist#991): the six group kinds retired — the signed group cursors \
+             and ApplyReplicatedCommunity and their results are removed from the op and result \
+             wire; the rows ride ApplyReplicatedAttestation, so a consumer built against 11 \
+             sends ops this host no longer decodes; AttestationRefusalReason gains \
+             GroupPlaneRefused. Previous move: \
+             v60.0.0 (CIRISPersist#1036): the operational kinds retired — ListOrgMembershipsSince \
              / ListOrganizationsSince and their results are removed from the op and result \
              wire, so a consumer built against 10 sends ops this host no longer decodes. \
              Previous move: v59.0.0 (CIRISPersist#1064): AttestationRefusalReason gained SelfRosterPending \
@@ -4944,7 +4702,7 @@ mod tests {
              built for"
         );
         assert_eq!(
-            PERSIST_DIRECTORY_VTABLE.abi_version, 11,
+            PERSIST_DIRECTORY_VTABLE.abi_version, 12,
             "the shipped vtable must advertise what consumers pin against"
         );
     }
@@ -5018,9 +4776,16 @@ mod tests {
         // APPENDED, nothing existing touched; DIRECTORY_ABI_VERSION stays.
         // v60.0.0 (CIRISPersist#1036) — a BREAK: `ListOrgMembershipsSince` and
         // `ListOrganizationsSince` removed; DIRECTORY_ABI_VERSION 10 → 11.
+        // v59.1.2 (CIRISPersist#1162), merged forward — GROWTH:
+        // `ExecuteAttestationQuery`, `ListComposersReferencingAny`,
+        // `ListIdentityOccurrenceHistoryByOccurrence` and
+        // `ListIdentityOccurrencesByOccurrenceKey` APPENDED; v61's ABI is 12
+        // for #991's removals, not for this.
+        // v61 (CIRISPersist#991) — `ListSignedCommunityMembershipListingsSince`
+        // removed with the member listing (a BREAK, inside ABI 12).
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "b8c73d71ef70c97a2ede3c0b3aed9c387ec1b1ce6f99391e12d4af82e9703c57",
+            "d78ffc44212864622c15230a9eb0228626aaa4631b4305890823d1cfd7258230",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -5066,9 +4831,17 @@ mod tests {
         // results removed (a BREAK, with the op gate's bump to 9).
         // v60.0.0 (CIRISPersist#1036) — `OrgMemberships` / `Organizations`
         // removed (a BREAK, with the op gate's bump to 11).
+        // v61 (CIRISPersist#991) — the six signed group results and
+        // `ReplicatedCommunityOutcome` removed (a BREAK, with the op gate's
+        // bump to 12).
+        // v59.1.2 (CIRISPersist#1162), merged forward — GROWTH:
+        // `AttestationQueryRows`, `AttestationRows`, `OccurrenceHistory` and
+        // `IdentityOccurrences` APPENDED.
+        // v61 (CIRISPersist#991) — `SignedCommunityMembershipListings` removed
+        // with the member listing (a BREAK, inside ABI 12).
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "0043d184699c08d81551475dc116633616df366abbae8b5dc021c0ae2d79f5bf",
+            "072218ce981010c91c962f75e2939a33814e2f179d9da3a178a4f2dbb0ef951b",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );
@@ -5539,7 +5312,10 @@ mod tests {
             occurrence_key_id: "occ-1".into(),
             transport_kind: "reticulum".into(),
             destination: "abcd".into(),
-            asserted_at: chrono::Utc::now(),
+            // v61 (CC 2.6.2) — a signed member crosses the ABI `.sssZ`.
+            asserted_at: crate::federation::admission::truncate_to_substrate_resolution(
+                chrono::Utc::now(),
+            ),
             last_seen_at: Some(chrono::Utc::now()),
             // #397/#411 — the transport-tier Ed25519 + X25519 (KEX) must cross
             // the ABI intact (prime + re-seal after restart).
@@ -6195,6 +5971,509 @@ mod tests {
             "proxy result must equal a direct backend call"
         );
         assert!(via_proxy.is_none(), "unbound occurrence resolves to None");
+    }
+
+    // ── CIRISPersist#1162 — the typed bounded read crosses the capsule ──
+
+    /// The owner walk's own query (`live_delegation_granter_instants`), run
+    /// through the CONSUMER-SIDE proxy over a real backend, against the same
+    /// call on the backend directly. Before #1162 the proxy answered
+    /// `execute_attestation_query` with `Unsupported`, so every
+    /// `AttestationQuery` read on a phone or agent-embedded node — the owner
+    /// walk, `owner_of`, a chat reader — was a refusal.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn exercise_attestation_query_through_the_proxy_1162(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: Arc<dyn FederationDirectory>,
+        suffix: &str,
+    ) {
+        use crate::ceg::list::federation::AttestationCursor;
+        use crate::federation::attestation_query::{AttestationQuery, AttestationReads, FOLD_PAGE};
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::attestation_type;
+
+        let owner = format!("owner-1162-{suffix}");
+        let node = format!("node-1162-{suffix}");
+        rt.block_on(async {
+            ts::register_user_role_key(dir.as_ref(), &owner).await;
+            ts::register_hybrid_key(dir.as_ref(), &node).await;
+            ts::put_owner_binding(dir.as_ref(), &owner, &node).await;
+        });
+        let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
+            rt.clone(),
+        ));
+        let proxy =
+            build_ops_directory(build_persist_directory(dir.clone()), executor).expect("abi ok");
+
+        let walk = AttestationQuery::to(&node, FOLD_PAGE).types(&[attestation_type::DELEGATES_TO]);
+        let retractions = AttestationQuery::to(&node, FOLD_PAGE)
+            .types(&[attestation_type::WITHDRAWS, attestation_type::RECANTS]);
+        for q in [&walk, &retractions] {
+            // The storage half: the rows, the decoded bytes AND the backend
+            // that ran it survive the capsule.
+            let raw_proxy = rt
+                .block_on(proxy.execute_attestation_query(q))
+                .unwrap_or_else(|e| panic!("#1162 {}: routed, not {e:?}", q.shape()));
+            let raw_direct = rt
+                .block_on(dir.execute_attestation_query(q))
+                .expect("direct execute");
+            assert_eq!(raw_proxy.rows, raw_direct.rows, "#1162 {}", q.shape());
+            assert_eq!(raw_proxy.bytes, raw_direct.bytes, "#1162 {}", q.shape());
+            assert_eq!(raw_proxy.backend, raw_direct.backend, "#1162 {}", q.shape());
+            // The read every fold makes.
+            let via_proxy = rt
+                .block_on(proxy.query_attestations(q))
+                .served()
+                .unwrap_or_else(|e| panic!("#1162 {}: served, not {e:?}", q.shape()));
+            let via_direct = rt
+                .block_on(dir.query_attestations(q))
+                .served()
+                .expect("direct read");
+            assert_eq!(via_proxy, via_direct, "#1162 {}", q.shape());
+        }
+        let page = rt
+            .block_on(proxy.query_attestations(&walk))
+            .served()
+            .expect("served");
+        assert_eq!(page.rows.len(), 1, "#1162 the one owner-binding");
+        assert_eq!(page.rows[0].attesting_key_id, owner);
+
+        // A cursor crosses too: resuming after the only row is an empty page
+        // on both sides, not the same row again.
+        let after = walk.clone().after(Some(AttestationCursor::from_trailing(
+            page.rows[0].asserted_at,
+            page.rows[0].attestation_id.clone(),
+        )));
+        let resumed = rt
+            .block_on(proxy.query_attestations(&after))
+            .served()
+            .expect("served");
+        assert_eq!(
+            resumed,
+            rt.block_on(dir.query_attestations(&after))
+                .served()
+                .expect("direct read")
+        );
+        assert!(resumed.rows.is_empty(), "#1162 the cursor was honoured");
+
+        // And the fold the field log named resolves through the proxy.
+        assert_eq!(
+            rt.block_on(crate::federation::admission::owner_of(
+                proxy.as_ref(),
+                &node
+            ))
+            .expect("#1162 owner_of through the capsule"),
+            Some(owner),
+        );
+    }
+
+    /// CIRISPersist#1162 — sqlite arm.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn i1162_attestation_query_through_the_proxy_sqlite() {
+        let rt = test_runtime();
+        let backend = rt.block_on(async {
+            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .expect("open sqlite");
+            crate::store::backend::Backend::run_migrations(&b)
+                .await
+                .expect("migrate");
+            b
+        });
+        exercise_attestation_query_through_the_proxy_1162(&rt, Arc::new(backend), "sqlite");
+    }
+
+    /// CIRISPersist#1162 — postgres arm.
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[serial_test::serial(postgres)]
+    fn i1162_attestation_query_through_the_proxy_pg() {
+        let Some(dsn) = crate::test_pg::dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let rt = test_runtime();
+        let backend = rt.block_on(async {
+            let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+                .await
+                .expect("connect");
+            crate::store::backend::Backend::run_migrations(&b)
+                .await
+                .expect("migrate");
+            b
+        });
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        exercise_attestation_query_through_the_proxy_1162(&rt, Arc::new(backend), &suffix);
+    }
+
+    /// CIRISPersist#1162 — every field of the query and of its rows crosses
+    /// the capsule's JSON as itself, and an unknown field is a refusal: a
+    /// newer consumer's narrowing that an older host silently dropped would
+    /// run a WIDER read than the one asked for.
+    #[test]
+    fn i1162_attestation_query_serde_round_trips_every_field() {
+        use crate::federation::attestation_query::{
+            page_size, AttestationQuery, QueryOrder, QueryRows, QueryTier,
+        };
+        let q = AttestationQuery::to("k-to", page_size(7))
+            .authored_by("k-by")
+            .dimension_any_of(&["a", "b"])
+            .types(&["delegates_to"])
+            .type_prefix("dele")
+            .excluding_dimensions(&["x"])
+            .tier(QueryTier::Local)
+            .oldest_first()
+            .as_of("2026-10-30T00:00:00Z".parse().unwrap())
+            .scope("community", Some("c-1"))
+            .after(Some(
+                crate::ceg::list::federation::AttestationCursor::from_trailing(
+                    "2026-10-29T00:00:00Z".parse().unwrap(),
+                    "row-1".into(),
+                ),
+            ));
+        assert_eq!(
+            q.order,
+            QueryOrder::ByAssertedAt(crate::federation::attestation_query::Direction::Asc)
+        );
+        let op = DirectoryOp::ExecuteAttestationQuery { query: q.clone() };
+        match serde_json::from_slice::<DirectoryOp>(&serde_json::to_vec(&op).unwrap()).unwrap() {
+            DirectoryOp::ExecuteAttestationQuery { query } => assert_eq!(query, q),
+            other => panic!("{other:?}"),
+        }
+        let mut v = serde_json::to_value(&q).unwrap();
+        v["widened_by_a_newer_consumer"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<AttestationQuery>(v).is_err(),
+            "an unknown query field must refuse, never drop"
+        );
+        let mut v = serde_json::to_value(&q).unwrap();
+        v["limit"] = serde_json::json!(0);
+        assert!(
+            serde_json::from_value::<AttestationQuery>(v).is_err(),
+            "a zero page is not a page"
+        );
+        let rows = QueryRows {
+            rows: Vec::new(),
+            bytes: 42,
+            backend: crate::observe::StoreBackend::Postgres,
+        };
+        let back: QueryRows = serde_json::from_slice(&serde_json::to_vec(&rows).unwrap()).unwrap();
+        assert_eq!((back.bytes, back.backend), (42, rows.backend));
+    }
+
+    /// The `fn` items at the top level of the `{…}` body that opens after
+    /// `anchor` in `blanked` (comments and string contents blanked): each
+    /// name with its body, or `None` for a bodiless (required) declaration.
+    fn top_level_fns(blanked: &str, anchor: &str) -> BTreeMap<String, Option<String>> {
+        let start = blanked
+            .find(anchor)
+            .unwrap_or_else(|| panic!("`{anchor}` not found — the scan's recognizer broke"));
+        let b = blanked.as_bytes();
+        let open = start + blanked[start..].find('{').expect("body");
+        // The span of the `{…}` block opening at `at`.
+        let block_end = |at: usize| -> usize {
+            let mut depth = 0i32;
+            for (i, &c) in b.iter().enumerate().skip(at) {
+                match c {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return i;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unterminated block at {at}");
+        };
+        let end = block_end(open);
+        let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut out = BTreeMap::new();
+        let mut i = open + 1;
+        while i < end {
+            match b[i] {
+                // A nested block that is not an fn body (an attribute's
+                // tokens never hold braces): skip it whole.
+                b'{' => i = block_end(i) + 1,
+                b'f' if b[i..].starts_with(b"fn ") && (i == 0 || !ident(b[i - 1])) => {
+                    let name_at = i + 3;
+                    let name_len = b[name_at..].iter().take_while(|&&c| ident(c)).count();
+                    let name = blanked[name_at..name_at + name_len].to_owned();
+                    // The signature ends at the first `;` or `{` outside
+                    // parens/brackets (`[u8; 32]` holds a `;`).
+                    let mut depth = 0i32;
+                    let mut j = name_at + name_len;
+                    loop {
+                        match b[j] {
+                            b'(' | b'[' => depth += 1,
+                            b')' | b']' => depth -= 1,
+                            b';' if depth == 0 => {
+                                out.insert(name, None);
+                                i = j + 1;
+                                break;
+                            }
+                            b'{' if depth == 0 => {
+                                let close = block_end(j);
+                                out.insert(name, Some(blanked[j..=close].to_owned()));
+                                i = close + 1;
+                                break;
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
+    /// The reasons a `FederationDirectory` method may answer `Unsupported`
+    /// on the capsule proxy. A method on this list is a KNOWN gap with its
+    /// reason, never a silent one.
+    const PRE_1162: &str = "pre-existing at v59.1.1: no DirectoryOp carries it; not \
+                            audited by #1162 — routing it is appending an op";
+    const INHERITED_DEFAULT: &str = "the trait DEFAULT answers Unsupported for any backend that \
+                                     does not override it; the proxy inherits it (pre-existing \
+                                     at v59.1.1)";
+    const GROUP_ROWS_991: &str = "v61 (#991): the framed kind is retired and its op left the \
+                                  capsule at ABI 12; the record replicates as its group-plane \
+                                  row through ApplyReplicatedAttestation";
+    const PROXY_UNSUPPORTED_ALLOWLIST: &[(&str, &str)] = &[
+        (
+            "list_keys_by_identity_type",
+            "routed for ACCORD_HOLDER only (ListAccordHolders); every \
+          other identity_type has no op",
+        ),
+        (
+            "attestation_type_census",
+            "v53.0.0 (#975): a local report door; no DirectoryOp \
+          carries it",
+        ),
+        ("lookup_keys_for_identity", PRE_1162),
+        (
+            "set_consent_role",
+            "v13.0.0 (#365): no DirectoryOp carries consent_role mutation",
+        ),
+        (
+            "attestation_upsert_local",
+            "a node-LOCAL tier write: no DirectoryOp carries the local \
+          tier (pre-existing at v59.1.1)",
+        ),
+        (
+            "attestation_insert_local",
+            "a node-LOCAL tier write: no DirectoryOp carries the local \
+          tier (pre-existing at v59.1.1)",
+        ),
+        (
+            "list_attestations_by_dimension_citing",
+            "#1162: Edge confirms no production edge path \
+          calls it; left unrouted so the patch grows the wire by one op",
+        ),
+        (
+            "list_attestations_referencing",
+            "v47.2.0 (#853): not proxied, as its siblings",
+        ),
+        ("attestations_binding_content", PRE_1162),
+        (
+            "dag_manifests_of_chunk",
+            "v53.1.0 (#979): a capsule host stores no blobs through this \
+          surface",
+        ),
+        ("list_identity_occurrences_for", PRE_1162),
+        ("add_family_member", PRE_1162),
+        ("lookup_family", PRE_1162),
+        ("list_families_for_member", PRE_1162),
+        ("lookup_community", PRE_1162),
+        ("list_communities_for_member", PRE_1162),
+        ("put_family_membership_revocation", PRE_1162),
+        ("put_community_membership_revocation", PRE_1162),
+        ("put_community_membership_widening", PRE_1162),
+        ("put_family_membership_widening", PRE_1162),
+        ("list_family_membership_revocations_for", PRE_1162),
+        ("list_community_membership_revocations_for", PRE_1162),
+        ("list_community_membership_widenings_for", PRE_1162),
+        ("list_family_membership_widenings_for", PRE_1162),
+        ("list_location_proofs_for", PRE_1162),
+        ("withdraw_location_proof", PRE_1162),
+        ("communities_containing", PRE_1162),
+        ("add_community_member", PRE_1162),
+        ("supersede_group_row", PRE_1162),
+        ("list_group_versions", PRE_1162),
+        ("attach_key_pqc_signature", PRE_1162),
+        ("attach_attestation_pqc_signature", PRE_1162),
+        ("get_attestation", PRE_1162),
+        ("enter_mesh", PRE_1162),
+        ("list_hybrid_pending_keys", PRE_1162),
+        ("list_hybrid_pending_attestations", PRE_1162),
+        ("put_accord_proposal", PRE_1162),
+        ("get_accord_proposal", PRE_1162),
+        ("list_accord_proposals_by_anchor", PRE_1162),
+        ("put_accord_participation", PRE_1162),
+        ("list_accord_participations", PRE_1162),
+        ("put_accord_decision", PRE_1162),
+        ("get_accord_decision", PRE_1162),
+        ("set_active_halt", PRE_1162),
+        ("get_active_halt", PRE_1162),
+        ("clear_active_halt", PRE_1162),
+        // v61 (CIRISPersist#991): the group framed kinds retired; their ops
+        // left the capsule at ABI 12 and the records replicate as rows.
+        ("apply_replicated_community", GROUP_ROWS_991),
+        ("list_signed_families_since", GROUP_ROWS_991),
+        ("list_signed_communities_since", GROUP_ROWS_991),
+        (
+            "list_signed_family_membership_revocations_since",
+            GROUP_ROWS_991,
+        ),
+        (
+            "list_signed_family_membership_widenings_since",
+            GROUP_ROWS_991,
+        ),
+        (
+            "list_signed_community_membership_revocations_since",
+            GROUP_ROWS_991,
+        ),
+        (
+            "list_signed_community_membership_widenings_since",
+            GROUP_ROWS_991,
+        ),
+        // Trait defaults the proxy does not override.
+        ("store_rebound_key_record", INHERITED_DEFAULT),
+        ("store_invalid_replaced_key_record", INHERITED_DEFAULT),
+        ("list_key_registration_history", INHERITED_DEFAULT),
+        ("list_derived_hex", INHERITED_DEFAULT),
+        ("adopt_genesis_reanchor", INHERITED_DEFAULT),
+        ("list_attestations_citing_by_dimension", INHERITED_DEFAULT),
+        ("list_targeted_by_dimension_prefix", INHERITED_DEFAULT),
+        ("list_consent_peers_for", INHERITED_DEFAULT),
+        ("list_live_consent_grants_by", INHERITED_DEFAULT),
+        ("list_live_consent_grants_for", INHERITED_DEFAULT),
+        ("list_local_tier_attestations", INHERITED_DEFAULT),
+        ("list_widening_candidates", INHERITED_DEFAULT),
+        ("list_attestations_for_migration", INHERITED_DEFAULT),
+        ("reseal_attestation_v31", INHERITED_DEFAULT),
+        ("list_expired_attestation_ids", INHERITED_DEFAULT),
+        ("purge_attestation_v31", INHERITED_DEFAULT),
+        ("purge_genesis_delegation_row_v31", INHERITED_DEFAULT),
+        ("lookup_signed_community", INHERITED_DEFAULT),
+        ("store_lineage_head_cosign", INHERITED_DEFAULT),
+        ("list_lineage_head_cosigns_for", INHERITED_DEFAULT),
+        ("note_self_roster_proposal", INHERITED_DEFAULT),
+        ("list_open_self_roster_proposals", INHERITED_DEFAULT),
+        ("list_settled_self_roster_proposals", INHERITED_DEFAULT),
+        ("settle_self_roster_proposal", INHERITED_DEFAULT),
+        ("family_roster_signers", INHERITED_DEFAULT),
+        ("community_roster_signers", INHERITED_DEFAULT),
+        ("purge_scan_attestations", INHERITED_DEFAULT),
+        ("purge_trace_ids_for_llm_model", INHERITED_DEFAULT),
+        ("purge_trace_ids_signed_by", INHERITED_DEFAULT),
+        ("purge_trace_row_counts", INHERITED_DEFAULT),
+        ("purge_put_execution", INHERITED_DEFAULT),
+        ("purge_execution", INHERITED_DEFAULT),
+        ("purge_tombstones_of", INHERITED_DEFAULT),
+        ("purge_tombstoned", INHERITED_DEFAULT),
+        ("purge_tombstone_notices", INHERITED_DEFAULT),
+        ("list_purge_executions_since", INHERITED_DEFAULT),
+        ("purge_delete_tombstoned_attestation", INHERITED_DEFAULT),
+        ("purge_delete_tombstoned_trace", INHERITED_DEFAULT),
+        ("purge_mark_finalized", INHERITED_DEFAULT),
+    ];
+
+    /// **I1162 — proxy parity.** Every `FederationDirectory` method the
+    /// capsule proxy answers `Unsupported` — its own stub, or a trait default
+    /// it inherits that answers `Unsupported` itself — is on
+    /// [`PROXY_UNSUPPORTED_ALLOWLIST`] with a reason, and every entry there
+    /// still answers `Unsupported` (a routed method leaves the list).
+    ///
+    /// From disk, so a new trait method or a new stub cannot slip past a hand
+    /// list: #1162 was `execute_attestation_query`, a typed read every fold
+    /// moved onto in v56.0.0, left a stub on the one surface phones run. The
+    /// compiler is no backstop here — a stub type-checks.
+    ///
+    /// Blind spot: a trait default that COMPOSES other methods is not
+    /// classified (it routes or fails through what it calls, which this gate
+    /// sees at those methods).
+    #[test]
+    fn i1162_proxy_parity_every_unsupported_method_is_allowlisted() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |p: &str| {
+            crate::federation::blank_comments_and_strings(
+                &std::fs::read_to_string(root.join(p)).expect("read source"),
+            )
+        };
+        let tr = top_level_fns(
+            &read("src/federation/mod.rs"),
+            "pub trait FederationDirectory",
+        );
+        let px = top_level_fns(
+            &read("src/ffi/directory_capsule.rs"),
+            "impl FederationDirectory for OpsDirectory",
+        );
+        assert!(
+            tr.len() > 200,
+            "I1162 the trait scan found {} methods",
+            tr.len()
+        );
+        assert!(
+            px.len() > 100,
+            "I1162 the proxy scan found {} methods",
+            px.len()
+        );
+        for m in ["execute_attestation_query", "lookup_public_key"] {
+            assert!(
+                tr.contains_key(m) && px.contains_key(m),
+                "I1162 recognizer: {m}"
+            );
+        }
+        let answers_unsupported =
+            |body: &Option<String>| body.as_deref().is_some_and(|b| b.contains("Unsupported"));
+        let mut unsupported = BTreeSet::new();
+        for (name, body) in &tr {
+            let on_proxy = match px.get(name) {
+                Some(own) => answers_unsupported(own),
+                None => answers_unsupported(body),
+            };
+            if on_proxy {
+                unsupported.insert(name.as_str());
+            }
+        }
+        let extra: Vec<&String> = px.keys().filter(|n| !tr.contains_key(*n)).collect();
+        assert!(
+            extra.is_empty(),
+            "I1162 proxy methods not on the trait: {extra:?}"
+        );
+
+        let allow: BTreeMap<&str, &str> = PROXY_UNSUPPORTED_ALLOWLIST.iter().copied().collect();
+        assert_eq!(
+            allow.len(),
+            PROXY_UNSUPPORTED_ALLOWLIST.len(),
+            "I1162 a duplicate allowlist entry"
+        );
+        assert!(
+            allow.values().all(|r| r.trim().len() > 20),
+            "I1162 every allowlisted method carries its reason"
+        );
+        let unlisted: Vec<&&str> = unsupported
+            .iter()
+            .filter(|m| !allow.contains_key(**m))
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "I1162 the capsule proxy answers Unsupported for {unlisted:?} — every call \
+             to them fails on a phone or agent-embedded node. Append a DirectoryOp and \
+             route it, or allowlist it WITH a reason"
+        );
+        let stale: Vec<&&str> = allow
+            .keys()
+            .filter(|m| !unsupported.contains(**m))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "I1162 allowlisted but no longer Unsupported on the proxy (remove them): {stale:?}"
+        );
     }
 }
 

@@ -278,6 +278,10 @@ pub mod dimension_rejected_reason {
         REGISTERED_FAMILY_HELD_SHUT_REASON,
         LEDGER_BINDING_REASON,
         crate::federation::invariant::INVARIANT_SELF_EMISSION_REASON,
+        // v61 (CIRISPersist#991) — a group-plane dimension outside its door.
+        crate::federation::group_plane::GROUP_PLANE_ROW_SHAPE_REASON,
+        // v61 (CIRISPersist#1126) — a bare-`scores` partnership half.
+        crate::federation::self_at_login::PARTNERSHIP_SHAPE_RETIRED_REASON,
     ];
 
     /// The tokens a later re-offer of the same row can turn into an
@@ -859,15 +863,11 @@ pub const REGISTERED_FAMILIES_HELD_SHUT: &[(&str, &str)] = &[
     // `key_grant:` was held here by the rc7 re-vendor (A0) until v55 slice B
     // built its door: the per-recipient row with CC 3.3.2's sealer rule,
     // `key_grant::check_key_grant_row_admission` (CIRISPersist#989).
-    // CC 3.1.3.2 rc7: three new `membership:{stage}` leaves — widening and
+    // CC 3.1.3.2 rc7: three `membership:{stage}` leaves — widening and
     // removal "cosigned under the group's consensus_protocol", resignation
-    // "the leaving member". rc6's closed vocabulary refused all three;
-    // `membership_acceptance` gates only proposal / acceptance / decline, so
-    // the re-vendor would admit these from any signer. The cosigned-row doors
-    // are CIRISPersist#991's.
-    ("membership:widening:", "CIRISPersist#991"),
-    ("membership:removal:", "CIRISPersist#991"),
-    ("membership:resignation:", "CIRISPersist#991"),
+    // "the leaving member" — were held here from the rc7 re-vendor until v61
+    // built their door (CIRISPersist#991): `group_plane::apply_group_plane_row`
+    // takes each row to the typed door of the object it carries.
     // CC 3.1.5 rc8 (the Retirement Standard, CC 7.5.5) — five families, each
     // reserved to a named emitter (the agent, its custodian, a seated Wise
     // Authority, the steward). Unregistered open vocabulary at rc7, so any
@@ -921,49 +921,149 @@ pub fn check_registered_family_not_held(dimension: &str) -> Result<(), Error> {
 /// ([`check_ledger_emitter_admission`]).
 pub const LEDGER_DIMENSION_PREFIX: &str = "ledger:";
 
-/// v38.0.0 (CIRISPersist#721) — the pinned signing bytes for a
-/// [`TrustGrant`](super::TrustGrant): pinned-JCS over a domain-tagged
-/// projection of the grant. Pinned canonicalizer, never
-/// `produce_canon_version()` — a stored signature is a contract (the
-/// `compute_persist_row_hash` reasoning).
-pub fn trust_grant_signing_bytes(grant: &super::TrustGrant) -> Result<Vec<u8>, Error> {
-    let value = serde_json::json!({
-        "domain": "ciris.trust.grant.v1",
-        "grant": grant,
-    });
+/// v38.0.0 (CIRISPersist#721) — the `ciris.trust.grant.v1` domain.
+pub const TRUST_GRANT_DOMAIN_V1: &str = "ciris.trust.grant.v1";
+/// v61 (CC 2.6.2) — the `ciris.trust.grant.v2` domain: `expires_at`
+/// written `.sssZ`. What persist signs from v61; v1 still verifies as v1.
+pub const TRUST_GRANT_DOMAIN_V2: &str = "ciris.trust.grant.v2";
+/// v38.0.0 (CIRISPersist#721) — the `ciris.trust.revocation.v1` domain.
+pub const TRUST_REVOCATION_DOMAIN_V1: &str = "ciris.trust.revocation.v1";
+/// v61 (CC 2.6.2) — the `ciris.trust.revocation.v2` domain: `revoked_at`
+/// written `.sssZ` (v1 wrote six fractional digits). v1 still verifies as v1.
+pub const TRUST_REVOCATION_DOMAIN_V2: &str = "ciris.trust.revocation.v2";
+
+/// v61 (CC 2.6.2) — render `t` as `.sssZ` for a preimage that persist
+/// re-derives from a typed column, refusing an instant finer than a
+/// millisecond: the render would truncate it, and the signed bytes would name
+/// an instant the column does not hold.
+fn render_exact_signed_instant(
+    what: &'static str,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<String, Error> {
+    use chrono::Timelike as _;
+    if t.nanosecond() % SIGNED_INSTANT_RESOLUTION_NANOS != 0 {
+        return Err(Error::InvalidArgument(format!(
+            "{what} {} carries sub-millisecond precision, which the CC 2.6.2 form `.sssZ` \
+             cannot carry; truncate to milliseconds before signing",
+            t.to_rfc3339()
+        )));
+    }
+    Ok(render_signed_instant(t))
+}
+
+fn pinned_trust_bytes(what: &'static str, value: &serde_json::Value) -> Result<Vec<u8>, Error> {
     crate::verify::canonical::canonicalizer_for(crate::verify::canonical::CanonVersion::V2Jcs)
-        .canonicalize_value(&value)
+        .canonicalize_value(value)
         .map_err(|e| {
             Error::malformed_row(
-                "trust_grant",
+                what,
                 super::malformed_row::ENVELOPE_NOT_CANONICAL,
-                format!("trust grant canonicalize: {e}"),
+                format!("{what} canonicalize: {e}"),
             )
         })
 }
 
-/// v38.0.0 (CIRISPersist#721) — the pinned signing bytes for a trust
-/// revocation. Same discipline as [`trust_grant_signing_bytes`].
+/// The pinned signing bytes for a [`TrustGrant`](super::TrustGrant), in the
+/// `ciris.trust.grant.v2` domain persist signs from v61: pinned-JCS over
+/// a domain-tagged projection of the grant, `expires_at` written `.sssZ`.
+/// Pinned canonicalizer, never `produce_canon_version()` — a stored signature
+/// is a contract (the `compute_persist_row_hash` reasoning).
+///
+/// # Errors
+/// [`Error::InvalidArgument`] when `expires_at` is finer than a millisecond.
+pub fn trust_grant_signing_bytes(grant: &super::TrustGrant) -> Result<Vec<u8>, Error> {
+    let mut projected = serde_json::to_value(grant)
+        .map_err(|e| Error::InvalidArgument(format!("trust grant project: {e}")))?;
+    if let (Some(obj), Some(t)) = (projected.as_object_mut(), grant.expires_at) {
+        obj.insert(
+            "expires_at".to_owned(),
+            serde_json::Value::String(render_exact_signed_instant("trust grant expires_at", t)?),
+        );
+    }
+    let value = serde_json::json!({
+        "domain": TRUST_GRANT_DOMAIN_V2,
+        "grant": projected,
+    });
+    pinned_trust_bytes("trust_grant", &value)
+}
+
+/// The v1 (v38.0.0, CIRISPersist#721) signing bytes for a
+/// [`TrustGrant`](super::TrustGrant): the grant as serde writes it (`expires_at`
+/// with chrono's own fractional digits). Verified, never minted, from v61.
+pub fn trust_grant_signing_bytes_v1(grant: &super::TrustGrant) -> Result<Vec<u8>, Error> {
+    let value = serde_json::json!({
+        "domain": TRUST_GRANT_DOMAIN_V1,
+        "grant": grant,
+    });
+    pinned_trust_bytes("trust_grant", &value)
+}
+
+/// The pinned signing bytes for a trust revocation, in the
+/// `ciris.trust.revocation.v2` domain persist signs from v61 (`revoked_at`
+/// written `.sssZ`). Same discipline as [`trust_grant_signing_bytes`].
+///
+/// # Errors
+/// [`Error::InvalidArgument`] when `revoked_at` is finer than a millisecond.
 pub fn trust_revocation_signing_bytes(
     key: &str,
     revoked_by: &str,
     revoked_at: &chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<u8>, Error> {
     let value = serde_json::json!({
-        "domain": "ciris.trust.revocation.v1",
+        "domain": TRUST_REVOCATION_DOMAIN_V2,
+        "key": key,
+        "revoked_at": render_exact_signed_instant("trust revocation revoked_at", *revoked_at)?,
+        "revoked_by": revoked_by,
+    });
+    pinned_trust_bytes("trust_revocation", &value)
+}
+
+/// The v1 (v38.0.0) signing bytes for a trust revocation (`revoked_at` with six
+/// fractional digits). Verified, never minted, from v61.
+pub fn trust_revocation_signing_bytes_v1(
+    key: &str,
+    revoked_by: &str,
+    revoked_at: &chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<u8>, Error> {
+    let value = serde_json::json!({
+        "domain": TRUST_REVOCATION_DOMAIN_V1,
         "key": key,
         "revoked_at": revoked_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
         "revoked_by": revoked_by,
     });
-    crate::verify::canonical::canonicalizer_for(crate::verify::canonical::CanonVersion::V2Jcs)
-        .canonicalize_value(&value)
-        .map_err(|e| {
-            Error::malformed_row(
-                "trust_revocation",
-                super::malformed_row::ENVELOPE_NOT_CANONICAL,
-                format!("trust revocation canonicalize: {e}"),
-            )
-        })
+    pinned_trust_bytes("trust_revocation", &value)
+}
+
+/// v61 — verify a trust-plane signature over the v2 preimage, else the v1
+/// one. The two domains are separated by their `domain` member, so a signature
+/// verifies under at most the preimage it was made over; a v2 preimage that
+/// cannot be built (a sub-millisecond instant) leaves only v1.
+async fn verify_trust_plane_signature(
+    directory: &dyn super::FederationDirectory,
+    v2: Result<Vec<u8>, Error>,
+    v1: Vec<u8>,
+    signer: &str,
+    classical: &str,
+    pqc: Option<&str>,
+) -> Result<(), crate::verify::hybrid::VerifyError> {
+    let verify = |bytes: Vec<u8>| async move {
+        crate::verify::hybrid::verify_hybrid_via_directory(
+            directory,
+            &bytes,
+            signer,
+            classical,
+            pqc,
+            crate::verify::hybrid::HybridPolicy::Strict,
+            None,
+        )
+        .await
+    };
+    if let Ok(bytes) = v2 {
+        if verify(bytes).await.is_ok() {
+            return Ok(());
+        }
+    }
+    verify(v1).await.map(|_| ())
 }
 
 /// v38.0.0 (CIRISPersist#721) — **the trust-grant authority gate.** The
@@ -978,15 +1078,13 @@ pub async fn check_trust_grant_authority(
     directory: &dyn super::FederationDirectory,
     signed: &super::SignedTrustGrant,
 ) -> Result<(), Error> {
-    let bytes = trust_grant_signing_bytes(&signed.grant)?;
-    crate::verify::hybrid::verify_hybrid_via_directory(
+    verify_trust_plane_signature(
         directory,
-        &bytes,
+        trust_grant_signing_bytes(&signed.grant),
+        trust_grant_signing_bytes_v1(&signed.grant)?,
         &signed.grant.trusted_by,
         &signed.signature_classical_base64,
         signed.signature_pqc_base64.as_deref(),
-        crate::verify::hybrid::HybridPolicy::Strict,
-        None,
     )
     .await
     .map_err(|e| {
@@ -1009,16 +1107,13 @@ pub async fn check_trust_revocation_authority(
     directory: &dyn super::FederationDirectory,
     signed: &super::SignedTrustRevocation,
 ) -> Result<(), Error> {
-    let bytes =
-        trust_revocation_signing_bytes(&signed.key, &signed.revoked_by, &signed.revoked_at)?;
-    crate::verify::hybrid::verify_hybrid_via_directory(
+    verify_trust_plane_signature(
         directory,
-        &bytes,
+        trust_revocation_signing_bytes(&signed.key, &signed.revoked_by, &signed.revoked_at),
+        trust_revocation_signing_bytes_v1(&signed.key, &signed.revoked_by, &signed.revoked_at)?,
         &signed.revoked_by,
         &signed.signature_classical_base64,
         signed.signature_pqc_base64.as_deref(),
-        crate::verify::hybrid::HybridPolicy::Strict,
-        None,
     )
     .await
     .map_err(|e| {
@@ -2462,11 +2557,15 @@ pub enum CohortStandingRefusal {
     /// ABOUT somebody else, and placing it into a cohort plane publishes that
     /// claim to a cohort the producer cannot be shown to stand in.
     AttestedParty,
-    /// `subject_key_ids` names a key other than the producer. Subject-naming is
-    /// the revocability-authority surface (CEG 0.6 §4.2), so a row that names
-    /// a foreign subject is a row a foreign party has standing over — not a
-    /// self-declaration about the producer's own content's visibility.
-    NamedSubject,
+    /// v61 S2 (CIRISPersist#1161; CC rc15 2.1, `CLM-subject-within-audience`)
+    /// — `subject_key_ids` names a person OUTSIDE the row's audience: not the
+    /// producer, not a member of the targeted cohort by its authorized roster
+    /// fold at the row's `asserted_at`, and not on the closed delivered-key
+    /// list (a membership proposal's invitee, a `key_grant` recipient, the
+    /// owner's own node). Replaces AV-84's `named_subject`, which refused every
+    /// foreign subject; a row about a person reaches only an audience that
+    /// person is already in. Token `subject_outside_audience`, CC's.
+    SubjectOutsideAudience,
 }
 
 impl CohortStandingRefusal {
@@ -2475,7 +2574,7 @@ impl CohortStandingRefusal {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::AttestedParty => "attested_party",
-            Self::NamedSubject => "named_subject",
+            Self::SubjectOutsideAudience => "subject_outside_audience",
         }
     }
 
@@ -2484,12 +2583,12 @@ impl CohortStandingRefusal {
     pub const fn field(&self) -> &'static str {
         match self {
             Self::AttestedParty => "attested_key_id",
-            Self::NamedSubject => "subject_key_ids",
+            Self::SubjectOutsideAudience => "subject_key_ids",
         }
     }
 
     /// Every variant, in declaration order — the closed set.
-    pub const ALL: &'static [Self] = &[Self::AttestedParty, Self::NamedSubject];
+    pub const ALL: &'static [Self] = &[Self::AttestedParty, Self::SubjectOutsideAudience];
 }
 
 impl std::fmt::Display for CohortStandingRefusal {
@@ -2509,6 +2608,22 @@ impl std::fmt::Display for CohortStandingRefusal {
 /// names none.
 fn names_its_key_grant_recipient(row: &super::Attestation) -> bool {
     super::key_grant::is_key_grant_row(row) && row.subject_key_ids.is_empty()
+}
+
+/// v61 (CIRISPersist#1140; CC 2.4.1.2, rc14 3.2) — AV-84's `attested_party`
+/// arm reads the row type: it applies to a `scores` row, never to a
+/// `delegates_to`, whose `attested_key_id` is the delegate BY DEFINITION, not
+/// a third party the row speaks about (an owner re-signs a node's
+/// owner-binding at the scope of a group the node joins, CC 3.2).
+///
+/// v61 S2 (CIRISPersist#1161) — it still applies to every other row type
+/// too, deliberately: a placement composer (`widen_audience`) carries its
+/// prior's `attested_key_id`, and exempting it would reopen #592 (B9 in
+/// `bootstrap_admission` places a stranger's row into a cohort plane through
+/// exactly that composer). Subjects are governed by the
+/// `subject_outside_audience` arm.
+fn attested_party_applies(row: &super::Attestation) -> bool {
+    row.attestation_type != attestation_type::DELEGATES_TO
 }
 
 /// The ONE standing comparison, parameterised over party resolution: refuse
@@ -2531,24 +2646,118 @@ fn cohort_standing_core(
         })
     };
     if row.attested_key_id != producer
+        && attested_party_applies(row)
         && resolve(&row.attested_key_id) != producer_identity
         && !names_its_key_grant_recipient(row)
     {
         return refuse(CohortStandingRefusal::AttestedParty, &row.attested_key_id);
     }
-    // v52.0.0 (CIRISPersist#955) — AV-84's one exception: a membership
-    // proposal names its invitee (exactly one) in `subject_key_ids`.
+    // v52.0.0 (CIRISPersist#955) — a membership proposal names its invitee
+    // (exactly one) in `subject_key_ids`: the delivered-key list's first entry.
     if super::membership_acceptance::is_invitee_subject_list(row) {
         return Ok(());
     }
+    // v61 S2 (CIRISPersist#1161) — the pure form holds no roster, so it
+    // cannot show a foreign subject is inside the audience: it refuses, on
+    // the audience rule's token. The directory form
+    // ([`check_cohort_standing_resolved`]) admits a subject the roster fold
+    // seats.
     if let Some(foreign) = row
         .subject_key_ids
         .iter()
         .find(|s| s.as_str() != producer && resolve(s) != producer_identity)
     {
-        return refuse(CohortStandingRefusal::NamedSubject, foreign);
+        return refuse(CohortStandingRefusal::SubjectOutsideAudience, foreign);
     }
     Ok(())
+}
+
+/// v61 S2 (CIRISPersist#1161; CC rc15 2.1, `CLM-subject-within-audience`) —
+/// **is `subject` inside the row's audience?** In order:
+///
+/// - the closed delivered-key list: a `key_grant` row's recipient (its
+///   `attested_key_id`), and the producer's own node (a node whose single live
+///   owner is the producer's identity, [`owner_of`]). A membership proposal's
+///   invitee is admitted before this is asked ([`is_invitee_subject_list`](super::membership_acceptance::is_invitee_subject_list));
+/// - a member of the targeted cohort (the family or the room the envelope
+///   names) by its AUTHORIZED roster fold at the row's `asserted_at`, the
+///   subject's key or the identity it resolves to;
+/// - a canonical id (CC 4.2.2.2) reached from such a member: the member holds
+///   an admitted `identity:canonical_binding` to it, or a
+///   `consent_revocation`-scoped `delegates_to` chain reaches it (its rule-3
+///   proxy, CC 2.4.1.1), at the CC default depth.
+///
+/// A cohort this node does not hold seats nobody here.
+async fn subject_within_audience(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+    subject: &str,
+    subject_identity: &str,
+    producer_identity: &str,
+) -> Result<bool, Error> {
+    use crate::federation::types::cohort_scope as cs;
+    if super::key_grant::is_key_grant_row(row) && subject == row.attested_key_id {
+        return Ok(true);
+    }
+    if owner_of(directory, subject).await?.as_deref() == Some(producer_identity) {
+        return Ok(true);
+    }
+    let Some(target) = envelope_cohort_target(&row.attestation_envelope)? else {
+        return Ok(false);
+    };
+    let roster: Vec<String> = match cs::target_plane(&row.cohort_scope) {
+        Some(cs::TargetPlane::Family) => match directory.lookup_family(target).await {
+            Ok(Some(family)) => Box::pin(super::authorized_family_roster_at(
+                directory,
+                &family,
+                row.asserted_at,
+            ))
+            .await?
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect(),
+            Ok(None) | Err(Error::Unsupported { .. }) => return Ok(false),
+            Err(e) => return Err(e),
+        },
+        Some(cs::TargetPlane::Room) => match directory.lookup_community(target).await {
+            Ok(Some(community)) => Box::pin(super::authorized_community_roster_at(
+                directory,
+                &community,
+                row.asserted_at,
+            ))
+            .await?
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect(),
+            Ok(None) | Err(Error::Unsupported { .. }) => return Ok(false),
+            Err(e) => return Err(e),
+        },
+        None => return Ok(false),
+    };
+    if roster.iter().any(|k| k == subject || k == subject_identity) {
+        return Ok(true);
+    }
+    let wanted: std::collections::HashSet<String> = std::iter::once(subject.to_owned()).collect();
+    for member in &roster {
+        if canonical_binding_hashes_for(directory, member)
+            .await?
+            .contains(subject)
+        {
+            return Ok(true);
+        }
+        if Box::pin(consent_revocation_reach(
+            directory,
+            member,
+            &wanted,
+            super::topology::DEFAULT_DELEGATION_DEPTH,
+        ))
+        .await?
+        .hit_target
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// v38.2.0 (PR #759 review) — AV-84 with **occurrence→identity resolution**:
@@ -2600,6 +2809,7 @@ pub async fn check_cohort_standing_resolved(
         })
     };
     if row.attested_key_id != producer
+        && attested_party_applies(row)
         && !names_its_key_grant_recipient(row)
         && admission_identity_for_writer(directory, &row.attested_key_id).await?
             != producer_identity
@@ -2611,11 +2821,27 @@ pub async fn check_cohort_standing_resolved(
     if super::membership_acceptance::is_invitee_subject_list(row) {
         return Ok(());
     }
+    // v61 S2 (CIRISPersist#1161; CC rc15 2.1) — a subject other than the
+    // producer is admitted when it is inside the row's audience
+    // ([`subject_within_audience`]); otherwise `subject_outside_audience`.
     for subject in &row.subject_key_ids {
-        if subject.as_str() != producer
-            && admission_identity_for_writer(directory, subject).await? != producer_identity
+        if subject.as_str() == producer {
+            continue;
+        }
+        let subject_identity = admission_identity_for_writer(directory, subject).await?;
+        if subject_identity == producer_identity {
+            continue;
+        }
+        if !subject_within_audience(
+            directory,
+            row,
+            subject,
+            &subject_identity,
+            &producer_identity,
+        )
+        .await?
         {
-            return refuse(CohortStandingRefusal::NamedSubject, subject);
+            return refuse(CohortStandingRefusal::SubjectOutsideAudience, subject);
         }
     }
     Ok(())
@@ -2928,6 +3154,8 @@ pub async fn check_promotion_admission(
     // Pure function of the row (no directory read, no crypto), and a REFUSAL,
     // so it leads with the other free arms.
     check_row_column_binding(row)?;
+    // CIRISPersist#1098 F4/F5 — the promoted row's envelope shape.
+    check_envelope_member_shapes(row)?;
     // v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot, beside the
     // binding. Uncounted: the local door counted this row when it was written.
     crate::federation::row_type::check_row_type(row)?;
@@ -4282,6 +4510,7 @@ async fn community_quorum_cosigned_at(
         roster: &seats,
         signers: &signers,
         direction: super::consensus::Direction::Add,
+        subject: None,
     })
     .admits())
 }
@@ -6222,8 +6451,12 @@ where
 /// compares the typed instant exactly, so an unsigned sub-millisecond part
 /// would let a relay move an occurrence across a same-millisecond revocation.
 /// Unparseable ⇒ not equal.
+///
+/// v61 (CC 2.6.2, strict) — the envelope's spelling must be `.sssZ`; an
+/// instant written in any other form is not equal to anything.
 fn same_instant_ms(envelope: &str, typed: chrono::DateTime<chrono::Utc>) -> bool {
     typed.timestamp_subsec_nanos() % 1_000_000 == 0
+        && crate::verify::canonical_validation::validate_canonical_datetime(envelope).is_ok()
         && chrono::DateTime::parse_from_rfc3339(envelope)
             .map(|e| e.timestamp_millis() == typed.timestamp_millis())
             .unwrap_or(false)
@@ -6518,6 +6751,9 @@ pub async fn verify_signed_transport_destination(
 
     let row = &signed.transport_destination;
     let env = &signed.signed_envelope;
+    // v61 (CIRISPersist#1122, steward ruling 2026-10-24) — an agent
+    // announces no route; it is reached through its node's binding.
+    crate::federation::transport_routes::check_route_key_not_agent(directory, row).await?;
 
     // (1) Authoritative fields FROM the signed envelope; the typed projection
     // must equal them (the signature covers only the envelope).
@@ -6534,6 +6770,14 @@ pub async fn verify_signed_transport_destination(
             })
     };
     let parse_ts = |k: &str, s: &str| -> Result<chrono::DateTime<chrono::Utc>, Error> {
+        // v61 (CC 2.6.2, strict) — only `.sssZ` verifies.
+        crate::verify::canonical_validation::validate_canonical_datetime(s).map_err(|e| {
+            Error::malformed_row(
+                "transport_destination",
+                super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                format!("signed transport_destination envelope `{k}` is not CC 2.6.2 form: {e}"),
+            )
+        })?;
         chrono::DateTime::parse_from_rfc3339(s)
             .map(|t| t.with_timezone(&chrono::Utc))
             .map_err(|e| {
@@ -6825,6 +7069,50 @@ pub fn render_signed_instant(t: chrono::DateTime<chrono::Utc>) -> String {
     truncate_to_substrate_resolution(t).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// v61 (CC 2.6.2) — serde for a typed instant that is also a signed
+/// member: written `.sssZ` ([`render_signed_instant`]), read as any RFC 3339.
+/// A producer that builds a signed envelope by serializing the typed struct
+/// (the route plane's `serde_json::to_value(&route)`) then writes the one
+/// canonical form instead of chrono's own fractional digits.
+pub mod signed_instant_serde {
+    use chrono::{DateTime, Utc};
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    /// Serialize `.sssZ`.
+    pub fn serialize<S: Serializer>(t: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&super::render_signed_instant(*t))
+    }
+
+    /// Deserialize any RFC 3339 instant.
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DateTime<Utc>, D::Error> {
+        DateTime::<Utc>::deserialize(d)
+    }
+
+    /// The same, for an optional instant.
+    pub mod option {
+        use chrono::{DateTime, Utc};
+        use serde::{Deserialize as _, Deserializer, Serializer};
+
+        /// Serialize `.sssZ`, or `null` (skipped by the field's own attribute).
+        pub fn serialize<S: Serializer>(
+            t: &Option<DateTime<Utc>>,
+            s: S,
+        ) -> Result<S::Ok, S::Error> {
+            match t {
+                Some(t) => s.serialize_str(&super::super::render_signed_instant(*t)),
+                None => s.serialize_none(),
+            }
+        }
+
+        /// Deserialize an optional RFC 3339 instant.
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            d: D,
+        ) -> Result<Option<DateTime<Utc>>, D::Error> {
+            Option::<DateTime<Utc>>::deserialize(d)
+        }
+    }
+}
+
 /// v31.0.0 (CIRISPersist#598) — the instant a LOCAL-tier write stamps on
 /// its row: the envelope's own signed `asserted_at` when it carries one, else
 /// this node's clock truncated to the substrate resolution.
@@ -7084,6 +7372,247 @@ pub fn check_instant_binding(
             now.to_rfc3339(),
             max_skew.num_seconds(),
         )));
+    }
+    Ok(())
+}
+
+/// v61 (CC 2.6.2, CC 2.6.1.7) — the attestation envelope's datetime
+/// members, typed `rfc3339-ms` in CC 2.6.1.7's member table: the signed
+/// envelope's own (`asserted_at`, `expires_at`, `widened_at`) and its
+/// registered extras. Each, when present as a string, must be exactly
+/// `YYYY-MM-DDTHH:MM:SS.sssZ`. `additional_scrubs[].cosigned_at` is the
+/// table's one `rfc3339-ms` member beside the bytes and is held to the same
+/// form ([`signed_instant_form_violation`]).
+///
+/// The list is typed, never a scan for strings shaped like a datetime: an
+/// envelope also carries nested signed objects (`group_record`, `revocation`,
+/// `widening`) whose own bytes this rule must not judge, and free-text members
+/// whose content is not an instant.
+pub const SIGNED_INSTANT_MEMBERS: &[&str] = &[
+    crate::federation::envelope::paths::ASSERTED_AT,
+    crate::federation::envelope::paths::EXPIRES_AT,
+    crate::federation::envelope::paths::WIDENED_AT,
+    "valid_until",
+    "claimed_at",
+    DELEGATION_VALID_FROM_FIELD,
+    "delegation_valid_until",
+    "window_from",
+    "window_to",
+];
+
+/// A signed instant written in a form other than CC 2.6.2's: the member (a
+/// [`SIGNED_INSTANT_MEMBERS`] name, or `additional_scrubs[n].cosigned_at`) and
+/// the value as carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstantFormViolation {
+    /// The member, as named in a refusal.
+    pub member: String,
+    /// The value as the producer wrote it.
+    pub value: String,
+}
+
+/// v61 (CC 2.6.2; the steward's strict ruling) — the first signed instant
+/// on `row` that is not `YYYY-MM-DDTHH:MM:SS.sssZ`, or `None`.
+///
+/// The one predicate for the form: the admission doors refuse on it
+/// ([`check_envelope_member_shapes`]), the attestation list reads drop a stored
+/// row on it, and the open-time heal re-signs this node's own rows on it. No
+/// reader normalises a non-canonical instant and no cut-over instant exempts an
+/// old row: a signature over the other form does not verify.
+///
+/// A member present with a non-string value is left to the typed readers
+/// (`check_instant_binding` refuses a non-string `expires_at`; the family doors
+/// refuse their own members); this predicate asks only about the form.
+#[must_use]
+pub fn signed_instant_form_violation(row: &super::Attestation) -> Option<InstantFormViolation> {
+    signed_instant_form_violation_in(&row.attestation_envelope, &row.additional_scrubs)
+}
+
+/// [`signed_instant_form_violation_in`] at the local write door: `expires_at`
+/// is the door's own to stamp from the typed column (#598), so it is not read
+/// from the caller's envelope.
+#[must_use]
+pub fn local_write_instant_form_violation(
+    envelope: &serde_json::Value,
+) -> Option<InstantFormViolation> {
+    let mut caller = envelope.clone();
+    if let Some(m) = caller.as_object_mut() {
+        m.remove(crate::federation::envelope::paths::EXPIRES_AT);
+    }
+    signed_instant_form_violation_in(&caller, &[])
+}
+
+/// [`signed_instant_form_violation`] over an envelope and a scrub set, for a
+/// door that holds them before there is a row (the local write).
+#[must_use]
+pub fn signed_instant_form_violation_in(
+    envelope: &serde_json::Value,
+    additional_scrubs: &[super::types::ScrubSig],
+) -> Option<InstantFormViolation> {
+    let canonical =
+        |s: &str| crate::verify::canonical_validation::validate_canonical_datetime(s).is_ok();
+    if let Some(members) = envelope.as_object() {
+        for member in SIGNED_INSTANT_MEMBERS {
+            if let Some(serde_json::Value::String(s)) = members.get(*member) {
+                if !canonical(s) {
+                    return Some(InstantFormViolation {
+                        member: (*member).to_owned(),
+                        value: s.clone(),
+                    });
+                }
+            }
+        }
+    }
+    additional_scrubs
+        .iter()
+        .enumerate()
+        .find_map(|(n, scrub)| match scrub.cosigned_at.as_deref() {
+            Some(s) if !canonical(s) => Some(InstantFormViolation {
+                member: format!("additional_scrubs[{n}].cosigned_at"),
+                value: s.to_owned(),
+            }),
+            _ => None,
+        })
+}
+
+/// CC 2.6.1.1.1 — the signed `witnesses` member: a lineage charter's
+/// witness directory, an array of key records. It rides the envelope as an
+/// extra member (CC 2.6.1.7: `signed:envelope-extra`).
+pub const WITNESSES_MEMBER: &str = "witnesses";
+
+/// CIRISPersist#1098 F4 and F5 (CC 2.6.1.1.1 and 2.6.1.7, rc12) — two shape
+/// rules over the signed envelope's own members, asked at every door a row
+/// enters by (put and replication, the mint, the promotion).
+///
+/// - **F4.** An optional member written as an explicit JSON `null` is refused
+///   `federation_malformed_row` / `envelope_member_null`, naming the member,
+///   at the envelope's top level and inside the `row` mirror. CC writes a
+///   default as `null` to mean absent; on the wire the member is absent.
+/// - **F5.** `witnesses` is a set-kind member: sorted by each element's JCS
+///   string and carrying no repeat, refused `federation_set_semantics_unsorted`
+///   naming the member otherwise. A member that is not an array is
+///   `envelope_member_invalid`.
+///
+/// Nothing is re-sorted or normalised: the signed bytes are the producer's,
+/// so a relay cannot repair them.
+///
+/// One carve-out, until CIRISPersist#1151 retires it: `role: null` on a
+/// `membership:proposal` / `membership:acceptance` row (a v60 peer's form) is
+/// admitted and read as absent.
+///
+/// The key plane's `revocation_envelope` binds absent optionals as explicit
+/// `null` inside its own signed object (CC 2.6.1.1.1 names it as the one
+/// exception); it is a nested member and this check does not read inside it.
+pub(crate) fn check_envelope_member_shapes(row: &super::Attestation) -> Result<(), Error> {
+    use crate::federation::envelope::paths;
+    let Some(members) = row.attestation_envelope.as_object() else {
+        return Ok(());
+    };
+    // CIRISPersist#1151 (the sunset) — a v60 peer writes `"role": null` on a
+    // membership proposal or acceptance when no role is offered. Until every
+    // peer emits the absent form, that one member on those two families is
+    // admitted and read as absent (`membership_acceptance::env_role` already
+    // reads null as no role). Nothing else is carved out.
+    let membership_role_carve_out = matches!(
+        envelope_dimension(&row.attestation_envelope),
+        Some(
+            super::membership_acceptance::PROPOSAL_DIMENSION
+                | super::membership_acceptance::ACCEPTANCE_DIMENSION
+        )
+    );
+    let null_member = |members: &serde_json::Map<String, serde_json::Value>| {
+        members
+            .iter()
+            .find(|(_, v)| v.is_null())
+            .map(|(k, _)| k.clone())
+    };
+    let top_level_null = members
+        .iter()
+        .find(|(k, v)| v.is_null() && !(membership_role_carve_out && k.as_str() == "role"))
+        .map(|(k, _)| k.clone());
+    let nulled = top_level_null.or_else(|| {
+        members
+            .get(paths::ROW)
+            .and_then(serde_json::Value::as_object)
+            .and_then(null_member)
+            .map(|k| format!("{}.{k}", paths::ROW))
+    });
+    if let Some(member) = nulled {
+        return Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_MEMBER_NULL,
+            format!(
+                "attestation {}: signed envelope member `{member}` is an explicit JSON null; an \
+                 optional member that is not carried is absent, never null (CC 2.6.1.1.1)",
+                row.attestation_id,
+            ),
+        ));
+    }
+    if let Some(v) = signed_instant_form_violation(row) {
+        return Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_MEMBER_INVALID,
+            format!(
+                "attestation {}: `{}` = {:?} is not in the CC 2.6.2 form \
+                 YYYY-MM-DDTHH:MM:SS.sssZ (literal `Z`, exactly three fractional digits); a \
+                 signed instant in any other form does not verify",
+                row.attestation_id, v.member, v.value,
+            ),
+        ));
+    }
+    let Some(witnesses) = members.get(WITNESSES_MEMBER) else {
+        return Ok(());
+    };
+    let Some(elements) = witnesses.as_array() else {
+        return Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_MEMBER_INVALID,
+            format!(
+                "attestation {}: signed envelope member `{WITNESSES_MEMBER}` is not an array of \
+                 key records (CC 2.1, CC 3.2 T6)",
+                row.attestation_id,
+            ),
+        ));
+    };
+    let mut keys = Vec::with_capacity(elements.len());
+    for element in elements {
+        let jcs = crate::verify::canonical::ceg_produce_canonicalize(element).map_err(|e| {
+            Error::malformed_row(
+                "attestation",
+                super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                format!(
+                    "attestation {}: a `{WITNESSES_MEMBER}` element does not canonicalize: {e}",
+                    row.attestation_id,
+                ),
+            )
+        })?;
+        keys.push(String::from_utf8(jcs).map_err(|e| {
+            Error::malformed_row(
+                "attestation",
+                super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                format!(
+                    "attestation {}: a `{WITNESSES_MEMBER}` element is not UTF-8: {e}",
+                    row.attestation_id,
+                ),
+            )
+        })?);
+    }
+    for (n, pair) in keys.windows(2).enumerate() {
+        let order = super::operational::jcs_string_order(&pair[0], &pair[1]);
+        if order != std::cmp::Ordering::Less {
+            let why = if order == std::cmp::Ordering::Equal {
+                "repeats element"
+            } else {
+                "is out of order after element"
+            };
+            return Err(Error::SetSemanticsUnsorted(format!(
+                "attestation {}: `{WITNESSES_MEMBER}` element {} {why} {n} — a set-semantics \
+                 array is sorted by each element's JCS string and carries no repeat (CC \
+                 2.6.1.1.1, CC 2.6.1.7)",
+                row.attestation_id,
+                n + 1,
+            )));
+        }
     }
     Ok(())
 }
@@ -7574,6 +8103,16 @@ pub async fn verify_signed_touch_claim(
         return Err(diverges("target_kind"));
     }
     let env_fresh_str = str_field("fresh_as_of")?;
+    // v61 (CC 2.6.2, strict) — only `.sssZ` verifies.
+    crate::verify::canonical_validation::validate_canonical_datetime(&env_fresh_str).map_err(
+        |e| {
+            Error::malformed_row(
+                "touch_claim",
+                super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                format!("signed touch_claim envelope `fresh_as_of` is not CC 2.6.2 form: {e}"),
+            )
+        },
+    )?;
     let env_fresh_as_of = chrono::DateTime::parse_from_rfc3339(&env_fresh_str)
         .map(|t| t.with_timezone(&chrono::Utc))
         .map_err(|e| {
@@ -7878,6 +8417,20 @@ pub fn check_consensus_protocol_form(consensus_protocol: &str) -> Result<(), Err
             consensus_protocol: consensus_protocol.to_string(),
         })
     }
+}
+
+/// v61 (CIRISPersist#1123; CC 4.4.3.2) — a FAMILY's `consensus_protocol`:
+/// [`check_consensus_protocol_form`], and never `open:self_admit`, which is a
+/// `public` group's protocol and a family is never public. Refused as
+/// [`Error::ConsensusProtocolMalformed`] (it is not a family's form).
+pub fn check_family_consensus_protocol_form(consensus_protocol: &str) -> Result<(), Error> {
+    check_consensus_protocol_form(consensus_protocol)?;
+    if consensus_protocol == crate::federation::types::consensus_protocol::OPEN_SELF_ADMIT {
+        return Err(Error::ConsensusProtocolMalformed {
+            consensus_protocol: consensus_protocol.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// v13.3.0 (CIRISPersist#386) — the REAL family invariant, enforced at
@@ -9995,8 +10548,17 @@ pub async fn resolve_withdraws_admission_rule_at(
     // which it holds standing ([`check_reconsideration_admission`]: the
     // licence subject arm and the authority's duty-holders), never
     // withdrawal. Same check, same refusal, widened in place.
+    // v61 S2 (CIRISPersist#1161) — and a cosigned act: its other signers'
+    // voices are not the subject's to take back. A node's tier-crossing
+    // co-scrub (stamped `cosigned_at`, CC 2.6.7) is custody, not a voice in
+    // the act, and does not make a row cosigned.
+    let cosigned_act = target
+        .additional_scrubs
+        .iter()
+        .any(|sc| sc.cosigned_at.is_none() && sc.scrub_key_id != target.attesting_key_id);
     let target_denies_subject_revocation = envelope_dimension(&target.attestation_envelope)
-        .is_some_and(|d| SUBJECT_WITHDRAWS_CARVE_OUT.iter().any(|p| d.starts_with(p)));
+        .is_some_and(|d| SUBJECT_WITHDRAWS_CARVE_OUT.iter().any(|p| d.starts_with(p)))
+        || cosigned_act;
     if target_denies_subject_revocation {
         return Err(Error::WithdrawsNotAdmitted {
             issuer: issuer.to_string(),
@@ -10191,8 +10753,23 @@ pub(crate) async fn owner_bindings_in_force_at(
 /// `detection:*` since v21.11.0; `licensure:*` and `revocation:*` since
 /// v60.0.0. The subject's contest path for all four is
 /// `reconsideration:{grounds}`.
-pub const SUBJECT_WITHDRAWS_CARVE_OUT: [&str; 4] =
-    ["capacity:", "detection:", "licensure:", "revocation:"];
+///
+/// v61 S2 (CIRISPersist#1161; CC rc15 standing rules) — a named person may
+/// withdraw a peer's row about them, but not a `moderation:*`, `hard_case:*`
+/// or `slashing:*` act, nor a legal-weight act (`takedown_notice:*`). A
+/// COSIGNED act ([`Attestation::additional_scrubs`](super::Attestation)
+/// non-empty) is not the subject's to withdraw either
+/// ([`resolve_withdraws_admission_rule_at`]).
+pub const SUBJECT_WITHDRAWS_CARVE_OUT: [&str; 8] = [
+    "capacity:",
+    "detection:",
+    "licensure:",
+    "revocation:",
+    "moderation:",
+    "hard_case:",
+    "slashing:",
+    "takedown_notice:",
+];
 
 /// v6.4.0 (CIRISPersist#146 Ask 2) — the `put_attestation` entry point
 /// for the broadened gate. A no-op (`Ok(None)`) for any
@@ -10421,6 +10998,14 @@ pub async fn check_withdraws_admission_at(
     // not a withdrawal of holders". The retired `holds_bytes` carve-out that
     // let a moderation key withdraw a third party's claim is gone with the
     // carrier; a holder's own retraction falls through to rule 1 below.
+    // v61 (CIRISPersist#991, CC 2.4.1.1) — a group-plane row (a cosigned
+    // roster event) is retracted by a cosigned `withdraws` under the same
+    // protocol; rules 1-4 do not decide it.
+    if let Some(rule) =
+        crate::federation::group_plane::check_cosigned_withdraws(directory, row, &target).await?
+    {
+        return Ok(Some(rule));
+    }
     super::custody_ack::check_custody_withdraws_signer(row, &target)?;
     // v25.x (CIRISPersist#578, CIRISConstitution rc3 CC 3.2) — **the recovery
     // gate, in BOTH directions.**
@@ -10666,17 +11251,22 @@ pub fn revocation_binding(row: &super::Revocation) -> Vec<(&'static str, serde_j
                 None => serde_json::Value::Null,
             },
         ),
+        // v61 (CC 2.6.2, strict) — the three instants bind in the one
+        // canonical form, `.sssZ`. The comparison is over the raw JSON, so a
+        // revocation signed over another spelling is refused at admission; a
+        // revocation this node already holds is never re-judged and stays in
+        // force (CC 3.2 T3, CC 6.1.7).
         (
             REVOKED_AT_ENVELOPE_FIELD,
-            serde_json::Value::from(row.revoked_at.to_rfc3339()),
+            serde_json::Value::from(render_signed_instant(row.revoked_at)),
         ),
         (
             EFFECTIVE_AT_ENVELOPE_FIELD,
-            serde_json::Value::from(row.effective_at.to_rfc3339()),
+            serde_json::Value::from(render_signed_instant(row.effective_at)),
         ),
         (
             SCRUB_TIMESTAMP_ENVELOPE_FIELD,
-            serde_json::Value::from(row.scrub_timestamp.to_rfc3339()),
+            serde_json::Value::from(render_signed_instant(row.scrub_timestamp)),
         ),
     ]
 }
@@ -10960,15 +11550,20 @@ pub fn check_revocation_envelope_binding(row: &super::Revocation) -> Result<(), 
         (EFFECTIVE_AT_ENVELOPE_FIELD, row.effective_at),
         (SCRUB_TIMESTAMP_ENVELOPE_FIELD, row.scrub_timestamp),
     ] {
-        if t.nanosecond() % CONSENT_INSTANT_RESOLUTION_NANOS != 0 {
+        // v61 (CC 2.6.2) — the signed form carries milliseconds, so a
+        // column finer than a millisecond is an instant no signature names:
+        // equality above compared the envelope with the column RENDERED, and
+        // the render truncates. Refused here so the column is the signed
+        // instant exactly. (Pre-v61 this floor was the microsecond, the finest
+        // a postgres TIMESTAMPTZ stores.)
+        if t.nanosecond() % SIGNED_INSTANT_RESOLUTION_NANOS != 0 {
             return Err(unbound(
                 field,
                 format!(
-                    "signed instant {} carries sub-microsecond precision, which postgres \
-                     TIMESTAMPTZ cannot store — the row would fail its own binding after a \
-                     round-trip, and `effective_at` orders the standing fold, so the same \
-                     sequence would be a strict order on sqlite/memory and a TIE on postgres. \
-                     Truncate to microseconds at the producer",
+                    "signed instant {} carries sub-millisecond precision, which the CC 2.6.2 \
+                     form `.sssZ` cannot carry — the column would name an instant the signed \
+                     envelope does not. Truncate to milliseconds at the producer \
+                     (`bind_revocation_into_envelope` does)",
                     t.to_rfc3339()
                 ),
             ));
@@ -11129,6 +11724,11 @@ pub(crate) enum DelegationEdgeFilter {
     /// Only CC 1.13.3.3 / CC 3.2 owner-binding edges
     /// ([`is_owner_binding_envelope`]) — the ownership projection.
     OwnerBindingOnly,
+    /// v61 (CIRISPersist#1101, CC 5.4.6) — only owner-binding edges that
+    /// are ANNOUNCED: carried at `cohort_scope: federation`, or re-signed at
+    /// federation by the same granter as a live widening `supersedes`
+    /// (`widen_audience`, what CC calls announcing).
+    AnnouncedOwnerBindingOnly,
 }
 
 /// **THE live incoming-`delegates_to` walk — one predicate, one impl**
@@ -11248,6 +11848,33 @@ pub(crate) async fn live_delegation_granter_instants<F: super::FederationDirecto
     // into [`retracted_edge_ids`], which the scoped-delegation BFS shares — the
     // same defect, one plane over, so the same predicate.)
     let withdrawn = retracted_edge_ids(&rows);
+    // v61 (CIRISPersist#1101, CC 5.4.6) — the edges a live widening at
+    // federation announces: a `supersedes` by the edge's own granter at
+    // `cohort_scope: federation` naming it, not itself retracted.
+    let announced_by_widening: std::collections::HashSet<String> =
+        if filter == DelegationEdgeFilter::AnnouncedOwnerBindingOnly {
+            let granter_of: std::collections::HashMap<&str, &str> = rows
+                .iter()
+                .filter(|r| r.attestation_type == attestation_type::DELEGATES_TO)
+                .map(|r| (r.attestation_id.as_str(), r.attesting_key_id.as_str()))
+                .collect();
+            rows.iter()
+                .filter(|w| {
+                    w.attestation_type == attestation_type::SUPERSEDES
+                        && w.cohort_scope == super::types::cohort_scope::FEDERATION
+                        && !withdrawn.contains(w.attestation_id.as_str())
+                })
+                .filter_map(|w| {
+                    let target = super::precedence::references_attestation_id_from_envelope(
+                        &w.attestation_envelope,
+                    )?;
+                    (granter_of.get(target) == Some(&w.attesting_key_id.as_str()))
+                        .then(|| target.to_owned())
+                })
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
 
     for r in rows {
         // (1) shape.
@@ -11261,8 +11888,18 @@ pub(crate) async fn live_delegation_granter_instants<F: super::FederationDirecto
         // parent per CC 4.5.13). Must match `check_single_node_owner_admission`
         // exactly so the gate and the `owner_of` resolver agree on what an
         // owner-binding IS.
-        if filter == DelegationEdgeFilter::OwnerBindingOnly
-            && !is_owner_binding_envelope(&r.attestation_envelope)
+        if matches!(
+            filter,
+            DelegationEdgeFilter::OwnerBindingOnly
+                | DelegationEdgeFilter::AnnouncedOwnerBindingOnly
+        ) && !is_owner_binding_envelope(&r.attestation_envelope)
+        {
+            continue;
+        }
+        // (1b) v61 (CIRISPersist#1101) — announced, for that filter.
+        if filter == DelegationEdgeFilter::AnnouncedOwnerBindingOnly
+            && r.cohort_scope != super::types::cohort_scope::FEDERATION
+            && !announced_by_widening.contains(&r.attestation_id)
         {
             continue;
         }
@@ -11702,6 +12339,33 @@ pub async fn nodes_stewarded_by(
 /// unrepaired at the three steward-binding sites; the walk now lives in one
 /// place, so `owner_of(node) ⊆ steward_bindings_of(node)` holds by construction
 /// rather than by two functions being edited in step.
+/// v61 (CIRISPersist#1101; CC 5.4.6, `CLM-serve-seat-announced`) — the
+/// refusal a serve seat in an infrastructure community carries when its node
+/// has no live announced owner binding.
+pub const SERVE_SEAT_OWNER_UNANNOUNCED: &str = "serve_seat_owner_unannounced";
+
+/// v61 (CIRISPersist#1101; CC 5.4.6, steward ruling 2026-10-21) — **is
+/// `node_key_id`'s owner announced?** True while a live owner binding
+/// (`delegates_to(owner → node)`, [`is_owner_binding_envelope`]) is carried at
+/// `cohort_scope: federation`, directly or by its granter's live widening
+/// `supersedes`. Judged at evaluation time, not at a seating instant: a later
+/// announcement satisfies it, and withdrawing the announcement un-satisfies
+/// it. The walk is the one live-delegation fold
+/// ([`live_delegation_granter_instants`]), filtered, never a second copy. A
+/// named human is then responsible for the node and can be found.
+pub async fn serve_seat_owner_announced<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    node_key_id: &str,
+) -> Result<bool, Error> {
+    Ok(!live_delegation_granter_instants(
+        directory,
+        node_key_id,
+        DelegationEdgeFilter::AnnouncedOwnerBindingOnly,
+    )
+    .await?
+    .is_empty())
+}
+
 async fn live_owner_binding_granters<F: super::FederationDirectory + ?Sized>(
     directory: &F,
     node: &str,
@@ -12084,6 +12748,14 @@ pub async fn check_owner_binding_affiliation_admission(
     let Some(named) = envelope_cohort_target(&row.attestation_envelope)? else {
         return Ok(());
     };
+    // v61 (CIRISPersist#1140, CC rc14 3.2) — a NODE's owner-binding naming a
+    // group is the owner re-signing it at that group's scope so the group's
+    // members can see who owns the node: an audience, not an organisation on
+    // the bond (CC 3.2 names that for an `agent` key held on an
+    // organisation's behalf).
+    if binding_is_group_audience(row) {
+        return Ok(());
+    }
     let refuse = |reason: &'static str, detail: String| {
         Err(Error::InvalidArgument(format!(
             "{OWNER_BINDING_AFFILIATION_REFUSED}: {reason}: owner-binding {} by {} over {} names \
@@ -12130,6 +12802,17 @@ pub async fn check_owner_binding_affiliation_admission(
     Ok(())
 }
 
+/// v61 (CIRISPersist#1140, CC rc14 3.2) — is `row` (an owner-binding naming a
+/// group) the owner's re-signing of the binding AT that group's scope — an
+/// audience, "placed under the audience rule of its tier" — rather than an
+/// organisation's bond? True when the row is PLACED at a targeted scope
+/// (`family` / `community` / `affiliations`): the group it names is then the
+/// audience it is placed in. An organisation's bond names the affiliation in
+/// `community_id` from a non-targeted placement (CIRISPersist#1062, I1219).
+fn binding_is_group_audience(row: &super::Attestation) -> bool {
+    crate::federation::types::cohort_scope::is_targeted(&row.cohort_scope)
+}
+
 /// v60.0.0 (CIRISPersist#1062, CLM-org-on-the-bond) — **the affiliation named
 /// on `key`'s live owner-binding**, for slashing / quarantine propagation and
 /// for the record: the community the binding in force now names
@@ -12149,6 +12832,11 @@ pub async fn affiliation_of_binding(
     // affiliations): the smallest id, so every node names the same one.
     let mut named = Vec::new();
     for b in &bindings {
+        // v61 (CIRISPersist#1140) — a node binding re-signed at a group's
+        // scope names an audience, never an organisation on the bond.
+        if binding_is_group_audience(b) {
+            continue;
+        }
         if let Some(c) = envelope_cohort_target(&b.attestation_envelope)? {
             named.push(c.to_owned());
         }
@@ -12944,48 +13632,47 @@ pub fn bind_subject_into_envelope(
 /// #640 and #643); a fresh genesis re-mints every conferral record against
 /// this preimage.
 pub fn verify_envelope_binds_subject(row: &super::KeyRecord) -> Result<(), String> {
+    // v61 (CC 2.6.2) — the expiry binds as `.sssZ`, which carries
+    // milliseconds; a column finer than that names an instant no signature
+    // names, and the canonical render below would truncate it into agreeing.
+    if let Some(t) = row.valid_until {
+        use chrono::Timelike as _;
+        if t.nanosecond() % SIGNED_INSTANT_RESOLUTION_NANOS != 0 {
+            return Err(format!(
+                "valid_until {} carries sub-millisecond precision, which the signed CC 2.6.2 \
+                 form cannot carry (key_id {:?})",
+                t.to_rfc3339(),
+                row.key_id
+            ));
+        }
+    }
     for (field, expected) in subject_binding(
         &row.key_id,
         &row.identity_type,
         &row.pubkey_ed25519_base64,
         row.pubkey_ml_dsa_65_base64.as_deref(),
-        row.valid_until.map(|t| t.to_rfc3339()).as_deref(),
+        row.valid_until.map(render_signed_instant).as_deref(),
     ) {
         match row.registration_envelope.get(&field) {
             Some(bound) if *bound == expected => {}
-            // v38.7.0 (verify v14.0.0) — `valid_until` is an INSTANT, and two
-            // spellings of one instant must not read as two subjects.
-            //
-            // RFC-3339 renders UTC as either `Z` or `+00:00`, and with any
-            // sub-second precision. verify's fixtures and producers write
-            // `…00:00Z`; persist renders its typed column with
-            // `to_rfc3339()`, which writes `…00:00+00:00`. Compared as
-            // strings those disagree, so persist would refuse a record whose
-            // envelope names the very instant its own row carries — and the
-            // refusal text would say the signers "never named" a subject they
-            // did name.
-            //
-            // Compared as instants they agree. This is the ONLY member with a
-            // parse: every other one is an opaque identifier or base64, where
-            // byte equality IS the semantics and normalising would be a way
-            // to admit something the signers did not write. Same class as the
-            // prune-cutoff bug in #776 — a lexicographic comparison across
-            // two spellings of one moment — but this one sits on a
-            // signature-bearing path.
-            Some(bound)
+            // v61 (CC 2.6.2, strict) — `valid_until` binds in the one
+            // canonical form, `.sssZ`, compared as bytes like every other
+            // member. v38.7.0 compared it as a parsed instant so that `Z` and
+            // `+00:00` spellings of one moment agreed; the steward's ruling is
+            // that only the canonical form verifies, so a record whose envelope
+            // spells its expiry any other way is refused, naming the form.
+            Some(serde_json::Value::String(bound))
                 if field == "valid_until"
-                    && match (bound.as_str(), expected.as_str()) {
-                        (Some(b), Some(e)) => {
-                            match (
-                                b.parse::<chrono::DateTime<chrono::Utc>>(),
-                                e.parse::<chrono::DateTime<chrono::Utc>>(),
-                            ) {
-                                (Ok(b), Ok(e)) => b == e,
-                                _ => false,
-                            }
-                        }
-                        _ => false,
-                    } => {}
+                    && crate::verify::canonical_validation::validate_canonical_datetime(bound)
+                        .is_err() =>
+            {
+                return Err(format!(
+                    "the signed registration_envelope binds valid_until = {bound:?}, which is not \
+                     in the CC 2.6.2 form YYYY-MM-DDTHH:MM:SS.sssZ (key_id {key_id:?}); a signed \
+                     instant in any other form does not verify (CIRISPersist#659)",
+                    key_id = row.key_id,
+                ));
+            }
             Some(bound) => {
                 return Err(format!(
                     "the signed registration_envelope binds {field} = {bound_brief}, but this \
@@ -15166,6 +15853,208 @@ pub fn infrastructure_quorum(protocol: &str) -> Option<(u32, u32)> {
     (n >= 1 && m >= 1 && m <= n && (n < 2 || m >= 2)).then_some((m, n))
 }
 
+/// v61 (CIRISPersist#1123; CC 4.5.13, 4.4.3.4.2) — rule: a community
+/// above the family names `founder_only`. One voice never decides who is in a
+/// room: `founder_only` is a family's protocol (and a publication's subscriber
+/// list's, and a room's own listing's), and an affiliation's only under the
+/// one-voice countersign rule (CC 4.4.3.2.8, CIRISPersist#1143).
+pub const FOUNDER_ONLY_ABOVE_FAMILY: &str = "founder_only_above_family";
+
+/// v61 (CIRISPersist#1123; CC 4.5.13) — **`founder_only` is refused for a
+/// community above the family**, with the token an `infrastructure` community
+/// already gets (`federation_community_consensus_protocol_violation`) and the
+/// rule [`FOUNDER_ONLY_ABOVE_FAMILY`]. A declared affiliation keeps it: its
+/// acts against a member are gated by the one-voice countersign door
+/// instead (CC 4.4.3.2.8).
+///
+/// Runs at the record doors only (a NEW or CHANGED record at `put_community`,
+/// the supersede door, and a replicated version that would move a stored room
+/// onto `founder_only`). A room already stored under `founder_only` stays
+/// readable and folds as before; its next version must name another protocol.
+///
+/// # Errors
+///
+/// [`Error::CommunityConsensusProtocolViolation`]; a malformed declared cohort
+/// ([`Error::AffiliationConfigInvalid`]).
+pub fn check_founder_only_above_family(community: &super::Community) -> Result<(), Error> {
+    if community.consensus_protocol != super::types::consensus_protocol::FOUNDER_ONLY {
+        return Ok(());
+    }
+    if super::affiliation_config::declared_cohort(community)? == super::cohort::Cohort::Affiliations
+    {
+        return Ok(());
+    }
+    Err(Error::CommunityConsensusProtocolViolation {
+        community_key_id: community.community_key_id.clone(),
+        rule: FOUNDER_ONLY_ABOVE_FAMILY,
+        detail: "founder_only is a family's protocol; a community above the family is \
+                 admitted under a protocol no single vote satisfies (CC 4.5.13)"
+            .into(),
+    })
+}
+
+/// v61 S2 (CIRISPersist#1123; CC 4.5.13; the release lead's ruling) — a
+/// STORED community above the family whose `consensus_protocol` is
+/// `founder_only` (not a declared affiliation): a legacy room kept as data.
+/// `None` for any other room, or one this node does not hold.
+pub(crate) async fn stored_founder_only_room<F>(
+    directory: &F,
+    community_key_id: &str,
+) -> Result<Option<super::Community>, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    let Some(c) = directory.lookup_community(community_key_id).await? else {
+        return Ok(None);
+    };
+    if c.consensus_protocol != super::types::consensus_protocol::FOUNDER_ONLY
+        || super::affiliation_config::declared_cohort(&c)? == super::cohort::Cohort::Affiliations
+    {
+        return Ok(None);
+    }
+    Ok(Some(c))
+}
+
+fn founder_only_refused(community_key_id: &str, detail: String) -> Error {
+    Error::CommunityConsensusProtocolViolation {
+        community_key_id: community_key_id.to_owned(),
+        rule: FOUNDER_ONLY_ABOVE_FAMILY,
+        detail,
+    }
+}
+
+/// v61 S2 (CIRISPersist#1123) — **a stored `founder_only` room admits no
+/// membership event**: no proposal, acceptance, widening or removal (a
+/// member's own resignation is not asked here). The one event it admits is
+/// its escape ([`check_founder_only_escape`]). Refused
+/// [`Error::CommunityConsensusProtocolViolation`] /
+/// [`FOUNDER_ONLY_ABOVE_FAMILY`], on the local and the replicated door alike.
+///
+/// # Errors
+///
+/// The refusal; directory reads.
+pub(crate) async fn refuse_membership_event_under_founder_only<F>(
+    directory: &F,
+    community_key_id: &str,
+    event: &str,
+) -> Result<(), Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    if stored_founder_only_room(directory, community_key_id)
+        .await?
+        .is_some()
+    {
+        return Err(founder_only_refused(
+            community_key_id,
+            format!(
+                "a {event} in a room stored under founder_only: the room admits one event, the \
+                 supersede that moves consensus_protocol off founder_only (CC 4.5.13)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// v61 S2 (CIRISPersist#1123; CC 4.5.13) — **the escape.** When the offered
+/// record's room is stored under `founder_only` (above the family, not an
+/// affiliation), the offered version is admitted only if:
+///
+/// - its `consensus_protocol` is not `founder_only`;
+/// - nothing else changes (the version-chain fields `prev_head_digest` and
+///   `persist_row_hash` aside): the members stay as they are;
+/// - it is signed under the OLD protocol: at least one active founder of the
+///   stored room (by the authorized roster fold at `at`) is among its
+///   verified signers ([`count_distinct_roster_scrubs`](super::reverse_quorum::count_distinct_roster_scrubs)
+///   over the record's signing envelope).
+///
+/// An identical re-offer of the stored record settles. Anything else is
+/// refused [`FOUNDER_ONLY_ABOVE_FAMILY`], whatever the door.
+///
+/// # Errors
+///
+/// The refusal; directory reads.
+pub(crate) async fn check_founder_only_escape<F>(
+    directory: &F,
+    offered: &super::SignedCommunity,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    // The trust-root door decides a trust-root-grade record (the reserved
+    // canonical id's accord birth replaces a squat, #926).
+    if super::canonical_community::is_trust_root_grade(&offered.community) {
+        return Ok(());
+    }
+    let id = offered.community.community_key_id.as_str();
+    let Some(stored) = stored_founder_only_room(directory, id).await? else {
+        return Ok(());
+    };
+    if stored.persist_row_hash == super::types::compute_persist_row_hash(&offered.community)? {
+        return Ok(());
+    }
+    if offered.community.consensus_protocol == super::types::consensus_protocol::FOUNDER_ONLY {
+        return Err(founder_only_refused(
+            id,
+            "the room's next version keeps founder_only; its one admissible version moves \
+             consensus_protocol off it"
+                .into(),
+        ));
+    }
+    let mut unchanged = offered.community.clone();
+    unchanged.consensus_protocol = stored.consensus_protocol.clone();
+    unchanged.prev_head_digest = stored.prev_head_digest.clone();
+    unchanged.persist_row_hash = stored.persist_row_hash.clone();
+    if unchanged != stored {
+        return Err(founder_only_refused(
+            id,
+            "the escape from founder_only changes consensus_protocol alone; this version \
+             changes the record (its members) as well"
+                .into(),
+        ));
+    }
+    let founders: Vec<String> = Box::pin(super::authorized_community_roster_at(
+        directory, &stored, at,
+    ))
+    .await?
+    .into_iter()
+    .filter(|m| m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER))
+    .map(|m| m.key_id)
+    .collect();
+    let scrubs: Vec<super::types::ScrubSig> = std::iter::once(super::types::ScrubSig {
+        scrub_key_id: offered.authority_key_id.clone(),
+        scrub_signature_classical: offered.scrub_signature_classical.clone(),
+        scrub_signature_pqc: offered.scrub_signature_pqc.clone(),
+        cosigned_at: None,
+    })
+    .chain(offered.cosignatures.iter().map(|c| super::types::ScrubSig {
+        scrub_key_id: c.authority_key_id.clone(),
+        scrub_signature_classical: c.scrub_signature_classical.clone(),
+        scrub_signature_pqc: c.scrub_signature_pqc.clone(),
+        cosigned_at: None,
+    }))
+    .collect();
+    let counted = super::reverse_quorum::count_distinct_roster_scrubs(
+        directory,
+        &offered.community.signing_envelope(),
+        &scrubs,
+        &founders,
+    )
+    .await;
+    if counted.is_empty() {
+        return Err(founder_only_refused(
+            id,
+            format!(
+                "the escape from founder_only is signed under the old protocol: no active \
+                 founder of the room ({} held) signed it",
+                founders.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn is_infrastructure_labeled(community: &super::Community) -> bool {
     super::community_subkind(community) == Some(COHORT_SUBKIND_INFRASTRUCTURE)
 }
@@ -15349,6 +16238,7 @@ pub async fn check_infrastructure_community_conformance(
         });
     }
     check_infrastructure_consensus_protocol(community)?;
+    check_founder_only_above_family(community)?;
     check_infrastructure_founders_not_node(directory, community, at).await?;
     // v55.0.0 (CIRISPersist#1053, CC 3.2 `public`) — `admission: open` only on
     // a public room, and no version crosses the `public` boundary.
@@ -15389,7 +16279,13 @@ pub async fn check_replicated_supersede_does_not_degrade(
         // through the replicated door either: the offered version stays on the
         // public side with a well-formed admission.
         if super::public_room::is_public_community(&stored) {
-            return super::public_room::check_public_room_conformance(directory, offered).await;
+            super::public_room::check_public_room_conformance(directory, offered).await?;
+        }
+        // v61 (CIRISPersist#1123) — nor onto `founder_only`: a room stored
+        // under another protocol is never moved onto one voice by a peer. A
+        // room already stored under it still syncs its versions as data.
+        if stored.consensus_protocol != super::types::consensus_protocol::FOUNDER_ONLY {
+            check_founder_only_above_family(offered)?;
         }
         return Ok(());
     }
@@ -15426,8 +16322,11 @@ pub async fn check_infrastructure_record_admission(
         }
     }
     if !is_infrastructure_labeled(community) {
+        // v61 (CIRISPersist#1123) — no NEW or CHANGED room record names
+        // `founder_only` above the family.
+        check_founder_only_above_family(community)?;
         // v55.0.0 (CIRISPersist#1053, CC 3.2 `public`) — every NEW or CHANGED
-        // room record, infrastructure or not, keeps `admission: open` on the
+        // room record, infrastructure or not, keeps open admission on the
         // public side and does not cross the `public` boundary.
         return super::public_room::check_public_room_conformance(directory, community).await;
     }
@@ -15590,8 +16489,11 @@ pub async fn check_no_moderator_federate_admission(
     }
     // Authority set from the in-flight roster (mirrors community_authority_set:
     // founders always; every member too under a non-`founder_only` protocol).
-    let founder_only =
-        community.consensus_protocol == crate::federation::types::consensus_protocol::FOUNDER_ONLY;
+    // v61 (CIRISPersist#1123) — founders alone under `open:self_admit`
+    // too: joining a public room confers membership, never its authority.
+    let founder_only = crate::federation::types::consensus_protocol::founders_hold_authority(
+        &community.consensus_protocol,
+    );
     // v48.0.0 (CIRISPersist#860) — the roster is the fold (a widened founder
     // is a moderator; a revoked one is not).
     for m in &crate::federation::effective_roster(directory, community).await? {
@@ -16357,8 +17259,11 @@ pub async fn community_authority_set_for(
     directory: &dyn super::FederationDirectory,
     community: &super::Community,
 ) -> Result<std::collections::HashSet<String>, Error> {
-    let founder_only =
-        community.consensus_protocol == crate::federation::types::consensus_protocol::FOUNDER_ONLY;
+    // v61 (CIRISPersist#1123) — founders alone under `open:self_admit`
+    // too: joining a public room confers membership, never its authority.
+    let founder_only = crate::federation::types::consensus_protocol::founders_hold_authority(
+        &community.consensus_protocol,
+    );
     let mut out = std::collections::HashSet::new();
     for m in &crate::federation::effective_roster(directory, community).await? {
         let is_founder = m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER);
@@ -16401,6 +17306,19 @@ pub const MEMBER_ROLE_FOUNDER: &str = "founder";
 /// error's `on_behalf_of` field carries the target descriptor for audit
 /// (the model no longer has a principal field).
 ///
+///
+/// v61 S2 (CIRISPersist#1160; CC 4.5.5) — the gate asks about the signer's
+/// IDENTITY. A person's device or occurrence key is first resolved to the
+/// identity it is an ACTIVE occurrence of
+/// ([`FederationDirectory::active_identity_for_occurrence`](super::FederationDirectory::active_identity_for_occurrence)).
+/// A federation-identity moderator acting through one of its live occurrence
+/// keys therefore holds its duty, and the delegation walk reaches either the
+/// key or its identity. It is deliberately NOT [`admission_identity_for_writer`]:
+/// that also resolves a NODE to its owner, and a node has no agency. A node
+/// gives no acceptance and holds no duty, so an owner's machine never acts as
+/// the moderator it belongs to (release lead's ruling). A key bound to nobody
+/// resolves to itself.
+///
 /// [`MODERATION_DUTY`]: DelegationWalkPolicy::MODERATION_DUTY
 pub async fn check_moderation_admission(
     directory: &dyn super::FederationDirectory,
@@ -16409,13 +17327,17 @@ pub async fn check_moderation_admission(
     duty: &str,
     target_descriptor: &str,
 ) -> Result<(), Error> {
-    // (a) as-self: signer itself holds the duty over the target.
-    if duty_holders.contains(signer) {
+    let signer_identity = directory.active_identity_for_occurrence(signer).await?;
+    // (a) as-self: the signer, or the identity it acts for, holds the duty
+    //     over the target.
+    if duty_holders.contains(signer) || duty_holders.contains(&signer_identity) {
         return Ok(());
     }
-    // (b) delegated: an steward-bound duty-holder root reaches signer via a
-    //     live duty-scoped chain (§11.10 attenuation + sub_delegation).
-    let target: std::collections::HashSet<String> = std::iter::once(signer.to_owned()).collect();
+    // (b) delegated: an steward-bound duty-holder root reaches the signer
+    //     (or its identity) via a live duty-scoped chain (§11.10 attenuation
+    //     + sub_delegation).
+    let target: std::collections::HashSet<String> =
+        [signer.to_owned(), signer_identity].into_iter().collect();
     for root in duty_holders {
         if !is_steward_bound(directory, root).await? {
             continue;
@@ -18355,7 +19277,10 @@ pub async fn check_reserved_prefix_admission(
     if let Some(dim) = envelope_dimension(&row.attestation_envelope) {
         check_namespace_family_registered(dim)?;
         check_registered_family_not_held(dim)?;
+        crate::federation::group_plane::check_generic_row_dimension(at, dim)?;
     }
+    // v61 (CIRISPersist#1126) — a partnership half is a `consent_record`.
+    crate::federation::self_at_login::check_partnership_shape(at, &row.attestation_envelope)?;
     // v58.0.0 (CC 3.1.7 R4 rc8) — the family's declared polarity, read from
     // the same registry row as the gate above, at the same door.
     check_score_within_declared_polarity(row)?;
@@ -19245,15 +20170,16 @@ mod tests {
         bind_revocation_into_envelope(&mut row).expect("object");
         check_revocation_envelope_binding(&row).expect("the producer truncated both");
 
-        // Now the divergence the producer cannot mint but a hostile relay can.
-        let ns = row.effective_at + chrono::Duration::nanoseconds(1);
+        // Now the divergence the producer cannot mint but a hostile relay can:
+        // a column finer than the millisecond the canonical form carries.
+        let ns = row.effective_at + chrono::Duration::microseconds(1);
         row.effective_at = ns;
         row.revocation_envelope[EFFECTIVE_AT_ENVELOPE_FIELD] =
-            serde_json::Value::from(ns.to_rfc3339());
-        let err = check_revocation_envelope_binding(&row).expect_err("sub-microsecond");
+            serde_json::Value::from(render_signed_instant(ns));
+        let err = check_revocation_envelope_binding(&row).expect_err("sub-millisecond");
         assert!(
-            format!("{err}").contains("sub-microsecond"),
-            "the refusal must say what postgres cannot store: {err}"
+            format!("{err}").contains("sub-millisecond"),
+            "the refusal must say what the signed form cannot carry: {err}"
         );
     }
 
@@ -19393,7 +20319,7 @@ mod tests {
                     .expect_err("a foreign SUBJECT is a foreign party too");
             assert!(
                 matches!(&err, Error::CohortStandingRefused { reason, .. }
-                    if *reason == CohortStandingRefusal::NamedSubject),
+                    if *reason == CohortStandingRefusal::SubjectOutsideAudience),
                 "the subject arm names its own branch: {err:?}"
             );
 
@@ -21337,6 +22263,13 @@ mod tests {
         // stream), which no identity type expresses. The gate is
         // `key_grant::check_key_grant_row_admission` (CIRISPersist#989).
         "key_grant:",
+        // rc12 re-vendor (CC 3.1.5) — "the agent's occurrence key about its
+        // identity key; admitted only citing an admitted
+        // deferral:response:approved by a seated WA": the rule asks whether the
+        // cited answer's signer held a WA seat at its instant, which no identity
+        // type expresses. The gate is
+        // `identity_amendment::check_identity_amendment_admission` (#1120).
+        "identity_amendment",
     ];
 
     /// Manifest-reserved families persist has **no gate for yet** — a different
@@ -21371,6 +22304,28 @@ mod tests {
         ("key:revocation", "CIRISPersist#991"),
         ("identity:occurrence", "CIRISPersist#991"),
         ("group:roster", "CIRISPersist#991"),
+        // rc12 re-vendor (CC 3.1.3) — the mesh census and the community tally:
+        // serve seats aggregate, tally members recompute, shares are addressed
+        // to one seat or member. The doors are #1121 (after v60).
+        ("census:share:", "CIRISPersist#1121"),
+        ("census:partial:", "CIRISPersist#1121"),
+        ("census:composite:", "CIRISPersist#1121"),
+        ("census:expected_active", "CIRISPersist#1121"),
+        ("census:member:share", "CIRISPersist#1121"),
+        ("census:member:partial", "CIRISPersist#1121"),
+        ("ballot:tally:", "CIRISPersist#1121"),
+        // rc12 re-vendor (CC 3.1.9.4) — first-person observation, `+1.0` only.
+        // The polarity is gated by the class; the first-person rule is #1115.
+        ("observation:access_assumption", "CIRISPersist#1115"),
+        // rc12 re-vendor (CC 3.1.9.3) — the deferring agent's occurrence key,
+        // and a seated WA's answer. Persist reads the approved answer for the
+        // identity amendment; neither row's own emitter rule is gated. CC
+        // staged both on CIRISAgent#1316.
+        ("deferral:request", "CIRISAgent#1316"),
+        ("deferral:response:", "CIRISAgent#1316"),
+        // rc12 re-vendor (CC 3.1.4) — self: attester == subject == the
+        // period's fresh rendezvous key. Persist has no emitter and no gate.
+        ("rendezvous:route", "CIRISPersist#1149"),
     ];
 
     /// **CC 3.1.7 R2(a) — the mint gate.** Every family persist declares itself
@@ -21739,6 +22694,11 @@ mod tests {
             "membership:proposal:v1",
             "membership:acceptance:v1",
             "membership:decline:v1",
+            // v61 (#991) built the group-plane door.
+            "membership:widening:v1",
+            "membership:removal:v1",
+            "membership:resignation:v1",
+            "group:roster:v1",
             "key:record:v1",
             "custody:ack:v1",
             "key_granted:v1",
@@ -26422,20 +27382,21 @@ pub(crate) mod r2_test_support {
         }
         refused(bare, "(f)", "binds NONE of".to_owned()).await;
 
-        // (g) THE RESOLUTION FLOOR — an envelope that mirrors the column
-        //     EXACTLY and still cannot survive a postgres round-trip. Built
-        //     after sealing, deliberately: a fixture that merely forgot to
-        //     truncate is indistinguishable from a stale one.
+        // (g) THE RESOLUTION FLOOR — an envelope in the canonical form and a
+        //     column finer than the millisecond it can carry (v61: the
+        //     signed form `.sssZ`). Built after sealing, deliberately: a
+        //     fixture that merely forgot to truncate is indistinguishable from
+        //     a stale one.
         let mut sub_micro = build(&unnamed, now);
-        let ns = now + chrono::Duration::nanoseconds(1);
+        let ns = now + chrono::Duration::microseconds(1);
         sub_micro.effective_at = ns;
         sub_micro.revocation_envelope[EFFECTIVE_AT_ENVELOPE_FIELD] =
-            serde_json::Value::from(ns.to_rfc3339());
+            serde_json::Value::from(render_signed_instant(ns));
         let (och, sc, sp) = sign_envelope(&moderator, &sub_micro.revocation_envelope);
         sub_micro.original_content_hash = och;
         sub_micro.scrub_signature_classical = sc;
         sub_micro.scrub_signature_pqc = sp;
-        refused(sub_micro, "(g)", "sub-microsecond".to_owned()).await;
+        refused(sub_micro, "(g)", "sub-millisecond".to_owned()).await;
 
         // (h) THE ORDER — the binding refuses BEFORE authority is resolved.
         //
@@ -27342,7 +28303,7 @@ pub(crate) mod r2_test_support {
                     role: Some("founder".to_owned()),
                 }],
                 founded_at: now,
-                consensus_protocol: "founder_only".to_owned(),
+                consensus_protocol: "quorum:1/1".into(),
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },
@@ -27372,16 +28333,68 @@ pub(crate) mod r2_test_support {
         // v59.0.0 (sealed-transport floor) — a key is its `key:record:v1`
         // row (an Attestation ref under a row id; 634/640 resolve it); the
         // framed `Key` kind is never indexed.
-        for kind in ["Attestation", "LocationProof", "Family", "Community"] {
+        // v61 (CIRISPersist#991) — the family and the community are their
+        // `group:roster:v1` rows (Attestation refs under row ids, resolved
+        // below); the framed `Family` / `Community` kinds are never indexed.
+        for kind in ["Attestation", "LocationProof"] {
             assert!(
                 mine.iter().any(|(k, _, _)| *k == kind),
                 "[{tag}] no {kind} ref for the seeded fixture; got {mine:?}"
             );
         }
         assert!(
-            !mine.iter().any(|(k, _, _)| *k == "Key"),
-            "[{tag}] a retired framed Key ref is indexed; got {mine:?}"
+            !mine
+                .iter()
+                .any(|(k, _, _)| ["Key", "Family", "Community"].contains(k)),
+            "[{tag}] a retired framed ref is indexed; got {mine:?}"
         );
+        let family = dir
+            .list_signed_families_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|f| f.family.family.family_key_id == fam)
+            .expect("the family is held")
+            .family;
+        let community = dir
+            .list_signed_communities_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.community.community.community_key_id == comm)
+            .expect("the community is held")
+            .community;
+        for record in [
+            crate::federation::group_plane::GroupSigned::Family(family),
+            crate::federation::group_plane::GroupSigned::Community(community),
+        ] {
+            let row = dir
+                .list_attestations_since(None, u32::MAX)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|s| s.attestation)
+                .find(|r| {
+                    crate::federation::group_plane::group_signed_of_row(r)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|g| {
+                            g.group_key_id() == record.group_key_id() && g.member_key_id().is_none()
+                        })
+                })
+                .unwrap_or_else(|| {
+                    panic!("[{tag}] {}'s record row is held", record.group_key_id())
+                });
+            let hash = crate::federation::wire_index::content_hash_of(&row).unwrap();
+            assert!(
+                dir.lookup_signed_record_by_content_hash("Attestation", &hash)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "[{tag}] {}'s nanosecond-signed record row resolves by hash",
+                record.group_key_id()
+            );
+        }
 
         for (kind, content_hash, record_key) in &mine {
             let served = dir
@@ -28607,7 +29620,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
     };
     use super::*;
     use crate::federation::tier_ingest::test_support::sign_community;
-    use crate::federation::types::{attestation_type, consensus_protocol, identity_type};
+    use crate::federation::types::{attestation_type, identity_type};
     use crate::federation::types::{Community, CommunityMember};
     use crate::federation::{Attestation, FederationDirectory};
     use chrono::Utc;
@@ -28659,7 +29672,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
                     role: Some(MEMBER_ROLE_FOUNDER.to_owned()),
                 }],
                 founded_at: now,
-                consensus_protocol: consensus_protocol::FOUNDER_ONLY.to_owned(),
+                consensus_protocol: "quorum:1/1".into(),
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },

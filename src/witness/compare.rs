@@ -2,7 +2,7 @@
 //! the security-critical part).
 //!
 //! Over the **verified** corpus set persist calls
-//! [`ciris_verify_core::holonomic::compare_witnesses`] and routes the
+//! [`ciris_verify_core::substrate::compare_witnesses`] and routes the
 //! verdict (N4 / WW-vs-§10.1.6):
 //!
 //! - [`WitnessComparison::Equivocation`] → **retain + emit a
@@ -27,7 +27,7 @@
 //! newer if its `epoch_id` strictly advances the last accepted epoch for
 //! that peer.
 
-use ciris_verify_core::holonomic::{compare_witnesses, Equivocation, WitnessComparison};
+use ciris_verify_core::substrate::{compare_witnesses, Equivocation, WitnessComparison};
 
 use super::types::StoredWitness;
 use crate::witness::WitnessAdmitError;
@@ -73,7 +73,7 @@ pub const QUORUM_MERGE_SUBJECT_KINDS: &[&str] = &["revocation", "licensure"];
 /// signatures were checked at the gate).
 #[must_use]
 pub fn classify(
-    verified: &[ciris_verify_core::holonomic::WholenessWitness],
+    verified: &[ciris_verify_core::substrate::WholenessWitness],
 ) -> WitnessReconcileAction {
     match compare_witnesses(verified) {
         WitnessComparison::Consistent => WitnessReconcileAction::NoAction,
@@ -219,7 +219,7 @@ pub fn equivocation_hard_case(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ciris_verify_core::holonomic::{compute_merkle_root, WholenessWitness};
+    use ciris_verify_core::substrate::{compute_merkle_root, WholenessWitness};
 
     fn ww(peer: &str, epoch: u64, ns: &[&str], leaf: &[u8]) -> WholenessWitness {
         WholenessWitness {

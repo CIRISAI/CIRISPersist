@@ -1060,6 +1060,9 @@ impl Engine {
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
         engine.sweep_dag_chunk_links_at_boot().await;
+        // v61 — the open legs every open runs, the Python `Engine(...)`
+        // included ([`Self::settle_at_open`]). Never boot-fatal.
+        engine.settle_at_open().await;
         // v31.0.0 (CIRISPersist#650) — the in-place v31 migration. Here rather
         // than in `Backend::run_migrations` because a re-stamp is a re-SIGN and
         // `Backend` has no signer; this is the first point at which the backend
@@ -1144,6 +1147,9 @@ impl Engine {
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
         engine.sweep_dag_chunk_links_at_boot().await;
+        // v61 — the open legs every open runs, the Python `Engine(...)`
+        // included ([`Self::settle_at_open`]). Never boot-fatal.
+        engine.settle_at_open().await;
         // v31.0.0 (CIRISPersist#650) — same hook as `with_signer`. A
         // pre-genesis node usually has nothing to migrate (no identity ⇒ no
         // authorship), and the routine returns early in that case; but a node
@@ -1212,6 +1218,9 @@ impl Engine {
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
         engine.sweep_dag_chunk_links_at_boot().await;
+        // v61 — the open legs every open runs, the Python `Engine(...)`
+        // included ([`Self::settle_at_open`]). Never boot-fatal.
+        engine.settle_at_open().await;
         Ok(engine)
     }
 
@@ -1283,6 +1292,9 @@ impl Engine {
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
         engine.sweep_dag_chunk_links_at_boot().await;
+        // v61 — the open legs every open runs, the Python `Engine(...)`
+        // included ([`Self::settle_at_open`]). Never boot-fatal.
+        engine.settle_at_open().await;
         Ok(engine)
     }
 
@@ -2558,7 +2570,7 @@ impl Engine {
     /// **consent-driven retention decision** (N5). Resolve the subject's
     /// consent stance over the content (§8.1.11.1), run it through the
     /// FROZEN verify-core
-    /// [`retention_decision`](ciris_verify_core::holonomic::retention_decision),
+    /// [`retention_decision`](ciris_verify_core::substrate::retention_decision),
     /// and route the verdict:
     ///
     /// - `ConsentState::Revoked` (→ `Withdrawn` → `EvictEligible`) →
@@ -2928,7 +2940,7 @@ impl Engine {
         &self,
         aggregate_content_id: &str,
         sources: &[(String, String)],
-        consent: ciris_verify_core::holonomic::ConsentState,
+        consent: ciris_verify_core::substrate::ConsentState,
         under_capacity_pressure: bool,
         target_tier: Option<crate::fountain::FountainTier>,
     ) -> Result<u64, crate::store::Error> {
@@ -3039,10 +3051,10 @@ impl Engine {
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(b) => {
-                let client =
-                    b.pool().get().await.map_err(|e| {
-                        crate::federation::BlobError::Backend(format!("pool get: {e}"))
-                    })?;
+                let client = b
+                    .checkout()
+                    .await
+                    .map_err(|e| crate::federation::BlobError::Backend(format!("pool get: {e}")))?;
                 let row = client
                     .query_one(
                         "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT AS total \
@@ -3241,6 +3253,39 @@ impl Engine {
             None => None,
         };
 
+        // v61 (CC 2.6.2) — the expiry is a signed instant: `.sssZ`, at the
+        // millisecond, and the record carries the same truncated instant.
+        let valid_until =
+            valid_until.map(crate::federation::admission::truncate_to_substrate_resolution);
+
+        // v61 (CIRISPersist#1146) — a RESTART re-registers the same key.
+        // When the held row already states this registration (same pubkeys,
+        // identity, roles and expiry), the call is a no-op success and the held
+        // row is kept byte for byte: re-signing a fresh envelope would move its
+        // `persist_row_hash` and everything that cites it. Any difference is a
+        // real change and still goes to the put, which refuses it `Conflict`
+        // (a key change goes through the rebind door, #864). The replicated
+        // put keeps its exact-hash rule; this applies to self-registration only.
+        if let Some(held) = self
+            .federation_directory()
+            .lookup_public_key(&key_id)
+            .await?
+        {
+            if crate::federation::register::self_registration_unchanged(
+                &held,
+                &crate::federation::register::SelfRegistration {
+                    pubkey_ed25519_base64: &pubkey_ed25519_base64,
+                    pubkey_ml_dsa_65_base64: pqc_pubkey_b64.as_deref(),
+                    identity_type,
+                    identity_ref,
+                    roles: &roles,
+                    valid_until,
+                },
+            ) {
+                return Ok(key_id);
+            }
+        }
+
         // v31.0.0 (CIRISPersist#659, one plane wider) — **BIND THE SUBJECT
         // BEFORE THE BYTES ARE FORMED.** This row is not verified here (the
         // §5.6.8.15 gate is for PEER registration, see below) but it is
@@ -3267,13 +3312,62 @@ impl Engine {
             identity_type,
             &pubkey_ed25519_base64,
             pqc_pubkey_b64.as_deref(),
-            // v38.7.0 (verify v14.0.0) — the expiry is BOUND now. A
-            // self-registration has no expiry to bind; a caller that grows
-            // one must pass it here, or the envelope will not satisfy
-            // verify's checker.
-            None,
+            // v38.7.0 (verify v14.0.0) — the expiry is BOUND. v61: the
+            // caller's `valid_until` (stored on the record below) is bound
+            // here in the CC 2.6.2 form; binding `None` beside a stored expiry
+            // made the row fail its own subject binding at every peer.
+            valid_until
+                .map(crate::federation::admission::render_signed_instant)
+                .as_deref(),
         )
         .map_err(crate::federation::Error::InvalidArgument)?;
+
+        // v61 (CC 2.6.2; the key record's preimage table puts `valid_from`
+        // beside `valid_until`) — the signed `valid_from` is `.sssZ`. A
+        // caller's `valid_from` in that form is kept; any other form is
+        // refused, naming the member, because persist signs these bytes and a
+        // producer MUST emit the canonical form. With none, persist writes the
+        // registration instant at the millisecond. The record carries the
+        // signed instant either way.
+        let valid_from = {
+            use crate::federation::admission::{
+                render_signed_instant, truncate_to_substrate_resolution,
+            };
+            let env = registration_envelope.as_object_mut().ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(
+                    "registration_envelope must be a JSON object".into(),
+                )
+            })?;
+            match env.get("valid_from") {
+                None => {
+                    let t = truncate_to_substrate_resolution(chrono::Utc::now());
+                    env.insert(
+                        "valid_from".into(),
+                        serde_json::Value::String(render_signed_instant(t)),
+                    );
+                    t
+                }
+                Some(serde_json::Value::String(s))
+                    if crate::verify::canonical_validation::validate_canonical_datetime(s)
+                        .is_ok() =>
+                {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .map_err(|e| {
+                            crate::federation::Error::InvalidArgument(format!(
+                                "registration_envelope valid_from {s:?}: {e}"
+                            ))
+                        })?
+                        .with_timezone(&chrono::Utc)
+                }
+                Some(other) => {
+                    return Err(crate::federation::Error::InvalidArgument(format!(
+                        "registration_envelope valid_from = {other} is not in the CC 2.6.2 form \
+                         YYYY-MM-DDTHH:MM:SS.sssZ; a signed instant in any other form does not \
+                         verify"
+                    )));
+                }
+            }
+        };
 
         // Canonicalize the registration envelope **through the CEG produce
         // gate**, SHA-256 it, and self-sign with the composed signer.
@@ -3347,7 +3441,7 @@ impl Engine {
             algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
             identity_type: identity_type.to_owned(),
             identity_ref: identity_ref.to_owned(),
-            valid_from: now,
+            valid_from,
             valid_until,
             registration_envelope,
             original_content_hash,
@@ -3512,7 +3606,12 @@ impl Engine {
         }
 
         let mut registration_envelope = existing.registration_envelope.clone();
-        let valid_until_text = existing.valid_until.map(|t| t.to_rfc3339());
+        // v61 (CC 2.6.2) — the expiry binds as `.sssZ`, at the
+        // millisecond; the record carries the same truncated instant.
+        let valid_until = existing
+            .valid_until
+            .map(crate::federation::admission::truncate_to_substrate_resolution);
+        let valid_until_text = valid_until.map(crate::federation::admission::render_signed_instant);
         crate::federation::admission::bind_subject_into_envelope(
             &mut registration_envelope,
             &key_id,
@@ -3558,6 +3657,7 @@ impl Engine {
             scrub_timestamp: now,
             pqc_completed_at,
             persist_row_hash: String::new(),
+            valid_until,
             ..existing
         };
         self.rebind_key_record(crate::federation::SignedKeyRecord { record })
@@ -6957,6 +7057,110 @@ impl Engine {
     /// (Self::emit_pending_key_grants): best effort, logged, never an abort —
     /// a node that cannot emit right now must still boot, and every write
     /// door retries the dirty axis on its own path.
+    /// v61 (CC 2.6.2; the steward's strict ruling) — the open-time pass
+    /// over stored attestation rows whose signed instants are not
+    /// `.sssZ` ([`crate::federation::instant_form`]). Idempotent, logged,
+    /// never an abort: a node that cannot finish the pass still boots, and
+    /// the next open resumes it.
+    pub async fn settle_instant_forms(
+        &self,
+    ) -> Result<crate::federation::instant_form::InstantFormPass, crate::federation::Error> {
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        {
+            use crate::federation::instant_form::{run_pass, EngineStore};
+            let self_key_id = self.local_derived_key_id().await.map_err(|e| {
+                crate::federation::Error::Backend(format!("instant form pass: key id: {e}"))
+            })?;
+            let now = chrono::Utc::now();
+            match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => {
+                    run_pass(
+                        &EngineStore {
+                            engine: self,
+                            backend: b.as_ref(),
+                        },
+                        &self_key_id,
+                        now,
+                    )
+                    .await
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => {
+                    run_pass(
+                        &EngineStore {
+                            engine: self,
+                            backend: b.as_ref(),
+                        },
+                        &self_key_id,
+                        now,
+                    )
+                    .await
+                }
+            }
+        }
+        #[cfg(not(any(feature = "postgres", feature = "sqlite")))]
+        {
+            Ok(crate::federation::instant_form::InstantFormPass::default())
+        }
+    }
+
+    /// v61 (CIRISPersist#1122) — the boot leg of
+    /// [`transport_routes::sweep_agent_routes`](crate::federation::transport_routes::sweep_agent_routes):
+    /// a route an agent key published before v61 is deleted. Logged, never an
+    /// abort.
+    async fn sweep_agent_routes_at_boot(&self) {
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        {
+            let dir = self.federation_directory();
+            match crate::federation::transport_routes::sweep_agent_routes(dir.as_ref()).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    removed = n,
+                    "agent-key transport routes removed at open (CIRISPersist#1122)"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "agent-key route sweep could not run at open; the next open retries (#1122)"
+                ),
+            }
+        }
+    }
+
+    /// v61 — **the open legs every open runs**: the CC 2.6.2 instant-form
+    /// pass ([`Self::settle_instant_forms`]: re-sign this node's own rows,
+    /// keep in force what takes something away, set aside the rest) and the
+    /// CIRISPersist#1122 agent-route sweep. Called by every Rust constructor
+    /// that opens a store AND by the Python `Engine(...)` open, which builds
+    /// its engine through the shared constructor and so ran neither before
+    /// v61: every host opens persist from Python, so the V211 DDL ran in the
+    /// field and the pass never did. Logged, never boot-fatal, idempotent.
+    pub async fn settle_at_open(&self) {
+        self.settle_instant_forms_at_boot().await;
+        self.sweep_agent_routes_at_boot().await;
+    }
+
+    async fn settle_instant_forms_at_boot(&self) {
+        match self.settle_instant_forms().await {
+            Ok(pass) if pass.violations == 0 => {}
+            Ok(pass) => tracing::info!(
+                scanned = pass.scanned,
+                violations = pass.violations,
+                healed = pass.healed,
+                already_healed = pass.already_healed,
+                heal_refused = pass.heal_refused,
+                own_left = pass.own_left,
+                kept_in_force = pass.kept_in_force,
+                set_aside = pass.set_aside,
+                "CC 2.6.2 instant-form pass at open"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "CC 2.6.2 instant-form pass could not run at open; the next open retries"
+            ),
+        }
+    }
+
     /// v54.0.0 (CIRISPersist#994) — the boot leg of
     /// [`Self::backfill_dag_chunk_links`]: best effort, logged, never an
     /// abort, capped per boot.
@@ -8505,7 +8709,11 @@ impl Engine {
             })?;
 
         // (3) Partner: bilateral grant (user) + accept (agent), sharing
-        // one bilateral_pair_id. Local-tier, self-cohort.
+        // one bilateral_pair_id. Local-tier, self-cohort. v61
+        // (CIRISPersist#1126): each half is a `consent_record` naming the
+        // other party, at one instant.
+        let partnered_at =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
         let grant_id = directory
             .attestation_upsert_local(LocalAttestationInput {
                 attestation_id: None,
@@ -8518,6 +8726,7 @@ impl Engine {
                     partnership_grant_envelope(
                         &input.agent.occurrence_key_id,
                         &input.bilateral_pair_id,
+                        partnered_at,
                     ),
                 )?,
                 subject_key_ids: Vec::new(),
@@ -8535,7 +8744,11 @@ impl Engine {
                 weight: None,
                 expires_at: None,
                 attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                    partnership_accept_envelope(&input.identity_key_id, &input.bilateral_pair_id),
+                    partnership_accept_envelope(
+                        &input.identity_key_id,
+                        &input.bilateral_pair_id,
+                        partnered_at,
+                    ),
                 )?,
                 subject_key_ids: Vec::new(),
                 cohort_scope: cohort_scope::SELF.to_owned(),
@@ -8627,6 +8840,16 @@ impl Engine {
         // supersedes the old one across the mesh.
         let mut transport_rows = 0usize;
         for occ in [&input.app, &input.agent] {
+            // v61 (CIRISPersist#1122, steward ruling 2026-10-24) — an agent
+            // announces no route; it is reached through its node's binding.
+            if crate::federation::transport_routes::is_agent_key(
+                directory.as_ref(),
+                &occ.occurrence_key_id,
+            )
+            .await?
+            {
+                continue;
+            }
             let existing = directory
                 .list_transport_destinations_for(&occ.occurrence_key_id)
                 .await?;
@@ -14212,7 +14435,7 @@ mod tests {
         let tenant_a = format!("tnt-A-{}", uuid::Uuid::new_v4().simple());
         let tenant_b = format!("tnt-B-{}", uuid::Uuid::new_v4().simple());
         let base_ts = chrono::Utc::now();
-        let client = pg.pool().get().await.unwrap();
+        let client = pg.checkout().await.unwrap();
         let id_a1 = uuid::Uuid::new_v4();
         let id_a2 = uuid::Uuid::new_v4();
         let id_b = uuid::Uuid::new_v4();
@@ -15068,7 +15291,7 @@ mod tests {
         // Pin the stored hash equals the CEG produce-gate canonical
         // hash — same invariant the SQLite test checks.
         let attestation_type = "scores".to_owned();
-        let client = pg.pool().get().await.expect("pg client");
+        let client = pg.checkout().await.expect("pg client");
         let row = client
             .query_one(
                 "SELECT encode(original_content_hash, 'hex'), scrub_key_id \
@@ -16996,7 +17219,23 @@ mod tests {
             .await
             .expect("the widening verifies at ingest");
 
+        // v61 (CIRISPersist#1155) — a placement is idempotent PER AUDIENCE:
+        // the same prior placed again at Species is the same placement, SAID
+        // so; placed at Federation it is a second, live placement.
         let again = engine
+            .widen_audience(
+                &id,
+                &producer_ci(&prior, crate::federation::Audience::Species),
+                None,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(again, MeshCrossingOutcome::AlreadyWidened { .. }),
+            "the same prior placed in the same audience is deduplicated and SAID so: {again:?}"
+        );
+        let elsewhere = engine
             .widen_audience(
                 &id,
                 &producer_ci(&prior, crate::federation::Audience::Federation),
@@ -17006,8 +17245,8 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(again, MeshCrossingOutcome::AlreadyWidened { .. }),
-            "a second supersedes of the same prior is deduplicated and SAID so: {again:?}"
+            matches!(elsewhere, MeshCrossingOutcome::Crossed(_)),
+            "a placement into another audience is a new row: {elsewhere:?}"
         );
     }
 
@@ -18048,7 +18287,7 @@ mod tests {
             serde_json::json!({
                 "grants": "transfer",
                 "attestation_prefixes": ["trace:"],
-                "valid_until": "2020-01-01T00:00:00Z",
+                "valid_until": "2020-01-01T00:00:00.000Z",
             }),
         )
         .await;
@@ -18963,7 +19202,7 @@ mod tests {
                 role: Some("founder".into()),
             }],
             founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-            consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
+            consensus_protocol: "quorum:1/1".into(),
             policy_blob: None,
             persist_row_hash: String::new(),
         };
@@ -19220,7 +19459,9 @@ mod tests {
         );
 
         // (2) The aperture: a conforming CC 3.4.12 binding ADMITS end-to-end.
-        let valid_until = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+        let valid_until = crate::federation::admission::render_signed_instant(
+            chrono::Utc::now() + chrono::Duration::days(30),
+        );
         engine
             .steward_bind_incapacity(
                 &s_signer,
@@ -20211,7 +20452,7 @@ mod tests {
                         role: Some("founder".into()),
                     }],
                     founded_at: joined,
-                    consensus_protocol: types::consensus_protocol::FOUNDER_ONLY.into(),
+                    consensus_protocol: "quorum:1/1".into(),
                     policy_blob: None,
                     persist_row_hash: String::new(),
                 },
@@ -20236,9 +20477,16 @@ mod tests {
                 .expect("lookup_group")
                 .expect("group exists");
             assert_eq!(g.cohort, cohort);
+            // v61 (CIRISPersist#1123) — the family keeps founder_only;
+            // the community, refused it above the family, is quorum:1/1.
+            let want = if cohort == crate::federation::cohort::Cohort::Family {
+                types::consensus_protocol::FOUNDER_ONLY
+            } else {
+                "quorum:1/1"
+            };
             assert_eq!(
                 g.consensus_protocol.as_deref(),
-                Some(types::consensus_protocol::FOUNDER_ONLY),
+                Some(want),
                 "{tag} lookup_group carries consensus_protocol"
             );
             assert!(g.name.is_some(), "{tag} lookup_group carries name");
@@ -21053,28 +21301,28 @@ mod tests {
             );
         };
 
-        // founder_only, 3 members (1 founder): a plain member alone is refused;
-        // ONE founder signature admits (a strict majority would need 2).
-        let (room, ks) = setup("fo", 3, 1, 1, "founder_only").await;
-        let grown = ks[..4].to_vec();
-        let msg = refused(
-            attempt(
-                room.clone(),
-                grown.clone(),
-                1,
-                "founder_only",
-                vec![ks[1].clone()],
-            )
-            .await,
-            "founder_only: a plain member alone",
+        // v61 (CIRISPersist#1123; CC 4.5.13) — `founder_only` is refused
+        // for a community above the family, at the record door, before any
+        // quorum is asked. (Its evaluator arm is unit-witnessed in
+        // `consensus::tests`; a family and an affiliation keep it.)
+        let fo_room = format!("pd-fo-room-{s}");
+        let fo_keys: Vec<String> = (0..3).map(|i| k("fo", i)).collect();
+        for key in &fo_keys {
+            ts::register_hybrid_key_as(d, key, key, identity_type::USER).await;
+        }
+        let e = d
+            .put_community(community(&fo_room, &fo_keys, 1, "founder_only"))
+            .await
+            .expect_err("founder_only above the family");
+        assert!(
+            matches!(
+                e,
+                crate::federation::Error::CommunityConsensusProtocolViolation { rule, .. }
+                    if rule == crate::federation::admission::FOUNDER_ONLY_ABOVE_FAMILY
+            ),
+            "founder_only: {e}"
         );
-        assert!(msg.contains("founder_only"), "{msg}");
-        assert_eq!(live_len(room.clone()).await, 3);
-        refused_add(
-            attempt(room.clone(), grown, 1, "founder_only", vec![ks[0].clone()]).await,
-            "founder_only: one founder has the quorum, and a supersede still cannot add",
-        );
-        assert_eq!(live_len(room).await, 3);
+        assert!(d.lookup_community(&fo_room).await.unwrap().is_none());
 
         // unanimous, 3: two of three refused (a strict majority would admit);
         // all three admit.
@@ -21374,7 +21622,7 @@ mod tests {
                         })
                         .collect(),
                     founded_at: joined,
-                    consensus_protocol: "founder_only".into(),
+                    consensus_protocol: "quorum:1/1".into(),
                     policy_blob: None,
                     persist_row_hash: String::new(),
                 },
@@ -22453,8 +22701,14 @@ mod tests {
             .expect("scope array");
         assert_eq!(scope.len(), 4);
 
-        // (6) A transport_destination per occurrence.
-        assert_eq!(outcome.transport_destinations_registered, 2);
+        // (6) A transport_destination per occurrence that announces one:
+        // v61 (CIRISPersist#1122) an agent occurrence announces none.
+        assert_eq!(outcome.transport_destinations_registered, 1);
+        assert!(dir
+            .list_transport_destinations_for(&agent_key)
+            .await
+            .expect("agent dests")
+            .is_empty());
         let app_dests = dir
             .list_transport_destinations_for(&app_key)
             .await
@@ -22621,7 +22875,7 @@ mod tests {
             .expect("engine");
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let occ = format!("occ-{suffix}");
-        self_login_seed_key(&engine, &occ, identity_type::AGENT).await;
+        self_login_seed_key(&engine, &occ, identity_type::NODE).await;
         let dir = engine.federation_directory();
         let now = chrono::Utc::now();
 
@@ -22714,7 +22968,7 @@ mod tests {
         let key_id = signer.derived_key_id();
         let (ed_pk, mldsa_pk) = crate::federation::tier_ingest::test_support::hybrid_pubkeys(label);
         let pg = engine.postgres_backend().expect("postgres");
-        let client = pg.pool().get().await.expect("pool get");
+        let client = pg.checkout().await.expect("pool get");
         client
             .execute(
                 "INSERT INTO cirislens.federation_keys (\
@@ -22737,7 +22991,7 @@ mod tests {
     #[cfg(feature = "postgres")]
     async fn pg_seed_key(engine: &Engine, key_id: &str, identity_type: &str) {
         let pg = engine.postgres_backend().expect("postgres");
-        let client = pg.pool().get().await.expect("pool get");
+        let client = pg.checkout().await.expect("pool get");
         client
             .execute(
                 "INSERT INTO cirislens.federation_keys (\
@@ -23143,6 +23397,11 @@ mod register_self_canonicalizer_parity {
             None,
         )
         .expect("subject binding");
+        // v61 (CC 2.6.2) — the emitter writes the signed `valid_from`, the
+        // instant the record carries.
+        env["valid_from"] = serde_json::Value::String(
+            crate::federation::admission::render_signed_instant(row.valid_from),
+        );
         env
     }
 

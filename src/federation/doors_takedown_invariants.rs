@@ -111,10 +111,15 @@
 //!   the Engine are `cirisnode::rows_invariants`' I1170.) Every takedown
 //!   witness here builds its notice as a signed `takedown_notice:{basis}:v1`
 //!   row.
-//! - **I1171** (memory, sqlite, postgres; v60.x compat) — a v59 peer's
-//!   replicated takedown, its notice the retired Contribution in the old
-//!   spelling, is still applied (re-verified, re-asked, recorded in CC's
-//!   spelling); the local door refuses it as retired.
+//! - **I1171** (sqlite, postgres; v61, CIRISPersist#803/#1160) — a v59
+//!   peer's raw-pubkey `takedown_notice` Contribution is refused as retired
+//!   on the local AND the replicated door, and nothing is recorded (v60.x
+//!   applied it replicated, one release of compat).
+//! - **I1517** (sqlite, postgres; v61, CIRISPersist#1160) — the CC 4.5.5
+//!   duty gate resolves the signer to its identity first: a room's named
+//!   moderator (a federation identity) takes content down through a live
+//!   occurrence key; an unbound key, and the moderator's own owner-bound
+//!   NODE key (a node holds no duty), are refused.
 //! - **I1402** (sqlite, postgres; v60.1.0, CIRISPersist#1070 item 1) — an
 //!   Engine with no LocalSigner (`from_shared`, `with_hardware_signer`)
 //!   executes an immediate-removal takedown to the end: the bytes are
@@ -235,7 +240,7 @@ pub(crate) mod bodies {
         })
     }
 
-    /// v60.x COMPAT fixture — a v59 peer's `takedown_notice` CONTRIBUTION,
+    /// A v59 peer's retired `takedown_notice` CONTRIBUTION (refused since v61),
     /// shaped as `ContributionEnvelope` serialized and self-signed Ed25519 by
     /// the raw key whose base64 pubkey is `author_id`, in the pre-v60 basis
     /// spelling. Returns `(notice, author_id)`.
@@ -341,12 +346,11 @@ pub(crate) mod bodies {
     }
 
     // ── I1171 ─────────────────────────────────────────────────────────────
-    /// v60.x compat (one release): a v59 peer's replicated takedown, its
-    /// notice the retired Contribution in the old spelling, is still applied
-    /// — re-verified (Ed25519, as v59 did) and re-asked under CC 4.5.5 here,
-    /// recorded under CC 3.3.2's spelling. The LOCAL door refuses the same
-    /// Contribution: a notice filed here is a row.
-    pub(crate) async fn i1171_a_v59_peers_contribution_notice_still_applies<D>(d: &D)
+    /// v61 S2 (CIRISPersist#803 "remove in v61", #1160) — a v59 peer's
+    /// raw-pubkey `takedown_notice` Contribution is refused on BOTH doors,
+    /// named as retired, even where its author moderates the content's room;
+    /// nothing is recorded. (v60.x applied it on the replicated door.)
+    pub(crate) async fn i1171_a_v59_peers_contribution_notice_is_refused<D>(d: &D)
     where
         D: FederationDirectory + Sync,
     {
@@ -378,27 +382,112 @@ pub(crate) mod bodies {
             "I1171: named as retired: {e}"
         );
         let record = format!("blob:{sha}");
-        // A whitespace member is empty (the compat read keeps v59's rule),
-        // even signed.
-        let (blank, _) = legacy_contribution_notice_with(0x6b, &sha, "dmca_512", |p| {
-            p["claimant_key_id"] = serde_json::json!("  ");
-        });
-        let e =
-            td::apply_replicated_takedown(dir, &blank, std::slice::from_ref(&record), "receiver")
-                .await
-                .expect_err("I1171: a blank claim_text");
-        assert_eq!(e.kind(), token::UNAUTHORISED, "I1171: {e}");
-        let r = td::apply_replicated_takedown(dir, &n, &[record], "receiver")
+        let e = td::apply_replicated_takedown(dir, &n, &[record], "receiver")
             .await
-            .expect("I1171: the v59 peer's replicated notice is applied (compat)");
-        assert_eq!(r.legal_basis, "dmca512", "I1171: recorded in CC's spelling");
-        assert_eq!(
-            r.notice_attestation_id, None,
-            "I1171: a Contribution has no row"
+            .expect_err("I1171: the replicated door refuses the retired Contribution");
+        assert_eq!(e.kind(), token::UNAUTHORISED, "I1171: {e}");
+        assert!(
+            e.to_string().contains("retired"),
+            "I1171: named as retired: {e}"
         );
-        let e = dir.purge_execution(&r.notice_id).await.unwrap().unwrap();
-        assert_eq!(e.legal_basis, "dmca512");
-        assert_eq!(e.origin, sp::origin::REPLICATED);
+        assert_eq!(
+            dir.purge_tombstoned("blob", &sha).await.unwrap(),
+            None,
+            "I1171: nothing recorded"
+        );
+    }
+
+    // ── I1517 (#1160) ─────────────────────────────────────────────────────
+    /// v61 S2 (CIRISPersist#1160; CC 4.5.5) — the duty gate asks about the
+    /// signer's IDENTITY: a room's named moderator (a federation identity)
+    /// files a takedown notice through one of its live occurrence keys, and it
+    /// is admitted. An unbound key with the same notice is not.
+    pub(crate) async fn i1517_a_moderators_occurrence_files_the_takedown<D>(d: &D)
+    where
+        D: FederationDirectory + Sync,
+    {
+        let dir = d.as_dyn_directory();
+        let (moderator, occurrence, stranger) = (claimant(0xa1), claimant(0xa2), claimant(0xa3));
+        let comm = "i1517-comm";
+        community_of(dir, comm, &moderator.id).await;
+        for k in [&occurrence.id, &stranger.id] {
+            ts::register_hybrid_key_as(dir, k, k, crate::federation::types::identity_type::USER)
+                .await;
+        }
+        let at = |secs: i64| {
+            let t = chrono::Utc::now() - chrono::Duration::seconds(secs);
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis())
+                .expect("ms instant")
+        };
+        // Both halves of the binding: the identity claims the device, and the
+        // device agrees.
+        for (signer, t) in [(&moderator.id, at(3)), (&occurrence.id, at(1))] {
+            dir.put_identity_occurrence(
+                ts::signed_content_only_occurrence(signer, &moderator.id, &occurrence.id, t).await,
+            )
+            .await
+            .expect("I1517: the occurrence binding");
+        }
+        let sha = sha_of("i1517");
+        let now = chrono::Utc::now();
+        let row = Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: moderator.id.clone(),
+            attested_key_id: moderator.id.clone(),
+            attestation_type: attestation_type::SCORES.into(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": "content:established:v1",
+                "evidence_refs": [sha],
+                "community_id": comm,
+            }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: moderator.id.clone(),
+            scrub_timestamp: now,
+            pqc_completed_at: Some(now),
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: crate::federation::types::cohort_scope::COMMUNITY.to_string(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        dir.put_attestation(SignedAttestation {
+            attestation: ts::seal_row(&moderator.id, row),
+        })
+        .await
+        .expect("I1517: the binding row in the moderator's room");
+        let e = td::takedown_tombstone(dir, &notice(&stranger, &sha, "dmca512"), NODE)
+            .await
+            .expect_err("I1517: a key bound to no duty-holder");
+        assert_eq!(e.kind(), token::UNAUTHORISED, "I1517: {e}");
+        // The moderator's own NODE (owner-bound, not an occurrence of theirs)
+        // holds no duty: a node has no agency, so it never acts as the
+        // moderator whose machine it is.
+        let node = claimant(0xa4);
+        ts::register_hybrid_key(dir, &node.id).await;
+        ts::put_owner_binding(dir, &moderator.id, &node.id).await;
+        assert_eq!(
+            crate::federation::admission::owner_of(dir, &node.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(moderator.id.as_str()),
+            "I1517 precondition: the node is the moderator's"
+        );
+        let e = td::takedown_tombstone(dir, &notice(&node, &sha, "dmca512"), NODE)
+            .await
+            .expect_err("I1517: the moderator's NODE files the takedown");
+        assert_eq!(e.kind(), token::UNAUTHORISED, "I1517: {e}");
+        let ok = td::takedown_tombstone(dir, &notice(&occurrence, &sha, "dmca512"), NODE)
+            .await
+            .expect("I1517: the moderator's takedown through its occurrence key");
+        assert!(ok.tombstoned, "I1517: tombstoned");
     }
 
     /// A community whose only member is `member` (a person, so a
@@ -2545,6 +2634,11 @@ mod run {
                     b::i798_cc_4_5_5_item_by_item(&d).await
                 }
                 #[tokio::test]
+                async fn i1517() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i1517_a_moderators_occurrence_files_the_takedown(&d).await
+                }
+                #[tokio::test]
                 async fn i796() {
                     let Some(d) = $fresh.await else { return };
                     b::i796_the_contents_own_community_judges(&d).await
@@ -2567,7 +2661,7 @@ mod run {
                 #[tokio::test]
                 async fn i1171() {
                     let Some(d) = $fresh.await else { return };
-                    b::i1171_a_v59_peers_contribution_notice_still_applies(&d).await
+                    b::i1171_a_v59_peers_contribution_notice_is_refused(&d).await
                 }
             }
         };
@@ -2833,19 +2927,35 @@ mod run {
         const EXEMPT: &[(&str, &str)] = &[
             (
                 "sqlite_append_chunk_item",
-                "the chunk floor's per-item writer; put_blob_chunks_floor asks before it",
+                "the chunk floor's per-item writer; its plan (chunk_floor_planned) asks before it",
             ),
             (
                 "pg_append_chunk_item",
-                "the chunk floor's per-item writer; put_blob_chunks_floor asks before it",
+                "the chunk floor's per-item writer; its plan (chunk_floor_planned) asks before it",
             ),
             (
                 "seal_stream",
                 "writes a manifest this node computes over chunks the chunk floor admitted",
             ),
             (
-                "seal_stream_with_scope",
+                "store_planned_seal",
                 "writes a manifest this node computes over chunks the chunk floor admitted",
+            ),
+            // v61 (CIRISPersist#934, S4a) — the byte writes' executors: each
+            // door's shared plan asks the tombstone (`tombstone_floor`) before
+            // it hands the executor a row; the plans are held below.
+            (
+                "store_planned_blob",
+                "the byte doors' executor; put_blob_planned / store_blob_local_planned / \
+                 adopt_sealed_blob_planned ask before it",
+            ),
+            (
+                "store_planned_dag",
+                "put_blob_chunks' executor; put_blob_chunks_planned asks before it",
+            ),
+            (
+                "store_planned_dag_over_held",
+                "the DAG finalize's executor; put_dag_manifest_over_held_planned asks before it",
             ),
         ];
         let root = env!("CARGO_MANIFEST_DIR");
@@ -2887,24 +2997,52 @@ mod run {
                 checked.insert(name);
             }
             for door in [
-                "put_blob_with_scope",
-                "store_blob_local",
-                "put_blob_chunks",
-                "put_dag_manifest_over_held",
-                "adopt_sealed_blob_at",
+                "store_planned_blob",
+                "store_planned_dag",
+                "store_planned_dag_over_held",
             ] {
                 assert!(
                     checked.contains(door),
                     "I797 {backend}: the scan reached {door} ({checked:?})"
                 );
             }
-            let floor = &src[src
-                .find("async fn put_blob_chunks_floor(")
-                .expect("the chunk floor")..];
-            let floor = &floor[..floor.find("\n    }\n").expect("its end")];
+        }
+        // v61 (CIRISPersist#934, S4a) — the chunk floor is one shared plan:
+        // its per-item writers are exempt above because it asks first.
+        let plan = production(
+            &std::fs::read_to_string(format!("{root}/src/federation/blob_admit.rs")).unwrap(),
+        );
+        let floor = &plan[plan
+            .find("async fn chunk_floor_planned<")
+            .expect("the chunk floor")..];
+        let floor = &floor[..floor.find("\n}\n").expect("its end")];
+        assert!(
+            floor.contains("steward_purge::refuse_tombstoned_bytes("),
+            "I797: the chunk floor asks the tombstone for every item"
+        );
+        // ...and every byte write's plan asks before its executor writes.
+        let ask = &plan[plan
+            .find("async fn tombstone_floor<")
+            .expect("the byte writes' pre-read")..];
+        let ask = &ask[..ask.find("\n}\n").expect("its end")];
+        assert!(
+            ask.contains("steward_purge::refuse_tombstoned_bytes("),
+            "I797: the byte writes' pre-read asks the tombstone"
+        );
+        for door in [
+            "put_blob_planned<",
+            "store_blob_local_planned<",
+            "adopt_sealed_blob_planned<",
+            "put_blob_chunks_planned<",
+            "put_dag_manifest_over_held_planned<",
+        ] {
+            let body = &plan[plan
+                .find(&format!("async fn {door}"))
+                .unwrap_or_else(|| panic!("I797: {door} is not in blob_admit.rs"))..];
+            let body = &body[..body.find("\n}\n").expect("its end")];
             assert!(
-                floor.contains("steward_purge::refuse_tombstoned_bytes("),
-                "I797 {backend}: the chunk floor asks the tombstone for every item"
+                body.contains("tombstone_floor(dir,"),
+                "I797: {door} writes bytes without asking the tombstone first"
             );
         }
     }

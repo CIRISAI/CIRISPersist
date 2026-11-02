@@ -5,7 +5,157 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
-## [Unreleased]
+## [61.0.0] - 2026-11-02
+
+### Adoption
+
+- CIRISVerify 22 is required: `ciris-keyring`, `ciris-verify-core` and `ciris-crypto` are pinned at tag v22.0.0, and the wheel declares `ciris-verify>=22.0.0,<23`. A host that pins verify itself must move to 22 with persist.
+- `ciris_verify_core::holonomic` is `ciris_verify_core::substrate` in verify 22, with no alias. A consumer that names verify's module directly must rename the path; persist's own re-export (`witness::admit::WitnessPreimageBuilder`) keeps its name.
+- `federation::genesis::bundle::authorization_digest` returns the same 32 bytes for every bundle; a bundle it cannot project is refused `Error::GenesisBundleInvalid` in every case (a canonicalization failure was `Error::InvalidArgument`).
+- New refusals: an optional signed envelope member written as an explicit JSON `null` (top level or inside the `row` mirror) is refused `federation_malformed_row` / `envelope_member_null` (Python `ValueError`); a `witnesses` member out of JCS-string order or carrying a repeat is refused `federation_set_semantics_unsorted`, and one that is not an array `envelope_member_invalid`. Producers omit an optional member instead of writing `null`, and write `witnesses[]` sorted and unique.
+- `malformed_row::ALL` gains `envelope_member_null`, appended at the end; existing positions do not move.
+- A family's or community's record, a membership widening and a membership revocation are rows on the attestation plane: `group:roster:v1` (attested by the group), `membership:widening:v1`, `membership:removal:v1`, and `membership:resignation:v1` when the leaving member signs the revocation. Persist mints each row from the signed object a `put_*` call stores, so the local `put_family`, `put_community`, `put_*_membership_revocation` and `put_*_membership_widening` calls are unchanged. The row carries the signed object (envelope member `group_record`, `widening` or `revocation`), its base signature is the object's authority signature, its co-signatures ride as `additional_scrubs`, and it is placed at the group: `cohort_scope` `family` or `community`, with `group_kind` and the group id (`family_key_id` / `community_key_id`) in the envelope. A `group:roster:v1` row also carries `prev_head_digest` and `charter_digest` when the record has them. A receiver re-derives the row from the object; a row that differs by one byte, or is missing a co-signature, is refused `federation_malformed_row`.
+- The wire kinds `Family`, `Community`, `FamilyMembershipRevocation`, `CommunityMembershipRevocation`, `CommunityMembershipWidening` and `FamilyMembershipWidening` are retired (`RETIRED_FRAMED`). They keep their positions in the hashed vocabulary, so `REPLICATION_POLICY_HASH` does not move. An inbound object or advertisement of one of these kinds is refused `federation_envelope_kind_retired`. Their records replicate as the rows above, through `ApplyReplicatedAttestation` and the attestation cursor; their `signed_wire_index` and `known_wire_hashes` entries are deleted at migration.
+
+  The old kind → new row mapping (also in `FSD/ROOM_ROSTER_PLANES.md` §7):
+
+  | retired kind | row | attester → attested | `cohort_scope` | envelope member |
+  |---|---|---|---|---|
+  | `Family` | `group:roster:v1` | the record's signer → the family | `family` | `group_record` |
+  | `Community` | `group:roster:v1` | the record's signer → the community | `community` | `group_record` |
+  | `FamilyMembershipRevocation` | `membership:removal:v1` (`membership:resignation:v1` when the removed member signs) | the signer → the member removed | `family` | `revocation` |
+  | `CommunityMembershipRevocation` | `membership:removal:v1` (`membership:resignation:v1` when the removed member signs) | the signer → the member removed | `community` | `revocation` |
+  | `CommunityMembershipWidening` | `membership:widening:v1` | the signer → the member added | `community` | `widening` |
+  | `FamilyMembershipWidening` | `membership:widening:v1` | the signer → the member added | `family` | `widening` |
+- The wire kind `KeyGrant` is retired too (`RETIRED_FRAMED`, at its hashed position; `REPLICATION_POLICY_HASH` does not move). A key grant has been one `key_grant:{content,epoch,stream}:v1` `scores` row per recipient since v55.0.0, and those rows ride the `Attestation` kind. A peer's advertisement of a `KeyGrant` hash is refused `federation_envelope_kind_retired: key_grant`; V208 deletes any `signed_wire_index` or `known_wire_hashes` entry that names it. CIRISEdge matches `EnvelopeKind` exhaustively in `protocol.rs`, `serve_policy.rs`, `retention.rs` and `multimedia.rs`: the `KeyGrant` arms stay (the variant is kept), and they now name a kind that is never served, advertised or fetched framed. Treat it like the other retired kinds.
+- The member listing is retired with no successor (the steward's final ruling: there is no outward member listing, and CC removes `listed`). The wire kind `CommunityMembershipListing` joins `RETIRED_FRAMED`, at its hashed position, and an advertisement of it is refused `federation_envelope_kind_retired: community_membership_listing`. These are removed with nothing replacing them: `FederationDirectory::put_community_membership_listing`, `list_community_membership_listings_for`, `listed_members` and `list_signed_community_membership_listings_since`; the capsule op `ListSignedCommunityMembershipListingsSince` and its result `SignedCommunityMembershipListings` (inside the ABI 12 break); the module `federation::listing` (`LISTED_PUBLIC` and the three `envelope_listed_*` rule tokens); the types `CommunityMembershipListing`, `SignedCommunityMembershipListing` and `ServedCommunityMembershipListing`; `verify_community_membership_listing_admission`; and `Error::MembershipListingRefused` (kind `federation_membership_listing_refused`). The listing never had a Python method. A host that served a roster view from `listed_members` serves none. A consumer that matches `federation::Error` exhaustively drops the arm.
+- Persist no longer emits `listed`. `EnvelopeCore.listed` and `envelope::paths::LISTED` are removed, and `listed` leaves the envelope vocabulary's `universal_paths`. `ENVELOPE_VOCABULARY_SHA256` is now `4c5a5e8a019bc8c9c895a5b91693438aafe9066237305d07e04dd31d36596eff` (was `8064aafe…`), so CIRISServer and any consumer that asserts it re-pins.
+- V209 deletes the listing kind's `signed_wire_index` and `known_wire_hashes` entries and drops `federation_community_membership_listings` (both dialects). Five upgraded local nodes held no rows when counted from disk. The rows of a node that did hold some are deleted, not migrated.
+- CIRISEdge: the `CommunityMembershipListing` arms of its exhaustive `EnvelopeKind` matches (`protocol.rs`, `serve_policy.rs`, `retention.rs`, `multimedia.rs`) stay, since the variant is kept, and name a kind that is never served, advertised or fetched.
+- `DIRECTORY_ABI_VERSION` is 12. These capsule ops and their results are removed: `ListSignedFamiliesSince`, `ListSignedCommunitiesSince`, `ListSignedFamilyMembershipRevocationsSince`, `ListSignedFamilyMembershipWideningsSince`, `ListSignedCommunityMembershipRevocationsSince`, `ListSignedCommunityMembershipWideningsSince` and `ApplyReplicatedCommunity` (result `ReplicatedCommunityOutcome`).
+- These Python methods are removed: `Engine.list_signed_families_since`, `Engine.list_signed_communities_since`, `Engine.list_signed_family_membership_revocations_since`, `Engine.list_signed_community_membership_revocations_since` and `Engine.apply_replicated_community_json`.
+- `AttestationRefusalReason` gains `GroupPlaneRefused` (`group_plane_refused`), appended. A group-plane row whose typed door did not apply its object is refused with it.
+- The six `FederationDirectory::list_signed_*_since` reads for these kinds stay on the Rust trait as projection reads, now with a default body (`Unsupported`). They are no longer a replication surface. A backend that does not override one answers `Error::Unsupported`. A consumer that read a group's record or roster from these feeds reads it keyed by the group or member instead: `lookup_family` / `lookup_community`, `list_families_for_member` / `list_families_for_member_active`, `list_communities_for_member` / `list_communities_for_member_active`, and `list_family_membership_widenings_for` / `list_community_membership_widenings_for` (the revocations: `list_*_membership_revocations_for`). In Python: `lookup_family_json`, `lookup_community_json`, `list_families_for_member(_active)_json`, `list_communities_for_member(_active)_json` and `list_*_membership_revocations_for_json`. The widening reads have no Python method.
+- Withdrawing a widening or removal row takes a cosigned `withdraws` under the group's `consensus_protocol`: the base scrub and `additional_scrubs`, counted over the active roster. One signature short is refused `federation_roster_authority_unauthorized` / `roster_consensus_insufficient`. A resignation can be withdrawn only by its signer. A `withdraws` of a `group:roster:v1` row means the group's dissolution, which v61 does not admit: it is refused `group_record_withdraws_refused` (Python `ValueError`), with any number of roster co-signatures, and stores nothing. Dissolution arrives with CIRISPersist#1143. An admitted retraction removes the roster event from the group's roster.
+- A row of any type other than a minted `scores` row (or a `withdraws` / `recants`) that names one of the four group-plane dimensions is refused `federation_dimension_rejected` / `group_plane_row_shape`. `dimension_rejected_reason::ALL` gains the token, appended at the end (terminal, not retryable).
+- `observation:access_assumption:v1` is registered at `+1.0` only (CC rc12): a row with any other score is refused `score_outside_declared_polarity`.
+- `listed` is no longer a member persist types. CC rc13 removed it from CC 2.1 and the signed object; at admission it is an unknown envelope member like any other `signed:envelope-extra`: carried untyped and kept in the signed bytes, so a non-boolean value is admitted. `"listed": null` is refused `envelope_member_null` like any other explicit null.
+- `membership:proposal` and `membership:acceptance` rows omit `role` when no role is offered; they wrote `"role": null` before. No cross-version break: `role: null` on those two families is still admitted and read as no role, the one exception to `envelope_member_null`, until it sunsets per CIRISPersist#1151.
+- **A signed instant is `YYYY-MM-DDTHH:MM:SS.sssZ` and nothing else verifies (CC 2.6.2, the steward's strict ruling; `FSD/SIGNED_INSTANT_FORM.md`).** On an attestation, a CC 2.6.1.7 `rfc3339-ms` member (`asserted_at`, `expires_at`, `widened_at`, `valid_until`, `claimed_at`, `delegation_valid_from`, `delegation_valid_until`, `window_from`, `window_to`) or an `additional_scrubs[].cosigned_at` in any other form is refused `federation_malformed_row` / `envelope_member_invalid`, naming the member, at put, replication, the mint, promotion and the local write (the local write still stamps `expires_at` itself). There is no cut-over instant: a `+00:00` row from a v60 peer is refused. CC's `refuse_timestamp_form` vector now agrees.
+- The key plane binds its instants `.sssZ`: `revocation_binding` renders `revoked_at`, `effective_at` and `scrub_timestamp` canonically and compares the raw JSON, a revocation column finer than a millisecond is refused `RevocationEnvelopeUnbound` ("sub-millisecond"; it was the microsecond), and a `revoked_after` in another form is `RevocationBoundRefusal::BoundNotRfc3339`. A key record's signed `valid_until` binds as bytes against the canonical render (v38.7.0 compared it as a parsed instant) and a sub-millisecond expiry is refused. `register_self_federation_key` writes the envelope's signed `valid_from` `.sssZ` (the record carries the same instant) and refuses a caller's `valid_from` in any other form `InvalidArgument` (Python `ValueError`); a host that passes its own `valid_from` must pass `YYYY-MM-DDTHH:MM:SS.sssZ`. v61 emits `.sssZ` `valid_from`; verification of the `valid_from` form follows the genesis re-sign in v62 (the compiled-in genesis signs it in offset form; CIRISPersist#1178). The identity occurrence's `asserted_at` / `valid_until`, the signed transport destination's `asserted_at` / `retired_at` and the touch claim's `fresh_as_of` admit only `.sssZ`. A revocation this node already holds is never re-judged and stays in force.
+- `TransportDestination.asserted_at` and `retired_at` serialize `.sssZ` (`admission::signed_instant_serde`), so a producer that builds the signed route envelope from `serde_json::to_value(&route)` writes the canonical form; it must still hold the instant at the millisecond. CIRISEdge: a route envelope written with chrono's default digits (0, 3, 6 or 9) or `+00:00` is refused.
+- **Key records and revocations that v59 or v60 signed are refused on form until they are re-signed.** A key record whose `registration_envelope` binds `valid_until` in any form other than `.sssZ` is refused at admission, naming the form. A revocation whose bound `revoked_at` / `effective_at` / `scrub_timestamp` is not the canonical millisecond render (v60 wrote six digits) is refused `RevocationEnvelopeUnbound`. Each arriving from a v59/v60 peer is refused until its signer re-signs it under v61. A revocation this node already holds stays in force, and it is not re-judged. A host that signs key records or revocations re-signs them on v61 before it replicates them.
+- Persist's producers write `.sssZ`: `mesh_config_envelope`'s `valid_until`, the `hard_case` membership-change `effective_at` (added and removed), the founders' `amended_at`, the touch claim's `fresh_as_of`, the transform algebra's `round` on an instant (it wrote no fractional digits), and `register_self_federation_key`'s `valid_until`, which is now bound into the registration envelope (it was bound as absent while the record carried it).
+- New domains for persist's own preimages; the old ones still verify as themselves. `ciris.trust.grant.v2` (`expires_at` `.sssZ`) and `ciris.trust.revocation.v2` (`revoked_at` `.sssZ`, was six digits): `admission::trust_grant_signing_bytes` / `trust_revocation_signing_bytes` return the v2 bytes and refuse a sub-millisecond instant, `trust_grant_signing_bytes_v1` / `trust_revocation_signing_bytes_v1` build the old ones, and the two doors verify v2, else v1. A signer of a trust grant or revocation signs v2. The trace scrub signature (`ingest::scrub_preimage`, #690) carries `domain: "ciris.scrub_envelope.v2"` and `scrub_timestamp` `.sssZ` (the signer truncates it to the millisecond); `ingest::scrub_preimage_v1` rebuilds the pre-v61 bytes. A verifier of trace scrub signatures (CIRISLens) rebuilds v2 for a v61 envelope.
+- **Open-time pass (V211).** Every `Engine` constructor that opens a store settles stored attestation rows that fail the form (`federation::instant_form`, `Engine::settle_instant_forms`): this node's own federation-tier `scores` / `delegates_to` / `supersedes` rows are re-stated as a canonical `supersedes` naming each (the claim's own `asserted_at` kept); rows that take something away (composers, delegations, revocations, quarantine, moderation, reconsideration, slashing, objections, the accountability record, membership removal and resignation, a revoked consent) stay in force; any other row another producer signed is removed and recorded in the new ledger `federation_attestations_form_refused` (id, attester, row hash, member, value, instant; no body). Idempotent; never boot-fatal. `admission::signed_instant_form_violation` is the one predicate.
+- **The Python `Engine(...)` open runs the pass too.** The first open after upgrading runs it (and the CIRISPersist#1122 agent-route sweep) on every host, through `Engine::settle_at_open`, the one leg the Rust constructors and the Python constructor share; before this the Python open ran the V211 DDL and never the pass. The counts are logged at `tracing::info` when the pass finds anything, and `Engine.settle_instant_forms_json()` (Python) runs the pass on demand and returns `{scanned, violations, healed, already_healed, heal_refused, own_left, kept_in_force, set_aside}`: idempotent, a second call re-states nothing (`healed` 0, earlier re-statements counted `already_healed`).
+- **Partnership halves are `consent_record` rows (CIRISPersist#1126, CC 4.4.3.4.3.1).** `self_at_login` writes `consent:partnership_grant:v1` / `consent:partnership_accept:v1` as `{dimension, subject_kind: "consent_record", stance: "granted", subject_key_id: <the partner>, bilateral_pair_id, asserted_at}`; `kind` and `partner_occurrence_key_id` are gone. `self_at_login::partnership_grant_envelope` / `partnership_accept_envelope` take an `asserted_at`, and `partnership_envelope(dimension, partner, pair, stance, asserted_at)` builds either half or a `stance: "revoked"` end. A bare-`scores` half is refused at the federation and local doors: `federation_dimension_rejected` / `partnership_shape_retired` (appended to `dimension_rejected_reason::ALL`, terminal). Persist folds no partnership pair itself. The Python `self_at_login` output is unchanged.
+- **A serve seat needs an announced owner (CIRISPersist#1101, CC 5.4.6, `CLM-serve-seat-announced`).** A widening that would seat an accord-scrubbed node in an infrastructure community without acceptance is refused `MembershipAcceptanceRefused` with rule `serve_seat_owner_unannounced` (retryable) unless a live owner binding for the node is carried at `cohort_scope: federation`, directly or by its granter's live widening. Judged at evaluation time: a later announcement satisfies it and a withdrawn one does not. The founding rule is unchanged (a genesis bundle carries no owner binding). `admission::serve_seat_owner_announced(dir, node)` and `Engine.serve_seat_owner_announced(node_key_id)` (Python) are the predicate a serve gate calls.
+- **One destination, one live key; an agent announces no route (CIRISPersist#1122).** A route at an `agent`-typed key is refused `transport_destination_agent_key` (`InvalidArgument`, Python `ValueError`) at the signed apply and the unsigned local put; an occurrence write projects no route for an agent; and every route an agent key published before v61 is deleted at open. The three route reads (`list_transport_destinations_for`, `list_transport_destinations_by_destination`, `list_all_transport_destinations`) drop a route that a newer route on the same destination by a key with the same live owner displaces; keys with no owner tie still coexist (AV-42). The signed replication read is unchanged. A `FederationDirectory` implementer overrides the new `list_transport_destinations_for_unfolded`, `list_transport_destinations_by_destination_unfolded` and `list_all_transport_destinations_unfolded` (the stored rows); the public reads are default methods that fold over them. A split home retires its actor key's routes with the signed retirement it always had.
+- **`register_self_federation_key` is idempotent on a restart (CIRISPersist#1146).** When the held row for the node's own key states the same Ed25519 and PQC pubkeys, `identity_type`, `identity_ref`, roles (as a set) and expiry, the call returns the `key_id` and writes nothing, so the row hash stays put. Any difference is still `Conflict`; the replicated put keeps its exact-hash rule.
+- **The storage summary counts a table persist does not own (CIRISPersist#1156).** The time column is resolved against the table's real columns (`pragma_table_info` on SQLite, `information_schema.columns` with a timestamp type on Postgres), so a host's `audit_log (id, ts)` is counted with no instant and never fails the aggregate. On SQLite the bare PG spellings (`audit_log`, `detection_events`) are not persist's (`retention::ts_column_for_sqlite`). On Postgres a table outside persist's schemas (`retention::postgres::PERSIST_SCHEMAS`) is keyed by its qualified `schema.table` name and carries no instant; persist's own tables keep their bare keys. Table names are quoted, and a table dropped mid-walk is counted empty.
+- `founder_only` is refused for a community above the family (CIRISPersist#1123, CC 4.5.13). `put_community` and `supersede_community` refuse a new or changed record that names it, with `federation_community_consensus_protocol_violation` (`Error::CommunityConsensusProtocolViolation`, Python `ValueError`), rule `founder_only_above_family`. This is the infrastructure token; there is no new one. Families keep `founder_only`, and so does a community record that declares `cohort_scope: affiliations` (CC 4.4.3.2.8). A room already stored under `founder_only` stays readable and folds as before, and admits exactly one event, its escape (below). A peer's version that would move a stored room onto `founder_only` is `ReplicatedCommunityOutcome::Refused { reason: DegradesConformance }`. A NEW `founder_only` room received from a peer is still admitted as data, so legacy rooms keep replicating. Counted read-only on 16 local node databases: one `founder_only` community, a CIRISServer chat room (`chat:room:v1:…`, 2026-10-31). CIRISServer creates rooms under `founder_only` and must choose another protocol.
+- `open:self_admit` is a canonical `consensus_protocol` (CIRISPersist#1123; CC 4.4.3.2, 4.4.3.4.2). It is admissible only on a `public` community. A private room that names it is refused with rule `open_admission_not_public`, and a family with `federation_consensus_protocol_malformed`. V210 (both dialects) widens the `federation_communities.consensus_protocol` CHECK to admit it; on SQLite this is a staged table rebuild that keeps every row.
+- Open admission is the protocol: `public_room::is_open_admission` now reads `consensus_protocol == "open:self_admit"`. The `policy_blob` member `admission` is retired (CC rc14 3.2: "there is no admission field"). A record that carries it is refused with rule `admission_member_retired`, and `public_room::PUBLIC_RULE_ADMISSION_MALFORMED` is removed. A `community:listing:v1` row still states `admission: "open"`, exactly when the room's protocol is `open:self_admit`. Counted on the same 16 databases: no public room and no `admission` member.
+- Under `open:self_admit`:
+  - A widening that seats one new key is admitted on that key's own signature, after their acceptance of the founder's standing proposal.
+  - A founder signing for the joiner does not admit them.
+  - A role change of a seated member and a removal each take at least two distinct eligible voices, not counting the member named (`consensus::OPEN_SELF_ADMIT_REMOVAL_FLOOR`).
+  - A named moderator's standing does not remove anyone alone.
+  - Only founders propose, and only founders sign on the room's behalf (`types::consensus_protocol::founders_hold_authority`).
+  - Refusals are `federation_roster_authority_unauthorized` / `roster_consensus_insufficient`.
+- Under every other protocol a self-signed admission is refused (`roster_consensus_insufficient`). This is a widening whose only signer is the member it seats or re-roles, including a seated member re-roling themselves.
+- `consensus::Ballot` gains `subject: Option<&str>`, the one member a change names. A Rust consumer that builds a `Ballot` literal adds it.
+- `public_room::live_standing_proposal(directory, community_key_id)` is new (CIRISPersist#1063; CC 3.2 "replicated on join, visible to everyone on request"). It is the read a member's node answers a non-member's request with. It returns a public `open:self_admit` room's live standing proposal: signed by a founder active now, not expired, not withdrawn or superseded by its proposer, the latest by signed instant. The row is servable to the requester's node, because a public room is a public group to `may_receive`, and that node admits it on its replicated door. A host serves it on request; nothing pushes it.
+- Under a `reverse_quorum` protocol a membership WIDENING is reversible, as a removal already was (CIRISPersist#1100 item 2(i)). It uses the same objection fold, action reference, `m`, window and dismissals. An add's reversal must also reach the two-path count minimum of a community (2), so one objector never takes a member off. A roster that held an objected-to widening now folds without that member once enough objections land.
+- Structural composers (`supersedes`, `withdraws`, `recants`) are idempotent on the ROW (CIRISPersist#1157 with #1155; CC rc14 3.1.9.4, `CLM-composer-convergent-rank`). Before, any second row with the same `(type, attester, references_attestation_id)` triple was silently dropped as a replay, so the first row a node held won and nodes that held different rows never converged. Now a replay is the same `attestation_id` with the same `original_content_hash`. A DISTINCT same-type row from the same attester on the same target is stored, and the `Live` view ranks it read-time within one audience (cohort scope and cohort target): the later `asserted_at` wins, and a tie goes to the lower `attestation_id`, bytewise. The loser stays stored and hidden, so a late-arriving winner flips every node the same way. A second edit of a placed chat message is no longer swallowed, and the latest edit is the visible head. `AttestationStore::composer_replay_held` (crate-private) now takes `(attestation_id, original_content_hash)`.
+- A placement is idempotent per audience (CIRISPersist#1155). `widen_audience` answers `AlreadyWidened` when the same attester has already placed the prior in the SAME audience. Placing one `self` row into two rooms leaves BOTH placements live; before, the second room's placement was swallowed (`AlreadyWidened`, no row written). It was witnessed red on both backends before the fix. `ReplicatedAttestationOutcome::Deduplicated` stays in the enum; an exact replay of a held id resolves `Unchanged`.
+- Replicated writes need the audience (CIRISPersist#1148). On a directory that has declared its node key (`FederationDirectory::node_key_id`; an `Engine` always does), the replicated doors refuse a row this node may not receive. They ask the same `may_receive` the serve side asks, for the node's own key, before any door runs:
+  - `apply_replicated_attestation` and `put_attestation_synced` answer `ReplicatedAttestationOutcome::Refused { reason: NotInAudience }` (`not_in_audience`, retryable);
+  - `apply_replicated_community` answers `ReplicatedCommunityOutcome::Refused { reason: NotInAudience }`.
+
+  Key-plane rows are exempt, and so are `key_grant:{axis}:v1` rows. A key-grant row's audience is the key-grant door's own rule (`recipient_not_in_audience`), which admits it on every node hosting an occurrence of its recipient, so a self-axis grant reaches the person's other devices (I1519). The local doors are unchanged, and a directory with no node key keeps the pre-v61 behaviour.
+  A replicated row is verified before its audience verdict. On the refusing branch the signature is checked first, so a forged row is `federation_federation_tier_unverified`, never `not_in_audience` (I1509). An in-audience row is verified once, by admission. On that branch a row whose attester key this node does not hold reports the retryable `AttesterKeyUnknown` instead of `NotInAudience`; a peer backs off on either. `AttestationRefusalReason` and `ReplicatedCommunityRefusal` each gain `NotInAudience`, appended (inside the ABI 12 break); a consumer that matches either exhaustively adds the arm. A group's record now names its own audience in `may_receive`: a public record reaches every peer, and a member it lists is in its audience before any node holds the record (`replication_audience::may_receive_community_record` is new).
+- The owner-binding audience (CIRISPersist#1140; CC rc14 3.2, 2.4.1.2):
+  - AV-84's `attested_party` arm no longer applies to a `delegates_to` row, whose attested key is the delegate by definition. Its `named_subject` arm is replaced by `subject_outside_audience` (below).
+  - An owner may re-sign a node's owner-binding at any group's scope as a second owner-signed row alongside the `self` one, and every scope is an admissible audience. `owner_of` folds every live binding to the one owner.
+  - The organisation-on-the-bond gate (CIRISPersist#1062) applies only to a binding of a non-node key. A NODE's binding naming a group is an audience, not an organisation's bond, and `affiliation_of_binding` ignores it.
+  - A bounded-scope `delegates_to` whose attested key is a third party was refused `federation_cohort_standing_refused` / `attested_party`; it is now admitted.
+- Room moderation in CC's 2026-11-01 shape is admitted at `community` scope as v61 stands (CIRISPersist#1161, I1512). A flag or `moderation:*` act names the flagged row by `references_attestation_id`, its `attested_key_id` is the moderator, and the author is not in `subject_key_ids`. Server and Edge re-shape their flag rows to this shape.
+- The one-voice affiliation floor (CIRISPersist#1143; CC rc14 4.4.3.2.8, `CLM-affiliation-one-voice-countersign`). An affiliation with ONE deciding seat (its active founders, or its active members where it names no founder) removes a member only with a countersign from a key outside the seat, a designated official (`affiliation_config.designated_officials`) who is not the seat. Otherwise the removal is refused `federation_roster_authority_unauthorized` / `affiliation_countersign_missing`. A member's own resignation and a body of two or more seats are unchanged. Not built in this cut: the quarantine, slash and takedown planes, the review-holder of an overseeing body, and CC's "stands as a reconsideration proposal" held state (CIRISPersist#1186).
+- Dissolution of a community or an affiliation is the `withdraws` of its `group:roster:v1` record row, cosigned under its `consensus_protocol` (judged as a whole-group change; under `open:self_admit`, two voices). It replaces S1's `group_record_withdraws_refused` for communities. From the withdrawal's signed instant the room's seats lapse (`active_community_members` is empty), and no new seat, removal or version is admitted (`federation_group_dissolved`, `Error::GroupDissolved`), so the DEK rotates no more. The record and its custody rows stand. `group_plane::community_dissolved_at` and `refuse_if_community_dissolved` are new. A FAMILY's record withdraws is still refused `group_record_withdraws_refused`, because a family dissolves by its own `dissolved_at` amendment. Not built in this cut: licences reading `lapsed` from the dissolution instant, and a dissolved authority's `trust:accepts:v1` edges ending (CIRISPersist#1186).
+- Under `open:self_admit`, a change that names no one member (a dissolution, a whole-roster change) takes the two-voice floor. It was refused outright before.
+- **Every Postgres checkout is bounded (CIRISPersist#1166).** `store::postgres::checkout_bounded` is the one pooled checkout; 204 sites that called deadpool's unbounded `get()` (outbound, read, telemetry, cirisnode, the ledgers and lens services, the engine, the Python surface, the audit Merkle store) go through it. A starved pool is now an error after the checkout wait on every family, where it was a hang. No API removed: `PostgresBackend::pool()` stays public, and `PgMerkleStore::from_pool` keeps its signature (it waits `POOL_WAIT_TIMEOUT`). A host that held a pooled client across a second persist call on a small pool now gets the exhaustion error instead of a wedge.
+- **`PoolExhausted` is a variant of four exhaustive enums** (from v59.1.2, carried into v61; new to anyone on v60.1.0): `store::Error`, `federation::Error`, `audit::Error` and `secrets::SecretsError`. A consumer that matches any of them exhaustively adds the arm. It reports a starved pool, not a bad row (Python `ciris_persist.PoolExhausted`, a `RuntimeError`): the call may succeed once the pool drains.
+- **`NotInAudience` is retryable; a peer should back off per (peer, row), not spin.** A peer whose replicated row or community record is refused `not_in_audience` should drop that row from this receiver's queue and re-offer it only after the receiver's audience changes (a membership or owner-binding row that admits it). The refusal is retryable by `AttestationRefusalReason::is_retryable`; it says nothing about the row's validity.
+- **A `founder_only` room admits exactly one event: its escape (CIRISPersist#1123, CC 4.5.13).** A community stored under `founder_only` (above the family, not a declared affiliation) stays readable and replicating. On the local AND the replicated door it admits one thing: a `group:roster:v1` supersede (`supersede_community`, or a peer's version) that meets three conditions:
+  - its only change is `consensus_protocol`, moving away from `founder_only`;
+  - the members are unchanged;
+  - it is signed under the OLD protocol, by at least one active founder of the stored room (counted with `count_distinct_roster_scrubs` over the record's signing envelope).
+
+  Each of these is refused `federation_community_consensus_protocol_violation` / `founder_only_above_family` (on the replicated record door, `ReplicatedCommunityOutcome::Refused { reason: DegradesConformance }`):
+  - a version that keeps `founder_only`;
+  - an escape that also changes members;
+  - an escape no founder signed;
+  - a membership proposal, an acceptance, a widening, or a removal (a member's own resignation excepted).
+
+  `admission::check_founder_only_escape` and `refuse_membership_event_under_founder_only` are the two gates (I1518, I1518b; sqlite and postgres). **Adoption (CIRISServer):** migrate every live room to `majority` with one supersede per room. Take the held record, change `consensus_protocol` from `founder_only` to `majority` and nothing else, chain `prev_head_digest` to the held head, and sign it as a founder of the room. Do this before any other membership change; until then the room refuses widenings, removals and proposals. Rename the room or change its members in a LATER version, under `majority`.
+- `DirectoryOp` gains `ExecuteAttestationQuery`, `ListComposersReferencingAny`, `ListIdentityOccurrenceHistoryByOccurrence` and `ListIdentityOccurrencesByOccurrenceKey`, and `DirectoryOpResult` gains `AttestationQueryRows`, `AttestationRows`, `OccurrenceHistory` and `IdentityOccurrences` (from v59.1.2, #1162), appended after v61's removals inside the ABI 12 break; both capsule digests moved. A capsule host that matches the op exhaustively adds the four arms.
+- **The removal window under `open:self_admit`** (CC 4.5.13). Each counted voice of a removal signs within 259 200 s (`consensus::OPEN_SELF_ADMIT_REMOVAL_WINDOW_SECS`) of the removal's `removed_at`. A `RosterCosignature` carries no signed instant of its own, so the bound falls back to the LOCAL door's receipt. A removal received more than the window from its `removed_at` is refused `federation_roster_authority_unauthorized` / `roster_removal_outside_window` (`ROSTER_REMOVAL_OUTSIDE_WINDOW`). The replicated door does not ask: a peer's clock is no witness to when the voices signed. A resignation is not bounded (I1515). **Adoption:** a host files an `open:self_admit` removal promptly after its voices sign, and does not queue it for days.
+- **`subject_outside_audience` replaces AV-84's `named_subject`** (CIRISPersist#1161; CC rc15 2.1, `CLM-subject-within-audience`). A `family`/`community`/`affiliations` row that names a person in `subject_key_ids` is admitted when that person is inside the row's audience:
+  - the producer itself;
+  - a membership proposal's invitee;
+  - a `key_grant` recipient;
+  - the producer's own node;
+  - a member of the targeted group by its authorized roster fold at the row's `asserted_at`;
+  - a canonical id whose rule-3 proxy (a `consent_revocation` `delegates_to` chain) or `identity:canonical_binding` is such a member.
+
+  Anyone else is refused `federation_cohort_standing_refused` with the reason token `subject_outside_audience`. `admission::CohortStandingRefusal::NamedSubject` is replaced by `SubjectOutsideAudience` (clean break; the enum is exhaustive). The Python message carries the new token. The `attested_party` arm is unchanged: it applies to every row type except `delegates_to` (narrowing it to `scores` reopens CIRISPersist#592 through `widen_audience`). The retraction classes change too. A named person still withdraws a peer's row about them (rule 2), but not a `moderation:*`, `hard_case:*`, `slashing:*` or `takedown_notice:*` act, nor a cosigned act. A cosigned act is one carrying an actor's `additional_scrubs` entry; a tier-crossing co-scrub, which is stamped `cosigned_at`, does not count. `SUBJECT_WITHDRAWS_CARVE_OUT` grows from 4 to 8 entries. I1494 (CC rc15's 14 signed-object vectors) now agrees with CC on `scores_subject_and_scope` and `refuse_subject_outside_audience`; I1516 runs on sqlite and postgres.
+- **The CC 4.5.5 duty gate asks about the signer's identity** (CIRISPersist#1160). `admission::check_moderation_admission` first resolves the signer to the identity it is an active occurrence of (`active_identity_for_occurrence`). A federation-identity moderator's takedown notice, or `moderation:*` act, signed by one of its live occurrence keys is admitted (I1517). A NODE is never resolved to its owner here: a node holds no duty, so an owner's node key that signs a takedown or moderation act is refused (I1517). **The raw-pubkey `takedown_notice` Contribution is gone** (#803 "remove in v61"). A v59 peer's Contribution is refused `takedown_unauthorised` as retired on the replicated door too (I1171). These pub items are removed: `takedown_tombstone::NoticeOrigin` (so `takedown_terms` takes two arguments), `LEGACY_BASIS_SPELLINGS` and `cc_basis_spelling`.
+- The dedup short-circuit's witness now probes the row-keyed replay key (#1157): a corrupt-signature copy of a held composer, under its own id and content hash, is refused on the signature on sqlite and postgres. No behaviour changed; the replay short-circuit still runs after the crypto gate.
+- `silo_projection::SiloProjection` gains `Families`, `Communities`, `FamilyMembershipRevocations`, `CommunityMembershipRevocations`, `FamilyMembershipWidenings` and `CommunityMembershipWidenings` (the six group tables as projections, CIRISPersist#991). The enum is exhaustive. `replication_audience::Reason` is unchanged from v60.1.0 (the #1165 relay arm was reverted before release: CC rc15's first contact gives the forwarder no contact grant).
+- The list above is checked against `scripts/api_break_report.sh v60.1.0` (cargo-semver-checks over the `postgres server pyo3 sqlite cirisaudit secrets cirisnode cirisgraph telemetry` set): 10 lints, 68 instances: 21 enum variants added and 17 removed, 6 functions, 1 module, 6 consts, 6 structs, 1 struct field and 4 trait methods removed, 4 functions whose arity changed and 1 struct field added (`consensus::Ballot.subject`). (Recounted by hand after the #1165 revert removed `Reason::Relay` and its two moved discriminants; the report was not re-run.) S2's close-out adds more breaks, named above and not in that count: `CohortStandingRefusal::NamedSubject` is replaced by `SubjectOutsideAudience`; `takedown_tombstone::NoticeOrigin`, `LEGACY_BASIS_SPELLINGS` and `cc_basis_spelling` are removed; `takedown_terms` loses an argument. Each is named in an entry here.
+- **The CC pins moved (v1.0-rc9 at v60.1.0 → v1.0-rc15).** A consumer that asserts any of these re-pins:
+
+  | constant | v60.1.0 | v61.0.0 |
+  |---|---|---|
+  | `namespace::registry::VENDORED_CC_VERSION` | `1.0-rc9` | `1.0-rc15` |
+  | `VENDORED_CC_COMMIT` | `5d50c6bb…` | `ace6b74217b4496a67e47aef2258461517e4493c` (tag object `6869eb10`) |
+  | `VENDORED_N_FAMILIES` | 176 | 189 |
+  | `VENDORED_REGISTRY_SHA256` (CC's grammar hash) | `feeb06a0…` | `df79a1dde30a380380da83f0d776737e580705b6305741f037a5a78c2bef9898` |
+  | `VENDORED_SOURCE_SHA256` (CC part 3) | — | `a930a011bd6dc0767f21a5589bb5181f6a189158b247a9d374868293af33999b` |
+  | `cc_manifests::VENDORED_WIRE_VOCABULARY_FILE_SHA256` (new) | — | `baf75371f6f25c83c7cd2f6cd0774677f47e9fca5c9c555a09e662249e40a3ff` |
+
+  `wire_vocabulary::WIRE_VOCABULARY_HASH` does not move (`c6bd6aa4…`).
+- **The first open after the upgrade runs the instant-form pass** (V211, `Engine::settle_instant_forms`, above): it reads every stored attestation row once, so the first boot of an upgraded node with a large attestation table takes longer than later boots. It is idempotent and never boot-fatal.
+- No wire or API change for the read-storm fix. V212 builds one index on `federation_attestations` (both backends) at upgrade. The first SQLite open after upgrade runs `ANALYZE` once, sampling at most 1,000 rows per index; measured at about 4 ms on a 2,401-row store of 15 KB envelopes. A Postgres open runs `ANALYZE federation_attestations` once when the table has never been analyzed (a fresh restore before autovacuum's first pass); Postgres samples a bounded number of rows (`default_statistics_target`) whatever the table's size. The pinned statements name their indexes, so a store missing V107, V178, V180, V181 or V212 refuses these reads with `no such index` instead of planning around it.
+- The unheld-supersede refusal text is now uniform across backends: `supersede: unknown {cohort} group {key:?} (nothing to supersede)`, with the key and the cohort that was asked (SQLite omitted the key; Postgres said `community` for `affiliations`). Its kind is unchanged (`InvalidArgument`, Python `ValueError`). Match on the error kind, not the text (CIRISPersist#934 S4b).
+
+### Changed
+
+- CIRISConstitution v1.0-rc15 is vendored at its tag (`ace6b74`, which contains rc12, rc13 and rc14): the namespace registry (189 families; rc12 adds the six census families and the ballot tally, `deferral:request`, `deferral:response:{outcome}`, `identity_amendment`, `observation:access_assumption` and `rendezvous:route`; rc14 adds `evidence:{suite}:{kind}:{cell}:{prefix}`), its match vectors (1244), the governance policy table (rc14 appends the `affiliation_member_action` cosign row) and its vectors, the CSD/4 chain and atom vocabulary (v6), the 14 signed-object vectors (rc15 re-mints `scores_subject_and_scope` with its audience and adds its refusal twin `refuse_subject_outside_audience`) and the six self-roster traces, each pinned by SHA-256. `wa_adjudication:{state}` gains `petition`. The goal refusal reasons cite CC 3.1.9.7, where rc12 registers them. `WIRE_VOCABULARY_HASH` does not move; the tag's `WIRE_VOCABULARY.md` file hash is pinned beside the manifests. The CSD/4 catalogue fixtures stay at the CIRISServer v0.5.234 release, whose pin names the rc12 vocabulary, until a tagged Server release carries a catalogue on vocabulary v6.
+- A bare `scope` token is read as the one-element set it denotes by every scope reader, and the stored envelope keeps the producer's bytes. CC's 13 signed-object vectors (CC 2.6.1.7) are vendored and replayed through the attestation door on both backends.
+- The genesis bundle's authorization digest is CIRISVerify's `genesis_bundle::authorization_digest`; persist's own projection is removed and the threshold policy (`max(carried M, strict majority of the node's own roster)`) stays in persist. A byte-identity test pins the digest against verify's seven genesis-bundle vectors.
+- Every write door that both backends spelled identically now runs on one shared plan, and each backend only executes it (CIRISPersist#934, S4a/S4b). This covers the accord evidence, the location / touch / witness doors, the erasure, fountain and byte writes, the chunk floor and stream records, the peer add, the known-hash sighting, the purge write, the trust revocation, the family doors, the group supersede, the transport-destination writes and the identity-occurrence writes. `store::parity::no_backend_door_reads_identical` keeps it that way. There is no wire or API change. The behaviour where the two backends differed now matches on both:
+  - Postgres stamps a witness's and a fountain content's `admitted_at` with the door's receipt instant, as SQLite did; before, it took the column's `now()` default.
+  - On a repeated family membership revocation, Postgres now runs the group-row sync too, as SQLite did. The sync is idempotent.
+  - The local identity-occurrence door projects its route from the binding before the write, and the signed door reads the pair row's pointer before projecting the route.
+  - The unheld-supersede refusal text is the same on both backends (Adoption, above).
+
+### Fixed
+
+- The read storm on a canonical-shaped SQLite store: the unpinned attestation listing, the custody reads and the composer fold no longer read pages in proportion to the store or to one key's history.
+  - `list_attestations` and `list_scores` under the default `Live` view ran their lifecycle subquery as a full scan of `federation_attestations` for every candidate row. The correlated compare against a bare `attestation_id` column carried TEXT affinity, so V181's `federation_attestations_reference_seek` expression index was ineligible. The compare is now `= +outer.attestation_id`, and the subquery is pinned to `reference_seek` with `INDEXED BY`.
+  - `list_attestations` with no attester, subject or dimension pinned (CIRISServer's equivocation detector: valid now, federation tier, keyset cursor) had no index in `(asserted_at, attestation_id)` order. Each page scanned the table and sorted every qualifying row before its `LIMIT`. V212 adds `federation_attestations_asserted_seek (asserted_at DESC, attestation_id DESC)` on both backends, and the sqlite statement is pinned to it. A page of 512 at a cursor 20,000 rows deep in a 42,000-row store costs what page 1 costs.
+  - `list_attestations_by_dimension_citing` and every axis form of `list_composers_referencing_any` (attesting, attested, both, none) are pinned with `INDEXED BY` to V180's, V107's, V178's and V181's three-column indexes. Unpinned, SQLite preferred V004's single-column `federation_attestations_attesting` / `_attested` index because it also yields `ORDER BY asserted_at DESC`, with or without statistics, and every call walked the key's history. Against a 2,400-row own-key slice of 15 KB envelopes, `custody_acks_of` for one blob reads 31 pages. Unpinned, it read 10,202 pages against a smaller 2,002-row history.
+  - The trigger is any caller of these reads once a key's history, or the store, outgrows the page cache. On the canonical that was the attestation listing and the composer fold, not the durability pass alone.
+- A SQLite store is analyzed at open. When `sqlite_stat1` does not exist, the open runs `ANALYZE` once, bounded by `PRAGMA analysis_limit = 1000`, and every open then runs `PRAGMA optimize`. This is planner hygiene, not the storm fix: statistics did not move the statements above, which is why they are pinned. A failure is logged and the open proceeds.
+- A Postgres store whose `federation_attestations` has never been analyzed (`pg_stat_user_tables` shows neither `last_analyze` nor `last_autoanalyze`) is analyzed once at open. Postgres has no `INDEXED BY`, and with no statistics it planned the unpinned `Live` listing as a bitmap AND of every visible row plus a sort: 12,319 buffers for one page over a 2,002-row history. Analyzed, the page walks V212's `federation_attestations_asserted_seek` with the `federation_attestations_reference_live` probe per row: 13 buffers. A failure is logged and the open proceeds.
+- A node identity whose software-tier key a pre-20.3.0 keyring archived as `*.superseded-pre-v8` (leaving no live key) reopens with the same key instead of failing to boot; verify 22 restores the archived files on open.
+
+### Security
+
+- RUSTSEC-2026-0387 cleared: verify 22 moves k256/p256 to 0.14, the tree carries crypto-bigint 0.7, and the advisory ignore is removed.
 
 ## [60.1.0] - 2026-10-27
 
@@ -69,6 +219,152 @@ Signed attestations are the only state: the cirisnode classes and Goals become `
 - Producers: sign a licence as a cosigned `licensure:{community_key_id}:v1` row, call `PartnerRecord::canonicalize_sets` before signing, and pass a term on every term-bearing `delegates_to`.
 - Migrations: V202 (`hard_case_events.emitter_key_id`), V203 (drops eight cirisnode tables; ledgers gain `attestation_id`), V204 (`goals` rebuilt, `scope_kind` → `scale`), V205 (drops the organisation tables).
 - Telemetry: the `backend` label set is `{sqlite, postgres}`.
+## [59.1.2] - 2026-10-31
+
+### Fixed — a capsule consumer's `AttestationQuery` reads reach the host's backend (#1162)
+
+- **The shape** (field log, every phone and agent-embedded node). Edge gets
+  its directory through `directory_ops_capsule` on the pyo3
+  `init_edge_runtime` path, so every directory call crosses the capsule proxy.
+  v56.0.0 (#1001) moved the attestation folds onto the typed bounded read
+  `execute_attestation_query`, but the proxy answered it with
+  `Error::Unsupported` ("directory ops proxy: method
+  execute_attestation_query has no DirectoryOp"). The owner walk, `owner_of`
+  and edge's chat reader all failed.
+- **The fix.** `DirectoryOp::ExecuteAttestationQuery { query }` and
+  `DirectoryOpResult::AttestationQueryRows` are APPENDED to the wire, and the
+  proxy forwards the query. The host runs only the statement. Routing that op
+  alone did not fix `owner_of` on a phone: the witness then failed on the
+  next three stubs the owner walk reaches. Those are routed too, each an
+  appended op with its result: `list_composers_referencing_any` (the
+  retraction read, result `AttestationRows`),
+  `list_identity_occurrence_history_by_occurrence` (`OccurrenceHistory`) and
+  `list_identity_occurrences_by_occurrence_key` (`IdentityOccurrences`). The
+  last two are `self_of_at`'s reads. The page cut,
+  the cursor and the per-door count stay in the consumer's
+  `query_attestations`, so a read is counted once, against the backend that
+  ran it. `AttestationQuery` and what it carries, plus `QueryRows` and
+  `StoreBackend`, now derive serde. `AttestationQuery`, `ScopeFilter` and
+  `QueryRows` refuse unknown fields: a narrowing that an older host dropped
+  would run a wider read than the one asked for.
+- **Witnesses** (`ffi::directory_capsule`):
+  - **`i1162_attestation_query_through_the_proxy_{sqlite,pg}`**: the owner
+    walk's two queries (`to(node).types([delegates_to])` and its
+    withdraws/recants read) run through the proxy over a real backend. Rows,
+    bytes, backend and the served page equal a direct call, a cursor crosses,
+    and `owner_of` resolves through the capsule.
+  - **`i1162_attestation_query_serde_round_trips_every_field`**: every query
+    field survives the capsule JSON. An unknown field and a zero page are
+    refused.
+  - **I1162, proxy parity**: a from-disk scan of the trait and the proxy
+    impl. Every method the proxy answers `Unsupported`, through its own stub
+    or an inherited default, must be on an allowlist with a reason, and every
+    allowlisted method must still answer `Unsupported`.
+    `list_attestations_by_dimension_citing` is allowlisted, not routed: Edge
+    confirms no production edge path calls it.
+
+### Fixed — a Postgres pool is never smaller than 16, starvation is a typed error, and no door holds a client across a second checkout
+
+- **The shape** (field, v59.1.1 on 1-vCPU Postgres nodes).
+  `PostgresBackend::connect` left deadpool's `PoolConfig` at its default:
+  `2 × CPUs`, which is 2 on one vCPU, and no timeouts, so a checkout waited
+  forever. Doors that held a pooled client across an await that checked out
+  another wedged the node. Both connections sat idle in `ClientRead`, and
+  `setup/root`, `setup/status` and agent memory init never returned. The
+  likely culprit is the audit write: `record_entry` kept its client past the
+  commit, then the Merkle hook (armed whenever a signer is installed) and
+  the trust-grant projection each took another.
+- **The fix.**
+  - `pool_config`: `max_size` is `max(2 × CPUs, 16)` unless the caller sets
+    one.
+  - `PostgresBackend::checkout` bounds the whole checkout, including a new
+    connection's create, at 30 s. deadpool's own wait, create and recycle
+    timeouts stay off on purpose. deadpool runs them on a tokio timer on
+    the thread that polls `pool.get()`. Edge polls persist's pool from its
+    own tokio copy (#705), where that timer panics ("no reactor running"),
+    and across two `.so` files a panic is an abort. So the bound runs its
+    timer on persist's runtime: inline on a persist thread, otherwise
+    spawned on the runtime captured when the backend was built.
+  - A starved pool is `PoolExhausted { waited }` on the store, federation,
+    audit and secrets error types (kinds `store_pool_exhausted`,
+    `federation_pool_exhausted`, `audit_pool_exhausted`,
+    `secrets_pool_exhausted`). In Python it is `ciris_persist.PoolExhausted`,
+    a `RuntimeError` subclass: the backend arm it was carved from raised
+    `RuntimeError`, so `except RuntimeError` still catches it. Exhaustion is
+    not retried: one wait, not four.
+  - Each nested door now drops its client before the helper that takes its
+    own:
+    - audit: `record_entry`, `try_claim_event`;
+    - store: `store_pqc_completion`, `store_planned_community_widening` and
+      `_listing`, `put_family_membership_widening`, `put_identity_occurrence`
+      (and its re-wrap) and `_local`, `lookup_signed_record_by_content_hash`,
+      `list_signed_accord_quorum_evidence_since`,
+      `community_dek_evict_epoch_objects` (which also took a second client
+      while holding the first), `put_stream_sth`;
+    - secrets: `store_secret`, `retrieve_secret`, `recall_secret`,
+      `forget_secret`, `get_service_stats`, `reencrypt_all`,
+      `rotate_master_key`, `try_claim_secret`, `store_detected_secret`.
+  - The secrets access-log write is `let _ =`. On a starved pool those doors
+    returned Ok and lost the audit row without a trace.
+- **Witnesses** (postgres):
+  - **I1480**: the sizing function at 0, 1, 2, 7, 8 and 12 CPUs, and with
+    an explicit size. deadpool's own timers are pinned OFF.
+  - **I320c**: a starved pool polled from a thread with no persist runtime
+    is `PoolExhausted` within the wait. With deadpool's timers it was a
+    panic, and I320 went red.
+  - **I1481**: on a held pool of one, a second checkout is `PoolExhausted`
+    within one wait. Checked for the store, a federation door, `checkout`,
+    and the audit and secrets conversions.
+  - **I1482**: the occurrence door, the wire-index point read and the
+    secrets doors finish on a one-connection pool with a 3 s wait. The
+    secrets witness counts each access-log row.
+  - **I1483**: two concurrent `record_entry` writers with a signer, on a
+    pool of two, held together after the commit by a test barrier, plus
+    `try_claim_event` on one connection.
+  - Each of those drop points was removed by hand, and its witness went red.
+    The other doors' drops have no witness of their own.
+  - Mutation scope `scripts/mutants/scope-5912-pool.txt`: 2 mutants. One is
+    caught. The other, `checkout` returning a default `Object`, is unviable.
+    0 missed.
+
+### Fixed — the boot audit self-check reads `cirislens.audit_log` on Postgres
+
+- `boot_audit_self_verify` listed tenants from `cirislens_audit_log`, which
+  is the SQLite table name. On Postgres the table is `cirislens.audit_log`
+  (V014), so every Postgres boot logged "list tenants: db error" and
+  verified no chain. Witness: `boot_audit_self_check_reads_the_postgres_table`
+  lists the one audited tenant. It was red on the old name.
+
+### Adoption
+
+- A pin bump for Edge. `DIRECTORY_ABI_VERSION` stays 10: four appended ops
+  and four appended results are growth, and no existing variant changed. Both enum-body digests
+  are re-pinned for that growth. Both sides must be on 59.1.2: Edge's crate
+  pin (the proxy) and the persist wheel the host loads (the dispatch). A
+  59.1.2 proxy against a 59.1.1 host gets `federation_backend` (the host
+  cannot decode the new op), not `Unsupported`. Other methods the proxy still
+  answers `Unsupported` (for example `lookup_family`, `lookup_community`,
+  `get_attestation`) are listed with their reasons in the I1162 allowlist.
+- Pool fix: no API break. Hosts that catch `RuntimeError` keep working. A
+  host that wants to tell starvation apart catches `PoolExhausted`, or keys
+  on the `*_pool_exhausted` kind. A pool built with `from_pool` keeps the
+  caller's configuration.
+
+## [59.1.1] - 2026-10-27
+
+### Fixed
+
+- `self_collective::principals_of` drops a node's owner only when a held identity-occurrence revocation naming `(owner, node)` is effective. An occurrence row the node never agreed to resolves nothing and is not evidence either way, so the live owner binding still lifts the node to its owner; a pair-room invitation now reaches the invitee's node. A revoked occurrence beside a live owner binding still has no principal, and an occurrence agreed again after its revocation keeps the owner. The same fold serves `speaks_for`, the send set, the hold path and the read gate.
+- `replication_audience::may_receive_group_plane` reads `principals_of`, so a split-home invitee's node receives the room's record and membership planes.
+- `epoch_minter::resolve`: when several minters grant the reader, it keeps those that are the author or whose `principals_of` names the author. One survivor is the minter; with none or several it falls back to the author. A pair-room blob adopted after both members minted the same epoch binds to the author's sealer instead of a key that holds no DEK.
+
+### Security
+
+- RUSTSEC-2026-0386 (tokio 1.54.1), RUSTSEC-2026-0385 (ctutils 0.4.6), RUSTSEC-2026-0382 (rustls-webpki 0.103.16) and RUSTSEC-2026-0381 (webpki-roots 1.0.11) cleared by lockfile bumps; RUSTSEC-2026-0387 (crypto-bigint 0.5, transitive via p256 in ciris-verify) ignored as unreachable.
+
+### Adoption
+
+- No break: no wire, schema or Python change. `epoch_minter::resolve`, `adopt_cascade::resolve_adopt` and `adopt_cascade::resolve_provenance` gain a `FederationDirectory` bound.
 
 ## [59.1.0] - 2026-10-20
 

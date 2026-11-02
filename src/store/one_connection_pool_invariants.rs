@@ -23,6 +23,18 @@
 //!   reads took another. A cycle-gated put and a crossing must both finish
 //!   and land, and the cycle-closing edge must still be refused on the same
 //!   one-connection pool (the re-check still runs, on the transaction).
+//! - **I1480** (v59.1.2) — the pool itself: a default pool is never smaller
+//!   than [`POOL_MAX_SIZE_FLOOR`](crate::store::postgres::POOL_MAX_SIZE_FLOOR)
+//!   whatever the CPU count (deadpool's own default was 2 on a 1-vCPU node),
+//!   and deadpool's own timers stay off (they panic on a thread without
+//!   persist's reactor; I320).
+//! - **I1481** (v59.1.2) — a starved pool is a TYPED error inside its wait,
+//!   never a hang: the store, federation, audit and secrets arms each carry
+//!   it as `PoolExhausted`.
+//! - **I1482** (v59.1.2) — the doors the field wedge named hold one client
+//!   and reach for a second no more: each finishes on a one-connection pool
+//!   whose checkout gives up after [`SHORT_WAIT`] (a nested checkout answers
+//!   `PoolExhausted`, so a regression fails fast instead of at the bound).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -35,6 +47,30 @@ use crate::store::Backend as _;
 /// Long enough for every door on a cold one-connection pool, short enough
 /// that a hang reports instead of eating the lane's budget.
 const BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// v59.1.2 — the checkout wait on the I1481/I1482 pools: a nested checkout
+/// fails inside it instead of hanging to [`BOUND`].
+const SHORT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// v59.1.2 — a migrated backend on its own database, `max_size` connections,
+/// checkout wait [`SHORT_WAIT`].
+async fn starved_backend(test: &str, max_size: usize) -> Option<PostgresBackend> {
+    let Some(dsn) = crate::test_pg::isolated_dsn() else {
+        eprintln!("{test}: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+        return None;
+    };
+    let b = PostgresBackend::connect_with_pool_for_test(&dsn, max_size, SHORT_WAIT)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    assert_eq!(
+        b.pool_max_size_for_test(),
+        max_size,
+        "the witness's own premise"
+    );
+    eprintln!("{test}: RAN on {dsn} with a {max_size}-connection pool, wait {SHORT_WAIT:?}");
+    Some(b)
+}
 
 fn suffix() -> String {
     uuid::Uuid::new_v4().simple().to_string()
@@ -174,4 +210,298 @@ async fn i602_the_cycle_recheck_completes_on_one_connection() {
         dc::has_fed_edge(d, &x, &y).await,
         "I602 the crossing landed at the federation tier"
     );
+}
+
+/// **I1480** — see the module doc. The sizing function directly, at the CPU
+/// counts that matter: one vCPU (the field node), a mid-size host, and a
+/// caller's explicit size, which is kept as given.
+#[test]
+fn i1480_a_default_pool_is_floored_and_bounded() {
+    use crate::store::postgres::{pool_config, POOL_MAX_SIZE_FLOOR};
+    for cpus in [0, 1, 2, 7, 8] {
+        assert_eq!(
+            pool_config(None, cpus).max_size,
+            POOL_MAX_SIZE_FLOOR,
+            "I1480 {cpus} CPU(s): the floor, not deadpool's 2 x CPUs"
+        );
+    }
+    assert_eq!(
+        pool_config(None, 12).max_size,
+        24,
+        "I1480 above the floor the CPU-derived size stands"
+    );
+    assert_eq!(
+        POOL_MAX_SIZE_FLOOR, 16,
+        "I1480 the floor the field fix chose"
+    );
+    assert_eq!(
+        pool_config(Some(1), 1).max_size,
+        1,
+        "I1480 an explicit size is the caller's"
+    );
+    // No deadpool timer: it would panic on a thread without persist's
+    // reactor (I320). The wait bound is `PostgresBackend::checkout`'s (I1481).
+    let t = pool_config(None, 1).timeouts;
+    assert_eq!(
+        (t.wait, t.create, t.recycle),
+        (None, None, None),
+        "I1480 deadpool's own timers stay off"
+    );
+    assert_eq!(
+        crate::store::postgres::POOL_WAIT_TIMEOUT,
+        std::time::Duration::from_secs(30)
+    );
+}
+
+/// **I1481** — see the module doc.
+#[tokio::test(flavor = "multi_thread")]
+async fn i1481_a_starved_pool_is_a_typed_error_not_a_hang() {
+    let Some(b) = starved_backend("i1481", 1).await else {
+        return;
+    };
+    let held = b.get_client().await.expect("I1481 the only connection");
+    let started = std::time::Instant::now();
+    match within_bound("I1481 a second checkout", b.get_client()).await {
+        Err(crate::store::Error::PoolExhausted { waited }) => assert_eq!(waited, SHORT_WAIT),
+        other => panic!(
+            "I1481 a second checkout must be PoolExhausted: {:?}",
+            other.map(|_| ())
+        ),
+    }
+    // One wait, not one per retry attempt.
+    assert!(
+        started.elapsed() < SHORT_WAIT * 2,
+        "I1481 exhaustion is not retried: {:?}",
+        started.elapsed()
+    );
+    let e = within_bound(
+        "I1481 a federation door",
+        FederationDirectory::lookup_public_key(&b, "i1481-none"),
+    )
+    .await
+    .expect_err("I1481 the door cannot check out");
+    assert!(
+        matches!(e, Error::PoolExhausted { waited } if waited == SHORT_WAIT),
+        "I1481 a federation door keeps the type: {e:?}"
+    );
+    assert_eq!(e.kind(), "federation_pool_exhausted");
+    let c = b.checkout().await.expect_err("I1481 checkout");
+    #[cfg(feature = "cirisaudit")]
+    {
+        let a = crate::audit::Error::from(crate::store::postgres::CheckoutError::Exhausted {
+            waited: SHORT_WAIT,
+        });
+        assert_eq!(a.kind(), "audit_pool_exhausted");
+    }
+    #[cfg(feature = "secrets")]
+    {
+        let s =
+            crate::secrets::SecretsError::from(crate::store::postgres::CheckoutError::Exhausted {
+                waited: SHORT_WAIT,
+            });
+        assert_eq!(s.kind(), "secrets_pool_exhausted");
+    }
+    assert!(
+        matches!(c, crate::store::postgres::CheckoutError::Exhausted { waited } if waited == SHORT_WAIT),
+        "I1481 {c:?}"
+    );
+    drop(held);
+    let _free = within_bound("I1481 a checkout once one is free", b.get_client())
+        .await
+        .expect("I1481 the pool recovers");
+}
+
+/// **I1482** — the occurrence doors: the route projection and the re-index
+/// each check out their own client after the occurrence lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn i1482_occurrence_doors_complete_on_one_connection() {
+    use crate::federation::types::{device_class, OccurrenceTransportBinding};
+    use base64::Engine as _;
+    let Some(b) = starved_backend("i1482-occ", 1).await else {
+        return;
+    };
+    let d = &b as &dyn FederationDirectory;
+    let tag = suffix();
+    let (identity, occ) = (format!("i1482-id-{tag}"), format!("i1482-occ-{tag}"));
+    ts::register_hybrid_key(d, &identity).await;
+    // v61 (CIRISPersist#1122) — a node: an agent's occurrence projects no route.
+    ts::register_hybrid_key_as(d, &occ, &occ, crate::federation::types::identity_type::NODE).await;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let row = crate::federation::IdentityOccurrence {
+        identity_key_id: identity.clone(),
+        occurrence_key_id: occ.clone(),
+        device_class: device_class::AGENT.into(),
+        hardware_attestation: None,
+        asserted_at: chrono::Utc::now(),
+        valid_until: None,
+        encryption_pubkeys: None,
+        transport_binding: Some(OccurrenceTransportBinding {
+            reticulum_x25519_pubkey_base64: b64.encode([0x21; 32]),
+            reticulum_ed25519_pubkey_base64: b64.encode([0x22; 32]),
+            destination_hash_base64: b64.encode([0x21; 16]),
+            app_name: "ciris.federation".into(),
+            aspects: vec!["announce".into()],
+        }),
+        persist_row_hash: String::new(),
+    };
+    within_bound(
+        "I1482 put_identity_occurrence_local",
+        b.put_identity_occurrence_local(row),
+    )
+    .await
+    .expect("I1482 the local occurrence lands and projects its route");
+    assert_eq!(
+        b.list_transport_destinations_for(&occ).await.unwrap().len(),
+        1,
+        "I1482 the route projection ran"
+    );
+}
+
+/// **I1482** — the wire-index point read reloads the record through the
+/// directory after reading its key.
+#[tokio::test(flavor = "multi_thread")]
+async fn i1482_the_wire_index_point_read_completes_on_one_connection() {
+    let Some(b) = starved_backend("i1482-wire", 1).await else {
+        return;
+    };
+    let k = format!("i1482-k-{}", suffix());
+    within_bound(
+        "I1482 key registration",
+        b.put_public_key(crate::federation::SignedKeyRecord {
+            record: crate::federation::key_plane_invariants::bodies::pop_record(&k),
+        }),
+    )
+    .await
+    .expect("I1482 the key registers");
+    let row_id = crate::federation::key_plane_invariants::bodies::key_row(&b, &k)
+        .await
+        .expect("I1482 the key row")
+        .attestation_id;
+    let key = crate::federation::wire_index::record_key(&[("attestation_id", &row_id)]);
+    let hash = crate::federation::wire_index::entry_as_stored(&b, "Attestation", &key)
+        .await
+        .unwrap()
+        .expect("I1482 stored");
+    let bytes = within_bound(
+        "I1482 lookup_signed_record_by_content_hash",
+        b.lookup_signed_record_by_content_hash("Attestation", &hash),
+    )
+    .await
+    .expect("I1482 the point read finishes");
+    assert!(bytes.is_some(), "I1482 the indexed record reloads");
+}
+
+/// **I1570** (v61, CIRISPersist#1166) — every family of Postgres checkouts
+/// runs the bounded checkout: on a one-connection pool whose only connection
+/// is held, a door of each family answers an exhausted pool inside the
+/// checkout wait, never a hang. Before v61 these families called the pool's
+/// own `get()`, which waits without a bound (`store::pool_checkout_gate`
+/// now refuses that from disk). A family whose error has no typed
+/// `PoolExhausted` arm carries the exhaustion in its text.
+#[tokio::test(flavor = "multi_thread")]
+async fn i1570_every_checkout_family_answers_an_exhausted_pool_inside_the_wait() {
+    use crate::outbound::OutboundQueue as _;
+    use crate::read::ReadEngine as _;
+    let Some(b) = starved_backend("i1570", 1).await else {
+        return;
+    };
+    let held = b.checkout().await.expect("I1570 the only connection");
+    let mut answered = Vec::new();
+    // Each door must refuse inside the wait, and say why.
+    async fn refused<T, E: std::fmt::Display>(
+        family: &str,
+        answered: &mut Vec<String>,
+        door: impl std::future::Future<Output = Result<T, E>>,
+    ) {
+        let started = std::time::Instant::now();
+        let e = match within_bound(family, door).await {
+            Ok(_) => panic!("I1570 {family}: a door ran on a pool whose only connection is held"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            started.elapsed() < SHORT_WAIT * 2,
+            "I1570 {family}: answered after {:?}, past the checkout wait",
+            started.elapsed()
+        );
+        assert!(
+            e.to_lowercase().contains("exhausted"),
+            "I1570 {family}: the refusal does not name the exhausted pool: {e}"
+        );
+        answered.push(family.to_owned());
+    }
+    refused("outbound", &mut answered, b.sweep_ack_timeouts()).await;
+    refused(
+        "read",
+        &mut answered,
+        b.list_federation_keys(
+            crate::ceg::list::federation::FederationKeyFilter::default(),
+            None,
+            10,
+            crate::scope::CallerScope::Unauthenticated,
+        ),
+    )
+    .await;
+    #[cfg(feature = "cirislens_sequence")]
+    {
+        use crate::sequence::SequenceService as _;
+        refused(
+            "sequence",
+            &mut answered,
+            b.next_sequence("i1570-identity", "i1570-stream"),
+        )
+        .await;
+    }
+    #[cfg(feature = "cirislens_occurrence")]
+    {
+        use crate::occurrence::OccurrenceService as _;
+        refused(
+            "occurrence",
+            &mut answered,
+            b.register_occurrence("i1570-occ", "i1570-identity", 60, None),
+        )
+        .await;
+    }
+    #[cfg(feature = "cirislens_maintenance_locks")]
+    {
+        use crate::maintenance_locks::MaintenanceLockService as _;
+        refused(
+            "maintenance_locks",
+            &mut answered,
+            b.try_acquire_lock("i1570-lock", "i1570", 10, None),
+        )
+        .await;
+    }
+    #[cfg(feature = "cirisaudit")]
+    {
+        refused(
+            "retention",
+            &mut answered,
+            crate::retention::postgres::storage_summary_pg_with(&b, false),
+        )
+        .await;
+        // The audit Merkle store holds the bare pool and checks out through
+        // `checkout_bounded` on its own runtime.
+        let store = crate::audit::merkle_store::PgMerkleStore::from_backend(
+            &b,
+            tokio::runtime::Handle::current(),
+            "i1570",
+        );
+        let started = std::time::Instant::now();
+        let e = tokio::task::spawn_blocking(move || {
+            use ciris_verify_core::transparency::TransparencyStore;
+            TransparencyStore::<crate::audit::merkle_leaf::AuditLeaf>::tree_size(&store)
+        })
+        .await
+        .expect("I1570 merkle join")
+        .expect_err("I1570 merkle: a store read ran on a held pool")
+        .to_string();
+        assert!(
+            started.elapsed() < SHORT_WAIT * 2 && e.to_lowercase().contains("exhausted"),
+            "I1570 merkle: {e} after {:?}",
+            started.elapsed()
+        );
+        answered.push("merkle".to_owned());
+    }
+    drop(held);
+    eprintln!("I1570: bounded on {answered:?}");
 }

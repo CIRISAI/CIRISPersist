@@ -5,9 +5,9 @@
 //! verdict-routing assertions.
 //!
 //! persist is the §19 store + the WW-2 leaf-walk owner + the
-//! divergence→merge router. The holonomic verifiers themselves (Merkle,
+//! divergence→merge router. The substrate verifiers themselves (Merkle,
 //! the PQC bound-hybrid gate, the equivocation classifier) are frozen +
-//! cross-impl-proven in `ciris_verify_core::holonomic` (CIRISVerify
+//! cross-impl-proven in `ciris_verify_core::substrate` (CIRISVerify
 //! v5.9.0); persist CALLS them and never re-rolls the crypto.
 //!
 //! Project rule (NO pg/sqlite asymmetry): the V085 schema + the admit
@@ -29,7 +29,7 @@ use ciris_persist::witness::{
     accept_if_monotonic, build_local_witness, classify, verdict_json, WitnessLeaf,
     WitnessReconcileAction, WitnessWire, QUORUM_MERGE_SUBJECT_KINDS, WITNESS_EQUIVOCATION,
 };
-use ciris_verify_core::holonomic::WholenessWitness;
+use ciris_verify_core::substrate::WholenessWitness;
 
 /// Producer identity (Ed25519 + ML-DSA-65) with b64 pubkeys.
 struct Producer {
@@ -174,7 +174,7 @@ async fn run_corpus_assertions<B: FederationDirectory + Sync>(backend: &B, suffi
     ];
     let w_ww2 = build_local_witness(&peer_ww2, 1, 1000, &mixed);
     // Root is over exactly the one survivor.
-    let expected_root = ciris_verify_core::holonomic::compute_merkle_root(&[b"keep".to_vec()]);
+    let expected_root = ciris_verify_core::substrate::compute_merkle_root(&[b"keep".to_vec()]);
     assert_eq!(
         w_ww2.merkle_root, expected_root,
         "(c) root over survivors only"
@@ -405,7 +405,7 @@ async fn run_projection_assertions<B: FederationDirectory + Sync>(
         peer_id: peer_self.clone(),
         epoch_id: 1,
         claim_namespaces: vec!["scores:self".into()], // WW-2 violation
-        merkle_root: ciris_verify_core::holonomic::compute_merkle_root(&[b"x".to_vec()]),
+        merkle_root: ciris_verify_core::substrate::compute_merkle_root(&[b"x".to_vec()]),
         leaf_count: 1,
         observed_at_unix_ms: 1000,
         witness_version: 1,
@@ -462,13 +462,13 @@ fn root_hex_builder_and_wire_shape() {
     use sha2::{Digest as _, Sha256};
 
     // Empty leaf set → the §19.1 empty sentinel root.
-    let empty = ciris_verify_core::holonomic::compute_merkle_root(&[]);
+    let empty = ciris_verify_core::substrate::compute_merkle_root(&[]);
     let sentinel: [u8; 32] = Sha256::digest(b"WW-v1-empty").into();
     assert_eq!(empty, sentinel, "empty array → the WW-v1-empty sentinel");
 
     // Non-empty parity with the verify-core scheme + hex round-trip.
     let leaves = vec![b"l1".to_vec(), b"l2".to_vec()];
-    let root = ciris_verify_core::holonomic::compute_merkle_root(&leaves);
+    let root = ciris_verify_core::substrate::compute_merkle_root(&leaves);
     let hex = encode_root_hex(&root);
     assert_eq!(hex.len(), 64);
     assert_eq!(decode_root_hex(&hex).unwrap(), root);
@@ -664,7 +664,7 @@ async fn divergent_triggers_quorum_merge_revoked_not_resurrected() {
         peer_id: "peer-a".into(),
         epoch_id: 1,
         claim_namespaces: vec!["revocation".into()],
-        merkle_root: ciris_verify_core::holonomic::compute_merkle_root(&[b"state-a".to_vec()]),
+        merkle_root: ciris_verify_core::substrate::compute_merkle_root(&[b"state-a".to_vec()]),
         leaf_count: 1,
         observed_at_unix_ms: 1,
         witness_version: 1,
@@ -673,7 +673,7 @@ async fn divergent_triggers_quorum_merge_revoked_not_resurrected() {
         peer_id: "peer-b".into(),
         epoch_id: 1,
         claim_namespaces: vec!["revocation".into()],
-        merkle_root: ciris_verify_core::holonomic::compute_merkle_root(&[b"state-b".to_vec()]),
+        merkle_root: ciris_verify_core::substrate::compute_merkle_root(&[b"state-b".to_vec()]),
         leaf_count: 1,
         observed_at_unix_ms: 1,
         witness_version: 1,

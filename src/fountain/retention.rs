@@ -7,17 +7,17 @@
 //! opaque ordering. Both are decided by the FROZEN verify-core verdict
 //! functions — persist does not re-roll the policy:
 //!
-//! - [`ciris_verify_core::holonomic::retention_decision`] →
+//! - [`ciris_verify_core::substrate::retention_decision`] →
 //!   [`RetentionAction`]: a withdrawn/revoked `content_id` is
 //!   `EvictEligible` regardless of rarity (the §8.1.11.3 deletion-SLA
 //!   always wins), routed to the v8.1.0
 //!   [`evict_fountain_content_hard_delete`](crate::store::Backend::evict_fountain_content_hard_delete)
 //!   path.
-//! - [`ciris_verify_core::holonomic::holding_claim_counts_toward_rarity`]
+//! - [`ciris_verify_core::substrate::holding_claim_counts_toward_rarity`]
 //!   (N6) — an unverified/unchallenged claim MUST NOT lower another
 //!   peer's retention priority.
 
-use ciris_verify_core::holonomic::{
+use ciris_verify_core::substrate::{
     holding_claim_counts_toward_rarity, retention_decision, ConsentState as VerifyConsentState,
     RetentionDecision,
 };

@@ -80,6 +80,11 @@ macro_rules! label_set {
 
 label_set! {
     /// The storage backend a door read ran on.
+    ///
+    /// Serde: carried inside a [`QueryRows`](crate::federation::attestation_query::QueryRows)
+    /// across the directory capsule (CIRISPersist#1162), so a proxied read is
+    /// counted against the backend that ran it.
+    #[derive(serde::Serialize, serde::Deserialize)]
     StoreBackend {
         /// The SQLite backend.
         Sqlite => "sqlite",

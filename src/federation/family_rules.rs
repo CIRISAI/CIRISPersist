@@ -233,9 +233,8 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
         enforced_at: &["federation::identity_amendment::check_identity_amendment_admission"],
         gap: RowRuleGap::NoRuleOnTheRow,
         minted_by_persist: false,
-        cc_ask: "none outstanding: CC rc10 cadd5a9 registers the row with this rule \
-                 (CIRISConstitution main, carried ahead of the rc12 cut by \
-                 CIRISConstitution#188); it reaches persist with the rc12 re-vendor (v61 S0)",
+        cc_ask: "none outstanding: CC rc12 registers the row with this rule \
+                 (cadd5a9, CIRISConstitution#188); vendored at the v1.0-rc15 tag",
     },
     // v38.7.0 (CIRISPersist#782) — the session-claim plane. CC has not ruled
     // on `session:` yet, so persist states a rule the row does not carry and
@@ -271,11 +270,11 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
         enforced_at: &["federation::goal::check_goal_row_admission"],
         gap: RowRuleGap::NoRuleOnTheRow,
         minted_by_persist: false,
-        cc_ask: "CIRISConstitution#67 (family-level rule): the goal:{scale} row should state \
-                 the M-1 requirement (CIRISPersist#988 item 4, v60.0.0) as its reserved_rule \
-                 and register the three refusal reasons (goal_meta_alignment_malformed, \
-                 goal_body_malformed, goal_typed_object_retired), so a consumer reading the \
-                 classifier does not conclude the family is open",
+        cc_ask: "CC 3.1.9.7 (rc12) registers the three refusal reasons \
+                 (goal_meta_alignment_malformed, goal_body_malformed, goal_typed_object_retired) \
+                 as federation_malformed_row reasons and states the M-1 requirement in the \
+                 family text; the row still carries no reserved_rule, so the classifier reads \
+                 the family as open (CIRISConstitution#67, family-level rule)",
     },
     // v42.0.0 (CIRISPersist#814 part 1) — CC 3.1.1 ratified the duty family in
     // rc5; the persist-side evidence row (`CLM-duty` @ 3.1.1) publishes on

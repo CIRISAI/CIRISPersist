@@ -96,6 +96,14 @@ class EngineUsedAcrossFork(PersistError):
     ``fork()`` and used in the child. A tokio runtime does not survive
     a fork; construct ``Engine`` after all forking is done."""
 
+class PoolExhausted(RuntimeError):
+    """v59.1.2 — no pooled Postgres connection was freed within the pool's
+    wait timeout (30 s by default). Before v59.1.2 the checkout waited
+    forever. A ``RuntimeError`` subclass, so ``except RuntimeError`` still
+    catches it. The message leads with the kind (``federation_pool_exhausted``
+    / ``store_pool_exhausted`` / ``audit_pool_exhausted`` /
+    ``secrets_pool_exhausted``)."""
+
 class NodeIdentityRequired(PersistError):
     """v57.0.0 (CIRISPersist#988) — an act that must record a
     ``hard_case:{kind}`` row (an erasure, a peer removal) was refused before
@@ -621,9 +629,6 @@ class Engine:
 
     def apply_replicated_attestation(self, signed_attestation_json: str) -> str:
         """(derived) deontic — v36.0.0 (CIRISPersist#624) — typed, pre-write replicated Attestation-plane apply. FFI mirror of [Engine::apply_replicated_attestation](crate::engin..."""
-
-    def apply_replicated_community_json(self, payload_json: str) -> str:
-        """(derived) deontic — v50.0.0 (CIRISPersist#925/#931) — the REPLICATED community entry: admit a SignedCommunity received from a peer (the shape the signed since-read ser..."""
 
     def apply_replicated_key_grant(self, signed_key_grant_json: str) -> str:
         """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §12–§13), v55.0.0 (#989, CC 3.3.2 rc7) — admit one replicated key-grant row and project its wrap. FFI mirror..."""
@@ -1531,6 +1536,9 @@ class Engine:
     def serve_blob_to_peer_json(self, sha256_hex: str, requesting_peer_key_id: str) -> str:
         """(derived) deontic — v6.8.0 (CIRISPersist#149) — serve blob bytes to a federation PEER, with the proactive disk-pressure gate on the proxy-SERVE path. At the stop tier..."""
 
+    def serve_seat_owner_announced(self, node_key_id: str) -> bool:
+        """(derived) deontic — v61 (CIRISPersist#1101; CC 5.4.6, CLM-serve-seat-announced) — is node_key_id's owner announced? True while a live owner binding for the node is car..."""
+
     def service_token_revocation_check(self, token_hash: str) -> str | None:
         """v1.5.23 — point-lookup the revocation record for a service token hash.
 
@@ -2298,23 +2306,11 @@ class Engine:
     def list_signed_accord_quorum_evidence_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v31.1.0 (CIRISPersist#662) — bulk-list the signed accord EVIDENCE bundles (proposal + its hybrid-signed participations) since a cursor, as a JSON a..."""
 
-    def list_signed_communities_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
-        """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedCommunity wrappers since a cursor, as a JSON array. Same contract as [list_signed_famil..."""
-
-    def list_signed_community_membership_revocations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
-        """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedCommunityMembershipRevocation wrappers since a cursor, as a JSON array. Same contract a..."""
-
-    def list_signed_families_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
-        """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR, edge advertise/serve bridge) — bulk-list the full SignedFamily wrappers (row + the V110 authority signature put_fa..."""
-
-    def list_signed_family_membership_revocations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
-        """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedFamilyMembershipRevocation wrappers since a cursor, as a JSON array. Same contract as [..."""
-
     def list_signed_identity_occurrences_for_json(self, identity_key_id: str) -> str:
         """(derived) epistemic — v14.1.0 (CIRISPersist#418, replication read) — the signed-put occurrences of identity_key_id, each as a full SignedIdentityOccurrence JSON object (..."""
 
     def list_signed_location_proofs_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
-        """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedLocationProof wrappers since a cursor, as a JSON array. Same contract as [list_signed_f..."""
+        """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedLocationProof wrappers since a cursor, as a JSON array (signed rows only, a pair cursor..."""
 
     def list_signed_transport_destinations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v21.1.0 (CIRISPersist#507c) — bulk-list the full SignedTransportDestination wrappers since a cursor, as a JSON array. Signed rows only; RETIRED row..."""
@@ -3972,6 +3968,9 @@ class Engine:
         reference an existing row in ``cirislens.thoughts`` (PG:
         DEFERRABLE FK; SQLite: immediate FK).
         """
+
+    def settle_instant_forms_json(self) -> str:
+        """(derived) procedural — v61 (CC 2.6.2) — run the open-time instant-form pass now and return its counts as JSON: {scanned, violations, healed, already_healed, heal_refused,..."""
 
     def sweep_ack_timeouts(self) -> int:
         """(derived) procedural — v0.4.0 — Sweep ACK timeouts. Returns the count of rows touched (retried or abandoned)."""

@@ -78,8 +78,7 @@ impl MaintenanceService for PostgresMaintenanceBackend {
         // `batch_execute` runs the statement at top level.
         let client = self
             .backend
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("vacuum pool: {e}")))?;
         let started = Instant::now();
@@ -97,8 +96,7 @@ impl MaintenanceService for PostgresMaintenanceBackend {
     async fn archive_expired(&self, window: ArchiveWindow) -> Result<ArchiveReport, Error> {
         let client = self
             .backend
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("archive pool: {e}")))?;
 
@@ -240,8 +238,7 @@ impl MaintenanceService for PostgresMaintenanceBackend {
         crate::maintenance::validate_sql_identifier(&policy.time_column)?;
         let client = self
             .backend
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("retention pool: {e}")))?;
         client
@@ -274,8 +271,7 @@ impl MaintenanceService for PostgresMaintenanceBackend {
     async fn get_retention(&self, table_name: &str) -> Result<Option<RetentionPolicy>, Error> {
         let client = self
             .backend
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("retention pool: {e}")))?;
         let row = client
@@ -293,8 +289,7 @@ impl MaintenanceService for PostgresMaintenanceBackend {
     async fn list_retention(&self) -> Result<Vec<RetentionPolicyRow>, Error> {
         let client = self
             .backend
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("retention pool: {e}")))?;
         let rows = client
@@ -319,8 +314,7 @@ impl MaintenanceService for PostgresMaintenanceBackend {
         let policies = self.list_retention().await?;
         let client = self
             .backend
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("retention pool: {e}")))?;
         let mut reports = Vec::with_capacity(policies.len());
@@ -428,7 +422,7 @@ mod tests {
         let tbl = format!("ret_test_{}", Uuid::new_v4().simple());
         let now = Utc::now();
         {
-            let client = arc.pool().get().await.unwrap();
+            let client = arc.checkout().await.unwrap();
             client
                 .execute(
                     &format!("CREATE TABLE {tbl} (ts TIMESTAMPTZ NOT NULL, v INT)"),
@@ -480,7 +474,7 @@ mod tests {
         assert!(r.db_size_bytes > 0, "pg_database_size measured");
 
         // cleanup — drop the temp table + its policy row.
-        let client = arc.pool().get().await.unwrap();
+        let client = arc.checkout().await.unwrap();
         client
             .execute(&format!("DROP TABLE {tbl}"), &[])
             .await
@@ -521,7 +515,7 @@ mod tests {
 
         // Insert one row past its expires_at.
         {
-            let client = arc.pool().get().await.unwrap();
+            let client = arc.checkout().await.unwrap();
             client
                 .execute(
                     "INSERT INTO cirisgraph.telemetry_metrics (\
@@ -555,7 +549,7 @@ mod tests {
         );
 
         // Cleanup any residual.
-        let client = arc.pool().get().await.unwrap();
+        let client = arc.checkout().await.unwrap();
         client
             .execute(
                 "DELETE FROM cirisgraph.telemetry_metrics WHERE tenant_id = $1",

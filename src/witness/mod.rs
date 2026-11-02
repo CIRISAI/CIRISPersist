@@ -3,10 +3,10 @@
 //! items 1–2 / #229 item 1).
 //!
 //! persist is the §19 **store + the WW-2 leaf-walk owner + the
-//! divergence→§10.1.6 router**. The holonomic verifiers themselves
+//! divergence→§10.1.6 router**. The substrate verifiers themselves
 //! (Merkle construction, the PQC bound-hybrid gate, the equivocation
 //! classifier) are frozen + cross-impl-proven in
-//! `ciris_verify_core::holonomic` (CIRISVerify v5.9.0); persist CALLS
+//! `ciris_verify_core::substrate` (CIRISVerify v5.9.0); persist CALLS
 //! them and never re-rolls Merkle / preimage / signature logic.
 //!
 //! # The three persist-owned guards

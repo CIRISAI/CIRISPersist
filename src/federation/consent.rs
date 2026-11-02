@@ -896,7 +896,7 @@ mod causal_fold_tests {
             "attesting_key_id": S,
             "attested_key_id": "target-642",
             "attestation_type": ty,
-            "asserted_at": at(secs).to_rfc3339(),
+            "asserted_at": crate::federation::admission::render_signed_instant(at(secs)),
             "attestation_envelope": env,
             "original_content_hash": "00",
             "scrub_signature_classical": "AA",

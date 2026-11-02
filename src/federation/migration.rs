@@ -3125,8 +3125,7 @@ pub(crate) mod test_support {
             "score": 1.0,
             "confidence": 0.9,
             crate::federation::envelope::paths::ASSERTED_AT:
-                crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now())
-                    .to_rfc3339(),
+                crate::federation::admission::render_signed_instant(chrono::Utc::now()),
         });
         let (_hash, sig_classical, sig_pqc) = seal::sign_envelope(&subject, &envelope);
         let err = dir

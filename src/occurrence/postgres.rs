@@ -89,8 +89,7 @@ impl OccurrenceService for PostgresBackend {
         let now = Utc::now();
         let expires_at = now + Duration::seconds(ttl_seconds);
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         // Idempotent upsert: re-registering an occurrence refreshes
@@ -135,8 +134,7 @@ impl OccurrenceService for PostgresBackend {
         let now = Utc::now();
         let expires_at = now + Duration::seconds(ttl_seconds);
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let affected = client
@@ -156,8 +154,7 @@ impl OccurrenceService for PostgresBackend {
             return Err(Error::InvalidArgument("occurrence_id required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let affected = client
@@ -176,8 +173,7 @@ impl OccurrenceService for PostgresBackend {
         }
         let now = Utc::now();
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let rows = client
@@ -369,7 +365,7 @@ mod tests {
             .unwrap();
         // Force occ_b's expires_at into the past via raw SQL — proves
         // the `expires_at > now` filter without a real sleep.
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let past = Utc::now() - Duration::hours(1);
         client
             .execute(

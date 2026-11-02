@@ -2,7 +2,7 @@
 //! canonical verify-core shapes (CIRISPersist#356 / CIRISVerify#170).
 //!
 //! The signed shapes themselves live in
-//! [`ciris_verify_core::holonomic::storage_contention`] (the canonical home for
+//! [`ciris_verify_core::substrate::storage_contention`] (the canonical home for
 //! every §19/§Q signed object). persist does NOT redefine the crypto — it wraps
 //! it: serde **wire** structs that (de)serialize the JSON the PyO3 boundary
 //! carries, plus `build` (sign a payload with the engine's local signer) and
@@ -55,7 +55,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use ciris_verify_core::holonomic::storage_contention::{
+use ciris_verify_core::substrate::storage_contention::{
     verify_corpus_want_v1, verify_storage_budget_v1, CorpusWantV1, ScopeBudget, StorageBudgetV1,
     StorageContentionVerification,
 };

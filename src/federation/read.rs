@@ -744,7 +744,7 @@ mod postgres_tests {
     }
 
     async fn pg_seed_federation_key(backend: &PostgresBackend, key_id: &str) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .execute(
                 "INSERT INTO cirislens.federation_keys (\
@@ -762,7 +762,7 @@ mod postgres_tests {
     }
 
     async fn pg_cleanup(backend: &PostgresBackend, tenant: &str) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         for sql in [
             "DELETE FROM cirislens.federation_trust_grants WHERE tenant_id = $1",
             "DELETE FROM cirislens.merkle_sth_log WHERE tenant_id = $1",

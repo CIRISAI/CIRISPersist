@@ -1,10 +1,10 @@
-//! v60.0.0 (S6v) — **the CC manifests persist vendors beside the namespace
-//! registry, pinned at the CIRISConstitution `v1.0-rc9` tag.**
+//! **The CC manifests persist vendors beside the namespace registry, pinned
+//! at the CIRISConstitution `v1.0-rc15` tag.**
 //!
 //! [`registry`](super::registry) carries the namespace registry and its match
-//! vectors; this module carries the other four CC `manifests/` files persist
-//! reads, copied byte for byte with `git show v1.0-rc9:manifests/<file>` at
-//! [`VENDORED_CC_COMMIT`](super::registry::VENDORED_CC_COMMIT) (`5d50c6bb`):
+//! vectors; this module carries the other five CC `manifests/` files persist
+//! reads, copied byte for byte with `git show v1.0-rc15:manifests/<file>` at
+//! [`VENDORED_CC_COMMIT`](super::registry::VENDORED_CC_COMMIT) (`ace6b74`):
 //!
 //! | file | CC | read by |
 //! |---|---|---|
@@ -12,14 +12,13 @@
 //! | `governance_policy_vectors.json` | 4.5.13, 732 decision vectors | the `two_path` replay (test) |
 //! | `csd4_chain.json` | the CSD/4 chain as data | `scripts/csd4_coverage.py` (report) |
 //! | `topology_vocabulary.json` | the CSD/4 atom vocabulary | `scripts/csd4_coverage.py`, the chain's own vocabulary pin |
+//! | `signed_object_vectors.json` | 2.6.1.7, the 13 signed-object vectors | the signed-object replay (test) |
 //!
-//! Until v60 the four were test fixtures under `tests/fixtures/` (v59 / v60
-//! S0), copied from the untagged `rc9` branch; their bytes are the tag's. Only
-//! the policy table is compiled in: the other three have no runtime reader,
-//! so they live here as data with their pins and are read from disk by the
-//! report script and the witnesses.
+//! Only the policy table is compiled in: the other four have no runtime
+//! reader, so they live here as data with their pins and are read from disk
+//! by the report script and the witnesses.
 //!
-//! JSON carries no comments, so this doc is the four files' header. Do not
+//! JSON carries no comments, so this doc is the five files' header. Do not
 //! hand-edit them: re-copy from the tag CC names, move each pin below and
 //! [`VENDORED_CC_COMMIT`](super::registry::VENDORED_CC_COMMIT) in the same
 //! commit, and run `scripts/check_vendored_cc.sh <tag>`.
@@ -34,28 +33,43 @@ pub(crate) const GOVERNANCE_POLICY_JSON: &str = include_str!("governance_policy.
 
 /// SHA-256 of the vendored `governance_policy.json` FILE bytes.
 pub const VENDORED_GOVERNANCE_POLICY_FILE_SHA256: &str =
-    "12df61a92b398fac99f4cfc64f34548c43cca60944b9f90addd845f90c9f33f8";
+    "e5b8961f149576f24dc52d13c964091e6b4704b2ad4dad650b42aa90c55411d5";
 
 /// The table's own `_meta.policy_sha256` (CC's hash over the rows; the
 /// vectors carry the same value, so a vector set is tied to its table).
 pub const VENDORED_GOVERNANCE_POLICY_SHA256: &str =
-    "b7d2370da9d9a91193f5a5b904fdec3c0a629c3873429f3e1a0439a5e0502264";
+    "418c1aa616170b612c2cc7999ae362b69d3931e20d5b8afb85a865e175ee1837";
 
 /// SHA-256 of the vendored `governance_policy_vectors.json` FILE bytes.
 pub const VENDORED_GOVERNANCE_POLICY_VECTORS_FILE_SHA256: &str =
-    "e010d44719a9de5116c9f7cd9dd1972827bf7b51ce6acd175f55fa869fb60faa";
+    "24bb0cda064216c0c38564d5c673e5af5411812166ebe0c4e231a69649097033";
 
 /// SHA-256 of the vendored `csd4_chain.json` FILE bytes.
 pub const VENDORED_CSD4_CHAIN_FILE_SHA256: &str =
-    "b759e4886432bc73bc3b94a41c43f168c911cf7fd85af4b201bf40b87b99a08f";
+    "d4cd9d169a7ddca2c91a2c237228a78d2c5475df02275cd43aa551a413ac5448";
 
 /// SHA-256 of the vendored `topology_vocabulary.json` FILE bytes. The chain's
 /// `_meta.pins.vocabulary_sha256` and CIRISServer's catalogue pin
 /// (`tests/fixtures/csd4/topology_vocabulary.pin`) name the same value.
 pub const VENDORED_TOPOLOGY_VOCABULARY_FILE_SHA256: &str =
-    "b0b220507d08424a8ced6f5390fc2a01a9987123530b0cf620be2d34bfc69afc";
+    "c37f6f9651579932835ff700a2ec376a0c5c928545c3ed476362ec4bd4ac0769";
 
-/// The four files, `(file under src/federation/namespace/, pinned sha256)`,
+/// SHA-256 of the vendored `signed_object_vectors.json` FILE bytes (CC 2.6.1.7:
+/// the 13 signed-object vectors the replay runs through the attestation door,
+/// CIRISPersist#1098).
+pub const VENDORED_SIGNED_OBJECT_VECTORS_FILE_SHA256: &str =
+    "89122268a39b7267a2381221fdd5accb7ce45b1d8358af2ed6cf96f5e163994b";
+
+/// SHA-256 of CC's `manifests/WIRE_VOCABULARY.md` FILE bytes at the tag.
+/// Persist does not vendor the file: it pins the document's hash as
+/// [`crate::wire_vocabulary::WIRE_VOCABULARY_HASH`], a cross-repo value
+/// (`c6bd6aa4…`, CC 2.6.4 §4) shared with CIRISEdge and CIRISRegistry, which
+/// stays where it is. This is the tag's file hash, so a re-vendor sees the
+/// document move; I1302 checks it against the CC checkout.
+pub const VENDORED_WIRE_VOCABULARY_FILE_SHA256: &str =
+    "baf75371f6f25c83c7cd2f6cd0774677f47e9fca5c9c555a09e662249e40a3ff";
+
+/// The five files, `(file under src/federation/namespace/, pinned sha256)`,
 /// in the order `scripts/check_vendored_cc.sh` compares them.
 pub const VENDORED_CC_MANIFEST_FILES: &[(&str, &str)] = &[
     (
@@ -70,6 +84,10 @@ pub const VENDORED_CC_MANIFEST_FILES: &[(&str, &str)] = &[
     (
         "topology_vocabulary.json",
         VENDORED_TOPOLOGY_VOCABULARY_FILE_SHA256,
+    ),
+    (
+        "signed_object_vectors.json",
+        VENDORED_SIGNED_OBJECT_VECTORS_FILE_SHA256,
     ),
 ];
 
@@ -86,15 +104,15 @@ pub const SELF_ROSTER_TRACE_FILE_SHA256: &[(&str, &str)] = &[
     ),
     (
         "combined3_lost.json",
-        "94bf12cf48a5266d6b123cc5b946954e5a30d94fb58e5f8c73019c24442c81d9",
+        "e0ca6f5dfd3e5d1e63787f77f9c9446569b37823625ce83162d212ce3bef1c0c",
     ),
     (
         "combined3_stolen.json",
-        "db9563a3d3641ff3cb2b570f6bde4d99a65cc341d5c0bbbff5341a135273d66b",
+        "1ca56beebf06179805406765a5dda807ec37840ae2a718ae6ed63b92dec3d624",
     ),
     (
         "combined4_mixed.json",
-        "0ea2719bb096c1f55943b7d5b11f29dfe6791a16886819c9afdbb5fae0024b91",
+        "417f8baadd44a457d88c89f6b8ccd621797d742e2fa172823b242a660eba16a3",
     ),
     (
         "unilateral3_stolen.json",
@@ -155,7 +173,7 @@ mod tests {
     }
 
     /// **I1300** — the vendored bytes are the pinned bytes: every CC file
-    /// persist vendors (the registry, its vectors, the four manifests here and
+    /// persist vendors (the registry, its vectors, the five manifests here and
     /// the six self-roster traces) hashes to its constant, and the compiled-in
     /// policy table is the file on disk.
     #[test]
@@ -163,8 +181,8 @@ mod tests {
         let all = every_pinned_file();
         assert_eq!(
             all.len(),
-            12,
-            "two registry files, four manifests, six traces"
+            13,
+            "two registry files, five manifests, six traces"
         );
         for (_, local, pin) in &all {
             let bytes = std::fs::read(local).unwrap_or_else(|e| panic!("{local:?}: {e}"));
@@ -203,10 +221,25 @@ mod tests {
         );
     }
 
-    /// **I1301** — CIRISServer's catalogue pin (a CIRISClient byte copy that
-    /// stays a test fixture) names the vocabulary persist vendors from CC.
+    /// The vocabulary CIRISServer's catalogue pin names while the CSD/4
+    /// fixtures stay at the CIRISServer v0.5.234 release: CC's `v1.0-rc12`
+    /// `topology_vocabulary.json` (catalogue v5). rc14 and rc15 carry vocabulary v6
+    /// ([`VENDORED_TOPOLOGY_VOCABULARY_FILE_SHA256`]), and no tagged Server
+    /// release carries a catalogue built on it yet.
+    const SERVER_CATALOGUE_PREVIOUS_VOCABULARY_SHA256: &str =
+        "871c5dfa1c20892db214c1a0bf60a04dfd1e117e7f5b82bc483d0cf3ce376587";
+
+    /// **I1301** — CIRISServer's catalogue pin (the tagged release's
+    /// `csd4-topology_vocabulary.pin` asset, a test fixture) names the
+    /// PREVIOUS vocabulary, pending a tagged Server release carrying CSD/4 v6.
+    ///
+    /// A latch, both ways: the pin must name the rc12 vocabulary and must NOT
+    /// name the one persist vendors now. When the fixtures are re-pinned from
+    /// a Server release built on v6, this test goes red; the fix is to assert
+    /// equality with [`VENDORED_TOPOLOGY_VOCABULARY_FILE_SHA256`] again and
+    /// drop the previous-vocabulary constant.
     #[test]
-    fn i1301_the_catalogue_pin_names_the_vendored_vocabulary() {
+    fn i1301_the_catalogue_pin_names_the_previous_vocabulary_pending_csd4_v6() {
         let pin = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/csd4/topology_vocabulary.pin"),
@@ -215,25 +248,34 @@ mod tests {
         let named = pin
             .lines()
             .find_map(|l| l.strip_prefix("sha256="))
-            .expect("a sha256= line");
-        assert_eq!(named.trim(), VENDORED_TOPOLOGY_VOCABULARY_FILE_SHA256);
+            .expect("a sha256= line")
+            .trim();
+        assert_ne!(
+            named, VENDORED_TOPOLOGY_VOCABULARY_FILE_SHA256,
+            "the CSD/4 fixtures now carry the vendored vocabulary (v6): the latch is spent — \
+             assert equality with the vendored vocabulary again"
+        );
+        assert_eq!(
+            named, SERVER_CATALOGUE_PREVIOUS_VOCABULARY_SHA256,
+            "pending a tagged Server release carrying CSD/4 v6, the catalogue pin names the \
+             previous (rc12) vocabulary"
+        );
     }
 
-    /// **I1308** — the refusal tokens at the pin. CC rc9's chain
+    /// **I1308** — the refusal tokens at the pin. CC rc15's chain
     /// (`refusal_tokens`, the tokens its text names) names
     /// `federation_set_semantics_unsorted`, `federation_malformed_row` and the
     /// reasons `aggregate_source_duplicate`, `envelope_member_missing`,
     /// `typed_diverges_from_envelope` and `envelope_member_null`; persist emits
-    /// each spelling but `envelope_member_null` (CC 2.6.1.1.1 finding F4,
-    /// CIRISPersist#1098, which docs/V60_TASK_PLAN.md §2 keeps out of v60).
-    /// Two reasons persist emits are named by NO CC text at the pin
+    /// each (`envelope_member_null` since CIRISPersist#1098 F4). Two reasons
+    /// persist emits are named by NO chain token at the pin
     /// (`key_id_fingerprint_mismatch`, CIRISPersist#1103;
     /// `carrier_without_roster_quorum`, CIRISPersist#1104), nor the three CC
-    /// rc10 appended after the tag (`content_hash_mismatch`,
-    /// `envelope_row_member_unknown`, `subject_key_id_malformed`,
-    /// CIRISPersist#1114, pinned here until the next re-pin). Both lists are
-    /// latches: a re-vendor that names one, or a persist cut that emits
-    /// `envelope_member_null`, reds this test until the line moves.
+    /// 2.6.1.7 lists in its text but the chain does not carry as tokens
+    /// (`content_hash_mismatch`, `envelope_row_member_unknown`,
+    /// `subject_key_id_malformed`, CIRISPersist#1114). The second list is a
+    /// latch: a re-vendor whose chain names one reds this test until the line
+    /// moves.
     #[test]
     fn i1308_the_refusal_tokens_at_the_pin() {
         use crate::federation::malformed_row;
@@ -246,21 +288,21 @@ mod tests {
         let unsorted = crate::federation::Error::SetSemanticsUnsorted(String::new()).kind();
         let malformed = crate::federation::Error::malformed_row("p", "r", "m").kind();
         for kind in [unsorted, malformed] {
-            assert!(named.contains_key(kind), "rc9 names {kind}");
+            assert!(named.contains_key(kind), "rc15 names {kind}");
         }
         for reason in [
             malformed_row::AGGREGATE_SOURCE_DUPLICATE,
             malformed_row::ENVELOPE_MEMBER_MISSING,
             malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
         ] {
-            assert!(named.contains_key(reason), "rc9 names {reason}");
+            assert!(named.contains_key(reason), "rc15 names {reason}");
             assert!(malformed_row::ALL.contains(&reason));
         }
-        // Named at rc9, not emitted (#1098 F4; out of v60).
-        assert!(named.contains_key("envelope_member_null"));
-        assert!(!malformed_row::ALL.contains(&"envelope_member_null"));
-        // Emitted, named by no CC text at the pin. The last three are CC rc10
-        // tokens (2.6.1.7 at `99bf187`, CIRISPersist#1114), after the tag.
+        // Named at rc9, emitted since #1098 F4 (rc12).
+        assert!(named.contains_key(malformed_row::ENVELOPE_MEMBER_NULL));
+        assert!(malformed_row::ALL.contains(&malformed_row::ENVELOPE_MEMBER_NULL));
+        // Emitted, named by no chain token at the pin. The last three are in
+        // CC 2.6.1.7's text (CIRISPersist#1114) but not in the chain.
         for reason in [
             malformed_row::KEY_ID_FINGERPRINT_MISMATCH,
             malformed_row::CARRIER_WITHOUT_ROSTER_QUORUM,
@@ -336,6 +378,19 @@ mod tests {
                 "{local:?} is not {tag}:{cc_path}"
             );
         }
-        eprintln!("I1302: 12 files equal {tag} ({VENDORED_CC_COMMIT}): RAN");
+        let wire = git(
+            &repo,
+            &["show", &format!("{tag}:manifests/WIRE_VOCABULARY.md")],
+        )
+        .unwrap_or_else(|| panic!("{tag} carries no manifests/WIRE_VOCABULARY.md"));
+        assert_eq!(
+            hex_sha256(&wire),
+            VENDORED_WIRE_VOCABULARY_FILE_SHA256,
+            "manifests/WIRE_VOCABULARY.md at {tag} is not the pinned byte string"
+        );
+        eprintln!(
+            "I1302: 13 files equal {tag} ({VENDORED_CC_COMMIT}), and WIRE_VOCABULARY.md \
+             hashes to its pin: RAN"
+        );
     }
 }

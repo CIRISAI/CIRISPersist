@@ -45,6 +45,7 @@
 use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use super::{Attestation, Error};
 use crate::ceg::list::federation::AttestationCursor;
@@ -75,7 +76,7 @@ pub const FOLD_PAGE: NonZeroU32 = if cfg!(test) {
 };
 
 /// What the query asks of the envelope's top-level `dimension`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DimensionFilter {
     /// Any dimension, and none.
     #[default]
@@ -106,7 +107,8 @@ pub enum DimensionFilter {
 /// `(attested_key_id, cohort_scope, asserted_at DESC)`; a `by` query filters
 /// the attester's ordered walk (no index leads with the attester and the
 /// scope), bounded by the page like an exclusion.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeFilter {
     /// The stored `cohort_scope` (`self` / `family` / `community` /
     /// `affiliations` / `species` / `biosphere` / `federation`).
@@ -116,7 +118,7 @@ pub struct ScopeFilter {
 }
 
 /// Which storage tier the rows come from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum QueryTier {
     /// The signed, replicated tier — every read the directory serves.
     #[default]
@@ -137,7 +139,7 @@ impl QueryTier {
 }
 
 /// A sort direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
     /// Ascending (oldest first).
     Asc,
@@ -146,7 +148,7 @@ pub enum Direction {
 }
 
 /// The order rows come in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueryOrder {
     /// By the row's SIGNED `asserted_at` (never receipt time), ties broken by
     /// `attestation_id` (byte order), so the order — and every page cut from
@@ -187,7 +189,14 @@ impl QueryOrder {
 /// `AttestationQuery::by(k, limit).types(&["withdraws", "supersedes",
 /// "recants"])` paged on `next`, joined on the envelope's
 /// `references_attestation_id`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **Wire.** v59.1.2 (CIRISPersist#1162): the query crosses the directory
+/// capsule inside `DirectoryOp::ExecuteAttestationQuery`, and its rows come
+/// back as [`QueryRows`]. A changed field here, or in a type it carries, is a
+/// payload break outside the op digests' sight, so it bumps
+/// `DIRECTORY_ABI_VERSION`. An unknown field is refused, never dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttestationQuery {
     /// Rows `by` authored (`attesting_key_id`).
     pub by: Option<String>,
@@ -535,7 +544,8 @@ impl AttestationQuery {
 /// What a backend's executor returns: at most [`AttestationQuery::fetch`]
 /// rows in the query's order, the envelope bytes it decoded (the per-door
 /// telemetry's definition) and which backend ran it.
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryRows {
     /// The rows, in order, at most `limit + 1`.
     pub rows: Vec<Attestation>,
@@ -765,25 +775,80 @@ pub(crate) fn lifecycle_predicate(
         .collect::<Vec<_>>()
         .join(",");
     let path = crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID;
-    let (table, target, id) = match dialect {
+    // v61 (the canonical's read storm) — sqlite: the outer id is
+    // compared as `+outer.attestation_id`. A bare column carries TEXT
+    // affinity, which the comparison then applies to the expression side;
+    // V181's `reference_seek` indexes the expression with NO affinity, so the
+    // index was ineligible and the subquery was `SCAN c` once per outer row
+    // (one page of 256 at 3.9k rows: 15.2M full-scan steps). The unary plus
+    // strips the affinity. The seek is pinned to V212's partial
+    // `reference_live` (composer rows only): with statistics on a store with
+    // few composers, `reference_seek` (every row, nearly all NULL) is judged
+    // no better than a scan, and the pin alone then walks the whole index.
+    // The convergent-rank subquery below (`r`) is pinned to the same index:
+    // its `{rank_ref} = {outer_ref}` and `r.attestation_type` equalities are
+    // the index's two columns, and a non-composer outer row (reference NULL)
+    // seeks nothing.
+    let (table, pin, target, id) = match dialect {
         Dialect::Sqlite => (
             "federation_attestations",
+            " INDEXED BY federation_attestations_reference_live",
             format!("json_extract(c.attestation_envelope, '$.{path}')"),
-            format!("{outer}.attestation_id"),
+            format!("+{outer}.attestation_id"),
         ),
         Dialect::Postgres => (
             "cirislens.federation_attestations",
+            "",
             format!("c.attestation_envelope::jsonb->>'{path}'"),
             format!("{outer}.attestation_id::text"),
         ),
     };
+    // v61 (CIRISPersist#1157 / #1155, CC rc14 3.1.9.4) — **the convergent
+    // rank, read-time.** A distinct composer of the same type from the same
+    // attester on the same target, placed in the SAME audience (cohort scope
+    // and cohort target), outranks this one when its signed instant is later,
+    // or equal with the lower `attestation_id` bytewise: the loser is hidden,
+    // both stay stored, and every node converges on one winner whichever row
+    // it held first. Placements of one row into DIFFERENT audiences never
+    // compete (they carry the prior's instant), so each room keeps its own.
+    let (rank_ref, outer_ref, null_eq, older) = match dialect {
+        Dialect::Sqlite => (
+            format!("json_extract(r.attestation_envelope, '$.{path}')"),
+            format!("json_extract({outer}.attestation_envelope, '$.{path}')"),
+            format!("r.cohort_target IS {outer}.cohort_target"),
+            format!(
+                "(r.asserted_at > {outer}.asserted_at \
+                  OR (r.asserted_at = {outer}.asserted_at \
+                      AND r.attestation_id < {outer}.attestation_id))"
+            ),
+        ),
+        Dialect::Postgres => (
+            format!("r.attestation_envelope::jsonb->>'{path}'"),
+            format!("{outer}.attestation_envelope::jsonb->>'{path}'"),
+            format!("r.cohort_target IS NOT DISTINCT FROM {outer}.cohort_target"),
+            format!(
+                "(r.asserted_at > {outer}.asserted_at \
+                  OR (r.asserted_at = {outer}.asserted_at \
+                      AND r.attestation_id::text COLLATE \"C\" \
+                          < {outer}.attestation_id::text COLLATE \"C\"))"
+            ),
+        ),
+    };
     Some((
         format!(
-            "NOT EXISTS (SELECT 1 FROM {table} c \
+            "NOT EXISTS (SELECT 1 FROM {table} c{pin} \
                WHERE (c.attesting_key_id = {outer}.attesting_key_id \
                       OR c.withdraws_admission_rule IS NOT NULL) \
                  AND c.attestation_type IN ({list}) \
-                 AND {target} = {id})"
+                 AND {target} = {id}) \
+             AND NOT EXISTS (SELECT 1 FROM {table} r{pin} \
+               WHERE r.attestation_type = {outer}.attestation_type \
+                 AND r.attestation_type IN ({list}) \
+                 AND r.attesting_key_id = {outer}.attesting_key_id \
+                 AND {rank_ref} = {outer_ref} \
+                 AND r.cohort_scope = {outer}.cohort_scope \
+                 AND {null_eq} \
+                 AND {older})"
         ),
         hide.iter().map(|t| (*t).to_owned()).collect(),
     ))

@@ -39,9 +39,7 @@ pub mod bodies {
     use crate::federation::tier_ingest::test_support::{
         moderate_delegation_attestation, reseal, sign_community,
     };
-    use crate::federation::types::{
-        attestation_type, consensus_protocol, identity_type, Community, CommunityMember,
-    };
+    use crate::federation::types::{attestation_type, identity_type, Community, CommunityMember};
     use crate::federation::{Attestation, FederationDirectory};
     use chrono::{DateTime, Duration, Utc};
 
@@ -87,7 +85,7 @@ pub mod bodies {
                     role: Some(MEMBER_ROLE_FOUNDER.to_owned()),
                 }],
                 founded_at: now,
-                consensus_protocol: consensus_protocol::FOUNDER_ONLY.to_owned(),
+                consensus_protocol: "quorum:1/1".into(),
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },
@@ -418,7 +416,7 @@ pub mod bodies {
                 community_name: format!("epoch room {here}"),
                 members: vec![seat(&alice, true), seat(&bob, true), seat(&carol, false)],
                 founded_at: now,
-                consensus_protocol: consensus_protocol::FOUNDER_ONLY.to_owned(),
+                consensus_protocol: "quorum:1/1".into(),
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },

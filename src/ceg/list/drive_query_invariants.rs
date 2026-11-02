@@ -537,6 +537,10 @@ pub mod bodies {
                 .unwrap()
                 .items
                 .into_iter()
+                // v61 (CIRISPersist#991): the rooms' own records and roster
+                // events are rows placed in them too; this witness is about
+                // the fixture row.
+                .filter(|a| !crate::federation::group_plane::is_group_plane_row(a))
                 .map(|a| a.attestation_id)
                 .collect();
                 v.sort();

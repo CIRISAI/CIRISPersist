@@ -221,7 +221,7 @@ impl PartnerRecord {
 /// CC 2.6.1.1.1 rule 1: strings order by their UTF-16 code units, the order
 /// JCS (RFC 8785 §3.2.3) sorts members by. It differs from Rust's byte order
 /// only above U+FFFF against U+E000..=U+FFFF.
-fn jcs_string_order(a: &str, b: &str) -> std::cmp::Ordering {
+pub(crate) fn jcs_string_order(a: &str, b: &str) -> std::cmp::Ordering {
     a.encode_utf16().cmp(b.encode_utf16())
 }
 
@@ -4570,7 +4570,7 @@ pub mod test_support {
 
         // UN-faulted: every call must reach the inner backend.
         let dbl = FaultInjectingDirectory::new(std::sync::Arc::clone(&inner));
-        dbl.insert_known_wire_hash("Community", &hash, Some("peer-1"), now)
+        dbl.insert_known_wire_hash("LocationProof", &hash, Some("peer-1"), now)
             .await
             .unwrap_or_else(|e| {
                 panic!(
@@ -4582,14 +4582,14 @@ pub mod test_support {
                 )
             });
         assert!(
-            dbl.known_wire_hash_contains("Community", &hash)
+            dbl.known_wire_hash_contains("LocationProof", &hash)
                 .await
                 .unwrap_or_else(|e| panic!("({label}) contains through double: {e}")),
             "({label}) #785: the hash inserted through the double is not visible \
              through it"
         );
         let rows = dbl
-            .list_known_wire_hashes_since("Community", None, u32::MAX)
+            .list_known_wire_hashes_since("LocationProof", None, u32::MAX)
             .await
             .unwrap_or_else(|e| panic!("({label}) list through double: {e}"));
         assert!(
@@ -4606,7 +4606,7 @@ pub mod test_support {
         let faulted = FaultInjectingDirectory::new(inner).unsupported("insert_known_wire_hash");
         assert!(
             faulted
-                .insert_known_wire_hash("Community", &hash, None, now)
+                .insert_known_wire_hash("LocationProof", &hash, None, now)
                 .await
                 .is_err(),
             "({label}) #785: a DECLARED fault on a delegated method must still \
@@ -4659,16 +4659,16 @@ pub mod test_support {
         let newer = base + chrono::Duration::microseconds(100_001);
         assert!(older < newer, "fixture instants are ordered");
 
-        dir.insert_known_wire_hash("Family", &hash, Some("peer-new"), newer)
+        dir.insert_known_wire_hash("LocationProof", &hash, Some("peer-new"), newer)
             .await
             .unwrap_or_else(|e| panic!("({label}) insert newer: {e}"));
         // The delayed write, carrying the OLDER observation.
-        dir.insert_known_wire_hash("Family", &hash, Some("peer-old"), older)
+        dir.insert_known_wire_hash("LocationProof", &hash, Some("peer-old"), older)
             .await
             .unwrap_or_else(|e| panic!("({label}) insert older: {e}"));
 
         let row = dir
-            .list_known_wire_hashes_since("Family", None, u32::MAX)
+            .list_known_wire_hashes_since("LocationProof", None, u32::MAX)
             .await
             .unwrap_or_else(|e| panic!("({label}) list: {e}"))
             .into_iter()
@@ -4712,7 +4712,7 @@ pub mod test_support {
             .await
             .unwrap_or_else(|e| panic!("({label}) evict below both: {e}"));
         assert!(
-            dir.known_wire_hash_contains("Family", &hash)
+            dir.known_wire_hash_contains("LocationProof", &hash)
                 .await
                 .unwrap_or_else(|e| panic!("({label}) contains: {e}")),
             "({label}) #785: a cutoff BELOW every entry evicted one anyway — the \
@@ -4721,7 +4721,10 @@ pub mod test_support {
 
         // Non-canonical hashes are REFUSED at the door, not normalised.
         for bad in ["", "ABC", &hash.to_uppercase(), &hash[..63]] {
-            let Err(why) = dir.insert_known_wire_hash("Family", bad, None, newer).await else {
+            let Err(why) = dir
+                .insert_known_wire_hash("LocationProof", bad, None, newer)
+                .await
+            else {
                 panic!(
                     "({label}) #785: {bad:?} was accepted as a content hash. An \
                      empty value stores but can never be paged, and a case \
@@ -4773,19 +4776,19 @@ pub mod test_support {
             crate::federation::wire_index::content_hash_of_bytes(format!("live{label}").as_bytes());
 
         // Advertised long ago, and never again.
-        dir.insert_known_wire_hash("Community", &stale_hash, Some("peer-1"), old)
+        dir.insert_known_wire_hash("LocationProof", &stale_hash, Some("peer-1"), old)
             .await
             .unwrap_or_else(|e| panic!("({label}) insert stale: {e}"));
         // Advertised long ago, then RE-advertised by the wrapping re-sweep.
-        dir.insert_known_wire_hash("Community", &live_hash, Some("peer-1"), old)
+        dir.insert_known_wire_hash("LocationProof", &live_hash, Some("peer-1"), old)
             .await
             .unwrap_or_else(|e| panic!("({label}) insert live: {e}"));
-        dir.insert_known_wire_hash("Community", &live_hash, Some("peer-2"), fresh)
+        dir.insert_known_wire_hash("LocationProof", &live_hash, Some("peer-2"), fresh)
             .await
             .unwrap_or_else(|e| panic!("({label}) re-advertise live: {e}"));
 
         let rows = dir
-            .list_known_wire_hashes_since("Community", None, u32::MAX)
+            .list_known_wire_hashes_since("LocationProof", None, u32::MAX)
             .await
             .unwrap_or_else(|e| panic!("({label}) list: {e}"));
         let live = rows
@@ -4818,7 +4821,7 @@ pub mod test_support {
             "({label}) the entry not advertised since the cutoff must be evicted"
         );
         assert!(
-            dir.known_wire_hash_contains("Community", &live_hash)
+            dir.known_wire_hash_contains("LocationProof", &live_hash)
                 .await
                 .unwrap_or_else(|e| panic!("({label}) contains: {e}")),
             "({label}) a hash re-advertised AFTER the cutoff must survive — \
@@ -4826,7 +4829,7 @@ pub mod test_support {
              re-sweep wraps back around"
         );
         assert!(
-            !dir.known_wire_hash_contains("Community", &stale_hash)
+            !dir.known_wire_hash_contains("LocationProof", &stale_hash)
                 .await
                 .unwrap_or_else(|e| panic!("({label}) contains: {e}")),
             "({label}) the stale hash must be gone"
@@ -4847,7 +4850,7 @@ pub mod test_support {
              floor is not"
         );
         assert!(
-            dir.known_wire_hash_contains("Community", &live_hash)
+            dir.known_wire_hash_contains("LocationProof", &live_hash)
                 .await
                 .unwrap_or_else(|e| panic!("({label}) contains: {e}")),
             "({label}) a bound of 0 must NOT evict below the caller's floor"

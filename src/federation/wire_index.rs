@@ -229,6 +229,10 @@ pub(crate) async fn entry_as_stored(
 /// tables (V205): their index rows were dropped with them, and a kind this
 /// function does not name is refused below.
 ///
+/// v61 (CIRISPersist#991) — the member listing (`CommunityMembershipListing`)
+/// retired the same way, with no successor: V209 drops its table and its
+/// index rows, and the kind is refused below.
+///
 /// The `_since(None, u32::MAX)` full-scan arms (`Family`/`Community`/
 /// `LocationProof`/`*MembershipRevocation`) are O(n) in table size — acceptable for a point-read
 /// fallback/backfill path (not a per-request hot path); the 3 primary
@@ -250,6 +254,15 @@ pub async fn reload_record_bytes(
         // `identity:occurrence:v1`: their entries are `Attestation`). A framed
         // ref resolves to nothing.
         "Key" | "Revocation" | "IdentityOccurrence" | "IdentityOccurrenceRevocation" => None,
+        // v61 (CIRISPersist#991) — the group records and their widening and
+        // revocation planes ride as group-plane rows (`Attestation` entries);
+        // their six framed kinds are retired.
+        "Family"
+        | "Community"
+        | "FamilyMembershipRevocation"
+        | "CommunityMembershipRevocation"
+        | "CommunityMembershipWidening"
+        | "FamilyMembershipWidening" => None,
         "Attestation" => {
             let attestation_id = record_key_field(record_key_json, "attestation_id")?;
             match dir.get_attestation(&attestation_id).await? {
@@ -293,30 +306,6 @@ pub async fn reload_record_bytes(
         // over the INNER signed record ONLY: a node-local instant in the
         // hashed bytes would make the advertised ref unresolvable on every
         // other node (the ServedKeyRecord wire-hash lesson).
-        "Family" => {
-            let family_key_id = record_key_field(record_key_json, "family_key_id")?;
-            let rows = dir.list_signed_families_since(None, u32::MAX).await?;
-            match rows
-                .into_iter()
-                .find(|r| r.family.family.family_key_id == family_key_id)
-            {
-                Some(r) => Some(serde_json::to_vec(&r.family).map_err(|e| to_bytes(e, "Family"))?),
-                None => None,
-            }
-        }
-        "Community" => {
-            let community_key_id = record_key_field(record_key_json, "community_key_id")?;
-            let rows = dir.list_signed_communities_since(None, u32::MAX).await?;
-            match rows
-                .into_iter()
-                .find(|r| r.community.community.community_key_id == community_key_id)
-            {
-                Some(r) => {
-                    Some(serde_json::to_vec(&r.community).map_err(|e| to_bytes(e, "Community"))?)
-                }
-                None => None,
-            }
-        }
         "LocationProof" => {
             let subject_key_id = record_key_field(record_key_json, "subject_key_id")?;
             let asserted_at = record_key_field(record_key_json, "asserted_at")?;
@@ -335,116 +324,6 @@ pub async fn reload_record_bytes(
                 Some(r) => {
                     Some(serde_json::to_vec(&r.proof).map_err(|e| to_bytes(e, "LocationProof"))?)
                 }
-                None => None,
-            }
-        }
-        "FamilyMembershipRevocation" => {
-            let family_key_id = record_key_field(record_key_json, "family_key_id")?;
-            let removed_identity_key_id =
-                record_key_field(record_key_json, "removed_identity_key_id")?;
-            // v49.0.0 (#910.1, V154) — the PK carries the instant: a re-added
-            // family member can be removed again.
-            let effective_at = record_key_field(record_key_json, "effective_at")?;
-            let rows = dir
-                .list_signed_family_membership_revocations_since(None, u32::MAX)
-                .await?;
-            match rows.into_iter().find(|r| {
-                let rev = &r.revocation.family_membership_revocation;
-                rev.family_key_id == family_key_id
-                    && rev.removed_identity_key_id == removed_identity_key_id
-                    && rev.effective_at.to_rfc3339() == effective_at
-            }) {
-                Some(r) => Some(
-                    serde_json::to_vec(&r.revocation)
-                        .map_err(|e| to_bytes(e, "FamilyMembershipRevocation"))?,
-                ),
-                None => None,
-            }
-        }
-        "CommunityMembershipRevocation" => {
-            let community_key_id = record_key_field(record_key_json, "community_key_id")?;
-            let removed_identity_key_id =
-                record_key_field(record_key_json, "removed_identity_key_id")?;
-            // v48.0.0 (#860) — the PK carries the instant: a re-added member
-            // can be removed again, so the key must name WHICH removal.
-            let effective_at = record_key_field(record_key_json, "effective_at")?;
-            let rows = dir
-                .list_signed_community_membership_revocations_since(None, u32::MAX)
-                .await?;
-            match rows.into_iter().find(|r| {
-                let rev = &r.revocation.community_membership_revocation;
-                rev.community_key_id == community_key_id
-                    && rev.removed_identity_key_id == removed_identity_key_id
-                    && rev.effective_at.to_rfc3339() == effective_at
-            }) {
-                Some(r) => Some(
-                    serde_json::to_vec(&r.revocation)
-                        .map_err(|e| to_bytes(e, "CommunityMembershipRevocation"))?,
-                ),
-                None => None,
-            }
-        }
-        "CommunityMembershipWidening" => {
-            // v48.0.0 (#860) — the addition plane, keyed like the revocation.
-            let community_key_id = record_key_field(record_key_json, "community_key_id")?;
-            let member_key_id = record_key_field(record_key_json, "member_key_id")?;
-            let effective_at = record_key_field(record_key_json, "effective_at")?;
-            let rows = dir
-                .list_signed_community_membership_widenings_since(None, u32::MAX)
-                .await?;
-            match rows.into_iter().find(|w| {
-                let row = &w.widening.community_membership_widening;
-                row.community_key_id == community_key_id
-                    && row.member_key_id == member_key_id
-                    && row.effective_at.to_rfc3339() == effective_at
-            }) {
-                Some(w) => Some(
-                    serde_json::to_vec(&w.widening)
-                        .map_err(|e| to_bytes(e, "CommunityMembershipWidening"))?,
-                ),
-                None => None,
-            }
-        }
-        "FamilyMembershipWidening" => {
-            // v49.0.0 (#910) — the family addition plane, keyed like the
-            // room's.
-            let family_key_id = record_key_field(record_key_json, "family_key_id")?;
-            let member_key_id = record_key_field(record_key_json, "member_key_id")?;
-            let effective_at = record_key_field(record_key_json, "effective_at")?;
-            let rows = dir
-                .list_signed_family_membership_widenings_since(None, u32::MAX)
-                .await?;
-            match rows.into_iter().find(|w| {
-                let row = &w.widening.family_membership_widening;
-                row.family_key_id == family_key_id
-                    && row.member_key_id == member_key_id
-                    && row.effective_at.to_rfc3339() == effective_at
-            }) {
-                Some(w) => Some(
-                    serde_json::to_vec(&w.widening)
-                        .map_err(|e| to_bytes(e, "FamilyMembershipWidening"))?,
-                ),
-                None => None,
-            }
-        }
-        "CommunityMembershipListing" => {
-            // v49.0.0 (#912) — the listing plane, keyed like the widening.
-            let community_key_id = record_key_field(record_key_json, "community_key_id")?;
-            let member_key_id = record_key_field(record_key_json, "member_key_id")?;
-            let effective_at = record_key_field(record_key_json, "effective_at")?;
-            let rows = dir
-                .list_signed_community_membership_listings_since(None, u32::MAX)
-                .await?;
-            match rows.into_iter().find(|l| {
-                let row = &l.listing.community_membership_listing;
-                row.community_key_id == community_key_id
-                    && row.member_key_id == member_key_id
-                    && row.effective_at.to_rfc3339() == effective_at
-            }) {
-                Some(l) => Some(
-                    serde_json::to_vec(&l.listing)
-                        .map_err(|e| to_bytes(e, "CommunityMembershipListing"))?,
-                ),
                 None => None,
             }
         }
@@ -600,14 +479,6 @@ pub async fn all_kind_hash_keys(
         ]);
         out.push(("TransportDestination", content_hash_of(d)?, rk));
     }
-    for r in dir.list_signed_families_since(None, u32::MAX).await? {
-        let rk = record_key(&[("family_key_id", &r.family.family.family_key_id)]);
-        out.push(("Family", content_hash_of(&r.family)?, rk));
-    }
-    for r in dir.list_signed_communities_since(None, u32::MAX).await? {
-        let rk = record_key(&[("community_key_id", &r.community.community.community_key_id)]);
-        out.push(("Community", content_hash_of(&r.community)?, rk));
-    }
     for r in dir
         .list_signed_location_proofs_since(None, u32::MAX)
         .await?
@@ -621,90 +492,6 @@ pub async fn all_kind_hash_keys(
             ),
         ]);
         out.push(("LocationProof", content_hash_of(p)?, rk));
-    }
-    for r in dir
-        .list_signed_family_membership_revocations_since(None, u32::MAX)
-        .await?
-    {
-        let v = &r.revocation;
-        let effective_at = v.family_membership_revocation.effective_at.to_rfc3339();
-        let rk = record_key(&[
-            (
-                "family_key_id",
-                &v.family_membership_revocation.family_key_id,
-            ),
-            (
-                "removed_identity_key_id",
-                &v.family_membership_revocation.removed_identity_key_id,
-            ),
-            ("effective_at", &effective_at),
-        ]);
-        out.push(("FamilyMembershipRevocation", content_hash_of(v)?, rk));
-    }
-    for r in dir
-        .list_signed_community_membership_revocations_since(None, u32::MAX)
-        .await?
-    {
-        let v = &r.revocation;
-        let effective_at = v.community_membership_revocation.effective_at.to_rfc3339();
-        let rk = record_key(&[
-            (
-                "community_key_id",
-                &v.community_membership_revocation.community_key_id,
-            ),
-            (
-                "removed_identity_key_id",
-                &v.community_membership_revocation.removed_identity_key_id,
-            ),
-            ("effective_at", &effective_at),
-        ]);
-        out.push(("CommunityMembershipRevocation", content_hash_of(v)?, rk));
-    }
-    for r in dir
-        .list_signed_community_membership_widenings_since(None, u32::MAX)
-        .await?
-    {
-        let v = &r.widening;
-        let effective_at = v.community_membership_widening.effective_at.to_rfc3339();
-        let rk = record_key(&[
-            (
-                "community_key_id",
-                &v.community_membership_widening.community_key_id,
-            ),
-            (
-                "member_key_id",
-                &v.community_membership_widening.member_key_id,
-            ),
-            ("effective_at", &effective_at),
-        ]);
-        out.push(("CommunityMembershipWidening", content_hash_of(v)?, rk));
-    }
-    for r in dir
-        .list_signed_family_membership_widenings_since(None, u32::MAX)
-        .await?
-    {
-        let v = &r.widening;
-        let effective_at = v.family_membership_widening.effective_at.to_rfc3339();
-        let rk = record_key(&[
-            ("family_key_id", &v.family_membership_widening.family_key_id),
-            ("member_key_id", &v.family_membership_widening.member_key_id),
-            ("effective_at", &effective_at),
-        ]);
-        out.push(("FamilyMembershipWidening", content_hash_of(v)?, rk));
-    }
-    for r in dir
-        .list_signed_community_membership_listings_since(None, u32::MAX)
-        .await?
-    {
-        let v = &r.listing;
-        let row = &v.community_membership_listing;
-        let effective_at = row.effective_at.to_rfc3339();
-        let rk = record_key(&[
-            ("community_key_id", &row.community_key_id),
-            ("member_key_id", &row.member_key_id),
-            ("effective_at", &effective_at),
-        ]);
-        out.push(("CommunityMembershipListing", content_hash_of(v)?, rk));
     }
     Ok(out)
 }

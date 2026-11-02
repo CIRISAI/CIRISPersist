@@ -75,6 +75,11 @@ pub enum ReplicatedCommunityRefusal {
     /// stored infrastructure record with a non-conformant one (a weakening
     /// supersede, CC 3.2).
     DegradesConformance,
+    /// v61 (CIRISPersist#1148) — THIS node is not in the record's audience
+    /// (`replication_audience::may_receive_community_record` for its own
+    /// key): a replicated door stores only what this node may receive.
+    /// APPENDED.
+    NotInAudience,
 }
 
 /// v50.0.0 (PR #921 review, Codex F3) — what a community write DID, as the
@@ -223,7 +228,7 @@ where
     if !admit_amendment(dir, &offer, &stored).await? {
         return Ok(OccupiedRoute::Settled(CommunityWrite::Unchanged));
     }
-    super::check_consensus_protocol_form(&f.consensus_protocol)?;
+    super::admission::check_family_consensus_protocol_form(&f.consensus_protocol)?;
     super::admission::validate_family_members(dir, f).await?;
     // v53.0.0 (CC 3.2 T6, consequence (i)) — a family version carries no
     // signed instant, so it is judged at admission.
@@ -675,7 +680,7 @@ pub(crate) async fn supersede_family_signed<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    super::check_consensus_protocol_form(&new.family.consensus_protocol)?;
+    super::admission::check_family_consensus_protocol_form(&new.family.consensus_protocol)?;
     super::verify_family_admission(dir, &new).await?;
     // v52.0.0 (#956) — a dissolved family admits no change, on either door.
     super::family_dissolution::refuse_if_held_family_dissolved(dir, &new.family.family_key_id)
@@ -749,6 +754,9 @@ where
     super::affiliation_config::check_record_is(&new.community, cohort)?;
     super::affiliation_config::check_community_record(&new.community)?;
     super::verify_community_admission(dir, &new).await?;
+    // v61 S2 (CIRISPersist#1123) — a room stored under founder_only admits
+    // one new version, its escape.
+    super::admission::check_founder_only_escape(dir, &new, chrono::Utc::now()).await?;
     // v52.0.0 (#955, Q2) — an amendment never adds a member. The one
     // exception is a trust-root founders' amendment (#926 HIGH-3: its founder
     // seats move ONLY through the record): a founder it seats signed that very

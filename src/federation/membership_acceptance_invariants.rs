@@ -76,6 +76,50 @@ pub(crate) mod bodies {
         found_room(d, cid, protocol, founders, unsigned, Some(blob)).await
     }
 
+    /// v61 (CIRISPersist#1123) — [`found_community`] as a `public` room
+    /// (`policy_blob.cohort_subkind: public`).
+    pub(crate) async fn found_public_room<D: FederationDirectory + ?Sized>(
+        d: &D,
+        cid: &str,
+        protocol: &str,
+        founders: &[&str],
+        unsigned: &[&str],
+    ) -> Result<(), Error> {
+        let blob = serde_json::json!({
+            "cohort_subkind": crate::federation::public_room::COHORT_SUBKIND_PUBLIC
+        });
+        found_room(d, cid, protocol, founders, unsigned, Some(blob)).await
+    }
+
+    /// v61 S2 (CIRISPersist#1143) — [`found_community`] carrying `policy_blob`
+    /// (an affiliation with its config).
+    pub(crate) async fn found_room_with_blob<D: FederationDirectory + ?Sized>(
+        d: &D,
+        cid: &str,
+        protocol: &str,
+        founders: &[&str],
+        unsigned: &[&str],
+        policy_blob: Option<serde_json::Value>,
+    ) -> Result<(), Error> {
+        found_room(d, cid, protocol, founders, unsigned, policy_blob).await
+    }
+
+    /// v61 S2 — [`found_public_room`] founded (and its seats taken) at
+    /// `founded_at`, for a witness whose roster events lie further back than
+    /// the default day.
+    pub(crate) async fn found_public_room_at<D: FederationDirectory + ?Sized>(
+        d: &D,
+        cid: &str,
+        protocol: &str,
+        founders: &[&str],
+        founded_at: DateTime<Utc>,
+    ) -> Result<(), Error> {
+        let blob = serde_json::json!({
+            "cohort_subkind": crate::federation::public_room::COHORT_SUBKIND_PUBLIC
+        });
+        found_room_at(d, cid, protocol, founders, &[], Some(blob), founded_at).await
+    }
+
     async fn found_room<D: FederationDirectory + ?Sized>(
         d: &D,
         cid: &str,
@@ -84,13 +128,35 @@ pub(crate) mod bodies {
         unsigned: &[&str],
         policy_blob: Option<serde_json::Value>,
     ) -> Result<(), Error> {
+        let founded_at = Utc::now() - Duration::days(1);
+        found_room_at(
+            d,
+            cid,
+            protocol,
+            founders,
+            unsigned,
+            policy_blob,
+            founded_at,
+        )
+        .await
+    }
+
+    async fn found_room_at<D: FederationDirectory + ?Sized>(
+        d: &D,
+        cid: &str,
+        protocol: &str,
+        founders: &[&str],
+        unsigned: &[&str],
+        policy_blob: Option<serde_json::Value>,
+        founded_at: DateTime<Utc>,
+    ) -> Result<(), Error> {
         let members = founders
             .iter()
             .map(|k| ((*k).to_owned(), Some("founder".to_owned())))
             .chain(unsigned.iter().map(|k| ((*k).to_owned(), None)))
             .map(|(key_id, role)| CommunityMember {
                 key_id,
-                joined_at: ms(Utc::now() - Duration::days(1)),
+                joined_at: ms(founded_at),
                 role,
             })
             .collect();
@@ -100,7 +166,7 @@ pub(crate) mod bodies {
             community_key_id: cid.to_owned(),
             community_name: "I21x co-op".into(),
             members,
-            founded_at: ms(Utc::now() - Duration::days(1)),
+            founded_at: ms(founded_at),
             consensus_protocol: protocol.to_owned(),
             policy_blob,
             persist_row_hash: String::new(),
@@ -200,17 +266,21 @@ pub(crate) mod bodies {
         asserted_at: DateTime<Utc>,
         ttl: Option<Duration>,
     ) -> Attestation {
+        let mut env = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "dimension": PROPOSAL_DIMENSION,
+            "group_kind": group_kind(scope),
+            target_key(scope): group,
+        });
+        // Absent when no role is offered (CC 2.6.1.7: never `null`).
+        if let Some(role) = role {
+            env["role"] = role.into();
+        }
         row(
             proposer,
             proposer,
             scope,
-            serde_json::json!({
-                "id": uuid::Uuid::new_v4().to_string(),
-                "dimension": PROPOSAL_DIMENSION,
-                "group_kind": group_kind(scope),
-                target_key(scope): group,
-                "role": role,
-            }),
+            env,
             asserted_at,
             ttl.map(|t| asserted_at + t),
             vec![invitee.to_owned()],
@@ -239,11 +309,9 @@ pub(crate) mod bodies {
             "proposal_hash": p.original_content_hash,
         });
         if accept {
-            env["role"] = p
-                .attestation_envelope
-                .get("role")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
+            if let Some(role) = p.attestation_envelope.get("role").filter(|v| !v.is_null()) {
+                env["role"] = role.clone();
+            }
         }
         row(
             signer,
@@ -343,7 +411,7 @@ pub(crate) mod bodies {
             format!("i210-x-{s}"),
         );
         reg(d, &[&cid, &founder, &k, &stranger]).await;
-        found_community(d, &cid, "founder_only", &[&founder], &[])
+        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .expect("I210: the founder founds the room");
         let p = proposal(
@@ -429,7 +497,7 @@ pub(crate) mod bodies {
             format!("i211-x-{s}"),
         );
         reg(d, &[&cid, &founder, &k, &stranger]).await;
-        found_community(d, &cid, "founder_only", &[&founder], &[])
+        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let p = proposal(
@@ -473,6 +541,77 @@ pub(crate) mod bodies {
     // ── I212 ──────────────────────────────────────────────────────────────
     /// **I212 — a growth needs the member's acceptance (founder_only, both
     /// planes); a role change of an active member needs none.**
+    /// **I1495 (CIRISPersist#1151, the sunset)** — a v60 peer's
+    /// `membership:proposal` and `membership:acceptance` carry `"role": null`
+    /// when no role is offered. They are admitted, read as no role, and the
+    /// growth they authorise lands as a plain member. A `null` on any OTHER
+    /// member of the same rows is still refused `envelope_member_null`.
+    pub async fn i1495_a_v60_null_role_is_read_as_absent<D: FederationDirectory + ?Sized>(
+        d: &D,
+        s: &str,
+    ) {
+        let (cid, founder, k) = (
+            format!("i1495-c-{s}"),
+            format!("i1495-f-{s}"),
+            format!("i1495-k-{s}"),
+        );
+        reg(d, &[&cid, &founder, &k]).await;
+        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let mut p = proposal(
+            &founder,
+            COMMUNITY,
+            &cid,
+            &k,
+            None,
+            now,
+            Some(Duration::days(7)),
+        );
+        p.attestation_envelope["role"] = serde_json::Value::Null;
+        ts::seal_row_in_place(&founder, &mut p);
+
+        let mut other = p.clone();
+        other.attestation_envelope["note"] = serde_json::Value::Null;
+        ts::seal_row_in_place(&founder, &mut other);
+        let e = put(d, &other)
+            .await
+            .expect_err("I1495: a null on another member of the row is refused");
+        assert!(
+            matches!(
+                &e,
+                Error::MalformedRow { reason, .. }
+                    if *reason == crate::federation::malformed_row::ENVELOPE_MEMBER_NULL
+            ) && e.to_string().contains("`note`"),
+            "I1495: {e}"
+        );
+
+        put(d, &p)
+            .await
+            .expect("I1495: a v60 proposal with role null is admitted");
+        let mut a = reply(&k, &k, &p, true, now);
+        a.attestation_envelope["role"] = serde_json::Value::Null;
+        ts::seal_row_in_place(&k, &mut a);
+        put(d, &a)
+            .await
+            .expect("I1495: a v60 acceptance with role null is admitted");
+        let held = d
+            .get_attestation(&p.attestation_id)
+            .await
+            .unwrap()
+            .expect("I1495: the proposal is held");
+        assert_eq!(
+            held.attestation_envelope["role"],
+            serde_json::Value::Null,
+            "I1495: the signed bytes are kept as written"
+        );
+        widen_community(d, &cid, &[&founder], &k, None, now)
+            .await
+            .expect("I1495: the null role reads as no role, so the role-less growth matches");
+        assert!(active_in_community(d, &cid, &k).await, "I1495: K is in");
+    }
+
     pub async fn i212_growth_needs_acceptance<D: FederationDirectory + ?Sized>(d: &D, s: &str) {
         let (cid, fid, founder, k, j) = (
             format!("i212-c-{s}"),
@@ -482,7 +621,7 @@ pub(crate) mod bodies {
             format!("i212-j-{s}"),
         );
         reg(d, &[&cid, &fid, &founder, &k, &j]).await;
-        found_community(d, &cid, "founder_only", &[&founder], &[])
+        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let now = Utc::now();
@@ -517,17 +656,16 @@ pub(crate) mod bodies {
         )
         .await
         .expect("I212: a role change needs no acceptance");
-        // under founder_only only a founder invites: K (a plain member) cannot
-        let e = put(
+        // v61 (CIRISPersist#1123) — `founder_only` is refused above the
+        // family, so the room is `quorum:1/1`, under which any member invites:
+        // K (a plain member) may. The founders-only proposer rule on a room is
+        // `open:self_admit`'s (I1502); on a family it is witnessed below.
+        put(
             d,
             &proposal(&k, COMMUNITY, &cid, &j, None, now, Some(Duration::days(7))),
         )
         .await
-        .expect_err("I212: a non-founder's proposal under founder_only");
-        assert!(
-            matches!(e, Error::InvalidArgument(ref m) if m.contains("founder_only")),
-            "I212: {e:?}"
-        );
+        .expect("I212: a member's proposal under quorum:1/1");
         // the family plane, the same rule
         found_family(d, &fid, "founder_only", &[&founder], &[])
             .await
@@ -594,7 +732,7 @@ pub(crate) mod bodies {
             format!("i213-k-{s}"),
         );
         reg(d, &[&cid, &founder, &k]).await;
-        found_community(d, &cid, "founder_only", &[&founder], &[])
+        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let now = Utc::now();
@@ -688,7 +826,7 @@ pub(crate) mod bodies {
             format!("i214-m-{s}"),
         );
         reg(d, &[&cid, &founder, &k, &j, &m]).await;
-        found_community(d, &cid, "founder_only", &[&founder], &[])
+        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let t0 = Utc::now() - Duration::days(20);
@@ -782,7 +920,7 @@ pub(crate) mod bodies {
             format!("i215-k-{s}"),
         );
         reg(d, &[&cid, &founder, &k]).await;
-        found_community(d, &cid, "founder_only", &[&founder], &[])
+        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let now = Utc::now();
@@ -906,7 +1044,7 @@ pub(crate) mod bodies {
             format!("i217-k-{s}"),
         );
         reg(d, &[&cid, &founder, &k]).await;
-        found_community(d, &cid, "founder_only", &[&founder], &[])
+        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let mut c = d.lookup_community(&cid).await.unwrap().unwrap();
@@ -974,7 +1112,7 @@ pub(crate) mod bodies {
         for n in [a, b] {
             reg(n, &[&cid, &founder, &k]).await;
         }
-        found_community(a, &cid, "founder_only", &[&founder], &[])
+        found_community(a, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let now = Utc::now();
@@ -1070,6 +1208,11 @@ mod run {
                 async fn i211() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i211_the_reply_arm(&b, &bodies::suffix()).await
+                }
+                #[tokio::test]
+                async fn i1495() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i1495_a_v60_null_role_is_read_as_absent(&b, &bodies::suffix()).await
                 }
                 #[tokio::test]
                 async fn i212() {

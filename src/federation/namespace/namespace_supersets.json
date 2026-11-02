@@ -15893,6 +15893,54 @@
     "manifest_round": "cc-rc7-536b8cb-1053"
    },
    {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-public-community",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/public_room.rs#live_standing_proposal",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1063"
+   },
+   {
+    "decimal_id": "3.1.9.4",
+    "claim_id": "CLM-composer-convergent-rank",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/attestation_query.rs#lifecycle_predicate",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1157"
+   },
+   {
+    "decimal_id": "4.4.3.2.8",
+    "claim_id": "CLM-affiliation-one-voice-countersign",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/affiliation_config.rs#check_one_voice_countersign",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1143"
+   },
+   {
+    "decimal_id": "4.5.13",
+    "claim_id": "CLM-one-voice-room",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_founder_only_above_family",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1123"
+   },
+   {
+    "decimal_id": "2.1",
+    "claim_id": "CLM-subject-within-audience",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_cohort_standing_resolved",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1161"
+   },
+   {
+    "decimal_id": "4.5.13",
+    "claim_id": "CLM-one-voice-room",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/consensus.rs#evaluate_open_self_admit",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1123"
+   },
+   {
     "decimal_id": "3.1.9.4",
     "claim_id": "CLM-nsproc-class-dual-scope-gate-watchlist-id",
     "repo": "CIRISPersist",
@@ -16335,6 +16383,60 @@
      "# family's held hashes are its scores rows' wire-index entries, one shared read."
     ],
     "witness": "I1201 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-planes-as-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/group_plane.rs#plan_group_row",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-991",
+    "tsv_comment_before": [
+     "",
+     "# v61 (CIRISPersist#991 planes 2 and 3) — the group records and the roster planes",
+     "# as rows: group:roster:v1, membership:{widening,removal,resignation}:v1."
+    ],
+    "witness": "I1484, I1485 (sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-planes-as-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/group_plane.rs#apply_group_plane_row",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-991",
+    "witness": "I1486 (sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-planes-as-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/group_plane.rs#rehome_group_records",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-991",
+    "witness": "I1489 (sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-cosigned-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/tier_ingest.rs#verify_roster_cosignatures",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-991",
+    "tsv_comment_before": [
+     "# v61 (CIRISPersist#991) — cosigned rows: the co-signatures ride as additional_scrubs,",
+     "# counted by the one predicate; a retraction is a cosigned withdraws."
+    ],
+    "witness": "I1484, I1485, I1486 (sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-cosigned-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/group_plane.rs#check_cosigned_withdraws",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-991",
+    "witness": "I1487 (sqlite, postgres)"
    },
    {
     "decimal_id": "3.3.1",
@@ -17064,6 +17166,31 @@
     "decimal_id": "2.6.1.7",
     "claim_id": "CLM-signed-object",
     "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_envelope_member_shapes",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s0",
+    "witness": "I1478, I1479 (sqlite, postgres): envelope_member_null on an explicit-null member; witnesses[] sorted and unique, else federation_set_semantics_unsorted (CIRISPersist#1098 F4, F5)"
+   },
+   {
+    "decimal_id": "3.1.5",
+    "claim_id": "CLM-trace-family",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_trace_dimension_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s0"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-steward-binding-by-custody",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#is_steward_bound",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s0"
+   },
+   {
+    "decimal_id": "2.6.1.7",
+    "claim_id": "CLM-signed-object",
+    "repo": "CIRISPersist",
     "path#symbol": "src/federation/mod.rs#validate_subject_key_ids",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v60-1114",
@@ -17225,6 +17352,29 @@
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v60.1-b",
     "witness": "infra_relay_is_appended_and_pinned_by_position (unit): infra:relay is ALL[24] and INFRA[12], appended; I1361 (sqlite, postgres) (CIRISPersist#1119)"
+   },
+   {
+    "decimal_id": "5.3",
+    "claim_id": "CLM-serve-seat-announced",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#serve_seat_owner_announced",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s3",
+    "tsv_comment_before": [
+     "",
+     "# v61 slice S3 — a serve seat needs an announced owner (CIRISPersist#1101), and a",
+     "# signed instant is `.sssZ` and nothing else verifies (CC 2.6.2, strict)."
+    ],
+    "witness": "I1101 (sqlite, postgres): a node whose owner binding is self-scope only is refused serve_seat_owner_unannounced at the widening; a later announcement seats it and a withdrawn one does not (CIRISPersist#1101)"
+   },
+   {
+    "decimal_id": "2.6.2",
+    "claim_id": "CLM-canonicalization",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#signed_instant_form_violation",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s3",
+    "witness": "I-IFP-2 (unit): the predicate reads every rfc3339-ms member of CC 2.6.1.7; I1494 (sqlite, postgres): CC's refuse_timestamp_form vector is refused envelope_member_invalid; I-IFP-1 (sqlite, postgres): the open-time pass settles a v60 node"
    }
   ],
   "CIRISServer": [

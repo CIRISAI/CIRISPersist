@@ -80,8 +80,7 @@ impl FeedbackMappingService for PostgresBackend {
     ) -> Result<ClaimResult<FeedbackMapping>, Error> {
         validate_feedback(&feedback)?;
         let mut client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let tx = client
@@ -142,8 +141,7 @@ impl FeedbackMappingService for PostgresBackend {
             )));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let rows = client
@@ -207,8 +205,7 @@ impl FeedbackMappingService for PostgresBackend {
              LIMIT ${p_limit}"
         );
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =

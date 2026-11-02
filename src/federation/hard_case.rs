@@ -599,7 +599,7 @@ pub fn membership_removed_event(
             "change_kind": change_kind::REMOVED,
             "subject_key_id": removed_identity_key_id,
             "cohort_key_id": cohort_key_id,
-            "effective_at": effective_at.to_rfc3339(),
+            "effective_at": crate::federation::admission::render_signed_instant(effective_at),
         }),
         emitted_at: effective_at,
         emitter_key_id: String::new(),

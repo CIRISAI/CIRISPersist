@@ -1029,25 +1029,35 @@ mod run {
             ENVELOPE.contains("paths::MEDIA,"),
             "I119: the vocabulary manifest lists the member (and re-pins)"
         );
+        // v61 (CIRISPersist#934, S4a) — the two claim-carrying byte doors are
+        // shared plans; each backend's executor stores the size and indexes
+        // the claim (#870).
         for (name, text) in [("sqlite.rs", SQLITE), ("postgres.rs", PG)] {
             for door in [
-                "async fn put_blob_with_scope(",
-                "async fn adopt_sealed_blob_at(",
+                "blob_admit::put_blob_planned(",
+                "blob_admit::adopt_sealed_blob_planned(",
+            ] {
+                assert!(
+                    text.contains(door),
+                    "I119: {name}'s byte door is not the shared `{door}`"
+                );
+            }
+            for (executor, stores_size) in [
+                ("async fn store_planned_blob(", true),
+                ("async fn store_planned_announcement(", false),
             ] {
                 let body = text
-                    .split(door)
+                    .split(executor)
                     .nth(1)
-                    .unwrap_or_else(|| panic!("I119: {name} has {door}"));
+                    .unwrap_or_else(|| panic!("I119: {name} has {executor}"));
                 let body = &body[..body.find("\n    }\n").expect("end")];
                 assert!(
-                    body.contains("size_bytes")
-                        || body.contains("size_i64")
-                        || body.contains("size,"),
-                    "I119: {name} {door} stores the size"
+                    !stores_size || body.contains("size_bytes"),
+                    "I119: {name} {executor} stores the size"
                 );
                 assert!(
                     live_lines(body).any(|l| l.contains("index_holder_claim(")),
-                    "I119: {name} {door} indexes the claim (#870)"
+                    "I119: {name} {executor} indexes the claim (#870)"
                 );
             }
         }

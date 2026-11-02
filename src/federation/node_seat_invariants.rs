@@ -21,6 +21,21 @@ pub(crate) mod bodies {
     const PLAIN: &str = "pn2-plain-node";
     const HUMAN: &str = "hx3-conferred-human";
 
+    /// v61 (CIRISPersist#1101, CC 5.4.6) — the node's owner announces:
+    /// a live owner binding at `cohort_scope: federation`. Returns the
+    /// binding's id.
+    pub(crate) async fn announce(d: &dyn FederationDirectory, node: &str) -> String {
+        let owner = format!("own-{node}");
+        m::reg(d, &[&owner]).await;
+        let id = uuid::Uuid::new_v4().to_string();
+        d.put_attestation(SignedAttestation {
+            attestation: ts::owner_binding_attestation(&id, &owner, node),
+        })
+        .await
+        .expect("the owner announces the node");
+        id
+    }
+
     async fn seated(d: &dyn FederationDirectory, group: &str, key: &str) -> bool {
         d.active_community_members(group)
             .await
@@ -62,6 +77,7 @@ pub(crate) mod bodies {
             .await
             .unwrap();
         put_conferred(d, &holders, BLESSED, identity_type::NODE).await;
+        announce(d, BLESSED).await;
         let e = d
             .put_community_membership_widening(widening_by(&[FOUNDERS[0]], BLESSED, Some("member")))
             .await
@@ -126,6 +142,76 @@ pub(crate) mod bodies {
         assert!(!seated(d, CANON, HUMAN).await);
     }
 
+    /// **I1101 — a serve seat needs an announced owner (CC 5.4.6,
+    /// `CLM-serve-seat-announced`).** An accord-scrubbed node whose owner
+    /// binding is `self`-scope only is refused `serve_seat_owner_unannounced`
+    /// at the widening and is not seated (a founding record seats its node
+    /// as before: a genesis bundle carries no owner binding); the owner
+    /// announcing later satisfies the predicate and the re-offered widening
+    /// seats it; withdrawing the announcement un-satisfies the predicate.
+    pub async fn i1101_a_serve_seat_needs_an_announced_owner(d: &dyn FederationDirectory) {
+        use crate::federation::admission::{
+            serve_seat_owner_announced, SERVE_SEAT_OWNER_UNANNOUNCED,
+        };
+        use crate::federation::membership_acceptance::is_retryable_rule;
+        let holders = stand_up(d).await;
+        put_conferred(d, &holders, BLESSED, identity_type::NODE).await;
+        // The owner's binding at `self` only: the node is owned, not announced.
+        let owner = format!("own-{BLESSED}");
+        m::reg(d, &[&owner]).await;
+        let mut private =
+            ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &owner, BLESSED);
+        private.cohort_scope = crate::federation::types::cohort_scope::SELF.to_owned();
+        ts::reseal(&mut private);
+        d.put_attestation(SignedAttestation {
+            attestation: private,
+        })
+        .await
+        .expect("I1101: the owner binds the node at self");
+        assert!(!serve_seat_owner_announced(d, BLESSED).await.unwrap());
+        assert!(is_retryable_rule(SERVE_SEAT_OWNER_UNANNOUNCED));
+        d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+            .await
+            .unwrap();
+        let widening = || widening_by(&[FOUNDERS[0], FOUNDERS[1]], BLESSED, Some("member"));
+        let e = d
+            .put_community_membership_widening(widening())
+            .await
+            .expect_err("I1101: an unannounced node is not seated by a widening");
+        assert_eq!(m::rule_of(&e), SERVE_SEAT_OWNER_UNANNOUNCED, "I1101: {e}");
+        assert!(!seated(d, CANON, BLESSED).await);
+
+        // The owner announces later: live, not instant-bound.
+        let announced = announce(d, BLESSED).await;
+        assert!(serve_seat_owner_announced(d, BLESSED).await.unwrap());
+        d.put_community_membership_widening(widening())
+            .await
+            .expect("I1101: the announced node is seated");
+        assert!(seated(d, CANON, BLESSED).await);
+
+        // Withdrawing the announcement un-satisfies the predicate.
+        let binding = d.get_attestation(&announced).await.unwrap().unwrap();
+        let mut w = ts::bare_attestation(
+            &uuid::Uuid::new_v4().to_string(),
+            &binding.attesting_key_id,
+            BLESSED,
+            &serde_json::json!({
+                "dimension": crate::federation::types::owner_binding::DIMENSION,
+                "references_attestation_id": announced,
+                "withdrawal_reason": "the owner withdraws the announcement",
+            }),
+        );
+        w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.to_owned();
+        let w = ts::seal_row(&binding.attesting_key_id, w);
+        d.put_attestation(SignedAttestation { attestation: w })
+            .await
+            .expect("I1101: the owner withdraws the announcement");
+        assert!(
+            !serve_seat_owner_announced(d, BLESSED).await.unwrap(),
+            "I1101: a withdrawn announcement does not satisfy the predicate"
+        );
+    }
+
     /// **I339 — the exemption is the infrastructure community's only: the same
     /// accord-scrubbed node is refused in an ordinary community and a family.**
     pub async fn i339_a_node_elsewhere_is_refused(d: &dyn FederationDirectory) {
@@ -151,14 +237,14 @@ pub(crate) mod bodies {
         let e = m::found_community(
             d,
             &format!("i339-x-{s}"),
-            "founder_only",
+            "quorum:1/1",
             &[&founder],
             &[BLESSED],
         )
         .await
         .expect_err("I339: an unsigned node at an ordinary community's founding");
         assert_eq!(m::rule_of(&e), RULE_FOUNDING_MEMBER_UNSIGNED, "I339: {e}");
-        m::found_community(d, &cid, "founder_only", &[&founder], &[])
+        m::found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let e = m::widen_community(d, &cid, &[&founder], BLESSED, None, now)
@@ -230,6 +316,14 @@ mod run {
                 async fn i338() {
                     let Some(d) = $fresh.await else { return };
                     bodies::i338_a_human_member_still_accepts(&d as &dyn FederationDirectory).await
+                }
+                #[tokio::test]
+                async fn i1101() {
+                    let Some(d) = $fresh.await else { return };
+                    bodies::i1101_a_serve_seat_needs_an_announced_owner(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
                 }
                 #[tokio::test]
                 async fn i339() {

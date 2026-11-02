@@ -22,29 +22,29 @@
    "T18",
    "T19"
   ],
-  "catalogue_version": 3,
-  "generator": "packaging/vendor_csd4.py (harness.native.model.trace at the pinned commit)",
+  "catalogue_version": 5,
+  "generator": "python -m harness.native trace (harness.native.model.traces)",
   "sources": {
-   "T0-just-me-offline.yaml": "beef50682515ce31fed500fb9143dea359b9986cb41f3eef9126ef8806840038",
-   "T1-one-person-two-devices.yaml": "4f0a8b4f6d5c6ddfbf557b753d389229f637d989d11986c75ef5d50067a4ca5d",
-   "T10-stolen-device-quorum-evict.yaml": "d77b54a4f5a94e3fa859861156db869ea690eb5e4450cdfef0e93f8cd5fa8e25",
-   "T11-lost-devices-lone-recovery.yaml": "58ed9167fc9ce50fc7b530dfaad9eb658d866e59856c0affd7e090c49b7a8cbb",
-   "T12-root-stall-recovery.yaml": "6cb5aebd56efb129557eeb99aaba1db3bd762b940cae36d361c3797a6715970b",
-   "T13-witnessed-lineage.yaml": "9f4908b93c1983c668ae6b325d9be3e7c5719fcda44dd07280c24e30bf59129f",
-   "T14-consent-end-to-end.yaml": "80c2e2596edcbc5ef1d52cb4429199c2021a5202c11ad76901c638f0971dbb64",
-   "T15-community-ceremony.yaml": "f8e2c6cd5d754720c4e9499fcfbd886f174b47e0ed36ade36c60cfb04daaa590",
-   "T16-agent-retirement.yaml": "16aed4cdc287f1001c255239c43f524c69fb0856510db1c2884549a49b52a607",
-   "T17-takedown-purge.yaml": "ff9df050d70ed20fafe2e12cb2b6d7b28afc0a7e0ab931ec0d9f083cb766cecc",
-   "T18-delegation-ends.yaml": "c26b11d1bcaa007809a9dae27094821c4c2f3f63479e4cbccaac910db897d92a",
-   "T19-holders-under-coercion.yaml": "b5fcca370623a56acbbacd78bd372ba79b20645eb711dff87c3a25ebcc250d39",
-   "T2-pair-room-outsider.yaml": "74c1887b64fedf824ab511a82aa355738b1ff5e876f00e6ec40a6420317b9fd5",
-   "T3-second-device-approval.yaml": "8cf100dcf0a1255ffadc0e846383890b170cd9a71d5e129f029a112065582e7b",
-   "T4-household.yaml": "c314962dd0fa8dd67e8f73561291fe10f379a6843ffb5cb7780d30e3ac5ff160",
-   "T5-community-quorum.yaml": "e57ca85b3a391866a3fe5d9eed6050499bc5ba31d57058d5e8fd6515252ee62f",
-   "T6-affiliation-delegation.yaml": "d46ba6368f9cb99472a57af812c60887bb0002d16fabec2bfe3d4cb0ec4f2712",
-   "T7-agent-steward-wa.yaml": "7813ec9880986ff75467113745c1976ef7df3153f15c18be5fbd61958230af85",
-   "T8-accord-halt.yaml": "908fa85dca44c3341db8d8cd7a24fc15edb296a6078cd14d7335de6118d8ff6f",
-   "T9-two-roots-outsider.yaml": "eaba4f2ab638bc3411b0664c12c3f92bcb09918270a2fa0e18836c40bb8201a0"
+   "T0-just-me-offline.yaml": "927c4a632e99ff7eb1de3003052bf4a22364bc5e3755dc7e31b79c1fbf485a4e",
+   "T1-one-person-two-devices.yaml": "2029af1b1727063a17ee51afe1b1f4cf8ff71af4dda1b428986ebb16f7786e08",
+   "T10-stolen-device-quorum-evict.yaml": "885959cc4ce6019dd459eb1b356d6329fb8c9a291b03b45dda063a081f0439d4",
+   "T11-lost-devices-lone-recovery.yaml": "b433133229ff5cd5a79a2468a5ab1ca5303ac719c4d49ce47713b5cbc399d12a",
+   "T12-root-stall-recovery.yaml": "8d9a94641e0ab93a206d6abe7504ff0fc867568d0e89f38ebc36e9b1e8c881b6",
+   "T13-witnessed-lineage.yaml": "90a25b7d9e3310b40c0682eac9f436ba8f073917f70854c0041a9e26d47c82ae",
+   "T14-consent-end-to-end.yaml": "5aa4e8f69a365199007f60dd909b5a66aef28644924548394c198814b337b754",
+   "T15-community-ceremony.yaml": "5710dc47916d2589d78d3fc95c63cb74cccae7203fc45787fde85486ce33ff49",
+   "T16-agent-retirement.yaml": "5f963a681b0bdee2ba31948e38ccaa69122180a97771ab7bb1f70fadecdd35e7",
+   "T17-takedown-purge.yaml": "81277055e97457f9974563b39d461a027e77414689528a1b1c4f75fc0b1f8602",
+   "T18-delegation-ends.yaml": "ebeb3f8bcde67a7d3ce25875e2742a6fda4154b1b3b05835e6bc6cb82186f292",
+   "T19-holders-under-coercion.yaml": "76daff802d8cff73ca8ef27c65baa12ff26dbd6c5595e375574e75b9d53bf263",
+   "T2-pair-room-outsider.yaml": "b8b277e803fff3fcc63e8ec269b2ad886bedae5e57120170c8797eefba61e07f",
+   "T3-second-device-approval.yaml": "22332ad0bc4b86c299a926afb3f953e0999e5656742ff733f0aa919f3e5bdfa4",
+   "T4-household.yaml": "20adfba53490723d8eb2820e4bcb148faa2b7a89dd5f65efbaf2f3c5f87169b5",
+   "T5-community-quorum.yaml": "67a3e7efdf6e3cbd137f98620eac2c5a27662445d0ec3a2dafa518b522b478d7",
+   "T6-affiliation-delegation.yaml": "6429359d777adda21c95e1b260c9140ccb034520486b3e6d8bdd2091b50498f0",
+   "T7-agent-steward-wa.yaml": "b519c44f5f2525bf39b4b8458ff6cfa1c9e72a37ef89d03850285274c87300a0",
+   "T8-accord-halt.yaml": "e85405bc36270d701ebed925fa5ac46c1192b0faf8fa377601c4858b14027596",
+   "T9-two-roots-outsider.yaml": "e66a9e1549f0a780322a30dba9ba968d028378ccab6adafc2e8d7f685c9140bf"
   }
  },
  "entries": {
@@ -61,6 +61,7 @@
     "node.unannounced",
     "values.ready"
    ],
+   "realized_by": {},
    "refused": {},
    "steps": [
     {
@@ -136,6 +137,7 @@
     "file.custody_received",
     "file.withdrawn"
    ],
+   "realized_by": {},
    "refused": {},
    "steps": [
     {
@@ -406,6 +408,7 @@
     "key.membership.evicted",
     "self.roster_size.three_more"
    ],
+   "realized_by": {},
    "refused": {},
    "steps": [
     {
@@ -841,6 +844,7 @@
     "key.membership.evicted",
     "self.roster_size.one"
    ],
+   "realized_by": {},
    "refused": {
     "rel[14]:evict_lone": "known red: CIRISServer#794 (a filed product defect; --include-known-red builds through it)",
     "rel[15]:evict_lone": "known red: CIRISServer#794 (a filed product defect; --include-known-red builds through it)"
@@ -1302,6 +1306,7 @@
     "root.liveness.live",
     "seat.identity_type.human"
    ],
+   "realized_by": {},
    "refused": {
     "rel[4]:resign": "relation `resign`: route exists, builder branch not written \u2014 POST /v1/accord/family/supersede + /cosign (a founder leaves the seated roster); the witness is persist's hard_case:community_liveness_stalled row, not /v1/trust-root's posture string",
     "rel[5]:confer": "relation `confer`: route exists, builder branch not written \u2014 POST /v1/accord/family/supersede + /cosign (a conferred human widens the roster: T7 recovery)"
@@ -1540,6 +1545,7 @@
     "root.head.stale",
     "seat.identity_type.node_bearing"
    ],
+   "realized_by": {},
    "refused": {
     "rel[1]:lineage_head": "known red: CIRISServer#693 (a filed product defect; --include-known-red builds through it)",
     "rel[2]:seat_node_bearing": "relation `seat_node_bearing`: a node-bearing seat on a SUCCESSOR family head: the anchor mints one family per mesh, so there is no successor head to seat it on (one root per mesh, as T9)"
@@ -1721,6 +1727,7 @@
     "consent.community_trust.bounded",
     "consent.replication.none"
    ],
+   "realized_by": {},
    "refused": {
     "rel[10]:consent_expire": "known red: CIRISServer#182 (a filed product defect; --include-known-red builds through it)",
     "rel[11]:consent_decay": "relation `consent_decay`: the agent's consent decay (identity_severed \u2192 patterns_anonymized \u2192 complete, CC 3.3.1) is a self-report of a CIRISAgent process; no agent runs in this harness",
@@ -2145,6 +2152,7 @@
     "group.moderator.fail_secure",
     "group.federating.no"
    ],
+   "realized_by": {},
    "refused": {
     "rel[18]:invite": "relation `invite`: route exists, builder branch not written \u2014 POST /v1/communities/{id}/invites (a proposal, not yet accepted)",
     "rel[19]:accept": "relation `accept`: route exists, builder branch not written \u2014 the invitee's acceptance while the group's quorum is pending",
@@ -2932,6 +2940,7 @@
     "agent.retirement.retired",
     "agent.halt_gate.acting"
    ],
+   "realized_by": {},
    "refused": {
     "rel[0]:agent_bond": "relation `agent_bond`: the agent's bond to its node (CC 1.13.2): needs a CIRISAgent process",
     "rel[10]:retirement": "relation `retirement`: retirement under the Standard (CC 7.5.5): the agent's own ladder; needs a CIRISAgent process",
@@ -3243,6 +3252,7 @@
     "row.scope.family",
     "row.scope.community"
    ],
+   "realized_by": {},
    "refused": {
     "rel[10]:purge": "known red: CIRISServer#756 (a filed product defect; --include-known-red builds through it)",
     "rel[7]:scoped_file": "relation `scoped_file`: route exists, builder branch not written \u2014 POST /v1/files to a family or community cohort (src/drive.rs)",
@@ -3607,6 +3617,7 @@
     "grant.state.held",
     "guardian.bond.none"
    ],
+   "realized_by": {},
    "refused": {
     "rel[4]:key_grant": "relation `key_grant`: route exists, builder branch not written \u2014 persist emits key_grant:content:v1 per recipient on a sealed share; no read witnesses it yet",
     "rel[5]:guardian_bond": "relation `guardian_bond`: the guardian bond (CC 3.4.13): no server route writes it \u2014 family roles are free words (src/family_api.rs), CSD-119 drives the route",
@@ -3951,6 +3962,7 @@
     "key.revocation.revoked_all",
     "key.revocation.none"
    ],
+   "realized_by": {},
    "refused": {
     "rel[4]:holder": "relation `holder`: route exists, builder branch not written \u2014 the T8 accord machinery: honest signs, lost never signs, coerced signs an invocation the standing rule refuses, censored signs but its rows are withheld past the window",
     "rel[5]:holder": "relation `holder`: route exists, builder branch not written \u2014 the T8 accord machinery: honest signs, lost never signs, coerced signs an invocation the standing rule refuses, censored signs but its rows are withheld past the window",
@@ -4302,6 +4314,7 @@
     "node.unannounced",
     "negatives.held"
    ],
+   "realized_by": {},
    "refused": {},
    "steps": [
     {
@@ -4619,6 +4632,7 @@
     "roster.visible",
     "negatives.held"
    ],
+   "realized_by": {},
    "refused": {},
    "steps": [
     {
@@ -5141,6 +5155,7 @@
     "person.multi_device",
     "room.self.keyed"
    ],
+   "realized_by": {},
    "refused": {
     "rel[6]:guardian_bond": "relation `guardian_bond`: the guardian bond (CC 3.4.13): no server route writes it \u2014 family roles are free words (src/family_api.rs), CSD-119 drives the route",
     "rel[7]:age_assurance": "relation `age_assurance`: POST /v1/safety/age-assurance is authorized by the x-ciris-* HYBRID request signature (src/auth/verify.rs), which this harness has no signer for"
@@ -5430,6 +5445,7 @@
     "quorum_change.applied",
     "moderator.named"
    ],
+   "realized_by": {},
    "refused": {},
    "steps": [
     {
@@ -5720,6 +5736,7 @@
     "authority.licensing",
     "delegation.chain"
    ],
+   "realized_by": {},
    "refused": {
     "rel[4]:authority": "relation `authority`: a licensing authority affiliation (CSD-120\u2013126, the Registry fold): no server route",
     "rel[5]:delegation": "relation `delegation`: a delegates_to CHAIN between persons (CC 4.4.3.2.8): POST /v1/auth/device/delegate writes owner\u2192actor only, and sub-delegation is the delegate's own act"
@@ -5948,8 +5965,18 @@
    "promises": [
     "agent.bound",
     "steward.bonded",
-    "wa.present"
+    "wa.present",
+    "agent.deferral.pending",
+    "agent.deferral.approved",
+    "agent.deferral.rejected",
+    "agent.identity.amended"
    ],
+   "realized_by": {
+    "agent.deferral.approved": "CIRISAgent",
+    "agent.deferral.pending": "CIRISAgent",
+    "agent.deferral.rejected": "CIRISAgent",
+    "agent.identity.amended": "CIRISAgent"
+   },
    "refused": {
     "rel[0]:agent": "relation `agent`: a CIRISAgent process hard-bound to the node: the server serves no agent routes without one (src/py_adapter.rs proxy_routes); halt_agent drives an EXTERNAL agent",
     "rel[1]:steward": "relation `steward`: the agent's steward bond (CSD-115): no route yet",
@@ -6109,6 +6136,7 @@
     "root.halt_confirmed",
     "root.resumed"
    ],
+   "realized_by": {},
    "refused": {},
    "steps": [
     {
@@ -6374,6 +6402,7 @@
     "root.infrastructure",
     "party.outside_roots"
    ],
+   "realized_by": {},
    "refused": {
     "canonical:C2": "a canonical beyond the first (C2): one root per mesh \u2014 mint_accord_root rewrites the mesh's base env, so a second root cannot share it"
    },

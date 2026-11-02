@@ -192,10 +192,19 @@ mod persist_errors {
         NodeIdentityRequired,
         super::persist_errors::PersistError
     );
+    // v59.1.2 — no pooled Postgres connection was freed within the pool's
+    // wait timeout. A `RuntimeError` subclass: it is carved out of the
+    // backend arms, which raised `RuntimeError`, so `except RuntimeError`
+    // still catches it; the message leads with the kind token.
+    pyo3::create_exception!(
+        ciris_persist,
+        PoolExhausted,
+        pyo3::exceptions::PyRuntimeError
+    );
 }
 pub use persist_errors::{
     Conflict, EngineClosed, EngineConfigMismatch, EngineUsedAcrossFork, NodeIdentityRequired,
-    NotFound, Permanent, PersistError, Transient,
+    NotFound, Permanent, PersistError, PoolExhausted, Transient,
 };
 
 /// v60.0.0 (CIRISPersist#988 item 1) — call `$call` on the engine's
@@ -2432,6 +2441,30 @@ impl PyEngine {
                     "pending key-grant rows could not be emitted at init; the write doors retry (#848 §14)"
                 ),
             }
+        }
+
+        // v61 (CC 2.6.2, CIRISPersist#1122) — the open legs every Rust
+        // constructor runs (`Engine::settle_at_open`): the instant-form pass
+        // and the agent-route sweep. Every host opens persist here, through
+        // the shared constructor, which runs no boot legs; without this the
+        // V211 DDL ran in the field and the pass never did. Logged, never
+        // fatal. The counts are also `settle_instant_forms_json()`.
+        {
+            let open_engine = crate::Engine::from_shared_with_local(
+                match &backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        crate::engine::BackendDispatch::Postgres(pg.clone())
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        crate::engine::BackendDispatch::Sqlite(sq.clone())
+                    }
+                },
+                signer.clone(),
+                local_signer.clone(),
+            );
+            py.detach(|| runtime.block_on(open_engine.settle_at_open()));
         }
 
         // v0.3.2 (CIRISPersist#11) — Auto-sweep on init when a local
@@ -6823,6 +6856,30 @@ impl PyEngine {
         })
     }
 
+    /// v61 (CC 2.6.2) — **run the open-time instant-form pass now and return
+    /// its counts** as JSON: `{scanned, violations, healed, already_healed,
+    /// heal_refused, own_left, kept_in_force, set_aside}`. The pass already
+    /// runs at `Engine(...)` (logged at `tracing::info` when it finds
+    /// anything); this lets an operator read the counts after the open.
+    /// Idempotent: a second call re-states nothing (`healed` 0, the earlier
+    /// re-statements counted `already_healed`). FFI mirror of
+    /// [`Engine::settle_instant_forms`](crate::engine::Engine::settle_instant_forms).
+    fn settle_instant_forms_json(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let engine = crate::Engine::from_shared_with_local(
+                self.engine_dispatch(),
+                self.signer.clone(),
+                self.local_signer.clone(),
+            );
+            let pass = py
+                .detach(|| self.runtime.block_on(engine.settle_instant_forms()))
+                .map_err(federation_err_to_py)?;
+            serde_json::to_string(&pass)
+                .map_err(|e| PyRuntimeError::new_err(format!("InstantFormPass JSON encode: {e}")))
+        })
+    }
+
     /// CIRISPersist#848 (BLOB_REPLICATION.md §14, V146) —
     /// **emit every key-grant row this node owes and has not yet carried**: each
     /// epoch it minted whose set is dirty per the emission ledger (never
@@ -8763,103 +8820,10 @@ impl PyEngine {
         })
     }
 
-    /// v21.0.0 (CIRISPersist#504 FLOOR, edge advertise/serve bridge) —
-    /// bulk-list the full `SignedFamily` wrappers (row + the V110 authority
-    /// signature `put_family`'s E4 gate verified at admission) since a
-    /// cursor, as a JSON array, ordered `(founded_at ASC, family_key_id
-    /// ASC)`. **Signed rows only** — a `put_family_local` genesis-bake row
-    /// (legitimately unsigned) is never emitted; serving one would hand the
-    /// edge responder empty signature bytes.
-    #[pyo3(signature = (since_rfc3339, since_id, limit))]
-    fn list_signed_families_since(
-        &self,
-        py: Python<'_>,
-        since_rfc3339: Option<&str>,
-        since_id: Option<&str>,
-        limit: u32,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        let since = parse_pair_cursor("list_signed_families_since", since_rfc3339, since_id)?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    macro_rules! dispatch {
-                        ($backend:expr) => {{
-                            let b = $backend.clone();
-                            let rows = b
-                                .list_signed_families_since(since, limit)
-                                .await
-                                .map_err(federation_err_to_py)?;
-                            serde_json::to_string(&rows).map_err(|e| {
-                                PyRuntimeError::new_err(format!(
-                                    "signed family list JSON encode: {e}"
-                                ))
-                            })
-                        }};
-                    }
-                    match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => dispatch!(pg),
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
-                    }
-                })
-            })
-        })
-    }
-
     /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
-    /// `SignedCommunity` wrappers since a cursor, as a JSON array. Same
-    /// contract as
-    /// [`list_signed_families_since`](Self::list_signed_families_since);
-    /// ordered `(founded_at ASC, community_key_id ASC)`.
-    #[pyo3(signature = (since_rfc3339, since_id, limit))]
-    fn list_signed_communities_since(
-        &self,
-        py: Python<'_>,
-        since_rfc3339: Option<&str>,
-        since_id: Option<&str>,
-        limit: u32,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        let since = parse_pair_cursor("list_signed_communities_since", since_rfc3339, since_id)?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    macro_rules! dispatch {
-                        ($backend:expr) => {{
-                            let b = $backend.clone();
-                            let rows = b
-                                .list_signed_communities_since(since, limit)
-                                .await
-                                .map_err(federation_err_to_py)?;
-                            serde_json::to_string(&rows).map_err(|e| {
-                                PyRuntimeError::new_err(format!(
-                                    "signed community list JSON encode: {e}"
-                                ))
-                            })
-                        }};
-                    }
-                    match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => dispatch!(pg),
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
-                    }
-                })
-            })
-        })
-    }
-
-    /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
-    /// `SignedLocationProof` wrappers since a cursor, as a JSON array. Same
-    /// contract as
-    /// [`list_signed_families_since`](Self::list_signed_families_since);
-    /// ordered `(asserted_at ASC, subject_key_id ASC)`.
+    /// `SignedLocationProof` wrappers since a cursor, as a JSON array (signed
+    /// rows only, a pair cursor); ordered `(asserted_at ASC, subject_key_id
+    /// ASC)`.
     #[pyo3(signature = (since_rfc3339, since_id, limit))]
     fn list_signed_location_proofs_since(
         &self,
@@ -8886,106 +8850,6 @@ impl PyEngine {
                             serde_json::to_string(&rows).map_err(|e| {
                                 PyRuntimeError::new_err(format!(
                                     "signed location_proof list JSON encode: {e}"
-                                ))
-                            })
-                        }};
-                    }
-                    match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => dispatch!(pg),
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
-                    }
-                })
-            })
-        })
-    }
-
-    /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
-    /// `SignedFamilyMembershipRevocation` wrappers since a cursor, as a JSON
-    /// array. Same contract as
-    /// [`list_signed_families_since`](Self::list_signed_families_since);
-    /// ordered `(removed_at ASC, family_key_id ASC,
-    /// removed_identity_key_id ASC)`.
-    #[pyo3(signature = (since_rfc3339, since_id, limit))]
-    fn list_signed_family_membership_revocations_since(
-        &self,
-        py: Python<'_>,
-        since_rfc3339: Option<&str>,
-        since_id: Option<&str>,
-        limit: u32,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        let since = parse_pair_cursor(
-            "list_signed_family_membership_revocations_since",
-            since_rfc3339,
-            since_id,
-        )?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    macro_rules! dispatch {
-                        ($backend:expr) => {{
-                            let b = $backend.clone();
-                            let rows = b
-                                .list_signed_family_membership_revocations_since(since, limit)
-                                .await
-                                .map_err(federation_err_to_py)?;
-                            serde_json::to_string(&rows).map_err(|e| {
-                                PyRuntimeError::new_err(format!(
-                                    "signed family_membership_revocation list JSON encode: {e}"
-                                ))
-                            })
-                        }};
-                    }
-                    match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => dispatch!(pg),
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
-                    }
-                })
-            })
-        })
-    }
-
-    /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
-    /// `SignedCommunityMembershipRevocation` wrappers since a cursor, as a
-    /// JSON array. Same contract as
-    /// [`list_signed_families_since`](Self::list_signed_families_since);
-    /// ordered `(removed_at ASC, community_key_id ASC,
-    /// removed_identity_key_id ASC)`.
-    #[pyo3(signature = (since_rfc3339, since_id, limit))]
-    fn list_signed_community_membership_revocations_since(
-        &self,
-        py: Python<'_>,
-        since_rfc3339: Option<&str>,
-        since_id: Option<&str>,
-        limit: u32,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        let since = parse_pair_cursor(
-            "list_signed_community_membership_revocations_since",
-            since_rfc3339,
-            since_id,
-        )?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    macro_rules! dispatch {
-                        ($backend:expr) => {{
-                            let b = $backend.clone();
-                            let rows = b
-                                .list_signed_community_membership_revocations_since(since, limit)
-                                .await
-                                .map_err(federation_err_to_py)?;
-                            serde_json::to_string(&rows).map_err(|e| {
-                                PyRuntimeError::new_err(format!(
-                                    "signed community_membership_revocation list JSON encode: {e}"
                                 ))
                             })
                         }};
@@ -10738,7 +10602,7 @@ impl PyEngine {
     //    gate + verdict routing shipped in v8.2.0 (#228) on the
     //    FederationDirectory; these four methods make CC 6.1.1 drivable
     //    over PyO3. The crypto (Merkle, bound-hybrid gate, equivocation
-    //    classifier) stays frozen in `ciris_verify_core::holonomic` —
+    //    classifier) stays frozen in `ciris_verify_core::substrate` —
     //    persist calls it, never re-rolls it. ──
 
     /// v16 (CIRISPersist#431) — pure §19.1 root builder: the WW-scheme
@@ -10757,7 +10621,7 @@ impl PyEngine {
             let leaf_bytes_b64_json = leaf_bytes_b64_json.to_owned();
             py.detach(move || {
                 let leaves = decode_b64_leaves(&leaf_bytes_b64_json)?;
-                let root = ciris_verify_core::holonomic::compute_merkle_root(&leaves);
+                let root = ciris_verify_core::substrate::compute_merkle_root(&leaves);
                 Ok(crate::witness::encode_root_hex(&root))
             })
         })
@@ -11277,54 +11141,6 @@ impl PyEngine {
                     }
                 })
             })
-        })
-    }
-
-    /// v50.0.0 (CIRISPersist#925/#931) — the REPLICATED community entry:
-    /// admit a `SignedCommunity` received from a peer (the shape the signed
-    /// since-read serves). Distinct from [`Self::put_community_json`], the
-    /// LOCAL door, which runs the full CC 3.2 infrastructure gate whoever
-    /// signed: here a legacy infrastructure record is admitted as data and
-    /// the fold's gates apply. Returns the typed outcome as JSON —
-    /// `"inserted"`, `"unchanged"`, `"superseded"`, or
-    /// `{"refused":{"reason":"conflicting_record"}}`.
-    fn apply_replicated_community_json(
-        &self,
-        py: Python<'_>,
-        payload_json: &str,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let community: crate::federation::SignedCommunity = serde_json::from_str(payload_json)
-                .map_err(|e| PyValueError::new_err(format!("signed community decode: {e}")))?;
-            let backend = self.backend.clone();
-            let outcome = py.detach(move || match &backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(b) => {
-                    let b = b.clone();
-                    runtime.block_on(async move {
-                        crate::federation::FederationDirectory::apply_replicated_community(
-                            &*b, community,
-                        )
-                        .await
-                        .map_err(federation_err_to_py)
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(b) => {
-                    let b = b.clone();
-                    runtime.block_on(async move {
-                        crate::federation::FederationDirectory::apply_replicated_community(
-                            &*b, community,
-                        )
-                        .await
-                        .map_err(federation_err_to_py)
-                    })
-                }
-            })?;
-            serde_json::to_string(&outcome)
-                .map_err(|e| PyRuntimeError::new_err(format!("outcome encode: {e}")))
         })
     }
 
@@ -17295,9 +17111,9 @@ impl PyEngine {
         let sources: Vec<(String, String)> = serde_json::from_str(sources_json)
             .map_err(|e| PyValueError::new_err(format!("decode sources_json: {e}")))?;
         let consent_state = match consent {
-            "active" => ciris_verify_core::holonomic::ConsentState::Active,
-            "withdrawn" => ciris_verify_core::holonomic::ConsentState::Withdrawn,
-            "unknown" => ciris_verify_core::holonomic::ConsentState::Unknown,
+            "active" => ciris_verify_core::substrate::ConsentState::Active,
+            "withdrawn" => ciris_verify_core::substrate::ConsentState::Withdrawn,
+            "unknown" => ciris_verify_core::substrate::ConsentState::Unknown,
             other => {
                 return Err(PyValueError::new_err(format!(
                     "unknown consent {other:?} — one of active|withdrawn|unknown"
@@ -24962,6 +24778,41 @@ impl PyEngine {
         })
     }
 
+    /// v61 (CIRISPersist#1101; CC 5.4.6, `CLM-serve-seat-announced`) —
+    /// **is `node_key_id`'s owner announced?** `True` while a live owner
+    /// binding for the node is carried at `cohort_scope: federation` (directly,
+    /// or by its granter's live widening). Judged now: a later announcement
+    /// satisfies it and a withdrawn one does not. A node holding a serve seat in
+    /// an infrastructure community serves only while this is `True`; persist's
+    /// seating doors refuse `serve_seat_owner_unannounced` otherwise.
+    fn serve_seat_owner_announced(&self, py: Python<'_>, node_key_id: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let node = node_key_id.to_owned();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::admission::serve_seat_owner_announced(&*backend, &node)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::admission::serve_seat_owner_announced(&*backend, &node)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
     /// CIRISPersist#299 — the OUTBOUND steward-binding reader: the nodes
     /// `steward_user_key_id` owns (exact inverse of `steward_bindings_of_json` —
     /// `n ∈ nodes_stewarded_by(U)` ⟺ `U ∈ steward_bindings_of(n)`). Returns a JSON
@@ -32308,6 +32159,7 @@ fn audit_err_to_py(e: crate::audit::Error) -> PyErr {
         | crate::audit::Error::Signature(_)
         | crate::audit::Error::Conflict(_)
         | crate::audit::Error::NotFound(_) => PyValueError::new_err(kind),
+        crate::audit::Error::PoolExhausted { .. } => PoolExhausted::new_err(e.to_string()),
         crate::audit::Error::Backend(_)
         | crate::audit::Error::NotImplemented(_)
         | crate::audit::Error::Internal(_)
@@ -32392,6 +32244,7 @@ fn fountain_store_err_to_py(e: crate::store::Error) -> PyErr {
         | Error::Backend(_)
         | Error::Migration { .. }
         | Error::MigrationLockTimeout { .. } => PyRuntimeError::new_err(format!("{e}")),
+        Error::PoolExhausted { .. } => PoolExhausted::new_err(format!("{e}")),
         // v57.0.0 (CIRISPersist#988 item 2) — the erasure doors' typed
         // attester refusal (no fountain door raises it).
         Error::HardCaseAttesterUnavailable(inner) => {
@@ -32530,6 +32383,7 @@ fn secrets_err_to_py(e: crate::secrets::SecretsError) -> PyErr {
         SecretsError::InvalidArgument(_)
         | SecretsError::NotAuthorized(_)
         | SecretsError::NotFound(_) => PyValueError::new_err(e.to_string()),
+        SecretsError::PoolExhausted { .. } => PoolExhausted::new_err(e.to_string()),
         SecretsError::Crypto(_)
         | SecretsError::Backend(_)
         | SecretsError::Internal(_)
@@ -33307,6 +33161,7 @@ fn erasure_err_to_py(e: crate::store::Error) -> PyErr {
         crate::store::Error::HardCaseAttesterUnavailable(inner) => {
             NodeIdentityRequired::new_err(format!("{}: {inner}", inner.kind()))
         }
+        e @ crate::store::Error::PoolExhausted { .. } => PoolExhausted::new_err(format!("{e}")),
         other => PyRuntimeError::new_err(format!("{other}")),
     }
 }
@@ -33571,9 +33426,6 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::DeviceRekeyRefused { rule, .. } => {
             PyValueError::new_err(rule_refusal_message(kind, rule))
         }
-        // v49.0.0 (#912) — a listing its door refuses (not the member's own,
-        // or not `public`): the same caller-side refusal, the same type.
-        crate::federation::Error::MembershipListingRefused { .. } => PyValueError::new_err(kind),
         // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — a refused
         // `delegates_to` carrying agency (or any non-infra scope) to a
         // node-role key is caller-side authorization failure; ValueError
@@ -33707,6 +33559,9 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         }
         // Server-fault → RuntimeError (5xx).
         crate::federation::Error::Backend(_) => PyRuntimeError::new_err(kind),
+        // v59.1.2 — carved out of `Backend`: a RuntimeError subclass, the
+        // kind and the wait in the message.
+        crate::federation::Error::PoolExhausted { .. } => PoolExhausted::new_err(e.to_string()),
         // v11.8.1 (CIRISPersist#329) — the directory-ops proxy was asked
         // for a method with no DirectoryOp. This is a persist-side contract
         // gap (add the op), not caller-fault; RuntimeError (5xx).
@@ -35130,11 +34985,13 @@ async fn boot_audit_self_verify(backend: &BackendDispatch) -> Result<BootAuditSu
     let tenant_ids: Vec<String> = match backend {
         #[cfg(feature = "postgres")]
         BackendDispatch::Postgres(pg) => pg
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| format!("pool: {e}"))?
-            .query("SELECT DISTINCT tenant_id FROM cirislens_audit_log", &[])
+            // v59.1.2 — the Postgres table is `cirislens.audit_log` (V014);
+            // `cirislens_audit_log` is the SQLite spelling, so every Postgres
+            // boot logged "list tenants: db error" and checked nothing.
+            .query("SELECT DISTINCT tenant_id FROM cirislens.audit_log", &[])
             .await
             .map_err(|e| format!("list tenants: {e}"))?
             .iter()
@@ -35245,7 +35102,7 @@ async fn build_audit_chain_proof(
     let located: Option<(String, i64)> = match backend {
         #[cfg(feature = "postgres")]
         BackendDispatch::Postgres(pg) => {
-            let client = pg.pool().get().await.map_err(|e| format!("pool: {e}"))?;
+            let client = pg.checkout().await.map_err(|e| format!("pool: {e}"))?;
             let rows = client
                 .query(
                     "SELECT tenant_id, sequence_number \
@@ -35308,7 +35165,7 @@ async fn build_audit_chain_proof(
     let entries: Vec<AuditChainEntry> = match backend {
         #[cfg(feature = "postgres")]
         BackendDispatch::Postgres(pg) => {
-            let client = pg.pool().get().await.map_err(|e| format!("pool: {e}"))?;
+            let client = pg.checkout().await.map_err(|e| format!("pool: {e}"))?;
             let rows = client
                 .query(
                     "SELECT sequence_number, tenant_id, action_type, recorded_at, \
@@ -35440,6 +35297,75 @@ async fn build_audit_chain_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v59.1.2 — a starved pool reaches Python as `PoolExhausted`, a
+    /// `RuntimeError` subclass (the type the backend arm it was carved from
+    /// raised, so `except RuntimeError` still catches it), its message
+    /// leading with the kind token.
+    #[test]
+    fn pool_exhausted_is_a_runtime_error_carrying_its_kind() {
+        Python::initialize();
+        let waited = std::time::Duration::from_secs(30);
+        let errs = [
+            federation_err_to_py(crate::federation::Error::PoolExhausted { waited }),
+            erasure_err_to_py(crate::store::Error::PoolExhausted { waited }),
+        ];
+        Python::attach(|py| {
+            for (e, kind) in errs
+                .iter()
+                .zip(["federation_pool_exhausted", "store_pool_exhausted"])
+            {
+                assert!(e.is_instance_of::<PoolExhausted>(py), "{kind}");
+                assert!(e.is_instance_of::<PyRuntimeError>(py), "{kind}");
+                let text = e.value(py).to_string();
+                assert!(text.starts_with(kind), "{kind}: {text}");
+            }
+        });
+    }
+
+    /// v59.1.2 — the boot audit self-check reads the Postgres table by its
+    /// Postgres name. It queried `cirislens_audit_log` (the SQLite spelling)
+    /// on Postgres, so every Postgres boot logged "list tenants: db error"
+    /// and verified nothing. On a migrated database with one audited tenant
+    /// it must list that tenant and walk its chain.
+    #[cfg(all(feature = "postgres", feature = "cirisaudit"))]
+    #[test]
+    fn boot_audit_self_check_reads_the_postgres_table() {
+        use crate::store::Backend;
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("boot-audit-pg: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+            return;
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let pg = Arc::new(PostgresBackend::connect(&dsn).await.unwrap());
+            pg.run_migrations().await.unwrap();
+            pg.get_client()
+                .await
+                .unwrap()
+                .execute(
+                    "INSERT INTO cirislens.audit_log (\
+                        entry_id, sequence_number, tenant_id, actor_id, action_type, \
+                        subject_kind, subject_id, payload, prev_hash, entry_hash, \
+                        recorded_at, signature, signing_key_id, signature_verified, \
+                        persist_row_hash\
+                     ) VALUES (gen_random_uuid(), 1, 'boot-audit-pg', 'actor', 'system_event', \
+                        'task', 's', '{}'::jsonb, '\\x00'::bytea, '\\x01'::bytea, now(), \
+                        'sig', 'actor', TRUE, 'h')",
+                    &[],
+                )
+                .await
+                .unwrap();
+            let summary = boot_audit_self_verify(&BackendDispatch::Postgres(pg))
+                .await
+                .expect("the self-check lists tenants on Postgres");
+            assert_eq!(summary.tenants_checked, 1, "the audited tenant is listed");
+            assert_eq!(summary.breaks.len(), usize::from(!summary.all_ok));
+        });
+    }
 
     /// v55.0.0 (CIRISPersist#989, operator ruling 2026-10-12) — **a blob
     /// invalid-argument refusal shows Python its token.** The error is the
@@ -38388,6 +38314,8 @@ pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         "NodeIdentityRequired",
         py.get_type::<NodeIdentityRequired>(),
     )?;
+    // v59.1.2 — a starved Postgres pool (a RuntimeError subclass).
+    m.add("PoolExhausted", py.get_type::<PoolExhausted>())?;
     // v1.10.1 (CIRISPersist#88) — handle-free process-singleton
     // reset; the deterministic teardown door for consumer test
     // suites and the cohabitation epic.
@@ -39024,3 +38952,7 @@ mod verify_trace_canon_parity_class {
         );
     }
 }
+
+/// v61 (CC 2.6.2) — I-IFP-10: the Python open settles stored instant forms.
+#[cfg(test)]
+mod instant_form_open_tests;

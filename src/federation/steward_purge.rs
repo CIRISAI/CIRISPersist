@@ -432,6 +432,40 @@ pub const ATTESTATION_PROJECTIONS: &[(&str, &str, ProjectionRemoval)] = &[
         "attestation_id",
         ProjectionRemoval::ForeignKeyCascade,
     ),
+    // v61 (CIRISPersist#991; V206) — the group records and the roster
+    // planes. SET NULL, the key plane's rule: a hard delete of a row leaves
+    // the group and its roster events held, without their rows, and the
+    // rebuild gate names them.
+    (
+        "federation_families",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeySetNull,
+    ),
+    (
+        "federation_communities",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeySetNull,
+    ),
+    (
+        "federation_family_membership_revocations",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeySetNull,
+    ),
+    (
+        "federation_community_membership_revocations",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeySetNull,
+    ),
+    (
+        "federation_family_membership_widenings",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeySetNull,
+    ),
+    (
+        "federation_community_membership_widenings",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeySetNull,
+    ),
 ];
 
 /// Tables with an `*attestation_id` column that are NOT projections of a
@@ -442,6 +476,11 @@ pub const INDEPENDENT_ATTESTATION_ID_TABLES: &[(&str, &str)] = &[
     (
         "cirisnode_promotion_attestations",
         "the cirisnode plane's own promotion records, written by src/cirisnode",
+    ),
+    (
+        "federation_attestations_form_refused",
+        "v61 (CC 2.6.2) — the ledger of rows refused for the form of a signed instant; \
+         the row itself is gone and no body is kept",
     ),
 ];
 
@@ -2988,7 +3027,16 @@ pub(crate) fn refuse_tombstoned_at_write(
     notices: Vec<String>,
     floor: &TombstoneFloor,
 ) -> Result<(), TombstonedAtWrite> {
-    match standing_notice(notices, &floor.reversed) {
+    refuse_standing_notice(sha256, standing_notice(notices, &floor.reversed))?;
+    Ok(())
+}
+
+/// v61 (CIRISPersist#934, S4a) — the refusal [`refuse_tombstoned_at_write`]
+/// decides: a standing notice names the address. A shared plan every byte
+/// write's executor re-asks inside its transaction.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+fn refuse_standing_notice(sha256: &[u8], notice: Option<String>) -> Result<(), TombstonedAtWrite> {
+    match notice {
         None => Ok(()),
         Some(notice_id) => Err(TombstonedAtWrite {
             sha256_hex: hex::encode(sha256),

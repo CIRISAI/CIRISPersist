@@ -79,9 +79,12 @@ pub(crate) mod bodies {
         let mut env = serde_json::json!({
             "id": id,
             "dimension": format!("consent:state:{stance}:v1"),
-            crate::federation::envelope::paths::ASSERTED_AT: asserted.to_rfc3339(),
+            crate::federation::envelope::paths::ASSERTED_AT: crate::federation::admission::render_signed_instant(asserted),
         });
-        env["scope"] = scope;
+        // A `null` scope is a row with no scope member (absent, never `null`).
+        if !scope.is_null() {
+            env["scope"] = scope;
+        }
         if let (Some(obj), Some(extra)) = (env.as_object_mut(), extras.as_object()) {
             for (k, v) in extra {
                 obj.insert(k.clone(), v.clone());
@@ -334,7 +337,7 @@ pub(crate) mod bodies {
             &producer,
             &subject,
             serde_json::json!({"id": format!("i106b-held-{s}"), "dimension": "i106b:held:v1", "score": 1.0,
-                crate::federation::envelope::paths::ASSERTED_AT: at("2026-05-01T00:00:00Z").to_rfc3339()}),
+                crate::federation::envelope::paths::ASSERTED_AT: crate::federation::admission::render_signed_instant(at("2026-05-01T00:00:00Z"))}),
             vec![subject.clone()],
             at("2026-05-01T00:00:00Z"),
             None,
@@ -424,7 +427,7 @@ pub(crate) mod bodies {
                 &subject,
                 &target,
                 serde_json::json!({"id": format!("i107-companion-{s}"), "dimension": "consent:scope:analyze:v1", "score": 1.0,
-                    crate::federation::envelope::paths::ASSERTED_AT: at("2026-05-01T00:00:00Z").to_rfc3339()}),
+                    crate::federation::envelope::paths::ASSERTED_AT: crate::federation::admission::render_signed_instant(at("2026-05-01T00:00:00Z"))}),
                 Vec::new(),
                 at("2026-05-01T00:00:00Z"),
                 None,
@@ -603,7 +606,7 @@ pub(crate) mod bodies {
         let score = |n: &str| {
             let id = format!("i112-score-{n}-{s}");
             let env = serde_json::json!({"id": id, "dimension": "capacity:core_identity:v1", "score": 1.0, "confidence": 0.9,
-                crate::federation::envelope::paths::ASSERTED_AT: at("2026-05-02T00:00:00Z").to_rfc3339()});
+                crate::federation::envelope::paths::ASSERTED_AT: crate::federation::admission::render_signed_instant(at("2026-05-02T00:00:00Z"))});
             let mut r = row(
                 &id,
                 &scorer,

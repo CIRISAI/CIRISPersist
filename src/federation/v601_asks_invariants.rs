@@ -874,8 +874,10 @@ mod tests {
         for r in DimensionRejectionReason::ALL {
             assert!(dr::ALL.contains(&r.as_str()), "{r:?} unclassified");
         }
-        assert_eq!(dr::ALL.len(), DimensionRejectionReason::ALL.len() + 3);
+        assert_eq!(dr::ALL.len(), DimensionRejectionReason::ALL.len() + 5);
+        assert_eq!(dr::is_retryable("partnership_shape_retired"), Some(false));
         assert_eq!(dr::is_retryable("registered_family_held_shut"), Some(false));
+        assert_eq!(dr::is_retryable("group_plane_row_shape"), Some(false));
         assert_eq!(dr::is_retryable("not_a_reason"), None);
 
         // The construction sites, from disk.
@@ -883,6 +885,8 @@ mod tests {
             "LEDGER_BINDING_REASON",
             "REGISTERED_FAMILY_HELD_SHUT_REASON",
             "INVARIANT_SELF_EMISSION_REASON",
+            "GROUP_PLANE_ROW_SHAPE_REASON",
+            "PARTNERSHIP_SHAPE_RETIRED_REASON",
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut stack = vec![root];

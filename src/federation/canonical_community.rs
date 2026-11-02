@@ -561,9 +561,9 @@ pub fn bind_next_version(
         }
     }
     change_envelope[NEXT_PERSIST_ROW_HASH] = serde_json::Value::String(row_hash(next)?);
-    change_envelope[AMENDED_AT] = serde_json::Value::String(
-        super::admission::truncate_to_substrate_resolution(amended_at).to_rfc3339(),
-    );
+    // CC 2.6.2: the signed instant is `.sssZ` (v61 S3).
+    change_envelope[AMENDED_AT] =
+        serde_json::Value::String(super::admission::render_signed_instant(amended_at));
     Ok(())
 }
 
@@ -1059,6 +1059,7 @@ where
         roster: &seats,
         signers: &signers,
         direction: super::consensus::Direction::Add,
+        subject: None,
     });
     if !verdict.admits() {
         return Err(Error::RosterAuthorityUnauthorized {
@@ -3913,6 +3914,7 @@ where
         roster: &seats,
         signers: &signers,
         direction: super::consensus::Direction::Add,
+        subject: None,
     });
     match verdict {
         super::consensus::Verdict::Admit => Ok(Ok(signers)),

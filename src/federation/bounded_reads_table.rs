@@ -56,6 +56,10 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         Bound::Open("every route of every occurrence: the boot reload, grows with the federation"),
     ),
     (
+        "list_all_transport_destinations_unfolded",
+        Bound::Open("every stored route before the one-live-key fold (#1122): grows with the federation"),
+    ),
+    (
         "list_announced_peers",
         Bound::Open("every live announced-peer bookmark: grows with the federation"),
     ),
@@ -85,10 +89,6 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
     (
         "list_communities_for_member_active",
         Bound::Schema("the communities one member is active in now"),
-    ),
-    (
-        "list_community_membership_listings_for",
-        Bound::Open("one community's full listing history: grows with membership churn"),
     ),
     (
         "list_community_membership_revocations_for",
@@ -226,7 +226,6 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
     ("list_scores", Bound::Paged),
     ("list_signed_accord_quorum_evidence_since", Bound::Paged),
     ("list_signed_communities_since", Bound::Paged),
-    ("list_signed_community_membership_listings_since", Bound::Paged),
     ("list_signed_community_membership_revocations_since", Bound::Paged),
     ("list_signed_community_membership_widenings_since", Bound::Paged),
     ("list_signed_families_since", Bound::Paged),
@@ -255,8 +254,16 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         Bound::Schema("the claimants of ONE destination hash (competing claims, one per claimant)"),
     ),
     (
+        "list_transport_destinations_by_destination_unfolded",
+        Bound::Schema("the stored claimants of ONE destination hash, before the #1122 fold"),
+    ),
+    (
         "list_transport_destinations_for",
         Bound::Schema("one occurrence's LIVE routes: at most one per transport kind (#443)"),
+    ),
+    (
+        "list_transport_destinations_for_unfolded",
+        Bound::Schema("one occurrence's stored live routes, before the #1122 fold"),
     ),
     (
         "list_trusted_keys",
@@ -279,7 +286,7 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
 ];
 
 #[cfg(test)]
-mod gates {
+pub(super) mod gates {
     use super::{Bound, LIST_READ_BOUNDS};
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
@@ -291,7 +298,7 @@ mod gates {
     /// `src` with comments and string-literal contents blanked (newlines
     /// kept, so line structure survives). Char literals are left alone; a
     /// lifetime's `'` is not a quote.
-    pub(super) fn blank_comments_and_strings(src: &str) -> String {
+    pub(crate) fn blank_comments_and_strings(src: &str) -> String {
         let b: Vec<char> = src.chars().collect();
         let mut out = String::with_capacity(src.len());
         let mut i = 0;

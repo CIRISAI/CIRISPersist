@@ -346,6 +346,15 @@ mod run {
                 .expect("the backend file has a trailing test module");
             let prod = &text[..prod_end];
             for (site, _) in prod.match_indices(needle) {
+                // v61 — the table name exactly, not a prefix of another
+                // table's (`federation_attestations_form_refused`).
+                if prod[site + needle.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
                 // The INSERT OR IGNORE of put_attestation is the reference door.
                 let head = &prod[..site];
                 let fn_start = [

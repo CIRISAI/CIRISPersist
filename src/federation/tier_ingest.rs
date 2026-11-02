@@ -176,6 +176,12 @@ where
     if super::key_plane::verify_plane_row(directory, row).await? {
         return Ok(());
     }
+    // v61 (CIRISPersist#991) — a group-plane row is minted from the signed
+    // object it carries, under the same rule; its co-signatures are the
+    // object's, over the object's own bytes.
+    if super::group_plane::verify_plane_row(directory, row).await? {
+        return Ok(());
+    }
     // v59.0.0 (CIRISPersist#1099) — a self-roster proposal row is minted from
     // the signed object it carries, under the same rule.
     if super::self_roster::verify_proposal_row(directory, row).await? {
@@ -765,17 +771,47 @@ where
             )));
         }
     }
-    for c in cosignatures {
-        verify_envelope_hybrid_signature(
-            directory,
-            &c.authority_key_id,
-            envelope,
-            &c.scrub_signature_classical,
-            c.scrub_signature_pqc.as_deref(),
-        )
-        .await?;
+    // v61 (CIRISPersist#991, CC 2.4) — the co-signatures are counted by the
+    // ONE predicate every cosigned family uses
+    // (`reverse_quorum::count_distinct_roster_scrubs`): each is a scrub over
+    // the object's own signed bytes, counted once, hybrid-verified against
+    // this node's registered keys. A roster row admits only when every one
+    // counts; the first that does not is refused by its own verification
+    // error (an unknown co-signer stays the retryable ordering gap).
+    let scrubs: Vec<super::types::ScrubSig> = cosignatures
+        .iter()
+        .map(|c| super::types::ScrubSig {
+            scrub_key_id: c.authority_key_id.clone(),
+            scrub_signature_classical: c.scrub_signature_classical.clone(),
+            scrub_signature_pqc: c.scrub_signature_pqc.clone(),
+            cosigned_at: None,
+        })
+        .collect();
+    let signers: Vec<String> = cosignatures
+        .iter()
+        .map(|c| c.authority_key_id.clone())
+        .collect();
+    let counted =
+        super::reverse_quorum::count_distinct_roster_scrubs(directory, envelope, &scrubs, &signers)
+            .await;
+    if counted.len() == cosignatures.len() {
+        return Ok(());
     }
-    Ok(())
+    for c in cosignatures {
+        if !counted.contains(&c.authority_key_id) {
+            verify_envelope_hybrid_signature(
+                directory,
+                &c.authority_key_id,
+                envelope,
+                &c.scrub_signature_classical,
+                c.scrub_signature_pqc.as_deref(),
+            )
+            .await?;
+        }
+    }
+    Err(Error::InvalidArgument(format!(
+        "{row_kind}: a co-signature did not count"
+    )))
 }
 
 /// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated
@@ -903,29 +939,6 @@ where
         &signed.cosignatures,
     )
     .await
-}
-
-/// v49.0.0 (CIRISPersist#912) — the hybrid-signature gate for a membership
-/// LISTING, over [`super::types::CommunityMembershipListing::signing_envelope`].
-/// A listing has no co-signatures: the only signer the door admits is the
-/// member (see [`super::listing::check_community_membership_listing`], which
-/// runs this first).
-pub async fn verify_community_membership_listing_admission<F>(
-    directory: &F,
-    signed: &super::SignedCommunityMembershipListing,
-) -> Result<(), Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    verify_envelope_hybrid_signature(
-        directory,
-        &signed.authority_key_id,
-        &signed.community_membership_listing.signing_envelope(),
-        &signed.scrub_signature_classical,
-        signed.scrub_signature_pqc.as_deref(),
-    )
-    .await?;
-    Ok(())
 }
 
 /// The [`Error::LocationAuthorityUnauthorized`] `rule` token for *"this node
@@ -1122,7 +1135,7 @@ pub mod test_support {
     /// has two subjects. Put the distinguishing part FIRST, and assert the
     /// pubkeys differ (CIRISPersist#659 hit exactly this, on postgres only,
     /// where the tag carries a uuid).
-    fn seed_for(key_id: &str) -> [u8; 32] {
+    pub(crate) fn seed_for(key_id: &str) -> [u8; 32] {
         let mut seed = [0x11u8; 32];
         for (i, b) in key_id.bytes().take(32).enumerate() {
             seed[i] = b;
@@ -1191,8 +1204,12 @@ pub mod test_support {
     /// signing bytes, so the door's authority gate verifies against the
     /// pubkeys [`register_hybrid_key`] registered for `trusted_by`.
     pub fn signed_trust_grant(
-        grant: crate::federation::TrustGrant,
+        mut grant: crate::federation::TrustGrant,
     ) -> crate::federation::SignedTrustGrant {
+        // v61 (CC 2.6.2) — the v2 preimage carries milliseconds.
+        grant.expires_at = grant
+            .expires_at
+            .map(crate::federation::admission::truncate_to_substrate_resolution);
         let bytes = crate::federation::admission::trust_grant_signing_bytes(&grant)
             .expect("trust grant canonicalizes");
         let sig = threshold_sign(&grant.trusted_by, &bytes);
@@ -1536,7 +1553,7 @@ pub mod test_support {
             "dimension": "consent:state:revoked:v1",
             "score": 1.0,
             "confidence": 0.9,
-            crate::federation::envelope::paths::ASSERTED_AT: asserted.to_rfc3339(),
+            crate::federation::envelope::paths::ASSERTED_AT: crate::federation::admission::render_signed_instant(asserted),
         });
         if let (Some(obj), Some(more)) = (envelope.as_object_mut(), extra.as_object()) {
             for (k, v) in more {
@@ -2922,7 +2939,7 @@ pub mod test_support {
         register_identity_key(dir, &lapsed_node, "node,infra:serve").await;
         for (scope, valid_until) in [
             // The lapsed serve grant.
-            (ds::INFRA_SERVE, Some("2020-01-01T00:00:00Z")),
+            (ds::INFRA_SERVE, Some("2020-01-01T00:00:00.000Z")),
             // The refresh: live, and deliberately NOT bearing infra:serve, so
             // ownership resolves while no live grant carries serve standing.
             (ds::INFRA_NETWORK_PRESENCE, None),
@@ -3769,23 +3786,6 @@ pub mod test_support {
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
             cosignatures: Vec::new(),
-        }
-    }
-
-    /// v49.0.0 (CIRISPersist#912) — sign a
-    /// [`CommunityMembershipListing`](crate::federation::types::CommunityMembershipListing)
-    /// under `authority_key_id` (the door admits it only when that is the
-    /// member).
-    pub fn sign_community_membership_listing(
-        authority_key_id: &str,
-        listing: crate::federation::types::CommunityMembershipListing,
-    ) -> crate::federation::SignedCommunityMembershipListing {
-        let (_hash, classical, pqc) = sign_envelope(authority_key_id, &listing.signing_envelope());
-        crate::federation::SignedCommunityMembershipListing {
-            community_membership_listing: listing,
-            authority_key_id: authority_key_id.to_owned(),
-            scrub_signature_classical: classical,
-            scrub_signature_pqc: pqc,
         }
     }
 

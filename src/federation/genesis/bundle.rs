@@ -26,77 +26,38 @@
 //!   ceremony whose durable write failed (CIRISServer#309/#310) without
 //!   re-running the ceremony.
 //!
-//! The [`authorization_digest`] preimage is BYTE-IDENTICAL to CIRISServer
-//! `mesh_genesis::authorization_digest` — which is guaranteed rather than
-//! asserted, because that module **re-exports this function**: bundle identity,
-//! the holder and serve-node RECORDS, and the whole delegation plane,
-//! canonicalized with the same JCS producer and then **SHA-256'd**.
-//!
-//! v31.2.0 — that final hash is new, and it is not cosmetic. This function used
-//! to return the canonical bytes themselves, so holders signed a preimage whose
-//! size grew with the bundle: 1,976 bytes narrow, **83,060 bytes** once it bound
-//! full `KeyRecord`s. PKCS#11 PureEdDSA refuses an input that large and a
-//! YubiKey failed mid-ceremony. It is called a digest and now behaves as one
+//! The [`authorization_digest`] holders sign is CIRISVerify's
+//! [`ciris_verify_core::genesis_bundle::authorization_digest`]: SHA-256 over the
+//! JCS canonicalization of a projection of the bundle. Persist delegates to it
+//! (CIRISPersist#1141), so persist, CIRISServer and CIRISVerify sign and check
+//! one preimage. The digest is 32 bytes so a hardware token can sign it
 //! (CIRISServer#398).
 //!
-//! # What that digest does and does not bind (CIRISPersist#660)
+//! # What the digest binds
 //!
-//! This paragraph used to end *"a co-signer cannot be replayed onto a bundle
-//! with a swapped serve node or a widened charter."* Half of that was true and
-//! the half that was not is corrected here rather than deleted, because a
-//! comment claiming a property the code does not have is worse than no comment:
-//! it is the thing a reviewer trusts instead of reading the preimage.
-//!
-//! - **A widened charter: genuinely covered.** Each attestation contributes its
+//! - **The delegation plane.** Each attestation contributes its
 //!   `attestation_id`, `attesting_key_id`, `attested_key_id`,
-//!   `attestation_type` AND its whole `attestation_envelope`, so the conferral
-//!   plane — the scopes, the subject, the verb — is bound byte-for-byte.
-//! - **A swapped serve node: covered by RECORD CONTENT, as of v31.2.0.**
-//!   `holders` and `serve_nodes` contribute the whole `KeyRecord` minus
-//!   [`NODE_LOCAL_RECORD_FIELDS`] and [`CEREMONY_MUTATED_RECORD_FIELDS`], so
-//!   `pubkey_ed25519_base64`, the PQC leg, `identity_type`, `identity_ref`,
-//!   `valid_from`/`valid_until`, `registration_envelope`,
-//!   `original_content_hash`, `roles` and `attestation_evidence` are bound
-//!   byte-for-byte. Substituting the record under an unchanged `key_id` breaks
-//!   every authorization.
+//!   `attestation_type` and its whole `attestation_envelope`, so the scopes, the
+//!   subject and the verb are bound byte for byte. Each roster record
+//!   contributes its own signing envelope under `family` / `community`.
+//! - **Record content.** `holders` and `serve_nodes` contribute the whole
+//!   `KeyRecord` through typed serde, minus two node-local members
+//!   (`persist_row_hash`, `pqc_completed_at`) and the five scrub members the
+//!   ceremony itself accumulates (`scrub_key_id`, `scrub_signature_classical`,
+//!   `scrub_signature_pqc`, `scrub_timestamp`, `additional_scrubs`). A record
+//!   substituted under an unchanged `key_id` breaks every authorization
+//!   (CIRISPersist#660).
+//! - **The scrub set is not bound.** It is quorum evidence about the record
+//!   that the ceremony accumulates between holder signatures; binding it makes
+//!   a 2-of-3 genesis impossible to complete (CIRISPersist#683). Each scrub is
+//!   verified on its own against this node's pinned holder anchors, and the
+//!   record's content is bound through every content member plus
+//!   `original_content_hash`.
+//! - **Version ≥ 4 only:** each serve node's transport row, as
+//!   `{attesting_key_id, signed_envelope}`.
 //!
-//!   The **scrub set is deliberately NOT bound** — and that is not a gap, it is
-//!   the same rule the `attestations` arm has always followed. The scrub set is
-//!   quorum evidence *about* the record which the CEREMONY ITSELF accumulates
-//!   between holder signatures; binding it makes the ceremony circular and a
-//!   2-of-3 genesis impossible to complete (CIRISPersist#683, measured on a live
-//!   ceremony: `have=2 needed=2 complete=false`). Each scrub remains
-//!   independently verifiable against this node's pinned holder anchors, and the
-//!   record's content is still bound through every content field plus
-//!   `original_content_hash`. **Content is bound; evidence about content is
-//!   not.**
-//!
-//! Until v31.2.0 that was NOT true: holders and serve nodes contributed their
-//! `key_id`s and nothing else, so a record substituted under an unchanged id was
-//! invisible to the digest (CIRISPersist#660). It was never exploitable on its
-//! own, because a serve-node record still has to pass `put_public_key`'s
-//! canonical-role admission (a 2-of-3 accord co-scrub re-verified against THIS
-//! node's pinned holder anchors), and [`bake_assembled_genesis`] refuses a
-//! re-anchor whose pubkey differs from the anchored row or whose `valid_from`
-//! does not move forward. Those gates still stand — but they adjudicate a
-//! different question, and the digest is no longer described as if it did their
-//! job because it now genuinely does.
-//!
-//! **Why this could not be widened earlier, and why it could now.** The preimage
-//! is a cross-repo wire contract, declared byte-identical to the PRODUCER's, and
-//! holder authorizations are computed over the producer's construction. Widening
-//! it in persist alone would have made this node refuse every bundle CIRISServer
-//! emits — including a baked seed already signed over the narrow preimage — a
-//! consumer-side break with no producer-side half.
-//!
-//! Two things closed that gap. CIRISServer `mesh_genesis` **re-exports this
-//! function** rather than declaring its own (*"two implementations drifting by a
-//! byte silently invalidates a ceremony's quorum"*), so widening here widens the
-//! producer in the same act, with no server code change. And the seed is
-//! **re-minted by a fresh genesis ceremony** on this cut, so no existing
-//! authorization has to survive the change. That is the window this comment said
-//! to wait for (CIRISServer#398 §5); it is here, and the bullet above has been
-//! rewritten rather than dropped.
+//! The threshold is persist's policy and stays here: [`verify_bundle_quorum`]
+//! requires `max(carried M, strict majority of persist's OWN roster)`.
 
 use super::super::types::{SignedAttestation, SignedKeyRecord};
 use super::super::{Error, FederationDirectory};
@@ -140,18 +101,6 @@ impl GenesisRosterRecord {
         match self {
             Self::Family(f) => &f.family.family_key_id,
             Self::Community(c) => &c.community.community_key_id,
-        }
-    }
-
-    /// The signed content's projection into [`authorization_digest`]: the
-    /// record's own signing envelope under its kind. The signatures are
-    /// evidence the ceremony accumulates, not content (the module doc's rule).
-    fn digest_projection(&self) -> serde_json::Value {
-        match self {
-            Self::Family(f) => serde_json::json!({ "family": f.family.signing_envelope() }),
-            Self::Community(c) => {
-                serde_json::json!({ "community": c.community.signing_envelope() })
-            }
         }
     }
 }
@@ -366,216 +315,28 @@ impl GenesisBundle {
     }
 }
 
-/// The fields of [`KeyRecord`] that are **node-local** and therefore must
-/// never enter the authorization preimage.
+/// The bytes every holder authorization signs:
+/// [`ciris_verify_core::genesis_bundle::authorization_digest`] over this bundle.
 ///
-/// v31.2.0 (CIRISPersist#660, CIRISServer#398 §5) — the line is *"producer
-/// authors it"* versus *"this node computes it"*, and it is drawn here rather
-/// than by listing what to INCLUDE, so a field added to `KeyRecord` is bound by
-/// default and a reviewer has to argue for excluding it.
+/// CIRISVerify owns the projection (CIRISPersist#1141); this is a thin
+/// adapter. The bundle is serialized to its wire form and parsed by verify's
+/// [`GenesisBundle::from_value`](ciris_verify_core::genesis_bundle::GenesisBundle::from_value),
+/// whose mirror types carry `KeyRecord`'s, `Family`'s and `Community`'s serde
+/// attributes member for member, so the records are projected through typed
+/// serde exactly as before. `authorizations` are not in the preimage (they are
+/// what is being accumulated). The module doc lists what is bound.
 ///
-/// - `persist_row_hash` is documented **"Server-computed"** and *"ignored on
-///   write — persist computes its own"*. Binding it would make the producer and
-///   every consumer disagree by construction.
-/// - `pqc_completed_at` is a *"telemetry + observability signal"* stamped
-///   locally by `attach_pqc_signature`. A node-local instant inside a content
-///   hash is the exact defect class v31.1.0 removed from five replication
-///   positions (#655/#662); it does not get to reappear here.
-const NODE_LOCAL_RECORD_FIELDS: [&str; 2] = ["persist_row_hash", "pqc_completed_at"];
-
-/// The record fields the CEREMONY ITSELF mutates after a holder has signed —
-/// the accumulating scrub set.
-///
-/// v31.2.0 (CIRISPersist#683) — **this is not an aesthetic exclusion; binding
-/// these makes a 2-of-3 genesis impossible to complete.** The ceremony
-/// accumulates two things over one bundle, one pass per holder: the
-/// `authorizations`, and the serve node's scrub set (each holder appends its
-/// scrub so the canonical reaches family quorum — persist's own baked-genesis
-/// test asserts `distinct_scrub_count() >= 2`, so a 1-scrub canonical is not a
-/// shippable seed).
-///
-/// If the digest binds the scrub set, those two accumulations are **circular**:
-/// A1 signs, B1's co-scrub rewrites bytes A1 authorized, and A1's entirely
-/// honest signature stops verifying. Measured on a live ceremony: `have=2
-/// needed=2 complete=false`, with a third holder unable to help because every
-/// new signature is taken over bytes the next co-scrub moves again.
-///
-/// **The `attestations` arm already had this right**, and this makes the two
-/// arms consistent: attestations project
-/// `{attestation_id, attesting_key_id, attested_key_id, attestation_type,
-/// attestation_envelope}` and have never carried scrub evidence — which is
-/// exactly what lets CIRISServer's cosign path work, since a 1-scrub and a
-/// 2-scrub attestation canonicalize identically.
-///
-/// **Excluding them costs nothing.** The scrub set is accumulating quorum
-/// evidence *about* the record, each scrub signed over the record's own
-/// canonical bytes — which the digest still binds through every content field
-/// plus `original_content_hash`. A forged scrub does not survive
-/// `put_public_key`'s co-scrub admission against this node's pinned holder
-/// anchors. The #660 substitution this widening exists to stop — a swapped
-/// pubkey, `identity_type`, `roles` or envelope under an unchanged `key_id` —
-/// is still caught, because that is CONTENT, not evidence.
-const CEREMONY_MUTATED_RECORD_FIELDS: [&str; 5] = [
-    "scrub_key_id",
-    "scrub_signature_classical",
-    "scrub_signature_pqc",
-    "scrub_timestamp",
-    "additional_scrubs",
-];
-
-/// One holder's or serve node's contribution to [`authorization_digest`]:
-/// the whole record MINUS [`NODE_LOCAL_RECORD_FIELDS`].
-///
-/// v31.2.0 — this used to be `&record.key_id` and nothing else, which is why
-/// **substituting the RECORD under an unchanged `key_id`** — a different
-/// `pubkey_ed25519_base64`, `registration_envelope`, scrub set, `valid_from`,
-/// `identity_type`, roles or custody evidence — did not appear in the digest at
-/// all (CIRISPersist#660).
-///
-/// `identity_type` deserves its own mention: `is_canonical` reads it off the row
-/// to decide canonical standing, and it was the member persist's subject binding
-/// omitted in the v31.0.0 alignment (#659/#661). A projection that binds a
-/// pubkey but not the type that decides what the pubkey is ALLOWED to do closes
-/// half a door.
-///
-/// Serialization is by `serde`, so a field ADDED to `KeyRecord` is bound
-/// automatically; `authorized_record_projection_binds_every_producer_field`
-/// fails the build if the field set changes, so "bound automatically" is a
-/// reviewed act rather than a silent one.
-fn authorized_record_projection(
-    record: &super::super::types::KeyRecord,
-) -> Result<serde_json::Value, Error> {
-    let mut value = serde_json::to_value(record).map_err(|e| Error::GenesisBundleInvalid {
-        detail: format!(
-            "authorization_digest: could not project key record {}: {e}",
-            record.key_id
-        ),
-    })?;
-    let map = value
-        .as_object_mut()
-        .ok_or_else(|| Error::GenesisBundleInvalid {
-            detail: format!(
-                "authorization_digest: key record {} did not serialize to an object",
-                record.key_id
-            ),
-        })?;
-    for field in NODE_LOCAL_RECORD_FIELDS
-        .iter()
-        .chain(CEREMONY_MUTATED_RECORD_FIELDS.iter())
-    {
-        map.remove(*field);
-    }
-    Ok(value)
-}
-
-/// The bytes every holder authorization signs — BYTE-IDENTICAL to the
-/// producer's construction, because CIRISServer `mesh_genesis` **re-exports
-/// this function** rather than declaring one. Bundle identity, the holder and
-/// serve-node RECORDS, and the whole delegation plane. Deliberately excludes
-/// `authorizations` (they are what is being accumulated).
-///
-/// # Read the preimage below, not a summary of it (CIRISPersist#660)
-///
-/// v31.2.0 (CIRISServer#398 §5) — `holders` and `serve_nodes` now contribute
-/// their whole [`KeyRecord`] minus [`NODE_LOCAL_RECORD_FIELDS`], not `key_id`
-/// alone, so a record substituted under an unchanged id breaks every
-/// authorization. `attestations` contribute their full `attestation_envelope`
-/// and were always bound.
-///
-/// **This is a signing-preimage change and it is deliberately breaking.** Every
-/// authorization taken over the narrow preimage is invalid against these bytes —
-/// which is the point, and why it lands with a fresh genesis ceremony rather
-/// than alone. See this module's doc for the full before/after.
-///
-/// # It returns a DIGEST now, and did not before (CIRISServer#398)
-///
-/// Until v31.2.0 this returned `ceg_produce_canonicalize(&preimage)` — the
-/// **canonical bytes themselves**. The name said digest; the behaviour was
-/// preimage; holders signed the whole preimage directly. That was survivable
-/// only while it stayed small: the narrow preimage was **1,976 bytes**.
-///
-/// Widening it to bind full `KeyRecord`s took it to **83,060 bytes** — 42×
-/// larger, because each record carries a ~2.6 KB base64 ML-DSA-65 pubkey twice
-/// over (top level, and again inside `registration_envelope`). PKCS#11
-/// PureEdDSA refuses an input that size, so a YubiKey `C_Sign` failed with
-/// *"plaintext input data has a bad length… too long"* and the ceremony could
-/// not complete. Measured by CIRISServer, not inferred.
-///
-/// So this now returns `SHA-256(canonical)` — 32 bytes, signable on any token.
-/// **The security property is unchanged**: the hash covers exactly the same
-/// widened preimage, so record substitution is still detected. What changed is
-/// only how much the holder's key has to swallow.
-///
-/// Producer and verifier cannot drift apart on this, because CIRISServer
-/// `mesh_genesis` re-exports this function rather than declaring its own — the
-/// same property that let the widening land with no server code change.
-///
-/// `authorization_digest_returns_a_fixed_size_digest` pins the 32-byte output,
-/// so a future change back to returning a variable-length preimage fails the
-/// build instead of failing at a hardware token during a ceremony.
+/// I1476 pins the result against verify's seven vectors;
+/// `authorization_digest_returns_a_fixed_size_digest` pins the 32-byte output.
 pub fn authorization_digest(bundle: &GenesisBundle) -> Result<Vec<u8>, Error> {
-    let mut preimage = serde_json::json!({
-        "version": bundle.version,
-        "family_key_id": bundle.family_key_id,
-        "consensus_protocol": bundle.consensus_protocol,
-        "produced_at": bundle.produced_at,
-        "holders": bundle
-            .holders
-            .iter()
-            .map(|h| authorized_record_projection(&h.record))
-            .collect::<Result<Vec<_>, Error>>()?,
-        "serve_nodes": bundle
-            .serve_nodes
-            .iter()
-            .map(|n| authorized_record_projection(&n.record))
-            .collect::<Result<Vec<_>, Error>>()?,
-        // v53.0.0 (CC rc7) — the roster records follow the rows, as on the
-        // wire, each projected to its signed content. A version-2 bundle has
-        // none, so its preimage is unchanged.
-        "attestations": bundle
-            .attestations
-            .iter()
-            .map(|a| {
-                serde_json::json!({
-                    "attestation_id": a.attestation.attestation_id,
-                    "attesting_key_id": a.attestation.attesting_key_id,
-                    "attested_key_id": a.attestation.attested_key_id,
-                    "attestation_type": a.attestation.attestation_type,
-                    "attestation_envelope": a.attestation.attestation_envelope,
-                })
-            })
-            .chain(bundle.roster_records.iter().map(GenesisRosterRecord::digest_projection))
-            .collect::<Vec<_>>(),
-    });
-    // v59.0.0 (CIRISPersist#1106) — version ≥ 4 ONLY: the serve nodes'
-    // transport rows, each projected to its signed content (signer and the
-    // exact signed envelope; the detached signature is evidence). A v2 / v3
-    // preimage carries no such member, so it is byte-identical to before.
-    if bundle.version >= SERVE_TRANSPORT_DESTINATIONS_VERSION {
-        if let Some(map) = preimage.as_object_mut() {
-            map.insert(
-                "serve_transport_destinations".to_owned(),
-                bundle
-                    .serve_transport_destinations
-                    .iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "attesting_key_id": r.attesting_key_id,
-                            "signed_envelope": r.signed_envelope,
-                        })
-                    })
-                    .collect::<Vec<_>>()
-                    .into(),
-            );
-        }
-    }
-    let canonical = crate::verify::canonical::ceg_produce_canonicalize(&preimage)
-        .map_err(|e| Error::InvalidArgument(format!("genesis digest canonicalize: {e}")))?;
-    // v31.2.0 — HASH the canonical bytes. See this function's doc: until now it
-    // returned the canonical bytes themselves, so holders signed a preimage
-    // whose size grew with the bundle. Signing 32 bytes is what the name always
-    // claimed and what every token can actually do.
-    Ok(<sha2::Sha256 as sha2::Digest>::digest(&canonical).to_vec())
+    use ciris_verify_core::genesis_bundle as vgb;
+    let refused = |e: &dyn std::fmt::Display| Error::GenesisBundleInvalid {
+        detail: format!("authorization_digest: {e}"),
+    };
+    let wire = serde_json::to_value(bundle).map_err(|e| refused(&e))?;
+    let parsed = vgb::GenesisBundle::from_value(&wire).map_err(|e| refused(&e))?;
+    let digest = vgb::authorization_digest(&parsed).map_err(|e| refused(&e))?;
+    Ok(digest.to_vec())
 }
 
 /// v23.0.0 (CIRISPersist#551 item 1) — the **single door** every genesis
@@ -1379,22 +1140,105 @@ mod authorization_digest_tests {
         .is_err());
     }
 
-    /// v31.2.0 (CIRISPersist#660, CIRISServer#398 §5) — **the field set of
-    /// `KeyRecord` is pinned, so widening the record widens the digest as a
-    /// REVIEWED act.**
+    /// I1476 (CIRISPersist#1141) — **persist's digest is byte-identical
+    /// to the one CIRISVerify owns, on every vector it was cut from.**
     ///
-    /// `authorized_record_projection` serializes the whole record and removes
-    /// only [`NODE_LOCAL_RECORD_FIELDS`], which means a field added to
-    /// `KeyRecord` enters the signing preimage automatically. That is the right
-    /// default — a new producer-authored field SHOULD be bound — but it must not
-    /// happen silently, because it changes the bytes every holder signs.
-    ///
-    /// So this test fails on ANY change to the record's shape. Adding a field:
-    /// decide whether it is producer-authored (leave it bound, add it here) or
-    /// node-local (add it to `NODE_LOCAL_RECORD_FIELDS`, add it here). Either
-    /// way the decision is made by a human and shows up in a diff.
+    /// The seven files in `tests/vectors/genesis_bundle/` are copied byte for
+    /// byte from CIRISVerify v22.0.0's
+    /// `src/ciris-verify-core/tests/vectors/genesis_bundle/`. They were produced
+    /// by persist's own `authorization_digest` (v2 is the live registry bundle,
+    /// v3 is persist at c45a1519, v4 is the v59.1.0 seed) plus four v4 variants
+    /// that edit holder 0's record where a raw-JSON projection and a typed one
+    /// differ: an `Option` written as `null`, `roles` absent, a `+00:00` instant,
+    /// and an unknown member. The expected digests are the ones verify's own test
+    /// pins. Each vector goes through persist's parser and persist's
+    /// `authorization_digest`, and separately through verify's
+    /// `GenesisBundle::from_value` over the raw file, so a drift on either side
+    /// reds here.
     #[test]
-    fn authorized_record_projection_binds_every_producer_field() {
+    fn i1476_authorization_digest_matches_verify_on_every_vector() {
+        use ciris_verify_core::genesis_bundle as vgb;
+        const V4_DIGEST: &str = "8e5f5a7c5af3ecad7f4e370b6b53b624683bd69729e39bcf4ee41b39077a198a";
+        macro_rules! vector {
+            ($f:literal) => {
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/vectors/genesis_bundle/",
+                    $f
+                ))
+            };
+        }
+        let cases: [(&str, &str, &str); 7] = [
+            (
+                "v2_registry_live",
+                vector!("v2_registry_live.json"),
+                "787d0632ae8a645d2c52c6f65909724d8cb370399b14b4c7077786229dabe952",
+            ),
+            (
+                "v3_persist_c45a1519",
+                vector!("v3_persist_c45a1519.json"),
+                "4ccbed38990cb4b6127ff13c2444126fe5e8ca168f5d4e69832b5b9a399eaf0f",
+            ),
+            (
+                "v4_persist_v59_1_0",
+                vector!("v4_persist_v59_1_0.json"),
+                V4_DIGEST,
+            ),
+            (
+                "v4_variant_valid_until_null",
+                vector!("v4_variant_valid_until_null.json"),
+                V4_DIGEST,
+            ),
+            (
+                "v4_variant_roles_absent",
+                vector!("v4_variant_roles_absent.json"),
+                V4_DIGEST,
+            ),
+            (
+                "v4_variant_offset_instant",
+                vector!("v4_variant_offset_instant.json"),
+                V4_DIGEST,
+            ),
+            (
+                "v4_variant_null_and_unknown",
+                vector!("v4_variant_null_and_unknown.json"),
+                "ee49f07c7e32cecfd26250c13e278876c20174219259089b7f607c0cf51222e1",
+            ),
+        ];
+        for (name, src, want) in cases {
+            let bundle = parse_genesis_bundle(src).unwrap_or_else(|e| panic!("{name}: parse: {e}"));
+            let ours = authorization_digest(&bundle).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(hex::encode(&ours), want, "{name}: persist's digest");
+            let raw: serde_json::Value = serde_json::from_str(src).expect("vector is JSON");
+            let theirs = vgb::authorization_digest(
+                &vgb::GenesisBundle::from_value(&raw).unwrap_or_else(|e| panic!("{name}: {e}")),
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(hex::encode(theirs), want, "{name}: verify's digest");
+        }
+        // The compiled-in seed is the v4 vector's bundle (the same JSON), so it
+        // carries the same digest. Parsed from the embedded bytes, not through
+        // `canonical_genesis_bundle`, which a test anchor can stand in for.
+        let seed = parse_genesis_bundle(crate::federation::genesis::CANONICAL_SEED_JSON)
+            .expect("the embedded seed parses");
+        assert_eq!(
+            hex::encode(authorization_digest(&seed).expect("seed digest")),
+            V4_DIGEST,
+            "the compiled-in production seed"
+        );
+    }
+
+    /// CIRISPersist#660, #1141 — **the field set of `KeyRecord` is pinned, so a
+    /// new member cannot fall out of the digest unnoticed.**
+    ///
+    /// The digest is CIRISVerify's, computed over its mirror of `KeyRecord`. A
+    /// member persist adds and verify's mirror does not carry is DROPPED by
+    /// verify's parse, so the digest would silently not bind it. This test
+    /// fails on ANY change to the record's shape: a new member needs verify's
+    /// mirror to carry it first (a new preimage version, with a new `*_VERSION`
+    /// gate), and the decision shows up in a diff.
+    #[test]
+    fn key_record_field_set_is_pinned_to_the_digest() {
         let bundle = crate::federation::genesis::canonical_genesis_bundle();
 
         // UNION over every record, holders AND serve nodes. Sampling one record
@@ -1417,11 +1261,6 @@ mod authorization_digest_tests {
             .flat_map(|v| v.as_object().expect("record is an object").keys())
             .map(String::as_str)
             .collect();
-        let record = &bundle
-            .serve_nodes
-            .first()
-            .expect("the canonical bundle carries a serve node")
-            .record;
 
         // Every field the record actually carries, as of v31.2.0. `Option`
         // fields with `skip_serializing_if` only appear when populated, so this
@@ -1462,33 +1301,12 @@ mod authorization_digest_tests {
         let unexpected: Vec<_> = full_keys.difference(&expected).collect();
         assert!(
             unexpected.is_empty(),
-            "KeyRecord grew {unexpected:?}. These are now in the AUTHORIZATION \
-             PREIMAGE that every genesis holder signs. Decide deliberately: \
-             producer-authored (leave bound) or node-local (add to \
-             NODE_LOCAL_RECORD_FIELDS) — then update this list."
+            "KeyRecord grew {unexpected:?}. CIRISVerify's digest projects its own \
+             mirror of KeyRecord and drops a member it does not know, so these \
+             would NOT be bound by the authorization every genesis holder signs. \
+             Widen verify's mirror first (a new preimage version), then update \
+             this list."
         );
-
-        // The projection must drop exactly the node-local pair, nothing else.
-        let projected = authorized_record_projection(record).expect("projects");
-        let projected_keys: std::collections::BTreeSet<&str> = projected
-            .as_object()
-            .expect("projection is an object")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        for field in NODE_LOCAL_RECORD_FIELDS {
-            assert!(
-                !projected_keys.contains(field),
-                "{field} is node-local and must never enter the preimage"
-            );
-        }
-        for field in CEREMONY_MUTATED_RECORD_FIELDS {
-            assert!(
-                !projected_keys.contains(field),
-                "{field} is mutated BY THE CEREMONY after a holder signs; \
-                 binding it makes a 2-of-3 genesis impossible to complete (#683)"
-            );
-        }
     }
 
     /// v31.2.0 (CIRISServer#398) — **the output is a FIXED-SIZE digest, and

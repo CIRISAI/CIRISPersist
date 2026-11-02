@@ -466,9 +466,11 @@ mod pure {
                 put.contains("attestation_admit::put_attestation_planned("),
                 "{name}: the put door is the shared attestation door"
             );
+            // v61 (CIRISPersist#934, S4a) — the log door is the shared read
+            // plan; its SQL (and the filter) is the executor's page read.
             for read in [
                 "async fn list_attestations_since(",
-                "async fn list_attestation_log(",
+                "async fn read_attestation_log_page(",
             ] {
                 let b = body(&s, read);
                 assert!(

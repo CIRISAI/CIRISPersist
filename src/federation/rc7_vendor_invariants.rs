@@ -232,7 +232,11 @@ pub(crate) mod bodies {
         .await;
     }
 
-    /// **I706** — the dimensions rc7 opens and persist holds shut.
+    /// **I706** — the dimensions rc7 opened and persist held shut until v61
+    /// built their door (CIRISPersist#991): a row naming one is admitted only
+    /// as a minted `scores` row carrying its signed object. A bare `scores`
+    /// row is malformed at the group-plane door; any other type is refused by
+    /// the generic plan (`group_plane_row_shape`). Neither is stored.
     pub async fn i706_held_dimensions_refused<B: FederationDirectory + Sync>(b: &B, s: &str) {
         let w = who(b, &format!("i706-{s}")).await;
         // `key_grant:{axis}:v1` left this list with v55 slice B (#989): its
@@ -255,16 +259,24 @@ pub(crate) mod bodies {
                 let id = r.attestation_id.clone();
                 let e = put(b, r)
                     .await
-                    .expect_err("I706 a held dimension is refused");
-                assert!(
-                    matches!(
-                        &e,
-                        crate::federation::Error::DimensionRejected { reason, .. }
-                            if *reason
-                                == crate::federation::admission::REGISTERED_FAMILY_HELD_SHUT_REASON
-                    ),
-                    "I706 {t} {dim}: {e}"
-                );
+                    .expect_err("I706 a group-plane dimension outside its door is refused");
+                if t == "scores" {
+                    assert_eq!(
+                        e.kind(),
+                        "federation_malformed_row",
+                        "I706 {t} {dim}: a bare scores row carries no object: {e}"
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            &e,
+                            crate::federation::Error::DimensionRejected { reason, .. }
+                                if *reason
+                                    == crate::federation::group_plane::GROUP_PLANE_ROW_SHAPE_REASON
+                        ),
+                        "I706 {t} {dim}: {e}"
+                    );
+                }
                 assert!(b.get_attestation(&id).await.unwrap().is_none());
             }
         }

@@ -859,12 +859,22 @@ pub mod bodies {
                 "{p}: {err}"
             );
             assert!(d.lookup_community(&room).await.unwrap().is_none(), "{p}");
-            // Not infrastructure: the same protocol is admitted.
+            // Not infrastructure: the same protocol is admitted — except
+            // `founder_only`, which v61 refuses for every community above
+            // the family (CIRISPersist#1123, CC 4.5.13).
             let mut plain = infra_room(&format!("{room}-plain"), p, vec![seat(&human, "founder")]);
             plain.policy_blob = None;
-            d.put_community(ts::sign_community(&human, plain))
-                .await
-                .unwrap_or_else(|e| panic!("{tag}: {p} outside infrastructure: {e}"));
+            let put = d.put_community(ts::sign_community(&human, plain)).await;
+            if *p == crate::federation::types::consensus_protocol::FOUNDER_ONLY {
+                let err = put.expect_err("founder_only above the family");
+                assert_eq!(
+                    violation_rule(&err),
+                    crate::federation::admission::FOUNDER_ONLY_ABOVE_FAMILY,
+                    "{tag}: {err}"
+                );
+            } else {
+                put.unwrap_or_else(|e| panic!("{tag}: {p} outside infrastructure: {e}"));
+            }
         }
         let room = format!("root-ok-{tag}");
         authorized_room_key(d, &room).await;
@@ -2330,7 +2340,11 @@ mod runners {
                         async fn $name() {
                             let Some(d) = $fresh.await else { return };
                             let s = suffix();
-                            let host = format!("host-{s}");
+                            // v61 (CIRISPersist#1148) — the host declares its
+                            // key, and a replicated record reaches only its
+                            // audience: the host is the room's human member's
+                            // own node (its key is the member's).
+                            let host = format!("human-{}-{}", stringify!($name), s);
                             d.set_node_key_id(host.clone());
                             super::super::bodies::$name(
                                 &d as &dyn FederationDirectory,
@@ -2367,8 +2381,11 @@ mod runners {
                     };
                     let s = suffix();
                     // Both nodes know their own key — the production shape.
-                    a.set_node_key_id(format!("host-a-{s}"));
-                    b.set_node_key_id(format!("host-b-{s}"));
+                    // v61 (CIRISPersist#1148): a replicated record reaches
+                    // only its audience, so each node is the room's human
+                    // member's own (its key is the member's).
+                    a.set_node_key_id(format!("human-m6-{s}"));
+                    b.set_node_key_id(format!("human-m6-{s}"));
                     super::super::bodies::infrastructure_record_authored_elsewhere_is_data(
                         &a as &dyn FederationDirectory,
                         &b as &dyn FederationDirectory,

@@ -1020,6 +1020,24 @@ fn is_placement_member(member: &str) -> bool {
         || admission::COHORT_TARGET_ENVELOPE_FIELDS.contains(&member)
 }
 
+/// v61 (CIRISPersist#1155 / #1157) — is the held composer `held` the SAME
+/// placement as `offered`: a `supersedes` by the same attester, at the same
+/// cohort scope and cohort target (the same audience)? A placement is
+/// idempotent per audience; one into another room is a new one.
+///
+/// # Errors
+///
+/// A split-brain cohort target on either row.
+pub fn same_placement(held: &Attestation, offered: &Attestation) -> Result<bool, Error> {
+    Ok(
+        held.attestation_type == super::types::attestation_type::SUPERSEDES
+            && held.attesting_key_id == offered.attesting_key_id
+            && held.cohort_scope == offered.cohort_scope
+            && super::admission::envelope_cohort_target(&held.attestation_envelope)?
+                == super::admission::envelope_cohort_target(&offered.attestation_envelope)?,
+    )
+}
+
 /// Does a `differs_in` entry account for a difference in top-level `member`?
 /// Entries are JSON-pointer paths (`/agent_id_hash`, `/trace/step`) or bare
 /// member names; a nested pointer accounts for a CHANGE to the member it

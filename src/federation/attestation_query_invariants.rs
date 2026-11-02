@@ -121,7 +121,16 @@ pub(crate) mod bodies {
     }
 
     async fn land(d: &dyn FederationDirectory, r: Attestation, local: bool) -> Row {
-        let row = Row {
+        let row = row_of(&r, local);
+        d.put_attestation(SignedAttestation { attestation: r })
+            .await
+            .expect("I900 fixture row lands");
+        row
+    }
+
+    /// The oracle's view of a row.
+    fn row_of(r: &Attestation, local: bool) -> Row {
+        Row {
             id: r.attestation_id.clone(),
             by: r.attesting_key_id.clone(),
             to: r.attested_key_id.clone(),
@@ -133,11 +142,7 @@ pub(crate) mod bodies {
             scope: r.cohort_scope.clone(),
             target: crate::federation::cohort_target_of_envelope(&r.attestation_envelope)
                 .map(str::to_owned),
-        };
-        d.put_attestation(SignedAttestation { attestation: r })
-            .await
-            .expect("I900 fixture row lands");
-        row
+        }
     }
 
     /// Seed the corpus on `d`; `s` keeps keys unique per run (postgres
@@ -180,6 +185,23 @@ pub(crate) mod bodies {
         let comm2 = format!("i900-comm2-{s}");
         ts::seed_two_member_community(d, &comm1, &a, &b).await;
         ts::seed_two_member_community(d, &comm2, &a, &a).await;
+        // v61 (CIRISPersist#991) — each community's record and roster events
+        // are group-plane rows signed by their founder: rows of the corpus.
+        for r in d
+            .list_attestations_since(None, u32::MAX)
+            .await
+            .expect("I900 the plane")
+            .into_iter()
+            .map(|s| s.attestation)
+        {
+            if crate::federation::group_plane::group_signed_of_row(&r)
+                .ok()
+                .flatten()
+                .is_some_and(|g| g.group_key_id() == comm1 || g.group_key_id() == comm2)
+            {
+                rows.push(row_of(&r, false));
+            }
+        }
         let community = crate::federation::types::cohort_scope::COMMUNITY;
         let species = crate::federation::types::cohort_scope::SPECIES;
         rows.push(
@@ -1006,7 +1028,14 @@ mod lifecycle_predicate {
                 sql.contains("OR c.withdraws_admission_rule IS NOT NULL"),
                 "{sql}"
             );
-            assert!(sql.contains("= fa.attestation_id)"), "{sql}");
+            // v61 — the affinity-stripped compare and the pinned seek.
+            assert!(sql.contains("= +fa.attestation_id)"), "{sql}");
+            assert!(
+                sql.contains(
+                    "FROM federation_attestations c INDEXED BY federation_attestations_reference_live"
+                ),
+                "{sql}"
+            );
             let (pg, pg_binds) =
                 lifecycle_predicate(view, Dialect::Postgres, "federation_attestations", 2).unwrap();
             assert_eq!(pg_binds, want);

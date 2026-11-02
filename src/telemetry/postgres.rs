@@ -122,8 +122,7 @@ impl TelemetryService for PostgresBackend {
         let expires_at = resolve_expires_at(&obs);
 
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         client
@@ -181,8 +180,7 @@ impl TelemetryService for PostgresBackend {
         }
 
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let n = client
@@ -269,8 +267,7 @@ impl TelemetryService for PostgresBackend {
         );
 
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -312,8 +309,7 @@ impl TelemetryService for PostgresBackend {
         }
 
         let mut client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
 
@@ -429,8 +425,7 @@ impl TelemetryService for PostgresBackend {
             )));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let rows = client
@@ -481,8 +476,7 @@ impl TelemetryService for PostgresBackend {
             period_start.to_rfc3339()
         );
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row_opt = client
@@ -510,8 +504,7 @@ impl TelemetryService for PostgresBackend {
         before: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, Error> {
         let mut client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let tx = client
@@ -581,8 +574,7 @@ impl TelemetryService for PostgresBackend {
             )));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let rows = client
@@ -617,8 +609,7 @@ impl TelemetryService for PostgresBackend {
     ) -> Result<TypedConsolidationOutcome, Error> {
         validate_typed_req(&req)?;
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
 
@@ -699,8 +690,7 @@ impl TelemetryService for PostgresBackend {
     ) -> Result<TypedConsolidationOutcome, Error> {
         validate_typed_req(&req)?;
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
 
@@ -756,8 +746,7 @@ impl TelemetryService for PostgresBackend {
     ) -> Result<TypedConsolidationOutcome, Error> {
         validate_typed_req(&req)?;
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
 
@@ -819,8 +808,7 @@ impl TelemetryService for PostgresBackend {
     ) -> Result<TypedConsolidationOutcome, Error> {
         validate_typed_req(&req)?;
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
 
@@ -908,8 +896,7 @@ impl TelemetryService for PostgresBackend {
             )));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let rows = client
@@ -1589,7 +1576,7 @@ mod tests {
         let period_end = period_start + Duration::hours(6);
 
         // Plant a fresh lock from a different worker.
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .execute(
                 "INSERT INTO cirisgraph.consolidation_locks \
@@ -1616,7 +1603,7 @@ mod tests {
         assert!(!outcome.broke_stale_lock);
 
         // Clean up.
-        let cleanup = backend.pool().get().await.unwrap();
+        let cleanup = backend.checkout().await.unwrap();
         cleanup
             .execute(
                 "DELETE FROM cirisgraph.consolidation_locks \
@@ -1694,7 +1681,7 @@ mod tests {
         );
 
         // Verify the daily summary row carries consolidation_level='daily'.
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let row = client
             .query_one(
                 "SELECT consolidation_level, attributes \
@@ -1895,7 +1882,7 @@ mod tests {
         let period_start = Utc::now() - Duration::hours(6);
         let period_end = period_start + Duration::hours(6);
 
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         // Tenant-scoped task_ids so re-runs (and parallel test runs in
         // PG's shared DB) don't collide on the PK.
         let t1 = format!("t1-{tenant}");
@@ -1980,7 +1967,7 @@ mod tests {
         let period_start = Utc::now() - Duration::hours(6);
         let period_end = period_start + Duration::hours(6);
 
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         for (cid, action, actor, offset_min) in &[
             ("c1", "SPEAK", "alice", 0i64),
             ("c2", "observe", "alice", 5),
@@ -2064,7 +2051,7 @@ mod tests {
         let period_start = Utc::now() - Duration::hours(6);
         let period_end = period_start + Duration::hours(6);
 
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         for (action, ctype, offset_min) in &[
             ("call", "trace", 0i64),
             ("call", "trace", 5),
@@ -2132,7 +2119,7 @@ mod tests {
         let period_start = Utc::now() - Duration::hours(6);
         let period_end = period_start + Duration::hours(6);
 
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let prev_hash: [u8; 32] = [0; 32];
         let payload = serde_json::json!({});
         // Use action_types from V018's CHECK constraint allow-list.

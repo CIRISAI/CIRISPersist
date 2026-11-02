@@ -64,11 +64,14 @@ pub const RULE_SUPERSEDE_CANNOT_ADD: &str = "membership_supersede_cannot_add";
 /// acceptance of one whose room is no longer open at the growth.
 pub const RULE_OPEN_PROPOSAL_NOT_OPEN: &str = "membership_open_proposal_not_open";
 
-/// The two retryable rules: rows arrive out of order and persist holds no
-/// deferral queue, so the caller re-submits.
+/// The retryable rules: rows arrive out of order and persist holds no
+/// deferral queue, so the caller re-submits. v61 (CIRISPersist#1101): an
+/// unannounced serve seat too, once the owner announces.
 #[must_use]
 pub fn is_retryable_rule(rule: &str) -> bool {
-    rule == RULE_ACCEPTANCE_UNRESOLVED || rule == RULE_PROPOSAL_UNRESOLVED
+    rule == RULE_ACCEPTANCE_UNRESOLVED
+        || rule == RULE_PROPOSAL_UNRESOLVED
+        || rule == super::admission::SERVE_SEAT_OWNER_UNANNOUNCED
 }
 
 fn refuse(group: &str, member: &str, rule: &'static str) -> Error {
@@ -411,6 +414,21 @@ where
     };
     check_membership_row_shape(row)?;
     let group = group_of(row)?;
+    // v61 S2 (CIRISPersist#1123) — a room stored under founder_only admits
+    // no proposal and no acceptance (its one event is the escape).
+    if membership_plane(&row.cohort_scope) == Some(cohort_scope::TargetPlane::Room)
+        && matches!(kind, MembershipRow::Proposal | MembershipRow::Acceptance)
+    {
+        super::admission::refuse_membership_event_under_founder_only(
+            dir,
+            &group,
+            match kind {
+                MembershipRow::Proposal => "membership proposal",
+                _ => "membership acceptance",
+            },
+        )
+        .await?;
+    }
     // v52.0.0 (#956) — no invitation to, or reply about, a dissolved family.
     if row.cohort_scope == cohort_scope::FAMILY {
         super::family_dissolution::refuse_if_held_family_dissolved(dir, &group).await?;
@@ -519,7 +537,7 @@ where
         let Some(f) = dir.lookup_family(group).await? else {
             return Ok(());
         };
-        f.consensus_protocol != super::types::consensus_protocol::FOUNDER_ONLY
+        !super::types::consensus_protocol::founders_hold_authority(&f.consensus_protocol)
             || dir
                 .active_family_members(group)
                 .await?
@@ -529,7 +547,7 @@ where
         let Some(c) = dir.lookup_community(group).await? else {
             return Ok(());
         };
-        c.consensus_protocol != super::types::consensus_protocol::FOUNDER_ONLY
+        !super::types::consensus_protocol::founders_hold_authority(&c.consensus_protocol)
             || dir
                 .active_community_members(group)
                 .await?
@@ -540,7 +558,7 @@ where
         Ok(())
     } else {
         Err(Error::InvalidArgument(format!(
-            "{PROPOSAL_DIMENSION}: under founder_only only a founder of {group} proposes"
+            "{PROPOSAL_DIMENSION}: under founder_only or open:self_admit only a founder of {group} proposes"
         )))
     }
 }
@@ -554,10 +572,14 @@ where
 /// needs no acceptance in `community` at `at` iff the community is
 /// `infrastructure`, the key is node-bearing at `at` (#925's predicate), and
 /// its own key record carries the accord's m-of-n scrub. The founders' quorum
-/// is the caller's roster-authority check and is not weakened here. The owner
-/// binding is NOT read: it is `self`-scope on the node and no other node can
-/// see it; the claim is enforced where the node operates. A person in the
-/// same community, and a node anywhere else, still needs what they needed.
+/// is the caller's roster-authority check and is not weakened here. A person
+/// in the same community, and a node anywhere else, still needs what they
+/// needed.
+///
+/// v61 (CIRISPersist#1101) — the announced-owner leg is the growth
+/// gate's ([`check_growth_accepted`]), not this predicate's: the founding
+/// record a genesis bundle carries seats its serve node before any owner
+/// binding exists (the steward's ruling: nothing in genesis carries one).
 pub async fn node_seated_without_acceptance<F>(
     dir: &F,
     community: &super::types::Community,
@@ -599,6 +621,17 @@ where
     if membership_plane(scope) == Some(cohort_scope::TargetPlane::Room) {
         if let Some(c) = dir.lookup_community(group).await? {
             if node_seated_without_acceptance(dir, &c, member, growth_instant).await? {
+                // v61 (CIRISPersist#1101; CC 5.4.6, `CLM-serve-seat-announced`)
+                // — a serve seat needs an announced owner: a live owner
+                // binding at `cohort_scope: federation`, judged now. A later
+                // announcement satisfies it, so the refusal is retryable.
+                if !super::admission::serve_seat_owner_announced(dir, member).await? {
+                    return Err(refuse(
+                        group,
+                        member,
+                        super::admission::SERVE_SEAT_OWNER_UNANNOUNCED,
+                    ));
+                }
                 return Ok(());
             }
         }
@@ -936,10 +969,11 @@ pub fn proposal_input(
         group_kind_for_scope(scope).unwrap_or("community").into(),
     );
     extra.insert(target_key.into(), group.into());
-    extra.insert(
-        "role".into(),
-        role.map_or(serde_json::Value::Null, Into::into),
-    );
+    // CC 2.6.1.7 (rc12): `role` is OPTIONAL and absent when no role is
+    // offered; an explicit `null` is refused `envelope_member_null`.
+    if let Some(role) = role {
+        extra.insert("role".into(), role.into());
+    }
     let envelope = super::envelope::EnvelopeCore {
         dimension: Some(PROPOSAL_DIMENSION.to_owned()),
         extra,
@@ -995,15 +1029,16 @@ pub fn reply_input(proposal: &Attestation, accept: bool) -> super::types::EmitAt
         "proposal_hash".into(),
         proposal.original_content_hash.clone().into(),
     );
+    // The acceptance restates the offered role, and carries none when none
+    // was offered (absent, never `null`).
     if accept {
-        extra.insert(
-            "role".into(),
-            proposal
-                .attestation_envelope
-                .get("role")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-        );
+        if let Some(role) = proposal
+            .attestation_envelope
+            .get("role")
+            .filter(|v| !v.is_null())
+        {
+            extra.insert("role".into(), role.clone());
+        }
     }
     let envelope = super::envelope::EnvelopeCore {
         dimension: Some(
@@ -1089,19 +1124,23 @@ pub mod test_support {
         role: Option<&str>,
         at: DateTime<Utc>,
     ) -> Attestation {
+        let mut envelope = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "dimension": PROPOSAL_DIMENSION,
+            // v54.0.0 (#1034) — the production mapping (`affiliations`
+            // is a room: `community`), not the raw scope.
+            "group_kind": super::group_kind_for_scope(scope).unwrap_or("community"),
+            target_key(scope): group,
+        });
+        // Absent when no role is offered, as the production emitter writes it.
+        if let Some(role) = role {
+            envelope["role"] = role.into();
+        }
         sealed(
             proposer,
             proposer,
             scope,
-            serde_json::json!({
-                "id": uuid::Uuid::new_v4().to_string(),
-                "dimension": PROPOSAL_DIMENSION,
-                // v54.0.0 (#1034) — the production mapping (`affiliations`
-                // is a room: `community`), not the raw scope.
-                "group_kind": super::group_kind_for_scope(scope).unwrap_or("community"),
-                target_key(scope): group,
-                "role": role,
-            }),
+            envelope,
             at,
             Some(at + Duration::seconds(super::MEMBERSHIP_PROPOSAL_MAX_TTL_SECS)),
             vec![member.to_owned()],
@@ -1112,25 +1151,22 @@ pub mod test_support {
     #[must_use]
     pub fn acceptance_row(member: &str, p: &Attestation, at: DateTime<Utc>) -> Attestation {
         let scope = p.cohort_scope.clone();
-        sealed(
-            member,
-            member,
-            &scope,
-            serde_json::json!({
-                "id": uuid::Uuid::new_v4().to_string(),
-                "dimension": ACCEPTANCE_DIMENSION,
-                // v54.0.0 (#1034) — the production mapping (`affiliations`
-                // is a room: `community`), not the raw scope.
-                "group_kind": super::group_kind_for_scope(&scope).unwrap_or("community"),
-                target_key(&scope): p.attestation_envelope.get(target_key(&scope)).cloned(),
-                "references_attestation_id": p.attestation_id,
-                "proposal_hash": p.original_content_hash,
-                "role": p.attestation_envelope.get("role").cloned(),
-            }),
-            at,
-            None,
-            vec![],
-        )
+        let mut envelope = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "dimension": ACCEPTANCE_DIMENSION,
+            // v54.0.0 (#1034) — the production mapping (`affiliations`
+            // is a room: `community`), not the raw scope.
+            "group_kind": super::group_kind_for_scope(&scope).unwrap_or("community"),
+            target_key(&scope): p.attestation_envelope.get(target_key(&scope)).cloned(),
+            "references_attestation_id": p.attestation_id,
+            "proposal_hash": p.original_content_hash,
+        });
+        // The acceptance restates the offered role, and carries none when none
+        // was offered.
+        if let Some(role) = p.attestation_envelope.get("role").filter(|v| !v.is_null()) {
+            envelope["role"] = role.clone();
+        }
+        sealed(member, member, &scope, envelope, at, None, vec![])
     }
 
     async fn founder_of<D: FederationDirectory + ?Sized>(

@@ -81,7 +81,7 @@ pub mod bodies {
         let signer = record_signer
             .map(str::to_owned)
             .unwrap_or_else(|| keys[0].clone());
-        d.put_community(ts::sign_community(
+        let community = ts::sign_community(
             &signer,
             Community {
                 prev_head_digest: String::new(),
@@ -102,9 +102,32 @@ pub mod bodies {
                 policy_blob,
                 persist_row_hash: String::new(),
             },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("{tag}: room: {e}"));
+        );
+        // v61 (CIRISPersist#1123) — the local door refuses `founder_only`
+        // above the family. A room under it is a LEGACY room (stored before
+        // v61, as the field holds one), which a peer still delivers: the
+        // replicated door admits it as data, and every fold reads it as
+        // before. An affiliation keeps `founder_only` on the local door.
+        let legacy = protocol == consensus_protocol::FOUNDER_ONLY
+            && crate::federation::affiliation_config::declared_cohort(&community.community)
+                .is_ok_and(|c| c != crate::federation::cohort::Cohort::Affiliations);
+        if legacy {
+            let outcome = d
+                .apply_replicated_community(community)
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: legacy room: {e}"));
+            assert!(
+                matches!(
+                    outcome,
+                    crate::federation::ReplicatedCommunityOutcome::Inserted
+                ),
+                "{tag}: legacy room: {outcome:?}"
+            );
+        } else {
+            d.put_community(community)
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: room: {e}"));
+        }
         (room, keys)
     }
 
@@ -213,7 +236,7 @@ pub mod bodies {
     /// **I170 — admission is the roster.** A `founder_only` room, so the
     /// founder's single signature is the protocol (CC 4.4.3.4.2).
     pub async fn i170_admission_is_the_roster(d: &dyn FederationDirectory, tag: &str) {
-        let (room, alice, _bob) = make_room(d, tag, consensus_protocol::FOUNDER_ONLY).await;
+        let (room, alice, _bob) = make_room(d, tag, "quorum:1/1").await;
         let carol = format!("{tag}-carol");
         user(d, &carol).await;
         assert!(!admitted(d, &carol, &room).await, "{tag} I170: control");
@@ -274,7 +297,11 @@ pub mod bodies {
         }
         let eve = newcomer("eve");
 
-        // founder_only: a plain member refused, a founder admitted.
+        // v61 S2 (CIRISPersist#1123) — a legacy room stored under
+        // founder_only admits no widening and no removal, a founder's
+        // included: its one event is the escape (I1518). (The evaluator's
+        // founder_only arm stays witnessed on families and in
+        // `consensus::tests`.)
         let (r, k) = make_group(
             d,
             &format!("{tag}-fo"),
@@ -285,24 +312,25 @@ pub mod bodies {
             None,
         )
         .await;
-        refused(
+        let founder_only = |res: Result<(), Error>, what: &str| match res {
+            Err(Error::CommunityConsensusProtocolViolation { rule, .. }) => assert_eq!(
+                rule,
+                crate::federation::admission::FOUNDER_ONLY_ABOVE_FAMILY,
+                "{tag} I171 {what}"
+            ),
+            other => panic!("{tag} I171 {what}: {other:?}"),
+        };
+        founder_only(
             widen_by(d, &[&k[1]], widening(&r, &newcomer("x1"), t(1), None)).await,
-            INSUFFICIENT,
             "founder_only: a plain member",
         );
-        widen_by(d, &[&k[0]], widening(&r, &newcomer("x1"), t(2), None))
-            .await
-            .unwrap_or_else(|e| panic!("{tag} founder_only admits a founder: {e}"));
-        // A stranger: retryable, and no row is stored.
-        refused(
-            widen_by(d, &[&eve], widening(&r, &eve, t(3), None)).await,
-            NOT_ESTABLISHED,
-            "a stranger widens itself",
+        founder_only(
+            widen_by(d, &[&k[0]], widening(&r, &newcomer("x1"), t(2), None)).await,
+            "founder_only: a founder",
         );
-        refused(
-            revoke_by(d, &[&eve], revocation(&r, &k[1], t(3))).await,
-            NOT_ESTABLISHED,
-            "a stranger removes a member",
+        founder_only(
+            revoke_by(d, &[&k[0]], revocation(&r, &k[1], t(3))).await,
+            "founder_only: a founder removes a member",
         );
         assert!(
             d.list_community_membership_revocations_for(&r)
@@ -323,6 +351,24 @@ pub mod bodies {
             None,
         )
         .await;
+        // A stranger: retryable, and no row is stored.
+        refused(
+            widen_by(d, &[&eve], widening(&r, &eve, t(3), None)).await,
+            NOT_ESTABLISHED,
+            "a stranger widens itself",
+        );
+        refused(
+            revoke_by(d, &[&eve], revocation(&r, &k[1], t(3))).await,
+            NOT_ESTABLISHED,
+            "a stranger removes a member",
+        );
+        assert!(
+            d.list_community_membership_revocations_for(&r)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{tag} I171: a refused removal stores no row (and rotates nothing)"
+        );
         refused(
             widen_by(d, &[&k[1]], widening(&r, &newcomer("x2"), t(1), None)).await,
             INSUFFICIENT,
@@ -417,7 +463,7 @@ pub mod bodies {
         let (r, _k) = make_group(
             d,
             &format!("{tag}-rs"),
-            consensus_protocol::FOUNDER_ONLY,
+            "quorum:1/1",
             &["a", "b"],
             1,
             None,
@@ -940,7 +986,7 @@ pub mod bodies {
 
     /// The store-half setup: a room, bob removed by alice.
     pub async fn i173_setup(d: &dyn FederationDirectory, tag: &str) -> (String, String) {
-        let (room, alice, bob) = make_room(d, tag, consensus_protocol::FOUNDER_ONLY).await;
+        let (room, alice, bob) = make_room(d, tag, "quorum:1/1").await;
         revoke(
             d,
             &alice,

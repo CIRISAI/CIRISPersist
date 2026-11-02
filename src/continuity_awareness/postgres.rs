@@ -147,8 +147,7 @@ impl ContinuityAwarenessService for PostgresBackend {
         validate_record(&record)?;
         let scope_str = record.preservation_scope.as_sql_str();
         let mut client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let tx = client
@@ -214,8 +213,7 @@ impl ContinuityAwarenessService for PostgresBackend {
             return Err(Error::InvalidArgument("agent_id required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row_opt = client
@@ -241,8 +239,7 @@ impl ContinuityAwarenessService for PostgresBackend {
             return Err(Error::InvalidArgument("agent_id required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let changed = client
@@ -552,7 +549,7 @@ mod tests {
         // Bypass the typed enum to write an arbitrary scope string
         // directly — verify the CHECK constraint kicks in at the
         // database layer.
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let now = Utc::now();
         let cid = format!("shutdown-bad-{}", Uuid::new_v4().simple());
         let res = client

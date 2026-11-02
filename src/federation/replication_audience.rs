@@ -748,6 +748,28 @@ where
     // Every stage also reaches the group's membership-plane audience
     // ([`may_receive_group_plane`]: member nodes and live invitees' nodes by
     // principal binding, not the per-node content allow list).
+    // v61 (CIRISPersist#991, CC 6.1.5.3) — a group's record and its roster
+    // events (`group:roster:v1`, `membership:{widening,removal,resignation}:v1`)
+    // are the group's membership plane: they reach its membership-plane
+    // audience, the member the row names included, never the per-node
+    // content allow list.
+    if let Ok(Some(signed)) = super::group_plane::group_signed_of_row(row) {
+        // v61 (CIRISPersist#1148) — a group's RECORD names its own audience:
+        // a public record reaches everyone, and a member it seats is in its
+        // audience before any node holds it (a founder's node receives the
+        // founding record it co-signed; the put-time gate asks this).
+        if let Some(v) = record_names_its_audience(dir, recipient, &signed).await? {
+            return Ok(v);
+        }
+        return may_receive_group_plane(
+            dir,
+            recipient,
+            &row.cohort_scope,
+            signed.group_key_id(),
+            signed.member_key_id(),
+        )
+        .await;
+    }
     if !key_set {
         if let Some((stage, group)) = super::membership_acceptance::membership_group_of(row) {
             let mut mine: HashSet<String> = super::self_collective::principals_of(dir, recipient)
@@ -814,6 +836,73 @@ where
     }
 }
 
+/// v61 (CIRISPersist#1148) — the audience a group RECORD names by itself:
+/// `Some(Yes(Public))` for a public community record, `Some(Yes(Cohort))`
+/// when a member it lists is one of `recipient`'s principals, else `None`
+/// (the stored group's membership plane decides). Not a plane row: `None`.
+async fn record_names_its_audience<D>(
+    dir: &D,
+    recipient: &str,
+    signed: &super::group_plane::GroupSigned,
+) -> Result<Option<Verdict>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    use super::group_plane::GroupSigned;
+    let members: Vec<&str> = match signed {
+        GroupSigned::Community(c) => {
+            if super::public_room::is_public_community(&c.community) {
+                return Ok(Some(Verdict::Yes(Reason::Public)));
+            }
+            c.community
+                .members
+                .iter()
+                .map(|m| m.key_id.as_str())
+                .collect()
+        }
+        GroupSigned::Family(f) => f.family.members.iter().map(|m| m.key_id.as_str()).collect(),
+        _ => return Ok(None),
+    };
+    let mut principals: HashSet<String> = super::self_collective::principals_of(dir, recipient)
+        .await?
+        .into_iter()
+        .collect();
+    principals.insert(recipient.to_owned());
+    Ok(members
+        .iter()
+        .any(|m| principals.contains(*m))
+        .then_some(Verdict::Yes(Reason::Cohort)))
+}
+
+/// v61 (CIRISPersist#1148) — may `recipient` receive the community RECORD
+/// `community` (the typed replicated door's question): what the record names
+/// by itself, else the stored group's membership-plane audience.
+///
+/// # Errors
+///
+/// Directory reads.
+pub async fn may_receive_community_record<D>(
+    dir: &D,
+    recipient: &str,
+    community: &super::types::SignedCommunity,
+) -> Result<Verdict, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let signed = super::group_plane::GroupSigned::Community(community.clone());
+    if let Some(v) = record_names_its_audience(dir, recipient, &signed).await? {
+        return Ok(v);
+    }
+    may_receive_group_plane(
+        dir,
+        recipient,
+        cs::COMMUNITY,
+        &community.community.community_key_id,
+        None,
+    )
+    .await
+}
+
 /// **The membership-plane audience of a group (CIRISEdge#761, CC 5.4.6).**
 /// May `recipient` receive the group's record and its membership planes
 /// (widenings, revocations, listings)?
@@ -826,8 +915,9 @@ where
 ///   revocation, the removed member): yes;
 /// - else no.
 ///
-/// Node-of here is a principal binding (`active_identities_for_occurrence` or
-/// the key itself), not the per-node content allow list: a group's roster is
+/// Node-of here is a principal binding
+/// ([`principals_of`](super::self_collective::principals_of), or the key
+/// itself), not the per-node content allow list: a group's roster is
 /// not content, and a member's node must be able to judge it.
 pub async fn may_receive_group_plane<D>(
     dir: &D,
@@ -842,8 +932,14 @@ where
     if is_public_group(dir, group).await? {
         return Ok(Verdict::Yes(Reason::Public));
     }
-    let mut principals: HashSet<String> = dir
-        .active_identities_for_occurrence(recipient)
+    // v59.1.1 — the SAME principal fold as the proposal branch and the send
+    // set: `principals_of` (active occurrences, the node's owner unless an
+    // effective revocation says otherwise, a user key itself). Reading only
+    // `active_identities_for_occurrence` here dropped a split-home node whose
+    // login occurrence row was never agreed (#932 H1): the invitation reached
+    // it, but the group's record and membership planes never did, so the
+    // joiner never learned it was seated (CIRISServer live chat).
+    let mut principals: HashSet<String> = super::self_collective::principals_of(dir, recipient)
         .await?
         .into_iter()
         .collect();

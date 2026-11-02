@@ -1819,7 +1819,7 @@ pub mod orchestrate {
                         "change_kind": hard_case::change_kind::ADDED,
                         "subject_key_id": member,
                         "cohort_key_id": target_key_id,
-                        "effective_at": observed_at.to_rfc3339(),
+                        "effective_at": crate::federation::admission::render_signed_instant(observed_at),
                         // Diagnostic fields persist has always carried.
                         "cohort_scope": cohort_scope,
                         "blobs_scanned": result.blobs_scanned,

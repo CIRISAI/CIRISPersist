@@ -1794,7 +1794,19 @@ mod tests {
         // v60.1.0 slice B: +1 (CIRISPersist#1120), CLM-identity-amendment-row.
         // v60.1.0 CC ids: +2, CLM-takedown-reversal (4.5.3, #1113) and
         // CLM-scope-infra-relay (4.4.3.4.3, #1119).
-        const EXPECTED: usize = 349;
+        // v61 slice S1: +5 (CIRISPersist#991 planes 2 and 3): CLM-planes-as-rows
+        // at the group-plane row builder, its door and the rehome (3);
+        // CLM-cosigned-rows at the one co-signature count and the cosigned
+        // withdraws (2).
+        // v61 slice S2: +2 (CIRISPersist#1123): CLM-one-voice-room at the
+        // founder_only gate and the open:self_admit evaluator; +1
+        // (CIRISPersist#1063): CLM-public-community at the on-request read;
+        // +1 (CIRISPersist#1157): CLM-composer-convergent-rank at the rank;
+        // +1 (CIRISPersist#1143): CLM-affiliation-one-voice-countersign.
+        // v61 slice S3: +2 (CIRISPersist#1101, CC 2.6.2): CLM-serve-seat-announced
+        // (5.3) at the owner-announced predicate, CLM-canonicalization (2.6.2) at
+        // the signed-instant form predicate.
+        const EXPECTED: usize = 365;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

@@ -5,7 +5,7 @@ witnesses, mutation scopes and refusal tokens (docs/V60_TASK_PLAN.md §3b).
     scripts/csd4_coverage.py [--out <report.md>] [--cewpos-dir <dir>]
 
 A REPORT, NOT A GATE (v60). The join is READ from CC's chain manifest,
-src/federation/namespace/csd4_chain.json (CIRISConstitution v1.0-rc9
+src/federation/namespace/csd4_chain.json (CIRISConstitution v1.0-rc15
 `manifests/csd4_chain.json`, vendored byte for byte at the tag beside the
 namespace registry and pinned in `federation::namespace::cc_manifests`),
 never guessed from `cc_ref` prefixes:
@@ -51,7 +51,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 FIX = REPO / "tests" / "fixtures" / "csd4"
-# v60.0.0 (S6v): CC's two files are runtime manifests at the v1.0-rc9 tag,
+# CC's two files are runtime manifests at the vendored CC tag (v1.0-rc15),
 # beside the namespace registry; the CIRISServer catalogue (traces.json,
 # requirements.yaml, PIN.md, topology_vocabulary.pin) stays a test fixture.
 MANIFESTS = REPO / "src" / "federation" / "namespace"

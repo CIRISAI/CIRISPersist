@@ -1259,12 +1259,6 @@ pub mod delegation_scope {
              offers",
         ),
         (
-            "listing::LISTED_RULE_SCOPE_INVALID",
-            "v49.0.0 (CIRISPersist#912) — a REFUSAL RULE TOKEN \
-             (Error::MembershipListingRefused.rule = \"envelope_listed_scope_invalid\"), not a \
-             delegates_to scope value; `scope` in its name is the cohort scope a listing named",
-        ),
-        (
             "holding_claim::HOLDING_CLAIM_SCOPE_UNRESOLVED",
             "v55.0.0 (CIRISPersist#989) — a REFUSAL TOKEN (a holding claim whose content names              no cohort to be placed at), not a delegates_to scope value; `scope` in its name is              the claim's cohort scope",
         ),
@@ -2565,7 +2559,9 @@ pub struct Revocation {
     /// `key_id` carries its keystore label in cleartext, so a revoker may
     /// name the subject by digest alone. When present it must name a key
     /// this node holds whose digest is [`Self::revoked_key_sha256_ed25519_raw`]
-    /// — one subject is never named two ways. Absent is bound as JSON `null`.
+    /// — one subject is never named two ways. Absent, the row object omits the
+    /// member, and the signed `revocation_envelope` binds it as JSON `null`
+    /// (the key plane's own contract, CC 2.6.1.1.1's one exception).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_key_id: Option<String>,
     /// v52.0.0 (#784) — **the SUBJECT**: SHA-256 of the revoked key's RAW
@@ -2854,8 +2850,29 @@ pub mod consensus_protocol {
     /// mistaken for a smaller number.
     pub const REVERSE_QUORUM_PREFIX: &str = "reverse_quorum:";
 
+    /// v61 (CIRISPersist#1123; CC 4.4.3.2, 4.4.3.4.2, 4.5.13) — **open
+    /// admission**, the one protocol of a `public` group: the group's side of a
+    /// widening that seats one new key is that key's OWN signature (the joiner
+    /// still accepts the founder's standing proposal, CC 3.1.3.2), and a
+    /// removal runs under the CC 4.5.13 floor, never one vote
+    /// ([`crate::federation::consensus::OPEN_SELF_ADMIT_REMOVAL_FLOOR`]).
+    /// Admissible only on a `public` community; a family or a private room
+    /// that names it is refused.
+    pub const OPEN_SELF_ADMIT: &str = "open:self_admit";
+
+    /// v61 (CIRISPersist#1123) — do the group's FOUNDERS alone hold its
+    /// authority (sign on its behalf, propose, appoint)? Under `founder_only`
+    /// by definition; under [`OPEN_SELF_ADMIT`] because joining confers
+    /// membership, never authority: a room anyone may join must not hand
+    /// everyone who joins its voice.
+    #[must_use]
+    pub fn founders_hold_authority(s: &str) -> bool {
+        matches!(s, FOUNDER_ONLY | OPEN_SELF_ADMIT)
+    }
+
     /// True iff `s` parses into one of the canonical-kinds shapes:
-    /// the three bare forms (`founder_only`, `unanimous`, `majority`),
+    /// the three bare forms (`founder_only`, `unanimous`, `majority`), the
+    /// open form [`OPEN_SELF_ADMIT`] (exactly that string),
     /// one of the three prefixed forms with a non-empty tail
     /// (`quorum:{m}/{n}` where m, n parse as integers; `weighted:rubric`;
     /// `custom:id`), or the v24.3.0 objection form
@@ -2863,7 +2880,7 @@ pub mod consensus_protocol {
     /// strings, unprefixed names not in the bare set, and `quorum:` strings
     /// whose tail is not `{int}/{int}`.
     pub fn is_canonical_form(s: &str) -> bool {
-        if matches!(s, FOUNDER_ONLY | UNANIMOUS | MAJORITY) {
+        if matches!(s, FOUNDER_ONLY | UNANIMOUS | MAJORITY | OPEN_SELF_ADMIT) {
             return true;
         }
         if s.starts_with(REVERSE_QUORUM_PREFIX) {
@@ -4450,7 +4467,8 @@ impl SignedTouchClaim {
         serde_json::json!({
             "target_key_id": self.target_key_id,
             "target_kind": self.target_kind,
-            "fresh_as_of": self.fresh_as_of.to_rfc3339(),
+            // CC 2.6.2: `.sssZ` (v61 S3).
+            "fresh_as_of": crate::federation::admission::render_signed_instant(self.fresh_as_of),
             "signer_form": self.signer_form.as_str(),
             "attesting_key_id": self.attesting_key_id,
             "cohort_scope": self.cohort_scope,
@@ -4904,7 +4922,7 @@ fn truncate_rfc3339_to_microseconds(s: &str) -> Option<String> {
 /// a column holds or what a signature covers. The rows keep whatever precision
 /// their backend keeps; only the identity derived from them stops varying with
 /// it.
-fn truncate_instants_to_microseconds(value: &mut serde_json::Value) {
+pub(crate) fn truncate_instants_to_microseconds(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(s) => {
             if let Some(truncated) = truncate_rfc3339_to_microseconds(s) {
@@ -7299,95 +7317,6 @@ impl ServedFamilyMembershipWidening {
                 &w.family_key_id,
                 &w.member_key_id,
                 &w.effective_at.to_rfc3339(),
-            ]),
-        )
-    }
-}
-
-/// v49.0.0 (CIRISPersist#912, FSD `ROOM_ROSTER_AUTHORITY.md` §11) — one
-/// member's PUBLIC-LISTING choice in one room: CC 2's `listed`, a
-/// per-membership opt-in the member makes and no one else can. The plane is
-/// forward-only: setting it is a row with `listed: Some("public")`, clearing
-/// it is a LATER row with `listed: None`, and the latest row at or before an
-/// instant decides. Nothing is ever rewritten — and un-listing stops new
-/// readers but does not unread what was read while the member was listed.
-///
-/// Rooms only (`community` / `affiliations`, which share
-/// `federation_communities`). A family and `self` have no listing plane:
-/// CC 5.2 structural invisibility leaves nothing to list.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommunityMembershipListing {
-    /// The room (`federation_communities.community_key_id`).
-    pub community_key_id: String,
-    /// The member whose membership is (un)listed — and the only key that may
-    /// sign the row.
-    pub member_key_id: String,
-    /// When the choice takes effect (`effective_at <= now`); the PK's third
-    /// part, so a later row supersedes an earlier one without touching it.
-    pub effective_at: DateTime<Utc>,
-    /// [`crate::federation::envelope::paths::LISTED`]: `Some("public")` lists
-    /// the membership; `None` clears it (and is omitted from the envelope,
-    /// exactly as CC 2 spells an absent member). No other value is admitted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub listed: Option<String>,
-    /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
-    pub persist_row_hash: String,
-}
-
-impl CommunityMembershipListing {
-    /// The signed preimage: the row minus `persist_row_hash` (the roster
-    /// planes' discipline). Carries the `listed` key only when `Some`.
-    pub fn signing_envelope(&self) -> serde_json::Value {
-        let mut v =
-            serde_json::to_value(self).expect("CommunityMembershipListing always serializes");
-        if let Some(obj) = v.as_object_mut() {
-            obj.remove("persist_row_hash");
-        }
-        v
-    }
-}
-
-/// A SIGNED [`CommunityMembershipListing`]: the hybrid scrub under
-/// `authority_key_id` over [`CommunityMembershipListing::signing_envelope`].
-/// There are no co-signatures — a listing is one person's disclosure, and the
-/// door refuses any signer but the member.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignedCommunityMembershipListing {
-    /// The listing itself.
-    pub community_membership_listing: CommunityMembershipListing,
-    /// The signer — must equal `member_key_id`.
-    #[serde(default)]
-    pub authority_key_id: String,
-    /// Ed25519 over the canonical envelope.
-    #[serde(default)]
-    pub scrub_signature_classical: String,
-    /// ML-DSA-65 over canonical ‖ ed_sig.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scrub_signature_pqc: Option<String>,
-}
-
-/// A served [`SignedCommunityMembershipListing`] with THIS node's serve
-/// position — the mirror of [`ServedCommunityMembershipWidening`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ServedCommunityMembershipListing {
-    /// The signed row, unchanged.
-    pub listing: SignedCommunityMembershipListing,
-    /// THIS node's serve position on the row (node-local, never hashed).
-    pub admitted_at: chrono::DateTime<chrono::Utc>,
-}
-
-impl ServedCommunityMembershipListing {
-    /// The `(admitted_at, compound id)` pair a caller resumes from: the
-    /// three-part PK `(community_key_id, member_key_id, effective_at)`.
-    #[must_use]
-    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
-        let l = &self.listing.community_membership_listing;
-        (
-            self.admitted_at,
-            compound_resume_id(&[
-                &l.community_key_id,
-                &l.member_key_id,
-                &l.effective_at.to_rfc3339(),
             ]),
         )
     }

@@ -77,6 +77,20 @@ impl PostgresBackend {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// v61 (CIRISPersist#991) — test-only: one integer a SQL statement
+    /// selects, read straight off the database (the from-disk count a rehome
+    /// witness checks, independent of the executor it witnesses).
+    #[cfg(test)]
+    pub(crate) async fn test_count(&self, sql: &str) -> i64 {
+        let client = self.get_client().await.expect("test_count client");
+        client
+            .query_one(sql, &[])
+            .await
+            .expect("test_count")
+            .try_get::<_, i64>(0)
+            .expect("test_count: an integer")
+    }
+
     /// v57.0.0 (CIRISPersist#988, I960/I961) — run raw SQL: the projection
     /// witnesses tamper with a live table to prove the gate red.
     #[cfg(test)]
@@ -97,7 +111,19 @@ impl PostgresBackend {
         dsn: &str,
         max_size: usize,
     ) -> Result<Self, Error> {
-        Self::connect_sized(dsn, Some(max_size)).await
+        Self::connect_sized(dsn, Some(max_size), POOL_WAIT_TIMEOUT).await
+    }
+
+    /// v59.1.2 — [`Self::connect_with_max_size_for_test`] with a short
+    /// checkout wait, so a starved pool answers
+    /// [`Error::PoolExhausted`] inside a test's budget.
+    #[cfg(test)]
+    pub(crate) async fn connect_with_pool_for_test(
+        dsn: &str,
+        max_size: usize,
+        wait: std::time::Duration,
+    ) -> Result<Self, Error> {
+        Self::connect_sized(dsn, Some(max_size), wait).await
     }
 
     /// The pool's configured `max_size` (the one-connection witnesses assert
@@ -156,7 +182,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT attestation_id FROM cirislens.federation_attestations \
@@ -187,7 +213,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         if !pg_key_plane_present(&**client).await? {
             return Ok(Default::default());
         }
@@ -264,7 +290,7 @@ impl PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -361,6 +387,315 @@ where
     client.query(&stmt.sql, &params_ref[..]).await
 }
 
+/// v61 (CIRISPersist#991) — the primary-key predicate of a group-plane
+/// projection row, from bind position `first`.
+fn pg_group_link_where(
+    link: &crate::federation::group_plane::GroupRowLink,
+    first: usize,
+) -> (
+    String,
+    Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+) {
+    use crate::federation::group_plane::GroupPlaneTable as T;
+    let group = match link.table.kind() {
+        crate::federation::group_plane::GroupKind::Family => "family_key_id",
+        crate::federation::group_plane::GroupKind::Community => "community_key_id",
+    };
+    let member = match link.table {
+        T::Families | T::Communities => None,
+        T::FamilyRevocations | T::CommunityRevocations => Some("removed_identity_key_id"),
+        T::FamilyWidenings | T::CommunityWidenings => Some("member_key_id"),
+    };
+    let mut binds: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+        vec![Box::new(link.group_key_id.clone())];
+    let mut sql = format!("{group} = ${first}");
+    if let (Some(col), Some(m), Some(at)) = (member, &link.member_key_id, link.effective_at) {
+        sql.push_str(&format!(
+            " AND {col} = ${} AND effective_at = ${}",
+            first + 1,
+            first + 2
+        ));
+        binds.push(Box::new(m.clone()));
+        binds.push(Box::new(at));
+    }
+    (sql, binds)
+}
+
+/// v61 (CIRISPersist#991) — the group plane's executor on postgres.
+/// Storage only: the row is `group_plane::plan_group_row`'s.
+#[async_trait::async_trait]
+impl crate::federation::group_plane::GroupPlaneStore for PostgresBackend {
+    async fn unlinked_group_objects(
+        &self,
+        table: crate::federation::group_plane::GroupPlaneTable,
+    ) -> Result<Vec<crate::federation::group_plane::GroupSigned>, crate::federation::Error> {
+        use crate::federation::group_plane::{GroupPlaneTable as T, GroupSigned as G};
+        use crate::federation::Error;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT * FROM cirislens.{} WHERE attestation_id IS NULL \
+                       AND authority_key_id IS NOT NULL AND authority_key_id <> ''",
+                    table.as_str()
+                ),
+                &[],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("unlinked group objects: {e}")))?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(match table {
+                    T::Families => G::Family(pg_row_to_signed_family(r)?),
+                    T::Communities => G::Community(pg_row_to_signed_community(r)?),
+                    T::FamilyRevocations => {
+                        G::FamilyRevocation(pg_row_to_signed_family_membership_revocation(r)?)
+                    }
+                    T::CommunityRevocations => {
+                        G::CommunityRevocation(pg_row_to_signed_community_membership_revocation(r)?)
+                    }
+                    T::FamilyWidenings => {
+                        G::FamilyWidening(pg_row_to_signed_family_membership_widening(r)?)
+                    }
+                    T::CommunityWidenings => {
+                        G::CommunityWidening(pg_row_to_signed_community_membership_widening(r)?)
+                    }
+                })
+            })
+            .collect()
+    }
+
+    async fn group_plane_present(&self) -> Result<bool, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        client
+            .query_opt(
+                "SELECT 1 FROM information_schema.columns \
+                  WHERE table_schema = 'cirislens' AND table_name = 'federation_families' \
+                    AND column_name = 'attestation_id'",
+                &[],
+            )
+            .await
+            .map(|r| r.is_some())
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("group plane schema probe: {e}"))
+            })
+    }
+
+    async fn read_group_object(
+        &self,
+        link: &crate::federation::group_plane::GroupRowLink,
+    ) -> Result<Option<crate::federation::group_plane::GroupSigned>, crate::federation::Error> {
+        use crate::federation::group_plane::{GroupPlaneTable as T, GroupSigned as G};
+        use crate::federation::Error;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let (pk, binds) = pg_group_link_where(link, 1);
+        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            binds.iter().map(|b| b.as_ref() as _).collect();
+        let Some(r) = client
+            .query_opt(
+                &format!(
+                    "SELECT * FROM cirislens.{} WHERE {pk} \
+                       AND authority_key_id IS NOT NULL AND authority_key_id <> ''",
+                    link.table.as_str()
+                ),
+                &refs,
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("read group object: {e}")))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(match link.table {
+            T::Families => G::Family(pg_row_to_signed_family(r)?),
+            T::Communities => G::Community(pg_row_to_signed_community(r)?),
+            T::FamilyRevocations => {
+                G::FamilyRevocation(pg_row_to_signed_family_membership_revocation(r)?)
+            }
+            T::CommunityRevocations => {
+                G::CommunityRevocation(pg_row_to_signed_community_membership_revocation(r)?)
+            }
+            T::FamilyWidenings => {
+                G::FamilyWidening(pg_row_to_signed_family_membership_widening(r)?)
+            }
+            T::CommunityWidenings => {
+                G::CommunityWidening(pg_row_to_signed_community_membership_widening(r)?)
+            }
+        }))
+    }
+
+    async fn link_group_plane_row(
+        &self,
+        link: crate::federation::group_plane::GroupRowLink,
+        row: Option<crate::federation::Attestation>,
+    ) -> Result<bool, crate::federation::Error> {
+        use crate::federation::Error;
+        let table = link.table.as_str();
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("link group-plane row: begin: {e}")))?;
+        let (pk, binds) = pg_group_link_where(&link, 1);
+        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            binds.iter().map(|b| b.as_ref() as _).collect();
+        let current = tx
+            .query_opt(
+                &format!("SELECT attestation_id FROM cirislens.{table} WHERE {pk} FOR UPDATE"),
+                &refs,
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("link group-plane row: read: {e}")))?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        let current: Option<String> = current.get(0);
+        let new_id = row.as_ref().map(|r| r.attestation_id.clone());
+        if current == new_id {
+            return Ok(true);
+        }
+        if let Some(row) = &row {
+            pg_insert_plane_row(&tx, row).await?;
+        }
+        let (pk2, binds2) = pg_group_link_where(&link, 2);
+        let mut refs2: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&new_id];
+        refs2.extend(
+            binds2
+                .iter()
+                .map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)),
+        );
+        tx.execute(
+            &format!("UPDATE cirislens.{table} SET attestation_id = $1 WHERE {pk2}"),
+            &refs2,
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("link group-plane row: point: {e}")))?;
+        // A superseded record's head leaves the plane with its pointer.
+        if let Some(old) = current {
+            tx.execute(
+                "DELETE FROM cirislens.federation_attestations WHERE attestation_id::text = $1",
+                &[&old],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("link group-plane row: drop prior: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("link group-plane row: commit: {e}")))?;
+        drop(client);
+        self.index_plane_row(new_id.as_deref()).await?;
+        Ok(true)
+    }
+
+    async fn drop_group_projection_row(
+        &self,
+        link: crate::federation::group_plane::GroupRowLink,
+        attestation_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let (pk, binds) = pg_group_link_where(&link, 2);
+        let mut refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&attestation_id];
+        refs.extend(
+            binds
+                .iter()
+                .map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)),
+        );
+        client
+            .execute(
+                &format!(
+                    "DELETE FROM cirislens.{} WHERE {pk} AND attestation_id = $1",
+                    link.table.as_str()
+                ),
+                &refs,
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("drop group projection row: {e}")))?;
+        Ok(())
+    }
+
+    async fn read_group_plane(
+        &self,
+        table: crate::federation::group_plane::GroupPlaneTable,
+    ) -> Result<crate::federation::group_plane::GroupPlaneRead, crate::federation::Error> {
+        use crate::federation::group_plane::{GroupPlaneTable as T, GroupSigned as G};
+        use crate::federation::Error;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT * FROM cirislens.{} \
+                     WHERE authority_key_id IS NOT NULL AND authority_key_id <> ''",
+                    table.as_str()
+                ),
+                &[],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("read group plane: {e}")))?;
+        let mut live = Vec::with_capacity(rows.len());
+        for r in rows {
+            let attestation_id: Option<String> = r
+                .try_get("attestation_id")
+                .map_err(|e| Error::Backend(format!("read group plane: attestation_id: {e}")))?;
+            let signed = match table {
+                T::Families => G::Family(pg_row_to_signed_family(r)?),
+                T::Communities => G::Community(pg_row_to_signed_community(r)?),
+                T::FamilyRevocations => {
+                    G::FamilyRevocation(pg_row_to_signed_family_membership_revocation(r)?)
+                }
+                T::CommunityRevocations => {
+                    G::CommunityRevocation(pg_row_to_signed_community_membership_revocation(r)?)
+                }
+                T::FamilyWidenings => {
+                    G::FamilyWidening(pg_row_to_signed_family_membership_widening(r)?)
+                }
+                T::CommunityWidenings => {
+                    G::CommunityWidening(pg_row_to_signed_community_membership_widening(r)?)
+                }
+            };
+            live.push((signed, attestation_id));
+        }
+        let dimensions: Vec<String> = table
+            .families()
+            .iter()
+            .map(|f| f.dimension().to_owned())
+            .collect();
+        let plane = client
+            .query(
+                &format!(
+                    "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+                     WHERE attestation_type = 'scores' \
+                       AND (dimension COLLATE \"C\") = ANY($1) ORDER BY attestation_id"
+                ),
+                &[&dimensions],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("read group plane rows: {e}")))?;
+        let rows = plane
+            .into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::federation::group_plane::GroupPlaneRead { live, rows })
+    }
+}
+
 /// v60.0.0 (CIRISPersist#934 step 4) — the sweeps' executor on postgres.
 /// Storage only: the selections are `federation::sweep_plan`'s.
 #[async_trait::async_trait]
@@ -372,7 +707,7 @@ impl crate::federation::sweep_plan::SweepStore for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = pg_query_statement(
             &**client,
             selection.render(crate::federation::attestation_query::Dialect::Postgres),
@@ -399,7 +734,7 @@ impl crate::federation::sweep_plan::SweepStore for PostgresBackend {
         &self,
         selection: crate::federation::sweep_plan::ExpiredSelection,
     ) -> Result<Vec<String>, crate::federation::Error> {
-        let client = self.pool().get().await.map_err(|e| {
+        let client = self.checkout().await.map_err(|e| {
             crate::federation::Error::Backend(format!("list_expired_attestation_ids pool: {e}"))
         })?;
         let rows = pg_query_statement(
@@ -419,7 +754,7 @@ impl crate::federation::sweep_plan::SweepStore for PostgresBackend {
         &self,
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<(u64, u64), crate::federation::Error> {
-        let client = self.pool().get().await.map_err(|e| {
+        let client = self.checkout().await.map_err(|e| {
             crate::federation::Error::Backend(format!("evict_known_wire_hashes pool: {e}"))
         })?;
         let evicted = client
@@ -519,10 +854,3009 @@ impl crate::federation::sweep_plan::RoomEvictionStore for PostgresBackend {
     }
 }
 
+/// v61 (CIRISPersist#934) — the `Backend` doors' executor on postgres: one
+/// erasure transaction, one content transaction. Storage only: the decisions
+/// are `store::backend_plan`'s.
+#[async_trait::async_trait]
+impl super::backend_plan::BackendStore for PostgresBackend {
+    async fn store_planned_trace_erasure(
+        &self,
+        planned: &super::backend_plan::PlannedTraceErasure,
+    ) -> Result<super::backend_plan::ErasedTraces, Error> {
+        let mut erased = super::backend_plan::ErasedTraces::default();
+        let agent = planned.agent_id_hash.as_str();
+        let key = planned.signature_key_id();
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("begin erasure tx: {e}")))?;
+        let strings = |rows: Vec<tokio_postgres::Row>| -> Result<Vec<String>, Error> {
+            rows.into_iter()
+                .map(|row| row.safe_get_with::<String, _, _, _>(0, Error::Backend))
+                .collect()
+        };
+        // The scope's traces: one signing key's (the per-key DSAR), or every
+        // key's (Art. 17). The LLM-call cascade and the tombstone key off
+        // these.
+        let trace_ids = strings(
+            match key {
+                Some(k) => {
+                    tx.query(
+                        "SELECT DISTINCT trace_id FROM cirislens.trace_events \
+                         WHERE agent_id_hash = $1 AND signing_key_id = $2",
+                        &[&agent, &k],
+                    )
+                    .await
+                }
+                None => {
+                    tx.query(
+                        "SELECT DISTINCT trace_id FROM cirislens.trace_events \
+                         WHERE agent_id_hash = $1",
+                        &[&agent],
+                    )
+                    .await
+                }
+            }
+            .map_err(|e| Error::Backend(format!("collect trace_ids: {e}")))?,
+        )?;
+        // v57.0.0 (#988 item 3) — a pre-v57 silo row takes the V080 tombstone
+        // in place; v58.0.0 (#1094 item 2) — a ROW-BACKED one is hard-deleted
+        // only under its producer's rule-1 `withdraws` (the citations), and
+        // leaves no projection row.
+        erased.legacy_tombstoned =
+            pg_tombstone_detection_events(&tx, &trace_ids, planned.received_at)
+                .await
+                .map_err(|e| Error::Backend(format!("tombstone detection_events: {e}")))?;
+        pg_store_erasure_withdraws(&tx, &planned.plan.new_withdraws)
+            .await
+            .map_err(|e| Error::Backend(format!("erasure withdraws: {e}")))?;
+        let erased_rows = pg_erase_cited_rows(&tx, &planned.plan.citations)
+            .await
+            .map_err(|e| Error::Backend(format!("erase detection rows: {e}")))?;
+        erased.detection_rows_erased = erased_rows.len() as u64;
+        if !trace_ids.is_empty() {
+            erased.trace_llm_calls = tx
+                .execute(
+                    "DELETE FROM cirislens.trace_llm_calls WHERE trace_id = ANY($1::text[])",
+                    &[&trace_ids],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("delete trace_llm_calls: {e}")))?;
+        }
+        // v54.1.0 (Codex round 4 sweep on PR #1057) — on a full erasure the
+        // agent's thoughts, read before its rows go: their signature rows are
+        // removed once no remaining event cites them.
+        let thought_ids = if key.is_none() {
+            strings(
+                tx.query(
+                    "SELECT DISTINCT thought_id FROM cirislens.trace_events \
+                     WHERE agent_id_hash = $1",
+                    &[&agent],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("collect thought_ids: {e}")))?,
+            )?
+        } else {
+            Vec::new()
+        };
+        erased.trace_events = match key {
+            Some(k) => {
+                tx.execute(
+                    "DELETE FROM cirislens.trace_events \
+                     WHERE agent_id_hash = $1 AND signing_key_id = $2",
+                    &[&agent, &k],
+                )
+                .await
+            }
+            None => {
+                tx.execute(
+                    "DELETE FROM cirislens.trace_events WHERE agent_id_hash = $1",
+                    &[&agent],
+                )
+                .await
+            }
+        }
+        .map_err(|e| Error::Backend(format!("delete trace_events: {e}")))?;
+        if key.is_none() {
+            pg_drop_orphaned_thought_signatures(&tx, &thought_ids)
+                .await
+                .map_err(|e| Error::Backend(format!("drop orphaned thought signatures: {e}")))?;
+        }
+        if planned.includes_federation_key() {
+            // The single key_id matching (agent_id_hash, key): the agent's
+            // other registered keys stay.
+            let target_key_ids = strings(
+                tx.query(
+                    "SELECT key_id FROM cirislens.federation_keys \
+                     WHERE identity_type = 'agent' AND identity_ref = $1 AND key_id = $2",
+                    &[&agent, &key],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("collect target_key_ids: {e}")))?,
+            )?;
+            if !target_key_ids.is_empty() {
+                erased.federation_revocations = tx
+                    .execute(
+                        "DELETE FROM cirislens.federation_revocations \
+                         WHERE revoked_key_id = ANY($1::text[]) \
+                            OR revoked_key_sha256_ed25519_raw IN \
+                               (SELECT encode(sha256(decode(k.pubkey_ed25519_base64, 'base64')), 'hex') \
+                                  FROM cirislens.federation_keys k WHERE k.key_id = ANY($1::text[])) \
+                            OR revoking_key_id = ANY($1::text[]) \
+                            OR scrub_key_id    = ANY($1::text[])",
+                        &[&target_key_ids],
+                    )
+                    .await
+                    .map_err(|e| Error::Backend(format!("delete federation_revocations: {e}")))?;
+                erased.federation_attestations = tx
+                    .execute(
+                        "DELETE FROM cirislens.federation_attestations \
+                         WHERE attesting_key_id = ANY($1::text[]) \
+                            OR attested_key_id  = ANY($1::text[]) \
+                            OR scrub_key_id     = ANY($1::text[])",
+                        &[&target_key_ids],
+                    )
+                    .await
+                    .map_err(|e| Error::Backend(format!("delete federation_attestations: {e}")))?;
+                erased.federation_keys = tx
+                    .execute(
+                        "DELETE FROM cirislens.federation_keys WHERE key_id = ANY($1::text[])",
+                        &[&target_key_ids],
+                    )
+                    .await
+                    .map_err(|e| Error::Backend(format!("delete federation_keys: {e}")))?;
+            }
+        }
+        if let Some(event) = planned.audit_event(&erased) {
+            pg_record_erasure(
+                &tx,
+                &planned.attester,
+                &event,
+                &erased_rows,
+                planned.received_at,
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("trace_erasure audit: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("commit erasure tx: {e}")))?;
+        Ok(erased)
+    }
+
+    async fn store_planned_fountain_content(
+        &self,
+        planned: super::backend_plan::PlannedFountainContent<'_>,
+    ) -> Result<(), Error> {
+        let manifest = planned.manifest;
+        let manifest_version = i32::from(manifest.manifest_version);
+        let n_source = i64::from(manifest.n_source);
+        let k_repair = i64::from(manifest.k_repair);
+        let symbol_size = i64::from(manifest.symbol_size);
+        let min_viable = i64::from(manifest.min_viable_symbols);
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("begin fountain tx: {e}")))?;
+        // The manifest: idempotent on the (content_id, corpus_kind) PK. Never
+        // evicted. `admitted_at` is the door's receipt instant, as on sqlite.
+        tx.execute(
+            "INSERT INTO cirislens.content_manifest \
+             (content_id, corpus_kind, manifest_version, n_source, k_repair, \
+              symbol_size, original_content_length, min_viable_symbols, \
+              symbol_hashes, envelope, signature, signature_ml_dsa_65, pqc_key_id, \
+              admitted_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) \
+             ON CONFLICT (content_id, corpus_kind) DO NOTHING",
+            &[
+                &manifest.content_id,
+                &manifest.corpus_kind,
+                &manifest_version,
+                &n_source,
+                &k_repair,
+                &symbol_size,
+                &planned.original_content_length,
+                &min_viable,
+                &planned.symbol_hashes,
+                &manifest.envelope,
+                &manifest.signature,
+                &manifest.signature_ml_dsa_65,
+                &manifest.pqc_key_id,
+                &planned.admitted_at,
+            ],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("insert content_manifest: {e}")))?;
+        // Symbols: upsert by (content_id, symbol_id).
+        for sym in planned.symbols {
+            let symbol_id = i64::from(sym.symbol_id);
+            let retention_priority = i16::from(sym.retention_priority);
+            tx.execute(
+                "INSERT INTO cirislens.content_symbols \
+                 (content_id, symbol_id, retention_priority, symbol_bytes) \
+                 VALUES ($1,$2,$3,$4) \
+                 ON CONFLICT (content_id, symbol_id) DO UPDATE SET \
+                   retention_priority = EXCLUDED.retention_priority, \
+                   symbol_bytes = EXCLUDED.symbol_bytes",
+                &[
+                    &sym.content_id,
+                    &symbol_id,
+                    &retention_priority,
+                    &sym.symbol_bytes,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("insert content_symbols: {e}")))?;
+        }
+        // An aggregated tier's provenance row (opaque aggregation_meta).
+        if let Some(a) = &planned.aggregation {
+            let agg_meta: &[u8] = &a.agg.aggregation_meta;
+            tx.execute(
+                "INSERT INTO cirislens.content_aggregation \
+                 (aggregate_content_id, source_corpus_kind, aggregation_level, fan_in, \
+                  member_commitment, aggregation_meta, aggregated_at_unix_ms) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7) \
+                 ON CONFLICT (aggregate_content_id) DO NOTHING",
+                &[
+                    &a.agg.aggregate_content_id,
+                    &a.agg.source_corpus_kind,
+                    &a.aggregation_level,
+                    &a.fan_in,
+                    &a.agg.member_commitment,
+                    &agg_meta,
+                    &a.aggregated_at_unix_ms,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("insert content_aggregation: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("commit fountain tx: {e}")))
+    }
+}
+
+/// v61 (CIRISPersist#934) — the gated directory reads' executor on postgres.
+/// Storage only: the decisions are `federation::read_plan`'s.
+#[async_trait::async_trait]
+impl crate::federation::read_plan::ReadPlanStore for PostgresBackend {
+    async fn read_scores_page(
+        &self,
+        filter: &crate::read::AttestationFilter,
+        scope: &crate::scope::CallerScope,
+        cursor: Option<&crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        // v61 (the canonical's read storm) — the one builder the plan
+        // witness EXPLAINs.
+        let (sql, params) = pg_list_scores_sql(filter, cursor, limit, scope);
+        Ok(self
+            .query_attestations("list_scores", &sql, &params)
+            .await?
+            .0)
+    }
+
+    async fn read_score_candidates(
+        &self,
+        filter: &crate::read::AttestationFilter,
+        scope: &crate::scope::CallerScope,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let (mut where_parts, mut params) = pg_scores_shared_predicates(filter, scope);
+        where_parts.push("fa.attestation_type = 'scores'".to_string());
+        params.push(Box::new(crate::federation::scores::RESOLVE_CANDIDATE_CAP));
+        let sql = format!(
+            "SELECT DISTINCT {PG_SCORES_FA_COLS} \
+             FROM cirislens.attestation_subjects s \
+             JOIN cirislens.federation_attestations fa ON fa.attestation_id = s.attestation_id \
+             WHERE {} \
+             ORDER BY asserted_at DESC, attestation_id DESC \
+             LIMIT ${}",
+            where_parts.join(" AND "),
+            params.len()
+        );
+        Ok(self
+            .query_attestations("resolve_scores", &sql, &params)
+            .await?
+            .0)
+    }
+
+    async fn read_score_composers(
+        &self,
+        attesters: &[String],
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let sql = format!(
+            "SELECT {PG_SCORES_FA_COLS} FROM cirislens.federation_attestations fa \
+             WHERE fa.attestation_type IN ('supersedes','withdraws','recants') \
+               AND fa.attesting_key_id = ANY($1)"
+        );
+        let params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            vec![Box::new(attesters.to_vec())];
+        Ok(self
+            .query_attestations("resolve_scores composers", &sql, &params)
+            .await?
+            .0)
+    }
+
+    async fn read_attestation_log_page(
+        &self,
+        subject_key_id: Option<&str>,
+        cursor: Option<&crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::federation::attestation_query::QueryRows, crate::federation::Error> {
+        // #455 — NO caller gate, NO lifecycle folding, federation tier only.
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        let mut where_parts: Vec<String> = vec!["fa.tier = 'federation'".to_string()];
+        // v53.0.0 (#975) — the replicable set excludes an unregistered type
+        // under enforcement.
+        where_parts.extend(crate::federation::row_type::serve_filter_sql(
+            "fa.attestation_type",
+            crate::federation::row_type::SqlDialect::Postgres,
+        ));
+        let (from, distinct) = if let Some(subj) = subject_key_id {
+            params.push(Box::new(subj.to_string()));
+            where_parts.push(format!("s.subject_key_id = ${}", params.len()));
+            (
+                "cirislens.attestation_subjects s \
+                 JOIN cirislens.federation_attestations fa ON fa.attestation_id = s.attestation_id",
+                "DISTINCT ",
+            )
+        } else {
+            ("cirislens.federation_attestations fa", "")
+        };
+        if let Some(c) = cursor {
+            params.push(Box::new(c.last_asserted_at));
+            let p_at = params.len();
+            params.push(Box::new(c.last_attestation_id.clone()));
+            let p_id = params.len();
+            where_parts.push(format!(
+                "(fa.asserted_at, fa.attestation_id::text) < (${p_at}, ${p_id})"
+            ));
+        }
+        params.push(Box::new(limit));
+        let sql = format!(
+            "SELECT {distinct}{PG_SCORES_FA_COLS} FROM {from} \
+             WHERE {} \
+             ORDER BY asserted_at DESC, attestation_id DESC \
+             LIMIT ${}",
+            where_parts.join(" AND "),
+            params.len()
+        );
+        let (rows, bytes) = self
+            .query_attestations("list_attestation_log", &sql, &params)
+            .await?;
+        Ok(crate::federation::attestation_query::QueryRows {
+            rows,
+            bytes,
+            backend: crate::observe::StoreBackend::Postgres,
+        })
+    }
+
+    async fn read_key_registration_history(
+        &self,
+        key_id: &str,
+    ) -> Result<
+        Vec<crate::federation::read_plan::StoredKeyRegistrationHistory>,
+        crate::federation::Error,
+    > {
+        let col = |e: tokio_postgres::Error| {
+            crate::federation::Error::Backend(format!("list_key_registration_history: {e}"))
+        };
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let rows = client
+            .query(
+                "SELECT key_id, registration_envelope, original_content_hash, \
+                        scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                        scrub_timestamp, replaced_at, replaced_by_hash, \
+                        replaced_row_hash, replacement_kind \
+                 FROM cirislens.federation_key_registration_history \
+                 WHERE key_id = $1 ORDER BY history_id ASC",
+                &[&key_id],
+            )
+            .await
+            .map_err(col)?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(crate::federation::read_plan::StoredKeyRegistrationHistory {
+                    key_id: r.try_get("key_id").map_err(col)?,
+                    registration_envelope: r.try_get("registration_envelope").map_err(col)?,
+                    original_content_hash: r.try_get("original_content_hash").map_err(col)?,
+                    scrub_signature_classical: r
+                        .try_get("scrub_signature_classical")
+                        .map_err(col)?,
+                    scrub_signature_pqc: r.try_get("scrub_signature_pqc").map_err(col)?,
+                    scrub_key_id: r.try_get("scrub_key_id").map_err(col)?,
+                    scrub_timestamp: r.try_get("scrub_timestamp").map_err(col)?,
+                    replaced_at: r.try_get("replaced_at").map_err(col)?,
+                    replaced_by_hash: r.try_get("replaced_by_hash").map_err(col)?,
+                    replaced_row_hash: r.try_get("replaced_row_hash").map_err(col)?,
+                    replacement_kind: r.try_get("replacement_kind").map_err(col)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn read_renditions(
+        &self,
+        original_sha256: [u8; 32],
+    ) -> Result<Vec<crate::federation::renditions::Rendition>, crate::federation::Error> {
+        let col = |e: tokio_postgres::Error| {
+            crate::federation::Error::Backend(format!("list_derived_hex: {e}"))
+        };
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let rows = client
+            .query(
+                "SELECT rendition_sha256, original_sha256, format, size, width, height, \
+                        role, source_attestation_id, cohort_scope \
+                 FROM cirislens.blob_renditions WHERE original_sha256 = $1 \
+                 ORDER BY rendition_sha256 ASC",
+                &[&original_sha256.to_vec()],
+            )
+            .await
+            .map_err(col)?;
+        rows.into_iter()
+            .map(|r| {
+                let size: i64 = r.try_get("size").map_err(col)?;
+                let width: Option<i32> = r.try_get("width").map_err(col)?;
+                let height: Option<i32> = r.try_get("height").map_err(col)?;
+                Ok(crate::federation::renditions::Rendition {
+                    rendition_sha256_hex: hex::encode(
+                        r.try_get::<_, Vec<u8>>("rendition_sha256").map_err(col)?,
+                    ),
+                    original_sha256_hex: hex::encode(
+                        r.try_get::<_, Vec<u8>>("original_sha256").map_err(col)?,
+                    ),
+                    format: r.try_get("format").map_err(col)?,
+                    size: u64::try_from(size).unwrap_or(0),
+                    width: width.and_then(|w| u32::try_from(w).ok()),
+                    height: height.and_then(|h| u32::try_from(h).ok()),
+                    role: r.try_get("role").map_err(col)?,
+                    source_attestation_id: r.try_get("source_attestation_id").map_err(col)?,
+                    cohort_scope: r.try_get("cohort_scope").map_err(col)?,
+                })
+            })
+            .collect()
+    }
+}
+
+impl PostgresBackend {
+    /// v61 (CIRISPersist#934) — run one attestation SELECT and map its rows,
+    /// with the envelope bytes decoded (`op` names it in the error).
+    async fn query_attestations(
+        &self,
+        op: &'static str,
+        sql: &str,
+        params: &[Box<dyn tokio_postgres::types::ToSql + Sync + Send>],
+    ) -> Result<(Vec<crate::federation::Attestation>, u64), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client
+            .query(sql, &params_ref[..])
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("{op}: {e}")))?;
+        let bytes = pg_envelope_bytes(&rows);
+        let items = rows
+            .into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((items, bytes))
+    }
+}
+
+/// v61 (CIRISPersist#934) — the directory executor on postgres (the peer add,
+/// the known-hash sighting, the purge write). Storage only: the decisions are
+/// `federation::directory_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::directory_admit::DirectoryStore for PostgresBackend {
+    async fn store_planned_peer_record(
+        &self,
+        planned: crate::federation::directory_admit::PlannedPeerRecord,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::directory_admit::{HeldPeerMeta, PeerMetaWrite};
+        use crate::federation::Error;
+        let (key, meta) = (&planned.key, &planned.meta);
+        let roles_param: Option<&Vec<String>> = None;
+        // v13.0.0 (CIRISPersist#365) — wire None ⇔ stored 'unregistered'.
+        let consent_role_stored =
+            crate::federation::types::consent_role::stored_from_wire(key.consent_role.as_deref());
+        // v31.0.0 (#644) — registration_envelope is TEXT since V122.
+        let registration_envelope_text =
+            pg_envelope_text(&key.registration_envelope, "registration_envelope")?;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
+        // v31.4.0 (CIRISPersist#682) — THIS node's admission position (V126),
+        // read through `tx`, so the MAX and the INSERT are one snapshot.
+        let admitted_at = self.next_key_serve_position(&tx).await?;
+        tx.execute(
+            "INSERT INTO cirislens.federation_keys (\
+                key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                attestation_evidence, consent_role, admitted_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
+                       $17, $18, $19, $20) \
+             ON CONFLICT (key_id) DO NOTHING",
+            &[
+                &key.key_id,
+                &key.pubkey_ed25519_base64,
+                &key.pubkey_ml_dsa_65_base64,
+                &key.algorithm,
+                &key.identity_type,
+                &key.identity_ref,
+                &key.valid_from,
+                &key.valid_until,
+                &registration_envelope_text,
+                &planned.original_content_hash,
+                &key.scrub_signature_classical,
+                &key.scrub_signature_pqc,
+                &key.scrub_key_id,
+                &key.scrub_timestamp,
+                &key.pqc_completed_at,
+                &key.persist_row_hash,
+                &roles_param,
+                &key.attestation_evidence,
+                &consent_role_stored,
+                &admitted_at,
+            ],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("add_peer_record federation_keys: {e}")))?;
+        let held_pubkey: Option<String> = tx
+            .query_opt(
+                "SELECT pubkey_ed25519_base64 FROM cirislens.federation_keys WHERE key_id = $1",
+                &[&key.key_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("add_peer_record held pubkey: {e}")))?
+            .map(|r| r.safe_get_with(0, Error::Backend))
+            .transpose()?;
+        let held_meta = match tx
+            .query_opt(
+                "SELECT transport_identity, removed_at \
+                 FROM cirislens.federation_peer_metadata WHERE key_id = $1",
+                &[&key.key_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("add_peer_record held peer_metadata: {e}")))?
+        {
+            Some(row) => Some(HeldPeerMeta {
+                transport_identity: row.safe_get_with(0, Error::Backend)?,
+                removed: row
+                    .safe_get_with::<Option<chrono::DateTime<chrono::Utc>>, _, _, _>(
+                        1,
+                        Error::Backend,
+                    )?
+                    .is_some(),
+            }),
+            None => None,
+        };
+        let write = crate::federation::directory_admit::peer_record_held_verdict(
+            &planned,
+            held_pubkey.as_deref(),
+            held_meta.as_ref(),
+        )?;
+        let sql = match write {
+            PeerMetaWrite::Keep => None,
+            PeerMetaWrite::ReAdd => Some(
+                "UPDATE cirislens.federation_peer_metadata SET \
+                    alias = NULL, trust = 'untrusted', notes = NULL, \
+                    policy_blob = NULL, transport_identity = $2, \
+                    removed_at = NULL, inserted_at = $3, updated_at = $3, \
+                    persist_row_hash = $4 \
+                 WHERE key_id = $1",
+            ),
+            PeerMetaWrite::Insert => Some(
+                "INSERT INTO cirislens.federation_peer_metadata (\
+                    key_id, alias, trust, notes, policy_blob, \
+                    transport_identity, removed_at, inserted_at, updated_at, persist_row_hash\
+                 ) VALUES ($1, NULL, 'untrusted', NULL, NULL, $2, NULL, $3, $3, $4)",
+            ),
+        };
+        if let Some(sql) = sql {
+            tx.execute(
+                sql,
+                &[
+                    &key.key_id,
+                    &meta.transport_identity,
+                    &meta.inserted_at,
+                    &meta.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("add_peer_record peer_metadata: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("commit tx: {e}")))
+    }
+
+    async fn store_known_wire_hash(
+        &self,
+        kind: &str,
+        content_hash: &str,
+        advertised_by: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // Upsert: the same hash arrives on every wrap of edge's re-sweep, and
+        // the bump is what makes the eviction floor meaningful (#776).
+        // MONOTONIC: execution order is not observation order, so an older
+        // sighting applied late must not move the column back.
+        client
+            .execute(
+                "INSERT INTO cirislens.known_wire_hashes \
+                     (kind, content_hash, last_advertised_at, advertised_by) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (kind, content_hash) DO UPDATE SET \
+                     last_advertised_at = EXCLUDED.last_advertised_at, \
+                     advertised_by = EXCLUDED.advertised_by \
+                 WHERE EXCLUDED.last_advertised_at \
+                       > cirislens.known_wire_hashes.last_advertised_at",
+                &[&kind, &content_hash, &now, &advertised_by],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("insert_known_wire_hash: {e}"))
+            })?;
+        Ok(())
+    }
+
+    async fn store_purge_execution(
+        &self,
+        execution: &crate::federation::steward_purge::PurgeExecution,
+        tombstones: &[crate::federation::steward_purge::PurgeTombstone],
+    ) -> Result<crate::federation::steward_purge::PurgePutOutcome, crate::federation::Error> {
+        // Codex on PR #1057 — the header and every tombstone are ONE
+        // transaction: run on the bare client, each statement autocommitted,
+        // and a failure or a process loss between them left a durable header
+        // holding part of its `record_count`.
+        #[cfg(test)]
+        let inject_tombstone_fault = self
+            .test_hooks()
+            .fail_if_armed("purge_put_execution_tombstones")
+            .is_err();
+        #[cfg(not(test))]
+        let inject_tombstone_fault = false;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
+        // v60.1.0 (CIRISPersist#1070 item 3) — a bytes-plane tombstone is
+        // written under the EXCLUSIVE lock a byte write holds shared from its
+        // in-transaction tombstone read to its commit (sorted, as the writers
+        // take theirs): a write already past that read commits first and the
+        // finalize that follows this commit deletes its bytes; a later write
+        // reads this tombstone and refuses.
+        pg_lock_bytes_tombstones_exclusive(&tx, tombstones).await?;
+        let e = execution;
+        let record_count = i64::try_from(e.record_count).unwrap_or(i64::MAX);
+        let n = tx
+            .execute(
+                "INSERT INTO cirislens.purge_executions (notice_id, selection_digest, \
+                    claimant_key_id, record_count, notice_jcs, cosignatures_json, executed_by, \
+                    origin, executed_at, admitted_at, finalized_at, legal_basis) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp(), NULL, $10) \
+                 ON CONFLICT (notice_id) DO NOTHING",
+                &[
+                    &e.notice_id,
+                    &e.selection_digest,
+                    &e.claimant_key_id,
+                    &record_count,
+                    &e.notice_jcs,
+                    &e.cosignatures_json,
+                    &e.executed_by,
+                    &e.origin,
+                    &e.executed_at,
+                    &e.legal_basis,
+                ],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge_put_execution: {e}")))?;
+        if inject_tombstone_fault {
+            return Err(crate::federation::Error::Backend(
+                "purge_put_execution tombstones: injected fault".into(),
+            ));
+        }
+        let stmt = tx
+            .prepare(
+                "INSERT INTO cirislens.purge_tombstones \
+                    (notice_id, plane, record_ref, ordinal, derived_from) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (notice_id, plane, record_ref) DO NOTHING",
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge tombstone: {e}")))?;
+        let mut inserted = Vec::with_capacity(tombstones.len());
+        for t in tombstones {
+            let ordinal = i64::try_from(t.ordinal).unwrap_or(i64::MAX);
+            let k = tx
+                .execute(
+                    &stmt,
+                    &[
+                        &t.notice_id,
+                        &t.plane.as_str(),
+                        &t.record_ref,
+                        &ordinal,
+                        &t.derived_from,
+                    ],
+                )
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("purge tombstone: {e}")))?;
+            inserted.push(k > 0);
+        }
+        // Codex round 4 sweep on PR #1057 — a newly tombstoned attestation
+        // leaves the signed-wire index at once, so the node stops ADVERTISING a
+        // hash it no longer serves (the rebuild re-indexes from the
+        // tombstone-filtered serve read).
+        for (t, fresh) in tombstones.iter().zip(&inserted) {
+            if *fresh && t.plane == crate::federation::steward_purge::PurgePlane::Attestation {
+                let rk =
+                    crate::federation::wire_index::record_key(&[("attestation_id", &t.record_ref)]);
+                tx.execute(
+                    "DELETE FROM cirislens.signed_wire_index \
+                     WHERE kind = 'Attestation' AND record_key = $1",
+                    &[&rk],
+                )
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("purge wire index: {e}")))?;
+                // v57.0.0 (CIRISPersist#988 item 3; lead ruling 5) — a
+                // tombstoned detection row's projection is the V080
+                // tombstone at its execution's instant, in this write. Only
+                // a live projection row moves: the earliest-admitted
+                // execution's instant stands (the rebuild's rule).
+                tx.execute(
+                    "UPDATE cirislens_derived.detection_events \
+                     SET trace_id = NULL, body_sha256 = NULL, canonical_bytes = NULL, \
+                         erased_at = (SELECT executed_at FROM cirislens.purge_executions \
+                                       WHERE notice_id = $2) \
+                     WHERE attestation_id = $1 AND erased_at IS NULL",
+                    &[&t.record_ref, &t.notice_id],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("purge detection projection: {e}"))
+                })?;
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("commit: {e}")))?;
+        Ok(crate::federation::steward_purge::PurgePutOutcome {
+            header_inserted: n > 0,
+            tombstones_inserted: inserted,
+        })
+    }
+}
+
+/// v61 (CIRISPersist#934) — the blob plane's executor on postgres (the chunk
+/// floor's transaction, the stream plane's records). Storage only: the
+/// decisions are `federation::blob_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::blob_admit::BlobFloorStore for PostgresBackend {
+    fn tombstone_plane_present(&self) -> bool {
+        self.bytes_tombstone_plane()
+    }
+
+    #[cfg(test)]
+    async fn pause_after_tombstone_precheck(&self) {
+        self.test_hooks()
+            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
+            .await;
+    }
+
+    async fn store_planned_chunk_batch(
+        &self,
+        batch: crate::federation::blob_admit::PlannedChunkBatch,
+    ) -> Result<
+        Vec<(usize, crate::federation::blob_admit::ItemAppended)>,
+        crate::federation::BlobError,
+    > {
+        use crate::federation::blob_admit::{HeldStream, ItemAppended, StreamClaimWrite};
+        use crate::federation::BlobError;
+        let be = |what: &'static str| {
+            move |e: tokio_postgres::Error| {
+                BlobError::Backend(format!("put_blob_chunk {what}: {e}"))
+            }
+        };
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| BlobError::Backend(e.to_string()))?;
+        let mut tx = client.transaction().await.map_err(be("begin tx"))?;
+        // §11.4 / I27 — a community bind runs under the community's
+        // serialization boundary, like every other epoch-state operation.
+        if let Some(b) = &batch.binding {
+            lock_community_tx(&tx, &b.community_key_id).await?;
+        }
+        // v60.1.0 (#1070) — every item's tombstone lock, sorted, for the whole
+        // batch; each item reads its tombstone again under it.
+        let shas: Vec<[u8; 32]> = batch.rows.iter().map(|r| r.sha256).collect();
+        pg_lock_bytes_tombstones(&tx, &shas, batch.tombstones.plane()).await?;
+        // #837 (§12.9 / I41) — the STREAM's row, insert-if-absent in this
+        // transaction, then judged. ON CONFLICT DO NOTHING waits on a
+        // concurrent first append's transaction, and the SELECT that follows
+        // is a new statement under READ COMMITTED, so the loser compares
+        // against the winner's row.
+        tx.execute(
+            "INSERT INTO cirislens.federation_streams \
+                (stream_id, cohort_scope, community_key_id, owner_key_id) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (stream_id) DO NOTHING",
+            &[
+                &batch.stream_id,
+                &batch.cohort_scope,
+                &batch.claim.community_key_id,
+                &batch.claim.owner_key_id,
+            ],
+        )
+        .await
+        .map_err(be("stream row"))?;
+        let head = tx
+            .query_one(
+                "SELECT cohort_scope, community_key_id, owner_key_id, \
+                        (abandoned_at IS NOT NULL) AS abandoned \
+                   FROM cirislens.federation_streams WHERE stream_id = $1",
+                &[&batch.stream_id],
+            )
+            .await
+            .map_err(be("stream head"))?;
+        let held = HeldStream {
+            cohort_scope: head.safe_get_with("cohort_scope", BlobError::Backend)?,
+            community_key_id: head.safe_get_with("community_key_id", BlobError::Backend)?,
+            owner_key_id: head.safe_get_with("owner_key_id", BlobError::Backend)?,
+            abandoned: head.safe_get_with("abandoned", BlobError::Backend)?,
+        };
+        // A refusal drops `tx`, which rolls it back: nothing stored.
+        if crate::federation::blob_admit::stream_claim_verdict(&batch, &held)?
+            == StreamClaimWrite::Adopt
+        {
+            // The predicate makes two adopters resolve to one.
+            let n = tx
+                .execute(
+                    "UPDATE cirislens.federation_streams SET owner_key_id = $2 \
+                      WHERE stream_id = $1 AND owner_key_id IS NULL",
+                    &[&batch.stream_id, &batch.claim.owner_key_id],
+                )
+                .await
+                .map_err(be("stream adopt"))?;
+            if n == 0 {
+                return Err(crate::federation::blob_admit::foreign_stream(&batch, &held));
+            }
+        }
+        let ctx = PgChunkTx {
+            stream_id: &batch.stream_id,
+            epoch_i64: batch.epoch_i64,
+            scope: &batch.cohort_scope,
+            tier: &batch.tier,
+            owner_key_id: batch.claim.owner_key_id.as_deref(),
+            group_key_id: batch.claim.community_key_id.as_deref(),
+            binding: batch.binding.as_ref(),
+            bind_as_declared: batch.bind_as_declared,
+            stream_key: batch.claim.stream_key,
+            tombstones: &batch.tombstones,
+        };
+        let mut appended = Vec::with_capacity(batch.rows.len());
+        for row in &batch.rows {
+            let sp = tx.savepoint("chunk_item").await.map_err(be("savepoint"))?;
+            let got = pg_append_chunk_item(&sp, &ctx, row).await?;
+            if matches!(got, ItemAppended::Ok) {
+                sp.commit().await.map_err(be("release"))?;
+            } else {
+                // No blob row, no index row, no counter step, no binding.
+                sp.rollback().await.map_err(be("rollback to savepoint"))?;
+            }
+            appended.push((row.slot, got));
+        }
+        // Nothing landed ⇒ nothing is written, the stream row either.
+        if appended.iter().any(|(_, a)| matches!(a, ItemAppended::Ok)) {
+            tx.commit().await.map_err(be("commit"))?;
+        } else {
+            let _ = tx.rollback().await;
+        }
+        Ok(appended)
+    }
+
+    async fn read_stream_chunk_hashes(
+        &self,
+        stream_id: &str,
+    ) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        pg_load_stream_chunk_hashes(&client, stream_id).await
+    }
+
+    async fn store_stream_sth(
+        &self,
+        sth: crate::federation::blob_admit::PlannedSth<'_>,
+    ) -> Result<Option<Vec<u8>>, crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let witness_value: serde_json::Value = serde_json::from_str(&sth.witness_json)
+            .map_err(|e| BlobError::Backend(format!("put_stream_sth witness json: {e}")))?;
+        let epoch_i64 = 0i64;
+        let root = sth.sth.root_hash.to_vec();
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| BlobError::Backend(e.to_string()))?;
+        let inserted = client
+            .execute(
+                "INSERT INTO cirislens.federation_stream_sth (\
+                    stream_id, tree_size, epoch, root_hash, signed_at, \
+                    producer_key_id, signature_blob, witness_signatures\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 ON CONFLICT (stream_id, tree_size) DO NOTHING",
+                &[
+                    &sth.stream_id,
+                    &sth.tree_size_i64,
+                    &epoch_i64,
+                    &root,
+                    &sth.sth.timestamp,
+                    &sth.producer_key_id,
+                    &sth.signature_blob,
+                    &witness_value,
+                ],
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("put_stream_sth insert: {e}")))?;
+        if inserted > 0 {
+            return Ok(None);
+        }
+        client
+            .query_one(
+                "SELECT root_hash FROM cirislens.federation_stream_sth \
+                  WHERE stream_id = $1 AND tree_size = $2",
+                &[&sth.stream_id, &sth.tree_size_i64],
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("put_stream_sth conflict re-read: {e}")))?
+            .safe_get_with("root_hash", BlobError::Backend)
+            .map(Some)
+    }
+
+    async fn store_delivery_receipt(
+        &self,
+        planned: crate::federation::blob_admit::PlannedReceipt<'_>,
+    ) -> Result<crate::federation::blob_admit::ReceiptWrite, crate::federation::BlobError> {
+        use crate::federation::blob_admit::ReceiptWrite;
+        use crate::federation::BlobError;
+        let be =
+            |e: tokio_postgres::Error| BlobError::Backend(format!("put_delivery_receipt: {e}"));
+        let r = planned.receipt;
+        let root = r.chunk_root.to_vec();
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| BlobError::Backend(e.to_string()))?;
+        let tx = client.transaction().await.map_err(be)?;
+        let published: i64 = tx
+            .query_one(
+                "SELECT COUNT(*) AS n FROM cirislens.federation_stream_sth \
+                  WHERE stream_id = $1 AND root_hash = $2 AND tree_size >= $3",
+                &[&r.stream_id, &root, &planned.k_i64],
+            )
+            .await
+            .map_err(be)?
+            .safe_get_with("n", BlobError::Backend)?;
+        if published == 0 {
+            return Ok(ReceiptWrite::Unpublished);
+        }
+        let inserted = tx
+            .execute(
+                "INSERT INTO cirislens.federation_stream_delivery_receipts (\
+                    stream_id, subscriber_key_id, epoch, k, chunk_root, \
+                    signature_blob, received_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                 ON CONFLICT (stream_id, subscriber_key_id, k) DO NOTHING",
+                &[
+                    &r.stream_id,
+                    &r.subscriber_key_id,
+                    &planned.epoch_i64,
+                    &planned.k_i64,
+                    &root,
+                    &planned.signature_blob,
+                    &planned.received_at,
+                ],
+            )
+            .await
+            .map_err(be)?;
+        if inserted == 0 {
+            let held: Vec<u8> = tx
+                .query_one(
+                    "SELECT chunk_root FROM cirislens.federation_stream_delivery_receipts \
+                      WHERE stream_id = $1 AND subscriber_key_id = $2 AND k = $3",
+                    &[&r.stream_id, &r.subscriber_key_id, &planned.k_i64],
+                )
+                .await
+                .map_err(be)?
+                .safe_get_with("chunk_root", BlobError::Backend)?;
+            return Ok(ReceiptWrite::Held(held));
+        }
+        tx.commit().await.map_err(be)?;
+        Ok(ReceiptWrite::Inserted)
+    }
+
+    async fn store_holding_claim(
+        &self,
+        sha256: &[u8; 32],
+        prepared: crate::federation::holding_claim::PreparedHoldingClaim,
+    ) -> Result<bool, crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let sha_vec = sha256.to_vec();
+        {
+            let mut client = self
+                .get_client()
+                .await
+                .map_err(|e| BlobError::Backend(e.to_string()))?;
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|e| BlobError::Backend(format!("begin tx: {e}")))?;
+            // §11.5 / I28 — an announcement never stores; an evicted binding
+            // is an eviction RECORD, not a held row.
+            let held: bool = tx
+                .query_one(
+                    "SELECT (EXISTS(SELECT 1 FROM cirislens.federation_blobs WHERE sha256 = $1) \
+                        AND NOT EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
+                                        WHERE at_rest_sha256 = $1 AND evicted_at IS NOT NULL)) AS h",
+                    &[&sha_vec],
+                )
+                .await
+                .map_err(|e| BlobError::Backend(format!("announce: {e}")))?
+                .safe_get_with("h", BlobError::Backend)?;
+            if !held {
+                let _ = tx.rollback().await;
+                return Ok(false);
+            }
+            self.insert_holding_claim_tx(&tx, &prepared).await?;
+            tx.commit()
+                .await
+                .map_err(|e| BlobError::Backend(format!("commit holding claim: {e}")))?;
+        }
+        // The pooled client is released before the re-index takes its own.
+        self.index_holder_claim(&prepared.row.attestation_id, &prepared.row.tier)
+            .await?;
+        Ok(true)
+    }
+
+    async fn store_stream_dek(
+        &self,
+        record: &crate::federation::StreamDekRecord,
+        epoch_i64: i64,
+    ) -> Result<crate::federation::StreamDekRecord, crate::federation::BlobError> {
+        let be = |e: tokio_postgres::Error| {
+            crate::federation::BlobError::Backend(format!("stream_dek_insert: {e}"))
+        };
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_stream_deks \
+                    (stream_id, epoch, owner_key_id, cohort_scope, group_key_id, \
+                     self_retention_wrap, supplied, room_epoch) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 ON CONFLICT (stream_id, epoch) DO NOTHING",
+                &[
+                    &record.stream_id,
+                    &epoch_i64,
+                    &record.owner_key_id,
+                    &record.cohort_scope,
+                    &record.group_key_id,
+                    &record.self_retention_wrap,
+                    &record.supplied,
+                    &record
+                        .room_epoch
+                        .map(|e| i64::try_from(e).unwrap_or(i64::MAX)),
+                ],
+            )
+            .await
+            .map_err(be)?;
+        let row = client
+            .query_one(
+                &format!("{PG_STREAM_DEK_SELECT} WHERE d.stream_id = $1 AND d.epoch = $2"),
+                &[&record.stream_id, &epoch_i64],
+            )
+            .await
+            .map_err(be)?;
+        pg_stream_dek_row(&row)
+    }
+
+    async fn store_stream_dek_grants(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+        sealer_key_id: &str,
+        cohort_scope: &str,
+        wraps: &[crate::federation::GrantWrap],
+    ) -> Result<usize, crate::federation::BlobError> {
+        let be = |e: tokio_postgres::Error| {
+            crate::federation::BlobError::Backend(format!("stream_dek_put_grants: {e}"))
+        };
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let ep = epoch as i64;
+        let tx = client.transaction().await.map_err(be)?;
+        let mut inserted = 0usize;
+        for w in wraps {
+            inserted += tx
+                .execute(
+                    "INSERT INTO cirislens.federation_stream_dek_grants (\
+                        stream_id, epoch, sealer_key_id, recipient_key_id, wrap_algorithm, \
+                        wrapped_dek, cohort_scope\
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                     ON CONFLICT (stream_id, epoch, sealer_key_id, recipient_key_id) DO NOTHING",
+                    &[
+                        &stream_id,
+                        &ep,
+                        &sealer_key_id,
+                        &w.recipient_key_id,
+                        &w.wrap_algorithm,
+                        &w.wrapped_dek,
+                        &cohort_scope,
+                    ],
+                )
+                .await
+                .map_err(be)? as usize;
+        }
+        tx.commit().await.map_err(be)?;
+        Ok(inserted)
+    }
+}
+
+/// v61 (CIRISPersist#934) — the blob writes' half of the blob plane's
+/// executor on postgres.
+#[async_trait::async_trait]
+impl crate::federation::blob_admit::BlobWriteStore for PostgresBackend {
+    fn blob_admission_gate(&self) -> Option<crate::federation::AdmissionGate> {
+        self.admission_gate()
+    }
+
+    async fn store_planned_blob(
+        &self,
+        planned: crate::federation::blob_admit::PlannedBlob,
+    ) -> Result<(), crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let door = planned.door;
+        let be = |what: &'static str| {
+            move |e: tokio_postgres::Error| BlobError::Backend(format!("{door} {what}: {e}"))
+        };
+        #[cfg(test)]
+        let inject_association_fault = self
+            .test_hooks()
+            .fail_if_armed("store_blob_local_association")
+            .is_err();
+        let r = &planned.row;
+        let sha_vec = r.sha256.to_vec();
+        {
+            let mut client = self
+                .get_client()
+                .await
+                .map_err(|e| BlobError::Backend(e.to_string()))?;
+            let tx = client.transaction().await.map_err(be("begin tx"))?;
+            // §11.4 / I27 — a community bind runs under the community's
+            // serialization boundary.
+            if let Some(b) = &planned.binding {
+                lock_community_tx(&tx, &b.community_key_id).await?;
+            }
+            // v60.1.0 (#1070) — the tombstone again, under the write.
+            pg_refuse_tombstoned_at_write(&tx, &[r.sha256], &planned.tombstones).await?;
+            #[cfg(test)]
+            self.test_hooks()
+                .pause_if_armed(crate::store::test_hooks::BYTES_INSIDE_THE_WRITE)
+                .await;
+            // #846 (§5) / #984 (V177) — the row records its author and group;
+            // first write wins on the address.
+            tx.execute(
+                "INSERT INTO cirislens.federation_blobs (\
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                    cohort_scope, crypto_tier, author_key_id, group_key_id\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                 ON CONFLICT (sha256) DO NOTHING",
+                &[
+                    &sha_vec,
+                    &r.storage_kind,
+                    &r.bytes_inline,
+                    &r.external_ref,
+                    &r.size_bytes,
+                    &r.media_type,
+                    &r.cohort_scope,
+                    &r.tier,
+                    &r.author_key_id,
+                    &r.group_key_id,
+                ],
+            )
+            .await
+            .map_err(be("insert"))?;
+            if planned.associate {
+                #[cfg(test)]
+                if inject_association_fault {
+                    return Err(BlobError::Backend(
+                        "store_blob_local association: injected fault".into(),
+                    ));
+                }
+                tx.execute(
+                    "INSERT INTO cirislens.federation_blob_associations \
+                        (sha256, cohort_scope, group_key_id) VALUES ($1, $2, COALESCE($3, '')) \
+                     ON CONFLICT DO NOTHING",
+                    &[&sha_vec, &r.cohort_scope, &r.group_key_id],
+                )
+                .await
+                .map_err(be("association"))?;
+            }
+            if let Some(b) = &planned.binding {
+                let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+                // #848 — the minter is the AUTHOR, as declared (§11).
+                tx.execute(
+                    "INSERT INTO cirislens.federation_community_blob_epoch \
+                        (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                     VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (at_rest_sha256) DO NOTHING",
+                    &[&sha_vec, &b.community_key_id, &b.minter_key_id, &ep],
+                )
+                .await
+                .map_err(be("bind"))?;
+            }
+            if let Some(c) = &planned.claim {
+                self.insert_holding_claim_tx(&tx, c).await?;
+            }
+            tx.commit().await.map_err(be("commit"))?;
+        }
+        // The pooled client is released before the index reload takes its
+        // own (#870: the index moves WITH the row).
+        if let Some(c) = &planned.claim {
+            self.index_holder_claim(&c.row.attestation_id, &c.row.tier)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn store_planned_announcement(
+        &self,
+        planned: crate::federation::blob_admit::PlannedAnnouncement,
+    ) -> Result<bool, crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let sha_vec = planned.sha256.to_vec();
+        {
+            let mut client = self
+                .get_client()
+                .await
+                .map_err(|e| BlobError::Backend(e.to_string()))?;
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|e| BlobError::Backend(format!("begin tx: {e}")))?;
+            if planned.needs_binding {
+                // #833 — an evicted binding is an eviction RECORD, not a bound
+                // row; a bound row's community is locked for the announce.
+                let bound = tx
+                    .query_opt(
+                        "SELECT community_key_id FROM cirislens.federation_community_blob_epoch \
+                          WHERE at_rest_sha256 = $1 AND evicted_at IS NULL",
+                        &[&sha_vec],
+                    )
+                    .await
+                    .map_err(|e| BlobError::Backend(format!("announce: {e}")))?;
+                let Some(row) = bound else {
+                    let _ = tx.rollback().await;
+                    return Ok(false);
+                };
+                let community: String =
+                    row.safe_get_with("community_key_id", BlobError::Backend)?;
+                lock_community_tx(&tx, &community).await?;
+            }
+            // §11.5 / I28 — an announcement never stores.
+            let held: bool = tx
+                .query_one(
+                    "SELECT (EXISTS(SELECT 1 FROM cirislens.federation_blobs WHERE sha256 = $1) \
+                        AND ($2 OR EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
+                                           WHERE at_rest_sha256 = $1 AND evicted_at IS NULL))) AS h",
+                    &[&sha_vec, &(!planned.needs_binding)],
+                )
+                .await
+                .map_err(|e| BlobError::Backend(format!("announce: {e}")))?
+                .safe_get_with("h", BlobError::Backend)?;
+            if !held {
+                let _ = tx.rollback().await;
+                return Ok(false);
+            }
+            // #846 (§5) — a row the cascade could not attribute takes the
+            // announcer's key; a recorded author is never overwritten.
+            tx.execute(
+                "UPDATE cirislens.federation_blobs SET author_key_id = $2 \
+                  WHERE sha256 = $1 AND author_key_id IS NULL",
+                &[&sha_vec, &planned.author_key_id],
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("announce author: {e}")))?;
+            self.insert_holding_claim_tx(&tx, &planned.claim).await?;
+            tx.commit()
+                .await
+                .map_err(|e| BlobError::Backend(format!("commit blob+attestation: {e}")))?;
+        }
+        self.index_holder_claim(&planned.claim.row.attestation_id, &planned.claim.row.tier)
+            .await?;
+        Ok(true)
+    }
+
+    async fn store_planned_dag(
+        &self,
+        planned: crate::federation::blob_admit::PlannedDag,
+    ) -> Result<(), crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let be = |what: &'static str| {
+            move |e: tokio_postgres::Error| {
+                BlobError::Backend(format!("put_blob_chunks {what}: {e}"))
+            }
+        };
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| BlobError::Backend(e.to_string()))?;
+        let tx = client.transaction().await.map_err(be("begin tx"))?;
+        // v60.1.0 (#1070) — every row's tombstone again, under the write.
+        let shas: Vec<[u8; 32]> = planned.rows.iter().map(|r| r.sha256).collect();
+        pg_refuse_tombstoned_at_write(&tx, &shas, &planned.tombstones).await?;
+        let media_type_null: Option<String> = None;
+        for row in &planned.rows {
+            tx.execute(
+                "INSERT INTO cirislens.federation_blobs (\
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type\
+                 ) VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (sha256) DO NOTHING",
+                &[
+                    &row.sha256.to_vec(),
+                    &row.storage_kind,
+                    &row.bytes_inline,
+                    &row.external_ref,
+                    &row.size_bytes,
+                    &media_type_null,
+                ],
+            )
+            .await
+            .map_err(be("insert"))?;
+        }
+        pg_insert_dag_links(&tx, &planned).await?;
+        tx.commit().await.map_err(be("commit"))
+    }
+
+    async fn store_planned_dag_over_held(
+        &self,
+        planned: crate::federation::blob_admit::PlannedDag,
+    ) -> Result<(), crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let be = |what: &'static str| {
+            move |e: tokio_postgres::Error| {
+                BlobError::Backend(format!("put_dag_manifest_over_held {what}: {e}"))
+            }
+        };
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| BlobError::Backend(e.to_string()))?;
+        let tx = client.transaction().await.map_err(be("begin"))?;
+        for (idx, (chunk_sha, size)) in planned.held_chunks.iter().enumerate() {
+            // FOR SHARE: a chunk row cannot leave under the finalize.
+            let held = tx
+                .query_opt(
+                    "SELECT storage_kind, crypto_tier, size_bytes \
+                     FROM cirislens.federation_blobs WHERE sha256 = $1 FOR SHARE",
+                    &[&chunk_sha.to_vec()],
+                )
+                .await
+                .map_err(be("read chunk"))?
+                .map(|r| -> Result<(String, String, i64), BlobError> {
+                    Ok((
+                        r.safe_get_with("storage_kind", BlobError::Backend)?,
+                        r.safe_get_with("crypto_tier", BlobError::Backend)?,
+                        r.safe_get_with("size_bytes", BlobError::Backend)?,
+                    ))
+                })
+                .transpose()?;
+            crate::federation::blob_admit::held_dag_chunk_verdict(idx, chunk_sha, *size, held)?;
+        }
+        // v60.1.0 (#1070) — the tombstones again, under the write: the
+        // manifest's own and every chunk's.
+        let shas: Vec<[u8; 32]> = planned
+            .rows
+            .iter()
+            .map(|r| r.sha256)
+            .chain(planned.held_chunks.iter().map(|(c, _)| *c))
+            .collect();
+        pg_refuse_tombstoned_at_write(&tx, &shas, &planned.tombstones).await?;
+        let media_type_null: Option<String> = None;
+        for row in &planned.rows {
+            tx.execute(
+                "INSERT INTO cirislens.federation_blobs (\
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type\
+                 ) VALUES ($1, $2, $3, NULL, $4, $5) \
+                 ON CONFLICT (sha256) DO NOTHING",
+                &[
+                    &row.sha256.to_vec(),
+                    &row.storage_kind,
+                    &row.bytes_inline,
+                    &row.size_bytes,
+                    &media_type_null,
+                ],
+            )
+            .await
+            .map_err(be("insert"))?;
+        }
+        pg_insert_dag_links(&tx, &planned).await?;
+        tx.commit().await.map_err(be("commit"))
+    }
+
+    async fn store_planned_seal(
+        &self,
+        planned: crate::federation::blob_admit::PlannedSeal,
+    ) -> Result<crate::federation::blob_admit::SealWrite, crate::federation::BlobError> {
+        use crate::federation::blob_admit::SealWrite;
+        use crate::federation::BlobError;
+        let be = |what: &'static str| {
+            move |e: tokio_postgres::Error| {
+                BlobError::Backend(format!("seal_stream_with_scope {what}: {e}"))
+            }
+        };
+        let p = &planned;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| BlobError::Backend(e.to_string()))?;
+        let tx = client.transaction().await.map_err(be("begin tx"))?;
+        if let Some(b) = &p.binding {
+            lock_community_tx(&tx, &b.community_key_id).await?;
+        }
+        // #954 — an abandoned stream is never sealed.
+        let abandoned = tx
+            .query_opt(
+                "SELECT (abandoned_at IS NOT NULL) AS a FROM cirislens.federation_streams \
+                  WHERE stream_id = $1",
+                &[&p.stream_id],
+            )
+            .await
+            .map_err(be("head"))?
+            .map(|r| r.safe_get_with::<bool, _, _, _>("a", BlobError::Backend))
+            .transpose()?
+            .unwrap_or(false);
+        if abandoned {
+            let _ = tx.rollback().await;
+            return Ok(SealWrite::Abandoned);
+        }
+        // §12.3 — the stream must still hold the chunks the manifest was
+        // built over.
+        let count: i64 = tx
+            .query_one(
+                "SELECT COUNT(*) AS n FROM cirislens.federation_stream_chunks WHERE stream_id = $1",
+                &[&p.stream_id],
+            )
+            .await
+            .map_err(be("count"))?
+            .safe_get_with("n", BlobError::Backend)?;
+        if count != p.expected_chunks {
+            let _ = tx.rollback().await;
+            return Ok(SealWrite::StreamMoved(count));
+        }
+        let sha_vec = p.spec.sha256.to_vec();
+        let group = &p.spec.group_key_id;
+        // #846 (§5) — the manifest's author is the stream's owner, read in
+        // this transaction (NULL for an unclaimed stream).
+        tx.execute(
+            "INSERT INTO cirislens.federation_blobs (\
+                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                cohort_scope, crypto_tier, author_key_id, group_key_id\
+             ) VALUES ($1, 'chunk_dag', $2, NULL, $3, $4, $5, $6, \
+                       (SELECT owner_key_id FROM cirislens.federation_streams WHERE stream_id = $7), \
+                       $8) \
+             ON CONFLICT (sha256) DO NOTHING",
+            &[
+                &sha_vec,
+                &p.spec.body,
+                &p.size_bytes,
+                &p.media_type,
+                &p.cohort_scope,
+                &p.tier,
+                &p.stream_id,
+                group,
+            ],
+        )
+        .await
+        .map_err(be("manifest insert"))?;
+        if let Some(b) = &p.binding {
+            let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+            // #848 — current-and-enabled against the MINTER's own state.
+            let n = tx
+                .execute(
+                    "INSERT INTO cirislens.federation_community_blob_epoch \
+                        (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                     SELECT $1, $2, $3, $4 \
+                      WHERE EXISTS (SELECT 1 FROM cirislens.federation_community_dek \
+                                     WHERE community_key_id = $2 AND minter_key_id = $3 AND epoch = $4 \
+                                       AND key_state = 'enabled') \
+                        AND $4 = COALESCE((SELECT epoch FROM cirislens.federation_community_dek_epoch \
+                                            WHERE community_key_id = $2 AND minter_key_id = $3), 0) \
+                     ON CONFLICT (at_rest_sha256) DO NOTHING",
+                    &[&sha_vec, &b.community_key_id, &b.minter_key_id, &ep],
+                )
+                .await
+                .map_err(be("bind"))?;
+            let already: bool = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
+                                    WHERE at_rest_sha256 = $1 AND community_key_id = $2 \
+                                      AND minter_key_id = $3 AND epoch = $4) AS b",
+                    &[&sha_vec, &b.community_key_id, &b.minter_key_id, &ep],
+                )
+                .await
+                .map_err(be("bind check"))?
+                .safe_get_with("b", BlobError::Backend)?;
+            if n == 0 && !already {
+                let _ = tx.rollback().await;
+                return Ok(SealWrite::EpochMoved);
+            }
+        }
+        // #954 — a v3 root's children, one transaction with the root.
+        for c in &p.spec.children {
+            let child_sha = c.sha256.to_vec();
+            let len = i64::try_from(c.body.len()).unwrap_or(i64::MAX);
+            let idx = i64::try_from(c.index).unwrap_or(i64::MAX);
+            tx.execute(
+                "INSERT INTO cirislens.federation_blobs (\
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                    cohort_scope, crypto_tier, author_key_id, group_key_id\
+                 ) VALUES ($1, 'inline', $2, NULL, $3, NULL, $4, $5, \
+                           (SELECT owner_key_id FROM cirislens.federation_streams WHERE stream_id = $6), \
+                           $7) \
+                 ON CONFLICT (sha256) DO NOTHING",
+                &[
+                    &child_sha,
+                    &c.body,
+                    &len,
+                    &p.cohort_scope,
+                    &p.tier,
+                    &p.stream_id,
+                    group,
+                ],
+            )
+            .await
+            .map_err(be("child insert"))?;
+            if let Some(b) = &p.binding {
+                let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+                tx.execute(
+                    "INSERT INTO cirislens.federation_community_blob_epoch \
+                        (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                     VALUES ($1, $2, $3, $4) ON CONFLICT (at_rest_sha256) DO NOTHING",
+                    &[&child_sha, &b.community_key_id, &b.minter_key_id, &ep],
+                )
+                .await
+                .map_err(be("child bind"))?;
+            }
+            tx.execute(
+                "INSERT INTO cirislens.federation_manifest_children \
+                    (root_sha256, child_index, child_sha256) VALUES ($1, $2, $3) \
+                 ON CONFLICT (root_sha256, child_index) DO NOTHING",
+                &[&sha_vec, &idx, &child_sha],
+            )
+            .await
+            .map_err(be("child relation"))?;
+        }
+        // v53.1.0 (#979) — the manifest's chunks, from the stream's own rows.
+        tx.execute(
+            "INSERT INTO cirislens.federation_dag_chunks (manifest_sha256, seq, chunk_sha256, stream_id) \
+             SELECT $1, seq, chunk_sha, stream_id FROM cirislens.federation_stream_chunks \
+             WHERE stream_id = $2 ON CONFLICT (manifest_sha256, seq) DO NOTHING",
+            &[&sha_vec, &p.stream_id],
+        )
+        .await
+        .map_err(be("dag chunk links"))?;
+        tx.execute(
+            "UPDATE cirislens.federation_stream_chunks SET sealed_at = NOW() WHERE stream_id = $1",
+            &[&p.stream_id],
+        )
+        .await
+        .map_err(be("sealed_at"))?;
+        tx.commit().await.map_err(be("commit"))?;
+        Ok(SealWrite::Sealed)
+    }
+}
+
+/// v61 (CIRISPersist#934) — Codex r2 on #1065: a DAG manifest's chunk
+/// relation, written in its row's transaction.
+async fn pg_insert_dag_links(
+    tx: &tokio_postgres::Transaction<'_>,
+    planned: &crate::federation::blob_admit::PlannedDag,
+) -> Result<(), crate::federation::BlobError> {
+    if let Some(m) = planned.manifest_sha() {
+        let m = m.to_vec();
+        for (seq, chunk) in &planned.links {
+            tx.execute(
+                "INSERT INTO cirislens.federation_dag_chunks \
+                     (manifest_sha256, seq, chunk_sha256, stream_id) VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (manifest_sha256, seq) DO NOTHING",
+                &[&m, seq, chunk, &planned.link_stream],
+            )
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("dag chunk link: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+/// v61 (CIRISPersist#934, S4b) — the transport-destination executor on
+/// postgres. Storage only: the decisions are `federation::transport_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::transport_admit::TransportStore for PostgresBackend {
+    async fn store_planned_destination(
+        &self,
+        planned: crate::federation::transport_admit::PlannedDestination<'_>,
+    ) -> Result<(), crate::federation::Error> {
+        let destination = planned.destination;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // #443 route-table put: keyed on (occ, kind) — `destination` is
+        // payload — and GUARDED monotonic on (epoch, asserted_at)
+        // lexicographic. A stale assertion is a silent no-op.
+        //
+        // v21.4.0 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: an
+        // unsigned writer never demotes a signed row (signature columns
+        // preserved unconditionally; a content-CHANGING unsigned write
+        // against a signed row is a silent no-op). See the sqlite twin's
+        // comment for the full rationale.
+        // v21.17.1 (CIRISPersist#541) — the preserve set must equal the
+        // VERIFIED set: `verify_signed_transport_destination` checks nine
+        // fields, so on a signed row an unsigned writer may advance only
+        // `last_seen_at`. See the sqlite guard for the full rationale.
+        let provenance_token = destination.binding_provenance.as_str();
+        let epoch = planned.epoch_i64;
+        // v36.0.0 (#668) — serve position (V130). The unsigned door stamps it
+        // on INSERT and re-stamps only through the `signature IS NULL` arm:
+        // on a SIGNED row this door may advance ONLY `last_seen_at` (advisory
+        // liveness, outside the verifier's nine fields), and re-serving the
+        // signed stream on every liveness ping would churn it for content no
+        // verifier covers.
+        let admitted_at = self
+            .next_plane_position(&client, "transport_destinations")
+            .await?;
+        client
+            .execute(
+                "INSERT INTO cirislens.transport_destinations \
+                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                     binding_provenance, epoch, retired_at, \
+                     attesting_key_id, signed_envelope, signature, admitted_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, NULL, $11) \
+                 ON CONFLICT (occurrence_key_id, transport_kind) \
+                 DO UPDATE SET destination = \
+                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.destination \
+                        ELSE cirislens.transport_destinations.destination END, \
+                    asserted_at = \
+                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.asserted_at \
+                        ELSE cirislens.transport_destinations.asserted_at END, \
+                    last_seen_at = EXCLUDED.last_seen_at, \
+                    transport_ed25519_pubkey_base64 = \
+                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.transport_ed25519_pubkey_base64 \
+                        ELSE cirislens.transport_destinations.transport_ed25519_pubkey_base64 END, \
+                    transport_x25519_pubkey_base64 = \
+                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.transport_x25519_pubkey_base64 \
+                        ELSE cirislens.transport_destinations.transport_x25519_pubkey_base64 END, \
+                    binding_provenance = \
+                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.binding_provenance \
+                        ELSE cirislens.transport_destinations.binding_provenance END, \
+                    epoch = CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.epoch ELSE cirislens.transport_destinations.epoch END, \
+                    retired_at = CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.retired_at \
+                        ELSE cirislens.transport_destinations.retired_at END, \
+                    admitted_at = CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.admitted_at \
+                        ELSE cirislens.transport_destinations.admitted_at END, \
+                    attesting_key_id = cirislens.transport_destinations.attesting_key_id, \
+                    signed_envelope = cirislens.transport_destinations.signed_envelope, \
+                    signature = cirislens.transport_destinations.signature \
+                 WHERE (EXCLUDED.epoch > cirislens.transport_destinations.epoch \
+                    OR (EXCLUDED.epoch = cirislens.transport_destinations.epoch \
+                        AND EXCLUDED.asserted_at > cirislens.transport_destinations.asserted_at)) \
+                   AND (cirislens.transport_destinations.signature IS NULL \
+                    OR (EXCLUDED.destination = cirislens.transport_destinations.destination \
+                        AND COALESCE(EXCLUDED.transport_ed25519_pubkey_base64, '') \
+                            = COALESCE(cirislens.transport_destinations.transport_ed25519_pubkey_base64, '') \
+                        AND COALESCE(EXCLUDED.transport_x25519_pubkey_base64, '') \
+                            = COALESCE(cirislens.transport_destinations.transport_x25519_pubkey_base64, '')))",
+                &[
+                    &destination.occurrence_key_id,
+                    &destination.transport_kind,
+                    &destination.destination,
+                    &destination.asserted_at,
+                    &destination.last_seen_at,
+                    &destination.transport_ed25519_pubkey_base64,
+                    &destination.transport_x25519_pubkey_base64,
+                    &provenance_token,
+                    &epoch,
+                    &destination.retired_at,
+                    &admitted_at,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("put_transport_destination: {e}"))
+            })?;
+        Ok(())
+    }
+
+    async fn store_planned_signed_destination(
+        &self,
+        planned: crate::federation::transport_admit::PlannedSignedDestination<'_>,
+    ) -> Result<crate::federation::TransportDestinationApplyOutcome, crate::federation::Error> {
+        use crate::federation::transport_admit::{DestinationVerdict, HeldDestination};
+        use crate::federation::Error;
+        use crate::federation::TransportDestinationApplyOutcome as Outcome;
+        let signed = planned.signed;
+        let d = &signed.transport_destination;
+        let be = |e: tokio_postgres::Error| {
+            Error::Backend(format!("put_signed_transport_destination: {e}"))
+        };
+        let fresh = {
+            let client = self
+                .get_client()
+                .await
+                .map_err(crate::store::Error::into_federation)?;
+            let existing = client
+                .query_opt(
+                    "SELECT occurrence_key_id, transport_kind, destination, asserted_at, \
+                        last_seen_at, transport_ed25519_pubkey_base64, \
+                        transport_x25519_pubkey_base64, binding_provenance, epoch, retired_at, \
+                        signature IS NOT NULL AS held_signed, signed_envelope \
+                     FROM cirislens.transport_destinations \
+                     WHERE occurrence_key_id = $1 AND transport_kind = $2",
+                    &[&d.occurrence_key_id, &d.transport_kind],
+                )
+                .await
+                .map_err(be)?
+                .map(|row| -> Result<HeldDestination, Error> {
+                    Ok(HeldDestination {
+                        destination: pg_row_to_transport_destination(&row)?,
+                        signed: row.safe_get_with("held_signed", Error::Backend)?,
+                        envelope: row.safe_get_with("signed_envelope", Error::Backend)?,
+                    })
+                })
+                .transpose()?;
+            let fresh = match crate::federation::transport_admit::held_destination_verdict(
+                signed,
+                existing.as_ref(),
+            ) {
+                DestinationVerdict::Answer(outcome) => return Ok(outcome),
+                DestinationVerdict::Write { fresh } => fresh,
+            };
+            let admitted_at = self
+                .next_plane_position(&client, "transport_destinations")
+                .await?;
+            let n = client
+                .execute(
+                    "INSERT INTO cirislens.transport_destinations \
+                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                     binding_provenance, epoch, retired_at, \
+                     attesting_key_id, signed_envelope, signature, admitted_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                 ON CONFLICT (occurrence_key_id, transport_kind) \
+                 DO UPDATE SET destination = EXCLUDED.destination, \
+                    asserted_at = EXCLUDED.asserted_at, \
+                    last_seen_at = EXCLUDED.last_seen_at, \
+                    transport_ed25519_pubkey_base64 = EXCLUDED.transport_ed25519_pubkey_base64, \
+                    transport_x25519_pubkey_base64 = EXCLUDED.transport_x25519_pubkey_base64, \
+                    binding_provenance = EXCLUDED.binding_provenance, \
+                    epoch = EXCLUDED.epoch, \
+                    retired_at = EXCLUDED.retired_at, \
+                    attesting_key_id = EXCLUDED.attesting_key_id, \
+                    signed_envelope = EXCLUDED.signed_envelope, \
+                    signature = EXCLUDED.signature, \
+                    admitted_at = EXCLUDED.admitted_at \
+                 WHERE EXCLUDED.epoch > cirislens.transport_destinations.epoch \
+                    OR (EXCLUDED.epoch = cirislens.transport_destinations.epoch \
+                        AND EXCLUDED.asserted_at > cirislens.transport_destinations.asserted_at) \
+                    OR cirislens.transport_destinations.signature IS NULL",
+                    &[
+                        &d.occurrence_key_id,
+                        &d.transport_kind,
+                        &d.destination,
+                        &d.asserted_at,
+                        &d.last_seen_at,
+                        &d.transport_ed25519_pubkey_base64,
+                        &d.transport_x25519_pubkey_base64,
+                        &d.binding_provenance.as_str(),
+                        &planned.epoch_i64,
+                        &d.retired_at,
+                        &signed.attesting_key_id,
+                        &planned.envelope_json,
+                        &planned.signature_json,
+                        &admitted_at,
+                    ],
+                )
+                .await
+                .map_err(be)?;
+            // The read and the write are two statements on a pooled client: a
+            // newer record that landed between them leaves nothing to write.
+            if n == 0 {
+                return Ok(Outcome::Refused {
+                    reason: "superseded concurrently by a newer record".into(),
+                });
+            }
+            fresh
+        };
+        // The pooled client is released before the re-index takes its own.
+        self.index_stored_record("TransportDestination", &planned.wire_index_key)
+            .await?;
+        Ok(if fresh {
+            Outcome::Inserted
+        } else {
+            Outcome::Superseded
+        })
+    }
+}
+
+/// v61 (CIRISPersist#934, S4b) — the identity-occurrence executor on
+/// postgres. Storage only: the decisions are `federation::occurrence_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::occurrence_admit::OccurrenceStore for PostgresBackend {
+    async fn rehome_key_plane_before_write(&self) -> Result<(), crate::federation::Error> {
+        self.rehome_legacy_key_plane().await
+    }
+
+    async fn store_planned_occurrence(
+        &self,
+        planned: crate::federation::occurrence_admit::PlannedOccurrence,
+    ) -> Result<crate::federation::occurrence_admit::OccurrenceWrite, crate::federation::Error>
+    {
+        let crate::federation::occurrence_admit::PlannedOccurrence {
+            row,
+            enc_x25519,
+            enc_ml_kem,
+            transport_binding_json,
+            signed,
+        } = planned;
+        let signed = signed.ok_or_else(|| {
+            crate::federation::Error::Backend("store_planned_occurrence: no signature".into())
+        })?;
+        let signed_envelope_text = pg_envelope_text(&signed.signed_envelope, "signed_envelope")?;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let tx = client.transaction().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("put_identity_occurrence tx: {e}"))
+        })?;
+        // v36.0.0 (#668) — THIS node's serve position (V130), read through
+        // `tx`; v52.0.0 (#930) — the history row in the same statement,
+        // whether or not the last-signed-wins upsert takes the record.
+        let admitted_at = self
+            .next_plane_position(&tx, "federation_identity_occurrences")
+            .await?;
+        let applied: i64 = tx
+            .query_one(
+                "WITH hist AS (\
+                    INSERT INTO cirislens.federation_identity_occurrence_history (\
+                        identity_key_id, occurrence_key_id, asserted_at, valid_until, \
+                        attesting_key_id, signed_envelope, signature\
+                    ) VALUES ($1, $2, $5, $6, $10, $11, $12) ON CONFLICT DO NOTHING\
+                 ), up AS (\
+                 INSERT INTO cirislens.federation_identity_occurrences (\
+                    identity_key_id, occurrence_key_id, device_class, \
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, \
+                    attesting_key_id, signed_envelope, signature, transport_binding, \
+                    admitted_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                 ON CONFLICT (identity_key_id, occurrence_key_id) DO UPDATE SET \
+                    device_class = EXCLUDED.device_class, \
+                    hardware_attestation = EXCLUDED.hardware_attestation, \
+                    asserted_at = EXCLUDED.asserted_at, \
+                    valid_until = EXCLUDED.valid_until, \
+                    persist_row_hash = EXCLUDED.persist_row_hash, \
+                    pubkey_x25519_base64 = EXCLUDED.pubkey_x25519_base64, \
+                    pubkey_ml_kem_768_base64 = EXCLUDED.pubkey_ml_kem_768_base64, \
+                    attesting_key_id = EXCLUDED.attesting_key_id, \
+                    signed_envelope = EXCLUDED.signed_envelope, \
+                    signature = EXCLUDED.signature, \
+                    transport_binding = EXCLUDED.transport_binding, \
+                    admitted_at = EXCLUDED.admitted_at \
+                 WHERE EXCLUDED.asserted_at > cirislens.federation_identity_occurrences.asserted_at \
+                 RETURNING 1) SELECT COUNT(*) FROM up",
+                &[
+                    &row.identity_key_id,
+                    &row.occurrence_key_id,
+                    &row.device_class,
+                    &row.hardware_attestation,
+                    &row.asserted_at,
+                    &row.valid_until,
+                    &row.persist_row_hash,
+                    &enc_x25519,
+                    &enc_ml_kem,
+                    &signed.attesting_key_id,
+                    &signed_envelope_text,
+                    &signed.signature_json,
+                    &transport_binding_json,
+                    &admitted_at,
+                ],
+            )
+            .await
+            .and_then(|r| r.try_get::<_, i64>(0))
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("foreign key") {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "FK constraint violated on identity_occurrence insert: {msg}"
+                    ))
+                } else {
+                    crate::federation::Error::Backend(format!("insert identity_occurrence: {msg}"))
+                }
+            })?;
+        // v58.0.0 (#991) — the pair's `identity:occurrence:v1` row follows the
+        // current signed occurrence, in this transaction.
+        pg_sync_occurrence_row(&tx, &row.identity_key_id, &row.occurrence_key_id).await?;
+        tx.commit().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("put_identity_occurrence commit: {e}"))
+        })?;
+        let row_id: Option<String> = if applied == 0 || !pg_key_plane_present(&**client).await? {
+            None
+        } else {
+            match client
+                .query_opt(
+                    "SELECT attestation_id FROM cirislens.federation_identity_occurrences \
+                      WHERE identity_key_id = $1 AND occurrence_key_id = $2",
+                    &[&row.identity_key_id, &row.occurrence_key_id],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("occurrence row pointer: {e}"))
+                })? {
+                Some(r) => r.safe_get_with(0, crate::federation::Error::Backend)?,
+                None => None,
+            }
+        };
+        Ok(crate::federation::occurrence_admit::OccurrenceWrite {
+            applied: applied > 0,
+            row_id,
+        })
+    }
+
+    async fn store_planned_local_occurrence(
+        &self,
+        planned: crate::federation::occurrence_admit::PlannedOccurrence,
+    ) -> Result<(), crate::federation::Error> {
+        // #418 / v21.17.1 (#541) — the trusted-local upsert never mutates a
+        // SIGNED occurrence (`WHERE signature IS NULL`).
+        let crate::federation::occurrence_admit::PlannedOccurrence {
+            row,
+            enc_x25519,
+            enc_ml_kem,
+            transport_binding_json,
+            ..
+        } = planned;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let admitted_at = self
+            .next_plane_position(&client, "federation_identity_occurrences")
+            .await?;
+        client
+            .execute(
+                "WITH hist AS (\
+                    INSERT INTO cirislens.federation_identity_occurrence_history (\
+                        identity_key_id, occurrence_key_id, asserted_at, valid_until, \
+                        attesting_key_id\
+                    ) VALUES ($1, $2, $5, $6, '') ON CONFLICT DO NOTHING\
+                 ) \
+                 INSERT INTO cirislens.federation_identity_occurrences (\
+                    identity_key_id, occurrence_key_id, device_class, \
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding, \
+                    admitted_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 ON CONFLICT (identity_key_id, occurrence_key_id) DO UPDATE SET \
+                    device_class = EXCLUDED.device_class, \
+                    hardware_attestation = EXCLUDED.hardware_attestation, \
+                    asserted_at = EXCLUDED.asserted_at, \
+                    valid_until = EXCLUDED.valid_until, \
+                    persist_row_hash = EXCLUDED.persist_row_hash, \
+                    pubkey_x25519_base64 = EXCLUDED.pubkey_x25519_base64, \
+                    pubkey_ml_kem_768_base64 = EXCLUDED.pubkey_ml_kem_768_base64, \
+                    transport_binding = EXCLUDED.transport_binding, \
+                    admitted_at = EXCLUDED.admitted_at \
+                 WHERE cirislens.federation_identity_occurrences.signature IS NULL",
+                &[
+                    &row.identity_key_id,
+                    &row.occurrence_key_id,
+                    &row.device_class,
+                    &row.hardware_attestation,
+                    &row.asserted_at,
+                    &row.valid_until,
+                    &row.persist_row_hash,
+                    &enc_x25519,
+                    &enc_ml_kem,
+                    &transport_binding_json,
+                    &admitted_at,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("put_identity_occurrence_local: {e}"))
+            })?;
+        Ok(())
+    }
+
+    async fn index_occurrence_row(
+        &self,
+        row_id: Option<&str>,
+    ) -> Result<(), crate::federation::Error> {
+        self.index_plane_row(row_id).await
+    }
+}
+
+/// v61 (CIRISPersist#934, S4b) — the group supersede executor on postgres.
+/// Storage only: the decisions are `federation::group_supersede_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::group_supersede_admit::GroupSupersedeStore for PostgresBackend {
+    async fn store_planned_supersede(
+        &self,
+        planned: crate::federation::group_supersede_admit::PlannedSupersede,
+    ) -> Result<u32, crate::federation::Error> {
+        use crate::federation::group_supersede_admit::{held_head_verdict, PlannedHead};
+        use crate::federation::Error;
+        let cohort_discriminator = planned.cohort_str;
+        let now = chrono::Utc::now();
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let next: i32 = match &planned.head {
+            PlannedHead::Family(signed) => {
+                let new_fam = &signed.family;
+                let proof_value = pg_supersede_proof_value(signed.supersede_proof.as_ref())?;
+                let cosignatures_value = serde_json::to_value(&signed.cosignatures)
+                    .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
+                let members_value = serde_json::to_value(&new_fam.members)
+                    .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
+                let tx = client
+                    .transaction()
+                    .await
+                    .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
+                // FOR UPDATE: two concurrent supersedes cannot both pass the
+                // verdict against the same prior (v49.0.0).
+                let prior = tx
+                    .query_opt(
+                        "SELECT version, family_key_id, family_name, members, founded_at, \
+                                consensus_protocol, consensus_protocol_entrenched, dissolved_at, prev_head_digest, charter_digest, persist_row_hash \
+                         FROM cirislens.federation_families WHERE family_key_id = $1 \
+                         FOR UPDATE",
+                        &[&new_fam.family_key_id],
+                    )
+                    .await
+                    .map_err(|e| Error::Backend(format!("supersede read prior family: {e}")))?;
+                let prior = match prior {
+                    Some(row) => {
+                        let v: i32 = row.safe_get_with("version", Error::Backend)?;
+                        Some((v, pg_row_to_family(row)?))
+                    }
+                    None => None,
+                };
+                // v61 (CIRISPersist#934) — the shared verdict, on the row
+                // read FOR UPDATE.
+                held_head_verdict(
+                    &planned,
+                    prior.as_ref().map(|(_, f)| f.persist_row_hash.as_str()),
+                )?;
+                let Some((prior_version, prior_fam)) = prior else {
+                    return Err(Error::Backend(
+                        "supersede: the verdict admitted an unheld family".into(),
+                    ));
+                };
+                let snapshot = serde_json::to_value(&prior_fam)
+                    .map_err(|e| Error::Backend(format!("snapshot serialize: {e}")))?;
+                tx.execute(
+                    "INSERT INTO cirislens.federation_group_versions \
+                        (cohort, group_key_id, version, snapshot, change_authorization, \
+                         superseded_at, persist_row_hash) \
+                     VALUES ('family', $1, $2, $3, $4, $5, $6)",
+                    &[
+                        &new_fam.family_key_id,
+                        &prior_version,
+                        &snapshot,
+                        &planned.authorization,
+                        &now,
+                        &prior_fam.persist_row_hash,
+                    ],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("insert group version: {e}")))?;
+                let next = prior_version + 1;
+                // v36.0.0 (#668/#707-class) — a supersede rewrites the served
+                // bytes; the serve position moves with them (allocated inside
+                // the same transaction as the write).
+                let admitted_at = self.next_plane_position(&tx, "federation_families").await?;
+                tx.execute(
+                    "UPDATE cirislens.federation_families SET \
+                        family_name = $2, members = $3, founded_at = $4, \
+                        consensus_protocol = $5, consensus_protocol_entrenched = $6, \
+                        persist_row_hash = $7, version = $8, \
+                        authority_key_id = $9, scrub_signature_classical = $10, \
+                        scrub_signature_pqc = $11, admitted_at = $12, \
+                        supersede_proof = $13, cosignatures = $14, dissolved_at = $15, \
+                        prev_head_digest = $16, charter_digest = $17 \
+                     WHERE family_key_id = $1",
+                    &[
+                        &new_fam.family_key_id,
+                        &new_fam.family_name,
+                        &members_value,
+                        &new_fam.founded_at,
+                        &new_fam.consensus_protocol,
+                        &new_fam.consensus_protocol_entrenched,
+                        &new_fam.persist_row_hash,
+                        &next,
+                        // v31.0.0 (CIRISPersist#651) — the signature moves with
+                        // the record it authorizes, in the SAME statement.
+                        &signed.authority_key_id,
+                        &signed.scrub_signature_classical,
+                        &signed.scrub_signature_pqc,
+                        &admitted_at,
+                        &proof_value,
+                        &cosignatures_value,
+                        &new_fam.dissolved_at,
+                        &new_fam.prev_head_digest,
+                        &new_fam.charter_digest,
+                    ],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("update family: {e}")))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| Error::Backend(format!("commit: {e}")))?;
+                next
+            }
+            PlannedHead::Community(signed) => {
+                let new_comm = &signed.community;
+                let proof_value = pg_supersede_proof_value(signed.supersede_proof.as_ref())?;
+                // v50.0.0 (#926, V158) — the co-signatures travel with the
+                // authority signature they sit beside.
+                let cosignatures_value = serde_json::to_value(&signed.cosignatures)
+                    .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
+                let lineage_value = serde_json::to_value(&signed.lineage)
+                    .map_err(|e| Error::Backend(format!("lineage encode: {e}")))?;
+                let members_value = serde_json::to_value(&new_comm.members)
+                    .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
+                let tx = client
+                    .transaction()
+                    .await
+                    .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
+                let prior = tx
+                    .query_opt(
+                        "SELECT version, community_key_id, community_name, members, founded_at, \
+                                consensus_protocol, policy_blob, prev_head_digest, charter_digest, persist_row_hash \
+                         FROM cirislens.federation_communities WHERE community_key_id = $1 \
+                         FOR UPDATE",
+                        &[&new_comm.community_key_id],
+                    )
+                    .await
+                    .map_err(|e| Error::Backend(format!("supersede read prior community: {e}")))?;
+                let prior = match prior {
+                    Some(row) => {
+                        let v: i32 = row.safe_get_with("version", Error::Backend)?;
+                        Some((v, pg_row_to_community(row)?))
+                    }
+                    None => None,
+                };
+                // v61 (CIRISPersist#934) — the shared verdict.
+                held_head_verdict(
+                    &planned,
+                    prior.as_ref().map(|(_, c)| c.persist_row_hash.as_str()),
+                )?;
+                let Some((prior_version, prior_comm)) = prior else {
+                    return Err(Error::Backend(
+                        "supersede: the verdict admitted an unheld community".into(),
+                    ));
+                };
+                let snapshot = serde_json::to_value(&prior_comm)
+                    .map_err(|e| Error::Backend(format!("snapshot serialize: {e}")))?;
+                tx.execute(
+                    "INSERT INTO cirislens.federation_group_versions \
+                        (cohort, group_key_id, version, snapshot, change_authorization, \
+                         superseded_at, persist_row_hash) \
+                     VALUES ($7, $1, $2, $3, $4, $5, $6)",
+                    &[
+                        &new_comm.community_key_id,
+                        &prior_version,
+                        &snapshot,
+                        &planned.authorization,
+                        &now,
+                        &prior_comm.persist_row_hash,
+                        &cohort_discriminator,
+                    ],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("insert group version: {e}")))?;
+                let next = prior_version + 1;
+                // v36.0.0 (#668/#707-class) — see the family arm.
+                let admitted_at = self
+                    .next_plane_position(&tx, "federation_communities")
+                    .await?;
+                tx.execute(
+                    "UPDATE cirislens.federation_communities SET \
+                        community_name = $2, members = $3, founded_at = $4, \
+                        consensus_protocol = $5, policy_blob = $6, \
+                        persist_row_hash = $7, version = $8, \
+                        authority_key_id = $9, scrub_signature_classical = $10, \
+                        scrub_signature_pqc = $11, admitted_at = $12, \
+                        supersede_proof = $13, cosignatures = $14, lineage = $15, \
+                        prev_head_digest = $16, charter_digest = $17 \
+                     WHERE community_key_id = $1",
+                    &[
+                        &new_comm.community_key_id,
+                        &new_comm.community_name,
+                        &members_value,
+                        &new_comm.founded_at,
+                        &new_comm.consensus_protocol,
+                        &new_comm.policy_blob,
+                        &new_comm.persist_row_hash,
+                        &next,
+                        // v31.0.0 (CIRISPersist#651) — see the family arm.
+                        &signed.authority_key_id,
+                        &signed.scrub_signature_classical,
+                        &signed.scrub_signature_pqc,
+                        &admitted_at,
+                        &proof_value,
+                        &cosignatures_value,
+                        &lineage_value,
+                        &new_comm.prev_head_digest,
+                        &new_comm.charter_digest,
+                    ],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("update community: {e}")))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| Error::Backend(format!("commit: {e}")))?;
+                next
+            }
+        };
+        u32::try_from(next).map_err(|_| Error::Backend("supersede: negative version".into()))
+    }
+}
+
+/// v61 (CIRISPersist#934, S4b) — the family executor on postgres. Storage
+/// only: the decisions are `federation::family_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::family_admit::FamilyStore for PostgresBackend {
+    async fn store_planned_family(
+        &self,
+        row: crate::federation::types::Family,
+    ) -> Result<(), crate::federation::Error> {
+        let members_value = serde_json::to_value(&row.members)
+            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // v36.0.0 (#668) — THIS node's serve position (V130).
+        let admitted_at = self
+            .next_plane_position(&client, "federation_families")
+            .await?;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_families (\
+                    family_key_id, family_name, members, founded_at, \
+                    consensus_protocol, consensus_protocol_entrenched, persist_row_hash, \
+                    admitted_at, dissolved_at, prev_head_digest, charter_digest\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                &[
+                    &row.family_key_id,
+                    &row.family_name,
+                    &members_value,
+                    &row.founded_at,
+                    &row.consensus_protocol,
+                    &row.consensus_protocol_entrenched,
+                    &row.persist_row_hash,
+                    &admitted_at,
+                    &row.dissolved_at,
+                    &row.prev_head_digest,
+                    &row.charter_digest,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("foreign key") {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "FK constraint violated on family insert: {msg}"
+                    ))
+                } else {
+                    crate::federation::Error::Backend(format!("insert family: {msg}"))
+                }
+            })?;
+        Ok(())
+    }
+
+    async fn store_family_signature(
+        &self,
+        planned: crate::federation::family_admit::PlannedFamilySignature,
+    ) -> Result<(), crate::federation::Error> {
+        let supersede_proof_value = pg_supersede_proof_value(planned.supersede_proof.as_ref())?;
+        let cosignatures_value = serde_json::to_value(&planned.cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // v36.0.0 (#668) — attaching the authority signature makes the row
+        // VISIBLE to the signed serve cursor: the serve position is re-stamped.
+        let admitted_at = self
+            .next_plane_position(&client, "federation_families")
+            .await?;
+        client
+            .execute(
+                "UPDATE cirislens.federation_families \
+                    SET authority_key_id = $2, scrub_signature_classical = $3, \
+                        scrub_signature_pqc = $4, admitted_at = $5, supersede_proof = $6, \
+                        cosignatures = $7 \
+                  WHERE family_key_id = $1",
+                &[
+                    &planned.family_key_id,
+                    &planned.authority_key_id,
+                    &planned.scrub_signature_classical,
+                    &planned.scrub_signature_pqc,
+                    &admitted_at,
+                    &supersede_proof_value,
+                    &cosignatures_value,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("store family authority signature: {e}"))
+            })?;
+        Ok(())
+    }
+
+    async fn store_planned_family_revocation(
+        &self,
+        revocation: &crate::federation::SignedFamilyMembershipRevocation,
+    ) -> Result<bool, crate::federation::Error> {
+        let row = &revocation.family_membership_revocation;
+        let witness = serde_json::json!(row.witness_set);
+        let cosignatures = serde_json::to_value(&revocation.cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures: {e}")))?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // v36.0.0 (#668) — THIS node's serve position (V130), computed from
+        // `MAX(admitted_at)`, not allocated, so a skipped write leaves nothing.
+        let admitted_at = self
+            .next_plane_position(&client, "federation_family_membership_revocations")
+            .await?;
+        // v47.1.0 (#861) / v49.0.0 (#910.1, V154) — IDEMPOTENT on the
+        // three-part PK; the unique index arbitrates (race-safe).
+        let inserted = client
+            .execute(
+                "INSERT INTO cirislens.federation_family_membership_revocations (\
+                    family_key_id, removed_identity_key_id, removed_at, effective_at, \
+                    reason, witness_set, persist_row_hash, \
+                    authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
+                    admitted_at, cosignatures\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                 ON CONFLICT (family_key_id, removed_identity_key_id, effective_at) DO NOTHING",
+                &[
+                    &row.family_key_id,
+                    &row.removed_identity_key_id,
+                    &row.removed_at,
+                    &row.effective_at,
+                    &row.reason,
+                    &witness,
+                    &row.persist_row_hash,
+                    &revocation.authority_key_id,
+                    &revocation.scrub_signature_classical,
+                    &revocation.scrub_signature_pqc,
+                    &admitted_at,
+                    &cosignatures,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("family_membership_revocation"))?;
+        Ok(inserted > 0)
+    }
+
+    async fn store_planned_family_widening(
+        &self,
+        widening: &crate::federation::SignedFamilyMembershipWidening,
+    ) -> Result<(), crate::federation::Error> {
+        let row = &widening.family_membership_widening;
+        let cosignatures = serde_json::to_value(&widening.cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures: {e}")))?;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
+        let admitted_at = self
+            .next_plane_position(&tx, "federation_family_membership_widenings")
+            .await?;
+        tx.execute(
+            "INSERT INTO cirislens.federation_family_membership_widenings (\
+                family_key_id, member_key_id, joined_at, effective_at, role, \
+                persist_row_hash, authority_key_id, scrub_signature_classical, \
+                scrub_signature_pqc, admitted_at, cosignatures\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             ON CONFLICT (family_key_id, member_key_id, effective_at) DO NOTHING",
+            &[
+                &row.family_key_id,
+                &row.member_key_id,
+                &row.joined_at,
+                &row.effective_at,
+                &row.role,
+                &row.persist_row_hash,
+                &widening.authority_key_id,
+                &widening.scrub_signature_classical,
+                &widening.scrub_signature_pqc,
+                &admitted_at,
+                &cosignatures,
+            ],
+        )
+        .await
+        .map_err(map_revocation_pg_err("family_membership_widening"))?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
+        Ok(())
+    }
+}
+
+/// v61 (CIRISPersist#934) — the accord evidence executor on postgres.
+/// Storage only: the decisions are `federation::accord_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::accord_admit::AccordStore for PostgresBackend {
+    async fn last_accord_proposal_created_at(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::Error> {
+        let c = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        c.query_one("SELECT MAX(created_at) FROM cirislens.accord_proposal", &[])
+            .await
+            .and_then(|r| r.try_get(0))
+            .map_err(|e| crate::federation::Error::Backend(format!("last accord created_at: {e}")))
+    }
+
+    async fn last_accord_participation_arrival(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::Error> {
+        let c = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        c.query_one(
+            "SELECT MAX(server_arrival_at) FROM cirislens.accord_participation",
+            &[],
+        )
+        .await
+        .and_then(|r| r.try_get(0))
+        .map_err(|e| crate::federation::Error::Backend(format!("last server_arrival_at: {e}")))
+    }
+
+    async fn store_planned_accord_proposal(
+        &self,
+        prep: crate::federation::accord_quorum::PreparedProposal,
+    ) -> Result<Option<String>, crate::federation::Error> {
+        use crate::federation::Error;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // v54.1.0 (#1047) — the check and the insert are one transaction
+        // under an advisory lock, so two processes sharing the database
+        // cannot both admit a different proposal under one nonce.
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("accord_proposal transaction: {e}")))?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&crate::federation::accord_quorum::ACCORD_PROPOSAL_NONCE_LOCK_KEY],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("accord_proposal nonce lock: {e}")))?;
+        // Codex round 4 on PR #1057 — a HELD digest is an idempotent replay,
+        // accepted before the claim is asked.
+        let held = tx
+            .query_opt(
+                "SELECT 1 FROM cirislens.accord_proposal WHERE proposal_digest = $1",
+                &[&prep.proposal_digest],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("accord_proposal held read: {e}")))?
+            .is_some();
+        if !held {
+            // Codex round 3 on PR #1057 — the V189 claim's PRIMARY KEY makes
+            // the pair the database's invariant, not only this door's lock.
+            tx.execute(
+                "INSERT INTO cirislens.accord_proposal_nonce_claim \
+                    (family_key_id, nonce, proposal_digest) VALUES ($1, $2, $3) \
+                 ON CONFLICT (family_key_id, nonce) DO NOTHING",
+                &[&prep.family_key_id, &prep.nonce, &prep.proposal_digest],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("accord_proposal nonce claim: {e}")))?;
+            let owner: String = tx
+                .query_one(
+                    "SELECT proposal_digest FROM cirislens.accord_proposal_nonce_claim \
+                     WHERE family_key_id = $1 AND nonce = $2",
+                    &[&prep.family_key_id, &prep.nonce],
+                )
+                .await
+                .and_then(|r| r.try_get(0))
+                .map_err(|e| Error::Backend(format!("accord_proposal nonce read: {e}")))?;
+            if owner != prep.proposal_digest {
+                return Ok(Some(owner));
+            }
+            tx.execute(
+                "INSERT INTO cirislens.accord_proposal (\
+                        proposal_digest, family_key_id, action, nonce, window_until, \
+                        prior_family_digest, payload_sha256, proposal_json, \
+                        authority_signature, persist_row_hash, created_at\
+                     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+                     ON CONFLICT (proposal_digest) DO NOTHING",
+                &[
+                    &prep.proposal_digest,
+                    &prep.family_key_id,
+                    &prep.action,
+                    &prep.nonce,
+                    &prep.window_until,
+                    &prep.prior_family_digest,
+                    &prep.payload_sha256,
+                    &prep.proposal_json,
+                    &prep.authority_signature,
+                    &prep.persist_row_hash,
+                    &prep.created_at,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("accord_proposal commit: {e}")))?;
+        Ok(None)
+    }
+
+    async fn store_planned_accord_participation(
+        &self,
+        prep: crate::federation::accord_quorum::PreparedParticipation,
+    ) -> Result<crate::federation::accord_admit::HeldRow, crate::federation::Error> {
+        use crate::federation::accord_admit::HeldRow;
+        use crate::federation::Error;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // v36.0.0 (CIRISPersist#719) — no transaction: the insert absorbs a
+        // concurrent insert (`ON CONFLICT DO NOTHING`) and a zero-row result
+        // re-reads the winner, so the verdict is always the held row's hash.
+        let inserted = client
+            .execute(
+                "INSERT INTO cirislens.accord_participation (\
+                    proposal_digest, member_id, pinned_pubkey, vote, window_until, \
+                    signed_at, server_arrival_at, participation_json, persist_row_hash\
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
+                 ON CONFLICT (proposal_digest, pinned_pubkey) DO NOTHING",
+                &[
+                    &prep.proposal_digest,
+                    &prep.member_id,
+                    &prep.pinned_pubkey,
+                    &prep.vote,
+                    &prep.window_until,
+                    &prep.signed_at,
+                    &prep.server_arrival_at,
+                    &prep.participation_json,
+                    &prep.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("insert accord_participation: {e}")))?;
+        if inserted > 0 {
+            return Ok(HeldRow::Inserted);
+        }
+        let held: Option<String> = client
+            .query_opt(
+                "SELECT persist_row_hash FROM cirislens.accord_participation \
+                 WHERE proposal_digest = $1 AND pinned_pubkey = $2",
+                &[&prep.proposal_digest, &prep.pinned_pubkey],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("accord_participation held read: {e}")))?
+            .map(|r| r.safe_get_with("persist_row_hash", Error::Backend))
+            .transpose()?;
+        match held {
+            Some(h) => Ok(HeldRow::of_held(Some(&h), &prep.persist_row_hash)),
+            // DO NOTHING fired but the row is gone: only a concurrent delete
+            // explains it, and this plane is append-only.
+            None => Err(Error::Backend(
+                "accord_participation: insert conflicted but no row is present — the \
+                 append-only invariant does not hold on this table"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    async fn store_planned_accord_decision(
+        &self,
+        prep: crate::federation::accord_quorum::PreparedDecision,
+    ) -> Result<crate::federation::accord_admit::HeldRow, crate::federation::Error> {
+        use crate::federation::accord_admit::HeldRow;
+        use crate::federation::Error;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let held: Option<String> = client
+            .query_opt(
+                "SELECT persist_row_hash FROM cirislens.accord_decision WHERE proposal_digest = $1",
+                &[&prep.proposal_digest],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("accord_decision immutability check: {e}")))?
+            .map(|r| r.safe_get_with("persist_row_hash", Error::Backend))
+            .transpose()?;
+        if held.is_some() {
+            return Ok(HeldRow::of_held(held.as_deref(), &prep.persist_row_hash));
+        }
+        client
+            .execute(
+                "INSERT INTO cirislens.accord_decision (\
+                    proposal_digest, family_key_id, authorized, yes, no, abstain, \
+                    live_set, window_until, decision_json, \
+                    persist_row_hash, decided_at\
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                &[
+                    &prep.proposal_digest,
+                    &prep.family_key_id,
+                    &prep.authorized,
+                    &prep.yes,
+                    &prep.no,
+                    &prep.abstain,
+                    &prep.live_set,
+                    &prep.window_until,
+                    &prep.decision_json,
+                    &prep.persist_row_hash,
+                    &prep.decided_at,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("insert accord_decision: {e}")))?;
+        Ok(HeldRow::Inserted)
+    }
+}
+
+/// v61 (CIRISPersist#934) — the location proof, touch claim and wholeness
+/// witness executor on postgres. Storage only: the decisions are
+/// `federation::evidence_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::evidence_admit::EvidenceStore for PostgresBackend {
+    async fn held_location_proof(
+        &self,
+        subject_key_id: &str,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<crate::federation::SignedLocationProof>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        client
+            .query_opt(
+                "SELECT * FROM cirislens.federation_location_proofs \
+                  WHERE subject_key_id = $1 AND asserted_at = $2",
+                &[&subject_key_id, &asserted_at],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("held location proof: {e}")))?
+            .map(pg_row_to_signed_location_proof)
+            .transpose()
+    }
+
+    async fn store_planned_location_proof(
+        &self,
+        planned: crate::federation::evidence_admit::PlannedLocationProof,
+    ) -> Result<(), crate::federation::Error> {
+        let crate::federation::evidence_admit::PlannedLocationProof {
+            proof,
+            wire_index_key,
+        } = planned;
+        let row = &proof.location_proof;
+        let resolution = i16::from(row.cell_resolution);
+        {
+            let client = self
+                .get_client()
+                .await
+                .map_err(crate::store::Error::into_federation)?;
+            // v36.0.0 (#668) — THIS node's serve position (V130).
+            let admitted_at = self
+                .next_plane_position(&client, "federation_location_proofs")
+                .await?;
+            client
+                .execute(
+                    "INSERT INTO cirislens.federation_location_proofs (\
+                        subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
+                        attestation_evidence, withdrawn_at, persist_row_hash, \
+                        authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
+                        admitted_at\
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                    &[
+                        &row.subject_key_id,
+                        &row.cell_id,
+                        &resolution,
+                        &row.asserted_at,
+                        &row.valid_until,
+                        &row.attestation_evidence,
+                        &row.withdrawn_at,
+                        &row.persist_row_hash,
+                        &proof.authority_key_id,
+                        &proof.scrub_signature_classical,
+                        &proof.scrub_signature_pqc,
+                        &admitted_at,
+                    ],
+                )
+                .await
+                .map_err(map_revocation_pg_err("location_proof"))?;
+        }
+        // The pooled client is released before the re-index takes its own.
+        self.index_stored_record("LocationProof", &wire_index_key)
+            .await
+    }
+
+    async fn store_planned_location_proof_withdrawal(
+        &self,
+        planned: crate::federation::evidence_admit::PlannedLocationProof,
+    ) -> Result<bool, crate::federation::Error> {
+        let crate::federation::evidence_admit::PlannedLocationProof {
+            proof,
+            wire_index_key,
+        } = planned;
+        let row = &proof.location_proof;
+        let written = {
+            let client = self
+                .get_client()
+                .await
+                .map_err(crate::store::Error::into_federation)?;
+            // The row moves to a fresh serve position (V130) so a peer past
+            // its cursor is served the withdrawal.
+            let admitted_at = self
+                .next_plane_position(&client, "federation_location_proofs")
+                .await?;
+            // v53.1.3 (#986) — a COMPARE-AND-SET: a rival withdrawal can land
+            // between the plan's read and this write; the loser writes
+            // nothing.
+            client
+                .execute(
+                    "UPDATE cirislens.federation_location_proofs \
+                        SET withdrawn_at = $3, persist_row_hash = $4, authority_key_id = $5, \
+                            scrub_signature_classical = $6, scrub_signature_pqc = $7, \
+                            admitted_at = $8 \
+                      WHERE subject_key_id = $1 AND asserted_at = $2 AND withdrawn_at IS NULL",
+                    &[
+                        &row.subject_key_id,
+                        &row.asserted_at,
+                        &row.withdrawn_at,
+                        &row.persist_row_hash,
+                        &proof.authority_key_id,
+                        &proof.scrub_signature_classical,
+                        &proof.scrub_signature_pqc,
+                        &admitted_at,
+                    ],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("withdraw_location_proof: {e}"))
+                })?
+        };
+        if written == 0 {
+            return Ok(false);
+        }
+        // v53.1.3 (#986) — the row's bytes changed, so the signed wire index
+        // learns the new content hash, the pooled client released first.
+        self.index_stored_record("LocationProof", &wire_index_key)
+            .await?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    async fn rival_location_proof_withdrawal(&self) -> Result<(), crate::federation::Error> {
+        self.test_rival_location_proof_withdrawal().await
+    }
+
+    async fn store_planned_touch_claim(
+        &self,
+        planned: crate::federation::evidence_admit::PlannedTouchClaim<'_>,
+    ) -> Result<bool, crate::federation::Error> {
+        let claim = planned.claim;
+        let signer_form = claim.signer_form.as_str();
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // Monotonic-max merge: `fresh_as_of` only ever advances; the SQL
+        // guard is the single source of truth against a held row.
+        let n = client
+            .execute(
+                "INSERT INTO cirislens.freshness_floor \
+                    (target_key_id, target_kind, fresh_as_of, signer_form, attesting_key_id, \
+                     signed_envelope, signature, cohort_scope) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 ON CONFLICT (target_key_id, target_kind) \
+                 DO UPDATE SET fresh_as_of = EXCLUDED.fresh_as_of, \
+                    signer_form = EXCLUDED.signer_form, \
+                    attesting_key_id = EXCLUDED.attesting_key_id, \
+                    signed_envelope = EXCLUDED.signed_envelope, \
+                    signature = EXCLUDED.signature, \
+                    cohort_scope = EXCLUDED.cohort_scope \
+                 WHERE EXCLUDED.fresh_as_of > cirislens.freshness_floor.fresh_as_of",
+                &[
+                    &claim.target_key_id,
+                    &claim.target_kind,
+                    &claim.fresh_as_of,
+                    &signer_form,
+                    &claim.attesting_key_id,
+                    &planned.envelope_json,
+                    &planned.signature_json,
+                    &claim.cohort_scope,
+                ],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("put_touch_claim: {e}")))?;
+        Ok(n > 0)
+    }
+
+    async fn store_planned_witness(
+        &self,
+        planned: crate::federation::evidence_admit::PlannedWitness,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        let w = &planned.stored;
+        let leaf_count = i64::from(w.leaf_count);
+        let witness_version = i32::from(w.witness_version);
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("begin witness tx: {e}")))?;
+        // Idempotent on (peer_id, epoch_id, observed_at_unix_ms); `admitted_at`
+        // is the door's receipt instant, as on sqlite.
+        tx.execute(
+            "INSERT INTO cirislens.wholeness_witness_corpus \
+             (peer_id, epoch_id, observed_at_unix_ms, claim_namespaces, merkle_root, \
+              leaf_count, witness_version, signature, signature_ml_dsa_65, pqc_key_id, \
+              admitted_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+             ON CONFLICT (peer_id, epoch_id, observed_at_unix_ms) DO NOTHING",
+            &[
+                &w.peer_id,
+                &planned.epoch_id,
+                &planned.observed_at_unix_ms,
+                &planned.claim_namespaces,
+                &w.merkle_root_hex,
+                &leaf_count,
+                &witness_version,
+                &w.signature,
+                &w.signature_ml_dsa_65,
+                &w.pqc_key_id,
+                &planned.admitted_at,
+            ],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("insert wholeness_witness_corpus: {e}")))?;
+        // Prune to the newest K by observed_at.
+        tx.execute(
+            "DELETE FROM cirislens.wholeness_witness_corpus \
+             WHERE peer_id = $1 AND (epoch_id, observed_at_unix_ms) IN ( \
+               SELECT epoch_id, observed_at_unix_ms FROM ( \
+                 SELECT epoch_id, observed_at_unix_ms, ROW_NUMBER() OVER ( \
+                   ORDER BY observed_at_unix_ms DESC, epoch_id DESC) AS rn \
+                 FROM cirislens.wholeness_witness_corpus WHERE peer_id = $1 \
+               ) ranked WHERE ranked.rn > $2 )",
+            &[&w.peer_id, &planned.keep],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("prune wholeness_witness_corpus: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("commit witness tx: {e}")))
+    }
+}
+
 /// v60.0.0 (CIRISPersist#934 step 4) — the consent plane's executor on
 /// postgres. Storage only: the decisions are `federation::consent_admit`'s.
 #[async_trait::async_trait]
 impl crate::federation::consent_admit::ConsentStore for PostgresBackend {
+    async fn trust_granter(&self, key: &str) -> Result<Option<String>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        client
+            .query_opt(
+                "SELECT trusted_by FROM cirislens.federation_keys \
+                 WHERE key_id = $1 AND trusted_by IS NOT NULL",
+                &[&key],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("revoke_trust granter read: {e}"))
+            })?
+            .map(|r| r.safe_get_with(0, crate::federation::Error::Backend))
+            .transpose()
+    }
+
+    async fn store_trust_revocation(
+        &self,
+        key: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // Idempotent: only an unexpired grant moves.
+        client
+            .execute(
+                "UPDATE cirislens.federation_keys \
+                 SET expires_at = $2 \
+                 WHERE key_id = $1 \
+                   AND trusted_by IS NOT NULL \
+                   AND (expires_at IS NULL OR expires_at > $2)",
+                &[&key, &at],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("revoke_trust: {e}")))?;
+        Ok(())
+    }
+
     async fn store_planned_consent_role(
         &self,
         planned: crate::federation::consent_admit::PlannedConsentRole,
@@ -530,7 +3864,7 @@ impl crate::federation::consent_admit::ConsentStore for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v36.0.0 (CIRISPersist#707) — `consent_role` IS in the served
         // `KeyRecord` bytes, so this rewrite must move the serve position.
         let mutated_at = self.next_key_serve_position(&client).await?;
@@ -564,7 +3898,7 @@ impl crate::federation::consent_admit::ConsentStore for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // PG TEXT[] binds from `&Vec<String>`; `None` stays NULL.
         let n = client
             .execute(
@@ -610,7 +3944,7 @@ impl crate::federation::consent_admit::ConsentStore for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client.query(sql, &[&read.key()]).await.map_err(|e| {
             crate::federation::Error::Backend(format!("read_consent_peer_rows: {e}"))
         })?;
@@ -647,7 +3981,7 @@ impl crate::federation::consent_admit::ConsentStore for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client.query(&sql, &[&read.key()]).await.map_err(|e| {
             crate::federation::Error::Backend(format!("read_live_consent_grant_candidates: {e}"))
         })?;
@@ -670,7 +4004,7 @@ impl crate::federation::consent_admit::ConsentStore for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Not tier-filtered: the §10.1.3 promotion-overdue check needs the
         // local-tier rows.
         let base = format!(
@@ -717,7 +4051,7 @@ impl crate::federation::key_plane::KeyPlaneStore for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -804,7 +4138,7 @@ impl crate::federation::key_plane::KeyPlaneStore for PostgresBackend {
         &self,
         read: crate::federation::key_plane::KeyPlaneHoldingsRead,
     ) -> Result<Vec<String>, crate::federation::Error> {
-        let client = self.pool().get().await.map_err(|e| {
+        let client = self.checkout().await.map_err(|e| {
             crate::federation::Error::Backend(format!("list_key_plane_wire_hashes_since pool: {e}"))
         })?;
         let rows = pg_query_statement(
@@ -841,7 +4175,7 @@ impl crate::federation::key_plane::KeyPlaneStore for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client.transaction().await.map_err(|e| failed("begin", e))?;
         let position = self.next_key_serve_position(&tx).await?;
         let rows: u64 = match (&planned, &columns) {
@@ -1097,7 +4431,7 @@ impl PostgresBackend {
         manifest: &[u8; 32],
         add: Option<(u64, [u8; 32], &str)>,
     ) {
-        let client = self.pool.get().await.expect("pool");
+        let client = self.checkout().await.expect("pool");
         match add {
             None => {
                 client
@@ -1125,7 +4459,7 @@ impl PostgresBackend {
     /// no longer holds exactly its manifest's chunks).
     #[cfg(test)]
     pub(crate) async fn test_drop_stream_chunk_row(&self, stream_id: &str, seq: u64) {
-        let client = self.pool.get().await.expect("pool");
+        let client = self.checkout().await.expect("pool");
         client
             .execute(
                 "DELETE FROM cirislens.federation_stream_chunks WHERE stream_id = $1 AND seq = $2",
@@ -1145,7 +4479,7 @@ impl PostgresBackend {
         from_seq: u64,
         new_seq: u64,
     ) {
-        let client = self.pool.get().await.expect("pool");
+        let client = self.checkout().await.expect("pool");
         let n = client
             .execute(
                 "INSERT INTO cirislens.federation_stream_chunks \
@@ -1170,10 +4504,7 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         &self,
         planned: crate::federation::community_admit::CommunityInsert,
     ) -> Result<crate::federation::community_admit::StoredCommunity, crate::federation::Error> {
-        let crate::federation::community_admit::CommunityInsert {
-            community,
-            wire_index_key,
-        } = planned;
+        let crate::federation::community_admit::CommunityInsert { community } = planned;
         let row = community.community;
         let supersede_proof_value = pg_supersede_proof_value(community.supersede_proof.as_ref())?;
         // v50.0.0 (CIRISPersist#926, V158) — persisted beside the authority
@@ -1193,7 +4524,7 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v36.0.0 (#668) — THIS node's serve position (V130).
         let admitted_at = self
             .next_plane_position(&client, "federation_communities")
@@ -1261,8 +4592,6 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
             );
         }
         drop(client);
-        self.index_stored_record("Community", &wire_index_key)
-            .await?;
         Ok(crate::federation::community_admit::StoredCommunity::Inserted)
     }
 
@@ -1273,7 +4602,6 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         let crate::federation::community_admit::PlannedCommunityRevocation {
             revocation,
             removal_event,
-            wire_index_key,
         } = planned;
         let row = revocation.community_membership_revocation;
         let witness = serde_json::json!(row.witness_set);
@@ -1297,7 +4625,7 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // SecReview F5 — INSERT + hard_case + epoch bump in ONE transaction:
         // a bump failure after the INSERT must NOT leave a durable un-rotated
         // revocation.
@@ -1407,8 +4735,6 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
         drop(client);
-        self.index_stored_record("CommunityMembershipRevocation", &wire_index_key)
-            .await?;
         Ok(())
     }
 
@@ -1416,10 +4742,7 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         &self,
         planned: crate::federation::community_admit::PlannedCommunityWidening,
     ) -> Result<(), crate::federation::Error> {
-        let crate::federation::community_admit::PlannedCommunityWidening {
-            widening,
-            wire_index_key,
-        } = planned;
+        let crate::federation::community_admit::PlannedCommunityWidening { widening } = planned;
         let row = widening.community_membership_widening;
         let authority_key_id = widening.authority_key_id;
         let scrub_signature_classical = widening.scrub_signature_classical;
@@ -1430,7 +4753,7 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -1438,92 +4761,32 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         let admitted_at = self
             .next_plane_position(&tx, "federation_community_membership_widenings")
             .await?;
-        let inserted = tx
-            .execute(
-                "INSERT INTO cirislens.federation_community_membership_widenings (\
+        tx.execute(
+            "INSERT INTO cirislens.federation_community_membership_widenings (\
                 community_key_id, member_key_id, joined_at, effective_at, role, \
                 persist_row_hash, authority_key_id, scrub_signature_classical, \
                 scrub_signature_pqc, admitted_at, cosignatures\
              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
              ON CONFLICT (community_key_id, member_key_id, effective_at) DO NOTHING",
-                &[
-                    &row.community_key_id,
-                    &row.member_key_id,
-                    &row.joined_at,
-                    &row.effective_at,
-                    &row.role,
-                    &row.persist_row_hash,
-                    &authority_key_id,
-                    &scrub_signature_classical,
-                    &scrub_signature_pqc,
-                    &admitted_at,
-                    &cosignatures,
-                ],
-            )
-            .await
-            .map_err(map_revocation_pg_err("community_membership_widening"))?;
+            &[
+                &row.community_key_id,
+                &row.member_key_id,
+                &row.joined_at,
+                &row.effective_at,
+                &row.role,
+                &row.persist_row_hash,
+                &authority_key_id,
+                &scrub_signature_classical,
+                &scrub_signature_pqc,
+                &admitted_at,
+                &cosignatures,
+            ],
+        )
+        .await
+        .map_err(map_revocation_pg_err("community_membership_widening"))?;
         tx.commit()
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
-        if inserted == 1 {
-            self.index_stored_record("CommunityMembershipWidening", &wire_index_key)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn store_planned_community_listing(
-        &self,
-        planned: crate::federation::community_admit::PlannedCommunityListing,
-    ) -> Result<(), crate::federation::Error> {
-        let crate::federation::community_admit::PlannedCommunityListing {
-            listing,
-            wire_index_key,
-        } = planned;
-        let row = listing.community_membership_listing;
-        let authority_key_id = listing.authority_key_id;
-        let scrub_signature_classical = listing.scrub_signature_classical;
-        let scrub_signature_pqc = listing.scrub_signature_pqc;
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
-        let admitted_at = self
-            .next_plane_position(&tx, "federation_community_membership_listings")
-            .await?;
-        let inserted = tx
-            .execute(
-                "INSERT INTO cirislens.federation_community_membership_listings (\
-                community_key_id, member_key_id, effective_at, listed, \
-                persist_row_hash, authority_key_id, scrub_signature_classical, \
-                scrub_signature_pqc, admitted_at\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-             ON CONFLICT (community_key_id, member_key_id, effective_at) DO NOTHING",
-                &[
-                    &row.community_key_id,
-                    &row.member_key_id,
-                    &row.effective_at,
-                    &row.listed,
-                    &row.persist_row_hash,
-                    &authority_key_id,
-                    &scrub_signature_classical,
-                    &scrub_signature_pqc,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(map_revocation_pg_err("community_membership_listing"))?;
-        tx.commit()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
-        if inserted == 1 {
-            self.index_stored_record("CommunityMembershipListing", &wire_index_key)
-                .await?;
-        }
         Ok(())
     }
 
@@ -2020,6 +5283,128 @@ fn env_u64(var: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// v59.1.2 — the floor under a default pool's `max_size`. deadpool's own
+/// default is `2 × CPUs`: a pool of 2 on a 1-vCPU node, where two doors that
+/// each hold a client and want a second wait on each other forever (the field
+/// wedge: `setup/root`, `setup/status` and agent memory init never returned).
+pub(crate) const POOL_MAX_SIZE_FLOOR: usize = 16;
+/// v59.1.2 — how long a checkout waits for a free connection before it is
+/// [`Error::PoolExhausted`]. Generous for real load; finite, so starvation
+/// is a typed error an operator can see instead of a hang. It bounds the
+/// whole checkout, a new connection's create included.
+pub(crate) const POOL_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// v59.1.2 — the pool configuration [`PostgresBackend::connect`] builds:
+/// the caller's `max_size` when given, else deadpool's `2 × cpus` raised to
+/// [`POOL_MAX_SIZE_FLOOR`].
+///
+/// **No deadpool timeouts, on purpose.** deadpool applies its wait, create
+/// and recycle timeouts with a tokio timer on the thread that polls
+/// `pool.get()`. Edge polls persist's pool from its own tokio copy (#705),
+/// where persist's tokio has no reactor, and the timer panics there: an
+/// abort across the two `.so`s (I320 went red on it). The wait bound lives in
+/// [`PostgresBackend::checkout`] instead, which runs the timer on persist's
+/// runtime when the polling thread has none.
+pub(crate) fn pool_config(max_size: Option<usize>, cpus: usize) -> deadpool_postgres::PoolConfig {
+    deadpool_postgres::PoolConfig::new(
+        max_size.unwrap_or_else(|| cpus.saturating_mul(2).max(POOL_MAX_SIZE_FLOOR)),
+    )
+}
+
+/// The CPU count the pool's default size derives from (1 when unknown).
+fn available_cpus() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
+/// v61 (CIRISPersist#1166) — **the one pooled checkout**: `pool`'s next
+/// connection, waiting at most `wait`. Every Postgres checkout in the crate
+/// runs through here ([`PostgresBackend::checkout`], or this function for a
+/// holder of the bare pool such as the audit Merkle store); a bare
+/// `pool.get()` anywhere else is refused from disk
+/// (`store::pool_checkout_gate`), because it waits without a bound and a
+/// starved pool hangs it instead of answering [`CheckoutError::Exhausted`].
+///
+/// The timer runs where persist's tokio has a reactor: inline on a runtime
+/// thread, else on `persist_rt`, raced against the checkout polled here (a
+/// waker, no reactor needed: the #705 shape, where Edge polls this pool from
+/// its own tokio copy).
+pub(crate) async fn checkout_bounded(
+    pool: &Pool,
+    wait: std::time::Duration,
+    persist_rt: Option<&tokio::runtime::Handle>,
+) -> Result<deadpool_postgres::Object, CheckoutError> {
+    let got = match (tokio::runtime::Handle::try_current(), persist_rt) {
+        (Ok(_), _) => tokio::time::timeout(wait, pool.get()).await.ok(),
+        (Err(_), Some(rt)) => {
+            // The `Sleep` is built INSIDE the task: constructing it here would
+            // ask this thread for a timer it does not have.
+            let mut timer = rt.spawn(async move { tokio::time::sleep(wait).await });
+            tokio::select! {
+                biased;
+                r = pool.get() => {
+                    timer.abort();
+                    Some(r)
+                }
+                _ = &mut timer => None,
+            }
+        }
+        // No persist runtime anywhere: nothing can run a timer.
+        (Err(_), None) => Some(pool.get().await),
+    };
+    match got {
+        None => Err(CheckoutError::Exhausted { waited: wait }),
+        Some(Ok(client)) => Ok(client),
+        Some(Err(e)) => Err(CheckoutError::Failed(e.to_string())),
+    }
+}
+
+/// v59.1.2 — why a pooled checkout failed.
+#[derive(Debug)]
+pub(crate) enum CheckoutError {
+    /// No connection was checked out within the backend's checkout wait.
+    Exhausted {
+        /// The wait the backend was built with.
+        waited: std::time::Duration,
+    },
+    /// Any other failure: a connect error, a closed pool. deadpool's own
+    /// text.
+    Failed(String),
+}
+
+/// v61 (CIRISPersist#1166) — the text a family without a typed
+/// `PoolExhausted` arm carries: an exhausted pool names itself and its wait.
+impl std::fmt::Display for CheckoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exhausted { waited } => write!(
+                f,
+                "pool exhausted: no connection was free within {waited:?}"
+            ),
+            Self::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+#[cfg(feature = "cirisaudit")]
+impl From<CheckoutError> for crate::audit::Error {
+    fn from(e: CheckoutError) -> Self {
+        match e {
+            CheckoutError::Exhausted { waited } => Self::PoolExhausted { waited },
+            CheckoutError::Failed(e) => Self::Backend(format!("pool: {e}")),
+        }
+    }
+}
+
+#[cfg(feature = "secrets")]
+impl From<CheckoutError> for crate::secrets::SecretsError {
+    fn from(e: CheckoutError) -> Self {
+        match e {
+            CheckoutError::Exhausted { waited } => Self::PoolExhausted { waited },
+            CheckoutError::Failed(e) => Self::Backend(format!("pool: {e}")),
+        }
+    }
+}
+
 /// v52.0.2 (CIRISServer#705) — the pool every [`PostgresBackend::connect`]
 /// builds: deadpool's connector wrapped in
 /// [`PersistRuntimeConnect`](super::postgres_runtime_connect::PersistRuntimeConnect),
@@ -2155,6 +5540,12 @@ pub struct PostgresBackend {
     /// ([`crate::federation::admission::delegation_cycle_gated`]): held from
     /// the cycle check through the insert of every gated write.
     delegation_write_lock: tokio::sync::Mutex<()>,
+    /// v59.1.2 — how long [`Self::checkout`] waits for a connection.
+    checkout_wait: std::time::Duration,
+    /// v59.1.2 — persist's runtime, captured where the backend was built:
+    /// the checkout's timer runs there when the polling thread has none of
+    /// persist's (Edge's thread, #705).
+    persist_rt: Option<tokio::runtime::Handle>,
     /// v54.0.0 (Codex on PR #1050) — the per-record stripe a
     /// `signed_wire_index` re-index holds from its read of the stored bytes
     /// through the replacement ([`crate::store::record_locks`]).
@@ -2164,59 +5555,10 @@ pub struct PostgresBackend {
     test_hooks: crate::store::test_hooks::TestHooks,
 }
 
-/// v43.0.0 (§11.4, I27) — **the community's serialization boundary.** Every
-/// operation that reads or moves a community's epoch state — bind, key-state
-/// change, rotation, eviction, and the announcement of a community blob —
-/// takes this transaction-scoped advisory lock first. Under READ COMMITTED the
-/// statement predicates are snapshot reads; without this lock a seal that
-/// read `enabled` and a destroy that read `no binding` could both commit.
-/// Released at commit or rollback; per community, so unrelated communities
-/// never wait on each other.
-/// #957 — one chunk of a batch, validated and hashed, ready for the tx.
-struct PgChunkRow {
-    seq: u64,
-    seq_i64: i64,
-    plaintext_i64: i64,
-    sha256: [u8; 32],
-    storage_kind: &'static str,
-    bytes_inline: Option<Vec<u8>>,
-    external_ref: Option<String>,
-    size_bytes: i64,
-}
-
-/// #957 — an item's validation, outside the transaction.
-fn pg_prepare_chunk_item(
-    item: &crate::federation::blobs::ChunkFloorItem,
-    cap: usize,
-    floor: crate::federation::StorageFloor,
-) -> Result<PgChunkRow, crate::federation::BlobError> {
-    let row = crate::federation::blobs::prepare_stream_chunk_row(
-        &item.body,
-        cap,
-        floor,
-        item.plaintext_size,
-    )?;
-    let seq_i64 = i64::try_from(item.seq).map_err(|_| {
-        crate::federation::BlobError::InvalidArgument(
-            "put_blob_chunk: seq exceeds i64 — federation_stream_chunks.seq is BIGINT".into(),
-        )
-    })?;
-    let plaintext_i64 = i64::try_from(item.plaintext_size).map_err(|_| {
-        crate::federation::BlobError::InvalidArgument(
-            "put_blob_chunk: plaintext_size exceeds i64".into(),
-        )
-    })?;
-    Ok(PgChunkRow {
-        seq: item.seq,
-        seq_i64,
-        plaintext_i64,
-        sha256: row.sha256,
-        storage_kind: row.storage_kind,
-        bytes_inline: row.bytes_inline,
-        external_ref: row.external_ref,
-        size_bytes: row.size_bytes,
-    })
-}
+/// v61 (CIRISPersist#934) — the chunk floor's row and per-item answer are
+/// the shared plan's (`federation::blob_admit`).
+type PgChunkRow = crate::federation::blob_admit::ChunkFloorRow;
+type PgItemAppended = crate::federation::blob_admit::ItemAppended;
 
 /// v53.0.0 (CIRISPersist#969) — the `federation_stream_deks` projection
 /// every stream-DEK read shares, joined to the epoch's V165 count.
@@ -2250,21 +5592,6 @@ fn pg_stream_dek_row(
             .safe_get_with::<Option<i64>, _, _, _>("room_epoch", B)?
             .map(|e| u64::try_from(e).unwrap_or_default()),
     })
-}
-
-/// #957 — what one item's savepoint did.
-enum PgItemAppended {
-    Ok,
-    SeqConflict,
-    CapReached,
-    EpochMoved,
-    /// #969 — the V165 count is not the counter the chunk was sealed at.
-    StreamCounterMoved,
-    /// #969 — the stream epoch is closed / terminated / has no DEK row.
-    StreamEpochClosed,
-    /// v60.1.0 (#1070) — a tombstone committed after the pre-read: the notice
-    /// naming the chunk's address.
-    Purged(String),
 }
 
 /// v60.1.0 (CIRISPersist#1070 item 3) — take, inside the caller's write
@@ -2677,11 +6004,7 @@ impl PostgresBackend {
         &self,
         node_key_id: Option<&str>,
     ) -> Result<usize, Error> {
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let mut client = self.get_client().await?;
         let tx = client.transaction().await.map_err(|e| Error::Migration {
             sqlstate: None,
             detail: format!("postgres minter-sentinel resolution (#848): begin: {e}"),
@@ -2744,6 +6067,50 @@ impl PostgresBackend {
         Ok(n)
     }
 
+    /// v61 (the canonical's read storm) — **planner statistics at open**, the
+    /// sqlite twin's postgres half. A table postgres has never analyzed (a
+    /// fresh restore before autovacuum's first pass: `pg_stat_user_tables`
+    /// has neither `last_analyze` nor `last_autoanalyze`) is planned without
+    /// statistics, and the unpinned Live listing then bitmap-ANDs every
+    /// visible row and sorts it (measured: 12,319 buffers for one page over
+    /// a 2,002-row history, 13 once analyzed). This runs `ANALYZE` on
+    /// `federation_attestations` once in that state; postgres samples a
+    /// bounded number of rows (`default_statistics_target`), whatever the
+    /// table's size. A failure is logged and the open proceeds.
+    pub(crate) async fn plan_statistics_at_open(&self) {
+        let r: Result<bool, String> = async {
+            let client = self.get_client().await.map_err(|e| e.to_string())?;
+            let row = client
+                .query_opt(
+                    "SELECT (last_analyze IS NULL AND last_autoanalyze IS NULL) \
+                     FROM pg_stat_user_tables \
+                     WHERE schemaname = 'cirislens' AND relname = 'federation_attestations'",
+                    &[],
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let never = match row {
+                Some(row) => row.try_get::<_, bool>(0).map_err(|e| e.to_string())?,
+                None => false,
+            };
+            if never {
+                client
+                    .batch_execute("ANALYZE cirislens.federation_attestations")
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(never)
+        }
+        .await;
+        match r {
+            Ok(true) => tracing::info!("postgres: first ANALYZE of federation_attestations ran"),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "postgres: planner statistics at open failed; open proceeds")
+            }
+        }
+    }
+
     /// Test-only: apply migrations up to and including `version` (see the
     /// sqlite twin). No advisory lock — a test database has one writer.
     #[cfg(any(test, feature = "test-anchor"))]
@@ -2787,11 +6154,7 @@ impl PostgresBackend {
     async fn backfill_trace_dedup_shard_keys(&self) -> Result<(), Error> {
         const BATCH: i64 = 5_000;
         loop {
-            let mut client = self
-                .pool
-                .get()
-                .await
-                .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+            let mut client = self.get_client().await?;
             let rows = client
                 .query(
                     "SELECT event_id, ts, agent_id_hash, trace_id, thought_id, \
@@ -2845,12 +6208,17 @@ impl PostgresBackend {
     /// - `postgres://user:pass@host:5432/dbname`
     /// - `host=db user=lens password=… dbname=cirislens`
     pub async fn connect(dsn: &str) -> Result<Self, Error> {
-        Self::connect_sized(dsn, None).await
+        Self::connect_sized(dsn, None, POOL_WAIT_TIMEOUT).await
     }
 
     /// [`Self::connect`], with the pool's `max_size` set when `Some` (else
-    /// deadpool's default).
-    async fn connect_sized(dsn: &str, max_size: Option<usize>) -> Result<Self, Error> {
+    /// [`pool_config`]'s floored default) and a checkout that waits at most
+    /// `wait` for a free connection.
+    async fn connect_sized(
+        dsn: &str,
+        max_size: Option<usize>,
+        wait: std::time::Duration,
+    ) -> Result<Self, Error> {
         #[cfg(feature = "tls")]
         ensure_rustls_provider();
         let pg_config: tokio_postgres::Config = dsn
@@ -2877,9 +6245,9 @@ impl PostgresBackend {
             .map(|b| String::from_utf8_lossy(b).into_owned());
         cfg.dbname = pg_config.get_dbname().map(str::to_owned);
         cfg.manager = Some(mgr_config);
-        if let Some(n) = max_size {
-            cfg.pool = Some(deadpool_postgres::PoolConfig::new(n));
-        }
+        // v59.1.2 — never deadpool's bare default: a CPU-derived size with no
+        // timeouts wedged 1-vCPU nodes for good (see `pool_config`).
+        cfg.pool = Some(pool_config(max_size, available_cpus()));
 
         // THREAT_MODEL.md AV-18: TLS for the Postgres connection
         // pool, gated on the `tls` feature. Sovereign-mode
@@ -2935,6 +6303,8 @@ impl PostgresBackend {
                 crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
             ),
             minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
+            checkout_wait: wait,
+            persist_rt: tokio::runtime::Handle::try_current().ok(),
             key_plane_rehomed: std::sync::atomic::AtomicBool::new(false),
             pre_purge_schema: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
@@ -2996,6 +6366,8 @@ impl PostgresBackend {
                 crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
             ),
             minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
+            checkout_wait: POOL_WAIT_TIMEOUT,
+            persist_rt: tokio::runtime::Handle::try_current().ok(),
             key_plane_rehomed: std::sync::atomic::AtomicBool::new(false),
             pre_purge_schema: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
@@ -3197,6 +6569,28 @@ impl PostgresBackend {
         &self.pool
     }
 
+    /// v61 (CIRISPersist#1166) — how long this backend's checkout waits for
+    /// a connection before the pool is exhausted (for a holder of the bare
+    /// pool that checks out through [`checkout_bounded`]).
+    #[cfg(feature = "cirisaudit")]
+    pub(crate) fn checkout_wait(&self) -> std::time::Duration {
+        self.checkout_wait
+    }
+
+    /// v59.1.2 — check out one pooled connection, waiting at most the
+    /// backend's checkout wait ([`POOL_WAIT_TIMEOUT`] unless a test set
+    /// one). The one place a starved pool becomes
+    /// [`CheckoutError::Exhausted`]; [`Self::get_client`] and the audit and
+    /// secrets doors map it into their own typed `PoolExhausted`.
+    ///
+    /// The timer runs where persist's tokio has a reactor: inline on a
+    /// persist runtime thread, else on the runtime captured at construction,
+    /// raced against the checkout polled here (a waker, no reactor needed:
+    /// the #705 shape, where Edge polls this pool from its own tokio copy).
+    pub(crate) async fn checkout(&self) -> Result<deadpool_postgres::Object, CheckoutError> {
+        checkout_bounded(&self.pool, self.checkout_wait, self.persist_rt.as_ref()).await
+    }
+
     /// Acquire a pooled connection, with a **bounded retry on transient
     /// acquisition failure** (CIRISPersist#200 follow-on).
     ///
@@ -3207,13 +6601,20 @@ impl PostgresBackend {
     /// that had no reproducible failing test). The happy path takes one
     /// iteration (no added cost); a hard-down DB still surfaces the real error
     /// after a short, bounded backoff (50 + 100 + 150 ms).
+    ///
+    /// v59.1.2 — a pool that stayed exhausted for its whole wait is NOT
+    /// retried: it is [`Error::PoolExhausted`] at once (a retry would only
+    /// multiply the wait by the attempt count).
     pub(crate) async fn get_client(&self) -> Result<deadpool_postgres::Object, Error> {
         const MAX_ATTEMPTS: u32 = 4;
         let mut last_err = None;
         for attempt in 1..=MAX_ATTEMPTS {
-            match self.pool.get().await {
+            match self.checkout().await {
                 Ok(client) => return Ok(client),
-                Err(e) => {
+                Err(CheckoutError::Exhausted { waited }) => {
+                    return Err(Error::PoolExhausted { waited });
+                }
+                Err(CheckoutError::Failed(e)) => {
                     last_err = Some(e);
                     if attempt < MAX_ATTEMPTS {
                         tokio::time::sleep(std::time::Duration::from_millis(
@@ -3251,7 +6652,7 @@ impl PostgresBackend {
             let client = self
                 .get_client()
                 .await
-                .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+                .map_err(crate::store::Error::into_federation)?;
             if !pg_key_plane_present(&**client).await? {
                 return Ok(());
             }
@@ -3439,7 +6840,7 @@ impl PostgresBackend {
                     let mut client = self
                         .get_client()
                         .await
-                        .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+                        .map_err(crate::store::Error::into_federation)?;
                     let tx = client.transaction().await.map_err(|e| {
                         crate::federation::Error::Backend(format!(
                             "signed_wire_index transaction: {e}"
@@ -4523,6 +7924,10 @@ impl Backend for PostgresBackend {
             self.rehome_key_plane_at_open()
                 .await
                 .map_err(|e| Error::Backend(format!("key-plane rehome at open: {e}")))?;
+            // v61 (CIRISPersist#991) — and so is the group-plane rehome.
+            crate::federation::group_plane::rehome_group_records(self)
+                .await
+                .map_err(|e| Error::Backend(format!("group-plane rehome at open: {e}")))?;
             // v59.0.0 (CIRISPersist#1096) — count, never rewrite.
             self.legacy_community_trust_grants_at_open()
                 .await
@@ -4697,11 +8102,18 @@ impl Backend for PostgresBackend {
         self.rehome_key_plane_at_open()
             .await
             .map_err(|e| Error::Backend(format!("key-plane rehome at open: {e}")))?;
+        // v61 (CIRISPersist#991) — the v60 group records and roster events
+        // rehomed once onto their group-plane rows, before anything serves.
+        crate::federation::group_plane::rehome_group_records(self)
+            .await
+            .map_err(|e| Error::Backend(format!("group-plane rehome at open: {e}")))?;
         // v59.0.0 (CIRISPersist#1096) — count, never rewrite, the held
         // node-authored capture grants in the v52 shape.
         self.legacy_community_trust_grants_at_open()
             .await
             .map_err(|e| Error::Backend(format!("community_trust grandfather count: {e}")))?;
+        // v61 (the canonical's read storm) — planner statistics, last.
+        self.plan_statistics_at_open().await;
         Ok(())
     }
 
@@ -4711,378 +8123,21 @@ impl Backend for PostgresBackend {
         signature_key_id: &str,
         include_federation_key: bool,
     ) -> Result<super::types::DeleteSummary, Error> {
-        // v57.0.0 (CIRISPersist#988 item 2) — the audit row's attester, read
-        // before the transaction (the plan inside it reads nothing). Held as
-        // a Result: a door that deletes nothing records nothing and needs no
-        // attester; one that deletes is refused, rolled back, without one.
-        // An act: refused, typed, before anything moves when this node cannot
-        // attest its audit row (CIRISPersist#988 ruling: a host must hold a
-        // node key before any erasure is recorded).
-        let attester = crate::federation::attestation_admit::hard_case_attester(self)
-            .await
-            .map_err(Error::from_hard_case_attester)?;
-        // v57.0.0 (#988 item 3) — a pre-v57 detection this node can attest
-        // to its detector is moved onto the plane first, so the erasure
-        // below takes it the row way (hard delete) and the table stays its
-        // rows' rebuild.
-        {
-            use crate::federation::attestation_admit::AttestationStore as _;
-            self.rehome_legacy_detection_events(chrono::Utc::now())
-                .await
-                .map_err(|e| Error::Backend(format!("rehome before erasure: {e}")))?;
-        }
-        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — the row-backed
-        // detections this erasure reaches: each erased under its PRODUCER's
-        // rule-1 `withdraws` (planned here when not already held), or refused
-        // with a reason (read before the transaction).
-        let received_at = chrono::Utc::now();
-        let crate::federation::subject_erasure::ErasurePlan {
-            citations,
-            new_withdraws,
-            refused,
-        } = crate::federation::subject_erasure::plan_store_erasure(
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        super::backend_plan::delete_traces_for_agent_planned(
             self,
             agent_id_hash,
-            Some(signature_key_id),
-            received_at,
+            signature_key_id,
+            include_federation_key,
         )
         .await
-        .map_err(|e| Error::Backend(format!("erasure plan: {e}")))?;
-        let refused_count = refused.len() as u64;
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
-
-        // Per-key DSAR scope: both agent_id_hash AND signing_key_id
-        // must match. trace_llm_calls cascade walks the matching set
-        // via the trace_id bridge (V001 schema: LLM call rows have
-        // no signing_key_id column).
-        // Step 1: collect matching trace_ids.
-        let trace_ids: Vec<String> = tx
-            .query(
-                "SELECT DISTINCT trace_id FROM cirislens.trace_events \
-                 WHERE agent_id_hash = $1 AND signing_key_id = $2",
-                &[&agent_id_hash, &signature_key_id],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("collect trace_ids: {e}")))?
-            .into_iter()
-            .map(|row| row.safe_get_with::<String, _, _, _>(0, Error::Backend))
-            .collect::<Result<_, _>>()?;
-
-        // v57.0.0 (CIRISPersist#988 item 3) — a pre-v57 silo row takes the
-        // V080 tombstone in place. v58.0.0 (CIRISPersist#1094 item 2) — a
-        // ROW-BACKED one is hard-deleted only under its producer's `withdraws`
-        // (the citations), and leaves no projection row.
-        let legacy_tombstoned = pg_tombstone_detection_events(&tx, &trace_ids, received_at)
-            .await
-            .map_err(|e| Error::Backend(format!("tombstone detection_events: {e}")))?;
-        pg_store_erasure_withdraws(&tx, &new_withdraws)
-            .await
-            .map_err(|e| Error::Backend(format!("erasure withdraws: {e}")))?;
-        let erased_rows = pg_erase_cited_rows(&tx, &citations)
-            .await
-            .map_err(|e| Error::Backend(format!("erase detection rows: {e}")))?;
-        let detection_events_tombstoned = legacy_tombstoned + erased_rows.len() as u64;
-
-        // Step 2: delete LLM call rows joined by the matching
-        // trace_ids. Cross-key traces (agent rotated keys, signed
-        // under multiple keys) only cascade for this DSAR's key.
-        let trace_llm_calls_deleted = if trace_ids.is_empty() {
-            0u64
-        } else {
-            tx.execute(
-                "DELETE FROM cirislens.trace_llm_calls \
-                 WHERE trace_id = ANY($1::text[])",
-                &[&trace_ids],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("delete trace_llm_calls: {e}")))?
-        };
-
-        // Step 3: delete trace_events rows. Same key-scope filter as
-        // step 1 — both must agree, else step 2 could cascade
-        // delete LLM calls for trace_events rows step 3 leaves alive.
-        let trace_events_deleted = tx
-            .execute(
-                "DELETE FROM cirislens.trace_events \
-                 WHERE agent_id_hash = $1 AND signing_key_id = $2",
-                &[&agent_id_hash, &signature_key_id],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("delete trace_events: {e}")))?;
-
-        // Step 4 (optional): federation key cascade. Find target key_ids,
-        // delete cascading attestation/revocation rows, then the keys.
-        let mut federation_keys_deleted = 0u64;
-        let mut federation_attestations_deleted = 0u64;
-        let mut federation_revocations_deleted = 0u64;
-
-        if include_federation_key {
-            // Per-key federation_keys cascade: the single key_id
-            // matching (agent_id_hash, signature_key_id). The agent's
-            // other registered keys stay alive.
-            let target_key_ids: Vec<String> = tx
-                .query(
-                    "SELECT key_id FROM cirislens.federation_keys \
-                     WHERE identity_type = 'agent' AND identity_ref = $1 AND key_id = $2",
-                    &[&agent_id_hash, &signature_key_id],
-                )
-                .await
-                .map_err(|e| Error::Backend(format!("collect target_key_ids: {e}")))?
-                .into_iter()
-                .map(|row| row.safe_get_with::<String, _, _, _>(0, Error::Backend))
-                .collect::<Result<_, _>>()?;
-
-            if !target_key_ids.is_empty() {
-                federation_revocations_deleted = tx
-                    .execute(
-                        "DELETE FROM cirislens.federation_revocations \
-                         WHERE revoked_key_id = ANY($1::text[]) \
-                            OR revoked_key_sha256_ed25519_raw IN \
-                               (SELECT encode(sha256(decode(k.pubkey_ed25519_base64, 'base64')), 'hex') \
-                                  FROM cirislens.federation_keys k WHERE k.key_id = ANY($1::text[])) \
-                            OR revoking_key_id = ANY($1::text[]) \
-                            OR scrub_key_id    = ANY($1::text[])",
-                        &[&target_key_ids],
-                    )
-                    .await
-                    .map_err(|e| Error::Backend(format!("delete federation_revocations: {e}")))?;
-
-                federation_attestations_deleted = tx
-                    .execute(
-                        "DELETE FROM cirislens.federation_attestations \
-                         WHERE attesting_key_id = ANY($1::text[]) \
-                            OR attested_key_id  = ANY($1::text[]) \
-                            OR scrub_key_id     = ANY($1::text[])",
-                        &[&target_key_ids],
-                    )
-                    .await
-                    .map_err(|e| Error::Backend(format!("delete federation_attestations: {e}")))?;
-
-                federation_keys_deleted = tx
-                    .execute(
-                        "DELETE FROM cirislens.federation_keys \
-                         WHERE key_id = ANY($1::text[])",
-                        &[&target_key_ids],
-                    )
-                    .await
-                    .map_err(|e| Error::Backend(format!("delete federation_keys: {e}")))?;
-            }
-        }
-
-        // v38.0.0 (#721) — ANNOUNCED inside the transaction, exactly like
-        // the Art.-17 sibling: this door deletes strictly MORE (three
-        // federation planes the erasure sibling never touches) and was the
-        // one of the pair that said nothing.
-        if trace_events_deleted > 0
-            || trace_llm_calls_deleted > 0
-            || federation_keys_deleted > 0
-            || federation_attestations_deleted > 0
-            || federation_revocations_deleted > 0
-            || detection_events_tombstoned > 0
-        {
-            // v58.0.0 (#1094 item 2, CC 4.5.3) — subject-free.
-            let event = crate::federation::hard_case::trace_erasure_event(
-                &crate::federation::hard_case::TraceErasureCounts {
-                    op: crate::federation::hard_case::trace_erasure_op::ONE_KEY,
-                    trace_events: trace_events_deleted,
-                    trace_llm_calls: trace_llm_calls_deleted,
-                    detection_events_tombstoned,
-                    detection_rows_erased: erased_rows.len() as u64,
-                    detection_rows_refused: refused_count,
-                    federation_keys: federation_keys_deleted,
-                    federation_attestations: federation_attestations_deleted,
-                    federation_revocations: federation_revocations_deleted,
-                },
-                received_at,
-            );
-            pg_record_erasure(&tx, &attester, &event, &erased_rows, received_at)
-                .await
-                .map_err(|e| Error::Backend(format!("dsar announcement: {e}")))?;
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| Error::Backend(format!("commit dsar tx: {e}")))?;
-
-        Ok(super::types::DeleteSummary {
-            trace_events_deleted,
-            trace_llm_calls_deleted,
-            federation_keys_deleted,
-            federation_attestations_deleted,
-            federation_revocations_deleted,
-            detection_rows_refused: refused,
-            deleted_at: chrono::Utc::now(),
-        })
     }
 
     async fn delete_traces_for_agent_id_hash(
         &self,
         agent_id_hash: &str,
     ) -> Result<super::types::ErasureSummary, Error> {
-        // v57.0.0 (CIRISPersist#988 item 2) — the audit row's attester, read
-        // before the transaction (see `delete_traces_for_agent`).
-        // An act: refused, typed, before anything moves when this node cannot
-        // attest its audit row (CIRISPersist#988 ruling: a host must hold a
-        // node key before any erasure is recorded).
-        let attester = crate::federation::attestation_admit::hard_case_attester(self)
-            .await
-            .map_err(Error::from_hard_case_attester)?;
-        // v57.0.0 (#988 item 3) — a pre-v57 detection this node can attest
-        // to its detector is moved onto the plane first, so the erasure
-        // below takes it the row way (hard delete) and the table stays its
-        // rows' rebuild.
-        {
-            use crate::federation::attestation_admit::AttestationStore as _;
-            self.rehome_legacy_detection_events(chrono::Utc::now())
-                .await
-                .map_err(|e| Error::Backend(format!("rehome before erasure: {e}")))?;
-        }
-        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — each reached row
-        // erased under its producer's rule-1 `withdraws`, or refused with a
-        // reason; read before the transaction.
-        let erased_at = chrono::Utc::now();
-        let crate::federation::subject_erasure::ErasurePlan {
-            citations,
-            new_withdraws,
-            refused,
-        } = crate::federation::subject_erasure::plan_store_erasure(
-            self,
-            agent_id_hash,
-            None,
-            erased_at,
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("erasure plan: {e}")))?;
-        let refused_count = refused.len() as u64;
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| Error::Backend(format!("begin erasure tx: {e}")))?;
-
-        // Step 1: collect the agent's trace_ids across ALL signing keys
-        // (full Art. 17 erasure — not key-scoped). Both the trace_llm_calls
-        // cascade and the detection_events tombstone key off these.
-        let trace_ids: Vec<String> = tx
-            .query(
-                "SELECT DISTINCT trace_id FROM cirislens.trace_events \
-                 WHERE agent_id_hash = $1",
-                &[&agent_id_hash],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("collect trace_ids: {e}")))?
-            .into_iter()
-            .map(|row| row.safe_get_with::<String, _, _, _>(0, Error::Backend))
-            .collect::<Result<_, _>>()?;
-
-        // Step 2: TOMBSTONE the derived detection_events for those traces
-        // (V080) — NULL the PII linkage, stamp erased_at. NOT a delete.
-        // Only rows not already tombstoned are counted (idempotent
-        // re-run touches nothing). Done BEFORE the trace_events delete so
-        // the trace_id set is still resolvable here for symmetry; the
-        // tombstone reads its own table by trace_id so ordering is moot,
-        // but keeping it inside the txn is what guarantees atomicity.
-        let legacy_tombstoned = pg_tombstone_detection_events(&tx, &trace_ids, erased_at)
-            .await
-            .map_err(|e| Error::Backend(format!("tombstone detection_events: {e}")))?;
-        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — a ROW-BACKED
-        // detection is erased by its producer's rule-1 `withdraws`: each cited row is
-        // HARD-DELETED here (its projection row leaves by cascade), never
-        // rewritten, and its tombstone — citing the withdraws — is written
-        // below, so the row cannot be re-admitted and a peer holding a replica
-        // receives it.
-        pg_store_erasure_withdraws(&tx, &new_withdraws)
-            .await
-            .map_err(|e| Error::Backend(format!("erasure withdraws: {e}")))?;
-        let erased_rows = pg_erase_cited_rows(&tx, &citations)
-            .await
-            .map_err(|e| Error::Backend(format!("erase detection rows: {e}")))?;
-        let detection_events_tombstoned = legacy_tombstoned + erased_rows.len() as u64;
-
-        // Step 3: hard-delete the LLM call rows joined by trace_id.
-        let trace_llm_calls = if trace_ids.is_empty() {
-            0u64
-        } else {
-            tx.execute(
-                "DELETE FROM cirislens.trace_llm_calls \
-                 WHERE trace_id = ANY($1::text[])",
-                &[&trace_ids],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("delete trace_llm_calls: {e}")))?
-        };
-
-        // v54.1.0 (Codex round 4 sweep on PR #1057) — the agent's thoughts,
-        // read before its rows go: their signature rows are removed once no
-        // remaining event cites them (the steward purge's own rule, one
-        // helper).
-        let thought_ids: Vec<String> = tx
-            .query(
-                "SELECT DISTINCT thought_id FROM cirislens.trace_events WHERE agent_id_hash = $1",
-                &[&agent_id_hash],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("collect thought_ids: {e}")))?
-            .into_iter()
-            .map(|row| row.safe_get_with::<String, _, _, _>(0, Error::Backend))
-            .collect::<Result<_, _>>()?;
-
-        // Step 4: hard-delete the trace_events rows for the agent.
-        let trace_events = tx
-            .execute(
-                "DELETE FROM cirislens.trace_events WHERE agent_id_hash = $1",
-                &[&agent_id_hash],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("delete trace_events: {e}")))?;
-        pg_drop_orphaned_thought_signatures(&tx, &thought_ids)
-            .await
-            .map_err(|e| Error::Backend(format!("drop orphaned thought signatures: {e}")))?;
-
-        // Step 5: emit the `hard_case:trace_erasure` audit row INSIDE the
-        // txn (atomic with the erasure). Emit only when something was
-        // erased, so an idempotent re-run stays a clean no-op.
-        if trace_events > 0 || trace_llm_calls > 0 || detection_events_tombstoned > 0 {
-            let event = crate::federation::hard_case::trace_erasure_event(
-                &crate::federation::hard_case::TraceErasureCounts {
-                    op: crate::federation::hard_case::trace_erasure_op::FULL,
-                    trace_events,
-                    trace_llm_calls,
-                    detection_events_tombstoned,
-                    detection_rows_erased: erased_rows.len() as u64,
-                    detection_rows_refused: refused_count,
-                    ..Default::default()
-                },
-                erased_at,
-            );
-            pg_record_erasure(&tx, &attester, &event, &erased_rows, erased_at)
-                .await
-                .map_err(|e| Error::Backend(format!("emit trace_erasure audit: {e}")))?;
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| Error::Backend(format!("commit erasure tx: {e}")))?;
-
-        Ok(super::types::ErasureSummary {
-            trace_events,
-            trace_llm_calls,
-            detection_events_tombstoned,
-            detection_rows_refused: refused,
-            erased_at,
-        })
+        super::backend_plan::delete_traces_for_agent_id_hash_planned(self, agent_id_hash).await
     }
 
     async fn fetch_trace_events_page(
@@ -5091,11 +8146,7 @@ impl Backend for PostgresBackend {
         limit: i64,
         agent_id_hash: Option<&str>,
     ) -> Result<Vec<(i64, TraceEventRow)>, Error> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let client = self.get_client().await?;
 
         // Branch on filter so the no-filter case skips the optional
         // WHERE-clause bind. Same shape Postgres planners optimize
@@ -5177,89 +8228,7 @@ impl Backend for PostgresBackend {
         manifest: &crate::fountain::FountainManifestV1,
         symbols: &[crate::fountain::FountainSymbolV1],
     ) -> Result<(), Error> {
-        // Verify-before-mutation (AV-9): the full admission gate runs
-        // first; on any failure NOTHING is written.
-        crate::fountain::check_admission_via_envelope(
-            manifest,
-            symbols,
-            &crate::verify::PythonJsonDumpsCanonicalizer,
-        )?;
-
-        let symbol_hashes_json = serde_json::Value::Array(
-            manifest
-                .symbol_hashes
-                .iter()
-                .map(|h| serde_json::Value::String(h.clone()))
-                .collect(),
-        );
-        let manifest_version = i32::from(manifest.manifest_version);
-        let n_source = i64::from(manifest.n_source);
-        let k_repair = i64::from(manifest.k_repair);
-        let symbol_size = i64::from(manifest.symbol_size);
-        let original_content_length = i64::try_from(manifest.original_content_length)
-            .map_err(|_| Error::Backend("original_content_length exceeds i64".into()))?;
-        let min_viable = i64::from(manifest.min_viable_symbols);
-
-        let mut client = self.get_client().await?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| Error::Backend(format!("begin fountain tx: {e}")))?;
-
-        // Manifest: idempotent insert (ON CONFLICT DO NOTHING on the
-        // (content_id, corpus_kind) PK). Never evicted.
-        tx.execute(
-            "INSERT INTO cirislens.content_manifest \
-             (content_id, corpus_kind, manifest_version, n_source, k_repair, \
-              symbol_size, original_content_length, min_viable_symbols, \
-              symbol_hashes, envelope, signature, signature_ml_dsa_65, pqc_key_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
-             ON CONFLICT (content_id, corpus_kind) DO NOTHING",
-            &[
-                &manifest.content_id,
-                &manifest.corpus_kind,
-                &manifest_version,
-                &n_source,
-                &k_repair,
-                &symbol_size,
-                &original_content_length,
-                &min_viable,
-                &symbol_hashes_json,
-                &manifest.envelope,
-                &manifest.signature,
-                &manifest.signature_ml_dsa_65,
-                &manifest.pqc_key_id,
-            ],
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("insert content_manifest: {e}")))?;
-
-        // Symbols: upsert by (content_id, symbol_id).
-        for sym in symbols {
-            let symbol_id = i64::from(sym.symbol_id);
-            let retention_priority = i16::from(sym.retention_priority);
-            tx.execute(
-                "INSERT INTO cirislens.content_symbols \
-                 (content_id, symbol_id, retention_priority, symbol_bytes) \
-                 VALUES ($1,$2,$3,$4) \
-                 ON CONFLICT (content_id, symbol_id) DO UPDATE SET \
-                   retention_priority = EXCLUDED.retention_priority, \
-                   symbol_bytes = EXCLUDED.symbol_bytes",
-                &[
-                    &sym.content_id,
-                    &symbol_id,
-                    &retention_priority,
-                    &sym.symbol_bytes,
-                ],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("insert content_symbols: {e}")))?;
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| Error::Backend(format!("commit fountain tx: {e}")))?;
-        Ok(())
+        super::backend_plan::put_fountain_content_planned(self, manifest, symbols).await
     }
 
     async fn evict_fountain_content_to_tier(
@@ -5533,121 +8502,14 @@ impl Backend for PostgresBackend {
         agg: &crate::fountain::AggregationMetaV1,
         aggregated_at_unix_ms: i64,
     ) -> Result<(), Error> {
-        // Verify-before-mutation (AV-9): BOTH gates run BEFORE any write; on
-        // any failure NOTHING is persisted (neither the composite nor the
-        // aggregation row).
-        //   (i)  the composite goes through the EXISTING #225 fountain admit
-        //        gate — classical-only composite manifest REJECTED (hard cut).
-        //   (ii) v8.4.0 §19.7.1 PQC-mandatory store-path gate (§10.1.5.1.1):
-        //        verify the aggregation_meta bound-hybrid signature against the
-        //        aggregator pubkeys on the composite envelope; a missing/invalid
-        //        ML-DSA-65 half is rejected. The STORAGE aggregation_meta column
-        //        stays OPAQUE — the verification inputs are admission-only.
-        crate::fountain::check_admission_via_envelope(
+        super::backend_plan::put_aggregated_tier_planned(
+            self,
             manifest,
             symbols,
-            &crate::verify::PythonJsonDumpsCanonicalizer,
-        )?;
-        agg.verify_for_admission(manifest)?;
-
-        let symbol_hashes_json = serde_json::Value::Array(
-            manifest
-                .symbol_hashes
-                .iter()
-                .map(|h| serde_json::Value::String(h.clone()))
-                .collect(),
-        );
-        let manifest_version = i32::from(manifest.manifest_version);
-        let n_source = i64::from(manifest.n_source);
-        let k_repair = i64::from(manifest.k_repair);
-        let symbol_size = i64::from(manifest.symbol_size);
-        let original_content_length = i64::try_from(manifest.original_content_length)
-            .map_err(|_| Error::Backend("original_content_length exceeds i64".into()))?;
-        let min_viable = i64::from(manifest.min_viable_symbols);
-        let aggregation_level = i64::try_from(agg.aggregation_level)
-            .map_err(|_| Error::Backend("aggregation_level exceeds i64".into()))?;
-        let fan_in =
-            i64::try_from(agg.fan_in).map_err(|_| Error::Backend("fan_in exceeds i64".into()))?;
-        let agg_meta: &[u8] = &agg.aggregation_meta;
-
-        let mut client = self.get_client().await?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| Error::Backend(format!("begin aggregation tx: {e}")))?;
-
-        // (a) The composite manifest (idempotent) + its symbols.
-        tx.execute(
-            "INSERT INTO cirislens.content_manifest \
-             (content_id, corpus_kind, manifest_version, n_source, k_repair, \
-              symbol_size, original_content_length, min_viable_symbols, \
-              symbol_hashes, envelope, signature, signature_ml_dsa_65, pqc_key_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
-             ON CONFLICT (content_id, corpus_kind) DO NOTHING",
-            &[
-                &manifest.content_id,
-                &manifest.corpus_kind,
-                &manifest_version,
-                &n_source,
-                &k_repair,
-                &symbol_size,
-                &original_content_length,
-                &min_viable,
-                &symbol_hashes_json,
-                &manifest.envelope,
-                &manifest.signature,
-                &manifest.signature_ml_dsa_65,
-                &manifest.pqc_key_id,
-            ],
+            agg,
+            aggregated_at_unix_ms,
         )
         .await
-        .map_err(|e| Error::Backend(format!("insert composite content_manifest: {e}")))?;
-
-        for sym in symbols {
-            let symbol_id = i64::from(sym.symbol_id);
-            let retention_priority = i16::from(sym.retention_priority);
-            tx.execute(
-                "INSERT INTO cirislens.content_symbols \
-                 (content_id, symbol_id, retention_priority, symbol_bytes) \
-                 VALUES ($1,$2,$3,$4) \
-                 ON CONFLICT (content_id, symbol_id) DO UPDATE SET \
-                   retention_priority = EXCLUDED.retention_priority, \
-                   symbol_bytes = EXCLUDED.symbol_bytes",
-                &[
-                    &sym.content_id,
-                    &symbol_id,
-                    &retention_priority,
-                    &sym.symbol_bytes,
-                ],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("insert composite content_symbols: {e}")))?;
-        }
-
-        // (b) The aggregation provenance row (opaque aggregation_meta).
-        tx.execute(
-            "INSERT INTO cirislens.content_aggregation \
-             (aggregate_content_id, source_corpus_kind, aggregation_level, fan_in, \
-              member_commitment, aggregation_meta, aggregated_at_unix_ms) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7) \
-             ON CONFLICT (aggregate_content_id) DO NOTHING",
-            &[
-                &agg.aggregate_content_id,
-                &agg.source_corpus_kind,
-                &aggregation_level,
-                &fan_in,
-                &agg.member_commitment,
-                &agg_meta,
-                &aggregated_at_unix_ms,
-            ],
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("insert content_aggregation: {e}")))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| Error::Backend(format!("commit aggregation tx: {e}")))?;
-        Ok(())
     }
 
     async fn get_aggregation(
@@ -5717,7 +8579,8 @@ fn pg_row_to_transport_destination(
         last_seen_at: row.safe_get_with(4, FErr::Backend)?,
         transport_ed25519_pubkey_base64: row.safe_get_with(5, FErr::Backend)?,
         transport_x25519_pubkey_base64: row.safe_get_with(6, FErr::Backend)?,
-        binding_provenance: crate::federation::self_at_login::BindingProvenance::from_token(
+        // v61 (CIRISPersist#934) — the decode's refusal is the shared plan's.
+        binding_provenance: crate::federation::transport_admit::stored_binding_provenance(
             provenance_token.as_deref(),
         )
         .map_err(|e| FErr::Backend(e.to_string()))?,
@@ -6221,7 +9084,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .execute(
                 "UPDATE cirislens.federation_keys SET identity_type = $2 WHERE key_id = $1",
@@ -6249,7 +9112,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .query(
                 "SELECT trace_count FROM cirislens.trace_events_factor_rollup_1h \
@@ -6276,7 +9139,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .execute(
                 "DELETE FROM cirislens.purge_tombstones \
@@ -6301,7 +9164,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .execute(
                 "UPDATE cirislens.federation_attestations SET asserted_at = $2 \
@@ -6327,7 +9190,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let env: Option<String> = envelope.map(serde_json::Value::to_string);
         client
             .execute(
@@ -6352,7 +9215,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .execute(
                 "UPDATE cirislens.federation_keys SET additional_scrubs = '[]' WHERE key_id = $1",
@@ -6380,7 +9243,7 @@ impl PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
@@ -6470,7 +9333,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         // V121: `attestation_id` is TEXT (genesis rows carry symbolic ids), so
         // the scan pages on the PK in its own order.
@@ -6502,7 +9365,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .query(
                 "SELECT DISTINCT trace_id FROM cirislens.trace_llm_calls WHERE model = $1 \
@@ -6525,7 +9388,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .query(
                 "SELECT DISTINCT trace_id FROM cirislens.trace_events WHERE signing_key_id = $1 \
@@ -6551,7 +9414,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let ids: Vec<&str> = trace_ids.iter().map(String::as_str).collect();
         let row = client
             .query_one(
@@ -6578,130 +9441,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         execution: &crate::federation::steward_purge::PurgeExecution,
         tombstones: &[crate::federation::steward_purge::PurgeTombstone],
     ) -> Result<crate::federation::steward_purge::PurgePutOutcome, crate::federation::Error> {
-        crate::federation::steward_purge::check_purge_put_set(execution, tombstones)?;
-        // Codex on PR #1057 — the header and every tombstone are ONE
-        // transaction: run on the bare client, each statement autocommitted,
-        // and a failure or a process loss between them left a durable header
-        // holding part of its `record_count`.
-        #[cfg(test)]
-        let inject_tombstone_fault = self
-            .test_hooks()
-            .fail_if_armed("purge_put_execution_tombstones")
-            .is_err();
-        #[cfg(not(test))]
-        let inject_tombstone_fault = false;
-        let mut client = self
-            .get_client()
+        crate::federation::directory_admit::purge_put_execution_planned(self, execution, tombstones)
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
-        // v60.1.0 (CIRISPersist#1070 item 3) — a bytes-plane tombstone is
-        // written under the EXCLUSIVE lock a byte write holds shared from its
-        // in-transaction tombstone read to its commit (sorted, as the writers
-        // take theirs): a write already past that read commits first and the
-        // finalize that follows this commit deletes its bytes; a later write
-        // reads this tombstone and refuses.
-        pg_lock_bytes_tombstones_exclusive(&tx, tombstones).await?;
-        let e = execution;
-        let record_count = i64::try_from(e.record_count).unwrap_or(i64::MAX);
-        let n = tx
-            .execute(
-                "INSERT INTO cirislens.purge_executions (notice_id, selection_digest, \
-                    claimant_key_id, record_count, notice_jcs, cosignatures_json, executed_by, \
-                    origin, executed_at, admitted_at, finalized_at, legal_basis) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp(), NULL, $10) \
-                 ON CONFLICT (notice_id) DO NOTHING",
-                &[
-                    &e.notice_id,
-                    &e.selection_digest,
-                    &e.claimant_key_id,
-                    &record_count,
-                    &e.notice_jcs,
-                    &e.cosignatures_json,
-                    &e.executed_by,
-                    &e.origin,
-                    &e.executed_at,
-                    &e.legal_basis,
-                ],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("purge_put_execution: {e}")))?;
-        if inject_tombstone_fault {
-            return Err(crate::federation::Error::Backend(
-                "purge_put_execution tombstones: injected fault".into(),
-            ));
-        }
-        let stmt = tx
-            .prepare(
-                "INSERT INTO cirislens.purge_tombstones \
-                    (notice_id, plane, record_ref, ordinal, derived_from) \
-                 VALUES ($1, $2, $3, $4, $5) \
-                 ON CONFLICT (notice_id, plane, record_ref) DO NOTHING",
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("purge tombstone: {e}")))?;
-        let mut inserted = Vec::with_capacity(tombstones.len());
-        for t in tombstones {
-            let ordinal = i64::try_from(t.ordinal).unwrap_or(i64::MAX);
-            let k = tx
-                .execute(
-                    &stmt,
-                    &[
-                        &t.notice_id,
-                        &t.plane.as_str(),
-                        &t.record_ref,
-                        &ordinal,
-                        &t.derived_from,
-                    ],
-                )
-                .await
-                .map_err(|e| crate::federation::Error::Backend(format!("purge tombstone: {e}")))?;
-            inserted.push(k > 0);
-        }
-        // Codex round 4 sweep on PR #1057 — a newly tombstoned attestation
-        // leaves the signed-wire index at once, so the node stops ADVERTISING a
-        // hash it no longer serves (the rebuild re-indexes from the
-        // tombstone-filtered serve read).
-        for (t, fresh) in tombstones.iter().zip(&inserted) {
-            if *fresh && t.plane == crate::federation::steward_purge::PurgePlane::Attestation {
-                let rk =
-                    crate::federation::wire_index::record_key(&[("attestation_id", &t.record_ref)]);
-                tx.execute(
-                    "DELETE FROM cirislens.signed_wire_index \
-                     WHERE kind = 'Attestation' AND record_key = $1",
-                    &[&rk],
-                )
-                .await
-                .map_err(|e| crate::federation::Error::Backend(format!("purge wire index: {e}")))?;
-                // v57.0.0 (CIRISPersist#988 item 3; lead ruling 5) — a
-                // tombstoned detection row's projection is the V080
-                // tombstone at its execution's instant, in this write. Only
-                // a live projection row moves: the earliest-admitted
-                // execution's instant stands (the rebuild's rule).
-                tx.execute(
-                    "UPDATE cirislens_derived.detection_events \
-                     SET trace_id = NULL, body_sha256 = NULL, canonical_bytes = NULL, \
-                         erased_at = (SELECT executed_at FROM cirislens.purge_executions \
-                                       WHERE notice_id = $2) \
-                     WHERE attestation_id = $1 AND erased_at IS NULL",
-                    &[&t.record_ref, &t.notice_id],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!("purge detection projection: {e}"))
-                })?;
-            }
-        }
-        tx.commit()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("commit: {e}")))?;
-        Ok(crate::federation::steward_purge::PurgePutOutcome {
-            header_inserted: n > 0,
-            tombstones_inserted: inserted,
-        })
     }
 
     async fn purge_execution(
@@ -6712,7 +9453,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .query_opt(
                 &format!("{PG_PURGE_EXECUTION_SELECT} WHERE notice_id = $1"),
@@ -6732,7 +9473,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .query(
                 "SELECT notice_id, plane, record_ref, ordinal, derived_from \
@@ -6762,7 +9503,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_one(
                 "SELECT MIN(notice_id) FROM cirislens.purge_tombstones \
@@ -6793,7 +9534,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .query(
                 "SELECT DISTINCT notice_id FROM cirislens.purge_tombstones \
@@ -6818,7 +9559,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let since_at = since.as_ref().map(|(t, _)| *t);
         let since_id = since.as_ref().map(|(_, id)| id.clone());
         let limit = i64::from(limit);
@@ -6847,7 +9588,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // The door's own gate, in the statement: only a row a purge tombstone
         // names, and never the accountability record (Codex on PR #1057: a
         // tombstone is void for it). The V106 / V121 cascades follow as on the
@@ -6878,10 +9619,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         trace_id: &str,
     ) -> Result<(u64, u64), crate::federation::Error> {
         let mut client = self
-            .pool
-            .get()
+            .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(format!("pool: {e}")))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -7031,7 +9771,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let n = client
             .execute(
                 "UPDATE cirislens.purge_executions SET finalized_at = $2 \
@@ -7055,7 +9795,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(format!("pg pool: {e}")))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_opt(
                 "SELECT depth FROM cirislens.federation_withdraws_admission_depths \
@@ -7083,7 +9823,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(format!("pg pool: {e}")))?;
+            .map_err(crate::store::Error::into_federation)?;
         let ids: Vec<&str> = attestation_ids.iter().map(String::as_str).collect();
         let rows = client
             .query(
@@ -7223,56 +9963,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         key_id: &str,
     ) -> Result<Vec<crate::federation::types::KeyRegistrationHistoryRow>, crate::federation::Error>
     {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let rows = client
-            .query(
-                "SELECT key_id, registration_envelope, original_content_hash, \
-                        scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                        scrub_timestamp, replaced_at, replaced_by_hash, \
-                        replaced_row_hash, replacement_kind \
-                 FROM cirislens.federation_key_registration_history \
-                 WHERE key_id = $1 ORDER BY history_id ASC",
-                &[&key_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_key_registration_history: {e}"))
-            })?;
-        let col = |e: tokio_postgres::Error| {
-            crate::federation::Error::Backend(format!("list_key_registration_history: {e}"))
-        };
-        rows.into_iter()
-            .map(|r| {
-                let envelope: String = r.try_get("registration_envelope").map_err(col)?;
-                let hash: Vec<u8> = r.try_get("original_content_hash").map_err(col)?;
-                let kind: String = r.try_get("replacement_kind").map_err(col)?;
-                Ok(crate::federation::types::KeyRegistrationHistoryRow {
-                    key_id: r.try_get("key_id").map_err(col)?,
-                    registration_envelope: serde_json::from_str(&envelope).map_err(|e| {
-                        crate::federation::Error::Backend(format!("history envelope: {e}"))
-                    })?,
-                    original_content_hash: hex::encode(hash),
-                    scrub_signature_classical: r
-                        .try_get("scrub_signature_classical")
-                        .map_err(col)?,
-                    scrub_signature_pqc: r.try_get("scrub_signature_pqc").map_err(col)?,
-                    scrub_key_id: r.try_get("scrub_key_id").map_err(col)?,
-                    scrub_timestamp: r.try_get("scrub_timestamp").map_err(col)?,
-                    replaced_at: r.try_get("replaced_at").map_err(col)?,
-                    replaced_by_hash: r.try_get("replaced_by_hash").map_err(col)?,
-                    replaced_row_hash: r.try_get("replaced_row_hash").map_err(col)?,
-                    replacement: crate::federation::types::KeyReplacementKind::from_token(&kind)
-                        .ok_or_else(|| {
-                            crate::federation::Error::Backend(format!(
-                                "history replacement_kind {kind:?}"
-                            ))
-                        })?,
-                })
-            })
-            .collect()
+        crate::federation::read_plan::list_key_registration_history_planned(self, key_id).await
     }
 
     /// v45.0.0 (CIRISPersist#871, FSD §5) — the rendition index read: a plain
@@ -7282,46 +9973,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         original_sha256_hex: &str,
     ) -> Result<Vec<crate::federation::renditions::Rendition>, crate::federation::Error> {
-        let original = crate::federation::renditions::decode_sha256_hex(original_sha256_hex)?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let rows = client
-            .query(
-                "SELECT rendition_sha256, original_sha256, format, size, width, height, \
-                        role, source_attestation_id, cohort_scope \
-                 FROM cirislens.blob_renditions WHERE original_sha256 = $1 \
-                 ORDER BY rendition_sha256 ASC",
-                &[&original.to_vec()],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("list_derived_hex: {e}")))?;
-        let col = |e: tokio_postgres::Error| {
-            crate::federation::Error::Backend(format!("list_derived_hex: {e}"))
-        };
-        rows.into_iter()
-            .map(|r| {
-                let size: i64 = r.try_get("size").map_err(col)?;
-                let width: Option<i32> = r.try_get("width").map_err(col)?;
-                let height: Option<i32> = r.try_get("height").map_err(col)?;
-                Ok(crate::federation::renditions::Rendition {
-                    rendition_sha256_hex: hex::encode(
-                        r.try_get::<_, Vec<u8>>("rendition_sha256").map_err(col)?,
-                    ),
-                    original_sha256_hex: hex::encode(
-                        r.try_get::<_, Vec<u8>>("original_sha256").map_err(col)?,
-                    ),
-                    format: r.try_get("format").map_err(col)?,
-                    size: u64::try_from(size).unwrap_or(0),
-                    width: width.and_then(|w| u32::try_from(w).ok()),
-                    height: height.and_then(|h| u32::try_from(h).ok()),
-                    role: r.try_get("role").map_err(col)?,
-                    source_attestation_id: r.try_get("source_attestation_id").map_err(col)?,
-                    cohort_scope: r.try_get("cohort_scope").map_err(col)?,
-                })
-            })
-            .collect()
+        crate::federation::read_plan::list_derived_hex_planned(self, original_sha256_hex).await
     }
 
     // v19.1.0 (#490) — the authenticated re-anchor (see sqlite impl for the
@@ -7367,7 +10019,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
@@ -7392,7 +10044,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
@@ -7422,7 +10074,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
@@ -7487,7 +10139,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Idempotency: an existing tombstone with matching superseded_by +
         // authority digest is a no-op; a differing one Conflicts (mirrors the
         // SQLite SELECT-then-INSERT).
@@ -7547,7 +10199,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_opt(
                 "SELECT key_id, withdrawn_at, authority_decision_digest, superseded_by, \
@@ -7570,7 +10222,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT key_id, withdrawn_at, authority_decision_digest, superseded_by, \
@@ -7608,7 +10260,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let existing = client
             .query_opt(
                 "SELECT superseded_by, authority_decision_digest \
@@ -7717,7 +10369,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_opt(
                 "SELECT role, key_id, withdrawn_at, authority_decision_digest, superseded_by, \
@@ -7842,7 +10494,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 // weight::float8 AS weight — tokio-postgres has no
@@ -7887,7 +10539,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         pg_execute_attestation_query(&**client, q).await
     }
 
@@ -7911,26 +10563,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             Box::new(attestation_type::RECANTS.to_owned()),
             Box::new(attestation_type::SUPERSEDES.to_owned()),
         ];
-        let mut axes = String::new();
         if let Some(k) = attested_key_id {
             params.push(Box::new(k.to_owned()));
-            axes.push_str(&format!(" AND attested_key_id = ${}", params.len()));
         }
         if let Some(k) = attesting_key_id {
             params.push(Box::new(k.to_owned()));
-            axes.push_str(&format!(" AND attesting_key_id = ${}", params.len()));
         }
-        let sql = format!(
-            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
-             WHERE tier = 'federation' \
-               AND attestation_type IN ($2, $3, $4) \
-               AND (attestation_envelope::jsonb->>'references_attestation_id') = ANY($1){axes} \
-             ORDER BY asserted_at DESC"
-        );
+        let sql =
+            pg_composers_referencing_any_sql(attested_key_id.is_some(), attesting_key_id.is_some());
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref() as _).collect();
         let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
@@ -7968,7 +10612,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(&sql, &[&dimension, &evidence_ref])
             .await
@@ -8000,17 +10644,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         dimension: &str,
         evidence_ref: &str,
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let sql = format!(
-            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
-             WHERE attesting_key_id = $1 AND dimension COLLATE \"C\" = $2 \
-               AND (attestation_envelope::jsonb->'evidence_refs'->>0) = $3 \
-               AND tier = 'federation' \
-             ORDER BY asserted_at DESC"
-        );
+        let sql = pg_by_dimension_citing_sql();
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(&sql, &[&attesting_key_id, &dimension, &evidence_ref])
             .await
@@ -8058,7 +10696,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref() as _).collect();
         let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
@@ -8154,7 +10792,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let rows = client
             .query(
@@ -8206,7 +10844,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let unplaced = crate::federation::admission::postgres_envelope_names_no_cohort_target(
             "a.attestation_envelope",
@@ -8283,7 +10921,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let rows = client
             .query(
@@ -8362,9 +11000,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     ) -> Result<Vec<String>, crate::federation::Error> {
         let after = after_content_hash.unwrap_or("");
         let lim = i64::from(limit);
-        let client = self.pool().get().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("list_wire_hashes_since pool: {e}"))
-        })?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT content_hash FROM cirislens.signed_wire_index \
@@ -8394,43 +11033,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         advertised_by: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), crate::federation::Error> {
-        crate::federation::wire_index::validate_content_hash(
-            "insert_known_wire_hash",
+        crate::federation::directory_admit::insert_known_wire_hash_planned(
+            self,
+            kind,
             content_hash,
-        )?;
-        // v59.0.0 — a peer's advertisement of a framed key-plane hash is
-        // refused: that carriage is retired.
-        crate::federation::replication_policy::refuse_retired_framed(kind)?;
-        let client = self.pool().get().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("insert_known_wire_hash pool: {e}"))
-        })?;
-        // Upsert, because the same hash arrives on EVERY wrap of edge's
-        // re-sweep. `last_advertised_at` is bumped on each sighting — that
-        // movement is what makes the eviction floor meaningful, and a plain
-        // DO NOTHING would freeze it at first-seen and reproduce #776.
-        //
-        // The bump is MONOTONIC because execution order is not observation
-        // order: a caller that stamps `now` and hands the write to a delayed
-        // task can apply an OLDER sighting after a newer one and move the
-        // column BACKWARDS, so the next sweep evicts a hash that was in fact
-        // recently advertised — invisibly, until the re-sweep wraps.
-        client
-            .execute(
-                "INSERT INTO cirislens.known_wire_hashes \
-                     (kind, content_hash, last_advertised_at, advertised_by) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (kind, content_hash) DO UPDATE SET \
-                     last_advertised_at = EXCLUDED.last_advertised_at, \
-                     advertised_by = EXCLUDED.advertised_by \
-                 WHERE EXCLUDED.last_advertised_at \
-                       > cirislens.known_wire_hashes.last_advertised_at",
-                &[&kind, &content_hash, &now, &advertised_by],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("insert_known_wire_hash: {e}"))
-            })?;
-        Ok(())
+            advertised_by,
+            now,
+        )
+        .await
     }
 
     /// CIRISPersist#785 — is this hash known to exist?
@@ -8439,9 +11049,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         kind: &str,
         content_hash: &str,
     ) -> Result<bool, crate::federation::Error> {
-        let client = self.pool().get().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("known_wire_hash_contains pool: {e}"))
-        })?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_opt(
                 "SELECT 1 FROM cirislens.known_wire_hashes \
@@ -8465,9 +11076,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     ) -> Result<Vec<crate::federation::KnownWireHash>, crate::federation::Error> {
         let after = after_content_hash.unwrap_or("");
         let lim = i64::from(limit);
-        let client = self.pool().get().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("list_known_wire_hashes_since pool: {e}"))
-        })?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT kind, content_hash, last_advertised_at, advertised_by \
@@ -8543,9 +11155,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     ) -> Result<(), crate::federation::Error> {
         let record_key =
             crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]);
-        let mut client = self.pool().get().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("purge_attestation_projections pool: {e}"))
-        })?;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
         // One transaction: every projection leaves together.
         let tx = client.transaction().await.map_err(|e| {
             crate::federation::Error::Backend(format!("purge_attestation_projections tx: {e}"))
@@ -8609,9 +11222,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         chunk_sha256: &[u8; 32],
     ) -> Result<Vec<[u8; 32]>, crate::federation::Error> {
         // v53.1.0 (#979) — V176 (chunk → manifest) and V160 (child → root).
-        let client = self.pool.get().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("dag_manifests_of_chunk pool: {e}"))
-        })?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
         let sha = chunk_sha256.to_vec();
         let rows = client
             .query(
@@ -8649,7 +11263,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v47.2.0 (#862) — the pointer shape has no evidence_ref: prefilter on any mention.
         let like = format!("%{content_sha256}%");
         let needle =
@@ -8717,7 +11331,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT revocation_id::text, revoked_key_id, revoking_key_id, reason, \
@@ -8743,263 +11357,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         occurrence: crate::federation::SignedIdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
-        // v14.0.0 (CIRISPersist#418) — verify the hybrid signature over the exact
-        // producer envelope + signer authority + C4 BEFORE any write (one gate,
-        // HTTP + wire; fail-secure). Backend-symmetric with SQLite.
-        crate::federation::admission::verify_signed_identity_occurrence(self, &occurrence).await?;
-        // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — a roster change lands by
-        // the two-path door or is held as a proposal.
-        crate::federation::self_roster::gate_occurrence(self, &occurrence).await?;
-        self.rehome_legacy_key_plane().await?;
-        let crate::federation::SignedIdentityOccurrence {
-            identity_occurrence: mut row,
-            attesting_key_id,
-            signed_envelope,
-            signature,
-        } = occurrence;
-        // v50.0.0 (CIRISPersist#916) — who, through what, for the re-wrap below.
-        let rewrap_for = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
-        crate::federation::check_device_class(&row.device_class)?;
-        crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let (enc_x25519, enc_ml_kem) = match &row.encryption_pubkeys {
-            Some(k) => (
-                Some(k.x25519_base64.clone()),
-                Some(k.ml_kem_768_base64.clone()),
-            ),
-            None => (None, None),
-        };
-        // v31.0.0 (#644) — the V102 trio is TEXT since V122: serialize here,
-        // exactly as the SQLite leg does, so both backends store the same bytes.
-        let signed_envelope_text = pg_envelope_text(&signed_envelope, "signed_envelope")?;
-        let signature_json = serde_json::to_string(&signature)
-            .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
-        let transport_binding_json = match &row.transport_binding {
-            Some(tb) => Some(serde_json::to_string(tb).map_err(|e| {
-                crate::federation::Error::Backend(format!("transport_binding: {e}"))
-            })?),
-            None => None,
-        };
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // v58.0.0 (CIRISPersist#991) — the occurrence and its
-        // `identity:occurrence:v1` row, one transaction.
-        let tx = client.transaction().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("put_identity_occurrence tx: {e}"))
-        })?;
-        // v36.0.0 (#668) — THIS node's serve position (V130). One allocation
-        // covers both arms: the INSERT stamps it, the last-signed-wins DO
-        // UPDATE re-stamps it (`EXCLUDED.admitted_at`) because a supersede
-        // rewrites the served bytes and must move the row forward.
-        let admitted_at = self
-            .next_plane_position(&tx, "federation_identity_occurrences")
-            .await?;
-        // Last-signed-wins: UPSERT only when strictly newer asserted_at; a
-        // stale/equal replay is a safe no-op (poisoned/older row can't win).
-        // v52.0.0 (#930) — ONE statement: the current-state upsert, and the
-        // assertion appended to the V161 history whether or not the upsert
-        // took it (an older verified assertion still bounded a binding).
-        let occurrence_applied: i64 = tx
-            .query_one(
-                "WITH hist AS (\
-                    INSERT INTO cirislens.federation_identity_occurrence_history (\
-                        identity_key_id, occurrence_key_id, asserted_at, valid_until, \
-                        attesting_key_id, signed_envelope, signature\
-                    ) VALUES ($1, $2, $5, $6, $10, $11, $12) ON CONFLICT DO NOTHING\
-                 ), up AS (\
-                 INSERT INTO cirislens.federation_identity_occurrences (\
-                    identity_key_id, occurrence_key_id, device_class, \
-                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
-                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, \
-                    attesting_key_id, signed_envelope, signature, transport_binding, \
-                    admitted_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
-                 ON CONFLICT (identity_key_id, occurrence_key_id) DO UPDATE SET \
-                    device_class = EXCLUDED.device_class, \
-                    hardware_attestation = EXCLUDED.hardware_attestation, \
-                    asserted_at = EXCLUDED.asserted_at, \
-                    valid_until = EXCLUDED.valid_until, \
-                    persist_row_hash = EXCLUDED.persist_row_hash, \
-                    pubkey_x25519_base64 = EXCLUDED.pubkey_x25519_base64, \
-                    pubkey_ml_kem_768_base64 = EXCLUDED.pubkey_ml_kem_768_base64, \
-                    attesting_key_id = EXCLUDED.attesting_key_id, \
-                    signed_envelope = EXCLUDED.signed_envelope, \
-                    signature = EXCLUDED.signature, \
-                    transport_binding = EXCLUDED.transport_binding, \
-                    admitted_at = EXCLUDED.admitted_at \
-                 WHERE EXCLUDED.asserted_at > cirislens.federation_identity_occurrences.asserted_at \
-                 RETURNING 1) SELECT COUNT(*) FROM up",
-                &[
-                    &row.identity_key_id,
-                    &row.occurrence_key_id,
-                    &row.device_class,
-                    &row.hardware_attestation,
-                    &row.asserted_at,
-                    &row.valid_until,
-                    &row.persist_row_hash,
-                    &enc_x25519,
-                    &enc_ml_kem,
-                    &attesting_key_id,
-                    &signed_envelope_text,
-                    &signature_json,
-                    &transport_binding_json,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .and_then(|r| r.try_get::<_, i64>(0))
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("foreign key") {
-                    crate::federation::Error::InvalidArgument(format!(
-                        "FK constraint violated on identity_occurrence insert: {msg}"
-                    ))
-                } else {
-                    crate::federation::Error::Backend(format!("insert identity_occurrence: {msg}"))
-                }
-            })?;
-        pg_sync_occurrence_row(&tx, &row.identity_key_id, &row.occurrence_key_id).await?;
-        tx.commit().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("put_identity_occurrence commit: {e}"))
-        })?;
-        // #446 — materialize the embedded binding into the
-        // `transport_destinations` read model (local derived row on the
-        // occurrence's own (epoch=0, asserted_at) clock — see project_route).
-        // ONLY when the occurrence write actually applied: projecting on a
-        // stale no-op could seed the read model with a binding older than
-        // the stored occurrence.
-        if occurrence_applied > 0 {
-            if let Some(tb) = &row.transport_binding {
-                let route = tb.project_route(&row.occurrence_key_id, row.asserted_at)?;
-                crate::federation::FederationDirectory::put_transport_destination(self, &route)
-                    .await?;
-            }
-            // v58.0.0 (CIRISPersist#991) — the pair's `identity:occurrence:v1`
-            // row is the wire-index entry (the Attestation kind).
-            // A schema before V198 (a test's `run_migrations_through`) has no
-            // pointer: no row to index.
-            let occurrence_row_id: Option<String> = if !pg_key_plane_present(&**client).await? {
-                None
-            } else {
-                match client
-                    .query_opt(
-                        "SELECT attestation_id FROM cirislens.federation_identity_occurrences \
-                      WHERE identity_key_id = $1 AND occurrence_key_id = $2",
-                        &[&row.identity_key_id, &row.occurrence_key_id],
-                    )
-                    .await
-                    .map_err(|e| {
-                        crate::federation::Error::Backend(format!("occurrence row pointer: {e}"))
-                    })? {
-                    Some(r) => r.safe_get_with(0, crate::federation::Error::Backend)?,
-                    None => None,
-                }
-            };
-            drop(client);
-            self.index_plane_row(occurrence_row_id.as_deref()).await?;
-        }
-        // v50.0.0 (CIRISPersist#916) — a member's device occurrence arriving
-        // (typically after its owner-binding): this node re-wraps its own
-        // epochs to it. The row stands whatever the re-wrap does.
-        if rewrap_for.0 != rewrap_for.1 {
-            crate::federation::rewrap_after_admission(self, &rewrap_for.0, &rewrap_for.1).await;
-        }
-        Ok(())
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::occurrence_admit::put_identity_occurrence_planned(self, occurrence).await
     }
 
     async fn put_identity_occurrence_local(
         &self,
         occurrence: crate::federation::IdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
-        // #418 — trusted-local (grandfathered) write; NO gate, signed cols NULL.
-        // v21.17.1 (CIRISPersist#541) — `WHERE signature IS NULL` on the DO UPDATE
-        // (parity with sqlite): a SIGNED occurrence is authoritative and is never
-        // mutated by the local writer, so a later local self-write cannot NULL its
-        // envelope-covered columns (transport_binding / both KEM pubkeys) while
-        // keeping the signature and make the row diverge from its own envelope.
-        let mut row = occurrence;
-        crate::federation::check_device_class(&row.device_class)?;
-        crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let (enc_x25519, enc_ml_kem) = match &row.encryption_pubkeys {
-            Some(k) => (
-                Some(k.x25519_base64.clone()),
-                Some(k.ml_kem_768_base64.clone()),
-            ),
-            None => (None, None),
-        };
-        // v31.0.0 (#644) — transport_binding is TEXT since V122.
-        let transport_binding_json = match &row.transport_binding {
-            Some(tb) => Some(serde_json::to_string(tb).map_err(|e| {
-                crate::federation::Error::Backend(format!("transport_binding: {e}"))
-            })?),
-            None => None,
-        };
-        let client = self
-            .get_client()
+        crate::federation::occurrence_admit::put_identity_occurrence_local_planned(self, occurrence)
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // v36.0.0 (#668) — serve position (V130); the local upsert stamps and
-        // re-stamps it like the signed door (unsigned rows only — the
-        // `WHERE signature IS NULL` guard is unchanged).
-        let admitted_at = self
-            .next_plane_position(&client, "federation_identity_occurrences")
-            .await?;
-        // v52.0.0 (#930) — ONE statement: the upsert and the history row (a
-        // trusted-local assertion bounds an interval; it is never agreement).
-        client
-            .execute(
-                "WITH hist AS (\
-                    INSERT INTO cirislens.federation_identity_occurrence_history (\
-                        identity_key_id, occurrence_key_id, asserted_at, valid_until, \
-                        attesting_key_id\
-                    ) VALUES ($1, $2, $5, $6, '') ON CONFLICT DO NOTHING\
-                 ) \
-                 INSERT INTO cirislens.federation_identity_occurrences (\
-                    identity_key_id, occurrence_key_id, device_class, \
-                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
-                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding, \
-                    admitted_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-                 ON CONFLICT (identity_key_id, occurrence_key_id) DO UPDATE SET \
-                    device_class = EXCLUDED.device_class, \
-                    hardware_attestation = EXCLUDED.hardware_attestation, \
-                    asserted_at = EXCLUDED.asserted_at, \
-                    valid_until = EXCLUDED.valid_until, \
-                    persist_row_hash = EXCLUDED.persist_row_hash, \
-                    pubkey_x25519_base64 = EXCLUDED.pubkey_x25519_base64, \
-                    pubkey_ml_kem_768_base64 = EXCLUDED.pubkey_ml_kem_768_base64, \
-                    transport_binding = EXCLUDED.transport_binding, \
-                    admitted_at = EXCLUDED.admitted_at \
-                 WHERE cirislens.federation_identity_occurrences.signature IS NULL",
-                &[
-                    &row.identity_key_id,
-                    &row.occurrence_key_id,
-                    &row.device_class,
-                    &row.hardware_attestation,
-                    &row.asserted_at,
-                    &row.valid_until,
-                    &row.persist_row_hash,
-                    &enc_x25519,
-                    &enc_ml_kem,
-                    &transport_binding_json,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("put_identity_occurrence_local: {e}"))
-            })?;
-        // #446 — the trusted-local path projects too (accepted write; the
-        // invariant is "every stored occurrence carrying a binding has its
-        // route materialized").
-        if let Some(tb) = &row.transport_binding {
-            let route = tb.project_route(&row.occurrence_key_id, row.asserted_at)?;
-            crate::federation::FederationDirectory::put_transport_destination(self, &route).await?;
-        }
-        Ok(())
     }
 
     async fn list_identity_occurrences_for(
@@ -9009,7 +11376,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT identity_key_id, occurrence_key_id, device_class, \
@@ -9036,7 +11403,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // #418 replication read: only signed-put rows carry the signature
         // container; trusted-local rows (NULL sig cols) are omitted.
         let rows = client
@@ -9074,7 +11441,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT identity_key_id, occurrence_key_id, device_class, \
@@ -9105,7 +11472,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT identity_key_id, occurrence_key_id, asserted_at, valid_until, \
@@ -9145,7 +11512,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT identity_key_id, occurrence_key_id, device_class, \
@@ -9169,152 +11536,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         family: crate::federation::SignedFamily,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::Family,
-            &family,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
-        // other admission step. Hybrid-Strict vs the authority's registered
-        // pubkeys — was FK-existence only, a forgeable keyless declaration.
-        crate::federation::verify_family_admission(self, &family).await?;
-        // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
-        // is a no-op, a proof-carrying amendment this node's own state
-        // authorizes is applied as a supersede, anything else is refused.
-        if let crate::federation::group_amendment::OccupiedRoute::Settled(_) =
-            crate::federation::group_amendment::route_occupied_family(self, &family).await?
-        {
-            return Ok(());
-        }
-        let crate::federation::SignedFamily {
-            family: row,
-            authority_key_id,
-            scrub_signature_classical,
-            scrub_signature_pqc,
-            supersede_proof,
-            cosignatures,
-        } = family;
-        let supersede_proof_value = pg_supersede_proof_value(supersede_proof.as_ref())?;
-        // v52.0.0 (#955, V162) — the founding members' consent.
-        let cosignatures_value = serde_json::to_value(&cosignatures)
-            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
-        let family_key_id = row.family_key_id.clone();
-        self.put_family_local(row).await?;
-        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
-        // signature the gate above already verified (was verified-then-
-        // discarded: the durable row had no home for it, so it couldn't
-        // prove its own authorship later). `put_family_local` (the
-        // genesis-bake bypass) is untouched — its INSERT leaves these
-        // columns NULL, correct for a legitimately-unsigned bake row; this
-        // UPDATE targets only the signed, gate-verified path.
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // v36.0.0 (#668) — attaching the authority signature is what makes
-        // the row VISIBLE to the signed serve cursor; the serve position is
-        // re-stamped here, because admission to the signed stream is this
-        // statement, not the local insert above.
-        let admitted_at = self
-            .next_plane_position(&client, "federation_families")
-            .await?;
-        client
-            .execute(
-                "UPDATE cirislens.federation_families \
-                    SET authority_key_id = $2, scrub_signature_classical = $3, \
-                        scrub_signature_pqc = $4, admitted_at = $5, supersede_proof = $6, \
-                        cosignatures = $7 \
-                  WHERE family_key_id = $1",
-                &[
-                    &family_key_id,
-                    &authority_key_id,
-                    &scrub_signature_classical,
-                    &scrub_signature_pqc,
-                    &admitted_at,
-                    // v49.0.0 (#910.5) — a first copy of an amended version
-                    // keeps its proof, so the next peer can apply it.
-                    &supersede_proof_value,
-                    &cosignatures_value,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("store family authority signature: {e}"))
-            })?;
-        // v21.1.0 (CIRISPersist#507b) — wire-index the FULL `SignedFamily`
-        // shape `list_signed_families_since` re-serializes. Reload rather
-        // than reuse the pre-write `Family` value: `put_family_local` stamps
-        // `persist_row_hash` on its OWN local copy, invisible from here.
-        // v31.0.0 (CIRISPersist#646) — that reload is now the SHARED one. This
-        // site had the right instinct and its own implementation of it; the
-        // instinct is now the rule and the implementation is one function.
-        drop(client);
-        self.index_stored_record(
-            "Family",
-            &crate::federation::wire_index::record_key(&[("family_key_id", &family_key_id)]),
-        )
-        .await?;
-        Ok(())
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::family_admit::put_family_planned(self, family).await
     }
 
     async fn put_family_local(
         &self,
-        mut row: crate::federation::types::Family,
+        row: crate::federation::types::Family,
     ) -> Result<(), crate::federation::Error> {
-        crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
-        // v13.3.0 (CIRISPersist#386) — the real invariant (replaces the dropped
-        // family_key_id FK): every member key_id must be a registered key.
-        crate::federation::admission::validate_family_members(self, &row).await?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let members_value = serde_json::to_value(&row.members)
-            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // v36.0.0 (#668) — THIS node's serve position (V130).
-        let admitted_at = self
-            .next_plane_position(&client, "federation_families")
-            .await?;
-        client
-            .execute(
-                "INSERT INTO cirislens.federation_families (\
-                    family_key_id, family_name, members, founded_at, \
-                    consensus_protocol, consensus_protocol_entrenched, persist_row_hash, \
-                    admitted_at, dissolved_at, prev_head_digest, charter_digest\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-                &[
-                    &row.family_key_id,
-                    &row.family_name,
-                    &members_value,
-                    &row.founded_at,
-                    &row.consensus_protocol,
-                    &row.consensus_protocol_entrenched,
-                    &row.persist_row_hash,
-                    &admitted_at,
-                    &row.dissolved_at,
-                    &row.prev_head_digest,
-                    &row.charter_digest,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("foreign key") {
-                    crate::federation::Error::InvalidArgument(format!(
-                        "FK constraint violated on family insert: {msg}"
-                    ))
-                } else {
-                    crate::federation::Error::Backend(format!("insert family: {msg}"))
-                }
-            })?;
-        Ok(())
+        crate::federation::family_admit::put_family_local_planned(self, row).await
     }
 
     // #249 Cut G2 — supersede + versioning (CIRISServer #249 §3/§8).
@@ -9324,307 +11554,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         new_snapshot: serde_json::Value,
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, crate::federation::Error> {
-        // Test-only (PR #921 review, F3): a rival supersede of the same
-        // community lands here, before this one re-checks its prior.
-        #[cfg(test)]
-        if matches!(cohort, crate::federation::cohort::Cohort::Community) {
-            self.test_rival_at(crate::store::test_hooks::RivalPoint::BeforeSupersede)
-                .await?;
-        }
-        use crate::federation::cohort::Cohort;
-        use crate::federation::Error;
-        match cohort {
-            Cohort::SelfId => {
-                return Err(Error::InvalidArgument(
-                    "supersede: the `self` cohort is not versioned".to_string(),
-                ))
-            }
-            // CC 4.4.3.2.8 / #308: `affiliations` supersedes via the community
-            // storage path below, recorded under the `affiliations` discriminator.
-            Cohort::Family | Cohort::Community | Cohort::Affiliations => {}
-        }
-        // The version-history discriminator: `cohort.as_str()` keeps the
-        // `affiliations` chain separable from `community` even though they
-        // share the `federation_communities` live row.
-        let cohort_discriminator = cohort.as_str();
-        let now = chrono::Utc::now();
-        let group_key_id =
-            crate::federation::group_amendment::snapshot_group_key_id(cohort, &new_snapshot);
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
-        let next: i32 = match cohort {
-            Cohort::Family => {
-                // v31.0.0 (CIRISPersist#651) — the snapshot is the SIGNED
-                // wrapper. Decoding the bare record here is what silently
-                // stranded the caller's signature while every field
-                // `signing_envelope()` covers was replaced below.
-                let crate::federation::SignedFamily {
-                    family: mut new_fam,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                    supersede_proof,
-                    cosignatures,
-                } = serde_json::from_value(new_snapshot).map_err(|e| {
-                    Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
-                })?;
-                let proof_value = pg_supersede_proof_value(supersede_proof.as_ref())?;
-                let cosignatures_value = serde_json::to_value(&cosignatures)
-                    .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
-                new_fam.persist_row_hash =
-                    crate::federation::types::compute_persist_row_hash(&new_fam)?;
-                let members_value = serde_json::to_value(&new_fam.members)
-                    .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
-                let tx = client
-                    .transaction()
-                    .await
-                    .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
-                let prior = tx
-                    .query_opt(
-                        "SELECT version, family_key_id, family_name, members, founded_at, \
-                                consensus_protocol, consensus_protocol_entrenched, dissolved_at, prev_head_digest, charter_digest, persist_row_hash \
-                         FROM cirislens.federation_families WHERE family_key_id = $1 \
-                         FOR UPDATE",
-                        &[&new_fam.family_key_id],
-                    )
-                    .await
-                    .map_err(|e| Error::Backend(format!("supersede read prior family: {e}")))?
-                    .ok_or_else(|| {
-                        Error::InvalidArgument(format!(
-                            "supersede: unknown family group {:?} (nothing to supersede)",
-                            new_fam.family_key_id
-                        ))
-                    })?;
-                let prior_version: i32 = prior.get("version");
-                let prior_fam = pg_row_to_family(prior)?;
-                // v49.0.0 (#910.5) — a proof names the version it replaces;
-                // checked inside the transaction that replaces it, on a row
-                // read FOR UPDATE (v49.0.0 — so two concurrent supersedes
-                // cannot both pass the check against the same prior).
-                if let Some(p) = &supersede_proof {
-                    crate::federation::group_amendment::check_proof_names_prior(
-                        cohort_discriminator,
-                        &new_fam.family_key_id,
-                        p,
-                        &prior_fam.persist_row_hash,
-                    )?;
-                }
-                // v53.0.0 (CC 3.2 T6) — the version names the head it succeeds,
-                // judged against the row read FOR UPDATE.
-                crate::federation::group_amendment::check_prev_head_names_held(
-                    cohort_discriminator,
-                    &new_fam.family_key_id,
-                    &new_fam.prev_head_digest,
-                    &prior_fam.persist_row_hash,
-                    authorization.as_ref(),
-                )?;
-                let snapshot = serde_json::to_value(&prior_fam)
-                    .map_err(|e| Error::Backend(format!("snapshot serialize: {e}")))?;
-                tx.execute(
-                    "INSERT INTO cirislens.federation_group_versions \
-                        (cohort, group_key_id, version, snapshot, change_authorization, \
-                         superseded_at, persist_row_hash) \
-                     VALUES ('family', $1, $2, $3, $4, $5, $6)",
-                    &[
-                        &new_fam.family_key_id,
-                        &prior_version,
-                        &snapshot,
-                        &authorization,
-                        &now,
-                        &prior_fam.persist_row_hash,
-                    ],
-                )
-                .await
-                .map_err(|e| Error::Backend(format!("insert group version: {e}")))?;
-                let next = prior_version + 1;
-                // v36.0.0 (#668/#707-class) — a supersede rewrites the served
-                // bytes; the serve position moves with them (allocated inside
-                // the same transaction as the write).
-                let admitted_at = self.next_plane_position(&tx, "federation_families").await?;
-                tx.execute(
-                    "UPDATE cirislens.federation_families SET \
-                        family_name = $2, members = $3, founded_at = $4, \
-                        consensus_protocol = $5, consensus_protocol_entrenched = $6, \
-                        persist_row_hash = $7, version = $8, \
-                        authority_key_id = $9, scrub_signature_classical = $10, \
-                        scrub_signature_pqc = $11, admitted_at = $12, \
-                        supersede_proof = $13, cosignatures = $14, dissolved_at = $15, \
-                        prev_head_digest = $16, charter_digest = $17 \
-                     WHERE family_key_id = $1",
-                    &[
-                        &new_fam.family_key_id,
-                        &new_fam.family_name,
-                        &members_value,
-                        &new_fam.founded_at,
-                        &new_fam.consensus_protocol,
-                        &new_fam.consensus_protocol_entrenched,
-                        &new_fam.persist_row_hash,
-                        &next,
-                        // v31.0.0 (CIRISPersist#651) — the signature moves with
-                        // the record it authorizes, in the SAME statement, so a
-                        // future edit cannot rewrite the roster and forget the
-                        // authorship.
-                        &authority_key_id,
-                        &scrub_signature_classical,
-                        &scrub_signature_pqc,
-                        &admitted_at,
-                        &proof_value,
-                        &cosignatures_value,
-                        &new_fam.dissolved_at,
-                        &new_fam.prev_head_digest,
-                        &new_fam.charter_digest,
-                    ],
-                )
-                .await
-                .map_err(|e| Error::Backend(format!("update family: {e}")))?;
-                tx.commit()
-                    .await
-                    .map_err(|e| Error::Backend(format!("commit: {e}")))?;
-                next
-            }
-            Cohort::Community | Cohort::Affiliations => {
-                // v31.0.0 (CIRISPersist#651) — the SIGNED wrapper; see the
-                // family arm above.
-                let crate::federation::SignedCommunity {
-                    community: mut new_comm,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                    supersede_proof,
-                    cosignatures,
-                    lineage,
-                } = serde_json::from_value(new_snapshot).map_err(|e| {
-                    Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
-                })?;
-                let proof_value = pg_supersede_proof_value(supersede_proof.as_ref())?;
-                // v50.0.0 (#926, V158) — the co-signatures travel with the
-                // authority signature they sit beside.
-                let cosignatures_value = serde_json::to_value(&cosignatures)
-                    .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
-                let lineage_value = serde_json::to_value(&lineage)
-                    .map_err(|e| Error::Backend(format!("lineage encode: {e}")))?;
-                new_comm.persist_row_hash =
-                    crate::federation::types::compute_persist_row_hash(&new_comm)?;
-                let members_value = serde_json::to_value(&new_comm.members)
-                    .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
-                let tx = client
-                    .transaction()
-                    .await
-                    .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
-                let prior = tx
-                    .query_opt(
-                        "SELECT version, community_key_id, community_name, members, founded_at, \
-                                consensus_protocol, policy_blob, prev_head_digest, charter_digest, persist_row_hash \
-                         FROM cirislens.federation_communities WHERE community_key_id = $1 \
-                         FOR UPDATE",
-                        &[&new_comm.community_key_id],
-                    )
-                    .await
-                    .map_err(|e| Error::Backend(format!("supersede read prior community: {e}")))?
-                    .ok_or_else(|| {
-                        Error::InvalidArgument(format!(
-                            "supersede: unknown community group {:?} (nothing to supersede)",
-                            new_comm.community_key_id
-                        ))
-                    })?;
-                let prior_version: i32 = prior.get("version");
-                let prior_comm = pg_row_to_community(prior)?;
-                // v49.0.0 (#910.5) — see the family arm.
-                if let Some(p) = &supersede_proof {
-                    crate::federation::group_amendment::check_proof_names_prior(
-                        cohort_discriminator,
-                        &new_comm.community_key_id,
-                        p,
-                        &prior_comm.persist_row_hash,
-                    )?;
-                }
-                // v53.0.0 (CC 3.2 T6) — see the family arm.
-                crate::federation::group_amendment::check_prev_head_names_held(
-                    cohort_discriminator,
-                    &new_comm.community_key_id,
-                    &new_comm.prev_head_digest,
-                    &prior_comm.persist_row_hash,
-                    authorization.as_ref(),
-                )?;
-                let snapshot = serde_json::to_value(&prior_comm)
-                    .map_err(|e| Error::Backend(format!("snapshot serialize: {e}")))?;
-                tx.execute(
-                    "INSERT INTO cirislens.federation_group_versions \
-                        (cohort, group_key_id, version, snapshot, change_authorization, \
-                         superseded_at, persist_row_hash) \
-                     VALUES ($7, $1, $2, $3, $4, $5, $6)",
-                    &[
-                        &new_comm.community_key_id,
-                        &prior_version,
-                        &snapshot,
-                        &authorization,
-                        &now,
-                        &prior_comm.persist_row_hash,
-                        &cohort_discriminator,
-                    ],
-                )
-                .await
-                .map_err(|e| Error::Backend(format!("insert group version: {e}")))?;
-                let next = prior_version + 1;
-                // v36.0.0 (#668/#707-class) — see the family arm.
-                let admitted_at = self
-                    .next_plane_position(&tx, "federation_communities")
-                    .await?;
-                tx.execute(
-                    "UPDATE cirislens.federation_communities SET \
-                        community_name = $2, members = $3, founded_at = $4, \
-                        consensus_protocol = $5, policy_blob = $6, \
-                        persist_row_hash = $7, version = $8, \
-                        authority_key_id = $9, scrub_signature_classical = $10, \
-                        scrub_signature_pqc = $11, admitted_at = $12, \
-                        supersede_proof = $13, cosignatures = $14, lineage = $15, \
-                        prev_head_digest = $16, charter_digest = $17 \
-                     WHERE community_key_id = $1",
-                    &[
-                        &new_comm.community_key_id,
-                        &new_comm.community_name,
-                        &members_value,
-                        &new_comm.founded_at,
-                        &new_comm.consensus_protocol,
-                        &new_comm.policy_blob,
-                        &new_comm.persist_row_hash,
-                        &next,
-                        // v31.0.0 (CIRISPersist#651) — see the family arm.
-                        &authority_key_id,
-                        &scrub_signature_classical,
-                        &scrub_signature_pqc,
-                        &admitted_at,
-                        &proof_value,
-                        &cosignatures_value,
-                        &lineage_value,
-                        &new_comm.prev_head_digest,
-                        &new_comm.charter_digest,
-                    ],
-                )
-                .await
-                .map_err(|e| Error::Backend(format!("update community: {e}")))?;
-                tx.commit()
-                    .await
-                    .map_err(|e| Error::Backend(format!("commit: {e}")))?;
-                next
-            }
-            Cohort::SelfId => unreachable!("guarded above"),
-        };
-        drop(client);
-        // v49.0.0 (#910.5) — a supersede changes the served record; re-index
-        // it, or a peer's content-hash lookup never sees the new version.
-        let (kind, key_field) = match cohort {
-            Cohort::Family => ("Family", "family_key_id"),
-            _ => ("Community", "community_key_id"),
-        };
-        self.index_stored_record(
-            kind,
-            &crate::federation::wire_index::record_key(&[(key_field, &group_key_id)]),
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::group_supersede_admit::supersede_group_row_planned(
+            self,
+            cohort,
+            new_snapshot,
+            authorization,
         )
-        .await?;
-        Ok(next as u32)
+        .await
     }
 
     // #249 Cut G2 (§8) — full version chain: history rows + the live current.
@@ -9647,7 +11584,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT version, snapshot, change_authorization, superseded_at \
@@ -9732,7 +11669,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT family_key_id, family_name, members, founded_at, \
@@ -9756,7 +11693,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let containment = serde_json::json!([{ "key_id": member_identity_key_id }]);
         let rows = client
             .query(
@@ -9819,7 +11756,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let n = client
             .execute(
                 "INSERT INTO cirislens.federation_lineage_head_cosigns \
@@ -9854,7 +11791,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT lineage_key_id, head_digest_sha256_hex, witness_key_id, head_asserted_at, \
@@ -9894,7 +11831,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_opt(
                 "SELECT * FROM cirislens.federation_communities WHERE community_key_id = $1 \
@@ -9915,7 +11852,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT community_key_id, community_name, members, founded_at, \
@@ -9939,7 +11876,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let containment = serde_json::json!([{ "key_id": member_identity_key_id }]);
         let rows = client
             .query(
@@ -9968,116 +11905,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
         authority_signature: Option<serde_json::Value>,
     ) -> Result<(), crate::federation::Error> {
-        use crate::federation::Error;
-        // v31.1.0 (CIRISPersist#662, PR #667 round-4) — `created_at` is half the
-        // evidence cursor, so it is an allocated position rather than a
-        // wall-clock read; see `monotonic_admission_instant`.
-        let created_at = {
-            let c = self
-                .get_client()
-                .await
-                .map_err(|e| Error::Backend(e.to_string()))?;
-            let last: Option<chrono::DateTime<chrono::Utc>> = c
-                .query_one("SELECT MAX(created_at) FROM cirislens.accord_proposal", &[])
-                .await
-                .map_err(|e| Error::Backend(format!("last accord created_at: {e}")))?
-                .get(0);
-            crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last)
-        };
-        let prep = crate::federation::accord_quorum::prepare_proposal(
-            &proposal,
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::accord_admit::put_accord_proposal_planned(
+            self,
+            proposal,
             authority_signature,
-            created_at,
-        )?;
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
-        // v54.1.0 (#1047) — single use: a proposer-minted nonce names one
-        // proposal per family. The check and the insert are one transaction
-        // under an advisory lock, so two processes sharing the database
-        // cannot both admit a different proposal under one nonce.
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| Error::Backend(format!("accord_proposal transaction: {e}")))?;
-        tx.execute(
-            "SELECT pg_advisory_xact_lock($1)",
-            &[&crate::federation::accord_quorum::ACCORD_PROPOSAL_NONCE_LOCK_KEY],
         )
         .await
-        .map_err(|e| Error::Backend(format!("accord_proposal nonce lock: {e}")))?;
-        // Codex round 4 on PR #1057 — a HELD digest is an idempotent replay,
-        // accepted before the claim is asked: a legacy proposal V189 did not
-        // give the claim to is held evidence, and its replay must not abort
-        // the delivery its participations ride on.
-        let held = tx
-            .query_opt(
-                "SELECT 1 FROM cirislens.accord_proposal WHERE proposal_digest = $1",
-                &[&prep.proposal_digest],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("accord_proposal held read: {e}")))?
-            .is_some();
-        if held {
-            tx.commit()
-                .await
-                .map_err(|e| Error::Backend(format!("accord_proposal commit: {e}")))?;
-            return Ok(());
-        }
-        // Codex round 3 on PR #1057 — and the V189 claim's PRIMARY KEY makes
-        // the pair the database's invariant on both dialects, not only this
-        // door's lock.
-        tx.execute(
-            "INSERT INTO cirislens.accord_proposal_nonce_claim \
-                (family_key_id, nonce, proposal_digest) VALUES ($1, $2, $3) \
-             ON CONFLICT (family_key_id, nonce) DO NOTHING",
-            &[&prep.family_key_id, &prep.nonce, &prep.proposal_digest],
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("accord_proposal nonce claim: {e}")))?;
-        let owner: String = tx
-            .query_one(
-                "SELECT proposal_digest FROM cirislens.accord_proposal_nonce_claim \
-                 WHERE family_key_id = $1 AND nonce = $2",
-                &[&prep.family_key_id, &prep.nonce],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("accord_proposal nonce read: {e}")))?
-            .try_get(0)
-            .map_err(|e| Error::Backend(format!("accord_proposal nonce read: {e}")))?;
-        if owner != prep.proposal_digest {
-            return Err(crate::federation::accord_quorum::nonce_reused(
-                &proposal, &owner,
-            ));
-        }
-        tx.execute(
-            "INSERT INTO cirislens.accord_proposal (\
-                    proposal_digest, family_key_id, action, nonce, window_until, \
-                    prior_family_digest, payload_sha256, proposal_json, \
-                    authority_signature, persist_row_hash, created_at\
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
-                 ON CONFLICT (proposal_digest) DO NOTHING",
-            &[
-                &prep.proposal_digest,
-                &prep.family_key_id,
-                &prep.action,
-                &prep.nonce,
-                &prep.window_until,
-                &prep.prior_family_digest,
-                &prep.payload_sha256,
-                &prep.proposal_json,
-                &prep.authority_signature,
-                &prep.persist_row_hash,
-                &prep.created_at,
-            ],
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))?;
-        tx.commit()
-            .await
-            .map_err(|e| Error::Backend(format!("accord_proposal commit: {e}")))?;
-        Ok(())
     }
 
     async fn get_accord_proposal(
@@ -10088,7 +11922,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
@@ -10109,7 +11943,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
@@ -10135,7 +11969,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Answered from the V124 `accord_proposal(payload_sha256)` index.
         let rows = client
             .query(
@@ -10158,129 +11992,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
         standing_roster: &[ciris_verify_core::threshold::ThresholdMember],
     ) -> Result<(), crate::federation::Error> {
-        use crate::federation::Error;
-        let stored = self
-            .get_accord_proposal(&participation.proposal_digest)
-            .await?
-            .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "accord participation references unknown proposal {:?}",
-                    participation.proposal_digest
-                ))
-            })?;
-        // The other half of the evidence cursor; same rule.
-        let arrival = {
-            let c = self
-                .get_client()
-                .await
-                .map_err(|e| Error::Backend(e.to_string()))?;
-            let last: Option<chrono::DateTime<chrono::Utc>> = c
-                .query_one(
-                    "SELECT MAX(server_arrival_at) FROM cirislens.accord_participation",
-                    &[],
-                )
-                .await
-                .map_err(|e| Error::Backend(format!("last server_arrival_at: {e}")))?
-                .get(0);
-            crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last)
-        };
-        let prep = crate::federation::accord_quorum::verify_and_prepare_participation(
-            &stored.proposal,
-            &participation,
+        crate::federation::accord_admit::put_accord_participation_planned(
+            self,
+            participation,
             standing_roster,
-            arrival,
-        )?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
-        // M6 dedup by (proposal_digest, pinned_pubkey): idempotent if
-        // identical, conflict if a different vote.
-        let existing: Option<String> = client
-            .query_opt(
-                "SELECT persist_row_hash FROM cirislens.accord_participation \
-                 WHERE proposal_digest = $1 AND pinned_pubkey = $2",
-                &[&prep.proposal_digest, &prep.pinned_pubkey],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("accord_participation dedup check: {e}")))?
-            .map(|r| r.safe_get_with("persist_row_hash", Error::Backend))
-            .transpose()?;
-        if let Some(h) = existing {
-            if h == prep.persist_row_hash {
-                return Ok(());
-            }
-            return Err(Error::Conflict(format!(
-                "accord participation: holder (pinned pubkey) already voted differently on proposal {:?} (M6 — one vote per holder)",
-                participation.proposal_digest
-            )));
-        }
-        // v36.0.0 (CIRISPersist#719) — the dedup SELECT above runs on a POOLED
-        // connection with NO transaction, so it is a check-then-act window:
-        // two carriers offering overlapping bundles both saw no row, and the
-        // loser hit the (proposal_digest, pinned_pubkey) PK and surfaced
-        // `Error::Backend("duplicate key ...")` where this contract says
-        // idempotent no-op. Integrity always held — the PK is the backstop —
-        // but the ERROR PATH lied, and it is reachable today by two peers
-        // relaying the same accord evidence to one node.
-        //
-        // `ON CONFLICT DO NOTHING` alone would be WRONG: it silently accepts a
-        // DIFFERING concurrent vote, which is exactly what M6 exists to refuse.
-        // So the insert absorbs the race and a zero-row result re-reads to
-        // decide — identical ⇒ the no-op this contract promises, different ⇒
-        // the same Conflict the pre-check would have raised.
-        let inserted = client
-            .execute(
-                "INSERT INTO cirislens.accord_participation (\
-                    proposal_digest, member_id, pinned_pubkey, vote, window_until, \
-                    signed_at, server_arrival_at, participation_json, persist_row_hash\
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
-                 ON CONFLICT (proposal_digest, pinned_pubkey) DO NOTHING",
-                &[
-                    &prep.proposal_digest,
-                    &prep.member_id,
-                    &prep.pinned_pubkey,
-                    &prep.vote,
-                    &prep.window_until,
-                    &prep.signed_at,
-                    &prep.server_arrival_at,
-                    &prep.participation_json,
-                    &prep.persist_row_hash,
-                ],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("insert accord_participation: {e}")))?;
-        if inserted == 0 {
-            let raced: Option<String> = client
-                .query_opt(
-                    "SELECT persist_row_hash FROM cirislens.accord_participation \
-                     WHERE proposal_digest = $1 AND pinned_pubkey = $2",
-                    &[&prep.proposal_digest, &prep.pinned_pubkey],
-                )
-                .await
-                .map_err(|e| Error::Backend(format!("accord_participation race re-read: {e}")))?
-                .map(|r| r.safe_get_with("persist_row_hash", Error::Backend))
-                .transpose()?;
-            match raced {
-                Some(h) if h == prep.persist_row_hash => return Ok(()),
-                Some(_) => {
-                    return Err(Error::Conflict(format!(
-                        "accord participation: holder (pinned pubkey) already voted differently on proposal {:?} (M6 — one vote per holder, decided on the concurrent-insert path)",
-                        participation.proposal_digest
-                    )))
-                }
-                // DO NOTHING fired but the row is gone: only a concurrent
-                // delete explains it, and this plane is append-only.
-                None => {
-                    return Err(Error::Backend(
-                        "accord_participation: insert conflicted but no row is present — the \
-                         append-only invariant does not hold on this table"
-                            .to_owned(),
-                    ))
-                }
-            }
-        }
-        Ok(())
+        )
+        .await
     }
 
     async fn list_accord_participations(
@@ -10291,7 +12008,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT participation_json, pinned_pubkey, server_arrival_at, persist_row_hash \
@@ -10312,56 +12029,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         decision: ciris_verify_core::accord_live_quorum::AccordDecision,
     ) -> Result<(), crate::federation::Error> {
-        use crate::federation::Error;
-        let prep =
-            crate::federation::accord_quorum::prepare_decision(&decision, chrono::Utc::now())?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
-        // Immutable (M2).
-        let existing: Option<String> = client
-            .query_opt(
-                "SELECT persist_row_hash FROM cirislens.accord_decision WHERE proposal_digest = $1",
-                &[&prep.proposal_digest],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("accord_decision immutability check: {e}")))?
-            .map(|r| r.safe_get_with("persist_row_hash", Error::Backend))
-            .transpose()?;
-        if let Some(h) = existing {
-            if h == prep.persist_row_hash {
-                return Ok(());
-            }
-            return Err(Error::Conflict(format!(
-                "accord decision for proposal {:?} already recorded with different content (M2 — immutable)",
-                prep.proposal_digest
-            )));
-        }
-        client
-            .execute(
-                "INSERT INTO cirislens.accord_decision (\
-                    proposal_digest, family_key_id, authorized, yes, no, abstain, \
-                    live_set, window_until, decision_json, \
-                    persist_row_hash, decided_at\
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-                &[
-                    &prep.proposal_digest,
-                    &prep.family_key_id,
-                    &prep.authorized,
-                    &prep.yes,
-                    &prep.no,
-                    &prep.abstain,
-                    &prep.live_set,
-                    &prep.window_until,
-                    &prep.decision_json,
-                    &prep.persist_row_hash,
-                    &prep.decided_at,
-                ],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("insert accord_decision: {e}")))?;
-        Ok(())
+        crate::federation::accord_admit::put_accord_decision_planned(self, decision).await
     }
 
     async fn get_accord_decision(
@@ -10372,7 +12040,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT decision_json, persist_row_hash, decided_at \
@@ -10392,7 +12060,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .execute(
                 "INSERT INTO cirislens.accord_active_halt (family_key_id, active_halt_id, set_at) \
@@ -10414,7 +12082,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT family_key_id, active_halt_id, set_at FROM cirislens.accord_active_halt \
@@ -10434,7 +12102,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .execute(
                 "DELETE FROM cirislens.accord_active_halt \
@@ -10460,7 +12128,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v36.0.0 (#668) — THIS node's serve position (V130).
         let admitted_at = self
             .next_plane_position(&client, "federation_identity_occurrence_revocations")
@@ -10516,7 +12184,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let backend = |e: tokio_postgres::Error| {
             crate::federation::Error::Backend(format!("self-roster receipt: {e}"))
         };
@@ -10556,7 +12224,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT attestation_id, identity_key_id, received_at, settled_at, outcome \
@@ -10578,7 +12246,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT attestation_id, identity_key_id, received_at, settled_at, outcome \
@@ -10601,7 +12269,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .execute(
                 "UPDATE cirislens.federation_self_roster_proposals \
@@ -10618,123 +12286,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         revocation: crate::federation::SignedFamilyMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::FamilyMembershipRevocation,
-            &revocation,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
-        // other admission step.
-        crate::federation::verify_family_membership_revocation_admission(self, &revocation).await?;
-        let mut row = revocation.family_membership_revocation;
-        // v49.0.0 (CIRISPersist#910.3) — standing, by the family's own
-        // `consensus_protocol` at the row's instant (the #908 family half).
-        crate::federation::check_family_roster_authority(
-            self,
-            &row.family_key_id,
-            &revocation.authority_key_id,
-            &crate::federation::roster_row_signer_set(
-                &revocation.authority_key_id,
-                &revocation.cosignatures,
-            ),
-            crate::federation::types::FamilyMember {
-                key_id: row.removed_identity_key_id.clone(),
-                joined_at: row.effective_at,
-                role: None,
-            },
-            true,
-            row.effective_at,
-        )
-        .await?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let witness = serde_json::json!(row.witness_set);
-        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
-        // signature the gate above already verified (was verified-then-
-        // discarded).
-        let authority_key_id = revocation.authority_key_id;
-        let scrub_signature_classical = revocation.scrub_signature_classical;
-        let scrub_signature_pqc = revocation.scrub_signature_pqc;
-        // v49.0.0 (CIRISPersist#908, V153) — the co-signatures the gate above
-        // verified, stored so the since-read serves the row byte-exact.
-        let cosignatures = serde_json::to_value(&revocation.cosignatures)
-            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures: {e}")))?;
-        let client = self
-            .get_client()
+        crate::federation::family_admit::put_family_membership_revocation_planned(self, revocation)
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // v36.0.0 (#668) — THIS node's serve position (V130).
-        let admitted_at = self
-            .next_plane_position(&client, "federation_family_membership_revocations")
-            .await?;
-        // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK. v49.0.0 (#910.1,
-        // V154): the PK carries `effective_at`, so an exact retry is the no-op
-        // and returns before the index entry and the hard_case event (one
-        // removal is recorded — and announced — once), while a removal at
-        // another instant is another event. The unique index arbitrates
-        // (race-safe). The serve position is computed from
-        // `MAX(admitted_at)`, not allocated, so a skipped write leaves nothing.
-        let inserted = client
-            .execute(
-                "INSERT INTO cirislens.federation_family_membership_revocations (\
-                    family_key_id, removed_identity_key_id, removed_at, effective_at, \
-                    reason, witness_set, persist_row_hash, \
-                    authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                    admitted_at, cosignatures\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-                 ON CONFLICT (family_key_id, removed_identity_key_id, effective_at) DO NOTHING",
-                &[
-                    &row.family_key_id,
-                    &row.removed_identity_key_id,
-                    &row.removed_at,
-                    &row.effective_at,
-                    &row.reason,
-                    &witness,
-                    &row.persist_row_hash,
-                    &authority_key_id,
-                    &scrub_signature_classical,
-                    &scrub_signature_pqc,
-                    &admitted_at,
-                    &cosignatures,
-                ],
-            )
-            .await
-            .map_err(map_revocation_pg_err("family_membership_revocation"))?;
-        if inserted == 0 {
-            return Ok(());
-        }
-        // v21.1.0 (CIRISPersist#507b) — computed after the INSERT succeeds
-        // (`row` still owns its final `persist_row_hash`).
-        let effective_at_rfc3339 = row.effective_at.to_rfc3339();
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("family_key_id", &row.family_key_id),
-            ("removed_identity_key_id", &row.removed_identity_key_id),
-            ("effective_at", &effective_at_rfc3339),
-        ]);
-        drop(client);
-        self.index_stored_record("FamilyMembershipRevocation", &wire_index_key)
-            .await?;
-        // CEG §7.7 (CIRISPersist#161 Ask 5) — emit the removal-direction
-        // membership-change hard_case (`change_kind: "removed"`), keyed on
-        // the re-key epoch. Idempotent on event_id (ON CONFLICT DO NOTHING).
-        // v57.0.0 (CIRISPersist#988 item 2) — an observation: a node with no
-        // attester records nothing; the removal already landed.
-        crate::federation::hard_case::record_observation(
-            self,
-            crate::federation::hard_case::membership_removed_event(
-                crate::federation::hard_case::kind::FAMILY_MEMBERSHIP_CHANGE,
-                &row.family_key_id,
-                &row.removed_identity_key_id,
-                row.effective_at,
-            ),
-        )
-        .await?;
-        Ok(())
     }
 
     async fn put_community_membership_revocation(
@@ -10761,103 +12314,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         widening: crate::federation::SignedFamilyMembershipWidening,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::FamilyMembershipWidening,
-            &widening,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        // v49.0.0 (CIRISPersist#910) — the family twin of the room's widening
-        // door; see the sqlite twin for the legs.
-        crate::federation::verify_family_membership_widening_admission(self, &widening).await?;
-        let mut row = widening.family_membership_widening;
-        crate::federation::reject_future_dated_family_widening(row.effective_at)?;
-        crate::federation::check_family_roster_authority(
-            self,
-            &row.family_key_id,
-            &widening.authority_key_id,
-            &crate::federation::roster_row_signer_set(
-                &widening.authority_key_id,
-                &widening.cosignatures,
-            ),
-            row.member(),
-            false,
-            row.effective_at,
-        )
-        .await?;
-        if self.lookup_family(&row.family_key_id).await?.is_none() {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "{} does not exist in federation_families",
-                row.family_key_id
-            )));
-        }
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let authority_key_id = widening.authority_key_id;
-        let scrub_signature_classical = widening.scrub_signature_classical;
-        let scrub_signature_pqc = widening.scrub_signature_pqc;
-        let cosignatures = serde_json::to_value(&widening.cosignatures)
-            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures: {e}")))?;
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
-        let admitted_at = self
-            .next_plane_position(&tx, "federation_family_membership_widenings")
-            .await?;
-        let inserted = tx
-            .execute(
-                "INSERT INTO cirislens.federation_family_membership_widenings (\
-                family_key_id, member_key_id, joined_at, effective_at, role, \
-                persist_row_hash, authority_key_id, scrub_signature_classical, \
-                scrub_signature_pqc, admitted_at, cosignatures\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-             ON CONFLICT (family_key_id, member_key_id, effective_at) DO NOTHING",
-                &[
-                    &row.family_key_id,
-                    &row.member_key_id,
-                    &row.joined_at,
-                    &row.effective_at,
-                    &row.role,
-                    &row.persist_row_hash,
-                    &authority_key_id,
-                    &scrub_signature_classical,
-                    &scrub_signature_pqc,
-                    &admitted_at,
-                    &cosignatures,
-                ],
-            )
-            .await
-            .map_err(map_revocation_pg_err("family_membership_widening"))?;
-        tx.commit()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
-        if inserted == 1 {
-            let effective_at_rfc3339 = row.effective_at.to_rfc3339();
-            let wire_index_key = crate::federation::wire_index::record_key(&[
-                ("family_key_id", &row.family_key_id),
-                ("member_key_id", &row.member_key_id),
-                ("effective_at", &effective_at_rfc3339),
-            ]);
-            self.index_stored_record("FamilyMembershipWidening", &wire_index_key)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn put_community_membership_listing(
-        &self,
-        listing: crate::federation::SignedCommunityMembershipListing,
-    ) -> Result<(), crate::federation::Error> {
-        crate::federation::community_admit::put_community_membership_listing_planned(self, listing)
+        crate::federation::family_admit::put_family_membership_widening_planned(self, widening)
             .await
     }
 
@@ -10869,7 +12326,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT identity_key_id, occurrence_key_id, revoked_at, effective_at, \
@@ -10896,7 +12353,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT family_key_id, removed_identity_key_id, removed_at, effective_at, \
@@ -10924,7 +12381,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT community_key_id, removed_identity_key_id, removed_at, effective_at, \
@@ -10951,7 +12408,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT family_key_id, member_key_id, joined_at, effective_at, role, \
@@ -10978,7 +12435,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT community_key_id, member_key_id, joined_at, effective_at, role, \
@@ -10998,33 +12455,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
-    async fn list_community_membership_listings_for(
-        &self,
-        community_key_id: &str,
-    ) -> Result<Vec<crate::federation::CommunityMembershipListing>, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let rows = client
-            .query(
-                "SELECT community_key_id, member_key_id, effective_at, listed, \
-                    persist_row_hash \
-                 FROM cirislens.federation_community_membership_listings \
-                 WHERE community_key_id = $1 ORDER BY member_key_id ASC, effective_at ASC",
-                &[&community_key_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "list_community_membership_listings_for: {e}"
-                ))
-            })?;
-        rows.into_iter()
-            .map(pg_row_to_community_membership_listing)
-            .collect()
-    }
-
     async fn community_roster_signers(
         &self,
         community_key_id: &str,
@@ -11032,7 +12462,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let be = |e: tokio_postgres::Error| {
             crate::federation::Error::Backend(format!("community_roster_signers: {e}"))
         };
@@ -11107,7 +12537,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let be = |e: tokio_postgres::Error| {
             crate::federation::Error::Backend(format!("family_roster_signers: {e}"))
         };
@@ -11181,228 +12611,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         proof: crate::federation::SignedLocationProof,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::LocationProof,
-            &proof,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
-        // other admission step.
-        crate::federation::verify_location_proof_admission(self, &proof).await?;
-        // v53.1.2 (CIRISPersist#984 row 19) — a held PK re-offered as a
-        // WITHDRAWAL (the attester's re-signed row, as a peer serves it) is the
-        // withdraw door's case: the local and the replicated path run the one
-        // predicate. Any other re-offer keeps its path (the PK refuses it).
-        if proof.location_proof.withdrawn_at.is_some() {
-            let probe = self
-                .get_client()
-                .await
-                .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-            let held = probe
-                .query_opt(
-                    "SELECT 1 FROM cirislens.federation_location_proofs \
-                      WHERE subject_key_id = $1 AND asserted_at = $2",
-                    &[
-                        &proof.location_proof.subject_key_id,
-                        &proof.location_proof.asserted_at,
-                    ],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!("put_location_proof held: {e}"))
-                })?
-                .is_some();
-            drop(probe);
-            if held {
-                return crate::federation::FederationDirectory::withdraw_location_proof(
-                    self, proof,
-                )
-                .await;
-            }
-        }
-        let mut row = proof.location_proof;
-        crate::federation::location::validate_location_cell(&row.cell_id, row.cell_resolution)?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let resolution = i16::from(row.cell_resolution);
-        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
-        // signature the gate above already verified (was verified-then-
-        // discarded).
-        let authority_key_id = proof.authority_key_id;
-        let scrub_signature_classical = proof.scrub_signature_classical;
-        let scrub_signature_pqc = proof.scrub_signature_pqc;
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // v36.0.0 (#668) — THIS node's serve position (V130).
-        let admitted_at = self
-            .next_plane_position(&client, "federation_location_proofs")
-            .await?;
-        client
-            .execute(
-                "INSERT INTO cirislens.federation_location_proofs (\
-                    subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
-                    attestation_evidence, withdrawn_at, persist_row_hash, \
-                    authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                    admitted_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-                &[
-                    &row.subject_key_id,
-                    &row.cell_id,
-                    &resolution,
-                    &row.asserted_at,
-                    &row.valid_until,
-                    &row.attestation_evidence,
-                    &row.withdrawn_at,
-                    &row.persist_row_hash,
-                    &authority_key_id,
-                    &scrub_signature_classical,
-                    &scrub_signature_pqc,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(map_revocation_pg_err("location_proof"))?;
-        // v21.1.0 (CIRISPersist#507b) — computed after the INSERT succeeds.
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("subject_key_id", &row.subject_key_id),
-            // v31.0.0 (CIRISPersist#646) — the microsecond-floor spelling.
-            // `to_rfc3339()` here wrote a locator postgres could never match
-            // back, because the reloaded `asserted_at` comes out rounded.
-            (
-                "asserted_at",
-                &crate::federation::wire_index::locator_instant(&row.asserted_at),
-            ),
-        ]);
-        drop(client);
-        self.index_stored_record("LocationProof", &wire_index_key)
-            .await?;
-        Ok(())
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::evidence_admit::put_location_proof_planned(self, proof).await
     }
 
     async fn withdraw_location_proof(
         &self,
         proof: crate::federation::SignedLocationProof,
     ) -> Result<(), crate::federation::Error> {
-        use crate::federation::location::{
-            check_location_proof_withdrawal, LocationProofWithdrawal,
-        };
-        // #984 row 16 — the signature and standing legs, exactly as a put.
-        crate::federation::verify_location_proof_admission(self, &proof).await?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let subject = proof.location_proof.subject_key_id.clone();
-        let asserted_at = proof.location_proof.asserted_at;
-        let held = client
-            .query_opt(
-                "SELECT * FROM cirislens.federation_location_proofs \
-                  WHERE subject_key_id = $1 AND asserted_at = $2",
-                &[&subject, &asserted_at],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("withdraw_location_proof read: {e}"))
-            })?
-            .map(pg_row_to_signed_location_proof)
-            .transpose()?;
-        let Some(held) = held else {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "location_proof_withdraw_not_held: no proof by {subject} at {asserted_at} is held \
-                 here"
-            )));
-        };
-        match check_location_proof_withdrawal(&held, &proof)? {
-            LocationProofWithdrawal::AlreadyWithdrawn => return Ok(()),
-            LocationProofWithdrawal::Apply => {}
-        }
-        #[cfg(test)]
-        self.test_rival_location_proof_withdrawal().await?;
-        let mut row = proof.location_proof;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        // The row moves to a fresh serve position (V130) so a peer past its
-        // cursor is served the withdrawal.
-        let admitted_at = self
-            .next_plane_position(&client, "federation_location_proofs")
-            .await?;
-        // v53.1.3 (Codex on #985 P2, #986) — a COMPARE-AND-SET: the decision
-        // above was made from a read, and a rival withdrawal can land between
-        // that read and this write. The guard makes the loser write nothing;
-        // it re-reads below.
-        let written = client
-            .execute(
-                "UPDATE cirislens.federation_location_proofs \
-                    SET withdrawn_at = $3, persist_row_hash = $4, authority_key_id = $5, \
-                        scrub_signature_classical = $6, scrub_signature_pqc = $7, \
-                        admitted_at = $8 \
-                  WHERE subject_key_id = $1 AND asserted_at = $2 AND withdrawn_at IS NULL",
-                &[
-                    &subject,
-                    &asserted_at,
-                    &row.withdrawn_at,
-                    &row.persist_row_hash,
-                    &proof.authority_key_id,
-                    &proof.scrub_signature_classical,
-                    &proof.scrub_signature_pqc,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("withdraw_location_proof: {e}"))
-            })?;
-        if written == 0 {
-            // Lost the race: the row is withdrawn by the rival (already
-            // withdrawn, the first instant stands), or gone.
-            let now_held = client
-                .query_opt(
-                    "SELECT withdrawn_at FROM cirislens.federation_location_proofs \
-                      WHERE subject_key_id = $1 AND asserted_at = $2",
-                    &[&subject, &asserted_at],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!(
-                        "withdraw_location_proof re-read: {e}"
-                    ))
-                })?
-                .map(|r| {
-                    r.safe_get_with::<Option<chrono::DateTime<chrono::Utc>>, _, _, _>(
-                        "withdrawn_at",
-                        crate::federation::Error::Backend,
-                    )
-                })
-                .transpose()?;
-            return match now_held {
-                Some(Some(_)) => Ok(()),
-                _ => Err(crate::federation::Error::Backend(format!(
-                    "withdraw_location_proof: the held proof by {subject} at {asserted_at} \
-                     changed under the write and is not withdrawn"
-                ))),
-            };
-        }
-        // v53.1.3 (Codex on #985 P1, #986) — the row's bytes changed, so the
-        // signed wire index must learn the new content hash exactly as the
-        // put path teaches it: after the durable write, the pooled client
-        // released first (see `index_stored_record`).
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("subject_key_id", &subject),
-            (
-                "asserted_at",
-                &crate::federation::wire_index::locator_instant(&asserted_at),
-            ),
-        ]);
-        drop(client);
-        self.index_stored_record("LocationProof", &wire_index_key)
-            .await?;
-        Ok(())
+        crate::federation::evidence_admit::withdraw_location_proof_planned(self, proof).await
     }
 
     async fn list_location_proofs_for(
@@ -11412,7 +12629,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
@@ -11443,7 +12660,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Single-statement atomic election: insert fresh, or steal iff the
         // incumbent's heartbeat is stale. A live incumbent fails the DO
         // UPDATE WHERE → 0 rows → RETURNING empty → we lost. Two racers:
@@ -11487,7 +12704,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Refresh only if WE are still the current owner — match on
         // (instance, lease_version, pid). If the lease was stolen the
         // version/pid moved on → 0 rows → None (demotion signal).
@@ -11518,7 +12735,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_opt(
                 "SELECT instance_name, owner_pid, owner_hostname, acquired_at, \
@@ -11540,7 +12757,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Ownership-checked + idempotent: only delete our own current
         // lease. A no-op if it was already stolen (never delete a sibling's).
         client
@@ -11562,305 +12779,27 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         destination: &crate::federation::TransportDestination,
     ) -> Result<(), crate::federation::Error> {
-        let client = self
-            .get_client()
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::transport_admit::put_transport_destination_planned(self, destination)
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // #443 route-table put: keyed on (occ, kind) — `destination` is
-        // payload — and GUARDED monotonic on (epoch, asserted_at)
-        // lexicographic. A stale assertion is a silent no-op.
-        //
-        // v21.4.0 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: an
-        // unsigned writer never demotes a signed row (signature columns
-        // preserved unconditionally; a content-CHANGING unsigned write
-        // against a signed row is a silent no-op). See the sqlite twin's
-        // comment for the full rationale.
-        // v21.17.1 (CIRISPersist#541) — the preserve set must equal the
-        // VERIFIED set: `verify_signed_transport_destination` checks nine
-        // fields, so on a signed row an unsigned writer may advance only
-        // `last_seen_at`. See the sqlite guard for the full rationale.
-        let provenance_token = destination.binding_provenance.as_str();
-        let epoch = i64::try_from(destination.epoch).map_err(|_| {
-            crate::federation::Error::InvalidArgument(
-                "transport_destination epoch exceeds i64".into(),
-            )
-        })?;
-        // v36.0.0 (#668) — serve position (V130). The unsigned door stamps it
-        // on INSERT and re-stamps only through the `signature IS NULL` arm:
-        // on a SIGNED row this door may advance ONLY `last_seen_at` (advisory
-        // liveness, outside the verifier's nine fields), and re-serving the
-        // signed stream on every liveness ping would churn it for content no
-        // verifier covers.
-        let admitted_at = self
-            .next_plane_position(&client, "transport_destinations")
-            .await?;
-        client
-            .execute(
-                "INSERT INTO cirislens.transport_destinations \
-                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
-                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
-                     binding_provenance, epoch, retired_at, \
-                     attesting_key_id, signed_envelope, signature, admitted_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, NULL, $11) \
-                 ON CONFLICT (occurrence_key_id, transport_kind) \
-                 DO UPDATE SET destination = \
-                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
-                        THEN EXCLUDED.destination \
-                        ELSE cirislens.transport_destinations.destination END, \
-                    asserted_at = \
-                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
-                        THEN EXCLUDED.asserted_at \
-                        ELSE cirislens.transport_destinations.asserted_at END, \
-                    last_seen_at = EXCLUDED.last_seen_at, \
-                    transport_ed25519_pubkey_base64 = \
-                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
-                        THEN EXCLUDED.transport_ed25519_pubkey_base64 \
-                        ELSE cirislens.transport_destinations.transport_ed25519_pubkey_base64 END, \
-                    transport_x25519_pubkey_base64 = \
-                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
-                        THEN EXCLUDED.transport_x25519_pubkey_base64 \
-                        ELSE cirislens.transport_destinations.transport_x25519_pubkey_base64 END, \
-                    binding_provenance = \
-                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
-                        THEN EXCLUDED.binding_provenance \
-                        ELSE cirislens.transport_destinations.binding_provenance END, \
-                    epoch = CASE WHEN cirislens.transport_destinations.signature IS NULL \
-                        THEN EXCLUDED.epoch ELSE cirislens.transport_destinations.epoch END, \
-                    retired_at = CASE WHEN cirislens.transport_destinations.signature IS NULL \
-                        THEN EXCLUDED.retired_at \
-                        ELSE cirislens.transport_destinations.retired_at END, \
-                    admitted_at = CASE WHEN cirislens.transport_destinations.signature IS NULL \
-                        THEN EXCLUDED.admitted_at \
-                        ELSE cirislens.transport_destinations.admitted_at END, \
-                    attesting_key_id = cirislens.transport_destinations.attesting_key_id, \
-                    signed_envelope = cirislens.transport_destinations.signed_envelope, \
-                    signature = cirislens.transport_destinations.signature \
-                 WHERE (EXCLUDED.epoch > cirislens.transport_destinations.epoch \
-                    OR (EXCLUDED.epoch = cirislens.transport_destinations.epoch \
-                        AND EXCLUDED.asserted_at > cirislens.transport_destinations.asserted_at)) \
-                   AND (cirislens.transport_destinations.signature IS NULL \
-                    OR (EXCLUDED.destination = cirislens.transport_destinations.destination \
-                        AND COALESCE(EXCLUDED.transport_ed25519_pubkey_base64, '') \
-                            = COALESCE(cirislens.transport_destinations.transport_ed25519_pubkey_base64, '') \
-                        AND COALESCE(EXCLUDED.transport_x25519_pubkey_base64, '') \
-                            = COALESCE(cirislens.transport_destinations.transport_x25519_pubkey_base64, '')))",
-                &[
-                    &destination.occurrence_key_id,
-                    &destination.transport_kind,
-                    &destination.destination,
-                    &destination.asserted_at,
-                    &destination.last_seen_at,
-                    &destination.transport_ed25519_pubkey_base64,
-                    &destination.transport_x25519_pubkey_base64,
-                    &provenance_token,
-                    &epoch,
-                    &destination.retired_at,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("put_transport_destination: {e}"))
-            })?;
-        Ok(())
     }
 
     async fn put_signed_transport_destination(
         &self,
         signed: &crate::federation::SignedTransportDestination,
     ) -> Result<crate::federation::TransportDestinationApplyOutcome, crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::TransportDestination,
-            signed,
-        )
-        .await?
-        {
-            return Ok(
-                crate::federation::self_at_login::TransportDestinationApplyOutcome::Unchanged,
-            );
-        }
-        use crate::federation::TransportDestinationApplyOutcome as Outcome;
-        // #443 — the admission gate BEFORE any write (one gate, all backends).
-        crate::federation::admission::verify_signed_transport_destination(self, signed).await?;
-        // v59.0.0 (CIRISPersist#1106, CC 5.3.4) — a seated serve node's
-        // bundle-pinned transit pair rotates by holder quorum, not alone.
-        crate::federation::transport_rebind::check_serve_rotation(self, signed).await?;
-        let d = &signed.transport_destination;
-        let envelope_json = serde_json::to_string(&signed.signed_envelope)
-            .map_err(|e| crate::federation::Error::Backend(format!("signed_envelope: {e}")))?;
-        let signature_json = serde_json::to_string(&signed.signature)
-            .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
-        let epoch = i64::try_from(d.epoch).map_err(|_| {
-            crate::federation::Error::InvalidArgument(
-                "transport_destination epoch exceeds i64".into(),
-            )
-        })?;
-        let client = self
-            .get_client()
+        crate::federation::transport_admit::put_signed_transport_destination_planned(self, signed)
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // Classify against the current row (retired rows INCLUDED — the
-        // tombstone must keep winning) ...
-        let existing = client
-            .query_opt(
-                "SELECT occurrence_key_id, transport_kind, destination, asserted_at, \
-                    last_seen_at, transport_ed25519_pubkey_base64, \
-                    transport_x25519_pubkey_base64, binding_provenance, epoch, retired_at \
-                 FROM cirislens.transport_destinations \
-                 WHERE occurrence_key_id = $1 AND transport_kind = $2",
-                &[&d.occurrence_key_id, &d.transport_kind],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("put_signed_transport_destination: {e}"))
-            })?
-            .map(|row| pg_row_to_transport_destination(&row))
-            .transpose()?;
-        // v21.4.0 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: the
-        // monotonic-clock refusal applies only against a stored row that is
-        // itself SIGNED; a signed write always reclaims an unsigned row
-        // (occurrence-projection / announce state) regardless of clocks.
-        let (stored_signed, stored_envelope): (bool, Option<String>) = if existing.is_some() {
-            let r = client
-                .query_one(
-                    "SELECT signature IS NOT NULL, signed_envelope \
-                     FROM cirislens.transport_destinations \
-                     WHERE occurrence_key_id = $1 AND transport_kind = $2",
-                    &[&d.occurrence_key_id, &d.transport_kind],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!("signed-presence read: {e}"))
-                })?;
-            (r.get(0), r.get(1))
-        } else {
-            (false, None)
-        };
-        // v56.0.0 (#1077) — the transit KEX pair is envelope-only: an equal
-        // typed projection is `Unchanged` only when the stored envelope carries
-        // the same pair. A same-clock re-sign that changes it falls to the
-        // monotonic refusal below.
-        let same_pair = stored_envelope
-            .as_deref()
-            .and_then(|e| serde_json::from_str::<serde_json::Value>(e).ok())
-            .is_some_and(|stored| {
-                crate::federation::self_at_login::same_transit_kex_member(
-                    &stored,
-                    &signed.signed_envelope,
-                )
-            });
-        let fresh = match existing {
-            Some(ref ex) if *ex == *d && stored_signed && same_pair => {
-                return Ok(Outcome::Unchanged)
-            }
-            Some(ref ex)
-                if stored_signed && (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) =>
-            {
-                return Ok(Outcome::Refused {
-                    reason: format!(
-                        "incoming (epoch {}, asserted_at {}) does not supersede stored \
-                         SIGNED (epoch {}, asserted_at {})",
-                        d.epoch,
-                        d.asserted_at.to_rfc3339(),
-                        ex.epoch,
-                        ex.asserted_at.to_rfc3339()
-                    ),
-                })
-            }
-            Some(_) => false,
-            None => true,
-        };
-        // v36.0.0 (#668) — serve position (V130). A signed apply always
-        // stamps/re-stamps: it either admits a new signed row or supersedes
-        // covered content, and either way the signed stream must re-serve it.
-        let admitted_at = self
-            .next_plane_position(&client, "transport_destinations")
-            .await?;
-        // ... then write with the SAME guard in the SQL (defense in depth: a
-        // concurrent supersession between plan and act loses monotonically).
-        let n = client
-            .execute(
-                "INSERT INTO cirislens.transport_destinations \
-                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
-                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
-                     binding_provenance, epoch, retired_at, \
-                     attesting_key_id, signed_envelope, signature, admitted_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
-                 ON CONFLICT (occurrence_key_id, transport_kind) \
-                 DO UPDATE SET destination = EXCLUDED.destination, \
-                    asserted_at = EXCLUDED.asserted_at, \
-                    last_seen_at = EXCLUDED.last_seen_at, \
-                    transport_ed25519_pubkey_base64 = EXCLUDED.transport_ed25519_pubkey_base64, \
-                    transport_x25519_pubkey_base64 = EXCLUDED.transport_x25519_pubkey_base64, \
-                    binding_provenance = EXCLUDED.binding_provenance, \
-                    epoch = EXCLUDED.epoch, \
-                    retired_at = EXCLUDED.retired_at, \
-                    attesting_key_id = EXCLUDED.attesting_key_id, \
-                    signed_envelope = EXCLUDED.signed_envelope, \
-                    signature = EXCLUDED.signature, \
-                    admitted_at = EXCLUDED.admitted_at \
-                 WHERE EXCLUDED.epoch > cirislens.transport_destinations.epoch \
-                    OR (EXCLUDED.epoch = cirislens.transport_destinations.epoch \
-                        AND EXCLUDED.asserted_at > cirislens.transport_destinations.asserted_at) \
-                    OR cirislens.transport_destinations.signature IS NULL",
-                &[
-                    &d.occurrence_key_id,
-                    &d.transport_kind,
-                    &d.destination,
-                    &d.asserted_at,
-                    &d.last_seen_at,
-                    &d.transport_ed25519_pubkey_base64,
-                    &d.transport_x25519_pubkey_base64,
-                    &d.binding_provenance.as_str(),
-                    &epoch,
-                    &d.retired_at,
-                    &signed.attesting_key_id,
-                    &envelope_json,
-                    &signature_json,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("put_signed_transport_destination: {e}"))
-            })?;
-        if n == 0 {
-            // Lost a race to a concurrent (newer) write — fail-closed,
-            // re-offerable (the replication-plane Conflict rule).
-            return Ok(Outcome::Refused {
-                reason: "superseded concurrently by a newer record".into(),
-            });
-        }
-        // v21.1.0 (CIRISPersist#507b) — indexed under the shape
-        // `list_signed_transport_destinations_since` re-serializes.
-        // v31.0.0 (CIRISPersist#646) — "the stored row is byte-identical to
-        // `signed`" was the assumption this whole class is made of. It is not
-        // this site's to make: read the row back and hash that.
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("occurrence_key_id", &d.occurrence_key_id),
-            ("transport_kind", &d.transport_kind),
-        ]);
-        drop(client);
-        self.index_stored_record("TransportDestination", &wire_index_key)
-            .await?;
-        Ok(if fresh {
-            Outcome::Inserted
-        } else {
-            Outcome::Superseded
-        })
     }
 
-    async fn list_transport_destinations_for(
+    async fn list_transport_destinations_for_unfolded(
         &self,
         occurrence_key_id: &str,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // #443 — live routes only: retired tombstones are excluded from
         // every list_* read (they still gossip via the signed read).
         let rows = client
@@ -11887,7 +12826,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // #443 replication read: only signed-put rows carry the signature
         // container; trusted-local rows (NULL sig cols) are omitted.
         // RETIRED rows are INCLUDED — tombstones must gossip.
@@ -11916,13 +12855,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
-    async fn list_all_transport_destinations(
+    async fn list_all_transport_destinations_unfolded(
         &self,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // #443 — live routes only, ordered by the route key (deterministic
         // restore; one row per (occ, kind) is structural).
         let rows = client
@@ -11942,14 +12881,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.iter().map(pg_row_to_transport_destination).collect()
     }
 
-    async fn list_transport_destinations_by_destination(
+    async fn list_transport_destinations_by_destination_unfolded(
         &self,
         destination: &str,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // #443 — live routes only.
         let rows = client
             .query(
@@ -11979,7 +12918,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let n = client
             .execute(
                 "DELETE FROM cirislens.transport_destinations \
@@ -11999,62 +12938,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         claim: &crate::federation::types::SignedTouchClaim,
     ) -> Result<crate::federation::TouchApplyOutcome, crate::federation::Error> {
-        use crate::federation::TouchApplyOutcome as Outcome;
-        // v21.6.0 (#519 item 2a-iii) — verify-before-mutation: the full
-        // hybrid admission gate, THEN the future-skew guard, THEN the
-        // monotonic-max merge. Mirrors put_signed_transport_destination.
-        crate::federation::admission::verify_signed_touch_claim(self, claim).await?;
-        crate::federation::admission::verify_touch_claim_admission(
-            claim,
-            chrono::Utc::now(),
-            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
-        )?;
-        let envelope_json = serde_json::to_string(&claim.signed_envelope)
-            .map_err(|e| crate::federation::Error::Backend(format!("signed_envelope: {e}")))?;
-        let signature_json = serde_json::to_string(&claim.signature)
-            .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
-        let signer_form = claim.signer_form.as_str();
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // Monotonic-max merge: `fresh_as_of` only ever advances. A fresh
-        // insert always applies (no conflict target); against an existing
-        // row the SQL guard is the single source of truth — mirrors the
-        // put_transport_destination ON-CONFLICT guard EXACTLY, collapsed to
-        // the freshness floor's single-field monotonic comparator.
-        let n = client
-            .execute(
-                "INSERT INTO cirislens.freshness_floor \
-                    (target_key_id, target_kind, fresh_as_of, signer_form, attesting_key_id, \
-                     signed_envelope, signature, cohort_scope) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-                 ON CONFLICT (target_key_id, target_kind) \
-                 DO UPDATE SET fresh_as_of = EXCLUDED.fresh_as_of, \
-                    signer_form = EXCLUDED.signer_form, \
-                    attesting_key_id = EXCLUDED.attesting_key_id, \
-                    signed_envelope = EXCLUDED.signed_envelope, \
-                    signature = EXCLUDED.signature, \
-                    cohort_scope = EXCLUDED.cohort_scope \
-                 WHERE EXCLUDED.fresh_as_of > cirislens.freshness_floor.fresh_as_of",
-                &[
-                    &claim.target_key_id,
-                    &claim.target_kind,
-                    &claim.fresh_as_of,
-                    &signer_form,
-                    &claim.attesting_key_id,
-                    &envelope_json,
-                    &signature_json,
-                    &claim.cohort_scope,
-                ],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("put_touch_claim: {e}")))?;
-        Ok(if n > 0 {
-            Outcome::Advanced
-        } else {
-            Outcome::NotFresher
-        })
+        crate::federation::evidence_admit::put_touch_claim_planned(self, claim).await
     }
 
     async fn lookup_freshness_floor(
@@ -12065,7 +12949,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_opt(
                 "SELECT target_key_id, target_kind, fresh_as_of, signer_form, attesting_key_id, \
@@ -12109,7 +12993,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let mut sql = String::from(
             "SELECT event_id, kind, target_key_id, subject_key_id, detail, emitted_at, \
                 emitter_key_id \
@@ -12146,7 +13030,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
 
     async fn put_wholeness_witness(
         &self,
-        witness: &ciris_verify_core::holonomic::WholenessWitness,
+        witness: &ciris_verify_core::substrate::WholenessWitness,
         sig_ed25519_b64: &str,
         sig_ml_dsa_65_b64: Option<&str>,
         pqc_key_id: &str,
@@ -12154,10 +13038,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         ml_dsa_65_pubkey_b64: Option<&str>,
         disclosed_leaves: Option<&[Vec<u8>]>,
     ) -> Result<(), crate::federation::Error> {
-        // Verify-BEFORE-persist (N3 / RC8 / AV-9): full hybrid-PQC gate +
-        // WW-2 namespace guard + optional leaf/root recompute. On any
-        // failure NOTHING is written.
-        let stored = crate::witness::admit_witness(
+        crate::federation::evidence_admit::put_wholeness_witness_planned(
+            self,
             witness,
             sig_ed25519_b64,
             sig_ml_dsa_65_b64,
@@ -12165,75 +13047,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             ed25519_pubkey_b64,
             ml_dsa_65_pubkey_b64,
             disclosed_leaves,
-        )?;
-        let claim_namespaces_json = serde_json::Value::Array(
-            stored
-                .claim_namespaces
-                .iter()
-                .map(|n| serde_json::Value::String(n.clone()))
-                .collect(),
-        );
-        let epoch_id = i64::try_from(stored.epoch_id).map_err(|_| {
-            crate::federation::Error::Backend("witness epoch_id exceeds i64".into())
-        })?;
-        let observed = i64::try_from(stored.observed_at_unix_ms).map_err(|_| {
-            crate::federation::Error::Backend("witness observed_at_unix_ms exceeds i64".into())
-        })?;
-        let leaf_count = i64::from(stored.leaf_count);
-        let witness_version = i32::from(stored.witness_version);
-        let k = crate::witness::WITNESS_CORPUS_K as i64;
-
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("begin witness tx: {e}")))?;
-        // Idempotent on (peer_id, epoch_id, observed_at_unix_ms).
-        tx.execute(
-            "INSERT INTO cirislens.wholeness_witness_corpus \
-             (peer_id, epoch_id, observed_at_unix_ms, claim_namespaces, merkle_root, \
-              leaf_count, witness_version, signature, signature_ml_dsa_65, pqc_key_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
-             ON CONFLICT (peer_id, epoch_id, observed_at_unix_ms) DO NOTHING",
-            &[
-                &stored.peer_id,
-                &epoch_id,
-                &observed,
-                &claim_namespaces_json,
-                &stored.merkle_root_hex,
-                &leaf_count,
-                &witness_version,
-                &stored.signature,
-                &stored.signature_ml_dsa_65,
-                &stored.pqc_key_id,
-            ],
         )
         .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("insert wholeness_witness_corpus: {e}"))
-        })?;
-        // Prune to the last-K by observed_at (keep newest).
-        tx.execute(
-            "DELETE FROM cirislens.wholeness_witness_corpus \
-             WHERE peer_id = $1 AND (epoch_id, observed_at_unix_ms) IN ( \
-               SELECT epoch_id, observed_at_unix_ms FROM ( \
-                 SELECT epoch_id, observed_at_unix_ms, ROW_NUMBER() OVER ( \
-                   ORDER BY observed_at_unix_ms DESC, epoch_id DESC) AS rn \
-                 FROM cirislens.wholeness_witness_corpus WHERE peer_id = $1 \
-               ) ranked WHERE ranked.rn > $2 )",
-            &[&stored.peer_id, &k],
-        )
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("prune wholeness_witness_corpus: {e}"))
-        })?;
-        tx.commit()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("commit witness tx: {e}")))?;
-        Ok(())
     }
 
     async fn list_wholeness_witnesses_for_peer(
@@ -12243,7 +13058,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT peer_id, epoch_id, observed_at_unix_ms, claim_namespaces, merkle_root, \
@@ -12312,7 +13127,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = client
             .query_one(
                 "SELECT MAX(epoch_id) AS max_epoch FROM cirislens.wholeness_witness_corpus \
@@ -12336,7 +13151,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT DISTINCT peer_id FROM cirislens.wholeness_witness_corpus \
@@ -12370,7 +13185,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT community_key_id, community_name, members, founded_at, \
@@ -12414,7 +13229,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let since_id = since.as_ref().map(|(_, id)| id.clone());
@@ -12450,7 +13265,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let since_id = since.as_ref().map(|(_, id)| id.clone());
@@ -12486,7 +13301,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         // Row-unique tie-break: (subject_key_id, persist_row_hash) — the PK
         // carries an instant, which stays out of the resume token.
@@ -12532,7 +13347,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         // v49.0.0 (#910.1) — the resume id is the three-part PK.
@@ -12583,7 +13398,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         // v48.0.0 (#860) — the resume id is the three-part PK.
@@ -12634,7 +13449,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let (since_a, since_b, since_c) = match since.as_ref() {
@@ -12684,7 +13499,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let (since_a, since_b, since_c) = match since.as_ref() {
@@ -12725,56 +13540,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
-    async fn list_signed_community_membership_listings_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedCommunityMembershipListing>, crate::federation::Error>
-    {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let limit = i64::from(limit);
-        let since_at = since.as_ref().map(|(t, _)| *t);
-        let (since_a, since_b, since_c) = match since.as_ref() {
-            Some((_, id)) => {
-                let [a, b, c] = crate::federation::types::split_resume_id::<3>(id);
-                let c: Option<chrono::DateTime<chrono::Utc>> = c.parse().ok();
-                (Some(a.to_owned()), Some(b.to_owned()), c)
-            }
-            None => (None, None, None),
-        };
-        let rows = client
-            .query(
-                "SELECT * FROM cirislens.federation_community_membership_listings \
-                 WHERE ($1::timestamptz IS NULL OR \
-                        (admitted_at, community_key_id, member_key_id, effective_at) \
-                          > ($1, $2, $3, $4::timestamptz)) \
-                   AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
-                 ORDER BY admitted_at ASC, community_key_id ASC, member_key_id ASC, \
-                          effective_at ASC \
-                 LIMIT $5",
-                &[&since_at, &since_a, &since_b, &since_c, &limit],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "list_signed_community_membership_listings_since: {e}"
-                ))
-            })?;
-        rows.into_iter()
-            .map(|row| {
-                let admitted_at =
-                    row.safe_get_with("admitted_at", crate::federation::Error::Backend)?;
-                Ok(crate::federation::ServedCommunityMembershipListing {
-                    listing: pg_row_to_signed_community_membership_listing(row)?,
-                    admitted_at,
-                })
-            })
-            .collect()
-    }
-
     // ─── v21.1.0 (CIRISPersist#507c) — bulk signed-since reads for the 5
     //     PRIMARY signed planes.
 
@@ -12794,7 +13559,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit_i = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let since_id = since.as_ref().map(|(_, id)| id.clone());
@@ -12845,6 +13610,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 .map_err(|e| crate::federation::Error::Backend(format!("evidence_at: {e}")))?;
             page.push((pg_row_to_stored_proposal(row)?, evidence_at));
         }
+        // v59.1.2 — assembly reads each proposal's participations through
+        // the directory (its own clients).
+        drop(client);
         crate::federation::accord_carriage::assemble_evidence_page(self, page).await
     }
 
@@ -12865,7 +13633,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let (since_a, since_b) = match since.as_ref() {
@@ -12919,7 +13687,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT attestation_type, COUNT(*)::int8, MIN(asserted_at), MAX(asserted_at) \
@@ -12964,7 +13732,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let since_id = since.as_ref().map(|(_, id)| id.clone());
@@ -13048,7 +13816,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT record_key FROM cirislens.signed_wire_index \
@@ -13064,6 +13832,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         };
         let record_key: String =
             row.safe_get_with("record_key", crate::federation::Error::Backend)?;
+        // v59.1.2 — the reload reads through the directory (its own clients).
+        drop(client);
         let bytes =
             crate::federation::wire_index::reload_record_bytes(self, kind, &record_key).await?;
         let Some(bytes) = bytes else {
@@ -13087,7 +13857,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         for (kind, hash, record_key) in &triples {
             pg_upsert_wire_index(&**client, kind, hash, record_key).await?;
         }
@@ -13136,7 +13906,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Parse attestation_id to uuid::Uuid before binding — the driver
         // refuses to serialize a &str against a `uuid`-typed param (see
         // put_revocation / the 1693 comment). Invalid → no such row.
@@ -13219,7 +13989,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let admitted_at = self
             .next_plane_position(&client, "federation_attestations")
             .await?;
@@ -13304,87 +14074,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         cursor: Option<crate::read::AttestationCursor>,
         limit: i64,
     ) -> Result<crate::read::ScoresPage, crate::federation::Error> {
-        use crate::federation::Error;
-        // #552 (CC 3.4.5) — the scores-plane read log. FIRST statement in the
-        // door, ahead of every refusal, so a read rejected for a bad limit or
-        // cursor is logged exactly like one that is served.
-        crate::federation::scores_read_audit::log_scores_read(
-            crate::federation::scores_read_audit::ScoresReadSite::ListScores,
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::read_plan::list_scores_planned(
+            self,
             caller_occurrence_key_id,
-            &filter,
-        );
-        if !(1..=10_000).contains(&limit) {
-            return Err(Error::InvalidArgument(format!(
-                "limit must be in [1, 10000], got {limit}"
-            )));
-        }
-        let scope = crate::scope::caller_scope_from_directory(self, caller_occurrence_key_id)
-            .await
-            .map_err(|e| Error::Backend(format!("list_scores admission: {e}")))?;
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
-        let (mut where_parts, mut params) = pg_scores_shared_predicates(&filter, &scope);
-        // lifecycle: exclude rows retracted by a still-hiding composer (the
-        // one predicate, CIRISPersist#720).
-        if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
-            filter.lifecycle,
-            crate::federation::attestation_query::Dialect::Postgres,
-            "fa",
-            params.len() + 1,
-        ) {
-            for t in types {
-                params.push(Box::new(t));
-            }
-            where_parts.push(sql);
-        }
-        if let Some(c) = &cursor {
-            if c.version != "v1" {
-                return Err(Error::InvalidArgument(format!(
-                    "AttestationCursor version {} unsupported; v1 only",
-                    c.version
-                )));
-            }
-            params.push(Box::new(c.last_asserted_at));
-            let p_at = params.len();
-            params.push(Box::new(c.last_attestation_id.clone()));
-            let p_id = params.len();
-            where_parts.push(format!(
-                "(fa.asserted_at, fa.attestation_id::text) < (${p_at}, ${p_id})"
-            ));
-        }
-        let where_sql = format!("WHERE {}", where_parts.join(" AND "));
-        params.push(Box::new(limit));
-        let p_limit = params.len();
-        let sql = format!(
-            "SELECT DISTINCT {PG_SCORES_FA_COLS} \
-             FROM cirislens.attestation_subjects s \
-             JOIN cirislens.federation_attestations fa ON fa.attestation_id = s.attestation_id \
-             {where_sql} \
-             ORDER BY asserted_at DESC, attestation_id DESC \
-             LIMIT ${p_limit}"
-        );
-        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as _).collect();
-        let rows = client
-            .query(&sql, &params_ref[..])
-            .await
-            .map_err(|e| Error::Backend(format!("list_scores: {e}")))?;
-        let items: Result<Vec<crate::federation::Attestation>, crate::federation::Error> =
-            rows.into_iter().map(pg_row_to_attestation).collect();
-        let items = items?;
-        let next_cursor = if items.len() == limit as usize {
-            let last = &items[items.len() - 1];
-            Some(crate::read::AttestationCursor::from_trailing(
-                last.asserted_at,
-                last.attestation_id.clone(),
-            ))
-        } else {
-            None
-        };
-        Ok(crate::read::ScoresPage { items, next_cursor })
+            filter,
+            cursor,
+            limit,
+        )
+        .await
     }
 
     async fn resolve_scores(
@@ -13394,76 +14092,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         policy: String,
         trace: bool,
     ) -> Result<crate::read::ComposedVerdict, crate::federation::Error> {
-        use crate::federation::Error;
-        // #552 (CC 3.4.5) — the scores-plane read log; see `list_scores`.
-        crate::federation::scores_read_audit::log_scores_read(
-            crate::federation::scores_read_audit::ScoresReadSite::ResolveScores,
+        crate::federation::read_plan::resolve_scores_planned(
+            self,
             caller_occurrence_key_id,
-            &filter,
-        );
-        let scope = crate::scope::caller_scope_from_directory(self, caller_occurrence_key_id)
-            .await
-            .map_err(|e| Error::Backend(format!("resolve_scores admission: {e}")))?;
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
-        let (mut where_parts, mut params) = pg_scores_shared_predicates(&filter, &scope);
-        where_parts.push("fa.attestation_type = 'scores'".to_string());
-        let where_sql = format!("WHERE {}", where_parts.join(" AND "));
-        // #456 — BOUNDED candidate fetch (see sqlite): cap at the newest
-        // RESOLVE_CANDIDATE_CAP rows; ancient superseded rows can't change a
-        // live verdict, and the admission path must not be O(history).
-        params.push(Box::new(crate::federation::scores::RESOLVE_CANDIDATE_CAP));
-        let p_cap = params.len();
-        let sql = format!(
-            "SELECT DISTINCT {PG_SCORES_FA_COLS} \
-             FROM cirislens.attestation_subjects s \
-             JOIN cirislens.federation_attestations fa ON fa.attestation_id = s.attestation_id \
-             {where_sql} \
-             ORDER BY asserted_at DESC, attestation_id DESC \
-             LIMIT ${p_cap}"
-        );
-        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as _).collect();
-        let rows = client
-            .query(&sql, &params_ref[..])
-            .await
-            .map_err(|e| Error::Backend(format!("resolve_scores: {e}")))?;
-        let data: Vec<crate::federation::Attestation> = rows
-            .into_iter()
-            .map(pg_row_to_attestation)
-            .collect::<Result<Vec<_>, _>>()?;
-        // Composers (retractions) from the same attesters, regardless of their
-        // own subject/scope — a retraction applies for everyone.
-        let mut attesters: Vec<String> = data.iter().map(|a| a.attesting_key_id.clone()).collect();
-        attesters.sort();
-        attesters.dedup();
-        let composers: Vec<crate::federation::Attestation> = if attesters.is_empty() {
-            Vec::new()
-        } else {
-            let csql = format!(
-                "SELECT {PG_SCORES_FA_COLS} FROM cirislens.federation_attestations fa \
-                 WHERE fa.attestation_type IN ('supersedes','withdraws','recants') \
-                   AND fa.attesting_key_id = ANY($1)"
-            );
-            let crows = client
-                .query(&csql, &[&attesters])
-                .await
-                .map_err(|e| Error::Backend(format!("resolve_scores composers: {e}")))?;
-            crows
-                .into_iter()
-                .map(pg_row_to_attestation)
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        Ok(crate::federation::scores::compose_verdict(
-            data,
-            composers,
-            &policy,
+            filter,
+            policy,
             trace,
-            chrono::Utc::now(),
-        ))
+        )
+        .await
     }
 
     async fn list_attestation_log(
@@ -13472,103 +14108,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         cursor: Option<crate::read::AttestationCursor>,
         limit: i64,
     ) -> Result<crate::read::ScoresPage, crate::federation::Error> {
-        use crate::federation::Error;
-        if !(1..=10_000).contains(&limit) {
-            return Err(Error::InvalidArgument(format!(
-                "limit must be in [1, 10000], got {limit}"
-            )));
-        }
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
-        // #455 — owner-scope LOG walk: NO caller gate, NO lifecycle folding,
-        // federation-tier (the replicable set) only, byte-faithful rows.
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
-        let mut where_parts: Vec<String> = vec!["fa.tier = 'federation'".to_string()];
-        // v53.0.0 (#975) — the replicable set excludes an unregistered type
-        // under enforcement.
-        where_parts.extend(crate::federation::row_type::serve_filter_sql(
-            "fa.attestation_type",
-            crate::federation::row_type::SqlDialect::Postgres,
-        ));
-        let from = if let Some(subj) = subject_key_id {
-            params.push(Box::new(subj.to_string()));
-            where_parts.push(format!("s.subject_key_id = ${}", params.len()));
-            "cirislens.attestation_subjects s \
-             JOIN cirislens.federation_attestations fa ON fa.attestation_id = s.attestation_id"
-        } else {
-            "cirislens.federation_attestations fa"
-        };
-        if let Some(c) = &cursor {
-            if c.version != "v1" {
-                return Err(Error::InvalidArgument(format!(
-                    "AttestationCursor version {} unsupported; v1 only",
-                    c.version
-                )));
-            }
-            params.push(Box::new(c.last_asserted_at));
-            let p_at = params.len();
-            params.push(Box::new(c.last_attestation_id.clone()));
-            let p_id = params.len();
-            where_parts.push(format!(
-                "(fa.asserted_at, fa.attestation_id::text) < (${p_at}, ${p_id})"
-            ));
-        }
-        params.push(Box::new(limit));
-        let p_limit = params.len();
-        let distinct = if subject_key_id.is_some() {
-            "DISTINCT "
-        } else {
-            ""
-        };
-        let sql = format!(
-            "SELECT {distinct}{PG_SCORES_FA_COLS} FROM {from} \
-             WHERE {} \
-             ORDER BY asserted_at DESC, attestation_id DESC \
-             LIMIT ${p_limit}",
-            where_parts.join(" AND ")
-        );
-        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as _).collect();
-        let rows = client
-            .query(&sql, &params_ref[..])
-            .await
-            .map_err(|e| Error::Backend(format!("list_attestation_log: {e}")))?;
-        let bytes = pg_envelope_bytes(&rows);
-        let items: Vec<crate::federation::Attestation> = rows
-            .into_iter()
-            .map(pg_row_to_attestation)
-            .collect::<Result<Vec<_>, _>>()?;
-        let next_cursor = if items.len() == limit as usize {
-            let last = &items[items.len() - 1];
-            Some(crate::read::AttestationCursor::from_trailing(
-                last.asserted_at,
-                last.attestation_id.clone(),
-            ))
-        } else {
-            None
-        };
-        // Release the pooled client before the quarantine consult below —
-        // `filter_withheld_rows` re-enters this backend and takes its own.
-        drop(client);
-
-        // v25.1.0 (CIRISPersist#570 ask 5) — THE SERVE CONSULT. See the
-        // sqlite twin for the full rationale, including why `next_cursor` is
-        // computed BEFORE the filter (a fully-withheld page must still advance
-        // the walk) and why pages may come back short.
-        let items =
-            crate::federation::quarantine::filter_withheld_rows(self, items, chrono::Utc::now())
-                .await?;
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Postgres,
-            crate::observe::Door::ListAttestationLog,
-            subject_key_id.unwrap_or("*"),
-            &items,
-            bytes,
-        );
-        Ok(crate::read::ScoresPage { items, next_cursor })
+        crate::federation::read_plan::list_attestation_log_planned(
+            self,
+            subject_key_id,
+            cursor,
+            limit,
+        )
+        .await
     }
 
     async fn record_announced_peer(
@@ -13729,57 +14275,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         revocation: crate::federation::SignedTrustRevocation,
     ) -> Result<(), crate::federation::Error> {
-        if revocation.key.is_empty() {
-            return Err(crate::federation::Error::InvalidArgument(
-                "key must be non-empty".into(),
-            ));
-        }
-        // v38.0.0 (#721) — signature proof first; then ownership against the
-        // STORED granter (only the granter withdraws its own grant). The row
-        // keeps the original trusted_by for forensic continuity, and the
-        // revoker is no longer discarded — it is PROVEN.
-        crate::federation::admission::check_trust_revocation_authority(self, &revocation).await?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let stored = client
-            .query_opt(
-                "SELECT trusted_by FROM cirislens.federation_keys \
-                 WHERE key_id = $1 AND trusted_by IS NOT NULL",
-                &[&revocation.key],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("revoke_trust granter read: {e}"))
-            })?;
-        if let Some(row) = stored {
-            let granter: String = row
-                .try_get(0)
-                .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-            if granter != revocation.revoked_by {
-                return Err(crate::federation::Error::InvalidArgument(format!(
-                    "trust on {} was granted by {granter:?}; {:?} may not revoke it — only \
-                     the granter withdraws its own grant (CIRISPersist#721)",
-                    revocation.key, revocation.revoked_by
-                )));
-            }
-        }
-        // Idempotent: only set expires_at if the row isn't already
-        // expired. UPDATE returning zero rows is fine (idempotent
-        // no-op); only backend errors propagate.
-        client
-            .execute(
-                "UPDATE cirislens.federation_keys \
-                 SET expires_at = NOW() \
-                 WHERE key_id = $1 \
-                   AND trusted_by IS NOT NULL \
-                   AND (expires_at IS NULL OR expires_at > NOW())",
-                &[&revocation.key],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("revoke_trust: {e}")))?;
-        Ok(())
+        crate::federation::consent_admit::revoke_trust_planned(self, revocation).await
     }
 
     async fn lookup_trust(
@@ -13789,7 +14285,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT key_id, trust_type, trust_relationship, trust_domains, \
@@ -13810,7 +14306,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // Build the parametric WHERE clause. Owned-string holders
         // keep references alive for the tokio_postgres ToSql binding.
         let mut where_parts: Vec<String> = vec!["trusted_by IS NOT NULL".to_owned()];
@@ -13856,7 +14352,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 &format!(
@@ -13877,7 +14373,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let mut where_parts: Vec<String> = vec!["attestation_id IS NOT NULL".to_owned()];
         let mut params: Vec<String> = Vec::new();
         if !filter.include_retired {
@@ -13919,7 +14415,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
     ) -> Result<Vec<crate::federation::LegacyGoal>, crate::federation::Error> {
         let mk = crate::federation::Error::Backend;
-        let client = self.get_client().await.map_err(|e| mk(e.to_string()))?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT goal_id, declared_by_key_id, goal_text, scale, scope_cohort_id, \
@@ -13951,7 +14450,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .execute(
                 "DELETE FROM cirislens.goals WHERE goal_id = $1 AND attestation_id IS NULL",
@@ -13971,248 +14470,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         identity_type: &str,
         transport_identity: Option<String>,
     ) -> Result<(), crate::federation::Error> {
-        if key_id.is_empty() {
-            return Err(crate::federation::Error::InvalidArgument(
-                "key_id must be non-empty".into(),
-            ));
-        }
-        if pubkey_ed25519_base64.is_empty() {
-            return Err(crate::federation::Error::InvalidArgument(
-                "pubkey_ed25519_base64 must be non-empty".into(),
-            ));
-        }
-        if identity_type.is_empty() {
-            return Err(crate::federation::Error::InvalidArgument(
-                "identity_type must be non-empty".into(),
-            ));
-        }
-
-        // v31.0.0 (CIRISPersist#656) — THE FIFTH `federation_keys` ADMISSION
-        // PATH. This door writes a caller-supplied `identity_type` and ran no
-        // role gate at all, so `add_peer_record(k, pk, "canonical", None)` made
-        // `is_canonical_effective` answer true for an attacker-named key.
-        // BEFORE any lock or DB work: the gates read the directory, which locks
-        // itself. One gate, three backends.
-        crate::federation::admission::check_peer_record_admission(self, key_id, identity_type)
-            .await?;
-
-        // Build the federation_keys row + its persist_row_hash up
-        // front (same shape as put_public_key but without the
-        // SignedKeyRecord scrub envelope — peer-add is operator-
-        // authorized at the UniFFI layer, not via a peer-supplied
-        // signed registration envelope).
-        let now = chrono::Utc::now();
-        let mut key = crate::federation::KeyRecord {
-            key_id: key_id.to_owned(),
-            pubkey_ed25519_base64: pubkey_ed25519_base64.to_owned(),
-            pubkey_ml_dsa_65_base64: None,
-            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
-            identity_type: identity_type.to_owned(),
-            identity_ref: key_id.to_owned(),
-            valid_from: now,
-            valid_until: None,
-            registration_envelope: serde_json::json!({"peer_added_by_operator": true}),
-            // 32 bytes of zeros — placeholder sha; no signed envelope.
-            original_content_hash: "00".repeat(32),
-            scrub_signature_classical: String::new(),
-            scrub_signature_pqc: None,
-            scrub_key_id: key_id.to_owned(),
-            scrub_timestamp: now,
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            capability_roles: Vec::new(),
-            attestation_evidence: None,
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        };
-        key.persist_row_hash = crate::federation::types::compute_persist_row_hash(&key)?;
-
-        let mut meta = crate::federation::PeerMetadataRow {
-            key_id: key_id.to_owned(),
-            alias: None,
-            trust: crate::federation::TrustClass::Untrusted,
-            notes: None,
-            policy_blob: None,
-            transport_identity: transport_identity.clone(),
-            removed_at: None,
-            inserted_at: now,
-            updated_at: now,
-            persist_row_hash: String::new(),
-        };
-        meta.persist_row_hash = crate::federation::types::compute_persist_row_hash(&meta)?;
-
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
-
-        // The federation_keys row — ON CONFLICT (key_id) DO NOTHING
-        // (matches put_public_key semantics; conflict-with-different-
-        // content is detected by re-reading the existing pubkey
-        // below).
-        let original_content_hash = hex::decode(&key.original_content_hash).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!(
-                "original_content_hash hex decode: {e}"
-            ))
-        })?;
-        let roles_param: Option<&Vec<String>> = None;
-        // v13.0.0 (CIRISPersist#365) — wire None ⇔ stored 'unregistered'.
-        let consent_role_stored =
-            crate::federation::types::consent_role::stored_from_wire(key.consent_role.as_deref())
-                .to_owned();
-        // v31.0.0 (#644) — registration_envelope is TEXT since V122.
-        let registration_envelope_text =
-            pg_envelope_text(&key.registration_envelope, "registration_envelope")?;
-        // v31.4.0 (CIRISPersist#682) — THIS node's admission position (V126).
-        // An operator-added peer is a `federation_keys` row like any other and
-        // is served by the same cursor, so it is stamped by the same allocator.
-        // Read through `tx`, so the MAX and the INSERT are the same snapshot.
-        let admitted_at = self.next_key_serve_position(&tx).await?;
-        tx.execute(
-            "INSERT INTO cirislens.federation_keys (\
-                key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
-                identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
-                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                attestation_evidence, consent_role, admitted_at\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
-             ON CONFLICT (key_id) DO NOTHING",
-            &[
-                &key.key_id,
-                &key.pubkey_ed25519_base64,
-                &key.pubkey_ml_dsa_65_base64,
-                &key.algorithm,
-                &key.identity_type,
-                &key.identity_ref,
-                &key.valid_from,
-                &key.valid_until,
-                &registration_envelope_text,
-                &original_content_hash,
-                &key.scrub_signature_classical,
-                &key.scrub_signature_pqc,
-                &key.scrub_key_id,
-                &key.scrub_timestamp,
-                &key.pqc_completed_at,
-                &key.persist_row_hash,
-                &roles_param,
-                &key.attestation_evidence,
-                &consent_role_stored,
-                &admitted_at,
-            ],
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::directory_admit::add_peer_record_planned(
+            self,
+            key_id,
+            pubkey_ed25519_base64,
+            identity_type,
+            transport_identity,
         )
         .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("add_peer_record federation_keys: {e}"))
-        })?;
-
-        // Conflict detection on federation_keys: if pubkey differs,
-        // the operator is trying to re-add a peer with a different
-        // pubkey under the same key_id → reject.
-        let existing_pubkey: Option<String> = tx
-            .query_opt(
-                "SELECT pubkey_ed25519_base64 FROM cirislens.federation_keys WHERE key_id = $1",
-                &[&key.key_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "add_peer_record federation_keys conflict check: {e}"
-                ))
-            })?
-            .map(|r| r.safe_get_with(0, crate::federation::Error::Backend))
-            .transpose()?;
-        if let Some(existing) = existing_pubkey {
-            if existing != key.pubkey_ed25519_base64 {
-                return Err(crate::federation::Error::Conflict(format!(
-                    "key_id {} already exists with different pubkey",
-                    key.key_id
-                )));
-            }
-        }
-
-        // The federation_peer_metadata row.
-        // - Soft-removed re-add: clear removed_at + repopulate;
-        // - Live row with matching transport: idempotent no-op;
-        // - Live row with different transport: Conflict.
-        let existing_meta: Option<tokio_postgres::Row> = tx
-            .query_opt(
-                "SELECT transport_identity, removed_at \
-                 FROM cirislens.federation_peer_metadata WHERE key_id = $1",
-                &[&key.key_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "add_peer_record peer_metadata existence: {e}"
-                ))
-            })?;
-        match existing_meta {
-            Some(row) => {
-                let existing_transport: Option<String> =
-                    row.safe_get_with(0, crate::federation::Error::Backend)?;
-                let existing_removed_at: Option<chrono::DateTime<chrono::Utc>> =
-                    row.safe_get_with(1, crate::federation::Error::Backend)?;
-                if existing_removed_at.is_some() {
-                    // Re-add: replace with the new row.
-                    tx.execute(
-                        "UPDATE cirislens.federation_peer_metadata SET \
-                            alias = NULL, trust = 'untrusted', notes = NULL, \
-                            policy_blob = NULL, transport_identity = $2, \
-                            removed_at = NULL, inserted_at = $3, updated_at = $3, \
-                            persist_row_hash = $4 \
-                         WHERE key_id = $1",
-                        &[
-                            &key.key_id,
-                            &meta.transport_identity,
-                            &now,
-                            &meta.persist_row_hash,
-                        ],
-                    )
-                    .await
-                    .map_err(|e| {
-                        crate::federation::Error::Backend(format!(
-                            "add_peer_record peer_metadata re-add: {e}"
-                        ))
-                    })?;
-                } else if existing_transport == transport_identity {
-                    // Idempotent no-op.
-                } else {
-                    return Err(crate::federation::Error::Conflict(format!(
-                        "peer_metadata row for key_id {} already exists with different transport_identity",
-                        key.key_id
-                    )));
-                }
-            }
-            None => {
-                tx.execute(
-                    "INSERT INTO cirislens.federation_peer_metadata (\
-                        key_id, alias, trust, notes, policy_blob, \
-                        transport_identity, removed_at, inserted_at, updated_at, persist_row_hash\
-                     ) VALUES ($1, NULL, 'untrusted', NULL, NULL, $2, NULL, $3, $3, $4)",
-                    &[
-                        &key.key_id,
-                        &meta.transport_identity,
-                        &now,
-                        &meta.persist_row_hash,
-                    ],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!(
-                        "add_peer_record peer_metadata insert: {e}"
-                    ))
-                })?;
-            }
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
-        Ok(())
     }
 
     async fn remove_peer_record(
@@ -14254,7 +14520,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -14437,7 +14703,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
                 "SELECT key_id, alias, trust, notes, policy_blob, \
@@ -14539,7 +14805,7 @@ async fn pg_update_peer_field(
     let mut client = backend
         .get_client()
         .await
-        .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        .map_err(crate::store::Error::into_federation)?;
     let tx = client
         .transaction()
         .await
@@ -14812,260 +15078,19 @@ impl crate::federation::BlobStorage for PostgresBackend {
         floor: crate::federation::StorageFloor,
         group_key_id: Option<&str>,
     ) -> Result<(), crate::federation::BlobError> {
-        floor.check_scope(cohort_scope)?;
-        // v55.0.0 (#1007) — taken-down bytes never come back.
-        let reversed =
-            crate::federation::steward_purge::refuse_tombstoned_bytes(self, sha256).await?;
-        // v60.1.0 (#1070) — the in-transaction second look's inputs (the
-        // switch, and #1113's reversals the pre-read found), and the
-        // witnesses' seam between the pre-read and the write.
-        let tombstones = crate::federation::steward_purge::TombstoneFloor::new(
-            self.bytes_tombstone_plane(),
-            reversed,
-        );
-        #[cfg(test)]
-        self.test_hooks()
-            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
-            .await;
-        let scope = cohort_scope.to_owned();
-        let tier = floor.tier().as_str().to_owned();
-        let group = group_key_id.map(str::to_owned);
-        // v3.4.0 (CIRISPersist#123) — admission ordering:
-        //   1. empty-string → InvalidArgument
-        //   2. trust-threshold → TrustBelowThreshold
-        //   3. inline-size → InlineSizeExceeded
-        //   4. hash-mismatch → HashMismatch
-        //   5. DB FK → AttestationEmissionFailed
-        if attestation.attesting_key_id.is_empty() {
-            return Err(crate::federation::BlobError::InvalidArgument(
-                "attesting_key_id is empty".into(),
-            ));
-        }
-        if let Some(gate) = self.admission_gate() {
-            gate.check_blob(&attestation.attesting_key_id).await?;
-        }
-        // v4.1 (Cut B) — a ChunkDag body is a multi-row manifest; it
-        // only ever goes through put_blob_chunks.
-        if matches!(body, crate::federation::BlobBody::ChunkDag(_)) {
-            return Err(crate::federation::BlobError::InvalidArgument(
-                "put_blob does not accept a ChunkDag body — use put_blob_chunks".into(),
-            ));
-        }
-        let cap = self.inline_bytes_cap();
-        if let crate::federation::BlobBody::Inline(ref bytes) = body {
-            if bytes.len() > cap {
-                return Err(crate::federation::BlobError::InlineSizeExceeded {
-                    size: bytes.len(),
-                    cap,
-                });
-            }
-            crate::federation::blobs::verify_inline_hash(sha256, bytes)?;
-        }
-        let storage_kind = body.storage_kind();
-        let size_bytes_i64 = i64::try_from(body.size_bytes()).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "size_bytes exceeds i64 — federation_blobs.size_bytes is BIGINT".into(),
-            )
-        })?;
-        let (bytes_inline_opt, external_ref_opt) = match &body {
-            crate::federation::BlobBody::Inline(b) => (Some(b.clone()), None),
-            crate::federation::BlobBody::External(e) => (None, Some(e.uri.clone())),
-            // Rejected above; matched here only for exhaustiveness.
-            crate::federation::BlobBody::ChunkDag(_) => {
-                return Err(crate::federation::BlobError::InvalidArgument(
-                    "put_blob does not accept a ChunkDag body — use put_blob_chunks".into(),
-                ))
-            }
-        };
-
-        // 3. Compose the holding claim.
-        //
-        // v45.0.0 (CIRISPersist#871, AV-89) — the claim's declared size must be
-        // the length of the bytes this door stores. Checked BEFORE the rebuild
-        // so the refusal names the size, not a hash: a holder that announces
-        // one length and holds another is refused here, never advertised.
-        if attestation.size != body.size_bytes() {
-            return Err(crate::federation::BlobError::InvalidArgument(format!(
-                "holding claim declares size {} but the stored bytes are {} \
-                 (CC 5.3.2.5 / AV-89: a holder announces exactly what it holds)",
-                attestation.size,
-                body.size_bytes()
-            )));
-        }
-        // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — the claim is placed
-        // at the content's scope, derived from THIS write (its tier, cohort and
-        // group), and rebuilt through the ONE builder; the caller's hash must
-        // cover the rebuilt bytes (#656), and at a bounded scope the holder
-        // must be in the cohort (rule 2) — both before anything is written.
-        //
-        // A sealed-tier token ANNOUNCES a row a cascade already stored, so its
-        // scope is read off that row (`content_claim_scope`: the binding's
-        // room, the recorded group) and an absent row is `NotHeld` before any
-        // other question (§11.5 / I28); a plaintext write's scope is this
-        // write's.
-        let claim_scope =
-            if floor.tier() == crate::federation::types::cohort_scope::CryptoTier::Plaintext {
-                crate::federation::holding_claim::ClaimScope::of_content(
-                    floor.tier(),
-                    cohort_scope,
-                    group_key_id,
-                )?
-            } else {
-                crate::federation::holding_claim::content_claim_scope(self, sha256)
-                    .await?
-                    .ok_or_else(|| crate::federation::BlobError::NotHeld {
-                        sha256_hex: hex::encode(sha256),
-                    })?
-            };
-        let prepared = crate::federation::holding_claim::prepare_holding_claim_row(
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::blob_admit::put_blob_planned(
+            self,
+            author_key_id,
             sha256,
-            &attestation,
-            &claim_scope,
-        )?;
-        crate::federation::holding_claim::check_holding_claim_audience(self, &prepared.row).await?;
-
-        // 4. Atomic transaction: insert blob row (idempotent on PK)
-        //    THEN insert the holding claim. If the attestation FK
-        //    fails, the blob row is rolled back too — caller sees no
-        //    half-written state.
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        // §20.5 (PR #852 review) — the ROW's author is the supplied one (a
-        // proxy write's peer); absent that, the claim's attester. The claim
-        // itself is always the holder's (this node, I23).
-        let row_author = author_key_id
-            .map(str::to_owned)
-            .unwrap_or_else(|| attestation.attesting_key_id.clone());
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
-
-        let sha_vec = sha256.to_vec();
-        if floor.tier() == crate::federation::types::cohort_scope::CryptoTier::Plaintext {
-            // v60.1.0 (#1070) — the tombstone again, under the write.
-            pg_refuse_tombstoned_at_write(&tx, &[*sha256], &tombstones).await?;
-            // #846 (§5) — the row records its AUTHOR: the attesting key of
-            // the holder claim, which for a local write is the writer's
-            // derived key (I23) and for a proxy write the peer's.
-            tx.execute(
-                "INSERT INTO cirislens.federation_blobs (\
-                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                    cohort_scope, crypto_tier, author_key_id, group_key_id\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
-                 ON CONFLICT (sha256) DO NOTHING",
-                &[
-                    &sha_vec,
-                    &storage_kind,
-                    &bytes_inline_opt,
-                    &external_ref_opt,
-                    &size_bytes_i64,
-                    &media_type,
-                    &scope,
-                    &tier,
-                    &row_author,
-                    &group,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("insert federation_blobs: {e}"))
-            })?;
-            // v54.0.0 (#995 row 4, V184) — THIS write's room, whether or not
-            // the row above was new: shared plaintext keeps every room.
-            tx.execute(
-                "INSERT INTO cirislens.federation_blob_associations \
-                    (sha256, cohort_scope, group_key_id) VALUES ($1, $2, COALESCE($3, '')) \
-                 ON CONFLICT DO NOTHING",
-                &[&sha_vec, &scope, &group],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("insert blob association: {e}"))
-            })?;
-        } else {
-            // §11.5 / I28 — AN ANNOUNCEMENT NEVER STORES. A sealed-tier token
-            // means a cascade already stored and bound these bytes; this
-            // floor emits the holder attestation for that row and nothing
-            // else. Evicted between bind and announce ⇒ NotHeld, never a
-            // re-inserted row without its binding.
-            let not_held = || crate::federation::BlobError::NotHeld {
-                sha256_hex: hex::encode(sha256),
-            };
-            let community_tier =
-                floor.tier() == crate::federation::types::cohort_scope::CryptoTier::CommunityDek;
-            if community_tier {
-                // #833 — an evicted binding is an eviction RECORD, not a
-                // bound row; the announcement treats it as absent.
-                let bound = tx
-                    .query_opt(
-                        "SELECT community_key_id FROM cirislens.federation_community_blob_epoch \
-                          WHERE at_rest_sha256 = $1 AND evicted_at IS NULL",
-                        &[&sha_vec],
-                    )
-                    .await
-                    .map_err(|e| crate::federation::BlobError::Backend(format!("announce: {e}")))?;
-                let Some(row) = bound else {
-                    let _ = tx.rollback().await;
-                    return Err(not_held());
-                };
-                let community: String =
-                    row.safe_get_with("community_key_id", crate::federation::BlobError::Backend)?;
-                lock_community_tx(&tx, &community).await?;
-            }
-            let held = tx
-                .query_one(
-                    "SELECT (EXISTS(SELECT 1 FROM cirislens.federation_blobs WHERE sha256 = $1) \
-                        AND ($2 OR EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
-                                           WHERE at_rest_sha256 = $1 AND evicted_at IS NULL))) AS h",
-                    &[&sha_vec, &(!community_tier)],
-                )
-                .await
-                .map_err(|e| crate::federation::BlobError::Backend(format!("announce: {e}")))?;
-            let held: bool = held.safe_get_with("h", crate::federation::BlobError::Backend)?;
-            if !held {
-                let _ = tx.rollback().await;
-                return Err(not_held());
-            }
-            // #846 (§5) — a sealed row is stored by a cascade and announced
-            // here; the announce names the writer, so a row the cascade
-            // could not attribute (NULL) takes the announcer's key. An
-            // author already recorded is never overwritten.
-            tx.execute(
-                "UPDATE cirislens.federation_blobs SET author_key_id = $2 \
-                  WHERE sha256 = $1 AND author_key_id IS NULL",
-                &[&sha_vec, &row_author],
-            )
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(format!("announce author: {e}")))?;
-        }
-
-        // v55.0.0 (CIRISPersist#989) — the holding claim, in the same
-        // transaction as the write, through the one insert the three claim
-        // doors share.
-        self.insert_holding_claim_tx(&tx, &prepared).await?;
-
-        tx.commit().await.map_err(|e| {
-            crate::federation::BlobError::Backend(format!("commit blob+attestation: {e}"))
-        })?;
-        // The pooled client is RELEASED before the index reload takes its own
-        // — holding one while acquiring another is how a small pool deadlocks.
-        drop(client);
-        // v44.8.1 (CIRISPersist#870) — the index moves WITH the row (#610). The
-        // holder claim just written is a federation-tier attestation like every
-        // one `put_attestation` writes, and gets its `signed_wire_index` entry
-        // now — not at the next boot's rebuild. Without it the claim was
-        // ADVERTISED (the summary reads the row) and UNFETCHABLE (the packer
-        // resolves a want through the index), so no peer ever learned a holder
-        // and every blob-backed body read `not_fetched`. Same hook, same
-        // posture as `put_attestation`: the primary write is durable; an index
-        // failure is logged loudly by the hook and repaired by the rebuild.
-        self.index_holder_claim(&prepared.row.attestation_id, &prepared.row.tier)
-            .await?;
-
-        Ok(())
+            body,
+            media_type,
+            attestation,
+            cohort_scope,
+            floor,
+            group_key_id,
+        )
+        .await
     }
 
     async fn put_holding_claim(
@@ -15074,45 +15099,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
         claim: crate::federation::PutBlobAttestation,
         scope: &crate::federation::holding_claim::ClaimScope,
     ) -> Result<(), crate::federation::BlobError> {
-        // v55.0.0 (CIRISPersist#989) — scope, size, rebuild and audience, before
-        // the transaction; the transaction re-asks only "still held".
-        let prepared =
-            crate::federation::holding_claim::prepare_announcement(self, sha256, &claim, scope)
-                .await?;
-        let sha_vec = sha256.to_vec();
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
-        // §11.5 / I28 — an announcement never stores; an evicted binding is an
-        // eviction RECORD, not a held row.
-        let held = tx
-            .query_one(
-                "SELECT (EXISTS(SELECT 1 FROM cirislens.federation_blobs WHERE sha256 = $1) \
-                    AND NOT EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
-                                    WHERE at_rest_sha256 = $1 AND evicted_at IS NOT NULL)) AS h",
-                &[&sha_vec],
-            )
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(format!("announce: {e}")))?;
-        let held: bool = held.safe_get_with("h", crate::federation::BlobError::Backend)?;
-        if !held {
-            let _ = tx.rollback().await;
-            return Err(crate::federation::BlobError::NotHeld {
-                sha256_hex: hex::encode(sha256),
-            });
-        }
-        self.insert_holding_claim_tx(&tx, &prepared).await?;
-        tx.commit().await.map_err(|e| {
-            crate::federation::BlobError::Backend(format!("commit holding claim: {e}"))
-        })?;
-        drop(client);
-        self.index_holder_claim(&prepared.row.attestation_id, &prepared.row.tier)
-            .await
+        crate::federation::blob_admit::put_holding_claim_planned(self, sha256, claim, scope).await
     }
 
     // v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob
@@ -15194,129 +15181,17 @@ impl crate::federation::BlobStorage for PostgresBackend {
         author_key_id: Option<&str>,
         group_key_id: Option<&str>,
     ) -> Result<(), crate::federation::BlobError> {
-        floor.check_scope(cohort_scope)?;
-        // v55.0.0 (#1007) — taken-down bytes never come back.
-        let reversed =
-            crate::federation::steward_purge::refuse_tombstoned_bytes(self, sha256).await?;
-        // v60.1.0 (#1070) — the in-transaction second look's inputs (the
-        // switch, and #1113's reversals the pre-read found), and the
-        // witnesses' seam between the pre-read and the write.
-        let tombstones = crate::federation::steward_purge::TombstoneFloor::new(
-            self.bytes_tombstone_plane(),
-            reversed,
-        );
-        #[cfg(test)]
-        self.test_hooks()
-            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
-            .await;
-        let scope = cohort_scope.to_owned();
-        let tier = floor.tier().as_str().to_owned();
-        let author = author_key_id.map(str::to_owned);
-        let group = group_key_id.map(str::to_owned);
-        // v4.1 (Cut B) — ChunkDag is a multi-row manifest; routed through
-        // put_blob_chunks, never store_blob_local.
-        if matches!(body, crate::federation::BlobBody::ChunkDag(_)) {
-            return Err(crate::federation::BlobError::InvalidArgument(
-                "store_blob_local does not accept a ChunkDag body — use put_blob_chunks".into(),
-            ));
-        }
-        let cap = self.inline_bytes_cap();
-        if let crate::federation::BlobBody::Inline(ref bytes) = body {
-            if bytes.len() > cap {
-                return Err(crate::federation::BlobError::InlineSizeExceeded {
-                    size: bytes.len(),
-                    cap,
-                });
-            }
-            crate::federation::blobs::verify_inline_hash(sha256, bytes)?;
-        }
-        let storage_kind = body.storage_kind();
-        let size_bytes_i64 = i64::try_from(body.size_bytes()).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "size_bytes exceeds i64 — federation_blobs.size_bytes is BIGINT".into(),
-            )
-        })?;
-        let (bytes_inline_opt, external_ref_opt) = match &body {
-            crate::federation::BlobBody::Inline(b) => (Some(b.clone()), None),
-            crate::federation::BlobBody::External(e) => (None, Some(e.uri.clone())),
-            crate::federation::BlobBody::ChunkDag(_) => {
-                return Err(crate::federation::BlobError::InvalidArgument(
-                    "store_blob_local does not accept a ChunkDag body — use put_blob_chunks".into(),
-                ))
-            }
-        };
-        // v54.0.0 (Codex round 3 on PR #1050) — the row and its V184
-        // association are ONE transaction. Run on the bare client, the row
-        // insert autocommitted first, and a process loss or a failed
-        // association statement left a durable plaintext row whose room was
-        // never recorded (I611).
-        #[cfg(test)]
-        let inject_association_fault = self
-            .test_hooks()
-            .fail_if_armed("store_blob_local_association")
-            .is_err();
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
-        // v60.1.0 (#1070) — the tombstone again, under the write.
-        pg_refuse_tombstoned_at_write(&tx, &[*sha256], &tombstones).await?;
-        #[cfg(test)]
-        self.test_hooks()
-            .pause_if_armed(crate::store::test_hooks::BYTES_INSIDE_THE_WRITE)
-            .await;
-        let sha_vec = sha256.to_vec();
-        tx.execute(
-            // #984 (V177) — the group the write named, on the row.
-            "INSERT INTO cirislens.federation_blobs (\
-                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                    cohort_scope, crypto_tier, author_key_id, group_key_id\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
-                 ON CONFLICT (sha256) DO NOTHING",
-            &[
-                &sha_vec,
-                &storage_kind,
-                &bytes_inline_opt,
-                &external_ref_opt,
-                &size_bytes_i64,
-                &media_type,
-                &scope,
-                &tier,
-                &author,
-                &group,
-            ],
+        crate::federation::blob_admit::store_blob_local_planned(
+            self,
+            sha256,
+            body,
+            media_type,
+            cohort_scope,
+            floor,
+            author_key_id,
+            group_key_id,
         )
         .await
-        .map_err(|e| {
-            crate::federation::BlobError::Backend(format!("store_blob_local insert: {e}"))
-        })?;
-        // v54.0.0 (#995 row 4, V184) — a plaintext row keeps every room.
-        if tier == crate::federation::types::cohort_scope::CryptoTier::Plaintext.as_str() {
-            #[cfg(test)]
-            if inject_association_fault {
-                return Err(crate::federation::BlobError::Backend(
-                    "store_blob_local association: injected fault".into(),
-                ));
-            }
-            tx.execute(
-                "INSERT INTO cirislens.federation_blob_associations \
-                    (sha256, cohort_scope, group_key_id) VALUES ($1, $2, COALESCE($3, '')) \
-                 ON CONFLICT DO NOTHING",
-                &[&sha_vec, &scope, &group],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("store_blob_local association: {e}"))
-            })?;
-        }
-        tx.commit().await.map_err(|e| {
-            crate::federation::BlobError::Backend(format!("store_blob_local commit: {e}"))
-        })?;
-        Ok(())
     }
 
     // v4.14.0 (CIRISPersist#152) — at-rest self/family DEK cascade grants.
@@ -16180,49 +16055,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
         &self,
         record: &crate::federation::StreamDekRecord,
     ) -> Result<crate::federation::StreamDekRecord, crate::federation::BlobError> {
-        // v55.0.0 — the chunk floor's stream-name rule (#953): no stream row
-        // under a name reserved for an inline blob's log.
-        crate::federation::stream_sth::refuse_reserved_stream_id(&record.stream_id)?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let ep = i64::try_from(record.epoch).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument("stream epoch exceeds i64".into())
-        })?;
-        let be = |e: tokio_postgres::Error| {
-            crate::federation::BlobError::Backend(format!("stream_dek_insert: {e}"))
-        };
-        client
-            .execute(
-                "INSERT INTO cirislens.federation_stream_deks \
-                    (stream_id, epoch, owner_key_id, cohort_scope, group_key_id, \
-                     self_retention_wrap, supplied, room_epoch) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-                 ON CONFLICT (stream_id, epoch) DO NOTHING",
-                &[
-                    &record.stream_id,
-                    &ep,
-                    &record.owner_key_id,
-                    &record.cohort_scope,
-                    &record.group_key_id,
-                    &record.self_retention_wrap,
-                    &record.supplied,
-                    &record
-                        .room_epoch
-                        .map(|e| i64::try_from(e).unwrap_or(i64::MAX)),
-                ],
-            )
-            .await
-            .map_err(be)?;
-        let row = client
-            .query_one(
-                &format!("{PG_STREAM_DEK_SELECT} WHERE d.stream_id = $1 AND d.epoch = $2"),
-                &[&record.stream_id, &ep],
-            )
-            .await
-            .map_err(be)?;
-        pg_stream_dek_row(&row)
+        crate::federation::blob_admit::stream_dek_insert_planned(self, record).await
     }
 
     async fn stream_dek_evict_room_chunks(
@@ -16274,43 +16107,15 @@ impl crate::federation::BlobStorage for PostgresBackend {
         cohort_scope: &str,
         wraps: &[crate::federation::GrantWrap],
     ) -> Result<usize, crate::federation::BlobError> {
-        // v55.0.0 — the chunk floor's stream-name rule (#953): no stream row
-        // under a name reserved for an inline blob's log.
-        crate::federation::stream_sth::refuse_reserved_stream_id(stream_id)?;
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let ep = epoch as i64;
-        let be = |e: tokio_postgres::Error| {
-            crate::federation::BlobError::Backend(format!("stream_dek_put_grants: {e}"))
-        };
-        // A UNION in one transaction: `DO NOTHING` per row (§13).
-        let tx = client.transaction().await.map_err(be)?;
-        let mut inserted = 0usize;
-        for w in wraps {
-            inserted += tx
-                .execute(
-                    "INSERT INTO cirislens.federation_stream_dek_grants (\
-                        stream_id, epoch, sealer_key_id, recipient_key_id, wrap_algorithm, \
-                        wrapped_dek, cohort_scope\
-                     ) VALUES ($1, $2, $3, $4, $5, $6, $7) \
-                     ON CONFLICT (stream_id, epoch, sealer_key_id, recipient_key_id) DO NOTHING",
-                    &[
-                        &stream_id,
-                        &ep,
-                        &sealer_key_id,
-                        &w.recipient_key_id,
-                        &w.wrap_algorithm,
-                        &w.wrapped_dek,
-                        &cohort_scope,
-                    ],
-                )
-                .await
-                .map_err(be)? as usize;
-        }
-        tx.commit().await.map_err(be)?;
-        Ok(inserted)
+        crate::federation::blob_admit::stream_dek_put_grants_planned(
+            self,
+            stream_id,
+            epoch,
+            sealer_key_id,
+            cohort_scope,
+            wraps,
+        )
+        .await
     }
 
     async fn stream_dek_grants(
@@ -17027,6 +16832,9 @@ impl crate::federation::BlobStorage for PostgresBackend {
             )?;
             sha_hexes.insert(hex::encode(v));
         }
+        // v59.1.2 — the retractions below write through the directory, and the
+        // delete takes a fresh client: none may wait on this one.
+        drop(client);
         if sha_hexes.is_empty() {
             return Ok(0);
         }
@@ -17764,86 +17572,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
         manifest: crate::federation::ChunkManifest,
         chunks: Vec<([u8; 32], crate::federation::BlobBody)>,
     ) -> Result<(), crate::federation::BlobError> {
-        let cap = self.inline_bytes_cap();
-        // Validation + row preparation (chunks first, manifest last).
-        let rows = crate::federation::blobs::prepare_chunk_rows(&manifest, &chunks, cap)?;
-        // v55.0.0 (#1007) — taken-down bytes never come back: no chunk, and
-        // not the manifest.
-        let mut reversed = crate::federation::steward_purge::ReversedTakedowns::default();
-        for row in &rows {
-            reversed.absorb(
-                crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256)
-                    .await?,
-            );
-        }
-        // v60.1.0 (#1070) — the in-transaction second look's inputs (the
-        // switch, and #1113's reversals the pre-read found), and the
-        // witnesses' seam between the pre-read and the write.
-        let tombstones = crate::federation::steward_purge::TombstoneFloor::new(
-            self.bytes_tombstone_plane(),
-            reversed,
-        );
-        #[cfg(test)]
-        self.test_hooks()
-            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
-            .await;
-
-        // Codex r2 on #1065 — the manifest's chunk relation, written in the
-        // same transaction (the manifest row is the last prepared row).
-        let manifest_sha = rows.last().map(|r| r.sha256.to_vec());
-        let (links, link_stream) = crate::federation::blobs::manifest_chunk_links(&manifest);
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
-        // v60.1.0 (#1070) — the tombstones again, under the write.
-        let shas: Vec<[u8; 32]> = rows.iter().map(|r| r.sha256).collect();
-        pg_refuse_tombstoned_at_write(&tx, &shas, &tombstones).await?;
-        for row in &rows {
-            let sha_vec = row.sha256.to_vec();
-            // media_type is NULL for chunk rows + the manifest row.
-            let media_type_null: Option<String> = None;
-            tx.execute(
-                "INSERT INTO cirislens.federation_blobs (\
-                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type\
-                 ) VALUES ($1, $2, $3, $4, $5, $6) \
-                 ON CONFLICT (sha256) DO NOTHING",
-                &[
-                    &sha_vec,
-                    &row.storage_kind,
-                    &row.bytes_inline,
-                    &row.external_ref,
-                    &row.size_bytes,
-                    &media_type_null,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("put_blob_chunks insert: {e}"))
-            })?;
-        }
-        if let Some(m) = &manifest_sha {
-            for (seq, chunk) in &links {
-                tx.execute(
-                    "INSERT INTO cirislens.federation_dag_chunks \
-                     (manifest_sha256, seq, chunk_sha256, stream_id) VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (manifest_sha256, seq) DO NOTHING",
-                    &[m, seq, chunk, &link_stream],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::BlobError::Backend(format!("put_blob_chunks link: {e}"))
-                })?;
-            }
-        }
-        tx.commit().await.map_err(|e| {
-            crate::federation::BlobError::Backend(format!("put_blob_chunks commit: {e}"))
-        })?;
-        Ok(())
+        crate::federation::blob_admit::put_blob_chunks_planned(self, manifest, chunks).await
     }
 
     // v55.0.0 (CIRISPersist#952) — the incremental plaintext DAG's finalize:
@@ -17853,95 +17582,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
         &self,
         manifest: crate::federation::ChunkManifest,
     ) -> Result<[u8; 32], crate::federation::BlobError> {
-        let be = |what: &str, e: tokio_postgres::Error| {
-            crate::federation::BlobError::Backend(format!("put_dag_manifest_over_held {what}: {e}"))
-        };
-        let row =
-            crate::federation::blobs::prepare_manifest_row(&manifest, self.inline_bytes_cap())?;
-        // v55.0.0 (#1007) — taken-down bytes never come back: neither the
-        // manifest nor a withheld chunk becomes a DAG.
-        let mut reversed =
-            crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256).await?;
-        for c in &manifest.chunks {
-            reversed.absorb(
-                crate::federation::steward_purge::refuse_tombstoned_bytes(self, &c.sha).await?,
-            );
-        }
-        // v60.1.0 (#1070) — the in-transaction second look's inputs (the
-        // switch, and #1113's reversals the pre-read found), and the
-        // witnesses' seam between the pre-read and the write.
-        let tombstones = crate::federation::steward_purge::TombstoneFloor::new(
-            self.bytes_tombstone_plane(),
-            reversed,
-        );
-        #[cfg(test)]
-        self.test_hooks()
-            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
-            .await;
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let tx = client.transaction().await.map_err(|e| be("begin", e))?;
-        for (idx, c) in manifest.chunks.iter().enumerate() {
-            let held = tx
-                .query_opt(
-                    "SELECT storage_kind, crypto_tier, size_bytes \
-                     FROM cirislens.federation_blobs WHERE sha256 = $1 FOR SHARE",
-                    &[&c.sha.to_vec()],
-                )
-                .await
-                .map_err(|e| be("read chunk", e))?
-                .map(
-                    |r| -> Result<(String, String, i64), crate::federation::BlobError> {
-                        use crate::federation::BlobError as B;
-                        Ok((
-                            r.safe_get_with("storage_kind", B::Backend)?,
-                            r.safe_get_with("crypto_tier", B::Backend)?,
-                            r.safe_get_with("size_bytes", B::Backend)?,
-                        ))
-                    },
-                )
-                .transpose()?;
-            // Dropping `tx` uncommitted rolls back; nothing was written.
-            crate::federation::blobs::check_held_dag_chunk(idx, &c.sha, u64::from(c.size), held)?;
-        }
-        // v60.1.0 (#1070) — the tombstones again, under the write: the
-        // manifest's own and every chunk's.
-        let shas: Vec<[u8; 32]> = std::iter::once(row.sha256)
-            .chain(manifest.chunks.iter().map(|c| c.sha))
-            .collect();
-        pg_refuse_tombstoned_at_write(&tx, &shas, &tombstones).await?;
-        let media_type_null: Option<String> = None;
-        tx.execute(
-            "INSERT INTO cirislens.federation_blobs (\
-                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type\
-             ) VALUES ($1, $2, $3, NULL, $4, $5) \
-             ON CONFLICT (sha256) DO NOTHING",
-            &[
-                &row.sha256.to_vec(),
-                &row.storage_kind,
-                &row.bytes_inline,
-                &row.size_bytes,
-                &media_type_null,
-            ],
-        )
-        .await
-        .map_err(|e| be("insert", e))?;
-        // Codex r2 on #1065 — the manifest's chunk relation, with the row.
-        let (links, link_stream) = crate::federation::blobs::manifest_chunk_links(&manifest);
-        for (seq, chunk) in &links {
-            tx.execute(
-                "INSERT INTO cirislens.federation_dag_chunks \
-                     (manifest_sha256, seq, chunk_sha256, stream_id) VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (manifest_sha256, seq) DO NOTHING",
-                &[&row.sha256.to_vec(), seq, chunk, &link_stream],
-            )
-            .await
-            .map_err(|e| be("link", e))?;
-        }
-        tx.commit().await.map_err(|e| be("commit", e))?;
-        Ok(row.sha256)
+        crate::federation::blob_admit::put_dag_manifest_over_held_planned(self, manifest).await
     }
 
     async fn put_blob_chunk_with_scope(
@@ -17956,22 +17597,20 @@ impl crate::federation::BlobStorage for PostgresBackend {
         binding: Option<crate::federation::EpochBinding>,
         claim: crate::federation::StreamClaim,
     ) -> Result<[u8; 32], crate::federation::BlobError> {
-        // #832 (§12.3 / I17) — a WRITE binds the current epoch.
-        let sha = self
-            .put_blob_chunk_floor(
-                stream_id,
-                seq,
-                body,
-                epoch,
-                plaintext_size,
-                cohort_scope,
-                floor,
-                binding,
-                claim,
-                false,
-            )
-            .await?;
-        Ok(sha)
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::blob_admit::put_blob_chunk_planned(
+            self,
+            stream_id,
+            seq,
+            body,
+            epoch,
+            plaintext_size,
+            cohort_scope,
+            floor,
+            binding,
+            claim,
+        )
+        .await
     }
 
     async fn adopt_sealed_chunk_at(
@@ -17987,33 +17626,20 @@ impl crate::federation::BlobStorage for PostgresBackend {
         binding: Option<crate::federation::EpochBinding>,
         community_key_id: Option<&str>,
     ) -> Result<[u8; 32], crate::federation::BlobError> {
-        // #846 (§6.2, I50) — the AUTHOR is the claimed owner: the stream row
-        // is written insert-if-absent naming the author, so the adopter can
-        // never append to it as its own (I41 carried across nodes). The
-        // binding is written AS DECLARED (no current-epoch check).
-        let claim = crate::federation::StreamClaim {
-            // v55.0.0 (#977) — the provenance's community, bound or not.
-            community_key_id: community_key_id
-                .map(str::to_owned)
-                .or_else(|| binding.as_ref().map(|b| b.community_key_id.clone())),
-            owner_key_id: Some(author_key_id.to_owned()),
-            stream_key: None,
-        };
-        let sha = self
-            .put_blob_chunk_floor(
-                stream_id,
-                seq,
-                crate::federation::BlobBody::Inline(envelope_bytes),
-                epoch,
-                plaintext_size,
-                cohort_scope,
-                floor,
-                binding,
-                claim,
-                true,
-            )
-            .await?;
-        Ok(sha)
+        crate::federation::blob_admit::adopt_sealed_chunk_planned(
+            self,
+            stream_id,
+            seq,
+            envelope_bytes,
+            epoch,
+            plaintext_size,
+            cohort_scope,
+            author_key_id,
+            floor,
+            binding,
+            community_key_id,
+        )
+        .await
     }
 
     async fn adopt_sealed_chunks_at(
@@ -18028,34 +17654,16 @@ impl crate::federation::BlobStorage for PostgresBackend {
         community_key_id: Option<&str>,
     ) -> Result<Vec<Result<[u8; 32], crate::federation::BlobError>>, crate::federation::BlobError>
     {
-        // #846 (§6.2, I50) — the AUTHOR is the claimed owner, as for one chunk.
-        let claim = crate::federation::StreamClaim {
-            // v55.0.0 (#977) — the provenance's community, bound or not.
-            community_key_id: community_key_id
-                .map(str::to_owned)
-                .or_else(|| binding.as_ref().map(|b| b.community_key_id.clone())),
-            owner_key_id: Some(author_key_id.to_owned()),
-            stream_key: None,
-        };
-        let items = items
-            .into_iter()
-            .map(
-                |(seq, envelope, plaintext_size)| crate::federation::blobs::ChunkFloorItem {
-                    seq,
-                    body: crate::federation::BlobBody::Inline(envelope),
-                    plaintext_size,
-                },
-            )
-            .collect();
-        self.put_blob_chunks_floor(
+        crate::federation::blob_admit::adopt_sealed_chunks_planned(
+            self,
             stream_id,
             items,
             epoch,
             cohort_scope,
+            author_key_id,
             floor,
             binding,
-            claim,
-            true,
+            community_key_id,
         )
         .await
     }
@@ -18069,223 +17677,16 @@ impl crate::federation::BlobStorage for PostgresBackend {
         floor: crate::federation::StorageFloor,
         binding: Option<crate::federation::EpochBinding>,
     ) -> Result<(), crate::federation::BlobError> {
-        floor.check_scope(cohort_scope)?;
-        let cap = self.inline_bytes_cap();
-        if spec.body.len() > cap {
-            return Err(crate::federation::BlobError::InlineSizeExceeded {
-                size: spec.body.len(),
-                cap,
-            });
-        }
-        crate::federation::blobs::verify_inline_hash(&spec.sha256, &spec.body)?;
-        let size_i64 = i64::try_from(spec.size_bytes).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "seal_stream_with_scope: size_bytes exceeds i64".into(),
-            )
-        })?;
-        let expected = i64::try_from(spec.expected_chunk_count).unwrap_or(i64::MAX);
-        let scope = cohort_scope.to_owned();
-        let tier = floor.tier().as_str().to_owned();
-        let media = media_type.map(str::to_owned);
-
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
-        if let Some(b) = &binding {
-            lock_community_tx(&tx, &b.community_key_id).await?;
-        }
-        for c in &spec.children {
-            if c.body.len() > cap {
-                let _ = tx.rollback().await;
-                return Err(crate::federation::BlobError::InlineSizeExceeded {
-                    size: c.body.len(),
-                    cap,
-                });
-            }
-            crate::federation::blobs::verify_inline_hash(&c.sha256, &c.body)?;
-        }
-        // #954 — an abandoned stream is never sealed.
-        let abandoned = tx
-            .query_opt(
-                "SELECT (abandoned_at IS NOT NULL) AS a FROM cirislens.federation_streams \
-                  WHERE stream_id = $1",
-                &[&stream_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("seal_stream_with_scope head: {e}"))
-            })?
-            .map(|r| r.safe_get_with::<bool, _, _, _>("a", crate::federation::BlobError::Backend))
-            .transpose()?
-            .unwrap_or(false);
-        if abandoned {
-            let _ = tx.rollback().await;
-            return Err(crate::federation::blobs::stream_abandoned_refusal(
-                stream_id,
-            ));
-        }
-        // §12.3 — the door listed N chunks and sealed a manifest over them;
-        // if the stream has moved since, refuse rather than truncate.
-        let count_row = tx
-            .query_one(
-                "SELECT COUNT(*) AS n FROM cirislens.federation_stream_chunks WHERE stream_id = $1",
-                &[&stream_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("seal_stream_with_scope count: {e}"))
-            })?;
-        let count: i64 = count_row.safe_get_with("n", crate::federation::BlobError::Backend)?;
-        if count != expected {
-            let _ = tx.rollback().await;
-            return Err(crate::federation::BlobError::InvalidArgument(format!(
-                "seal_stream_with_scope: stream {stream_id} has {count} chunk(s) but the manifest \
-                 was built over {}; the stream moved under the seal — list it again \
-                 (BLOB_ENCRYPTION_AT_REST.md §12.3)",
-                spec.expected_chunk_count
-            )));
-        }
-        let sha_vec = spec.sha256.to_vec();
-        // #984 (V177) — the group the seal named, on the root and each child.
-        let group = spec.group_key_id.clone();
-        // #846 (§5) — the manifest's author is the stream's owner: the first
-        // attributed writer (I41), read from the stream row in this
-        // transaction. NULL for an unclaimed stream.
-        tx.execute(
-            "INSERT INTO cirislens.federation_blobs (\
-                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                cohort_scope, crypto_tier, author_key_id, group_key_id\
-             ) VALUES ($1, 'chunk_dag', $2, NULL, $3, $4, $5, $6, \
-                       (SELECT owner_key_id FROM cirislens.federation_streams WHERE stream_id = $7), \
-                       $8) \
-             ON CONFLICT (sha256) DO NOTHING",
-            &[
-                &sha_vec, &spec.body, &size_i64, &media, &scope, &tier, &stream_id, &group,
-            ],
+        crate::federation::blob_admit::seal_stream_planned(
+            self,
+            stream_id,
+            spec,
+            media_type,
+            cohort_scope,
+            floor,
+            binding,
         )
         .await
-        .map_err(|e| {
-            crate::federation::BlobError::Backend(format!(
-                "seal_stream_with_scope manifest insert: {e}"
-            ))
-        })?;
-        if let Some(b) = &binding {
-            let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
-            // #848 — the manifest binds `(community, minter, epoch)`,
-            // current-and-enabled against the MINTER's own state.
-            let n = tx
-                .execute(
-                    "INSERT INTO cirislens.federation_community_blob_epoch \
-                        (at_rest_sha256, community_key_id, minter_key_id, epoch) \
-                     SELECT $1, $2, $3, $4 \
-                      WHERE EXISTS (SELECT 1 FROM cirislens.federation_community_dek \
-                                     WHERE community_key_id = $2 AND minter_key_id = $3 AND epoch = $4 \
-                                       AND key_state = 'enabled') \
-                        AND $4 = COALESCE((SELECT epoch FROM cirislens.federation_community_dek_epoch \
-                                            WHERE community_key_id = $2 AND minter_key_id = $3), 0) \
-                     ON CONFLICT (at_rest_sha256) DO NOTHING",
-                    &[&sha_vec, &b.community_key_id, &b.minter_key_id, &ep],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::BlobError::Backend(format!(
-                        "seal_stream_with_scope bind: {e}"
-                    ))
-                })?;
-            let already_row = tx
-                .query_one(
-                    "SELECT EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
-                                    WHERE at_rest_sha256 = $1 AND community_key_id = $2 \
-                                      AND minter_key_id = $3 AND epoch = $4) AS b",
-                    &[&sha_vec, &b.community_key_id, &b.minter_key_id, &ep],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::BlobError::Backend(format!(
-                        "seal_stream_with_scope bind check: {e}"
-                    ))
-                })?;
-            let already: bool =
-                already_row.safe_get_with("b", crate::federation::BlobError::Backend)?;
-            if n == 0 && !already {
-                let _ = tx.rollback().await;
-                return Err(crate::federation::BlobError::EpochNotCurrent {
-                    community_key_id: b.community_key_id.clone(),
-                    epoch: b.epoch,
-                });
-            }
-        }
-        // #954 — a v3 root's children, in the root's transaction (see the
-        // sqlite twin).
-        for c in &spec.children {
-            let child_sha = c.sha256.to_vec();
-            let len = i64::try_from(c.body.len()).unwrap_or(i64::MAX);
-            let idx = i64::try_from(c.index).unwrap_or(i64::MAX);
-            tx.execute(
-                "INSERT INTO cirislens.federation_blobs (\
-                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                    cohort_scope, crypto_tier, author_key_id, group_key_id\
-                 ) VALUES ($1, 'inline', $2, NULL, $3, NULL, $4, $5, \
-                           (SELECT owner_key_id FROM cirislens.federation_streams WHERE stream_id = $6), \
-                           $7) \
-                 ON CONFLICT (sha256) DO NOTHING",
-                &[&child_sha, &c.body, &len, &scope, &tier, &stream_id, &group],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("seal child insert: {e}"))
-            })?;
-            if let Some(b) = &binding {
-                let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
-                tx.execute(
-                    "INSERT INTO cirislens.federation_community_blob_epoch \
-                        (at_rest_sha256, community_key_id, minter_key_id, epoch) \
-                     VALUES ($1, $2, $3, $4) ON CONFLICT (at_rest_sha256) DO NOTHING",
-                    &[&child_sha, &b.community_key_id, &b.minter_key_id, &ep],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::BlobError::Backend(format!("seal child bind: {e}"))
-                })?;
-            }
-            tx.execute(
-                "INSERT INTO cirislens.federation_manifest_children \
-                    (root_sha256, child_index, child_sha256) VALUES ($1, $2, $3) \
-                 ON CONFLICT (root_sha256, child_index) DO NOTHING",
-                &[&sha_vec, &idx, &child_sha],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("seal child relation: {e}"))
-            })?;
-        }
-        // v53.1.0 (#979) — the manifest's chunks, from the stream's own rows
-        // (whose count was checked above), in this transaction.
-        tx.execute(
-            "INSERT INTO cirislens.federation_dag_chunks (manifest_sha256, seq, chunk_sha256, stream_id) \
-             SELECT $1, seq, chunk_sha, stream_id FROM cirislens.federation_stream_chunks \
-             WHERE stream_id = $2 ON CONFLICT (manifest_sha256, seq) DO NOTHING",
-            &[&sha_vec, &stream_id],
-        )
-        .await
-        .map_err(|e| crate::federation::BlobError::Backend(format!("seal dag chunk links: {e}")))?;
-        tx.execute(
-            "UPDATE cirislens.federation_stream_chunks SET sealed_at = NOW() WHERE stream_id = $1",
-            &[&stream_id],
-        )
-        .await
-        .map_err(|e| {
-            crate::federation::BlobError::Backend(format!("seal_stream_with_scope sealed_at: {e}"))
-        })?;
-        tx.commit().await.map_err(|e| {
-            crate::federation::BlobError::Backend(format!("seal_stream_with_scope commit: {e}"))
-        })?;
-        Ok(())
     }
 
     async fn manifest_children(
@@ -18656,8 +18057,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
     ) -> Result<Vec<(u64, [u8; 32])>, crate::federation::BlobError> {
         use crate::federation::BlobError;
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| BlobError::Backend(format!("dag_chunks_of_manifest pool: {e}")))?;
         let sha = manifest_sha.to_vec();
@@ -18688,8 +18088,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
     ) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
         use crate::federation::BlobError;
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| BlobError::Backend(format!("list_unlinked_chunk_dags pool: {e}")))?;
         let after = after.map(|a| a.to_vec()).unwrap_or_default();
@@ -18723,8 +18122,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
     ) -> Result<bool, crate::federation::BlobError> {
         use crate::federation::BlobError;
         let mut client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| BlobError::Backend(format!("link_dag_chunks_if_exact pool: {e}")))?;
         let mut want: Vec<(i64, Vec<u8>)> = chunks
@@ -18788,8 +18186,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
     ) -> Result<Option<[u8; 32]>, crate::federation::BlobError> {
         use crate::federation::BlobError;
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| BlobError::Backend(format!("dag_link_backfill_cursor pool: {e}")))?;
         let row = client
@@ -18813,10 +18210,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
         after: Option<[u8; 32]>,
     ) -> Result<(), crate::federation::BlobError> {
         use crate::federation::BlobError;
-        let client =
-            self.pool.get().await.map_err(|e| {
-                BlobError::Backend(format!("set_dag_link_backfill_cursor pool: {e}"))
-            })?;
+        let client = self
+            .checkout()
+            .await
+            .map_err(|e| BlobError::Backend(format!("set_dag_link_backfill_cursor pool: {e}")))?;
         let after = after.map(|a| a.to_vec());
         client
             .execute(
@@ -18998,167 +18395,18 @@ impl crate::federation::BlobStorage for PostgresBackend {
         group_key_id: Option<&str>,
         announce: Option<crate::federation::PutBlobAttestation>,
     ) -> Result<[u8; 32], crate::federation::BlobError> {
-        use sha2::Digest as _;
-        floor.check_scope(cohort_scope)?;
-        let cap = self.inline_bytes_cap();
-        if envelope_bytes.len() > cap {
-            return Err(crate::federation::BlobError::InlineSizeExceeded {
-                size: envelope_bytes.len(),
-                cap,
-            });
-        }
-        // The address is the SHA-256 of the CIPHERTEXT, computed here from
-        // the bytes that are stored — never trusted from the sender.
-        let sha256: [u8; 32] = sha2::Sha256::digest(&envelope_bytes).into();
-        // v55.0.0 (#1007) — taken-down bytes never come back.
-        let reversed =
-            crate::federation::steward_purge::refuse_tombstoned_bytes(self, &sha256).await?;
-        // v60.1.0 (#1070) — the in-transaction second look's inputs (the
-        // switch, and #1113's reversals the pre-read found), and the
-        // witnesses' seam between the pre-read and the write.
-        let tombstones = crate::federation::steward_purge::TombstoneFloor::new(
-            self.bytes_tombstone_plane(),
-            reversed,
-        );
-        #[cfg(test)]
-        self.test_hooks()
-            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
-            .await;
-        let size_i64 = i64::try_from(envelope_bytes.len()).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "adopt_sealed_blob_at: size_bytes exceeds i64".into(),
-            )
-        })?;
-        // v45.0.0 (CIRISPersist#871, AV-89) — the announce's declared size must
-        // be the length of the sealed bytes this door stores.
-        if let Some(a) = &announce {
-            if a.size != envelope_bytes.len() as u64 {
-                return Err(crate::federation::BlobError::InvalidArgument(format!(
-                    "holding claim declares size {} but the adopted bytes are {} \
-                     (CC 5.3.2.5 / AV-89: a holder announces exactly what it holds)",
-                    a.size,
-                    envelope_bytes.len()
-                )));
-            }
-        }
-        // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — the group a sealed
-        // room row names is its binding's community: a group that disagrees
-        // with the binding is a contradiction the floor refuses.
-        if let (Some(b), Some(g)) = (&binding, group_key_id) {
-            if b.community_key_id != g {
-                return Err(crate::federation::BlobError::InvalidArgument(format!(
-                    "adopt_sealed_blob_at: group {g:?} is not the binding's community {:?}",
-                    b.community_key_id
-                )));
-            }
-        }
-        let group = group_key_id
-            .map(str::to_owned)
-            .or_else(|| binding.as_ref().map(|b| b.community_key_id.clone()));
-        // The holding claim is admitted on the same terms as `put_blob`'s, at
-        // the content's scope, with the holder in the cohort.
-        let prepared = match announce.as_ref() {
-            Some(a) => {
-                let claim_scope = crate::federation::holding_claim::ClaimScope::of_content(
-                    floor.tier(),
-                    cohort_scope,
-                    group.as_deref(),
-                )?;
-                let p = crate::federation::holding_claim::prepare_holding_claim_row(
-                    &sha256,
-                    a,
-                    &claim_scope,
-                )?;
-                crate::federation::holding_claim::check_holding_claim_audience(self, &p.row)
-                    .await?;
-                Some(p)
-            }
-            None => None,
-        };
-        let sha_vec = sha256.to_vec();
-        let scope = cohort_scope.to_owned();
-        let tier = floor.tier().as_str().to_owned();
-        let media = media_type.map(str::to_owned);
-
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
-        // I27 — the binding is epoch state; take the community's boundary.
-        if let Some(b) = &binding {
-            lock_community_tx(&tx, &b.community_key_id).await?;
-        }
-        // v60.1.0 (#1070) — the tombstone again, under the write.
-        pg_refuse_tombstoned_at_write(&tx, &[sha256], &tombstones).await?;
-        // 1. The row, verbatim bytes, tier from the token, cohort and author
-        //    AS DECLARED, and (v55.0.0) the group the provenance names (V177).
-        //    First-write-wins on the address.
-        tx.execute(
-            "INSERT INTO cirislens.federation_blobs (\
-                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                cohort_scope, crypto_tier, author_key_id, group_key_id\
-             ) VALUES ($1, 'inline', $2, NULL, $3, $4, $5, $6, $7, $8) \
-             ON CONFLICT (sha256) DO NOTHING",
-            &[
-                &sha_vec,
-                &envelope_bytes,
-                &size_i64,
-                &media,
-                &scope,
-                &tier,
-                &author_key_id,
-                &group,
-            ],
+        crate::federation::blob_admit::adopt_sealed_blob_planned(
+            self,
+            envelope_bytes,
+            media_type,
+            cohort_scope,
+            author_key_id,
+            floor,
+            binding,
+            group_key_id,
+            announce,
         )
         .await
-        .map_err(|e| {
-            crate::federation::BlobError::Backend(format!("adopt_sealed_blob_at insert: {e}"))
-        })?;
-        // 2. The binding AS DECLARED (§3): the epoch the author sealed under,
-        //    which may be past and may be one this node holds no key state
-        //    for. No `enabled` check, no current-epoch check.
-        if let Some(b) = &binding {
-            let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
-            // #848 — the minter is the AUTHOR, as declared (§11).
-            tx.execute(
-                "INSERT INTO cirislens.federation_community_blob_epoch \
-                    (at_rest_sha256, community_key_id, minter_key_id, epoch) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (at_rest_sha256) DO NOTHING",
-                &[&sha_vec, &b.community_key_id, &b.minter_key_id, &ep],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("adopt_sealed_blob_at bind: {e}"))
-            })?;
-        }
-        // 3. The holder claim, signed by THIS node (§6.1 (4)), in the same
-        //    transaction as the row it announces.
-        if let Some(p) = &prepared {
-            self.insert_holding_claim_tx(&tx, p).await?;
-        }
-        tx.commit().await.map_err(|e| {
-            crate::federation::BlobError::Backend(format!("adopt_sealed_blob_at commit: {e}"))
-        })?;
-        drop(client);
-        // v44.8.1 (CIRISPersist#870) — the index moves WITH the row (#610). The
-        // holder claim just written is a federation-tier attestation like every
-        // one `put_attestation` writes, and gets its `signed_wire_index` entry
-        // now — not at the next boot's rebuild. Without it the claim was
-        // ADVERTISED (the summary reads the row) and UNFETCHABLE (the packer
-        // resolves a want through the index), so no peer ever learned a holder
-        // and every blob-backed body read `not_fetched`. Same hook, same
-        // posture as `put_attestation`: the primary write is durable; an index
-        // failure is logged loudly by the hook and repaired by the rebuild.
-        if let Some(p) = &prepared {
-            self.index_holder_claim(&p.row.attestation_id, &p.row.tier)
-                .await?;
-        }
-        Ok(sha256)
     }
 
     async fn blob_associations(
@@ -19167,8 +18415,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
     ) -> Result<Vec<(String, Option<String>)>, crate::federation::BlobError> {
         use crate::federation::BlobError;
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| BlobError::Backend(format!("blob_associations pool: {e}")))?;
         let rows = client
@@ -19392,102 +18639,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
         sth: ciris_verify_core::transparency::SignedTreeHead,
         producer_key_id: &str,
     ) -> Result<(), crate::federation::BlobError> {
-        use crate::federation::stream_sth;
-        // Step 1: parse stream_id (must be `stream:<id>`).
-        let stream_id = stream_sth::parse_stream_id(&sth.log_id)?.to_string();
-
-        // Step 2: load the seq-ordered chunk hashes for the stream
-        // (the first `tree_size` are what the gate compares against; we
-        // load all and let recompute_and_assert_root slice + check the
-        // count).
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let chunk_hashes = pg_load_stream_chunk_hashes(&client, &stream_id).await?;
-
-        // Steps 3–4: recompute the RFC 6962 root from persist's own
-        // chunks and assert it equals the STH's claimed root (the
-        // anti-equivocation gate; rejects over-claimed tree_size too).
-        stream_sth::recompute_and_assert_root(&sth, &chunk_hashes)?;
-
-        // Step 5: verify the producer's hybrid signature, resolving the
-        // pinned key from federation_keys via producer_key_id.
-        crate::federation::blobs::verify_stream_sth_signature(self, &sth, producer_key_id).await?;
-
-        // Step 5b (v31.0.0, CIRISPersist#657): verify the WITNESS
-        // cosignatures the same way; see the sqlite twin.
-        crate::federation::blobs::verify_stream_sth_witnesses(self, &sth).await?;
-
-        // Step 6: INSERT. A (stream_id, tree_size) PK conflict with a
-        // DIFFERENT root is an equivocation attempt → reject; identical
-        // → idempotent. We read any existing row's root first.
-        let tree_size_i64 = i64::try_from(sth.tree_size).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "put_stream_sth: tree_size exceeds i64 — federation_stream_sth.tree_size is BIGINT"
-                    .into(),
-            )
-        })?;
-        let epoch_i64 = i64::try_from(0u64).expect("0 fits i64");
-        let root_vec = sth.root_hash.to_vec();
-        let signed_at = sth.timestamp;
-        let signature_blob = stream_sth::serialize_signature(&sth.signature)?;
-        let witness_json = stream_sth::serialize_witness_signatures(&sth.witness_signatures)?;
-        let witness_value: serde_json::Value =
-            serde_json::from_str(&witness_json).map_err(|e| {
-                crate::federation::BlobError::Backend(format!("put_stream_sth witness json: {e}"))
-            })?;
-
-        // Idempotent/equivocation: only insert when absent.
-        let inserted = client
-            .execute(
-                "INSERT INTO cirislens.federation_stream_sth (\
-                    stream_id, tree_size, epoch, root_hash, signed_at, \
-                    producer_key_id, signature_blob, witness_signatures\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-                 ON CONFLICT (stream_id, tree_size) DO NOTHING",
-                &[
-                    &stream_id,
-                    &tree_size_i64,
-                    &epoch_i64,
-                    &root_vec,
-                    &signed_at,
-                    &producer_key_id,
-                    &signature_blob,
-                    &witness_value,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("put_stream_sth insert: {e}"))
-            })?;
-
-        if inserted == 0 {
-            // A row already exists at (stream_id, tree_size). Equivocation
-            // iff its stored root differs from the new STH's root.
-            let existing_root: Vec<u8> = client
-                .query_one(
-                    "SELECT root_hash FROM cirislens.federation_stream_sth \
-                      WHERE stream_id = $1 AND tree_size = $2",
-                    &[&stream_id, &tree_size_i64],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::BlobError::Backend(format!(
-                        "put_stream_sth conflict re-read: {e}"
-                    ))
-                })?
-                .get(0);
-            if existing_root != root_vec {
-                return Err(crate::federation::BlobError::InvalidArgument(format!(
-                    "put_stream_sth: equivocation — an STH at stream={stream_id} \
-                     tree_size={} already exists with a different root",
-                    sth.tree_size
-                )));
-            }
-            // Identical re-PUT → idempotent OK.
-        }
-        Ok(())
+        crate::federation::blob_admit::put_stream_sth_planned(self, sth, producer_key_id).await
     }
 
     async fn latest_stream_sth(
@@ -19579,117 +18731,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
         &self,
         receipt: crate::federation::stream_receipt::DeliveryReceipt,
     ) -> Result<(), crate::federation::BlobError> {
-        use crate::federation::stream_receipt;
-
-        // Step 1: verify the subscriber's hybrid signature (pinned key
-        // resolved from federation_keys via subscriber_key_id). Necessary,
-        // NOT sufficient.
-        stream_receipt::verify_receipt_signature(self, &receipt).await?;
-
-        let k_i64 = i64::try_from(receipt.k).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "put_delivery_receipt: k exceeds i64 — \
-                 federation_stream_delivery_receipts.k is BIGINT"
-                    .into(),
-            )
-        })?;
-        let epoch_i64 = i64::try_from(receipt.epoch).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "put_delivery_receipt: epoch exceeds i64".into(),
-            )
-        })?;
-        let root_vec = receipt.chunk_root.to_vec();
-        let signature_blob =
-            crate::federation::stream_sth::serialize_signature(&receipt.signature)?;
-        let received_at = chrono::Utc::now();
-
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let tx = client.transaction().await.map_err(|e| {
-            crate::federation::BlobError::Backend(format!("put_delivery_receipt tx: {e}"))
-        })?;
-
-        // Step 2: the JOIN gate. The acknowledged chunk_root MUST be a root
-        // persist itself published as an STH for this stream
-        // (federation_stream_sth, C1b) at tree_size >= k. A subscriber
-        // cannot acknowledge an unpublished root, nor a chunk index beyond
-        // the published tree. The sig proved WHO; this proves the root is
-        // REAL.
-        let published: i64 = tx
-            .query_one(
-                "SELECT COUNT(*) FROM cirislens.federation_stream_sth \
-                  WHERE stream_id = $1 AND root_hash = $2 AND tree_size >= $3",
-                &[&receipt.stream_id, &root_vec, &k_i64],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("put_delivery_receipt STH JOIN: {e}"))
-            })?
-            .get(0);
-        if published == 0 {
-            return Err(crate::federation::BlobError::InvalidArgument(format!(
-                "put_delivery_receipt: no published STH for stream={} matches the \
-                 acknowledged chunk_root at tree_size >= {} (a subscriber cannot \
-                 acknowledge an unpublished root)",
-                receipt.stream_id, receipt.k
-            )));
-        }
-
-        // Step 3: INSERT. A (stream_id, subscriber_key_id, k) PK conflict
-        // with a DIFFERENT root is a subscriber equivocation attempt →
-        // reject; identical → idempotent.
-        let inserted = tx
-            .execute(
-                "INSERT INTO cirislens.federation_stream_delivery_receipts (\
-                    stream_id, subscriber_key_id, epoch, k, chunk_root, \
-                    signature_blob, received_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7) \
-                 ON CONFLICT (stream_id, subscriber_key_id, k) DO NOTHING",
-                &[
-                    &receipt.stream_id,
-                    &receipt.subscriber_key_id,
-                    &epoch_i64,
-                    &k_i64,
-                    &root_vec,
-                    &signature_blob,
-                    &received_at,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("put_delivery_receipt insert: {e}"))
-            })?;
-
-        if inserted == 0 {
-            let existing_root: Vec<u8> = tx
-                .query_one(
-                    "SELECT chunk_root FROM cirislens.federation_stream_delivery_receipts \
-                      WHERE stream_id = $1 AND subscriber_key_id = $2 AND k = $3",
-                    &[&receipt.stream_id, &receipt.subscriber_key_id, &k_i64],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::BlobError::Backend(format!(
-                        "put_delivery_receipt conflict re-read: {e}"
-                    ))
-                })?
-                .get(0);
-            if existing_root != root_vec {
-                return Err(crate::federation::BlobError::InvalidArgument(format!(
-                    "put_delivery_receipt: subscriber equivocation — a receipt for \
-                     stream={} subscriber={} k={} already exists with a different chunk_root",
-                    receipt.stream_id, receipt.subscriber_key_id, receipt.k
-                )));
-            }
-            // Identical re-PUT → idempotent OK; nothing to commit.
-            return Ok(());
-        }
-        tx.commit().await.map_err(|e| {
-            crate::federation::BlobError::Backend(format!("put_delivery_receipt commit: {e}"))
-        })?;
-        Ok(())
+        crate::federation::blob_admit::put_delivery_receipt_planned(self, receipt).await
     }
 
     async fn list_delivery_receipts_for(
@@ -20153,321 +19195,6 @@ async fn pg_load_stream_chunk_hashes(
 // ─── Eviction sweeper helpers (v3.4.0, CIRISPersist#123) ───────────
 
 impl PostgresBackend {
-    /// #832 (§12.3) / #846 (§6.2) — **the chunk floor, shared by the write
-    /// door and the adopt door.** One body, so the I41 stream-claim logic has
-    /// one spelling. `bind_as_declared` selects the binding rule: `false` is
-    /// the write rule (the epoch must be the community's CURRENT enabled one,
-    /// I17); `true` is the adopt rule (record the epoch the author sealed
-    /// under, whatever this node knows about it).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn put_blob_chunk_floor(
-        &self,
-        stream_id: &str,
-        seq: u64,
-        body: crate::federation::BlobBody,
-        epoch: u64,
-        plaintext_size: u64,
-        cohort_scope: &str,
-        floor: crate::federation::StorageFloor,
-        binding: Option<crate::federation::EpochBinding>,
-        claim: crate::federation::StreamClaim,
-        bind_as_declared: bool,
-    ) -> Result<[u8; 32], crate::federation::BlobError> {
-        // #957 — one append is a batch of one: one floor spelling.
-        let mut out = self
-            .put_blob_chunks_floor(
-                stream_id,
-                vec![crate::federation::blobs::ChunkFloorItem {
-                    seq,
-                    body,
-                    plaintext_size,
-                }],
-                epoch,
-                cohort_scope,
-                floor,
-                binding,
-                claim,
-                bind_as_declared,
-            )
-            .await?;
-        out.pop().expect("a batch of one answers with one result")
-    }
-
-    /// v52.0.0 (CIRISPersist#957) — **the chunk floor, batched**, the
-    /// postgres twin of the sqlite floor: the stream's row once (a refusal
-    /// there refuses the whole batch, nothing written), then per item a
-    /// savepoint running the blob row, the nonce cap by the V165 counter
-    /// (`+1 … RETURNING`, which also row-locks the (stream, epoch) counter
-    /// for the rest of the transaction, so two concurrent appends to one
-    /// stream cannot both pass the cap), the index row, and the binding. An
-    /// item refused there rolls back its savepoint and answers `Err` in its
-    /// slot.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn put_blob_chunks_floor(
-        &self,
-        stream_id: &str,
-        items: Vec<crate::federation::blobs::ChunkFloorItem>,
-        epoch: u64,
-        cohort_scope: &str,
-        floor: crate::federation::StorageFloor,
-        binding: Option<crate::federation::EpochBinding>,
-        claim: crate::federation::StreamClaim,
-        bind_as_declared: bool,
-    ) -> Result<Vec<Result<[u8; 32], crate::federation::BlobError>>, crate::federation::BlobError>
-    {
-        use crate::federation::BlobStorage as _;
-        floor.check_scope(cohort_scope)?;
-        crate::federation::stream_sth::refuse_reserved_stream_id(stream_id)?;
-        crate::federation::blobs::check_chunk_batch_bounds(&items)?;
-        crate::federation::blobs::check_stream_key_batch(&claim, items.len())?;
-        let cap = self.inline_bytes_cap();
-        // u64 → i64 binds (tokio_postgres has no ToSql for u64).
-        let epoch_i64 = i64::try_from(epoch).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "put_blob_chunk: epoch exceeds i64 — federation_stream_chunks.epoch is BIGINT"
-                    .into(),
-            )
-        })?;
-        // Per item: validation + hash-on-write + the §12.3 floor check. A
-        // refusal here is that item's answer; it never enters the transaction.
-        let mut results: Vec<Option<Result<[u8; 32], crate::federation::BlobError>>> =
-            Vec::with_capacity(items.len());
-        let mut ready: Vec<(usize, PgChunkRow)> = Vec::with_capacity(items.len());
-        for (slot, item) in items.into_iter().enumerate() {
-            match pg_prepare_chunk_item(&item, cap, floor) {
-                Ok(row) => {
-                    results.push(None);
-                    ready.push((slot, row));
-                }
-                Err(e) => results.push(Some(Err(e))),
-            }
-        }
-        // v55.0.0 (#1007) — taken-down bytes never come back: that item's
-        // answer is the refusal, as for any other per-item refusal.
-        let mut kept: Vec<(usize, PgChunkRow)> = Vec::with_capacity(ready.len());
-        let mut reversed = crate::federation::steward_purge::ReversedTakedowns::default();
-        for (slot, row) in ready {
-            match crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256).await
-            {
-                Ok(r) => {
-                    reversed.absorb(r);
-                    kept.push((slot, row));
-                }
-                Err(e) => results[slot] = Some(Err(e)),
-            }
-        }
-        let ready = kept;
-        // v60.1.0 (#1070) — the in-transaction second look's inputs (the
-        // switch, and #1113's reversals the pre-read found), and the
-        // witnesses' seam between the pre-read and the write.
-        let tombstones = crate::federation::steward_purge::TombstoneFloor::new(
-            self.bytes_tombstone_plane(),
-            reversed,
-        );
-        #[cfg(test)]
-        self.test_hooks()
-            .pause_if_armed(crate::store::test_hooks::BYTES_AFTER_TOMBSTONE_PRECHECK)
-            .await;
-        let scope = cohort_scope.to_owned();
-        let tier = floor.tier().as_str().to_owned();
-
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let mut tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
-        // §11.4 / I27 — a community bind runs under the community's
-        // serialization boundary, like every other epoch-state operation.
-        if let Some(b) = &binding {
-            lock_community_tx(&tx, &b.community_key_id).await?;
-        }
-        // v60.1.0 (#1070) — every item's tombstone lock, sorted, for the
-        // whole batch; each item reads its tombstone again under it.
-        let shas: Vec<[u8; 32]> = ready.iter().map(|(_, r)| r.sha256).collect();
-        pg_lock_bytes_tombstones(&tx, &shas, tombstones.plane()).await?;
-
-        // 0. #837 (§12.9 / I41) — the STREAM's row, insert-if-absent in this
-        //    transaction, then compared: a stream belongs to its first
-        //    append. ON CONFLICT DO NOTHING waits on a concurrent first
-        //    append's transaction, and the SELECT that follows is a new
-        //    statement under READ COMMITTED, so the loser compares against
-        //    the winner's row. Refused ⇒ rollback, nothing stored. A NULL
-        //    owner (unclaimed) is adopted by the first attributed claim.
-        tx.execute(
-            "INSERT INTO cirislens.federation_streams \
-                (stream_id, cohort_scope, community_key_id, owner_key_id) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (stream_id) DO NOTHING",
-            &[
-                &stream_id,
-                &scope,
-                &claim.community_key_id,
-                &claim.owner_key_id,
-            ],
-        )
-        .await
-        .map_err(|e| {
-            crate::federation::BlobError::Backend(format!("put_blob_chunk stream row: {e}"))
-        })?;
-        let head = tx
-            .query_one(
-                "SELECT cohort_scope, community_key_id, owner_key_id, \
-                        (abandoned_at IS NOT NULL) AS abandoned \
-                   FROM cirislens.federation_streams WHERE stream_id = $1",
-                &[&stream_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("put_blob_chunk stream head: {e}"))
-            })?;
-        // #954 — an abandoned stream takes no more chunks.
-        let s_abandoned: bool =
-            head.safe_get_with("abandoned", crate::federation::BlobError::Backend)?;
-        if s_abandoned {
-            let _ = tx.rollback().await;
-            return Err(crate::federation::blobs::stream_abandoned_refusal(
-                stream_id,
-            ));
-        }
-        let s_cohort: String =
-            head.safe_get_with("cohort_scope", crate::federation::BlobError::Backend)?;
-        let s_comm: Option<String> =
-            head.safe_get_with("community_key_id", crate::federation::BlobError::Backend)?;
-        let s_owner: Option<String> =
-            head.safe_get_with("owner_key_id", crate::federation::BlobError::Backend)?;
-        if s_cohort != scope || s_comm != claim.community_key_id {
-            let _ = tx.rollback().await;
-            return Err(crate::federation::blobs::stream_elsewhere_refusal(
-                stream_id,
-                &s_cohort,
-                s_comm.as_deref(),
-                cohort_scope,
-                claim.community_key_id.as_deref(),
-            ));
-        }
-        let foreign = match (&s_owner, &claim.owner_key_id) {
-            (None, None) => false,
-            (Some(owner), Some(mine)) => owner != mine,
-            (None, Some(mine)) => {
-                // Adopt. The predicate makes two adopters resolve to one.
-                let n = tx
-                    .execute(
-                        "UPDATE cirislens.federation_streams SET owner_key_id = $2 \
-                          WHERE stream_id = $1 AND owner_key_id IS NULL",
-                        &[&stream_id, mine],
-                    )
-                    .await
-                    .map_err(|e| {
-                        crate::federation::BlobError::Backend(format!(
-                            "put_blob_chunk stream adopt: {e}"
-                        ))
-                    })?;
-                n == 0
-            }
-            (Some(_), None) => true,
-        };
-        if foreign {
-            let _ = tx.rollback().await;
-            return Err(crate::federation::blobs::stream_foreign_refusal(
-                stream_id,
-                &s_cohort,
-                s_comm.as_deref(),
-            ));
-        }
-
-        let ctx = PgChunkTx {
-            stream_id,
-            epoch_i64,
-            scope: &scope,
-            tier: &tier,
-            owner_key_id: claim.owner_key_id.as_deref(),
-            group_key_id: claim.community_key_id.as_deref(),
-            binding: binding.as_ref(),
-            bind_as_declared,
-            stream_key: claim.stream_key,
-            tombstones: &tombstones,
-        };
-        let mut landed = false;
-        for (slot, row) in &ready {
-            let sp = tx.savepoint("chunk_item").await.map_err(|e| {
-                crate::federation::BlobError::Backend(format!("put_blob_chunk savepoint: {e}"))
-            })?;
-            let got = pg_append_chunk_item(&sp, &ctx, row).await?;
-            let answer = match got {
-                PgItemAppended::Ok => {
-                    sp.commit().await.map_err(|e| {
-                        crate::federation::BlobError::Backend(format!(
-                            "put_blob_chunk release: {e}"
-                        ))
-                    })?;
-                    landed = true;
-                    Ok(row.sha256)
-                }
-                refused => {
-                    // No blob row, no index row, no counter step, no binding.
-                    sp.rollback().await.map_err(|e| {
-                        crate::federation::BlobError::Backend(format!(
-                            "put_blob_chunk rollback to savepoint: {e}"
-                        ))
-                    })?;
-                    Err(match refused {
-                        PgItemAppended::SeqConflict => {
-                            crate::federation::BlobError::InvalidArgument(format!(
-                                "stream {stream_id} seq {} already exists",
-                                row.seq
-                            ))
-                        }
-                        PgItemAppended::CapReached => {
-                            crate::federation::blobs::epoch_cap_refusal(stream_id, epoch)
-                        }
-                        PgItemAppended::EpochMoved => {
-                            let b = binding
-                                .as_ref()
-                                .expect("EpochMoved only arises with a binding");
-                            crate::federation::BlobError::EpochNotCurrent {
-                                community_key_id: b.community_key_id.clone(),
-                                epoch: b.epoch,
-                            }
-                        }
-                        PgItemAppended::StreamCounterMoved => {
-                            crate::federation::blobs::stream_counter_moved_refusal(
-                                stream_id,
-                                epoch,
-                                claim.stream_key.map_or(0, |k| k.counter),
-                            )
-                        }
-                        PgItemAppended::StreamEpochClosed => {
-                            crate::federation::blobs::stream_epoch_closed_refusal(stream_id, epoch)
-                        }
-                        PgItemAppended::Purged(notice_id) => crate::federation::BlobError::Purged {
-                            sha256_hex: hex::encode(row.sha256),
-                            notice_id,
-                        },
-                        PgItemAppended::Ok => unreachable!("handled above"),
-                    })
-                }
-            };
-            results[*slot] = Some(answer);
-        }
-
-        // Nothing landed ⇒ nothing is written, the stream row either: a
-        // refused first append does not claim the stream.
-        if landed {
-            tx.commit().await.map_err(|e| {
-                crate::federation::BlobError::Backend(format!("put_blob_chunk commit: {e}"))
-            })?;
-        } else {
-            let _ = tx.rollback().await;
-        }
-        Ok(results
-            .into_iter()
-            .map(|r| r.expect("every slot answered"))
-            .collect())
-    }
-
     /// v3.4.0 (CIRISPersist#123) — fetch the next `limit` eviction
     /// candidates ordered ASC by the full decay-weighted score
     /// `(access_count + 1) * exp(-ln(2) * Δt_secs / half_life_secs)`.
@@ -20718,7 +19445,7 @@ impl crate::federation::BlackholeRules for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
                 "SELECT identity_hash, until, reason, added_at, hits, persist_row_hash \
@@ -20748,7 +19475,7 @@ impl crate::federation::BlackholeRules for PostgresBackend {
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client.transaction().await.map_err(|e| {
             crate::federation::Error::Backend(format!("blackhole_upsert begin tx: {e}"))
         })?;
@@ -20811,7 +19538,7 @@ impl crate::federation::BlackholeRules for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let identity_vec = identity_hash.to_vec();
         client
             .execute(
@@ -20831,7 +19558,7 @@ impl crate::federation::BlackholeRules for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let identity_vec = identity_hash.to_vec();
         // Single-statement UPDATE; no transaction wrap. When no row
         // exists the rows-affected count is 0 — silent no-op.
@@ -20854,7 +19581,7 @@ impl crate::federation::BlackholeRules for PostgresBackend {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let n = client
             .execute(
                 "DELETE FROM cirislens.blackhole_rules \
@@ -20909,8 +19636,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         initial_next_attempt_after: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::outbound::QueueId, crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let body_sha256_vec: Vec<u8> = body_sha256.to_vec();
@@ -20952,8 +19678,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         claimed_by: &str,
     ) -> Result<Vec<crate::outbound::OutboundRow>, crate::outbound::Error> {
         let mut client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let tx = client
@@ -21008,8 +19733,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         transport: &str,
     ) -> Result<(), crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let now = chrono::Utc::now();
@@ -21052,8 +19776,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         next_attempt_after: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::outbound::OutboundFailureOutcome, crate::outbound::Error> {
         let mut client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let tx = client
@@ -21152,8 +19875,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         queue_id: &crate::outbound::QueueId,
     ) -> Result<(), crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let now = chrono::Utc::now();
@@ -21178,8 +19900,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         in_reply_to_sha256: &[u8; 32],
     ) -> Result<Option<crate::outbound::OutboundRow>, crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let hash_vec: Vec<u8> = in_reply_to_sha256.to_vec();
@@ -21212,8 +19933,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         ack_envelope_bytes: &[u8],
     ) -> Result<(), crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let now = chrono::Utc::now();
@@ -21238,8 +19958,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
 
     async fn sweep_ack_timeouts(&self) -> Result<i64, crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let now = chrono::Utc::now();
@@ -21293,8 +20012,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
 
     async fn sweep_ttl_expired(&self) -> Result<i64, crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let now = chrono::Utc::now();
@@ -21316,8 +20034,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
 
     async fn sweep_expired_claims(&self) -> Result<i64, crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let now = chrono::Utc::now();
@@ -21339,8 +20056,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         queue_id: &crate::outbound::QueueId,
     ) -> Result<Option<crate::outbound::OutboundRow>, crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let row_opt = client
@@ -21371,8 +20087,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         limit: i64,
     ) -> Result<Vec<crate::outbound::OutboundRow>, crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         // Build the WHERE clause dynamically. Bind each filter param;
@@ -21438,8 +20153,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         crate::outbound::Error,
     > {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let rows = client
@@ -21463,8 +20177,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         queue_id: &crate::outbound::QueueId,
     ) -> Result<(), crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let now = chrono::Utc::now();
@@ -21487,8 +20200,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         queue_id: &crate::outbound::QueueId,
     ) -> Result<(), crate::outbound::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
         let now = chrono::Utc::now();
@@ -21843,7 +20555,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .query_opt(
                 "SELECT identity_type FROM cirislens.federation_keys WHERE key_id = $1",
@@ -21859,30 +20571,25 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
 
     async fn composer_replay_held(
         &self,
-        attestation_type: &str,
-        attesting_key_id: &str,
-        references_attestation_id: &str,
+        attestation_id: &str,
+        original_content_hash: &str,
     ) -> Result<bool, crate::federation::Error> {
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
+        // v61 (CIRISPersist#1157) — the SAME row, by id and signed content
+        // (BYTEA here; a hash that is not hex names no held row).
+        let Ok(och) = hex::decode(original_content_hash) else {
+            return Ok(false);
+        };
         let exists = client
             .query_opt(
-                // v20.0.0 (#495 C2) — path from the ONE constant.
-                &format!(
-                    "SELECT 1 AS one FROM cirislens.federation_attestations \
-                     WHERE attestation_type = $1 \
-                       AND attesting_key_id = $2 \
-                       AND attestation_envelope::jsonb->>'{}' = $3 \
-                     LIMIT 1",
-                    crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID
-                ),
-                &[
-                    &attestation_type,
-                    &attesting_key_id,
-                    &references_attestation_id,
-                ],
+                "SELECT 1 AS one FROM cirislens.federation_attestations \
+                 WHERE attestation_id::text = $1 \
+                   AND original_content_hash = $2 \
+                 LIMIT 1",
+                &[&attestation_id, &och],
             )
             .await
             .map_err(|e| {
@@ -21899,7 +20606,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .execute(
                 "INSERT INTO cirislens.federation_withdraws_admission_depths \
@@ -21921,7 +20628,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // v36.0.0 (#668/#707-class) — the hybrid-completion write rewrites
         // THREE served columns; the serve position moves with them.
         let admitted_at = self
@@ -21951,6 +20658,9 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                 completion.attestation_id
             )));
         }
+        // v59.1.2 — the re-index checks out its own client (the boot PQC
+        // sweep reaches this door).
+        drop(client);
         // v31.0.0 (CIRISPersist#657) — re-index; see the sqlite twin. The
         // hybrid-completion write moves three serialized columns, so it moves
         // the wire content hash. Postgres rounds `pqc_completed_at` to
@@ -21982,7 +20692,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -22024,7 +20734,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -22044,7 +20754,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // The partial index makes the common case (nothing left) one probe.
         let any = client
             .query_opt(
@@ -22105,7 +20815,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         client
             .query_opt(
                 "SELECT agent_id_hash FROM cirislens.trace_events WHERE trace_id = $1 \
@@ -22127,7 +20837,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // The full erasure also reaches the rows NAMING the subject, so a row
         // an earlier run left (its trace already gone) is found again.
         let subject = signing_key_id
@@ -22163,7 +20873,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -22193,7 +20903,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
             let client = self
                 .get_client()
                 .await
-                .map_err(|e| Error::Backend(e.to_string()))?;
+                .map_err(crate::store::Error::into_federation)?;
             client
                 .query(
                     "SELECT detection_id::text, trace_id, body_sha256, detector, severity, \
@@ -22251,7 +20961,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
             let mut client = self
                 .get_client()
                 .await
-                .map_err(|e| Error::Backend(e.to_string()))?;
+                .map_err(crate::store::Error::into_federation)?;
             let tx = client
                 .transaction()
                 .await
@@ -22286,6 +20996,13 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
     {
         use crate::federation::silo_projection::SiloProjection;
         use crate::federation::Error;
+        // v61 (CIRISPersist#991) — a group table's rebuild is the group
+        // plane's, over the executor's two reads.
+        if let Some(table) =
+            crate::federation::group_plane::GroupPlaneTable::of_projection(projection)
+        {
+            return crate::federation::group_plane::projection_rebuild(self, table).await;
+        }
         let (live_table, scratch, order, family) = match projection {
             SiloProjection::HardCaseEvents => (
                 "cirislens.hard_case_events",
@@ -22305,21 +21022,21 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                 let client = self
                     .get_client()
                     .await
-                    .map_err(|e| Error::Backend(e.to_string()))?;
+                    .map_err(crate::store::Error::into_federation)?;
                 return pg_key_projection_rebuild(&**client).await;
             }
             SiloProjection::FederationRevocations => {
                 let client = self
                     .get_client()
                     .await
-                    .map_err(|e| Error::Backend(e.to_string()))?;
+                    .map_err(crate::store::Error::into_federation)?;
                 return pg_revocation_projection_rebuild(&**client).await;
             }
             SiloProjection::IdentityOccurrences => {
                 let client = self
                     .get_client()
                     .await
-                    .map_err(|e| Error::Backend(e.to_string()))?;
+                    .map_err(crate::store::Error::into_federation)?;
                 return pg_occurrence_projection_rebuild(&**client).await;
             }
             // v60.0.0 (CIRISPersist#988 item 1) — the ledgers: this node's rows
@@ -22330,7 +21047,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                 let mut client = self
                     .get_client()
                     .await
-                    .map_err(|e| Error::Backend(e.to_string()))?;
+                    .map_err(crate::store::Error::into_federation)?;
                 return pg_ledger_projection_rebuild(&mut client, projection, node.as_deref())
                     .await;
             }
@@ -22340,14 +21057,21 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                 let mut client = self
                     .get_client()
                     .await
-                    .map_err(|e| Error::Backend(e.to_string()))?;
+                    .map_err(crate::store::Error::into_federation)?;
                 return pg_goal_projection_rebuild(&mut client).await;
             }
+            // Answered above.
+            SiloProjection::Families
+            | SiloProjection::Communities
+            | SiloProjection::FamilyMembershipRevocations
+            | SiloProjection::CommunityMembershipRevocations
+            | SiloProjection::FamilyMembershipWidenings
+            | SiloProjection::CommunityMembershipWidenings => return Ok(Default::default()),
         };
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -22377,7 +21101,13 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                 | SiloProjection::IdentityOccurrences
                 | SiloProjection::CreditsLedger
                 | SiloProjection::ExpertiseLedger
-                | SiloProjection::Goals => {}
+                | SiloProjection::Goals
+                | SiloProjection::Families
+                | SiloProjection::Communities
+                | SiloProjection::FamilyMembershipRevocations
+                | SiloProjection::CommunityMembershipRevocations
+                | SiloProjection::FamilyMembershipWidenings
+                | SiloProjection::CommunityMembershipWidenings => {}
                 SiloProjection::HardCaseEvents => {
                     if let Some(event) = crate::federation::hard_case::project_hard_case_row(&row) {
                         pg_project_hard_case(&*tx, scratch, &row.attestation_id, &event).await?;
@@ -22428,7 +21158,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let tx = client
             .transaction()
             .await
@@ -22520,7 +21250,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         // `attestation_subjects` follows via `ON DELETE CASCADE` (V106). The
         // re-bake's compare-and-delete is ONE statement (#665 review).
         let n =
@@ -22545,6 +21275,52 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         Ok(n > 0)
     }
 
+    async fn set_aside_form_refused(
+        &self,
+        row: &crate::federation::Attestation,
+        member: &str,
+        value: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, crate::federation::Error> {
+        let err = |e: tokio_postgres::Error| {
+            crate::federation::Error::Backend(format!("set_aside_form_refused: {e}"))
+        };
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let tx = client.transaction().await.map_err(err)?;
+        let gone = tx
+            .execute(
+                "DELETE FROM cirislens.federation_attestations \
+                 WHERE attestation_id = $1 AND persist_row_hash = $2",
+                &[&row.attestation_id, &row.persist_row_hash],
+            )
+            .await
+            .map_err(err)?;
+        if gone == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO cirislens.federation_attestations_form_refused \
+             (attestation_id, attesting_key_id, persist_row_hash, refused_member, \
+              refused_value, refused_at) VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (attestation_id) DO NOTHING",
+            &[
+                &row.attestation_id,
+                &row.attesting_key_id,
+                &row.persist_row_hash,
+                &member,
+                &value,
+                &at,
+            ],
+        )
+        .await
+        .map_err(err)?;
+        tx.commit().await.map_err(err)?;
+        Ok(true)
+    }
+
     async fn store_planned_attestation(
         &self,
         planned: crate::federation::attestation_admit::PlannedAttestation,
@@ -22563,7 +21339,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         let mut client = self
             .get_client()
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            .map_err(crate::store::Error::into_federation)?;
         let row = &planned.row;
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!(
@@ -23194,6 +21970,296 @@ const PG_ATTESTATION_COLUMNS: &str = "attestation_id::text, attesting_key_id, at
     scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, \
     withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs";
 
+/// v61 — `list_attestations_by_dimension_citing`'s statement (`$1` the
+/// attester, `$2` the dimension, `$3` the cited blob), spelled once so the
+/// plan witness reads the statement the door runs.
+pub(crate) fn pg_by_dimension_citing_sql() -> String {
+    format!(
+        "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+         WHERE attesting_key_id = $1 AND dimension COLLATE \"C\" = $2 \
+           AND (attestation_envelope::jsonb->'evidence_refs'->>0) = $3 \
+           AND tier = 'federation' \
+         ORDER BY asserted_at DESC"
+    )
+}
+
+/// v61 — `list_composers_referencing_any`'s statement (`$1` the id set,
+/// `$2..$4` the composer types, then the attested axis and the attesting
+/// axis, each when pinned, in that order), spelled once so the plan witness
+/// reads the statement the door runs.
+pub(crate) fn pg_composers_referencing_any_sql(attested: bool, attesting: bool) -> String {
+    let mut axes = String::new();
+    let mut next = 5;
+    if attested {
+        axes.push_str(&format!(" AND attested_key_id = ${next}"));
+        next += 1;
+    }
+    if attesting {
+        axes.push_str(&format!(" AND attesting_key_id = ${next}"));
+    }
+    format!(
+        "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+         WHERE tier = 'federation' \
+           AND attestation_type IN ($2, $3, $4) \
+           AND (attestation_envelope::jsonb->>'references_attestation_id') = ANY($1){axes} \
+         ORDER BY asserted_at DESC"
+    )
+}
+
+/// v61 — `list_scores`' statement and params: the read-plan executor's
+/// `read_scores_page` issues exactly this, and the postgres storm witness
+/// EXPLAINs it. Storage only: the limit and cursor-version refusals are
+/// `federation::read_plan`'s, ahead of this.
+pub(crate) fn pg_list_scores_sql(
+    filter: &crate::read::AttestationFilter,
+    cursor: Option<&crate::read::AttestationCursor>,
+    limit: i64,
+    scope: &crate::scope::CallerScope,
+) -> (
+    String,
+    Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+) {
+    let (mut where_parts, mut params) = pg_scores_shared_predicates(filter, scope);
+    // lifecycle: exclude rows retracted by a still-hiding composer (the
+    // one predicate, CIRISPersist#720).
+    if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
+        filter.lifecycle,
+        crate::federation::attestation_query::Dialect::Postgres,
+        "fa",
+        params.len() + 1,
+    ) {
+        for t in types {
+            params.push(Box::new(t));
+        }
+        where_parts.push(sql);
+    }
+    if let Some(c) = cursor {
+        params.push(Box::new(c.last_asserted_at));
+        let p_at = params.len();
+        params.push(Box::new(c.last_attestation_id.clone()));
+        let p_id = params.len();
+        where_parts.push(format!(
+            "(fa.asserted_at, fa.attestation_id::text) < (${p_at}, ${p_id})"
+        ));
+    }
+    params.push(Box::new(limit));
+    let sql = format!(
+        "SELECT DISTINCT {PG_SCORES_FA_COLS} \
+         FROM cirislens.attestation_subjects s \
+         JOIN cirislens.federation_attestations fa ON fa.attestation_id = s.attestation_id \
+         WHERE {} \
+         ORDER BY asserted_at DESC, attestation_id DESC \
+         LIMIT ${}",
+        where_parts.join(" AND "),
+        params.len()
+    );
+    (sql, params)
+}
+
+/// v61 — `list_attestations`' statement and params, built once so the
+/// plan witnesses EXPLAIN the statement the door runs.
+#[allow(clippy::type_complexity)]
+pub(crate) fn pg_list_attestations_sql(
+    filter: &crate::read::AttestationFilter,
+    cursor: Option<&crate::read::AttestationCursor>,
+    limit: i64,
+    scope: &crate::scope::CallerScope,
+) -> Result<
+    (
+        String,
+        Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+    ),
+    crate::read::Error,
+> {
+    let mut where_parts: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+    // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `= ANY`, never looped.
+    {
+        let keys = crate::ceg::list::federation::merge_key_predicate(
+            filter.attesting_key_id.as_ref(),
+            &filter.attesting_key_ids,
+        );
+        if !keys.is_empty() {
+            params.push(Box::new(keys));
+            where_parts.push(format!("attesting_key_id = ANY(${})", params.len()));
+        }
+    }
+    // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `= ANY`, never looped.
+    {
+        let keys = crate::ceg::list::federation::merge_key_predicate(
+            filter.attested_key_id.as_ref(),
+            &filter.attested_key_ids,
+        );
+        if !keys.is_empty() {
+            params.push(Box::new(keys));
+            where_parts.push(format!("attested_key_id = ANY(${})", params.len()));
+        }
+    }
+    if let Some(t) = &filter.attestation_type {
+        params.push(Box::new(t.clone()));
+        where_parts.push(format!("attestation_type = ${}", params.len()));
+    }
+    if let Some(pqc) = filter.pqc_completed {
+        where_parts.push(if pqc {
+            "pqc_completed_at IS NOT NULL".to_owned()
+        } else {
+            "pqc_completed_at IS NULL".to_owned()
+        });
+    }
+    // v4.5 (CEG §10.1.5.4) — open-vocab dimension-prefix filter.
+    // v42.1.0 (#817, #818) — a half-open BYTE RANGE over V106's generated
+    // `dimension` column, matching the SQLite builder's shape exactly so the
+    // two dialects cannot answer this filter differently again.
+    //
+    // `COLLATE "C"` is LOAD-BEARING, not decoration. `>=`/`<` compare under
+    // the database collation, and ours (`en_US.utf8`) is linguistic, not
+    // byte order: measured on the test cluster, BOTH `'config:Z'` and
+    // `'config:-x'` fall OUTSIDE `['config:', 'config;')` under the default
+    // collation, though both are `config:`-prefixed rows. C collation is
+    // byte order, which is also what CC 3.1.7 R3 means by a dimension being
+    // a byte string. V137 indexes this same collated expression — the
+    // predicate and the index must agree or the planner cannot use it.
+    if !filter.dimension_prefixes.is_empty() {
+        let mut ors: Vec<String> = Vec::new();
+        for p in &filter.dimension_prefixes {
+            match crate::ceg::list::federation::dimension_prefix_bounds(p) {
+                Some((lo, hi)) => {
+                    params.push(Box::new(lo));
+                    let a = params.len();
+                    params.push(Box::new(hi));
+                    let b = params.len();
+                    ors.push(format!(
+                        "(dimension COLLATE \"C\" >= ${a} AND dimension COLLATE \"C\" < ${b})"
+                    ));
+                }
+                None => {
+                    // No representable upper bound. `=` is a byte compare
+                    // under a deterministic collation, so this is still
+                    // case-correct; it is only unindexed.
+                    params.push(Box::new(p.clone()));
+                    let a = params.len();
+                    ors.push(format!(
+                        "substr(dimension, 1, {}) = ${a}",
+                        p.chars().count()
+                    ));
+                }
+            }
+        }
+        where_parts.push(format!("({})", ors.join(" OR ")));
+    }
+    // v17.5.2 (#461) — EXACT dimension match. Was silently a no-op in
+    // list_attestations (only `dimension_prefixes` was ever applied; a
+    // caller-supplied `dimension_exact` — or a mistaken `{"dimension":…}`
+    // key — filtered nothing), forcing a fetch-then-fold-in-Python. Mirrors
+    // `list_scores`' `dimension_exact`; AND-composed with any prefix set.
+    // v42.1.0 (#817) — V106's generated column, `COLLATE "C"` so the one
+    // V137 index serves the exact shape as well as the range shape.
+    if let Some(d) = &filter.dimension_exact {
+        params.push(Box::new(d.clone()));
+        where_parts.push(format!("dimension COLLATE \"C\" = ${}", params.len()));
+    }
+    // v4.5 — point-in-time validity.
+    if let Some(va) = filter.valid_at {
+        params.push(Box::new(va));
+        let p = params.len();
+        where_parts.push(format!(
+            "(asserted_at <= ${p} AND (expires_at IS NULL OR expires_at > ${p}))"
+        ));
+    }
+    // v4.5 — confidence floor (NUMERIC weight compared via float8;
+    // NULL weight excluded when a floor is set).
+    if let Some(floor) = filter.confidence_floor {
+        params.push(Box::new(floor));
+        where_parts.push(format!(
+            "(weight IS NOT NULL AND weight::float8 >= ${})",
+            params.len()
+        ));
+    }
+    // v4.5 — subject membership (subject_key_ids JSONB array ? element).
+    if let Some(subj) = &filter.subject_key_id {
+        params.push(Box::new(subj.clone()));
+        where_parts.push(format!("(subject_key_ids ? ${})", params.len()));
+    }
+    // v30.0.0 (CIRISPersist#596 item 2) — window / tier / attester_filter,
+    // dropped by this builder on BOTH backends until now. Same emitter as
+    // `list_scores`; unaliased because this query does not join. `tier:
+    // None` keeps this handle's historical meaning (no predicate).
+    pg_selection_axes(filter, "", false, &mut where_parts, &mut params);
+    // §4.3 scope gate — federation_attestations carries cohort_scope
+    // (V056) + attested_key_id (target identity, V055).
+    {
+        let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg_with_dimension(
+            scope,
+            "cohort_scope",
+            "attested_key_id",
+            Some("cohort_target"),
+            Some("dimension"),
+            params.len(),
+        );
+        where_parts.push(frag);
+        params.extend(sparams);
+    }
+    // V4.4 §3 (PR #889 review) — a LOCAL-tier row is visible to its
+    // producing occurrence alone; the collective never reaches it.
+    {
+        let (frag, sparams) = crate::store::scope_bind::local_tier_predicate_pg(
+            scope,
+            "tier",
+            "attesting_key_id",
+            params.len(),
+        );
+        where_parts.push(frag);
+        params.extend(sparams);
+    }
+    // v49.0.0 (CIRISPersist#909) — the lifecycle view (see the sqlite
+    // twin): `Live` hides rows retracted by a still-hiding composer.
+    if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
+        filter.lifecycle,
+        crate::federation::attestation_query::Dialect::Postgres,
+        "federation_attestations",
+        params.len() + 1,
+    ) {
+        for t in types {
+            params.push(Box::new(t));
+        }
+        where_parts.push(sql);
+    }
+    if let Some(c) = cursor {
+        if c.version != "v1" {
+            return Err(crate::read::Error::InvalidCursor(format!(
+                "AttestationCursor version {} unsupported; v0.5.5 ships v1",
+                c.version
+            )));
+        }
+        params.push(Box::new(c.last_asserted_at));
+        let p_at = params.len();
+        params.push(Box::new(c.last_attestation_id.clone()));
+        let p_id = params.len();
+        where_parts.push(format!(
+            "(asserted_at, attestation_id::text) < (${p_at}, ${p_id})"
+        ));
+    }
+    let where_sql = if where_parts.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", where_parts.join(" AND "))
+    };
+    params.push(Box::new(limit));
+    let p_limit = params.len();
+    let sql = format!(
+            // weight::float8 AS weight — see list_attestations_for.
+            "SELECT attestation_id::text AS attestation_id, attesting_key_id, attested_key_id, \
+                    attestation_type, weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
+             FROM cirislens.federation_attestations \
+             {where_sql} \
+             ORDER BY asserted_at DESC, attestation_id DESC \
+             LIMIT ${p_limit}"
+        );
+    Ok((sql, params))
+}
+
 /// v53.1.5 — the #817/#818 dimension-prefix predicate over V106's stored
 /// column, `COLLATE "C"` so the byte range is what the V137 / V178 indexes
 /// serve; `substr` when no upper bound is representable. Pushes its params
@@ -23725,6 +22791,10 @@ async fn pg_insert_plane_row(
         .map_err(|e| Error::Backend(format!("original_content_hash hex decode: {e}")))?;
     let attestation_envelope_text = serde_json::to_string(&row.attestation_envelope)
         .map_err(|e| Error::Backend(format!("attestation_envelope encode: {e}")))?;
+    // v61 (CIRISPersist#991) — a group-plane row carries its
+    // co-signatures; a key-plane row carries none (`[]`).
+    let additional_scrubs = serde_json::to_string(&row.additional_scrubs)
+        .map_err(|e| Error::Backend(format!("additional_scrubs encode: {e}")))?;
     let admitted_at = pg_next_plane_position(tx, "federation_attestations").await?;
     tx.execute(
         "INSERT INTO cirislens.federation_attestations (\
@@ -23735,7 +22805,7 @@ async fn pg_insert_plane_row(
             subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
             additional_scrubs, admitted_at\
          ) VALUES ($1, $2, $3, $4, NULL, $5, NULL, $6, $7, $8, $9, $10, $11, $12, $13, \
-                   '[]'::jsonb, NULL, $14, $15, NULL, '[]', $16) \
+                   '[]'::jsonb, NULL, $14, $15, NULL, $17, $16) \
          ON CONFLICT (attestation_id) DO NOTHING",
         &[
             &row.attestation_id,
@@ -23754,6 +22824,7 @@ async fn pg_insert_plane_row(
             &row.cohort_scope,
             &row.tier,
             &admitted_at,
+            &additional_scrubs,
         ],
     )
     .await
@@ -24958,36 +24029,6 @@ fn pg_row_to_community_membership_widening(
     })
 }
 
-fn pg_row_to_community_membership_listing(
-    row: tokio_postgres::Row,
-) -> Result<crate::federation::CommunityMembershipListing, crate::federation::Error> {
-    let mk_err = crate::federation::Error::Backend;
-    Ok(crate::federation::CommunityMembershipListing {
-        community_key_id: row.safe_get_with("community_key_id", mk_err)?,
-        member_key_id: row.safe_get_with("member_key_id", mk_err)?,
-        effective_at: row.safe_get_with("effective_at", mk_err)?,
-        listed: row.safe_get_with("listed", mk_err)?,
-        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
-    })
-}
-
-fn pg_row_to_signed_community_membership_listing(
-    row: tokio_postgres::Row,
-) -> Result<crate::federation::SignedCommunityMembershipListing, crate::federation::Error> {
-    let mk_err = crate::federation::Error::Backend;
-    let authority_key_id: String = row.safe_get_with("authority_key_id", mk_err)?;
-    let scrub_signature_classical: String =
-        row.safe_get_with("scrub_signature_classical", mk_err)?;
-    let scrub_signature_pqc: Option<String> = row.safe_get_with("scrub_signature_pqc", mk_err)?;
-    let community_membership_listing = pg_row_to_community_membership_listing(row)?;
-    Ok(crate::federation::SignedCommunityMembershipListing {
-        community_membership_listing,
-        authority_key_id,
-        scrub_signature_classical,
-        scrub_signature_pqc,
-    })
-}
-
 fn pg_row_to_family_membership_widening(
     row: tokio_postgres::Row,
 ) -> Result<crate::federation::FamilyMembershipWidening, crate::federation::Error> {
@@ -25775,8 +24816,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         }
 
         let mut client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -25913,8 +24953,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         scope: crate::scope::CallerScope,
     ) -> Result<Option<crate::read::TraceSummary>, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -25978,8 +25017,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         };
 
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -26122,8 +25160,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             )));
         }
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -26354,8 +25391,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             )));
         }
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -26450,8 +25486,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         _scope: crate::scope::CallerScope,
     ) -> Result<crate::read::LlmCostAggregate, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -26638,8 +25673,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         }
 
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -26737,8 +25771,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         scope: crate::scope::CallerScope,
     ) -> Result<crate::read::CorpusShape, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -26988,8 +26021,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         scope: crate::scope::CallerScope,
     ) -> Result<crate::read::ScrubAggregate, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -27070,8 +26102,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             )));
         }
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -27196,197 +26227,11 @@ impl crate::read::ReadEngine for PostgresBackend {
             )));
         }
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
-        let mut where_parts: Vec<String> = Vec::new();
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
-        // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `= ANY`, never looped.
-        {
-            let keys = crate::ceg::list::federation::merge_key_predicate(
-                filter.attesting_key_id.as_ref(),
-                &filter.attesting_key_ids,
-            );
-            if !keys.is_empty() {
-                params.push(Box::new(keys));
-                where_parts.push(format!("attesting_key_id = ANY(${})", params.len()));
-            }
-        }
-        // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `= ANY`, never looped.
-        {
-            let keys = crate::ceg::list::federation::merge_key_predicate(
-                filter.attested_key_id.as_ref(),
-                &filter.attested_key_ids,
-            );
-            if !keys.is_empty() {
-                params.push(Box::new(keys));
-                where_parts.push(format!("attested_key_id = ANY(${})", params.len()));
-            }
-        }
-        if let Some(t) = &filter.attestation_type {
-            params.push(Box::new(t.clone()));
-            where_parts.push(format!("attestation_type = ${}", params.len()));
-        }
-        if let Some(pqc) = filter.pqc_completed {
-            where_parts.push(if pqc {
-                "pqc_completed_at IS NOT NULL".to_owned()
-            } else {
-                "pqc_completed_at IS NULL".to_owned()
-            });
-        }
-        // v4.5 (CEG §10.1.5.4) — open-vocab dimension-prefix filter.
-        // v42.1.0 (#817, #818) — a half-open BYTE RANGE over V106's generated
-        // `dimension` column, matching the SQLite builder's shape exactly so the
-        // two dialects cannot answer this filter differently again.
-        //
-        // `COLLATE "C"` is LOAD-BEARING, not decoration. `>=`/`<` compare under
-        // the database collation, and ours (`en_US.utf8`) is linguistic, not
-        // byte order: measured on the test cluster, BOTH `'config:Z'` and
-        // `'config:-x'` fall OUTSIDE `['config:', 'config;')` under the default
-        // collation, though both are `config:`-prefixed rows. C collation is
-        // byte order, which is also what CC 3.1.7 R3 means by a dimension being
-        // a byte string. V137 indexes this same collated expression — the
-        // predicate and the index must agree or the planner cannot use it.
-        if !filter.dimension_prefixes.is_empty() {
-            let mut ors: Vec<String> = Vec::new();
-            for p in &filter.dimension_prefixes {
-                match crate::ceg::list::federation::dimension_prefix_bounds(p) {
-                    Some((lo, hi)) => {
-                        params.push(Box::new(lo));
-                        let a = params.len();
-                        params.push(Box::new(hi));
-                        let b = params.len();
-                        ors.push(format!(
-                            "(dimension COLLATE \"C\" >= ${a} AND dimension COLLATE \"C\" < ${b})"
-                        ));
-                    }
-                    None => {
-                        // No representable upper bound. `=` is a byte compare
-                        // under a deterministic collation, so this is still
-                        // case-correct; it is only unindexed.
-                        params.push(Box::new(p.clone()));
-                        let a = params.len();
-                        ors.push(format!(
-                            "substr(dimension, 1, {}) = ${a}",
-                            p.chars().count()
-                        ));
-                    }
-                }
-            }
-            where_parts.push(format!("({})", ors.join(" OR ")));
-        }
-        // v17.5.2 (#461) — EXACT dimension match. Was silently a no-op in
-        // list_attestations (only `dimension_prefixes` was ever applied; a
-        // caller-supplied `dimension_exact` — or a mistaken `{"dimension":…}`
-        // key — filtered nothing), forcing a fetch-then-fold-in-Python. Mirrors
-        // `list_scores`' `dimension_exact`; AND-composed with any prefix set.
-        // v42.1.0 (#817) — V106's generated column, `COLLATE "C"` so the one
-        // V137 index serves the exact shape as well as the range shape.
-        if let Some(d) = &filter.dimension_exact {
-            params.push(Box::new(d.clone()));
-            where_parts.push(format!("dimension COLLATE \"C\" = ${}", params.len()));
-        }
-        // v4.5 — point-in-time validity.
-        if let Some(va) = filter.valid_at {
-            params.push(Box::new(va));
-            let p = params.len();
-            where_parts.push(format!(
-                "(asserted_at <= ${p} AND (expires_at IS NULL OR expires_at > ${p}))"
-            ));
-        }
-        // v4.5 — confidence floor (NUMERIC weight compared via float8;
-        // NULL weight excluded when a floor is set).
-        if let Some(floor) = filter.confidence_floor {
-            params.push(Box::new(floor));
-            where_parts.push(format!(
-                "(weight IS NOT NULL AND weight::float8 >= ${})",
-                params.len()
-            ));
-        }
-        // v4.5 — subject membership (subject_key_ids JSONB array ? element).
-        if let Some(subj) = &filter.subject_key_id {
-            params.push(Box::new(subj.clone()));
-            where_parts.push(format!("(subject_key_ids ? ${})", params.len()));
-        }
-        // v30.0.0 (CIRISPersist#596 item 2) — window / tier / attester_filter,
-        // dropped by this builder on BOTH backends until now. Same emitter as
-        // `list_scores`; unaliased because this query does not join. `tier:
-        // None` keeps this handle's historical meaning (no predicate).
-        pg_selection_axes(&filter, "", false, &mut where_parts, &mut params);
-        // §4.3 scope gate — federation_attestations carries cohort_scope
-        // (V056) + attested_key_id (target identity, V055).
-        {
-            let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg_with_dimension(
-                &scope,
-                "cohort_scope",
-                "attested_key_id",
-                Some("cohort_target"),
-                Some("dimension"),
-                params.len(),
-            );
-            where_parts.push(frag);
-            params.extend(sparams);
-        }
-        // V4.4 §3 (PR #889 review) — a LOCAL-tier row is visible to its
-        // producing occurrence alone; the collective never reaches it.
-        {
-            let (frag, sparams) = crate::store::scope_bind::local_tier_predicate_pg(
-                &scope,
-                "tier",
-                "attesting_key_id",
-                params.len(),
-            );
-            where_parts.push(frag);
-            params.extend(sparams);
-        }
-        // v49.0.0 (CIRISPersist#909) — the lifecycle view (see the sqlite
-        // twin): `Live` hides rows retracted by a still-hiding composer.
-        if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
-            filter.lifecycle,
-            crate::federation::attestation_query::Dialect::Postgres,
-            "federation_attestations",
-            params.len() + 1,
-        ) {
-            for t in types {
-                params.push(Box::new(t));
-            }
-            where_parts.push(sql);
-        }
-        if let Some(c) = &cursor {
-            if c.version != "v1" {
-                return Err(crate::read::Error::InvalidCursor(format!(
-                    "AttestationCursor version {} unsupported; v0.5.5 ships v1",
-                    c.version
-                )));
-            }
-            params.push(Box::new(c.last_asserted_at));
-            let p_at = params.len();
-            params.push(Box::new(c.last_attestation_id.clone()));
-            let p_id = params.len();
-            where_parts.push(format!(
-                "(asserted_at, attestation_id::text) < (${p_at}, ${p_id})"
-            ));
-        }
-        let where_sql = if where_parts.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", where_parts.join(" AND "))
-        };
-        params.push(Box::new(limit));
-        let p_limit = params.len();
-        let sql = format!(
-            // weight::float8 AS weight — see list_attestations_for.
-            "SELECT attestation_id::text AS attestation_id, attesting_key_id, attested_key_id, \
-                    attestation_type, weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
-                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
-             FROM cirislens.federation_attestations \
-             {where_sql} \
-             ORDER BY asserted_at DESC, attestation_id DESC \
-             LIMIT ${p_limit}"
-        );
+        let (sql, params) = pg_list_attestations_sql(&filter, cursor.as_ref(), limit, &scope)?;
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref() as _).collect();
         let rows = client
@@ -27440,8 +26285,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             )));
         }
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -27545,8 +26389,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             )));
         }
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -27648,8 +26491,7 @@ impl crate::read::ReadEngine for PostgresBackend {
     ) -> Result<Vec<crate::read::DivergenceRow>, crate::read::Error> {
         use crate::read::DeviationMetric;
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -27781,8 +26623,7 @@ impl crate::read::ReadEngine for PostgresBackend {
     ) -> Result<Vec<crate::read::TemporalDriftRow>, crate::read::Error> {
         use crate::read::DeviationMetric;
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -27907,8 +26748,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         _scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::HashChainGap>, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -27958,8 +26798,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         scope: crate::scope::CallerScope,
     ) -> Result<Vec<crate::read::OverrideRateRow>, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -28230,8 +27069,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
         let (where_sql, params) = build_scope_filter_where(&filter, &scope)?;
@@ -28257,8 +27095,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
         let (where_sql, params) = build_scope_filter_where(&filter, &scope)?;
@@ -28293,8 +27130,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         scope: crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
         let (where_sql, params) = build_scope_filter_where(&filter, &scope)?;
@@ -28322,8 +27158,7 @@ impl crate::read::ReadEngine for PostgresBackend {
         scope: crate::scope::CallerScope,
     ) -> Result<crate::read::AuditChainAggregate, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
         let (where_sql, params) = build_scope_filter_where(&filter, &scope)?;
@@ -28644,8 +27479,7 @@ impl PostgresBackend {
     /// not have it) and stays valid with or without TimescaleDB installed.
     async fn factor_rollup_present(&self) -> Result<bool, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
         // `to_regclass` is NULL when the relation is absent; it does not
@@ -28689,8 +27523,7 @@ impl PostgresBackend {
         since: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), crate::read::Error> {
         let mut client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -28841,8 +27674,7 @@ impl PostgresBackend {
         self.refresh_factor_rollup(None).await?;
 
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -28921,8 +27753,7 @@ impl PostgresBackend {
         // scope for the drift sub-call below.
         use crate::read::ReadEngine as _;
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
 
@@ -29251,8 +28082,7 @@ impl PostgresBackend {
         scope: &crate::scope::CallerScope,
     ) -> Result<i64, crate::read::Error> {
         let client = self
-            .pool
-            .get()
+            .checkout()
             .await
             .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
         // agent_id_hash = ANY($1); scope predicate rebases to $2+.
@@ -32899,7 +31729,7 @@ mod tests {
             let decoy =
                 crate::federation::genesis::seed_decoy_attestation(&backend, "postgres").await;
             let target = crate::federation::genesis::genesis_delegation_ids()[0];
-            let client = backend.pool().get().await.expect("client");
+            let client = backend.checkout().await.expect("client");
             let n = client
                 .execute(
                     "UPDATE cirislens.federation_attestations SET attestation_id = $1 \
@@ -32941,7 +31771,7 @@ mod tests {
                 .await
                 .expect("a fresh node seeds the baked plane");
 
-            let client = backend.pool().get().await.expect("client");
+            let client = backend.checkout().await.expect("client");
             for id in crate::federation::genesis::genesis_delegation_ids() {
                 let prior = crate::federation::genesis::prior_ceremony_row(id);
                 let envelope = serde_json::to_string(&prior.attestation_envelope).unwrap();
@@ -33011,7 +31841,7 @@ mod tests {
             let och = hex::decode(&prior.original_content_hash).unwrap();
             let empty = "[]".to_string();
             {
-                let client = backend.pool().get().await.expect("client");
+                let client = backend.checkout().await.expect("client");
                 let n = client
                     .execute(
                         "UPDATE cirislens.federation_attestations SET \
@@ -33146,7 +31976,7 @@ mod tests {
                 .await
                 .expect("a fresh node seeds the baked plane");
             {
-                let client = backend.pool().get().await.expect("client");
+                let client = backend.checkout().await.expect("client");
                 for id in crate::federation::genesis::genesis_delegation_ids() {
                     let prior = crate::federation::genesis::prior_ceremony_row(id);
                     let envelope = serde_json::to_string(&prior.attestation_envelope).unwrap();
@@ -33212,7 +32042,7 @@ mod tests {
                 .attestation
                 .attestation_id;
             {
-                let client = backend.pool().get().await.expect("client");
+                let client = backend.checkout().await.expect("client");
                 let empty = "[]".to_string();
                 let n = client
                     .execute(
@@ -35495,7 +34325,7 @@ mod tests {
         )
         .await;
 
-        let client = backend.pool.get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let row = client
             .query_one(
                 "SELECT event_id FROM cirislens.trace_events \
@@ -36008,7 +34838,7 @@ mod tests {
         .await;
         // Add a second gpt-4o + a claude row by directly inserting
         // additional LLM calls referencing the same trace.
-        let client = backend.pool.get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let parent_event_id: i64 = client
             .query_one(
                 "SELECT event_id FROM cirislens.trace_events \
@@ -37172,8 +36002,7 @@ mod tests {
                         community_name: "fixture room".into(),
                         members: vec![],
                         founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-                        consensus_protocol:
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.to_owned(),
+                        consensus_protocol: "quorum:1/1".into(),
                         policy_blob: None,
                         persist_row_hash: String::new(),
                     },
@@ -37409,8 +36238,7 @@ mod tests {
                         community_name: "fixture room".into(),
                         members: vec![],
                         founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-                        consensus_protocol:
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.to_owned(),
+                        consensus_protocol: "quorum:1/1".into(),
                         policy_blob: None,
                         persist_row_hash: String::new(),
                     },
@@ -38884,7 +37712,7 @@ mod tests {
         backend.insert_trace_events_batch(&rows).await.unwrap();
         refresh_factor_rollup(&backend).await;
 
-        let client = backend.pool.get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let row = client
             .query_one(
                 "SELECT csdma_sum, csdma_n, k_eff_sum, k_eff_n, \
@@ -39560,7 +38388,7 @@ mod tests {
 
         // UPDATE the (trace_id, thought_id) rows we just inserted so
         // every row carries the pipeline JSONB.
-        let client = backend.pool.get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let n = client
             .execute(
                 "UPDATE cirislens.trace_events \
@@ -40803,8 +39631,7 @@ mod tests {
                         role: Some(MEMBER_ROLE_FOUNDER.into()),
                     }],
                     founded_at: now,
-                    consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
-                        .into(),
+                    consensus_protocol: "quorum:1/1".into(),
                     policy_blob: None,
                     persist_row_hash: String::new(),
                 },
@@ -40842,11 +39669,14 @@ mod tests {
             "federation apply keyed on a moderator-less community must refuse, got {err:?}"
         );
         assert_eq!(err.kind(), "federation_community_no_moderator");
+        // v61 (CIRISPersist#991): the community's own record row is the only
+        // row about it.
         assert!(backend
             .all_attestations_for(&comm_no)
             .await
             .unwrap()
-            .is_empty());
+            .iter()
+            .all(crate::federation::group_plane::is_group_plane_row));
 
         // (2) Same shape onto the MODERATORED community → ADMITTED + stored.
         backend
@@ -40861,7 +39691,13 @@ mod tests {
             .await
             .expect("moderatored community continues to federate");
         assert_eq!(
-            backend.all_attestations_for(&comm_ok).await.unwrap().len(),
+            backend
+                .all_attestations_for(&comm_ok)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| !crate::federation::group_plane::is_group_plane_row(r))
+                .count(),
             1
         );
 
@@ -41227,7 +40063,9 @@ mod tests {
                     consensus_protocol:
                         crate::federation::tier_ingest::test_support::fixture_protocol(
                             policy.as_ref(),
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                            // v61 (CIRISPersist#1123): founder_only is
+                            // refused above the family.
+                            "quorum:1/1",
                         ),
                     policy_blob: policy,
                     persist_row_hash: String::new(),
@@ -41579,8 +40417,7 @@ mod tests {
                             role: Some("founder".into()),
                         }],
                         founded_at: now,
-                        consensus_protocol:
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
+                        consensus_protocol: "quorum:1/1".into(),
                         policy_blob: None,
                         persist_row_hash: String::new(),
                     },
@@ -42411,7 +41248,10 @@ mod tests {
         );
         assert_eq!(mine[0].detail["cohort_key_id"], fam);
         assert_eq!(mine[0].subject_key_id.as_deref(), Some(member.as_str()));
-        assert_eq!(mine[0].detail["effective_at"], effective.to_rfc3339());
+        assert_eq!(
+            mine[0].detail["effective_at"],
+            crate::federation::admission::render_signed_instant(effective)
+        );
     }
 
     /// Clause 2 (#146 Ask 5, CEG §5.6.8.7) — consent_record admission on
@@ -43243,16 +42083,27 @@ mod tests {
         w2.asserted_at += chrono::Duration::seconds(60);
         crate::federation::tier_ingest::test_support::reseal(&mut w2);
         w2.scrub_timestamp = w2.asserted_at;
+        // v61 (CIRISPersist#1157, CC rc14 3.1.9.4) — a composer is
+        // idempotent on the ROW: the same triple under a different id is a
+        // distinct row (stored, ranked at read time); an exact re-put of the
+        // first is the silent no-op.
+        let w2_id = w2.attestation_id.clone();
         backend
-            .put_attestation(crate::federation::SignedAttestation { attestation: w1 })
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: w1.clone(),
+            })
             .await
             .unwrap();
         backend
             .put_attestation(crate::federation::SignedAttestation { attestation: w2 })
             .await
             .unwrap();
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: w1 })
+            .await
+            .expect("an exact re-put of a held composer is the silent no-op");
         let rows = backend.all_attestations_by(&steward).await.unwrap();
-        let withdraws_for_upstream: Vec<_> = rows
+        let mut withdraws_for_upstream: Vec<_> = rows
             .iter()
             .filter(|r| {
                 r.attestation_type == crate::federation::types::attestation_type::WITHDRAWS
@@ -43260,13 +42111,15 @@ mod tests {
                         &r.attestation_envelope,
                     ) == Some(upstream.as_str())
             })
+            .map(|r| r.attestation_id.clone())
             .collect();
+        withdraws_for_upstream.sort_unstable();
+        let mut want = vec![w1_id, w2_id];
+        want.sort_unstable();
         assert_eq!(
-            withdraws_for_upstream.len(),
-            1,
-            "duplicate triple should be silent no-op"
+            withdraws_for_upstream, want,
+            "the distinct same-triple withdraws is stored; the exact re-put adds nothing"
         );
-        assert_eq!(withdraws_for_upstream[0].attestation_id, w1_id);
     }
 
     #[tokio::test]
@@ -44170,12 +43023,7 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
-        let client = backend
-            .pool()
-            .get()
-            .await
-            .map_err(|e| e.to_string())
-            .unwrap();
+        let client = backend.checkout().await.map_err(|e| e.to_string()).unwrap();
         let key_id = format!("pg-ah-direct-§102-{}", uuid_like());
         let err = client
             .execute(
@@ -45627,7 +44475,7 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let row = client
             .query_one(
                 "SELECT column_name FROM information_schema.columns \
@@ -45715,7 +44563,7 @@ mod tests {
         let _ = backend.get_blob(&sha).await.unwrap();
         // has_blob also bumps.
         assert!(backend.has_blob(&sha).await.unwrap());
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let row = client
             .query_one(
                 "SELECT access_count FROM cirislens.federation_blobs WHERE sha256 = $1",
@@ -49291,7 +48139,7 @@ mod tests {
     }
 
     async fn pg_truncate_scope_blobs(backend: &PostgresBackend) {
-        let client = backend.pool().get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         client
             .execute("DELETE FROM cirislens.federation_scope_blobs", &[])
             .await
@@ -49404,7 +48252,7 @@ mod tests {
             .await
             .unwrap();
         let read_la = || async {
-            let client = backend.pool().get().await.unwrap();
+            let client = backend.checkout().await.unwrap();
             let row = client
                 .query_one(
                     "SELECT last_accessed_at FROM cirislens.federation_scope_blobs \
@@ -49586,8 +48434,7 @@ mod tests {
                         // founder_only protocol.
                         members: vec![member(&u0, Some(MEMBER_ROLE_FOUNDER)), member(&u1, None)],
                         founded_at: now,
-                        consensus_protocol:
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
+                        consensus_protocol: "quorum:1/1".into(),
                         policy_blob: None,
                         persist_row_hash: String::new(),
                     },
@@ -49694,8 +48541,7 @@ mod tests {
                         community_name: "mods".into(),
                         members: vec![member(&founder, Some(MEMBER_ROLE_FOUNDER))],
                         founded_at: now,
-                        consensus_protocol:
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
+                        consensus_protocol: "quorum:1/1".into(),
                         policy_blob: None,
                         persist_row_hash: String::new(),
                     },
@@ -50563,8 +49409,7 @@ mod tests {
                         community_name: "fixture room".into(),
                         members: vec![],
                         founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-                        consensus_protocol:
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.to_owned(),
+                        consensus_protocol: "quorum:1/1".into(),
                         policy_blob: None,
                         persist_row_hash: String::new(),
                     },
@@ -50886,11 +49731,23 @@ mod tests {
             .find(|r| r.family.family.family_key_id == fam)
             .expect("family row present")
             .family;
-        let content_hash = crate::federation::wire_index::content_hash_of(&mine).unwrap();
-        let expected_bytes = serde_json::to_vec(&mine).unwrap();
+        // v61 (CIRISPersist#991) — the family rides as its `group:roster:v1`
+        // row, an Attestation-kind entry; the framed `Family` kind is retired.
+        let row = crate::federation::group_plane::plan_group_row(
+            &crate::federation::group_plane::GroupSigned::Family(mine.clone()),
+        )
+        .unwrap()
+        .expect("a hybrid-signed family has a row");
+        let held = backend
+            .get_attestation(&row.attestation_id)
+            .await
+            .unwrap()
+            .expect("the family's row is held");
+        let content_hash = crate::federation::wire_index::content_hash_of(&held).unwrap();
+        let expected_bytes = serde_json::to_vec(&held).unwrap();
 
         let hit = backend
-            .lookup_signed_record_by_content_hash("Family", &content_hash)
+            .lookup_signed_record_by_content_hash("Attestation", &content_hash)
             .await
             .unwrap()
             .expect("indexed at put_family");
@@ -50898,9 +49755,11 @@ mod tests {
             hit, expected_bytes,
             "point-read must return byte-exact bytes"
         );
-
         assert!(backend
-            .lookup_signed_record_by_content_hash("Family", "0000000000000000")
+            .lookup_signed_record_by_content_hash(
+                "Family",
+                &crate::federation::wire_index::content_hash_of(&mine).unwrap()
+            )
             .await
             .unwrap()
             .is_none());
@@ -50908,14 +49767,15 @@ mod tests {
         let client = backend.get_client().await.unwrap();
         client
             .execute(
-                "DELETE FROM cirislens.signed_wire_index WHERE kind = 'Family' AND content_hash = $1",
+                "DELETE FROM cirislens.signed_wire_index \
+                  WHERE kind = 'Attestation' AND content_hash = $1",
                 &[&content_hash],
             )
             .await
             .unwrap();
         assert!(
             backend
-                .lookup_signed_record_by_content_hash("Family", &content_hash)
+                .lookup_signed_record_by_content_hash("Attestation", &content_hash)
                 .await
                 .unwrap()
                 .is_none(),
@@ -50923,9 +49783,9 @@ mod tests {
         );
 
         let indexed = backend.rebuild_signed_wire_index().await.unwrap();
-        assert!(indexed >= 1, "rebuild must index at least the family row");
+        assert!(indexed >= 1, "rebuild must index at least the family's row");
         let rehit = backend
-            .lookup_signed_record_by_content_hash("Family", &content_hash)
+            .lookup_signed_record_by_content_hash("Attestation", &content_hash)
             .await
             .unwrap()
             .expect("rebuild_signed_wire_index must reindex the row");
@@ -51359,7 +50219,7 @@ mod tests {
         limit: i64,
         scope: crate::scope::CallerScope,
     ) -> crate::read::TraceListPage {
-        let client = backend.pool.get().await.unwrap();
+        let client = backend.checkout().await.unwrap();
         let (mut where_parts, mut params) = pg_trace_filter_parts(&filter).unwrap();
         let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
             &scope,

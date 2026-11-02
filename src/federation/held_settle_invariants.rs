@@ -166,7 +166,7 @@ pub(crate) mod bodies {
                     role: Some("founder".to_owned()),
                 }],
                 founded_at: now,
-                consensus_protocol: "founder_only".to_owned(),
+                consensus_protocol: "quorum:1/1".into(),
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },
@@ -213,14 +213,19 @@ pub(crate) mod bodies {
         // under their row ids, settled by the key-plane door (I975+). v59.0.0
         // (sealed-transport floor) — their framed `Key` / `Revocation` entries
         // are no longer indexed.
-        for kind in ["Attestation", "LocationProof", "Family", "Community"] {
+        // v61 (CIRISPersist#991) — the family and the community are
+        // `group:roster:v1` rows: Attestation-kind entries; their framed
+        // `Family` / `Community` entries are no longer indexed.
+        for kind in ["Attestation", "LocationProof"] {
             assert!(
                 mine.iter().any(|(k, _)| k == kind),
                 "[{tag}] I230: no {kind} ref seeded; got {mine:?}"
             );
         }
         assert!(
-            !mine.iter().any(|(k, _)| k == "Key" || k == "Revocation"),
+            !mine
+                .iter()
+                .any(|(k, _)| ["Key", "Revocation", "Family", "Community"].contains(&k.as_str())),
             "[{tag}] I230: a retired framed kind is indexed; got {mine:?}"
         );
 
@@ -436,50 +441,30 @@ mod from_disk {
     /// Each replicated kind → the door every backend implements for it.
     const DOORS: &[(EnvelopeKind, &str)] = &[
         (EnvelopeKind::Attestation, "put_attestation_with_origin"),
-        (EnvelopeKind::Family, "put_family"),
-        (EnvelopeKind::Community, "put_community"),
-        (
-            EnvelopeKind::FamilyMembershipRevocation,
-            "put_family_membership_revocation",
-        ),
-        (
-            EnvelopeKind::CommunityMembershipRevocation,
-            "put_community_membership_revocation",
-        ),
+        // v61 (CIRISPersist#991) — the six group kinds left this list: their
+        // framed carriage is retired (`RETIRED_FRAMED`) and their objects
+        // ride as group-plane rows, settled at the attestation door
+        // (`SETTLE_EXEMPT` says so for each).
         (EnvelopeKind::LocationProof, "put_location_proof"),
         (
             EnvelopeKind::TransportDestination,
             "put_signed_transport_destination",
         ),
-        (
-            EnvelopeKind::CommunityMembershipWidening,
-            "put_community_membership_widening",
-        ),
-        (
-            EnvelopeKind::FamilyMembershipWidening,
-            "put_family_membership_widening",
-        ),
-        (
-            EnvelopeKind::CommunityMembershipListing,
-            "put_community_membership_listing",
-        ),
     ];
 
-    /// v57.0.0 (CIRISPersist#934 step 2) — the replicated kinds whose door is
-    /// a shared one in `federation::community_admit`: `(kind, shared door)`.
-    const COMMUNITY_SHARED: &[(EnvelopeKind, &str)] = &[
-        (EnvelopeKind::Community, "put_community_planned"),
+    /// v61 (CIRISPersist#934) — the replicated doors whose decision is a
+    /// shared plan: `(kind, plan file under src/federation, the call each
+    /// backend's door makes)`.
+    const SHARED_SETTLE_PLANS: &[(EnvelopeKind, &str, &str)] = &[
         (
-            EnvelopeKind::CommunityMembershipRevocation,
-            "put_community_membership_revocation_planned",
+            EnvelopeKind::LocationProof,
+            "evidence_admit.rs",
+            "evidence_admit::put_location_proof_planned(",
         ),
         (
-            EnvelopeKind::CommunityMembershipWidening,
-            "put_community_membership_widening_planned",
-        ),
-        (
-            EnvelopeKind::CommunityMembershipListing,
-            "put_community_membership_listing_planned",
+            EnvelopeKind::TransportDestination,
+            "transport_admit.rs",
+            "transport_admit::put_signed_transport_destination_planned(",
         ),
     ];
 
@@ -553,13 +538,13 @@ mod from_disk {
                     );
                     continue;
                 }
-                // v57.0.0 (CIRISPersist#934 step 2) — the community plane's
-                // doors are calls into their shared doors, read once below.
-                if let Some((_, shared)) = COMMUNITY_SHARED.iter().find(|(k, _)| k == kind) {
+                // v61 (CIRISPersist#934, S4a/S4b) — the location proof and
+                // transport destination doors' decisions are shared plans,
+                // read once below.
+                if let Some((_, _, call)) = SHARED_SETTLE_PLANS.iter().find(|(k, _, _)| k == kind) {
                     assert!(
-                        body.join(" ")
-                            .contains(&format!("community_admit::{shared}(")),
-                        "I235: {backend}::{door} is not the shared door `{shared}`"
+                        body.join(" ").contains(call),
+                        "I235: {backend}::{door} is not the shared door `{call}`"
                     );
                     continue;
                 }
@@ -584,39 +569,38 @@ mod from_disk {
                 );
             }
         }
-        // v57.0.0 (CIRISPersist#934 step 2) — each shared community door's
-        // FIRST statement is the settle, under its own kind.
-        let community =
-            std::fs::read_to_string(format!("{root}/src/federation/community_admit.rs")).unwrap();
-        for (kind, shared) in COMMUNITY_SHARED {
-            let start = community
-                .find(&format!("pub(crate) async fn {shared}<"))
-                .unwrap_or_else(|| panic!("I235: the shared door `{shared}`"));
-            let f = &community[start..];
-            let f = &f[..f.find("\n}\n").unwrap_or(f.len())];
-            let open = f.find("\n{\n").expect("I235: a shared door's body") + 3;
-            let first = f[open..]
+        // v61 (CIRISPersist#934, S4a/S4b) — each shared settling plan's FIRST
+        // statement is the settle, under its kind.
+        for (kind, file, call) in SHARED_SETTLE_PLANS {
+            let name = call
+                .rsplit("::")
+                .next()
+                .unwrap_or(call)
+                .trim_end_matches('(');
+            let text = std::fs::read_to_string(format!("{root}/src/federation/{file}")).unwrap();
+            let start = text
+                .find(&format!("pub(crate) async fn {name}<"))
+                .unwrap_or_else(|| panic!("I235: the shared plan `{name}` in {file}"));
+            let plan = &text[start..];
+            let plan = &plan[plan.find("{\n").expect("its body") + 2..];
+            let plan: Vec<&str> = plan[..plan.find("\n}\n").unwrap_or(plan.len())]
                 .lines()
                 .map(|l| l.split("//").next().unwrap_or("").trim())
-                .find(|l| !l.is_empty())
-                .unwrap_or("");
+                .filter(|l| !l.is_empty())
+                .collect();
             assert!(
-                first.starts_with("if crate::federation::replication_policy::settle_if_held("),
-                "I235: `{shared}`'s first statement must be the settle, got `{first}`"
+                plan[0].starts_with("if super::replication_policy::settle_if_held("),
+                "I235: `{name}`'s first statement must be the settle, got `{}`",
+                plan[0]
             );
-            let joined: String = f[open..]
-                .lines()
-                .map(|l| l.split("//").next().unwrap_or("").trim())
-                .collect::<Vec<_>>()
-                .join(" ");
-            let at = joined.find("settle_if_held(").unwrap();
-            let stmt = &joined[at..joined[at..].find('}').map_or(joined.len(), |e| at + e)];
+            let joined = plan.join(" ");
+            let stmt = &joined[..joined.find('}').unwrap_or(joined.len())];
             assert!(
                 stmt.contains(&format!(
-                    "crate::federation::replication_policy::EnvelopeKind::{}",
+                    "replication_policy::EnvelopeKind::{}",
                     kind.as_str()
                 )),
-                "I235: `{shared}` settles under the wrong kind: {stmt}"
+                "I235: `{name}` settles under the wrong kind: {stmt}"
             );
         }
         // The shared attestation plan: it settles under the Attestation kind,

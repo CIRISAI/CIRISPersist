@@ -163,7 +163,6 @@ Engine	aggregate_scoring_factors_stream	axiotic
 Engine	aggregate_scrub_stats	axiotic	
 Engine	apply_replicated_accord_evidence	deontic
 Engine	apply_replicated_attestation	deontic
-Engine	apply_replicated_community_json	deontic
 Engine	apply_replicated_key_grant	deontic
 Engine	apply_replicated_key_record	deontic
 Engine	attach_attestation_pqc_signature	ontological
@@ -443,10 +442,6 @@ Engine	list_retention	empirical
 Engine	list_revocations	empirical	
 Engine	list_scores	axiotic	
 Engine	list_signed_accord_quorum_evidence_since	epistemic
-Engine	list_signed_communities_since	epistemic	
-Engine	list_signed_community_membership_revocations_since	epistemic	
-Engine	list_signed_families_since	epistemic	
-Engine	list_signed_family_membership_revocations_since	epistemic	
 Engine	list_signed_identity_occurrences_for_json	epistemic	
 Engine	list_signed_location_proofs_since	epistemic	
 Engine	list_signed_transport_destinations_since	epistemic
@@ -604,6 +599,7 @@ Engine	secrets_update_filter_config	deontic
 Engine	self_enc_pubkeys	ontological	
 Engine	self_key_id	ontological	
 Engine	serve_blob_to_peer_json	deontic	
+Engine	serve_seat_owner_announced	deontic	
 Engine	service_token_revocation_check	deontic	
 Engine	service_token_revocation_list	empirical	
 Engine	service_token_revocation_record	deontic	
@@ -787,3 +783,7 @@ Engine	purge_notice_signing_payload_json	nomological
 # the finalize decides when a DAG is whole enough to be held and claimed.
 Engine	put_plaintext_dag_chunk	deontic
 Engine	finalize_blob_chunks_signing_json	deontic
+# v61 (CC 2.6.2) — the open-time instant-form pass on demand, beside
+# run_pqc_sweep: a maintenance pass that re-signs this node's own rows; what
+# stands is decided by the pass, not by calling it.
+Engine	settle_instant_forms_json	procedural

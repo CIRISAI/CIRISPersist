@@ -83,8 +83,7 @@ impl MaintenanceLockService for PostgresBackend {
     ) -> Result<Option<MaintenanceLock>, Error> {
         validate_acquire_args(lock_key, locked_by, timeout_seconds)?;
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         // Single-statement race-safe acquire. The WHERE clause on
@@ -132,8 +131,7 @@ impl MaintenanceLockService for PostgresBackend {
             return Err(Error::InvalidArgument("locked_by required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let changed = client
@@ -154,8 +152,7 @@ impl MaintenanceLockService for PostgresBackend {
             return Err(Error::InvalidArgument("lock_key required".into()));
         }
         let client = self
-            .pool()
-            .get()
+            .checkout()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
         let row_opt = client

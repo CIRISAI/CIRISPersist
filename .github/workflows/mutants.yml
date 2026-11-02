@@ -103,6 +103,70 @@ jobs:
           - {scope: scope-601-asks, shard: '1/4', id: 601-asks-1-of-4, weekly: true}
           - {scope: scope-601-asks, shard: '2/4', id: 601-asks-2-of-4, weekly: true}
           - {scope: scope-601-asks, shard: '3/4', id: 601-asks-3-of-4, weekly: true}
+          # The principal fold (v59.1.1): `principals_of`'s owner-revocation
+          # clause, `may_receive_group_plane` reading it, and `epoch_minter::resolve`
+          # narrowing several granting minters to the author's sealer.
+          # 14 mutants, one shard (600 s + 168 s x 14 = 2952 s), nightly.
+          - {scope: scope-5911-principals, shard: '', id: 5911-principals, weekly: false}
+          # The Postgres pool (v59.1.2): `pool_config`'s size floor and
+          # `checkout`'s typed starvation. 2 mutants, one shard, nightly.
+          - {scope: scope-5912-pool, shard: '', id: 5912-pool, weekly: false}
+          # The group plane (CIRISPersist#991 planes 2 and 3): 162 mutants, six
+          # shards of <= 27 at the measured 168 s per mutant
+          # (600 s + 168 s x 27 = 5136 s each), weekly.
+          - {scope: scope-s1-group-plane, shard: '0/6', id: s1-group-plane-0-of-6, weekly: true}
+          - {scope: scope-s1-group-plane, shard: '1/6', id: s1-group-plane-1-of-6, weekly: true}
+          - {scope: scope-s1-group-plane, shard: '2/6', id: s1-group-plane-2-of-6, weekly: true}
+          - {scope: scope-s1-group-plane, shard: '3/6', id: s1-group-plane-3-of-6, weekly: true}
+          - {scope: scope-s1-group-plane, shard: '4/6', id: s1-group-plane-4-of-6, weekly: true}
+          - {scope: scope-s1-group-plane, shard: '5/6', id: s1-group-plane-5-of-6, weekly: true}
+          # The S1 retirements (KeyGrant, the member listing, the group
+          # record's withdraws): 10 mutants, one shard
+          # (600 s + 168 s x 10 = 2280 s), nightly.
+          - {scope: scope-s1-retire, shard: '', id: s1-retire, weekly: false}
+          # v61 S4a (CIRISPersist#934, #1166): the shared plans the identical
+          # doors moved onto, the bounded checkout. 161 mutants, nine shards
+          # of <= 18; the witness filter is the doors' own suites on both
+          # backends (~330 s per mutant, ESTIMATED from the local filter run),
+          # so 600 s + 330 s x 18 = 6540 s each, weekly.
+          - {scope: scope-s4a-plans, shard: '0/9', id: s4a-plans-0-of-9, weekly: true}
+          - {scope: scope-s4a-plans, shard: '1/9', id: s4a-plans-1-of-9, weekly: true}
+          - {scope: scope-s4a-plans, shard: '2/9', id: s4a-plans-2-of-9, weekly: true}
+          - {scope: scope-s4a-plans, shard: '3/9', id: s4a-plans-3-of-9, weekly: true}
+          - {scope: scope-s4a-plans, shard: '4/9', id: s4a-plans-4-of-9, weekly: true}
+          - {scope: scope-s4a-plans, shard: '5/9', id: s4a-plans-5-of-9, weekly: true}
+          - {scope: scope-s4a-plans, shard: '6/9', id: s4a-plans-6-of-9, weekly: true}
+          - {scope: scope-s4a-plans, shard: '7/9', id: s4a-plans-7-of-9, weekly: true}
+          - {scope: scope-s4a-plans, shard: '8/9', id: s4a-plans-8-of-9, weekly: true}
+          # v61 S4b (CIRISPersist#934): the last identical doors' shared plans
+          # (transport, occurrence, family, supersede). ~90 mutants (ESTIMATED:
+          # 30 fns at ~3 each), five shards of <= 18; the witness filter is the
+          # doors' own suites on both backends (~330 s per mutant, ESTIMATED
+          # as S4a's), so 600 s + 330 s x 18 = 6540 s each, weekly.
+          - {scope: scope-s4b-plans, shard: '0/5', id: s4b-plans-0-of-5, weekly: true}
+          - {scope: scope-s4b-plans, shard: '1/5', id: s4b-plans-1-of-5, weekly: true}
+          - {scope: scope-s4b-plans, shard: '2/5', id: s4b-plans-2-of-5, weekly: true}
+          - {scope: scope-s4b-plans, shard: '3/5', id: s4b-plans-3-of-5, weekly: true}
+          - {scope: scope-s4b-plans, shard: '4/5', id: s4b-plans-4-of-5, weekly: true}
+          # The S3 record-shape breaks (CC 2.6.2 strict instants, #1126, #1101,
+          # #1122, #1146, #1156): 147 mutants, six shards of <= 25
+          # (600 s + 168 s x 25 = 4800 s each), weekly.
+          - {scope: scope-s3-shapes, shard: '0/6', id: s3-shapes-0-of-6, weekly: true}
+          - {scope: scope-s3-shapes, shard: '1/6', id: s3-shapes-1-of-6, weekly: true}
+          - {scope: scope-s3-shapes, shard: '2/6', id: s3-shapes-2-of-6, weekly: true}
+          - {scope: scope-s3-shapes, shard: '3/6', id: s3-shapes-3-of-6, weekly: true}
+          - {scope: scope-s3-shapes, shard: '4/6', id: s3-shapes-4-of-6, weekly: true}
+          - {scope: scope-s3-shapes, shard: '5/6', id: s3-shapes-5-of-6, weekly: true}
+          # v61 S2 — rooms on the new rows and the field blockers (#1123,
+          # #1063, #1100 2(i), #1157/#1155, #1148, #1165, #1140, #1143):
+          # 154 mutants, six shards of <= 26 at the measured 168 s per mutant
+          # (600 s + 168 s x 26 = 4968 s each), weekly.
+          - {scope: scope-s2-rooms, shard: '0/6', id: s2-rooms-0-of-6, weekly: true}
+          - {scope: scope-s2-rooms, shard: '1/6', id: s2-rooms-1-of-6, weekly: true}
+          - {scope: scope-s2-rooms, shard: '2/6', id: s2-rooms-2-of-6, weekly: true}
+          - {scope: scope-s2-rooms, shard: '3/6', id: s2-rooms-3-of-6, weekly: true}
+          - {scope: scope-s2-rooms, shard: '4/6', id: s2-rooms-4-of-6, weekly: true}
+          - {scope: scope-s2-rooms, shard: '5/6', id: s2-rooms-5-of-6, weekly: true}
     services:
       postgres:
         image: ghcr.io/cirisai/postgres:16
@@ -149,6 +213,14 @@ jobs:
       - name: mutants_matrix self-test
         if: steps.gate.outputs.run == 'true'
         run: python3 scripts/mutants_matrix_test.py
+      # The runner ran out of disk mid-scope (slice-gate run 41502607791:
+      # "Free space left: 0 MB" → cargo-mutants stopped, mutants "not run").
+      - name: Free runner disk (mutated builds of the crate and its graph)
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h / | tail -1
       # The scope this job is about to run resolves and names tests.
       - name: mutation scopes are well-formed (from disk)
         if: steps.gate.outputs.run == 'true'

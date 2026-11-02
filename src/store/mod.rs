@@ -9,6 +9,11 @@
 //! contract.
 
 pub mod backend;
+/// v61 (CIRISPersist#934, S4a) — the `Backend` trait's gated doors (the two
+/// trace erasures, the two fountain writes), decided once, with the
+/// per-backend `BackendStore` executor.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod backend_plan;
 /// v60.0.0 (CIRISPersist#1002) — the tests the retired memory backend carried, on SQLite.
 #[cfg(all(test, feature = "sqlite"))]
 mod backend_suite;
@@ -50,6 +55,10 @@ pub(crate) mod postgres_runtime_connect;
 // v54.0.0 (Codex round 2 on PR #1050) — every door on a one-connection pool.
 #[cfg(all(test, feature = "postgres"))]
 mod one_connection_pool_invariants;
+/// v61 (CIRISPersist#1166) — from disk: every Postgres checkout is the
+/// bounded one.
+#[cfg(test)]
+mod pool_checkout_gate;
 /// v54.0.0 (Codex on PR #1050) — the striped per-record lock a wire-index
 /// re-index holds from its read through its replacement.
 pub(crate) mod record_locks;
@@ -116,6 +125,16 @@ pub enum Error {
     /// future variants can be added per-backend.
     #[error("backend: {0}")]
     Backend(String),
+
+    /// v59.1.2 — no pooled connection was freed within the pool's wait
+    /// timeout (`waited`): the pool is starved. Before v59.1.2 the checkout
+    /// had no timeout and waited forever. Python `ciris_persist.PoolExhausted`
+    /// (a `RuntimeError`, the type the backend arm it was carved from had).
+    #[error("store_pool_exhausted: no pooled connection freed within {waited:?}")]
+    PoolExhausted {
+        /// The wait the pool was configured with.
+        waited: std::time::Duration,
+    },
 
     /// v57.0.0 (CIRISPersist#988 item 2) — an erasure that must record its
     /// `hard_case:trace_erasure` row was refused before it deleted anything:
@@ -244,6 +263,18 @@ impl Error {
         }
     }
 
+    /// v59.1.2 — a store error crossing into a federation door: a starved
+    /// pool stays typed ([`crate::federation::Error::PoolExhausted`]); every
+    /// other error is the federation `Backend` arm with this error's text, as
+    /// each door spelled it by hand before.
+    #[must_use]
+    pub fn into_federation(self) -> crate::federation::Error {
+        match self {
+            Error::PoolExhausted { waited } => crate::federation::Error::PoolExhausted { waited },
+            other => crate::federation::Error::Backend(other.to_string()),
+        }
+    }
+
     /// Stable string-token identifying the error variant.
     /// THREAT_MODEL.md AV-15: HTTP / PyO3 sanitization. The verbose
     /// `Display` form (which may include Postgres error context)
@@ -253,6 +284,7 @@ impl Error {
             Error::Schema(s) => s.kind(),
             Error::NotImplemented(_) => "store_not_implemented",
             Error::Backend(_) => "store_backend",
+            Error::PoolExhausted { .. } => "store_pool_exhausted",
             Error::HardCaseAttesterUnavailable(_) => {
                 crate::federation::hard_case::refusal::ATTESTER_UNAVAILABLE
             }

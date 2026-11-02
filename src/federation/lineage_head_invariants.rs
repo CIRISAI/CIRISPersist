@@ -670,34 +670,51 @@ pub(crate) mod bodies {
 
 #[cfg(test)]
 mod pure {
-    /// **I448** — from disk: every backend's `supersede_group_row` runs the
-    /// prev check on BOTH arms (family, community). Comments stripped, so a
-    /// commented-out call cannot pass.
+    /// **I448** — from disk: every backend's supersede runs the prev check on
+    /// BOTH arms (family, community). v61 (CIRISPersist#934, S4b): the check
+    /// lives once, in `group_supersede_admit::held_head_verdict`, which judges
+    /// both head kinds' `prev_head_digest`; each backend's executor asks that
+    /// verdict on both arms. Comments stripped, so a commented-out call
+    /// cannot pass.
     #[test]
     fn i448_every_backend_runs_the_prev_check_on_both_arms() {
-        for file in ["src/store/sqlite.rs", "src/store/postgres.rs"] {
+        fn fn_body(file: &str, head: &str) -> String {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
             let text = std::fs::read_to_string(&path).unwrap();
-            let start = text
-                .find("async fn supersede_group_row(")
-                .unwrap_or_else(|| panic!("{file}: supersede_group_row"));
+            let start = text.find(head).unwrap_or_else(|| panic!("{file}: {head}"));
             let body = &text[start..];
             let end = body[1..]
                 .find("\n    async fn ")
+                .or_else(|| body[1..].find("\n}\n"))
                 .map_or(body.len(), |i| i + 1);
-            let code: String = body[..end]
+            body[..end]
                 .lines()
                 .map(|l| l.split("//").next().unwrap_or(""))
                 .collect::<Vec<_>>()
-                .join("\n");
-            let calls = code.matches("check_prev_head_names_held(").count();
+                .join("\n")
+        }
+        let plan = "src/federation/group_supersede_admit.rs";
+        let verdict = fn_body(plan, "pub(crate) fn held_head_verdict(");
+        assert_eq!(
+            verdict.matches("check_prev_head_names_held(").count(),
+            1,
+            "{plan}: the verdict runs the prev check"
+        );
+        assert!(
+            verdict.contains("planned.head.prev_head_digest()"),
+            "{plan}: the verdict judges the offered head's prev_head_digest"
+        );
+        let accessor = fn_body(plan, "fn prev_head_digest(&self)");
+        for field in ["f.family.prev_head_digest", "c.community.prev_head_digest"] {
+            assert!(accessor.contains(field), "{plan}: judges {field}");
+        }
+        for file in ["src/store/sqlite.rs", "src/store/postgres.rs"] {
+            let code = fn_body(file, "async fn store_planned_supersede(");
             assert_eq!(
-                calls, 2,
-                "{file}: the prev check on the family AND community arm"
+                code.matches("held_head_verdict(").count(),
+                2,
+                "{file}: the verdict on the family AND community arm"
             );
-            for field in ["new_fam.prev_head_digest", "new_comm.prev_head_digest"] {
-                assert!(code.contains(field), "{file}: judges {field}");
-            }
         }
     }
 

@@ -1,0 +1,30 @@
+# Mutation scope: v61 slice S1, the retirements after the group plane
+# (CIRISPersist#991; commits ea69f8e8, 1b678b42, dc76dbe0 and the rc14
+# re-vendor 4eca870b).
+#
+# - `refuse_retired_framed`: the replication path's refusal of a framed kind.
+#   KeyGrant (ea69f8e8) and CommunityMembershipListing (dc76dbe0) joined
+#   RETIRED_FRAMED, a const array cargo-mutants does not mutate. The function
+#   reading it is the decision. I1150 iterates RETIRED_FRAMED on sqlite and
+#   postgres.
+# - `check_cosigned_withdraws`: 1b678b42 changed the group record's arm
+#   (a withdraws of a group's record is its dissolution, refused by name).
+#   I1487 drives it three ways; I1492 holds the retraction's direction (a
+#   widening's withdraws takes a member off, a removal's puts one back),
+#   the `==` the first run (2026-11-01) left missed without it.
+# - The two backends' `insert_known_wire_hash`, the advertisement door that
+#   calls the refusal.
+# - Removed, not mutated: dc76dbe0 deleted the listing's plan, executors,
+#   wire-index arms and admission check. The rc14 re-vendor added no
+#   decision logic outside tests (pins, a test-only latch module, data).
+#
+# I1497 (the listing's V209 upgrade) killed nothing here: it witnesses the
+# migration, not a mutated function, so it is not in the filter.
+#
+# Grammar: docs/MUTATION_TESTING.md "Scope files".
+tests: test(/i1150|i1487|i1492|replication_policy::tests/)
+
+src/federation/replication_policy.rs refuse_retired_framed
+src/federation/group_plane.rs check_cosigned_withdraws
+src/store/sqlite.rs insert_known_wire_hash
+src/store/postgres.rs insert_known_wire_hash
