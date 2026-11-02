@@ -3782,14 +3782,16 @@ mod tests {
 
     /// v56.0.0 (CIRISPersist#934 step 1) — **the door report**: one line per
     /// door saying WHERE its decision lives, the question #934 asks of every
-    /// door. A report, not a gate: [`every_backend_runs_the_same_gates_in_the_same_order`]
-    /// and [`shared_doors_decide_nothing_in_a_backend`] are the gates. Run with
+    /// door. A report, not a gate: [`every_backend_runs_the_same_gates_in_the_same_order`],
+    /// [`shared_doors_decide_nothing_in_a_backend`] and (v61, #934 step 5)
+    /// [`no_backend_door_reads_identical`] are the gates. Run with
     /// `cargo test --lib store::parity::tests::door_report -- --ignored --nocapture`.
     ///
     /// - `shared` — every backend's door is a call into a shared plan and runs
     ///   no gate of its own (the #934 target shape);
     /// - `identical xN (k gates)` — the decision is written N times, byte-equal
-    ///   by this scan (the #670 state, the triplication #934 removes);
+    ///   by this scan (the #670 state, the triplication #934 removed; RED since
+    ///   v61 by [`no_backend_door_reads_identical`]);
     /// - `declared` — a [`DECLARED_DIVERGENCES`] row pins one backend's shape;
     /// - `gateless` — no backend runs a gate in this door.
     #[test]
@@ -3813,6 +3815,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// v61 (CIRISPersist#934 step 5) — **no backend door reads
+    /// `identical`.** Every door that wrote the same decision once per
+    /// backend has moved onto a shared plan (S4a, S4b), so the class the
+    /// [`door_report`] calls `identical` is now RED: a door that re-grows a
+    /// copied gate sequence in every backend fails here, naming the door and
+    /// its sequence, instead of reading as parity. The fix is a plan (a
+    /// [`SHARED_PLANS`] body the backends call), not a second copy.
+    #[test]
+    fn no_backend_door_reads_identical() {
+        let scan = scan();
+        let mut failures = Vec::new();
+        for ((trait_name, method), per_backend) in &scan.doors {
+            let seqs: Vec<(&str, &Vec<String>)> = BACKENDS
+                .iter()
+                .filter_map(|(b, _)| per_backend.get(*b).map(|(s, _)| (*b, s)))
+                .collect();
+            let verdict = door_verdict(trait_name, method, &seqs);
+            if verdict.starts_with("identical") {
+                let seq = seqs.first().map(|(_, s)| (*s).clone()).unwrap_or_default();
+                failures.push(format!(
+                    "{trait_name}::{method} reads {verdict}: {seq:?} is decided once per \
+                     backend; move it onto a shared plan (#934)"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// The one-word answer [`door_report`] prints for a door.
