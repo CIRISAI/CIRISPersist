@@ -128,6 +128,15 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v61 (CIRISPersist#934, S4b) — the family doors.
+    ("put_family_planned", Class::Plan),
+    ("put_family_local_planned", Class::Plan),
+    ("put_family_membership_revocation_planned", Class::Plan),
+    ("put_family_membership_widening_planned", Class::Plan),
+    // The family executor (storage only; compared across backends as the `FamilyStore` trait).
+    ("store_family_signature", Class::Plumbing),
+    ("store_planned_family_revocation", Class::Plumbing),
+    ("store_planned_family_widening", Class::Plumbing),
     // v61 (CIRISPersist#934, S4b) — the identity-occurrence writes.
     ("put_identity_occurrence_planned", Class::Plan),
     ("put_identity_occurrence_local_planned", Class::Plan),
@@ -1214,7 +1223,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // answer (cap, seq conflict, moved epoch).
     ("sqlite_append_chunk_item", Class::Delegates),
     ("pg_append_chunk_item", Class::Delegates),
-    ("put_family_local", Class::Delegates),
     // v61 (CIRISPersist#1122) — the occurrence write projects its route
     // through one shared step, which skips an agent's and otherwise runs the
     // local route door (its gates).
@@ -1494,7 +1502,9 @@ mod tests {
     /// The traits whose impls are compared, and where each trait's **default**
     /// bodies live. A backend that does not override a defaulted method runs
     /// the default, so the default's gate sequence is what it contributes.
-    const TRAITS: [(&str, &str); 18] = [
+    const TRAITS: [(&str, &str); 19] = [
+        // v61 (CIRISPersist#934, S4b) — the family doors.
+        ("FamilyStore", "src/federation/family_admit.rs"),
         // v61 (CIRISPersist#934, S4b) — the identity-occurrence writes.
         ("OccurrenceStore", "src/federation/occurrence_admit.rs"),
         // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
@@ -1533,7 +1543,18 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 65] = [
+    const SHARED_PLANS: [(&str, &str); 69] = [
+        // v61 (CIRISPersist#934, S4b) — the family doors.
+        ("src/federation/family_admit.rs", "put_family_planned"),
+        ("src/federation/family_admit.rs", "put_family_local_planned"),
+        (
+            "src/federation/family_admit.rs",
+            "put_family_membership_revocation_planned",
+        ),
+        (
+            "src/federation/family_admit.rs",
+            "put_family_membership_widening_planned",
+        ),
         // v61 (CIRISPersist#934, S4b) — the identity-occurrence writes.
         (
             "src/federation/occurrence_admit.rs",
@@ -1775,7 +1796,24 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 75] = [
+    const SHARED_DOORS: [(&str, &str, &str); 79] = [
+        // v61 (CIRISPersist#934, S4b) — the family doors.
+        ("FederationDirectory", "put_family", "put_family_planned"),
+        (
+            "FederationDirectory",
+            "put_family_local",
+            "put_family_local_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_family_membership_revocation",
+            "put_family_membership_revocation_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_family_membership_widening",
+            "put_family_membership_widening_planned",
+        ),
         // v61 (CIRISPersist#934, S4b) — the identity-occurrence writes.
         (
             "FederationDirectory",

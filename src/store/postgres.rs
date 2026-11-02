@@ -2959,6 +2959,195 @@ impl crate::federation::occurrence_admit::OccurrenceStore for PostgresBackend {
     }
 }
 
+/// v61 (CIRISPersist#934, S4b) — the family executor on postgres. Storage
+/// only: the decisions are `federation::family_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::family_admit::FamilyStore for PostgresBackend {
+    async fn store_planned_family(
+        &self,
+        row: crate::federation::types::Family,
+    ) -> Result<(), crate::federation::Error> {
+        let members_value = serde_json::to_value(&row.members)
+            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // v36.0.0 (#668) — THIS node's serve position (V130).
+        let admitted_at = self
+            .next_plane_position(&client, "federation_families")
+            .await?;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_families (\
+                    family_key_id, family_name, members, founded_at, \
+                    consensus_protocol, consensus_protocol_entrenched, persist_row_hash, \
+                    admitted_at, dissolved_at, prev_head_digest, charter_digest\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                &[
+                    &row.family_key_id,
+                    &row.family_name,
+                    &members_value,
+                    &row.founded_at,
+                    &row.consensus_protocol,
+                    &row.consensus_protocol_entrenched,
+                    &row.persist_row_hash,
+                    &admitted_at,
+                    &row.dissolved_at,
+                    &row.prev_head_digest,
+                    &row.charter_digest,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("foreign key") {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "FK constraint violated on family insert: {msg}"
+                    ))
+                } else {
+                    crate::federation::Error::Backend(format!("insert family: {msg}"))
+                }
+            })?;
+        Ok(())
+    }
+
+    async fn store_family_signature(
+        &self,
+        planned: crate::federation::family_admit::PlannedFamilySignature,
+    ) -> Result<(), crate::federation::Error> {
+        let supersede_proof_value = pg_supersede_proof_value(planned.supersede_proof.as_ref())?;
+        let cosignatures_value = serde_json::to_value(&planned.cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // v36.0.0 (#668) — attaching the authority signature makes the row
+        // VISIBLE to the signed serve cursor: the serve position is re-stamped.
+        let admitted_at = self
+            .next_plane_position(&client, "federation_families")
+            .await?;
+        client
+            .execute(
+                "UPDATE cirislens.federation_families \
+                    SET authority_key_id = $2, scrub_signature_classical = $3, \
+                        scrub_signature_pqc = $4, admitted_at = $5, supersede_proof = $6, \
+                        cosignatures = $7 \
+                  WHERE family_key_id = $1",
+                &[
+                    &planned.family_key_id,
+                    &planned.authority_key_id,
+                    &planned.scrub_signature_classical,
+                    &planned.scrub_signature_pqc,
+                    &admitted_at,
+                    &supersede_proof_value,
+                    &cosignatures_value,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("store family authority signature: {e}"))
+            })?;
+        Ok(())
+    }
+
+    async fn store_planned_family_revocation(
+        &self,
+        revocation: &crate::federation::SignedFamilyMembershipRevocation,
+    ) -> Result<bool, crate::federation::Error> {
+        let row = &revocation.family_membership_revocation;
+        let witness = serde_json::json!(row.witness_set);
+        let cosignatures = serde_json::to_value(&revocation.cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures: {e}")))?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // v36.0.0 (#668) — THIS node's serve position (V130), computed from
+        // `MAX(admitted_at)`, not allocated, so a skipped write leaves nothing.
+        let admitted_at = self
+            .next_plane_position(&client, "federation_family_membership_revocations")
+            .await?;
+        // v47.1.0 (#861) / v49.0.0 (#910.1, V154) — IDEMPOTENT on the
+        // three-part PK; the unique index arbitrates (race-safe).
+        let inserted = client
+            .execute(
+                "INSERT INTO cirislens.federation_family_membership_revocations (\
+                    family_key_id, removed_identity_key_id, removed_at, effective_at, \
+                    reason, witness_set, persist_row_hash, \
+                    authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
+                    admitted_at, cosignatures\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                 ON CONFLICT (family_key_id, removed_identity_key_id, effective_at) DO NOTHING",
+                &[
+                    &row.family_key_id,
+                    &row.removed_identity_key_id,
+                    &row.removed_at,
+                    &row.effective_at,
+                    &row.reason,
+                    &witness,
+                    &row.persist_row_hash,
+                    &revocation.authority_key_id,
+                    &revocation.scrub_signature_classical,
+                    &revocation.scrub_signature_pqc,
+                    &admitted_at,
+                    &cosignatures,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("family_membership_revocation"))?;
+        Ok(inserted > 0)
+    }
+
+    async fn store_planned_family_widening(
+        &self,
+        widening: &crate::federation::SignedFamilyMembershipWidening,
+    ) -> Result<(), crate::federation::Error> {
+        let row = &widening.family_membership_widening;
+        let cosignatures = serde_json::to_value(&widening.cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures: {e}")))?;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
+        let admitted_at = self
+            .next_plane_position(&tx, "federation_family_membership_widenings")
+            .await?;
+        tx.execute(
+            "INSERT INTO cirislens.federation_family_membership_widenings (\
+                family_key_id, member_key_id, joined_at, effective_at, role, \
+                persist_row_hash, authority_key_id, scrub_signature_classical, \
+                scrub_signature_pqc, admitted_at, cosignatures\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             ON CONFLICT (family_key_id, member_key_id, effective_at) DO NOTHING",
+            &[
+                &row.family_key_id,
+                &row.member_key_id,
+                &row.joined_at,
+                &row.effective_at,
+                &row.role,
+                &row.persist_row_hash,
+                &widening.authority_key_id,
+                &widening.scrub_signature_classical,
+                &widening.scrub_signature_pqc,
+                &admitted_at,
+                &cosignatures,
+            ],
+        )
+        .await
+        .map_err(map_revocation_pg_err("family_membership_widening"))?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
+        Ok(())
+    }
+}
+
 /// v61 (CIRISPersist#934) — the accord evidence executor on postgres.
 /// Storage only: the decisions are `federation::accord_admit`'s.
 #[async_trait::async_trait]
@@ -11116,147 +11305,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         family: crate::federation::SignedFamily,
     ) -> Result<(), crate::federation::Error> {
-        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
-        // other admission step. Hybrid-Strict vs the authority's registered
-        // pubkeys — was FK-existence only, a forgeable keyless declaration.
-        crate::federation::verify_family_admission(self, &family).await?;
-        // v61 (CIRISPersist#991) — the object as signed, for its row.
-        let offered = crate::federation::group_plane::GroupSigned::Family(family.clone());
-        // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
-        // is a no-op, a proof-carrying amendment this node's own state
-        // authorizes is applied as a supersede, anything else is refused.
-        if let crate::federation::group_amendment::OccupiedRoute::Settled(_) =
-            crate::federation::group_amendment::route_occupied_family(self, &family).await?
-        {
-            return Ok(());
-        }
-        let crate::federation::SignedFamily {
-            family: row,
-            authority_key_id,
-            scrub_signature_classical,
-            scrub_signature_pqc,
-            supersede_proof,
-            cosignatures,
-        } = family;
-        let supersede_proof_value = pg_supersede_proof_value(supersede_proof.as_ref())?;
-        // v52.0.0 (#955, V162) — the founding members' consent.
-        let cosignatures_value = serde_json::to_value(&cosignatures)
-            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
-        let family_key_id = row.family_key_id.clone();
-        self.put_family_local(row).await?;
-        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
-        // signature the gate above already verified (was verified-then-
-        // discarded: the durable row had no home for it, so it couldn't
-        // prove its own authorship later). `put_family_local` (the
-        // genesis-bake bypass) is untouched — its INSERT leaves these
-        // columns NULL, correct for a legitimately-unsigned bake row; this
-        // UPDATE targets only the signed, gate-verified path.
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        // v36.0.0 (#668) — attaching the authority signature is what makes
-        // the row VISIBLE to the signed serve cursor; the serve position is
-        // re-stamped here, because admission to the signed stream is this
-        // statement, not the local insert above.
-        let admitted_at = self
-            .next_plane_position(&client, "federation_families")
-            .await?;
-        client
-            .execute(
-                "UPDATE cirislens.federation_families \
-                    SET authority_key_id = $2, scrub_signature_classical = $3, \
-                        scrub_signature_pqc = $4, admitted_at = $5, supersede_proof = $6, \
-                        cosignatures = $7 \
-                  WHERE family_key_id = $1",
-                &[
-                    &family_key_id,
-                    &authority_key_id,
-                    &scrub_signature_classical,
-                    &scrub_signature_pqc,
-                    &admitted_at,
-                    // v49.0.0 (#910.5) — a first copy of an amended version
-                    // keeps its proof, so the next peer can apply it.
-                    &supersede_proof_value,
-                    &cosignatures_value,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("store family authority signature: {e}"))
-            })?;
-        // v21.1.0 (CIRISPersist#507b) — wire-index the FULL `SignedFamily`
-        // shape `list_signed_families_since` re-serializes. Reload rather
-        // than reuse the pre-write `Family` value: `put_family_local` stamps
-        // `persist_row_hash` on its OWN local copy, invisible from here.
-        // v31.0.0 (CIRISPersist#646) — that reload is now the SHARED one. This
-        // site had the right instinct and its own implementation of it; the
-        // instinct is now the rule and the implementation is one function.
-        drop(client);
-        // v61 (CIRISPersist#991) — the row follows its object.
-        crate::federation::group_plane::sync_group_row_offered(
-            self,
-            offered.link(),
-            Some(&offered),
-        )
-        .await?;
-        Ok(())
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::family_admit::put_family_planned(self, family).await
     }
 
     async fn put_family_local(
         &self,
-        mut row: crate::federation::types::Family,
+        row: crate::federation::types::Family,
     ) -> Result<(), crate::federation::Error> {
-        crate::federation::admission::check_family_consensus_protocol_form(
-            &row.consensus_protocol,
-        )?;
-        // v13.3.0 (CIRISPersist#386) — the real invariant (replaces the dropped
-        // family_key_id FK): every member key_id must be a registered key.
-        crate::federation::admission::validate_family_members(self, &row).await?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let members_value = serde_json::to_value(&row.members)
-            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        // v36.0.0 (#668) — THIS node's serve position (V130).
-        let admitted_at = self
-            .next_plane_position(&client, "federation_families")
-            .await?;
-        client
-            .execute(
-                "INSERT INTO cirislens.federation_families (\
-                    family_key_id, family_name, members, founded_at, \
-                    consensus_protocol, consensus_protocol_entrenched, persist_row_hash, \
-                    admitted_at, dissolved_at, prev_head_digest, charter_digest\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-                &[
-                    &row.family_key_id,
-                    &row.family_name,
-                    &members_value,
-                    &row.founded_at,
-                    &row.consensus_protocol,
-                    &row.consensus_protocol_entrenched,
-                    &row.persist_row_hash,
-                    &admitted_at,
-                    &row.dissolved_at,
-                    &row.prev_head_digest,
-                    &row.charter_digest,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("foreign key") {
-                    crate::federation::Error::InvalidArgument(format!(
-                        "FK constraint violated on family insert: {msg}"
-                    ))
-                } else {
-                    crate::federation::Error::Backend(format!("insert family: {msg}"))
-                }
-            })?;
-        Ok(())
+        crate::federation::family_admit::put_family_local_planned(self, row).await
     }
 
     // #249 Cut G2 — supersede + versioning (CIRISServer #249 §3/§8).
@@ -12310,117 +12367,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         revocation: crate::federation::SignedFamilyMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
-        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
-        // other admission step.
-        crate::federation::verify_family_membership_revocation_admission(self, &revocation).await?;
-        // v61 (CIRISPersist#991) — the object as signed, for its row.
-        let offered =
-            crate::federation::group_plane::GroupSigned::FamilyRevocation(revocation.clone());
-        let mut row = revocation.family_membership_revocation;
-        // v49.0.0 (CIRISPersist#910.3) — standing, by the family's own
-        // `consensus_protocol` at the row's instant (the #908 family half).
-        crate::federation::check_family_roster_authority(
-            self,
-            &row.family_key_id,
-            &revocation.authority_key_id,
-            &crate::federation::roster_row_signer_set(
-                &revocation.authority_key_id,
-                &revocation.cosignatures,
-            ),
-            crate::federation::types::FamilyMember {
-                key_id: row.removed_identity_key_id.clone(),
-                joined_at: row.effective_at,
-                role: None,
-            },
-            true,
-            row.effective_at,
-        )
-        .await?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let witness = serde_json::json!(row.witness_set);
-        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
-        // signature the gate above already verified (was verified-then-
-        // discarded).
-        let authority_key_id = revocation.authority_key_id;
-        let scrub_signature_classical = revocation.scrub_signature_classical;
-        let scrub_signature_pqc = revocation.scrub_signature_pqc;
-        // v49.0.0 (CIRISPersist#908, V153) — the co-signatures the gate above
-        // verified, stored so the since-read serves the row byte-exact.
-        let cosignatures = serde_json::to_value(&revocation.cosignatures)
-            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures: {e}")))?;
-        let client = self
-            .get_client()
+        crate::federation::family_admit::put_family_membership_revocation_planned(self, revocation)
             .await
-            .map_err(crate::store::Error::into_federation)?;
-        // v36.0.0 (#668) — THIS node's serve position (V130).
-        let admitted_at = self
-            .next_plane_position(&client, "federation_family_membership_revocations")
-            .await?;
-        // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK. v49.0.0 (#910.1,
-        // V154): the PK carries `effective_at`, so an exact retry is the no-op
-        // and returns before the index entry and the hard_case event (one
-        // removal is recorded — and announced — once), while a removal at
-        // another instant is another event. The unique index arbitrates
-        // (race-safe). The serve position is computed from
-        // `MAX(admitted_at)`, not allocated, so a skipped write leaves nothing.
-        let inserted = client
-            .execute(
-                "INSERT INTO cirislens.federation_family_membership_revocations (\
-                    family_key_id, removed_identity_key_id, removed_at, effective_at, \
-                    reason, witness_set, persist_row_hash, \
-                    authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                    admitted_at, cosignatures\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-                 ON CONFLICT (family_key_id, removed_identity_key_id, effective_at) DO NOTHING",
-                &[
-                    &row.family_key_id,
-                    &row.removed_identity_key_id,
-                    &row.removed_at,
-                    &row.effective_at,
-                    &row.reason,
-                    &witness,
-                    &row.persist_row_hash,
-                    &authority_key_id,
-                    &scrub_signature_classical,
-                    &scrub_signature_pqc,
-                    &admitted_at,
-                    &cosignatures,
-                ],
-            )
-            .await
-            .map_err(map_revocation_pg_err("family_membership_revocation"))?;
-        if inserted == 0 {
-            return Ok(());
-        }
-        drop(client);
-        // v61 (CIRISPersist#991) — the row follows its object.
-        crate::federation::group_plane::sync_group_row_offered(
-            self,
-            crate::federation::group_plane::GroupRowLink::plane(
-                crate::federation::group_plane::GroupPlaneTable::FamilyRevocations,
-                &row.family_key_id,
-                &row.removed_identity_key_id,
-                row.effective_at,
-            ),
-            Some(&offered),
-        )
-        .await?;
-        // CEG §7.7 (CIRISPersist#161 Ask 5) — emit the removal-direction
-        // membership-change hard_case (`change_kind: "removed"`), keyed on
-        // the re-key epoch. Idempotent on event_id (ON CONFLICT DO NOTHING).
-        // v57.0.0 (CIRISPersist#988 item 2) — an observation: a node with no
-        // attester records nothing; the removal already landed.
-        crate::federation::hard_case::record_observation(
-            self,
-            crate::federation::hard_case::membership_removed_event(
-                crate::federation::hard_case::kind::FAMILY_MEMBERSHIP_CHANGE,
-                &row.family_key_id,
-                &row.removed_identity_key_id,
-                row.effective_at,
-            ),
-        )
-        .await?;
-        Ok(())
     }
 
     async fn put_community_membership_revocation(
@@ -12447,90 +12395,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         widening: crate::federation::SignedFamilyMembershipWidening,
     ) -> Result<(), crate::federation::Error> {
-        // v49.0.0 (CIRISPersist#910) — the family twin of the room's widening
-        // door; see the sqlite twin for the legs.
-        crate::federation::verify_family_membership_widening_admission(self, &widening).await?;
-        // v61 (CIRISPersist#991) — the object as signed, for its row.
-        let offered = crate::federation::group_plane::GroupSigned::FamilyWidening(widening.clone());
-        let mut row = widening.family_membership_widening;
-        crate::federation::reject_future_dated_family_widening(row.effective_at)?;
-        crate::federation::check_family_roster_authority(
-            self,
-            &row.family_key_id,
-            &widening.authority_key_id,
-            &crate::federation::roster_row_signer_set(
-                &widening.authority_key_id,
-                &widening.cosignatures,
-            ),
-            row.member(),
-            false,
-            row.effective_at,
-        )
-        .await?;
-        if self.lookup_family(&row.family_key_id).await?.is_none() {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "{} does not exist in federation_families",
-                row.family_key_id
-            )));
-        }
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let authority_key_id = widening.authority_key_id;
-        let scrub_signature_classical = widening.scrub_signature_classical;
-        let scrub_signature_pqc = widening.scrub_signature_pqc;
-        let cosignatures = serde_json::to_value(&widening.cosignatures)
-            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures: {e}")))?;
-        let mut client = self
-            .get_client()
+        crate::federation::family_admit::put_family_membership_widening_planned(self, widening)
             .await
-            .map_err(crate::store::Error::into_federation)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
-        let admitted_at = self
-            .next_plane_position(&tx, "federation_family_membership_widenings")
-            .await?;
-        tx.execute(
-            "INSERT INTO cirislens.federation_family_membership_widenings (\
-                family_key_id, member_key_id, joined_at, effective_at, role, \
-                persist_row_hash, authority_key_id, scrub_signature_classical, \
-                scrub_signature_pqc, admitted_at, cosignatures\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-             ON CONFLICT (family_key_id, member_key_id, effective_at) DO NOTHING",
-            &[
-                &row.family_key_id,
-                &row.member_key_id,
-                &row.joined_at,
-                &row.effective_at,
-                &row.role,
-                &row.persist_row_hash,
-                &authority_key_id,
-                &scrub_signature_classical,
-                &scrub_signature_pqc,
-                &admitted_at,
-                &cosignatures,
-            ],
-        )
-        .await
-        .map_err(map_revocation_pg_err("family_membership_widening"))?;
-        tx.commit()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
-        // v59.1.2 — the row sync checks out its own client.
-        drop(client);
-        // v61 (CIRISPersist#991) — the row follows its object.
-        crate::federation::group_plane::sync_group_row_offered(
-            self,
-            crate::federation::group_plane::GroupRowLink::plane(
-                crate::federation::group_plane::GroupPlaneTable::FamilyWidenings,
-                &row.family_key_id,
-                &row.member_key_id,
-                row.effective_at,
-            ),
-            Some(&offered),
-        )
-        .await?;
-        Ok(())
     }
 
     async fn list_identity_occurrence_revocations_for(
