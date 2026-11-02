@@ -12,9 +12,14 @@
 #   below), the from-disk gates that hold the doors to their plans
 #   (store::parity — including #934 step 5, no door reads identical —, I448,
 #   the ast-grep count parity).
+# - `device_readd_invariants::` (I188, #916): its two-node T3 leg is the
+#   witness of `put_identity_occurrence_planned`'s device re-wrap branch (an
+#   occurrence whose identity is not its occurrence re-wraps this node's
+#   epochs to it). The first runner left `!=` -> `==` there MISSED because
+#   this filter did not select I188; hand-applied, T3 is red on both backends.
 #
 # Grammar: docs/MUTATION_TESTING.md "Scope files".
-tests: test(/transport|destination|provenance|self_at_login|occurrence|family|roster|group_plane|group_amendment|hard_case|supersede|lineage_head|roster_head|rc5_adopts|cohort|amend|dissol|^store::parity::|ast_gate_parity::/)
+tests: test(/transport|destination|provenance|self_at_login|occurrence|family|roster|group_plane|group_amendment|hard_case|supersede|lineage_head|roster_head|rc5_adopts|cohort|amend|dissol|^store::parity::|ast_gate_parity::|device_readd_invariants::/)
 features: postgres,sqlite,server,cirisaudit
 
 src/federation/transport_admit.rs
