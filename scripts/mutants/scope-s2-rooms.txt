@@ -15,7 +15,6 @@
 #   the attestation_apply unit tests.
 # - CIRISPersist#1148: `replicated_row_in_audience`, the record's own
 #   audience, the typed community door (I1509).
-# - CIRISPersist#1165: `contact_grant_relay_over_roster` (I1510).
 # - CIRISPersist#1140: `names_its_delegate`, `binding_is_group_audience`
 #   (I1511).
 # - CIRISPersist#1143: `check_one_voice_countersign`, `community_dissolved_at`,
@@ -37,7 +36,7 @@ src/federation/mod.rs roster_event_standing roster_reversal_stands
 src/federation/crossing.rs same_placement
 src/federation/attestation_query.rs lifecycle_predicate
 src/federation/attestation_apply.rs replicated_row_in_audience
-src/federation/replication_audience.rs contact_grant_relay_over_roster record_names_its_audience may_receive_community_record
+src/federation/replication_audience.rs record_names_its_audience may_receive_community_record
 src/federation/affiliation_config.rs check_one_voice_countersign
 src/federation/group_plane.rs community_dissolved_at refuse_if_community_dissolved
 src/store/sqlite.rs composer_replay_held

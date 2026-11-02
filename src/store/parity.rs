@@ -157,9 +157,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("store_planned_local_occurrence", Class::Plumbing),
     ("index_occurrence_row", Class::Plumbing),
     // v61 (CIRISPersist#1148) — the replicated community apply's put-time
-    // audience precondition (`may_receive_community_record`, Gate) and the
-    // node key it asks about (`node_key_id`, Plumbing) are each classified
-    // once, below; the S2/S4b merge had listed both twice.
+    // audience precondition: the verdict refuses a record this node may not
+    // receive (a Gate), asked about this node's own key (Plumbing: a read of
+    // the node's identity). Classified exactly once.
+    ("may_receive_community_record", Class::Gate),
+    ("node_key_id", Class::Plumbing),
     // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
     ("put_transport_destination_planned", Class::Plan),
     ("put_signed_transport_destination_planned", Class::Plan),
