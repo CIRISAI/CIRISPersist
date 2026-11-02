@@ -92,7 +92,33 @@ every scope those tests witnessed).
 
 ## 3. v61.0.0 — finish the refactor
 
+### Scope (Eric's ruling, 2026-10-31)
+
+v61 is the S1–S4 refactor plus the field blockers below. Everything else in §3's "After v61" and
+the items moved to v62 stay out of the cut.
+
+| issue | what | slice |
+|---|---|---|
+| #1165 | `may_receive`: admit an owner's contact grant at an infrastructure relay | S2/S3 |
+| #1161 | community-scope carve-out for CC 4.5.5 duty rows (a moderation act names its target row and that row's subject) | S2/S3 |
+| #1160 | the takedown notice signer is a raw pubkey; the duty gate compares key ids | S2/S3 |
+| #1155, #1157 | composer dedup and ranking: idempotent on `attestation_id`, distinct rows ranked within one audience (CC rc14 3.1.9.4, `CLM-composer-convergent-rank`) | S2/S3 |
+| #1148 | replicated writes refuse a row this node is not in the audience for | S2/S3 |
+| #1140 | the owner-binding audience: re-signed at the group's scope when an unannounced node joins (CC rc14 3.2) | S2/S3 |
+| #1143 | the affiliation one-voice countersign door, and dissolution (a `withdraws` of a group's record) | S2 |
+| #1156 | the storage summary on an embedded node with a foreign `audit_log` table | S2/S3 |
+| #1166 | every Postgres checkout through the bounded checkout | S4 |
+
+Moved to v62: #1121 (census doors), #1152 (`evidence:safety_battery` rows, CC rc14 3.1.5.5),
+#1154 (community-declared goals, CC rc14 3.1.9.7), and the retirement series #1079–#1089. The rc14
+text these name is vendored and latched by I1499 (`federation::rc14_vendor_invariants`) until
+its cut builds it.
+
 ### S0 — vendor CC rc12 at its tag; re-pin; the signed-object cleanup (#1098)
+
+- **Superseded by S1 step 5:** CC is vendored at `v1.0-rc14` (`b4da527`, containing rc12 and
+  rc13). The CSD/4 fixtures stay at CIRISServer `v0.5.234` until a tagged Server release carries
+  vocabulary v6 (I1301 latches it).
 
 - rc12 vendored at the tag (never the PR branch): the #1125 readings, the rc11 rooms text, the
   affiliation tokens, `observation:access_assumption` at +1.0, the census families and tokens as
@@ -155,13 +181,16 @@ Version, evidence re-stamp, CHANGELOG `## [61.0.0]` with the Adoption list deriv
 method, every exhaustive enum that changed, the `Placement` consumers if S2 lands `addressed`),
 certify, the mutants matrix on the candidate, `--hold` for Edge's re-gate, tag on Edge's go.
 
-### After v61 (not scheduled here)
+### v62 (scheduled by the 2026-10-31 ruling)
 
 - #1121 census doors — on the new membership rows (its `addressed` placement is the one
-  exhaustive-enum break of the census; if S2 needs it for `open:self_admit` delivery it moves into
-  S2).
+  exhaustive-enum break of the census).
+- #1152 `evidence:safety_battery` rows; #1154 community-declared goals.
+- The retirement series #1079–#1089.
+
+### After v61 (not scheduled here)
+
 - LocationProof, TransportDestination, AccordQuorumEvidence as rows (accord waits on the steward).
-- The retirement record (#1079–#1088) as its own major.
 - #1004 workspace split; #1100's remaining doors; #974, #976, #962; #747, #728.
 - Parked / blocked unchanged: #147, #415, #672, #708, #727, #795, #803, #812, #890, #914, #1005.
 
