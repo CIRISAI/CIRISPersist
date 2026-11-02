@@ -8564,7 +8564,8 @@ fn pg_row_to_transport_destination(
         last_seen_at: row.safe_get_with(4, FErr::Backend)?,
         transport_ed25519_pubkey_base64: row.safe_get_with(5, FErr::Backend)?,
         transport_x25519_pubkey_base64: row.safe_get_with(6, FErr::Backend)?,
-        binding_provenance: crate::federation::self_at_login::BindingProvenance::from_token(
+        // v61 (CIRISPersist#934) — the decode's refusal is the shared plan's.
+        binding_provenance: crate::federation::transport_admit::stored_binding_provenance(
             provenance_token.as_deref(),
         )
         .map_err(|e| FErr::Backend(e.to_string()))?,

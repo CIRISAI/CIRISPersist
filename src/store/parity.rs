@@ -132,6 +132,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // executor asks of the held head inside its transaction.
     ("supersede_group_row_planned", Class::Plan),
     ("held_head_verdict", Class::Plan),
+    // v61 (CIRISPersist#934, S4b) — the transport row mappers' stored
+    // `binding_provenance` decode (its gate is `from_token`).
+    ("stored_binding_provenance", Class::Plan),
     // Gates: `self` is not versioned; a snapshot that is not the signed
     // wrapper of the cohort's record is refused (#651).
     ("check_supersede_cohort", Class::Gate),
@@ -1552,7 +1555,12 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 71] = [
+    const SHARED_PLANS: [(&str, &str); 72] = [
+        // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance.
+        (
+            "src/federation/transport_admit.rs",
+            "stored_binding_provenance",
+        ),
         // v61 (CIRISPersist#934, S4b) — the group supersede.
         (
             "src/federation/group_supersede_admit.rs",
@@ -1814,7 +1822,19 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 80] = [
+    const SHARED_DOORS: [(&str, &str, &str); 82] = [
+        // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance,
+        // decoded by the row mapper both doors read through.
+        (
+            "FederationDirectory",
+            "list_signed_transport_destinations_since",
+            "stored_binding_provenance",
+        ),
+        (
+            "TransportStore",
+            "store_planned_signed_destination",
+            "stored_binding_provenance",
+        ),
         // v61 (CIRISPersist#934, S4b) — the group supersede.
         (
             "FederationDirectory",
