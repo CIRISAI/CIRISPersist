@@ -28,7 +28,7 @@
 //! | the two trees declare the same columns | none — zero divergences |
 //! | every type pair is a sanctioned dialect encoding | [`DIALECT_ENCODINGS`] + [`PG_NARROWED_ID_COLUMNS`] |
 //! | nullability agrees | [`NULLABILITY_DIVERGENCES`] (1, `cirisnode`; the 14 `admitted_at` entries closed by V141 / #828) |
-//! | a column one dialect omits from its INSERT has a DEFAULT there | [`WRITE_COLUMN_DIVERGENCES`] (7) |
+//! | a column one dialect omits from its INSERT has a DEFAULT there | [`WRITE_COLUMN_DIVERGENCES`] (5) |
 //!
 //! # Why `UUID` is not just another encoding
 //!
@@ -281,28 +281,10 @@ pub(crate) const WRITE_COLUMN_DIVERGENCES: &[WriteColumnDivergence] = &[
                  distinguishable through the API.",
     },
     WriteColumnDivergence {
-        table: "content_manifest",
-        columns: &["admitted_at"],
-        omitted_by: "postgres",
-        reason: "`admitted_at` is the write wall-clock, `DEFAULT now()` on postgres and no \
-                 function default on sqlite. Neither door takes the value from the caller, so \
-                 the column records the same fact on both — the substrate that can compute it \
-                 does, and the one that cannot is handed it.",
-    },
-    WriteColumnDivergence {
-        table: "wholeness_witness_corpus",
-        columns: &["admitted_at"],
-        omitted_by: "postgres",
-        reason: "Same shape as `content_manifest`: a write wall-clock with `DEFAULT now()` on \
-                 postgres and no column-level function default on sqlite, taken from neither \
-                 caller and read by neither door. The witness corpus is compared on its \
-                 content, never on when a node happened to admit it.",
-    },
-    WriteColumnDivergence {
         table: "federation_stream_chunks",
         columns: &["created_at"],
         omitted_by: "postgres",
-        reason: "Same shape again: the chunk's write instant, defaulted by postgres and supplied \
+        reason: "The chunk's write instant (a wall clock), defaulted by postgres and supplied \
                  by the sqlite door because SQLite has no column-level `NOW()`. Nothing orders \
                  or seals on this column — the chunk DAG is addressed by hash — so the two \
                  instants are a diagnostic, not a fold input.",
