@@ -983,6 +983,21 @@ where
     Ok(GroupRowSync::Linked)
 }
 
+tokio::task_local! {
+    /// v61 S2 — set while [`apply_group_plane_row`] hands a REPLICATED roster
+    /// event to its typed door. The typed doors serve both the local write and
+    /// the replicated apply through one trait method; a gate that binds only
+    /// the local door ([`applying_replicated_group_row`]) reads this.
+    static REPLICATED_GROUP_ROW: ();
+}
+
+/// v61 S2 — is the current task applying a replicated group-plane row
+/// ([`GroupRowDoor::Replicated`])? `false` on every local write.
+#[must_use]
+pub(crate) fn applying_replicated_group_row() -> bool {
+    REPLICATED_GROUP_ROW.try_with(|()| ()).is_ok()
+}
+
 /// Which door a group-plane row arrived through: a community record's door
 /// decides on it whether the CC 3.2 infrastructure gate runs (#931).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1101,7 +1116,16 @@ where
             }
         },
         GroupSigned::FamilyRevocation(s) => dir.put_family_membership_revocation(s).await?,
-        GroupSigned::CommunityRevocation(s) => dir.put_community_membership_revocation(s).await?,
+        // v61 S2 — the removal window binds the local door only
+        // (`community_admit::check_open_self_admit_removal_window`).
+        GroupSigned::CommunityRevocation(s) => match door {
+            GroupRowDoor::Local => dir.put_community_membership_revocation(s).await?,
+            GroupRowDoor::Replicated => {
+                REPLICATED_GROUP_ROW
+                    .scope((), dir.put_community_membership_revocation(s))
+                    .await?;
+            }
+        },
         GroupSigned::FamilyWidening(s) => dir.put_family_membership_widening(s).await?,
         GroupSigned::CommunityWidening(s) => dir.put_community_membership_widening(s).await?,
     }

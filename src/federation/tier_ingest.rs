@@ -1135,7 +1135,7 @@ pub mod test_support {
     /// has two subjects. Put the distinguishing part FIRST, and assert the
     /// pubkeys differ (CIRISPersist#659 hit exactly this, on postgres only,
     /// where the tag carries a uuid).
-    fn seed_for(key_id: &str) -> [u8; 32] {
+    pub(crate) fn seed_for(key_id: &str) -> [u8; 32] {
         let mut seed = [0x11u8; 32];
         for (i, b) in key_id.bytes().take(32).enumerate() {
             seed[i] = b;

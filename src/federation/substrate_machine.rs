@@ -3387,12 +3387,18 @@ mod proptests {
     ///
     /// BOTH legs are asserted, because a "fix" that simply deleted the dedup
     /// would pass the first one and silently destroy §6.1 idempotence.
-    #[tokio::test]
-    async fn dedup_short_circuit_never_accepts_an_unverified_row() {
+    ///
+    /// v61 (CIRISPersist#1157) — the replay key is the ROW, `(attestation_id,
+    /// original_content_hash)`, not the triple. So the unverified probe that
+    /// matters is a corrupt-signature copy of a HELD composer under its own id
+    /// and content hash (the exact key the short-circuit answers for), and the
+    /// counter-witness is an exact re-put of that row; a distinct valid row on
+    /// the same triple is stored. Run on sqlite and postgres.
+    async fn dedup_short_circuit_body(sq: &dyn crate::federation::FederationDirectory) {
         const TAG: &str = "dedup_short_";
         use super::test_support::{register_cast, Family, SigState};
         use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
-        use crate::federation::{FederationDirectory, SignedAttestation};
+        use crate::federation::SignedAttestation;
 
         const TARGET: &str = "99999999-9999-5999-9999-999999999999";
         const FIRST: &str = "aaaaaaaa-aaaa-5aaa-9aaa-aaaaaaaaaaaa";
@@ -3411,24 +3417,23 @@ mod proptests {
             )
         };
 
-        let sq = SqliteBackend::open_in_memory().await.expect("open sqlite");
-        sq.run_migrations().await.expect("migrations");
-        register_cast(&sq, TAG).await;
+        register_cast(sq, TAG).await;
         sq.put_attestation(SignedAttestation {
             attestation: composer(FIRST, SigState::Valid),
         })
         .await
-        .expect("the genuine composer is admitted, populating the §6.1 dedup triple");
+        .expect("the genuine composer is admitted");
 
-        // (1) THE RULE: early-return to REFUSE, never to ACCEPT.
+        // (1) THE RULE: early-return to REFUSE, never to ACCEPT — a corrupt
+        // composer on the held triple.
         let err = sq
             .put_attestation(SignedAttestation {
                 attestation: composer(FORGED, SigState::Corrupt),
             })
             .await
             .expect_err(
-                "AV-76: a corrupt-signature composer matching an existing dedup triple must be \
-                 REFUSED — the short-circuit must not return Ok ahead of the crypto gate",
+                "AV-76: a corrupt-signature composer on a held triple must be REFUSED — the \
+                 short-circuit must not return Ok ahead of the crypto gate",
             );
         assert_eq!(
             err.kind(),
@@ -3440,17 +3445,85 @@ mod proptests {
             "and nothing is stored"
         );
 
-        // (2) THE COUNTER-WITNESS: §6.1 idempotence still works. Dedup was
-        // REORDERED, not removed.
+        // (2) #1157 — a corrupt copy of the HELD row under its own id and
+        // content hash: the very key the row-keyed short-circuit answers
+        // `ComposerReplay` for. It still meets the crypto gate first.
+        let forged_replay = composer(FIRST, SigState::Corrupt);
+        let held = sq
+            .get_attestation(FIRST)
+            .await
+            .expect("get")
+            .expect("FIRST is held");
+        assert_eq!(
+            forged_replay.original_content_hash, held.original_content_hash,
+            "the probe carries the held row's replay key (id, content hash)"
+        );
+        let err = sq
+            .put_attestation(SignedAttestation {
+                attestation: forged_replay,
+            })
+            .await
+            .expect_err(
+                "AV-76 under #1157: a corrupt-signature copy of a HELD composer (same id, same \
+                 content hash) is refused, never acknowledged as a replay",
+            );
+        assert_eq!(
+            err.kind(),
+            "federation_federation_tier_unverified",
+            "refused ON THE SIGNATURE"
+        );
+        let after = sq
+            .get_attestation(FIRST)
+            .await
+            .expect("get")
+            .expect("FIRST is still held");
+        assert_eq!(
+            after.scrub_signature_classical, held.scrub_signature_classical,
+            "the held row keeps its genuine signature"
+        );
+
+        // (3) THE COUNTER-WITNESS: §6.1 idempotence still works, on the row.
+        sq.put_attestation(SignedAttestation {
+            attestation: composer(FIRST, SigState::Valid),
+        })
+        .await
+        .expect("an exact VALID replay of a held composer is an idempotent no-op (§6.1, #1157)");
+
+        // (4) A DISTINCT valid row on the same triple is not a replay: it is
+        // stored and ranked at read time (#1157, CC rc14 3.1.9.4).
         sq.put_attestation(SignedAttestation {
             attestation: composer(REPLAY, SigState::Valid),
         })
         .await
-        .expect("a VALID replay on the same triple is still an idempotent no-op (§6.1)");
+        .expect("a distinct valid composer on the held triple is admitted (#1157)");
         assert!(
-            sq.get_attestation(REPLAY).await.expect("get").is_none(),
-            "the replay stores no new row"
+            sq.get_attestation(REPLAY).await.expect("get").is_some(),
+            "the distinct row is stored, not swallowed as a replay"
         );
+    }
+
+    #[tokio::test]
+    async fn dedup_short_circuit_never_accepts_an_unverified_row() {
+        let sq = SqliteBackend::open_in_memory().await.expect("open sqlite");
+        sq.run_migrations().await.expect("migrations");
+        dedup_short_circuit_body(&sq).await;
+    }
+
+    /// The postgres leg of [`dedup_short_circuit_body`], on a database of its
+    /// own (the witness's ids are constants).
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dedup_short_circuit_never_accepts_an_unverified_row_postgres() {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            eprintln!("dedup_short_circuit postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+            return;
+        };
+        let pg = crate::store::PostgresBackend::connect(&dsn)
+            .await
+            .expect("connect postgres");
+        pg.run_migrations().await.expect("migrations");
+        dedup_short_circuit_body(&pg).await;
+        eprintln!("dedup_short_circuit postgres: RAN");
     }
 
     /// **ATTESTATION-ID UNIQUENESS REGRESSION GUARD** — successor to the

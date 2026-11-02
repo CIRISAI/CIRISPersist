@@ -1060,13 +1060,9 @@ impl Engine {
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
         engine.sweep_dag_chunk_links_at_boot().await;
-        // v61 (CC 2.6.2) — settle stored rows whose signed instants are
-        // not in the canonical form: re-sign this node's own, keep in force
-        // what takes something away, set aside the rest. Never boot-fatal.
-        engine.settle_instant_forms_at_boot().await;
-
-        // v61 (CIRISPersist#1122) — routes an agent key published are removed.
-        engine.sweep_agent_routes_at_boot().await;
+        // v61 — the open legs every open runs, the Python `Engine(...)`
+        // included ([`Self::settle_at_open`]). Never boot-fatal.
+        engine.settle_at_open().await;
         // v31.0.0 (CIRISPersist#650) — the in-place v31 migration. Here rather
         // than in `Backend::run_migrations` because a re-stamp is a re-SIGN and
         // `Backend` has no signer; this is the first point at which the backend
@@ -1151,13 +1147,9 @@ impl Engine {
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
         engine.sweep_dag_chunk_links_at_boot().await;
-        // v61 (CC 2.6.2) — settle stored rows whose signed instants are
-        // not in the canonical form: re-sign this node's own, keep in force
-        // what takes something away, set aside the rest. Never boot-fatal.
-        engine.settle_instant_forms_at_boot().await;
-
-        // v61 (CIRISPersist#1122) — routes an agent key published are removed.
-        engine.sweep_agent_routes_at_boot().await;
+        // v61 — the open legs every open runs, the Python `Engine(...)`
+        // included ([`Self::settle_at_open`]). Never boot-fatal.
+        engine.settle_at_open().await;
         // v31.0.0 (CIRISPersist#650) — same hook as `with_signer`. A
         // pre-genesis node usually has nothing to migrate (no identity ⇒ no
         // authorship), and the routine returns early in that case; but a node
@@ -1226,13 +1218,9 @@ impl Engine {
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
         engine.sweep_dag_chunk_links_at_boot().await;
-        // v61 (CC 2.6.2) — settle stored rows whose signed instants are
-        // not in the canonical form: re-sign this node's own, keep in force
-        // what takes something away, set aside the rest. Never boot-fatal.
-        engine.settle_instant_forms_at_boot().await;
-
-        // v61 (CIRISPersist#1122) — routes an agent key published are removed.
-        engine.sweep_agent_routes_at_boot().await;
+        // v61 — the open legs every open runs, the Python `Engine(...)`
+        // included ([`Self::settle_at_open`]). Never boot-fatal.
+        engine.settle_at_open().await;
         Ok(engine)
     }
 
@@ -1304,13 +1292,9 @@ impl Engine {
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
         engine.sweep_dag_chunk_links_at_boot().await;
-        // v61 (CC 2.6.2) — settle stored rows whose signed instants are
-        // not in the canonical form: re-sign this node's own, keep in force
-        // what takes something away, set aside the rest. Never boot-fatal.
-        engine.settle_instant_forms_at_boot().await;
-
-        // v61 (CIRISPersist#1122) — routes an agent key published are removed.
-        engine.sweep_agent_routes_at_boot().await;
+        // v61 — the open legs every open runs, the Python `Engine(...)`
+        // included ([`Self::settle_at_open`]). Never boot-fatal.
+        engine.settle_at_open().await;
         Ok(engine)
     }
 
@@ -7141,6 +7125,19 @@ impl Engine {
                 ),
             }
         }
+    }
+
+    /// v61 — **the open legs every open runs**: the CC 2.6.2 instant-form
+    /// pass ([`Self::settle_instant_forms`]: re-sign this node's own rows,
+    /// keep in force what takes something away, set aside the rest) and the
+    /// CIRISPersist#1122 agent-route sweep. Called by every Rust constructor
+    /// that opens a store AND by the Python `Engine(...)` open, which builds
+    /// its engine through the shared constructor and so ran neither before
+    /// v61: every host opens persist from Python, so the V211 DDL ran in the
+    /// field and the pass never did. Logged, never boot-fatal, idempotent.
+    pub async fn settle_at_open(&self) {
+        self.settle_instant_forms_at_boot().await;
+        self.sweep_agent_routes_at_boot().await;
     }
 
     async fn settle_instant_forms_at_boot(&self) {

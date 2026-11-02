@@ -717,6 +717,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v59.0.0 (sealed-transport floor) — the eager key-plane rehome at open.
     ("rehome_key_plane_at_open", ConnClass::Read),
     ("legacy_community_trust_grants_at_open", ConnClass::Read),
+    // v61 (the canonical's read storm) — ANALYZE once on a never-analyzed
+    // store, then `PRAGMA optimize`: both write sqlite_stat1, on the writer.
+    ("plan_statistics_at_open", ConnClass::Write),
     ("list_open_self_roster_proposals", ConnClass::Read),
     ("list_settled_self_roster_proposals", ConnClass::Read),
     ("settle_self_roster_proposal", ConnClass::Write),

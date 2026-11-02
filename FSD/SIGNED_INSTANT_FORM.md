@@ -58,7 +58,7 @@ Every signed preimage persist builds or verifies that carries an instant, in thr
 |---|---|---|
 | attestation envelope, JCS (CC 2.6.1.7) | the §1 members | minted `.sssZ` (`render_signed_instant`); refused otherwise |
 | key revocation `revocation_envelope` (CC 2.4.1.1) | `revoked_at`, `effective_at`, `scrub_timestamp`, `revoked_after` | `bind_revocation_into_envelope` renders `.sssZ`; the binding compares the canonical render |
-| key record `registration_envelope` | `valid_until` (the signed twin) | bound `.sssZ` by `register_self_federation_key` and the rebind door |
+| key record `registration_envelope` | `valid_until` (the signed twin), `valid_from` | `valid_until` bound `.sssZ` by `register_self_federation_key` and the rebind door; `valid_from` written `.sssZ` by `register_self_federation_key`, which refuses a caller's `valid_from` in any other form (`InvalidArgument`), and the record carries the signed instant. The key-record door's refusal of another `valid_from` form waits on the genesis re-sign (CIRISPersist#1178) |
 | identity occurrence and signed transport destination envelopes | `asserted_at`, `valid_until`, `retired_at` | persist's producer renders `.sssZ`; the doors refuse any other form |
 
 **B. Persist-own domain preimages.** Persist names the domain. The canonical form is a new domain; the old one still verifies as itself.
@@ -82,7 +82,7 @@ The two trust doors verify a signature over v2, else over v1 (`verify_trust_plan
 | `fresh_as_of` | the touch claim's signing envelope |
 | a rounded instant | the transform algebra's `round` on an instant |
 
-**Not moved in v61.** These preimages are re-derived by their verifiers from typed fields through serde (chrono's own fractional digits). Changing the rendering in place would break every stored signature, so each needs a new domain and a re-sign, and two touch the baked genesis:
+**Not moved in v61 (CIRISPersist#1178, v62).** These preimages are re-derived by their verifiers from typed fields through serde (chrono's own fractional digits). Changing the rendering in place would break every stored signature, so each needs a new domain and a re-sign, and two touch the baked genesis:
 
 | preimage | instants |
 |---|---|
@@ -91,3 +91,14 @@ The two trust doors verify a signature over v2, else over v1 (`verify_trust_plan
 | the genesis bundle's `authorization_digest` (CIRISVerify) | `produced_at` and the nested records' instants |
 | the audit chain (`canonical_bytes_for_entry`, Merkle leaves) | `recorded_at` |
 | cirisnode `PromotionAttestation`; the pipeline's edge signature | `attested_at`; `batch_timestamp`, `consent_timestamp` |
+| the key record's signed `registration_envelope.valid_from` | `valid_from`: the compiled-in genesis signs it in nine-digit offset form for every holder and the serve node, so the key-record door does not refuse it until the genesis is re-signed under a ceremony |
+
+## 5. Where each rule stands in CC
+
+| rule | CC |
+|---|---|
+| the nine signed instants of the signed object and the cosigner's JCS bytes fail **verification** on form, not only admission | CC 2.6.2, CC 2.6.1.7 (the `rfc3339-ms` members) |
+| the beside instants `scrub_timestamp`, `pqc_completed_at` and `additional_scrubs[].cosigned_at` sit outside every preimage: persist emits them strict, and a door that reads one refuses another form with the typed form error | CC 2.6.1.7 (the `beside:*` rows), CC 2.6.7 |
+| `ciris.scrub_envelope.v2` is a persist-own domain for the trace scrub signature | CC 5.1 |
+| removing another producer's offset-form row, recorded in a ledger that keeps no body (`federation_attestations_form_refused`), is a storage choice | CC 2.6.2 says what verifies; how a node stores what does not is its own |
+| a refused-form row that takes something away is kept in force | CC 2.4.1.1, CC 3.2 T3, CC 6.1.7 |

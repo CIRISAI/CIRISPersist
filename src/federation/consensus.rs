@@ -104,6 +104,13 @@ pub struct Ballot<'a> {
 /// not among them, sign a removal.
 pub const OPEN_SELF_ADMIT_REMOVAL_FLOOR: usize = 2;
 
+/// v61 S2 (CC 4.5.13, the release lead's ruling) — under `open:self_admit`
+/// each counted voice of a removal signs within this many seconds of the
+/// removal's asserted instant (72 hours). A roster cosignature carries no
+/// signed instant of its own, so the bound falls back to the local door's
+/// receipt ([`crate::federation::ROSTER_REMOVAL_OUTSIDE_WINDOW`]).
+pub const OPEN_SELF_ADMIT_REMOVAL_WINDOW_SECS: i64 = 259_200;
+
 /// The evaluator's answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {

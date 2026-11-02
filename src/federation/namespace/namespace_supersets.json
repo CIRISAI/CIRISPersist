@@ -17344,6 +17344,29 @@
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v60.1-b",
     "witness": "infra_relay_is_appended_and_pinned_by_position (unit): infra:relay is ALL[24] and INFRA[12], appended; I1361 (sqlite, postgres) (CIRISPersist#1119)"
+   },
+   {
+    "decimal_id": "5.3",
+    "claim_id": "CLM-serve-seat-announced",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#serve_seat_owner_announced",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s3",
+    "tsv_comment_before": [
+     "",
+     "# v61 slice S3 — a serve seat needs an announced owner (CIRISPersist#1101), and a",
+     "# signed instant is `.sssZ` and nothing else verifies (CC 2.6.2, strict)."
+    ],
+    "witness": "I1101 (sqlite, postgres): a node whose owner binding is self-scope only is refused serve_seat_owner_unannounced at the widening; a later announcement seats it and a withdrawn one does not (CIRISPersist#1101)"
+   },
+   {
+    "decimal_id": "2.6.2",
+    "claim_id": "CLM-canonicalization",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#signed_instant_form_violation",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s3",
+    "witness": "I-IFP-2 (unit): the predicate reads every rfc3339-ms member of CC 2.6.1.7; I1494 (sqlite, postgres): CC's refuse_timestamp_form vector is refused envelope_member_invalid; I-IFP-1 (sqlite, postgres): the open-time pass settles a v60 node"
    }
   ],
   "CIRISServer": [

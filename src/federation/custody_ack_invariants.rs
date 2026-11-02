@@ -1987,3 +1987,826 @@ mod runners {
         .await;
     }
 }
+
+/// v61 — **the canonical's read storm, sized.** The canonical's own key
+/// authors most of the store (a custody report for every blob it holds,
+/// ~15 KB envelopes on overflow pages); the composer fold and the citing read
+/// are asked WITH that key on both axes. Each must cost pages proportional to
+/// the rows it returns, not to the key's slice: measured as the connection's
+/// pager fetches (`SQLITE_DBSTATUS_CACHE_HIT` + `_MISS`) across the door
+/// call, without `sqlite_stat1` and after ANALYZE, with a small-slice key as
+/// the control. And the Live listing at a deep cursor costs O(page).
+#[cfg(all(test, feature = "sqlite"))]
+mod storm_v61 {
+    use super::bodies as cab;
+    use crate::federation::custody_ack::{custody_acks_of, CustodyState, CUSTODY_ACK_DIMENSION};
+    use crate::federation::FederationDirectory;
+    use crate::store::Backend as _;
+
+    /// Pager fetches (hits + misses) on `conn` since the last call, reset.
+    // `unsafe_code` is denied crate-wide; this test-only call reads two
+    // per-connection pager counters the C API exposes and rusqlite does not
+    // wrap. Only the connection handle and two out-params cross the
+    // boundary (the I55c precedent in store::sqlite).
+    #[allow(unsafe_code)]
+    fn pager_fetches(conn: &rusqlite::Connection) -> i64 {
+        use rusqlite::ffi;
+        let mut total = 0i64;
+        for op in [
+            ffi::SQLITE_DBSTATUS_CACHE_HIT,
+            ffi::SQLITE_DBSTATUS_CACHE_MISS,
+        ] {
+            let (mut cur, mut hi) = (0i32, 0i32);
+            let rc = unsafe { ffi::sqlite3_db_status(conn.handle(), op, &mut cur, &mut hi, 1) };
+            assert_eq!(rc, ffi::SQLITE_OK, "sqlite3_db_status");
+            total += i64::from(cur);
+        }
+        total
+    }
+
+    fn sha(tag: &str) -> [u8; 32] {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(tag.as_bytes()).into()
+    }
+
+    /// Copies `n` rows of `template` into `federation_attestations` with a
+    /// fresh id and row hash, a citation `0…0{n/2}` (two reports per blob),
+    /// the envelope padded by `pad_bytes` of hex, `cohort_scope` replaced
+    /// when given, and an instant `n` seconds before the template's. Every
+    /// non-generated column is carried; the read path decodes, it does not
+    /// re-verify.
+    fn copy_history(
+        c: &rusqlite::Connection,
+        template: &str,
+        n: i64,
+        pad_bytes: i64,
+        cohort_scope: Option<&str>,
+    ) -> usize {
+        let cols: Vec<String> = c
+            .prepare(
+                "SELECT name FROM pragma_table_xinfo('federation_attestations') WHERE hidden = 0",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let select: Vec<String> = cols
+            .iter()
+            .map(|col| match col.as_str() {
+                "attestation_id" => "attestation_id || '-h' || n".to_owned(),
+                "persist_row_hash" => "persist_row_hash || '-h' || n".to_owned(),
+                "attestation_envelope" => format!(
+                    "json_set(attestation_envelope, '$.evidence_refs[0]', printf('%064d', n / 2), \
+                     '$.pad', hex(zeroblob({})))",
+                    pad_bytes / 2
+                ),
+                "asserted_at" => "strftime('%Y-%m-%dT%H:%M:%f', asserted_at, \
+                     '-' || (n + 10) || ' seconds') || '+00:00'"
+                    .to_owned(),
+                "cohort_scope" => match cohort_scope {
+                    Some(cs) => format!("'{cs}'"),
+                    None => "cohort_scope".to_owned(),
+                },
+                other => other.to_owned(),
+            })
+            .collect();
+        let sql = format!(
+            "WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n + 1 < ?2) \
+             INSERT INTO federation_attestations ({}) \
+             SELECT {} FROM federation_attestations, seq WHERE attestation_id = ?1",
+            cols.join(", "),
+            select.join(", ")
+        );
+        c.execute(&sql, rusqlite::params![template, n]).unwrap()
+    }
+
+    /// Pages per door call on the fitting index: the seek (a few interior
+    /// pages) plus the returned rows' table and overflow pages (~4 per
+    /// 15 KB envelope). Measured in the tens with the fix; the unpinned
+    /// plan walks the key's slice (thousands).
+    const CALL_BUDGET: i64 = 80;
+
+    /// The canonical's own-key slice: ~2,400 rows by one key.
+    const SLICE: i64 = 2_400;
+
+    #[tokio::test]
+    async fn v61_storm_own_key_reads_are_bounded_by_the_rows_they_return() {
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let d: &dyn FederationDirectory = &b;
+        let own = cab::device(d, "v61-storm-canonical-own-key-alpha-0000").await;
+        let small = cab::device(d, "v61-storm-small-slice-control-key-0000").await;
+        let target = sha("v61-storm-target-blob");
+        let base = cab::base();
+        let mut ids = Vec::new();
+        for key in [&own, &small] {
+            for m in 0..2 {
+                ids.push(
+                    cab::report(
+                        d,
+                        key,
+                        &target,
+                        CustodyState::Here,
+                        base + chrono::Duration::minutes(m),
+                    )
+                    .await,
+                );
+            }
+        }
+        let conn = b.conn_handle();
+        let landed = copy_history(&conn.lock(), &ids[0], SLICE, 15_000, None);
+        assert_eq!(landed as i64, SLICE, "the own key's slice landed");
+        let hex = hex::encode(target);
+        let (own_ids, small_ids) = (ids[..2].to_vec(), ids[2..].to_vec());
+
+        for stats in ["no sqlite_stat1", "after ANALYZE"] {
+            if stats == "after ANALYZE" {
+                conn.lock().execute_batch("ANALYZE").unwrap();
+            } else {
+                // The open analyzed the (then empty) store; the heuristic
+                // planner is what every pre-v61 node had.
+                conn.lock()
+                    .execute_batch("DROP TABLE IF EXISTS sqlite_stat1")
+                    .unwrap();
+            }
+            let has_stats: i64 = conn
+                .lock()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_stat1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(has_stats == 1, stats == "after ANALYZE", "{stats}");
+            for (who, key, kids) in [("own", &own, &own_ids), ("control", &small, &small_ids)] {
+                let measure = |label: &str, pages: i64, rows: usize, want: usize| {
+                    eprintln!("v61 [{stats}] {who} {label}: {rows} rows, {pages} pager fetches");
+                    assert_eq!(rows, want, "[{stats}] {who} {label}: rows");
+                    assert!(
+                        pages <= CALL_BUDGET,
+                        "[{stats}] {who} {label}: {pages} pages (budget {CALL_BUDGET}) — \
+                         the read walks the key's slice, not its rows"
+                    );
+                };
+                let _ = pager_fetches(&conn.lock());
+                let rows = d
+                    .list_attestations_by_dimension_citing(key, CUSTODY_ACK_DIMENSION, &hex)
+                    .await
+                    .unwrap();
+                measure("citing read", pager_fetches(&conn.lock()), rows.len(), 2);
+                for (axis, attested, attesting) in [
+                    ("composers, attesting axis", None, Some(key.as_str())),
+                    ("composers, attested axis", Some(key.as_str()), None),
+                    ("composers, no axis", None, None),
+                ] {
+                    let _ = pager_fetches(&conn.lock());
+                    let rows = d
+                        .list_composers_referencing_any(kids, attested, attesting)
+                        .await
+                        .unwrap();
+                    measure(axis, pager_fetches(&conn.lock()), rows.len(), 0);
+                }
+                let _ = pager_fetches(&conn.lock());
+                let acks = custody_acks_of(d, key, &hex).await.unwrap();
+                let pages = pager_fetches(&conn.lock());
+                eprintln!(
+                    "v61 [{stats}] {who} custody_acks_of: {} acks, {pages} pager fetches",
+                    acks.len()
+                );
+                assert_eq!(acks.len(), 2, "[{stats}] {who}: both reports of the blob");
+                assert!(
+                    pages <= 2 * CALL_BUDGET,
+                    "[{stats}] {who} custody_acks_of: {pages} pages"
+                );
+            }
+            // And the plans, as the doors issue them.
+            for (label, sql, binds) in [
+                (
+                    "citing",
+                    crate::store::sqlite::sqlite_by_dimension_citing_sql(),
+                    vec![own.clone(), CUSTODY_ACK_DIMENSION.to_owned(), hex.clone()],
+                ),
+                (
+                    "composers attesting",
+                    crate::store::sqlite::sqlite_composers_referencing_any_sql(false, true),
+                    vec![
+                        serde_json::to_string(&own_ids).unwrap(),
+                        "withdraws".into(),
+                        "recants".into(),
+                        "supersedes".into(),
+                        own.clone(),
+                    ],
+                ),
+                (
+                    "composers attested",
+                    crate::store::sqlite::sqlite_composers_referencing_any_sql(true, false),
+                    vec![
+                        serde_json::to_string(&own_ids).unwrap(),
+                        "withdraws".into(),
+                        "recants".into(),
+                        "supersedes".into(),
+                        own.clone(),
+                    ],
+                ),
+            ] {
+                let c = conn.lock();
+                let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                let plan: Vec<String> = st
+                    .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                        r.get::<_, String>(3)
+                    })
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                eprintln!("v61 [{stats}] {label} plan: {plan:?}");
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|l| l.contains("federation_attestations_attesting (")
+                            || l.contains("federation_attestations_attested (")),
+                    "[{stats}] {label}: never the key's whole slice: {plan:?}"
+                );
+            }
+        }
+    }
+
+    /// v61 — a store that was never analyzed (every node upgrading to v61)
+    /// is analyzed once at the next open, bounded: the own-key slice of
+    /// 2,400 × 15 KB rows, its statistics dropped, re-opened.
+    #[tokio::test]
+    async fn v61_storm_first_open_analyzes_an_unanalyzed_store_once() {
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let d: &dyn FederationDirectory = &b;
+        let own = cab::device(d, "v61-storm-analyze-own-key-alpha-00000").await;
+        let first = cab::report(
+            d,
+            &own,
+            &sha("v61-analyze"),
+            CustodyState::Here,
+            cab::base(),
+        )
+        .await;
+        let conn = b.conn_handle();
+        assert_eq!(
+            copy_history(&conn.lock(), &first, SLICE, 15_000, None) as i64,
+            SLICE
+        );
+        conn.lock()
+            .execute_batch("DROP TABLE sqlite_stat1")
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        b.plan_statistics_at_open().await;
+        let elapsed = t0.elapsed();
+        let rows: i64 = conn
+            .lock()
+            .query_row(
+                "SELECT count(*) FROM sqlite_stat1 WHERE tbl = 'federation_attestations'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        eprintln!(
+            "v61 first ANALYZE over {} rows: {rows} federation_attestations stat rows, {elapsed:?}",
+            SLICE + 1
+        );
+        assert!(rows > 0, "federation_attestations is analyzed");
+        // Once: a second open finds sqlite_stat1 and only optimizes.
+        let before: String = conn
+            .lock()
+            .query_row(
+                "SELECT group_concat(idx || '=' || stat, ';') FROM sqlite_stat1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        b.plan_statistics_at_open().await;
+        let after: String = conn
+            .lock()
+            .query_row(
+                "SELECT group_concat(idx || '=' || stat, ';') FROM sqlite_stat1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "the second open does not re-analyze an unchanged store"
+        );
+    }
+
+    /// The Live listing's page at a deep cursor: 42,000 visible rows, the
+    /// cursor at the 20,000th newest, one page of 512. ~1 KB envelopes here
+    /// (the canonical's are ~13 KB; in memory that would be ~550 MB): the
+    /// bound is on the walk, which the envelope size multiplies, not on it.
+    const LISTING_ROWS: i64 = 42_000;
+    const PAGE: i64 = 512;
+    /// O(page): per row its index entry, its table page and envelope, and one
+    /// `reference_live` probe per hidden composer type (three, a few interior
+    /// pages each) — measured ~14 per row. A table walk is ~14k pages for
+    /// the table alone, before the per-row composer scans the storm paid.
+    const PAGE_BUDGET: i64 = 20 * PAGE;
+
+    #[tokio::test]
+    async fn v61_storm_live_listing_at_a_deep_cursor_is_o_page() {
+        use crate::read::ReadEngine as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let d: &dyn FederationDirectory = &b;
+        let key = cab::device(d, "v61-storm-listing-author-alpha-000000").await;
+        let first = cab::report(
+            d,
+            &key,
+            &sha("v61-listing"),
+            CustodyState::Here,
+            cab::base(),
+        )
+        .await;
+        let conn = b.conn_handle();
+        let landed = copy_history(
+            &conn.lock(),
+            &first,
+            LISTING_ROWS,
+            1_000,
+            Some("federation"),
+        );
+        assert_eq!(landed as i64, LISTING_ROWS);
+        let (at, id): (String, String) = conn
+            .lock()
+            .query_row(
+                "SELECT asserted_at, attestation_id FROM federation_attestations \
+                 WHERE cohort_scope = 'federation' \
+                 ORDER BY asserted_at DESC, attestation_id DESC LIMIT 1 OFFSET 20000",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let at = chrono::DateTime::parse_from_rfc3339(&at)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let filter = crate::read::AttestationFilter {
+            valid_at: Some(chrono::Utc::now()),
+            tier: Some(crate::read::Tier::Federation),
+            ..Default::default()
+        };
+        for stats in ["as opened", "after ANALYZE"] {
+            if stats == "after ANALYZE" {
+                conn.lock().execute_batch("ANALYZE").unwrap();
+            }
+            let mut page_one = 0i64;
+            for (tag, cursor) in [
+                ("page 1", None),
+                (
+                    "cursor at row 20,000",
+                    Some(crate::read::AttestationCursor::from_trailing(
+                        at,
+                        id.clone(),
+                    )),
+                ),
+            ] {
+                let tag = format!("[{stats}] {tag}");
+                let plan: Vec<String> = {
+                    let (sql, binds) = crate::store::sqlite::sqlite_list_attestations_sql(
+                        &filter,
+                        cursor.as_ref(),
+                        PAGE,
+                        &crate::scope::CallerScope::Unauthenticated,
+                    )
+                    .unwrap();
+                    let c = conn.lock();
+                    let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                    st.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                        r.get::<_, String>(3)
+                    })
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect()
+                };
+                eprintln!("v61 Live listing {tag} plan: {plan:?}");
+                let _ = pager_fetches(&conn.lock());
+                let t0 = std::time::Instant::now();
+                let page = b
+                    .list_attestations(
+                        filter.clone(),
+                        cursor,
+                        PAGE,
+                        crate::scope::CallerScope::Unauthenticated,
+                    )
+                    .await
+                    .unwrap();
+                let elapsed = t0.elapsed();
+                let pages = pager_fetches(&conn.lock());
+                eprintln!(
+                "v61 Live listing {tag} over {LISTING_ROWS} rows: {} rows, {pages} pager fetches, {elapsed:?}",
+                page.items.len()
+            );
+                assert_eq!(page.items.len() as i64, PAGE, "{tag}: a full page");
+                assert!(
+                    pages <= PAGE_BUDGET,
+                    "{tag}: {pages} pages (budget {PAGE_BUDGET}) — the page walks the table"
+                );
+                // The property: the cursor SEEKS, so a page 20,000 rows deep
+                // costs what page 1 costs (a walk from the top would add every
+                // row above the cursor).
+                if page_one == 0 {
+                    page_one = pages;
+                } else {
+                    assert!(
+                        pages <= 2 * page_one,
+                        "{tag}: {pages} pages vs {page_one} on page 1 — the cost grows with depth"
+                    );
+                }
+            }
+        }
+        // The first open after upgrade on this store: statistics dropped,
+        // the open's bounded ANALYZE timed.
+        conn.lock()
+            .execute_batch("DROP TABLE IF EXISTS sqlite_stat1")
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        b.plan_statistics_at_open().await;
+        eprintln!(
+            "v61 first-open ANALYZE over {} rows: {:?}",
+            LISTING_ROWS + 1,
+            t0.elapsed()
+        );
+    }
+}
+
+/// v61 — **the read storm, postgres parity.** The same history as
+/// [`storm_v61`], on a database with NO statistics (autovacuum off for the
+/// table, no ANALYZE: a restore before its first analyze), then again after
+/// ANALYZE: both custody reads reach their multi-column index, never V004's
+/// single-column attester index, and the door's two statements together
+/// touch a bounded number of buffers.
+#[cfg(all(test, feature = "postgres"))]
+mod storm_v61_pg {
+    use super::bodies as cab;
+    use crate::federation::custody_ack::{custody_acks_of, CustodyState, CUSTODY_ACK_DIMENSION};
+    use crate::federation::types::attestation_type as at;
+    use crate::store::postgres::{pg_by_dimension_citing_sql, pg_composers_referencing_any_sql};
+    use crate::store::Backend as _;
+
+    type Params<'a> = Vec<&'a (dyn tokio_postgres::types::ToSql + Sync)>;
+
+    /// `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` of `sql`: every
+    /// `(Node Type, Index Name)` depth first, and the top node's shared
+    /// buffers (hit + read).
+    async fn plan(
+        client: &deadpool_postgres::Object,
+        sql: &str,
+        params: &Params<'_>,
+    ) -> (Vec<(String, Option<String>)>, i64) {
+        fn walk(n: &serde_json::Value, out: &mut Vec<(String, Option<String>)>) {
+            // A scan with no index carries its relation in the second slot.
+            out.push((
+                n["Node Type"].as_str().unwrap_or("?").to_owned(),
+                n["Index Name"]
+                    .as_str()
+                    .or_else(|| n["Relation Name"].as_str())
+                    .map(str::to_owned),
+            ));
+            for c in n["Plans"].as_array().into_iter().flatten() {
+                walk(c, out);
+            }
+        }
+        let row = client
+            .query_one(
+                &format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}"),
+                &params[..],
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = row.get(0);
+        let top = &v[0]["Plan"];
+        let mut out = Vec::new();
+        walk(top, &mut out);
+        let buffers = top["Shared Hit Blocks"].as_i64().unwrap_or(0)
+            + top["Shared Read Blocks"].as_i64().unwrap_or(0);
+        (out, buffers)
+    }
+
+    fn reaches(nodes: &[(String, Option<String>)], index: &str) -> bool {
+        nodes.iter().any(|(t, i)| {
+            matches!(
+                t.as_str(),
+                "Index Scan" | "Bitmap Index Scan" | "Index Only Scan"
+            ) && i.as_deref() == Some(index)
+        })
+    }
+
+    /// A table scan of `federation_attestations`, or V004's single-column
+    /// attester walk. (`list_scores` may scan its own subject table when no
+    /// subject is pinned, as on sqlite; that is not the history walk.)
+    fn walks_history(nodes: &[(String, Option<String>)]) -> bool {
+        nodes.iter().any(|(t, i)| {
+            (t == "Seq Scan" && i.as_deref() == Some("federation_attestations"))
+                || matches!(
+                    i.as_deref(),
+                    Some("federation_attestations_attesting")
+                        | Some("federation_attestations_attested")
+                )
+        })
+    }
+
+    /// Buffers for one of the two custody statements on the fitting index
+    /// (measured single digits); the attester walk reads the history.
+    const BUFFER_BUDGET: i64 = 100;
+
+    #[tokio::test]
+    async fn v61_storm_custody_reads_reach_their_index_postgres() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let client = b.get_client().await.unwrap();
+        client
+            .batch_execute(
+                "ALTER TABLE cirislens.federation_attestations SET (autovacuum_enabled = false)",
+            )
+            .await
+            .unwrap();
+        let d: &dyn crate::federation::FederationDirectory = &b;
+        let dev = cab::device(d, "v61-storm-canonical-device-pg-alpha-00").await;
+        use sha2::Digest as _;
+        let target: [u8; 32] = sha2::Sha256::digest(b"v61-storm-target-blob-pg").into();
+        let base = cab::base();
+        let first = cab::report(d, &dev, &target, CustodyState::Here, base).await;
+        let second = cab::report(
+            d,
+            &dev,
+            &target,
+            CustodyState::Here,
+            base + chrono::Duration::minutes(1),
+        )
+        .await;
+
+        // The history, as in the sqlite twin: 1,000 other blobs × two reports.
+        const OTHER_BLOBS: i64 = 1_000;
+        let cols: Vec<String> = client
+            .query(
+                "SELECT column_name::text FROM information_schema.columns \
+                 WHERE table_schema = 'cirislens' AND table_name = 'federation_attestations' \
+                   AND is_generated = 'NEVER' ORDER BY ordinal_position",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect();
+        let select: Vec<String> = cols
+            .iter()
+            .map(|c| match c.as_str() {
+                "attestation_id" => "gen_random_uuid()::text".to_owned(),
+                "persist_row_hash" => "persist_row_hash || '-h' || n".to_owned(),
+                "attestation_envelope" => "jsonb_set(attestation_envelope::jsonb, \
+                     '{evidence_refs,0}', to_jsonb(lpad((n / 2)::text, 64, '0')))::text"
+                    .to_owned(),
+                "asserted_at" => "asserted_at - make_interval(mins => (n + 10)::int)".to_owned(),
+                // Visible to every reader, so the listing below plans the
+                // page a detector actually reads.
+                "cohort_scope" => "'federation'".to_owned(),
+                other => other.to_owned(),
+            })
+            .collect();
+        let sql = format!(
+            "INSERT INTO cirislens.federation_attestations ({}) \
+             SELECT {} FROM cirislens.federation_attestations, generate_series(0::bigint, $2::bigint - 1) AS n \
+             WHERE attestation_id::text = $1",
+            cols.join(", "),
+            select.join(", ")
+        );
+        let inserted = client
+            .execute(&sql, &[&first, &(OTHER_BLOBS * 2)])
+            .await
+            .unwrap();
+        assert_eq!(inserted as i64, OTHER_BLOBS * 2, "the history landed");
+        // The scores plane's subject rows for that history, as the write
+        // path keeps them (one per subject), so `list_scores` below plans
+        // over a subject table the size of the history.
+        let subjects = client
+            .execute(
+                "INSERT INTO cirislens.attestation_subjects \
+                    (subject_key_id, dimension, asserted_at, attestation_id, tier, cohort_scope) \
+                 SELECT fa.attested_key_id, fa.dimension, fa.asserted_at, fa.attestation_id, \
+                        fa.tier, fa.cohort_scope \
+                 FROM cirislens.federation_attestations fa \
+                 ON CONFLICT (subject_key_id, attestation_id) DO NOTHING",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(
+            subjects as i64 >= OTHER_BLOBS * 2,
+            "the subject rows landed"
+        );
+
+        let hex = hex::encode(target);
+        let dim = CUSTODY_ACK_DIMENSION;
+        let ids = vec![first.clone(), second.clone()];
+        let (w, r, s) = (at::WITHDRAWS, at::RECANTS, at::SUPERSEDES);
+        // A page well below the history, so O(page) and O(history) differ.
+        const LISTING_PAGE: i64 = 64;
+        let mut listing_failures: Vec<String> = Vec::new();
+        // "stale statistics": the open analyzed the table while it was
+        // empty and the history landed after (autovacuum is off), which is
+        // what a planner sees with no statistics worth the name. Then a
+        // fresh restore is simulated (the table's analyze counters reset)
+        // and the open's twin analyzes it.
+        for stats in ["stale statistics", "after the open's ANALYZE"] {
+            if stats == "after the open's ANALYZE" {
+                client
+                    .batch_execute(
+                        "SELECT pg_stat_reset_single_table_counters(\
+                         'cirislens.federation_attestations'::regclass)",
+                    )
+                    .await
+                    .unwrap();
+                b.plan_statistics_at_open().await;
+                let analyzed = client
+                    .query_one(
+                        "SELECT last_analyze IS NOT NULL FROM pg_stat_user_tables \
+                         WHERE schemaname = 'cirislens' AND relname = 'federation_attestations'",
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+                    .try_get::<_, bool>(0)
+                    .unwrap();
+                assert!(analyzed, "the open analyzed a never-analyzed table");
+            }
+            let (nodes, bufs) = plan(
+                &client,
+                &pg_by_dimension_citing_sql(),
+                &vec![&dev, &dim, &hex],
+            )
+            .await;
+            eprintln!("v61 pg [{stats}] by_dimension_citing: {nodes:?}, {bufs} buffers");
+            // Postgres has no INDEXED BY: either citation index seeks the
+            // blob's reports (V180's attester-led one, or V190's
+            // `(dimension, evidence_refs[0])`, which postgres takes with no
+            // statistics); the attester walk is what must never happen.
+            assert!(
+                reaches(
+                    &nodes,
+                    "federation_attestations_attester_dimension_citation"
+                ) || reaches(&nodes, "federation_attestations_dimension_citation"),
+                "[{stats}] the citing read reaches a citation index: {nodes:?}"
+            );
+            assert!(!walks_history(&nodes), "[{stats}] {nodes:?}");
+            assert!(
+                bufs <= BUFFER_BUDGET,
+                "[{stats}] citing read: {bufs} buffers"
+            );
+
+            let (nodes, bufs) = plan(
+                &client,
+                &pg_composers_referencing_any_sql(false, true),
+                &vec![&ids, &w, &r, &s, &dev],
+            )
+            .await;
+            eprintln!("v61 pg [{stats}] composers(attesting): {nodes:?}, {bufs} buffers");
+            assert!(
+                // No INDEXED BY on postgres: the attester-led V107 index or a
+                // reference-led one (V181, V212's composer-only) both seek.
+                reaches(&nodes, "federation_attestations_composer_ref")
+                    || reaches(&nodes, "federation_attestations_reference_live")
+                    || reaches(&nodes, "federation_attestations_reference_seek"),
+                "[{stats}] the composer read reaches a composer index: {nodes:?}"
+            );
+            assert!(!walks_history(&nodes), "[{stats}] {nodes:?}");
+            assert!(
+                bufs <= BUFFER_BUDGET,
+                "[{stats}] composer read: {bufs} buffers"
+            );
+
+            let (nodes, bufs) = plan(
+                &client,
+                &pg_composers_referencing_any_sql(true, false),
+                &vec![&ids, &w, &r, &s, &dev],
+            )
+            .await;
+            eprintln!("v61 pg [{stats}] composers(attested): {nodes:?}, {bufs} buffers");
+            assert!(
+                reaches(&nodes, "federation_attestations_attested_composer_ref")
+                    || reaches(&nodes, "federation_attestations_reference_live")
+                    || reaches(&nodes, "federation_attestations_reference_seek"),
+                "[{stats}] the attested composer read reaches a composer index: {nodes:?}"
+            );
+            assert!(!walks_history(&nodes), "[{stats}] {nodes:?}");
+            assert!(
+                bufs <= BUFFER_BUDGET,
+                "[{stats}] attested composer read: {bufs} buffers"
+            );
+
+            let acks = custody_acks_of(d, &dev, &hex).await.unwrap();
+            assert_eq!(acks.len(), 2, "[{stats}] both reports of the blob");
+
+            // The Live listing (Server's equivocation detector's filter) at a
+            // cursor: the lifecycle subquery reaches a reference index, the
+            // outer walk V212's keyset index, no Sort of every row.
+            let filter = crate::read::AttestationFilter {
+                valid_at: Some(chrono::Utc::now()),
+                tier: Some(crate::read::Tier::Federation),
+                ..Default::default()
+            };
+            let cursor =
+                crate::read::AttestationCursor::from_trailing(chrono::Utc::now(), "x".into());
+            for (tag, cur) in [("page 1", None), ("at a cursor", Some(&cursor))] {
+                let (sql, params) = crate::store::postgres::pg_list_attestations_sql(
+                    &filter,
+                    cur,
+                    LISTING_PAGE,
+                    &crate::scope::CallerScope::Unauthenticated,
+                )
+                .unwrap();
+                let refs: Params<'_> = params.iter().map(|p| p.as_ref() as _).collect();
+                let (nodes, bufs) = plan(&client, &sql, &refs).await;
+                eprintln!(
+                    "v61 pg [{stats}] list_attestations Live {tag}: {nodes:?}, {bufs} buffers"
+                );
+                assert!(
+                    reaches(&nodes, "federation_attestations_reference_seek")
+                        || reaches(&nodes, "federation_attestations_reference_live"),
+                    "[{stats}] {tag}: the lifecycle subquery reaches a reference index: {nodes:?}"
+                );
+                // Postgres has no INDEXED BY and chooses the outer path from
+                // its estimates (V212's keyset index, or a scope index and a
+                // sort of a selective result): the plan is reported, and
+                // what is refused is a table scan or a page that reads more
+                // than O(page) buffers.
+                assert!(
+                    !nodes.iter().any(|(t, _)| t == "Seq Scan"),
+                    "[{stats}] {tag}: no table scan: {nodes:?}"
+                );
+                // Analyzed (autovacuum's steady state), the page is
+                // O(page): V212's keyset index walked in order, the
+                // composer probe per row. With NO statistics (a restore
+                // before its first analyze) postgres ANDs a bitmap of every
+                // visible row and sorts it: O(history), measured and
+                // reported, not refused here (postgres has no INDEXED BY;
+                // autovacuum's first analyze ends that state).
+                let index_scan = |name: &str| {
+                    nodes
+                        .iter()
+                        .any(|(t, i)| t == "Index Scan" && i.as_deref() == Some(name))
+                };
+                if stats != "stale statistics"
+                    && !(index_scan("federation_attestations_asserted_seek")
+                        && index_scan("federation_attestations_reference_live"))
+                {
+                    listing_failures.push(format!(
+                        "[{stats}] {tag}: the page does not walk V212's keyset index with the \
+                         composer-only probe: {nodes:?}"
+                    ));
+                }
+                if stats != "stale statistics" && bufs > 20 * LISTING_PAGE {
+                    listing_failures.push(format!(
+                        "[{stats}] {tag}: {bufs} buffers for a page of {LISTING_PAGE} over a \
+                         {}-row history: {nodes:?}",
+                        OTHER_BLOBS * 2 + 2
+                    ));
+                }
+
+                // `list_scores` under the same Live view, through the
+                // builder the read-plan executor issues: its lifecycle
+                // subqueries reach a reference index (the sqlite twin's
+                // `v61_storm_list_scores_live_subquery_seeks`). With no
+                // subject pinned the scores plane joins its whole subject
+                // table (sqlite: a covering scan of it), so the page is
+                // O(subjects) on both backends; that shape predates this
+                // fix and is reported here, not refused.
+                let (sql, params) = crate::store::postgres::pg_list_scores_sql(
+                    &filter,
+                    cur,
+                    LISTING_PAGE,
+                    &crate::scope::CallerScope::Unauthenticated,
+                );
+                let refs: Params<'_> = params.iter().map(|p| p.as_ref() as _).collect();
+                let (nodes, bufs) = plan(&client, &sql, &refs).await;
+                eprintln!("v61 pg [{stats}] list_scores Live {tag}: {nodes:?}, {bufs} buffers");
+                assert!(
+                    reaches(&nodes, "federation_attestations_reference_seek")
+                        || reaches(&nodes, "federation_attestations_reference_live"),
+                    "[{stats}] list_scores {tag}: the lifecycle subquery reaches a reference \
+                     index: {nodes:?}"
+                );
+            }
+        }
+        assert!(
+            listing_failures.is_empty(),
+            "the Live listing read more than O(page): {listing_failures:#?}"
+        );
+    }
+}

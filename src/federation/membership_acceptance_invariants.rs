@@ -104,6 +104,22 @@ pub(crate) mod bodies {
         found_room(d, cid, protocol, founders, unsigned, policy_blob).await
     }
 
+    /// v61 S2 — [`found_public_room`] founded (and its seats taken) at
+    /// `founded_at`, for a witness whose roster events lie further back than
+    /// the default day.
+    pub(crate) async fn found_public_room_at<D: FederationDirectory + ?Sized>(
+        d: &D,
+        cid: &str,
+        protocol: &str,
+        founders: &[&str],
+        founded_at: DateTime<Utc>,
+    ) -> Result<(), Error> {
+        let blob = serde_json::json!({
+            "cohort_subkind": crate::federation::public_room::COHORT_SUBKIND_PUBLIC
+        });
+        found_room_at(d, cid, protocol, founders, &[], Some(blob), founded_at).await
+    }
+
     async fn found_room<D: FederationDirectory + ?Sized>(
         d: &D,
         cid: &str,
@@ -112,13 +128,35 @@ pub(crate) mod bodies {
         unsigned: &[&str],
         policy_blob: Option<serde_json::Value>,
     ) -> Result<(), Error> {
+        let founded_at = Utc::now() - Duration::days(1);
+        found_room_at(
+            d,
+            cid,
+            protocol,
+            founders,
+            unsigned,
+            policy_blob,
+            founded_at,
+        )
+        .await
+    }
+
+    async fn found_room_at<D: FederationDirectory + ?Sized>(
+        d: &D,
+        cid: &str,
+        protocol: &str,
+        founders: &[&str],
+        unsigned: &[&str],
+        policy_blob: Option<serde_json::Value>,
+        founded_at: DateTime<Utc>,
+    ) -> Result<(), Error> {
         let members = founders
             .iter()
             .map(|k| ((*k).to_owned(), Some("founder".to_owned())))
             .chain(unsigned.iter().map(|k| ((*k).to_owned(), None)))
             .map(|(key_id, role)| CommunityMember {
                 key_id,
-                joined_at: ms(Utc::now() - Duration::days(1)),
+                joined_at: ms(founded_at),
                 role,
             })
             .collect();
@@ -128,7 +166,7 @@ pub(crate) mod bodies {
             community_key_id: cid.to_owned(),
             community_name: "I21x co-op".into(),
             members,
-            founded_at: ms(Utc::now() - Duration::days(1)),
+            founded_at: ms(founded_at),
             consensus_protocol: protocol.to_owned(),
             policy_blob,
             persist_row_hash: String::new(),

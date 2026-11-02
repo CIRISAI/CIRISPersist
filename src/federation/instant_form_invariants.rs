@@ -491,6 +491,119 @@ pub(crate) mod bodies {
         at_now.expires_at = Some(now + chrono::Duration::seconds(1));
         assert_eq!(disposition(&at_now, "me", now), Disposition::Heal);
     }
+
+    // Used only by I-IFP-10 (`ffi::pyo3::instant_form_open_tests`).
+    #[cfg(feature = "_pyffi")]
+    /// What [`seed_v60_own_and_foreign`] left on disk.
+    pub(crate) struct V60Seeded {
+        pub(crate) me: String,
+        pub(crate) own_id: String,
+        pub(crate) foreign_id: String,
+        pub(crate) later: chrono::DateTime<chrono::Utc>,
+    }
+
+    // Used only by I-IFP-10 (`ffi::pyo3::instant_form_open_tests`).
+    #[cfg(feature = "_pyffi")]
+    /// Two v60-form rows through the I-IFP-1 seam: this node's own `scores`
+    /// row and a peer's `scores` row (one that keeps no force), each with its
+    /// `valid_until` rewritten to the `+00:00` form and re-signed by its author.
+    /// `engine` must be registered as itself (`register_self_federation_key`).
+    pub(crate) async fn seed_v60_own_and_foreign<B>(
+        engine: &crate::Engine,
+        backend: &B,
+        tag: &str,
+    ) -> V60Seeded
+    where
+        B: V60Rewriter + FederationDirectory,
+    {
+        let peer = format!("ifp-peer-{tag}");
+        let me = engine.local_derived_key_id().await.unwrap();
+        ts::register_hybrid_key_as(backend, &peer, &peer, it::NODE).await;
+        let later = chrono::Utc::now() + chrono::Duration::days(30);
+        let own_id = engine
+            .emit_attestation_self(crate::federation::EmitAttestationInput::with_envelope(
+                attestation_type::SCORES,
+                crate::federation::envelope::EnvelopeCore::from_value(scores_envelope(
+                    &format!("own-{tag}"),
+                    Some(crate::federation::admission::render_signed_instant(later)),
+                ))
+                .unwrap(),
+                cohort_scope::FEDERATION,
+            ))
+            .await
+            .expect("seed: the own row is admitted in the canonical form");
+        let mut own = backend.get_attestation(&own_id).await.unwrap().unwrap();
+        own.attestation_envelope["valid_until"] = serde_json::json!(offset_form(later));
+        resign_with_engine(engine, &mut own).await;
+        backend.rewrite_signed(&own).await;
+
+        let mut foreign = ts::bare_attestation(
+            &uuid::Uuid::new_v4().to_string(),
+            &peer,
+            &peer,
+            &scores_envelope(&format!("foreign-{tag}"), None),
+        );
+        foreign.attestation_type = attestation_type::SCORES.to_owned();
+        let foreign = ts::seal_row(&peer, foreign);
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: foreign.clone(),
+            })
+            .await
+            .expect("seed: the peer row is admitted in the canonical form");
+        let mut foreign_v60 = backend
+            .get_attestation(&foreign.attestation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        foreign_v60.attestation_envelope["valid_until"] = serde_json::json!(offset_form(later));
+        resign_with_fixture(&peer, &mut foreign_v60);
+        backend.rewrite_signed(&foreign_v60).await;
+        V60Seeded {
+            me,
+            own_id,
+            foreign_id: foreign.attestation_id,
+            later,
+        }
+    }
+
+    // Used only by I-IFP-10 (`ffi::pyo3::instant_form_open_tests`).
+    #[cfg(feature = "_pyffi")]
+    /// From disk, after an open: the peer's row is gone and recorded once in
+    /// `federation_attestations_form_refused`; this node's row stays and has
+    /// exactly one `.sssZ` `supersedes` naming it.
+    pub(crate) async fn assert_v60_settled_from_disk<B>(backend: &B, s: &V60Seeded, who: &str)
+    where
+        B: V60Rewriter + FederationDirectory,
+    {
+        assert!(
+            backend
+                .get_attestation(&s.foreign_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "{who}: the peer's offset-form row is refused at read after the open"
+        );
+        assert_eq!(
+            backend.form_refused_count().await,
+            1,
+            "{who}: one row recorded in federation_attestations_form_refused"
+        );
+        assert!(backend.get_attestation(&s.own_id).await.unwrap().is_some());
+        let successors: Vec<Attestation> = backend
+            .list_composers_referencing_any(std::slice::from_ref(&s.own_id), None, Some(&s.me))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.attestation_type == attestation_type::SUPERSEDES)
+            .collect();
+        assert_eq!(successors.len(), 1, "{who}: one canonical re-statement");
+        assert_eq!(
+            successors[0].attestation_envelope["valid_until"],
+            serde_json::json!(crate::federation::admission::render_signed_instant(s.later)),
+            "{who}: the re-statement spells the instant `.sssZ`"
+        );
+    }
 }
 
 #[cfg(test)]
