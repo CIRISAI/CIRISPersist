@@ -715,6 +715,49 @@ pub(crate) mod bodies {
             .expect_err("another key does not withdraw a resignation");
         assert_eq!(e.kind(), "federation_withdraws_not_admitted", "{tag}: {e}");
         all_linked(d, GroupPlaneTable::FamilyRevocations, tag).await;
+        // v61 S2 (CIRISPersist#1143) — the record arm is the FAMILY's alone. A
+        // COMMUNITY's record withdraws is its dissolution, judged under its
+        // protocol: under `unanimous` one of its two founders is short
+        // (`RosterAuthorityUnauthorized`, never the family's record refusal),
+        // and both dissolve it.
+        use crate::federation::membership_acceptance_invariants::bodies::{found_community, reg};
+        let (f1, f2, room) = (
+            format!("i1487-f1-{tag}"),
+            format!("i1487-f2-{tag}"),
+            format!("i1487-room-{tag}"),
+        );
+        reg(dd, &[&f1, &f2, &room]).await;
+        found_community(dd, &room, "unanimous", &[&f1, &f2], &[])
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: the room: {e}"));
+        let room_record = dd
+            .list_targeted_by_dimension_prefix(
+                &[crate::federation::types::cohort_scope::COMMUNITY],
+                &room,
+                gp::GROUP_ROSTER_DIMENSION,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the room's record row");
+        let e = put_row(dd, withdraws_of(&f1, &[], &room_record))
+            .await
+            .expect_err("one of two founders under unanimous");
+        assert!(
+            matches!(e, Error::RosterAuthorityUnauthorized { .. }),
+            "{tag}: a community record's withdraws is judged under its protocol: {e}"
+        );
+        put_row(dd, withdraws_of(&f1, &[&f2], &room_record))
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: both founders dissolve the room: {e}"));
+        assert!(
+            gp::community_dissolved_at(dd, &room)
+                .await
+                .unwrap()
+                .is_some(),
+            "{tag}: the room is dissolved"
+        );
     }
 
     /// I1488 — a private group's rows go to its membership-plane audience.

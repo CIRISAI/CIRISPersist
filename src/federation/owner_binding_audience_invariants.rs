@@ -17,6 +17,9 @@
 //! - the group-scope row is not delivered to a non-member's node (it rides
 //!   the room's content audience);
 //! - a family-scope and a federation-scope re-sign are admitted as well;
+//! - a binding naming the room from a NON-targeted placement (federation) is
+//!   an organisation's bond, not an audience: #1062's gate refuses it
+//!   (`owner_binding_affiliation_refused`; the room is no affiliation);
 //! - a second, different owner's binding of the node is still refused (the
 //!   single-owner gate), and a `delegates_to` at community scope that names
 //!   a foreign subject is still refused by `named_subject`.
@@ -155,6 +158,33 @@ pub(crate) mod bodies {
                 .unwrap(),
             Some(owner.clone()),
             "I1511: still one owner"
+        );
+        // v61 S2 — the audience reading is the TARGETED placement's alone. A
+        // binding that names the room from a non-targeted placement
+        // (federation) is an organisation's bond, judged by #1062's gate. The
+        // room is no affiliation and the bond carries one signature, so it is
+        // refused by that gate's name, and no affiliation is read off it.
+        let bonded = k("bond-node");
+        ts::register_hybrid_key_as(d, &bonded, &bonded, identity_type::NODE).await;
+        let bond = binding_at(
+            &owner,
+            &bonded,
+            cohort_scope::FEDERATION,
+            Some(("community_key_id", &room)),
+        );
+        match put(d, &bond).await {
+            Err(Error::InvalidArgument(m)) => assert!(
+                m.starts_with(crate::federation::admission::OWNER_BINDING_AFFILIATION_REFUSED),
+                "I1511: a non-group placement naming a group is an organisation's bond: {m}"
+            ),
+            other => panic!("I1511: the bond at federation must meet #1062's gate: {other:?}"),
+        }
+        assert!(
+            d.get_attestation(&bond.attestation_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "I1511: the refused bond stores nothing"
         );
         // A different owner is still refused, whatever the scope.
         let rival = binding_at(
