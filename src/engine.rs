@@ -3338,6 +3338,53 @@ impl Engine {
         )
         .map_err(crate::federation::Error::InvalidArgument)?;
 
+        // v61 (CC 2.6.2; the key record's preimage table puts `valid_from`
+        // beside `valid_until`) — the signed `valid_from` is `.sssZ`. A
+        // caller's `valid_from` in that form is kept; any other form is
+        // refused, naming the member, because persist signs these bytes and a
+        // producer MUST emit the canonical form. With none, persist writes the
+        // registration instant at the millisecond. The record carries the
+        // signed instant either way.
+        let valid_from = {
+            use crate::federation::admission::{
+                render_signed_instant, truncate_to_substrate_resolution,
+            };
+            let env = registration_envelope.as_object_mut().ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(
+                    "registration_envelope must be a JSON object".into(),
+                )
+            })?;
+            match env.get("valid_from") {
+                None => {
+                    let t = truncate_to_substrate_resolution(chrono::Utc::now());
+                    env.insert(
+                        "valid_from".into(),
+                        serde_json::Value::String(render_signed_instant(t)),
+                    );
+                    t
+                }
+                Some(serde_json::Value::String(s))
+                    if crate::verify::canonical_validation::validate_canonical_datetime(s)
+                        .is_ok() =>
+                {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .map_err(|e| {
+                            crate::federation::Error::InvalidArgument(format!(
+                                "registration_envelope valid_from {s:?}: {e}"
+                            ))
+                        })?
+                        .with_timezone(&chrono::Utc)
+                }
+                Some(other) => {
+                    return Err(crate::federation::Error::InvalidArgument(format!(
+                        "registration_envelope valid_from = {other} is not in the CC 2.6.2 form \
+                         YYYY-MM-DDTHH:MM:SS.sssZ; a signed instant in any other form does not \
+                         verify"
+                    )));
+                }
+            }
+        };
+
         // Canonicalize the registration envelope **through the CEG produce
         // gate**, SHA-256 it, and self-sign with the composed signer.
         //
@@ -3410,7 +3457,7 @@ impl Engine {
             algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
             identity_type: identity_type.to_owned(),
             identity_ref: identity_ref.to_owned(),
-            valid_from: now,
+            valid_from,
             valid_until,
             registration_envelope,
             original_content_hash,
@@ -23330,6 +23377,11 @@ mod register_self_canonicalizer_parity {
             None,
         )
         .expect("subject binding");
+        // v61 (CC 2.6.2) — the emitter writes the signed `valid_from`, the
+        // instant the record carries.
+        env["valid_from"] = serde_json::Value::String(
+            crate::federation::admission::render_signed_instant(row.valid_from),
+        );
         env
     }
 

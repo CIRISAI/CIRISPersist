@@ -175,6 +175,91 @@ pub(crate) mod bodies {
             .expect("held row");
         assert_eq!(unchanged.persist_row_hash, held.persist_row_hash);
     }
+    /// I-IFP-9 — **the key record's signed `valid_from` is a CC 2.6.2
+    /// instant** (CC 2.6.1.7's preimage table, beside `valid_until`). The
+    /// self-registration door refuses a caller envelope whose `valid_from` is
+    /// offset-form or carries nine fractional digits, admits `.sssZ` and keeps
+    /// it, and with no `valid_from` writes one `.sssZ`, the same instant the
+    /// record carries.
+    pub(crate) async fn i_ifp_9_self_registration_valid_from(dsn: &str, tag: &str) {
+        use crate::verify::canonical_validation::validate_canonical_datetime;
+        let alias = format!("{tag}-ifp9-node");
+        let e = engine(dsn, &alias, &alias).await;
+        for bad in [
+            "2026-06-23T03:16:34.499535577+00:00",
+            "2026-06-23T03:16:34.499535577Z",
+            "2026-06-23T03:16:34.499+00:00",
+        ] {
+            let r = e
+                .register_self_federation_key(
+                    NODE,
+                    &alias,
+                    None,
+                    serde_json::json!({ "valid_from": bad }),
+                    vec![],
+                )
+                .await;
+            match r {
+                Err(Error::InvalidArgument(why)) => {
+                    assert!(
+                        why.contains("valid_from"),
+                        "I-IFP-9: names the member: {why}"
+                    )
+                }
+                other => panic!("I-IFP-9: {bad:?} is refused InvalidArgument: {other:?}"),
+            }
+        }
+        let good = "2026-06-23T03:16:34.499Z";
+        let key_id = e
+            .register_self_federation_key(
+                NODE,
+                &alias,
+                None,
+                serde_json::json!({ "valid_from": good }),
+                vec![],
+            )
+            .await
+            .expect("I-IFP-9: a .sssZ valid_from is admitted");
+        let held = e
+            .federation_directory()
+            .lookup_public_key(&key_id)
+            .await
+            .unwrap()
+            .expect("held row");
+        assert_eq!(
+            held.registration_envelope["valid_from"], good,
+            "I-IFP-9: kept"
+        );
+        assert_eq!(
+            crate::federation::admission::render_signed_instant(held.valid_from),
+            good,
+            "I-IFP-9: the record carries the signed instant"
+        );
+        drop(e);
+
+        let alias = format!("{tag}-ifp9-fresh");
+        let e = engine(dsn, &alias, &alias).await;
+        let key_id = e
+            .register_self_federation_key(NODE, &alias, None, serde_json::json!({}), vec![])
+            .await
+            .expect("I-IFP-9: registration");
+        let held = e
+            .federation_directory()
+            .lookup_public_key(&key_id)
+            .await
+            .unwrap()
+            .expect("held row");
+        let written = held.registration_envelope["valid_from"]
+            .as_str()
+            .expect("I-IFP-9: the emitter writes valid_from")
+            .to_owned();
+        validate_canonical_datetime(&written).expect("I-IFP-9: written .sssZ");
+        assert_eq!(
+            crate::federation::admission::render_signed_instant(held.valid_from),
+            written,
+            "I-IFP-9: the record carries the written instant"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -199,5 +284,23 @@ mod tests {
             return;
         };
         super::bodies::i1146_restart_is_a_no_op(&dsn, &tag()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i_ifp_9_self_registration_valid_from_sqlite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dsn = format!("sqlite:///{}", dir.path().join("node.db").display());
+        super::bodies::i_ifp_9_self_registration_valid_from(&dsn, &tag()).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i_ifp_9_self_registration_valid_from_postgres() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        super::bodies::i_ifp_9_self_registration_valid_from(&dsn, &tag()).await;
     }
 }
