@@ -17308,13 +17308,16 @@ pub const MEMBER_ROLE_FOUNDER: &str = "founder";
 ///
 ///
 /// v61 S2 (CIRISPersist#1160; CC 4.5.5) — the gate asks about the signer's
-/// IDENTITY. A device or occurrence key is first resolved through
-/// [`admission_identity_for_writer`] (the active occurrence binding, or a
-/// node's single live owner). A federation-identity moderator acting through
-/// one of its live occurrence keys therefore holds its duty, and the
-/// delegation walk reaches either the key or its identity. The resolution
-/// never widens to another identity's keys: a key bound to nobody resolves
-/// to itself.
+/// IDENTITY. A person's device or occurrence key is first resolved to the
+/// identity it is an ACTIVE occurrence of
+/// ([`FederationDirectory::active_identity_for_occurrence`](super::FederationDirectory::active_identity_for_occurrence)).
+/// A federation-identity moderator acting through one of its live occurrence
+/// keys therefore holds its duty, and the delegation walk reaches either the
+/// key or its identity. It is deliberately NOT [`admission_identity_for_writer`]:
+/// that also resolves a NODE to its owner, and a node has no agency. A node
+/// gives no acceptance and holds no duty, so an owner's machine never acts as
+/// the moderator it belongs to (release lead's ruling). A key bound to nobody
+/// resolves to itself.
 ///
 /// [`MODERATION_DUTY`]: DelegationWalkPolicy::MODERATION_DUTY
 pub async fn check_moderation_admission(
@@ -17324,7 +17327,7 @@ pub async fn check_moderation_admission(
     duty: &str,
     target_descriptor: &str,
 ) -> Result<(), Error> {
-    let signer_identity = admission_identity_for_writer(directory, signer).await?;
+    let signer_identity = directory.active_identity_for_occurrence(signer).await?;
     // (a) as-self: the signer, or the identity it acts for, holds the duty
     //     over the target.
     if duty_holders.contains(signer) || duty_holders.contains(&signer_identity) {
