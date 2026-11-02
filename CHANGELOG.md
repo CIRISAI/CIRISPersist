@@ -5,7 +5,7 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
-## [Unreleased]
+## [61.0.0] - UNRELEASED
 
 ### Adoption
 
@@ -83,6 +83,27 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 - The one-voice affiliation floor (CIRISPersist#1143; CC rc14 4.4.3.2.8, `CLM-affiliation-one-voice-countersign`). An affiliation with ONE deciding seat (its active founders, or its active members where it names no founder) removes a member only with a countersign from a key outside the seat, a designated official (`affiliation_config.designated_officials`) who is not the seat. Otherwise the removal is refused `federation_roster_authority_unauthorized` / `affiliation_countersign_missing`. A member's own resignation and a body of two or more seats are unchanged. Not built in this cut: the quarantine, slash and takedown planes, the review-holder of an overseeing body, and CC's "stands as a reconsideration proposal" held state.
 - Dissolution of a community or an affiliation is the `withdraws` of its `group:roster:v1` record row, cosigned under its `consensus_protocol` (judged as a whole-group change; under `open:self_admit`, two voices). It replaces S1's `group_record_withdraws_refused` for communities. From the withdrawal's signed instant the room's seats lapse (`active_community_members` is empty), and no new seat, removal or version is admitted (`federation_group_dissolved`, `Error::GroupDissolved`), so the DEK rotates no more. The record and its custody rows stand. `group_plane::community_dissolved_at` and `refuse_if_community_dissolved` are new. A FAMILY's record withdraws is still refused `group_record_withdraws_refused`, because a family dissolves by its own `dissolved_at` amendment. Not built in this cut: licences reading `lapsed` from the dissolution instant, and a dissolved authority's `trust:accepts:v1` edges ending.
 - Under `open:self_admit`, a change that names no one member (a dissolution, a whole-roster change) takes the two-voice floor. It was refused outright before.
+
+- **Every Postgres checkout is bounded (CIRISPersist#1166).** `store::postgres::checkout_bounded` is the one pooled checkout; 204 sites that called deadpool's unbounded `get()` (outbound, read, telemetry, cirisnode, the ledgers and lens services, the engine, the Python surface, the audit Merkle store) go through it. A starved pool is now an error after the checkout wait on every family, where it was a hang. No API removed: `PostgresBackend::pool()` stays public, and `PgMerkleStore::from_pool` keeps its signature (it waits `POOL_WAIT_TIMEOUT`). A host that held a pooled client across a second persist call on a small pool now gets the exhaustion error instead of a wedge.
+- **`PoolExhausted` is a variant of four exhaustive enums** (from v59.1.2, carried into v61; new to anyone on v60.1.0): `store::Error`, `federation::Error`, `audit::Error` and `secrets::SecretsError`. A consumer that matches any of them exhaustively adds the arm. It reports a starved pool, not a bad row (Python `ciris_persist.PoolExhausted`, a `RuntimeError`): the call may succeed once the pool drains.
+- **`NotInAudience` is a back-off, not a fault.** A peer whose replicated row or community record is refused `not_in_audience` should drop that row from this receiver's queue and re-offer it only after the receiver's audience changes (a membership or owner-binding row that admits it). The refusal is retryable by `AttestationRefusalReason::is_retryable`; it says nothing about the row's validity.
+- **A `founder_only` room migrates to `majority` (CIRISPersist#1123).** A community stored under `founder_only` stays readable and replicating, but its next record version must name another protocol. The path is a `supersede_community` whose new record names `majority` (or `open:self_admit`, on a `public` room only), signed as the room's current record requires. CIRISServer creates rooms under `founder_only` today and moves to one of the two.
+- `DirectoryOp` gains `ExecuteAttestationQuery`, `ListComposersReferencingAny`, `ListIdentityOccurrenceHistoryByOccurrence` and `ListIdentityOccurrencesByOccurrenceKey`, and `DirectoryOpResult` gains `AttestationQueryRows`, `AttestationRows`, `OccurrenceHistory` and `IdentityOccurrences` (from v59.1.2, #1162), appended after v61's removals inside the ABI 12 break; both capsule digests moved. A capsule host that matches the op exhaustively adds the four arms.
+- `silo_projection::SiloProjection` gains `Families`, `Communities`, `FamilyMembershipRevocations`, `CommunityMembershipRevocations`, `FamilyMembershipWidenings` and `CommunityMembershipWidenings` (the six group tables as projections, CIRISPersist#991); `replication_audience::Reason` gains `Relay` (#1165), declared before `NotInAudience` and `Malformed`, so their implicit discriminants move (4 → 5, 5 → 6): a consumer that casts a `Reason` to an integer re-maps it. Both enums are exhaustive.
+- The list above is checked against `scripts/api_break_report.sh v60.1.0` (cargo-semver-checks over the `postgres server pyo3 sqlite cirisaudit secrets cirisnode cirisgraph telemetry` set): 11 lints, 70 instances: 22 enum variants added and 17 removed, 6 functions, 1 module, 6 consts, 6 structs, 1 struct field and 4 trait methods removed, 4 functions whose arity changed, 1 struct field added (`consensus::Ballot.subject`) and 2 moved discriminants. Each is named in an entry here.
+- **The CC pins moved (v1.0-rc9 at v60.1.0 → v1.0-rc15).** A consumer that asserts any of these re-pins:
+
+  | constant | v60.1.0 | v61.0.0 |
+  |---|---|---|
+  | `namespace::registry::VENDORED_CC_VERSION` | `1.0-rc9` | `1.0-rc15` |
+  | `VENDORED_CC_COMMIT` | `5d50c6bb…` | `ace6b74217b4496a67e47aef2258461517e4493c` (tag object `6869eb10`) |
+  | `VENDORED_N_FAMILIES` | 176 | 189 |
+  | `VENDORED_REGISTRY_SHA256` (CC's grammar hash) | `feeb06a0…` | `df79a1dde30a380380da83f0d776737e580705b6305741f037a5a78c2bef9898` |
+  | `VENDORED_SOURCE_SHA256` (CC part 3) | — | `a930a011bd6dc0767f21a5589bb5181f6a189158b247a9d374868293af33999b` |
+  | `cc_manifests::VENDORED_WIRE_VOCABULARY_FILE_SHA256` (new) | — | `baf75371f6f25c83c7cd2f6cd0774677f47e9fca5c9c555a09e662249e40a3ff` |
+
+  `wire_vocabulary::WIRE_VOCABULARY_HASH` does not move (`c6bd6aa4…`).
+- **The first open after the upgrade runs the instant-form pass** (V211, `Engine::settle_instant_forms`, above): it reads every stored attestation row once, so the first boot of an upgraded node with a large attestation table takes longer than later boots. It is idempotent and never boot-fatal.
 
 ### Changed
 
