@@ -2443,6 +2443,30 @@ impl PyEngine {
             }
         }
 
+        // v61 (CC 2.6.2, CIRISPersist#1122) — the open legs every Rust
+        // constructor runs (`Engine::settle_at_open`): the instant-form pass
+        // and the agent-route sweep. Every host opens persist here, through
+        // the shared constructor, which runs no boot legs; without this the
+        // V211 DDL ran in the field and the pass never did. Logged, never
+        // fatal. The counts are also `settle_instant_forms_json()`.
+        {
+            let open_engine = crate::Engine::from_shared_with_local(
+                match &backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        crate::engine::BackendDispatch::Postgres(pg.clone())
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        crate::engine::BackendDispatch::Sqlite(sq.clone())
+                    }
+                },
+                signer.clone(),
+                local_signer.clone(),
+            );
+            py.detach(|| runtime.block_on(open_engine.settle_at_open()));
+        }
+
         // v0.3.2 (CIRISPersist#11) — Auto-sweep on init when a local
         // PQC key is configured. Drains hybrid-pending rows authored
         // before the per-write cold-path was wired (or rows where the
@@ -6829,6 +6853,30 @@ impl PyEngine {
                     })
                     .transpose()
             })
+        })
+    }
+
+    /// v61 (CC 2.6.2) — **run the open-time instant-form pass now and return
+    /// its counts** as JSON: `{scanned, violations, healed, already_healed,
+    /// heal_refused, own_left, kept_in_force, set_aside}`. The pass already
+    /// runs at `Engine(...)` (logged at `tracing::info` when it finds
+    /// anything); this lets an operator read the counts after the open.
+    /// Idempotent: a second call re-states nothing (`healed` 0, the earlier
+    /// re-statements counted `already_healed`). FFI mirror of
+    /// [`Engine::settle_instant_forms`](crate::engine::Engine::settle_instant_forms).
+    fn settle_instant_forms_json(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let engine = crate::Engine::from_shared_with_local(
+                self.engine_dispatch(),
+                self.signer.clone(),
+                self.local_signer.clone(),
+            );
+            let pass = py
+                .detach(|| self.runtime.block_on(engine.settle_instant_forms()))
+                .map_err(federation_err_to_py)?;
+            serde_json::to_string(&pass)
+                .map_err(|e| PyRuntimeError::new_err(format!("InstantFormPass JSON encode: {e}")))
         })
     }
 
@@ -38904,3 +38952,7 @@ mod verify_trace_canon_parity_class {
         );
     }
 }
+
+/// v61 (CC 2.6.2) — I-IFP-10: the Python open settles stored instant forms.
+#[cfg(test)]
+mod instant_form_open_tests;

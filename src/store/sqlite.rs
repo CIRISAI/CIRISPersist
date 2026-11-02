@@ -7331,319 +7331,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         destination: &crate::federation::TransportDestination,
     ) -> Result<(), crate::federation::Error> {
-        // v61 (CIRISPersist#1122) — an agent announces no route.
-        crate::federation::transport_routes::check_route_key_not_agent(self, destination).await?;
-        let d = destination.clone();
-        let asserted = d.asserted_at.to_rfc3339();
-        let last_seen = d.last_seen_at.map(|t| t.to_rfc3339());
-        let retired = d.retired_at.map(|t| t.to_rfc3339());
-        let epoch = i64::try_from(d.epoch).map_err(|_| {
-            crate::federation::Error::InvalidArgument(
-                "transport_destination epoch exceeds i64".into(),
-            )
-        })?;
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            // #443 route-table put: keyed on (occ, kind) — `destination` is
-            // payload — and GUARDED monotonic on (epoch, asserted_at)
-            // lexicographic. A stale assertion is a silent no-op. The
-            // asserted_at TEXT comparison is chronological for our uniform
-            // RFC-3339 UTC encoding (to_rfc3339, "+00:00").
-            //
-            // v21.4.0 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY. An
-            // unsigned writer (the occurrence projection / edge announce)
-            // carries no signature to offer, so it can NEVER demote a
-            // signed row:
-            // - signature columns are preserved UNCONDITIONALLY (the
-            //   v21.3.0 preserve-on-equal still demoted on any content
-            //   delta — the live canonical's admitted row landed
-            //   signature=NULL and the #393 item-2 gate missed);
-            // - an unsigned write that would CHANGE a signed row's material
-            //   content (destination + both transport pubkeys) is a silent
-            //   no-op (same posture as a stale assertion): the SIGNED
-            //   content is authoritative, and updating row fields while
-            //   keeping the old signature would serve a row whose plain
-            //   fields diverge from its signed envelope. Same-content
-            //   liveness refreshes (clocks) still apply.
-            // An unsigned row (signature IS NULL) keeps the plain monotonic
-            // upsert exactly as before.
-            //
-            // v21.17.1 (CIRISPersist#541) — THE PRESERVE SET MUST EQUAL THE
-            // VERIFIED SET. #515 modelled "material content" as three columns
-            // (destination + both transport pubkeys) and guarded only those,
-            // leaving `asserted_at`, `epoch`, `binding_provenance` and
-            // `retired_at` freely writable on a SIGNED row while the signature
-            // and envelope were preserved. But `verify_signed_transport_
-            // destination` (federation/admission.rs) checks NINE fields —
-            // every column here except `last_seen_at`. So a "same-content
-            // liveness refresh" desynchronised the typed row from its own
-            // signed envelope, and persist's own verifier then rejected the
-            // row on replication with `typed asserted_at diverges from the
-            // signed envelope`. This was not an edge case: the monotonic
-            // guard REQUIRES `excluded.asserted_at > stored.asserted_at`, so
-            // every accepted unsigned refresh corrupted the row BY
-            // CONSTRUCTION. Live effect: the canonical's own signed binding
-            // went divergent locally, replicated, was refused by every peer,
-            // and the #393 item-2 hybrid-route gate then dropped all inbound
-            // frames from it — the trace plane went dark with no error at the
-            // drop site.
-            // The rule is now structural rather than enumerated: on a signed
-            // row an unsigned writer may advance ONLY `last_seen_at` (the one
-            // column the verifier does not cover — advisory liveness, "NOT a
-            // lease"); every verifier-covered column is preserved so the
-            // signature and the fields it attests to move as ONE unit.
-            // Behaviour is unchanged for unsigned rows, and unchanged for the
-            // differing-material-content case (still a whole-statement no-op
-            // via the WHERE guard, which is left exactly as #515 wrote it).
-            // v36.0.0 (#668) — THIS node's serve position (V130). The unsigned
-            // door stamps it on INSERT and re-stamps only through the
-            // `signature IS NULL` arm below: on a SIGNED row this door may
-            // advance ONLY `last_seen_at` (advisory liveness, "NOT a lease",
-            // outside the verifier's nine fields), and re-serving the signed
-            // stream on every liveness ping would churn it for content no
-            // verifier covers.
-            let admitted_at =
-                sqlite_next_plane_position(conn, "transport_destinations", POS_ASSERTED)?;
-            conn.execute(
-                "INSERT INTO transport_destinations \
-                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
-                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
-                     binding_provenance, epoch, retired_at, \
-                     attesting_key_id, signed_envelope, signature, admitted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, NULL, ?11) \
-                 ON CONFLICT(occurrence_key_id, transport_kind) \
-                 DO UPDATE SET destination = CASE WHEN transport_destinations.signature IS NULL \
-                        THEN excluded.destination ELSE transport_destinations.destination END, \
-                    asserted_at = CASE WHEN transport_destinations.signature IS NULL \
-                        THEN excluded.asserted_at ELSE transport_destinations.asserted_at END, \
-                    last_seen_at = excluded.last_seen_at, \
-                    transport_ed25519_pubkey_base64 = \
-                        CASE WHEN transport_destinations.signature IS NULL \
-                        THEN excluded.transport_ed25519_pubkey_base64 \
-                        ELSE transport_destinations.transport_ed25519_pubkey_base64 END, \
-                    transport_x25519_pubkey_base64 = \
-                        CASE WHEN transport_destinations.signature IS NULL \
-                        THEN excluded.transport_x25519_pubkey_base64 \
-                        ELSE transport_destinations.transport_x25519_pubkey_base64 END, \
-                    binding_provenance = CASE WHEN transport_destinations.signature IS NULL \
-                        THEN excluded.binding_provenance \
-                        ELSE transport_destinations.binding_provenance END, \
-                    epoch = CASE WHEN transport_destinations.signature IS NULL \
-                        THEN excluded.epoch ELSE transport_destinations.epoch END, \
-                    retired_at = CASE WHEN transport_destinations.signature IS NULL \
-                        THEN excluded.retired_at ELSE transport_destinations.retired_at END, \
-                    admitted_at = CASE WHEN transport_destinations.signature IS NULL \
-                        THEN excluded.admitted_at ELSE transport_destinations.admitted_at END, \
-                    attesting_key_id = transport_destinations.attesting_key_id, \
-                    signed_envelope = transport_destinations.signed_envelope, \
-                    signature = transport_destinations.signature \
-                 WHERE (excluded.epoch > transport_destinations.epoch \
-                    OR (excluded.epoch = transport_destinations.epoch \
-                        AND excluded.asserted_at > transport_destinations.asserted_at)) \
-                   AND (transport_destinations.signature IS NULL \
-                    OR (excluded.destination = transport_destinations.destination \
-                        AND COALESCE(excluded.transport_ed25519_pubkey_base64, '') \
-                            = COALESCE(transport_destinations.transport_ed25519_pubkey_base64, '') \
-                        AND COALESCE(excluded.transport_x25519_pubkey_base64, '') \
-                            = COALESCE(transport_destinations.transport_x25519_pubkey_base64, '')))",
-                rusqlite::params![
-                    d.occurrence_key_id,
-                    d.transport_kind,
-                    d.destination,
-                    asserted,
-                    last_seen,
-                    d.transport_ed25519_pubkey_base64,
-                    d.transport_x25519_pubkey_base64,
-                    d.binding_provenance.as_str(),
-                    epoch,
-                    retired,
-                    admitted_at.to_rfc3339(),
-                ],
-            )?;
-            Ok(())
-        }).await
-        .map_err(|e| crate::federation::Error::Backend(format!("put_transport_destination: {e}")))
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::transport_admit::put_transport_destination_planned(self, destination)
+            .await
     }
 
     async fn put_signed_transport_destination(
         &self,
         signed: &crate::federation::SignedTransportDestination,
     ) -> Result<crate::federation::TransportDestinationApplyOutcome, crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::TransportDestination,
-            signed,
-        )
-        .await?
-        {
-            return Ok(
-                crate::federation::self_at_login::TransportDestinationApplyOutcome::Unchanged,
-            );
-        }
-        use crate::federation::TransportDestinationApplyOutcome as Outcome;
-        // #443 — the admission gate BEFORE any write: hybrid 1-of-1 over
-        // JCS(signed_envelope) against the pinned key of attesting_key_id,
-        // typed projection ≡ envelope, signer_acts_for.
-        crate::federation::admission::verify_signed_transport_destination(self, signed).await?;
-        // v59.0.0 (CIRISPersist#1106, CC 5.3.4) — a seated serve node's
-        // bundle-pinned transit pair rotates by holder quorum, not alone.
-        crate::federation::transport_rebind::check_serve_rotation(self, signed).await?;
-        let d = signed.transport_destination.clone();
-        let attesting = signed.attesting_key_id.clone();
-        let envelope_json = serde_json::to_string(&signed.signed_envelope)
-            .map_err(|e| crate::federation::Error::Backend(format!("signed_envelope: {e}")))?;
-        let signature_json = serde_json::to_string(&signed.signature)
-            .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
-        let asserted = d.asserted_at.to_rfc3339();
-        let incoming_envelope = signed.signed_envelope.clone();
-        let last_seen = d.last_seen_at.map(|t| t.to_rfc3339());
-        let retired = d.retired_at.map(|t| t.to_rfc3339());
-        let epoch = i64::try_from(d.epoch).map_err(|_| {
-            crate::federation::Error::InvalidArgument(
-                "transport_destination epoch exceeds i64".into(),
-            )
-        })?;
-        // v21.1.0 (CIRISPersist#507b) — the stored row is byte-identical to
-        // `signed` (its fields, verbatim), so `signed` itself IS the exact
-        // value `list_signed_transport_destinations_since` re-serializes.
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("occurrence_key_id", &d.occurrence_key_id),
-            ("transport_kind", &d.transport_kind),
-        ]);
-
-        let outcome = self
-            .write(move |conn| -> Result<Outcome, rusqlite::Error> {
-                // Classify against the current row (retired rows INCLUDED — the
-                // tombstone must keep winning), then write with the same guard in
-                // the SQL (single connection lock ⇒ no plan/act race).
-                use rusqlite::OptionalExtension;
-                let existing = conn
-                    .query_row(
-                        "SELECT occurrence_key_id, transport_kind, destination, asserted_at, \
-                        last_seen_at, transport_ed25519_pubkey_base64, \
-                        transport_x25519_pubkey_base64, binding_provenance, epoch, retired_at \
-                     FROM transport_destinations \
-                     WHERE occurrence_key_id = ?1 AND transport_kind = ?2",
-                        rusqlite::params![d.occurrence_key_id, d.transport_kind],
-                        sqlite_row_to_transport_destination,
-                    )
-                    .optional()?;
-                if let Some(ex) = existing {
-                    // v21.4.0 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY:
-                    // the monotonic-clock refusal applies only against a stored
-                    // row that is itself SIGNED. A signed write always reclaims
-                    // an unsigned row (occurrence-projection / announce state),
-                    // regardless of (epoch, asserted_at) — otherwise whichever
-                    // unsigned writer landed last with the freshest clock kept
-                    // the admitted producer signature out forever.
-                    let (stored_signed, stored_envelope): (bool, Option<String>) = conn.query_row(
-                        "SELECT signature IS NOT NULL, signed_envelope \
-                             FROM transport_destinations \
-                             WHERE occurrence_key_id = ?1 AND transport_kind = ?2",
-                        rusqlite::params![d.occurrence_key_id, d.transport_kind],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )?;
-                    // v56.0.0 (#1077) — the transit KEX pair is envelope-only:
-                    // an equal typed projection is `Unchanged` only when the
-                    // stored envelope carries the same pair. A same-clock
-                    // re-sign that changes it falls to the refusal below.
-                    let same_pair = stored_envelope
-                        .as_deref()
-                        .and_then(|e| serde_json::from_str::<serde_json::Value>(e).ok())
-                        .is_some_and(|stored| {
-                            crate::federation::self_at_login::same_transit_kex_member(
-                                &stored,
-                                &incoming_envelope,
-                            )
-                        });
-                    if ex == d && stored_signed && same_pair {
-                        // Byte-identical typed content (and pair) on an
-                        // already-signed row — idempotent re-offer.
-                        return Ok(Outcome::Unchanged);
-                    }
-                    if stored_signed && (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) {
-                        return Ok(Outcome::Refused {
-                            reason: format!(
-                                "incoming (epoch {}, asserted_at {}) does not supersede stored \
-                             SIGNED (epoch {}, asserted_at {})",
-                                d.epoch,
-                                d.asserted_at.to_rfc3339(),
-                                ex.epoch,
-                                ex.asserted_at.to_rfc3339()
-                            ),
-                        });
-                    }
-                }
-                let inserted_fresh = conn
-                    .query_row(
-                        "SELECT 1 FROM transport_destinations \
-                     WHERE occurrence_key_id = ?1 AND transport_kind = ?2",
-                        rusqlite::params![d.occurrence_key_id, d.transport_kind],
-                        |_| Ok(()),
-                    )
-                    .optional()?
-                    .is_none();
-                // v36.0.0 (#668) — THIS node's serve position (V130). A signed
-                // apply always stamps/re-stamps: it either admits a new signed
-                // row or supersedes covered content, and either way the signed
-                // stream must re-serve it.
-                let admitted_at =
-                    sqlite_next_plane_position(conn, "transport_destinations", POS_ASSERTED)?;
-                conn.execute(
-                    "INSERT INTO transport_destinations \
-                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
-                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
-                     binding_provenance, epoch, retired_at, \
-                     attesting_key_id, signed_envelope, signature, admitted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
-                 ON CONFLICT(occurrence_key_id, transport_kind) \
-                 DO UPDATE SET destination = excluded.destination, \
-                    asserted_at = excluded.asserted_at, \
-                    last_seen_at = excluded.last_seen_at, \
-                    transport_ed25519_pubkey_base64 = excluded.transport_ed25519_pubkey_base64, \
-                    transport_x25519_pubkey_base64 = excluded.transport_x25519_pubkey_base64, \
-                    binding_provenance = excluded.binding_provenance, \
-                    epoch = excluded.epoch, \
-                    retired_at = excluded.retired_at, \
-                    attesting_key_id = excluded.attesting_key_id, \
-                    signed_envelope = excluded.signed_envelope, \
-                    signature = excluded.signature, \
-                    admitted_at = excluded.admitted_at \
-                 WHERE excluded.epoch > transport_destinations.epoch \
-                    OR (excluded.epoch = transport_destinations.epoch \
-                        AND excluded.asserted_at > transport_destinations.asserted_at) \
-                    OR transport_destinations.signature IS NULL",
-                    rusqlite::params![
-                        d.occurrence_key_id,
-                        d.transport_kind,
-                        d.destination,
-                        asserted,
-                        last_seen,
-                        d.transport_ed25519_pubkey_base64,
-                        d.transport_x25519_pubkey_base64,
-                        d.binding_provenance.as_str(),
-                        epoch,
-                        retired,
-                        attesting,
-                        envelope_json,
-                        signature_json,
-                        admitted_at.to_rfc3339(),
-                    ],
-                )?;
-                Ok(if inserted_fresh {
-                    Outcome::Inserted
-                } else {
-                    Outcome::Superseded
-                })
-            })
+        crate::federation::transport_admit::put_signed_transport_destination_planned(self, signed)
             .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("put_signed_transport_destination: {e}"))
-            })?;
-        self.index_stored_record("TransportDestination", &wire_index_key)
-            .await?;
-        Ok(outcome)
     }
 
     async fn list_transport_destinations_for_unfolded(
@@ -25888,6 +25586,251 @@ fn sqlite_insert_dag_links(
         }
     }
     Ok(())
+}
+
+/// v61 (CIRISPersist#934, S4b) — the transport-destination executor on
+/// sqlite. Storage only: the decisions are `federation::transport_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::transport_admit::TransportStore for SqliteBackend {
+    async fn store_planned_destination(
+        &self,
+        planned: crate::federation::transport_admit::PlannedDestination<'_>,
+    ) -> Result<(), crate::federation::Error> {
+        let destination = planned.destination;
+        let d = destination.clone();
+        let asserted = d.asserted_at.to_rfc3339();
+        let last_seen = d.last_seen_at.map(|t| t.to_rfc3339());
+        let retired = d.retired_at.map(|t| t.to_rfc3339());
+        let epoch = planned.epoch_i64;
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            // #443 route-table put: keyed on (occ, kind) — `destination` is
+            // payload — and GUARDED monotonic on (epoch, asserted_at)
+            // lexicographic. A stale assertion is a silent no-op. The
+            // asserted_at TEXT comparison is chronological for our uniform
+            // RFC-3339 UTC encoding (to_rfc3339, "+00:00").
+            //
+            // v21.4.0 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY. An
+            // unsigned writer (the occurrence projection / edge announce)
+            // carries no signature to offer, so it can NEVER demote a
+            // signed row:
+            // - signature columns are preserved UNCONDITIONALLY (the
+            //   v21.3.0 preserve-on-equal still demoted on any content
+            //   delta — the live canonical's admitted row landed
+            //   signature=NULL and the #393 item-2 gate missed);
+            // - an unsigned write that would CHANGE a signed row's material
+            //   content (destination + both transport pubkeys) is a silent
+            //   no-op (same posture as a stale assertion): the SIGNED
+            //   content is authoritative, and updating row fields while
+            //   keeping the old signature would serve a row whose plain
+            //   fields diverge from its signed envelope. Same-content
+            //   liveness refreshes (clocks) still apply.
+            // An unsigned row (signature IS NULL) keeps the plain monotonic
+            // upsert exactly as before.
+            //
+            // v21.17.1 (CIRISPersist#541) — THE PRESERVE SET MUST EQUAL THE
+            // VERIFIED SET. #515 modelled "material content" as three columns
+            // (destination + both transport pubkeys) and guarded only those,
+            // leaving `asserted_at`, `epoch`, `binding_provenance` and
+            // `retired_at` freely writable on a SIGNED row while the signature
+            // and envelope were preserved. But `verify_signed_transport_
+            // destination` (federation/admission.rs) checks NINE fields —
+            // every column here except `last_seen_at`. So a "same-content
+            // liveness refresh" desynchronised the typed row from its own
+            // signed envelope, and persist's own verifier then rejected the
+            // row on replication with `typed asserted_at diverges from the
+            // signed envelope`. This was not an edge case: the monotonic
+            // guard REQUIRES `excluded.asserted_at > stored.asserted_at`, so
+            // every accepted unsigned refresh corrupted the row BY
+            // CONSTRUCTION. Live effect: the canonical's own signed binding
+            // went divergent locally, replicated, was refused by every peer,
+            // and the #393 item-2 hybrid-route gate then dropped all inbound
+            // frames from it — the trace plane went dark with no error at the
+            // drop site.
+            // The rule is now structural rather than enumerated: on a signed
+            // row an unsigned writer may advance ONLY `last_seen_at` (the one
+            // column the verifier does not cover — advisory liveness, "NOT a
+            // lease"); every verifier-covered column is preserved so the
+            // signature and the fields it attests to move as ONE unit.
+            // Behaviour is unchanged for unsigned rows, and unchanged for the
+            // differing-material-content case (still a whole-statement no-op
+            // via the WHERE guard, which is left exactly as #515 wrote it).
+            // v36.0.0 (#668) — THIS node's serve position (V130). The unsigned
+            // door stamps it on INSERT and re-stamps only through the
+            // `signature IS NULL` arm below: on a SIGNED row this door may
+            // advance ONLY `last_seen_at` (advisory liveness, "NOT a lease",
+            // outside the verifier's nine fields), and re-serving the signed
+            // stream on every liveness ping would churn it for content no
+            // verifier covers.
+            let admitted_at =
+                sqlite_next_plane_position(conn, "transport_destinations", POS_ASSERTED)?;
+            conn.execute(
+                "INSERT INTO transport_destinations \
+                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                     binding_provenance, epoch, retired_at, \
+                     attesting_key_id, signed_envelope, signature, admitted_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, NULL, ?11) \
+                 ON CONFLICT(occurrence_key_id, transport_kind) \
+                 DO UPDATE SET destination = CASE WHEN transport_destinations.signature IS NULL \
+                        THEN excluded.destination ELSE transport_destinations.destination END, \
+                    asserted_at = CASE WHEN transport_destinations.signature IS NULL \
+                        THEN excluded.asserted_at ELSE transport_destinations.asserted_at END, \
+                    last_seen_at = excluded.last_seen_at, \
+                    transport_ed25519_pubkey_base64 = \
+                        CASE WHEN transport_destinations.signature IS NULL \
+                        THEN excluded.transport_ed25519_pubkey_base64 \
+                        ELSE transport_destinations.transport_ed25519_pubkey_base64 END, \
+                    transport_x25519_pubkey_base64 = \
+                        CASE WHEN transport_destinations.signature IS NULL \
+                        THEN excluded.transport_x25519_pubkey_base64 \
+                        ELSE transport_destinations.transport_x25519_pubkey_base64 END, \
+                    binding_provenance = CASE WHEN transport_destinations.signature IS NULL \
+                        THEN excluded.binding_provenance \
+                        ELSE transport_destinations.binding_provenance END, \
+                    epoch = CASE WHEN transport_destinations.signature IS NULL \
+                        THEN excluded.epoch ELSE transport_destinations.epoch END, \
+                    retired_at = CASE WHEN transport_destinations.signature IS NULL \
+                        THEN excluded.retired_at ELSE transport_destinations.retired_at END, \
+                    admitted_at = CASE WHEN transport_destinations.signature IS NULL \
+                        THEN excluded.admitted_at ELSE transport_destinations.admitted_at END, \
+                    attesting_key_id = transport_destinations.attesting_key_id, \
+                    signed_envelope = transport_destinations.signed_envelope, \
+                    signature = transport_destinations.signature \
+                 WHERE (excluded.epoch > transport_destinations.epoch \
+                    OR (excluded.epoch = transport_destinations.epoch \
+                        AND excluded.asserted_at > transport_destinations.asserted_at)) \
+                   AND (transport_destinations.signature IS NULL \
+                    OR (excluded.destination = transport_destinations.destination \
+                        AND COALESCE(excluded.transport_ed25519_pubkey_base64, '') \
+                            = COALESCE(transport_destinations.transport_ed25519_pubkey_base64, '') \
+                        AND COALESCE(excluded.transport_x25519_pubkey_base64, '') \
+                            = COALESCE(transport_destinations.transport_x25519_pubkey_base64, '')))",
+                rusqlite::params![
+                    d.occurrence_key_id,
+                    d.transport_kind,
+                    d.destination,
+                    asserted,
+                    last_seen,
+                    d.transport_ed25519_pubkey_base64,
+                    d.transport_x25519_pubkey_base64,
+                    d.binding_provenance.as_str(),
+                    epoch,
+                    retired,
+                    admitted_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        }).await
+        .map_err(|e| crate::federation::Error::Backend(format!("put_transport_destination: {e}")))
+    }
+
+    async fn store_planned_signed_destination(
+        &self,
+        planned: crate::federation::transport_admit::PlannedSignedDestination<'_>,
+    ) -> Result<crate::federation::TransportDestinationApplyOutcome, crate::federation::Error> {
+        use crate::federation::transport_admit::{DestinationVerdict, HeldDestination};
+        use crate::federation::TransportDestinationApplyOutcome as Outcome;
+        let signed = planned.signed.clone();
+        let d = signed.transport_destination.clone();
+        let attesting = signed.attesting_key_id.clone();
+        let (envelope_json, signature_json) = (planned.envelope_json, planned.signature_json);
+        let asserted = d.asserted_at.to_rfc3339();
+        let last_seen = d.last_seen_at.map(|t| t.to_rfc3339());
+        let retired = d.retired_at.map(|t| t.to_rfc3339());
+        let epoch = planned.epoch_i64;
+        let outcome = self
+            .write(move |conn| -> Result<Outcome, rusqlite::Error> {
+                // The held row (retired rows INCLUDED — the tombstone must
+                // keep winning), judged by the shared verdict, then the write
+                // with the same guard in the SQL (single connection lock ⇒ no
+                // plan/act race).
+                use rusqlite::OptionalExtension;
+                let existing = conn
+                    .query_row(
+                        "SELECT occurrence_key_id, transport_kind, destination, asserted_at, \
+                        last_seen_at, transport_ed25519_pubkey_base64, \
+                        transport_x25519_pubkey_base64, binding_provenance, epoch, retired_at, \
+                        signature IS NOT NULL, signed_envelope \
+                     FROM transport_destinations \
+                     WHERE occurrence_key_id = ?1 AND transport_kind = ?2",
+                        rusqlite::params![d.occurrence_key_id, d.transport_kind],
+                        |r| {
+                            Ok(HeldDestination {
+                                destination: sqlite_row_to_transport_destination(r)?,
+                                signed: r.get(10)?,
+                                envelope: r.get(11)?,
+                            })
+                        },
+                    )
+                    .optional()?;
+                let fresh = match crate::federation::transport_admit::held_destination_verdict(
+                    &signed,
+                    existing.as_ref(),
+                ) {
+                    DestinationVerdict::Answer(outcome) => return Ok(outcome),
+                    DestinationVerdict::Write { fresh } => fresh,
+                };
+                // v36.0.0 (#668) — THIS node's serve position (V130). A signed
+                // apply always stamps/re-stamps: it either admits a new signed
+                // row or supersedes covered content, and either way the signed
+                // stream must re-serve it.
+                let admitted_at =
+                    sqlite_next_plane_position(conn, "transport_destinations", POS_ASSERTED)?;
+                conn.execute(
+                    "INSERT INTO transport_destinations \
+                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                     binding_provenance, epoch, retired_at, \
+                     attesting_key_id, signed_envelope, signature, admitted_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+                 ON CONFLICT(occurrence_key_id, transport_kind) \
+                 DO UPDATE SET destination = excluded.destination, \
+                    asserted_at = excluded.asserted_at, \
+                    last_seen_at = excluded.last_seen_at, \
+                    transport_ed25519_pubkey_base64 = excluded.transport_ed25519_pubkey_base64, \
+                    transport_x25519_pubkey_base64 = excluded.transport_x25519_pubkey_base64, \
+                    binding_provenance = excluded.binding_provenance, \
+                    epoch = excluded.epoch, \
+                    retired_at = excluded.retired_at, \
+                    attesting_key_id = excluded.attesting_key_id, \
+                    signed_envelope = excluded.signed_envelope, \
+                    signature = excluded.signature, \
+                    admitted_at = excluded.admitted_at \
+                 WHERE excluded.epoch > transport_destinations.epoch \
+                    OR (excluded.epoch = transport_destinations.epoch \
+                        AND excluded.asserted_at > transport_destinations.asserted_at) \
+                    OR transport_destinations.signature IS NULL",
+                    rusqlite::params![
+                        d.occurrence_key_id,
+                        d.transport_kind,
+                        d.destination,
+                        asserted,
+                        last_seen,
+                        d.transport_ed25519_pubkey_base64,
+                        d.transport_x25519_pubkey_base64,
+                        d.binding_provenance.as_str(),
+                        epoch,
+                        retired,
+                        attesting,
+                        envelope_json,
+                        signature_json,
+                        admitted_at.to_rfc3339(),
+                    ],
+                )?;
+                Ok(if fresh {
+                    Outcome::Inserted
+                } else {
+                    Outcome::Superseded
+                })
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("put_signed_transport_destination: {e}"))
+            })?;
+        self.index_stored_record("TransportDestination", &planned.wire_index_key)
+            .await?;
+        Ok(outcome)
+    }
 }
 
 /// v61 (CIRISPersist#934) — the accord evidence executor on sqlite.

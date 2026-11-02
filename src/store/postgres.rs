@@ -2541,6 +2541,225 @@ async fn pg_insert_dag_links(
     Ok(())
 }
 
+/// v61 (CIRISPersist#934, S4b) — the transport-destination executor on
+/// postgres. Storage only: the decisions are `federation::transport_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::transport_admit::TransportStore for PostgresBackend {
+    async fn store_planned_destination(
+        &self,
+        planned: crate::federation::transport_admit::PlannedDestination<'_>,
+    ) -> Result<(), crate::federation::Error> {
+        let destination = planned.destination;
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // #443 route-table put: keyed on (occ, kind) — `destination` is
+        // payload — and GUARDED monotonic on (epoch, asserted_at)
+        // lexicographic. A stale assertion is a silent no-op.
+        //
+        // v21.4.0 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: an
+        // unsigned writer never demotes a signed row (signature columns
+        // preserved unconditionally; a content-CHANGING unsigned write
+        // against a signed row is a silent no-op). See the sqlite twin's
+        // comment for the full rationale.
+        // v21.17.1 (CIRISPersist#541) — the preserve set must equal the
+        // VERIFIED set: `verify_signed_transport_destination` checks nine
+        // fields, so on a signed row an unsigned writer may advance only
+        // `last_seen_at`. See the sqlite guard for the full rationale.
+        let provenance_token = destination.binding_provenance.as_str();
+        let epoch = planned.epoch_i64;
+        // v36.0.0 (#668) — serve position (V130). The unsigned door stamps it
+        // on INSERT and re-stamps only through the `signature IS NULL` arm:
+        // on a SIGNED row this door may advance ONLY `last_seen_at` (advisory
+        // liveness, outside the verifier's nine fields), and re-serving the
+        // signed stream on every liveness ping would churn it for content no
+        // verifier covers.
+        let admitted_at = self
+            .next_plane_position(&client, "transport_destinations")
+            .await?;
+        client
+            .execute(
+                "INSERT INTO cirislens.transport_destinations \
+                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                     binding_provenance, epoch, retired_at, \
+                     attesting_key_id, signed_envelope, signature, admitted_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, NULL, $11) \
+                 ON CONFLICT (occurrence_key_id, transport_kind) \
+                 DO UPDATE SET destination = \
+                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.destination \
+                        ELSE cirislens.transport_destinations.destination END, \
+                    asserted_at = \
+                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.asserted_at \
+                        ELSE cirislens.transport_destinations.asserted_at END, \
+                    last_seen_at = EXCLUDED.last_seen_at, \
+                    transport_ed25519_pubkey_base64 = \
+                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.transport_ed25519_pubkey_base64 \
+                        ELSE cirislens.transport_destinations.transport_ed25519_pubkey_base64 END, \
+                    transport_x25519_pubkey_base64 = \
+                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.transport_x25519_pubkey_base64 \
+                        ELSE cirislens.transport_destinations.transport_x25519_pubkey_base64 END, \
+                    binding_provenance = \
+                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.binding_provenance \
+                        ELSE cirislens.transport_destinations.binding_provenance END, \
+                    epoch = CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.epoch ELSE cirislens.transport_destinations.epoch END, \
+                    retired_at = CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.retired_at \
+                        ELSE cirislens.transport_destinations.retired_at END, \
+                    admitted_at = CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.admitted_at \
+                        ELSE cirislens.transport_destinations.admitted_at END, \
+                    attesting_key_id = cirislens.transport_destinations.attesting_key_id, \
+                    signed_envelope = cirislens.transport_destinations.signed_envelope, \
+                    signature = cirislens.transport_destinations.signature \
+                 WHERE (EXCLUDED.epoch > cirislens.transport_destinations.epoch \
+                    OR (EXCLUDED.epoch = cirislens.transport_destinations.epoch \
+                        AND EXCLUDED.asserted_at > cirislens.transport_destinations.asserted_at)) \
+                   AND (cirislens.transport_destinations.signature IS NULL \
+                    OR (EXCLUDED.destination = cirislens.transport_destinations.destination \
+                        AND COALESCE(EXCLUDED.transport_ed25519_pubkey_base64, '') \
+                            = COALESCE(cirislens.transport_destinations.transport_ed25519_pubkey_base64, '') \
+                        AND COALESCE(EXCLUDED.transport_x25519_pubkey_base64, '') \
+                            = COALESCE(cirislens.transport_destinations.transport_x25519_pubkey_base64, '')))",
+                &[
+                    &destination.occurrence_key_id,
+                    &destination.transport_kind,
+                    &destination.destination,
+                    &destination.asserted_at,
+                    &destination.last_seen_at,
+                    &destination.transport_ed25519_pubkey_base64,
+                    &destination.transport_x25519_pubkey_base64,
+                    &provenance_token,
+                    &epoch,
+                    &destination.retired_at,
+                    &admitted_at,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("put_transport_destination: {e}"))
+            })?;
+        Ok(())
+    }
+
+    async fn store_planned_signed_destination(
+        &self,
+        planned: crate::federation::transport_admit::PlannedSignedDestination<'_>,
+    ) -> Result<crate::federation::TransportDestinationApplyOutcome, crate::federation::Error> {
+        use crate::federation::transport_admit::{DestinationVerdict, HeldDestination};
+        use crate::federation::Error;
+        use crate::federation::TransportDestinationApplyOutcome as Outcome;
+        let signed = planned.signed;
+        let d = &signed.transport_destination;
+        let be = |e: tokio_postgres::Error| {
+            Error::Backend(format!("put_signed_transport_destination: {e}"))
+        };
+        let fresh = {
+            let client = self
+                .get_client()
+                .await
+                .map_err(crate::store::Error::into_federation)?;
+            let existing = client
+                .query_opt(
+                    "SELECT occurrence_key_id, transport_kind, destination, asserted_at, \
+                        last_seen_at, transport_ed25519_pubkey_base64, \
+                        transport_x25519_pubkey_base64, binding_provenance, epoch, retired_at, \
+                        signature IS NOT NULL AS held_signed, signed_envelope \
+                     FROM cirislens.transport_destinations \
+                     WHERE occurrence_key_id = $1 AND transport_kind = $2",
+                    &[&d.occurrence_key_id, &d.transport_kind],
+                )
+                .await
+                .map_err(be)?
+                .map(|row| -> Result<HeldDestination, Error> {
+                    Ok(HeldDestination {
+                        destination: pg_row_to_transport_destination(&row)?,
+                        signed: row.safe_get_with("held_signed", Error::Backend)?,
+                        envelope: row.safe_get_with("signed_envelope", Error::Backend)?,
+                    })
+                })
+                .transpose()?;
+            let fresh = match crate::federation::transport_admit::held_destination_verdict(
+                signed,
+                existing.as_ref(),
+            ) {
+                DestinationVerdict::Answer(outcome) => return Ok(outcome),
+                DestinationVerdict::Write { fresh } => fresh,
+            };
+            let admitted_at = self
+                .next_plane_position(&client, "transport_destinations")
+                .await?;
+            let n = client
+                .execute(
+                    "INSERT INTO cirislens.transport_destinations \
+                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                     binding_provenance, epoch, retired_at, \
+                     attesting_key_id, signed_envelope, signature, admitted_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                 ON CONFLICT (occurrence_key_id, transport_kind) \
+                 DO UPDATE SET destination = EXCLUDED.destination, \
+                    asserted_at = EXCLUDED.asserted_at, \
+                    last_seen_at = EXCLUDED.last_seen_at, \
+                    transport_ed25519_pubkey_base64 = EXCLUDED.transport_ed25519_pubkey_base64, \
+                    transport_x25519_pubkey_base64 = EXCLUDED.transport_x25519_pubkey_base64, \
+                    binding_provenance = EXCLUDED.binding_provenance, \
+                    epoch = EXCLUDED.epoch, \
+                    retired_at = EXCLUDED.retired_at, \
+                    attesting_key_id = EXCLUDED.attesting_key_id, \
+                    signed_envelope = EXCLUDED.signed_envelope, \
+                    signature = EXCLUDED.signature, \
+                    admitted_at = EXCLUDED.admitted_at \
+                 WHERE EXCLUDED.epoch > cirislens.transport_destinations.epoch \
+                    OR (EXCLUDED.epoch = cirislens.transport_destinations.epoch \
+                        AND EXCLUDED.asserted_at > cirislens.transport_destinations.asserted_at) \
+                    OR cirislens.transport_destinations.signature IS NULL",
+                    &[
+                        &d.occurrence_key_id,
+                        &d.transport_kind,
+                        &d.destination,
+                        &d.asserted_at,
+                        &d.last_seen_at,
+                        &d.transport_ed25519_pubkey_base64,
+                        &d.transport_x25519_pubkey_base64,
+                        &d.binding_provenance.as_str(),
+                        &planned.epoch_i64,
+                        &d.retired_at,
+                        &signed.attesting_key_id,
+                        &planned.envelope_json,
+                        &planned.signature_json,
+                        &admitted_at,
+                    ],
+                )
+                .await
+                .map_err(be)?;
+            // The read and the write are two statements on a pooled client: a
+            // newer record that landed between them leaves nothing to write.
+            if n == 0 {
+                return Ok(Outcome::Refused {
+                    reason: "superseded concurrently by a newer record".into(),
+                });
+            }
+            fresh
+        };
+        // The pooled client is released before the re-index takes its own.
+        self.index_stored_record("TransportDestination", &planned.wire_index_key)
+            .await?;
+        Ok(if fresh {
+            Outcome::Inserted
+        } else {
+            Outcome::Superseded
+        })
+    }
+}
+
 /// v61 (CIRISPersist#934) — the accord evidence executor on postgres.
 /// Storage only: the decisions are `federation::accord_admit`'s.
 #[async_trait::async_trait]
@@ -12829,297 +13048,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         destination: &crate::federation::TransportDestination,
     ) -> Result<(), crate::federation::Error> {
-        // v61 (CIRISPersist#1122) — an agent announces no route.
-        crate::federation::transport_routes::check_route_key_not_agent(self, destination).await?;
-        let client = self
-            .get_client()
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::transport_admit::put_transport_destination_planned(self, destination)
             .await
-            .map_err(crate::store::Error::into_federation)?;
-        // #443 route-table put: keyed on (occ, kind) — `destination` is
-        // payload — and GUARDED monotonic on (epoch, asserted_at)
-        // lexicographic. A stale assertion is a silent no-op.
-        //
-        // v21.4.0 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: an
-        // unsigned writer never demotes a signed row (signature columns
-        // preserved unconditionally; a content-CHANGING unsigned write
-        // against a signed row is a silent no-op). See the sqlite twin's
-        // comment for the full rationale.
-        // v21.17.1 (CIRISPersist#541) — the preserve set must equal the
-        // VERIFIED set: `verify_signed_transport_destination` checks nine
-        // fields, so on a signed row an unsigned writer may advance only
-        // `last_seen_at`. See the sqlite guard for the full rationale.
-        let provenance_token = destination.binding_provenance.as_str();
-        let epoch = i64::try_from(destination.epoch).map_err(|_| {
-            crate::federation::Error::InvalidArgument(
-                "transport_destination epoch exceeds i64".into(),
-            )
-        })?;
-        // v36.0.0 (#668) — serve position (V130). The unsigned door stamps it
-        // on INSERT and re-stamps only through the `signature IS NULL` arm:
-        // on a SIGNED row this door may advance ONLY `last_seen_at` (advisory
-        // liveness, outside the verifier's nine fields), and re-serving the
-        // signed stream on every liveness ping would churn it for content no
-        // verifier covers.
-        let admitted_at = self
-            .next_plane_position(&client, "transport_destinations")
-            .await?;
-        client
-            .execute(
-                "INSERT INTO cirislens.transport_destinations \
-                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
-                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
-                     binding_provenance, epoch, retired_at, \
-                     attesting_key_id, signed_envelope, signature, admitted_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, NULL, $11) \
-                 ON CONFLICT (occurrence_key_id, transport_kind) \
-                 DO UPDATE SET destination = \
-                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
-                        THEN EXCLUDED.destination \
-                        ELSE cirislens.transport_destinations.destination END, \
-                    asserted_at = \
-                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
-                        THEN EXCLUDED.asserted_at \
-                        ELSE cirislens.transport_destinations.asserted_at END, \
-                    last_seen_at = EXCLUDED.last_seen_at, \
-                    transport_ed25519_pubkey_base64 = \
-                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
-                        THEN EXCLUDED.transport_ed25519_pubkey_base64 \
-                        ELSE cirislens.transport_destinations.transport_ed25519_pubkey_base64 END, \
-                    transport_x25519_pubkey_base64 = \
-                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
-                        THEN EXCLUDED.transport_x25519_pubkey_base64 \
-                        ELSE cirislens.transport_destinations.transport_x25519_pubkey_base64 END, \
-                    binding_provenance = \
-                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
-                        THEN EXCLUDED.binding_provenance \
-                        ELSE cirislens.transport_destinations.binding_provenance END, \
-                    epoch = CASE WHEN cirislens.transport_destinations.signature IS NULL \
-                        THEN EXCLUDED.epoch ELSE cirislens.transport_destinations.epoch END, \
-                    retired_at = CASE WHEN cirislens.transport_destinations.signature IS NULL \
-                        THEN EXCLUDED.retired_at \
-                        ELSE cirislens.transport_destinations.retired_at END, \
-                    admitted_at = CASE WHEN cirislens.transport_destinations.signature IS NULL \
-                        THEN EXCLUDED.admitted_at \
-                        ELSE cirislens.transport_destinations.admitted_at END, \
-                    attesting_key_id = cirislens.transport_destinations.attesting_key_id, \
-                    signed_envelope = cirislens.transport_destinations.signed_envelope, \
-                    signature = cirislens.transport_destinations.signature \
-                 WHERE (EXCLUDED.epoch > cirislens.transport_destinations.epoch \
-                    OR (EXCLUDED.epoch = cirislens.transport_destinations.epoch \
-                        AND EXCLUDED.asserted_at > cirislens.transport_destinations.asserted_at)) \
-                   AND (cirislens.transport_destinations.signature IS NULL \
-                    OR (EXCLUDED.destination = cirislens.transport_destinations.destination \
-                        AND COALESCE(EXCLUDED.transport_ed25519_pubkey_base64, '') \
-                            = COALESCE(cirislens.transport_destinations.transport_ed25519_pubkey_base64, '') \
-                        AND COALESCE(EXCLUDED.transport_x25519_pubkey_base64, '') \
-                            = COALESCE(cirislens.transport_destinations.transport_x25519_pubkey_base64, '')))",
-                &[
-                    &destination.occurrence_key_id,
-                    &destination.transport_kind,
-                    &destination.destination,
-                    &destination.asserted_at,
-                    &destination.last_seen_at,
-                    &destination.transport_ed25519_pubkey_base64,
-                    &destination.transport_x25519_pubkey_base64,
-                    &provenance_token,
-                    &epoch,
-                    &destination.retired_at,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("put_transport_destination: {e}"))
-            })?;
-        Ok(())
     }
 
     async fn put_signed_transport_destination(
         &self,
         signed: &crate::federation::SignedTransportDestination,
     ) -> Result<crate::federation::TransportDestinationApplyOutcome, crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::TransportDestination,
-            signed,
-        )
-        .await?
-        {
-            return Ok(
-                crate::federation::self_at_login::TransportDestinationApplyOutcome::Unchanged,
-            );
-        }
-        use crate::federation::TransportDestinationApplyOutcome as Outcome;
-        // #443 — the admission gate BEFORE any write (one gate, all backends).
-        crate::federation::admission::verify_signed_transport_destination(self, signed).await?;
-        // v59.0.0 (CIRISPersist#1106, CC 5.3.4) — a seated serve node's
-        // bundle-pinned transit pair rotates by holder quorum, not alone.
-        crate::federation::transport_rebind::check_serve_rotation(self, signed).await?;
-        let d = &signed.transport_destination;
-        let envelope_json = serde_json::to_string(&signed.signed_envelope)
-            .map_err(|e| crate::federation::Error::Backend(format!("signed_envelope: {e}")))?;
-        let signature_json = serde_json::to_string(&signed.signature)
-            .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
-        let epoch = i64::try_from(d.epoch).map_err(|_| {
-            crate::federation::Error::InvalidArgument(
-                "transport_destination epoch exceeds i64".into(),
-            )
-        })?;
-        let client = self
-            .get_client()
+        crate::federation::transport_admit::put_signed_transport_destination_planned(self, signed)
             .await
-            .map_err(crate::store::Error::into_federation)?;
-        // Classify against the current row (retired rows INCLUDED — the
-        // tombstone must keep winning) ...
-        let existing = client
-            .query_opt(
-                "SELECT occurrence_key_id, transport_kind, destination, asserted_at, \
-                    last_seen_at, transport_ed25519_pubkey_base64, \
-                    transport_x25519_pubkey_base64, binding_provenance, epoch, retired_at \
-                 FROM cirislens.transport_destinations \
-                 WHERE occurrence_key_id = $1 AND transport_kind = $2",
-                &[&d.occurrence_key_id, &d.transport_kind],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("put_signed_transport_destination: {e}"))
-            })?
-            .map(|row| pg_row_to_transport_destination(&row))
-            .transpose()?;
-        // v21.4.0 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: the
-        // monotonic-clock refusal applies only against a stored row that is
-        // itself SIGNED; a signed write always reclaims an unsigned row
-        // (occurrence-projection / announce state) regardless of clocks.
-        let (stored_signed, stored_envelope): (bool, Option<String>) = if existing.is_some() {
-            let r = client
-                .query_one(
-                    "SELECT signature IS NOT NULL, signed_envelope \
-                     FROM cirislens.transport_destinations \
-                     WHERE occurrence_key_id = $1 AND transport_kind = $2",
-                    &[&d.occurrence_key_id, &d.transport_kind],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!("signed-presence read: {e}"))
-                })?;
-            (r.get(0), r.get(1))
-        } else {
-            (false, None)
-        };
-        // v56.0.0 (#1077) — the transit KEX pair is envelope-only: an equal
-        // typed projection is `Unchanged` only when the stored envelope carries
-        // the same pair. A same-clock re-sign that changes it falls to the
-        // monotonic refusal below.
-        let same_pair = stored_envelope
-            .as_deref()
-            .and_then(|e| serde_json::from_str::<serde_json::Value>(e).ok())
-            .is_some_and(|stored| {
-                crate::federation::self_at_login::same_transit_kex_member(
-                    &stored,
-                    &signed.signed_envelope,
-                )
-            });
-        let fresh = match existing {
-            Some(ref ex) if *ex == *d && stored_signed && same_pair => {
-                return Ok(Outcome::Unchanged)
-            }
-            Some(ref ex)
-                if stored_signed && (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) =>
-            {
-                return Ok(Outcome::Refused {
-                    reason: format!(
-                        "incoming (epoch {}, asserted_at {}) does not supersede stored \
-                         SIGNED (epoch {}, asserted_at {})",
-                        d.epoch,
-                        d.asserted_at.to_rfc3339(),
-                        ex.epoch,
-                        ex.asserted_at.to_rfc3339()
-                    ),
-                })
-            }
-            Some(_) => false,
-            None => true,
-        };
-        // v36.0.0 (#668) — serve position (V130). A signed apply always
-        // stamps/re-stamps: it either admits a new signed row or supersedes
-        // covered content, and either way the signed stream must re-serve it.
-        let admitted_at = self
-            .next_plane_position(&client, "transport_destinations")
-            .await?;
-        // ... then write with the SAME guard in the SQL (defense in depth: a
-        // concurrent supersession between plan and act loses monotonically).
-        let n = client
-            .execute(
-                "INSERT INTO cirislens.transport_destinations \
-                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
-                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
-                     binding_provenance, epoch, retired_at, \
-                     attesting_key_id, signed_envelope, signature, admitted_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
-                 ON CONFLICT (occurrence_key_id, transport_kind) \
-                 DO UPDATE SET destination = EXCLUDED.destination, \
-                    asserted_at = EXCLUDED.asserted_at, \
-                    last_seen_at = EXCLUDED.last_seen_at, \
-                    transport_ed25519_pubkey_base64 = EXCLUDED.transport_ed25519_pubkey_base64, \
-                    transport_x25519_pubkey_base64 = EXCLUDED.transport_x25519_pubkey_base64, \
-                    binding_provenance = EXCLUDED.binding_provenance, \
-                    epoch = EXCLUDED.epoch, \
-                    retired_at = EXCLUDED.retired_at, \
-                    attesting_key_id = EXCLUDED.attesting_key_id, \
-                    signed_envelope = EXCLUDED.signed_envelope, \
-                    signature = EXCLUDED.signature, \
-                    admitted_at = EXCLUDED.admitted_at \
-                 WHERE EXCLUDED.epoch > cirislens.transport_destinations.epoch \
-                    OR (EXCLUDED.epoch = cirislens.transport_destinations.epoch \
-                        AND EXCLUDED.asserted_at > cirislens.transport_destinations.asserted_at) \
-                    OR cirislens.transport_destinations.signature IS NULL",
-                &[
-                    &d.occurrence_key_id,
-                    &d.transport_kind,
-                    &d.destination,
-                    &d.asserted_at,
-                    &d.last_seen_at,
-                    &d.transport_ed25519_pubkey_base64,
-                    &d.transport_x25519_pubkey_base64,
-                    &d.binding_provenance.as_str(),
-                    &epoch,
-                    &d.retired_at,
-                    &signed.attesting_key_id,
-                    &envelope_json,
-                    &signature_json,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("put_signed_transport_destination: {e}"))
-            })?;
-        if n == 0 {
-            // Lost a race to a concurrent (newer) write — fail-closed,
-            // re-offerable (the replication-plane Conflict rule).
-            return Ok(Outcome::Refused {
-                reason: "superseded concurrently by a newer record".into(),
-            });
-        }
-        // v21.1.0 (CIRISPersist#507b) — indexed under the shape
-        // `list_signed_transport_destinations_since` re-serializes.
-        // v31.0.0 (CIRISPersist#646) — "the stored row is byte-identical to
-        // `signed`" was the assumption this whole class is made of. It is not
-        // this site's to make: read the row back and hash that.
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("occurrence_key_id", &d.occurrence_key_id),
-            ("transport_kind", &d.transport_kind),
-        ]);
-        drop(client);
-        self.index_stored_record("TransportDestination", &wire_index_key)
-            .await?;
-        Ok(if fresh {
-            Outcome::Inserted
-        } else {
-            Outcome::Superseded
-        })
     }
 
     async fn list_transport_destinations_for_unfolded(

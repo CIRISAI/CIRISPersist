@@ -239,6 +239,9 @@ pub(crate) enum ConnClass {
 /// and are `Write`.
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
+    // v61 (CIRISPersist#934, S4b) — the transport-destination executor.
+    ("store_planned_destination", ConnClass::Write),
+    ("store_planned_signed_destination", ConnClass::Write),
     // v61 (CIRISPersist#934, S4a) — the byte writes' executor.
     ("store_planned_blob", ConnClass::Write),
     ("store_planned_announcement", ConnClass::Write),
@@ -635,8 +638,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("withdraws_admission_depth", ConnClass::Read),
     ("trust_direction_held_among", ConnClass::Read),
     ("put_scope_blob", ConnClass::Write),
-    ("put_signed_transport_destination", ConnClass::Write),
-    ("put_transport_destination", ConnClass::Write),
     ("read", ConnClass::Door),
     ("read_classifications", ConnClass::Read),
     ("read_features", ConnClass::Read),
