@@ -118,7 +118,8 @@
 //! - **I1517** (sqlite, postgres; v61, CIRISPersist#1160) — the CC 4.5.5
 //!   duty gate resolves the signer to its identity first: a room's named
 //!   moderator (a federation identity) takes content down through a live
-//!   occurrence key; an unbound key is refused.
+//!   occurrence key; an unbound key, and the moderator's own owner-bound
+//!   NODE key (a node holds no duty), are refused.
 //! - **I1402** (sqlite, postgres; v60.1.0, CIRISPersist#1070 item 1) — an
 //!   Engine with no LocalSigner (`from_shared`, `with_hardware_signer`)
 //!   executes an immediate-removal takedown to the end: the bytes are
@@ -464,6 +465,24 @@ pub(crate) mod bodies {
         let e = td::takedown_tombstone(dir, &notice(&stranger, &sha, "dmca512"), NODE)
             .await
             .expect_err("I1517: a key bound to no duty-holder");
+        assert_eq!(e.kind(), token::UNAUTHORISED, "I1517: {e}");
+        // The moderator's own NODE (owner-bound, not an occurrence of theirs)
+        // holds no duty: a node has no agency, so it never acts as the
+        // moderator whose machine it is.
+        let node = claimant(0xa4);
+        ts::register_hybrid_key(dir, &node.id).await;
+        ts::put_owner_binding(dir, &moderator.id, &node.id).await;
+        assert_eq!(
+            crate::federation::admission::owner_of(dir, &node.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(moderator.id.as_str()),
+            "I1517 precondition: the node is the moderator's"
+        );
+        let e = td::takedown_tombstone(dir, &notice(&node, &sha, "dmca512"), NODE)
+            .await
+            .expect_err("I1517: the moderator's NODE files the takedown");
         assert_eq!(e.kind(), token::UNAUTHORISED, "I1517: {e}");
         let ok = td::takedown_tombstone(dir, &notice(&occurrence, &sha, "dmca512"), NODE)
             .await
