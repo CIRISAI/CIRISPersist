@@ -1046,6 +1046,95 @@ pub mod two_node {
     }
 
     // ── I65 ──────────────────────────────────────────────────────────────
+    /// **I1519** (v61 S2, the release lead's ruling on #1148) — a self-axis
+    /// grant to a person's key reaches every node that hosts an occurrence
+    /// of that key. The key-grant door's own audience rule
+    /// (`recipient_not_in_audience`) is its gate, not the #1148 node-key
+    /// comparison. `b` hosts an occurrence of `a.key` and admits A's row
+    /// naming `a.key`; `c` hosts none and refuses it
+    /// `recipient_not_in_audience`. Both receivers have declared their node
+    /// key (the runner sets it), so the #1148 put-time gate is live on both.
+    pub async fn exercise_i1519_a_self_grant_reaches_the_persons_occurrences<B>(
+        a: &Node<'_, B>,
+        b: &Node<'_, B>,
+        c: &Node<'_, B>,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+        let occurrence = |_n: &Node<'_, B>| crate::federation::types::IdentityOccurrence {
+            identity_key_id: a.key.clone(),
+            occurrence_key_id: a.key.clone(),
+            device_class: crate::federation::types::device_class::LAPTOP.into(),
+            hardware_attestation: None,
+            asserted_at: chrono::Utc::now(),
+            valid_until: None,
+            encryption_pubkeys: Some(a.kem.clone()),
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        };
+        for n in [a, b] {
+            n.backend
+                .put_identity_occurrence_local(occurrence(n))
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I1519: occurrence of A on a node: {e}"));
+        }
+        let sealed = encrypt_and_cascade(
+            a.backend,
+            SELF,
+            &a.key,
+            b"i1519 self",
+            None,
+            None,
+            Some(&a.key),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I1519: A seals self: {e}"));
+        let emitted = emit_content_key_grant_with_local_signer(
+            a.backend,
+            &a.signer,
+            &sealed.at_rest_sha256,
+            SELF,
+            &a.key,
+        )
+        .await
+        .unwrap()
+        .expect("wraps");
+        let mut row = None;
+        for id in &emitted.attestation_ids {
+            let r = a
+                .backend
+                .get_attestation(id)
+                .await
+                .unwrap()
+                .expect("emitted");
+            if r.attested_key_id == a.key {
+                row = Some(r);
+            }
+        }
+        let row = row.expect("A's self-axis row names A's key");
+        let got = admit_replicated_key_grant(
+            b.backend,
+            SignedKeyGrantRow {
+                attestation: row.clone(),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("{tag} I1519: a node hosting an occurrence of the recipient admits: {e}")
+        });
+        assert_eq!(got.recipient_key_id, a.key, "{tag} I1519");
+        let err = admit_replicated_key_grant(c.backend, SignedKeyGrantRow { attestation: row })
+            .await
+            .expect_err("a node hosting no occurrence of the recipient");
+        assert_eq!(
+            refusal_reason(&err),
+            "recipient_not_in_audience",
+            "{tag} I1519: {err}"
+        );
+    }
+
     /// **Content axis**: the owner's second occurrence on B opens a self blob
     /// sealed on A once A's set is admitted on B.
     pub async fn exercise_i65_content_axis_second_device<B>(
@@ -3699,6 +3788,18 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn i1519_a_self_grant_reaches_the_persons_occurrences_sqlite() {
+            let (ba, bb, bc) = (fresh().await, fresh().await, fresh().await);
+            let a = node(&ba, "i1519-a").await;
+            let b = node(&bb, "i1519-b").await;
+            let c = node(&bc, "i1519-c").await;
+            introduce(&[&a, &b, &c], &["i1519-a", "i1519-b", "i1519-c"]).await;
+            bb.set_node_key_id(b.key.clone());
+            bc.set_node_key_id(c.key.clone());
+            exercise_i1519_a_self_grant_reaches_the_persons_occurrences(&a, &b, &c, "sqlite").await;
+        }
+
+        #[tokio::test]
         async fn i65_content_axis_second_device_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
             let a = node(&ba, "i65-a").await;
@@ -5190,6 +5291,24 @@ mod tests {
             let a2 = node(&bb, "i800-a2").await;
             introduce(&[&a, &a2], &["i800-a", "i800-a2"]).await;
             exercise_i800_the_blob_arrival_race(&a, &a2, "postgres").await;
+        }
+
+        #[tokio::test]
+        async fn i1519_a_self_grant_reaches_the_persons_occurrences_postgres() {
+            let (Some(ba), Some(bb), Some(bc)) = (fresh().await, fresh().await, fresh().await)
+            else {
+                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+                return;
+            };
+            let a = node(&ba, "i1519-a").await;
+            let b = node(&bb, "i1519-b").await;
+            let c = node(&bc, "i1519-c").await;
+            introduce(&[&a, &b, &c], &["i1519-a", "i1519-b", "i1519-c"]).await;
+            bb.set_node_key_id(b.key.clone());
+            bc.set_node_key_id(c.key.clone());
+            exercise_i1519_a_self_grant_reaches_the_persons_occurrences(&a, &b, &c, "postgres")
+                .await;
+            eprintln!("i1519 postgres: RAN");
         }
 
         #[tokio::test]

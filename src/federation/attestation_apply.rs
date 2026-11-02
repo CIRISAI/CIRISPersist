@@ -388,6 +388,16 @@ where
     if super::key_plane::is_key_plane_row(row) {
         return Ok(true);
     }
+    // v61 S2 (the release lead's ruling on #1148) — a `key_grant:{axis}:v1`
+    // row is exempt as the key plane is. Its audience gate is the key-grant
+    // door's own rule (`check_key_grant_row_admission`,
+    // `recipient_not_in_audience`), which knows the occurrences a node hosts.
+    // The key follows the bytes to the owner's occurrences (#848/#963). The
+    // serve-side node-key comparison below would refuse every self-axis grant
+    // to a person's other devices (I1519).
+    if super::key_grant::is_key_grant_row(row) {
+        return Ok(true);
+    }
     let Some(me) = dir.node_key_id() else {
         return Ok(true);
     };
