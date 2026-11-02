@@ -213,6 +213,14 @@ jobs:
       - name: mutants_matrix self-test
         if: steps.gate.outputs.run == 'true'
         run: python3 scripts/mutants_matrix_test.py
+      # The runner ran out of disk mid-scope (slice-gate run 41502607791:
+      # "Free space left: 0 MB" → cargo-mutants stopped, mutants "not run").
+      - name: Free runner disk (mutated builds of the crate and its graph)
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h / | tail -1
       # The scope this job is about to run resolves and names tests.
       - name: mutation scopes are well-formed (from disk)
         if: steps.gate.outputs.run == 'true'
