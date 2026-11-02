@@ -1,10 +1,10 @@
 //! **The CC manifests persist vendors beside the namespace registry, pinned
-//! at the CIRISConstitution `v1.0-rc14` tag.**
+//! at the CIRISConstitution `v1.0-rc15` tag.**
 //!
 //! [`registry`](super::registry) carries the namespace registry and its match
 //! vectors; this module carries the other five CC `manifests/` files persist
-//! reads, copied byte for byte with `git show v1.0-rc14:manifests/<file>` at
-//! [`VENDORED_CC_COMMIT`](super::registry::VENDORED_CC_COMMIT) (`b4da527`):
+//! reads, copied byte for byte with `git show v1.0-rc15:manifests/<file>` at
+//! [`VENDORED_CC_COMMIT`](super::registry::VENDORED_CC_COMMIT) (`ace6b74`):
 //!
 //! | file | CC | read by |
 //! |---|---|---|
@@ -46,7 +46,7 @@ pub const VENDORED_GOVERNANCE_POLICY_VECTORS_FILE_SHA256: &str =
 
 /// SHA-256 of the vendored `csd4_chain.json` FILE bytes.
 pub const VENDORED_CSD4_CHAIN_FILE_SHA256: &str =
-    "e13510748b6d613c1acd2920f20edab535afd475c917c775fd2bcd682ae8634b";
+    "d4cd9d169a7ddca2c91a2c237228a78d2c5475df02275cd43aa551a413ac5448";
 
 /// SHA-256 of the vendored `topology_vocabulary.json` FILE bytes. The chain's
 /// `_meta.pins.vocabulary_sha256` and CIRISServer's catalogue pin
@@ -58,7 +58,7 @@ pub const VENDORED_TOPOLOGY_VOCABULARY_FILE_SHA256: &str =
 /// the 13 signed-object vectors the replay runs through the attestation door,
 /// CIRISPersist#1098).
 pub const VENDORED_SIGNED_OBJECT_VECTORS_FILE_SHA256: &str =
-    "062aa2b2bdc958c391e79794278b594c10e7340f83db591a0185cb11f92d1e71";
+    "89122268a39b7267a2381221fdd5accb7ce45b1d8358af2ed6cf96f5e163994b";
 
 /// SHA-256 of CC's `manifests/WIRE_VOCABULARY.md` FILE bytes at the tag.
 /// Persist does not vendor the file: it pins the document's hash as
@@ -223,7 +223,7 @@ mod tests {
 
     /// The vocabulary CIRISServer's catalogue pin names while the CSD/4
     /// fixtures stay at the CIRISServer v0.5.234 release: CC's `v1.0-rc12`
-    /// `topology_vocabulary.json` (catalogue v5). rc14 carries vocabulary v6
+    /// `topology_vocabulary.json` (catalogue v5). rc14 and rc15 carry vocabulary v6
     /// ([`VENDORED_TOPOLOGY_VOCABULARY_FILE_SHA256`]), and no tagged Server
     /// release carries a catalogue built on it yet.
     const SERVER_CATALOGUE_PREVIOUS_VOCABULARY_SHA256: &str =
@@ -262,7 +262,7 @@ mod tests {
         );
     }
 
-    /// **I1308** — the refusal tokens at the pin. CC rc14's chain
+    /// **I1308** — the refusal tokens at the pin. CC rc15's chain
     /// (`refusal_tokens`, the tokens its text names) names
     /// `federation_set_semantics_unsorted`, `federation_malformed_row` and the
     /// reasons `aggregate_source_duplicate`, `envelope_member_missing`,
@@ -288,14 +288,14 @@ mod tests {
         let unsorted = crate::federation::Error::SetSemanticsUnsorted(String::new()).kind();
         let malformed = crate::federation::Error::malformed_row("p", "r", "m").kind();
         for kind in [unsorted, malformed] {
-            assert!(named.contains_key(kind), "rc14 names {kind}");
+            assert!(named.contains_key(kind), "rc15 names {kind}");
         }
         for reason in [
             malformed_row::AGGREGATE_SOURCE_DUPLICATE,
             malformed_row::ENVELOPE_MEMBER_MISSING,
             malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
         ] {
-            assert!(named.contains_key(reason), "rc14 names {reason}");
+            assert!(named.contains_key(reason), "rc15 names {reason}");
             assert!(malformed_row::ALL.contains(&reason));
         }
         // Named at rc9, emitted since #1098 F4 (rc12).
