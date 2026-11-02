@@ -1987,3 +1987,339 @@ mod runners {
         .await;
     }
 }
+
+/// v61 — **the canonical's read storm, sized.** One device that has
+/// authored a long custody history (two reports for each of ~1,000 blobs,
+/// the shape of a canonical acknowledging every blob it holds), and
+/// `custody_acks_of` for ONE blob: the read must cost pages proportional to
+/// that blob's two reports, not to the device's history. Measured as the
+/// connection's pager fetches (`SQLITE_DBSTATUS_CACHE_HIT` + `_MISS`) across
+/// the door call, on a database with no `sqlite_stat1` — the planner's
+/// heuristics, which is what every node that never ran ANALYZE gets.
+#[cfg(all(test, feature = "sqlite"))]
+mod storm_v61 {
+    use super::bodies as cab;
+    use crate::federation::custody_ack::{custody_acks_of, CustodyState};
+    use crate::store::Backend as _;
+
+    /// Pager fetches (hits + misses) on `conn` since the last call, reset.
+    // `unsafe_code` is denied crate-wide; this test-only call reads two
+    // per-connection pager counters the C API exposes and rusqlite does not
+    // wrap. Only the connection handle and two out-params cross the
+    // boundary (the I55c precedent in store::sqlite).
+    #[allow(unsafe_code)]
+    fn pager_fetches(conn: &rusqlite::Connection) -> i64 {
+        use rusqlite::ffi;
+        let mut total = 0i64;
+        for op in [
+            ffi::SQLITE_DBSTATUS_CACHE_HIT,
+            ffi::SQLITE_DBSTATUS_CACHE_MISS,
+        ] {
+            let (mut cur, mut hi) = (0i32, 0i32);
+            let rc = unsafe { ffi::sqlite3_db_status(conn.handle(), op, &mut cur, &mut hi, 1) };
+            assert_eq!(rc, ffi::SQLITE_OK, "sqlite3_db_status");
+            total += i64::from(cur);
+        }
+        total
+    }
+
+    fn sha(tag: &str) -> [u8; 32] {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(tag.as_bytes()).into()
+    }
+
+    /// The page budget for one `custody_acks_of` on the fitting indexes
+    /// (two seeks, two reports, their table rows): measured at ~20 with the
+    /// fix; the unpinned plan walks the device's whole history (thousands).
+    const PAGE_BUDGET: i64 = 200;
+
+    #[tokio::test]
+    async fn v61_storm_custody_acks_of_one_blob_is_bounded_by_the_blob() {
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let d: &dyn crate::federation::FederationDirectory = &b;
+        let dev = cab::device(d, "v61-storm-canonical-device-alpha-0000").await;
+        let target = sha("v61-storm-target-blob");
+        let base = cab::base();
+        let first = cab::report(d, &dev, &target, CustodyState::Here, base).await;
+        cab::report(
+            d,
+            &dev,
+            &target,
+            CustodyState::Here,
+            base + chrono::Duration::minutes(1),
+        )
+        .await;
+
+        // The device's history: 1,000 other blobs × two reports, copied from
+        // the admitted report (same signer, same shape) with a fresh id, a
+        // fresh citation and a later instant. Every non-generated column is
+        // carried; the read path decodes, it does not re-verify.
+        const OTHER_BLOBS: i64 = 1_000;
+        let conn = b.conn_handle();
+        let inserted = {
+            let c = conn.lock();
+            let cols: Vec<String> = c
+                .prepare("SELECT name FROM pragma_table_xinfo('federation_attestations') WHERE hidden = 0")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            let select: Vec<String> = cols
+                .iter()
+                .map(|col| match col.as_str() {
+                    "attestation_id" => "attestation_id || '-h' || n".to_owned(),
+                    "persist_row_hash" => "persist_row_hash || '-h' || n".to_owned(),
+                    "attestation_envelope" => "json_set(attestation_envelope, \
+                         '$.evidence_refs[0]', printf('%064d', n / 2))"
+                        .to_owned(),
+                    "asserted_at" => "strftime('%Y-%m-%dT%H:%M:%fZ', asserted_at, \
+                         '+' || (n + 10) || ' minutes')"
+                        .to_owned(),
+                    other => other.to_owned(),
+                })
+                .collect();
+            let sql = format!(
+                "WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n + 1 < ?2) \
+                 INSERT INTO federation_attestations ({}) \
+                 SELECT {} FROM federation_attestations, seq WHERE attestation_id = ?1",
+                cols.join(", "),
+                select.join(", ")
+            );
+            c.execute(&sql, rusqlite::params![first, OTHER_BLOBS * 2])
+                .unwrap()
+        };
+        assert_eq!(inserted as i64, OTHER_BLOBS * 2, "the history landed");
+
+        let hex = hex::encode(target);
+        let _ = pager_fetches(&conn.lock());
+        let t0 = std::time::Instant::now();
+        let acks = custody_acks_of(d, &dev, &hex).await.unwrap();
+        let elapsed = t0.elapsed();
+        let pages = pager_fetches(&conn.lock());
+        eprintln!(
+            "v61 custody_acks_of over a {}-row history: {} acks, {pages} pager fetches, {elapsed:?}",
+            OTHER_BLOBS * 2 + 2,
+            acks.len()
+        );
+        assert_eq!(acks.len(), 2, "both reports of the blob, nothing else");
+        assert!(
+            pages <= PAGE_BUDGET,
+            "custody_acks_of(one blob) fetched {pages} pages (budget {PAGE_BUDGET}): \
+             the read walks the device's history, not the blob's reports"
+        );
+    }
+}
+
+/// v61 — **the read storm, postgres parity.** The same history as
+/// [`storm_v61`], on a database with NO statistics (autovacuum off for the
+/// table, no ANALYZE: a restore before its first analyze), then again after
+/// ANALYZE: both custody reads reach their multi-column index, never V004's
+/// single-column attester index, and the door's two statements together
+/// touch a bounded number of buffers.
+#[cfg(all(test, feature = "postgres"))]
+mod storm_v61_pg {
+    use super::bodies as cab;
+    use crate::federation::custody_ack::{custody_acks_of, CustodyState, CUSTODY_ACK_DIMENSION};
+    use crate::federation::types::attestation_type as at;
+    use crate::store::postgres::{pg_by_dimension_citing_sql, pg_composers_referencing_any_sql};
+    use crate::store::Backend as _;
+
+    type Params<'a> = Vec<&'a (dyn tokio_postgres::types::ToSql + Sync)>;
+
+    /// `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` of `sql`: every
+    /// `(Node Type, Index Name)` depth first, and the top node's shared
+    /// buffers (hit + read).
+    async fn plan(
+        client: &deadpool_postgres::Object,
+        sql: &str,
+        params: &Params<'_>,
+    ) -> (Vec<(String, Option<String>)>, i64) {
+        fn walk(n: &serde_json::Value, out: &mut Vec<(String, Option<String>)>) {
+            out.push((
+                n["Node Type"].as_str().unwrap_or("?").to_owned(),
+                n["Index Name"].as_str().map(str::to_owned),
+            ));
+            for c in n["Plans"].as_array().into_iter().flatten() {
+                walk(c, out);
+            }
+        }
+        let row = client
+            .query_one(
+                &format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}"),
+                &params[..],
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = row.get(0);
+        let top = &v[0]["Plan"];
+        let mut out = Vec::new();
+        walk(top, &mut out);
+        let buffers = top["Shared Hit Blocks"].as_i64().unwrap_or(0)
+            + top["Shared Read Blocks"].as_i64().unwrap_or(0);
+        (out, buffers)
+    }
+
+    fn reaches(nodes: &[(String, Option<String>)], index: &str) -> bool {
+        nodes.iter().any(|(t, i)| {
+            matches!(
+                t.as_str(),
+                "Index Scan" | "Bitmap Index Scan" | "Index Only Scan"
+            ) && i.as_deref() == Some(index)
+        })
+    }
+
+    fn walks_history(nodes: &[(String, Option<String>)]) -> bool {
+        nodes.iter().any(|(t, i)| {
+            t == "Seq Scan"
+                || matches!(
+                    i.as_deref(),
+                    Some("federation_attestations_attesting")
+                        | Some("federation_attestations_attested")
+                )
+        })
+    }
+
+    /// Buffers for one of the two custody statements on the fitting index
+    /// (measured single digits); the attester walk reads the history.
+    const BUFFER_BUDGET: i64 = 100;
+
+    #[tokio::test]
+    async fn v61_storm_custody_reads_reach_their_index_postgres() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let client = b.get_client().await.unwrap();
+        client
+            .batch_execute(
+                "ALTER TABLE cirislens.federation_attestations SET (autovacuum_enabled = false)",
+            )
+            .await
+            .unwrap();
+        let d: &dyn crate::federation::FederationDirectory = &b;
+        let dev = cab::device(d, "v61-storm-canonical-device-pg-alpha-00").await;
+        use sha2::Digest as _;
+        let target: [u8; 32] = sha2::Sha256::digest(b"v61-storm-target-blob-pg").into();
+        let base = cab::base();
+        let first = cab::report(d, &dev, &target, CustodyState::Here, base).await;
+        let second = cab::report(
+            d,
+            &dev,
+            &target,
+            CustodyState::Here,
+            base + chrono::Duration::minutes(1),
+        )
+        .await;
+
+        // The history, as in the sqlite twin: 1,000 other blobs × two reports.
+        const OTHER_BLOBS: i64 = 1_000;
+        let cols: Vec<String> = client
+            .query(
+                "SELECT column_name::text FROM information_schema.columns \
+                 WHERE table_schema = 'cirislens' AND table_name = 'federation_attestations' \
+                   AND is_generated = 'NEVER' ORDER BY ordinal_position",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect();
+        let select: Vec<String> = cols
+            .iter()
+            .map(|c| match c.as_str() {
+                "attestation_id" => "gen_random_uuid()::text".to_owned(),
+                "persist_row_hash" => "persist_row_hash || '-h' || n".to_owned(),
+                "attestation_envelope" => "jsonb_set(attestation_envelope::jsonb, \
+                     '{evidence_refs,0}', to_jsonb(lpad((n / 2)::text, 64, '0')))::text"
+                    .to_owned(),
+                "asserted_at" => "asserted_at + make_interval(mins => (n + 10)::int)".to_owned(),
+                other => other.to_owned(),
+            })
+            .collect();
+        let sql = format!(
+            "INSERT INTO cirislens.federation_attestations ({}) \
+             SELECT {} FROM cirislens.federation_attestations, generate_series(0::bigint, $2::bigint - 1) AS n \
+             WHERE attestation_id::text = $1",
+            cols.join(", "),
+            select.join(", ")
+        );
+        let inserted = client
+            .execute(&sql, &[&first, &(OTHER_BLOBS * 2)])
+            .await
+            .unwrap();
+        assert_eq!(inserted as i64, OTHER_BLOBS * 2, "the history landed");
+
+        let hex = hex::encode(target);
+        let dim = CUSTODY_ACK_DIMENSION;
+        let ids = vec![first.clone(), second.clone()];
+        let (w, r, s) = (at::WITHDRAWS, at::RECANTS, at::SUPERSEDES);
+        for stats in ["no statistics", "after ANALYZE"] {
+            if stats == "after ANALYZE" {
+                client
+                    .batch_execute("ANALYZE cirislens.federation_attestations")
+                    .await
+                    .unwrap();
+            }
+            let (nodes, bufs) = plan(
+                &client,
+                &pg_by_dimension_citing_sql(),
+                &vec![&dev, &dim, &hex],
+            )
+            .await;
+            eprintln!("v61 pg [{stats}] by_dimension_citing: {nodes:?}, {bufs} buffers");
+            assert!(
+                reaches(
+                    &nodes,
+                    "federation_attestations_attester_dimension_citation"
+                ),
+                "[{stats}] the citing read reaches V180's index: {nodes:?}"
+            );
+            assert!(!walks_history(&nodes), "[{stats}] {nodes:?}");
+            assert!(
+                bufs <= BUFFER_BUDGET,
+                "[{stats}] citing read: {bufs} buffers"
+            );
+
+            let (nodes, bufs) = plan(
+                &client,
+                &pg_composers_referencing_any_sql(false, true),
+                &vec![&ids, &w, &r, &s, &dev],
+            )
+            .await;
+            eprintln!("v61 pg [{stats}] composers(attesting): {nodes:?}, {bufs} buffers");
+            assert!(
+                reaches(&nodes, "federation_attestations_composer_ref"),
+                "[{stats}] the composer read reaches V107's index: {nodes:?}"
+            );
+            assert!(!walks_history(&nodes), "[{stats}] {nodes:?}");
+            assert!(
+                bufs <= BUFFER_BUDGET,
+                "[{stats}] composer read: {bufs} buffers"
+            );
+
+            let (nodes, bufs) = plan(
+                &client,
+                &pg_composers_referencing_any_sql(true, false),
+                &vec![&ids, &w, &r, &s, &dev],
+            )
+            .await;
+            eprintln!("v61 pg [{stats}] composers(attested): {nodes:?}, {bufs} buffers");
+            assert!(
+                reaches(&nodes, "federation_attestations_attested_composer_ref"),
+                "[{stats}] the attested composer read reaches V178's index: {nodes:?}"
+            );
+            assert!(!walks_history(&nodes), "[{stats}] {nodes:?}");
+
+            let acks = custody_acks_of(d, &dev, &hex).await.unwrap();
+            assert_eq!(acks.len(), 2, "[{stats}] both reports of the blob");
+        }
+    }
+}

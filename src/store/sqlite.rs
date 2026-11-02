@@ -4857,22 +4857,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             SqlValue::Text(attestation_type::RECANTS.to_owned()),
             SqlValue::Text(attestation_type::SUPERSEDES.to_owned()),
         ];
-        let mut axes = String::new();
         if let Some(k) = attested_key_id {
             binds.push(SqlValue::Text(k.to_owned()));
-            axes.push_str(&format!(" AND attested_key_id = ?{}", binds.len()));
         }
         if let Some(k) = attesting_key_id {
             binds.push(SqlValue::Text(k.to_owned()));
-            axes.push_str(&format!(" AND attesting_key_id = ?{}", binds.len()));
         }
-        let sql = format!(
-            "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
-             WHERE tier = 'federation' \
-               AND attestation_type IN (?2, ?3, ?4) \
-               AND json_extract(attestation_envelope, '$.references_attestation_id') \
-                   IN (SELECT value FROM json_each(?1)){axes} \
-             ORDER BY asserted_at DESC"
+        let sql = sqlite_composers_referencing_any_sql(
+            attested_key_id.is_some(),
+            attesting_key_id.is_some(),
         );
         let (read, bytes) = self
             .read_measured(
@@ -4953,13 +4946,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             SqlValue::Text(dimension.to_owned()),
             SqlValue::Text(evidence_ref.to_owned()),
         ];
-        let sql = format!(
-            "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
-             WHERE attesting_key_id = ?1 AND dimension = ?2 \
-               AND json_extract(attestation_envelope, '$.evidence_refs[0]') = ?3 \
-               AND tier = 'federation' \
-             ORDER BY asserted_at DESC"
-        );
+        let sql = sqlite_by_dimension_citing_sql();
         let (read, bytes) = self
             .read_measured(
                 move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
@@ -20834,6 +20821,43 @@ fn sqlite_attestations_referencing_sql() -> String {
          WHERE tier = 'federation' \
            AND attestation_type IN (?2, ?3, ?4) \
            AND json_extract(attestation_envelope, '$.references_attestation_id') = ?1 \
+         ORDER BY asserted_at DESC"
+    )
+}
+
+/// v61 — `list_attestations_by_dimension_citing`'s statement (`?1` the
+/// attester, `?2` the dimension, `?3` the cited blob), spelled once so the
+/// plan witness reads the statement the door runs.
+fn sqlite_by_dimension_citing_sql() -> String {
+    format!(
+        "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
+         WHERE attesting_key_id = ?1 AND dimension = ?2 \
+           AND json_extract(attestation_envelope, '$.evidence_refs[0]') = ?3 \
+           AND tier = 'federation' \
+         ORDER BY asserted_at DESC"
+    )
+}
+
+/// v61 — `list_composers_referencing_any`'s statement (`?1` the id set
+/// as a JSON array, `?2..?4` the composer types, then the attested axis and
+/// the attesting axis, each when pinned, in that order), spelled once so the
+/// plan witness reads the statement the door runs.
+fn sqlite_composers_referencing_any_sql(attested: bool, attesting: bool) -> String {
+    let mut axes = String::new();
+    let mut next = 5;
+    if attested {
+        axes.push_str(&format!(" AND attested_key_id = ?{next}"));
+        next += 1;
+    }
+    if attesting {
+        axes.push_str(&format!(" AND attesting_key_id = ?{next}"));
+    }
+    format!(
+        "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
+         WHERE tier = 'federation' \
+           AND attestation_type IN (?2, ?3, ?4) \
+           AND json_extract(attestation_envelope, '$.references_attestation_id') \
+               IN (SELECT value FROM json_each(?1)){axes} \
          ORDER BY asserted_at DESC"
     )
 }
@@ -44499,6 +44523,125 @@ mod tests {
                 .any(|l| l.contains("federation_attestations_attested ")),
             "the for-type read does not walk the subject's whole slice in order: {plan:?}"
         );
+    }
+
+    // ── v61 — the canonical's read storm: the two custody reads ──────
+    //
+    // With no `sqlite_stat1` the planner prefers V004's single-column
+    // `federation_attestations_attesting (attesting_key_id, asserted_at
+    // DESC)`, because it also yields `ORDER BY asserted_at DESC`, over the
+    // three-column expression indexes the reads were written for: every
+    // call then walks the attester's whole history, json-parsing every
+    // envelope. These witnesses read the plan of the statement the door
+    // runs, on a migrated database with no statistics.
+
+    fn v61_storm_composer_binds(attested: bool, attesting: bool) -> Vec<SqlValue> {
+        let mut b = i546_referencing_binds();
+        b[0] = SqlValue::Text(r#"["a","b"]"#.into());
+        if attested {
+            b.push(SqlValue::Text("subject".into()));
+        }
+        if attesting {
+            b.push(SqlValue::Text("device".into()));
+        }
+        b
+    }
+
+    /// No plan line of `plan` walks V004's single-column attester or
+    /// subject index (the trailing space keeps the multi-column names out).
+    fn v61_storm_no_history_walk(plan: &[String], what: &str) {
+        assert!(
+            !plan.iter().any(|l| {
+                l.contains("federation_attestations_attesting ")
+                    || l.contains("federation_attestations_attested ")
+                    || l.ends_with("federation_attestations_attesting")
+                    || l.ends_with("federation_attestations_attested")
+            }),
+            "{what}: never the attester's / subject's whole history in asserted_at order: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|l| l.starts_with("SCAN federation_attestations")),
+            "{what}: never a table scan: {plan:?}"
+        );
+    }
+
+    /// v61 — `list_attestations_by_dimension_citing` (custody_acks_of's
+    /// first read) seeks V180's `(attesting_key_id, dimension,
+    /// evidence_refs[0])` on all three columns.
+    #[tokio::test]
+    async fn v61_storm_by_dimension_citing_seeks_the_citation_index() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let binds = vec![
+            SqlValue::Text("device".into()),
+            SqlValue::Text("custody:ack:v1".into()),
+            SqlValue::Text("ab".repeat(32)),
+        ];
+        let plan = sqlite_plan(&backend, &sqlite_by_dimension_citing_sql(), binds).await;
+        eprintln!("v61 list_attestations_by_dimension_citing plan: {plan:?}");
+        assert!(
+            plan.iter().any(|l| l.starts_with(
+                "SEARCH federation_attestations USING INDEX \
+                 federation_attestations_attester_dimension_citation \
+                 (attesting_key_id=? AND dimension=? AND <expr>=?)"
+            )),
+            "the citing read seeks (attester, dimension, citation): {plan:?}"
+        );
+        v61_storm_no_history_walk(&plan, "by_dimension_citing");
+    }
+
+    /// v61 — `list_composers_referencing_any` on the attesting axis
+    /// (custody_acks_of's second read) seeks V107's `composer_ref`, on the
+    /// attested axis V178's `attested_composer_ref`, with no axis V181's
+    /// `reference_seek`; never the pinned key's whole history.
+    #[tokio::test]
+    async fn v61_storm_composers_referencing_any_seeks_the_composer_index() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for (attested, attesting, index, cols) in [
+            (
+                false,
+                true,
+                "federation_attestations_composer_ref",
+                "(attesting_key_id=? AND attestation_type=? AND <expr>=?)",
+            ),
+            (
+                true,
+                false,
+                "federation_attestations_attested_composer_ref",
+                "(attested_key_id=? AND attestation_type=? AND <expr>=?)",
+            ),
+            (
+                true,
+                true,
+                "federation_attestations_composer_ref",
+                "(attesting_key_id=? AND attestation_type=? AND <expr>=?)",
+            ),
+            (
+                false,
+                false,
+                "federation_attestations_reference_seek",
+                "(<expr>=? AND attestation_type=?)",
+            ),
+        ] {
+            let plan = sqlite_plan(
+                &backend,
+                &sqlite_composers_referencing_any_sql(attested, attesting),
+                v61_storm_composer_binds(attested, attesting),
+            )
+            .await;
+            let what =
+                format!("composers_referencing_any(attested={attested}, attesting={attesting})");
+            eprintln!("v61 {what} plan: {plan:?}");
+            let want = format!("SEARCH federation_attestations USING INDEX {index} {cols}");
+            assert!(
+                plan.iter().any(|l| l.starts_with(&want)),
+                "{what} seeks `{want}`: {plan:?}"
+            );
+            v61_storm_no_history_walk(&plan, &what);
+        }
     }
 
     /// I547 (sqlite) — the trust-root walks' typed, job-filtered reads seek

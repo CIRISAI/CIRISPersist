@@ -8288,22 +8288,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             Box::new(attestation_type::RECANTS.to_owned()),
             Box::new(attestation_type::SUPERSEDES.to_owned()),
         ];
-        let mut axes = String::new();
         if let Some(k) = attested_key_id {
             params.push(Box::new(k.to_owned()));
-            axes.push_str(&format!(" AND attested_key_id = ${}", params.len()));
         }
         if let Some(k) = attesting_key_id {
             params.push(Box::new(k.to_owned()));
-            axes.push_str(&format!(" AND attesting_key_id = ${}", params.len()));
         }
-        let sql = format!(
-            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
-             WHERE tier = 'federation' \
-               AND attestation_type IN ($2, $3, $4) \
-               AND (attestation_envelope::jsonb->>'references_attestation_id') = ANY($1){axes} \
-             ORDER BY asserted_at DESC"
-        );
+        let sql =
+            pg_composers_referencing_any_sql(attested_key_id.is_some(), attesting_key_id.is_some());
         let client = self
             .get_client()
             .await
@@ -8377,13 +8369,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         dimension: &str,
         evidence_ref: &str,
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let sql = format!(
-            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
-             WHERE attesting_key_id = $1 AND dimension COLLATE \"C\" = $2 \
-               AND (attestation_envelope::jsonb->'evidence_refs'->>0) = $3 \
-               AND tier = 'federation' \
-             ORDER BY asserted_at DESC"
-        );
+        let sql = pg_by_dimension_citing_sql();
         let client = self
             .get_client()
             .await
@@ -23537,6 +23523,42 @@ const PG_ATTESTATION_COLUMNS: &str = "attestation_id::text, attesting_key_id, at
     original_content_hash, scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
     scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, \
     withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs";
+
+/// v61 — `list_attestations_by_dimension_citing`'s statement (`$1` the
+/// attester, `$2` the dimension, `$3` the cited blob), spelled once so the
+/// plan witness reads the statement the door runs.
+pub(crate) fn pg_by_dimension_citing_sql() -> String {
+    format!(
+        "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+         WHERE attesting_key_id = $1 AND dimension COLLATE \"C\" = $2 \
+           AND (attestation_envelope::jsonb->'evidence_refs'->>0) = $3 \
+           AND tier = 'federation' \
+         ORDER BY asserted_at DESC"
+    )
+}
+
+/// v61 — `list_composers_referencing_any`'s statement (`$1` the id set,
+/// `$2..$4` the composer types, then the attested axis and the attesting
+/// axis, each when pinned, in that order), spelled once so the plan witness
+/// reads the statement the door runs.
+pub(crate) fn pg_composers_referencing_any_sql(attested: bool, attesting: bool) -> String {
+    let mut axes = String::new();
+    let mut next = 5;
+    if attested {
+        axes.push_str(&format!(" AND attested_key_id = ${next}"));
+        next += 1;
+    }
+    if attesting {
+        axes.push_str(&format!(" AND attesting_key_id = ${next}"));
+    }
+    format!(
+        "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+         WHERE tier = 'federation' \
+           AND attestation_type IN ($2, $3, $4) \
+           AND (attestation_envelope::jsonb->>'references_attestation_id') = ANY($1){axes} \
+         ORDER BY asserted_at DESC"
+    )
+}
 
 /// v53.1.5 — the #817/#818 dimension-prefix predicate over V106's stored
 /// column, `COLLATE "C"` so the byte range is what the V137 / V178 indexes
