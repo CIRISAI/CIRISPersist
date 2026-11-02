@@ -27,7 +27,7 @@ Each ported gate keeps its original Rust witness beside the AST rule, and `src/a
 |---|---|---|---|
 | `i110-check-consent-scope-tokens` | `consent_scope_invariants.rs::i110_one_matcher_every_door` (≥ 2/2/2/1) | calls of `check_consent_scope_tokens` in sqlite, postgres, admission | 2/2/2/1 exactly |
 | `i119-check-media-source` | `media_source_invariants.rs::i119_every_door_and_the_vocabulary` (≥ 2/2/2/1) | calls of `check_media_source`, same four files | 2/2/2/1 exactly |
-| `i448-prev-head-check` | `lineage_head_invariants.rs::i448_every_backend_runs_the_prev_check_on_both_arms` (== 2 per backend) | calls of `check_prev_head_names_held` inside `fn supersede_group_row`, both backends | 2/2 |
+| `i448-prev-head-check` | `lineage_head_invariants.rs::i448_every_backend_runs_the_prev_check_on_both_arms` (== 2 per backend) | calls of `held_head_verdict` (the shared verdict that runs `check_prev_head_names_held`) inside `fn store_planned_supersede`, both backends (v61 #934 S4b) | 2/2 |
 | `scores-read-log` | `scores_read_audit.rs::every_scores_read_site_logs` (1 per site, 4 sites) | calls of `log_scores_read` inside `fn list_scores` / `fn resolve_scores`, both backends | 2/2 |
 | `i26-cached-content-master` | `blob_surface_gates.rs::i26_backends_resolve_the_content_master_through_the_cache` (cached ≥ 1) | calls of `resolve_persisted_content_master_cached`, sqlite + postgres | 1/1 |
 | `i26-uncached-content-master` | the same test (uncached == 0) | calls of `resolve_persisted_content_master`, sqlite + postgres | 0/0 |
@@ -118,7 +118,7 @@ Classes:
 | 〃 | i78_occurrence_plane_lists_signed_put_rows_only | I78 | sqlite, postgres | SQL has `attesting_key_id IS NOT NULL` | TEXTUAL (SQL) |
 | 〃 | i66e_every_dek_plane_door_resolves_the_sentinel_first | I66e, I68 | engine.rs | 16 doors call `ensure_minter_sentinels_resolved()` | AST-STRUCT |
 | federation/key_rebind_invariants.rs | i103_one_rule_every_door | I103 | register, backends, pyo3, engine | one `ReplicatedKeyPlan::Rebind` arm; mirrors delegate | AST-COUNT + AST-STRUCT |
-| federation/lineage_head_invariants.rs | **i448_every_backend_runs_the_prev_check_on_both_arms** | I448 | backends | 2 `check_prev_head_names_held(` in `supersede_group_row` | AST-COUNT — **ported** |
+| federation/lineage_head_invariants.rs | **i448_every_backend_runs_the_prev_check_on_both_arms** | I448 | backends | 2 `held_head_verdict(` in `store_planned_supersede`; the verdict runs `check_prev_head_names_held(` on both head kinds | AST-COUNT — **ported** |
 | federation/load_bearing.rs | nothing_yields_anti_entropy_satisfied_today | #564 | all src | nothing constructs `AntiEntropy::Satisfied` | AST-COUNT (== 0) |
 | federation/media_source_invariants.rs | **i119_every_door_and_the_vocabulary** | I119 | backends, admission, envelope | `check_media_source(` per door | AST-COUNT — **ported** |
 | federation/mesh_config.rs | the_doc_counts_match_the_registry | #602 | mesh_config.rs | prose key count == `ALL.len()` | TEXTUAL |

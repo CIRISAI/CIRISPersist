@@ -138,6 +138,16 @@ jobs:
           - {scope: scope-s4a-plans, shard: '6/9', id: s4a-plans-6-of-9, weekly: true}
           - {scope: scope-s4a-plans, shard: '7/9', id: s4a-plans-7-of-9, weekly: true}
           - {scope: scope-s4a-plans, shard: '8/9', id: s4a-plans-8-of-9, weekly: true}
+          # v61 S4b (CIRISPersist#934): the last identical doors' shared plans
+          # (transport, occurrence, family, supersede). ~90 mutants (ESTIMATED:
+          # 30 fns at ~3 each), five shards of <= 18; the witness filter is the
+          # doors' own suites on both backends (~330 s per mutant, ESTIMATED
+          # as S4a's), so 600 s + 330 s x 18 = 6540 s each, weekly.
+          - {scope: scope-s4b-plans, shard: '0/5', id: s4b-plans-0-of-5, weekly: true}
+          - {scope: scope-s4b-plans, shard: '1/5', id: s4b-plans-1-of-5, weekly: true}
+          - {scope: scope-s4b-plans, shard: '2/5', id: s4b-plans-2-of-5, weekly: true}
+          - {scope: scope-s4b-plans, shard: '3/5', id: s4b-plans-3-of-5, weekly: true}
+          - {scope: scope-s4b-plans, shard: '4/5', id: s4b-plans-4-of-5, weekly: true}
           # The S3 record-shape breaks (CC 2.6.2 strict instants, #1126, #1101,
           # #1122, #1146, #1156): 147 mutants, six shards of <= 25
           # (600 s + 168 s x 25 = 4800 s each), weekly.

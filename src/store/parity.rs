@@ -128,6 +128,27 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v61 (CIRISPersist#934, S4b) — the group supersede, and the verdict its
+    // executor asks of the held head inside its transaction.
+    ("supersede_group_row_planned", Class::Plan),
+    ("held_head_verdict", Class::Plan),
+    // v61 (CIRISPersist#934, S4b) — the transport row mappers' stored
+    // `binding_provenance` decode (its gate is `from_token`).
+    ("stored_binding_provenance", Class::Plan),
+    // Gates: `self` is not versioned; a snapshot that is not the signed
+    // wrapper of the cohort's record is refused (#651).
+    ("check_supersede_cohort", Class::Gate),
+    ("decode_planned_head", Class::Gate),
+    ("store_planned_supersede", Class::Plumbing),
+    // v61 (CIRISPersist#934, S4b) — the family doors.
+    ("put_family_planned", Class::Plan),
+    ("put_family_local_planned", Class::Plan),
+    ("put_family_membership_revocation_planned", Class::Plan),
+    ("put_family_membership_widening_planned", Class::Plan),
+    // The family executor (storage only; compared across backends as the `FamilyStore` trait).
+    ("store_family_signature", Class::Plumbing),
+    ("store_planned_family_revocation", Class::Plumbing),
+    ("store_planned_family_widening", Class::Plumbing),
     // v61 (CIRISPersist#934, S4b) — the identity-occurrence writes.
     ("put_identity_occurrence_planned", Class::Plan),
     ("put_identity_occurrence_local_planned", Class::Plan),
@@ -139,9 +160,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("store_planned_local_occurrence", Class::Plumbing),
     ("index_occurrence_row", Class::Plumbing),
     // v61 (CIRISPersist#1148) — the replicated community apply's put-time
-    // audience precondition (`may_receive_community_record`, Gate) and the
-    // node key it asks about (`node_key_id`, Plumbing) are each classified
-    // once, below; the S2/S4b merge had listed both twice.
+    // audience precondition: the verdict refuses a record this node may not
+    // receive (a Gate), asked about this node's own key (Plumbing: a read of
+    // the node's identity). Classified exactly once.
+    ("may_receive_community_record", Class::Gate),
+    ("node_key_id", Class::Plumbing),
     // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
     ("put_transport_destination_planned", Class::Plan),
     ("put_signed_transport_destination_planned", Class::Plan),
@@ -319,11 +342,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // `held_owner`'s reads (Plumbing: a held-state lookup that fails only on
     // the store's terms) and its axis decode (`sha_of`, Gate: a malformed
     // hex digest on the caller's axis is refused).
-    // v61 (CIRISPersist#1148) — the host's declared node key (an infallible
-    // read of configuration; `None` keeps the pre-v61 behaviour, the host
-    // gating, which is why it is not the fail-open direction for a node that
-    // has declared itself).
-    ("node_key_id", Class::Plumbing),
     ("blob_provenance", Class::Plumbing),
     ("stream_key_state", Class::Plumbing),
     ("sha_of", Class::Gate),
@@ -441,10 +459,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("pg_row_to_hard_case_event", Class::Plumbing),
     ("sqlite_render_table", Class::Plumbing),
     ("pg_render_table", Class::Plumbing),
-    // v60.0.0 (CIRISPersist#720) — the lifecycle filter's one predicate: it
-    // renders a read's WHERE fragment and refuses nothing (`None` is "this
-    // view hides nothing", not a failure).
-    ("lifecycle_predicate", Class::Plumbing),
     ("execute_batch", Class::Plumbing),
     ("batch_execute", Class::Plumbing),
     // The two projections (rows → table): a derivation that answers `None`
@@ -763,11 +777,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // presented lineage head is absent, stale or unwitnessed under an armed
     // charter (`trust_root_head_stale`).
     ("check_attach_freshness", Class::Gate),
-    // v50.0.0 (PR #921 review) — Plumbing: the `cfg(test)` rival write a
-    // witness arms at a fixed point of a community write
-    // (`store::test_hooks::RivalPoint`); never armed outside a test, so it
-    // adds nothing to a door's production sequence.
-    ("test_rival_at", Class::Plumbing),
     // v53.1.3 (CIRISPersist#986) — Plumbing: the `cfg(test)` rival withdrawal
     // I524 arms between the withdraw door's held read and its compare-and-set
     // write (`store::test_hooks::arm_rival_location_proof_withdrawal`); never
@@ -780,9 +789,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_trust_root_at_door", Class::Gate),
     ("check_consensus_protocol_form", Class::Gate),
     ("check_family_consensus_protocol_form", Class::Gate),
-    // v61 (CIRISPersist#1148) — the typed replicated record door's audience
-    // precondition: it refuses a record this node may not receive.
-    ("may_receive_community_record", Class::Gate),
     ("check_content_hash_hex", Class::Gate),
     ("check_delegated_duty_scores_admission", Class::Gate),
     // v60.0.0 (CIRISPersist#803) — the `takedown_notice:{basis}:v1` row's
@@ -1220,7 +1226,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // answer (cap, seq conflict, moved epoch).
     ("sqlite_append_chunk_item", Class::Delegates),
     ("pg_append_chunk_item", Class::Delegates),
-    ("put_family_local", Class::Delegates),
     // v61 (CIRISPersist#1122) — the occurrence write projects its route
     // through one shared step, which skips an agent's and otherwise runs the
     // local route door (its gates).
@@ -1508,7 +1513,14 @@ mod tests {
     /// The traits whose impls are compared, and where each trait's **default**
     /// bodies live. A backend that does not override a defaulted method runs
     /// the default, so the default's gate sequence is what it contributes.
-    const TRAITS: [(&str, &str); 18] = [
+    const TRAITS: [(&str, &str); 20] = [
+        // v61 (CIRISPersist#934, S4b) — the group supersede.
+        (
+            "GroupSupersedeStore",
+            "src/federation/group_supersede_admit.rs",
+        ),
+        // v61 (CIRISPersist#934, S4b) — the family doors.
+        ("FamilyStore", "src/federation/family_admit.rs"),
         // v61 (CIRISPersist#934, S4b) — the identity-occurrence writes.
         ("OccurrenceStore", "src/federation/occurrence_admit.rs"),
         // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
@@ -1547,7 +1559,32 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 65] = [
+    const SHARED_PLANS: [(&str, &str); 72] = [
+        // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance.
+        (
+            "src/federation/transport_admit.rs",
+            "stored_binding_provenance",
+        ),
+        // v61 (CIRISPersist#934, S4b) — the group supersede.
+        (
+            "src/federation/group_supersede_admit.rs",
+            "supersede_group_row_planned",
+        ),
+        (
+            "src/federation/group_supersede_admit.rs",
+            "held_head_verdict",
+        ),
+        // v61 (CIRISPersist#934, S4b) — the family doors.
+        ("src/federation/family_admit.rs", "put_family_planned"),
+        ("src/federation/family_admit.rs", "put_family_local_planned"),
+        (
+            "src/federation/family_admit.rs",
+            "put_family_membership_revocation_planned",
+        ),
+        (
+            "src/federation/family_admit.rs",
+            "put_family_membership_widening_planned",
+        ),
         // v61 (CIRISPersist#934, S4b) — the identity-occurrence writes.
         (
             "src/federation/occurrence_admit.rs",
@@ -1789,7 +1826,42 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 75] = [
+    const SHARED_DOORS: [(&str, &str, &str); 82] = [
+        // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance,
+        // decoded by the row mapper both doors read through.
+        (
+            "FederationDirectory",
+            "list_signed_transport_destinations_since",
+            "stored_binding_provenance",
+        ),
+        (
+            "TransportStore",
+            "store_planned_signed_destination",
+            "stored_binding_provenance",
+        ),
+        // v61 (CIRISPersist#934, S4b) — the group supersede.
+        (
+            "FederationDirectory",
+            "supersede_group_row",
+            "supersede_group_row_planned",
+        ),
+        // v61 (CIRISPersist#934, S4b) — the family doors.
+        ("FederationDirectory", "put_family", "put_family_planned"),
+        (
+            "FederationDirectory",
+            "put_family_local",
+            "put_family_local_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_family_membership_revocation",
+            "put_family_membership_revocation_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_family_membership_widening",
+            "put_family_membership_widening_planned",
+        ),
         // v61 (CIRISPersist#934, S4b) — the identity-occurrence writes.
         (
             "FederationDirectory",
@@ -3728,14 +3800,16 @@ mod tests {
 
     /// v56.0.0 (CIRISPersist#934 step 1) — **the door report**: one line per
     /// door saying WHERE its decision lives, the question #934 asks of every
-    /// door. A report, not a gate: [`every_backend_runs_the_same_gates_in_the_same_order`]
-    /// and [`shared_doors_decide_nothing_in_a_backend`] are the gates. Run with
+    /// door. A report, not a gate: [`every_backend_runs_the_same_gates_in_the_same_order`],
+    /// [`shared_doors_decide_nothing_in_a_backend`] and (v61, #934 step 5)
+    /// [`no_backend_door_reads_identical`] are the gates. Run with
     /// `cargo test --lib store::parity::tests::door_report -- --ignored --nocapture`.
     ///
     /// - `shared` — every backend's door is a call into a shared plan and runs
     ///   no gate of its own (the #934 target shape);
     /// - `identical xN (k gates)` — the decision is written N times, byte-equal
-    ///   by this scan (the #670 state, the triplication #934 removes);
+    ///   by this scan (the #670 state, the triplication #934 removed; RED since
+    ///   v61 by [`no_backend_door_reads_identical`]);
     /// - `declared` — a [`DECLARED_DIVERGENCES`] row pins one backend's shape;
     /// - `gateless` — no backend runs a gate in this door.
     #[test]
@@ -3759,6 +3833,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// v61 (CIRISPersist#934 step 5) — **no backend door reads
+    /// `identical`.** Every door that wrote the same decision once per
+    /// backend has moved onto a shared plan (S4a, S4b), so the class the
+    /// [`door_report`] calls `identical` is now RED: a door that re-grows a
+    /// copied gate sequence in every backend fails here, naming the door and
+    /// its sequence, instead of reading as parity. The fix is a plan (a
+    /// [`SHARED_PLANS`] body the backends call), not a second copy.
+    #[test]
+    fn no_backend_door_reads_identical() {
+        let scan = scan();
+        let mut failures = Vec::new();
+        for ((trait_name, method), per_backend) in &scan.doors {
+            let seqs: Vec<(&str, &Vec<String>)> = BACKENDS
+                .iter()
+                .filter_map(|(b, _)| per_backend.get(*b).map(|(s, _)| (*b, s)))
+                .collect();
+            let verdict = door_verdict(trait_name, method, &seqs);
+            if verdict.starts_with("identical") {
+                let seq = seqs.first().map(|(_, s)| (*s).clone()).unwrap_or_default();
+                failures.push(format!(
+                    "{trait_name}::{method} reads {verdict}: {seq:?} is decided once per \
+                     backend; move it onto a shared plan (#934)"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// The one-word answer [`door_report`] prints for a door.

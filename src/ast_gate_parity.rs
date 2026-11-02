@@ -36,8 +36,8 @@ const PORTED: &[(&str, &str, &[&str])] = &[
     ),
     (
         "i448-prev-head-check",
-        "check_prev_head_names_held",
-        &["supersede_group_row"],
+        "held_head_verdict",
+        &["store_planned_supersede"],
     ),
     (
         "scores-read-log",

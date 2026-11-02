@@ -492,6 +492,8 @@ pub(crate) mod bodies {
         assert_eq!(disposition(&at_now, "me", now), Disposition::Heal);
     }
 
+    // Used only by I-IFP-10 (`ffi::pyo3::instant_form_open_tests`).
+    #[cfg(feature = "_pyffi")]
     /// What [`seed_v60_own_and_foreign`] left on disk.
     pub(crate) struct V60Seeded {
         pub(crate) me: String,
@@ -500,6 +502,8 @@ pub(crate) mod bodies {
         pub(crate) later: chrono::DateTime<chrono::Utc>,
     }
 
+    // Used only by I-IFP-10 (`ffi::pyo3::instant_form_open_tests`).
+    #[cfg(feature = "_pyffi")]
     /// Two v60-form rows through the I-IFP-1 seam: this node's own `scores`
     /// row and a peer's `scores` row (one that keeps no force), each with its
     /// `valid_until` rewritten to the `+00:00` form and re-signed by its author.
@@ -563,6 +567,8 @@ pub(crate) mod bodies {
         }
     }
 
+    // Used only by I-IFP-10 (`ffi::pyo3::instant_form_open_tests`).
+    #[cfg(feature = "_pyffi")]
     /// From disk, after an open: the peer's row is gone and recorded once in
     /// `federation_attestations_form_refused`; this node's row stays and has
     /// exactly one `.sssZ` `supersedes` naming it.

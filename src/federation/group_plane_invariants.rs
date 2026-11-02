@@ -276,9 +276,16 @@ pub(crate) mod bodies {
         };
         let mut signed = ts::sign_family_membership_revocation(&ann, removal);
         ts::cosign_family_membership_revocation(&mut signed, &ben);
-        d.put_family_membership_revocation(signed)
+        d.put_family_membership_revocation(signed.clone())
             .await
             .expect("2 of 3 remove");
+        // v61 (CIRISPersist#934, S4b) — an exact repeat is the ON CONFLICT
+        // no-op, and the shared plan still syncs its group row on every
+        // backend (postgres skipped the sync until S4b). The sync is
+        // idempotent: the repeat leaves exactly one removal row, still linked.
+        d.put_family_membership_revocation(signed)
+            .await
+            .expect("an exact repeat is a no-op");
         let removals = rows(
             d,
             GroupPlaneTable::FamilyRevocations,
@@ -288,8 +295,9 @@ pub(crate) mod bodies {
         assert_eq!(
             removals.iter().filter(|r| r.attested_key_id == cat).count(),
             1,
-            "{tag}: one removal row"
+            "{tag}: one removal row, a repeated revocation included"
         );
+        all_linked(d, GroupPlaneTable::FamilyRevocations, tag).await;
         assert_placed(&removals, gp::GroupKind::Family, &fam, tag);
 
         // Resign: dan leaves on his own signature.

@@ -589,6 +589,43 @@ impl SqliteBackend {
         Ok(n)
     }
 
+    /// v61 (the canonical's read storm) — **planner statistics at open.**
+    /// Nothing ever ran ANALYZE, so every node planned on SQLite's heuristics
+    /// alone. When `sqlite_stat1` does not exist (a store never analyzed:
+    /// every node upgrading to v61, and every fresh store) this runs ANALYZE
+    /// ONCE, bounded by `analysis_limit` (rows sampled per index, so the cost
+    /// does not grow with the store), then `PRAGMA optimize` on every open,
+    /// which re-analyzes only what SQLite judges stale. Hygiene, not the fix:
+    /// the storm's statements are pinned with INDEXED BY, because statistics
+    /// did not move them (measured on a copy of the live store). A failure
+    /// here is logged and the open proceeds — statistics are advisory.
+    pub(crate) async fn plan_statistics_at_open(&self) {
+        let r = self
+            .write(|conn| -> Result<bool, rusqlite::Error> {
+                let analyzed: i64 = conn.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let first = analyzed == 0;
+                if first {
+                    conn.execute_batch(
+                        "PRAGMA analysis_limit = 1000; ANALYZE; PRAGMA analysis_limit = 0;",
+                    )?;
+                }
+                conn.execute_batch("PRAGMA optimize;")?;
+                Ok(first)
+            })
+            .await;
+        match r {
+            Ok(true) => tracing::info!("sqlite: first ANALYZE ran (analysis_limit 1000)"),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "sqlite: planner statistics at open failed; open proceeds")
+            }
+        }
+    }
+
     /// Test-only: apply migrations up to and including `version`, so a test
     /// can seed rows in the PRE-migration shape and then run the rest.
     #[cfg(any(test, feature = "test-anchor"))]
@@ -1632,6 +1669,8 @@ impl Backend for SqliteBackend {
         self.legacy_community_trust_grants_at_open()
             .await
             .map_err(|e| Error::Backend(format!("community_trust grandfather count: {e}")))?;
+        // v61 (the canonical's read storm) — planner statistics, last.
+        self.plan_statistics_at_open().await;
         Ok(())
     }
 
@@ -4176,22 +4215,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             SqlValue::Text(attestation_type::RECANTS.to_owned()),
             SqlValue::Text(attestation_type::SUPERSEDES.to_owned()),
         ];
-        let mut axes = String::new();
         if let Some(k) = attested_key_id {
             binds.push(SqlValue::Text(k.to_owned()));
-            axes.push_str(&format!(" AND attested_key_id = ?{}", binds.len()));
         }
         if let Some(k) = attesting_key_id {
             binds.push(SqlValue::Text(k.to_owned()));
-            axes.push_str(&format!(" AND attesting_key_id = ?{}", binds.len()));
         }
-        let sql = format!(
-            "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
-             WHERE tier = 'federation' \
-               AND attestation_type IN (?2, ?3, ?4) \
-               AND json_extract(attestation_envelope, '$.references_attestation_id') \
-                   IN (SELECT value FROM json_each(?1)){axes} \
-             ORDER BY asserted_at DESC"
+        let sql = sqlite_composers_referencing_any_sql(
+            attested_key_id.is_some(),
+            attesting_key_id.is_some(),
         );
         let (read, bytes) = self
             .read_measured(
@@ -4272,13 +4304,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             SqlValue::Text(dimension.to_owned()),
             SqlValue::Text(evidence_ref.to_owned()),
         ];
-        let sql = format!(
-            "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
-             WHERE attesting_key_id = ?1 AND dimension = ?2 \
-               AND json_extract(attestation_envelope, '$.evidence_refs[0]') = ?3 \
-               AND tier = 'federation' \
-             ORDER BY asserted_at DESC"
-        );
+        let sql = sqlite_by_dimension_citing_sql();
         let (read, bytes) = self
             .read_measured(
                 move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
@@ -5169,136 +5195,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         family: crate::federation::SignedFamily,
     ) -> Result<(), crate::federation::Error> {
-        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
-        // other admission step. Hybrid-Strict vs the authority's registered
-        // pubkeys — was FK-existence only, a forgeable keyless declaration.
-        crate::federation::verify_family_admission(self, &family).await?;
-        // v61 (CIRISPersist#991) — the object as signed, for its row.
-        let offered = crate::federation::group_plane::GroupSigned::Family(family.clone());
-        // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
-        // is a no-op, a proof-carrying amendment this node's own state
-        // authorizes is applied as a supersede, anything else is refused.
-        if let crate::federation::group_amendment::OccupiedRoute::Settled(_) =
-            crate::federation::group_amendment::route_occupied_family(self, &family).await?
-        {
-            return Ok(());
-        }
-        let crate::federation::SignedFamily {
-            family: row,
-            authority_key_id,
-            scrub_signature_classical,
-            scrub_signature_pqc,
-            supersede_proof,
-            cosignatures,
-        } = family;
-        let supersede_proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
-        // v52.0.0 (#955, V162) — the founding members' consent travels with the
-        // authority signature it sits beside.
-        let cosignatures_json = serde_json::to_string(&cosignatures)
-            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
-        let family_key_id = row.family_key_id.clone();
-        self.put_family_local(row).await?;
-        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
-        // signature the gate above already verified (was verified-then-
-        // discarded: the durable row had no home for it, so it couldn't
-        // prove its own authorship later). `put_family_local` (the
-        // genesis-bake bypass) is untouched — its INSERT leaves these
-        // columns NULL, correct for a legitimately-unsigned bake row; this
-        // UPDATE targets only the signed, gate-verified path.
-        let family_key_id_for_db = family_key_id.clone();
-        let authority_key_id_for_db = authority_key_id.clone();
-        let scrub_signature_classical_for_db = scrub_signature_classical.clone();
-        let scrub_signature_pqc_for_db = scrub_signature_pqc.clone();
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            // v36.0.0 (#668) — attaching the authority signature is what makes
-            // the row VISIBLE to the signed serve cursor, so the serve
-            // position is re-stamped here: admission to the signed stream is
-            // this statement, not the local insert above.
-            let admitted_at = sqlite_next_plane_position(conn, "federation_families", POS_FOUNDED)?;
-            conn.execute(
-                "UPDATE federation_families \
-                    SET authority_key_id = ?2, scrub_signature_classical = ?3, \
-                        scrub_signature_pqc = ?4, admitted_at = ?5, supersede_proof = ?6, \
-                        cosignatures = ?7 \
-                  WHERE family_key_id = ?1",
-                rusqlite::params![
-                    family_key_id_for_db,
-                    authority_key_id_for_db,
-                    scrub_signature_classical_for_db,
-                    scrub_signature_pqc_for_db,
-                    admitted_at.to_rfc3339(),
-                    // v49.0.0 (#910.5) — a first copy of an amended version
-                    // keeps its proof, so the next peer can apply it.
-                    supersede_proof_json,
-                    cosignatures_json,
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("store family authority signature: {e}"))
-        })?;
-        // v61 (CIRISPersist#991) — the row follows its object.
-        crate::federation::group_plane::sync_group_row_offered(
-            self,
-            offered.link(),
-            Some(&offered),
-        )
-        .await?;
-        Ok(())
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::family_admit::put_family_planned(self, family).await
     }
 
     async fn put_family_local(
         &self,
-        mut row: crate::federation::types::Family,
+        row: crate::federation::types::Family,
     ) -> Result<(), crate::federation::Error> {
-        crate::federation::admission::check_family_consensus_protocol_form(
-            &row.consensus_protocol,
-        )?;
-        // v13.3.0 (CIRISPersist#386) — the real invariant (replaces the dropped
-        // family_key_id FK): every member key_id must be a registered key.
-        crate::federation::admission::validate_family_members(self, &row).await?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let members_json = serde_json::to_string(&row.members)
-            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            // v36.0.0 (#668) — THIS node's serve position (V130).
-            let admitted_at = sqlite_next_plane_position(conn, "federation_families", POS_FOUNDED)?;
-            conn.execute(
-                "INSERT INTO federation_families (\
-                    family_key_id, family_name, members, founded_at, \
-                    consensus_protocol, consensus_protocol_entrenched, persist_row_hash, \
-                    admitted_at, dissolved_at, prev_head_digest, charter_digest\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                rusqlite::params![
-                    row.family_key_id,
-                    row.family_name,
-                    members_json,
-                    row.founded_at.to_rfc3339(),
-                    row.consensus_protocol,
-                    row.consensus_protocol_entrenched as i64,
-                    row.persist_row_hash,
-                    admitted_at.to_rfc3339(),
-                    row.dissolved_at.map(|t| t.to_rfc3339()),
-                    row.prev_head_digest,
-                    row.charter_digest,
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("FOREIGN KEY") {
-                crate::federation::Error::InvalidArgument(format!(
-                    "FK constraint violated on family insert: {msg}"
-                ))
-            } else {
-                crate::federation::Error::Backend(format!("insert family: {msg}"))
-            }
-        })?;
-        Ok(())
+        crate::federation::family_admit::put_family_local_planned(self, row).await
     }
 
     // #249 Cut G2 — supersede + versioning (CIRISServer #249 §3/§8).
@@ -5308,357 +5213,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         new_snapshot: serde_json::Value,
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, crate::federation::Error> {
-        // v61 (CIRISPersist#991) — the new head as its signer signed it, for
-        // its `group:roster:v1` row.
-        let offered_head = match cohort {
-            crate::federation::cohort::Cohort::Family => {
-                serde_json::from_value::<crate::federation::SignedFamily>(new_snapshot.clone())
-                    .ok()
-                    .map(crate::federation::group_plane::GroupSigned::Family)
-            }
-            crate::federation::cohort::Cohort::Community
-            | crate::federation::cohort::Cohort::Affiliations => {
-                serde_json::from_value::<crate::federation::SignedCommunity>(new_snapshot.clone())
-                    .ok()
-                    .map(crate::federation::group_plane::GroupSigned::Community)
-            }
-            crate::federation::cohort::Cohort::SelfId => None,
-        };
-        // Test-only (PR #921 review, F3): a rival supersede of the same
-        // community lands here, before this one re-checks its prior.
-        #[cfg(test)]
-        if matches!(cohort, crate::federation::cohort::Cohort::Community) {
-            self.test_rival_at(crate::store::test_hooks::RivalPoint::BeforeSupersede)
-                .await?;
-        }
-        use crate::federation::cohort::Cohort;
-        use crate::federation::Error;
-        let now = chrono::Utc::now().to_rfc3339();
-        // v53.0.0 (CC 3.2 T6) — the prev-head check reads it in the closure.
-        let auth_for_prev = authorization.clone();
-        let auth_json = match authorization {
-            Some(v) => Some(
-                serde_json::to_string(&v)
-                    .map_err(|e| Error::Backend(format!("authorization serialize: {e}")))?,
-            ),
-            None => None,
-        };
-        // Map a "group does not exist" sentinel back to a typed error.
-        let not_found = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let nf = not_found.clone();
-        // v49.0.0 (#910.5) — the stale-proof refusal, carried out of the
-        // write closure (whose error type is rusqlite's).
-        type StaleSlot = std::sync::Arc<std::sync::Mutex<Option<Error>>>;
-        let stale: StaleSlot = Default::default();
-        // CC 4.4.3.2.8 / #308: `affiliations` records its version history under
-        // its own `cohort.as_str()` discriminator while sharing the
-        // `federation_communities` storage path below.
-        let cohort_str = match cohort {
-            Cohort::SelfId => {
-                return Err(Error::InvalidArgument(
-                    "supersede: the `self` cohort is not versioned (manage occurrences via \
-                     put_identity_occurrence / put_identity_occurrence_revocation)"
-                        .to_string(),
-                ))
-            }
-            Cohort::Family | Cohort::Community | Cohort::Affiliations => cohort.as_str(),
-        };
-
-        let group_key_id =
-            crate::federation::group_amendment::snapshot_group_key_id(cohort, &new_snapshot);
-        let new_version = match cohort {
-            Cohort::Family => {
-                // v31.0.0 (CIRISPersist#651) — the snapshot is the SIGNED
-                // wrapper. Decoding the bare record here is what silently
-                // stranded the caller's signature: the UPDATE below rewrites
-                // every field `signing_envelope()` covers.
-                let crate::federation::SignedFamily {
-                    family: mut new_fam,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                    supersede_proof,
-                    cosignatures,
-                } = serde_json::from_value(new_snapshot).map_err(|e| {
-                    Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
-                })?;
-                let proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
-                let cosignatures_json = serde_json::to_string(&cosignatures)
-                    .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
-                let stale = stale.clone();
-                new_fam.persist_row_hash =
-                    crate::federation::types::compute_persist_row_hash(&new_fam)?;
-                let members_json = serde_json::to_string(&new_fam.members)
-                    .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
-                self.write(move |conn| -> Result<u32, rusqlite::Error> {
-                    let tx = conn.transaction()?;
-                    let prior = tx
-                        .query_row(
-                            "SELECT version, family_key_id, family_name, members, founded_at, \
-                                    consensus_protocol, consensus_protocol_entrenched, \
-                                    dissolved_at, prev_head_digest, charter_digest, persist_row_hash \
-                             FROM federation_families WHERE family_key_id = ?1",
-                            [&new_fam.family_key_id],
-                            |r| Ok((r.get::<_, u32>("version")?, sqlite_row_to_family(r)?)),
-                        )
-                        .optional()?;
-                    let (prior_version, prior_fam) = match prior {
-                        Some(p) => p,
-                        None => {
-                            nf.store(true, std::sync::atomic::Ordering::SeqCst);
-                            return Err(rusqlite::Error::QueryReturnedNoRows);
-                        }
-                    };
-                    // v49.0.0 (#910.5) — a proof names the version it replaces;
-                    // checked inside the transaction that replaces it.
-                    if let Some(p) = &supersede_proof {
-                        crate::federation::group_amendment::check_proof_names_prior(
-                            cohort_str,
-                            &new_fam.family_key_id,
-                            p,
-                            &prior_fam.persist_row_hash,
-                        )
-                        .map_err(|e| {
-                            *stale.lock().expect("stale slot") = Some(e);
-                            rusqlite::Error::QueryReturnedNoRows
-                        })?;
-                    }
-                    // v53.0.0 (CC 3.2 T6) — the version names the head it
-                    // succeeds, judged inside the transaction that replaces it.
-                    crate::federation::group_amendment::check_prev_head_names_held(
-                        cohort_str,
-                        &new_fam.family_key_id,
-                        &new_fam.prev_head_digest,
-                        &prior_fam.persist_row_hash,
-                        auth_for_prev.as_ref(),
-                    )
-                    .map_err(|e| {
-                        *stale.lock().expect("stale slot") = Some(e);
-                        rusqlite::Error::QueryReturnedNoRows
-                    })?;
-                    let snapshot = serde_json::to_string(&prior_fam)
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                    tx.execute(
-                        "INSERT INTO federation_group_versions \
-                            (cohort, group_key_id, version, snapshot, change_authorization, \
-                             superseded_at, persist_row_hash) \
-                         VALUES ('family', ?1, ?2, ?3, ?4, ?5, ?6)",
-                        rusqlite::params![
-                            new_fam.family_key_id,
-                            prior_version,
-                            snapshot,
-                            auth_json,
-                            now,
-                            prior_fam.persist_row_hash,
-                        ],
-                    )?;
-                    let next = prior_version + 1;
-                    // v36.0.0 (#668/#707-class) — a supersede rewrites the
-                    // served bytes; the serve position moves with them.
-                    // Allocated inside the same transaction as the write.
-                    let admitted_at =
-                        sqlite_next_plane_position(&tx, "federation_families", POS_FOUNDED)?;
-                    tx.execute(
-                        "UPDATE federation_families SET \
-                            family_name = ?2, members = ?3, founded_at = ?4, \
-                            consensus_protocol = ?5, consensus_protocol_entrenched = ?6, \
-                            persist_row_hash = ?7, version = ?8, \
-                            authority_key_id = ?9, scrub_signature_classical = ?10, \
-                            scrub_signature_pqc = ?11, admitted_at = ?12, \
-                            supersede_proof = ?13, cosignatures = ?14, dissolved_at = ?15, \
-                            prev_head_digest = ?16, charter_digest = ?17 \
-                         WHERE family_key_id = ?1",
-                        rusqlite::params![
-                            new_fam.family_key_id,
-                            new_fam.family_name,
-                            members_json,
-                            new_fam.founded_at.to_rfc3339(),
-                            new_fam.consensus_protocol,
-                            new_fam.consensus_protocol_entrenched as i64,
-                            new_fam.persist_row_hash,
-                            next,
-                            // v31.0.0 (CIRISPersist#651) — the signature moves
-                            // with the record it authorizes. Updated in the
-                            // SAME statement, so a future edit cannot rewrite
-                            // the roster and forget the authorship.
-                            authority_key_id,
-                            scrub_signature_classical,
-                            scrub_signature_pqc,
-                            admitted_at.to_rfc3339(),
-                            proof_json,
-                            cosignatures_json,
-                            new_fam.dissolved_at.map(|t| t.to_rfc3339()),
-                            new_fam.prev_head_digest,
-                            new_fam.charter_digest,
-                        ],
-                    )?;
-                    tx.commit()?;
-                    Ok(next)
-                })
-                .await
-            }
-            Cohort::Community | Cohort::Affiliations => {
-                // v31.0.0 (CIRISPersist#651) — the SIGNED wrapper; see the
-                // family arm above.
-                let crate::federation::SignedCommunity {
-                    community: mut new_comm,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                    supersede_proof,
-                    cosignatures,
-                    lineage,
-                } = serde_json::from_value(new_snapshot).map_err(|e| {
-                    Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
-                })?;
-                let proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
-                // v50.0.0 (#926, V158) — the co-signatures travel with the
-                // authority signature they sit beside.
-                let cosignatures_json = serde_json::to_string(&cosignatures)
-                    .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
-                let lineage_json = serde_json::to_string(&lineage)
-                    .map_err(|e| Error::Backend(format!("lineage encode: {e}")))?;
-                let stale = stale.clone();
-                new_comm.persist_row_hash =
-                    crate::federation::types::compute_persist_row_hash(&new_comm)?;
-                let members_json = serde_json::to_string(&new_comm.members)
-                    .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
-                let policy_json = match &new_comm.policy_blob {
-                    Some(v) => Some(
-                        serde_json::to_string(v)
-                            .map_err(|e| Error::Backend(format!("policy_blob serialize: {e}")))?,
-                    ),
-                    None => None,
-                };
-                self.write(move |conn| -> Result<u32, rusqlite::Error> {
-                    let tx = conn.transaction()?;
-                    let prior = tx
-                        .query_row(
-                            "SELECT version, community_key_id, community_name, members, \
-                                    founded_at, consensus_protocol, policy_blob, prev_head_digest, charter_digest, persist_row_hash \
-                             FROM federation_communities WHERE community_key_id = ?1",
-                            [&new_comm.community_key_id],
-                            |r| Ok((r.get::<_, u32>("version")?, sqlite_row_to_community(r)?)),
-                        )
-                        .optional()?;
-                    let (prior_version, prior_comm) = match prior {
-                        Some(p) => p,
-                        None => {
-                            nf.store(true, std::sync::atomic::Ordering::SeqCst);
-                            return Err(rusqlite::Error::QueryReturnedNoRows);
-                        }
-                    };
-                    // v49.0.0 (#910.5) — see the family arm.
-                    if let Some(p) = &supersede_proof {
-                        crate::federation::group_amendment::check_proof_names_prior(
-                            cohort_str,
-                            &new_comm.community_key_id,
-                            p,
-                            &prior_comm.persist_row_hash,
-                        )
-                        .map_err(|e| {
-                            *stale.lock().expect("stale slot") = Some(e);
-                            rusqlite::Error::QueryReturnedNoRows
-                        })?;
-                    }
-                    // v53.0.0 (CC 3.2 T6) — see the family arm.
-                    crate::federation::group_amendment::check_prev_head_names_held(
-                        cohort_str,
-                        &new_comm.community_key_id,
-                        &new_comm.prev_head_digest,
-                        &prior_comm.persist_row_hash,
-                        auth_for_prev.as_ref(),
-                    )
-                    .map_err(|e| {
-                        *stale.lock().expect("stale slot") = Some(e);
-                        rusqlite::Error::QueryReturnedNoRows
-                    })?;
-                    let snapshot = serde_json::to_string(&prior_comm)
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                    tx.execute(
-                        "INSERT INTO federation_group_versions \
-                            (cohort, group_key_id, version, snapshot, change_authorization, \
-                             superseded_at, persist_row_hash) \
-                         VALUES (?7, ?1, ?2, ?3, ?4, ?5, ?6)",
-                        rusqlite::params![
-                            new_comm.community_key_id,
-                            prior_version,
-                            snapshot,
-                            auth_json,
-                            now,
-                            prior_comm.persist_row_hash,
-                            cohort_str,
-                        ],
-                    )?;
-                    let next = prior_version + 1;
-                    // v36.0.0 (#668/#707-class) — a supersede rewrites the
-                    // served bytes; the serve position moves with them.
-                    let admitted_at =
-                        sqlite_next_plane_position(&tx, "federation_communities", POS_FOUNDED)?;
-                    tx.execute(
-                        "UPDATE federation_communities SET \
-                            community_name = ?2, members = ?3, founded_at = ?4, \
-                            consensus_protocol = ?5, policy_blob = ?6, \
-                            persist_row_hash = ?7, version = ?8, \
-                            authority_key_id = ?9, scrub_signature_classical = ?10, \
-                            scrub_signature_pqc = ?11, admitted_at = ?12, \
-                            supersede_proof = ?13, cosignatures = ?14, lineage = ?15, \
-                            prev_head_digest = ?16, charter_digest = ?17 \
-                         WHERE community_key_id = ?1",
-                        rusqlite::params![
-                            new_comm.community_key_id,
-                            new_comm.community_name,
-                            members_json,
-                            new_comm.founded_at.to_rfc3339(),
-                            new_comm.consensus_protocol,
-                            policy_json,
-                            new_comm.persist_row_hash,
-                            next,
-                            // v31.0.0 (CIRISPersist#651) — see the family arm.
-                            authority_key_id,
-                            scrub_signature_classical,
-                            scrub_signature_pqc,
-                            admitted_at.to_rfc3339(),
-                            proof_json,
-                            cosignatures_json,
-                            lineage_json,
-                            new_comm.prev_head_digest,
-                            new_comm.charter_digest,
-                        ],
-                    )?;
-                    tx.commit()?;
-                    Ok(next)
-                })
-                .await
-            }
-            Cohort::SelfId => unreachable!("guarded above"),
-        }
-        .map_err(|e| {
-            if let Some(stale) = stale.lock().expect("stale slot").take() {
-                stale
-            } else if not_found.load(std::sync::atomic::Ordering::SeqCst) {
-                Error::InvalidArgument(format!(
-                    "supersede: unknown {cohort_str} group (nothing to supersede)"
-                ))
-            } else {
-                Error::Backend(format!("supersede {cohort_str}: {e}"))
-            }
-        })?;
-        // v61 (CIRISPersist#991) — the new head's `group:roster:v1` row
-        // replaces the prior head's.
-        crate::federation::group_plane::sync_group_row_offered(
+        // v61 (CIRISPersist#934) — the decision is the shared plan's.
+        crate::federation::group_supersede_admit::supersede_group_row_planned(
             self,
-            crate::federation::group_plane::GroupRowLink::record(
-                match cohort {
-                    Cohort::Family => crate::federation::group_plane::GroupKind::Family,
-                    _ => crate::federation::group_plane::GroupKind::Community,
-                },
-                &group_key_id,
-            ),
-            offered_head.as_ref(),
+            cohort,
+            new_snapshot,
+            authorization,
         )
-        .await?;
-        Ok(new_version)
+        .await
     }
 
     // #249 Cut G2 (§8) — full version chain: history rows + the live current.
@@ -6385,118 +5947,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         revocation: crate::federation::SignedFamilyMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
-        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
-        // other admission step.
-        crate::federation::verify_family_membership_revocation_admission(self, &revocation).await?;
-        // v61 (CIRISPersist#991) — the object as signed, for its row.
-        let offered =
-            crate::federation::group_plane::GroupSigned::FamilyRevocation(revocation.clone());
-        let mut row = revocation.family_membership_revocation;
-        // v49.0.0 (CIRISPersist#910.3) — standing, by the family's own
-        // `consensus_protocol` at the row's instant (the #908 family half).
-        crate::federation::check_family_roster_authority(
-            self,
-            &row.family_key_id,
-            &revocation.authority_key_id,
-            &crate::federation::roster_row_signer_set(
-                &revocation.authority_key_id,
-                &revocation.cosignatures,
-            ),
-            crate::federation::types::FamilyMember {
-                key_id: row.removed_identity_key_id.clone(),
-                joined_at: row.effective_at,
-                role: None,
-            },
-            true,
-            row.effective_at,
-        )
-        .await?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let witness = serde_json::to_string(&row.witness_set)
-            .map_err(|e| crate::federation::Error::Backend(format!("witness_set encode: {e}")))?;
-        // CEG §7.7 (CIRISPersist#161 Ask 5) — the removal-direction
-        // membership-change hard_case (`change_kind: "removed"`), keyed on
-        // the re-key epoch. Built before the move-closure consumes `row`;
-        // emitted after the insert (idempotent on event_id).
-        let removal_event = crate::federation::hard_case::membership_removed_event(
-            crate::federation::hard_case::kind::FAMILY_MEMBERSHIP_CHANGE,
-            &row.family_key_id,
-            &row.removed_identity_key_id,
-            row.effective_at,
-        );
-        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
-        // signature the gate above already verified (was verified-then-
-        // discarded).
-        let authority_key_id = revocation.authority_key_id;
-        let scrub_signature_classical = revocation.scrub_signature_classical;
-        let scrub_signature_pqc = revocation.scrub_signature_pqc;
-        // v49.0.0 (CIRISPersist#908, V153) — the co-signatures the gate above
-        // verified, stored so the since-read serves the row byte-exact.
-        let cosignatures = serde_json::to_string(&revocation.cosignatures)
-            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
-        let group_link = crate::federation::group_plane::GroupRowLink::plane(
-            crate::federation::group_plane::GroupPlaneTable::FamilyRevocations,
-            &row.family_key_id,
-            &row.removed_identity_key_id,
-            row.effective_at,
-        );
-        let inserted = self
-            .write(move |conn| -> Result<bool, rusqlite::Error> {
-                // v47.1.0 (CIRISPersist#861) — one transaction, so a repeat can
-                // leave NOTHING behind (the position below included).
-                let tx = conn.transaction()?;
-                // v36.0.0 (#668) — THIS node's serve position (V130).
-                let admitted_at = sqlite_next_plane_position(
-                    &tx,
-                    "federation_family_membership_revocations",
-                    POS_REMOVED,
-                )?;
-                // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK. v49.0.0
-                // (#910.1, V154): the PK carries `effective_at`, so an exact
-                // retry is the no-op (the tx is dropped un-committed, the serve
-                // position with it) and a removal at another instant is another
-                // event — a re-removal after a re-add, or an earlier removal the
-                // fold honours first. The unique index arbitrates (race-safe).
-                let n = tx.execute(
-                    "INSERT INTO federation_family_membership_revocations (\
-                    family_key_id, removed_identity_key_id, removed_at, effective_at, \
-                    reason, witness_set, persist_row_hash, \
-                    authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                    admitted_at, cosignatures\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
-                 ON CONFLICT (family_key_id, removed_identity_key_id, effective_at) DO NOTHING",
-                    rusqlite::params![
-                        row.family_key_id,
-                        row.removed_identity_key_id,
-                        row.removed_at.to_rfc3339(),
-                        row.effective_at.to_rfc3339(),
-                        row.reason,
-                        witness,
-                        row.persist_row_hash,
-                        authority_key_id,
-                        scrub_signature_classical,
-                        scrub_signature_pqc,
-                        admitted_at.to_rfc3339(),
-                        cosignatures,
-                    ],
-                )?;
-                if n == 0 {
-                    return Ok(false); // a repeat: tx dropped, rolled back
-                }
-                tx.commit()?;
-                Ok(true)
-            })
+        crate::federation::family_admit::put_family_membership_revocation_planned(self, revocation)
             .await
-            .map_err(map_revocation_sqlite_err("family_membership_revocation"))?;
-        if inserted {
-            // v57.0.0 (CIRISPersist#988 item 2) — an observation: a node with
-            // no attester records nothing; the removal already landed.
-            crate::federation::hard_case::record_observation(self, removal_event).await?;
-        }
-        // v61 (CIRISPersist#991) — the row follows its object.
-        crate::federation::group_plane::sync_group_row_offered(self, group_link, Some(&offered))
-            .await?;
-        Ok(())
     }
 
     async fn put_community_membership_revocation(
@@ -6523,93 +5975,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         widening: crate::federation::SignedFamilyMembershipWidening,
     ) -> Result<(), crate::federation::Error> {
-        // v49.0.0 (CIRISPersist#910, FSD `ROOM_ROSTER_AUTHORITY.md` §10.1) —
-        // the family twin of the room's widening door: the primary and every
-        // co-signature, no future-dating, standing by the family's own
-        // `consensus_protocol` at the row's instant, the family and the member
-        // existing (the V154 FKs), idempotent on the three-part PK.
-        crate::federation::verify_family_membership_widening_admission(self, &widening).await?;
-        // v61 (CIRISPersist#991) — the object as signed, for its row.
-        let offered = crate::federation::group_plane::GroupSigned::FamilyWidening(widening.clone());
-        let mut row = widening.family_membership_widening;
-        crate::federation::reject_future_dated_family_widening(row.effective_at)?;
-        crate::federation::check_family_roster_authority(
-            self,
-            &row.family_key_id,
-            &widening.authority_key_id,
-            &crate::federation::roster_row_signer_set(
-                &widening.authority_key_id,
-                &widening.cosignatures,
-            ),
-            row.member(),
-            false,
-            row.effective_at,
-        )
-        .await?;
-        if self.lookup_family(&row.family_key_id).await?.is_none() {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "{} does not exist in federation_families",
-                row.family_key_id
-            )));
-        }
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let authority_key_id = widening.authority_key_id;
-        let scrub_signature_classical = widening.scrub_signature_classical;
-        let scrub_signature_pqc = widening.scrub_signature_pqc;
-        let cosignatures = serde_json::to_string(&widening.cosignatures)
-            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
-        let group_link = crate::federation::group_plane::GroupRowLink::plane(
-            crate::federation::group_plane::GroupPlaneTable::FamilyWidenings,
-            &row.family_key_id,
-            &row.member_key_id,
-            row.effective_at,
-        );
-        self.write(move |conn| -> Result<bool, rusqlite::Error> {
-            let admitted_at = sqlite_next_plane_position(
-                conn,
-                "federation_family_membership_widenings",
-                POS_JOINED,
-            )?;
-            let n = conn.execute(
-                "INSERT INTO federation_family_membership_widenings (\
-                    family_key_id, member_key_id, joined_at, effective_at, role, \
-                    persist_row_hash, authority_key_id, scrub_signature_classical, \
-                    scrub_signature_pqc, admitted_at, cosignatures\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
-                 ON CONFLICT (family_key_id, member_key_id, effective_at) DO NOTHING",
-                rusqlite::params![
-                    row.family_key_id,
-                    row.member_key_id,
-                    row.joined_at.to_rfc3339(),
-                    row.effective_at.to_rfc3339(),
-                    row.role,
-                    row.persist_row_hash,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                    admitted_at.to_rfc3339(),
-                    cosignatures,
-                ],
-            )?;
-            Ok(n == 1)
-        })
-        .await
-        .map_err(|e| match e {
-            rusqlite::Error::SqliteFailure(ref f, _)
-                if f.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
-                crate::federation::Error::InvalidArgument(format!(
-                    "FK constraint violated on family_membership_widening insert: {e}"
-                ))
-            }
-            other => crate::federation::Error::Backend(format!(
-                "insert family_membership_widening: {other}"
-            )),
-        })?;
-        // v61 (CIRISPersist#991) — the row follows its object.
-        crate::federation::group_plane::sync_group_row_offered(self, group_link, Some(&offered))
-            .await?;
-        Ok(())
+        crate::federation::family_admit::put_family_membership_widening_planned(self, widening)
+            .await
     }
 
     async fn list_identity_occurrence_revocations_for(
@@ -16846,6 +16213,343 @@ fn sqlite_attestations_referencing_sql() -> String {
     )
 }
 
+/// v61 — `list_attestations_by_dimension_citing`'s statement (`?1` the
+/// attester, `?2` the dimension, `?3` the cited blob), spelled once so the
+/// plan witness reads the statement the door runs.
+///
+/// Pinned to V180's index with INDEXED BY. Unpinned, the planner took V004's
+/// `federation_attestations_attesting (attesting_key_id, asserted_at DESC)`
+/// because it also yields `ORDER BY asserted_at DESC` (the sort-avoidance
+/// heuristic; dropping the ORDER BY alone flips the plan), and walked the
+/// attester's whole history. `ORDER BY +asserted_at` flips it without
+/// statistics but not reliably with them, so the pin is the fix; it also
+/// fails loudly if the index is ever renamed.
+pub(crate) fn sqlite_by_dimension_citing_sql() -> String {
+    format!(
+        "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
+           INDEXED BY federation_attestations_attester_dimension_citation \
+         WHERE attesting_key_id = ?1 AND dimension = ?2 \
+           AND json_extract(attestation_envelope, '$.evidence_refs[0]') = ?3 \
+           AND tier = 'federation' \
+         ORDER BY asserted_at DESC"
+    )
+}
+
+/// v61 — `list_composers_referencing_any`'s statement (`?1` the id set
+/// as a JSON array, `?2..?4` the composer types, then the attested axis and
+/// the attesting axis, each when pinned, in that order), spelled once so the
+/// plan witness reads the statement the door runs.
+pub(crate) fn sqlite_composers_referencing_any_sql(attested: bool, attesting: bool) -> String {
+    let mut axes = String::new();
+    let mut next = 5;
+    if attested {
+        axes.push_str(&format!(" AND attested_key_id = ?{next}"));
+        next += 1;
+    }
+    if attesting {
+        axes.push_str(&format!(" AND attesting_key_id = ?{next}"));
+    }
+    // v61 — each axis form pinned to the index that seeks all three of
+    // its columns (V107 attesting, V178 attested, V212's composer-only
+    // `reference_live` with no axis: V181's `reference_seek` is judged a
+    // scan once statistics see its NULL-heavy key). Unpinned,
+    // the ORDER BY made V004's single-column attester / subject index win
+    // (with or without sqlite_stat1, measured on a copy of the live store),
+    // and every call walked the key's history. The attesting form wins when
+    // both axes are pinned (the attested key is then a residual filter).
+    let pin = if attesting {
+        "federation_attestations_composer_ref"
+    } else if attested {
+        "federation_attestations_attested_composer_ref"
+    } else {
+        "federation_attestations_reference_live"
+    };
+    format!(
+        "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations INDEXED BY {pin} \
+         WHERE tier = 'federation' \
+           AND attestation_type IN (?2, ?3, ?4) \
+           AND json_extract(attestation_envelope, '$.references_attestation_id') \
+               IN (SELECT value FROM json_each(?1)){axes} \
+         ORDER BY asserted_at DESC"
+    )
+}
+
+/// v61 — `list_attestations`' statement and binds for `filter`, `cursor`,
+/// `limit` and `scope`, built once so the plan witnesses EXPLAIN the
+/// statement the door runs.
+pub(crate) fn sqlite_list_attestations_sql(
+    filter: &crate::read::AttestationFilter,
+    cursor: Option<&crate::read::AttestationCursor>,
+    limit: i64,
+    scope: &crate::scope::CallerScope,
+) -> Result<(String, Vec<SqlValue>), crate::read::Error> {
+    // v61 (the canonical's read storm) — with no attester, subject
+    // or dimension pinned, the keyset order is V212's
+    // `(asserted_at DESC, attestation_id DESC)`, pinned: the cursor's
+    // row-value bound seeks it and the walk stops at the LIMIT. Without
+    // it the page was a SCAN of every envelope plus a TEMP B-TREE sort of
+    // every qualifying row (with statistics: a skip-scan of V004's
+    // attester index, the sort unchanged). A pinned key keeps its own
+    // index.
+    let keyed = !filter.attesting_key_ids.is_empty()
+        || filter.attesting_key_id.is_some()
+        || !filter.attested_key_ids.is_empty()
+        || filter.attested_key_id.is_some()
+        || matches!(
+            filter.attester_filter,
+            Some(crate::read::AttesterSet::Explicit(_))
+        )
+        || filter.dimension_exact.is_some()
+        || !filter.dimension_prefixes.is_empty();
+    let from = if keyed {
+        "federation_attestations"
+    } else {
+        "federation_attestations INDEXED BY federation_attestations_asserted_seek"
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let mut binds: Vec<SqlValue> = Vec::new();
+    // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `IN (…)`, never looped.
+    {
+        let keys = crate::ceg::list::federation::merge_key_predicate(
+            filter.attesting_key_id.as_ref(),
+            &filter.attesting_key_ids,
+        );
+        if !keys.is_empty() {
+            let mut ph: Vec<String> = Vec::with_capacity(keys.len());
+            for k in keys {
+                binds.push(SqlValue::Text(k));
+                ph.push(format!("?{}", binds.len()));
+            }
+            parts.push(format!("attesting_key_id IN ({})", ph.join(", ")));
+        }
+    }
+    // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `IN (…)`, never looped.
+    {
+        let keys = crate::ceg::list::federation::merge_key_predicate(
+            filter.attested_key_id.as_ref(),
+            &filter.attested_key_ids,
+        );
+        if !keys.is_empty() {
+            let mut ph: Vec<String> = Vec::with_capacity(keys.len());
+            for k in keys {
+                binds.push(SqlValue::Text(k));
+                ph.push(format!("?{}", binds.len()));
+            }
+            parts.push(format!("attested_key_id IN ({})", ph.join(", ")));
+        }
+    }
+    if let Some(t) = &filter.attestation_type {
+        binds.push(SqlValue::Text(t.clone()));
+        parts.push(format!("attestation_type = ?{}", binds.len()));
+    }
+    if let Some(pqc) = filter.pqc_completed {
+        parts.push(if pqc {
+            "pqc_completed_at IS NOT NULL".to_owned()
+        } else {
+            "pqc_completed_at IS NULL".to_owned()
+        });
+    }
+    // v4.5 (CEG §10.1.5.4) — open-vocab dimension-prefix filter.
+    // v42.1.0 (#817, #818) — compiled as a half-open BYTE RANGE over V106's
+    // generated `dimension` column, never `LIKE`. Two reasons, either
+    // sufficient: SQLite's LIKE is case-INsensitive for ASCII, which
+    // over-matches a dimension CC 3.1.7 R3 defines as a case-sensitive byte
+    // string (#818); and SQLite declines its LIKE-to-range optimization
+    // whenever ESCAPE is present, which we always emitted, so V137's index
+    // would go unused (#817). Served by
+    // `federation_attestations_attester_dimension`.
+    if !filter.dimension_prefixes.is_empty() {
+        let mut ors: Vec<String> = Vec::new();
+        for p in &filter.dimension_prefixes {
+            match crate::ceg::list::federation::dimension_prefix_bounds(p) {
+                Some((lo, hi)) => {
+                    binds.push(SqlValue::Text(lo));
+                    let a = binds.len();
+                    binds.push(SqlValue::Text(hi));
+                    let b = binds.len();
+                    ors.push(format!("(dimension >= ?{a} AND dimension < ?{b})"));
+                }
+                None => {
+                    // No representable upper bound (empty prefix, all-0xFF,
+                    // or a non-UTF-8 successor). `=` on TEXT is a byte
+                    // compare, so this stays case-correct — it is only
+                    // unindexed. Never fall back to LIKE: that reopens #818.
+                    binds.push(SqlValue::Text(p.clone()));
+                    let a = binds.len();
+                    ors.push(format!(
+                        "substr(dimension, 1, {}) = ?{a}",
+                        p.chars().count()
+                    ));
+                }
+            }
+        }
+        parts.push(format!("({})", ors.join(" OR ")));
+    }
+    // v17.5.2 (#461) — EXACT dimension match. Was silently a no-op in
+    // list_attestations (only `dimension_prefixes` was ever applied; a
+    // caller-supplied `dimension_exact` — or a mistaken `{"dimension":…}`
+    // key — filtered nothing), forcing a fetch-then-fold-in-Python. Mirrors
+    // `list_scores`' `dimension_exact`; AND-composed with any prefix set.
+    // v42.1.0 (#817) — reads V106's generated column so the seek can use
+    // V137's index instead of json_extract-ing every row the attester wrote.
+    if let Some(d) = &filter.dimension_exact {
+        binds.push(SqlValue::Text(d.clone()));
+        parts.push(format!("dimension = ?{}", binds.len()));
+    }
+    // v4.5 — point-in-time validity.
+    if let Some(va) = filter.valid_at {
+        binds.push(SqlValue::Text(va.to_rfc3339()));
+        let p = binds.len();
+        parts.push(format!(
+            "(asserted_at <= ?{p} AND (expires_at IS NULL OR expires_at > ?{p}))"
+        ));
+    }
+    // v4.5 — confidence floor (NULL weight excluded when a floor is set).
+    if let Some(floor) = filter.confidence_floor {
+        binds.push(SqlValue::Real(floor));
+        parts.push(format!(
+            "(weight IS NOT NULL AND weight >= ?{})",
+            binds.len()
+        ));
+    }
+    // v4.5 — subject membership (subject_key_ids is a JSON array TEXT).
+    if let Some(subj) = &filter.subject_key_id {
+        binds.push(SqlValue::Text(subj.clone()));
+        parts.push(format!(
+            "EXISTS (SELECT 1 FROM json_each(subject_key_ids) WHERE value = ?{})",
+            binds.len()
+        ));
+    }
+    // v30.0.0 (CIRISPersist#596 item 2) — window / tier / attester_filter.
+    // This builder emitted nine axes and DROPPED these three, so a caller
+    // setting `window` got a bound that was never applied. Same emitter as
+    // `list_scores`, unaliased here because this query does not join.
+    // `tier: None` keeps this handle's historical meaning (no predicate) —
+    // see `sqlite_selection_axes` for why narrowing it silently would be
+    // worse than the inconsistency.
+    sqlite_selection_axes(filter, "", false, &mut parts, &mut binds);
+    // §4.3 scope gate — federation_attestations carries cohort_scope
+    // (V056) + attested_key_id (the row's target identity, V055). The
+    // gate compares the row's cohort_scope/attested_key_id against the
+    // reader's admission.
+    {
+        let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite_with_dimension(
+            scope,
+            "cohort_scope",
+            "attested_key_id",
+            Some("cohort_target"),
+            Some("dimension"),
+            binds.len(),
+        );
+        parts.push(frag);
+        binds.extend(sbinds);
+    }
+    // V4.4 §3 (PR #889 review) — a LOCAL-tier row is visible to its
+    // producing occurrence alone; the collective never reaches it.
+    {
+        let (frag, sbinds) = crate::store::scope_bind::local_tier_predicate_sqlite(
+            scope,
+            "tier",
+            "attesting_key_id",
+            binds.len(),
+        );
+        parts.push(frag);
+        binds.extend(sbinds);
+    }
+    // v49.0.0 (CIRISPersist#909) — the lifecycle view. `Live` is the
+    // documented default and hides rows retracted by a still-hiding
+    // composer from the same attester; this read took the filter and
+    // dropped the axis, so every drive listing showed withdrawn and
+    // replaced files. The same fold `list_scores` applies.
+    if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
+        filter.lifecycle,
+        crate::federation::attestation_query::Dialect::Sqlite,
+        "federation_attestations",
+        binds.len() + 1,
+    ) {
+        binds.extend(types.into_iter().map(SqlValue::Text));
+        parts.push(sql);
+    }
+    if let Some(c) = cursor {
+        if c.version != "v1" {
+            return Err(crate::read::Error::InvalidCursor(format!(
+                "AttestationCursor version {} unsupported; v1 only",
+                c.version
+            )));
+        }
+        binds.push(SqlValue::Text(c.last_asserted_at.to_rfc3339()));
+        let p_at = binds.len();
+        binds.push(SqlValue::Text(c.last_attestation_id.clone()));
+        let p_id = binds.len();
+        parts.push(format!(
+            "(asserted_at, attestation_id) < (?{p_at}, ?{p_id})"
+        ));
+    }
+    let where_sql = if parts.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", parts.join(" AND "))
+    };
+    binds.push(SqlValue::Integer(limit));
+    let p_limit = binds.len();
+    let sql = format!(
+            "SELECT attestation_id, attesting_key_id, attested_key_id, \
+                    attestation_type, weight, asserted_at, expires_at, \
+                    attestation_envelope, original_content_hash, \
+                    scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
+             FROM {from} {where_sql} \
+             ORDER BY asserted_at DESC, attestation_id DESC LIMIT ?{p_limit}"
+        );
+    Ok((sql, binds))
+}
+
+/// v61 — `list_scores`' statement and binds: the read-plan executor's
+/// `read_scores_page` issues exactly this, and the plan witnesses EXPLAIN
+/// it. Storage only: the limit and cursor-version refusals are
+/// `federation::read_plan`'s, ahead of this.
+fn sqlite_list_scores_sql(
+    filter: &crate::read::AttestationFilter,
+    cursor: Option<&crate::read::AttestationCursor>,
+    limit: i64,
+    scope: &crate::scope::CallerScope,
+) -> (String, Vec<SqlValue>) {
+    let (mut parts, mut binds) = sqlite_scores_shared_predicates(filter, scope);
+    // lifecycle: exclude rows retracted by a still-hiding composer (the
+    // one predicate, CIRISPersist#720; the composer-target path is the
+    // ONE envelope-path constant, #495 C2; an admitted retraction hides
+    // whoever authored it, #945).
+    if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
+        filter.lifecycle,
+        crate::federation::attestation_query::Dialect::Sqlite,
+        "fa",
+        binds.len() + 1,
+    ) {
+        binds.extend(types.into_iter().map(SqlValue::Text));
+        parts.push(sql);
+    }
+    if let Some(c) = cursor {
+        binds.push(SqlValue::Text(c.last_asserted_at.to_rfc3339()));
+        let p_at = binds.len();
+        binds.push(SqlValue::Text(c.last_attestation_id.clone()));
+        let p_id = binds.len();
+        parts.push(format!(
+            "(fa.asserted_at, fa.attestation_id) < (?{p_at}, ?{p_id})"
+        ));
+    }
+    let where_sql = format!("WHERE {}", parts.join(" AND "));
+    binds.push(SqlValue::Integer(limit));
+    let p_limit = binds.len();
+    let sql = format!(
+        "SELECT DISTINCT {SCORES_FA_COLS} \
+             FROM attestation_subjects s \
+             JOIN federation_attestations fa ON fa.attestation_id = s.attestation_id \
+             {where_sql} \
+             ORDER BY fa.asserted_at DESC, fa.attestation_id DESC LIMIT ?{p_limit}"
+    );
+    (sql, binds)
+}
+
 /// v53.1.5 — the #817/#818 dimension-prefix predicate over V106's generated
 /// column: a half-open byte range when an upper bound is representable
 /// (index-served), `substr` otherwise. Never `LIKE` (case-folding, and
@@ -17038,7 +16742,8 @@ fn sqlite_row_to_transport_destination(
         last_seen_at,
         transport_ed25519_pubkey_base64: row.get(5)?,
         transport_x25519_pubkey_base64: row.get(6)?,
-        binding_provenance: crate::federation::self_at_login::BindingProvenance::from_token(
+        // v61 (CIRISPersist#934) — the decode's refusal is the shared plan's.
+        binding_provenance: crate::federation::transport_admit::stored_binding_provenance(
             provenance_token.as_deref(),
         )
         .map_err(|e| {
@@ -20843,201 +20548,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                 "limit must be in [1, 10000], got {limit}"
             )));
         }
-        let mut parts: Vec<String> = Vec::new();
-        let mut binds: Vec<SqlValue> = Vec::new();
-        // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `IN (…)`, never looped.
-        {
-            let keys = crate::ceg::list::federation::merge_key_predicate(
-                filter.attesting_key_id.as_ref(),
-                &filter.attesting_key_ids,
-            );
-            if !keys.is_empty() {
-                let mut ph: Vec<String> = Vec::with_capacity(keys.len());
-                for k in keys {
-                    binds.push(SqlValue::Text(k));
-                    ph.push(format!("?{}", binds.len()));
-                }
-                parts.push(format!("attesting_key_id IN ({})", ph.join(", ")));
-            }
-        }
-        // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `IN (…)`, never looped.
-        {
-            let keys = crate::ceg::list::federation::merge_key_predicate(
-                filter.attested_key_id.as_ref(),
-                &filter.attested_key_ids,
-            );
-            if !keys.is_empty() {
-                let mut ph: Vec<String> = Vec::with_capacity(keys.len());
-                for k in keys {
-                    binds.push(SqlValue::Text(k));
-                    ph.push(format!("?{}", binds.len()));
-                }
-                parts.push(format!("attested_key_id IN ({})", ph.join(", ")));
-            }
-        }
-        if let Some(t) = &filter.attestation_type {
-            binds.push(SqlValue::Text(t.clone()));
-            parts.push(format!("attestation_type = ?{}", binds.len()));
-        }
-        if let Some(pqc) = filter.pqc_completed {
-            parts.push(if pqc {
-                "pqc_completed_at IS NOT NULL".to_owned()
-            } else {
-                "pqc_completed_at IS NULL".to_owned()
-            });
-        }
-        // v4.5 (CEG §10.1.5.4) — open-vocab dimension-prefix filter.
-        // v42.1.0 (#817, #818) — compiled as a half-open BYTE RANGE over V106's
-        // generated `dimension` column, never `LIKE`. Two reasons, either
-        // sufficient: SQLite's LIKE is case-INsensitive for ASCII, which
-        // over-matches a dimension CC 3.1.7 R3 defines as a case-sensitive byte
-        // string (#818); and SQLite declines its LIKE-to-range optimization
-        // whenever ESCAPE is present, which we always emitted, so V137's index
-        // would go unused (#817). Served by
-        // `federation_attestations_attester_dimension`.
-        if !filter.dimension_prefixes.is_empty() {
-            let mut ors: Vec<String> = Vec::new();
-            for p in &filter.dimension_prefixes {
-                match crate::ceg::list::federation::dimension_prefix_bounds(p) {
-                    Some((lo, hi)) => {
-                        binds.push(SqlValue::Text(lo));
-                        let a = binds.len();
-                        binds.push(SqlValue::Text(hi));
-                        let b = binds.len();
-                        ors.push(format!("(dimension >= ?{a} AND dimension < ?{b})"));
-                    }
-                    None => {
-                        // No representable upper bound (empty prefix, all-0xFF,
-                        // or a non-UTF-8 successor). `=` on TEXT is a byte
-                        // compare, so this stays case-correct — it is only
-                        // unindexed. Never fall back to LIKE: that reopens #818.
-                        binds.push(SqlValue::Text(p.clone()));
-                        let a = binds.len();
-                        ors.push(format!(
-                            "substr(dimension, 1, {}) = ?{a}",
-                            p.chars().count()
-                        ));
-                    }
-                }
-            }
-            parts.push(format!("({})", ors.join(" OR ")));
-        }
-        // v17.5.2 (#461) — EXACT dimension match. Was silently a no-op in
-        // list_attestations (only `dimension_prefixes` was ever applied; a
-        // caller-supplied `dimension_exact` — or a mistaken `{"dimension":…}`
-        // key — filtered nothing), forcing a fetch-then-fold-in-Python. Mirrors
-        // `list_scores`' `dimension_exact`; AND-composed with any prefix set.
-        // v42.1.0 (#817) — reads V106's generated column so the seek can use
-        // V137's index instead of json_extract-ing every row the attester wrote.
-        if let Some(d) = &filter.dimension_exact {
-            binds.push(SqlValue::Text(d.clone()));
-            parts.push(format!("dimension = ?{}", binds.len()));
-        }
-        // v4.5 — point-in-time validity.
-        if let Some(va) = filter.valid_at {
-            binds.push(SqlValue::Text(va.to_rfc3339()));
-            let p = binds.len();
-            parts.push(format!(
-                "(asserted_at <= ?{p} AND (expires_at IS NULL OR expires_at > ?{p}))"
-            ));
-        }
-        // v4.5 — confidence floor (NULL weight excluded when a floor is set).
-        if let Some(floor) = filter.confidence_floor {
-            binds.push(SqlValue::Real(floor));
-            parts.push(format!(
-                "(weight IS NOT NULL AND weight >= ?{})",
-                binds.len()
-            ));
-        }
-        // v4.5 — subject membership (subject_key_ids is a JSON array TEXT).
-        if let Some(subj) = &filter.subject_key_id {
-            binds.push(SqlValue::Text(subj.clone()));
-            parts.push(format!(
-                "EXISTS (SELECT 1 FROM json_each(subject_key_ids) WHERE value = ?{})",
-                binds.len()
-            ));
-        }
-        // v30.0.0 (CIRISPersist#596 item 2) — window / tier / attester_filter.
-        // This builder emitted nine axes and DROPPED these three, so a caller
-        // setting `window` got a bound that was never applied. Same emitter as
-        // `list_scores`, unaliased here because this query does not join.
-        // `tier: None` keeps this handle's historical meaning (no predicate) —
-        // see `sqlite_selection_axes` for why narrowing it silently would be
-        // worse than the inconsistency.
-        sqlite_selection_axes(&filter, "", false, &mut parts, &mut binds);
-        // §4.3 scope gate — federation_attestations carries cohort_scope
-        // (V056) + attested_key_id (the row's target identity, V055). The
-        // gate compares the row's cohort_scope/attested_key_id against the
-        // reader's admission.
-        {
-            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite_with_dimension(
-                &scope,
-                "cohort_scope",
-                "attested_key_id",
-                Some("cohort_target"),
-                Some("dimension"),
-                binds.len(),
-            );
-            parts.push(frag);
-            binds.extend(sbinds);
-        }
-        // V4.4 §3 (PR #889 review) — a LOCAL-tier row is visible to its
-        // producing occurrence alone; the collective never reaches it.
-        {
-            let (frag, sbinds) = crate::store::scope_bind::local_tier_predicate_sqlite(
-                &scope,
-                "tier",
-                "attesting_key_id",
-                binds.len(),
-            );
-            parts.push(frag);
-            binds.extend(sbinds);
-        }
-        // v49.0.0 (CIRISPersist#909) — the lifecycle view. `Live` is the
-        // documented default and hides rows retracted by a still-hiding
-        // composer from the same attester; this read took the filter and
-        // dropped the axis, so every drive listing showed withdrawn and
-        // replaced files. The same fold `list_scores` applies.
-        if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
-            filter.lifecycle,
-            crate::federation::attestation_query::Dialect::Sqlite,
-            "federation_attestations",
-            binds.len() + 1,
-        ) {
-            binds.extend(types.into_iter().map(SqlValue::Text));
-            parts.push(sql);
-        }
-        if let Some(c) = &cursor {
-            if c.version != "v1" {
-                return Err(crate::read::Error::InvalidCursor(format!(
-                    "AttestationCursor version {} unsupported; v1 only",
-                    c.version
-                )));
-            }
-            binds.push(SqlValue::Text(c.last_asserted_at.to_rfc3339()));
-            let p_at = binds.len();
-            binds.push(SqlValue::Text(c.last_attestation_id.clone()));
-            let p_id = binds.len();
-            parts.push(format!(
-                "(asserted_at, attestation_id) < (?{p_at}, ?{p_id})"
-            ));
-        }
-        let where_sql = if parts.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", parts.join(" AND "))
-        };
-        binds.push(SqlValue::Integer(limit));
-        let p_limit = binds.len();
-        let sql = format!(
-            "SELECT attestation_id, attesting_key_id, attested_key_id, \
-                    attestation_type, weight, asserted_at, expires_at, \
-                    attestation_envelope, original_content_hash, \
-                    scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
-             FROM federation_attestations {where_sql} \
-             ORDER BY asserted_at DESC, attestation_id DESC LIMIT ?{p_limit}"
-        );
+        let (sql, binds) = sqlite_list_attestations_sql(&filter, cursor.as_ref(), limit, &scope)?;
         let limit_usize = limit as usize;
         let (read, bytes) = self
             .read_measured(
@@ -23978,38 +23489,9 @@ impl crate::federation::read_plan::ReadPlanStore for SqliteBackend {
         cursor: Option<&crate::read::AttestationCursor>,
         limit: i64,
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let (mut parts, mut binds) = sqlite_scores_shared_predicates(filter, scope);
-        // lifecycle: exclude rows retracted by a still-hiding composer (the
-        // one predicate, CIRISPersist#720; an admitted retraction hides
-        // whoever authored it, #945).
-        if let Some((sql, types)) = crate::federation::attestation_query::lifecycle_predicate(
-            filter.lifecycle,
-            crate::federation::attestation_query::Dialect::Sqlite,
-            "fa",
-            binds.len() + 1,
-        ) {
-            binds.extend(types.into_iter().map(SqlValue::Text));
-            parts.push(sql);
-        }
-        if let Some(c) = cursor {
-            binds.push(SqlValue::Text(c.last_asserted_at.to_rfc3339()));
-            let p_at = binds.len();
-            binds.push(SqlValue::Text(c.last_attestation_id.clone()));
-            let p_id = binds.len();
-            parts.push(format!(
-                "(fa.asserted_at, fa.attestation_id) < (?{p_at}, ?{p_id})"
-            ));
-        }
-        binds.push(SqlValue::Integer(limit));
-        let sql = format!(
-            "SELECT DISTINCT {SCORES_FA_COLS} \
-             FROM attestation_subjects s \
-             JOIN federation_attestations fa ON fa.attestation_id = s.attestation_id \
-             WHERE {} \
-             ORDER BY fa.asserted_at DESC, fa.attestation_id DESC LIMIT ?{}",
-            parts.join(" AND "),
-            binds.len()
-        );
+        // v61 (the canonical's read storm) — the one builder the plan
+        // witnesses EXPLAIN.
+        let (sql, binds) = sqlite_list_scores_sql(filter, cursor, limit, scope);
         self.read_attestations("list_scores", sql, binds).await
     }
 
@@ -25774,6 +25256,438 @@ impl crate::federation::occurrence_admit::OccurrenceStore for SqliteBackend {
         row_id: Option<&str>,
     ) -> Result<(), crate::federation::Error> {
         self.index_plane_row(row_id).await
+    }
+}
+
+/// v61 (CIRISPersist#934, S4b) — the group supersede executor on sqlite.
+/// Storage only: the decisions are `federation::group_supersede_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::group_supersede_admit::GroupSupersedeStore for SqliteBackend {
+    async fn store_planned_supersede(
+        &self,
+        planned: crate::federation::group_supersede_admit::PlannedSupersede,
+    ) -> Result<u32, crate::federation::Error> {
+        use crate::federation::group_supersede_admit::{held_head_verdict, PlannedHead};
+        use crate::federation::Error;
+        let now = chrono::Utc::now().to_rfc3339();
+        let cohort_str = planned.cohort_str;
+        let auth_json = match &planned.authorization {
+            Some(v) => Some(
+                serde_json::to_string(v)
+                    .map_err(|e| Error::Backend(format!("authorization serialize: {e}")))?,
+            ),
+            None => None,
+        };
+        // The verdict's refusal, carried out of the write closure (whose
+        // error type is rusqlite's).
+        type VerdictSlot = std::sync::Arc<std::sync::Mutex<Option<Error>>>;
+        let refused: VerdictSlot = Default::default();
+        let slot = refused.clone();
+        let refuse = move |e: Error| {
+            *slot.lock().expect("verdict slot") = Some(e);
+            rusqlite::Error::QueryReturnedNoRows
+        };
+        let written = match planned.head.clone() {
+            PlannedHead::Family(signed) => {
+                let crate::federation::SignedFamily {
+                    family: new_fam,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                    supersede_proof,
+                    cosignatures,
+                } = signed;
+                let proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
+                let cosignatures_json = serde_json::to_string(&cosignatures)
+                    .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
+                let members_json = serde_json::to_string(&new_fam.members)
+                    .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
+                self.write(move |conn| -> Result<u32, rusqlite::Error> {
+                    let tx = conn.transaction()?;
+                    let prior = tx
+                        .query_row(
+                            "SELECT version, family_key_id, family_name, members, founded_at, \
+                                    consensus_protocol, consensus_protocol_entrenched, \
+                                    dissolved_at, prev_head_digest, charter_digest, persist_row_hash \
+                             FROM federation_families WHERE family_key_id = ?1",
+                            [&new_fam.family_key_id],
+                            |r| Ok((r.get::<_, u32>("version")?, sqlite_row_to_family(r)?)),
+                        )
+                        .optional()?;
+                    // v61 (CIRISPersist#934) — the shared verdict, on the
+                    // row this transaction replaces.
+                    held_head_verdict(
+                        &planned,
+                        prior.as_ref().map(|(_, f)| f.persist_row_hash.as_str()),
+                    )
+                    .map_err(&refuse)?;
+                    let Some((prior_version, prior_fam)) = prior else {
+                        return Err(rusqlite::Error::QueryReturnedNoRows);
+                    };
+                    let snapshot = serde_json::to_string(&prior_fam)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                    tx.execute(
+                        "INSERT INTO federation_group_versions \
+                            (cohort, group_key_id, version, snapshot, change_authorization, \
+                             superseded_at, persist_row_hash) \
+                         VALUES ('family', ?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            new_fam.family_key_id,
+                            prior_version,
+                            snapshot,
+                            auth_json,
+                            now,
+                            prior_fam.persist_row_hash,
+                        ],
+                    )?;
+                    let next = prior_version + 1;
+                    // v36.0.0 (#668/#707-class) — a supersede rewrites the
+                    // served bytes; the serve position moves with them,
+                    // allocated inside the same transaction as the write.
+                    let admitted_at =
+                        sqlite_next_plane_position(&tx, "federation_families", POS_FOUNDED)?;
+                    tx.execute(
+                        "UPDATE federation_families SET \
+                            family_name = ?2, members = ?3, founded_at = ?4, \
+                            consensus_protocol = ?5, consensus_protocol_entrenched = ?6, \
+                            persist_row_hash = ?7, version = ?8, \
+                            authority_key_id = ?9, scrub_signature_classical = ?10, \
+                            scrub_signature_pqc = ?11, admitted_at = ?12, \
+                            supersede_proof = ?13, cosignatures = ?14, dissolved_at = ?15, \
+                            prev_head_digest = ?16, charter_digest = ?17 \
+                         WHERE family_key_id = ?1",
+                        rusqlite::params![
+                            new_fam.family_key_id,
+                            new_fam.family_name,
+                            members_json,
+                            new_fam.founded_at.to_rfc3339(),
+                            new_fam.consensus_protocol,
+                            i64::from(new_fam.consensus_protocol_entrenched),
+                            new_fam.persist_row_hash,
+                            next,
+                            // v31.0.0 (CIRISPersist#651) — the signature moves
+                            // with the record it authorizes, in the SAME
+                            // statement.
+                            authority_key_id,
+                            scrub_signature_classical,
+                            scrub_signature_pqc,
+                            admitted_at.to_rfc3339(),
+                            proof_json,
+                            cosignatures_json,
+                            new_fam.dissolved_at.map(|t| t.to_rfc3339()),
+                            new_fam.prev_head_digest,
+                            new_fam.charter_digest,
+                        ],
+                    )?;
+                    tx.commit()?;
+                    Ok(next)
+                })
+                .await
+            }
+            PlannedHead::Community(signed) => {
+                let crate::federation::SignedCommunity {
+                    community: new_comm,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                    supersede_proof,
+                    cosignatures,
+                    lineage,
+                } = signed;
+                let proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
+                // v50.0.0 (#926, V158) — the co-signatures travel with the
+                // authority signature they sit beside.
+                let cosignatures_json = serde_json::to_string(&cosignatures)
+                    .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
+                let lineage_json = serde_json::to_string(&lineage)
+                    .map_err(|e| Error::Backend(format!("lineage encode: {e}")))?;
+                let members_json = serde_json::to_string(&new_comm.members)
+                    .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
+                let policy_json = match &new_comm.policy_blob {
+                    Some(v) => Some(
+                        serde_json::to_string(v)
+                            .map_err(|e| Error::Backend(format!("policy_blob serialize: {e}")))?,
+                    ),
+                    None => None,
+                };
+                self.write(move |conn| -> Result<u32, rusqlite::Error> {
+                    let tx = conn.transaction()?;
+                    let prior = tx
+                        .query_row(
+                            "SELECT version, community_key_id, community_name, members, \
+                                    founded_at, consensus_protocol, policy_blob, prev_head_digest, charter_digest, persist_row_hash \
+                             FROM federation_communities WHERE community_key_id = ?1",
+                            [&new_comm.community_key_id],
+                            |r| Ok((r.get::<_, u32>("version")?, sqlite_row_to_community(r)?)),
+                        )
+                        .optional()?;
+                    // v61 (CIRISPersist#934) — the shared verdict.
+                    held_head_verdict(
+                        &planned,
+                        prior.as_ref().map(|(_, c)| c.persist_row_hash.as_str()),
+                    )
+                    .map_err(&refuse)?;
+                    let Some((prior_version, prior_comm)) = prior else {
+                        return Err(rusqlite::Error::QueryReturnedNoRows);
+                    };
+                    let snapshot = serde_json::to_string(&prior_comm)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                    tx.execute(
+                        "INSERT INTO federation_group_versions \
+                            (cohort, group_key_id, version, snapshot, change_authorization, \
+                             superseded_at, persist_row_hash) \
+                         VALUES (?7, ?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            new_comm.community_key_id,
+                            prior_version,
+                            snapshot,
+                            auth_json,
+                            now,
+                            prior_comm.persist_row_hash,
+                            cohort_str,
+                        ],
+                    )?;
+                    let next = prior_version + 1;
+                    // v36.0.0 (#668/#707-class) — see the family arm.
+                    let admitted_at =
+                        sqlite_next_plane_position(&tx, "federation_communities", POS_FOUNDED)?;
+                    tx.execute(
+                        "UPDATE federation_communities SET \
+                            community_name = ?2, members = ?3, founded_at = ?4, \
+                            consensus_protocol = ?5, policy_blob = ?6, \
+                            persist_row_hash = ?7, version = ?8, \
+                            authority_key_id = ?9, scrub_signature_classical = ?10, \
+                            scrub_signature_pqc = ?11, admitted_at = ?12, \
+                            supersede_proof = ?13, cosignatures = ?14, lineage = ?15, \
+                            prev_head_digest = ?16, charter_digest = ?17 \
+                         WHERE community_key_id = ?1",
+                        rusqlite::params![
+                            new_comm.community_key_id,
+                            new_comm.community_name,
+                            members_json,
+                            new_comm.founded_at.to_rfc3339(),
+                            new_comm.consensus_protocol,
+                            policy_json,
+                            new_comm.persist_row_hash,
+                            next,
+                            // v31.0.0 (CIRISPersist#651) — see the family arm.
+                            authority_key_id,
+                            scrub_signature_classical,
+                            scrub_signature_pqc,
+                            admitted_at.to_rfc3339(),
+                            proof_json,
+                            cosignatures_json,
+                            lineage_json,
+                            new_comm.prev_head_digest,
+                            new_comm.charter_digest,
+                        ],
+                    )?;
+                    tx.commit()?;
+                    Ok(next)
+                })
+                .await
+            }
+        };
+        written.map_err(|e| {
+            if let Some(r) = refused.lock().expect("verdict slot").take() {
+                r
+            } else {
+                Error::Backend(format!("supersede {cohort_str}: {e}"))
+            }
+        })
+    }
+}
+
+/// v61 (CIRISPersist#934, S4b) — the family executor on sqlite. Storage only:
+/// the decisions are `federation::family_admit`'s.
+#[async_trait::async_trait]
+impl crate::federation::family_admit::FamilyStore for SqliteBackend {
+    async fn store_planned_family(
+        &self,
+        row: crate::federation::types::Family,
+    ) -> Result<(), crate::federation::Error> {
+        let members_json = serde_json::to_string(&row.members)
+            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            // v36.0.0 (#668) — THIS node's serve position (V130).
+            let admitted_at = sqlite_next_plane_position(conn, "federation_families", POS_FOUNDED)?;
+            conn.execute(
+                "INSERT INTO federation_families (\
+                    family_key_id, family_name, members, founded_at, \
+                    consensus_protocol, consensus_protocol_entrenched, persist_row_hash, \
+                    admitted_at, dissolved_at, prev_head_digest, charter_digest\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    row.family_key_id,
+                    row.family_name,
+                    members_json,
+                    row.founded_at.to_rfc3339(),
+                    row.consensus_protocol,
+                    i64::from(row.consensus_protocol_entrenched),
+                    row.persist_row_hash,
+                    admitted_at.to_rfc3339(),
+                    row.dissolved_at.map(|t| t.to_rfc3339()),
+                    row.prev_head_digest,
+                    row.charter_digest,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("FOREIGN KEY") {
+                crate::federation::Error::InvalidArgument(format!(
+                    "FK constraint violated on family insert: {msg}"
+                ))
+            } else {
+                crate::federation::Error::Backend(format!("insert family: {msg}"))
+            }
+        })
+    }
+
+    async fn store_family_signature(
+        &self,
+        planned: crate::federation::family_admit::PlannedFamilySignature,
+    ) -> Result<(), crate::federation::Error> {
+        let supersede_proof_json = sqlite_supersede_proof_json(planned.supersede_proof.as_ref())?;
+        let cosignatures_json = serde_json::to_string(&planned.cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            // v36.0.0 (#668) — attaching the authority signature makes the row
+            // VISIBLE to the signed serve cursor, so the serve position is
+            // re-stamped here.
+            let admitted_at = sqlite_next_plane_position(conn, "federation_families", POS_FOUNDED)?;
+            conn.execute(
+                "UPDATE federation_families \
+                    SET authority_key_id = ?2, scrub_signature_classical = ?3, \
+                        scrub_signature_pqc = ?4, admitted_at = ?5, supersede_proof = ?6, \
+                        cosignatures = ?7 \
+                  WHERE family_key_id = ?1",
+                rusqlite::params![
+                    planned.family_key_id,
+                    planned.authority_key_id,
+                    planned.scrub_signature_classical,
+                    planned.scrub_signature_pqc,
+                    admitted_at.to_rfc3339(),
+                    supersede_proof_json,
+                    cosignatures_json,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("store family authority signature: {e}"))
+        })
+    }
+
+    async fn store_planned_family_revocation(
+        &self,
+        revocation: &crate::federation::SignedFamilyMembershipRevocation,
+    ) -> Result<bool, crate::federation::Error> {
+        let r = revocation.clone();
+        let witness = serde_json::to_string(&r.family_membership_revocation.witness_set)
+            .map_err(|e| crate::federation::Error::Backend(format!("witness_set encode: {e}")))?;
+        let cosignatures = serde_json::to_string(&r.cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
+        self.write(move |conn| -> Result<bool, rusqlite::Error> {
+            let row = &r.family_membership_revocation;
+            // v47.1.0 (CIRISPersist#861) — one transaction, so a repeat leaves
+            // NOTHING behind (the serve position included).
+            let tx = conn.transaction()?;
+            // v36.0.0 (#668) — THIS node's serve position (V130).
+            let admitted_at = sqlite_next_plane_position(
+                &tx,
+                "federation_family_membership_revocations",
+                POS_REMOVED,
+            )?;
+            // v47.1.0 (#861) / v49.0.0 (#910.1, V154) — IDEMPOTENT on the
+            // three-part PK; the unique index arbitrates (race-safe).
+            let n = tx.execute(
+                "INSERT INTO federation_family_membership_revocations (\
+                    family_key_id, removed_identity_key_id, removed_at, effective_at, \
+                    reason, witness_set, persist_row_hash, \
+                    authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
+                    admitted_at, cosignatures\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+                 ON CONFLICT (family_key_id, removed_identity_key_id, effective_at) DO NOTHING",
+                rusqlite::params![
+                    row.family_key_id,
+                    row.removed_identity_key_id,
+                    row.removed_at.to_rfc3339(),
+                    row.effective_at.to_rfc3339(),
+                    row.reason,
+                    witness,
+                    row.persist_row_hash,
+                    r.authority_key_id,
+                    r.scrub_signature_classical,
+                    r.scrub_signature_pqc,
+                    admitted_at.to_rfc3339(),
+                    cosignatures,
+                ],
+            )?;
+            if n == 0 {
+                return Ok(false); // a repeat: tx dropped, rolled back
+            }
+            tx.commit()?;
+            Ok(true)
+        })
+        .await
+        .map_err(map_revocation_sqlite_err("family_membership_revocation"))
+    }
+
+    async fn store_planned_family_widening(
+        &self,
+        widening: &crate::federation::SignedFamilyMembershipWidening,
+    ) -> Result<(), crate::federation::Error> {
+        let w = widening.clone();
+        let cosignatures = serde_json::to_string(&w.cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
+        self.write(move |conn| -> Result<bool, rusqlite::Error> {
+            let row = &w.family_membership_widening;
+            let admitted_at = sqlite_next_plane_position(
+                conn,
+                "federation_family_membership_widenings",
+                POS_JOINED,
+            )?;
+            let n = conn.execute(
+                "INSERT INTO federation_family_membership_widenings (\
+                    family_key_id, member_key_id, joined_at, effective_at, role, \
+                    persist_row_hash, authority_key_id, scrub_signature_classical, \
+                    scrub_signature_pqc, admitted_at, cosignatures\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT (family_key_id, member_key_id, effective_at) DO NOTHING",
+                rusqlite::params![
+                    row.family_key_id,
+                    row.member_key_id,
+                    row.joined_at.to_rfc3339(),
+                    row.effective_at.to_rfc3339(),
+                    row.role,
+                    row.persist_row_hash,
+                    w.authority_key_id,
+                    w.scrub_signature_classical,
+                    w.scrub_signature_pqc,
+                    admitted_at.to_rfc3339(),
+                    cosignatures,
+                ],
+            )?;
+            Ok(n == 1)
+        })
+        .await
+        .map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(ref f, _)
+                if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                crate::federation::Error::InvalidArgument(format!(
+                    "FK constraint violated on family_membership_widening insert: {e}"
+                ))
+            }
+            other => crate::federation::Error::Backend(format!(
+                "insert family_membership_widening: {other}"
+            )),
+        })?;
+        Ok(())
     }
 }
 
@@ -42958,10 +42872,15 @@ mod tests {
         )
         .await;
         eprintln!("I546 list_attestations_referencing plan: {plan:?}");
+        // v61 — V212's composer-only `reference_live` carries the same key
+        // over composer rows only; the planner may take either.
         assert!(
             plan.iter().any(|l| l.starts_with(
                 "SEARCH federation_attestations USING INDEX \
                  federation_attestations_reference_seek (<expr>=? AND attestation_type=?)"
+            ) || l.starts_with(
+                "SEARCH federation_attestations USING INDEX \
+                 federation_attestations_reference_live (<expr>=? AND attestation_type=?)"
             )),
             "the referencing read seeks (reference, type): {plan:?}"
         );
@@ -43025,6 +42944,245 @@ mod tests {
                 .any(|l| l.contains("federation_attestations_attested ")),
             "the for-type read does not walk the subject's whole slice in order: {plan:?}"
         );
+    }
+
+    // ── v61 — the canonical's read storm: the two custody reads ──────
+    //
+    // With no `sqlite_stat1` the planner prefers V004's single-column
+    // `federation_attestations_attesting (attesting_key_id, asserted_at
+    // DESC)`, because it also yields `ORDER BY asserted_at DESC`, over the
+    // three-column expression indexes the reads were written for: every
+    // call then walks the attester's whole history, json-parsing every
+    // envelope. These witnesses read the plan of the statement the door
+    // runs, on a migrated database with no statistics.
+
+    fn v61_storm_composer_binds(attested: bool, attesting: bool) -> Vec<SqlValue> {
+        let mut b = i546_referencing_binds();
+        b[0] = SqlValue::Text("[\"a\",\"b\"]".into());
+        if attested {
+            b.push(SqlValue::Text("subject".into()));
+        }
+        if attesting {
+            b.push(SqlValue::Text("device".into()));
+        }
+        b
+    }
+
+    /// No plan line of `plan` walks V004's single-column attester or
+    /// subject index (the trailing space keeps the multi-column names out).
+    fn v61_storm_no_history_walk(plan: &[String], what: &str) {
+        assert!(
+            !plan.iter().any(|l| {
+                l.contains("federation_attestations_attesting ")
+                    || l.contains("federation_attestations_attested ")
+                    || l.ends_with("federation_attestations_attesting")
+                    || l.ends_with("federation_attestations_attested")
+            }),
+            "{what}: never the attester's / subject's whole history in asserted_at order: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|l| l.starts_with("SCAN federation_attestations")),
+            "{what}: never a table scan: {plan:?}"
+        );
+    }
+
+    /// v61 — `list_attestations_by_dimension_citing` (custody_acks_of's
+    /// first read) seeks V180's `(attesting_key_id, dimension,
+    /// evidence_refs[0])` on all three columns.
+    #[tokio::test]
+    async fn v61_storm_by_dimension_citing_seeks_the_citation_index() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let binds = vec![
+            SqlValue::Text("device".into()),
+            SqlValue::Text("custody:ack:v1".into()),
+            SqlValue::Text("ab".repeat(32)),
+        ];
+        let plan = sqlite_plan(&backend, &sqlite_by_dimension_citing_sql(), binds).await;
+        eprintln!("v61 list_attestations_by_dimension_citing plan: {plan:?}");
+        assert!(
+            plan.iter().any(|l| l.starts_with(
+                "SEARCH federation_attestations USING INDEX \
+                 federation_attestations_attester_dimension_citation \
+                 (attesting_key_id=? AND dimension=? AND <expr>=?)"
+            )),
+            "the citing read seeks (attester, dimension, citation): {plan:?}"
+        );
+        v61_storm_no_history_walk(&plan, "by_dimension_citing");
+    }
+
+    /// v61 — `list_composers_referencing_any` on the attesting axis
+    /// (custody_acks_of's second read) seeks V107's `composer_ref`, on the
+    /// attested axis V178's `attested_composer_ref`, with no axis
+    /// V212's `reference_live`; never the pinned key's whole history.
+    #[tokio::test]
+    async fn v61_storm_composers_referencing_any_seeks_the_composer_index() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for (attested, attesting, index, cols) in [
+            (
+                false,
+                true,
+                "federation_attestations_composer_ref",
+                "(attesting_key_id=? AND attestation_type=? AND <expr>=?)",
+            ),
+            (
+                true,
+                false,
+                "federation_attestations_attested_composer_ref",
+                "(attested_key_id=? AND attestation_type=? AND <expr>=?)",
+            ),
+            (
+                true,
+                true,
+                "federation_attestations_composer_ref",
+                "(attesting_key_id=? AND attestation_type=? AND <expr>=?)",
+            ),
+            (
+                false,
+                false,
+                "federation_attestations_reference_live",
+                "(<expr>=? AND attestation_type=?)",
+            ),
+        ] {
+            let plan = sqlite_plan(
+                &backend,
+                &sqlite_composers_referencing_any_sql(attested, attesting),
+                v61_storm_composer_binds(attested, attesting),
+            )
+            .await;
+            let what =
+                format!("composers_referencing_any(attested={attested}, attesting={attesting})");
+            eprintln!("v61 {what} plan: {plan:?}");
+            let want = format!("SEARCH federation_attestations USING INDEX {index} {cols}");
+            assert!(
+                plan.iter().any(|l| l.starts_with(&want)),
+                "{what} seeks `{want}`: {plan:?}"
+            );
+            v61_storm_no_history_walk(&plan, &what);
+        }
+    }
+
+    /// v61 — a fresh store is analyzed at open: `sqlite_stat1` exists and
+    /// carries rows (the schema history at least).
+    #[tokio::test]
+    async fn v61_storm_open_analyzes_a_fresh_store() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let n: i64 = backend
+            .read(|conn| {
+                conn.query_row("SELECT count(*) FROM sqlite_stat1", [], |r| r.get(0))
+                    .unwrap()
+            })
+            .await;
+        assert!(n > 0, "sqlite_stat1 carries rows after open: {n}");
+    }
+
+    /// The filter Server's equivocation detector pages with: valid now,
+    /// federation tier, the default (Live) lifecycle, no key pinned.
+    fn v61_storm_detector_filter() -> crate::read::AttestationFilter {
+        crate::read::AttestationFilter {
+            valid_at: Some(chrono::Utc::now()),
+            tier: Some(crate::read::Tier::Federation),
+            ..Default::default()
+        }
+    }
+
+    fn v61_storm_cursor() -> crate::read::AttestationCursor {
+        crate::read::AttestationCursor::from_trailing(chrono::Utc::now(), "x".into())
+    }
+
+    /// v61 — THE storm statement: `list_attestations` under the Live
+    /// view with no key pinned, page 1 and at a cursor. The lifecycle
+    /// subquery seeks V212's `reference_live` (never `SCAN c` per outer row)
+    /// and the outer walk seeks V212's `(asserted_at DESC, attestation_id
+    /// DESC)`, stopping at the LIMIT: no SCAN, no TEMP B-TREE.
+    #[tokio::test]
+    async fn v61_storm_list_attestations_live_plan_seeks() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for (tag, cursor) in [("page 1", None), ("at a cursor", Some(v61_storm_cursor()))] {
+            let (sql, binds) = sqlite_list_attestations_sql(
+                &v61_storm_detector_filter(),
+                cursor.as_ref(),
+                512,
+                &crate::scope::CallerScope::Unauthenticated,
+            )
+            .unwrap();
+            let plan = sqlite_plan(&backend, &sql, binds).await;
+            eprintln!("v61 list_attestations (Live, {tag}) plan: {plan:?}");
+            v61_storm_live_plan_ok(&plan, &format!("list_attestations {tag}"));
+            assert!(
+                plan.iter().any(|l| l.starts_with(
+                    "SEARCH federation_attestations USING INDEX federation_attestations_asserted_seek"
+                ) || l.starts_with(
+                    "SCAN federation_attestations USING INDEX federation_attestations_asserted_seek"
+                )),
+                "list_attestations {tag}: the outer walk is V212's keyset order: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|l| l.contains("TEMP B-TREE")),
+                "list_attestations {tag}: no sort of every qualifying row: {plan:?}"
+            );
+            if cursor.is_some() {
+                assert!(
+                    plan.iter().any(|l| l.starts_with(
+                        "SEARCH federation_attestations USING INDEX federation_attestations_asserted_seek"
+                    )),
+                    "list_attestations {tag}: the cursor seeks: {plan:?}"
+                );
+            }
+        }
+    }
+
+    /// The lifecycle subquery of a Live plan seeks `reference_live`.
+    fn v61_storm_live_plan_ok(plan: &[String], what: &str) {
+        assert!(
+            plan.iter().any(|l| l.contains(
+                "SEARCH c USING INDEX federation_attestations_reference_live (<expr>=? AND attestation_type=?)"
+            )),
+            "{what}: the lifecycle subquery seeks reference_live: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|l| l.ends_with("SCAN c") || l.contains("SCAN c ")),
+            "{what}: never a scan of the composers per outer row: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|l| l == "SCAN federation_attestations"),
+            "{what}: never a table scan: {plan:?}"
+        );
+    }
+
+    /// v61 — `list_scores` under the Live view shares the lifecycle
+    /// predicate: its subquery seeks `reference_live` too.
+    #[tokio::test]
+    async fn v61_storm_list_scores_live_subquery_seeks() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for (tag, filter) in [
+            ("detector filter", v61_storm_detector_filter()),
+            (
+                "by subject",
+                crate::read::AttestationFilter {
+                    subject_key_id: Some("subject".into()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let (sql, binds) = sqlite_list_scores_sql(
+                &filter,
+                Some(&v61_storm_cursor()),
+                256,
+                &crate::scope::CallerScope::Unauthenticated,
+            );
+            let plan = sqlite_plan(&backend, &sql, binds).await;
+            eprintln!("v61 list_scores (Live, {tag}) plan: {plan:?}");
+            v61_storm_live_plan_ok(&plan, &format!("list_scores {tag}"));
+        }
     }
 
     /// I547 (sqlite) — the trust-root walks' typed, job-filtered reads seek

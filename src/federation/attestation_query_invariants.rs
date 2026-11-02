@@ -1028,7 +1028,14 @@ mod lifecycle_predicate {
                 sql.contains("OR c.withdraws_admission_rule IS NOT NULL"),
                 "{sql}"
             );
-            assert!(sql.contains("= fa.attestation_id)"), "{sql}");
+            // v61 — the affinity-stripped compare and the pinned seek.
+            assert!(sql.contains("= +fa.attestation_id)"), "{sql}");
+            assert!(
+                sql.contains(
+                    "FROM federation_attestations c INDEXED BY federation_attestations_reference_live"
+                ),
+                "{sql}"
+            );
             let (pg, pg_binds) =
                 lifecycle_predicate(view, Dialect::Postgres, "federation_attestations", 2).unwrap();
             assert_eq!(pg_binds, want);
