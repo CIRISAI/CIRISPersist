@@ -477,6 +477,11 @@ pub const INDEPENDENT_ATTESTATION_ID_TABLES: &[(&str, &str)] = &[
         "cirisnode_promotion_attestations",
         "the cirisnode plane's own promotion records, written by src/cirisnode",
     ),
+    (
+        "federation_attestations_form_refused",
+        "v61 (CC 2.6.2) — the ledger of rows refused for the form of a signed instant; \
+         the row itself is gone and no body is kept",
+    ),
 ];
 
 /// The page size of the attestation scan the selection classes resolve over.

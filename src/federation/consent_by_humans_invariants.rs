@@ -70,7 +70,7 @@ pub(crate) mod bodies {
             "id": id,
             "dimension": format!("consent:state:{stance}:v1"),
             "scope": scope,
-            crate::federation::envelope::paths::ASSERTED_AT: at.to_rfc3339(),
+            crate::federation::envelope::paths::ASSERTED_AT: crate::federation::admission::render_signed_instant(at),
         });
         if let Some(f) = for_key {
             env[cbh::FOR_KEY_ID] = serde_json::Value::String(f.to_owned());

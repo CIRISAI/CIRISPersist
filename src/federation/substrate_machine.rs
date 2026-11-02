@@ -1236,7 +1236,7 @@ pub mod test_support {
             let envelope = envelope_for(family, attester, op.subject);
             let mut core = crate::federation::envelope::EnvelopeCore::from_value(envelope)
                 .expect("harness envelopes are objects");
-            core.asserted_at = Some(at.to_rfc3339());
+            core.asserted_at = Some(crate::federation::admission::render_signed_instant(at));
             LocalAttestationInput {
                 attestation_id: Some(id),
                 attesting_key_id: self.kid(attester),
@@ -1330,7 +1330,7 @@ pub mod test_support {
                     .expect("harness envelopes are objects");
                 obj.insert(
                     crate::federation::envelope::paths::ASSERTED_AT.into(),
-                    at.to_rfc3339().into(),
+                    crate::federation::admission::render_signed_instant(at).into(),
                 );
                 // Bound in BOTH directions, so the absent case is an ABSENT
                 // key, not a null.
@@ -1341,7 +1341,7 @@ pub mod test_support {
                     Some(t) => {
                         obj.insert(
                             crate::federation::envelope::paths::EXPIRES_AT.into(),
-                            t.to_rfc3339().into(),
+                            crate::federation::admission::render_signed_instant(t).into(),
                         );
                     }
                 }
@@ -3259,7 +3259,7 @@ mod proptests {
                 .expect("harness envelopes are objects");
             obj.insert(
                 crate::federation::envelope::paths::ASSERTED_AT.into(),
-                now.to_rfc3339().into(),
+                crate::federation::admission::render_signed_instant(now).into(),
             );
             obj.remove(crate::federation::envelope::paths::EXPIRES_AT);
         }
@@ -3746,9 +3746,15 @@ mod proptests {
         ] {
             let mut envelope = serde_json::json!({ "dimension": "identity:handle:v1" });
             let obj = envelope.as_object_mut().expect("object");
-            obj.insert(paths::ASSERTED_AT.into(), at.to_rfc3339().into());
+            obj.insert(
+                paths::ASSERTED_AT.into(),
+                crate::federation::admission::render_signed_instant(at).into(),
+            );
             if let Some(t) = expires {
-                obj.insert(paths::EXPIRES_AT.into(), t.to_rfc3339().into());
+                obj.insert(
+                    paths::EXPIRES_AT.into(),
+                    crate::federation::admission::render_signed_instant(t).into(),
+                );
             }
             let row = crate::federation::Attestation {
                 attestation_id: format!("harness-instant-{label}"),

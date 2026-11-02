@@ -263,7 +263,8 @@ const ROLE: &str = "conf-663-role";
 // Distinct INSTANTS, not one instant reused — these are the three timestamp
 // fields the old fixture collapsed together.
 const VALID_FROM: &str = "2026-01-01T00:00:00Z";
-const VALID_UNTIL: &str = "2027-02-02T00:00:00Z";
+// v61 (CC 2.6.2) — the signed expiry is `.sssZ`.
+const VALID_UNTIL: &str = "2027-02-02T00:00:00.000Z";
 const SCRUB_TIMESTAMP: &str = "2026-03-03T00:00:00Z";
 const PQC_COMPLETED_AT: &str = "2026-04-04T00:00:00Z";
 

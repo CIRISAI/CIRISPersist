@@ -5312,7 +5312,10 @@ mod tests {
             occurrence_key_id: "occ-1".into(),
             transport_kind: "reticulum".into(),
             destination: "abcd".into(),
-            asserted_at: chrono::Utc::now(),
+            // v61 (CC 2.6.2) — a signed member crosses the ABI `.sssZ`.
+            asserted_at: crate::federation::admission::truncate_to_substrate_resolution(
+                chrono::Utc::now(),
+            ),
             last_seen_at: Some(chrono::Utc::now()),
             // #397/#411 — the transport-tier Ed25519 + X25519 (KEX) must cross
             // the ABI intact (prime + re-seal after restart).

@@ -436,8 +436,13 @@ pub(crate) mod bodies {
         env["jurisdiction"] = serde_json::json!("ZZ");
         env["evidence_refs"] =
             serde_json::json!([format!("evidence/purges/2026-10-09-{digest}.tsv")]);
-        env["asserted_at"] = serde_json::json!((now - chrono::Duration::seconds(60)).to_rfc3339());
-        env["expires_at"] = serde_json::json!((now + chrono::Duration::days(1)).to_rfc3339());
+        env["asserted_at"] =
+            serde_json::json!(crate::federation::admission::render_signed_instant(
+                now - chrono::Duration::seconds(60)
+            ));
+        env["expires_at"] = serde_json::json!(crate::federation::admission::render_signed_instant(
+            now + chrono::Duration::days(1)
+        ));
         sign(env, signers)
     }
 

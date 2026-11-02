@@ -10676,8 +10676,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         if occurrence_applied > 0 {
             if let Some(tb) = &row.transport_binding {
                 let route = tb.project_route(&row.occurrence_key_id, row.asserted_at)?;
-                crate::federation::FederationDirectory::put_transport_destination(self, &route)
-                    .await?;
+                crate::federation::transport_routes::project_occurrence_route(self, &route).await?;
             }
             self.index_plane_row(occurrence_row_id.as_deref()).await?;
         }
@@ -10780,7 +10779,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // route materialized").
         if let Some(tb) = &row.transport_binding {
             let route = tb.project_route(&row.occurrence_key_id, row.asserted_at)?;
-            crate::federation::FederationDirectory::put_transport_destination(self, &route).await?;
+            crate::federation::transport_routes::project_occurrence_route(self, &route).await?;
         }
         Ok(())
     }
@@ -12828,6 +12827,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         destination: &crate::federation::TransportDestination,
     ) -> Result<(), crate::federation::Error> {
+        // v61 (CIRISPersist#1122) — an agent announces no route.
+        crate::federation::transport_routes::check_route_key_not_agent(self, destination).await?;
         let client = self
             .get_client()
             .await
@@ -13119,7 +13120,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         })
     }
 
-    async fn list_transport_destinations_for(
+    async fn list_transport_destinations_for_unfolded(
         &self,
         occurrence_key_id: &str,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
@@ -13182,7 +13183,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
-    async fn list_all_transport_destinations(
+    async fn list_all_transport_destinations_unfolded(
         &self,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
         let client = self
@@ -13208,7 +13209,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.iter().map(pg_row_to_transport_destination).collect()
     }
 
-    async fn list_transport_destinations_by_destination(
+    async fn list_transport_destinations_by_destination_unfolded(
         &self,
         destination: &str,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
@@ -21605,6 +21606,52 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
             }
             .map_err(|e| crate::federation::Error::Backend(format!("delete_attestation: {e}")))?;
         Ok(n > 0)
+    }
+
+    async fn set_aside_form_refused(
+        &self,
+        row: &crate::federation::Attestation,
+        member: &str,
+        value: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, crate::federation::Error> {
+        let err = |e: tokio_postgres::Error| {
+            crate::federation::Error::Backend(format!("set_aside_form_refused: {e}"))
+        };
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let tx = client.transaction().await.map_err(err)?;
+        let gone = tx
+            .execute(
+                "DELETE FROM cirislens.federation_attestations \
+                 WHERE attestation_id = $1 AND persist_row_hash = $2",
+                &[&row.attestation_id, &row.persist_row_hash],
+            )
+            .await
+            .map_err(err)?;
+        if gone == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO cirislens.federation_attestations_form_refused \
+             (attestation_id, attesting_key_id, persist_row_hash, refused_member, \
+              refused_value, refused_at) VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (attestation_id) DO NOTHING",
+            &[
+                &row.attestation_id,
+                &row.attesting_key_id,
+                &row.persist_row_hash,
+                &member,
+                &value,
+                &at,
+            ],
+        )
+        .await
+        .map_err(err)?;
+        tx.commit().await.map_err(err)?;
+        Ok(true)
     }
 
     async fn store_planned_attestation(
@@ -41431,7 +41478,10 @@ mod tests {
         );
         assert_eq!(mine[0].detail["cohort_key_id"], fam);
         assert_eq!(mine[0].subject_key_id.as_deref(), Some(member.as_str()));
-        assert_eq!(mine[0].detail["effective_at"], effective.to_rfc3339());
+        assert_eq!(
+            mine[0].detail["effective_at"],
+            crate::federation::admission::render_signed_instant(effective)
+        );
     }
 
     /// Clause 2 (#146 Ask 5, CEG §5.6.8.7) — consent_record admission on

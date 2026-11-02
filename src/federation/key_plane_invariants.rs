@@ -307,13 +307,13 @@ pub(crate) mod bodies {
             scrub_timestamp: at,
             pqc_completed_at: None,
             observed_region: crate::federation::verify_coord::region::US.to_owned(),
-            revoked_after,
+            revoked_after: revoked_after
+                .map(crate::federation::admission::truncate_to_substrate_resolution),
             persist_row_hash: String::new(),
         };
         if let Some(t) = revoked_after {
-            r.revocation_envelope[crate::federation::register::REVOKED_AFTER_ENVELOPE_FIELD] = t
-                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
-                .into();
+            r.revocation_envelope[crate::federation::register::REVOKED_AFTER_ENVELOPE_FIELD] =
+                crate::federation::admission::render_signed_instant(t).into();
         }
         ts::seal_revocation(r)
     }

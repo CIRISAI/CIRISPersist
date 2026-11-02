@@ -389,7 +389,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_accord_proposals_by_anchor", ConnClass::Read),
     ("list_accord_proposals_by_payload", ConnClass::Read),
     ("list_aggregations_at_level", ConnClass::Read),
-    ("list_all_transport_destinations", ConnClass::Read),
+    ("list_all_transport_destinations_unfolded", ConnClass::Read),
     ("list_announced_peers", ConnClass::Read),
     ("list_at_rest_blobs_for_recipients", ConnClass::Read),
     ("list_at_rest_grant_recipients", ConnClass::Read),
@@ -483,10 +483,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_tasks", ConnClass::Read),
     ("list_trace_summaries", ConnClass::Read),
     (
-        "list_transport_destinations_by_destination",
+        "list_transport_destinations_by_destination_unfolded",
         ConnClass::Read,
     ),
-    ("list_transport_destinations_for", ConnClass::Read),
+    ("list_transport_destinations_for_unfolded", ConnClass::Read),
     ("list_trusted_keys", ConnClass::Read),
     ("list_wholeness_witnesses_for_peer", ConnClass::Read),
     ("list_widening_candidates", ConnClass::Read),
@@ -704,6 +704,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("attesting_identity_type", ConnClass::Read),
     ("composer_replay_held", ConnClass::Read),
     ("delete_attestation", ConnClass::Write),
+    // v61 (CC 2.6.2) — the open-time pass's compare-and-delete + ledger row.
+    ("set_aside_form_refused", ConnClass::Write),
     ("repair_withdraws_depth", ConnClass::Write),
     // v59.0.0 (#1099) — the V199 self-roster receipts.
     ("note_self_roster_proposal", ConnClass::Write),

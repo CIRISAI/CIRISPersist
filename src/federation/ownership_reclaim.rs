@@ -1528,6 +1528,8 @@ pub(crate) mod test_support {
 
     /// A hybrid-signed `self_touch` freshness claim.
     fn self_touch(target_key_id: &str, fresh_as_of: DateTime<Utc>) -> SignedTouchClaim {
+        let fresh_as_of =
+            crate::federation::admission::truncate_to_substrate_resolution(fresh_as_of);
         let unsigned = SignedTouchClaim {
             target_key_id: target_key_id.to_owned(),
             target_kind: OWNERSHIP_FRESHNESS_TARGET_KIND.to_owned(),

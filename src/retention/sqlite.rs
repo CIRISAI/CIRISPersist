@@ -248,8 +248,26 @@ fn storage_summary_blocking(
             .map_err(|e| RetentionError::Backend(format!("catalogue collect: {e}")))?;
         drop(stmt);
         for name in names {
-            let usage =
-                table_usage_sqlite(&guard, &name, super::ts_column_for(&name), None, dbstat_ok)?;
+            // v61 (CIRISPersist#1156) — on an embedded node this walk is
+            // the host's whole database, so a table persist does not own is
+            // counted and never fails the aggregate. The time column is
+            // resolved against the table's real columns inside
+            // `table_usage_sqlite`; a foreign table whose instant column does
+            // not read as RFC 3339 is counted with no instant.
+            let ts = super::ts_column_for_sqlite(&name);
+            let usage = match table_usage_sqlite(&guard, &name, ts, None, dbstat_ok) {
+                Ok(u) => u,
+                Err(e) if ts.is_some() => {
+                    tracing::warn!(
+                        table = %name,
+                        error = %e,
+                        "storage summary: the table's time column did not read; counted with no \
+                         instant (CIRISPersist#1156)"
+                    );
+                    table_usage_sqlite(&guard, &name, None, None, dbstat_ok)?
+                }
+                Err(e) => return Err(e),
+            };
             tables.insert(name, usage);
         }
     }
@@ -346,14 +364,40 @@ fn table_usage_sqlite(
         return Ok(TableUsage::default());
     }
 
+    // v61 (CIRISPersist#1156) — the time column is resolved against the
+    // table's REAL columns. A name match is not a schema match: an embedded
+    // node's host database can hold its own table under a name persist maps
+    // (an agent's `audit_log (id, ts)`), and asking it for `MIN(recorded_at)`
+    // failed the whole summary. A column the table does not carry is no
+    // instant, the projection-table reading below.
+    let ts_column = match ts_column {
+        Some(col) => {
+            let has: bool = conn
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2",
+                    params![table, col],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(|e| RetentionError::Backend(format!("columns of {table}: {e}")))?
+                .unwrap_or(false);
+            has.then_some(col)
+        }
+        None => None,
+    };
+    let quoted = quote_ident(table);
+
     // A table with no time-series column (a projection like
     // `attestation_subjects`, a resolver like `signed_wire_index`) still
     // has weight and rows — it just cannot answer "how old". Counting it
     // with `oldest/newest = None` is the honest reading; omitting it
     // entirely is what made the store dark (#767).
     let stats_sql = match ts_column {
-        Some(col) => format!("SELECT count(*), MIN({col}), MAX({col}) FROM {table}"),
-        None => format!("SELECT count(*), NULL, NULL FROM {table}"),
+        Some(col) => format!(
+            "SELECT count(*), MIN({c}), MAX({c}) FROM {quoted}",
+            c = quote_ident(col)
+        ),
+        None => format!("SELECT count(*), NULL, NULL FROM {quoted}"),
     };
     let (rows_i, oldest_raw, newest_raw): (i64, Option<String>, Option<String>) = conn
         .query_row(&stats_sql, [], |row| {
@@ -378,7 +422,7 @@ fn table_usage_sqlite(
     // indistinguishable from an empty table.
     let newest_admitted_at = match admitted_col {
         Some(col) => {
-            let sql = format!("SELECT MAX({col}) FROM {table}");
+            let sql = format!("SELECT MAX({}) FROM {quoted}", quote_ident(col));
             let raw: Option<String> = conn
                 .query_row(&sql, [], |row| row.get(0))
                 .map_err(|e| RetentionError::Backend(format!("admitted stats {table}: {e}")))?;
@@ -397,6 +441,12 @@ fn table_usage_sqlite(
         newest_ts,
         newest_admitted_at,
     })
+}
+
+/// An SQL identifier, double-quoted with `"` doubled: the catalogue walk names
+/// tables persist did not create, so a name is never spliced in bare.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 fn parse_rfc3339(s: &str) -> Result<DateTime<Utc>, RetentionError> {

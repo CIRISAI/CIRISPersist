@@ -514,7 +514,7 @@ pub(crate) mod bodies {
         let mut envelope = serde_json::json!({
             paths::REFERENCES_ATTESTATION_ID: target.attestation_id,
             paths::WITHDRAWAL_REASON: "the group retracts the roster event",
-            paths::ASSERTED_AT: asserted_at.to_rfc3339(),
+            paths::ASSERTED_AT: crate::federation::admission::render_signed_instant(asserted_at),
         });
         for k in [GROUP_KIND_MEMBER, "family_key_id", "community_key_id"] {
             if let Some(v) = target.attestation_envelope.get(k) {

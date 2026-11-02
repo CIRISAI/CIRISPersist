@@ -256,7 +256,7 @@ pub(crate) mod bodies {
                 &p.holder,
                 &p.agent,
                 serde_json::json!({"id": held_id, "dimension": "i570b:held:v1", "score": 1.0,
-                    crate::federation::envelope::paths::ASSERTED_AT: at(T0).to_rfc3339()}),
+                    crate::federation::envelope::paths::ASSERTED_AT: crate::federation::admission::render_signed_instant(at(T0))}),
                 vec![p.agent.clone()],
                 at(T0),
                 None,

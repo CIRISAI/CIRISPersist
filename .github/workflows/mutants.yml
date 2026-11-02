@@ -138,6 +138,15 @@ jobs:
           - {scope: scope-s4a-plans, shard: '6/9', id: s4a-plans-6-of-9, weekly: true}
           - {scope: scope-s4a-plans, shard: '7/9', id: s4a-plans-7-of-9, weekly: true}
           - {scope: scope-s4a-plans, shard: '8/9', id: s4a-plans-8-of-9, weekly: true}
+          # The S3 record-shape breaks (CC 2.6.2 strict instants, #1126, #1101,
+          # #1122, #1146, #1156): 147 mutants, six shards of <= 25
+          # (600 s + 168 s x 25 = 4800 s each), weekly.
+          - {scope: scope-s3-shapes, shard: '0/6', id: s3-shapes-0-of-6, weekly: true}
+          - {scope: scope-s3-shapes, shard: '1/6', id: s3-shapes-1-of-6, weekly: true}
+          - {scope: scope-s3-shapes, shard: '2/6', id: s3-shapes-2-of-6, weekly: true}
+          - {scope: scope-s3-shapes, shard: '3/6', id: s3-shapes-3-of-6, weekly: true}
+          - {scope: scope-s3-shapes, shard: '4/6', id: s3-shapes-4-of-6, weekly: true}
+          - {scope: scope-s3-shapes, shard: '5/6', id: s3-shapes-5-of-6, weekly: true}
     services:
       postgres:
         image: ghcr.io/cirisai/postgres:16

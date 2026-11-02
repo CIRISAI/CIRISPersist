@@ -599,6 +599,7 @@ Engine	secrets_update_filter_config	deontic
 Engine	self_enc_pubkeys	ontological	
 Engine	self_key_id	ontological	
 Engine	serve_blob_to_peer_json	deontic	
+Engine	serve_seat_owner_announced	deontic	
 Engine	service_token_revocation_check	deontic	
 Engine	service_token_revocation_list	empirical	
 Engine	service_token_revocation_record	deontic	

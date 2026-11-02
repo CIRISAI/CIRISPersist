@@ -188,34 +188,122 @@ pub fn owner_binding_delegates_to_envelope(
     })
 }
 
-/// v6.5.0 (CEG §8.1.12.7) — the user-side `consent:partnership_grant`
-/// envelope: "I (user) offer a bilateral partnership to this agent
-/// occurrence", keyed by a shared `bilateral_pair_id`.
-pub fn partnership_grant_envelope(
-    partner_occurrence_key_id: &str,
+/// v61 (CIRISPersist#1126; CC 4.4.3.4.3.1, CC 3.3.5) — a partnership
+/// half is a **`consent_record`** row: `subject_kind: "consent_record"`, the
+/// `stance`, the singular `subject_key_id` naming the PARTNER (the agent
+/// occurrence on the grant, the user identity on the accept), the shared
+/// `bilateral_pair_id`, and the claim's own `asserted_at` in the CC 2.6.2
+/// form. No `valid_until`: a PARTNERED pair has no expiry. `stance: "revoked"`
+/// on the same dimension ends the partnership (a revoked `consent_record`
+/// transits the local tier and never rests there, CC 10.1.3).
+///
+/// Wire shape (sorted-keys when canonicalized):
+///
+/// ```json
+/// {
+///   "asserted_at": "2026-11-01T12:00:00.000Z",
+///   "bilateral_pair_id": "<shared pair id>",
+///   "dimension": "consent:partnership_grant:v1",
+///   "stance": "granted",
+///   "subject_key_id": "<the partner>",
+///   "subject_kind": "consent_record"
+/// }
+/// ```
+///
+/// Pre-v61 halves were bare `scores` (`kind`, `partner_occurrence_key_id`, no
+/// `stance`); that shape is refused at admission
+/// ([`PARTNERSHIP_SHAPE_RETIRED_REASON`]).
+pub fn partnership_envelope(
+    dimension: &str,
+    partner_key_id: &str,
     bilateral_pair_id: &str,
+    stance: &str,
+    asserted_at: DateTime<Utc>,
 ) -> serde_json::Value {
     serde_json::json!({
-        "kind": "partnership_grant",
-        "dimension": DIMENSION_PARTNERSHIP_GRANT,
-        "partner_occurrence_key_id": partner_occurrence_key_id,
+        "dimension": dimension,
+        "subject_kind": crate::federation::types::consent_record::SUBJECT_KIND,
+        "stance": stance,
+        "subject_key_id": partner_key_id,
         "bilateral_pair_id": bilateral_pair_id,
+        "asserted_at": crate::federation::admission::render_signed_instant(asserted_at),
     })
 }
 
-/// v6.5.0 (CEG §8.1.12.7) — the agent-side `consent:partnership_accept`
-/// envelope: "I (agent occurrence) accept the partnership offered under
-/// this `bilateral_pair_id`". The matching half of
-/// [`partnership_grant_envelope`].
-pub fn partnership_accept_envelope(
+/// v6.5.0 (CEG §8.1.12.7) — the user-side `consent:partnership_grant`
+/// half: "I (user) partner with this agent occurrence", keyed by a shared
+/// `bilateral_pair_id`. v61: a `consent_record`
+/// ([`partnership_envelope`], `stance: granted`).
+pub fn partnership_grant_envelope(
     partner_occurrence_key_id: &str,
     bilateral_pair_id: &str,
+    asserted_at: DateTime<Utc>,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "kind": "partnership_accept",
-        "dimension": DIMENSION_PARTNERSHIP_ACCEPT,
-        "partner_occurrence_key_id": partner_occurrence_key_id,
-        "bilateral_pair_id": bilateral_pair_id,
+    partnership_envelope(
+        DIMENSION_PARTNERSHIP_GRANT,
+        partner_occurrence_key_id,
+        bilateral_pair_id,
+        crate::federation::types::consent_record::stance::GRANTED,
+        asserted_at,
+    )
+}
+
+/// v6.5.0 (CEG §8.1.12.7) — the agent-side `consent:partnership_accept`
+/// half: "I (agent occurrence) accept the partnership offered under this
+/// `bilateral_pair_id`"; the partner is the user identity. v61: a
+/// `consent_record` ([`partnership_envelope`], `stance: granted`).
+pub fn partnership_accept_envelope(
+    partner_identity_key_id: &str,
+    bilateral_pair_id: &str,
+    asserted_at: DateTime<Utc>,
+) -> serde_json::Value {
+    partnership_envelope(
+        DIMENSION_PARTNERSHIP_ACCEPT,
+        partner_identity_key_id,
+        bilateral_pair_id,
+        crate::federation::types::consent_record::stance::GRANTED,
+        asserted_at,
+    )
+}
+
+/// v61 (CIRISPersist#1126) — the reason a pre-v61 bare-`scores`
+/// partnership half carries at admission: a `consent:partnership_grant` /
+/// `consent:partnership_accept` row that is not a `consent_record`.
+pub const PARTNERSHIP_SHAPE_RETIRED_REASON: &str = "partnership_shape_retired";
+
+/// v61 (CIRISPersist#1126, CC 4.4.3.4.3.1) — **a partnership half is a
+/// `consent_record`.** A `scores` row on `consent:partnership_grant` or
+/// `consent:partnership_accept` without `subject_kind: "consent_record"` is
+/// the retired bare shape, refused at every door a row enters by (the
+/// federation put and the local write). A `withdraws` or `recants` naming a
+/// half's dimension is not a half and passes; the `consent_record` gate
+/// ([`check_consent_record_admission`](crate::federation::admission::check_consent_record_admission))
+/// then asks the record's own rules.
+///
+/// # Errors
+/// [`Error::DimensionRejected`](crate::federation::Error::DimensionRejected)
+/// with [`PARTNERSHIP_SHAPE_RETIRED_REASON`].
+pub fn check_partnership_shape(
+    attestation_type: &str,
+    envelope: &serde_json::Value,
+) -> Result<(), crate::federation::Error> {
+    let Some(dimension) = crate::federation::admission::envelope_dimension(envelope) else {
+        return Ok(());
+    };
+    let is_half = ["consent:partnership_grant:", "consent:partnership_accept:"]
+        .iter()
+        .any(|p| dimension.starts_with(p));
+    if !is_half || attestation_type != crate::federation::types::attestation_type::SCORES {
+        return Ok(());
+    }
+    if crate::federation::admission::envelope_subject_kind(envelope)
+        == Some(crate::federation::types::consent_record::SUBJECT_KIND)
+    {
+        return Ok(());
+    }
+    Err(crate::federation::Error::DimensionRejected {
+        dimension: dimension.to_owned(),
+        reason: PARTNERSHIP_SHAPE_RETIRED_REASON,
     })
 }
 
@@ -297,7 +385,9 @@ pub struct TransportDestination {
     /// The reachable address (a Reticulum destination hash, a `wss://`
     /// URL, …).
     pub destination: String,
-    /// When the address was (re)asserted.
+    /// When the address was (re)asserted. A signed member: serialized in the
+    /// CC 2.6.2 form `.sssZ` (v61).
+    #[serde(with = "crate::federation::admission::signed_instant_serde")]
     pub asserted_at: DateTime<Utc>,
     /// Advisory liveness — operators sweep stale destinations. `None`
     /// until first observed. NOT a lease.
@@ -353,7 +443,11 @@ pub struct TransportDestination {
     /// resurrecting the route. Retired rows are EXCLUDED from the three
     /// `list_transport_destinations*` reads but INCLUDED in the signed
     /// replication read (tombstones must gossip).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::federation::admission::signed_instant_serde::option"
+    )]
     pub retired_at: Option<DateTime<Utc>>,
 }
 
@@ -1000,11 +1094,81 @@ mod tests {
 
     #[test]
     fn partnership_pair_shares_bilateral_id() {
-        let g = partnership_grant_envelope("agent-occ", "pair-7");
-        let a = partnership_accept_envelope("user-occ", "pair-7");
+        let at = chrono::Utc::now();
+        let g = partnership_grant_envelope("agent-occ", "pair-7", at);
+        let a = partnership_accept_envelope("user-occ", "pair-7", at);
         assert_eq!(g["bilateral_pair_id"], a["bilateral_pair_id"]);
         assert_eq!(g["dimension"], DIMENSION_PARTNERSHIP_GRANT);
         assert_eq!(a["dimension"], DIMENSION_PARTNERSHIP_ACCEPT);
+    }
+
+    /// v61 (CIRISPersist#1126, CC 4.4.3.4.3.1) — the two halves are
+    /// `consent_record` rows with exactly the pinned member set: the six
+    /// envelope members (the row's type and attester ride its `row` mirror),
+    /// the partner in the singular `subject_key_id`, no `valid_until`.
+    #[test]
+    fn partnership_halves_are_consent_records_1126() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-01T12:00:00.123456Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let g = partnership_grant_envelope("agent-occ", "pair-7", at);
+        let keys: Vec<&str> = g.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys = keys;
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "asserted_at",
+                "bilateral_pair_id",
+                "dimension",
+                "stance",
+                "subject_key_id",
+                "subject_kind"
+            ]
+        );
+        assert_eq!(g["subject_kind"], "consent_record");
+        assert_eq!(g["stance"], "granted");
+        assert_eq!(g["subject_key_id"], "agent-occ");
+        assert_eq!(g["asserted_at"], "2026-11-01T12:00:00.123Z");
+        let a = partnership_accept_envelope("user-occ", "pair-7", at);
+        assert_eq!(a["subject_key_id"], "user-occ");
+        assert!(
+            crate::federation::admission::check_consent_record_admission(
+                crate::federation::types::attestation_type::SCORES,
+                &g,
+                crate::federation::types::attestation_tier::LOCAL,
+            )
+            .is_ok()
+        );
+        assert!(
+            check_partnership_shape(crate::federation::types::attestation_type::SCORES, &g).is_ok()
+        );
+    }
+
+    /// v61 (CIRISPersist#1126) — the pre-v61 bare `scores` half is refused
+    /// `partnership_shape_retired`; a retraction naming the dimension, and any
+    /// other dimension, pass.
+    #[test]
+    fn the_bare_partnership_shape_is_refused_1126() {
+        use crate::federation::types::attestation_type::{SCORES, WITHDRAWS};
+        for dim in [DIMENSION_PARTNERSHIP_GRANT, DIMENSION_PARTNERSHIP_ACCEPT] {
+            let bare = serde_json::json!({
+                "kind": "partnership_grant",
+                "dimension": dim,
+                "partner_occurrence_key_id": "agent-occ",
+                "bilateral_pair_id": "pair-7",
+            });
+            assert!(matches!(
+                check_partnership_shape(SCORES, &bare),
+                Err(crate::federation::Error::DimensionRejected { reason, .. })
+                    if reason == PARTNERSHIP_SHAPE_RETIRED_REASON
+            ));
+            assert!(check_partnership_shape(WITHDRAWS, &bare).is_ok());
+        }
+        let other = serde_json::json!({ "dimension": "consent:state:granted:v1" });
+        assert!(check_partnership_shape(SCORES, &other).is_ok());
+        assert!(crate::federation::admission::dimension_rejected_reason::ALL
+            .contains(&PARTNERSHIP_SHAPE_RETIRED_REASON));
     }
 
     /// v17.0.0 (#443) — a BARE unsigned `TransportDestination` payload does
@@ -2604,7 +2768,11 @@ mod transit_kex_tests {
             occurrence_key_id: "kat-relay".into(),
             transport_kind: "reticulum".into(),
             destination: "kat-dest".into(),
-            asserted_at: "2026-10-13T00:00:00Z".parse().unwrap(),
+            // v61 (CC 2.6.2) — a millisecond the v55 reader's chrono
+            // default also writes with three digits, so the two serializations
+            // agree. A whole-second instant does not: chrono writes `…:00Z`
+            // and v61 writes `…:00.000Z`, which is the canonical form.
+            asserted_at: "2026-10-13T00:00:00.123Z".parse().unwrap(),
             last_seen_at: None,
             transport_ed25519_pubkey_base64: None,
             transport_x25519_pubkey_base64: Some(B64.encode([0x0Au8; 32])),
@@ -2630,8 +2798,14 @@ mod transit_kex_tests {
     /// Recomputed independently from the expected wire bytes (struct-order
     /// projection, sorted-key envelope, compact separators) in Python's
     /// `hashlib`, not read back from this code.
+    ///
+    /// v61 (CC 2.6.2) — re-pinned for the KAT's instant moving to
+    /// `2026-10-13T00:00:00.123Z`. This value was read from the code's own
+    /// output at that change, not recomputed independently; the v56 lockstep
+    /// property this pins (the projection carries nothing of the pair) is
+    /// unchanged and is asserted below.
     const KAT_CONTENT_HASH: &str =
-        "14da66a0045da51be64ec2fbfb501c57fd8faf745b8320de625b2fee371965e2";
+        "46e8e4057a9130aff67c2aa32f4d7892e97a4f1ddd9e959e841edf86f4c68b60";
 
     /// **I1010 (pure, the lockstep KAT).** One pair-bearing row serializes to
     /// the same bytes under the v56 reader and a v55 reader: the projection

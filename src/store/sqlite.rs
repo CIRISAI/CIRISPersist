@@ -5115,8 +5115,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             })?;
         if occurrence_applied > 0 {
             if let Some(route) = &projected_route {
-                crate::federation::FederationDirectory::put_transport_destination(self, route)
-                    .await?;
+                crate::federation::transport_routes::project_occurrence_route(self, route).await?;
             }
             // v58.0.0 (CIRISPersist#991) — the pair's `identity:occurrence:v1`
             // row is a wire-index entry too (the Attestation kind).
@@ -5257,7 +5256,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             crate::federation::Error::Backend(format!("put_identity_occurrence_local: {e}"))
         })?;
         if let Some(route) = &projected_route {
-            crate::federation::FederationDirectory::put_transport_destination(self, route).await?;
+            crate::federation::transport_routes::project_occurrence_route(self, route).await?;
         }
         Ok(())
     }
@@ -7330,6 +7329,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         destination: &crate::federation::TransportDestination,
     ) -> Result<(), crate::federation::Error> {
+        // v61 (CIRISPersist#1122) — an agent announces no route.
+        crate::federation::transport_routes::check_route_key_not_agent(self, destination).await?;
         let d = destination.clone();
         let asserted = d.asserted_at.to_rfc3339();
         let last_seen = d.last_seen_at.map(|t| t.to_rfc3339());
@@ -7643,7 +7644,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(outcome)
     }
 
-    async fn list_transport_destinations_for(
+    async fn list_transport_destinations_for_unfolded(
         &self,
         occurrence_key_id: &str,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
@@ -7702,7 +7703,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
-    async fn list_all_transport_destinations(
+    async fn list_all_transport_destinations_unfolded(
         &self,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
         self.read(
@@ -7727,7 +7728,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
-    async fn list_transport_destinations_by_destination(
+    async fn list_transport_destinations_by_destination_unfolded(
         &self,
         destination: &str,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
@@ -16754,6 +16755,41 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("delete_attestation: {e}")))?;
         Ok(n > 0)
+    }
+
+    async fn set_aside_form_refused(
+        &self,
+        row: &crate::federation::Attestation,
+        member: &str,
+        value: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, crate::federation::Error> {
+        let id = row.attestation_id.clone();
+        let attester = row.attesting_key_id.clone();
+        let hash = row.persist_row_hash.clone();
+        let (member, value) = (member.to_owned(), value.to_owned());
+        let at = at.to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
+        self.write(move |conn| -> Result<bool, rusqlite::Error> {
+            let tx = conn.transaction()?;
+            let gone = tx.execute(
+                "DELETE FROM federation_attestations \
+                 WHERE attestation_id = ?1 AND persist_row_hash = ?2",
+                rusqlite::params![id, hash],
+            )?;
+            if gone == 0 {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO federation_attestations_form_refused \
+                 (attestation_id, attesting_key_id, persist_row_hash, refused_member, \
+                  refused_value, refused_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![id, attester, hash, member, value, at],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("set_aside_form_refused: {e}")))
     }
 
     async fn store_planned_attestation(
@@ -30663,7 +30699,10 @@ mod tests {
         );
         assert_eq!(mine[0].detail["cohort_key_id"], fam);
         assert_eq!(mine[0].subject_key_id.as_deref(), Some(member.as_str()));
-        assert_eq!(mine[0].detail["effective_at"], effective.to_rfc3339());
+        assert_eq!(
+            mine[0].detail["effective_at"],
+            crate::federation::admission::render_signed_instant(effective)
+        );
     }
 
     /// Clause 2 (#146 Ask 5, CEG §5.6.8.7) — consent_record admission:
@@ -47070,7 +47109,8 @@ mod tests {
         };
 
         // LIVE binding (future valid_until) → S is a live anchor of A.
-        let future = (Utc::now() + Duration::days(30)).to_rfc3339();
+        let future =
+            crate::federation::admission::render_signed_instant(Utc::now() + Duration::days(30));
         backend
             .put_attestation(SignedAttestation {
                 attestation: binding("si-live", &future),
@@ -47106,7 +47146,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let lapsed = (Utc::now() - Duration::days(1)).to_rfc3339();
+        let lapsed =
+            crate::federation::admission::render_signed_instant(Utc::now() - Duration::days(1));
         let mut b = topo_attestation(
             "si-S",
             "si-B",

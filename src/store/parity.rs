@@ -260,6 +260,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // Gates: the stored-column shapes (hex content hash, hybrid algorithm),
     // the consent-role token.
     ("check_key_record_columns", Class::Gate),
+    // v61 (CC 2.6.2) — a signed instant not `.sssZ` is refused.
+    ("local_write_instant_form_violation", Class::Gate),
+    // v61 (CIRISPersist#1126) — a bare-`scores` partnership half is refused.
+    ("check_partnership_shape", Class::Gate),
+    // v61 (CIRISPersist#1122) — an agent key's route is refused.
+    ("check_route_key_not_agent", Class::Gate),
     ("admit_consent_role", Class::Gate),
     // The replicated apply's classification and its first-sight PoP gate
     // are refusals; the verify-error mapping re-raises anything that is not
@@ -1188,7 +1194,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("sqlite_append_chunk_item", Class::Delegates),
     ("pg_append_chunk_item", Class::Delegates),
     ("put_family_local", Class::Delegates),
-    ("put_transport_destination", Class::Delegates),
+    // v61 (CIRISPersist#1122) — the occurrence write projects its route
+    // through one shared step, which skips an agent's and otherwise runs the
+    // local route door (its gates).
+    ("project_occurrence_route", Class::Delegates),
     ("query", Class::Plumbing),
     ("query_map", Class::Plumbing),
     ("query_one", Class::Plumbing),

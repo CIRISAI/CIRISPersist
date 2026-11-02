@@ -656,8 +656,10 @@ fn round_timestamp(s: &str, precision: i32) -> Result<Value, TransformError> {
                 "round: {rounded_secs} seconds is out of chrono's representable range"
             ))
         })?;
+    // CC 2.6.2: exactly three fractional digits and `Z`, so a rounded instant
+    // is still in the one canonical form (v61 S3).
     Ok(Value::String(
-        rounded.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        crate::federation::admission::render_signed_instant(rounded),
     ))
 }
 
@@ -1276,7 +1278,7 @@ mod tests {
     fn round_timestamp_coarsens_to_a_second_bucket() {
         let op = TransformOp::Round { precision: 1 }; // nearest 10s
         let out = apply(&op, &serde_json::json!("2024-01-01T00:00:07Z")).unwrap();
-        assert_eq!(out, serde_json::json!("2024-01-01T00:00:10Z"));
+        assert_eq!(out, serde_json::json!("2024-01-01T00:00:10.000Z"));
     }
 
     #[test]

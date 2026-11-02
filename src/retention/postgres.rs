@@ -167,15 +167,35 @@ pub async fn storage_summary_pg_with(
             // Key on the BARE table name so a consumer reads the same key
             // on either backend; the qualified name is a PG detail.
             let bare = qname.rsplit('.').next().unwrap_or(&qname).to_owned();
-            let usage = table_usage_pg(
-                &client,
-                &qname,
-                super::ts_column_for(&bare),
-                None,
-                with_table_bytes,
-            )
-            .await?;
-            tables.insert(bare, usage);
+            let schema = qname.split('.').next().unwrap_or("").to_owned();
+            // v61 (CIRISPersist#1156) — a table in a schema persist does
+            // not own is keyed by its QUALIFIED name and carries no instant:
+            // keyed bare, a host's `public.audit_log` replaced persist's
+            // `cirislens.audit_log` in the map.
+            let owned = PERSIST_SCHEMAS.contains(&schema.as_str());
+            // v61 (CIRISPersist#1156) — the time column is resolved
+            // against the table's real columns in the catalogue: a table
+            // persist does not own (a host's `audit_log` in its own schema)
+            // can share a name persist maps, and asking it for `recorded_at`
+            // failed the whole summary. A column that is absent, or is not a
+            // timestamp, is no instant.
+            let ts = match super::ts_column_for(&bare).filter(|_| owned) {
+                Some(col) => client
+                    .query_opt(
+                        "SELECT 1 FROM information_schema.columns \
+                         WHERE table_schema = $1 AND table_name = $2 AND column_name = $3 \
+                         AND data_type IN ('timestamp with time zone', \
+                                           'timestamp without time zone')",
+                        &[&schema, &bare, &col],
+                    )
+                    .await
+                    .map_err(|e| RetentionError::Backend(format!("columns of {qname}: {e}")))?
+                    .map(|_| col),
+                None => None,
+            };
+            let quoted = format!("{}.{}", quote_ident(&schema), quote_ident(&bare));
+            let usage = table_usage_pg(&client, &quoted, ts, None, with_table_bytes).await?;
+            tables.insert(if owned { bare } else { qname }, usage);
         }
     }
     let dark_bytes = total_disk_bytes.saturating_sub(tables.values().map(|u| u.bytes).sum());
@@ -193,6 +213,22 @@ pub async fn storage_summary_pg_with(
         bytes_measurable: true,
         total_disk_bytes,
     })
+}
+
+/// v61 (CIRISPersist#1156) — the schemas persist's migrations create. A
+/// table in any other schema is the host's, counted under its qualified name.
+pub const PERSIST_SCHEMAS: &[&str] = &[
+    "cirisgraph",
+    "cirislens",
+    "cirislens_derived",
+    "cirislens_secrets",
+    "cirisnode",
+];
+
+/// An SQL identifier, double-quoted with `"` doubled: the catalogue walk names
+/// tables persist did not create, so a name is never spliced in bare.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// Per-table read helper: bytes (`pg_total_relation_size`) + row count + ts
@@ -231,7 +267,7 @@ async fn table_usage_pg(
             .query_one(
                 &format!(
                     "SELECT pg_total_relation_size('{}')::BIGINT AS sz",
-                    qualified
+                    qualified.replace('\'', "''")
                 ),
                 &[],
             )
@@ -262,10 +298,17 @@ async fn table_usage_pg(
         col = ts_column.unwrap_or("NULL"),
         tbl = qualified,
     );
-    let row = client
-        .query_one(&stats_sql, &[])
-        .await
-        .map_err(|e| RetentionError::Backend(format!("stats query {qualified}: {e}")))?;
+    let row = match client.query_one(&stats_sql, &[]).await {
+        Ok(row) => row,
+        // 42P01 — the table left the catalogue between the walk and the count
+        // (a host dropped it): soft-fail like the size query above.
+        Err(e) if e.code().is_some_and(|c| c.code() == "42P01") => return Ok(TableUsage::default()),
+        Err(e) => {
+            return Err(RetentionError::Backend(format!(
+                "stats query {qualified}: {e}"
+            )))
+        }
+    };
 
     let rows_i: i64 = row
         .try_get("rows")
