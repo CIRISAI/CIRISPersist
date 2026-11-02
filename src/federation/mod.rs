@@ -1168,6 +1168,14 @@ pub const ROSTER_CONSENSUS_UNEVALUABLE: &str = "roster_consensus_unevaluable";
 /// v49.0.0 (CIRISPersist#908) — substantive: the change would leave the group
 /// with other active members and no active founder.
 pub const ROSTER_LAST_FOUNDER: &str = "roster_last_founder";
+/// v61 S2 (CC 4.5.13) — substantive: under `open:self_admit` a removal
+/// reached the LOCAL door more than
+/// [`consensus::OPEN_SELF_ADMIT_REMOVAL_WINDOW_SECS`] from its signed
+/// `removed_at`. A roster cosignature carries no signed instant of its own,
+/// so no cosignature can show it was given inside the window; the local door
+/// bounds the removal on receipt instead. The replicated door does not: a
+/// peer's clock is no witness to when the voices signed.
+pub const ROSTER_REMOVAL_OUTSIDE_WINDOW: &str = "roster_removal_outside_window";
 
 /// v50.0.0 (CIRISPersist#916, FSD `SECOND_DEVICE.md` §3) — the device carries
 /// no live owner-binding here: nobody is responsible for it, so no member's

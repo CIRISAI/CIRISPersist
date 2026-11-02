@@ -29,14 +29,22 @@
 //!   distinct in-window objectors take the added member back off; one
 //!   objector does not, even where `m` is 1 (the two-path count minimum, one
 //!   voice never decides who is in a room).
+//! - **I1515** (v61 S2) — the removal window under `open:self_admit`. A
+//!   roster cosignature carries no signed instant of its own (every scrub
+//!   covers the same `signing_envelope`), so CC's per-cosignature bound falls
+//!   back to the local door's receipt: a two-voice removal whose `removed_at`
+//!   lies more than 259 200 s before receipt is refused
+//!   (`roster_removal_outside_window`); one inside the window is admitted; a
+//!   resignation is not a counted removal and is not bounded; the replicated
+//!   door applies a stale removal another node admitted, as data.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::admission::FOUNDER_ONLY_ABOVE_FAMILY;
     use crate::federation::membership_acceptance::RULE_ACCEPTANCE_UNRESOLVED;
     use crate::federation::membership_acceptance_invariants::bodies::{
-        found_affiliation, found_community, found_family, found_public_room, proposal, put, reg,
-        reply, widen_community,
+        found_affiliation, found_community, found_family, found_public_room, found_public_room_at,
+        proposal, put, reg, reply, widen_community,
     };
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::COMMUNITY;
@@ -528,6 +536,99 @@ pub(crate) mod bodies {
         d.put_community_membership_revocation(r).await
     }
 
+    fn removal(
+        cid: &str,
+        signers: &[&str],
+        member: &str,
+        at: DateTime<Utc>,
+    ) -> crate::federation::types::SignedCommunityMembershipRevocation {
+        let mut r = ts::sign_community_membership_revocation(
+            signers[0],
+            CommunityMembershipRevocation {
+                community_key_id: cid.to_owned(),
+                removed_identity_key_id: member.to_owned(),
+                removed_at: ms(at),
+                effective_at: ms(at),
+                reason: None,
+                witness_set: Vec::new(),
+                persist_row_hash: String::new(),
+            },
+        );
+        for c in &signers[1..] {
+            ts::cosign_community_membership_revocation(&mut r, c);
+        }
+        r
+    }
+
+    /// **I1515** — the removal window under `open:self_admit`.
+    pub(crate) async fn i1515_removal_window_under_open_self_admit(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::consensus::OPEN_SELF_ADMIT_REMOVAL_WINDOW_SECS as WINDOW;
+        let k = |n: &str| format!("i1515-{n}-{s}");
+        let (f1, f2, f3, f4, f5, cid) = (k("f1"), k("f2"), k("f3"), k("f4"), k("f5"), k("pub"));
+        reg(d, &[&f1, &f2, &f3, &f4, &f5, &cid]).await;
+        let now = Utc::now();
+        found_public_room_at(
+            d,
+            &cid,
+            OPEN_SELF_ADMIT,
+            &[&f1, &f2, &f3, &f4, &f5],
+            now - Duration::days(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(WINDOW, 259_200, "I1515: CC's window, 72 hours");
+        // A resignation is a member's own act, not a counted removal.
+        d.put_community_membership_revocation(removal(&cid, &[&f5], &f5, now - Duration::days(5)))
+            .await
+            .expect("I1515: a stale resignation is not bounded");
+        assert!(!active(d, &cid, &f5).await, "I1515: f5 left");
+        // Two voices, asserted four days before receipt: outside the window.
+        let stale = removal(&cid, &[&f1, &f2], &f3, now - Duration::days(4));
+        let e = d
+            .put_community_membership_revocation(stale.clone())
+            .await
+            .expect_err("I1515: a removal older than the window at the local door");
+        assert_eq!(
+            rule(&e),
+            crate::federation::ROSTER_REMOVAL_OUTSIDE_WINDOW,
+            "I1515: {e}"
+        );
+        assert!(active(d, &cid, &f3).await, "I1515: f3 still in");
+        // The replicated door applies it as data: another node admitted it in
+        // time, and this node's clock is no witness to when the voices signed.
+        let row = crate::federation::group_plane::plan_group_row(
+            &crate::federation::group_plane::GroupSigned::CommunityRevocation(stale),
+        )
+        .unwrap()
+        .expect("a hybrid-signed removal has a row");
+        let out = d
+            .apply_replicated_attestation(crate::federation::SignedAttestation { attestation: row })
+            .await
+            .expect("I1515: the replicated door");
+        assert_eq!(
+            out,
+            crate::federation::attestation_apply::ReplicatedAttestationOutcome::Inserted,
+            "I1515: a stale removal replicated in is applied"
+        );
+        assert!(
+            !active(d, &cid, &f3).await,
+            "I1515: f3 removed by the replica"
+        );
+        // Inside the window, at the local door: admitted.
+        d.put_community_membership_revocation(removal(
+            &cid,
+            &[&f1, &f2],
+            &f4,
+            now - Duration::seconds(WINDOW - 120),
+        ))
+        .await
+        .expect("I1515: a removal inside the window");
+        assert!(!active(d, &cid, &f4).await, "I1515: f4 removed");
+    }
+
     /// **I1503** — a removal under `open:self_admit` takes two voices.
     pub(crate) async fn i1503_removal_takes_two_voices(d: &dyn FederationDirectory, s: &str) {
         let (f1, f2, f3, joiner, cid) = (
@@ -727,6 +828,7 @@ mod runners {
                 case!(i1501_open_self_admit_only_on_a_public_room);
                 case!(i1502_the_joiner_admits_themselves);
                 case!(i1503_removal_takes_two_voices);
+                case!(i1515_removal_window_under_open_self_admit);
                 case!(i1505_a_widening_is_reversible_under_reverse_quorum);
 
                 #[tokio::test]

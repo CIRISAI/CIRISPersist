@@ -139,11 +139,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("store_planned_local_occurrence", Class::Plumbing),
     ("index_occurrence_row", Class::Plumbing),
     // v61 (CIRISPersist#1148) — the replicated community apply's put-time
-    // audience precondition: the verdict refuses a record this node may not
-    // receive (a Gate), asked about this node's own key (Plumbing: a read of
-    // the node's identity).
-    ("may_receive_community_record", Class::Gate),
-    ("node_key_id", Class::Plumbing),
+    // audience precondition (`may_receive_community_record`, Gate) and the
+    // node key it asks about (`node_key_id`, Plumbing) are each classified
+    // once, below; the S2/S4b merge had listed both twice.
     // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
     ("put_transport_destination_planned", Class::Plan),
     ("put_signed_transport_destination_planned", Class::Plan),
@@ -1241,6 +1239,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("recompute_and_assert_root", Class::Gate),
     ("references_attestation_id_from_envelope", Class::Plumbing),
     ("reject_future_dated_community_revocation", Class::Gate),
+    // v61 S2 (CC 4.5.13) — the open:self_admit removal window at the local
+    // door: refuses a removal received outside 259 200 s of its signed instant.
+    ("check_open_self_admit_removal_window", Class::Gate),
     ("reload_record_bytes", Class::Plumbing),
     // #840 (I44) — the V070 checksum repair. PLUMBING, and the reason is
     // that it cannot refuse anything: one conditional UPDATE whose entire
@@ -3441,6 +3442,13 @@ mod tests {
         (
             "plan_put_community_membership_revocation",
             "reject_future_dated_community_revocation",
+            Reads::ReceivedAt,
+        ),
+        // v61 S2 — the open:self_admit removal window, bounded on receipt at
+        // the local door (a roster cosignature carries no signed instant).
+        (
+            "plan_put_community_membership_revocation",
+            "check_open_self_admit_removal_window",
             Reads::ReceivedAt,
         ),
         (
