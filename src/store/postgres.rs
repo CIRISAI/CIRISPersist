@@ -3076,6 +3076,50 @@ impl PostgresBackend {
         Ok(n)
     }
 
+    /// v61 (the canonical's read storm) — **planner statistics at open**, the
+    /// sqlite twin's postgres half. A table postgres has never analyzed (a
+    /// fresh restore before autovacuum's first pass: `pg_stat_user_tables`
+    /// has neither `last_analyze` nor `last_autoanalyze`) is planned without
+    /// statistics, and the unpinned Live listing then bitmap-ANDs every
+    /// visible row and sorts it (measured: 12,319 buffers for one page over
+    /// a 2,002-row history, 13 once analyzed). This runs `ANALYZE` on
+    /// `federation_attestations` once in that state; postgres samples a
+    /// bounded number of rows (`default_statistics_target`), whatever the
+    /// table's size. A failure is logged and the open proceeds.
+    pub(crate) async fn plan_statistics_at_open(&self) {
+        let r: Result<bool, String> = async {
+            let client = self.get_client().await.map_err(|e| e.to_string())?;
+            let row = client
+                .query_opt(
+                    "SELECT (last_analyze IS NULL AND last_autoanalyze IS NULL) \
+                     FROM pg_stat_user_tables \
+                     WHERE schemaname = 'cirislens' AND relname = 'federation_attestations'",
+                    &[],
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let never = match row {
+                Some(row) => row.try_get::<_, bool>(0).map_err(|e| e.to_string())?,
+                None => false,
+            };
+            if never {
+                client
+                    .batch_execute("ANALYZE cirislens.federation_attestations")
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(never)
+        }
+        .await;
+        match r {
+            Ok(true) => tracing::info!("postgres: first ANALYZE of federation_attestations ran"),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "postgres: planner statistics at open failed; open proceeds")
+            }
+        }
+    }
+
     /// Test-only: apply migrations up to and including `version` (see the
     /// sqlite twin). No advisory lock — a test database has one writer.
     #[cfg(any(test, feature = "test-anchor"))]
@@ -5092,6 +5136,8 @@ impl Backend for PostgresBackend {
         self.legacy_community_trust_grants_at_open()
             .await
             .map_err(|e| Error::Backend(format!("community_trust grandfather count: {e}")))?;
+        // v61 (the canonical's read storm) — planner statistics, last.
+        self.plan_statistics_at_open().await;
         Ok(())
     }
 

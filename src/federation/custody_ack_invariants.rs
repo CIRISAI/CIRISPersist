@@ -2425,6 +2425,18 @@ mod storm_v61 {
                 }
             }
         }
+        // The first open after upgrade on this store: statistics dropped,
+        // the open's bounded ANALYZE timed.
+        conn.lock()
+            .execute_batch("DROP TABLE IF EXISTS sqlite_stat1")
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        b.plan_statistics_at_open().await;
+        eprintln!(
+            "v61 first-open ANALYZE over {} rows: {:?}",
+            LISTING_ROWS + 1,
+            t0.elapsed()
+        );
     }
 }
 
@@ -2581,12 +2593,32 @@ mod storm_v61_pg {
         // A page well below the history, so O(page) and O(history) differ.
         const LISTING_PAGE: i64 = 64;
         let mut listing_failures: Vec<String> = Vec::new();
-        for stats in ["no statistics", "after ANALYZE"] {
-            if stats == "after ANALYZE" {
+        // "stale statistics": the open analyzed the table while it was
+        // empty and the history landed after (autovacuum is off), which is
+        // what a planner sees with no statistics worth the name. Then a
+        // fresh restore is simulated (the table's analyze counters reset)
+        // and the open's twin analyzes it.
+        for stats in ["stale statistics", "after the open's ANALYZE"] {
+            if stats == "after the open's ANALYZE" {
                 client
-                    .batch_execute("ANALYZE cirislens.federation_attestations")
+                    .batch_execute(
+                        "SELECT pg_stat_reset_single_table_counters(\
+                         'cirislens.federation_attestations'::regclass)",
+                    )
                     .await
                     .unwrap();
+                b.plan_statistics_at_open().await;
+                let analyzed = client
+                    .query_one(
+                        "SELECT last_analyze IS NOT NULL FROM pg_stat_user_tables \
+                         WHERE schemaname = 'cirislens' AND relname = 'federation_attestations'",
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+                    .try_get::<_, bool>(0)
+                    .unwrap();
+                assert!(analyzed, "the open analyzed a never-analyzed table");
             }
             let (nodes, bufs) = plan(
                 &client,
@@ -2699,7 +2731,21 @@ mod storm_v61_pg {
                 // visible row and sorts it: O(history), measured and
                 // reported, not refused here (postgres has no INDEXED BY;
                 // autovacuum's first analyze ends that state).
-                if stats == "after ANALYZE" && bufs > 20 * LISTING_PAGE {
+                let index_scan = |name: &str| {
+                    nodes
+                        .iter()
+                        .any(|(t, i)| t == "Index Scan" && i.as_deref() == Some(name))
+                };
+                if stats != "stale statistics"
+                    && !(index_scan("federation_attestations_asserted_seek")
+                        && index_scan("federation_attestations_reference_live"))
+                {
+                    listing_failures.push(format!(
+                        "[{stats}] {tag}: the page does not walk V212's keyset index with the \
+                         composer-only probe: {nodes:?}"
+                    ));
+                }
+                if stats != "stale statistics" && bufs > 20 * LISTING_PAGE {
                     listing_failures.push(format!(
                         "[{stats}] {tag}: {bufs} buffers for a page of {LISTING_PAGE} over a \
                          {}-row history: {nodes:?}",
