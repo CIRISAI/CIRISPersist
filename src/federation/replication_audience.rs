@@ -849,6 +849,10 @@ where
     D: FederationDirectory + ?Sized,
 {
     use super::group_plane::GroupSigned;
+    let scope = match signed {
+        GroupSigned::Family(_) => cs::FAMILY,
+        _ => cs::COMMUNITY,
+    };
     let members: Vec<&str> = match signed {
         GroupSigned::Community(c) => {
             if super::public_room::is_public_community(&c.community) {
@@ -868,9 +872,24 @@ where
         .into_iter()
         .collect();
     principals.insert(recipient.to_owned());
-    Ok(members
+    if members.iter().any(|m| principals.contains(*m)) {
+        return Ok(Some(Verdict::Yes(Reason::Cohort)));
+    }
+    // v61.0.1 (CIRISPersist#1193) — **the record is self-certifying.** Its
+    // member list is verified on the door that judges it, so a live,
+    // undeclined proposal naming one of the recipient's principals, authored
+    // by a member THIS record lists (or that member's occurrence), puts the
+    // recipient in the record's audience before its node holds the group.
+    // Otherwise an invitee's node would wait forever: the stored group's
+    // members (which `may_receive_group_plane` reads) come from the very
+    // record being refused.
+    let listed: Vec<String> = members.iter().map(|m| (*m).to_owned()).collect();
+    let invitees =
+        super::membership_acceptance::live_invitees_of(dir, scope, signed.group_key_id(), &listed)
+            .await?;
+    Ok(invitees
         .iter()
-        .any(|m| principals.contains(*m))
+        .any(|i| principals.contains(i))
         .then_some(Verdict::Yes(Reason::Cohort)))
 }
 

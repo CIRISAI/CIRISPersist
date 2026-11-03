@@ -239,6 +239,156 @@ pub(crate) mod bodies {
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod invitee {
+    use crate::federation::attestation_apply::{
+        AttestationRefusalReason, ReplicatedAttestationOutcome,
+    };
+    use crate::federation::group_plane::{GROUP_ROSTER_DIMENSION, MEMBERSHIP_WIDENING_DIMENSION};
+    use crate::federation::membership_acceptance_invariants::bodies::{
+        found_community, found_family, proposal, put, reg, reply, widen_community, widen_family,
+    };
+    use crate::federation::types::cohort_scope::{COMMUNITY, FAMILY};
+    use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
+    use chrono::{Duration, Utc};
+
+    /// The proposer's node key in `tag`'s fixture.
+    pub(crate) fn proposer(tag: &str) -> String {
+        format!("i1520-p-{tag}")
+    }
+    /// The invitee's node key in `tag`'s fixture.
+    pub(crate) fn invitee(tag: &str) -> String {
+        format!("i1520-q-{tag}")
+    }
+
+    async fn plane_row(
+        d: &dyn FederationDirectory,
+        scope: &str,
+        group: &str,
+        dimension: &str,
+    ) -> Attestation {
+        d.list_targeted_by_dimension_prefix(&[scope], group, dimension)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("the source holds {group}'s {dimension} row"))
+    }
+
+    async fn carry(
+        to: &dyn FederationDirectory,
+        row: &Attestation,
+    ) -> ReplicatedAttestationOutcome {
+        to.apply_replicated_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("carry {}: {e}", row.attestation_id))
+    }
+
+    /// **I1520** (v61.0.1, CIRISPersist#1193) — an invitee's node receives
+    /// the group's record. The record is self-certifying: its member list is
+    /// verified on the door that judges it, so a live, undeclined proposal
+    /// naming one of the node's principals, authored by a member the OFFERED
+    /// record lists, puts the node in the record's audience before the node
+    /// holds the group. `a` is P's node and `b` is Q's node.
+    /// - family F founded by P alone: Q's node admits P's proposal, then F's
+    ///   `group:roster:v1` row (it was `NotInAudience` on 61.0.0), then the
+    ///   widening that seats Q once Q accepts;
+    /// - the community twin;
+    /// - a proposal authored by a NON-member of the offered record admits
+    ///   nothing: that record stays `NotInAudience`.
+    pub(crate) async fn i1520_an_invitee_receives_the_record(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let (p, q) = (proposer(tag), invitee(tag));
+        let (x, fam, room, other) = (
+            format!("i1520-x-{tag}"),
+            format!("i1520-fam-{tag}"),
+            format!("i1520-room-{tag}"),
+            format!("i1520-other-{tag}"),
+        );
+        for d in [a, b] {
+            reg(d, &[&p, &q, &x, &fam, &room, &other]).await;
+        }
+        // Every event in the past, so the seat is in force when it is read.
+        let now = Utc::now() - Duration::minutes(10);
+        found_family(a, &fam, "founder_only", &[&p], &[])
+            .await
+            .unwrap();
+        found_community(a, &room, "quorum:1/1", &[&p], &[])
+            .await
+            .unwrap();
+        for (scope, group) in [(FAMILY, &fam), (COMMUNITY, &room)] {
+            let invite = proposal(&p, scope, group, &q, None, now, Some(Duration::days(7)));
+            put(a, &invite).await.expect("I1520: P proposes Q");
+            assert_eq!(
+                carry(b, &invite).await,
+                ReplicatedAttestationOutcome::Inserted,
+                "I1520 {scope}: Q's node admits the proposal naming Q"
+            );
+            let record = plane_row(a, scope, group, GROUP_ROSTER_DIMENSION).await;
+            assert_eq!(
+                carry(b, &record).await,
+                ReplicatedAttestationOutcome::Inserted,
+                "I1520 {scope}: Q's node receives the record while Q's proposal is live"
+            );
+            let accept = reply(&q, &q, &invite, true, now + Duration::seconds(1));
+            put(b, &accept).await.expect("I1520: Q accepts on Q's node");
+            carry(a, &accept).await;
+            if scope == FAMILY {
+                widen_family(a, group, &p, &q, None, now + Duration::seconds(2))
+                    .await
+                    .expect("I1520: P seats Q");
+            } else {
+                widen_community(a, group, &[&p], &q, None, now + Duration::seconds(2))
+                    .await
+                    .expect("I1520: P seats Q");
+            }
+            let widening = plane_row(a, scope, group, MEMBERSHIP_WIDENING_DIMENSION).await;
+            assert_eq!(
+                carry(b, &widening).await,
+                ReplicatedAttestationOutcome::Inserted,
+                "I1520 {scope}: Q's node admits the widening that seats Q"
+            );
+        }
+        assert!(
+            b.active_family_members(&fam)
+                .await
+                .unwrap()
+                .iter()
+                .any(|m| m.key_id == q),
+            "I1520: Q is seated in F on Q's node"
+        );
+        assert!(
+            b.active_community_members(&room)
+                .await
+                .unwrap()
+                .iter()
+                .any(|m| m.key_id == q),
+            "I1520: Q is seated in the room on Q's node"
+        );
+        // A proposal by X, who is not a member of the record offered.
+        found_family(a, &other, "founder_only", &[&p], &[])
+            .await
+            .unwrap();
+        let stray = proposal(&x, FAMILY, &other, &q, None, now, Some(Duration::days(7)));
+        put(b, &stray)
+            .await
+            .expect("I1520: Q's node stores a proposal naming Q for a group it does not hold");
+        let record = plane_row(a, FAMILY, &other, GROUP_ROSTER_DIMENSION).await;
+        assert_eq!(
+            carry(b, &record).await,
+            ReplicatedAttestationOutcome::Refused {
+                reason: AttestationRefusalReason::NotInAudience
+            },
+            "I1520: a proposal no listed member authored admits no record"
+        );
+    }
+}
+
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
@@ -260,6 +410,46 @@ mod runners {
         out.set_node_key_id(super::bodies::stranger(&tag));
         ins.set_node_key_id(super::bodies::member(&tag));
         super::bodies::i1509_a_replicated_write_needs_the_audience(&src, &out, &ins, &tag).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i1520_an_invitee_receives_the_record_sqlite() {
+        use crate::store::Backend as _;
+        async fn fresh() -> crate::store::sqlite::SqliteBackend {
+            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .unwrap();
+            b.run_migrations().await.unwrap();
+            b
+        }
+        let tag = suffix();
+        let (a, b) = (fresh().await, fresh().await);
+        a.set_node_key_id(super::invitee::proposer(&tag));
+        b.set_node_key_id(super::invitee::invitee(&tag));
+        super::invitee::i1520_an_invitee_receives_the_record(&a, &b, &tag).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i1520_an_invitee_receives_the_record_postgres() {
+        use crate::store::Backend as _;
+        async fn fresh() -> Option<crate::store::postgres::PostgresBackend> {
+            let dsn = crate::test_pg::empty_dsn()?;
+            let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+                .await
+                .unwrap();
+            b.run_migrations().await.unwrap();
+            Some(b)
+        }
+        let tag = suffix();
+        let (Some(a), Some(b)) = (fresh().await, fresh().await) else {
+            return;
+        };
+        a.set_node_key_id(super::invitee::proposer(&tag));
+        b.set_node_key_id(super::invitee::invitee(&tag));
+        super::invitee::i1520_an_invitee_receives_the_record(&a, &b, &tag).await;
+        eprintln!("i1520 postgres: RAN");
     }
 
     #[cfg(feature = "postgres")]
