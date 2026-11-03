@@ -10,10 +10,12 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 ### Adoption
 
 - **An invitee's node receives the group's record while its proposal is live (CIRISPersist#1193).** No host change: CIRISEdge's park-and-re-ask of a refused `group:roster:v1` row now completes on the first offer after the proposal lands.
+- **`federation::Error::KeyGrantRefused` gains `attestation_reason: Option<AttestationRefusalReason>`** (CIRISPersist#1184). When `reason` is `attestation_refused`, it carries the attestation plane's typed refusal of the carrier row (`NotInAudience`, `ConflictingAttestation`, …); for every other reason it is `None`. Python: the raised `ValueError` carries an `attestation_reason` attribute, the snake_case token or `None`. CIRISEdge branches on it instead of matching `NotInAudience` in the message (the message is unchanged). A consumer that constructs or exhaustively destructures the variant in Rust adds the field.
 
 ### Fixed
 
 - **An invitee's node could never receive a private family's (or a room's) record** (CIRISPersist#1193; found gating CIRISEdge v44). On 61.0.0 the #1148 receiver gate asked for the group's members from the STORED record, which the invitee's node lacks because it is the row being refused. So a proposal by the group's founder counted for nothing, and the record was `NotInAudience` forever. The record is now self-certifying on the door that judges it. `replication_audience::record_names_its_audience` admits a recipient holding a live, undeclined proposal naming one of its principals, authored by a member the OFFERED record lists (or that member's occurrence). This covers families and communities, including every non-founder joiner. A proposal by anyone the record does not list admits nothing. I1520 (two nodes, sqlite and postgres) covers the family path, its community twin and the negative leg.
+- **A key-grant refusal by the attestation plane was a string** (CIRISPersist#1184). `admit_replicated_key_grant` flattened the plane's `ReplicatedAttestationOutcome::Refused { reason }` into `detail`. It now carries the reason typed (above). I1519 runs on sqlite and postgres: a conflicting copy of an admitted grant is refused with `attestation_reason: Some(ConflictingAttestation)`.
 
 ## [61.0.0] - 2026-11-02
 

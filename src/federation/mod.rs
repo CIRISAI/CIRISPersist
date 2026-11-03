@@ -12149,6 +12149,12 @@ pub enum Error {
         reason: &'static str,
         /// What was refused, in words.
         detail: String,
+        /// v61.0.1 (CIRISPersist#1184) — when `reason` is
+        /// `attestation_refused`, the attestation plane's TYPED refusal of the
+        /// carrier row (e.g. `NotInAudience`, which is retryable), so a host
+        /// branches on the variant instead of matching `detail`. `None` for
+        /// every other reason.
+        attestation_reason: Option<attestation_apply::AttestationRefusalReason>,
     },
 
     /// v8.2.0 (CEG 1.0-RC11 §19.1 / CIRISPersist#228 item 1 / #229 item 1)

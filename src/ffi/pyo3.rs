@@ -33701,8 +33701,23 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // envelope, or a carrier row the plane refused): ValueError carrying
         // the stable reason token, so a bridge can count refusals by cause
         // without a second copy of the taxonomy.
-        crate::federation::Error::KeyGrantRefused { reason, detail } => {
-            PyValueError::new_err(format!("{kind}: {reason}: {detail}"))
+        // v61.0.1 (CIRISPersist#1184) — and the attestation plane's typed
+        // refusal of the carrier row rides as the exception's
+        // `attestation_reason` attribute (its snake_case token, or `None`), so
+        // a bridge branches on it instead of matching the message.
+        crate::federation::Error::KeyGrantRefused {
+            reason,
+            detail,
+            attestation_reason,
+        } => {
+            let err = PyValueError::new_err(format!("{kind}: {reason}: {detail}"));
+            Python::attach(|py| {
+                let _ = err.value(py).setattr(
+                    "attestation_reason",
+                    attestation_reason.map(|r| r.as_str()),
+                );
+            });
+            err
         }
         crate::federation::Error::WideningMalformed { reason, .. } => {
             PyValueError::new_err(format!("{kind}: {reason}"))
