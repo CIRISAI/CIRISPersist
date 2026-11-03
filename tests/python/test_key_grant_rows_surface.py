@@ -168,8 +168,11 @@ def test_key_grant_rows_round_trip_between_two_nodes_989(tmp_path) -> None:
 
         # Before B knows A's occurrence, the recipient is outside the one
         # audience rule: refused, and re-offerable once it lands.
-        with pytest.raises(ValueError, match="recipient_not_in_audience"):
+        with pytest.raises(ValueError, match="recipient_not_in_audience") as refused:
             b.apply_replicated_key_grant(json.dumps({"attestation": stream_row}))
+        # v61.0.1 (CIRISPersist#1184) — a refusal the key-grant rule makes
+        # itself carries no plane reason.
+        assert refused.value.attestation_reason is None, refused.value
 
         for row in key_rows:
             b.apply_replicated_attestation(json.dumps({"attestation": row.get("attestation", row)}))
@@ -194,6 +197,14 @@ def test_key_grant_rows_round_trip_between_two_nodes_989(tmp_path) -> None:
         }, got
         assert got["recipient_key_id"] == ka, got
         assert (got["attestation"], got["projected"], got["pending"]) == ("inserted", True, False), got
+
+        # v61.0.1 (CIRISPersist#1184) — a refusal by the attestation plane is
+        # carried typed: the altered copy under the held row's id is a
+        # conflicting attestation, and the exception says so in
+        # `attestation_reason` (the snake_case token), not only in its text.
+        with pytest.raises(ValueError, match="attestation_refused") as conflict:
+            b.apply_replicated_key_grant(json.dumps({"attestation": forged}))
+        assert conflict.value.attestation_reason == "conflicting_attestation", conflict.value
 
         # The content wrap is admitted and kept pending: B holds none of the
         # bytes it opens (it is not party to A's self content).
