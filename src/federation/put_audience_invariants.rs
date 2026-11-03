@@ -389,6 +389,152 @@ pub(crate) mod invitee {
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod family_events {
+    use crate::federation::attestation_apply::ReplicatedAttestationOutcome;
+    use crate::federation::group_plane::{
+        GROUP_ROSTER_DIMENSION, MEMBERSHIP_REMOVAL_DIMENSION, MEMBERSHIP_RESIGNATION_DIMENSION,
+        MEMBERSHIP_WIDENING_DIMENSION,
+    };
+    use crate::federation::membership_acceptance_invariants::bodies::{found_family, reg};
+    use crate::federation::namespace::{projection_for, registry, Plane, Projection};
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::types::cohort_scope::FAMILY;
+    use crate::federation::types::FamilyMembershipRevocation;
+    use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
+    use chrono::{Duration, Utc};
+
+    /// The three members' node keys in `tag`'s fixture.
+    pub(crate) fn member(tag: &str, n: &str) -> String {
+        format!("i1521-{n}-{tag}")
+    }
+
+    fn projection(dimension: &str) -> Projection {
+        projection_for(
+            Plane::Attestation { dimension },
+            FAMILY,
+            registry::authority_for(dimension).class,
+            false,
+        )
+    }
+
+    async fn plane_row(d: &dyn FederationDirectory, fam: &str, dimension: &str) -> Attestation {
+        d.list_targeted_by_dimension_prefix(&[FAMILY], fam, dimension)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("the node holds {fam}'s {dimension} row"))
+    }
+
+    async fn carry(
+        to: &dyn FederationDirectory,
+        row: &Attestation,
+    ) -> ReplicatedAttestationOutcome {
+        to.apply_replicated_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("carry {}: {e}", row.attestation_id))
+    }
+
+    /// **I1521** (v61.0.1, CIRISPersist#1182) — a family's record and its
+    /// membership events reach every holder of the record, as the retired
+    /// framed planes did. At `family` scope `group:roster:v1` projects
+    /// `Cohort` and `membership:{widening,removal,resignation}:v1` project
+    /// `Global` (never `SelfOwn`, which let only the signer's nodes relay
+    /// them), each still narrowed per peer by `may_receive_group_plane`.
+    /// Three members: P removes R on P's node; R's node holds the removal
+    /// (it names R); Q's node, syncing only with R's node, receives the
+    /// removal from R's node and Q's fold drops R.
+    pub(crate) async fn i1521_a_family_removal_reaches_every_holder(
+        p_node: &dyn FederationDirectory,
+        q_node: &dyn FederationDirectory,
+        r_node: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        assert_eq!(
+            projection(GROUP_ROSTER_DIMENSION),
+            Projection::Cohort,
+            "I1521: a family's record is cohort-wide"
+        );
+        for dim in [
+            MEMBERSHIP_WIDENING_DIMENSION,
+            MEMBERSHIP_REMOVAL_DIMENSION,
+            MEMBERSHIP_RESIGNATION_DIMENSION,
+        ] {
+            assert_eq!(
+                projection(dim),
+                Projection::Global,
+                "I1521: a family's {dim} reaches every holder of the record"
+            );
+        }
+        let (p, q, r) = (member(tag, "p"), member(tag, "q"), member(tag, "r"));
+        let fam = format!("i1521-fam-{tag}");
+        for d in [p_node, q_node, r_node] {
+            reg(d, &[&p, &q, &r, &fam]).await;
+        }
+        found_family(p_node, &fam, "founder_only", &[&p, &q, &r], &[])
+            .await
+            .unwrap();
+        let record = plane_row(p_node, &fam, GROUP_ROSTER_DIMENSION).await;
+        for d in [q_node, r_node] {
+            assert_eq!(
+                carry(d, &record).await,
+                ReplicatedAttestationOutcome::Inserted,
+                "I1521: a listed member's node holds the record"
+            );
+        }
+        let at = Utc::now() - Duration::minutes(5);
+        p_node
+            .put_family_membership_revocation(ts::sign_family_membership_revocation(
+                &p,
+                FamilyMembershipRevocation {
+                    family_key_id: fam.clone(),
+                    removed_identity_key_id: r.clone(),
+                    removed_at: at,
+                    effective_at: at,
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .expect("I1521: P removes R");
+        let removal = plane_row(p_node, &fam, MEMBERSHIP_REMOVAL_DIMENSION).await;
+        assert_eq!(
+            carry(r_node, &removal).await,
+            ReplicatedAttestationOutcome::Inserted,
+            "I1521: R's node holds the removal that names R"
+        );
+        assert!(
+            q_node
+                .active_family_members(&fam)
+                .await
+                .unwrap()
+                .iter()
+                .any(|m| m.key_id == r),
+            "I1521 precondition: Q's node still seats R"
+        );
+        // Q's node syncs only with R's node: the copy R's node holds.
+        let relayed = plane_row(r_node, &fam, MEMBERSHIP_REMOVAL_DIMENSION).await;
+        assert_eq!(
+            carry(q_node, &relayed).await,
+            ReplicatedAttestationOutcome::Inserted,
+            "I1521: Q's node receives the removal from R's node"
+        );
+        assert!(
+            !q_node
+                .active_family_members(&fam)
+                .await
+                .unwrap()
+                .iter()
+                .any(|m| m.key_id == r),
+            "I1521: Q's fold drops R"
+        );
+    }
+}
+
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
@@ -450,6 +596,50 @@ mod runners {
         b.set_node_key_id(super::invitee::invitee(&tag));
         super::invitee::i1520_an_invitee_receives_the_record(&a, &b, &tag).await;
         eprintln!("i1520 postgres: RAN");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i1521_a_family_removal_reaches_every_holder_sqlite() {
+        use crate::store::Backend as _;
+        async fn fresh() -> crate::store::sqlite::SqliteBackend {
+            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .unwrap();
+            b.run_migrations().await.unwrap();
+            b
+        }
+        use super::family_events::member;
+        let tag = suffix();
+        let (p, q, r) = (fresh().await, fresh().await, fresh().await);
+        p.set_node_key_id(member(&tag, "p"));
+        q.set_node_key_id(member(&tag, "q"));
+        r.set_node_key_id(member(&tag, "r"));
+        super::family_events::i1521_a_family_removal_reaches_every_holder(&p, &q, &r, &tag).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i1521_a_family_removal_reaches_every_holder_postgres() {
+        use crate::store::Backend as _;
+        async fn fresh() -> Option<crate::store::postgres::PostgresBackend> {
+            let dsn = crate::test_pg::empty_dsn()?;
+            let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+                .await
+                .unwrap();
+            b.run_migrations().await.unwrap();
+            Some(b)
+        }
+        use super::family_events::member;
+        let tag = suffix();
+        let (Some(p), Some(q), Some(r)) = (fresh().await, fresh().await, fresh().await) else {
+            return;
+        };
+        p.set_node_key_id(member(&tag, "p"));
+        q.set_node_key_id(member(&tag, "q"));
+        r.set_node_key_id(member(&tag, "r"));
+        super::family_events::i1521_a_family_removal_reaches_every_holder(&p, &q, &r, &tag).await;
+        eprintln!("i1521 postgres: RAN");
     }
 
     #[cfg(feature = "postgres")]

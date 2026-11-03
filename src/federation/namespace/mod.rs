@@ -536,6 +536,32 @@ pub fn projection_for(
         // Attestation — per dimension FAMILY (v36.0.0, #713 second half).
         // The information-type parameter of this plane IS the dimension; one
         // row would repeat the #311 collapse a level down.
+        // v61.0.1 (CIRISPersist#1182) — a FAMILY's group plane carries the
+        // retired framed planes' reach: its record is cohort-wide and its
+        // membership events reach every holder of the record (Global), each
+        // still narrowed per peer by `may_receive_group_plane`. Without this
+        // they resolved `SelfOwn`, so only the signer's nodes relayed a
+        // removal and a member syncing elsewhere kept the removed member. The
+        // four EXACT dimensions at `family` only: no other dimension or scope
+        // moves (a room's rows keep the conservative Cohort cell), and the
+        // tombstone ceiling is untouched.
+        Plane::Attestation { dimension }
+            if cohort_scope == cohort_scope::FAMILY
+                && dimension == crate::federation::group_plane::GROUP_ROSTER_DIMENSION =>
+        {
+            Projection::Cohort
+        }
+        Plane::Attestation { dimension }
+            if cohort_scope == cohort_scope::FAMILY
+                && matches!(
+                    dimension,
+                    crate::federation::group_plane::MEMBERSHIP_WIDENING_DIMENSION
+                        | crate::federation::group_plane::MEMBERSHIP_REMOVAL_DIMENSION
+                        | crate::federation::group_plane::MEMBERSHIP_RESIGNATION_DIMENSION
+                ) =>
+        {
+            Projection::Global
+        }
         Plane::Attestation { dimension } => match attestation_family(dimension) {
             // consent:* / capacity:* / content_class:* share the LIVE shape
             // (SelfOwn | Cohort | Cohort | ✱ at federation only) — they
