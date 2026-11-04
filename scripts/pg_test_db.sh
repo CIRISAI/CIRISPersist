@@ -10,9 +10,10 @@
 #     `tightening_supersedes_and_is_idempotent_postgres` asserts exactly 3
 #     rows carry a value. A second suite's rows make it 6. It also means
 #     these tests are not re-runnable against a database they already ran on.
-#   * Destructive DDL. `av26_concurrent_boot_advisory_lock` does
-#     `DROP SCHEMA cirislens CASCADE`; every other PG test on that database
-#     then reports "relation cirislens.* does not exist" (CIRISPersist#128).
+#   * Destructive DDL. `av26_concurrent_boot_advisory_lock` used to
+#     `DROP SCHEMA cirislens CASCADE` here; every other PG test on that
+#     database then reported "relation cirislens.* does not exist"
+#     (CIRISPersist#128). It boots in a database of its own since v61.0.1.
 #
 # Measured, two concurrent copies of the same 4-test suite, 6 iterations:
 #     one shared database  -> 6/6 iterations RED
@@ -126,7 +127,7 @@ if [ -n "${CIRIS_PERSIST_TEST_PG_URL:-}" ]; then
         echo "pg_test_db: NOTE — the inherited CIRIS_PERSIST_TEST_PG_URL pointed at" >&2
         echo "  '$PRIOR_DB', which has ${OCCUPANTS} live backend(s). Running the suite" >&2
         echo "  there would have shared a database with another occupant, which reds" >&2
-        echo "  global-count assertions and breaks on av26's DROP SCHEMA. Overriding" >&2
+        echo "  global-count assertions. Overriding" >&2
         echo "  it with the fresh single-use database below." >&2
     fi
 fi
