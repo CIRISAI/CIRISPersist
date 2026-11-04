@@ -210,6 +210,22 @@ pub fn evaluate(b: &Ballot<'_>) -> Verdict {
         };
     }
     if p == cp::UNANIMOUS {
+        // CC 3.1.3.2 (CIRISPersist#1192): a removal is signed by every OTHER
+        // active member and is a strict majority of the roster. The two
+        // coincide above two members; at two nobody is removable, and
+        // resignation is the exit.
+        if let (Direction::Remove, Some(removed)) = (b.direction, b.subject) {
+            let voices = got.iter().filter(|s| s.key_id != removed).count();
+            let others = elig.iter().filter(|s| s.key_id != removed).count();
+            return if voices == others && 2 * voices > n {
+                Verdict::Admit
+            } else {
+                insufficient(format!(
+                    "unanimous removal: {voices} of the {others} other members signed, of \
+                     {n}, and a strict majority of the roster is needed"
+                ))
+            };
+        }
         return if got.len() == n {
             Verdict::Admit
         } else {
@@ -583,6 +599,39 @@ mod tests {
             eval_about(p, None, &r, &["j"], "j", Add),
             Verdict::Unevaluable { .. }
         ));
+    }
+
+    /// CIRISPersist#1192 (CC 3.1.3.2) — a `unanimous` removal is signed by
+    /// every OTHER member and is a strict majority of the roster. An admission
+    /// still needs every member.
+    #[test]
+    fn a_unanimous_removal_is_every_other_member() {
+        use Direction::{Add, Remove};
+        let u = cp::UNANIMOUS;
+        let two = seats(&[("a", None), ("b", None)]);
+        assert!(
+            !eval_about(u, None, &two, &["a"], "b", Remove).admits(),
+            "at two, one voice is no majority"
+        );
+        assert!(
+            !eval_about(u, None, &two, &["a", "b"], "b", Remove).admits(),
+            "the removed member is never a voice"
+        );
+
+        let three = seats(&[("a", None), ("b", None), ("c", None)]);
+        assert!(eval_about(u, None, &three, &["a", "c"], "b", Remove).admits());
+        assert!(!eval_about(u, None, &three, &["a"], "b", Remove).admits());
+        assert!(
+            !eval_about(u, None, &three, &["a", "b"], "b", Remove).admits(),
+            "the removed member's voice does not replace an other's"
+        );
+
+        let four = seats(&[("a", None), ("b", None), ("c", None), ("d", None)]);
+        assert!(eval_about(u, None, &four, &["a", "c", "d"], "b", Remove).admits());
+        assert!(!eval_about(u, None, &four, &["a", "c"], "b", Remove).admits());
+
+        assert!(!eval_about(u, None, &three, &["a", "c"], "x", Add).admits());
+        assert!(eval_about(u, None, &three, &["a", "b", "c"], "x", Add).admits());
     }
 
     /// v61 (CIRISPersist#1123; CC 4.4.3.4.2) — every protocol but
