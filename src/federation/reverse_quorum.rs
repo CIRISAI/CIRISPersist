@@ -2509,15 +2509,8 @@ pub(crate) async fn resolve_reverse_quorum_with(
     // tier that never appointed anybody. Skipped entirely when no steward tier
     // is declared, so #574 cohorts pay nothing for this.
     //
-    // ⚠ DO NOT swap this for `moderators_of` / `duty_holders_for_community`.
-    // They resolve `community_authority_set`, which is
-    // `if is_founder || !founder_only { insert }` — so for EVERY protocol other
-    // than the literal `founder_only`, and `reverse_quorum:*` is one by
-    // construction, the authority set is the entire roster. The steward tier
-    // would silently become "every member reviews", a member could rule on
-    // their own objection, and the escalated undo would be vetoable by anyone.
-    // It looks like an independent reviewer set and is the objectors. See the
-    // three-way table on `appointed_moderators_of`.
+    // The appointed set, never the signing set: a roster-wide steward tier
+    // would let a member rule on their own objection (#591, #1195).
     let duty_holders: Vec<String> = match (policy.and_then(|p| p.steward), cohort, duty_holders) {
         (_, _, Some(given)) => given,
         (Some(_), Cohort::Community | Cohort::Affiliations, None) => {

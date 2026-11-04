@@ -967,6 +967,148 @@ pub mod bodies {
         );
     }
 
+    /// **I1522** (CIRISPersist#1195; CC 4.5.4, 4.5.13) — moderation
+    /// is an appointment at every protocol. A plain member of a room can sign
+    /// for it, but holds no duty, is refused at the door and cannot root a
+    /// chain. A founder and the founder's delegate hold exactly what was
+    /// delegated.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub async fn i1522_moderation_is_an_appointment(d: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::admission::steward_liveness_test_support::signed_row;
+        use crate::federation::admission::{
+            appointed_moderators_of, check_no_moderator_federate_admission,
+            community_authority_set_for, duty_holders_for_community, is_named_moderator,
+            moderators_of, DELEGATION_SCOPE_MODERATE, DELEGATION_SCOPE_REVIEW,
+            DELEGATION_SCOPE_TAKEDOWN,
+        };
+        use crate::federation::types::{attestation_type, SignedAttestation};
+
+        for (i, protocol) in ["majority", "unanimous", "quorum:3/4"].iter().enumerate() {
+            let tag = format!("{tag}-{i}");
+            let (room, keys) = make_group(
+                d,
+                &tag,
+                protocol,
+                &["f", "plain", "mod", "x"],
+                1,
+                None,
+                None,
+            )
+            .await;
+            let (founder, plain, modk, x) = (&keys[0], &keys[1], &keys[2], &keys[3]);
+
+            // Who may sign is a different question, and it is unchanged.
+            let record = d.lookup_community(&room).await.unwrap().unwrap();
+            assert!(
+                community_authority_set_for(d, &record)
+                    .await
+                    .unwrap()
+                    .contains(plain),
+                "I1522 {protocol}: a member is still a consensus signer"
+            );
+            check_no_moderator_federate_admission(d, &record)
+                .await
+                .unwrap_or_else(|e| panic!("I1522 {protocol}: the room federates: {e}"));
+
+            for duty in [
+                DELEGATION_SCOPE_MODERATE,
+                DELEGATION_SCOPE_TAKEDOWN,
+                DELEGATION_SCOPE_REVIEW,
+            ] {
+                assert_eq!(
+                    moderators_of(d, &room, duty).await.unwrap(),
+                    vec![founder.clone()],
+                    "I1522 {protocol}/{duty}: the founder alone, before any appointment"
+                );
+                assert_eq!(
+                    appointed_moderators_of(d, &room, duty).await.unwrap(),
+                    vec![founder.clone()],
+                );
+                let holders = duty_holders_for_community(d, &room, duty).await.unwrap();
+                assert_eq!(
+                    holders.into_iter().collect::<Vec<_>>(),
+                    vec![founder.clone()],
+                    "I1522 {protocol}/{duty}: the door's holders"
+                );
+                assert!(!is_named_moderator(d, plain, &room, duty).await.unwrap());
+            }
+
+            // The door itself, not only its helpers: a plain member's
+            // community-scoped reconsideration is refused and not stored.
+            let review = |signer: &str, id: &str| {
+                signed_row(
+                    signer,
+                    signer,
+                    attestation_type::SCORES,
+                    serde_json::json!({
+                        "id": id,
+                        "dimension": "reconsideration:i1522:v1",
+                        "score": 1.0,
+                        "confidence": 0.9,
+                        "community_id": room,
+                    }),
+                )
+            };
+            let row = review(plain, &format!("{tag}-plain"));
+            let id = row.attestation_id.clone();
+            let err = d
+                .put_attestation(SignedAttestation { attestation: row })
+                .await
+                .expect_err("I1522: a plain member holds no review duty");
+            assert_eq!(
+                err.kind(),
+                "federation_delegated_scope_unauthorized",
+                "I1522 {protocol}: {err}"
+            );
+            assert!(d.get_attestation(&id).await.unwrap().is_none());
+            d.put_attestation(SignedAttestation {
+                attestation: review(founder, &format!("{tag}-founder")),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("I1522 {protocol}: the founder reviews: {e}"));
+
+            // The founder appoints one duty; only that duty moves.
+            let edge = |granter: &str, grantee: &str, id: &str| SignedAttestation {
+                attestation: signed_row(
+                    granter,
+                    grantee,
+                    attestation_type::DELEGATES_TO,
+                    serde_json::json!({
+                        "id": id,
+                        "scope": [DELEGATION_SCOPE_MODERATE],
+                        "sub_delegation": false,
+                    }),
+                ),
+            };
+            d.put_attestation(edge(founder, modk, &format!("{tag}-appoint")))
+                .await
+                .unwrap_or_else(|e| panic!("I1522 {protocol}: the appointment: {e}"));
+            assert!(
+                is_named_moderator(d, modk, &room, DELEGATION_SCOPE_MODERATE)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !is_named_moderator(d, modk, &room, DELEGATION_SCOPE_TAKEDOWN)
+                    .await
+                    .unwrap(),
+                "I1522 {protocol}: moderate confers no takedown"
+            );
+
+            // A plain member's own edge roots nothing. The row may or may not
+            // be stored; what it must not do is confer the duty.
+            let _ = d
+                .put_attestation(edge(plain, x, &format!("{tag}-self-appoint")))
+                .await;
+            assert!(
+                !is_named_moderator(d, x, &room, DELEGATION_SCOPE_MODERATE)
+                    .await
+                    .unwrap(),
+                "I1522 {protocol}: a member cannot appoint alone"
+            );
+        }
+    }
+
     /// **I173 (store half)** — the same, with the signer nulled in storage
     /// below the door: the backend read maps it to `None` and the fold counts it.
     pub async fn i173_after_nulling(d: &dyn FederationDirectory, room: &str, bob: &str) {
@@ -1019,6 +1161,15 @@ mod run {
                     super::super::bodies::i170_admission_is_the_roster(
                         &d as &dyn FederationDirectory,
                         &format!("i170-{}", super::suffix()),
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i1522() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i1522_moderation_is_an_appointment(
+                        &d as &dyn FederationDirectory,
+                        &format!("i1522-{}", super::suffix()),
                     )
                     .await
                 }
