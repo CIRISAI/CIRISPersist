@@ -972,6 +972,7 @@ pub mod bodies {
     /// for it, but holds no duty, is refused at the door and cannot root a
     /// chain. A founder and the founder's delegate hold exactly what was
     /// delegated.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i1522_moderation_is_an_appointment(d: &dyn FederationDirectory, tag: &str) {
         use crate::federation::admission::steward_liveness_test_support::signed_row;
         use crate::federation::admission::{
