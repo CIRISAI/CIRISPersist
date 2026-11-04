@@ -74,16 +74,10 @@ fail-fast = false
 max-threads = 16
 
 [[profile.default.overrides]]
-# v3.5.2 (CIRISPersist#128) — RCA found `av26_concurrent_boot_advisory_lock`
-# in tests/qa_harness.rs does `DROP SCHEMA cirislens CASCADE` to simulate
-# cold-start, then races 10 workers on run_migrations. While that's running,
-# OTHER PG tests see "relation cirislens.merkle_sth_log does not exist"
-# (and analogous failures on every other cirislens table). serial_test's
-# `#[serial(postgres)]` annotation only serializes within a process; nextest
-# spawns one process per test so the annotation is a no-op across the
-# process boundary. The test-group's max-threads=1 IS the cross-process
-# serializer — we just need to make sure av26 (and any future qa_harness
-# tests with similar destructive schema ops) is in the group.
+# v3.5.2 (CIRISPersist#128) — `serial_test`'s `#[serial(postgres)]` only
+# serializes within a process; nextest spawns one process per test, so the
+# annotation is a no-op across the process boundary. A test-group's
+# max-threads IS the cross-process serializer.
 filter = 'test(/_pg$/) + test(/_postgres$/) + test(/::pg_/) + test(/postgres_tests::/) + test(/::postgres::/)'
 test-group = "postgres"
 
@@ -92,8 +86,7 @@ test-group = "postgres"
 # `CIRIS_PERSIST_TEST_PG_URL` directly, because `test_pg` (the per-test
 # database provisioner) is a private module of the lib and no integration
 # test can reach it. They mutate global state in that one database — schema
-# objects, whole-corpus counts, `av26`'s `DROP SCHEMA cirislens CASCADE`
-# above — so they serialize against each other, exactly as the whole PG
+# objects and whole-corpus counts — so they serialize against each other, exactly as the whole PG
 # suite used to. Lifting the `postgres` cap to 16 raised the concurrency
 # around them and three went red on precisely this sharing (`db error` from
 # a torn-down connection): the honest split is that these ten share and the
@@ -103,7 +96,7 @@ test-group = "postgres"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'binary(/^(dedup_shard|accord_holder_real_custody|qa_harness|wholeness_witness|trace_hybrid_hard_cut|aggregation_tier|fountain_content)$/) and (test(/^postgres_/) + test(av26_concurrent_boot_advisory_lock))'
+filter = 'binary(/^(dedup_shard|accord_holder_real_custody|qa_harness|wholeness_witness|trace_hybrid_hard_cut|aggregation_tier|fountain_content)$/) and test(/^postgres_/)'
 test-group = "postgres-shared"
 
 # v22.0.0 (CIRISPersist#543) — THE SUBSTRATE GAUNTLET NEEDS A LONGER LEASH.

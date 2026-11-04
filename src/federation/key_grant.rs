@@ -401,6 +401,7 @@ fn refuse(reason: KeyGrantRefusalReason, detail: impl Into<String>) -> Error {
     Error::KeyGrantRefused {
         reason: reason.as_str(),
         detail: detail.into(),
+        attestation_reason: None,
     }
 }
 
@@ -2411,10 +2412,13 @@ where
             reason: AttestationRefusalReason::AlreadyPresentIdentical,
         } => {}
         ReplicatedAttestationOutcome::Refused { reason } => {
-            return Err(refuse(
-                KeyGrantRefusalReason::AttestationRefused,
-                format!("the attestation plane refused the row: {reason:?}"),
-            ));
+            // v61.0.1 (CIRISPersist#1184) — the plane's refusal rides TYPED;
+            // the detail keeps its words for a reader.
+            return Err(Error::KeyGrantRefused {
+                reason: KeyGrantRefusalReason::AttestationRefused.as_str(),
+                detail: format!("the attestation plane refused the row: {reason:?}"),
+                attestation_reason: Some(*reason),
+            });
         }
     }
     let projection = project_key_grant_row(backend, &row).await?;

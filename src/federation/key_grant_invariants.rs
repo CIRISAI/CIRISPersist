@@ -1125,14 +1125,62 @@ pub mod two_node {
             panic!("{tag} I1519: a node hosting an occurrence of the recipient admits: {e}")
         });
         assert_eq!(got.recipient_key_id, a.key, "{tag} I1519");
-        let err = admit_replicated_key_grant(c.backend, SignedKeyGrantRow { attestation: row })
-            .await
-            .expect_err("a node hosting no occurrence of the recipient");
+        let err = admit_replicated_key_grant(
+            c.backend,
+            SignedKeyGrantRow {
+                attestation: row.clone(),
+            },
+        )
+        .await
+        .expect_err("a node hosting no occurrence of the recipient");
         assert_eq!(
             refusal_reason(&err),
             "recipient_not_in_audience",
             "{tag} I1519: {err}"
         );
+        // v61.0.1 (CIRISPersist#1184) — a refusal by the attestation plane is
+        // carried TYPED. A copy of the admitted row under its own id with its
+        // wrap's ciphertext altered is a different attestation under a held
+        // id, which the plane refuses as conflicting before it reads a
+        // signature. The variant rides on the error, so no host reads it out
+        // of the message.
+        let mut altered = row.clone();
+        let mut wrap: serde_json::Value = serde_json::from_str(
+            altered.attestation_envelope["wrapped_dek"]
+                .as_str()
+                .expect("a wrapped_dek string"),
+        )
+        .expect("the wrap is JSON");
+        wrap["ciphertext_b64"] = serde_json::json!(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            [0u8; 48]
+        ));
+        altered.attestation_envelope["wrapped_dek"] = serde_json::json!(wrap.to_string());
+        let err = admit_replicated_key_grant(
+            b.backend,
+            SignedKeyGrantRow {
+                attestation: altered,
+            },
+        )
+        .await
+        .expect_err("a different attestation under a held id");
+        match &err {
+            Error::KeyGrantRefused {
+                reason,
+                attestation_reason,
+                ..
+            } => {
+                assert_eq!(*reason, "attestation_refused", "{tag} I1519: {err}");
+                assert_eq!(
+                    *attestation_reason,
+                    Some(
+                        crate::federation::attestation_apply::AttestationRefusalReason::ConflictingAttestation
+                    ),
+                    "{tag} I1519 (#1184): the plane's refusal is typed: {err}"
+                );
+            }
+            other => panic!("{tag} I1519 (#1184): expected KeyGrantRefused, got {other:?}"),
+        }
     }
 
     /// **Content axis**: the owner's second occurrence on B opens a self blob

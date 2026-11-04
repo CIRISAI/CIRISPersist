@@ -5,6 +5,21 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [61.0.1] - 2026-11-03
+
+### Adoption
+
+- **An invitee's node receives the group's record while its proposal is live (CIRISPersist#1193).** No host change: CIRISEdge's park-and-re-ask of a refused `group:roster:v1` row now completes on the first offer after the proposal lands.
+- **`federation::Error::KeyGrantRefused` gains `attestation_reason: Option<AttestationRefusalReason>`** (CIRISPersist#1184). When `reason` is `attestation_refused`, it carries the attestation plane's typed refusal of the carrier row (`NotInAudience`, `ConflictingAttestation`, …); for every other reason it is `None`. Python: the raised `ValueError` carries an `attestation_reason` attribute, the snake_case token or `None`. CIRISEdge branches on it instead of matching `NotInAudience` in the message (the message is unchanged). A consumer that constructs or exhaustively destructures the variant in Rust adds the field.
+- **A family's record and membership events project like the retired framed planes** (CIRISPersist#1182). Before, a node could advertise these only when the row's attester was in its own publish set. Now any node holding a family's record advertises the family's record and membership events, each still narrowed per peer by `may_receive_group_plane`. CIRISEdge can drop its `attestation_is_advertised` override for group-plane dimensions and read `namespace::projection_for` instead.
+
+### Fixed
+
+- **An invitee's node could never receive a private family's (or a room's) record** (CIRISPersist#1193; found gating CIRISEdge v44). On 61.0.0 the #1148 receiver gate asked for the group's members from the STORED record, which the invitee's node lacks because it is the row being refused. So a proposal by the group's founder counted for nothing, and the record was `NotInAudience` forever. The record is now self-certifying on the door that judges it. `replication_audience::record_names_its_audience` admits a recipient holding a live, undeclined proposal naming one of its principals, authored by a member the OFFERED record lists (or that member's occurrence). This covers families and communities, including every non-founder joiner. A proposal by anyone the record does not list admits nothing. I1520 (two nodes, sqlite and postgres) covers the family path, its community twin and the negative leg.
+- **A key-grant refusal by the attestation plane was a string** (CIRISPersist#1184). `admit_replicated_key_grant` flattened the plane's `ReplicatedAttestationOutcome::Refused { reason }` into `detail`. It now carries the reason typed (above). I1519 runs on sqlite and postgres: a conflicting copy of an admitted grant is refused with `attestation_reason: Some(ConflictingAttestation)`.
+- **A family's removal reached only the members whose nodes sync with the remover's** (CIRISPersist#1182). At `cohort_scope: family`, `namespace::projection_for` resolved `group:roster:v1` and `membership:{widening,removal,resignation}:v1` to `SelfOwn`, so only the signer's nodes relayed them. A member syncing with another member's node kept the removed member on its roster. At `family` the record now projects `Cohort` and the three membership events `Global`, each still narrowed per peer by `may_receive_group_plane`. These are the four exact dimensions at `family` only: a room's rows, every other dimension and the tombstone ceiling are unchanged. I1521 covers this with three member nodes on sqlite and postgres: P removes R, Q's node receives the removal from R's node, and Q's fold drops R.
+- **A postgres test could fail with `relation "cirislens.*" does not exist` under load.** `av26_concurrent_boot_advisory_lock` dropped every application schema of the shared test database to simulate a cold start, and only tests named `postgres_*` were serialized against it. It now boots in a fresh database of its own. Test harness only; no product change.
+
 ## [61.0.0] - 2026-11-02
 
 ### Adoption

@@ -636,89 +636,72 @@ async fn av17_attempt_index_out_of_range() {
 /// returns clean.
 ///
 /// Gated on `CIRIS_PERSIST_TEST_PG_URL` like the other postgres
-/// integration tests. Uses `#[serial_test::serial(postgres)]` to
-/// avoid races with other DB-touching tests sharing the runner.
+/// integration tests, but it boots in a database of its own. It used to
+/// `DROP SCHEMA` every application schema of the shared database to simulate
+/// a cold start, which pulled `cirislens` out from under whichever direct-DSN
+/// neighbour was running. The test-group serializer only covered neighbours
+/// named `postgres_*`, so `i1152_member_commitment_unique_postgres` reported
+/// `relation "cirislens.content_manifest" does not exist` on a loaded run
+/// (certify, v61.0.1). A database nobody else has ever touched is also the
+/// truer cold start: nothing can survive a drop that never happens.
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial_test::serial(postgres)]
 async fn av26_concurrent_boot_advisory_lock() {
-    let Some(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok() else {
+    let Some(base) = std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok() else {
         eprintln!("scenario H skipped: CIRIS_PERSIST_TEST_PG_URL unset");
         return;
     };
+    let name = format!("ciris_av26_{}", uuid::Uuid::new_v4().simple());
+    let cut = base.rfind('/').expect("dsn has a database");
+    let dsn = format!("{}/{name}", &base[..cut]);
+    let (admin, conn) = tokio_postgres::connect(&base, tokio_postgres::NoTls)
+        .await
+        .expect("scenario H setup: connect to the base test database");
+    tokio::spawn(conn);
+    admin
+        .batch_execute(&format!(r#"CREATE DATABASE "{name}""#))
+        .await
+        .expect("scenario H setup: create this test's database");
 
+    // Spawned so a failed assertion comes back as a value: the database is
+    // dropped either way, then the panic resumes.
+    let outcome = tokio::spawn(av26_cold_boot(dsn)).await;
+    admin
+        .batch_execute(&format!(r#"DROP DATABASE IF EXISTS "{name}" WITH (FORCE)"#))
+        .await
+        .expect("scenario H teardown: drop this test's database");
+    if let Err(e) = outcome {
+        std::panic::resume_unwind(e.into_panic());
+    }
+}
+
+#[cfg(feature = "postgres")]
+async fn av26_cold_boot(dsn: String) {
     use ciris_persist::store::{Backend, PostgresBackend};
 
-    // Cold-start simulation: drop every application schema AND the migration
-    // history table, so each worker really does see an unmigrated DB. (Don't
-    // drop schemas in normal test runs — production never starts here.)
-    //
-    // v34.0.0 (CIRISPersist#704) — THIS DROPPED ONE SCHEMA BY NAME
-    // (`cirislens`) while this comment claimed it left an unmigrated DB. The
-    // lens tree creates FIVE; `cirisnode`, `cirisgraph`, `cirislens_derived`
-    // and `cirislens_secrets` all survived. So refinery, seeing an empty
-    // history, re-ran from V001 against a HALF-MIGRATED `cirisnode`: V064
-    // re-added `key_grant_stream_id` (which V129 had renamed away), and V129
-    // then renamed it onto the `key_grant_scope_id` still sitting there —
-    // 42701 duplicate_column, all ten workers.
-    //
-    // The precondition had been false since the first non-`cirislens` schema
-    // appeared. It cost nothing only because every cirisnode migration until
-    // V129 happened to be re-runnable, so the test kept passing while
-    // simulating a warm start under the name of a cold one.
-    //
-    // DERIVED, not listed. A hand-maintained schema list is the same defect
-    // one layer up: it goes stale the first time a migration adds a schema and
-    // nobody edits this test — which is exactly how this one got here.
+    // The precondition is CHECKED, not narrated (#704: a warm boot once ran
+    // under this test's name because one schema was dropped of five).
+    // DERIVED, not listed, so a migration that adds a schema is covered.
     {
         let backend = PostgresBackend::connect(&dsn)
             .await
             .expect("scenario H setup: connect");
         let client = backend.pool().get().await.expect("setup: client");
-
-        const APP_SCHEMAS: &str = "SELECT nspname FROM pg_namespace \
-             WHERE nspname NOT IN ('public', 'information_schema') \
-               AND nspname NOT LIKE 'pg\\_%'";
-
-        let list = |rows: Vec<tokio_postgres::Row>| {
-            rows.iter()
-                .map(|r| r.try_get::<_, String>(0).expect("setup: nspname"))
-                .collect::<Vec<_>>()
-        };
-
-        let before = list(
-            client
-                .query(APP_SCHEMAS, &[])
-                .await
-                .expect("setup: enumerate application schemas"),
-        );
-        for schema in before {
-            // Not `let _ =`: a drop that fails silently leaves the warm state
-            // that caused this, and the next reader sees a green test.
-            client
-                .execute(&format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE"#), &[])
-                .await
-                .unwrap_or_else(|e| panic!("setup: drop schema {schema}: {e}"));
-        }
-        client
-            .execute(
-                "DROP TABLE IF EXISTS public.ciris_persist_schema_history",
+        let residual: Vec<String> = client
+            .query(
+                "SELECT nspname FROM pg_namespace \
+                 WHERE nspname NOT IN ('public', 'information_schema') \
+                   AND nspname NOT LIKE 'pg\\_%'",
                 &[],
             )
             .await
-            .expect("setup: drop migration history");
-
-        // The precondition is now CHECKED, not narrated. Without this the test
-        // reports on whatever state it happens to inherit.
-        let residual = list(
-            client
-                .query(APP_SCHEMAS, &[])
-                .await
-                .expect("setup: re-enumerate application schemas"),
-        );
+            .expect("setup: enumerate application schemas")
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
         assert!(
             residual.is_empty(),
-            "scenario H is a COLD start: {residual:?} survived the drop, so the \
+            "scenario H is a COLD start: {residual:?} already exist, so the \
              workers below would migrate over existing objects and this test \
              would measure a warm boot under a cold boot's name"
         );
