@@ -1806,7 +1806,8 @@ mod tests {
         // v61 slice S3: +2 (CIRISPersist#1101, CC 2.6.2): CLM-serve-seat-announced
         // (5.3) at the owner-announced predicate, CLM-canonicalization (2.6.2) at
         // the signed-instant form predicate.
-        const EXPECTED: usize = 365;
+        // CIRISPersist#1187: -2 for the dropped rows CC holds under other ids.
+        const EXPECTED: usize = 363;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

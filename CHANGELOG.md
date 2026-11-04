@@ -13,6 +13,8 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
 - **Nobody could be removed from a `unanimous` room against their will** (CIRISPersist#1192, CC 3.1.3.2). The tally counted the removed member as a required voice. A removal now needs every other active member, and those voices must be a strict majority of the roster. At two members nobody is removable and resignation is the exit. A membership-change envelope that names no single member, and every admission, still needs every member. Covered at two, three and four members.
 
+- **Evidence manifest corrected for the CC register** (CIRISPersist#1187). Five rows re-filed by decimal or claim, and two dropped rows CC already holds under other ids. No code change.
+
 ### Adoption
 
 - **Moderation in a room with more than one member now needs an appointment.** A host that relied on any member holding a duty has its founder delegate it with `delegates_to`. A room with no active founder has no moderator and no way to appoint one yet; tracked on CIRISPersist#1195.

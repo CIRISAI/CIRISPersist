@@ -14107,16 +14107,6 @@
    },
    {
     "decimal_id": "3.1.1",
-    "claim_id": "CLM-nsproc-holds-bytes-agent-files-kind-platform-or-target",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/holding_claim.rs#holding_claim_row",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "holds_bytes",
-    "prefix": "agent_files:{kind}:{platform_or_target}"
-   },
-   {
-    "decimal_id": "3.1.1",
     "claim_id": "CLM-nsproc-kind-open-vocab-registration-collision-g-agent-files-kind-platform-or-target",
     "repo": "CIRISPersist",
     "crate": "ciris-persist@21.4.0",
@@ -14573,7 +14563,7 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "4.4",
+    "decimal_id": "3.2",
     "claim_id": "CLM-pinned-trust-resolves",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/canonical_community.rs#resolve_community",
@@ -14581,8 +14571,8 @@
     "manifest_round": "backfill-1052"
    },
    {
-    "decimal_id": "4.4",
-    "claim_id": "CLM-pinned-trust-one-fetch",
+    "decimal_id": "4.4.3.8",
+    "claim_id": "CLM-trust-root",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/canonical_community.rs#pin_trust_from_bundle_response",
     "tsv_target": "evidence/cc_impl.tsv",
@@ -14675,7 +14665,7 @@
    },
    {
     "decimal_id": "5.3.4",
-    "claim_id": "CLM-trust-root-bundle-serves-community-beside",
+    "claim_id": "CLM-bundle-seeds-transit-pairs",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/canonical_community.rs#trust_root_bundle_response",
     "tsv_target": "evidence/cc_impl.tsv",
@@ -14998,14 +14988,6 @@
     "claim_id": "CLM-infrastructure-quorum-m-of-n",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#check_infrastructure_consensus_protocol",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "manifest_round": "backfill-1052"
-   },
-   {
-    "decimal_id": "3.4.7.3",
-    "claim_id": "CLM-node-exclusive-at-mint",
-    "repo": "CIRISPersist",
-    "path#symbol": "src/federation/register.rs#check_node_identity_exclusive",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "backfill-1052"
    },
@@ -16417,7 +16399,7 @@
     "witness": "I1489 (sqlite, postgres)"
    },
    {
-    "decimal_id": "3.1.3",
+    "decimal_id": "2.4",
     "claim_id": "CLM-cosigned-rows",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/tier_ingest.rs#verify_roster_cosignatures",
@@ -16430,7 +16412,7 @@
     "witness": "I1484, I1485, I1486 (sqlite, postgres)"
    },
    {
-    "decimal_id": "3.1.3",
+    "decimal_id": "2.4",
     "claim_id": "CLM-cosigned-rows",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/group_plane.rs#check_cosigned_withdraws",

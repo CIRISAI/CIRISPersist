@@ -9,7 +9,6 @@
 # Columns: decimal_id, claim_id, repo, path#symbol, crate@version
 decimal_id	claim_id	repo	path#symbol	crate@version
 3.1.1	CLM-nsproc-family-roster-membership-change-via-entr-accord	CIRISPersist	ciris-verify-core/src/accord_genesis.rs#build_accord_family_envelope	ciris-persist@31.0.0
-3.1.1	CLM-nsproc-holds-bytes-agent-files-kind-platform-or-target	CIRISPersist	src/federation/holding_claim.rs#holding_claim_row	ciris-persist@61.0.1
 3.1.1	CLM-nsproc-kind-open-vocab-registration-collision-g-agent-files-kind-platform-or-target	CIRISPersist	src/federation/schema_resolver.rs#BlobBackedSchemaResolver	ciris-persist@61.0.1
 3.1.2	CLM-nsproc-witness-key-id-transparency-log-cosigned-tree-size	CIRISPersist	src/federation/admission.rs#default_reserved_prefix_rules	ciris-persist@61.0.1
 3.1.2	CLM-nsproc-restrictions-attestation-license-validity	CIRISPersist	src/federation/consent_grammar.rs#RestrictionOp::StripField	ciris-persist@61.0.1
@@ -54,8 +53,8 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.4.11	CLM-nsproc-age-band-resolution-child-protection	CIRISPersist	src/engine.rs#age_band	ciris-persist@61.0.1
 3.4.13	CLM-child-protection	CIRISPersist	src/federation/age.rs#is_minor	ciris-persist@61.0.1
 3.4.13	CLM-nsproc-age-band-one-way-coarsening-child-protection	CIRISPersist	src/federation/age.rs#coarsen	ciris-persist@61.0.1
-4.4	CLM-pinned-trust-resolves	CIRISPersist	src/federation/canonical_community.rs#resolve_community	ciris-persist@61.0.1
-4.4	CLM-pinned-trust-one-fetch	CIRISPersist	src/federation/canonical_community.rs#pin_trust_from_bundle_response	ciris-persist@61.0.1
+3.2	CLM-pinned-trust-resolves	CIRISPersist	src/federation/canonical_community.rs#resolve_community	ciris-persist@61.0.1
+4.4.3.8	CLM-trust-root	CIRISPersist	src/federation/canonical_community.rs#pin_trust_from_bundle_response	ciris-persist@61.0.1
 4.5.8.3	CLM-nsproc-attestation-prefixes-trace-summary	CIRISPersist	src/federation/consent_grammar.rs#covers	ciris-persist@61.0.1
 4.5.8.3	CLM-nsproc-agent-key-id-trace-summary	CIRISPersist	src/store/sqlite.rs#list_trace_summaries	ciris-persist@61.0.1
 4.5.8.3	CLM-nsproc-extraction-manifest-hash-trace-summary	CIRISPersist	src/trace_summary_contract.rs#extraction_manifest_sha256	ciris-persist@61.0.1
@@ -63,7 +62,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 5.3.2.4	CLM-nsproc-cohort-scope-trace	CIRISPersist	src/engine.rs#Engine::promote_consented_backlog	ciris-persist@61.0.1
 5.3.2.4	CLM-nsproc-dimension-trace	CIRISPersist	src/federation/admission.rs#check_trace_dimension_admission	ciris-persist@61.0.1
 5.3.2.4	CLM-nsproc-subject-key-ids-trace	CIRISPersist	src/federation/admission.rs#check_trace_dimension_admission	ciris-persist@61.0.1
-5.3.4	CLM-trust-root-bundle-serves-community-beside	CIRISPersist	src/federation/canonical_community.rs#trust_root_bundle_response	ciris-persist@61.0.1
+5.3.4	CLM-bundle-seeds-transit-pairs	CIRISPersist	src/federation/canonical_community.rs#trust_root_bundle_response	ciris-persist@61.0.1
 
 # ── UNASSIGNED — awaiting a CC decimal ───────────────────────────────────────
 # v25.1.0 (CIRISPersist#577 follow-up) — adopted from CIRISVerify's registry
@@ -123,7 +122,6 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.2	CLM-infrastructure-does-not-vote	CIRISPersist	src/federation/consensus.rs#eligible	ciris-persist@61.0.1
 3.2	CLM-infrastructure-does-not-vote	CIRISPersist	src/federation/mod.rs#community_node_bearing_seats	ciris-persist@61.0.1
 3.2	CLM-infrastructure-quorum-m-of-n	CIRISPersist	src/federation/admission.rs#check_infrastructure_consensus_protocol	ciris-persist@61.0.1
-3.4.7.3	CLM-node-exclusive-at-mint	CIRISPersist	src/federation/register.rs#check_node_identity_exclusive	ciris-persist@61.0.1
 3.2	CLM-family-root-charter	CIRISPersist	src/federation/trust_root.rs#ConferralPlane	ciris-persist@61.0.1
 3.2	CLM-family-root-charter	CIRISPersist	src/federation/trust_root.rs#family_quorum_over	ciris-persist@61.0.1
 3.4.7	CLM-family-root-charter	CIRISPersist	src/federation/trust_root.rs#check_family_charter_admission	ciris-persist@61.0.1
@@ -298,8 +296,8 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.1.3	CLM-planes-as-rows	CIRISPersist	src/federation/group_plane.rs#rehome_group_records	ciris-persist@61.0.1
 # v61 (CIRISPersist#991) — cosigned rows: the co-signatures ride as additional_scrubs,
 # counted by the one predicate; a retraction is a cosigned withdraws.
-3.1.3	CLM-cosigned-rows	CIRISPersist	src/federation/tier_ingest.rs#verify_roster_cosignatures	ciris-persist@61.0.1
-3.1.3	CLM-cosigned-rows	CIRISPersist	src/federation/group_plane.rs#check_cosigned_withdraws	ciris-persist@61.0.1
+2.4	CLM-cosigned-rows	CIRISPersist	src/federation/tier_ingest.rs#verify_roster_cosignatures	ciris-persist@61.0.1
+2.4	CLM-cosigned-rows	CIRISPersist	src/federation/group_plane.rs#check_cosigned_withdraws	ciris-persist@61.0.1
 # v60.0.0 (CIRISPersist#934 step 4) — the subject-side revocation scan the
 # deletion-SLA watch reads, every tier, is one fold on every backend.
 3.3.1	CLM-nsproc-tier-consent	CIRISPersist	src/federation/consent_admit.rs#consent_revocations_planned	ciris-persist@61.0.1
