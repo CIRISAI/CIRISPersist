@@ -5068,9 +5068,7 @@ impl Engine {
     /// (`moderate` / `takedown` / `review`). A [`Self::grant_delegation`]
     /// specialization stamping the single `duty` scope. After this,
     /// [`is_named_moderator`](crate::federation::admission::is_named_moderator)`(moderator, community, duty)`
-    /// holds IFF the `signer` is in the community's authority set
-    /// (founder / consensus signer per
-    /// [`community_authority_set`](crate::federation::admission)) AND
+    /// holds IFF the `signer` is an active founder of the community AND
     /// steward-bound — the appointment edge `signer → moderator` is the
     /// root-out-edge the §11.10 duty walk traverses.
     ///
@@ -19178,7 +19176,7 @@ mod tests {
 
     /// Seed a `founder_only` community whose sole founder is
     /// `founder_key_id` (already registered + steward-bound). The community's
-    /// own key is registered too (required by `community_authority_set`).
+    /// own key is registered too.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn seed_community_with_founder(
         engine: &Engine,

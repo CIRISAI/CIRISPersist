@@ -47436,16 +47436,17 @@ mod tests {
             .unwrap();
         backend
             .put_community(
-                crate::federation::tier_ingest::test_support::sign_community(
-                    "duty-comm",
-                    fed_community(
+                crate::federation::tier_ingest::test_support::sign_community("duty-comm", {
+                    let mut c = fed_community(
                         "duty-comm",
                         "Duty Co-op",
                         vec!["owner"],
                         crate::federation::types::consensus_protocol::MAJORITY,
                         None,
-                    ),
-                ),
+                    );
+                    c.members[0].role = Some("founder".into());
+                    c
+                }),
             )
             .await
             .expect("steward-bound member admitted under MAJORITY");

@@ -16458,7 +16458,7 @@ pub async fn check_community_membership_steward_binding(
 /// is itself a **zero-hop** named moderator. So `moderators_of(C, moderate)`
 /// is non-empty IFF such a root exists; we test that directly (the authority
 /// set computed from the in-flight record's roster, per
-/// [`community_authority_set`]'s `founder_only`-vs-open rule), avoiding the
+/// [`community_authority_set_for`]'s `founder_only`-vs-open rule), avoiding the
 /// per-delegate walk.
 ///
 /// # Carve-out + fail-secure
@@ -16487,7 +16487,7 @@ pub async fn check_no_moderator_federate_admission(
     if is_authorized_infrastructure_community(directory, community).await? {
         return Ok(());
     }
-    // Authority set from the in-flight roster (mirrors community_authority_set:
+    // Authority set from the in-flight roster (mirrors community_authority_set_for:
     // founders always; every member too under a non-`founder_only` protocol).
     // v61 (CIRISPersist#1123) — founders alone under `open:self_admit`
     // too: joining a public room confers membership, never its authority.
@@ -16938,20 +16938,16 @@ pub async fn no_moderator_federate_verdict(
 ///   - every edge bears `duty` scope (the [`MODERATION_DUTY`] walk:
 ///     `⊆`-parent attenuation + `sub_delegation`-gated deputization +
 ///     depth ≤ 5 + no `withdraws`-revoked edge), AND
-///   - `root ∈ authority_set(community_id)` — the community's founders /
-///     `consensus_protocol` signers (resolved from the
-///     [`Community`](crate::federation::types::Community) record via
-///     [`FederationDirectory::lookup_community`]), AND
-///   - `is_steward_bound(root)`.
+///   - `root` is an active founder of the community and `is_steward_bound`
+///     ([`moderation_duty_roots`]).
 ///
-/// A zero-hop appointment (`root == k`, root directly in the authority set)
-/// is admitted — a founder IS a named moderator of their own community. The
+/// A zero-hop appointment (`root == k`) is admitted — a founder IS a named moderator of their own community. The
 /// §11.11 merit auto-promotion emits the SAME appointment shape (a
 /// `delegates_to` from a community authority), so this one predicate covers
 /// both the explicit-appointment and merit-promotion cases.
 ///
 /// `community_id` is the community's `community_key_id`. Returns `false`
-/// (never errors) when the community is unknown, declares no authority set,
+/// (never errors) when the community is unknown, has no founder,
 /// or no steward-bound authority reaches `k` — fail-closed.
 ///
 /// [`MODERATION_DUTY`]: DelegationWalkPolicy::MODERATION_DUTY
@@ -16961,14 +16957,9 @@ pub async fn is_named_moderator(
     community_id: &str,
     duty: &str,
 ) -> Result<bool, Error> {
-    let authority = community_authority_set(directory, community_id).await?;
     let target: std::collections::HashSet<String> = std::iter::once(k.to_owned()).collect();
-    for root in authority {
-        // Steward-binding of the root is REQUIRED (§11.11 → §5.6.8.10).
-        if !is_steward_bound(directory, &root).await? {
-            continue;
-        }
-        // Zero-hop: the steward-bound authority IS the named moderator.
+    for root in moderation_duty_roots(directory, community_id).await? {
+        // Zero-hop: a steward-bound founder IS a named moderator.
         if root == k {
             return Ok(true);
         }
@@ -16995,14 +16986,14 @@ pub async fn is_named_moderator(
 /// `duty`-scoped `delegates_to` chain (the same [`MODERATION_DUTY`] walk
 /// `is_named_moderator` probes, but accumulated instead of target-tested).
 ///
-/// For each root in the community authority set
-/// ([`community_authority_set`]) that [`is_steward_bound`], the root itself is
+/// For each duty root
+/// ([`moderation_duty_roots`]) that [`is_steward_bound`], the root itself is
 /// a named moderator (zero-hop founder) AND every key it reaches under the
 /// §11.10 scoped walk
 /// ([`enumerate_scoped_delegation_reach`]) is one too. Returns the deduped
 /// key_id set (sorted for a deterministic surface). Consistency with the
 /// predicate: `is_named_moderator(k, …)` ⟺ `k ∈ moderators_of(…)`, because
-/// both compose the SAME authority set, the SAME steward-binding gate, and the
+/// both compose the SAME root set, the SAME steward-binding gate, and the
 /// SAME scoped-reach walk.
 ///
 /// (CIRISPersist#593) The last of those three was a claim about two hand-mirrored
@@ -17018,15 +17009,9 @@ pub async fn moderators_of(
     community_id: &str,
     duty: &str,
 ) -> Result<Vec<String>, Error> {
-    let authority = community_authority_set(directory, community_id).await?;
     let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for root in authority {
-        // Steward-binding of the root is REQUIRED (§11.11 → §5.6.8.10) — a
-        // non-steward-bound authority roots no moderation duty.
-        if !is_steward_bound(directory, &root).await? {
-            continue;
-        }
-        // Zero-hop: the steward-bound authority IS a named moderator.
+    for root in moderation_duty_roots(directory, community_id).await? {
+        // Zero-hop: a steward-bound founder IS a named moderator.
         // Then every delegate it reaches under the duty-scoped walk.
         let reach = enumerate_scoped_delegation_reach(
             directory,
@@ -17155,101 +17140,51 @@ pub(crate) async fn moderation_reach_of(
 }
 
 /// CIRISPersist#591 — the **APPOINTED** moderator set of community
-/// `community_id` for `duty`: the steward-bound **founders** and every key they
-/// reach under the same §11.10 `duty`-scoped `delegates_to` walk.
+/// `community_id` for `duty`. The same set as [`moderators_of`] since
+/// CIRISPersist#1195: the split this function introduced for the
+/// `reverse_quorum` plane now holds for every duty read
+/// ([`moderation_duty_roots`]).
 ///
-/// # Three functions, three questions — read the table before adding a fourth
-///
-/// | question | function | set |
-/// |---|---|---|
-/// | who may **appoint** a moderator? | [`duty_holders_for_community`] | the steward-bound authority set — founders, **plus every current member for any non-`founder_only` protocol** |
-/// | who **counts as** a named moderator (§11.11 existence)? | [`moderators_of`] | that same widened authority set ∪ its `duty`-scoped delegates |
-/// | who has **been appointed** to the duty? | **this function** | founders ∪ their `duty`-scoped delegates |
-///
-/// For a `founder_only` community all three coincide, which is why the widening
-/// was invisible for as long as §11.11's only consumer was the
-/// moderator-EXISTENCE gate ([`check_no_moderator_federate_admission`]). There
-/// the widened reading is correct and deliberate: a community with any
-/// steward-bound member *can* appoint, so it is not moderator-less.
-///
-/// It is NOT correct for a **duty** question. Every cohort that adopts
-/// `reverse_quorum:*` is by construction non-`founder_only`, so `moderators_of`
-/// on that plane returns the ENTIRE steward-bound roster — and a "steward tier"
-/// whose membership equals the roster is not a tier. Worse than useless:
-/// [`reverse_quorum`](super::reverse_quorum)'s escalation is blocked by a
-/// duty-holder ruling, so a roster-wide steward set would let any member rule
-/// on any objection and freeze the commons' escalated undo forever — the exact
-/// 1-of-N capability grant the accord-ops invariant forbids. Reading an
-/// appointment-ELIGIBILITY set as an appointed-duty set is axis fusion; this is
-/// the split.
-///
-/// Fail-closed, exactly like [`moderators_of`]: an unknown community, a
-/// community with no founder-tagged member, or a founder that is not
-/// [`is_steward_bound`] yields the empty set (no appointed moderators), never
-/// an error. An empty result is a legible fact, not an error — see
+/// Empty is a legible fact, not an error: see
 /// [`StewardTierStanding::NoDutyHolders`](super::reverse_quorum::StewardTierStanding::NoDutyHolders).
 pub async fn appointed_moderators_of(
     directory: &dyn super::FederationDirectory,
     community_id: &str,
     duty: &str,
 ) -> Result<Vec<String>, Error> {
-    let Some(community) = directory.lookup_community(community_id).await? else {
-        return Ok(Vec::new());
-    };
-    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // v48.0.0 (CIRISPersist#860) — the fold, not the record.
-    for member in &crate::federation::effective_roster(directory, &community).await? {
-        if member.role.as_deref() != Some(MEMBER_ROLE_FOUNDER) {
-            continue;
-        }
-        // The SAME steward-binding gate `moderators_of` applies to its roots
-        // (§11.11 → §5.6.8.10) — a non-steward-bound founder roots no duty.
-        if !is_steward_bound(directory, &member.key_id).await? {
-            continue;
-        }
-        // …and the SAME duty-scoped walk. One reachability predicate, two root
-        // sets — never two walks that could drift on what a delegated duty is.
-        let reach = enumerate_scoped_delegation_reach(
-            directory,
-            &member.key_id,
-            duty,
-            MAX_MODERATION_DELEGATION_DEPTH,
-            DelegationWalkPolicy::MODERATION_DUTY,
-        )
-        .await?;
-        out.insert(member.key_id.clone());
-        out.extend(reach);
-    }
-    let mut out: Vec<String> = out.into_iter().collect();
-    out.sort();
-    Ok(out)
+    moderators_of(directory, community_id, duty).await
 }
 
-/// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §11.11) — the **authority set**
-/// of community `community_id`: the keys empowered to appoint moderators.
-/// Per §8.1.13.3 + §5.6.8.9 the community record carries a member roster
-/// (`role`-tagged) and a `consensus_protocol`; the authority set is the
-/// roster members whose `role` marks them a founder / consensus signer:
+/// CIRISPersist#1195 (CC 4.5.4, 4.5.13) — **the roots of a community's
+/// moderation duties**: its active, steward-bound founders, at every
+/// `consensus_protocol`. The one root set [`is_named_moderator`],
+/// [`moderators_of`] and [`named_moderator_holders`] read.
 ///
-///   - For `founder_only` (the default-strict protocol): members tagged
-///     [`MEMBER_ROLE_FOUNDER`].
-///   - For any OTHER `consensus_protocol` (`unanimous` / `majority` /
-///     `quorum:*` / `weighted:*` / `custom:*`): every current member is a
-///     consensus signer — the whole roster is the authority set (persist
-///     does not adjudicate the signature-count threshold here; that is the
-///     appointment ceremony's job — §5.6.8.9 normative-honesty).
+/// Not [`community_authority_set_for`]. That answers who may sign for the
+/// room, which outside `founder_only` and `open:self_admit` is every member. A
+/// named moderator is an appointment, and a member is capability-free presence
+/// (CC 4.1), so reading the signing set here made one member of a `majority`
+/// room able to moderate alone.
 ///
-/// Founders are always included regardless of protocol. Returns an empty
-/// set when the community is unknown — fail-closed (no authority ⇒ no named
-/// moderators).
-async fn community_authority_set(
+/// Empty for an unknown community, which fails closed. A family is held by
+/// `lookup_family`, so a family id also resolves to no roots here.
+async fn moderation_duty_roots(
     directory: &dyn super::FederationDirectory,
     community_id: &str,
 ) -> Result<std::collections::HashSet<String>, Error> {
     let Some(community) = directory.lookup_community(community_id).await? else {
         return Ok(std::collections::HashSet::new());
     };
-    community_authority_set_for(directory, &community).await
+    let mut roots = std::collections::HashSet::new();
+    for member in &crate::federation::effective_roster(directory, &community).await? {
+        // A non-steward-bound founder roots no duty (§11.11 → §5.6.8.10).
+        if member.role.as_deref() == Some(MEMBER_ROLE_FOUNDER)
+            && is_steward_bound(directory, &member.key_id).await?
+        {
+            roots.insert(member.key_id.clone());
+        }
+    }
+    Ok(roots)
 }
 
 /// v48.0.0 (CIRISPersist#860) — who may sign on the room's behalf, from the
@@ -17440,7 +17375,7 @@ pub async fn subject_of_content(
 /// community moderators, only subjects). The named-moderator half resolves
 /// only the AUTHORITY ROOTS into the holder set — the per-signer walk-down
 /// is then done by [`check_moderation_admission`]; here we materialize the
-/// roots (the community authority set, steward-bound) so a signer who IS a
+/// roots (the steward-bound founders) so a signer who IS a
 /// named moderator is admitted as-self.
 pub async fn duty_holders_for_content(
     directory: &dyn super::FederationDirectory,
@@ -17489,7 +17424,7 @@ pub async fn duty_holders_for_content(
 ///
 /// # NO steward-bound filter, and the asymmetry is deliberate
 ///
-/// [`duty_holders_for_community`] intersects its authority set with
+/// [`duty_holders_for_community`] intersects its founders with
 /// [`is_steward_bound`], because a community member may be a node or an agent
 /// and CC 3.2 requires authority to trace to an accountable human.
 ///
@@ -17559,7 +17494,7 @@ pub(crate) async fn community_duty_roots(
 
 /// Materialize the named-moderator AUTHORITY ROOTS for `community_id` /
 /// `duty` into the duty-holder set: each steward-bound member of the
-/// community authority set. (The full `is_named_moderator` relation —
+/// community's founders. (The full `is_named_moderator` relation —
 /// including delegates reached from these roots — is then enforced by
 /// [`check_moderation_admission`]'s per-signer walk-down rooted at these
 /// holders.) Empty community / no steward-bound authority ⇒ empty set.
@@ -17571,14 +17506,7 @@ async fn named_moderator_holders(
     if community_id.is_empty() {
         return Ok(std::collections::HashSet::new());
     }
-    let authority = community_authority_set(directory, community_id).await?;
-    let mut holders = std::collections::HashSet::new();
-    for root in authority {
-        if is_steward_bound(directory, &root).await? {
-            holders.insert(root);
-        }
-    }
-    Ok(holders)
+    moderation_duty_roots(directory, community_id).await
 }
 
 /// v44.6.0 (CIRISPersist#857, `FSD/CONSENT_BY_HUMANS.md` §4) — **a machine

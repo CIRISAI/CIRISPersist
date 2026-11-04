@@ -490,13 +490,14 @@ pub(crate) mod bodies {
         assert!(ok.tombstoned, "I1517: tombstoned");
     }
 
-    /// A community whose only member is `member` (a person, so a
-    /// steward-bound authority root: a named moderator).
+    /// A community whose only member is `member`, its founder (a person, so
+    /// a steward-bound duty root: a named moderator).
     pub(crate) async fn community_of(dir: &dyn FederationDirectory, comm: &str, member: &str) {
         group_of(dir, comm, &[member], None).await
     }
 
-    /// [`community_of`] with a `policy_blob` (an `affiliations` group).
+    /// [`community_of`] with a `policy_blob` (an `affiliations` group). The
+    /// first of `members` is the founder.
     async fn group_of(
         dir: &dyn FederationDirectory,
         comm: &str,
@@ -523,10 +524,12 @@ pub(crate) mod bodies {
                 community_name: comm.to_owned(),
                 members: members
                     .iter()
-                    .map(|m| crate::federation::types::CommunityMember {
+                    .enumerate()
+                    .map(|(i, m)| crate::federation::types::CommunityMember {
                         key_id: (*m).to_owned(),
                         joined_at: chrono::Utc::now(),
-                        role: None,
+                        role: (i == 0)
+                            .then(|| crate::federation::admission::MEMBER_ROLE_FOUNDER.to_owned()),
                     })
                     .collect(),
                 founded_at: chrono::Utc::now(),
