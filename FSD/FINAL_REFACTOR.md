@@ -507,7 +507,8 @@ effect needs tracing through the store.
 
 Room-level values live on the signed room record, not in config: consensus protocol, admission
 mode, `founder_only`, moderator quorum, discoverability, `federating`, normative regime,
-`dissolves_at`, declared cohort. The before-state on #1130 lists the fields the record lacks.
+`dissolves_at`, declared cohort, and `licence_classes` (CC 4.4.3.2.8, rc17 `523617d`: each class with `legal_weight`,
+read by the #1217 withdraw limbs). The before-state on #1130 lists the fields the record lacks.
 Admission mode and `founder_only` exist today only as protocol forms.
 
 ## 6. One answer per question
@@ -1106,7 +1107,7 @@ ticket, so they close with their evidence rows in 61.0.4. #1140 waits for Server
 |---|---|
 | the program | #1130, #1205 |
 | rides the format window | #1178, #914, #1098, #1067, #1116 |
-| becomes a row or primitive | #1100, #1115, #1131, #1149, #1150, #1152, #1154, #1173, #1174, #1186, #1191 |
+| becomes a row or primitive | #1100, #1115, #1131, #1149, #1150, #1152, #1154, #1173, #1174, #1186, #1191, #1217 |
 | committed for v62 | #1121 (CEWP: "The base lands with the substrate's next version"), #1118, #1142 |
 | waits for the model, then cheap | #962, #974, #976, #1079-#1083, #1085-#1088, #1175 |
 
