@@ -3973,6 +3973,9 @@ mod tests {
         // m1 objects; m1's device m1b is a duty-holder: recused, an empty bench.
         let e = inputs(&["m1b".to_string()], &[], "m1");
         assert_eq!(e.steward, StewardTierStanding::NoDutyHolders, "{e:?}");
+        // And the other way round: the objection is signed on the device.
+        let e = inputs(&["m1".to_string()], &[], "m1b");
+        assert_eq!(e.steward, StewardTierStanding::NoDutyHolders, "{e:?}");
         // Two seats of one self are one duty-holder.
         let e = inputs(&["m1".to_string(), "m1b".to_string()], &[], "m3");
         assert_eq!((e.duty_holders, e.steward_ruling_required), (1, 1), "{e:?}");

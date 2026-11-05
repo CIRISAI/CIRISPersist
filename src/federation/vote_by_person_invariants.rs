@@ -22,6 +22,8 @@
 //!   are one voice of the denominator and the numerator, a second device
 //!   signs for its seated person, another self and an evicted device do not,
 //!   in a room and in a family; the removal floor holds.
+//! - **I1532** (`group_plane_invariants`) — a cosigned `withdraws` of a roster
+//!   event counts persons, a second device signing for its seated person.
 //! - **I1531** — no row order, in arrival or in `asserted_at`, changes the
 //!   count.
 
@@ -282,6 +284,30 @@ pub(crate) mod bodies {
             (1, 1),
             "I1525: both seated, one voice: {e:?}"
         );
+
+        // The dismissal m-of-n's denominator is persons too: three of five,
+        // where six seats would ask four.
+        let lone = signed_row(
+            &uuid::Uuid::new_v4().to_string(),
+            &r,
+            &c.actor,
+            dismissal_envelope(Cohort::Community, &c.room, &c.action_id, &c.objection, "no"),
+            ms(Utc::now()),
+            &[],
+        );
+        let short = record_objection_dismissal(d, &lone).await.expect("door");
+        assert_eq!(
+            (short.quorum.roster_size, short.quorum.required),
+            (5, 3),
+            "I1525: {short:?}"
+        );
+
+        // A reversal's cap at the roster is a cap at the persons on it.
+        let room = format!("{tag}-capped");
+        let seats = [&f, &p, &pd, &q, &r, &actor].map(|k| k.clone());
+        seed_community(d, &room, &seats, "reverse_quorum:6/6:86400").await;
+        let c = case(d, &room, &actor, &q, tag).await;
+        assert_eq!(c.fold(d).await.required, 5, "I1525: six seats, five people");
 
         // ── An objection and a dismissal count persons too.
         let room = format!("{tag}-objectors");
@@ -725,6 +751,22 @@ pub(crate) mod bodies {
             .unwrap_or_else(|e| panic!("I1530: two persons remove: {e}"));
         assert!(!seated(d, &open, &j).await, "I1530: j is gone");
 
+        // The member a removal names is a person: their other device is never
+        // one of its voices, and the removal of one seat needs nobody of theirs.
+        let open2 = format!("{tag}-open2");
+        reg(d, &[&open2]).await;
+        found_public_room(d, &open2, OPEN_SELF_ADMIT, &[&p, &pd, &f1, &f2], &[])
+            .await
+            .unwrap();
+        let e = remove(d, &open2, &pd, &[&p, &f1])
+            .await
+            .expect_err("I1530: p is the person named, one voice is left");
+        assert!(insufficient(&e), "I1530: {e}");
+        remove(d, &open2, &pd, &[&f1, &f2])
+            .await
+            .unwrap_or_else(|e| panic!("I1530: two other persons: {e}"));
+        assert!(!seated(d, &open2, &pd).await, "I1530: pd is gone");
+
         // A family runs the same fold.
         found_family(d, &fam, MAJORITY, &[&p, &pd, &q], &[])
             .await
@@ -755,6 +797,38 @@ pub(crate) mod bodies {
         d.put_family_membership_widening_consented(widen_family(&[&pd, &q]))
             .await
             .unwrap_or_else(|e| panic!("I1530: two persons of a family: {e}"));
+
+        // The quorum-gated supersede counts persons too.
+        let fam2 = format!("{tag}-fam2");
+        reg(d, &[&fam2]).await;
+        found_family(d, &fam2, MAJORITY, &[&p, &pd, &q], &[])
+            .await
+            .unwrap();
+        let members = [p.clone(), pd.clone(), q.clone(), x.clone()];
+        let change = d
+            .build_membership_change_envelope(
+                Cohort::Family,
+                &fam2,
+                &members,
+                false,
+                Some(MAJORITY),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("I1530: build change: {e}"));
+        let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
+        let sign = |keys: &[&String]| {
+            keys.iter()
+                .map(|k| ts::threshold_sign(k, &bytes))
+                .collect::<Vec<_>>()
+        };
+        let e = d
+            .verify_membership_quorum(Cohort::Family, &fam2, &change, &sign(&[&p, &pd]))
+            .await
+            .expect_err("I1530: one person of two");
+        assert!(e.to_string().contains("not authorized"), "I1530: {e}");
+        d.verify_membership_quorum(Cohort::Family, &fam2, &change, &sign(&[&p, &q]))
+            .await
+            .unwrap_or_else(|e| panic!("I1530: two persons of two: {e}"));
     }
 }
 

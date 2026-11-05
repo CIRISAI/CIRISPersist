@@ -585,6 +585,52 @@ pub(crate) mod bodies {
             .map(|_| ())
     }
 
+    /// I1532 (CIRISPersist#1198, CC 4.5.13) — a cosigned `withdraws` of a
+    /// roster event counts persons under `quorum:2/3`: ann's two keys are one
+    /// voice, and ann's unseated device with ben's seat are two.
+    pub(crate) async fn i1532_a_retraction_counts_persons<D>(d: &D, tag: &str)
+    where
+        D: FederationDirectory + GroupPlaneStore + AttestationStore,
+    {
+        let dd: &dyn FederationDirectory = d;
+        for n in ["ann", "ben", "cat", "dan"] {
+            user(dd, &format!("{n}-{tag}")).await;
+        }
+        let device = format!("ann2-{tag}");
+        user(dd, &device).await;
+        let (fam, [ann, ben, _, dan]) = family_with_history(d, tag).await;
+        crate::federation::self_roster_invariants::bodies::add(
+            dd,
+            &ann,
+            &ann,
+            &device,
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now()),
+        )
+        .await
+        .expect("ann's second device");
+        let widening = one(
+            d,
+            &fam,
+            gp::MEMBERSHIP_WIDENING_DIMENSION,
+            GroupPlaneTable::FamilyWidenings,
+        )
+        .await;
+        let e = put_row(dd, withdraws_of(&ann, &[&device], &widening))
+            .await
+            .expect_err("I1532: one person's two keys are one voice");
+        assert!(
+            matches!(e, Error::RosterAuthorityUnauthorized { .. }),
+            "{tag}: I1532: {e}"
+        );
+        put_row(dd, withdraws_of(&ben, &[&device], &widening))
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: I1532: two persons: {e}"));
+        assert!(
+            !sorted_active(dd, &fam).await.contains(&dan),
+            "{tag}: I1532: the retracted widening seats nobody"
+        );
+    }
+
     /// I1487 — a cosigned row is retracted by a cosigned `withdraws`.
     pub(crate) async fn i1487_cosigned_withdraws<D>(d: &D, tag: &str)
     where
@@ -1542,6 +1588,12 @@ mod run {
                 async fn i1492() {
                     let Some(d) = $fresh.await else { return };
                     super::super::bodies::i1492_a_retraction_has_a_direction(&d, &super::tag())
+                        .await;
+                }
+                #[tokio::test]
+                async fn i1532() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i1532_a_retraction_counts_persons(&d, &super::tag())
                         .await;
                 }
                 #[tokio::test]
