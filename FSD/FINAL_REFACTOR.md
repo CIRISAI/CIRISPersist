@@ -346,7 +346,7 @@ What this means for the build:
 
 | consequence | |
 |---|---|
-| the mint path blinds by rule | `admit` refuses a row that seals a member its family's `blind` column names |
+| the mint path blinds by rule | `step` refuses a row that seals a member its family's `blind` column names |
 | a verdict never depends on a blinded value | ruled: no fold, verdict or admission reads a blindable member, or nodes that erased it and nodes that did not would disagree |
 | one quorum, one disclosure set | cosigners share a payload, so they share `_sd`, and the set is one object on the bytes plane |
 | SQL over blinded members goes | they leave the payload; §4.2's projection only renders what is still held |
@@ -425,15 +425,34 @@ derived from the family model: 191 families, 474 transitions and 22 gap cells at
 
 ```rust
 enabled(family, state, standing) -> impl Iterator<Item = Transition>
-admit(view: &RowView, door: DoorMode, state: &State) -> Result<Admitted<T>, Refusal>
+step(held: &Held, row: &RowView, door: DoorMode, now: Instant) -> Result<Admitted<Plan>, Refusal>
 ```
 
-`admit` finds the transition a row claims and asks whether it is enabled. `queue` lists
+`step` finds the transition a row claims and asks whether it is enabled. `queue` lists
 everything enabled for a person. That is one predicate, and `formal/event_lifecycle`
 proves the two agree: `queue_sound`, `queue_complete`, `door_is_queue`,
 `stranger_sees_nothing`. CEWP calls the queue "the admission door run forwards". Today
 persist has the door and no predicate a queue could reuse, so this claim
 (`CLM-queue-is-the-door`, normative, no implementer) is built here or nowhere.
+
+**The state processor (CC 4.5.13, rc17 `49a016b`).** The queue, the preview and the door are one function run
+three ways, and a node holds one. State is the held row set; object state, standing and seated roles are folds
+over it, never stored verdicts. A projection is a rebuildable cache and never the source of a verdict.
+
+| run over | is |
+|---|---|
+| the transitions enabled for one person | the queue |
+| a row before it is signed, with `Held` plus that candidate | the preview |
+| a row that arrives | the door |
+
+Plan and execute already give the commit flag CC asks for. `step` returns a plan; the door hands it to the
+executor, and a preview drops it. So `Held` is a read overlay of store plus candidates, and nothing in a preview can
+write. Signatures are outside `step`: the codec verifies before a row reaches it, and a preview has none to check.
+
+There is no third outcome. A row under a non-self policy is admitted at once, and the object moves when the fold
+meets the policy's numbers, so "pending" is what the view says afterwards: state unchanged, and what is missing.
+Impact is the diff of the fold before and after, plus the family's undo columns, never a stored field. `now` is
+the one outside input.
 
 The remaining columns follow the grammar locked on CC#189:
 
@@ -451,7 +470,7 @@ states in its chapter model, so draft 0's table is a floor, not the finished set
 Standing is the set of roles folded from held rows. All of this is integer arithmetic over
 signed inputs, "checked by vectors", so no float reaches a verdict.
 
-`Admitted<T>` is the only way to obtain a plan, so a missing gate is a compile error. That
+`Admitted<Plan>` is the only way to obtain a plan, so a missing gate is a compile error. That
 closes #681 step 4. Rule 0b, the halt gate, is one primitive at the door. No door has a
 halt gate today (T, census), so this is new behaviour and arrives as a named delta.
 
@@ -731,8 +750,8 @@ predicate, the rules are kept twice again. Proposed split:
 
 CC confirmed this at rc17, and Server confirmed it matches #851, #853 and #858.
 
-**The callable.** Server needs `enabled(object, signer)` run hypothetically, writing nothing, with `impact`
-beside it; #851 has nothing to call until it exists. It lands in v62, per family, as each family reaches the
+**The callable.** Server needs the preview: `step` over `Held` plus a candidate, writing nothing, with `impact`
+beside it (§5.3); #851 has nothing to call until it exists. It lands in v62, per family, as each family reaches the
 shared predicate (§5.5). Shipping it in 61.x would mean a second predicate that the door does not use, which is
 the fault this document exists to remove.
 
@@ -981,7 +1000,7 @@ Opens when Edge tags v44.
 1. Verify publishes (CIRISVerify#326). Schema for edition 2. Read side behind `RowView`.
 2. Vendor the family model. Migrate families per §5.5, simplest first.
 3. Inside it, as rows or primitives and not as doors: #1173, #1061, #1100, #720, #798, #991's cosign rule,
-   `Admitted<T>`.
+   `Admitted<Plan>`.
 4. `submit`, `view`, `queue`; trait decomposition; `DoorMode`. The one API break.
 
 **Exit:** every family through the interpreter; bespoke gates deleted; v62 **reads both and still writes
@@ -1014,7 +1033,7 @@ legacy tables. Docs pass (#1144), last. Chain retirement when the census allows.
 | split `admission.rs` now | #1130 deletes much of it; 101 `cc_impl` rows re-pointed twice |
 | hand-write #991's cosign rule, #1100's deltas or #1173's room doors | each is a manifest row |
 | re-key 27 gates one by one for #1174 | one `FamilyKey` closes the class |
-| build `Admitted<T>` on today's trait | its shape changes at `admit` |
+| build `Admitted<Plan>` on today's trait | its shape changes at `step` |
 | write #722's cursor witnesses for retired cursors | those planes are rows now |
 | refactor the 312 gateless doors for line count before #1205 | 629 signature-column references there get rewritten |
 | split `pyo3.rs` during v62 | guaranteed conflicts |
