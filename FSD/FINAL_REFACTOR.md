@@ -403,7 +403,7 @@ and they never mix.
 | operator settings | pool sizes, retention floors, sweep cadence | the node operator | config file, restart | **never** |
 
 A ruling becomes a manifest edit plus vectors at a CC tag (agreed on CC#189). An AST rule
-holds the third line: nothing reachable from `interpret` reads operator settings.
+holds the third line: nothing reachable from `step` reads operator settings.
 
 ### 5.2 The vendored manifest
 
@@ -1158,6 +1158,7 @@ baselines; schema baseline; statement catalogue; surface census; certify leg fil
 | 4 | committed features | Eric | **ruled:** pre-refactor needs ship in 61.0.4; a feature that fits v62 or breaks the wire goes to v62, including #1121, #1118, #1142 | |
 | 6 | a scrubbed corpus from a test mesh | Eric | **ruled yes** | |
 | 7 | `mold` on CI and certify | Eric | **ruled yes** | |
+| 16 | node-local first-held instants: part of `Held`, or `now` per row (state is "the rows held and nothing else", yet window starts are this node's own) | CC | a held row carries its own first-held instant; verdicts stay folds | Phase 2 |
 | 11 | ruled family rows for the gap cells | CC | gaps closed until ruled; refinements land as rows with vectors | Phase 2 |
 | 12 | Verify owns CBOR and COSE encode | Verify | yes (§4.7) | before build |
 | 13 | the persist and Server line | Server, CC | §8.3 | Phase 1 |
