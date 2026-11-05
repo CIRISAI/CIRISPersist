@@ -17842,11 +17842,7 @@ pub async fn check_reconsideration_admission(
     }
     let community_id = match &target {
         Some(t) => {
-            let held = t
-                .attestation_envelope
-                .get("community_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
+            let held = envelope_cohort_target(&t.attestation_envelope)?.unwrap_or("");
             if !declared_community_id.is_empty() && declared_community_id != held {
                 return Err(Error::InvalidArgument(format!(
                     "{RECONSIDERATION_COMMUNITY_MISMATCH}: reconsideration {} names community \

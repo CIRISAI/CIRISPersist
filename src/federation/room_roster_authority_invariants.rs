@@ -925,6 +925,40 @@ pub mod bodies {
         assert_eq!(unverified_signer(&e), bob);
     }
 
+    /// **I1524 (fold half; CIRISPersist#1200) — a held removal stands.** A
+    /// removal admitted on a moderator's standing before the door refused it
+    /// still applies in the fold: an admitted row is not unsaid by a later gate.
+    pub fn i1524_an_admitted_moderator_removal_stands() {
+        let t0 = at("2026-01-01T00:00:00Z");
+        let t1 = at("2026-03-01T00:00:00Z");
+        let member = |k: &str, role: Option<&str>| CommunityMember {
+            key_id: k.into(),
+            joined_at: t0,
+            role: role.map(str::to_owned),
+        };
+        let held = crate::federation::RosterEvent {
+            effective_at: t1,
+            is_add: false,
+            member: member("b", None),
+            signers: ["mo".to_owned()].into_iter().collect(),
+            moderator_roots: ["a".to_owned()].into_iter().collect(),
+            reversed: false,
+        };
+        let rules = crate::federation::RosterRules {
+            protocol: consensus_protocol::UNANIMOUS,
+            subkind: None,
+            policy_blob: None,
+            node_bearing: &crate::federation::NO_NODE_BEARING_SEATS,
+        };
+        let record = vec![member("a", Some("founder")), member("b", None)];
+        let roster = crate::federation::authorized_roster_at(&record, rules, &[held], t1);
+        assert_eq!(
+            roster.iter().map(|m| m.key_id.as_str()).collect::<Vec<_>>(),
+            vec!["a"],
+            "I1524: a held moderator removal still removes"
+        );
+    }
+
     /// **I173 (fold half) — a revocation with no recorded signer counts.**
     pub fn i173_a_legacy_revocation_counts() {
         let t0 = at("2026-01-01T00:00:00Z");
@@ -1144,6 +1178,11 @@ pub mod bodies {
 mod run {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
+    }
+
+    #[test]
+    fn i1524_fold() {
+        super::bodies::i1524_an_admitted_moderator_removal_stands();
     }
 
     #[test]

@@ -5,6 +5,18 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [61.0.3] - 2026-11-05
+
+### Fixed
+
+- **A room's founder could not take down chat content** (CIRISPersist#1199, CC 4.5.5). The takedown binding read a row's room only from `community_id`, and chat rows name it by `community_key_id`, so chat content bound no room and only its subjects held the duty. The binding now reads every cohort-target alias, as does the reconsideration door's read of its target. I1523 covers the founder, a delegate and another room's founder on memory, sqlite and postgres.
+
+- **A moderator's signature alone could remove a member** (CIRISPersist#1200, CC 4.5.13). A removal is a roster change under the room's protocol, in every protocol. In a two-member `unanimous` room a delegate of one founder could remove the other. The roster door now refuses a new removal signed only by a moderator; a moderator can still admit, and can still act on content and standing to speak. Removals already admitted stay in the fold. I1524 covers the door on sqlite and postgres and the fold.
+
+### Adoption
+
+- **A moderator can no longer remove a member.** A host that offered this needs the room's protocol signatures instead. Removals already held stand. A node on 61.0.3 refuses such a removal arriving from an older node, so the two can hold different rosters until the room acts under its protocol. Accepted on #1200.
+
 ## [61.0.2] - 2026-11-04
 
 ### Fixed

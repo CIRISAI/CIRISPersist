@@ -579,7 +579,8 @@ pub async fn verify_takedown_authority(
 /// former room's moderator never authorizes through a retired row. Each live
 /// row's subjects are its `subject_key_ids` AND its non-empty
 /// `attested_key_id` (the purge subject helper's reading), and its room is
-/// the `community_id` of a `community` or `affiliations` row.
+/// the cohort target of a `community` or `affiliations` row
+/// ([`envelope_cohort_target`](super::admission::envelope_cohort_target)).
 ///
 /// # Errors
 ///
@@ -622,11 +623,11 @@ pub async fn content_binding(
             row.cohort_scope.as_str(),
             super::types::cohort_scope::COMMUNITY | super::types::cohort_scope::AFFILIATIONS
         ) {
-            if let Some(c) = row
-                .attestation_envelope
-                .get("community_id")
-                .and_then(serde_json::Value::as_str)
-                .filter(|c| !c.is_empty())
+            // Every cohort-target alias: a chat row names its room by
+            // `community_key_id`. Aliases that disagree never reach a held
+            // row through the doors; one that did binds no room, so it
+            // confers no moderator's authority.
+            if let Ok(Some(c)) = super::admission::envelope_cohort_target(&row.attestation_envelope)
             {
                 out.communities.insert(c.to_owned());
             }
