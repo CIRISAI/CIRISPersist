@@ -2366,17 +2366,21 @@ async fn check_roster_authority_over<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let events: Vec<RosterEvent> = events
-        .into_iter()
-        .filter(|e| {
-            !(e.is_add == !is_revocation
-                && e.effective_at == effective_at
-                && e.member.key_id == incoming.key_id)
-        })
-        .collect();
+    let is_this_row = |e: &RosterEvent| {
+        e.is_add == !is_revocation
+            && e.effective_at == effective_at
+            && e.member.key_id == incoming.key_id
+    };
+    // v61.0.3 (CIRISPersist#1200, CC 4.5.13) — a moderator's signature never
+    // removes anyone: a NEW removal gets no moderator standing here, so it
+    // meets the room's protocol. The fold keeps honouring the removals already
+    // admitted (an admitted row is not unsaid by a later gate), and an exact
+    // retry of a held row is not a new removal.
+    let held_retry = events.iter().any(is_this_row);
+    let events: Vec<RosterEvent> = events.into_iter().filter(|e| !is_this_row(e)).collect();
     let state = authorized_roster_state_at(record_members, rules, &events, effective_at);
     let moderator_roots = match moderation_roots {
-        Some(mut roots) => {
+        Some(mut roots) if !is_revocation || held_retry => {
             if !is_revocation && incoming.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER) {
                 roots.remove(&incoming.key_id);
             }
@@ -2390,7 +2394,7 @@ where
             ))
             .await?
         }
-        None => std::collections::BTreeSet::new(),
+        _ => std::collections::BTreeSet::new(),
     };
     let e = RosterEvent {
         effective_at,

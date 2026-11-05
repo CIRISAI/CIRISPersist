@@ -374,6 +374,77 @@ pub mod bodies {
         );
     }
 
+    /// **I1524 (CIRISPersist#1200, CC 4.5.13) — a moderator removes nobody.**
+    /// Founder alice appoints mo, and mo may still widen; mo's own signature on
+    /// a removal is refused and the member stays; the protocol's signature
+    /// removes.
+    pub async fn exercise_a_moderator_removes_nobody(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::tier_ingest::test_support::{
+            sign_community_membership_revocation, sign_community_membership_widening,
+        };
+        use crate::federation::types::{
+            CommunityMembershipRevocation, CommunityMembershipWidening,
+        };
+        let [alice, mo, hank] = ["alice", "mo", "hank"].map(|k| format!("{tag}-{k}"));
+        let here = format!("{tag}-room");
+        register(dir, &alice, &[identity_type::USER]).await;
+        register(dir, &mo, &[identity_type::PRIMITIVE]).await;
+        register(dir, &hank, &[identity_type::USER]).await;
+        room(dir, &here, &alice).await;
+        put(
+            dir,
+            &appointment(&alice, &mo, Some(&here), None),
+            "appoint mo",
+        )
+        .await;
+        tick().await;
+        let at = Utc::now();
+        dir.put_community_membership_widening_consented(sign_community_membership_widening(
+            &mo,
+            CommunityMembershipWidening {
+                community_key_id: here.clone(),
+                member_key_id: hank.clone(),
+                joined_at: at,
+                effective_at: at,
+                role: None,
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] I1524: mo widens hank: {e}"));
+        tick().await;
+        let revoke = |signer: &str| {
+            sign_community_membership_revocation(
+                signer,
+                CommunityMembershipRevocation {
+                    community_key_id: here.clone(),
+                    removed_identity_key_id: hank.clone(),
+                    removed_at: Utc::now(),
+                    effective_at: Utc::now(),
+                    reason: None,
+                    witness_set: Vec::new(),
+                    persist_row_hash: String::new(),
+                },
+            )
+        };
+        dir.put_community_membership_revocation(revoke(&mo))
+            .await
+            .expect_err("I1524: a moderator's signature alone removes nobody");
+        let held = |roster: Vec<CommunityMember>| roster.iter().any(|m| m.key_id == hank);
+        assert!(
+            held(dir.active_community_members(&here).await.unwrap()),
+            "[{tag}] I1524: hank stays after mo's refused removal"
+        );
+        tick().await;
+        dir.put_community_membership_revocation(revoke(&alice))
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] I1524: the protocol removes: {e}"));
+        assert!(
+            !held(dir.active_community_members(&here).await.unwrap()),
+            "[{tag}] I1524: hank is gone after the protocol's removal"
+        );
+    }
+
     /// **I175b — an appointment belongs to the epoch it was issued in**
     /// (operator ruling 2026-09-25; CC 4.2.6 "past actions validly decided
     /// stand", CC 4.5.4 lapse = withdrawal or inactivity only). (1) Founder
@@ -530,6 +601,33 @@ mod run {
             .unwrap();
         b.run_migrations().await.unwrap();
         super::bodies::exercise_moderation_walk_as_of(&b, &format!("mao-{}", suffix())).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn a_moderator_removes_nobody_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::bodies::exercise_a_moderator_removes_nobody(&b, &format!("i1524-{}", suffix()))
+            .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn a_moderator_removes_nobody_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::bodies::exercise_a_moderator_removes_nobody(&b, &format!("i1524-{}", suffix()))
+            .await;
     }
 
     #[cfg(feature = "sqlite")]

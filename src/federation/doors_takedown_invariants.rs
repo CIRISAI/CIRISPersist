@@ -87,6 +87,10 @@
 //!   binding's subject is admitted); a binding's non-empty `attested_key_id`
 //!   is a subject; an `affiliations` binding's `community_id` is a bound
 //!   community, so that room's moderator is admitted.
+//! - **I1523** (memory, sqlite, postgres; v61.0.3) — a row names its room by
+//!   any cohort-target alias: a chat row's `community_key_id` binds the
+//!   content into the room, so its founder and a delegate hold the takedown
+//!   duty, and a founder of another room does not.
 //! - **I773** (sqlite, postgres; Codex r2 on #1065) — a plaintext DAG's
 //!   chunks belong to it: the incremental finalize and the one-shot door each
 //!   write the manifest → chunk relation with the `chunk_dag` row, so after an
@@ -545,6 +549,85 @@ pub(crate) mod bodies {
 
     // ── I796 ──────────────────────────────────────────────────────────────
     /// The content's community is the HELD binding's, never the notice's.
+    /// I1523: a chat row names its room by `community_key_id`, the canonical
+    /// cohort-target alias, beside a sealed-content pointer. The room's
+    /// founder and a key it delegates `takedown` to hold the duty over that
+    /// content; a plain member, and a founder of another room, do not.
+    pub(crate) async fn i1523_a_room_named_by_any_alias_binds_its_content<D>(d: &D)
+    where
+        D: FederationDirectory + Sync,
+    {
+        let dir = d.as_dyn_directory();
+        let (author, founder, deputy, other) = (
+            claimant(0xa1),
+            claimant(0xa2),
+            claimant(0xa3),
+            claimant(0xa4),
+        );
+        let (room, elsewhere) = ("i1523-room", "i1523-elsewhere");
+        group_of(dir, room, &[&founder.id, &author.id], None).await;
+        community_of(dir, elsewhere, &other.id).await;
+        ts::register_hybrid_key(dir, &deputy.id).await;
+        delegate(dir, &founder.id, &deputy.id, &["takedown"]).await;
+
+        let now = chrono::Utc::now();
+        let shas: Vec<String> = ["founder", "delegate"].map(sha_of).to_vec();
+        for sha in &shas {
+            let row = Attestation {
+                attestation_id: uuid::Uuid::new_v4().to_string(),
+                attesting_key_id: author.id.clone(),
+                attested_key_id: author.id.clone(),
+                attestation_type: attestation_type::SCORES.into(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: serde_json::json!({
+                    "dimension": "chat:message:v1",
+                    "evidence_refs": [sha],
+                    "community_key_id": room,
+                    "content": {"sha256": sha, "tier": "community"},
+                    "content_type": "text/plain",
+                }),
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: author.id.clone(),
+                scrub_timestamp: now,
+                pqc_completed_at: Some(now),
+                persist_row_hash: String::new(),
+                subject_key_ids: vec![author.id.clone()],
+                withdraws_admission_rule: None,
+                cohort_scope: crate::federation::types::cohort_scope::COMMUNITY.to_string(),
+                tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            };
+            dir.put_attestation(SignedAttestation {
+                attestation: ts::seal_row(&author.id, row),
+            })
+            .await
+            .expect("I1523: the chat row");
+        }
+
+        let binding = td::content_binding(dir, &shas[0]).await.unwrap().unwrap();
+        assert!(
+            binding.communities.contains(room),
+            "I1523: the chat row binds its room: {binding:?}"
+        );
+        let e = td::takedown_tombstone(dir, &notice(&other, &shas[0], "dmca512"), NODE)
+            .await
+            .expect_err("I1523: a founder of another room");
+        assert_eq!(e.kind(), token::UNAUTHORISED, "I1523: {e}");
+        let ok = td::takedown_tombstone(dir, &notice(&founder, &shas[0], "dmca512"), NODE)
+            .await
+            .expect("I1523: the room's founder");
+        assert!(ok.tombstoned);
+        let ok = td::takedown_tombstone(dir, &notice(&deputy, &shas[1], "dmca512"), NODE)
+            .await
+            .expect("I1523: the founder's delegate");
+        assert!(ok.tombstoned);
+    }
+
     pub(crate) async fn i796_the_contents_own_community_judges<D>(d: &D)
     where
         D: FederationDirectory + Sync,
@@ -2640,6 +2723,11 @@ mod run {
                 async fn i1517() {
                     let Some(d) = $fresh.await else { return };
                     b::i1517_a_moderators_occurrence_files_the_takedown(&d).await
+                }
+                #[tokio::test]
+                async fn i1523() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i1523_a_room_named_by_any_alias_binds_its_content(&d).await
                 }
                 #[tokio::test]
                 async fn i796() {
