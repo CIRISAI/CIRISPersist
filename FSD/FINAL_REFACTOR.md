@@ -2,11 +2,11 @@
 
 Status: DRAFT in review. CC ruled the spec questions at rc17 `6dc2091` and `4794d9f` (CIRISPersist#1205,
 comments 6670437725, 6670504193) and confirmed the §8.3 placement. Agent and Server censuses are in.
-Eric has ruled §16 items 1, 4, 6, 7 and 15. Edge and Verify are outstanding; Verify is down until Eric brings it
+Eric has ruled §16 items 1, 4, 6, 7 and 15. rc17 is the LTS edition, and v62 follows the re-cut spine (CC#203). Edge and Verify are outstanding; Verify is down until Eric brings it
 up before v62 starts. Nothing here is built.
 
 Issues: CIRISPersist#1130, #1205, #934 (residual), #681, #679, #1004, #1174,
-#1185. Spec: CC 2.6.1.8, CC 4.5.13, CC#189 (`manifests/family_model.json`). Measured
+#1185. Spec: CC 2.6.1.8, CC 4.5.13, CC#189 (`manifests/family_model.json`), CC#203 (the spine). Measured
 at v61.0.3 (`7894b39c`). Read with CEWP: https://cirisai.github.io/CEWP/.
 
 This document supersedes the layer description in
@@ -246,7 +246,7 @@ The production graph already allows this: `federation` to `store` has 2 referenc
 
 ### 3.4 What does not change
 
-Wire semantics apart from CC 2.6.1.8, refusal tokens (§5.6), the two-backend promise
+Wire semantics apart from CC 2.6.1.8 and the kernel rules (§5.8), refusal tokens outside those rules (§5.6), the two-backend promise
 (no backend-only door), the SQLite connection model, bounded Postgres checkout, the
 shipped-migration rule (I43), the release chain, and the rule that a row's signed
 instant belongs to its signer and never decides re-admission.
@@ -508,9 +508,9 @@ row. `hard_case:` and the #1061 groups come early, because they carry live risk.
 ### 5.6 Refusals
 
 Tokens are a public contract and do not change in a mechanical step. Terminal or retryable
-becomes a property of the refusal, which is the list #1206 needs, and which Edge's retry
-schedule depends on. Whether a family's refusal emits a `hard_case` row is a column, never a
-door-local choice. Emission keys on the refused row, so a re-ask writes nothing new.
+becomes a property of the refusal, which is what Edge's retry schedule depends on. Rule 2 of §5.8
+lists per-node `hard_case` emissions as stored verdicts, so #1206 is held until CC says what a
+refusal leaves behind.
 
 ### 5.7 The family key, now
 
@@ -525,7 +525,27 @@ signer, so a peer cannot impersonate this node. But row ids are deterministic an
 record is a no-op, so a peer might pre-empt an id this node would later use. That second
 effect needs tracing through the store.
 
-### 5.8 Room instance values
+### 5.8 The kernel rules (CC#203)
+
+CC#203 states the spine: a node holds rows, each with its first-held instant, and nothing else. Five readers
+found about 35 places that contradict it, and five of the six classes are fixed by one rule each. These become the
+ruled layer v62 implements. They change behaviour, so each lands as a named delta (§5.5 step 4), never in a
+mechanical step. The counts are production references at v61.0.3, by grep, and show reach, not work.
+
+| rule | persist today | what changes |
+|---|---|---|
+| admit both; the fold decides | refusals that depend on arrival order: first-claim owner binding, cosign refusal that sticks, the 72 h window on replication (123 references to the freshness and instant gates) | fewer refusals, more conflicting rows held, so quotas matter more. #1049 and #1159 resolve under this and the next rule |
+| a fold result is served, never written | `withdraws_admission_rule` is stamped on the row and covered by its hash (233 references); per-node `hard_case` emissions (32 calls); `capacity:composite`, `moderation_track_record` and similar | the stamp leaves the row. A fold change is a notice item of the view, not a row. This removes code |
+| a fold may order by signed instants; a gate compares only first-held instants to now | gates reading `asserted_at`, skew-bounded LWW, consent decay | `admitted_at` is already this node's receipt (586 references), so `Held` needs no new column |
+| doors read held rows only | reserved prefixes reading `identity_type` (1,759 references, most not gates), `consent:replication` on key registration, block, `k_eff` deny | each becomes a fold over rows or is named as outside the processor |
+| the ruled column is the text | `transitions.json` carries `code-v61` values | §5.5. The census must be regenerated first: for example, it shows subjects withdrawing `moderation:`, `hard_case:`, `slashing:` and `takedown_notice:` rows, which v61.0.3 already refuses (`SUBJECT_WITHDRAWS_CARVE_OUT`) |
+
+CC#203 adds six family-model columns: `tie_break`, `monotone_field`, `evidence_screen`, `signer_named_by_ref`, `formula`
+and `window`. It also drops `weighted:{rubric}` and `custom:{id}` protocols, open to Eric's reversal: nothing shipped
+uses them, and 28 references plus the `policy_blob` rubric path go with them. Removal (purge, reap, tombstone) shrinks
+the held set outside the step, and the kernel will say so.
+
+### 5.9 Room instance values
 
 Room-level values live on the signed room record, not in config: consensus protocol, admission
 mode, `founder_only`, moderator quorum, discoverability, `federating`, normative regime,
@@ -969,6 +989,10 @@ rules (M). 425 evidence rows point at symbols, 101 of them at `admission.rs`. So
 in the same commit, evidence rows travel with their symbols, and CC re-pins once: after `admission.rs` has
 shrunk, not while it does. That is why §13 puts the split last.
 
+**Re-cut decimals.** CC#203 re-cuts the constitution's decimals, with a codebook mapping old to new, so that every
+claim anchor and "CC x.y.z" citation resolves. Persist applies it once, by script, across `cc_impl.tsv`, the vendored
+manifests and the comments. The section numbers in this document move with it.
+
 ## 13. Phases and order
 
 No dates. Each phase ends on its exit criteria.
@@ -976,10 +1000,13 @@ No dates. Each phase ends on its exit criteria.
 ### Phase 0: now, on 61.x, no API change
 
 Anything needed before the refactor ships as 61.0.4. A feature that belongs in v62, or that carries a wire
-break, goes to v62 (Eric, 2026-11-05).
+break, goes to v62 (Eric, 2026-11-05). 61.x is the LTS series, conforming to rc17, which cuts after Server 245 and
+an agent release carry it (CC#203). So rc17-dependent work waits for that tag (#1198, the election, #1201, #1202),
+while work that needs no vendor, such as `FamilyKey`, can go earlier.
 
 - Close the 25 and rescope stale tickets and milestones (§15). File what has no ticket.
 - Security and live bugs: `FamilyKey` closing #1174, then #1206; #1185; #1139 first half; #791.
+- Regenerate the census at the merged v61 head and send CC the diff, before any ruled rows.
 - Certify leg filter, `mold`. Size ratchet live, `evidence/size.tsv` regenerated by the release bump.
 - Performance baselines (§11.1). Surface census (§8.1).
 - Running beside this: #1198, the room lock, election and appointment (#1195, #1202), #1201, on rc17.
@@ -999,6 +1026,9 @@ Opens when Edge tags v44.
 **Exit:** the 375 raw reads gone and gated; v61's suite green, unchanged.
 
 ### Phase 2: the read side, the model and the surface (v62.0)
+
+Starts on CC's verified re-cut edition (the six rules, the columns, the ruled layer and the codebook) and on Verify
+publishing. Phase 1 needs neither, so it can run while they land.
 
 1. Verify publishes (CIRISVerify#326). Schema for edition 2. Read side behind `RowView`.
 2. Vendor the family model. Migrate families per §5.5, simplest first.
@@ -1092,13 +1122,14 @@ others) move to the new surface. `sync` is replication and does not touch anythi
 ### CC
 
 **Gets:** one implementer of `CLM-queue-is-the-door`, evidence that moves once, census regeneration at the merged head.
-**Has ruled:** quorum key, anchor, erasure form, two-step switch, the `blind` column, the §8.3 placement, at rc17
-`6dc2091` and `4794d9f`.
-**Owes:** ruled family rows and the gap cells; the rc17 tag to vendor.
+**Has ruled:** quorum key, anchor, erasure form, two-step switch, the `blind` column, the state processor, the §8.3
+placement.
+**Owes:** the rc17 tag; the re-cut edition with its codebook; ruled family rows, starting from a regenerated census.
 
 ### Ordering
 
 ```
+rc17 tags (LTS) -> CC re-cut verified
 Verify #326 -> persist v62.0 reads both -> Edge, Server adopt -> fleet floor confirmed
             -> emission switch + genesis ceremony -> schema baseline
 ```
@@ -1161,6 +1192,8 @@ baselines; schema baseline; statement catalogue; surface census; certify leg fil
 | 4 | committed features | Eric | **ruled:** pre-refactor needs ship in 61.0.4; a feature that fits v62 or breaks the wire goes to v62, including #1121, #1118, #1142 | |
 | 6 | a scrubbed corpus from a test mesh | Eric | **ruled yes** | |
 | 7 | `mold` on CI and certify | Eric | **ruled yes** | |
+| 16 | what a refusal leaves behind, and #1206 under rule 2 | CC | hold #1206 | before 61.0.4 |
+| 17 | drop `weighted:` and `custom:` protocols | Eric | yes; nothing shipped uses them | Phase 2 |
 | 11 | ruled family rows for the gap cells | CC | gaps closed until ruled; refinements land as rows with vectors | Phase 2 |
 | 12 | Verify owns CBOR and COSE encode | Verify | yes (§4.7) | before build |
 | 13 | the persist and Server line | Server, CC | §8.3 | Phase 1 |
@@ -1171,7 +1204,8 @@ baselines; schema baseline; statement catalogue; surface census; certify leg fil
 
 | risk | effect | response |
 |---|---|---|
-| Verify's #326 slips | Phase 2 cannot start | Phase 1 and the family model do not depend on it, so they proceed |
+| Verify's #326 slips | the row work cannot start | Phase 1 does not depend on it, and family migration can proceed |
+| the re-cut takes longer than expected | Phase 2 waits on a verified edition | Phase 1 proceeds; `code-v61` rows can move without rulings |
 | ruled family rows arrive slowly | step 4 of §5.5 stalls | steps 1-3 run on `code_v61`; the cut-over proceeds and rulings follow |
 | the composite draft changes construction | signed bytes move | hold the switch until it is stable. CC says only the id changes later, so this is a question for Verify |
 | v62 becomes too large | a long-lived branch, drift from 61.x | merge forward each patch. The switch is already split out. Family migration can pause cleanly between families |
