@@ -20,6 +20,9 @@ buttons and in the code that refuses the request. They drift, and the drift is w
 authorization bugs live." Persist keeps its rules many times over. Every number in §1
 points at that one fault, and this refactor makes each fact stated once.
 
+The contract the refactor is measured against (CC#203): **persist is fold, enabled, append. Nothing stored, nothing
+rewritten, no clock except against first-held.**
+
 Persist has three jobs, in CEWP's placement: an append-only verifiable store, a
 registration policy that decides what may be logged, and an authorization walk ("the
 union of immudb, a SCITT transparency service [...] and SpiceDB"). Everything here serves
@@ -1001,8 +1004,8 @@ No dates. Each phase ends on its exit criteria.
 
 Anything needed before the refactor ships as 61.0.4. A feature that belongs in v62, or that carries a wire
 break, goes to v62 (Eric, 2026-11-05). 61.x is the LTS series, conforming to rc17, which cuts after Server 245 and
-an agent release carry it (CC#203). So rc17-dependent work waits for that tag (#1198, the election, #1201, #1202),
-while work that needs no vendor, such as `FamilyKey`, can go earlier.
+an agent release carry it (CC#203). rc17's text is frozen as of `f267ce8`, so 61.x builds against it now; #1198
+does, because Server 245 ships rooms. Vendoring still waits for the tag.
 
 - Close the 25 and rescope stale tickets and milestones (§15). File what has no ticket.
 - Security and live bugs: `FamilyKey` closing #1174, then #1206; #1185; #1139 first half; #791.
