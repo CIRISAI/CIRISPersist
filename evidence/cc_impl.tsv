@@ -238,6 +238,9 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 4.5.13	CLM-one-voice-room	CIRISPersist	src/federation/admission.rs#check_founder_only_above_family	ciris-persist@61.0.3
 2.1	CLM-subject-within-audience	CIRISPersist	src/federation/admission.rs#check_cohort_standing_resolved	ciris-persist@61.0.3
 4.5.13	CLM-one-voice-room	CIRISPersist	src/federation/consensus.rs#evaluate_open_self_admit	ciris-persist@61.0.3
+4.5.13	CLM-vote-once-per-person	CIRISPersist	src/federation/reverse_quorum.rs#voices	ciris-persist@61.0.3
+4.5.13	CLM-vote-once-per-person	CIRISPersist	src/federation/consensus.rs#eligible	ciris-persist@61.0.3
+4.5.13	CLM-vote-once-per-person	CIRISPersist	src/federation/key_person.rs#PersonsAt::voice	ciris-persist@61.0.3
 4.5.3	CLM-one-tombstone-row	CIRISPersist	src/federation/takedown_tombstone.rs#takedown_tombstone	ciris-persist@61.0.3
 4.5.3	CLM-one-tombstone-row	CIRISPersist	src/federation/takedown_tombstone.rs#apply_replicated_takedown	ciris-persist@61.0.3
 4.5.3	CLM-one-tombstone-row	CIRISPersist	src/federation/takedown_tombstone.rs#settles_at	ciris-persist@61.0.3

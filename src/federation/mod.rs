@@ -795,6 +795,12 @@ pub mod self_roster;
 // predicate on every backend.
 #[cfg(test)]
 mod self_roster_invariants;
+// CIRISPersist#1198 (CC 4.5.13, CC 3.3.6.3) — the person behind a key: what a
+// tally counts.
+pub mod key_person;
+// CIRISPersist#1198 (CC 4.5.13) — I1525–I1531: a vote counts once per person.
+#[cfg(test)]
+mod vote_by_person_invariants;
 // v55.0.0 (CIRISPersist#1007) — the duty-holder takedown on the steward
 // purge's tombstone row (CC 4.5.3 step 2, CC 4.5.5).
 #[cfg(test)]
@@ -1241,6 +1247,9 @@ pub struct RosterRules<'a> {
     /// fold asks [`NodeBearingSeats::at`] at each event's `effective_at`; it
     /// never re-reads the directory itself.
     pub node_bearing: &'a NodeBearingSeats,
+    /// CIRISPersist#1198 (CC 4.5.13) — the persons behind the group's keys,
+    /// asked at each event's `effective_at` the same way.
+    pub persons: &'a key_person::KeySelves,
 }
 
 /// A half-open `[start, end)` interval; `None` end = still open.
@@ -1298,6 +1307,7 @@ impl<'a> RosterRules<'a> {
             subkind: community_subkind(c),
             policy_blob: c.policy_blob.as_ref(),
             node_bearing,
+            persons: &key_person::NO_KEY_SELVES,
         }
     }
 
@@ -1311,7 +1321,23 @@ impl<'a> RosterRules<'a> {
             subkind: None,
             policy_blob: None,
             node_bearing: &NO_NODE_BEARING_SEATS,
+            persons: &key_person::NO_KEY_SELVES,
         }
+    }
+
+    /// CIRISPersist#1198 — these rules, counting persons by `persons`
+    /// ([`community_key_selves`], [`family_key_selves`]). Unset, a tally
+    /// counts keys.
+    #[must_use]
+    pub fn with_persons(self, persons: &'a key_person::KeySelves) -> Self {
+        Self { persons, ..self }
+    }
+
+    /// The per-key reading of these rules: what a roster event held from
+    /// before CIRISPersist#1198 was admitted under.
+    #[must_use]
+    fn counting_keys(self) -> Self {
+        self.with_persons(&key_person::NO_KEY_SELVES)
     }
 }
 
@@ -1656,6 +1682,7 @@ pub fn roster_event_standing(
                 consensus::Direction::Remove
             },
             subject: Some(e.member.key_id.as_str()),
+            persons: rules.persons.at(e.effective_at),
         }) {
             consensus::Verdict::Admit => Ok(()),
             consensus::Verdict::Unevaluable { reason } => {
@@ -1770,7 +1797,13 @@ fn fold_roster(
         if e.reversed {
             continue;
         }
-        if roster_event_standing(rules, &state, &e).is_ok() {
+        // CIRISPersist#1198 (CC 4.5.13) — the door counts persons. An event
+        // already held under the per-key count stays in the fold: an admitted
+        // row is not unsaid by a later gate (the #1200 posture). Nothing new
+        // arrives that way, since every door refuses it.
+        if roster_event_standing(rules, &state, &e).is_ok()
+            || roster_event_standing(rules.counting_keys(), &state, &e).is_ok()
+        {
             let was_active = matches!(state.get(&e.member.key_id), Some((true, _)));
             if !e.is_add {
                 spans.remove(&e.member.key_id);
@@ -2118,6 +2151,7 @@ where
             roster0.clone(),
             policy,
             duty_holders.clone(),
+            rules.persons,
             reverse_quorum::ActionRef {
                 actor_key_id: &actor,
                 action_id: &row_hash,
@@ -2146,6 +2180,76 @@ pub fn roster_reversal_stands(is_add: bool, fold: &reverse_quorum::ReverseQuorum
         && (!is_add || fold.distinct_objectors >= two_path::FloorClass::Voters.min_count())
 }
 
+/// CIRISPersist#1198 (CC 4.5.13) — the persons behind `community`'s keys, for
+/// [`RosterRules::persons`]: every key ever seated or signing. Under
+/// `open:self_admit` only a change's signers and subject are read, since that
+/// protocol has no denominator, and a joiner's own signature is one voice
+/// whoever they are; a public room's roster is not read key by key.
+pub async fn community_key_selves<F>(
+    directory: &F,
+    community: &Community,
+) -> Result<key_person::KeySelves, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let id = &community.community_key_id;
+    let signers = directory.community_roster_signers(id).await?;
+    let open = community.consensus_protocol == types::consensus_protocol::OPEN_SELF_ADMIT;
+    let mut keys = std::collections::BTreeSet::new();
+    if !open {
+        keys.extend(community.members.iter().map(|m| m.key_id.clone()));
+        keys.extend(
+            directory
+                .list_community_membership_widenings_for(id)
+                .await?
+                .into_iter()
+                .map(|w| w.member_key_id),
+        );
+    }
+    collect_event_keys(&signers, open, &mut keys);
+    key_person::KeySelves::read(directory, keys.into_iter().collect()).await
+}
+
+/// CIRISPersist#1198 — the family twin of [`community_key_selves`].
+pub async fn family_key_selves<F>(
+    directory: &F,
+    family: &Family,
+) -> Result<key_person::KeySelves, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let id = &family.family_key_id;
+    let signers = directory.family_roster_signers(id).await?;
+    let mut keys: std::collections::BTreeSet<String> =
+        family.members.iter().map(|m| m.key_id.clone()).collect();
+    keys.extend(
+        directory
+            .list_family_membership_widenings_for(id)
+            .await?
+            .into_iter()
+            .map(|w| w.member_key_id),
+    );
+    collect_event_keys(&signers, false, &mut keys);
+    key_person::KeySelves::read(directory, keys.into_iter().collect()).await
+}
+
+/// The keys roster events name. `self_admit_skips`: a lone signer of a
+/// widening is the joiner, a voice with nothing to fold.
+fn collect_event_keys(
+    signers: &CommunityRosterSigners,
+    self_admit_skips: bool,
+    keys: &mut std::collections::BTreeSet<String>,
+) {
+    let widenings = signers
+        .widening_signers
+        .iter()
+        .filter(|s| !self_admit_skips || signer_set(s).len() > 1);
+    for s in widenings.chain(signers.revocation_signers.iter()) {
+        keys.extend(signer_set(s));
+        keys.insert(s.member_key_id.clone());
+    }
+}
+
 /// v49.0.0 (CIRISPersist#908) — every stored roster event of `community`,
 /// prepared for the pure fold by [`prepare_roster_events`] (the moderation
 /// plane is the room's).
@@ -2153,6 +2257,7 @@ pub async fn community_roster_events<F>(
     directory: &F,
     community: &Community,
     node_bearing: &NodeBearingSeats,
+    persons: &key_person::KeySelves,
 ) -> Result<Vec<RosterEvent>, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -2190,7 +2295,7 @@ where
         cohort::Cohort::Community,
         id,
         &community.members,
-        RosterRules::of_community(community, node_bearing),
+        RosterRules::of_community(community, node_bearing).with_persons(persons),
         stored,
         &signers,
         Some(&roots),
@@ -2207,6 +2312,7 @@ where
 pub async fn family_roster_events<F>(
     directory: &F,
     family: &Family,
+    persons: &key_person::KeySelves,
 ) -> Result<Vec<RosterEvent>, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -2244,7 +2350,7 @@ where
         cohort::Cohort::Family,
         id,
         &record,
-        RosterRules::of_family(family),
+        RosterRules::of_family(family).with_persons(persons),
         stored,
         &signers,
         None,
@@ -2263,18 +2369,22 @@ pub async fn authorized_family_roster_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let events = Box::pin(family_roster_events(directory, family)).await?;
+    let persons = Box::pin(family_key_selves(directory, family)).await?;
+    let events = Box::pin(family_roster_events(directory, family, &persons)).await?;
     let record: Vec<types::CommunityMember> = family
         .members
         .iter()
         .map(family_member_as_roster_member)
         .collect();
-    Ok(
-        authorized_roster_at(&record, RosterRules::of_family(family), &events, as_of)
-            .into_iter()
-            .map(roster_member_as_family_member)
-            .collect(),
+    Ok(authorized_roster_at(
+        &record,
+        RosterRules::of_family(family).with_persons(&persons),
+        &events,
+        as_of,
     )
+    .into_iter()
+    .map(roster_member_as_family_member)
+    .collect())
 }
 
 /// v49.0.0 (CIRISPersist#912) — the authorized roster of a STORED room at
@@ -2295,8 +2405,12 @@ where
     F: FederationDirectory + ?Sized,
 {
     let nodes = Box::pin(community_node_bearing_seats(directory, community)).await?;
-    let events = Box::pin(community_roster_events(directory, community, &nodes)).await?;
-    let rules = RosterRules::of_community(community, &nodes);
+    let persons = Box::pin(community_key_selves(directory, community)).await?;
+    let events = Box::pin(community_roster_events(
+        directory, community, &nodes, &persons,
+    ))
+    .await?;
+    let rules = RosterRules::of_community(community, &nodes).with_persons(&persons);
     let spans = authorized_roster_spans_at(&community.members, rules, &events, as_of);
     Ok(
         authorized_roster_at(&community.members, rules, &events, as_of)
@@ -2333,10 +2447,14 @@ where
     // Boxed: the replay nests the moderator walk and the reverse-quorum
     // fold; a caller's future must not inline all of it (2 MiB worker stacks).
     let nodes = Box::pin(community_node_bearing_seats(directory, community)).await?;
-    let events = Box::pin(community_roster_events(directory, community, &nodes)).await?;
+    let persons = Box::pin(community_key_selves(directory, community)).await?;
+    let events = Box::pin(community_roster_events(
+        directory, community, &nodes, &persons,
+    ))
+    .await?;
     Ok(authorized_roster_at(
         &community.members,
-        RosterRules::of_community(community, &nodes),
+        RosterRules::of_community(community, &nodes).with_persons(&persons),
         &events,
         as_of,
     ))
@@ -2484,7 +2602,17 @@ where
         .await?;
     }
     let nodes = Box::pin(community_node_bearing_seats(directory, &community)).await?;
-    let events = Box::pin(community_roster_events(directory, &community, &nodes)).await?;
+    let mut persons = Box::pin(community_key_selves(directory, &community)).await?;
+    persons
+        .add(
+            directory,
+            signers.iter().chain([&incoming.key_id]).cloned().collect(),
+        )
+        .await?;
+    let events = Box::pin(community_roster_events(
+        directory, &community, &nodes, &persons,
+    ))
+    .await?;
     let roots = founder_candidates(
         &community,
         &directory
@@ -2496,7 +2624,7 @@ where
         types::cohort_scope::COMMUNITY,
         community_key_id,
         &community.members,
-        RosterRules::of_community(&community, &nodes),
+        RosterRules::of_community(&community, &nodes).with_persons(&persons),
         events,
         Some(roots),
         primary,
@@ -2530,7 +2658,14 @@ where
     };
     // v52.0.0 (CIRISPersist#956) — no roster change on a dissolved family.
     family_dissolution::refuse_if_dissolved(&family)?;
-    let events = Box::pin(family_roster_events(directory, &family)).await?;
+    let mut persons = Box::pin(family_key_selves(directory, &family)).await?;
+    persons
+        .add(
+            directory,
+            signers.iter().chain([&incoming.key_id]).cloned().collect(),
+        )
+        .await?;
+    let events = Box::pin(family_roster_events(directory, &family, &persons)).await?;
     let record: Vec<types::CommunityMember> = family
         .members
         .iter()
@@ -2541,7 +2676,7 @@ where
         types::cohort_scope::FAMILY,
         family_key_id,
         &record,
-        RosterRules::of_family(&family),
+        RosterRules::of_family(&family).with_persons(&persons),
         events,
         None,
         primary,
@@ -7545,6 +7680,11 @@ pub trait FederationDirectory: Send + Sync {
             (false, true) => &[consensus::Direction::Remove],
             _ => &[consensus::Direction::Add],
         };
+        // CIRISPersist#1198 (CC 4.5.13) — a tally counts fedIDs.
+        let persons =
+            key_person::KeySelves::read(self, roster.iter().map(|s| s.key_id.clone()).collect())
+                .await?;
+        let persons = persons.at(chrono::Utc::now());
         for &direction in directions {
             match consensus::evaluate(&consensus::Ballot {
                 protocol: &protocol,
@@ -7554,6 +7694,7 @@ pub trait FederationDirectory: Send + Sync {
                 signers: &signers,
                 direction,
                 subject: None,
+                persons,
             }) {
                 consensus::Verdict::Admit => {}
                 consensus::Verdict::Insufficient { detail } => {

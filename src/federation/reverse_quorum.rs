@@ -202,7 +202,8 @@
 use chrono::{DateTime, Duration, Utc};
 
 use super::attestation_query::{AttestationQuery, FOLD_PAGE};
-use super::types::Attestation;
+use super::key_person::{KeySelves, PersonsAt, NO_KEY_SELVES};
+use super::types::{attestation_type, Attestation};
 use super::{cohort::Cohort, Error, FederationDirectory};
 
 /// The `scores` dimension an objection carries: *"I, a member of this cohort,
@@ -1150,9 +1151,9 @@ pub struct ObjectionEscalation {
     pub respondents: usize,
     /// [`escalated_dismissal_required`] for that respondent count.
     pub required: usize,
-    /// Distinct respondents whose governing ballot upholds.
+    /// Distinct persons whose voice upholds.
     pub uphold_ballots: usize,
-    /// Distinct respondents whose governing ballot overrules.
+    /// Distinct persons whose voice overrules.
     pub overrule_ballots: usize,
     /// The `attestation_id`s of the GOVERNING ballots — one per respondent,
     /// sorted. A member who balloted twice contributes only the ballot that
@@ -1287,6 +1288,10 @@ pub struct ReverseQuorumInputs<'a> {
     pub policy: Option<ReverseQuorumPolicy>,
     /// The read-time instant every window is compared against.
     pub now: DateTime<Utc>,
+    /// CIRISPersist#1198 (CC 4.5.13) — the persons behind the keys, at the
+    /// count. A tally counts fedIDs, so `roster` and `duty_holders` are read
+    /// as the persons they seat. [`PersonsAt::each_key`] is the per-key count.
+    pub persons: PersonsAt<'a>,
 }
 
 /// The **pure fold**: a function of `(action, objections, dismissals, roster,
@@ -1348,6 +1353,7 @@ pub fn fold_reverse_quorum(
         duty_holders: &[],
         policy,
         now,
+        persons: PersonsAt::each_key(),
     })
 }
 
@@ -1383,12 +1389,12 @@ pub fn fold_reverse_quorum(
 ///    ordinary member; silence at the deadline is a fact of the record and is
 ///    not undone by arriving late.
 ///
-/// Ballots are counted **one per author**, by the same `(asserted_at,
-/// protective-side-wins, attestation_id)` ordering
-/// [`fold_quarantine`](super::quarantine::fold_quarantine) uses — so a member
-/// may change their mind (the latest ballot governs) and a same-instant
-/// contradiction resolves fail-secure to UPHELD, deterministically, on every
-/// node.
+/// Ballots are counted **one voice per person** (CC 4.5.13, see [`voices`]):
+/// a person's agreeing rows are one voice and rows that disagree are none. A
+/// member changes their mind by withdrawing the row they no longer stand by;
+/// no instant orders one person's rows, so every node holding the same rows
+/// reaches the same count. [`resolve_reverse_quorum`] drops withdrawn rows
+/// before this fold sees them.
 ///
 /// A ballot must be dated at or after the action it judges and at or before
 /// `now`. The `now` bound is the one asymmetry with the objection count, and it
@@ -1408,14 +1414,16 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
         duty_holders,
         policy,
         now,
+        persons,
     } = inputs;
+    let seated = persons.seated(roster);
     let Some(policy) = policy else {
         return ReverseQuorumFold {
             standing: ReverseQuorumStanding::NotGoverned,
             policy: None,
             distinct_objectors: 0,
             required: 0,
-            roster_size: roster.len(),
+            roster_size: seated.len(),
             window_opens_at: action.asserted_at,
             window_closes_at: action.asserted_at,
             window_open: false,
@@ -1428,7 +1436,7 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
     };
 
     let (opens, closes) = policy.window(action.asserted_at);
-    let required = policy.reversal_threshold(roster.len());
+    let required = policy.reversal_threshold(seated.len());
     let steward_deadline = policy.steward_deadline(action.asserted_at);
 
     // Which objections has a (pre-verified) dismissal named?
@@ -1442,8 +1450,9 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
         }
     }
 
-    let mut counted_ids: Vec<String> = Vec::new();
-    let mut objectors: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    // One person, one objection, however many rows: the lowest id stands for
+    // the voice, so the report does not depend on row order.
+    let mut objectors: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
     let mut dismissed_ids: Vec<String> = Vec::new();
     let mut escalated_ids: Vec<String> = Vec::new();
     let mut escalation: Vec<ObjectionEscalation> = Vec::new();
@@ -1454,9 +1463,12 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
         if envelope_str(o, field::OBJECTS_TO) != Some(action.action_id) {
             continue;
         }
-        if !roster.iter().any(|k| k == &o.attesting_key_id) {
+        let Some(person) = persons
+            .voice(&o.attesting_key_id)
+            .filter(|person| seated.contains(person))
+        else {
             continue;
-        }
+        };
         if o.asserted_at < opens || o.asserted_at > closes {
             continue;
         }
@@ -1468,7 +1480,16 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
             continue;
         }
         if policy.steward.is_some() {
-            let record = escalate_objection(action, o, ballots, roster, duty_holders, &policy, now);
+            let record = escalate_objection(
+                action,
+                o,
+                ballots,
+                roster,
+                duty_holders,
+                &policy,
+                now,
+                persons,
+            );
             let overruled = record.outcome == EscalationOutcome::Dismissed;
             escalation.push(record);
             if overruled {
@@ -1476,12 +1497,14 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
                 continue;
             }
         }
-        // DISTINCT objectors — one member is one objection, however many rows
-        // that member authored.
-        if objectors.insert(o.attesting_key_id.as_str()) {
-            counted_ids.push(o.attestation_id.clone());
-        }
+        // DISTINCT objectors — one person is one objection, however many rows
+        // that person authored, on however many devices.
+        objectors
+            .entry(person)
+            .and_modify(|id| *id = (*id).min(o.attestation_id.as_str()))
+            .or_insert(o.attestation_id.as_str());
     }
+    let mut counted_ids: Vec<String> = objectors.values().map(|id| (*id).to_owned()).collect();
     counted_ids.sort();
     dismissed_ids.sort();
     escalated_ids.sort();
@@ -1501,7 +1524,7 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
         policy: Some(policy.to_protocol_string()),
         distinct_objectors: objectors.len(),
         required,
-        roster_size: roster.len(),
+        roster_size: seated.len(),
         window_opens_at: opens,
         window_closes_at: closes,
         window_open,
@@ -1530,46 +1553,63 @@ fn is_ballot_on(
         && row.asserted_at <= now
 }
 
-/// One ballot per author — the GOVERNING one, by the `(asserted_at,
-/// protective-side-wins, attestation_id)` ordering
-/// [`fold_quarantine`](super::quarantine::fold_quarantine) uses.
-///
-/// Sorts ASCENDING and the last write per author wins, so `uphold_rank` is 1
-/// for an upholding ballot and 0 for an overruling one: the protective side
-/// sorts LAST, i.e. a member whose two ballots share an instant is counted as
-/// having upheld. Fail-secure, deterministic, and identical on every node.
-fn governing_ballots<'a>(
+/// **One voice per person** (CC 4.5.13, `CLM-vote-once-per-person`): a fold
+/// over the held rows, permutation-invariant and clock-free. Each row speaks
+/// for the person its key belongs to at the count; a row from a key with no
+/// voice, or for a person not in `eligible`, is held and counts for nothing.
+/// A person's rows that agree are one voice (the lowest id stands for it, so
+/// the result never depends on row order); rows that disagree are no voice,
+/// since a person at odds with themself has not spoken. `not_after` selects
+/// the rows of a dated tally before the fold; nothing inside the fold reads an
+/// instant.
+fn voices<'a, 'e>(
     candidates: &[&'a Attestation],
-    eligible: &[String],
+    eligible: &std::collections::BTreeSet<&'e str>,
     not_after: Option<DateTime<Utc>>,
-) -> std::collections::BTreeMap<&'a str, &'a Attestation> {
-    let mut rows: Vec<&'a Attestation> = candidates
-        .iter()
-        .copied()
-        .filter(|b| eligible.iter().any(|k| k == &b.attesting_key_id))
-        .filter(|b| not_after.is_none_or(|t| b.asserted_at <= t))
-        .collect();
-    let uphold_rank =
-        |b: &Attestation| u8::from(envelope_str(b, "dimension") == Some(DIMENSION_UPHELD));
-    rows.sort_by(|a, b| {
-        a.asserted_at
-            .cmp(&b.asserted_at)
-            .then_with(|| uphold_rank(a).cmp(&uphold_rank(b)))
-            .then_with(|| a.attestation_id.cmp(&b.attestation_id))
-    });
-    let mut out: std::collections::BTreeMap<&'a str, &'a Attestation> =
+    persons: PersonsAt<'_>,
+) -> std::collections::BTreeMap<String, &'a Attestation> {
+    let mut by_person: std::collections::BTreeMap<&'e str, Vec<&'a Attestation>> =
         std::collections::BTreeMap::new();
-    for b in rows {
-        out.insert(b.attesting_key_id.as_str(), b);
+    for b in candidates.iter().copied() {
+        if not_after.is_some_and(|t| b.asserted_at > t) {
+            continue;
+        }
+        if let Some(person) = person_of_row(b, eligible, persons) {
+            by_person.entry(person).or_default().push(b);
+        }
     }
-    out
+    by_person
+        .into_iter()
+        .filter_map(|(person, rows)| {
+            let answer = envelope_str(rows[0], "dimension");
+            rows.iter()
+                .all(|b| envelope_str(b, "dimension") == answer)
+                .then(|| {
+                    rows.into_iter()
+                        .min_by(|a, b| a.attestation_id.cmp(&b.attestation_id))
+                })
+                .flatten()
+                .map(|b| (person.to_owned(), b))
+        })
+        .collect()
 }
 
-/// How many of these governing ballots uphold, and how many overrule.
-fn tally(governing: &std::collections::BTreeMap<&str, &Attestation>) -> (usize, usize) {
+/// The eligible person this row speaks for, if any. The name is borrowed from
+/// the eligible set, so it outlives the view that resolved it.
+fn person_of_row<'e>(
+    row: &Attestation,
+    eligible: &std::collections::BTreeSet<&'e str>,
+    persons: PersonsAt<'_>,
+) -> Option<&'e str> {
+    let person = persons.voice(&row.attesting_key_id)?;
+    eligible.get(person).copied()
+}
+
+/// How many of these voices uphold, and how many overrule.
+fn tally(voices: &std::collections::BTreeMap<String, &Attestation>) -> (usize, usize) {
     let mut uphold = 0usize;
     let mut overrule = 0usize;
-    for b in governing.values() {
+    for b in voices.values() {
         match envelope_str(b, "dimension") {
             Some(DIMENSION_UPHELD) => uphold += 1,
             Some(DIMENSION_OVERRULED) => overrule += 1,
@@ -1581,6 +1621,7 @@ fn tally(governing: &std::collections::BTreeMap<&str, &Attestation>) -> (usize, 
 
 /// The steward-tier and escalation record for ONE objection — see
 /// [`fold_reverse_quorum_over`] for the ordering and the reasoning.
+#[allow(clippy::too_many_arguments)]
 fn escalate_objection(
     action: ActionRef<'_>,
     objection: &Attestation,
@@ -1589,6 +1630,7 @@ fn escalate_objection(
     duty_holders: &[String],
     policy: &ReverseQuorumPolicy,
     now: DateTime<Utc>,
+    persons: PersonsAt<'_>,
 ) -> ObjectionEscalation {
     // Re-derived here rather than passed in: the deadline is a function of the
     // action and the declaration, so there is no version of it a caller could
@@ -1599,17 +1641,18 @@ fn escalate_objection(
     //    objector has one on their own objection. A recusal removes the seat
     //    from BOTH sides of the fraction, which is what makes it a recusal and
     //    not a veto.
-    let actor = action.actor_key_id;
-    let objector = objection.attesting_key_id.as_str();
-    let seated_duty: Vec<String> = duty_holders
+    //    CC 4.5.13: both are persons, so every device of theirs recuses too.
+    let actor = persons.seat_person(action.actor_key_id);
+    let objector = persons.seat_person(&objection.attesting_key_id);
+    let seated_duty: std::collections::BTreeSet<&str> = duty_holders
         .iter()
-        .filter(|k| k.as_str() != actor && k.as_str() != objector)
-        .cloned()
+        .map(|k| persons.seat_person(k))
+        .filter(|person| *person != actor && *person != objector)
         .collect();
-    let seated_roster: Vec<String> = roster
-        .iter()
-        .filter(|k| k.as_str() != actor)
-        .cloned()
+    let seated_roster: std::collections::BTreeSet<&str> = persons
+        .seated(roster)
+        .into_iter()
+        .filter(|person| *person != actor)
         .collect();
 
     let relevant: Vec<&Attestation> = ballots
@@ -1619,7 +1662,7 @@ fn escalate_objection(
 
     // ── (2) THE DUTY-HOLDERS' RULING, in time.
     let ruling_required = policy.steward_ruling_threshold(seated_duty.len());
-    let ruling = governing_ballots(&relevant, &seated_duty, steward_deadline);
+    let ruling = voices(&relevant, &seated_duty, steward_deadline, persons);
     let (ruled_uphold, ruled_overrule) = tally(&ruling);
     let deadline_passed = steward_deadline.is_some_and(|d| now >= d);
     let steward = if ruled_uphold >= ruling_required {
@@ -1637,7 +1680,7 @@ fn escalate_objection(
     // ── (3) THE RESPONDENT POOL. Counted (and reported) whether or not
     //    escalation opened — the ballots are held rows and the numbers are
     //    facts about them; only the OUTCOME is conditional.
-    let pool = governing_ballots(&relevant, &seated_roster, None);
+    let pool = voices(&relevant, &seated_roster, None, persons);
     let (uphold_ballots, overrule_ballots) = tally(&pool);
     let respondents = pool.len();
     let required = escalated_dismissal_required(policy, respondents);
@@ -1861,6 +1904,45 @@ where
     counted
 }
 
+/// CIRISPersist#1198 (CC 4.5.13) — [`count_distinct_roster_scrubs`] in
+/// persons: the seated persons whose keys signed `envelope`, a second device
+/// signing for its person. Each signature is re-verified the same way.
+async fn count_distinct_voices<F>(
+    directory: &F,
+    envelope: &serde_json::Value,
+    scrubs: &[super::types::ScrubSig],
+    roster: &[String],
+    persons: PersonsAt<'_>,
+) -> std::collections::BTreeSet<String>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let keys = persons.roster_with_devices(roster, scrubs.iter().map(|s| s.scrub_key_id.as_str()));
+    let seated = persons.seated(roster);
+    count_distinct_roster_scrubs(directory, envelope, scrubs, &keys)
+        .await
+        .iter()
+        .filter_map(|k| persons.voice(k))
+        .filter(|person| seated.contains(person))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// May this key's row be admitted to `roster`'s plane? It holds a seat, or it
+/// is a live key of a person who does.
+fn is_member_or_device(persons: PersonsAt<'_>, key: &str, roster: &[String]) -> bool {
+    roster.iter().any(|k| k == key) || persons.speaks_for_a_seat(key, roster)
+}
+
+/// Is this row a vote on the ballot plane? CC 4.5.13's rule-1 lift reads it.
+#[must_use]
+pub fn is_vote_row(row: &Attestation) -> bool {
+    matches!(
+        envelope_str(row, "dimension"),
+        Some(DIMENSION_UPHELD | DIMENSION_OVERRULED)
+    )
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 //  The two admission doors
 // ─────────────────────────────────────────────────────────────────────────
@@ -1957,7 +2039,20 @@ where
     }
 
     // ── THE 1-of-N GATE, in full. One member is enough; a non-member is not.
-    if !roster.iter().any(|k| k == &objection.attesting_key_id) {
+    let selves = KeySelves::read(
+        directory,
+        roster
+            .iter()
+            .chain([&objection.attesting_key_id])
+            .cloned()
+            .collect(),
+    )
+    .await?;
+    if !is_member_or_device(
+        selves.at(objection.asserted_at),
+        &objection.attesting_key_id,
+        &roster,
+    ) {
         return refused(ObjectionRefusalReason::NotACohortMember);
     }
 
@@ -2075,13 +2170,27 @@ where
     let Some((roster, policy)) = cohort_state(directory, cohort, &cohort_key_id).await? else {
         return Ok(refuse(ObjectionRefusalReason::CohortUnknown, empty));
     };
+    // CIRISPersist#1198 (CC 4.5.13) — the m-of-n counts persons.
+    let scrubs = dismissal.scrubs();
+    let selves = KeySelves::read(
+        directory,
+        roster
+            .iter()
+            .chain(scrubs.iter().map(|s| &s.scrub_key_id))
+            .chain([&dismissal.attesting_key_id])
+            .cloned()
+            .collect(),
+    )
+    .await?;
+    let persons = selves.at(dismissal.asserted_at);
+    let roster_size = persons.seated(&roster).len();
     let Some(policy) = policy else {
         return Ok(refuse(
             ObjectionRefusalReason::NotGoverned,
             DismissalQuorum {
                 counted: 0,
                 required: 0,
-                roster_size: roster.len(),
+                roster_size,
             },
         ));
     };
@@ -2103,8 +2212,8 @@ where
             ObjectionRefusalReason::ObjectionUnknown,
             DismissalQuorum {
                 counted: 0,
-                required: policy.dismissal_threshold(roster.len()),
-                roster_size: roster.len(),
+                required: policy.dismissal_threshold(roster_size),
+                roster_size,
             },
         ));
     };
@@ -2113,27 +2222,34 @@ where
             ObjectionRefusalReason::NotFiledAgainstActor,
             DismissalQuorum {
                 counted: 0,
-                required: policy.dismissal_threshold(roster.len()),
-                roster_size: roster.len(),
+                required: policy.dismissal_threshold(roster_size),
+                roster_size,
             },
         ));
     }
-    let self_dismissal = objection.attesting_key_id == dismissal.attesting_key_id;
-    let required = dismissal_required(&policy, roster.len(), self_dismissal);
+    let mut selves = selves;
+    selves
+        .add(directory, vec![objection.attesting_key_id.clone()])
+        .await?;
+    let persons = selves.at(dismissal.asserted_at);
+    let self_dismissal =
+        persons.same_person(&objection.attesting_key_id, &dismissal.attesting_key_id);
+    let required = dismissal_required(&policy, roster_size, self_dismissal);
 
     // ── THE m-of-n GATE. Distinct roster members, each signature re-verified
     //    against pubkeys resolved from this node's own directory.
-    let counted = count_distinct_roster_scrubs(
+    let counted = count_distinct_voices(
         directory,
         &dismissal.attestation_envelope,
-        &dismissal.scrubs(),
+        &scrubs,
         &roster,
+        persons,
     )
     .await;
     let quorum = DismissalQuorum {
         counted: counted.len(),
         required,
-        roster_size: roster.len(),
+        roster_size,
     };
     if quorum.counted < quorum.required {
         return Ok(refuse(ObjectionRefusalReason::DismissalQuorumShort, quorum));
@@ -2174,14 +2290,19 @@ where
 /// - [`ObjectionRefusalReason::BallotPredatesAction`] — the ballot is dated
 ///   before the thing it judges.
 ///
-/// # A member may change their mind
+/// # Every vote row is admitted and kept
 ///
 /// There is deliberately NO duplicate-ballot refusal (contrast
-/// [`ObjectionRefusalReason::DuplicateObjection`]). Reconsidering is legitimate
-/// — it is most of what deliberation IS — and the fold already counts one
-/// ballot per author, the latest one governing. Refusing the second row would
-/// freeze a member's first reaction as their final answer, which on a plane
-/// built to make judgement possible would be the wrong direction.
+/// [`ObjectionRefusalReason::DuplicateObjection`]). CC 4.5.13: nothing is
+/// refused for arriving second, since two devices that sign offline would
+/// otherwise leave each node holding whichever arrived first. The count is a
+/// fold over the rows held: a person's agreeing rows are one voice, rows that
+/// disagree are none until a withdrawal by any key of the same fedID leaves one
+/// ([`voices`]). A member changes their answer by withdrawing the old row.
+///
+/// Any live key of a seated person votes as that person, seated or not; a
+/// key's standing here is judged at the row's own instant so that every node
+/// admits the same row, and at the count by the fold.
 pub async fn record_objection_ballot<F>(
     directory: &F,
     ballot: &Attestation,
@@ -2268,7 +2389,23 @@ where
     // plane reads `.reserved`, and nothing should start until the rule is on
     // the row — a hand-written gate that believes it is backed by a manifest
     // entry that does not exist is the split-truth shape #590 was filed about.
-    if !roster.iter().any(|k| k == &ballot.attesting_key_id) {
+    //
+    // CIRISPersist#1198 (CC 4.5.13) — a seated person's other device votes as
+    // that person.
+    let mut selves = KeySelves::read(
+        directory,
+        roster
+            .iter()
+            .chain([&ballot.attesting_key_id])
+            .cloned()
+            .collect(),
+    )
+    .await?;
+    if !is_member_or_device(
+        selves.at(ballot.asserted_at),
+        &ballot.attesting_key_id,
+        &roster,
+    ) {
         return refused(ObjectionRefusalReason::NotACohortMember);
     }
 
@@ -2291,8 +2428,15 @@ where
     }
     // RECUSAL, at the door: the actor does not vote on the objection to their
     // own act. Refused rather than silently dropped by the fold, so a producer
-    // learns it instead of believing it participated.
-    if ballot.attesting_key_id == action.actor_key_id {
+    // learns it instead of believing it participated. The actor is a person:
+    // their other device is recused with them.
+    selves
+        .add(directory, vec![action.actor_key_id.to_owned()])
+        .await?;
+    if selves
+        .at(ballot.asserted_at)
+        .same_person(&ballot.attesting_key_id, action.actor_key_id)
+    {
         return refused(ObjectionRefusalReason::ActorRecused);
     }
     if ballot.asserted_at < action.asserted_at {
@@ -2463,6 +2607,7 @@ pub async fn resolve_reverse_quorum_for(
         roster,
         policy,
         None,
+        &NO_KEY_SELVES,
         action,
         now,
     )
@@ -2476,7 +2621,9 @@ pub async fn resolve_reverse_quorum_for(
 /// recursion. The caller passes the roster with no reversals applied (the
 /// members who could object) and, for a declared steward tier, the moderators
 /// that roster's founders appoint. Everything else — objections, dismissals
-/// re-counted against `roster`, ballots, escalation — is identical.
+/// re-counted against `roster`, ballots, escalation — is identical. `known`
+/// is what the caller already read about the keys, so a fold over many events
+/// reads each key once.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_reverse_quorum_with(
     directory: &dyn FederationDirectory,
@@ -2485,6 +2632,7 @@ pub(crate) async fn resolve_reverse_quorum_with(
     roster: Vec<String>,
     policy: Option<ReverseQuorumPolicy>,
     duty_holders: Option<Vec<String>>,
+    known: &KeySelves,
     action: ActionRef<'_>,
     now: DateTime<Utc>,
 ) -> Result<ReverseQuorumFold, Error> {
@@ -2524,6 +2672,36 @@ pub(crate) async fn resolve_reverse_quorum_with(
         _ => Vec::new(),
     };
 
+    // CIRISPersist#1198 (CC 4.5.13) — who these keys are at the count, and
+    // which ballots still stand: a withdrawn row is no row, whoever of the
+    // same fedID signed the withdrawal.
+    let retractions = ballot_retractions(directory, &ballot_rows).await?;
+    let dismissal_scrubs: Vec<String> = dismissal_rows
+        .iter()
+        .flat_map(Attestation::scrubs)
+        .map(|s| s.scrub_key_id)
+        .collect();
+    let mut selves = KeySelves::default();
+    let keys = roster
+        .iter()
+        .chain(duty_holders.iter())
+        .chain(
+            ballot_rows
+                .iter()
+                .chain(&objection_rows)
+                .map(|r| &r.attesting_key_id),
+        )
+        .chain(retractions.iter().map(|(_, issuer)| issuer))
+        .chain(dismissal_scrubs.iter())
+        .map(String::as_str)
+        .chain([action.actor_key_id])
+        .filter(|k| !known.holds(k))
+        .map(str::to_owned)
+        .collect::<Vec<String>>();
+    selves.add(directory, keys).await?;
+    let persons = known.at_with(&selves, now);
+    let ballot_rows = standing_ballots(ballot_rows, &retractions, persons);
+
     // Re-derive each dismissal's threshold against the LIVE roster before it is
     // allowed to suppress an objection. The self-retraction case is resolved
     // the same way the admission door resolves it — from the OBJECTION's
@@ -2533,16 +2711,19 @@ pub(crate) async fn resolve_reverse_quorum_with(
     if let Some(policy) = policy {
         for d in dismissal_rows {
             let self_dismissal = envelope_str(&d, field::DISMISSES).is_some_and(|oid| {
-                objection_rows
-                    .iter()
-                    .any(|o| o.attestation_id == oid && o.attesting_key_id == d.attesting_key_id)
+                objection_rows.iter().any(|o| {
+                    o.attestation_id == oid
+                        && persons.same_person(&o.attesting_key_id, &d.attesting_key_id)
+                })
             });
-            let required = dismissal_required(&policy, roster.len(), self_dismissal);
-            let counted = count_distinct_roster_scrubs(
+            let required =
+                dismissal_required(&policy, persons.seated(&roster).len(), self_dismissal);
+            let counted = count_distinct_voices(
                 directory,
                 &d.attestation_envelope,
                 &d.scrubs(),
                 &roster,
+                persons,
             )
             .await;
             if counted.len() >= required {
@@ -2560,7 +2741,53 @@ pub(crate) async fn resolve_reverse_quorum_with(
         duty_holders: &duty_holders,
         policy,
         now,
+        persons,
     }))
+}
+
+/// Every retraction held against each ballot, as `(ballot id, issuer)`.
+async fn ballot_retractions<F>(
+    directory: &F,
+    ballots: &[Attestation],
+) -> Result<Vec<(String, String)>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut out = Vec::new();
+    for b in ballots {
+        for w in directory
+            .list_attestations_referencing(&b.attestation_id)
+            .await?
+        {
+            if matches!(
+                w.attestation_type.as_str(),
+                attestation_type::WITHDRAWS | attestation_type::RECANTS
+            ) {
+                out.push((b.attestation_id.clone(), w.attesting_key_id));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The ballots no retraction reaches. A retraction counts when its signer is
+/// the row's author or any key with the voice of the same person (CC 4.5.13,
+/// CC 2.4.1.1 rule 1); its instant plays no part.
+fn standing_ballots(
+    ballots: Vec<Attestation>,
+    retractions: &[(String, String)],
+    persons: PersonsAt<'_>,
+) -> Vec<Attestation> {
+    ballots
+        .into_iter()
+        .filter(|b| {
+            !retractions.iter().any(|(id, issuer)| {
+                *id == b.attestation_id
+                    && (*issuer == b.attesting_key_id
+                        || persons.voice(issuer) == Some(persons.seat_person(&b.attesting_key_id)))
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -3215,6 +3442,7 @@ mod tests {
             duty_holders: duty,
             policy: Some(escalating(2, 9, 3600, 600, 3)),
             now,
+            persons: PersonsAt::each_key(),
         })
     }
 
@@ -3611,22 +3839,25 @@ mod tests {
         );
     }
 
-    /// A member may change their mind; the latest ballot governs, and a
-    /// same-instant contradiction resolves fail-secure to UPHELD — the
-    /// `fold_quarantine` ordering, verbatim.
+    /// CC 4.5.13 retires the latest-instant fold. A person's rows are one
+    /// voice when they agree and no voice when they do not, whatever instants
+    /// they carry, and a tied instant upholds nothing.
     #[test]
-    fn the_latest_ballot_governs_and_a_tied_instant_upholds() {
+    fn a_persons_rows_are_one_voice_or_none_and_no_instant_decides() {
         let action = action_row(t0());
         let duty = vec!["m0".to_string()];
         let t = t0() + Duration::seconds(5000);
         let ballots = vec![
-            // m1 overrules, then thinks better of it a second later.
+            // m1 overrules, then thinks better of it a second later, with no
+            // withdrawal: at odds with themself.
             ballot("b0", "m1", "o1", false, t),
             ballot("b1", "m1", "o1", true, t + Duration::seconds(1)),
-            // m2 signs both in the SAME instant — protection wins.
+            // m2 signs both in the SAME instant.
             ballot("b2", "m2", "o1", false, t),
             ballot("b3", "m2", "o1", true, t),
-            ballot("b4", "m3", "o1", false, t),
+            // m3 says the same thing twice: one voice, the lowest id.
+            ballot("b5", "m3", "o1", false, t),
+            ballot("b4", "m3", "o1", false, t + Duration::seconds(1)),
         ];
         let f = fold_nine(
             &[objection("o1", "m4", t0())],
@@ -3638,14 +3869,126 @@ mod tests {
         let e = &f.escalation[0];
         assert_eq!(
             (e.respondents, e.uphold_ballots, e.overrule_ballots),
-            (3, 2, 1),
-            "three members, three ballots counted — one each: {e:?}"
+            (1, 0, 1),
+            "only m3 has spoken: {e:?}"
         );
+        assert_eq!(e.counted_ballot_ids, vec!["b4".to_string()]);
+    }
+
+    /// Who a persons fixture says the keys are: `m1b` is a live device of
+    /// `m1`, `e1` a device that left `m1`, `a1` a device of the actor `m4`,
+    /// and `m5b` a device of `m5`.
+    fn fixture_selves() -> KeySelves {
+        KeySelves::of_devices(&[
+            ("m1", "m1b", false),
+            ("m1", "e1", true),
+            ("m4", "a1", false),
+            ("m5", "m5b", false),
+        ])
+    }
+
+    /// **I1531 (the fold).** Every order of six rows folds to one answer: two
+    /// devices that disagree, two that agree, one seated member, a voiceless
+    /// device.
+    #[test]
+    fn no_permutation_of_the_rows_changes_the_count() {
+        let selves = fixture_selves();
+        let action = action_row(t0());
+        let duty = vec!["m0".to_string()];
+        let t = t0() + Duration::seconds(5000);
+        let roster = names(9);
+        let rows = [
+            ballot("b0", "m1", "o1", true, t),
+            ballot("b1", "m1b", "o1", false, t + Duration::seconds(1)),
+            ballot("b2", "m5", "o1", false, t + Duration::seconds(2)),
+            ballot("b3", "m5b", "o1", false, t + Duration::seconds(3)),
+            ballot("b4", "m2", "o1", true, t + Duration::seconds(4)),
+            ballot("b5", "e1", "o1", true, t + Duration::seconds(5)),
+        ];
+        let mut indices: Vec<usize> = (0..rows.len()).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        permute(&mut indices, 0, &mut |order| {
+            let ballots: Vec<Attestation> = order.iter().map(|i| rows[*i].clone()).collect();
+            let f = fold_reverse_quorum_over(&ReverseQuorumInputs {
+                action: (&action).into(),
+                objections: &[objection("o1", "m3", t0())],
+                dismissals: &[],
+                ballots: &ballots,
+                roster: &roster,
+                duty_holders: &duty,
+                policy: Some(escalating(2, 9, 3600, 600, 3)),
+                now: after_deadline(),
+                persons: selves.at(after_deadline()),
+            });
+            let e = &f.escalation[0];
+            seen.insert((
+                e.respondents,
+                e.uphold_ballots,
+                e.overrule_ballots,
+                e.counted_ballot_ids.clone(),
+            ));
+        });
         assert_eq!(
-            e.counted_ballot_ids,
-            vec!["b1".to_string(), "b3".into(), "b4".into()]
+            seen,
+            std::collections::BTreeSet::from([(2, 1, 1, vec!["b2".to_string(), "b4".to_string()])]),
+            "720 orders, one answer"
         );
-        assert_eq!(e.outcome, EscalationOutcome::Unresolved);
+    }
+
+    fn permute(items: &mut Vec<usize>, from: usize, visit: &mut impl FnMut(&[usize])) {
+        if from == items.len() {
+            visit(items);
+            return;
+        }
+        for i in from..items.len() {
+            items.swap(from, i);
+            permute(items, from + 1, visit);
+            items.swap(from, i);
+        }
+    }
+
+    /// I1525 on the bench: the objector's other device does not rule on their
+    /// objection, the actor's does not either, and two seats of one
+    /// duty-holder are one seat of the ruling.
+    #[test]
+    fn recusal_and_the_bench_are_persons() {
+        let selves = fixture_selves();
+        let action = action_row(t0());
+        let mut roster = names(9);
+        roster.push("m1b".to_string());
+        let inputs = |duty: &[String], ballots: &[Attestation], objector: &str| {
+            let f = fold_reverse_quorum_over(&ReverseQuorumInputs {
+                action: (&action).into(),
+                objections: &[objection("o1", objector, t0())],
+                dismissals: &[],
+                ballots,
+                roster: &roster,
+                duty_holders: duty,
+                policy: Some(escalating(2, 9, 3600, 600, 3)),
+                now: after_deadline(),
+                persons: selves.at(after_deadline()),
+            });
+            f.escalation[0].clone()
+        };
+        // m1 objects; m1's device m1b is a duty-holder: recused, an empty bench.
+        let e = inputs(&["m1b".to_string()], &[], "m1");
+        assert_eq!(e.steward, StewardTierStanding::NoDutyHolders, "{e:?}");
+        // Two seats of one self are one duty-holder.
+        let e = inputs(&["m1".to_string(), "m1b".to_string()], &[], "m3");
+        assert_eq!((e.duty_holders, e.steward_ruling_required), (1, 1), "{e:?}");
+        // The denominator of the pool: ten seats, nine persons.
+        let f = fold_reverse_quorum_over(&ReverseQuorumInputs {
+            action: (&action).into(),
+            objections: &[],
+            dismissals: &[],
+            ballots: &[],
+            roster: &roster,
+            duty_holders: &[],
+            policy: Some(escalating(2, 9, 3600, 600, 3)),
+            now: after_deadline(),
+            persons: selves.at(after_deadline()),
+        });
+        assert_eq!(f.roster_size, 9);
     }
 
     /// The two bounds a ballot's date must satisfy. The `now` bound is the one
@@ -3766,6 +4109,7 @@ mod tests {
             duty_holders: &["m0".to_string()],
             policy: Some(escalating(2, 9, 3600, 600, 3)),
             now: after_deadline(),
+            persons: PersonsAt::each_key(),
         });
         assert!(f.escalation.is_empty());
         assert_eq!(f.dismissed_objection_ids, vec!["o1".to_string()]);
@@ -3863,7 +4207,7 @@ pub(crate) mod test_support {
     /// admit. A `user`-role key satisfies both structurally, so the witness
     /// exercises the reverse-quorum gates rather than fighting the community
     /// gates that guard them.
-    async fn register_user_key<D: FederationDirectory + ?Sized>(dir: &D, key_id: &str) {
+    pub(crate) async fn register_user_key<D: FederationDirectory + ?Sized>(dir: &D, key_id: &str) {
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
         let now = Utc::now();
         dir.put_public_key(crate::federation::SignedKeyRecord {
@@ -3898,7 +4242,7 @@ pub(crate) mod test_support {
     /// A federation-tier row carrying `envelope`, authored + scrubbed by
     /// `author`, about `subject`. `co_signers` add REAL additional scrubs over
     /// the SAME canonical envelope — the m-of-n input.
-    fn signed_row(
+    pub(crate) fn signed_row(
         id: &str,
         author: &str,
         subject: &str,
@@ -3987,7 +4331,7 @@ pub(crate) mod test_support {
 
     /// Seed a community over `members` (founder = `members[0]`) declaring
     /// `protocol`, and nothing else.
-    async fn seed_community<D: FederationDirectory + ?Sized>(
+    pub(crate) async fn seed_community<D: FederationDirectory + ?Sized>(
         dir: &D,
         community_key_id: &str,
         members: &[String],

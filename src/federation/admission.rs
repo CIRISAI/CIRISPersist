@@ -4511,6 +4511,8 @@ async fn community_quorum_cosigned_at(
         signers: &signers,
         direction: super::consensus::Direction::Add,
         subject: None,
+        // Read at every licence walk over rows already held: left per key.
+        persons: super::key_person::PersonsAt::each_key(),
     })
     .admits())
 }
@@ -10500,6 +10502,20 @@ pub async fn resolve_withdraws_admission_rule_at(
     // nothing from the seller's time).
     if issuer_owned_the_producer_when(directory, issuer, target).await? {
         return Ok(1);
+    }
+    // Rule 1, lifted to the person — CIRISPersist#1198 (CC 4.5.13): a vote
+    // row's withdrawal is the author's own, "which any key of the same fedID
+    // signs".
+    if super::reverse_quorum::is_vote_row(target) {
+        let persons = super::key_person::KeySelves::read(
+            directory,
+            vec![issuer.to_owned(), target.attesting_key_id.clone()],
+        )
+        .await?;
+        let persons = persons.at(super::self_roster::roster_clock());
+        if persons.voice(issuer) == Some(persons.seat_person(&target.attesting_key_id)) {
+            return Ok(1);
+        }
     }
 
     // v21.11.0 (CIRISPersist#528), RATIFIED at **CC 2.4.1.1** as the

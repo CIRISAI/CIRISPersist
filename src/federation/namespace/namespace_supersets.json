@@ -15923,6 +15923,30 @@
     "manifest_round": "v61-s2-1123"
    },
    {
+    "decimal_id": "4.5.13",
+    "claim_id": "CLM-vote-once-per-person",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/reverse_quorum.rs#voices",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1123"
+   },
+   {
+    "decimal_id": "4.5.13",
+    "claim_id": "CLM-vote-once-per-person",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/consensus.rs#eligible",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1123"
+   },
+   {
+    "decimal_id": "4.5.13",
+    "claim_id": "CLM-vote-once-per-person",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/key_person.rs#PersonsAt::voice",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61-s2-1123"
+   },
+   {
     "decimal_id": "3.1.9.4",
     "claim_id": "CLM-nsproc-class-dual-scope-gate-watchlist-id",
     "repo": "CIRISPersist",

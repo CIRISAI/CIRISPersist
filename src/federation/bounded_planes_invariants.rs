@@ -130,6 +130,7 @@ pub(crate) mod bodies {
             vec![],
             None,
             None,
+            &crate::federation::key_person::NO_KEY_SELVES,
             action,
             now,
         )

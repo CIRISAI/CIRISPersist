@@ -146,25 +146,35 @@ where
 {
     let folded: std::collections::BTreeMap<String, String> = match record {
         LineageRecord::Family(f) => {
-            let mut events = Box::pin(super::family_roster_events(directory, f)).await?;
+            let persons = Box::pin(super::family_key_selves(directory, f)).await?;
+            let mut events = Box::pin(super::family_roster_events(directory, f, &persons)).await?;
             events.retain(|e| answered(e));
             let members: Vec<super::types::CommunityMember> = f
                 .members
                 .iter()
                 .map(super::family_member_as_roster_member)
                 .collect();
-            super::authorized_roster_at(&members, super::RosterRules::of_family(f), &events, as_of)
-                .into_iter()
-                .map(|m| (m.key_id, role_of(m.role.as_deref())))
-                .collect()
+            super::authorized_roster_at(
+                &members,
+                super::RosterRules::of_family(f).with_persons(&persons),
+                &events,
+                as_of,
+            )
+            .into_iter()
+            .map(|m| (m.key_id, role_of(m.role.as_deref())))
+            .collect()
         }
         LineageRecord::Community(c) => {
             let nodes = Box::pin(super::community_node_bearing_seats(directory, c)).await?;
-            let mut events = Box::pin(super::community_roster_events(directory, c, &nodes)).await?;
+            let persons = Box::pin(super::community_key_selves(directory, c)).await?;
+            let mut events = Box::pin(super::community_roster_events(
+                directory, c, &nodes, &persons,
+            ))
+            .await?;
             events.retain(|e| answered(e));
             super::authorized_roster_at(
                 &c.members,
-                super::RosterRules::of_community(c, &nodes),
+                super::RosterRules::of_community(c, &nodes).with_persons(&persons),
                 &events,
                 as_of,
             )

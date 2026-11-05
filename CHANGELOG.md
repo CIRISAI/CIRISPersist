@@ -5,6 +5,23 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [61.0.4] - UNRELEASED
+
+### Fixed
+
+- **A room counted keys, not people** (CIRISPersist#1198, CC 4.5.13, CC 3.3.6.3, `CLM-vote-once-per-person`). A tally now counts fedIDs: `federation::key_person` resolves a key to the self whose roster it belongs to, and every room count reads that. On the reverse-quorum plane this covers ballots, objections, dismissals, recusal, the duty-holders' bench and every threshold's denominator. On the roster plane it covers `consensus::evaluate` in every protocol, for communities and families, `verify_membership_quorum` and the cosigned `withdraws` of a roster event. Two seats held by one self are one voice in the numerator and the denominator, and any live key of a seated person votes and signs for them, seated or not. A key of another self counts for nothing, and neither does a key evicted from its self by the count, even in a row dated before the eviction. An evicted device's seat stays its person's, so the person's other keys keep the voice.
+
+- **A ballot's answer no longer depends on arrival or on a signed instant** (CIRISPersist#1198, CC 4.5.13). Every ballot row is admitted and kept, and the count is a fold with no clock inside it: a person's agreeing live rows are one voice, and rows that disagree are no voice until a withdrawal leaves one. This retires the latest-instant fold of `governing_ballots`, including the tied instant that counted as upheld. `withdraws` rule 1 now admits any key of the same fedID on a ballot row.
+
+I1525–I1531 cover both planes on sqlite and postgres through the doors, and 720 orders of six rows fold to one answer.
+
+### Adoption
+
+- **A changed answer takes a withdrawal.** A ballot that disagrees with the same person's earlier ballot used to replace it; now the person has no voice until one row is withdrawn. A host that lets a member re-vote must withdraw the old row, from any of the person's keys, and show the at-odds state.
+- **`roster_size`, `required`, `distinct_objectors`, `respondents`, `duty_holders` and `DismissalQuorum` count persons.** The fields keep their names and JSON shape; a room with two seats for one self reports fewer. `counted_ballot_ids` and `counted_objection_ids` hold one row per person, the lowest id.
+- **Public Rust shapes changed.** `consensus::Ballot` gained `persons`, `ReverseQuorumInputs` gained `persons`, `RosterRules` gained `persons` (`of_community` and `of_family` default to the per-key count; add `.with_persons`), and `community_roster_events` and `family_roster_events` take the persons as an argument. New: `community_key_selves`, `family_key_selves`, `reverse_quorum::is_vote_row`.
+- **Roster events already held stay in the fold.** One admitted under the per-key count stands, and a new one is judged by persons at the door. A node on 61.0.4 refuses such an event arriving from an older node, so the two can hold different rosters until the room acts under its protocol.
+
 ## [61.0.3] - 2026-11-05
 
 ### Fixed
