@@ -555,7 +555,7 @@ mechanical step. The counts are production references at v61.0.3, by grep, and s
 | the ruled column is the text | `transitions.json` carries `code-v61` values | §5.5. The census must be regenerated first: for example, it shows subjects withdrawing `moderation:`, `hard_case:`, `slashing:` and `takedown_notice:` rows, which v61.0.3 already refuses (`SUBJECT_WITHDRAWS_CARVE_OUT`) |
 
 CC#203 adds six family-model columns: `tie_break`, `monotone_field`, `evidence_screen`, `signer_named_by_ref`, `formula`
-and `window`. It also drops `weighted:{rubric}` and `custom:{id}` protocols, open to Eric's reversal: nothing shipped
+and `window`. It also drops `weighted:{rubric}` and `custom:{id}` protocols (Eric confirmed): nothing shipped
 uses them, and 28 references plus the `policy_blob` rubric path go with them. Removal (purge, reap, tombstone) shrinks
 the held set outside the step, and the kernel will say so.
 
@@ -1041,8 +1041,9 @@ Opens when Edge tags v44.
 
 ### Phase 2: the read side, the model and the surface (v62.0)
 
-Starts on CC's verified re-cut edition (the six rules, the columns, the ruled layer and the codebook) and on Verify
-publishing. Phase 1 needs neither, so it can run while they land.
+The row work starts when Verify publishes. CC's refactor branch is held until Eric opens it, so the ruled layer and
+the decimal map are not coming yet, and v62 proceeds on the §5.3 predicate as drafted. Families move through §5.5
+steps 1-3 on `code-v61`, and step 4 follows as ruled rows land.
 
 1. Verify publishes (CIRISVerify#326). Schema for edition 2. Read side behind `RowView`.
 2. Vendor the family model. Migrate families per §5.5, simplest first.
@@ -1143,7 +1144,7 @@ placement.
 ### Ordering
 
 ```
-rc17 tags (LTS) -> CC re-cut verified
+rc17 tags after Server 245 and an agent release (LTS); the CC re-cut opens when Eric says
 Verify #326 -> persist v62.0 reads both -> Edge, Server adopt -> fleet floor confirmed
             -> emission switch + genesis ceremony -> schema baseline
 ```
@@ -1206,7 +1207,7 @@ baselines; schema baseline; statement catalogue; surface census; certify leg fil
 | 4 | committed features | Eric | **ruled:** pre-refactor needs ship in 61.0.4; a feature that fits v62 or breaks the wire goes to v62, including #1121, #1118, #1142 | |
 | 6 | a scrubbed corpus from a test mesh | Eric | **ruled yes** | |
 | 7 | `mold` on CI and certify | Eric | **ruled yes** | |
-| 17 | drop `weighted:` and `custom:` protocols | Eric | yes; nothing shipped uses them | Phase 2 |
+| 17 | drop `weighted:` and `custom:` protocols | Eric | **ruled yes** (CC#203) | |
 | 11 | ruled family rows for the gap cells | CC | gaps closed until ruled; refinements land as rows with vectors | Phase 2 |
 | 12 | Verify owns CBOR and COSE encode | Verify | yes (§4.7) | before build |
 | 13 | the persist and Server line | Server, CC | §8.3 | Phase 1 |
@@ -1218,7 +1219,7 @@ baselines; schema baseline; statement catalogue; surface census; certify leg fil
 | risk | effect | response |
 |---|---|---|
 | Verify's #326 slips | the row work cannot start | Phase 1 does not depend on it, and family migration can proceed |
-| the re-cut takes longer than expected | Phase 2 waits on a verified edition | Phase 1 proceeds; `code-v61` rows can move without rulings |
+| the re-cut stays held | ruled rows and the decimal map do not arrive | v62 runs §5.5 steps 1-3 on `code-v61`; behaviour changes wait for ruled rows |
 | ruled family rows arrive slowly | step 4 of §5.5 stalls | steps 1-3 run on `code_v61`; the cut-over proceeds and rulings follow |
 | the composite draft changes construction | signed bytes move | hold the switch until it is stable. CC says only the id changes later, so this is a question for Verify |
 | v62 becomes too large | a long-lived branch, drift from 61.x | merge forward each patch. The switch is already split out. Family migration can pause cleanly between families |
