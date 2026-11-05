@@ -511,9 +511,13 @@ row. `hard_case:` and the #1061 groups come early, because they carry live risk.
 ### 5.6 Refusals
 
 Tokens are a public contract and do not change in a mechanical step. Terminal or retryable
-becomes a property of the refusal, which is what Edge's retry schedule depends on. Rule 2 of §5.8
-lists per-node `hard_case` emissions as stored verdicts, so #1206 is held until CC says what a
-refusal leaves behind.
+becomes a property of the refusal, which is what Edge's retry schedule depends on.
+
+A refused row never enters the held set and leaves nothing behind but the refusal returned to the
+signer, which the preview already showed. A `hard_case:*` row stays a row when it is someone's signed
+act: a report, an allegation, a duty holder's decision. One a node emits about what it computed
+(membership change, protocol violation, liveness, recipient excluded, consent expired) is a fold result
+and becomes a notice item of the view. The 32 emission sites sort by that test. #1206 is not built.
 
 ### 5.7 The family key, now
 
@@ -1195,7 +1199,6 @@ baselines; schema baseline; statement catalogue; surface census; certify leg fil
 | 4 | committed features | Eric | **ruled:** pre-refactor needs ship in 61.0.4; a feature that fits v62 or breaks the wire goes to v62, including #1121, #1118, #1142 | |
 | 6 | a scrubbed corpus from a test mesh | Eric | **ruled yes** | |
 | 7 | `mold` on CI and certify | Eric | **ruled yes** | |
-| 16 | what a refusal leaves behind, and #1206 under rule 2 | CC | hold #1206 | before 61.0.4 |
 | 17 | drop `weighted:` and `custom:` protocols | Eric | yes; nothing shipped uses them | Phase 2 |
 | 11 | ruled family rows for the gap cells | CC | gaps closed until ruled; refinements land as rows with vectors | Phase 2 |
 | 12 | Verify owns CBOR and COSE encode | Verify | yes (§4.7) | before build |
