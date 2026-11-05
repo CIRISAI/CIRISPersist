@@ -2,7 +2,7 @@
 
 Status: DRAFT in review. CC ruled the spec questions at rc17 `6dc2091` and `4794d9f` (CIRISPersist#1205,
 comments 6670437725, 6670504193) and confirmed the §8.3 placement. Agent and Server censuses are in.
-Eric has ruled §16 items 1, 4, 6, 7 and 15. rc17 is the LTS edition, and v62 follows the re-cut spine (CC#203). Edge and Verify are outstanding; Verify is down until Eric brings it
+Eric has ruled §16 items 1, 3, 4, 6, 7 and 15. rc17 is the LTS edition, and v62 follows the re-cut spine (CC#203). Edge and Verify are outstanding; Verify is down until Eric brings it
 up before v62 starts. Nothing here is built.
 
 Issues: CIRISPersist#1130, #1205, #934 (residual), #681, #679, #1004, #1174,
@@ -286,12 +286,19 @@ Nothing tickets this today.
 | A. keep a rendered JSON projection beside the bytes | every query keeps working; one rule for both editions | stores the payload twice for edition 2 |
 | B. promote every queried member to a column, no JSON | smallest storage, typed SQL | every query rewritten at the moment the row changes |
 
-**Recommendation: A, then promote.** Bytes hold the truth. `attestation_envelope` for an
-edition 2 row is a rendered projection, never read for a verdict, and rebuilt byte-equal
-from the bytes plus the disclosures still held (the `projection.rebuild = byte_equal` of the
-family model). Erasure therefore rebuilds the projection, so an erased value cannot survive
-in it. Hot members are promoted to columns afterwards, measured by §11. For an edition 1 row
-the JSON remains the truth, unchanged.
+**Ruled: A, then promote (Eric, 2026-11-05, on #1205).** Bytes hold the truth. For an edition 2 row,
+`attestation_envelope` is a rendered projection. Hot members are promoted to columns afterwards, measured by §11.
+For an edition 1 row the JSON remains the truth, unchanged.
+
+Two gates are part of the ruling. Without them this is the mirror again:
+
+1. **No verdict path reaches the projection.** No fold, door or standing read touches `attestation_envelope` for an
+   edition 2 row. An AST rule in CI holds it.
+2. **The projection is a pure rendering of the canonical bytes**, by a fixed rule (RFC 8949 §6), with a byte-equal
+   rebuild check on every projection write.
+
+So it renders the payload alone. A blinded member is not in the payload, so it never enters the projection, and
+erasure has nothing to rebuild.
 
 The id also changes. An edition 2 id is a tagged SHA-256, where today's `attestation_id`
 is 16 bytes as a UUID. Every foreign key and cursor over it must carry both. §4.8 orders
@@ -352,7 +359,7 @@ What this means for the build:
 | the mint path blinds by rule | `step` refuses a row that seals a member its family's `blind` column names |
 | a verdict never depends on a blinded value | ruled: no fold, verdict or admission reads a blindable member, or nodes that erased it and nodes that did not would disagree |
 | one quorum, one disclosure set | cosigners share a payload, so they share `_sd`, and the set is one object on the bytes plane |
-| SQL over blinded members goes | they leave the payload; §4.2's projection only renders what is still held |
+| SQL over blinded members goes | they leave the payload, so they never reach §4.2's projection |
 | reads handle absence | a display path that reads a member (`device:label`, a filename) must accept an erased one |
 | the disclosure store is required | the #914 FSD, approved in September and never written, is no longer optional. It is a section of this program |
 
@@ -1195,7 +1202,7 @@ baselines; schema baseline; statement catalogue; surface census; certify leg fil
 | # | decision | owner | recommendation | needed by |
 |---|---|---|---|---|
 | 1 | the API break rides v62, once | Eric | **ruled yes** | |
-| 3 | stored form: signed bytes plus a rendered JSON copy | Eric | option A (§4.2); proceeding on it, cheap to change until Phase 2 | Phase 2 |
+| 3 | stored form: signed bytes plus a rendered JSON projection, under two gates | Eric | **ruled yes** (§4.2) | |
 | 4 | committed features | Eric | **ruled:** pre-refactor needs ship in 61.0.4; a feature that fits v62 or breaks the wire goes to v62, including #1121, #1118, #1142 | |
 | 6 | a scrubbed corpus from a test mesh | Eric | **ruled yes** | |
 | 7 | `mold` on CI and certify | Eric | **ruled yes** | |
