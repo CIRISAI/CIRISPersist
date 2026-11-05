@@ -436,8 +436,11 @@ persist has the door and no predicate a queue could reuse, so this claim
 (`CLM-queue-is-the-door`, normative, no implementer) is built here or nowhere.
 
 **The state processor (CC 4.5.13, rc17 `49a016b`).** The queue, the preview and the door are one function run
-three ways, and a node holds one. State is the held row set; object state, standing and seated roles are folds
-over it, never stored verdicts. A projection is a rebuildable cache and never the source of a verdict.
+three ways, and a node holds one. State is the held rows, each with the instant this node first held it. That
+receipt is the node's own, outside the signed row and never replicated, and every window runs from it. Object
+state, standing and seated roles are folds over this, never stored verdicts. A projection is a rebuildable cache
+and never the source of a verdict. Counts and standings are the same on every node holding the rows; a window
+answer is this node's, so a preview says so (rc17 `817b2b7`).
 
 | run over | is |
 |---|---|
@@ -1158,7 +1161,6 @@ baselines; schema baseline; statement catalogue; surface census; certify leg fil
 | 4 | committed features | Eric | **ruled:** pre-refactor needs ship in 61.0.4; a feature that fits v62 or breaks the wire goes to v62, including #1121, #1118, #1142 | |
 | 6 | a scrubbed corpus from a test mesh | Eric | **ruled yes** | |
 | 7 | `mold` on CI and certify | Eric | **ruled yes** | |
-| 16 | node-local first-held instants: part of `Held`, or `now` per row (state is "the rows held and nothing else", yet window starts are this node's own) | CC | a held row carries its own first-held instant; verdicts stay folds | Phase 2 |
 | 11 | ruled family rows for the gap cells | CC | gaps closed until ruled; refinements land as rows with vectors | Phase 2 |
 | 12 | Verify owns CBOR and COSE encode | Verify | yes (§4.7) | before build |
 | 13 | the persist and Server line | Server, CC | §8.3 | Phase 1 |
