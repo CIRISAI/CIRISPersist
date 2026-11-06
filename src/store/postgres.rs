@@ -21495,6 +21495,17 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                     crate::federation::Error::Backend(format!("withdraws admission depth: {e}"))
                 })?;
             }
+            // CIRISPersist#1198 (V213) — first-held wins, in the row's
+            // transaction: no objection is held without its window.
+            if let Some((action_id, first_held_at)) = &planned.vote_window {
+                tx.execute(
+                    "INSERT INTO cirislens.federation_vote_windows (action_id, first_held_at) \
+                     VALUES ($1, $2) ON CONFLICT (action_id) DO NOTHING",
+                    &[action_id, first_held_at],
+                )
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("vote window: {e}")))?;
+            }
         }
         // PR #943 review (Codex): project ONLY a row this statement stored. An
         // occupied id (`ON CONFLICT DO NOTHING`, 0 rows) stored nothing, so its

@@ -134,6 +134,11 @@ pub(crate) struct PlannedAttestation {
     /// touches ([`super::goal_projection::goal_to_refold`]): the executor
     /// refolds its `goals` row in the row's transaction, after the insert.
     pub(crate) projected_goal: Option<String>,
+    /// CIRISPersist#1198 (V213) — the action a cohort objection names and this
+    /// door's receipt instant: the vote window's start, written first-held-wins
+    /// in the row's transaction, so no objection is ever held without one and
+    /// a later row can never set a later start.
+    pub(crate) vote_window: Option<(String, chrono::DateTime<chrono::Utc>)>,
     /// The signed-wire-index locator (#507b), federation tier only; the hash
     /// comes from the stored row (#646).
     pub(crate) wire_index_key: Option<String>,
@@ -467,8 +472,6 @@ where
     let withdraws_row = (attestation.attestation.attestation_type
         == super::types::attestation_type::WITHDRAWS)
         .then(|| attestation.attestation.clone());
-    let objection_row = super::reverse_quorum::is_cohort_objection(&attestation.attestation)
-        .then(|| attestation.attestation.clone());
     let roster_row = (super::self_roster::is_proposal_row(&attestation.attestation)
         || super::self_roster::answer_identity(&attestation.attestation).is_some())
     .then(|| attestation.attestation.clone());
@@ -513,11 +516,6 @@ where
         (&outcome, &roster_row)
     {
         super::self_roster::after_admission(dir, row).await;
-    }
-    if let (Ok(AttestationOutcome::Inserted | AttestationOutcome::AlreadyHeld), Some(row)) =
-        (&outcome, &objection_row)
-    {
-        super::reverse_quorum::after_objection_held(dir, row).await;
     }
     if let (Ok(AttestationOutcome::Inserted | AttestationOutcome::AlreadyHeld), Some(row)) =
         (&outcome, &rebind_row)
@@ -1363,6 +1361,7 @@ where
         == crate::federation::types::attestation_type::WITHDRAWS)
         .then(|| dir.withdraws_delegation_depth());
     let cycle_gated = crate::federation::admission::delegation_cycle_gated(&row);
+    let vote_window = super::reverse_quorum::objection_action(&row).map(|a| (a, received_at));
     Ok(AttestationPlan::Insert(Box::new(PlannedAttestation {
         row,
         withdraws_depth,
@@ -1371,6 +1370,7 @@ where
         projected_hard_case,
         projected_ledger,
         projected_goal,
+        vote_window,
         wire_index_key,
         cycle_gated,
         received_at,

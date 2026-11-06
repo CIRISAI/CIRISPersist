@@ -1904,30 +1904,13 @@ where
         .map(|row| (row.attesting_key_id, row.asserted_at)))
 }
 
-/// Is this row an objection of a cohort, the row that opens a vote window?
+/// The action a cohort objection names: the row that opens a vote window. The
+/// attestation plan writes the window in the row's transaction (V213).
 #[must_use]
-pub fn is_cohort_objection(row: &Attestation) -> bool {
-    envelope_str(row, "dimension") == Some(DIMENSION_OBJECTION) && is_vote_row(row)
-}
-
-/// The attestation door's hook: this node has held an objection, so the
-/// action's window has a start if it had none (V213). Never fails the
-/// admission that called it: the row is stored, and the next objection or the
-/// signed instant stands in.
-pub(crate) async fn after_objection_held<D>(dir: &D, row: &Attestation)
-where
-    D: FederationDirectory + ?Sized,
-{
-    let Some(action_id) = envelope_str(row, field::OBJECTS_TO) else {
-        return;
-    };
-    match dir
-        .note_vote_window(action_id, super::self_roster::roster_clock())
-        .await
-    {
-        Ok(()) | Err(Error::Unsupported { .. }) => {}
-        Err(e) => tracing::warn!(action_id, error = %e, "vote window receipt"),
-    }
+pub(crate) fn objection_action(row: &Attestation) -> Option<String> {
+    (envelope_str(row, "dimension") == Some(DIMENSION_OBJECTION) && is_vote_row(row))
+        .then(|| envelope_str(row, field::OBJECTS_TO).map(str::to_owned))
+        .flatten()
 }
 
 /// Is this row a vote of a cohort: a ballot or an objection? A retraction of

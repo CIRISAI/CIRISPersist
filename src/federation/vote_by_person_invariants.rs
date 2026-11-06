@@ -46,6 +46,14 @@
 //! - **I1539** (item 4) — `ActorRecused` reads the exact key from the row and
 //!   its held target; where the target is not yet held the ballot waits for
 //!   the fold, which recuses the actor.
+//! - **I1540** — an objection arriving through
+//!   `apply_replicated_attestation` opens the window as a local one does.
+//! - **I1541** — the window's receipt is written in the row's transaction, so
+//!   a failed write leaves neither: the door and the replicated path both
+//!   surface it, and a re-offer lands the row and the receipt together.
+//! - **I1542** — V213 backfills a populated V212 store: each action's window
+//!   is its earliest held objection, a cohort of `self` and a ballot open
+//!   none, and the store boots and folds.
 //! - **I1531** — no row order, in arrival or in `asserted_at`, changes the
 //!   count.
 
@@ -1023,6 +1031,224 @@ pub(crate) mod bodies {
         assert_eq!(a.escalation[0].outcome, b.escalation[0].outcome, "I1537");
     }
 
+    /// One room with one action no objection has named yet.
+    async fn quiet_case(d: &dyn FederationDirectory, tag: &str) -> (Case, [String; 5]) {
+        let keys = people(d, tag, ["f", "p", "q", "r", "actor"]).await;
+        let room = format!("{tag}-room");
+        seed_community(d, &room, &keys, ESCALATING).await;
+        let c = Case {
+            room,
+            actor: keys[4].clone(),
+            action_id: crate::federation::wire_index::content_hash_of_bytes(tag.as_bytes()),
+            action_at: Utc::now() - Duration::hours(2),
+            objection: String::new(),
+        };
+        (c, keys)
+    }
+
+    /// **I1540** — a replicated objection opens the window.
+    pub(crate) async fn i1540_a_replicated_objection_opens_the_window(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let (mut c, [_, _, q, _, _]) = quiet_case(d, tag).await;
+        let at = c.action_at + Duration::minutes(5);
+        let row = objection_row(&c, &q, &uuid::Uuid::new_v4().to_string(), at);
+        c.objection = row.attestation_id.clone();
+        assert_eq!(d.vote_window_first_held(&c.action_id).await.unwrap(), None);
+        let before = Utc::now() - Duration::seconds(1);
+        let outcome = d
+            .apply_replicated_attestation(crate::federation::SignedAttestation { attestation: row })
+            .await
+            .expect("apply");
+        assert_eq!(
+            outcome,
+            crate::federation::attestation_apply::ReplicatedAttestationOutcome::Inserted,
+            "I1540"
+        );
+        let held = d
+            .vote_window_first_held(&c.action_id)
+            .await
+            .expect("read")
+            .expect("I1540: the replicated row wrote a receipt");
+        assert!(held >= before, "I1540: {held}");
+        assert_eq!(
+            c.fold(d).await.escalation[0].steward,
+            StewardTierStanding::Awaiting,
+            "I1540: the window runs from this node's receipt"
+        );
+    }
+
+    /// **I1541** — no row without its receipt. `broken` makes the receipt's
+    /// table unwritable; `mended` restores it.
+    pub(crate) async fn i1541_a_failed_receipt_fails_the_row<B, M>(
+        d: &dyn FederationDirectory,
+        tag: &str,
+        broken: B,
+        mended: M,
+    ) where
+        B: std::future::Future<Output = ()>,
+        M: std::future::Future<Output = ()>,
+    {
+        let (mut c, [_, _, q, r, _]) = quiet_case(d, tag).await;
+        let at = c.action_at + Duration::minutes(5);
+        let local = objection_row(&c, &q, &uuid::Uuid::new_v4().to_string(), at);
+        let replicated = objection_row(&c, &r, &uuid::Uuid::new_v4().to_string(), at);
+        c.objection = local.attestation_id.clone();
+        let held =
+            |id: String| async move { d.get_attestation(&id).await.expect("read").is_some() };
+
+        broken.await;
+        record_objection_against(d, &local, c.action())
+            .await
+            .expect_err("I1541: the door surfaces a failed receipt");
+        assert!(
+            !held(local.attestation_id.clone()).await,
+            "I1541: no row without its receipt"
+        );
+        d.apply_replicated_attestation(crate::federation::SignedAttestation {
+            attestation: replicated.clone(),
+        })
+        .await
+        .expect_err("I1541: the replicated path surfaces it too");
+        assert!(!held(replicated.attestation_id.clone()).await, "I1541");
+        mended.await;
+        assert_eq!(
+            d.vote_window_first_held(&c.action_id).await.unwrap(),
+            None,
+            "I1541: nothing was noted"
+        );
+
+        // A re-offer lands both, and the first instant then stands.
+        record_objection_against(d, &local, c.action())
+            .await
+            .expect("I1541: the re-offer lands");
+        let first = d.vote_window_first_held(&c.action_id).await.unwrap();
+        assert!(first.is_some(), "I1541: the row brought its receipt");
+        d.apply_replicated_attestation(crate::federation::SignedAttestation {
+            attestation: replicated,
+        })
+        .await
+        .expect("I1541: the replicated re-offer lands");
+        assert_eq!(
+            d.vote_window_first_held(&c.action_id).await.unwrap(),
+            first,
+            "I1541: a later objection moves nothing"
+        );
+    }
+
+    /// **I1542** — V213 over a populated store. `d` is at V212 with a stand-in
+    /// table so the doors can run; `to_v212` drops it, `to_head` migrates.
+    pub(crate) async fn i1542_the_backfill<B, M>(
+        d: &dyn FederationDirectory,
+        tag: &str,
+        to_v212: B,
+        to_head: M,
+    ) where
+        B: std::future::Future<Output = ()>,
+        M: std::future::Future<Output = ()>,
+    {
+        let (a, [_, p, q, r, _]) = quiet_case(d, tag).await;
+        let other_action = |n: &str| Case {
+            room: a.room.clone(),
+            actor: a.actor.clone(),
+            action_id: crate::federation::wire_index::content_hash_of_bytes(
+                format!("{tag}-{n}").as_bytes(),
+            ),
+            action_at: a.action_at,
+            objection: "named".to_owned(),
+        };
+        let (b, own, voted) = (
+            other_action("b"),
+            other_action("own"),
+            other_action("voted"),
+        );
+        let at = a.action_at + Duration::minutes(5);
+
+        // Action a: two objections, in order. Action b: one.
+        let first = objection_row(&a, &q, &uuid::Uuid::new_v4().to_string(), at);
+        record_objection_against(d, &first, a.action())
+            .await
+            .expect("door");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let second = objection_row(&a, &r, &uuid::Uuid::new_v4().to_string(), at);
+        record_objection_against(d, &second, a.action())
+            .await
+            .expect("door");
+        let on_b = objection_row(&b, &q, &uuid::Uuid::new_v4().to_string(), at);
+        record_objection_against(d, &on_b, b.action())
+            .await
+            .expect("door");
+        // Neither of these opens a window: a self roster's objection, and a
+        // ballot alone.
+        let self_plane = signed_row(
+            &uuid::Uuid::new_v4().to_string(),
+            &q,
+            &own.actor,
+            objection_envelope(Cohort::SelfId, &q, &own.action_id, "mine"),
+            at,
+            &[],
+        );
+        d.put_attestation(crate::federation::SignedAttestation {
+            attestation: self_plane,
+        })
+        .await
+        .expect("held");
+        record_objection_ballot_against(d, &voted.ballot(&p, true, ms(Utc::now())), voted.action())
+            .await
+            .expect("door");
+
+        let served = d.list_attestations_since(None, 10_000).await.expect("rows");
+        let admitted = |id: &str| {
+            served
+                .iter()
+                .find(|s| s.attestation.attestation_id == id)
+                .expect("held")
+                .admitted_at
+        };
+        let (a_at, b_at) = (
+            admitted(&first.attestation_id),
+            admitted(&on_b.attestation_id),
+        );
+        assert!(a_at < admitted(&second.attestation_id), "I1542: fixture");
+
+        to_v212.await;
+        to_head.await;
+
+        let window =
+            |c: Case| async move { d.vote_window_first_held(&c.action_id).await.expect("read") };
+        let micros = |t: Option<DateTime<Utc>>| t.map(|t| t.timestamp_micros());
+        let a_held = d.vote_window_first_held(&a.action_id).await.expect("read");
+        assert_eq!(
+            micros(a_held),
+            Some(a_at.timestamp_micros()),
+            "I1542: the earliest objection's instant"
+        );
+        assert_eq!(
+            micros(window(other_action("b")).await),
+            Some(b_at.timestamp_micros()),
+            "I1542: each action its own"
+        );
+        assert_eq!(window(other_action("own")).await, None, "I1542: self plane");
+        assert_eq!(window(other_action("voted")).await, None, "I1542: a ballot");
+
+        // The store boots and folds, and a new objection moves nothing.
+        let mut c = other_action("a");
+        c.action_id = a.action_id.clone();
+        c.objection = first.attestation_id.clone();
+        let fold = c.fold(d).await;
+        assert_eq!(fold.distinct_objectors, 2, "I1542: {fold:?}");
+        let third = objection_row(&c, &p, &uuid::Uuid::new_v4().to_string(), at);
+        record_objection_against(d, &third, c.action())
+            .await
+            .expect("door");
+        assert_eq!(
+            d.vote_window_first_held(&c.action_id).await.unwrap(),
+            a_held,
+            "I1542: the backfilled instant stands"
+        );
+    }
+
     fn dismissal_row(c: &Case, author: &str, cosigners: &[&str], names: &str) -> Attestation {
         signed_row(
             &uuid::Uuid::new_v4().to_string(),
@@ -1574,6 +1800,112 @@ mod run {
         d.run_migrations().await.unwrap();
         bodies::i1538_a_row_waits_for_what_it_names(&c, &d, &tag("p")).await;
         bodies::i1537b_the_tally_is_shared_the_tier_is_not(&a, &b, &tag("p")).await;
+    }
+
+    on_every_backend!(i1540, bodies::i1540_a_replicated_objection_opens_the_window);
+
+    const RENAME_AWAY_SQLITE: &str = "ALTER TABLE federation_vote_windows RENAME TO vw_broken;";
+    const RENAME_BACK_SQLITE: &str = "ALTER TABLE vw_broken RENAME TO federation_vote_windows;";
+    const RENAME_AWAY_PG: &str =
+        "ALTER TABLE cirislens.federation_vote_windows RENAME TO vw_broken;";
+    const RENAME_BACK_PG: &str =
+        "ALTER TABLE cirislens.vw_broken RENAME TO federation_vote_windows;";
+    const STAND_IN_SQLITE: &str = "CREATE TABLE federation_vote_windows \
+        (action_id TEXT PRIMARY KEY, first_held_at TEXT NOT NULL);";
+    const STAND_IN_PG: &str = "CREATE TABLE cirislens.federation_vote_windows \
+        (action_id TEXT PRIMARY KEY, first_held_at TIMESTAMPTZ NOT NULL);";
+    const DROP_SQLITE: &str = "DROP TABLE federation_vote_windows;";
+    const DROP_PG: &str = "DROP TABLE cirislens.federation_vote_windows;";
+
+    #[cfg(feature = "sqlite")]
+    async fn sql_sqlite(b: &crate::store::sqlite::SqliteBackend, sql: &str) {
+        b.conn_handle().lock().execute_batch(sql).unwrap();
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn sql_pg(b: &crate::store::postgres::PostgresBackend, sql: &str) {
+        b.get_client()
+            .await
+            .unwrap()
+            .batch_execute(sql)
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1541_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Box::pin(bodies::i1541_a_failed_receipt_fails_the_row(
+            &b,
+            &tag("s"),
+            sql_sqlite(&b, RENAME_AWAY_SQLITE),
+            sql_sqlite(&b, RENAME_BACK_SQLITE),
+        ))
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1541_postgres() {
+        use crate::store::Backend as _;
+        let dsn = crate::test_pg::empty_dsn().expect("no CIRIS_PERSIST_TEST_PG base DSN");
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Box::pin(bodies::i1541_a_failed_receipt_fails_the_row(
+            &b,
+            &tag("p"),
+            sql_pg(&b, RENAME_AWAY_PG),
+            sql_pg(&b, RENAME_BACK_PG),
+        ))
+        .await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1542_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations_through(212).await.unwrap();
+        sql_sqlite(&b, STAND_IN_SQLITE).await;
+        Box::pin(bodies::i1542_the_backfill(
+            &b,
+            &tag("s"),
+            sql_sqlite(&b, DROP_SQLITE),
+            async {
+                b.run_migrations().await.unwrap();
+            },
+        ))
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1542_postgres() {
+        use crate::store::Backend as _;
+        let dsn = crate::test_pg::empty_dsn().expect("no CIRIS_PERSIST_TEST_PG base DSN");
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations_through(212).await.unwrap();
+        sql_pg(&b, STAND_IN_PG).await;
+        Box::pin(bodies::i1542_the_backfill(
+            &b,
+            &tag("p"),
+            sql_pg(&b, DROP_PG),
+            async {
+                b.run_migrations().await.unwrap();
+            },
+        ))
+        .await;
     }
 
     on_every_backend!(i1537, bodies::i1537_the_deadline_is_a_window);

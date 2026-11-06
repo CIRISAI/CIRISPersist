@@ -15671,6 +15671,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             projected_hard_case,
             projected_ledger,
             projected_goal,
+            vote_window,
             wire_index_key,
             ..
         } = planned;
@@ -15776,6 +15777,15 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                         "INSERT OR REPLACE INTO federation_withdraws_admission_depths \
                          (attestation_id, depth) VALUES (?1, ?2)",
                         rusqlite::params![row.attestation_id, depth],
+                    )?;
+                }
+                // CIRISPersist#1198 (V213) — first-held wins, in the row's
+                // transaction: no objection is held without its window.
+                if let Some((action_id, first_held_at)) = &vote_window {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO federation_vote_windows \
+                         (action_id, first_held_at) VALUES (?1, ?2)",
+                        rusqlite::params![action_id, self_roster_instant_text(*first_held_at)],
                     )?;
                 }
                 tx.commit()?;
