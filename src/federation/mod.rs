@@ -798,7 +798,7 @@ mod self_roster_invariants;
 // CIRISPersist#1198 (CC 4.5.13, CC 3.3.6.3) — the person behind a key: what a
 // tally counts.
 pub mod key_person;
-// CIRISPersist#1198 (CC 4.5.13) — I1525–I1536: a vote counts once per person.
+// CIRISPersist#1198 (CC 4.5.13) — I1525–I1539: a vote counts once per person.
 #[cfg(test)]
 mod vote_by_person_invariants;
 // v55.0.0 (CIRISPersist#1007) — the duty-holder takedown on the steward
@@ -5619,6 +5619,33 @@ pub trait FederationDirectory: Send + Sync {
         let _ = (proposal_id, identity_key_id, received_at);
         Err(Error::Unsupported {
             method: "note_self_roster_proposal",
+        })
+    }
+
+    /// CIRISPersist#1198 (V213; CC's ruling on the ticket) — record that this
+    /// node first held a vote on `action_id` at `first_held_at` (THIS node's
+    /// clock: the window's start). Insert-if-absent: the first instant stands,
+    /// so a window closes and never reopens.
+    async fn note_vote_window(
+        &self,
+        action_id: &str,
+        first_held_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        let _ = (action_id, first_held_at);
+        Err(Error::Unsupported {
+            method: "note_vote_window",
+        })
+    }
+
+    /// CIRISPersist#1198 (V213) — the instant [`Self::note_vote_window`] held
+    /// for `action_id`, if any.
+    async fn vote_window_first_held(
+        &self,
+        action_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, Error> {
+        let _ = action_id;
+        Err(Error::Unsupported {
+            method: "vote_window_first_held",
         })
     }
 

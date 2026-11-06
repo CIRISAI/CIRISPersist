@@ -36,6 +36,16 @@
 //!   `founder_only` family: the person's other key acts, the evicted one does
 //!   not.
 //! - **I1536** (item 5) — a recanted row is not live, as a withdrawn one.
+//! - **I1537** (CC's second ruling, item 1) — `deadline_passed` is a window
+//!   answer: it runs from this node's first-held instant, never a signed one,
+//!   it closes and never reopens, and a held steward ruling beats it.
+//! - **I1538** (item 3) — a vote row naming something not yet held is held and
+//!   counts once the fold can resolve it, in either arrival order; one naming
+//!   something never held counts for nothing; a dismissal short of its floor
+//!   is held and counts for nothing until its cosigners' standing is held.
+//! - **I1539** (item 4) — `ActorRecused` reads the exact key from the row and
+//!   its held target; where the target is not yet held the ballot waits for
+//!   the fold, which recuses the actor.
 //! - **I1531** — no row order, in arrival or in `asserted_at`, changes the
 //!   count.
 
@@ -52,8 +62,10 @@ pub(crate) mod bodies {
     };
     use crate::federation::reverse_quorum::{
         ballot_envelope, dismissal_envelope, objection_envelope, record_objection_against,
-        record_objection_ballot_against, record_objection_dismissal, resolve_reverse_quorum_for,
-        ActionRef, ObjectionEscalation, ObjectionOutcome, ReverseQuorumFold, ReverseQuorumStanding,
+        record_objection_ballot, record_objection_ballot_against, record_objection_dismissal,
+        resolve_reverse_quorum_for, ActionRef, EscalationOutcome, ObjectionEscalation,
+        ObjectionOutcome, ObjectionRefusalReason, ReverseQuorumFold, ReverseQuorumStanding,
+        StewardTierStanding,
     };
     use crate::federation::self_roster_invariants::bodies::add;
     use crate::federation::tier_ingest::test_support as ts;
@@ -863,6 +875,291 @@ pub(crate) mod bodies {
         );
     }
 
+    /// **I1537** — the deadline is this node's window.
+    pub(crate) async fn i1537_the_deadline_is_a_window(d: &dyn FederationDirectory, tag: &str) {
+        let [f, p, q, r, actor] = people(d, tag, ["f", "p", "q", "r", "actor"]).await;
+        let room = format!("{tag}-room");
+        let seats = [&f, &p, &q, &r, &actor].map(|k| k.clone());
+        seed_community(d, &room, &seats, ESCALATING).await;
+        // The action is signed two hours ago, past the signed window. This
+        // node has only just held its objection.
+        let before = Utc::now() - Duration::seconds(1);
+        let c = case(d, &room, &actor, &q, tag).await;
+        let first_held = d
+            .vote_window_first_held(&c.action_id)
+            .await
+            .expect("read")
+            .expect("the door noted the window");
+        assert!(first_held >= before, "I1537: {first_held}");
+        let at = |now| resolve_reverse_quorum_for(d, Cohort::Community, &room, c.action(), now);
+        let early = at(Utc::now()).await.expect("resolve");
+        assert_eq!(
+            early.escalation[0].steward,
+            StewardTierStanding::Awaiting,
+            "I1537: the window runs from first-held, not a signed instant: {early:?}"
+        );
+        let deadline = early.steward_deadline.expect("a declared tier");
+        let closed = deadline + Duration::seconds(1);
+        let late = at(closed).await.expect("resolve");
+        assert_eq!(
+            late.escalation[0].steward,
+            StewardTierStanding::Silent,
+            "I1537: the window closed: {late:?}"
+        );
+
+        // It never reopens: a second objection held afterwards moves nothing.
+        let again = objection_row(
+            &c,
+            &r,
+            &uuid::Uuid::new_v4().to_string(),
+            c.action_at + Duration::minutes(6),
+        );
+        record_objection_against(d, &again, c.action())
+            .await
+            .expect("door");
+        let after = at(closed).await.expect("resolve");
+        assert_eq!(
+            after.steward_deadline,
+            Some(deadline),
+            "I1537: one deadline"
+        );
+        assert!(
+            after
+                .escalation
+                .iter()
+                .all(|e| e.steward == StewardTierStanding::Silent),
+            "I1537: a closed window stays closed: {after:?}"
+        );
+
+        // A held row beats a window: the steward's ruling, signed after the
+        // close, decides. `f` is the founder and the one duty-holder.
+        let ruling = c.ballot(&f, true, ms(Utc::now()));
+        assert_eq!(
+            record_objection_ballot_against(d, &ruling, c.action())
+                .await
+                .expect("door"),
+            ObjectionOutcome::Admitted,
+            "I1537: the ruling is held"
+        );
+        let ruled = at(closed).await.expect("resolve");
+        let e = ruled
+            .escalation
+            .iter()
+            .find(|e| e.objection_id == c.objection)
+            .expect("escalated");
+        assert_eq!(
+            (e.steward, e.outcome),
+            (StewardTierStanding::Upheld, EscalationOutcome::NotEscalated),
+            "I1537: the held ruling beats the closed window: {e:?}"
+        );
+    }
+
+    /// **I1537 (two nodes)** — one tally, each node's own tier, and they
+    /// converge. The rows are the same; `early` first held them a day ago.
+    pub(crate) async fn i1537b_the_tally_is_shared_the_tier_is_not(
+        early: &dyn FederationDirectory,
+        late: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let [f, p, q, r, actor] = ["f", "p", "q", "r", "actor"].map(|n| format!("{tag}-{n}"));
+        let room = format!("{tag}-room");
+        let action_id = crate::federation::wire_index::content_hash_of_bytes(tag.as_bytes());
+        let action_at = Utc::now() - Duration::hours(2);
+        let mut c = Case {
+            room: room.clone(),
+            actor: actor.clone(),
+            action_id,
+            action_at,
+            objection: uuid::Uuid::new_v4().to_string(),
+        };
+        let objection = objection_row(&c, &q, &c.objection, action_at + Duration::minutes(5));
+        c.objection = objection.attestation_id.clone();
+        let ballot = c.ballot(&p, false, ms(Utc::now()));
+        early
+            .note_vote_window(&c.action_id, Utc::now() - Duration::days(1))
+            .await
+            .expect("window");
+        for d in [early, late] {
+            for k in [&f, &p, &q, &r, &actor] {
+                register_user_key(d, k).await;
+            }
+            let seats = [&f, &p, &q, &r, &actor].map(|k| k.clone());
+            seed_community(d, &room, &seats, ESCALATING).await;
+            record_objection_against(d, &objection, c.action())
+                .await
+                .expect("door");
+            record_objection_ballot_against(d, &ballot, c.action())
+                .await
+                .expect("door");
+        }
+        let fold =
+            |d, now| resolve_reverse_quorum_for(d, Cohort::Community, &room, c.action(), now);
+        let now = Utc::now();
+        let (a, b) = (
+            fold(early, now).await.expect("resolve"),
+            fold(late, now).await.expect("resolve"),
+        );
+        let tally = |f: &ReverseQuorumFold| {
+            let e = &f.escalation[0];
+            (
+                e.respondents,
+                e.uphold_ballots,
+                e.overrule_ballots,
+                e.counted_ballot_ids.clone(),
+            )
+        };
+        assert_eq!(tally(&a), tally(&b), "I1537: the tally is one");
+        assert_eq!(a.escalation[0].steward, StewardTierStanding::Silent);
+        assert_eq!(b.escalation[0].steward, StewardTierStanding::Awaiting);
+        let closed = b.steward_deadline.expect("tier") + Duration::seconds(1);
+        let (a, b) = (
+            fold(early, closed).await.expect("resolve"),
+            fold(late, closed).await.expect("resolve"),
+        );
+        assert_eq!(
+            a.escalation[0].steward, b.escalation[0].steward,
+            "I1537: converged"
+        );
+        assert_eq!(a.escalation[0].outcome, b.escalation[0].outcome, "I1537");
+    }
+
+    fn dismissal_row(c: &Case, author: &str, cosigners: &[&str], names: &str) -> Attestation {
+        signed_row(
+            &uuid::Uuid::new_v4().to_string(),
+            author,
+            &c.actor,
+            dismissal_envelope(Cohort::Community, &c.room, &c.action_id, names, "no"),
+            ms(Utc::now()),
+            cosigners,
+        )
+    }
+
+    /// **I1538** — either arrival order, one count. `first` takes the
+    /// objection then the ballot and dismissal; `second` the reverse.
+    pub(crate) async fn i1538_a_row_waits_for_what_it_names(
+        first: &dyn FederationDirectory,
+        second: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let [f, p, q, r, s, actor] =
+            ["f", "p", "q", "r", "s", "actor"].map(|n| format!("{tag}-{n}"));
+        let room = format!("{tag}-room");
+        let action_id = crate::federation::wire_index::content_hash_of_bytes(tag.as_bytes());
+        let action_at = Utc::now() - Duration::hours(2);
+        let mut c = Case {
+            room: room.clone(),
+            actor: actor.clone(),
+            action_id,
+            action_at,
+            objection: uuid::Uuid::new_v4().to_string(),
+        };
+        let objection = objection_row(&c, &q, &c.objection, action_at + Duration::minutes(5));
+        c.objection = objection.attestation_id.clone();
+        for d in [first, second] {
+            for k in [&f, &p, &q, &r, &s, &actor] {
+                register_user_key(d, k).await;
+            }
+            let seats = [&f, &p, &q, &r, &s, &actor].map(|k| k.clone());
+            seed_community(d, &room, &seats, ESCALATING).await;
+        }
+        let ballot = c.ballot(&p, false, ms(Utc::now()));
+        let other = uuid::Uuid::new_v4().to_string();
+        // Short of its floor when it lands; the read re-counts.
+        let dismissal = dismissal_row(&c, &r, &[p.as_str(), s.as_str()], &c.objection);
+        // Names an objection nobody ever held.
+        let stray_ballot = Case {
+            room: room.clone(),
+            actor: actor.clone(),
+            action_id: c.action_id.clone(),
+            action_at,
+            objection: other.clone(),
+        }
+        .ballot(&s, true, ms(Utc::now()));
+        let stray_dismissal = dismissal_row(&c, &s, &[], &other);
+
+        // first: what is named, then what names it.
+        record_objection_against(first, &objection, c.action())
+            .await
+            .expect("door");
+        for (d, tag_order) in [(first, "after"), (second, "before")] {
+            assert_eq!(
+                record_objection_ballot_against(d, &ballot, c.action())
+                    .await
+                    .expect("door"),
+                ObjectionOutcome::Admitted,
+                "I1538: a ballot {tag_order} its objection"
+            );
+            assert_eq!(
+                record_objection_ballot_against(d, &stray_ballot, c.action())
+                    .await
+                    .expect("door"),
+                ObjectionOutcome::Admitted,
+                "I1538: a ballot naming nothing held is held"
+            );
+            for row in [&dismissal, &stray_dismissal] {
+                assert_eq!(
+                    record_objection_dismissal(d, row)
+                        .await
+                        .expect("door")
+                        .outcome,
+                    ObjectionOutcome::Admitted,
+                    "I1538: a dismissal {tag_order} its objection"
+                );
+            }
+        }
+        record_objection_against(second, &objection, c.action())
+            .await
+            .expect("door");
+        for d in [first, second] {
+            let fold = c.fold(d).await;
+            assert_eq!(fold.escalation.len(), 1, "I1538: the stray named nothing");
+            let e = &fold.escalation[0];
+            assert_eq!(
+                (e.respondents, e.overrule_ballots),
+                (1, 1),
+                "I1538: p's ballot counts, the stray does not: {e:?}"
+            );
+            assert!(
+                fold.dismissed_objection_ids.is_empty(),
+                "I1538: three of six persons is short of the floor: {fold:?}"
+            );
+            assert_eq!(fold.distinct_objectors, 1, "I1538: {fold:?}");
+        }
+    }
+
+    /// **I1539** — recusal waits for the target.
+    pub(crate) async fn i1539_recusal_reads_the_held_target(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let [f, p, q, actor] = people(d, tag, ["f", "p", "q", "actor"]).await;
+        let room = format!("{tag}-room");
+        let seats = [&f, &p, &q, &actor].map(|k| k.clone());
+        seed_community(d, &room, &seats, ESCALATING).await;
+        let c = case(d, &room, &actor, &q, tag).await;
+
+        // The attestation door reads the target by id. This action is no held
+        // row, so the actor's own ballot is held for the fold.
+        let own = c.ballot(&actor, false, ms(Utc::now()));
+        assert_eq!(
+            record_objection_ballot(d, &own).await.expect("door"),
+            ObjectionOutcome::Admitted,
+            "I1539: with no held target the ballot waits"
+        );
+        assert_eq!(c.pool(d).await.respondents, 0, "I1539: the fold recuses");
+
+        // Given the target, the door reads the exact key and refuses.
+        let again = c.ballot(&actor, false, ms(Utc::now()));
+        assert_eq!(
+            record_objection_ballot_against(d, &again, c.action())
+                .await
+                .expect("door")
+                .refusal(),
+            Some(ObjectionRefusalReason::ActorRecused),
+            "I1539: the exact key, from the row and its target"
+        );
+    }
+
     fn insufficient(e: &Error) -> bool {
         matches!(
             e,
@@ -1241,6 +1538,16 @@ mod run {
         a.run_migrations().await.unwrap();
         b.run_migrations().await.unwrap();
         bodies::i1534b_either_arrival_order(&a, &b, &tag("s")).await;
+        let c = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        let d = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        c.run_migrations().await.unwrap();
+        d.run_migrations().await.unwrap();
+        bodies::i1538_a_row_waits_for_what_it_names(&c, &d, &tag("s")).await;
+        bodies::i1537b_the_tally_is_shared_the_tier_is_not(&a, &b, &tag("s")).await;
     }
 
     #[cfg(feature = "postgres")]
@@ -1257,8 +1564,20 @@ mod run {
         a.run_migrations().await.unwrap();
         b.run_migrations().await.unwrap();
         bodies::i1534b_either_arrival_order(&a, &b, &tag("p")).await;
+        let c = crate::store::postgres::PostgresBackend::connect(&dsn())
+            .await
+            .unwrap();
+        let d = crate::store::postgres::PostgresBackend::connect(&dsn())
+            .await
+            .unwrap();
+        c.run_migrations().await.unwrap();
+        d.run_migrations().await.unwrap();
+        bodies::i1538_a_row_waits_for_what_it_names(&c, &d, &tag("p")).await;
+        bodies::i1537b_the_tally_is_shared_the_tier_is_not(&a, &b, &tag("p")).await;
     }
 
+    on_every_backend!(i1537, bodies::i1537_the_deadline_is_a_window);
+    on_every_backend!(i1539, bodies::i1539_recusal_reads_the_held_target);
     on_every_backend!(i1533, bodies::i1533_the_count_reads_no_clock);
     on_every_backend!(i1534, bodies::i1534_a_ballot_before_its_occurrence);
     on_every_backend!(i1535, bodies::i1535_an_evicted_seat_stays_the_persons);

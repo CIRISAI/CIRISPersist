@@ -467,6 +467,8 @@ where
     let withdraws_row = (attestation.attestation.attestation_type
         == super::types::attestation_type::WITHDRAWS)
         .then(|| attestation.attestation.clone());
+    let objection_row = super::reverse_quorum::is_cohort_objection(&attestation.attestation)
+        .then(|| attestation.attestation.clone());
     let roster_row = (super::self_roster::is_proposal_row(&attestation.attestation)
         || super::self_roster::answer_identity(&attestation.attestation).is_some())
     .then(|| attestation.attestation.clone());
@@ -511,6 +513,11 @@ where
         (&outcome, &roster_row)
     {
         super::self_roster::after_admission(dir, row).await;
+    }
+    if let (Ok(AttestationOutcome::Inserted | AttestationOutcome::AlreadyHeld), Some(row)) =
+        (&outcome, &objection_row)
+    {
+        super::reverse_quorum::after_objection_held(dir, row).await;
     }
     if let (Ok(AttestationOutcome::Inserted | AttestationOutcome::AlreadyHeld), Some(row)) =
         (&outcome, &rebind_row)

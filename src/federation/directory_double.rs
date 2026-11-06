@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 93 delegations, generated. Every one: fault first, then delegate.
+// 95 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -806,6 +806,16 @@ impl FederationDirectory for FaultInjectingDirectory {
             .note_self_roster_proposal(proposal_id, identity_key_id, received_at)
             .await
     }
+    async fn note_vote_window(
+        &self,
+        action_id: &str,
+        first_held_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("note_vote_window") {
+            return Err(e);
+        }
+        self.inner.note_vote_window(action_id, first_held_at).await
+    }
     async fn project_key_grant_row(&self, row: &Attestation) -> Result<(), Error> {
         if let Some(e) = self.faulted("project_key_grant_row") {
             return Err(e);
@@ -1039,6 +1049,15 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     fn trust_root_standing_cache(&self) -> Option<&canonical_community::StandingCache> {
         self.inner.trust_root_standing_cache()
+    }
+    async fn vote_window_first_held(
+        &self,
+        action_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, Error> {
+        if let Some(e) = self.faulted("vote_window_first_held") {
+            return Err(e);
+        }
+        self.inner.vote_window_first_held(action_id).await
     }
     async fn withdraw_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error> {
         if let Some(e) = self.faulted("withdraw_location_proof") {

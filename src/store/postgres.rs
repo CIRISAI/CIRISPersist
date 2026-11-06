@@ -12175,6 +12175,46 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
+    async fn note_vote_window(
+        &self,
+        action_id: &str,
+        first_held_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // V213 — first-held wins.
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_vote_windows (action_id, first_held_at) \
+                 VALUES ($1, $2) ON CONFLICT (action_id) DO NOTHING",
+                &[&action_id, &first_held_at],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("vote window: {e}")))?;
+        Ok(())
+    }
+
+    async fn vote_window_first_held(
+        &self,
+        action_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let row = client
+            .query_opt(
+                "SELECT first_held_at FROM cirislens.federation_vote_windows \
+                  WHERE action_id = $1",
+                &[&action_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("vote window: {e}")))?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
     async fn note_self_roster_proposal(
         &self,
         proposal_id: &str,

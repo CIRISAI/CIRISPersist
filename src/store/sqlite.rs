@@ -5879,6 +5879,50 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .into_receipt()
     }
 
+    async fn note_vote_window(
+        &self,
+        action_id: &str,
+        first_held_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        let id = action_id.to_owned();
+        let at = self_roster_instant_text(first_held_at);
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            // V213 — first-held wins.
+            conn.execute(
+                "INSERT OR IGNORE INTO federation_vote_windows (action_id, first_held_at) \
+                 VALUES (?1, ?2)",
+                rusqlite::params![id, at],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("vote window: {e}")))
+    }
+
+    async fn vote_window_first_held(
+        &self,
+        action_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::Error> {
+        let id = action_id.to_owned();
+        let held = self
+            .read(move |conn| -> Result<Option<String>, rusqlite::Error> {
+                conn.query_row(
+                    "SELECT first_held_at FROM federation_vote_windows WHERE action_id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("vote window: {e}")))?;
+        held.map(|t| {
+            chrono::DateTime::parse_from_rfc3339(&t)
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .map_err(|e| crate::federation::Error::Backend(format!("vote window: {e}")))
+        })
+        .transpose()
+    }
+
     async fn list_open_self_roster_proposals(
         &self,
         identity_key_id: Option<&str>,

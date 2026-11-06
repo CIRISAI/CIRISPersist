@@ -63,6 +63,9 @@ DELEGATED_DEFAULTS = (
     "list_open_self_roster_proposals",
     "list_settled_self_roster_proposals",
     "settle_self_roster_proposal",
+    # CIRISPersist#1198 — the V213 vote windows, defaulted the same way.
+    "note_vote_window",
+    "vote_window_first_held",
     # v53.1.6 — defaulted `Unsupported`, overridden by every backend (the
     # V150 cohort_target seek has no unbounded twin to compose).
     "list_targeted_by_dimension_prefix",
