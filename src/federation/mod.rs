@@ -798,7 +798,7 @@ mod self_roster_invariants;
 // CIRISPersist#1198 (CC 4.5.13, CC 3.3.6.3) — the person behind a key: what a
 // tally counts.
 pub mod key_person;
-// CIRISPersist#1198 (CC 4.5.13) — I1525–I1531: a vote counts once per person.
+// CIRISPersist#1198 (CC 4.5.13) — I1525–I1536: a vote counts once per person.
 #[cfg(test)]
 mod vote_by_person_invariants;
 // v55.0.0 (CIRISPersist#1007) — the duty-holder takedown on the steward
@@ -7684,7 +7684,7 @@ pub trait FederationDirectory: Send + Sync {
         let persons =
             key_person::KeySelves::read(self, roster.iter().map(|s| s.key_id.clone()).collect())
                 .await?;
-        let persons = persons.at(chrono::Utc::now());
+        let persons = persons.held();
         for &direction in directions {
             match consensus::evaluate(&consensus::Ballot {
                 protocol: &protocol,

@@ -6,17 +6,19 @@
 //! - **I1525** — a person's two devices are one voice: on a ballot (second
 //!   device unseated, or both seated), on an objection, on a dismissal's
 //!   m-of-n, in the numerator and the denominator; an actor's other device is
-//!   recused with the actor.
+//!   recused with the actor; a held dismissal carried by two seats of one self
+//!   no longer clears.
 //! - **I1526** — a person's disagreeing rows are no voice, from two devices
 //!   or from one key, and every row stays held. The latest-instant fold is
 //!   gone.
 //! - **I1527** — a withdrawal by any key of the same fedID leaves one voice;
-//!   a key of another self cannot withdraw the row, and a person who
-//!   withdrew everything has not spoken.
-//! - **I1528** — a key of another self does not count: the door refuses it,
-//!   and a row held anyway is no voice.
+//!   a key of another self's withdrawal is held and retracts nothing, and a
+//!   person who withdrew everything has not spoken.
+//! - **I1528** — a key of another self does not count: its row is admitted
+//!   and held, and is no voice.
 //! - **I1529** — an evicted device's vote is void at the count: a row cast
-//!   before the eviction, a row backdated past it, and a seated device's row.
+//!   before the eviction, a row after it, one backdated past it, and a seated
+//!   device's row.
 //!   The person's other device keeps the voice.
 //! - **I1530** — a membership change counts persons: two seats of one self
 //!   are one voice of the denominator and the numerator, a second device
@@ -24,6 +26,16 @@
 //!   in a room and in a family; the removal floor holds.
 //! - **I1532** (`group_plane_invariants`) — a cosigned `withdraws` of a roster
 //!   event counts persons, a second device signing for its seated person.
+//! - **I1533** (CC's ruling on #1198, item 1) — the count reads no clock: a
+//!   held revocation ends a key's voice whatever instant it names, expiry
+//!   ends nothing, and two values of `now` give one count.
+//! - **I1534** (item 2) — every verifiable vote row is admitted and the fold
+//!   voids it: a ballot held before its occurrence row counts the moment that
+//!   row is held, and two nodes reach one count in either arrival order.
+//! - **I1535** (item 3) — an evicted seat stays its person's, in a
+//!   `founder_only` family: the person's other key acts, the evicted one does
+//!   not.
+//! - **I1536** (item 5) — a recanted row is not live, as a withdrawn one.
 //! - **I1531** — no row order, in arrival or in `asserted_at`, changes the
 //!   count.
 
@@ -41,12 +53,13 @@ pub(crate) mod bodies {
     use crate::federation::reverse_quorum::{
         ballot_envelope, dismissal_envelope, objection_envelope, record_objection_against,
         record_objection_ballot_against, record_objection_dismissal, resolve_reverse_quorum_for,
-        ActionRef, ObjectionEscalation, ObjectionOutcome, ObjectionRefusalReason,
-        ReverseQuorumFold, ReverseQuorumStanding,
+        ActionRef, ObjectionEscalation, ObjectionOutcome, ReverseQuorumFold, ReverseQuorumStanding,
     };
     use crate::federation::self_roster_invariants::bodies::add;
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::consensus_protocol::{MAJORITY, OPEN_SELF_ADMIT, UNANIMOUS};
+    use crate::federation::types::consensus_protocol::{
+        FOUNDER_ONLY, MAJORITY, OPEN_SELF_ADMIT, UNANIMOUS,
+    };
     use crate::federation::types::{
         CommunityMember, CommunityMembershipRevocation, CommunityMembershipWidening,
         FamilyMembershipWidening,
@@ -258,14 +271,13 @@ pub(crate) mod bodies {
             "I1525: one of p's rows stands for the voice: {e:?}"
         );
 
-        // ── An actor's other device is recused with them.
-        let recused = c.ballot(&actor2, true, ms(Utc::now()));
+        // ── An actor's other device is recused with them: the row is admitted,
+        //    since the door may not yet hold the occurrence, and the fold
+        //    voids it.
+        c.cast(d, &actor2, true).await;
         assert_eq!(
-            record_objection_ballot_against(d, &recused, c.action())
-                .await
-                .expect("door")
-                .refusal(),
-            Some(ObjectionRefusalReason::ActorRecused),
+            c.pool(d).await.respondents,
+            2,
             "I1525: the actor's second device is the actor"
         );
 
@@ -300,6 +312,32 @@ pub(crate) mod bodies {
             (short.quorum.roster_size, short.quorum.required),
             (5, 3),
             "I1525: {short:?}"
+        );
+
+        // A dismissal held from before this count, carried by two seats of one
+        // self, stops clearing: three keys, two persons (a named adopter
+        // delta, CC's ruling on #1198, item 4).
+        let held = signed_row(
+            &uuid::Uuid::new_v4().to_string(),
+            &r,
+            &c.actor,
+            dismissal_envelope(
+                Cohort::Community,
+                &c.room,
+                &c.action_id,
+                &c.objection,
+                "carried by keys",
+            ),
+            ms(Utc::now()),
+            &[p.as_str(), pd.as_str()],
+        );
+        d.put_attestation(crate::federation::SignedAttestation { attestation: held })
+            .await
+            .expect("held");
+        let fold = c.fold(d).await;
+        assert!(
+            fold.dismissed_objection_ids.is_empty(),
+            "I1525: two persons of five do not dismiss: {fold:?}"
         );
 
         // A reversal's cap at the roster is a cap at the persons on it.
@@ -427,11 +465,21 @@ pub(crate) mod bodies {
         let overrule = c.cast(d, &pd, false).await;
         assert_eq!(c.pool(d).await.respondents, 0, "I1527: at odds");
 
-        // Another self's key may not withdraw it, and its attempt changes
-        // nothing.
-        store(d, &withdraws_of(&r, &r, &uphold.attestation_id))
+        // Another self's key withdraws nothing: the row is admitted, carries
+        // no admission rule, and the fold ignores it.
+        let foreign = withdraws_of(&r, &r, &uphold.attestation_id);
+        store(d, &foreign)
             .await
-            .expect_err("I1527: a key of another self withdraws nothing");
+            .unwrap_or_else(|e| panic!("I1527: the row is verifiable: {e}"));
+        assert_eq!(
+            d.get_attestation(&foreign.attestation_id)
+                .await
+                .unwrap()
+                .expect("held")
+                .withdraws_admission_rule,
+            None,
+            "I1527: no reader may honour it as an admitted retraction"
+        );
         assert_eq!(c.pool(d).await.respondents, 0, "I1527: still at odds");
 
         // The sibling device withdraws the row the first device signed.
@@ -456,6 +504,18 @@ pub(crate) mod bodies {
         c.cast(d, &p, true).await;
         let e = c.pool(d).await;
         assert_eq!((e.respondents, e.uphold_ballots), (1, 1), "I1527: {e:?}");
+
+        // An objection is a vote row too: a stranger's withdrawal of it is
+        // held and ignored, the person's sibling key retracts it.
+        let c = case(d, &room, &actor, &p, tag).await;
+        store(d, &withdraws_of(&r, &r, &c.objection))
+            .await
+            .unwrap_or_else(|e| panic!("I1527: held: {e}"));
+        assert_eq!(c.fold(d).await.distinct_objectors, 1, "I1527: still raised");
+        store(d, &withdraws_of(&pd, &pd, &c.objection))
+            .await
+            .unwrap_or_else(|e| panic!("I1527: a sibling retracts: {e}"));
+        assert_eq!(c.fold(d).await.distinct_objectors, 0, "I1527: retracted");
     }
 
     /// **I1528** — a key of another self does not count.
@@ -468,21 +528,24 @@ pub(crate) mod bodies {
         seed_community(d, &room, &seats, ESCALATING).await;
         let c = case(d, &room, &actor, &q, tag).await;
         for stranger in [&o, &od] {
-            let row = c.ballot(stranger, true, ms(Utc::now()));
-            assert_eq!(
-                record_objection_ballot_against(d, &row, c.action())
-                    .await
-                    .expect("door")
-                    .refusal(),
-                Some(ObjectionRefusalReason::NotACohortMember),
-                "I1528: {stranger} is not of the room"
+            c.cast(d, stranger, true).await;
+            let objection = objection_row(
+                &c,
+                stranger,
+                &uuid::Uuid::new_v4().to_string(),
+                c.action_at + Duration::minutes(6),
             );
-            // Held anyway (a replicated row): no voice.
-            d.put_attestation(crate::federation::SignedAttestation { attestation: row })
-                .await
-                .expect("held");
+            assert_eq!(
+                record_objection_against(d, &objection, c.action())
+                    .await
+                    .expect("door"),
+                ObjectionOutcome::Admitted,
+                "I1528: a verifiable row is admitted"
+            );
         }
-        assert_eq!(c.pool(d).await.respondents, 0, "I1528: no voice");
+        let fold = c.fold(d).await;
+        assert_eq!(fold.escalation[0].respondents, 0, "I1528: no voice");
+        assert_eq!(fold.distinct_objectors, 1, "I1528: q's objection alone");
     }
 
     /// **I1529** — an evicted device's vote is void at the count.
@@ -510,16 +573,9 @@ pub(crate) mod bodies {
             "I1529: the row is held and the device is gone"
         );
 
-        // Signed after the eviction, unbackdated: not of the room.
-        let late = c.ballot(&pd, true, ms(Utc::now()));
-        assert_eq!(
-            record_objection_ballot_against(d, &late, c.action())
-                .await
-                .expect("door")
-                .refusal(),
-            Some(ObjectionRefusalReason::NotACohortMember),
-            "I1529: an evicted device is no member's device"
-        );
+        // Signed after the eviction: admitted, held, void.
+        c.cast(d, &pd, true).await;
+        assert_eq!(c.pool(d).await.respondents, 0, "I1529: void after it too");
 
         // Signed after the eviction and dated before it: a signer-chosen
         // instant reinstates nothing.
@@ -552,6 +608,259 @@ pub(crate) mod bodies {
         c.cast(d, &p, false).await;
         let e = c.pool(d).await;
         assert_eq!((e.respondents, e.overrule_ballots), (1, 1), "I1529: {e:?}");
+    }
+
+    /// **I1533** — the count reads no clock.
+    pub(crate) async fn i1533_the_count_reads_no_clock(d: &dyn FederationDirectory, tag: &str) {
+        let [f, p, pd, pe, q, r, s, actor] =
+            people(d, tag, ["f", "p", "pd", "pe", "q", "r", "s", "actor"]).await;
+        device(d, &p, &pd).await;
+        // pe's assertion expires almost at once.
+        let at = ms(Utc::now());
+        d.put_identity_occurrence(
+            ts::signed_content_only_occurrence_until(
+                &s,
+                &s,
+                &pe,
+                at,
+                Some(at + Duration::milliseconds(40)),
+            )
+            .await,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("I1533: pe joins s: {e}"));
+        let room = format!("{tag}-room");
+        let seats = [&f, &p, &q, &r, &s, &actor].map(|k| k.clone());
+        seed_community(d, &room, &seats, ESCALATING).await;
+        let c = case(d, &room, &actor, &q, tag).await;
+
+        // An expired device still votes: only a held revocation ends a voice.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        c.cast(d, &pe, true).await;
+        let e = c.pool(d).await;
+        assert_eq!(
+            (e.respondents, e.uphold_ballots),
+            (1, 1),
+            "I1533: expiry voids nothing at the count: {e:?}"
+        );
+
+        // A revocation dated in the future is held, so the voice is over now.
+        let cast = c.cast(d, &pd, false).await;
+        let later = ms(Utc::now()) + Duration::days(30);
+        d.put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
+            identity_key_id: p.clone(),
+            occurrence_key_id: pd.clone(),
+            revoked_at: later,
+            effective_at: later,
+            reason: None,
+            witness_set: Vec::new(),
+            persist_row_hash: String::new(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("I1533: the revocation lands: {e}"));
+        assert_eq!(
+            c.pool(d).await.respondents,
+            1,
+            "I1533: a held revocation ends the voice, whatever instant it names"
+        );
+        assert!(
+            d.get_attestation(&cast.attestation_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "I1533: the row stays held"
+        );
+
+        // Two values of `now`, before and long after the rows' instants, give
+        // one count. A row dated after `now` is counted: `now` is not an input.
+        let answer = |e: ObjectionEscalation| {
+            (
+                e.respondents,
+                e.uphold_ballots,
+                e.overrule_ballots,
+                e.counted_ballot_ids,
+            )
+        };
+        let mut answers = Vec::new();
+        for now in [
+            c.action_at + Duration::hours(1) + Duration::minutes(11),
+            Utc::now() + Duration::days(3650),
+        ] {
+            let fold = resolve_reverse_quorum_for(d, Cohort::Community, &c.room, c.action(), now)
+                .await
+                .expect("resolve");
+            answers.push(answer(fold.escalation[0].clone()));
+        }
+        assert_eq!(answers[0], answers[1], "I1533: `now` is not an input");
+        assert_eq!(answers[0].0, 1, "I1533: {answers:?}");
+
+        // The clock gates admission: a row dated far ahead is refused at the
+        // door by the universal signed-instant gate.
+        let ahead = c.ballot(&r, true, ms(Utc::now()) + Duration::days(36_500));
+        record_objection_ballot_against(d, &ahead, c.action())
+            .await
+            .expect_err("I1533: the door refuses a row past its skew");
+    }
+
+    /// **I1534** — a ballot held before its occurrence, on one node.
+    pub(crate) async fn i1534_a_ballot_before_its_occurrence(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let [f, p, pd, q, r, actor] = people(d, tag, ["f", "p", "pd", "q", "r", "actor"]).await;
+        let room = format!("{tag}-room");
+        let seats = [&f, &p, &q, &r, &actor].map(|k| k.clone());
+        seed_community(d, &room, &seats, ESCALATING).await;
+        let c = case(d, &room, &actor, &q, tag).await;
+
+        // The device's ballot arrives first, and is held. Its key is not yet
+        // anyone's.
+        c.cast(d, &pd, true).await;
+        assert_eq!(c.pool(d).await.respondents, 0, "I1534: not yet p's");
+
+        // The moment the occurrence is held, it is p's voice.
+        device(d, &p, &pd).await;
+        let e = c.pool(d).await;
+        assert_eq!((e.respondents, e.uphold_ballots), (1, 1), "I1534: {e:?}");
+
+        // A second objection by one key is admitted too: one voice.
+        let again = objection_row(
+            &c,
+            &q,
+            &uuid::Uuid::new_v4().to_string(),
+            c.action_at + Duration::minutes(6),
+        );
+        assert_eq!(
+            record_objection_against(d, &again, c.action())
+                .await
+                .expect("door"),
+            ObjectionOutcome::Admitted,
+            "I1534: nothing is refused for arriving second"
+        );
+        assert_eq!(c.fold(d).await.distinct_objectors, 1, "I1534: one voice");
+    }
+
+    /// **I1534 (two nodes)** — either arrival order, one count. `first` takes
+    /// the occurrence then the ballot, `second` the ballot then the
+    /// occurrence.
+    pub(crate) async fn i1534b_either_arrival_order(
+        first: &dyn FederationDirectory,
+        second: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let [f, p, pd, q, r, actor] =
+            ["f", "p", "pd", "q", "r", "actor"].map(|n| format!("{tag}-{n}"));
+        let room = format!("{tag}-room");
+        let action_id = crate::federation::wire_index::content_hash_of_bytes(tag.as_bytes());
+        let action_at = Utc::now() - Duration::hours(2);
+        let mut c = Case {
+            room: room.clone(),
+            actor: actor.clone(),
+            action_id,
+            action_at,
+            objection: uuid::Uuid::new_v4().to_string(),
+        };
+        let objection = objection_row(&c, &q, &c.objection, action_at + Duration::minutes(5));
+        c.objection = objection.attestation_id.clone();
+        for d in [first, second] {
+            for k in [&f, &p, &pd, &q, &r, &actor] {
+                register_user_key(d, k).await;
+            }
+            let seats = [&f, &p, &q, &r, &actor].map(|k| k.clone());
+            seed_community(d, &room, &seats, ESCALATING).await;
+            record_objection_against(d, &objection, c.action())
+                .await
+                .expect("door");
+        }
+        let occurrence = ts::signed_content_only_occurrence(&p, &p, &pd, ms(Utc::now())).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let ballot = c.ballot(&pd, false, ms(Utc::now()));
+        first
+            .put_identity_occurrence(occurrence.clone())
+            .await
+            .expect("occurrence");
+        for d in [first, second] {
+            assert_eq!(
+                record_objection_ballot_against(d, &ballot, c.action())
+                    .await
+                    .expect("door"),
+                ObjectionOutcome::Admitted,
+                "I1534: admitted in either order"
+            );
+        }
+        second
+            .put_identity_occurrence(occurrence)
+            .await
+            .expect("occurrence");
+        let (a, b) = (c.pool(first).await, c.pool(second).await);
+        assert_eq!(
+            (a.respondents, a.overrule_ballots, &a.counted_ballot_ids),
+            (b.respondents, b.overrule_ballots, &b.counted_ballot_ids),
+            "I1534: every node holding the same rows reaches the same count"
+        );
+        assert_eq!((a.respondents, a.overrule_ballots), (1, 1), "I1534: {a:?}");
+    }
+
+    /// **I1535** — an evicted founder seat in a `founder_only` family.
+    pub(crate) async fn i1535_an_evicted_seat_stays_the_persons(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let [p, ps, q, x, y] = ["p", "ps", "q", "x", "y"].map(|n| format!("{tag}-{n}"));
+        let fam = format!("{tag}-fam");
+        reg(d, &[&p, &ps, &q, &x, &y, &fam]).await;
+        device(d, &p, &ps).await;
+        found_family(d, &fam, FOUNDER_ONLY, &[&ps, &q], &[])
+            .await
+            .unwrap_or_else(|e| panic!("I1535: founded: {e}"));
+        evict(d, &p, &ps).await;
+        let widen = |signer: &str, member: &str| {
+            let at = ms(Utc::now());
+            ts::sign_family_membership_widening(
+                signer,
+                FamilyMembershipWidening {
+                    family_key_id: fam.clone(),
+                    member_key_id: member.to_owned(),
+                    joined_at: at,
+                    effective_at: at,
+                    role: None,
+                    persist_row_hash: String::new(),
+                },
+            )
+        };
+        let e = d
+            .put_family_membership_widening_consented(widen(&ps, &x))
+            .await
+            .expect_err("I1535: the evicted key signs for nobody");
+        assert!(insufficient(&e), "I1535: {e}");
+        d.put_family_membership_widening_consented(widen(&p, &y))
+            .await
+            .unwrap_or_else(|e| panic!("I1535: a lost phone wedges nothing: {e}"));
+    }
+
+    /// **I1536** — a recanted row is not live.
+    pub(crate) async fn i1536_a_recant_leaves_the_other_row(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let [f, p, pd, q, r, actor] = people(d, tag, ["f", "p", "pd", "q", "r", "actor"]).await;
+        device(d, &p, &pd).await;
+        let room = format!("{tag}-room");
+        let seats = [&f, &p, &q, &r, &actor].map(|k| k.clone());
+        seed_community(d, &room, &seats, ESCALATING).await;
+        let c = case(d, &room, &actor, &q, tag).await;
+        let uphold = c.cast(d, &p, true).await;
+        let overrule = c.cast(d, &pd, false).await;
+        assert_eq!(c.pool(d).await.respondents, 0, "I1536: at odds");
+        ts::put_retraction(d, &p, &p, &uphold.attestation_id, "recants")
+            .await
+            .unwrap_or_else(|e| panic!("I1536: p recants p's row: {e}"));
+        let e = c.pool(d).await;
+        assert_eq!(
+            e.counted_ballot_ids,
+            vec![overrule.attestation_id.clone()],
+            "I1536: the recant leaves the other row standing: {e:?}"
+        );
     }
 
     fn insufficient(e: &Error) -> bool {
@@ -918,6 +1227,42 @@ mod run {
         );
     }
 
+    /// Two empty nodes of one backend.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1534b_sqlite() {
+        use crate::store::Backend as _;
+        let a = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        a.run_migrations().await.unwrap();
+        b.run_migrations().await.unwrap();
+        bodies::i1534b_either_arrival_order(&a, &b, &tag("s")).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1534b_postgres() {
+        use crate::store::Backend as _;
+        let dsn = || crate::test_pg::empty_dsn().expect("no CIRIS_PERSIST_TEST_PG base DSN");
+        let a = crate::store::postgres::PostgresBackend::connect(&dsn())
+            .await
+            .unwrap();
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn())
+            .await
+            .unwrap();
+        a.run_migrations().await.unwrap();
+        b.run_migrations().await.unwrap();
+        bodies::i1534b_either_arrival_order(&a, &b, &tag("p")).await;
+    }
+
+    on_every_backend!(i1533, bodies::i1533_the_count_reads_no_clock);
+    on_every_backend!(i1534, bodies::i1534_a_ballot_before_its_occurrence);
+    on_every_backend!(i1535, bodies::i1535_an_evicted_seat_stays_the_persons);
+    on_every_backend!(i1536, bodies::i1536_a_recant_leaves_the_other_row);
     on_every_backend!(i1525, bodies::i1525_two_devices_are_one_voice);
     on_every_backend!(i1526, bodies::i1526_disagreement_is_no_voice);
     on_every_backend!(i1527, bodies::i1527_a_sibling_withdrawal_leaves_one);

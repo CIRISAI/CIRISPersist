@@ -464,7 +464,7 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     PersistFamilyRule {
         prefix: "objection:",
         rule: "cohort-member-only",
-        enforced_at: &["federation::reverse_quorum::record_objection"],
+        enforced_at: &["federation::reverse_quorum::fold_reverse_quorum_over"],
         gap: RowRuleGap::NoRuleOnTheRow,
         minted_by_persist: true,
         cc_ask: "CIRISConstitution#67 (the row itself defers: \"emitter/composition elaboration \

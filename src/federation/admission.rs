@@ -10503,21 +10503,6 @@ pub async fn resolve_withdraws_admission_rule_at(
     if issuer_owned_the_producer_when(directory, issuer, target).await? {
         return Ok(1);
     }
-    // Rule 1, lifted to the person — CIRISPersist#1198 (CC 4.5.13): a vote
-    // row's withdrawal is the author's own, "which any key of the same fedID
-    // signs".
-    if super::reverse_quorum::is_vote_row(target) {
-        let persons = super::key_person::KeySelves::read(
-            directory,
-            vec![issuer.to_owned(), target.attesting_key_id.clone()],
-        )
-        .await?;
-        let persons = persons.at(super::self_roster::roster_clock());
-        if persons.voice(issuer) == Some(persons.seat_person(&target.attesting_key_id)) {
-            return Ok(1);
-        }
-    }
-
     // v21.11.0 (CIRISPersist#528), RATIFIED at **CC 2.4.1.1** as the
     // anti-Goodhart retraction dual — for the scored families whose
     // SELF-EMISSION is banned (`capacity:*` /
@@ -11039,6 +11024,16 @@ pub async fn check_withdraws_admission_at(
     // conformant binding MUST name K there — at which point rule 2 would hand
     // K's key the power to shed its owner unilaterally. Gating the admitting
     // branch closes that before the producer change lands, not after.
+    // CIRISPersist#1198 (CC's ruling, item 2) — a retraction of a vote row
+    // is a vote row's: every verifiable one is admitted, and the fold decides
+    // whether its signer speaks for the author, which a door could only answer
+    // by arrival order. No rule is recorded, so no reader of the plane honours
+    // it as an admitted retraction.
+    if crate::federation::reverse_quorum::is_vote_row(&target)
+        && row.attesting_key_id != target.attesting_key_id
+    {
+        return Ok(None);
+    }
     match resolve_withdraws_admission_rule_at(directory, &row.attesting_key_id, &target, depth)
         .await
     {

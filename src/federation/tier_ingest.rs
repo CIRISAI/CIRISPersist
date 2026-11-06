@@ -1923,9 +1923,24 @@ pub mod test_support {
         occurrence: &str,
         asserted_at: chrono::DateTime<chrono::Utc>,
     ) -> crate::federation::SignedIdentityOccurrence {
-        let asserted_at =
-            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(asserted_at.timestamp_millis())
-                .expect("ms instant");
+        signed_content_only_occurrence_until(signer, identity, occurrence, asserted_at, None).await
+    }
+
+    /// CIRISPersist#1198 — [`signed_content_only_occurrence`] with a
+    /// `valid_until`, truncated to the millisecond as `asserted_at` is.
+    pub async fn signed_content_only_occurrence_until(
+        signer: &str,
+        identity: &str,
+        occurrence: &str,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+        valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> crate::federation::SignedIdentityOccurrence {
+        let ms = |t: chrono::DateTime<chrono::Utc>| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis())
+                .expect("ms instant")
+        };
+        let asserted_at = ms(asserted_at);
+        let valid_until = valid_until.map(ms);
         let x_pub = ciris_crypto::x25519::public_from_secret(&seed_for(occurrence));
         let (_sk, ml_pub) = ciris_crypto::ml_kem::generate_keypair().expect("ml-kem keypair");
         let enc = crate::federation::EncryptionPubkeys {
@@ -1942,7 +1957,8 @@ pub mod test_support {
                 "ml_kem_768_base64": enc.ml_kem_768_base64,
             },
             "asserted_at": asserted_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            "valid_until": serde_json::Value::Null,
+            "valid_until": valid_until
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
             "hardware_attestation": serde_json::Value::Null,
         });
         let id = Box::new(
@@ -1966,7 +1982,7 @@ pub mod test_support {
                 device_class: crate::federation::types::device_class::SERVER.to_owned(),
                 hardware_attestation: None,
                 asserted_at,
-                valid_until: None,
+                valid_until,
                 encryption_pubkeys: Some(enc),
                 transport_binding: None,
                 persist_row_hash: String::new(),

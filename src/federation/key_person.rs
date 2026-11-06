@@ -3,16 +3,23 @@
 //! whose self roster the key belongs to; a tally counts fedIDs.
 //!
 //! [`KeySelves`] holds what the directory says about a set of keys, and
-//! [`PersonsAt`] answers from it at one instant, with no further read, the
-//! same split as [`NodeBearingSeats`](super::NodeBearingSeats): the roster
-//! fold asks at every event's instant and stays pure.
+//! [`PersonsAt`] answers from it with no further read, the same split as
+//! [`NodeBearingSeats`](super::NodeBearingSeats).
+//!
+//! **No clock reaches an answer** (CC's ruling on #1198, item 1). A key has
+//! left its self when a held revocation is at or after its latest held
+//! assertion: an order among held rows by their signed instants. Expiry ends
+//! nothing here. [`KeySelves::held`] reads every held row, for a count over
+//! held votes; [`KeySelves::at`] stops at a row's own signed instant, for a
+//! roster event, whose signers are judged as they stood at that event (no
+//! ending is retroactive).
 //!
 //! Two questions, because a seat outlives the device in it:
 //!
 //! - [`PersonsAt::seat_person`] — whose seat is this key's? The live self of
 //!   the key, else the self it last belonged to, else the key itself. An
 //!   evicted device's seat stays its person's, so losing a phone costs the
-//!   device its voice and the person nothing.
+//!   device its voice and the person nothing (CC's ruling on #1198, item 3).
 //! - [`PersonsAt::voice`] — whom does this key's signature speak for? The
 //!   live self of the key, or the key itself when it never belonged to one.
 //!   `None` for a key that has left its self, and for a key on two rosters,
@@ -125,7 +132,7 @@ impl KeySelves {
         self.keys.contains_key(key)
     }
 
-    /// The answers at `at`.
+    /// The answers over the rows held up to the signed instant `at`.
     #[must_use]
     pub fn at(&self, at: DateTime<Utc>) -> PersonsAt<'_> {
         PersonsAt {
@@ -135,14 +142,20 @@ impl KeySelves {
         }
     }
 
-    /// The answers at `at`, reading `more` first (a caller's keys over a
-    /// fold's shared set, without copying it).
+    /// The answers over every row held: what a count over held votes reads.
     #[must_use]
-    pub fn at_with<'a>(&'a self, more: &'a KeySelves, at: DateTime<Utc>) -> PersonsAt<'a> {
+    pub fn held(&self) -> PersonsAt<'_> {
+        self.at(DateTime::<Utc>::MAX_UTC)
+    }
+
+    /// [`Self::held`], reading `more` first (a caller's keys over a fold's
+    /// shared set, without copying it).
+    #[must_use]
+    pub fn held_with<'a>(&'a self, more: &'a KeySelves) -> PersonsAt<'a> {
         PersonsAt {
             selves: self,
             more: Some(more),
-            at,
+            at: DateTime::<Utc>::MAX_UTC,
         }
     }
 }
@@ -225,7 +238,12 @@ impl<'a> PersonsAt<'a> {
         facts
             .selves
             .iter()
-            .filter(|s| roster_assertion_live(&s.asserted, &s.revocations, self.at))
+            .filter(|s| {
+                // No `valid_until`: expiry never voids a vote at the count.
+                let asserted: Vec<InstantInterval> =
+                    s.asserted.iter().map(|(at, _)| (*at, None)).collect();
+                roster_assertion_live(&asserted, &s.revocations, self.at)
+            })
             .map(|s| s.identity.as_str())
             .collect()
     }
@@ -331,7 +349,6 @@ impl<'a> PersonsAt<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
 
     fn t(secs: i64) -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap()
@@ -374,14 +391,25 @@ mod tests {
         assert_eq!(s.at(t(25)).seat_person("d"), "f");
     }
 
-    /// An expired assertion is a left self, the same as an eviction.
+    /// Expiry ends nothing, and only a held revocation does: CC's ruling on
+    /// #1198, item 1. A revocation at or after the latest assertion ends the
+    /// voice whatever instant it names; a later assertion re-establishes it.
     #[test]
-    fn an_expired_device_has_no_voice() {
-        let mut h = device("f", 10, None);
-        h.asserted[0].1 = Some(t(20));
-        let s = selves(vec![("d", user(vec![h]))]);
-        assert_eq!(s.at(t(15)).voice("d"), Some("f"));
-        assert_eq!(s.at(t(25)).voice("d"), None);
+    fn only_a_held_revocation_ends_a_voice() {
+        let mut expired = device("f", 10, None);
+        expired.asserted[0].1 = Some(t(20));
+        let s = selves(vec![("d", user(vec![expired]))]);
+        assert_eq!(s.held().voice("d"), Some("f"));
+        assert_eq!(s.at(t(25)).voice("d"), Some("f"));
+
+        let s = selves(vec![("d", user(vec![device("f", 10, Some(99_999))]))]);
+        assert_eq!(s.held().voice("d"), None, "future-dated, and held");
+        assert_eq!(s.held().seat_person("d"), "f");
+
+        let mut back = device("f", 10, Some(20));
+        back.asserted.push((t(30), None));
+        let s = selves(vec![("d", user(vec![back]))]);
+        assert_eq!(s.held().voice("d"), Some("f"), "the latest assertion wins");
     }
 
     /// An evicted genesis key speaks for nobody; its string still names the
@@ -433,8 +461,6 @@ mod tests {
     fn more_is_read_first() {
         let shared = selves(vec![("d", user(vec![device("f", 10, None)]))]);
         let more = selves(vec![("e", user(vec![device("f", 10, None)]))]);
-        let at = t(15) + Duration::seconds(1);
-        let p = shared.at_with(&more, at);
-        assert!(p.same_person("d", "e"));
+        assert!(shared.held_with(&more).same_person("d", "e"));
     }
 }
