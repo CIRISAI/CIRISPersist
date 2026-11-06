@@ -4131,7 +4131,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let (read, bytes) = self
             .read_measured(
                 move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                    let mut stmt = conn.prepare(&sql)?;
+                    let mut stmt = conn.prepare_cached(&sql)?;
                     let rows =
                         stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
                     rows.collect()
@@ -4169,7 +4169,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let (read, bytes) = self
             .read_measured(
                 move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                    let mut stmt = conn.prepare(&sql)?;
+                    let mut stmt = conn.prepare_cached(&sql)?;
                     let rows = stmt.query_map(
                         rusqlite::params![target, composers[0], composers[1], composers[2]],
                         sqlite_row_to_attestation,

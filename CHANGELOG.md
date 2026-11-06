@@ -5,6 +5,13 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [61.0.4] - 2026-11-06
+
+### Fixed
+
+- **SQLite attestation reads reuse their prepared statement.** `execute_attestation_query` and the referencing read now use the statement cache, and each reader holds 128 statements. Bridge profiled a production-sized copy of the 0.5.245 candidate at 24% of CPU in `sqlite3_prepare_v2`.
+- **The one-live-key route fold costs one owner read per key (Edge).** `fold_one_live_key` read `owner_of` for both keys of every pair on a destination, two attestation queries each, so a destination shared by k keys cost about k² read pairs. Production holds one with 3,281 live routes. The fold now keeps each key's owner for the call, and an ownerless row ends after its own read. Verdicts do not change.
+
 ## [61.0.3] - 2026-11-05
 
 ### Fixed

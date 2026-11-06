@@ -90,6 +90,72 @@ pub(crate) mod bodies {
         );
     }
 
+    /// I1543 (Edge, the v44 tag blocker) — **a shared destination costs one
+    /// owner read per key, never one per pair.** Anyone can mint this shape, so
+    /// the bound holds with no key record behind any of the routes. An ownerless
+    /// row read alone costs its own read, whatever else claims the destination.
+    pub(crate) async fn i1543_a_shared_destination_reads_each_owner_once(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        const CLAIMANTS: usize = 12;
+        let dest = format!("{tag}shared");
+        let mut rows = Vec::new();
+        for i in 0..CLAIMANTS {
+            let r = route(
+                &format!("{tag}-bench-{i}"),
+                &dest,
+                1 + i as u64,
+                "2026-10-22T00:00:00.000Z",
+            );
+            d.put_transport_destination(&r).await.unwrap();
+            rows.push(r);
+        }
+        let (kept, reads) =
+            crate::federation::transport_routes::fold_counting_owner_reads(d, rows.clone())
+                .await
+                .unwrap();
+        assert_eq!(kept.len(), CLAIMANTS, "I1543: ownerless keys coexist");
+        assert!(
+            reads <= CLAIMANTS,
+            "I1543: {reads} owner reads for {CLAIMANTS} keys"
+        );
+        let (_, one) = crate::federation::transport_routes::fold_counting_owner_reads(
+            d,
+            vec![rows[0].clone()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(one, 1, "I1543: an ownerless row costs its own read");
+
+        // Tied claimants: each key's owner is read once, and the verdict holds.
+        let owner = format!("{tag}-owner");
+        ts::register_identity_key(d, &owner, USER).await;
+        let tied_dest = format!("{tag}tied");
+        let mut tied = Vec::new();
+        for i in 0..CLAIMANTS {
+            let node = format!("{tag}-tied-{i}");
+            ts::register_identity_key(d, &node, NODE).await;
+            ts::put_owner_binding(d, &owner, &node).await;
+            let r = route(&node, &tied_dest, 1 + i as u64, "2026-10-22T00:00:00.000Z");
+            d.put_transport_destination(&r).await.unwrap();
+            tied.push(r);
+        }
+        let (kept, reads) =
+            crate::federation::transport_routes::fold_counting_owner_reads(d, tied.clone())
+                .await
+                .unwrap();
+        assert_eq!(
+            keys(&kept),
+            vec![format!("{tag}-tied-{}", CLAIMANTS - 1)],
+            "I1543: the newest tied key alone stays live"
+        );
+        assert!(
+            reads <= CLAIMANTS,
+            "I1543: {reads} owner reads for {CLAIMANTS} keys"
+        );
+    }
+
     /// I1122-B — **one destination, one live key.** Two node keys with one
     /// live owner (a split home) on one destination: the newer route displaces
     /// the older on every read, and the older key lists no route. A third key
@@ -261,6 +327,15 @@ mod tests {
                 async fn i1122_a_agent_routes_are_refused() {
                     let Some(b) = $make.await else { return };
                     super::super::bodies::i1122_a_agent_routes_are_refused(&b, &super::tag()).await;
+                }
+                #[tokio::test]
+                async fn i1543_a_shared_destination_reads_each_owner_once() {
+                    let Some(b) = $make.await else { return };
+                    super::super::bodies::i1543_a_shared_destination_reads_each_owner_once(
+                        &b,
+                        &super::tag(),
+                    )
+                    .await;
                 }
                 #[tokio::test]
                 async fn i1122_b_a_tied_newer_route_displaces() {
