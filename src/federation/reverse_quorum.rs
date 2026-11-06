@@ -3897,6 +3897,29 @@ mod tests {
         // Two seats of one self are one duty-holder.
         let e = inputs(&["m1".to_string(), "m1b".to_string()], &[], "m3");
         assert_eq!((e.duty_holders, e.steward_ruling_required), (1, 1), "{e:?}");
+        // The actor signed on a device: the person's seated key is recused.
+        let f = fold_reverse_quorum_over(&ReverseQuorumInputs {
+            action: ActionRef {
+                actor_key_id: "a1",
+                action_id: "action-1",
+                asserted_at: t0(),
+            },
+            objections: &[objection("o1", "m3", t0())],
+            dismissals: &[],
+            ballots: &[ballot(
+                "b0",
+                "m4",
+                "o1",
+                false,
+                t0() + Duration::seconds(5000),
+            )],
+            roster: &roster,
+            duty_holders: &[],
+            policy: Some(escalating(2, 9, 3600, 600, 3)),
+            now: after_deadline(),
+            persons: selves.at(after_deadline()),
+        });
+        assert_eq!(f.escalation[0].respondents, 0, "{f:?}");
         // The denominator of the pool: ten seats, nine persons.
         let f = fold_reverse_quorum_over(&ReverseQuorumInputs {
             action: (&action).into(),
