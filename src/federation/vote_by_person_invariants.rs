@@ -429,6 +429,12 @@ pub(crate) mod bodies {
             ObjectionOutcome::Admitted,
             "I1525: a second device signs for its person: {met:?}"
         );
+        assert_eq!(met.quorum.counted, 3, "I1525: {met:?}");
+        let fold = c.fold(d).await;
+        assert!(
+            fold.dismissed_objection_ids.contains(&third.attestation_id),
+            "I1525: the read counts the second device too: {fold:?}"
+        );
     }
 
     /// **I1526** — disagreeing rows are no voice; every row stays held.
