@@ -33,6 +33,11 @@ use rusqlite::{Connection, OpenFlags};
 /// defect in the pool has a one-line kill switch (FSD §3.2).
 pub const READERS_ENV: &str = "CIRIS_PERSIST_SQLITE_READERS";
 
+/// Prepared statements each reader keeps. Sized for the shapes a node cycles
+/// through: on a production-sized canonical copy `sqlite3_prepare_v2` was 24% of
+/// CPU, because the hot attestation reads re-parsed the same text on each call.
+const READER_STATEMENT_CACHE: usize = 128;
+
 /// FSD §3.2 — `available_parallelism().clamp(2, 8)`, or [`READERS_ENV`].
 pub fn default_reader_count() -> usize {
     if let Some(n) = std::env::var(READERS_ENV)
@@ -106,6 +111,10 @@ impl ReadPool {
             )?;
             // #784 — per-connection state, like the pragmas above.
             crate::federation::key_digest::register_sqlite_fn(&conn)?;
+            // A rendered attestation query varies by shape, not by value, so
+            // its text repeats. The cache must hold every live shape or a
+            // cycling read re-parses each call; rusqlite's default is 16.
+            conn.set_prepared_statement_cache_capacity(READER_STATEMENT_CACHE);
             free.push(conn);
         }
         Ok(Arc::new(Self {

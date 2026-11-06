@@ -8,6 +8,7 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 ## [61.0.4] - UNRELEASED
 
 ### Fixed
+- **SQLite attestation reads reuse their prepared statement.** `execute_attestation_query` and the referencing read now use the statement cache, and each reader holds 128 statements. Bridge profiled a production-sized copy of the 0.5.245 candidate at 24% of CPU in `sqlite3_prepare_v2`. The call rate behind it is a separate question.
 
 - **A room counted keys, not people** (CIRISPersist#1198, CC 4.5.13, CC 3.3.6.3, `CLM-vote-once-per-person`). A tally now counts fedIDs: `federation::key_person` resolves a key to the self whose roster it belongs to, and every room vote reads that. On the reverse-quorum plane this covers ballots, objections, dismissals, recusal, the duty-holders' bench and every threshold's denominator. On the roster plane it covers `consensus::evaluate` in every protocol, for communities and families, `verify_membership_quorum` and the cosigned `withdraws` of a roster event. Two seats held by one self are one voice in the numerator and the denominator, and any key of a seated person votes and signs for them, seated or not. A key of another self counts for nothing, and neither does a key with a held revocation. An evicted device's seat stays its person's, so the person's other keys keep the voice. The trust-root chain and the licence quorum stay per key.
 
