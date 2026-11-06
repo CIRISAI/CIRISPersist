@@ -679,11 +679,11 @@ jobs:
     name: darwin-aarch64 (no postgres)
     needs: tree
     if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.97.0
-      # `cache-bin: false` on macos-14: the runner image
+      # `cache-bin: false` on macos-15: the runner image
       # ships a rustup stub at `/Users/runner/.cargo/bin/cargo` that
       # falls through to `rustup-init` when the toolchain isn't
       # installed locally. dtolnay's action installs the real cargo
@@ -692,7 +692,7 @@ jobs:
       # `~/.cargo/bin/`. Disabling bin caching keeps the dtolnay-
       # installed cargo intact. Build cache (registry + target) is
       # unaffected.
-      # CIRISCache (#316) — macos-14 (Apple silicon) ⇒ PLAT=macos-aarch64.
+      # CIRISCache (#316) — macos-15 (Apple silicon) ⇒ PLAT=macos-aarch64.
       - uses: ./.github/actions/ciriscache
         with:
           plat: macos-aarch64
@@ -731,7 +731,7 @@ jobs:
       # version's build restore this warm target/ and recompile only changed
       # files instead of rebuilding persist's deps from the verify baseline.
       # CIRISPersist#762 — SAVE DISABLED on this leg (restore-only). The
-      # tar+gzip+push of target/ starves the macos-14 hosted runner: tests
+      # tar+gzip+push of target/ starves the macos-15 hosted runner: tests
       # green, then "the hosted runner lost communication with the server" at
       # this step. continue-on-error cannot rescue a job whose VM died, and the
       # save never completes, so restore-only loses no cache that exists.
@@ -796,7 +796,7 @@ jobs:
     # image), so this job can never be scheduled — enabled, it queues forever
     # on every main/tag push, holding the whole run open so it never concludes
     # (and auto-retry, keyed on a concluded run, never fires). Re-enable via
-    # #762 as a macos-14 (arm64) cross-compile with --target x86_64-apple-darwin.
+    # #762 as a macos-15 (arm64) cross-compile with --target x86_64-apple-darwin.
     if: false   # CIRISPersist#762 — see above; was: main + tags/v*
     runs-on: macos-13
     # Bound a hung Intel build (the runner-capacity caveat is about QUEUE time,
@@ -895,7 +895,7 @@ jobs:
     # actually built it green.
     needs: [tree, ios-paths]
     if: ${{ !cancelled() && needs.tree.outputs.skip_ios != 'true' && needs.ios-paths.outputs.ios != 'false' }}
-    runs-on: macos-14
+    runs-on: macos-15
     # The two iOS targets are a 2-entry matrix so they build in PARALLEL
     # (cargo's target-dir lock prevents in-job parallelism, so a matrix is
     # the way). `ios-package` below recombines them into
@@ -1785,7 +1785,7 @@ jobs:
           # mirroring the proven CIRISEdge#90 setup.
         # linux-x86_64 on every event; the other three only on a tag ref.
         include: ${{ fromJSON(startsWith(github.ref, 'refs/tags/v')
-          && '[{"os":"ubuntu-latest","label":"linux-x86_64","tag":"manylinux_2_34_x86_64"},{"os":"ubuntu-24.04-arm","label":"linux-aarch64","tag":"manylinux_2_34_aarch64"},{"os":"macos-14","label":"darwin-aarch64","tag":"macosx_11_0_arm64"},{"os":"windows-latest","label":"windows-x86_64","tag":"win_amd64"}]'
+          && '[{"os":"ubuntu-latest","label":"linux-x86_64","tag":"manylinux_2_34_x86_64"},{"os":"ubuntu-24.04-arm","label":"linux-aarch64","tag":"manylinux_2_34_aarch64"},{"os":"macos-15","label":"darwin-aarch64","tag":"macosx_11_0_arm64"},{"os":"windows-latest","label":"windows-x86_64","tag":"win_amd64"}]'
           || '[{"os":"ubuntu-latest","label":"linux-x86_64","tag":"manylinux_2_34_x86_64"}]') }}
           # darwin-x86_64 (macos-13) intentionally omitted — GitHub
           # Actions Intel macOS runners have ongoing capacity issues
