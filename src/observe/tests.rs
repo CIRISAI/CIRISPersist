@@ -202,6 +202,11 @@ const SHARED_FOLD_DOORS: &[(&str, &str)] = &[
     ("ListLiveConsentGrantsFor", "federation/consent_admit.rs"),
     // v61 (CIRISPersist#934, S4a) — the owner-scope log's serve consult.
     ("ListAttestationLog", "federation/read_plan.rs"),
+    // v61.0.5 (CIRISPersist#1225) — the subject read's page cut.
+    (
+        "ListAttestationsNamingByDimension",
+        "federation/read_plan.rs",
+    ),
 ];
 
 /// v60.0.0 — each shared-fold door is recorded in its fold's file.

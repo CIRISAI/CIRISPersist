@@ -5,6 +5,18 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [61.0.5] - 2026-11-08
+
+### Added
+
+- **A read of the rows naming a key, under one dimension (CIRISPersist#1225, Edge, agent 2.20).** `FederationDirectory::list_attestations_naming_by_dimension(subject_key_id, dimension, cursor, limit)` returns the federation-tier rows whose `subject_key_ids` name the key, newest first by `(asserted_at, attestation_id)`, one page at a time; `next_cursor` is present exactly when another row exists. A relayed `membership:proposal:v1` names its invitee only as a subject, so a waking invitee could not find it except by a paced history read. It serves what `list_attestations_since` serves (federation tier, no unregistered type under enforcement, no purge-tombstoned row the tombstone is not void for), with no caller gate and no lifecycle folding: the caller's serve gate runs after it. It seeks V106's `attestation_subjects_seek`; no migration.
+
+### Adoption
+
+- **New read: `list_attestations_naming_by_dimension`, and its capsule op `DirectoryOp::ListAttestationsNamingByDimension` (result `Scores`).** Append-only op growth; `DIRECTORY_ABI_VERSION` is unchanged at 12. A directory that does not override the method answers `Unsupported`.
+- **Order by the signer's instant.** A row dated behind a cursor already passed is found only by a read from the head, so a caller that must see late rows reads from the head each time. Anyone can name a key, so a page can be flooded: page to a budget, and treat one page as incomplete.
+- **New telemetry door label** `list_attestations_naming_by_dimension` on the read counters.
+
 ## [61.0.4] - 2026-11-06
 
 ### Fixed

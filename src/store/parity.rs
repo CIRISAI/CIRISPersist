@@ -230,6 +230,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("list_scores_planned", Class::Plan),
     ("resolve_scores_planned", Class::Plan),
     ("list_attestation_log_planned", Class::Plan),
+    ("list_attestations_naming_by_dimension_planned", Class::Plan),
     ("list_key_registration_history_planned", Class::Plan),
     ("list_derived_hex_planned", Class::Plan),
     // The erasure doors' shared planner (same-file helper of both plans): the attester gate and the erasure plan.
@@ -245,6 +246,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("read_score_candidates", Class::Plumbing),
     ("read_score_composers", Class::Plumbing),
     ("read_attestation_log_page", Class::Plumbing),
+    ("read_naming_page", Class::Plumbing),
     ("read_key_registration_history", Class::Plumbing),
     ("query_attestations", Class::Plumbing),
     // The erasure executors' string-column collector (a row decode).
@@ -1559,7 +1561,7 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 72] = [
+    const SHARED_PLANS: [(&str, &str); 73] = [
         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance.
         (
             "src/federation/transport_admit.rs",
@@ -1671,6 +1673,10 @@ mod tests {
         (
             "src/federation/read_plan.rs",
             "list_attestation_log_planned",
+        ),
+        (
+            "src/federation/read_plan.rs",
+            "list_attestations_naming_by_dimension_planned",
         ),
         (
             "src/federation/read_plan.rs",
@@ -1826,7 +1832,7 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 82] = [
+    const SHARED_DOORS: [(&str, &str, &str); 83] = [
         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance,
         // decoded by the row mapper both doors read through.
         (
@@ -2001,6 +2007,11 @@ mod tests {
             "FederationDirectory",
             "list_attestation_log",
             "list_attestation_log_planned",
+        ),
+        (
+            "FederationDirectory",
+            "list_attestations_naming_by_dimension",
+            "list_attestations_naming_by_dimension_planned",
         ),
         (
             "FederationDirectory",

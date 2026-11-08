@@ -101,6 +101,7 @@ pub const DOOR_VALUES: &[&str] = &[
     "get_attestation",
     "list_attestations_since",
     "list_attestation_log",
+    "list_attestations_naming_by_dimension",
     "attestation_query",
 ];
 

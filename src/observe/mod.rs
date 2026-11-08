@@ -124,6 +124,9 @@ label_set! {
         ListAttestationsSince => "list_attestations_since",
         /// `FederationDirectory::list_attestation_log`.
         ListAttestationLog => "list_attestation_log",
+        /// v61.0.5 (CIRISPersist#1225) —
+        /// `FederationDirectory::list_attestations_naming_by_dimension`.
+        ListAttestationsNamingByDimension => "list_attestations_naming_by_dimension",
         /// v56.0.0 (CIRISPersist#1001) — `AttestationReads::query_attestations`,
         /// the typed bounded read; recorded once, in its shared wrapper. It
         /// replaces the `list_attestations_{by,for}` doors and their six

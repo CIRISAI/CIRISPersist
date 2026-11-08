@@ -3154,6 +3154,23 @@ pub fn person_subject_sql(fa: &str, prefix: &str) -> String {
     )
 }
 
+/// v61.0.5 (CIRISPersist#1225) — "the held attestation `fa` is served under
+/// the purge plane" as SQL: no `attestation` tombstone names it, or the
+/// tombstone is void for it (the accountability record, a person-subject
+/// row). The rule `list_attestations_since` spells inline, for the reads that
+/// serve what it serves. `prefix` as [`person_subject_sql`].
+#[must_use]
+pub fn served_under_purge_sql(fa: &str, prefix: &str) -> String {
+    format!(
+        "(NOT EXISTS (SELECT 1 FROM {prefix}purge_tombstones pt \
+                      WHERE pt.plane = 'attestation' \
+                        AND pt.record_ref = {fa}.attestation_id) \
+          OR {} OR {})",
+        super::migration::accountability_record_sql(&format!("{fa}.dimension")),
+        person_subject_sql(fa, prefix)
+    )
+}
+
 /// The first subject of `row` (its `subject_key_ids` and `attested_key_id`)
 /// that resolves HERE to a person, if any. A key this node cannot resolve is
 /// not a person for this question: the void below is granted only on a

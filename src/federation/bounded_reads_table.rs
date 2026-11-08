@@ -64,6 +64,7 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         Bound::Open("every live announced-peer bookmark: grows with the federation"),
     ),
     ("list_attestation_log", Bound::Paged),
+    ("list_attestations_naming_by_dimension", Bound::Paged),
     (
         "list_attestations_by_dimension_citing",
         Bound::Schema("one attester's reports under one exact dimension citing one blob"),
