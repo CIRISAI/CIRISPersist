@@ -1069,6 +1069,20 @@ pub enum DirectoryOp {
         /// The occurrence key.
         occurrence_key_id: String,
     },
+    /// v61.0.5 (CIRISPersist#1225) —
+    /// [`FederationDirectory::list_attestations_naming_by_dimension`]: the
+    /// rows naming a key under one dimension, so a relayed invitation reaches
+    /// its invitee. Result rides `Scores`. APPEND-ONLY (Growth).
+    ListAttestationsNamingByDimension {
+        /// The key the rows name in `subject_key_ids`.
+        subject_key_id: String,
+        /// The one dimension.
+        dimension: String,
+        /// Opaque `(asserted_at, attestation_id)` page cursor.
+        cursor: Option<crate::read::AttestationCursor>,
+        /// Page size (1..=10_000).
+        limit: i64,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -1510,6 +1524,18 @@ pub async fn dispatch_directory_op(
             limit,
         } => match dir
             .list_attestation_log(subject_key_id.as_deref(), cursor, limit)
+            .await
+        {
+            Ok(v) => DirectoryOpResult::Scores(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::ListAttestationsNamingByDimension {
+            subject_key_id,
+            dimension,
+            cursor,
+            limit,
+        } => match dir
+            .list_attestations_naming_by_dimension(&subject_key_id, &dimension, cursor, limit)
             .await
         {
             Ok(v) => DirectoryOpResult::Scores(v),
@@ -3562,6 +3588,31 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
+    /// v61.0.5 (CIRISPersist#1225) — the subject read, proxied.
+    async fn list_attestations_naming_by_dimension(
+        &self,
+        subject_key_id: &str,
+        dimension: &str,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::ScoresPage, Error> {
+        match self
+            .run_op(&DirectoryOp::ListAttestationsNamingByDimension {
+                subject_key_id: subject_key_id.to_owned(),
+                dimension: dimension.to_owned(),
+                cursor,
+                limit,
+            })
+            .await?
+        {
+            DirectoryOpResult::Scores(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
     /// v17.8.0 (#469) — route the seeder-bridge bookmark write through the
     /// capsule so edge's `resolve_announce_cold_start` Advisory admit path can
     /// record LAN-announced peers without an admission.
@@ -4337,6 +4388,80 @@ mod tests {
         }
     }
 
+    /// v61.0.5 (CIRISPersist#1225) — **I1548: the subject read crosses the
+    /// capsule.** Rows seeded on the backend come back through the C-ABI as the
+    /// same page, in the same order and with the same cursor, as the direct
+    /// trait call, and a refused page size is refused through the capsule too.
+    #[test]
+    fn i1548_subject_read_round_trips_the_capsule() {
+        use crate::federation::subject_read_1225_invariants::bodies as b;
+        let rt = test_runtime();
+        let (dir, directory) = test_directory();
+        let (k, ids) = rt.block_on(async {
+            let (a, k) = b::keys(dir.as_ref(), "cap").await;
+            let mut ids = Vec::new();
+            for s in [30, 20, 10] {
+                ids.push(b::put_naming(dir.as_ref(), &a, &[&k], b::DIM, b::at(s), None).await);
+            }
+            (k, ids)
+        });
+        let direct = rt
+            .block_on(dir.list_attestations_naming_by_dimension(&k, b::DIM, None, 2))
+            .expect("direct");
+        let op = |cursor| DirectoryOp::ListAttestationsNamingByDimension {
+            subject_key_id: k.clone(),
+            dimension: b::DIM.into(),
+            cursor,
+            limit: 2,
+        };
+        let first = match run_op(&rt, &directory, &op(None)) {
+            DirectoryOpResult::Scores(page) => page,
+            other => panic!("I1548: expected Scores, got {other:?}"),
+        };
+        let page_ids = |p: &crate::read::ScoresPage| -> Vec<String> {
+            p.items.iter().map(|a| a.attestation_id.clone()).collect()
+        };
+        assert_eq!(page_ids(&first), page_ids(&direct), "I1548: the same page");
+        assert_eq!(
+            page_ids(&first),
+            vec![ids[2].clone(), ids[1].clone()],
+            "I1548: newest first"
+        );
+        let cursor = first
+            .next_cursor
+            .clone()
+            .expect("I1548: more past the first page");
+        assert_eq!(
+            Some(&cursor),
+            direct.next_cursor.as_ref(),
+            "I1548: the same cursor"
+        );
+        match run_op(&rt, &directory, &op(Some(cursor))) {
+            DirectoryOpResult::Scores(page) => {
+                assert_eq!(
+                    page_ids(&page),
+                    vec![ids[0].clone()],
+                    "I1548: the last page"
+                );
+                assert!(page.next_cursor.is_none(), "I1548: nothing past");
+            }
+            other => panic!("I1548: expected Scores, got {other:?}"),
+        }
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::ListAttestationsNamingByDimension {
+                subject_key_id: k.clone(),
+                dimension: b::DIM.into(),
+                cursor: None,
+                limit: 0,
+            },
+        ) {
+            DirectoryOpResult::Err(_) => {}
+            other => panic!("I1548: a page of 0 is refused through the capsule, got {other:?}"),
+        }
+    }
+
     /// v17.4.0 — the `scores` read ops (ListScores + ResolveScores) round-trip
     /// through the full C-ABI: serialize op → dispatch inside the `.so` →
     /// result variant back across the seam. Proves the composite-op wiring
@@ -4785,7 +4910,7 @@ mod tests {
         // removed with the member listing (a BREAK, inside ABI 12).
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "d78ffc44212864622c15230a9eb0228626aaa4631b4305890823d1cfd7258230",
+            "7105f22d1f3b2922a1931c34fbb79d5d79291cc7ce7f8005493de2f3ff499af6",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \

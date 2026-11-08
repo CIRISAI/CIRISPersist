@@ -90,6 +90,19 @@ pub(crate) trait ReadPlanStore: FederationDirectory + Sized {
         limit: i64,
     ) -> Result<QueryRows, Error>;
 
+    /// One page of the rows naming `subject_key_id` under exactly
+    /// `dimension` (#1225): the V106 `attestation_subjects_seek` seek,
+    /// federation tier, served as `list_attestations_since` serves (no
+    /// unregistered type under enforcement, no tombstoned row the tombstone
+    /// is not void for), after `cursor`, newest first, at most `fetch` rows.
+    async fn read_naming_page(
+        &self,
+        subject_key_id: &str,
+        dimension: &str,
+        cursor: Option<&AttestationCursor>,
+        fetch: i64,
+    ) -> Result<QueryRows, Error>;
+
     /// The key's registration history rows, oldest first.
     async fn read_key_registration_history(
         &self,
@@ -233,6 +246,54 @@ pub(crate) async fn list_attestation_log_planned(
         bytes,
     );
     Ok(ScoresPage { items, next_cursor })
+}
+
+/// The read: every backend's `list_attestations_naming_by_dimension`
+/// (v61.0.5, CIRISPersist#1225). The executor fetches one row past the page,
+/// so `next_cursor` is `Some` exactly when another row exists.
+pub(crate) async fn list_attestations_naming_by_dimension_planned(
+    dir: &impl ReadPlanStore,
+    subject_key_id: &str,
+    dimension: &str,
+    cursor: Option<AttestationCursor>,
+    limit: i64,
+) -> Result<ScoresPage, Error> {
+    check_page_limit(limit)?;
+    check_cursor_version(cursor.as_ref())?;
+    let QueryRows {
+        mut rows,
+        bytes,
+        backend,
+    } = dir
+        .read_naming_page(subject_key_id, dimension, cursor.as_ref(), limit + 1)
+        .await?;
+    let page = usize::try_from(limit).map_err(|_| Error::Backend("page size".into()))?;
+    // An executor that returned more than one row past the page dropped its
+    // LIMIT: its read was as wide as the slice.
+    if rows.len() > page + 1 {
+        return Err(Error::Backend(format!(
+            "list_attestations_naming_by_dimension: {} rows for a page of {page}",
+            rows.len()
+        )));
+    }
+    let next_cursor = if rows.len() > page {
+        rows.truncate(page);
+        rows.last()
+            .map(|a| AttestationCursor::from_trailing(a.asserted_at, a.attestation_id.clone()))
+    } else {
+        None
+    };
+    crate::observe::record_read(
+        backend,
+        crate::observe::Door::ListAttestationsNamingByDimension,
+        subject_key_id,
+        &rows,
+        bytes,
+    );
+    Ok(ScoresPage {
+        items: rows,
+        next_cursor,
+    })
 }
 
 /// The read: every backend's `list_key_registration_history`. A stored
