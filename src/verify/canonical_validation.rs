@@ -228,7 +228,7 @@ pub fn validate_canonical_hex(
         }
     }
     // Odd-length hex is structurally invalid (no whole-byte decoding).
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(CanonicalizationError::InvalidHex {
             value: truncate_for_log(s),
             reason: format!("odd hex length {} (not a whole-byte sequence)", s.len()),

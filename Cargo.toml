@@ -6,7 +6,7 @@ license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
 repository = "https://github.com/CIRISAI/CIRISPersist"
 authors = ["CIRIS AI <hello@ciris.ai>"]
-rust-version = "1.83"
+rust-version = "1.92"
 publish = false
 
 # Status: Phase 1 in flight (TDD + MDD; see MISSION.md).
@@ -577,14 +577,14 @@ getrandom = "0.2"
 # ciris-crypto invariant (FSD §7.5a) means persist takes ZERO direct
 # deps on AES-GCM/PBKDF2/HKDF/HMAC primitive crates ever — the
 # `src/secrets/crypto.rs` facade lands as a single import-site change.
-ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.0.0", version = "22", features = ["pqc-ml-dsa"] }
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.0.0", version = "22" }
+ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.2.0", version = "22", features = ["pqc-ml-dsa"] }
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.2.0", version = "22" }
 # v0.3.6 (CIRISPersist#14) — direct ciris-crypto dep for HybridVerifier
 # in `Engine.verify_hybrid`. Same git source / tag as ciris-keyring +
 # ciris-verify-core so versions are workspace-coherent. Features
 # `ed25519` + `pqc-ml-dsa` light up the concrete Ed25519Verifier +
 # MlDsa65Verifier impls used by HybridVerifier::verify.
-ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.0.0", version = "22", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant", "kdf"] }
+ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.2.0", version = "22", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant", "kdf"] }
 async-trait   = "0.1"
 # v0.1.14 — filesystem advisory locks for the cohabitation
 # bootstrap (docs/COHABITATION.md). POSIX flock cross-process,
@@ -682,7 +682,7 @@ postgres-types    = { version = "0.2.14", optional = true }
 # refinery backend: `sqlite` → `refinery/rusqlite`, `postgres` →
 # `refinery/tokio-postgres`. This keeps `tokio-postgres` (and its build
 # weight) out of a sqlite-only (`pyo3-sqlite`) tree.
-refinery          = { version = "0.9", default-features = false, optional = true }
+refinery          = { version = "0.10", default-features = false, optional = true }
 
 # v0.1.3 — TLS for tokio-postgres connection pool (THREAT_MODEL.md AV-18).
 tokio-postgres-rustls = { version = "0.13", optional = true }
@@ -765,7 +765,7 @@ ndarray              = { version = "0.16", optional = true }
 # v60.0.0 (CIRISPersist#1002) — `backup` (the safe wrapper over
 # `sqlite3_backup_*`, present in every SQLite build) clones the migrated
 # template behind `store::test_backend::test_backend()`.
-rusqlite = { version = "0.31", features = ["backup", "chrono", "serde_json", "functions"], optional = true }
+rusqlite = { version = "0.41", features = ["backup", "chrono", "serde_json", "functions"], optional = true }
 
 # Phase 1 robustness — local journal for outage tolerance (FSD §3.4)
 redb = "4"
@@ -869,18 +869,18 @@ tokio-stream = "0.1"
 # key). Placed AFTER every platform-independent dep — see the v0.9.0
 # bug note on the rusqlite target table above.
 [target.'cfg(target_os = "linux")'.dependencies]
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.0.0", version = "22", features = ["pqc-ml-dsa"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.2.0", version = "22", features = ["pqc-ml-dsa"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.0.0", version = "22", features = ["pqc-ml-dsa", "ios"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.2.0", version = "22", features = ["pqc-ml-dsa", "ios"] }
 # v12.3.0 (CIRISPersist#355) — vendored openssl removed here too (dead leaf;
 # see the base-deps note). No iOS openssl in any configuration now.
 
 [target.'cfg(target_os = "android")'.dependencies]
 # v3.5.2 (#132) — rusqlite `bundled` for Android. See comment block
 # before the iOS entry (~line 628) for the rationale.
-rusqlite = { version = "0.31", features = ["backup", "bundled", "chrono", "serde_json", "functions"], optional = true }
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.0.0", version = "22", features = ["pqc-ml-dsa", "android"] }
+rusqlite = { version = "0.41", features = ["backup", "bundled", "chrono", "serde_json", "functions"], optional = true }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.2.0", version = "22", features = ["pqc-ml-dsa", "android"] }
 # v12.3.0 (CIRISPersist#355) — vendored openssl removed here too (dead leaf;
 # see the base-deps note). No Android openssl in any configuration now,
 # retiring the flakiest part of the mobile wheel matrix.
@@ -904,7 +904,7 @@ required-features = ["test-anchor"]
 # own root (structurally inert against the pinned real Yubico root). Same
 # git tag as the [workspace] pins — one graph version, feature-unified in
 # test builds, absent from `--edges normal`.
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.0.0", version = "22", features = [
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.2.0", version = "22", features = [
     "test-support",
 ] }
 # Mission category §4: canonicalization parity. Used to validate our

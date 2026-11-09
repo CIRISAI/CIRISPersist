@@ -2784,7 +2784,7 @@ mod tests {
                         v,
                         // Deliberately colliding timestamps across roots and
                         // rows: the tie-break must be exercised, not avoided.
-                        if (ri + step as usize) % 2 == 0 {
+                        if (ri + step as usize).is_multiple_of(2) {
                             "2026-08-03T10:00:00Z"
                         } else {
                             "2026-08-03T11:00:00Z"

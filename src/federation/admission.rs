@@ -1062,7 +1062,10 @@ fn render_exact_signed_instant(
     t: chrono::DateTime<chrono::Utc>,
 ) -> Result<String, Error> {
     use chrono::Timelike as _;
-    if t.nanosecond() % SIGNED_INSTANT_RESOLUTION_NANOS != 0 {
+    if !t
+        .nanosecond()
+        .is_multiple_of(SIGNED_INSTANT_RESOLUTION_NANOS)
+    {
         return Err(Error::InvalidArgument(format!(
             "{what} {} carries sub-millisecond precision, which the CC 2.6.2 form `.sssZ` \
              cannot carry; truncate to milliseconds before signing",
@@ -6622,7 +6625,7 @@ where
 /// v61 (CC 2.6.2, strict) — the envelope's spelling must be `.sssZ`; an
 /// instant written in any other form is not equal to anything.
 fn same_instant_ms(envelope: &str, typed: chrono::DateTime<chrono::Utc>) -> bool {
-    typed.timestamp_subsec_nanos() % 1_000_000 == 0
+    typed.timestamp_subsec_nanos().is_multiple_of(1_000_000)
         && crate::verify::canonical_validation::validate_canonical_datetime(envelope).is_ok()
         && chrono::DateTime::parse_from_rfc3339(envelope)
             .map(|e| e.timestamp_millis() == typed.timestamp_millis())
@@ -7441,7 +7444,9 @@ pub fn check_instant_binding(
     };
     let on_resolution = |key: &str, t: chrono::DateTime<chrono::Utc>| -> Result<(), Error> {
         use chrono::Timelike as _;
-        if t.nanosecond() % CONSENT_INSTANT_RESOLUTION_NANOS == 0 {
+        if t.nanosecond()
+            .is_multiple_of(CONSENT_INSTANT_RESOLUTION_NANOS)
+        {
             return Ok(());
         }
         Err(Error::malformed_row(
