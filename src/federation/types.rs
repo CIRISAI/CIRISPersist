@@ -4315,27 +4315,102 @@ impl ServedAttestation {
     pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
         (self.admitted_at, self.attestation.attestation_id.clone())
     }
+
+    /// The row's [`ServePosition`].
+    #[must_use]
+    pub fn serve_position(&self) -> ServePosition {
+        ServePosition::new(self.admitted_at, self.attestation.attestation_id.clone())
+    }
 }
 
-/// v61.1.0 (CIRISPersist#1190) — one page of the serve stream narrowed by
-/// prefix ([`super::FederationDirectory::list_attestations_since_by_prefixes`]).
+/// v61.1.0 (CIRISPersist#1190, #1163) — **a position on the attestation
+/// serve stream**: THIS node's `admitted_at` on a row and its
+/// `attestation_id`, ordered as the stream is (the instant, then the id
+/// byte for byte). A read resumes strictly after it.
 ///
-/// The cursor is the `(admitted_at, attestation_id)` serve position of
+/// [`ServePosition::origin`] is the position before every row: a read that
+/// resumes from it reads from the start of the stream, and a page whose
+/// stream holds nothing yet carries it as its [`ServePage::high_water`]. A
+/// position whose id is empty is the position before every row at its
+/// instant (the postgres high water's commit-safe clamp is one).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServePosition {
+    /// The serve position's instant (node-local, never hashed).
+    pub admitted_at: DateTime<Utc>,
+    /// The row's id; empty for "before every row at `admitted_at`".
+    pub attestation_id: String,
+}
+
+impl ServePosition {
+    /// The position at `admitted_at`, `attestation_id`.
+    #[must_use]
+    pub fn new(admitted_at: DateTime<Utc>, attestation_id: impl Into<String>) -> Self {
+        Self {
+            admitted_at,
+            attestation_id: attestation_id.into(),
+        }
+    }
+
+    /// The position before every row: the Unix epoch, no id. Never bound
+    /// into a statement: a read given it reads from the start
+    /// ([`Self::resume_after`]).
+    #[must_use]
+    pub fn origin() -> Self {
+        Self::new(DateTime::<Utc>::UNIX_EPOCH, String::new())
+    }
+
+    /// Whether this is [`Self::origin`].
+    #[must_use]
+    pub fn is_origin(&self) -> bool {
+        *self == Self::origin()
+    }
+
+    /// The cursor a read binds for "strictly after this position": `None`
+    /// for [`Self::origin`] (read from the start), the pair otherwise.
+    #[must_use]
+    pub fn resume_after(since: Option<&Self>) -> Option<(DateTime<Utc>, String)> {
+        since
+            .filter(|p| !p.is_origin())
+            .map(|p| (p.admitted_at, p.attestation_id.clone()))
+    }
+}
+
+/// v61.1.0 (CIRISPersist#1190, #1163) — **one page of a serve-stream read**:
+/// [`super::FederationDirectory::list_attestations_since_by_prefixes`]
+/// (`T` = [`ServedAttestation`]) and
+/// [`super::FederationDirectory::list_owner_bindings_since`] (`T` =
+/// [`OwnerBindingChange`]).
+///
+/// The cursor is the [`ServePosition`] of
 /// [`super::FederationDirectory::list_attestations_since`], exclusive.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ServedAttestationPage {
-    /// The matching rows, oldest serve position first.
-    pub items: Vec<ServedAttestation>,
-    /// `Some` exactly when another matching row exists past the page: the
-    /// last item's serve position.
-    pub next_cursor: Option<(DateTime<Utc>, String)>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServePage<T> {
+    /// The page's items, oldest serve position first.
+    pub items: Vec<T>,
+    /// `Some` exactly when another selected row exists past the page: the
+    /// last selected row's serve position.
+    pub next_cursor: Option<ServePosition>,
     /// Where to resume so that no row this read already examined is
-    /// examined again. Equal to `next_cursor` when more remain. When none
-    /// remain it is the stream's head at the read (or the last item, or the
-    /// `since` passed in, whichever is furthest), so a sparse narrowing does
-    /// not rescan every non-matching row since its last match on each poll.
-    /// `None` only when the stream is empty and no `since` was given.
-    pub high_water: Option<(DateTime<Utc>, String)>,
+    /// examined again, and no row it could not yet see is skipped. Equal to
+    /// `next_cursor` when more remain. When none remain it is the furthest
+    /// of the `since` passed in, the last selected row, and the stream's
+    /// head at the read, so a sparse selection does not rescan every row it
+    /// ruled out on each poll; [`ServePosition::origin`] when the stream is
+    /// empty and no `since` was given.
+    ///
+    /// The head is EXACT on sqlite: its one writer assigns a row's serve
+    /// position inside the write transaction, above every committed
+    /// position, so no row can commit below a head a reader has seen. On
+    /// postgres a writer assigns the position (`MAX(admitted_at)`, then the
+    /// clock) BEFORE its transaction, so rows commit out of position order;
+    /// there the head is clamped to the commit-safe watermark `read clock −
+    /// read_plan::PG_SERVE_COMMIT_LAG_SECS` (a position with an empty id),
+    /// below which every position was assigned long enough ago to have
+    /// committed. A resume from it re-examines at most the last lag window
+    /// of the stream.
+    pub high_water: ServePosition,
 }
 
 /// v61.1.0 (CIRISPersist#1163, CC 5.4.6) — whether a node is on the
@@ -4358,6 +4433,16 @@ pub enum AnnouncedOwnerState {
     /// Announced, but more than one live owner: not a resolvable owner, so
     /// not on the roster (fail closed, as `owner_of`).
     AmbiguousOwner,
+    /// v61.1.0 (#1163 review M5) — the fold failed for this node at the read
+    /// (`reason` is its error). A feed item only, never an
+    /// `admission::announced_owner_state` answer: one node whose fold fails
+    /// is reported, not a page that fails, so it cannot stall the cursor.
+    /// The consumer keeps what it held for the node and re-asks
+    /// `announced_owner_state` for it later; it is not a removal.
+    Unresolved {
+        /// Why the fold did not answer.
+        reason: String,
+    },
 }
 
 /// v61.1.0 (CIRISPersist#1163) — one node whose announced-owner state may
@@ -4369,20 +4454,7 @@ pub struct OwnerBindingChange {
     /// The node's state, folded at the read.
     pub state: AnnouncedOwnerState,
     /// The serve position of the node's last row in this page.
-    pub position: (DateTime<Utc>, String),
-}
-
-/// v61.1.0 (CIRISPersist#1163) — one page of
-/// [`super::FederationDirectory::list_owner_bindings_since`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OwnerBindingPage {
-    /// One entry per node the page's rows touch, in the order of each
-    /// node's last row in the page.
-    pub items: Vec<OwnerBindingChange>,
-    /// `Some` exactly when another candidate row exists past the page.
-    pub next_cursor: Option<(DateTime<Utc>, String)>,
-    /// As [`ServedAttestationPage::high_water`].
-    pub high_water: Option<(DateTime<Utc>, String)>,
+    pub position: ServePosition,
 }
 
 // ─── Freshness floor (v21.6.0, CIRISPersist#519 item 2a-iii) ───────

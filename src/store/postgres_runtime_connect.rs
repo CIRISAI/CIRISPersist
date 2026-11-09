@@ -126,7 +126,9 @@ pub(crate) type TimerFuture =
 pub(crate) type PersistTimer = Arc<dyn PersistRuntimeTimer>;
 
 /// Timers this process started on persist's runtime through a
-/// [`PersistRuntimeTimer`]. The I1550-series witnesses read it.
+/// [`PersistRuntimeTimer`]. The I1550-series witnesses read it, and nothing
+/// else does, so it exists only in test builds.
+#[cfg(test)]
 pub(crate) static TIMER_STARTS: AtomicUsize = AtomicUsize::new(0);
 
 /// The one [`PersistRuntimeTimer`]: the runtime captured on the
@@ -148,6 +150,7 @@ impl Drop for AbortOnDrop {
 
 impl PersistRuntimeTimer for CapturedRuntime {
     fn sleep(&self, wait: std::time::Duration) -> TimerFuture {
+        #[cfg(test)]
         TIMER_STARTS.fetch_add(1, Ordering::Relaxed);
         // The `Sleep` is built INSIDE the task. Building it here would ask
         // the polling thread for a timer it does not have.

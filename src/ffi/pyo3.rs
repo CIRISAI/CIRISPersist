@@ -8974,25 +8974,27 @@ impl PyEngine {
     }
 
     /// v61.1.0 (CIRISPersist#1190) — `list_attestations_since` narrowed by
-    /// prefix: the federation-tier rows whose `dimension` starts with one of
-    /// `dimension_prefixes` or whose `attestation_type` starts with one of
-    /// `type_prefixes`, after the `(admitted_at, attestation_id)` pair cursor,
-    /// as a JSON `ServedAttestationPage` (`items`, `next_cursor`,
-    /// `high_water`). `next_cursor` is present exactly when more remain;
-    /// resume from `high_water` once none does. Served as
-    /// `list_attestations_since` serves. `limit` in [1, 10000].
-    #[pyo3(signature = (since_rfc3339, since_id, dimension_prefixes, type_prefixes, limit))]
+    /// family: the federation-tier rows whose family (`row_type::claim_token`:
+    /// a `scores` row's `dimension`, any other row's `attestation_type`)
+    /// starts with one of `family_prefixes`, after the serve position
+    /// `(since_rfc3339, since_id)`, as a JSON serve page (`items`,
+    /// `next_cursor`, `high_water`; a position is `{admitted_at,
+    /// attestation_id}`). `next_cursor` is present exactly when more remain;
+    /// resume from `high_water` once none does (its id may be empty: pass
+    /// it as given). Served as `list_attestations_since` serves. `limit` in
+    /// [1, 10000]. A refusal's message is led by `serve_prefixes_refused` or
+    /// `serve_limit_out_of_range`.
+    #[pyo3(signature = (since_rfc3339, since_id, family_prefixes, limit))]
     fn list_attestations_since_by_prefixes(
         &self,
         py: Python<'_>,
         since_rfc3339: Option<&str>,
         since_id: Option<&str>,
-        dimension_prefixes: Vec<String>,
-        type_prefixes: Vec<String>,
+        family_prefixes: Vec<String>,
         limit: i64,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let since = parse_pair_cursor(
+        let since = parse_serve_position(
             "list_attestations_since_by_prefixes",
             since_rfc3339,
             since_id,
@@ -9006,12 +9008,7 @@ impl PyEngine {
                         ($backend:expr) => {{
                             let b = $backend.clone();
                             let page = b
-                                .list_attestations_since_by_prefixes(
-                                    since,
-                                    &dimension_prefixes,
-                                    &type_prefixes,
-                                    limit,
-                                )
+                                .list_attestations_since_by_prefixes(since, &family_prefixes, limit)
                                 .await
                                 .map_err(federation_err_to_py)?;
                             serde_json::to_string(&page).map_err(|e| {
@@ -9033,12 +9030,14 @@ impl PyEngine {
     }
 
     /// v61.1.0 (CIRISPersist#1163, CC 5.4.6) — the announced-roster change
-    /// feed: after the `(admitted_at, attestation_id)` pair cursor, one item
+    /// feed: after the serve position `(since_rfc3339, since_id)`, one item
     /// per node whose owner-binding rows moved, each with its state folded
-    /// now (`announced` with the owner, `not_announced`, or
-    /// `ambiguous_owner`), as a JSON `OwnerBindingPage` (`items`,
-    /// `next_cursor`, `high_water`). A withdrawn or recanted binding arrives
-    /// through the same cursor as `not_announced`. `limit` in [1, 10000].
+    /// now (`announced` with the owner, `not_announced`, `ambiguous_owner`,
+    /// or `unresolved` with the fold's `reason`: keep what you held for that
+    /// node and re-ask), as a JSON serve page (`items`, `next_cursor`,
+    /// `high_water`). A withdrawn or recanted binding arrives through the
+    /// same cursor as `not_announced`. `limit` in [1, 500]; a refused page
+    /// size's message is led by `serve_limit_out_of_range`.
     #[pyo3(signature = (since_rfc3339, since_id, limit))]
     fn list_owner_bindings_since(
         &self,
@@ -9048,7 +9047,7 @@ impl PyEngine {
         limit: i64,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let since = parse_pair_cursor("list_owner_bindings_since", since_rfc3339, since_id)?;
+        let since = parse_serve_position("list_owner_bindings_since", since_rfc3339, since_id)?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || {
@@ -32700,17 +32699,30 @@ fn outbound_rows_to_pylist<'py>(
 /// lookup or crypto. `soft_freshness_window_seconds` is no longer read: the
 /// argument stays in the signature until v62 drops `policy` and both windows
 /// together.
+///
+/// The string is first DECODED to the [`HybridPolicy`](crate::verify::HybridPolicy)
+/// it names (an unknown name is a malformed policy, refused with the same
+/// token), and the decoded policy is then asked
+/// [`require_strict_policy`](crate::verify::hybrid::require_strict_policy) —
+/// the one hybrid-required check the Rust API and the capsule ask too.
 fn parse_hybrid_policy(
     policy: &str,
     soft_freshness_window_seconds: Option<f64>,
 ) -> PyResult<crate::verify::HybridPolicy> {
+    use crate::verify::hybrid::{require_strict_policy, VERIFY_POLICY_VIOLATION};
+    use crate::verify::HybridPolicy;
     let _ = soft_freshness_window_seconds; // v62 removes it with `policy`
-    if policy != "strict" {
-        return Err(PyValueError::new_err(
-            crate::verify::hybrid::VERIFY_POLICY_VIOLATION,
-        ));
-    }
-    Ok(crate::verify::HybridPolicy::Strict)
+    let named = match policy {
+        "strict" => HybridPolicy::Strict,
+        "ed25519_fallback" => HybridPolicy::Ed25519Fallback,
+        // The window is never read: the policy is refused below.
+        "soft_freshness" => HybridPolicy::SoftFreshness {
+            window: std::time::Duration::ZERO,
+        },
+        _ => return Err(PyValueError::new_err(VERIFY_POLICY_VIOLATION)),
+    };
+    require_strict_policy(&named).map_err(|e| PyValueError::new_err(e.kind()))?;
+    Ok(named)
 }
 
 /// v1.3.0 (CIRISPersist#46 + #47) — Wire shape for the `TrustFilter`
@@ -33125,6 +33137,32 @@ fn parse_pair_cursor(
             "{method}: the cursor is the PAIR (#668) — supply both since_rfc3339 and since_id, \
              or neither. Half a cursor would page from the start of that instant and re-serve \
              every row tied at it."
+        ))),
+    }
+}
+
+/// v61.1.0 (CIRISPersist#1190, #1163) — a serve-stream read's cursor, a
+/// [`ServePosition`](crate::federation::types::ServePosition) given as its
+/// two parts: both or neither, as [`parse_pair_cursor`], except that the id
+/// may be EMPTY (a `high_water` clamped below the rows still in flight, and
+/// the origin, carry no id: "before every row at this instant").
+fn parse_serve_position(
+    method: &str,
+    since_rfc3339: Option<&str>,
+    since_id: Option<&str>,
+) -> PyResult<Option<crate::federation::types::ServePosition>> {
+    match (since_rfc3339.filter(|s| !s.is_empty()), since_id) {
+        (Some(s), Some(id)) => Ok(Some(crate::federation::types::ServePosition::new(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
+                .with_timezone(&chrono::Utc),
+            id,
+        ))),
+        (None, None) => Ok(None),
+        (None, Some("")) => Ok(None),
+        _ => Err(PyValueError::new_err(format!(
+            "{method}: the cursor is a serve position — supply since_rfc3339 and since_id \
+             together (since_id may be empty, as a high_water gives it), or neither"
         ))),
     }
 }
@@ -35425,37 +35463,33 @@ async fn build_audit_chain_proof(
     // Step 3 — surface the current STH if one exists. `None` when no head
     // has been signed yet (Merkle hook disabled, or chain empty).
     //
-    // v61.1.0 (CIRISPersist#1233, CC 5.3.1) — a head the store REFUSES (one
-    // without its ML-DSA-65 half, `audit_sth_not_hybrid`) or cannot read is an
-    // error here, not `None`. Until v61.0.5 every `Err` folded to `None`, so a
-    // refused head became the chain served with no head at all — the refusal
-    // read as absence. Malformed is a refusal, not absence.
+    // v61.1.0 (CIRISPersist#1233) — refuse only a real error. A stored head
+    // is served AS ITSELF (CC 2.6.1.8; `latest_sth` asks no shape gate, and
+    // `verify_audit_sth` is the hybrid-Strict check a verifier asks of it),
+    // so what reaches here as an `Err` is a head the store could not read: a
+    // blob that does not decode, or a storage failure. That is an error, not
+    // `None` — until v61.0.5 every `Err` folded to `None`, and malformed is a
+    // refusal, not absence. The one `Err` that IS absence is
+    // `Error::NotImplemented`: an audit backend with no Merkle head surface
+    // has no head to serve, the case the old fold was written for.
+    fn head_json(
+        got: Result<Option<ciris_verify_core::transparency::SignedTreeHead>, crate::audit::Error>,
+    ) -> Result<Option<String>, String> {
+        match got {
+            Ok(Some(sth)) => serde_json::to_string(&sth)
+                .map(Some)
+                .map_err(|e| format!("SignedTreeHead encode: {e}")),
+            Ok(None) | Err(crate::audit::Error::NotImplemented(_)) => Ok(None),
+            Err(e) => Err(format!("current_sth: {e}")),
+        }
+    }
     let head_signature: Option<String> = match backend {
         #[cfg(feature = "postgres")]
-        BackendDispatch::Postgres(pg) => match pg
-            .current_sth(&tenant_id)
-            .await
-            .map_err(|e| format!("current_sth: {e}"))?
-        {
-            Some(sth) => Some(
-                serde_json::to_string(&sth).map_err(|e| format!("SignedTreeHead encode: {e}"))?,
-            ),
-            None => None,
-        },
+        BackendDispatch::Postgres(pg) => head_json(pg.current_sth(&tenant_id).await)?,
         #[cfg(feature = "sqlite")]
         BackendDispatch::Sqlite(sq) => {
             let audit = crate::audit::sqlite::SqliteAuditBackend::new(sq.conn_handle());
-            match audit
-                .current_sth(&tenant_id)
-                .await
-                .map_err(|e| format!("current_sth: {e}"))?
-            {
-                Some(sth) => Some(
-                    serde_json::to_string(&sth)
-                        .map_err(|e| format!("SignedTreeHead encode: {e}"))?,
-                ),
-                None => None,
-            }
+            head_json(audit.current_sth(&tenant_id).await)?
         }
     };
 

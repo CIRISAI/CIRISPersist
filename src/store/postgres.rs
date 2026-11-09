@@ -1254,10 +1254,17 @@ impl crate::federation::read_plan::ReadPlanStore for PostgresBackend {
     async fn read_serve_stream_page(
         &self,
         narrowing: crate::federation::read_plan::ServeNarrowing<'_>,
-        since: Option<&(chrono::DateTime<chrono::Utc>, String)>,
+        since: Option<&crate::federation::types::ServePosition>,
         fetch: i64,
     ) -> Result<crate::federation::read_plan::ServedRows, crate::federation::Error> {
         use crate::federation::attestation_query::Dialect;
+        // v61.1.0 (review R2/H4) — the commit-safe watermark, on this
+        // reader's clock, BEFORE the head and the page: a position assigned
+        // before it has committed, so it is visible to both reads below.
+        let settled_before = crate::federation::read_plan::serve_settled_before(
+            Dialect::Postgres,
+            chrono::Utc::now(),
+        );
         let head_stmt =
             crate::federation::read_plan::serve_stream_head_statement(Dialect::Postgres);
         let page_stmt = crate::federation::read_plan::serve_stream_statement(
@@ -1275,12 +1282,15 @@ impl crate::federation::read_plan::ReadPlanStore for PostgresBackend {
         let head_rows = pg_query_statement(&**client, head_stmt)
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("serve stream head: {e}")))?;
-        let head: Option<(chrono::DateTime<chrono::Utc>, String)> =
+        let head: Option<crate::federation::types::ServePosition> =
             match head_rows.into_iter().next() {
-                Some(r) => Some((
-                    r.safe_get_with("_pos", crate::federation::Error::Backend)?,
-                    r.safe_get_with("attestation_id", crate::federation::Error::Backend)?,
-                )),
+                Some(r) => {
+                    let pos: chrono::DateTime<chrono::Utc> =
+                        r.safe_get_with("_pos", crate::federation::Error::Backend)?;
+                    let id: String =
+                        r.safe_get_with("attestation_id", crate::federation::Error::Backend)?;
+                    Some(crate::federation::types::ServePosition::new(pos, id))
+                }
                 None => None,
             };
         let rows = pg_query_statement(&**client, page_stmt)
@@ -1300,6 +1310,7 @@ impl crate::federation::read_plan::ReadPlanStore for PostgresBackend {
         Ok(crate::federation::read_plan::ServedRows {
             rows,
             head,
+            settled_before,
             bytes,
             backend: crate::observe::StoreBackend::Postgres,
         })
@@ -13845,20 +13856,20 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
         let since_id = since.as_ref().map(|(_, id)| id.clone());
-        // E5 invariant: `tier = 'federation'` only — a local-tier row must
-        // never reach the advertise/serve wire surface.
-        //
-        // v53.0.0 (#975, CC 2.4) — under enforcement a held row of an
-        // unregistered type is neither served nor replicated.
-        //
-        // v54.1.0 (CIRISPersist#1046) — a tombstoned row is never served;
-        // excluded in the SQL, before the page is cut.
-        let row_type_filter = crate::federation::row_type::serve_filter_sql(
-            "attestation_type",
-            crate::federation::row_type::SqlDialect::Postgres,
+        // v61.1.0 (review D3) — THE serve rule (`read_plan::serve_rule_parts`):
+        // E5, the federation tier only (a local-tier row never reaches the
+        // advertise/serve wire surface); v53.0.0 (#975, CC 2.4), under
+        // enforcement a held row of an unregistered type is neither served
+        // nor replicated; v54.1.0 (#1046), a tombstoned row is not served
+        // unless the tombstone is void for it (the accountability record, a
+        // person-subject row: Codex rounds 1 and 4 on PR #1057). Excluded in
+        // the SQL, before the page is cut.
+        let serve_rule = crate::federation::read_plan::serve_rule_parts(
+            crate::federation::attestation_query::Dialect::Postgres,
+            "fa",
+            "cirislens.",
         )
-        .map(|p| format!(" AND {p}"))
-        .unwrap_or_default();
+        .join(" AND ");
         let rows = client
             .query(
                 &format!(
@@ -13872,19 +13883,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                      FROM cirislens.federation_attestations fa \
                      WHERE ($1::timestamptz IS NULL OR \
                             (admitted_at, attestation_id::text) > ($1, $2)) \
-                       AND tier = 'federation'{row_type_filter} \
-                       AND (NOT EXISTS (SELECT 1 FROM cirislens.purge_tombstones pt \
-                                        WHERE pt.plane = 'attestation' \
-                                          AND pt.record_ref = fa.attestation_id::text) \
-                            OR {accountability} OR {person}) \
-                     ORDER BY admitted_at ASC, attestation_id ASC LIMIT $3",
-                    // Codex rounds 1 and 4 on PR #1057 — a tombstone is void
-                    // for the accountability record and (interim) for a row a
-                    // person is the subject of: both are served.
-                    accountability =
-                        crate::federation::migration::accountability_record_sql("fa.dimension"),
-                    person =
-                        crate::federation::steward_purge::person_subject_sql("fa", "cirislens."),
+                       AND {serve_rule} \
+                     ORDER BY admitted_at ASC, attestation_id ASC LIMIT $3"
                 ),
                 &[&since_at, &since_id, &limit],
             )
@@ -14245,16 +14245,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
 
     async fn list_attestations_since_by_prefixes(
         &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        dimension_prefixes: &[String],
-        type_prefixes: &[String],
+        since: Option<crate::federation::types::ServePosition>,
+        family_prefixes: &[String],
         limit: i64,
-    ) -> Result<crate::federation::types::ServedAttestationPage, crate::federation::Error> {
+    ) -> Result<
+        crate::federation::types::ServePage<crate::federation::ServedAttestation>,
+        crate::federation::Error,
+    > {
         crate::federation::read_plan::list_attestations_since_by_prefixes_planned(
             self,
             since,
-            dimension_prefixes,
-            type_prefixes,
+            family_prefixes,
             limit,
         )
         .await
@@ -14262,9 +14263,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
 
     async fn list_owner_bindings_since(
         &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        since: Option<crate::federation::types::ServePosition>,
         limit: i64,
-    ) -> Result<crate::federation::types::OwnerBindingPage, crate::federation::Error> {
+    ) -> Result<
+        crate::federation::types::ServePage<crate::federation::types::OwnerBindingChange>,
+        crate::federation::Error,
+    > {
         crate::federation::read_plan::list_owner_bindings_since_planned(self, since, limit).await
     }
 
@@ -21632,30 +21636,6 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                     crate::federation::Error::Backend(format!("self-roster receipt: {e}"))
                 })?;
             }
-            // v61.1.0 (CIRISPersist#1218) — the deferred `withdraws` naming
-            // this row, stamped with the rule the door gives them now, in the
-            // row's transaction: the folds and the Live listing read the same
-            // rule whatever order the two arrived in. Guarded on each still
-            // being unstamped under the hash the plan read.
-            for r in &planned.restamped_withdraws {
-                let rule = i16::from(r.rule);
-                tx.execute(
-                    "UPDATE cirislens.federation_attestations \
-                        SET withdraws_admission_rule = $2, persist_row_hash = $3 \
-                      WHERE attestation_id = $1 AND withdraws_admission_rule IS NULL \
-                        AND persist_row_hash = $4",
-                    &[
-                        &r.attestation_id,
-                        &rule,
-                        &r.persist_row_hash,
-                        &r.held_persist_row_hash,
-                    ],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!("deferred withdraws stamp: {e}"))
-                })?;
-            }
         }
         // PR #943 review (Codex): project ONLY a row this statement stored. An
         // occupied id (`ON CONFLICT DO NOTHING`, 0 rows) stored nothing, so its
@@ -21780,15 +21760,6 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
             self.index_stored_record("Attestation", wire_index_key)
                 .await?;
         }
-        // v61.1.0 (CIRISPersist#1218) — a restamped `withdraws` changed its
-        // row hash; its index entry follows the stored row.
-        for key in planned
-            .restamped_withdraws
-            .iter()
-            .filter_map(|r| r.wire_index_key.as_deref())
-        {
-            self.index_stored_record("Attestation", key).await?;
-        }
         Ok(StoredAttestation::Inserted)
     }
 }
@@ -21800,12 +21771,7 @@ impl PostgresBackend {}
 /// s`). Casts match [`pg_row_to_attestation`]'s by-name reads
 /// (`attestation_id::text`, `weight::float8`). Output column names are
 /// unprefixed so ORDER BY / DISTINCT reference them directly.
-const PG_SCORES_FA_COLS: &str = "fa.attestation_id::text AS attestation_id, fa.attesting_key_id, \
-     fa.attested_key_id, fa.attestation_type, fa.weight::float8 AS weight, fa.asserted_at, \
-     fa.expires_at, fa.attestation_envelope, fa.original_content_hash, \
-     fa.scrub_signature_classical, fa.scrub_signature_pqc, fa.scrub_key_id, fa.scrub_timestamp, \
-     fa.pqc_completed_at, fa.persist_row_hash, fa.subject_key_ids, fa.withdraws_admission_rule, \
-     fa.cohort_scope, fa.tier, fa.promoted_at, fa.additional_scrubs";
+const PG_SCORES_FA_COLS: &str = crate::federation::attestation_query::POSTGRES_FA_COLUMNS;
 
 /// v17.4.0 — shared WHERE predicate builder for the postgres `scores` read
 /// handles. Emits the subject / dimension(exact+prefix) / type / attester /
@@ -22238,13 +22204,10 @@ pub(crate) fn pg_naming_page_sql(
     let mut parts: Vec<String> = vec![
         "s.subject_key_id = $1".to_owned(),
         "s.dimension = $2".to_owned(),
-        "fa.tier = 'federation'".to_owned(),
     ];
-    parts.extend(crate::federation::row_type::serve_filter_sql(
-        "fa.attestation_type",
-        crate::federation::row_type::SqlDialect::Postgres,
-    ));
-    parts.push(crate::federation::steward_purge::served_under_purge_sql(
+    // v61.1.0 (review D3) — the one serve rule.
+    parts.extend(crate::federation::read_plan::serve_rule_parts(
+        crate::federation::attestation_query::Dialect::Postgres,
         "fa",
         "cirislens.",
     ));
@@ -23601,12 +23564,43 @@ where
 /// v57.0.0 (CIRISPersist#988 item 2) — **the hard_case writer**, inside `tx`:
 /// the planned row (insert-if-absent on its event-derived id) and, when it
 /// landed, its projection. A re-recorded event writes nothing.
+///
+/// v61.1.0 (61.1 review H3, as ruled) — when the v1 id is held by a row
+/// ANOTHER key signed, this node's record is written under its emitter-bound
+/// id instead, logged and counted, and the act commits (the sqlite writer's
+/// rule, [`HeldOccupant`](crate::federation::hard_case::HeldOccupant)).
 async fn pg_store_hard_case(
     tx: &tokio_postgres::Transaction<'_>,
     planned: &crate::federation::attestation_admit::PlannedHardCase,
 ) -> Result<(), crate::federation::Error> {
+    use crate::federation::hard_case::{held_occupant, HeldOccupant};
     if pg_insert_local_attestation_row(tx, &planned.row, None).await? == 0 {
-        return Ok(());
+        let held = pg_hard_case_signer(tx, &planned.row.attestation_id).await?;
+        if held_occupant(held.as_deref(), &planned.row.attesting_key_id)
+            == HeldOccupant::AlreadyHeld
+        {
+            return Ok(());
+        }
+        let Some(bound) = planned.emitter_bound.as_deref() else {
+            return Ok(());
+        };
+        if pg_insert_local_attestation_row(tx, &bound.row, None).await? == 0 {
+            // This node's fallback record is already held: a re-record.
+            return Ok(());
+        }
+        crate::federation::hard_case::record_foreign_occupant_fallback(
+            &bound.projection.event_id,
+            &planned.row.attestation_id,
+            held.as_deref().unwrap_or(""),
+            &bound.row.attesting_key_id,
+        );
+        return pg_project_hard_case(
+            tx,
+            "cirislens.hard_case_events",
+            &bound.row.attestation_id,
+            &bound.projection,
+        )
+        .await;
     }
     pg_project_hard_case(
         tx,
@@ -23615,6 +23609,22 @@ async fn pg_store_hard_case(
         &planned.projection,
     )
     .await
+}
+
+/// v61.1.0 (H3) — the signer of the row held at `attestation_id`, if any.
+async fn pg_hard_case_signer(
+    tx: &tokio_postgres::Transaction<'_>,
+    attestation_id: &str,
+) -> Result<Option<String>, crate::federation::Error> {
+    tx.query_opt(
+        "SELECT attesting_key_id FROM cirislens.federation_attestations \
+         WHERE attestation_id::text = $1",
+        &[&attestation_id],
+    )
+    .await
+    .map_err(|e| crate::federation::Error::Backend(format!("hard_case occupant read: {e}")))?
+    .map(|r| r.safe_get_with(0, crate::federation::Error::Backend))
+    .transpose()
 }
 
 /// v57.0.0 (CIRISPersist#988 item 2) — an in-transaction emitter's record:
@@ -23660,6 +23670,36 @@ async fn pg_project_hard_case<C>(
 where
     C: tokio_postgres::GenericClient + Sync,
 {
+    // v61.1.0 (H3, as ruled) — one row per `event_id`, the one
+    // `projection_outranks` names (the sqlite writer's rule; the rebuild's
+    // scratch table carries no key, so this is asked in Rust).
+    let held = client
+        .query_opt(
+            &format!("SELECT attestation_id FROM {table} WHERE event_id = $1"),
+            &[&event.event_id],
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("project hard_case read: {e}")))?
+        .map(|r| r.safe_get_with::<Option<String>, _, _, _>(0, crate::federation::Error::Backend))
+        .transpose()?;
+    if let Some(held) = held {
+        if !crate::federation::hard_case::projection_outranks(
+            &event.event_id,
+            attestation_id,
+            held.as_deref(),
+        ) {
+            return Ok(());
+        }
+        client
+            .execute(
+                &format!("DELETE FROM {table} WHERE event_id = $1"),
+                &[&event.event_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("project hard_case replace: {e}"))
+            })?;
+    }
     client
         .execute(
             &format!(
@@ -42549,8 +42589,9 @@ mod tests {
             .await
             .unwrap();
         // v61.1.0 (CIRISPersist#1174, CC 3.4.3) — a substrate self-report is
-        // about the substrate that signs it; one about `agent_k` is refused
-        // (`admission::check_substrate_self_report_attester`, I1593).
+        // about the substrate that signs it; one about `agent_k` is refused at
+        // this node's own write door and reported from a peer until v62
+        // (`admission::check_substrate_self_report_attester_at`, I1593, I1607).
         let att = pg_scores_attestation(
             &persist_self,
             &persist_self,

@@ -1917,10 +1917,15 @@ pub(crate) fn objection_action(row: &Attestation) -> Option<String> {
 /// one is admitted from any verifiable signer and judged by the fold (CC's
 /// ruling on #1198, item 2). The self roster's objections are not: there the
 /// keys are the voters and the write gate stands.
+///
+/// v61.1.0 (D12) — the family is the row's claim token
+/// ([`row_type::claim_token`](super::row_type::claim_token): a `scores` row's
+/// `dimension`, any other row's type), the one classifier every family gate
+/// asks (CIRISPersist#1174), not the envelope `dimension` of whatever type.
 #[must_use]
 pub fn is_vote_row(row: &Attestation) -> bool {
     matches!(
-        envelope_str(row, "dimension"),
+        super::row_type::claim_token(row),
         Some(DIMENSION_UPHELD | DIMENSION_OVERRULED | DIMENSION_OBJECTION)
     ) && envelope_str(row, field::COHORT) != Some(Cohort::SelfId.as_str())
 }
@@ -4198,7 +4203,7 @@ pub(crate) mod test_support {
         };
         assert_eq!(
             planned.vote_window.as_ref().map(|(_, at)| *at),
-            Some(received_at),
+            Some(aa::first_held_instant(received_at)),
             "hold_objection_at: the plan opens the window at this node's receipt"
         );
         dir.store_planned_attestation(*planned)

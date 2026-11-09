@@ -5848,7 +5848,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         received_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::federation::self_roster::SelfRosterReceipt, crate::federation::Error> {
         let (id, identity) = (proposal_id.to_owned(), identity_key_id.to_owned());
-        let at = self_roster_instant_text(received_at);
+        let at = first_held_instant_text(received_at);
         let held = self
             .write(
                 move |conn| -> Result<Option<SelfRosterRow>, rusqlite::Error> {
@@ -5954,7 +5954,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         settled_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), crate::federation::Error> {
         let (id, outcome) = (proposal_id.to_owned(), outcome.to_owned());
-        let at = self_roster_instant_text(settled_at);
+        let at = first_held_instant_text(settled_at);
         self.write(move |conn| {
             conn.execute(
                 "UPDATE federation_self_roster_proposals SET settled_at = ?2, outcome = ?3 \
@@ -7312,34 +7312,23 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Vec<crate::federation::ServedAttestation>, crate::federation::Error> {
         let since_at = since.as_ref().map(|(t, _)| t.to_rfc3339());
         let since_id = since.as_ref().map(|(_, id)| id.clone());
-        // v53.0.0 (#975, CC 2.4) — under enforcement a held row of an
-        // unregistered type is neither served nor replicated. Read on the
-        // calling task, before the closure moves to the pool.
-        let row_type_filter = crate::federation::row_type::serve_filter_sql(
-            "attestation_type",
-            crate::federation::row_type::SqlDialect::Sqlite,
+        // v61.1.0 (review D3) — THE serve rule (`read_plan::serve_rule_parts`):
+        // E5, the federation tier only (a local-tier row never reaches the
+        // advertise/serve wire surface); v53.0.0 (#975, CC 2.4), under
+        // enforcement a held row of an unregistered type is neither served
+        // nor replicated; v54.1.0 (#1046), a tombstoned row is not served
+        // unless the tombstone is void for it (the accountability record,
+        // a person-subject row: Codex rounds 1 and 4 on PR #1057). Built on
+        // the calling task (the row-type filter reads its enforcement),
+        // before the closure moves to the pool.
+        let serve_rule = crate::federation::read_plan::serve_rule_parts(
+            crate::federation::attestation_query::Dialect::Sqlite,
+            "federation_attestations",
+            "",
         )
-        .map(|p| format!(" AND {p}"))
-        .unwrap_or_default();
-        // Codex rounds 1 and 4 on PR #1057 — a tombstone is void for the
-        // accountability record and (interim) for a row a person is the
-        // subject of: both are served.
-        let accountability = format!(
-            "{} OR {}",
-            crate::federation::migration::accountability_record_sql(
-                "federation_attestations.dimension"
-            ),
-            crate::federation::steward_purge::person_subject_sql("federation_attestations", "")
-        );
+        .join(" AND ");
         let (read, bytes) = self
             .read_measured(move |conn| -> Result<Vec<_>, rusqlite::Error> {
-                // E5 invariant: `tier = 'federation'` only — a local-tier row
-                // must never reach the advertise/serve wire surface.
-                //
-                // v54.1.0 (CIRISPersist#1046) — a tombstoned row is never
-                // served; excluded in the SQL, before the page is cut. Unless
-                // it is the accountability record (Codex on PR #1057): a
-                // tombstone is void for it.
                 let mut stmt = conn.prepare(&format!(
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
@@ -7349,14 +7338,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     additional_scrubs, {pos} AS _pos \
                  FROM federation_attestations \
                  WHERE (?1 IS NULL OR {pos} > ?1 OR ({pos} = ?1 AND attestation_id > ?2)) \
-                   AND tier = 'federation'{row_type_filter} \
-                   AND (NOT EXISTS (SELECT 1 FROM purge_tombstones pt \
-                                    WHERE pt.plane = 'attestation' \
-                                      AND pt.record_ref = federation_attestations.attestation_id) \
-                        OR {accountability}) \
+                   AND {serve_rule} \
                  ORDER BY {pos} ASC, attestation_id ASC LIMIT ?3",
                     pos = POS_ATTESTATION,
-                    accountability = accountability,
                 ))?;
                 let rows = stmt.query_map(rusqlite::params![since_at, since_id, limit], |row| {
                     let pos: String = row.get("_pos")?;
@@ -7661,16 +7645,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
 
     async fn list_attestations_since_by_prefixes(
         &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        dimension_prefixes: &[String],
-        type_prefixes: &[String],
+        since: Option<crate::federation::types::ServePosition>,
+        family_prefixes: &[String],
         limit: i64,
-    ) -> Result<crate::federation::types::ServedAttestationPage, crate::federation::Error> {
+    ) -> Result<
+        crate::federation::types::ServePage<crate::federation::ServedAttestation>,
+        crate::federation::Error,
+    > {
         crate::federation::read_plan::list_attestations_since_by_prefixes_planned(
             self,
             since,
-            dimension_prefixes,
-            type_prefixes,
+            family_prefixes,
             limit,
         )
         .await
@@ -7678,9 +7663,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
 
     async fn list_owner_bindings_since(
         &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        since: Option<crate::federation::types::ServePosition>,
         limit: i64,
-    ) -> Result<crate::federation::types::OwnerBindingPage, crate::federation::Error> {
+    ) -> Result<
+        crate::federation::types::ServePage<crate::federation::types::OwnerBindingChange>,
+        crate::federation::Error,
+    > {
         crate::federation::read_plan::list_owner_bindings_since_planned(self, since, limit).await
     }
 
@@ -14451,7 +14439,9 @@ fn sqlite_factor_rollup_upsert_sql(source_filter: &str) -> String {
 
 /// v59.0.0 (CIRISPersist#1099) — the V199 instant spelling: fixed-width
 /// RFC 3339 at microseconds, so `ORDER BY received_at` orders as time does.
-fn self_roster_instant_text(t: chrono::DateTime<chrono::Utc>) -> String {
+/// v61.1.0 — also V213's (`federation_vote_windows.first_held_at`): one
+/// spelling for every first-held instant (`attestation_admit::first_held_instant`).
+fn first_held_instant_text(t: chrono::DateTime<chrono::Utc>) -> String {
     t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
@@ -15695,15 +15685,10 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             projected_goal,
             vote_window,
             self_roster_receipt,
-            restamped_withdraws,
             wire_index_key,
             ..
         } = planned;
         let id_for_compare = row.attestation_id.clone();
-        let restamped_index_keys: Vec<String> = restamped_withdraws
-            .iter()
-            .filter_map(|r| r.wire_index_key.clone())
-            .collect();
         // v38.5.0 (#771) — ABSORB, then RE-READ: `OR IGNORE` makes a
         // re-delivered row stop raising a UNIQUE violation, and the plan's
         // caller resolves the zero-row result against the STORED hash.
@@ -15813,7 +15798,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                     tx.execute(
                         "INSERT OR IGNORE INTO federation_vote_windows \
                          (action_id, first_held_at) VALUES (?1, ?2)",
-                        rusqlite::params![action_id, self_roster_instant_text(*first_held_at)],
+                        rusqlite::params![action_id, first_held_instant_text(*first_held_at)],
                     )?;
                 }
                 // v61.1.0 (CIRISPersist#1220, V199) — a proposal's receipt,
@@ -15827,27 +15812,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                         rusqlite::params![
                             row.attestation_id,
                             identity_key_id,
-                            self_roster_instant_text(*received_at)
-                        ],
-                    )?;
-                }
-                // v61.1.0 (CIRISPersist#1218) — the deferred `withdraws`
-                // naming this row, stamped with the rule the door gives them
-                // now, in the row's transaction: the folds and the Live
-                // listing read the same rule whatever order the two arrived
-                // in. Guarded on each still being unstamped under the hash
-                // the plan read.
-                for r in &restamped_withdraws {
-                    tx.execute(
-                        "UPDATE federation_attestations \
-                            SET withdraws_admission_rule = ?2, persist_row_hash = ?3 \
-                          WHERE attestation_id = ?1 AND withdraws_admission_rule IS NULL \
-                            AND persist_row_hash = ?4",
-                        rusqlite::params![
-                            r.attestation_id,
-                            i64::from(r.rule),
-                            r.persist_row_hash,
-                            r.held_persist_row_hash
+                            first_held_instant_text(*received_at)
                         ],
                     )?;
                 }
@@ -15889,11 +15854,6 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             self.index_stored_record("Attestation", wire_index_key)
                 .await?;
         }
-        // v61.1.0 (CIRISPersist#1218) — a restamped `withdraws` changed its
-        // row hash; its index entry follows the stored row.
-        for key in &restamped_index_keys {
-            self.index_stored_record("Attestation", key).await?;
-        }
         // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
         // `trace:complete:v1` attestation materializes its `trace_events` rows
         // (the SAME decompose the ingest path uses). Idempotent.
@@ -15923,12 +15883,7 @@ impl SqliteBackend {}
 /// `scores` read handles (JOINed to `attestation_subjects s`). Column NAMES
 /// are unprefixed, so [`sqlite_row_to_attestation`] (which reads by name)
 /// resolves them unchanged.
-const SCORES_FA_COLS: &str = "fa.attestation_id, fa.attesting_key_id, fa.attested_key_id, \
-     fa.attestation_type, fa.weight, fa.asserted_at, fa.expires_at, \
-     fa.attestation_envelope, fa.original_content_hash, fa.scrub_signature_classical, \
-     fa.scrub_signature_pqc, fa.scrub_key_id, fa.scrub_timestamp, fa.pqc_completed_at, \
-     fa.persist_row_hash, fa.subject_key_ids, fa.withdraws_admission_rule, fa.cohort_scope, \
-     fa.tier, fa.promoted_at, fa.additional_scrubs";
+const SCORES_FA_COLS: &str = crate::federation::attestation_query::SQLITE_FA_COLUMNS;
 
 /// v17.4.0 — shared WHERE predicate builder for the sqlite `scores` read
 /// handles. Emits the subject / dimension(exact+prefix) / type / attester /
@@ -16692,14 +16647,12 @@ fn sqlite_naming_page_sql(
     let mut parts: Vec<String> = vec![
         "s.subject_key_id = ?1".to_owned(),
         "s.dimension = ?2".to_owned(),
-        "fa.tier = 'federation'".to_owned(),
     ];
-    parts.extend(crate::federation::row_type::serve_filter_sql(
-        "fa.attestation_type",
-        crate::federation::row_type::SqlDialect::Sqlite,
-    ));
-    parts.push(crate::federation::steward_purge::served_under_purge_sql(
-        "fa", "",
+    // v61.1.0 (review D3) — the one serve rule.
+    parts.extend(crate::federation::read_plan::serve_rule_parts(
+        crate::federation::attestation_query::Dialect::Sqlite,
+        "fa",
+        "",
     ));
     if let Some(c) = cursor {
         binds.push(SqlValue::Text(c.last_asserted_at.to_rfc3339()));
@@ -17914,12 +17867,43 @@ fn sqlite_record_hard_case_in_tx(
 /// v57.0.0 (CIRISPersist#988 item 2) — **the hard_case writer**, inside
 /// `tx`: the planned row (insert-if-absent on its event-derived id) and,
 /// when it landed, its projection. A re-recorded event writes nothing.
+///
+/// v61.1.0 (61.1 review H3, as ruled) — when the v1 id is held by a row
+/// ANOTHER key signed, this node's record is written under its emitter-bound
+/// id instead ([`HeldOccupant`](crate::federation::hard_case::HeldOccupant)),
+/// logged and counted with `hard_case_id_held_by_foreign_row`, and the act
+/// commits. The foreign row is left as it is.
 fn sqlite_store_hard_case(
     tx: &rusqlite::Transaction<'_>,
     planned: &crate::federation::attestation_admit::PlannedHardCase,
 ) -> Result<(), rusqlite::Error> {
+    use crate::federation::hard_case::{held_occupant, HeldOccupant};
     if sqlite_insert_local_attestation_row(tx, &planned.row, None)? == 0 {
-        return Ok(());
+        let held = sqlite_hard_case_signer(tx, &planned.row.attestation_id)?;
+        if held_occupant(held.as_deref(), &planned.row.attesting_key_id)
+            == HeldOccupant::AlreadyHeld
+        {
+            return Ok(());
+        }
+        let Some(bound) = planned.emitter_bound.as_deref() else {
+            return Ok(());
+        };
+        if sqlite_insert_local_attestation_row(tx, &bound.row, None)? == 0 {
+            // This node's fallback record is already held: a re-record.
+            return Ok(());
+        }
+        crate::federation::hard_case::record_foreign_occupant_fallback(
+            &bound.projection.event_id,
+            &planned.row.attestation_id,
+            held.as_deref().unwrap_or(""),
+            &bound.row.attesting_key_id,
+        );
+        return sqlite_project_hard_case(
+            tx,
+            "hard_case_events",
+            &bound.row.attestation_id,
+            &bound.projection,
+        );
     }
     sqlite_project_hard_case(
         tx,
@@ -17927,6 +17911,19 @@ fn sqlite_store_hard_case(
         &planned.row.attestation_id,
         &planned.projection,
     )
+}
+
+/// v61.1.0 (H3) — the signer of the row held at `attestation_id`, if any.
+fn sqlite_hard_case_signer(
+    tx: &rusqlite::Transaction<'_>,
+    attestation_id: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    tx.query_row(
+        "SELECT attesting_key_id FROM federation_attestations WHERE attestation_id = ?1",
+        [attestation_id],
+        |r| r.get(0),
+    )
+    .optional()
 }
 
 /// v57.0.0 (CIRISPersist#988 item 2) — one `hard_case_events`-shaped row into
@@ -17940,6 +17937,30 @@ fn sqlite_project_hard_case(
 ) -> Result<(), rusqlite::Error> {
     let detail = serde_json::to_string(&event.detail)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    // v61.1.0 (H3, as ruled) — two rows can now project one `event_id` (a
+    // peer's v1 row and this node's emitter-bound record): the table keeps the
+    // one `projection_outranks` names, in the live write and the rebuild alike
+    // (the rebuild's scratch table carries no key, so this is asked in Rust).
+    let held: Option<Option<String>> = tx
+        .query_row(
+            &format!("SELECT attestation_id FROM {table} WHERE event_id = ?1"),
+            [&event.event_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(held) = held {
+        if !crate::federation::hard_case::projection_outranks(
+            &event.event_id,
+            attestation_id,
+            held.as_deref(),
+        ) {
+            return Ok(());
+        }
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE event_id = ?1"),
+            [&event.event_id],
+        )?;
+    }
     tx.execute(
         &format!(
             "INSERT INTO {table} \
@@ -23819,11 +23840,16 @@ impl crate::federation::read_plan::ReadPlanStore for SqliteBackend {
     async fn read_serve_stream_page(
         &self,
         narrowing: crate::federation::read_plan::ServeNarrowing<'_>,
-        since: Option<&(chrono::DateTime<chrono::Utc>, String)>,
+        since: Option<&crate::federation::types::ServePosition>,
         fetch: i64,
     ) -> Result<crate::federation::read_plan::ServedRows, crate::federation::Error> {
         use crate::federation::attestation_query::Dialect;
+        use crate::federation::types::ServePosition;
         use crate::federation::Error;
+        // `None`: sqlite's head is exact (its one writer assigns the serve
+        // position inside the write transaction).
+        let settled_before =
+            crate::federation::read_plan::serve_settled_before(Dialect::Sqlite, chrono::Utc::now());
         let head_stmt = crate::federation::read_plan::serve_stream_head_statement(Dialect::Sqlite);
         let page_stmt = crate::federation::read_plan::serve_stream_statement(
             Dialect::Sqlite,
@@ -23834,7 +23860,7 @@ impl crate::federation::read_plan::ReadPlanStore for SqliteBackend {
         let head_sql = head_stmt.sql;
         let page_sql = page_stmt.sql;
         let binds = sqlite_binds(page_stmt.binds);
-        type Head = Option<(chrono::DateTime<chrono::Utc>, String)>;
+        type Head = Option<ServePosition>;
         let (read, bytes) = self
             .read_measured(
                 move |conn| -> Result<(Head, Vec<crate::federation::ServedAttestation>), Error> {
@@ -23844,7 +23870,7 @@ impl crate::federation::read_plan::ReadPlanStore for SqliteBackend {
                         .query_row(&head_sql, [], |r| {
                             let pos: String = r.get(0)?;
                             let id: String = r.get(1)?;
-                            Ok((parse_rfc3339(&pos), id))
+                            Ok(ServePosition::new(parse_rfc3339(&pos), id))
                         })
                         .optional()
                         .map_err(|e| Error::Backend(format!("serve stream head: {e}")))?;
@@ -23870,6 +23896,7 @@ impl crate::federation::read_plan::ReadPlanStore for SqliteBackend {
         Ok(crate::federation::read_plan::ServedRows {
             rows,
             head,
+            settled_before,
             bytes,
             backend: crate::observe::StoreBackend::Sqlite,
         })
@@ -40459,8 +40486,9 @@ mod tests {
             .await
             .unwrap();
         // v61.1.0 (CIRISPersist#1174, CC 3.4.3) — a substrate self-report is
-        // about the substrate that signs it; one about `k-a` is refused
-        // (`admission::check_substrate_self_report_attester`, I1593).
+        // about the substrate that signs it; one about `k-a` is refused at
+        // this node's own write door and reported from a peer until v62
+        // (`admission::check_substrate_self_report_attester_at`, I1593, I1607).
         let att = scores_attestation_with_dimension(
             "att-sys-2",
             "persist-self",
@@ -43480,15 +43508,20 @@ mod tests {
         };
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        let since = (chrono::Utc::now(), uuid::Uuid::new_v4().to_string());
-        let dims = vec!["membership:proposal:".to_owned(), "objection:".to_owned()];
-        let types = vec!["accord:invoke:".to_owned()];
+        let since = crate::federation::types::ServePosition::new(
+            chrono::Utc::now(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let families = vec![
+            "membership:proposal:".to_owned(),
+            "objection:".to_owned(),
+            "accord:invoke:".to_owned(),
+        ];
         for (tag, narrowing) in [
             (
-                "prefixes",
-                ServeNarrowing::Prefixes {
-                    dimension_prefixes: &dims,
-                    type_prefixes: &types,
+                "families",
+                ServeNarrowing::Families {
+                    family_prefixes: &families,
                 },
             ),
             ("owner bindings", ServeNarrowing::OwnerBindingChanges),

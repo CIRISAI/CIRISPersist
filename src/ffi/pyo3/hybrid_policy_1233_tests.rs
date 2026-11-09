@@ -14,9 +14,12 @@
 //!   lookup); and `verify_signed_key_record` / `verify_signed_attestation` /
 //!   `verify_signed_revocation` refuse a non-strict policy before decoding
 //!   the envelope.
-//! - **I1567** `audit_chain_proof`: a tenant whose stored head lacks its
-//!   ML-DSA-65 half yields an error carrying `audit_sth_not_hybrid`, not the
-//!   chain with `head_signature: None`; a genuine stored head is served.
+//! - **I1567** `audit_chain_proof`: a genuine stored head is served; a stored head without its ML-DSA-65 half
+//!   (written around the store gate, as an earlier build left it) is SERVED
+//!   as itself (CC 2.6.1.8) and `verify_audit_sth` REFUSES the head the proof
+//!   carries with `audit_sth_not_hybrid`; a stored head that does not decode
+//!   is an error, not the chain with `head_signature: None` (only a real
+//!   error is refused, and it is never folded to absence).
 //!
 //! Each runs on sqlite and postgres. The capsule leg is
 //! `ffi::directory_capsule`'s I1562; the wheel leg is
@@ -281,7 +284,8 @@ fn i1560_i1561_python_verify_doors_accept_only_strict_postgres() {
     eprintln!("i1560_i1561 postgres: RAN");
 }
 
-// ── I1567 — audit_chain_proof does not serve a refused head as no head ──
+// ── I1567 — audit_chain_proof serves a stored head as itself, and does not
+// serve an unreadable head as no head ──
 
 #[cfg(feature = "cirisaudit")]
 fn genesis_entry(tenant: &str, trace_id: &str) -> crate::audit::AuditEntry {
@@ -311,35 +315,94 @@ fn genesis_entry(tenant: &str, trace_id: &str) -> crate::audit::AuditEntry {
     e
 }
 
-/// After the genuine head (size 1) is stored, the proof serves it; after a
-/// head with its ML-DSA-65 half emptied (size 2) is stored around the door,
-/// the proof is an error carrying the token, not the chain without a head.
+/// The head a proof carries, decoded back from its JSON.
 #[cfg(feature = "cirisaudit")]
-async fn i1567_assert(
+fn proof_head(
+    proof: &crate::federation::AuditChainProof,
+    who: &str,
+) -> ciris_verify_core::transparency::SignedTreeHead {
+    let json = proof
+        .head_signature
+        .as_deref()
+        .unwrap_or_else(|| panic!("I1567 {who}: the stored head rides the proof"));
+    serde_json::from_str(json).expect("I1567: head_signature is a SignedTreeHead")
+}
+
+/// The stored heads `i1567_assert` injects around the store gate.
+#[cfg(feature = "cirisaudit")]
+struct I1567Heads<G, E, R> {
+    genuine: G,
+    emptied: E,
+    removed: R,
+}
+
+/// After the genuine head (size 1) is stored, the proof serves it. After a head with its ML-DSA-65 half emptied
+/// (size 2) is stored around the door, the proof serves THAT head as itself,
+/// and `verify_audit_sth` refuses it with the token. After a head whose blob
+/// does not decode (size 3, the `pqc` member removed), the proof is an error,
+/// not the chain without a head.
+#[cfg(feature = "cirisaudit")]
+async fn i1567_assert<G, E, R>(
     dispatch: &BackendDispatch,
     trace_id: &str,
-    inject_genuine: impl std::future::Future<Output = ()>,
-    inject_emptied: impl std::future::Future<Output = ()>,
+    heads: I1567Heads<G, E, R>,
+    pins: (&str, &str),
     who: &str,
-) {
-    use crate::audit::merkle_store::AUDIT_STH_NOT_HYBRID;
-    inject_genuine.await;
+) where
+    G: std::future::Future<Output = ()>,
+    E: std::future::Future<Output = ()>,
+    R: std::future::Future<Output = ()>,
+{
+    use crate::audit::merkle_store::{verify_audit_sth, AUDIT_STH_NOT_HYBRID};
+    let (ed_pk, pqc_pk) = pins;
+
+    heads.genuine.await;
     let proof = super::build_audit_chain_proof(dispatch, trace_id)
         .await
         .unwrap_or_else(|e| panic!("I1567 {who}: the genuine head is served: {e}"));
     assert_eq!(proof.entries.len(), 1, "I1567 {who}: the chain");
+    // The genuine row is injected without its `signed_at`, so its served
+    // instant is the column default and it is not verified here; I1565
+    // verifies a genuine head stored through the door.
+    let head = proof_head(&proof, who);
+    assert_eq!(head.tree_size, 1, "I1567 {who}: the genuine head");
     assert!(
-        proof.head_signature.is_some(),
-        "I1567 {who}: the genuine head rides the proof"
+        !head.signature.pqc.signature.is_empty(),
+        "I1567 {who}: the genuine head carries its ML-DSA-65 half"
     );
-    inject_emptied.await;
+
+    heads.emptied.await;
+    let proof = super::build_audit_chain_proof(dispatch, trace_id)
+        .await
+        .unwrap_or_else(|e| {
+            panic!("I1567 {who}: a stored head without its half is served as itself: {e}")
+        });
+    assert_eq!(proof.entries.len(), 1, "I1567 {who}: the chain");
+    let head = proof_head(&proof, who);
+    assert_eq!(
+        head.tree_size, 2,
+        "I1567 {who}: the newest stored head is served, not the genuine one below it"
+    );
+    assert!(
+        head.signature.pqc.signature.is_empty(),
+        "I1567 {who}: served as itself, its half still empty"
+    );
+    match verify_audit_sth(&head, ed_pk, pqc_pk) {
+        Err(e) => assert!(
+            e.to_string().contains(AUDIT_STH_NOT_HYBRID),
+            "I1567 {who}: verify refuses the served head with the token: {e}"
+        ),
+        Ok(()) => panic!("I1567 {who}: a head without its ML-DSA-65 half must not verify"),
+    }
+
+    heads.removed.await;
     match super::build_audit_chain_proof(dispatch, trace_id).await {
         Err(e) => assert!(
-            e.contains(AUDIT_STH_NOT_HYBRID),
-            "I1567 {who}: the refusal carries the token: {e}"
+            e.contains("sth signature deserialize"),
+            "I1567 {who}: the unreadable head is the error: {e}"
         ),
         Ok(p) => panic!(
-            "I1567 {who}: a head without its ML-DSA-65 half must not be served as \
+            "I1567 {who}: a head that does not decode must not be served as \
              head_signature={:?} over {} entries",
             p.head_signature,
             p.entries.len()
@@ -349,7 +412,7 @@ async fn i1567_assert(
 
 #[cfg(all(feature = "cirisaudit", feature = "sqlite"))]
 #[tokio::test(flavor = "multi_thread")]
-async fn i1567_audit_chain_proof_refuses_a_head_without_its_pqc_half_sqlite() {
+async fn i1567_audit_chain_proof_serves_a_stored_head_as_itself_sqlite() {
     use crate::audit::hybrid_head_1233_invariants::bodies as hb;
     use crate::audit::AuditService as _;
     use crate::store::Backend as _;
@@ -366,16 +429,21 @@ async fn i1567_audit_chain_proof_refuses_a_head_without_its_pqc_half_sqlite() {
         .await
         .expect("I1567: the genesis entry records");
     let log_id = crate::audit::merkle_store::log_id_for_tenant(&tenant);
-    let (genuine, _, _) = hb::genuine_head(&log_id, 1).await;
+    let (genuine, ed_pk, pqc_pk) = hb::genuine_head(&log_id, 1).await;
     let conn = backend.conn_handle();
     let genuine_blob = serde_json::to_vec(&genuine.signature).unwrap();
     let emptied_blob = hb::blob_with_the_pqc_half_emptied(&genuine);
+    let removed_blob = hb::blob_with_the_pqc_half_removed(&genuine);
     let dispatch = BackendDispatch::Sqlite(backend);
     i1567_assert(
         &dispatch,
         &trace_id,
-        async { hb::inject_sth_row_sqlite(&conn, &tenant, 1, &genuine_blob) },
-        async { hb::inject_sth_row_sqlite(&conn, &tenant, 2, &emptied_blob) },
+        I1567Heads {
+            genuine: async { hb::inject_sth_row_sqlite(&conn, &tenant, 1, &genuine_blob) },
+            emptied: async { hb::inject_sth_row_sqlite(&conn, &tenant, 2, &emptied_blob) },
+            removed: async { hb::inject_sth_row_sqlite(&conn, &tenant, 3, &removed_blob) },
+        },
+        (ed_pk.as_str(), pqc_pk.as_str()),
         "sqlite",
     )
     .await;
@@ -383,7 +451,7 @@ async fn i1567_audit_chain_proof_refuses_a_head_without_its_pqc_half_sqlite() {
 
 #[cfg(all(feature = "cirisaudit", feature = "postgres"))]
 #[tokio::test(flavor = "multi_thread")]
-async fn i1567_audit_chain_proof_refuses_a_head_without_its_pqc_half_postgres() {
+async fn i1567_audit_chain_proof_serves_a_stored_head_as_itself_postgres() {
     use crate::audit::hybrid_head_1233_invariants::bodies as hb;
     use crate::audit::AuditService as _;
     use crate::store::Backend as _;
@@ -404,15 +472,20 @@ async fn i1567_audit_chain_proof_refuses_a_head_without_its_pqc_half_postgres() 
         .await
         .expect("I1567: the genesis entry records");
     let log_id = crate::audit::merkle_store::log_id_for_tenant(&tenant);
-    let (genuine, _, _) = hb::genuine_head(&log_id, 1).await;
+    let (genuine, ed_pk, pqc_pk) = hb::genuine_head(&log_id, 1).await;
     let genuine_blob = serde_json::to_vec(&genuine.signature).unwrap();
     let emptied_blob = hb::blob_with_the_pqc_half_emptied(&genuine);
+    let removed_blob = hb::blob_with_the_pqc_half_removed(&genuine);
     let dispatch = BackendDispatch::Postgres(backend.clone());
     i1567_assert(
         &dispatch,
         &trace_id,
-        hb::inject_sth_row_pg(&backend, &tenant, 1, &genuine_blob),
-        hb::inject_sth_row_pg(&backend, &tenant, 2, &emptied_blob),
+        I1567Heads {
+            genuine: hb::inject_sth_row_pg(&backend, &tenant, 1, &genuine_blob),
+            emptied: hb::inject_sth_row_pg(&backend, &tenant, 2, &emptied_blob),
+            removed: hb::inject_sth_row_pg(&backend, &tenant, 3, &removed_blob),
+        },
+        (ed_pk.as_str(), pqc_pk.as_str()),
         "postgres",
     )
     .await;

@@ -97,8 +97,17 @@ pub const AUDIT_STH_SIGNATURE_INVALID: &str = "audit_sth_signature_invalid";
 /// An [`AuditEntry`](crate::audit::types::AuditEntry) is a leaf: its Ed25519
 /// signature is an inner signature, and what carries the log's accountability
 /// across a node boundary is the signed tree head plus an inclusion proof
-/// under it. So the head must carry its ML-DSA-65 half, and a head without
-/// one is refused wherever it would be stored or served.
+/// under it. So the head must carry its ML-DSA-65 half: a NEW head without
+/// one is refused where it would be stored (`store_sth`, both backends), and
+/// [`verify_audit_sth`] refuses one wherever a verifier checks it.
+///
+/// It is NOT asked where a stored head is served (`latest_sth`, and so
+/// `AuditService::current_sth`): a stored head is served as itself (CC
+/// 2.6.1.8: an earlier form verifies as itself for rows anchored before the
+/// cutover), so a tenant whose head was stored by an earlier build keeps its
+/// proofs and can still append. The only head this node's store would refuse
+/// today is one written after the gate, which `store_sth` makes impossible by
+/// construction.
 ///
 /// `HybridSignature` makes the half structurally REQUIRED (its `pqc` field
 /// has no serde default, so a blob with the half removed does not decode),
@@ -580,9 +589,11 @@ mod pg_impl {
                     signature,
                     witness_signatures,
                 };
-                // v61.1.0 (CIRISPersist#1233) — a stored head without its
-                // ML-DSA-65 half is refused, never served.
-                require_hybrid_sth(&sth)?;
+                // v61.1.0 (CIRISPersist#1233, CC 2.6.1.8) — a stored head is
+                // served AS ITSELF, with no shape gate: `store_sth` gates NEW
+                // heads, and `verify_audit_sth` is the hybrid-Strict check a
+                // verifier asks. A head stored before the gate (an earlier
+                // build) keeps its proofs, and the tenant can still append.
                 Ok(Some(sth))
             })
         }
@@ -895,9 +906,12 @@ mod sqlite_impl {
                         signature,
                         witness_signatures,
                     };
-                    // v61.1.0 (CIRISPersist#1233) — a stored head without its
-                    // ML-DSA-65 half is refused, never served.
-                    require_hybrid_sth(&sth)?;
+                    // v61.1.0 (CIRISPersist#1233, CC 2.6.1.8) — a stored head
+                    // is served AS ITSELF, with no shape gate: `store_sth`
+                    // gates NEW heads, and `verify_audit_sth` is the
+                    // hybrid-Strict check a verifier asks. A head stored before
+                    // the gate (an earlier build) keeps its proofs, and the
+                    // tenant can still append.
                     Ok(Some(sth))
                 })()
             })

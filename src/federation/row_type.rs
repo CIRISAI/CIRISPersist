@@ -392,6 +392,45 @@ pub fn composer_dimension_would_refuse_total() -> Vec<(String, u64)> {
         .collect()
 }
 
+static SUBSTRATE_SELF_REPORT_WOULD_REFUSE: Mutex<BTreeMap<String, u64>> =
+    Mutex::new(BTreeMap::new());
+
+/// v61.1.0 (CIRISPersist#1174 item 3, as ruled) — a peer's or replicated
+/// substrate self-report row about another key
+/// (`admission::check_substrate_self_report_attester`) was admitted under
+/// report. Counted by family stem (bounded as every peer-chosen label is) and
+/// logged with the refusal's token,
+/// `substrate_self_report_names_another_party`.
+pub(crate) fn record_substrate_self_report_would_refuse(row: &Attestation, refusal: &Error) {
+    let family = claim_token(row).unwrap_or("");
+    let stem = type_stem(family);
+    bump(&SUBSTRATE_SELF_REPORT_WOULD_REFUSE, stem.clone());
+    tracing::warn!(
+        metric = "persist_substrate_self_report_would_refuse_total",
+        reason = super::admission::SUBSTRATE_SELF_REPORT_SUBJECT_REASON,
+        type_stem = %stem,
+        attestation_id = %row.attestation_id,
+        attesting_key_id = %row.attesting_key_id,
+        attested_key_id = %row.attested_key_id,
+        error = %refusal,
+        "admitted a replicated substrate self-report about another key \
+         (substrate_self_report_names_another_party; CC 3.4.3): this node refuses its own such \
+         writes, and reports a peer's until v62 refuses them"
+    );
+}
+
+/// `persist_substrate_self_report_would_refuse_total{type_stem}` since
+/// process start.
+#[must_use]
+pub fn substrate_self_report_would_refuse_total() -> Vec<(String, u64)> {
+    SUBSTRATE_SELF_REPORT_WOULD_REFUSE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect()
+}
+
 /// **The row's family, in either form** — the one classifier every
 /// family-keyed reader and gate asks: the envelope `dimension` of a `scores`
 /// row (CC 2.4's shape), else the `attestation_type` itself (the type-slot
@@ -641,6 +680,10 @@ pub struct RowTypeReport {
     pub admitted_unregistered: Vec<LabelCount>,
     /// `persist_composer_dimension_would_refuse_total{label}`.
     pub composer_dimension_would_refuse: Vec<LabelCount>,
+    /// v61.1.0 — `persist_substrate_self_report_would_refuse_total{type_stem}`:
+    /// replicated substrate self-reports about another key, admitted under
+    /// report (CC 3.4.3; refused from v62).
+    pub substrate_self_report_would_refuse: Vec<LabelCount>,
 }
 
 /// Build the [`RowTypeReport`] from `dir`'s census and this process's
@@ -673,5 +716,6 @@ pub async fn row_type_report(dir: &dyn FederationDirectory) -> Result<RowTypeRep
         held_unregistered,
         admitted_unregistered: counts(unregistered_admitted_total()),
         composer_dimension_would_refuse: counts(composer_dimension_would_refuse_total()),
+        substrate_self_report_would_refuse: counts(substrate_self_report_would_refuse_total()),
     })
 }

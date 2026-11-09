@@ -799,13 +799,18 @@ pub(crate) mod revoke_countersign_1226_invariants;
 // gate its classic-form twin meets, on every backend.
 #[cfg(test)]
 mod scores_form_family_1174_invariants;
-// v61.1.0 (CIRISPersist#1218, #1220) — I1600–I1602: a retraction's verdict
-// does not depend on arrival order; a roster proposal is never held without
-// its window, on every backend.
+// v61.1.0 (CIRISPersist#1218, #1220) — I1600–I1604: past its producer, only
+// the door's stamp lets a retraction retire a row; a roster proposal is never
+// held without its window, on every backend.
 #[cfg(test)]
 mod withdraws_order_roster_receipt_invariants;
-// v61.1.0 (CIRISPersist#1163, #1190) — I1570–I1579: the narrowed serve
-// read and the owner-binding feed, on every backend.
+// v61.1.0 (61.1 review H3, as ruled) — I1605/I1606: a hard_case id held by a
+// foreign row never blocks this node's record; it lands under the
+// emitter-bound id.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod hard_case_occupant_invariants;
+// v61.1.0 (CIRISPersist#1163, #1190) — I1570–I1579 and I1670–I1675: the
+// narrowed serve read and the owner-binding feed, on every backend.
 #[cfg(test)]
 pub(crate) mod serve_feeds_1163_1190_invariants;
 // v60.1.0 (CIRISPersist#1113, CC 4.5.3) — I1366/I1367: a reversed
@@ -5323,39 +5328,49 @@ pub trait FederationDirectory: Send + Sync {
     }
 
     /// v61.1.0 (CIRISPersist#1190, Edge v44 / CIRISConstitution#198 §5) —
-    /// [`Self::list_attestations_since`] narrowed by prefix: the
-    /// federation-tier rows whose `dimension` starts with one of
-    /// `dimension_prefixes`, or whose `attestation_type` starts with one of
-    /// `type_prefixes`, so a consumer rebuilding a queue of one family of
+    /// [`Self::list_attestations_since`] narrowed by FAMILY: the
+    /// federation-tier rows whose family starts with one of
+    /// `family_prefixes`, so a consumer rebuilding a queue of one family of
     /// rows (Edge's pending-decision rows) does not page the whole plane.
     ///
-    /// The cursor is the same `(admitted_at, attestation_id)` serve position,
-    /// exclusive, ascending; a tie on `admitted_at` is broken by id. At most
-    /// `limit` (1..=10_000) per page; `next_cursor` is `Some` exactly when
-    /// another matching row exists past the page (the executor fetches one
-    /// row past it). `high_water` is where to resume once nothing remains:
-    /// the stream's head at the read, so a sparse family does not rescan the
-    /// rows of every other family on each poll.
+    /// A row's family is [`row_type::claim_token`]'s, the one classifier
+    /// every family-keyed gate asks: a `scores` row's envelope `dimension`,
+    /// and any other row's `attestation_type` (a composer's verb included).
+    /// So both shapes of one family (CC 2.4's `scores` form and the type-slot
+    /// form held rows were written in) are selected by the one prefix, and a
+    /// non-`scores` row is never selected by a `dimension` it carries.
+    ///
+    /// The cursor is the same [`types::ServePosition`] (`(admitted_at,
+    /// attestation_id)`), exclusive, ascending; a tie on `admitted_at` is
+    /// broken by id; [`types::ServePosition::origin`] reads from the start.
+    /// At most `limit` (1..=10_000) per page; `next_cursor` is `Some` exactly
+    /// when another matching row exists past the page (the executor fetches
+    /// one row past it). `high_water` is where to resume once nothing
+    /// remains: the stream's head at the read (clamped on postgres below any
+    /// position still in flight, [`types::ServePage::high_water`]), so a
+    /// sparse family does not rescan the rows of every other family on each
+    /// poll.
     ///
     /// A prefix is a byte prefix, case-sensitive, matched as a half-open
-    /// range (never `LIKE`: `%` and `_` are ordinary characters). Refused:
-    /// no prefix at all, an empty prefix, more than 64 prefixes, a page size
-    /// outside the bound.
+    /// range (never `LIKE`: `%` and `_` are ordinary characters). Refused,
+    /// the message led by a stable token: no prefix at all, an empty prefix,
+    /// more than 64 prefixes (`serve_prefixes_refused`); a page size outside
+    /// the bound (`serve_limit_out_of_range`).
     ///
-    /// It serves exactly what [`Self::list_attestations_since`] serves:
-    /// federation tier only, no unregistered type under row-type
-    /// enforcement (CC 2.4), and no purge-tombstoned row except those the
-    /// tombstone is void for. A plain read: no caller gate and no lifecycle
-    /// folding. Default = `Unsupported`; the sqlite and postgres backends and
-    /// the capsule proxy override.
+    /// It serves exactly what [`Self::list_attestations_since`] serves
+    /// (`read_plan::serve_rule_parts`, the one serve rule): federation tier
+    /// only, no unregistered type under row-type enforcement (CC 2.4), and no
+    /// purge-tombstoned row except those the tombstone is void for. A plain
+    /// read: no caller gate and no lifecycle folding. Default =
+    /// `Unsupported`; the sqlite and postgres backends and the capsule proxy
+    /// override.
     async fn list_attestations_since_by_prefixes(
         &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        dimension_prefixes: &[String],
-        type_prefixes: &[String],
+        since: Option<types::ServePosition>,
+        family_prefixes: &[String],
         limit: i64,
-    ) -> Result<types::ServedAttestationPage, Error> {
-        let _ = (since, dimension_prefixes, type_prefixes, limit);
+    ) -> Result<types::ServePage<types::ServedAttestation>, Error> {
+        let _ = (since, family_prefixes, limit);
         Err(Error::Unsupported {
             method: "list_attestations_since_by_prefixes",
         })
@@ -5374,9 +5389,11 @@ pub trait FederationDirectory: Send + Sync {
     /// ascending, over the rows that can change an owner binding's liveness:
     /// every owner-binding `delegates_to`, and every `withdraws` / `recants`
     /// / `supersedes` attested to a node some owner binding names (the rows
-    /// the live-delegation fold reads). At most `limit` (1..=10_000) such
-    /// rows per page; `next_cursor` is `Some` exactly when another exists;
-    /// `high_water` is where to resume once none remains.
+    /// the live-delegation fold reads). At most `limit` (1..=500: each node
+    /// a page touches is one fold) such rows per page, a page size outside
+    /// the bound refused with `serve_limit_out_of_range`; `next_cursor` is
+    /// `Some` exactly when another exists; `high_water` is where to resume
+    /// once none remains ([`types::ServePage::high_water`]).
     ///
     /// # What an item says
     ///
@@ -5385,7 +5402,11 @@ pub trait FederationDirectory: Send + Sync {
     /// [`admission::announced_owner_state`]: `Announced { owner }`,
     /// `NotAnnounced`, or `AmbiguousOwner`. It is a state, not a delta, so a
     /// consumer upserts by node (last item wins) and drops a node that is
-    /// not `Announced`; replaying from an older cursor is harmless.
+    /// `NotAnnounced` or `AmbiguousOwner`; replaying from an older cursor is
+    /// harmless. A node whose fold fails at the read is `Unresolved {
+    /// reason }`, not a failed page, so one bad node cannot stall the cursor;
+    /// the consumer keeps what it held for that node and re-asks
+    /// [`admission::announced_owner_state`] for it.
     ///
     /// # Removal
     ///
@@ -5406,9 +5427,9 @@ pub trait FederationDirectory: Send + Sync {
     /// and postgres backends and the capsule proxy override.
     async fn list_owner_bindings_since(
         &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        since: Option<types::ServePosition>,
         limit: i64,
-    ) -> Result<types::OwnerBindingPage, Error> {
+    ) -> Result<types::ServePage<types::OwnerBindingChange>, Error> {
         let _ = (since, limit);
         Err(Error::Unsupported {
             method: "list_owner_bindings_since",
@@ -7293,6 +7314,11 @@ pub trait FederationDirectory: Send + Sync {
         // v54.0.0 (CIRISPersist#1034) — the held record is this cohort.
         affiliation_config::check_group_cohort(self, cohort, group_key_id).await?;
         let now = chrono::Utc::now();
+        // v61.1.0 (D7) — the revocation row is the spec's own construction
+        // (`RevokeSpec::family_revocation` / `community_revocation`), the one
+        // its signers sign over (`RevokeSpec::signing_envelope`).
+        let family_revocation = spec.family_revocation(group_key_id, removed_key_id);
+        let community_revocation = spec.community_revocation(group_key_id, removed_key_id);
         let cohort::RevokeSpec {
             effective_at,
             reason,
@@ -7306,11 +7332,11 @@ pub trait FederationDirectory: Send + Sync {
         // local path: no gate counts a co-signature there, so one handed in
         // is refused rather than dropped unread.
         if cohort == cohort::Cohort::SelfId && !cosignatures.is_empty() {
-            return Err(Error::InvalidArgument(
-                "revoke_member: a `self` removal carries no co-signatures (the \
-                 occurrence revocation has no gate to count them)"
-                    .to_string(),
-            ));
+            return Err(Error::InvalidArgument(format!(
+                "{}: revoke_member: a `self` removal carries no co-signatures (the \
+                 occurrence revocation has no gate to count them)",
+                cohort::SELF_REMOVAL_COSIGNATURES_REFUSED
+            )));
         }
         // #249 Cut G4 (§9) — `kind` of the membership-change "removed" event to
         // emit after a family/community revocation (`self` uses the occurrence
@@ -7326,20 +7352,12 @@ pub trait FederationDirectory: Send + Sync {
         match cohort {
             cohort::Cohort::Family => {
                 self.put_family_membership_revocation(types::SignedFamilyMembershipRevocation {
-                    family_membership_revocation: types::FamilyMembershipRevocation {
-                        family_key_id: group_key_id.to_string(),
-                        removed_identity_key_id: removed_key_id.to_string(),
-                        // v21.0.0 (#502 E4) — `removed_at` is `effective_at`, NOT
-                        // a freshly-minted `now`: the caller signs the revocation
-                        // BEFORE calling `revoke_member` (it has no way to
-                        // predict a server-minted timestamp), so every field the
-                        // gate verifies over must be caller-known in advance.
-                        removed_at: effective_at,
-                        effective_at,
-                        reason,
-                        witness_set,
-                        persist_row_hash: String::new(),
-                    },
+                    // v21.0.0 (#502 E4) — `removed_at` is `effective_at`, NOT
+                    // a freshly-minted `now`: the caller signs the revocation
+                    // BEFORE calling `revoke_member` (it has no way to
+                    // predict a server-minted timestamp), so every field the
+                    // gate verifies over must be caller-known in advance.
+                    family_membership_revocation: family_revocation,
                     // v21.0.0 (#502 E4) — the caller-supplied authority
                     // signature; `put_family_membership_revocation` hybrid-
                     // Strict-verifies it before any write.
@@ -7358,17 +7376,9 @@ pub trait FederationDirectory: Send + Sync {
             cohort::Cohort::Community | cohort::Cohort::Affiliations => {
                 self.put_community_membership_revocation(
                     types::SignedCommunityMembershipRevocation {
-                        community_membership_revocation: types::CommunityMembershipRevocation {
-                            community_key_id: group_key_id.to_string(),
-                            removed_identity_key_id: removed_key_id.to_string(),
-                            // v21.0.0 (#502 E4) — see the family arm above:
-                            // `removed_at` MUST be caller-predictable.
-                            removed_at: effective_at,
-                            effective_at,
-                            reason,
-                            witness_set,
-                            persist_row_hash: String::new(),
-                        },
+                        // v21.0.0 (#502 E4) — see the family arm above:
+                        // `removed_at` MUST be caller-predictable.
+                        community_membership_revocation: community_revocation,
                         // v21.0.0 (#502 E4) — see the family arm above.
                         authority_key_id,
                         scrub_signature_classical,

@@ -14,6 +14,10 @@ pub mod canonical;
 pub mod canonical_validation;
 pub mod ed25519;
 pub mod hybrid;
+/// v61.1.0 (CIRISPersist#1233) — I1568: the public Rust verify API accepts
+/// only `Strict` (sqlite and postgres legs of `verify_hybrid_via_directory`).
+#[cfg(test)]
+mod strict_api_1233_invariants;
 
 pub use canonical::{
     body_sha256, canonicalize_envelope_for_signing, canonicalize_envelope_for_signing_v1_pinned,

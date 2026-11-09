@@ -13,11 +13,14 @@
 //!
 //! - **I1564** `store_sth` refuses every head without its ML-DSA-65 half and
 //!   writes nothing; a genuine hybrid head stores (the control).
-//! - **I1565** a STORED head without its half is refused where it is served:
-//!   `latest_sth` (the half removed from the blob, and the half emptied), and
-//!   `AuditService::current_sth` above it, the read the trust-grant inclusion
-//!   proof and `audit_chain_proof` serve from. The refusal does not fall back
-//!   to the older genuine head: refusal, not absence.
+//! - **I1565** a STORED head without its half, written around the store gate
+//!   (the row an earlier build left), is SERVED as itself by `latest_sth` and
+//!   by `AuditService::current_sth` above it (CC 2.6.1.8: an earlier form
+//!   verifies as itself for rows anchored before the cutover), and REFUSED by
+//!   `verify_audit_sth` with `audit_sth_not_hybrid`. The serve does not fall
+//!   back to the older genuine head either. A stored blob that does not
+//!   decode at all (the `pqc` member removed) is malformed, and `latest_sth`
+//!   refuses it: refusal, not absence.
 //! - **I1566** `verify_audit_sth` verifies a genuine head against its pinned
 //!   signer, and refuses the same head with its half emptied, with
 //!   `mode: ClassicalOnly`, with a corrupted (right-length) ML-DSA-65
@@ -201,15 +204,19 @@ pub(crate) mod bodies {
         );
     }
 
-    /// I1565 — a STORED head without its half is refused at `latest_sth`.
-    /// `genuine` (tree_size 1) is stored through the door first; `inject`
-    /// then writes a row at the given tree size around the door. The newest
-    /// row is the one served, so each malformed row must be REFUSED, not
-    /// skipped in favour of the genuine head below it.
-    pub(crate) fn i1565_serve_refuses_a_stored_head_without_its_pqc_half(
+    /// I1565 — a STORED head without its half is served as itself and
+    /// refused by `verify_audit_sth`. `genuine` (tree_size 1) is stored
+    /// through the door first and verifies against its pins (the control);
+    /// `inject` then writes a row at tree size 2 around the door, with the
+    /// ML-DSA-65 half emptied. The newest row is the one served, and it is
+    /// served AS ITSELF: not refused, and not skipped in favour of the
+    /// genuine head below it.
+    pub(crate) fn i1565_a_stored_head_without_its_pqc_half_is_served_and_refused_by_verify(
         store: &dyn TransparencyStore<AuditLeaf>,
         inject: &dyn Fn(i64, Vec<u8>),
         genuine: &SignedTreeHead,
+        ed_pk: &str,
+        pqc_pk: &str,
         who: &str,
     ) {
         assert_eq!(
@@ -219,12 +226,68 @@ pub(crate) mod bodies {
         store
             .store_sth(genuine)
             .expect("I1565: the genuine head stores");
-        assert!(
-            store.latest_sth().expect("I1565: control").is_some(),
-            "I1565 {who}: the genuine head is served"
-        );
+        let served = store
+            .latest_sth()
+            .expect("I1565: control")
+            .expect("I1565: the genuine head is present");
+        verify_audit_sth(&served, ed_pk, pqc_pk).unwrap_or_else(|e| {
+            panic!("I1565 {who}: the served genuine head verifies against its pins: {e}")
+        });
 
-        inject(2, blob_with_the_pqc_half_removed(genuine));
+        inject(2, blob_with_the_pqc_half_emptied(genuine));
+        let served = store
+            .latest_sth()
+            .unwrap_or_else(|e| {
+                panic!("I1565 {who}: a stored head with its pqc half EMPTIED is served: {e}")
+            })
+            .expect("I1565: a head is present");
+        assert_served_as_itself(&served, who);
+        let Err(err) = verify_audit_sth(&served, ed_pk, pqc_pk) else {
+            panic!("I1565 {who}: verify_audit_sth must refuse the served head without its half");
+        };
+        assert!(
+            err.to_string().contains(AUDIT_STH_NOT_HYBRID),
+            "I1565 {who}: verify refuses the emptied half as not hybrid: {err}"
+        );
+    }
+
+    /// The head `latest_sth` serves after I1565's injection is the injected
+    /// row itself: tree size 2, its ML-DSA-65 half empty.
+    fn assert_served_as_itself(served: &SignedTreeHead, who: &str) {
+        assert_eq!(
+            served.tree_size, 2,
+            "I1565 {who}: the newest stored head is served, not the genuine one below it"
+        );
+        assert!(
+            served.signature.pqc.signature.is_empty() && served.signature.pqc.public_key.is_empty(),
+            "I1565 {who}: the stored head is served as itself, its half still empty"
+        );
+    }
+
+    /// I1565, the service leg — `AuditService::current_sth` (what
+    /// `trust_grant_inclusion_proof` and `audit_chain_proof` serve) serves
+    /// the same stored head as itself.
+    pub(crate) fn assert_current_sth_serves_the_stored_head(
+        got: Result<Option<SignedTreeHead>, crate::audit::Error>,
+        who: &str,
+    ) {
+        match got {
+            Ok(Some(served)) => assert_served_as_itself(&served, who),
+            other => panic!("I1565 {who}: current_sth must serve the stored head: {other:?}"),
+        }
+    }
+
+    /// I1565, the malformed leg — a stored blob with the `pqc` member REMOVED
+    /// does not decode, and `latest_sth` refuses it (malformed is a refusal,
+    /// not absence; and not the older head below it). Injected at tree size
+    /// 3, after the served leg.
+    pub(crate) fn i1565_a_stored_head_that_does_not_decode_is_refused(
+        store: &dyn TransparencyStore<AuditLeaf>,
+        inject: &dyn Fn(i64, Vec<u8>),
+        genuine: &SignedTreeHead,
+        who: &str,
+    ) {
+        inject(3, blob_with_the_pqc_half_removed(genuine));
         let Err(err) = store.latest_sth() else {
             panic!("I1565 {who}: a stored head with its pqc half REMOVED is refused");
         };
@@ -232,31 +295,6 @@ pub(crate) mod bodies {
             err.to_string().contains("sth signature deserialize"),
             "I1565 {who}: the removed half fails to decode: {err}"
         );
-
-        inject(3, blob_with_the_pqc_half_emptied(genuine));
-        let Err(err) = store.latest_sth() else {
-            panic!("I1565 {who}: a stored head with its pqc half EMPTIED is refused");
-        };
-        assert!(
-            err.to_string().contains(AUDIT_STH_NOT_HYBRID),
-            "I1565 {who}: the emptied half is refused as not hybrid: {err}"
-        );
-    }
-
-    /// I1565, the service leg — `AuditService::current_sth` (what
-    /// `trust_grant_inclusion_proof` and `audit_chain_proof` serve) carries
-    /// the refusal up as an error, never `Ok(None)` and never the head.
-    pub(crate) fn assert_current_sth_refused(
-        got: Result<Option<SignedTreeHead>, crate::audit::Error>,
-        who: &str,
-    ) {
-        match got {
-            Err(e) => assert!(
-                e.to_string().contains(AUDIT_STH_NOT_HYBRID),
-                "I1565 {who}: current_sth refuses with the token: {e}"
-            ),
-            Ok(other) => panic!("I1565 {who}: current_sth must refuse, served {other:?}"),
-        }
     }
 
     /// I1566 — `verify_audit_sth`, hybrid-Strict against the pinned signer.
@@ -356,29 +394,46 @@ mod tests {
             use crate::audit::AuditService as _;
             let backend = open().await;
             let t = tenant("1565s");
-            let (genuine, _, _) = b::genuine_head(&log_id_for_tenant(&t), 1).await;
+            let (genuine, ed_pk, pqc_pk) = b::genuine_head(&log_id_for_tenant(&t), 1).await;
             let conn = backend.conn_handle();
             let store: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(SqliteMerkleStore::new(
                 conn.clone(),
                 tokio::runtime::Handle::current(),
                 t.clone(),
             ));
-            let t_inject = t.clone();
-            tokio::task::spawn_blocking(move || {
-                let inject = move |size: i64, blob: Vec<u8>| {
+            let inject: Arc<dyn Fn(i64, Vec<u8>) + Send + Sync> = {
+                let t_inject = t.clone();
+                Arc::new(move |size: i64, blob: Vec<u8>| {
                     b::inject_sth_row_sqlite(&conn, &t_inject, size, &blob);
-                };
-                b::i1565_serve_refuses_a_stored_head_without_its_pqc_half(
+                })
+            };
+            {
+                let (store, inject, genuine) = (store.clone(), inject.clone(), genuine.clone());
+                tokio::task::spawn_blocking(move || {
+                    b::i1565_a_stored_head_without_its_pqc_half_is_served_and_refused_by_verify(
+                        store.as_ref(),
+                        inject.as_ref(),
+                        &genuine,
+                        &ed_pk,
+                        &pqc_pk,
+                        "sqlite",
+                    );
+                })
+                .await
+                .expect("I1565 sqlite");
+            }
+            let audit = crate::audit::sqlite::SqliteAuditBackend::new(backend.conn_handle());
+            b::assert_current_sth_serves_the_stored_head(audit.current_sth(&t).await, "sqlite");
+            tokio::task::spawn_blocking(move || {
+                b::i1565_a_stored_head_that_does_not_decode_is_refused(
                     store.as_ref(),
-                    &inject,
+                    inject.as_ref(),
                     &genuine,
                     "sqlite",
                 );
             })
             .await
-            .expect("I1565 sqlite");
-            let audit = crate::audit::sqlite::SqliteAuditBackend::new(backend.conn_handle());
-            b::assert_current_sth_refused(audit.current_sth(&t).await, "sqlite");
+            .expect("I1565 sqlite (malformed)");
         }
     }
 
@@ -426,34 +481,52 @@ mod tests {
             use crate::audit::AuditService as _;
             let Some(backend) = open().await else { return };
             let t = tenant("1565p");
-            let (genuine, _, _) = b::genuine_head(&log_id_for_tenant(&t), 1).await;
+            let (genuine, ed_pk, pqc_pk) = b::genuine_head(&log_id_for_tenant(&t), 1).await;
             let store: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(PgMerkleStore::new(
                 backend.clone(),
                 tokio::runtime::Handle::current(),
                 t.clone(),
             ));
-            let handle = tokio::runtime::Handle::current();
-            let backend_inject = backend.clone();
-            let t_inject = t.clone();
-            tokio::task::spawn_blocking(move || {
-                let inject = move |size: i64, blob: Vec<u8>| {
+            // Called from a blocking thread, so it may block on the runtime.
+            let inject: Arc<dyn Fn(i64, Vec<u8>) + Send + Sync> = {
+                let handle = tokio::runtime::Handle::current();
+                let backend_inject = backend.clone();
+                let t_inject = t.clone();
+                Arc::new(move |size: i64, blob: Vec<u8>| {
                     handle.block_on(b::inject_sth_row_pg(
                         &backend_inject,
                         &t_inject,
                         size,
                         &blob,
                     ));
-                };
-                b::i1565_serve_refuses_a_stored_head_without_its_pqc_half(
+                })
+            };
+            {
+                let (store, inject, genuine) = (store.clone(), inject.clone(), genuine.clone());
+                tokio::task::spawn_blocking(move || {
+                    b::i1565_a_stored_head_without_its_pqc_half_is_served_and_refused_by_verify(
+                        store.as_ref(),
+                        inject.as_ref(),
+                        &genuine,
+                        &ed_pk,
+                        &pqc_pk,
+                        "postgres",
+                    );
+                })
+                .await
+                .expect("I1565 postgres");
+            }
+            b::assert_current_sth_serves_the_stored_head(backend.current_sth(&t).await, "postgres");
+            tokio::task::spawn_blocking(move || {
+                b::i1565_a_stored_head_that_does_not_decode_is_refused(
                     store.as_ref(),
-                    &inject,
+                    inject.as_ref(),
                     &genuine,
                     "postgres",
                 );
             })
             .await
-            .expect("I1565 postgres");
-            b::assert_current_sth_refused(backend.current_sth(&t).await, "postgres");
+            .expect("I1565 postgres (malformed)");
             eprintln!("i1565 postgres: RAN");
         }
     }

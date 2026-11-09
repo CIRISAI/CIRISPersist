@@ -17394,7 +17394,7 @@
      "# v61.1.0 (CIRISPersist#1233) — the verifier's hybrid-required check is always-on: the",
      "# caller verify doors accept only strict, and the audit plane's gate is its hybrid-signed head."
     ],
-    "witness": "I1560, I1561 (sqlite, postgres): Engine.verify_hybrid / verify_hybrid_via_directory / verify_signed_* refuse every policy but strict with verify_policy_violation before decode, lookup or crypto; I1562 (capsule): VerifyHybridViaDirectory refuses every HybridPolicy but Strict; I1563 (wheel)"
+    "witness": "I1568 (unit, trace; sqlite, postgres): the public Rust verify_hybrid, verify_trace_hybrid and verify_hybrid_via_directory refuse every policy but Strict with VerifyError::PolicyViolation (verify_policy_violation) before decode, canonicalization or lookup; I1560, I1561 (sqlite, postgres): Engine.verify_hybrid / verify_hybrid_via_directory / verify_signed_* refuse every policy but strict with verify_policy_violation before decode, lookup or crypto; I1562 (capsule): VerifyHybridViaDirectory refuses every HybridPolicy but Strict; I1563 (wheel). Every caller-facing path asks require_strict_policy; only the two pinned classical-only planes call the crate-private twin verify_hybrid_with_policy"
    },
    {
     "decimal_id": "5.3.2.4.3.1",
@@ -17403,7 +17403,7 @@
     "path#symbol": "src/audit/merkle_store.rs#require_hybrid_sth",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v61.1-1233",
-    "witness": "I1564, I1565 (sqlite, postgres): a signed tree head without its ML-DSA-65 half is refused at store_sth, latest_sth and current_sth; I1566 (unit): verify_audit_sth refuses it and verifies only against the pinned signer; I1567 (sqlite, postgres): audit_chain_proof refuses rather than serving no head"
+    "witness": "I1564 (sqlite, postgres): store_sth refuses a new signed tree head without its ML-DSA-65 half and writes nothing; I1565 (sqlite, postgres): a stored head without its half is served as itself by latest_sth and current_sth (CC 2.6.1.8) and refused by verify_audit_sth, and a stored head that does not decode is refused; I1566 (unit): verify_audit_sth refuses a head without its half and verifies only against the pinned signer; I1567 (sqlite, postgres): audit_chain_proof serves the stored head as itself, verify_audit_sth refuses it, and an undecodable head is an error rather than no head"
    }
   ],
   "CIRISServer": [

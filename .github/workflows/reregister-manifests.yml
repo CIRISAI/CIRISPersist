@@ -99,10 +99,18 @@ jobs:
           scripts/reregister_plan.sh
 
   # The fallback when a tag run's wheel artifact has expired: build that wheel
-  # from the tag, in pyo3-wheel's shape (maturin --release --strip, auditwheel
-  # repair excluding libsqlite3 on Linux, the tag's rust-toolchain.toml pin).
-  # The bytes differ from the release's, so the registration that uses them is
-  # labelled a REBUILD. Rebuilt wheels exist only as this run's artifacts.
+  # from the tag, in THAT TAG's pyo3-wheel shape (auditwheel repair excluding
+  # libsqlite3 on Linux, the tag's rust-toolchain.toml pin). Through 61.0.x
+  # that is `maturin build --release --strip` on every platform. From 61.1.0
+  # (CIRISPersist#1234) the linux wheel is built ONCE unstripped with line
+  # tables and `scripts/split_wheel_debuginfo.py` derives the stripped .so the
+  # wheel ships from that one link, after auditwheel, exactly as ci.yml's
+  # pyo3-wheel does; macOS/Windows keep `--strip`. The shape is chosen by the
+  # tag tree itself: a tag that carries scripts/split_wheel_debuginfo.py is one
+  # whose pyo3-wheel splits. The bytes differ from the release's, so the
+  # registration that uses them is labelled a REBUILD. Rebuilt wheels exist
+  # only as this run's artifacts (the split's .debug file is not kept: only
+  # the wheel is registered).
   rebuild:
     name: rebuild ${{ matrix.version }} ${{ matrix.label }} from the tag
     needs: plan
@@ -139,12 +147,32 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+      # #1234 — which pyo3-wheel shape this tag built its linux wheel in.
+      - name: the tag's linux wheel shape
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = Linux ] && [ -f scripts/split_wheel_debuginfo.py ]; then
+            echo "SPLIT_DEBUGINFO=1" >> "$GITHUB_ENV"
+            echo "v${{ matrix.version }}: linux wheel built unstripped, then split (#1234 shape)"
+          else
+            echo "SPLIT_DEBUGINFO=0" >> "$GITHUB_ENV"
+            echo "v${{ matrix.version }}: maturin --strip (pre-#1234 shape, or not linux)"
+          fi
+      # The same invocation as ci.yml's pyo3-wheel `maturin build` step: the
+      # rustc flags after `--` reach the ciris_persist crate only and override
+      # the profile's `-C strip=symbols`; `--build-id=sha1` pins the id the
+      # split checks.
       - name: maturin build
         shell: bash
         run: |
           pip install maturin
           rm -rf target/wheels
-          maturin build --release --strip --auditwheel skip
+          if [ "$SPLIT_DEBUGINFO" = 1 ]; then
+            maturin build --release --auditwheel skip -- \
+              -C strip=none -C debuginfo=line-tables-only -C link-arg=-Wl,--build-id=sha1
+          else
+            maturin build --release --strip --auditwheel skip
+          fi
       - name: auditwheel repair (Linux, libsqlite3 excluded)
         if: runner.os == 'Linux'
         shell: bash
@@ -156,6 +184,23 @@ jobs:
             auditwheel repair --exclude libsqlite3.so.0 --wheel-dir target/wheels/repaired/ "$whl"; rm "$whl"
           done
           mv target/wheels/repaired/*.whl target/wheels/ && rmdir target/wheels/repaired
+      # #1234 — as ci.yml's `split debuginfo (Linux)` step: after auditwheel,
+      # before anything reads the wheel. The wheel is rewritten in place with
+      # its stripped .so; the script refuses a wheel built stripped.
+      - name: split debuginfo (Linux, 61.1.0 and later)
+        if: runner.os == 'Linux' && env.SPLIT_DEBUGINFO == '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist/debuginfo
+          n=0
+          for whl in target/wheels/ciris_persist-*linux_*.whl; do
+            [ -e "$whl" ] || continue
+            python3 scripts/split_wheel_debuginfo.py "$whl" dist/debuginfo --label "${{ matrix.label }}"
+            n=$((n + 1))
+          done
+          [ "$n" -eq 1 ] || { echo "::error::expected 1 linux wheel to split, found $n"; ls -la target/wheels; exit 1; }
+          ls -la dist/debuginfo
       - name: exactly this version's wheel
         shell: bash
         run: |

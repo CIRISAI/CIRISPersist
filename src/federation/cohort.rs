@@ -647,6 +647,82 @@ pub struct RevokeSpec {
     pub cosignatures: Vec<crate::federation::types::RosterCosignature>,
 }
 
+/// v61.1.0 (D19; CIRISPersist#1226) — the stable token leading the refusal
+/// of a `self` removal that carries co-signatures
+/// (`FederationDirectory::revoke_member`): the occurrence revocation has no
+/// gate to count them, so they are refused rather than dropped unread. The
+/// [`crate::verify::hybrid::VERIFY_POLICY_VIOLATION`] style: the message is
+/// `{token}: {why}`.
+pub const SELF_REMOVAL_COSIGNATURES_REFUSED: &str = "self_removal_cosignatures_refused";
+
+impl RevokeSpec {
+    /// v61.1.0 (D7) — the family revocation row this spec removes `removed`
+    /// from `family_key_id` with, as `FederationDirectory::revoke_member`
+    /// stores it: `removed_at` is `effective_at` (the caller signs before the
+    /// call and cannot predict a server-minted instant, #502 E4).
+    #[must_use]
+    pub fn family_revocation(
+        &self,
+        family_key_id: &str,
+        removed: &str,
+    ) -> types::FamilyMembershipRevocation {
+        types::FamilyMembershipRevocation {
+            family_key_id: family_key_id.to_owned(),
+            removed_identity_key_id: removed.to_owned(),
+            removed_at: self.effective_at,
+            effective_at: self.effective_at,
+            reason: self.reason.clone(),
+            witness_set: self.witness_set.clone(),
+            persist_row_hash: String::new(),
+        }
+    }
+
+    /// v61.1.0 (D7) — the community (or affiliation) revocation row, as
+    /// [`Self::family_revocation`].
+    #[must_use]
+    pub fn community_revocation(
+        &self,
+        community_key_id: &str,
+        removed: &str,
+    ) -> types::CommunityMembershipRevocation {
+        types::CommunityMembershipRevocation {
+            community_key_id: community_key_id.to_owned(),
+            removed_identity_key_id: removed.to_owned(),
+            removed_at: self.effective_at,
+            effective_at: self.effective_at,
+            reason: self.reason.clone(),
+            witness_set: self.witness_set.clone(),
+            persist_row_hash: String::new(),
+        }
+    }
+
+    /// v61.1.0 (D7) — **the bytes this spec's authority signature and every
+    /// co-signature cover**: the `signing_envelope()` of the revocation row
+    /// `revoke_member` builds from it for `cohort`. One construction for the
+    /// door and every signer, so a signer cannot sign a row the door does not
+    /// build. `None` for [`Cohort::SelfId`], which takes the trusted-local
+    /// path and verifies no signature.
+    #[must_use]
+    pub fn signing_envelope(
+        &self,
+        cohort: Cohort,
+        group_key_id: &str,
+        removed: &str,
+    ) -> Option<serde_json::Value> {
+        match cohort {
+            Cohort::Family => Some(
+                self.family_revocation(group_key_id, removed)
+                    .signing_envelope(),
+            ),
+            Cohort::Community | Cohort::Affiliations => Some(
+                self.community_revocation(group_key_id, removed)
+                    .signing_envelope(),
+            ),
+            Cohort::SelfId => None,
+        }
+    }
+}
+
 /// A group identity, uniform across the three cohorts (the `lookup_group` /
 /// `groups_of` shape §1). `name` / `consensus_protocol` / `founded_at` are
 /// `None` for the `self` cohort (the identity_key IS the group; it carries no

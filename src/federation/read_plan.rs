@@ -16,10 +16,12 @@
 //! `list_attestation_log` consults the quarantine marker at its clock read.
 //! The others read no instant.
 
-use super::attestation_query::{Bind, Dialect, QueryRows, Statement};
+use super::attestation_query::{
+    placeholder, prefix_range_clause, Bind, Dialect, QueryRows, Statement,
+};
 use super::types::{
-    Attestation, KeyRegistrationHistoryRow, KeyReplacementKind, OwnerBindingChange,
-    OwnerBindingPage, ServedAttestation, ServedAttestationPage,
+    AnnouncedOwnerState, Attestation, KeyRegistrationHistoryRow, KeyReplacementKind,
+    OwnerBindingChange, ServePage, ServePosition, ServedAttestation,
 };
 use super::{Error, FederationDirectory};
 use crate::read::{AttestationCursor, AttestationFilter, ComposedVerdict, ScoresPage};
@@ -112,12 +114,13 @@ pub(crate) trait ReadPlanStore: FederationDirectory + Sized {
     /// enforcement, no tombstoned row the tombstone is not void for), after
     /// `since` (exclusive), oldest serve position first, at most `fetch`
     /// rows; and the stream's head (its greatest serve position over every
-    /// held row), read BEFORE the page. The SQL is
+    /// held row), read BEFORE the page, with the commit-safe watermark
+    /// ([`serve_settled_before`]) read before the head. The SQL is
     /// [`serve_stream_statement`] and [`serve_stream_head_statement`].
     async fn read_serve_stream_page(
         &self,
         narrowing: ServeNarrowing<'_>,
-        since: Option<&(chrono::DateTime<chrono::Utc>, String)>,
+        since: Option<&ServePosition>,
         fetch: i64,
     ) -> Result<ServedRows, Error>;
 
@@ -266,6 +269,25 @@ pub(crate) async fn list_attestation_log_planned(
     Ok(ScoresPage { items, next_cursor })
 }
 
+/// v61.1.0 (review D6) — **the one-past-the-page cut** every read that
+/// fetches `limit + 1` rows makes: refuse an executor that returned more
+/// than one row past the page (it dropped its LIMIT, and its read was as wide
+/// as the slice), keep at most `limit` rows, and say whether another row
+/// existed. The #1225 subject read and the serve-stream reads cut here.
+pub(crate) fn cut_one_past<T>(rows: &mut Vec<T>, limit: i64, door: &str) -> Result<bool, Error> {
+    let page =
+        usize::try_from(limit).map_err(|_| Error::Backend(format!("{door}: page size {limit}")))?;
+    if rows.len() > page + 1 {
+        return Err(Error::Backend(format!(
+            "{door}: {} rows for a page of {page}",
+            rows.len()
+        )));
+    }
+    let more = rows.len() > page;
+    rows.truncate(page);
+    Ok(more)
+}
+
 /// The read: every backend's `list_attestations_naming_by_dimension`
 /// (v61.0.5, CIRISPersist#1225). The executor fetches one row past the page,
 /// so `next_cursor` is `Some` exactly when another row exists.
@@ -285,17 +307,8 @@ pub(crate) async fn list_attestations_naming_by_dimension_planned(
     } = dir
         .read_naming_page(subject_key_id, dimension, cursor.as_ref(), limit + 1)
         .await?;
-    let page = usize::try_from(limit).map_err(|_| Error::Backend("page size".into()))?;
-    // An executor that returned more than one row past the page dropped its
-    // LIMIT: its read was as wide as the slice.
-    if rows.len() > page + 1 {
-        return Err(Error::Backend(format!(
-            "list_attestations_naming_by_dimension: {} rows for a page of {page}",
-            rows.len()
-        )));
-    }
-    let next_cursor = if rows.len() > page {
-        rows.truncate(page);
+    let more = cut_one_past(&mut rows, limit, "list_attestations_naming_by_dimension")?;
+    let next_cursor = if more {
         rows.last()
             .map(|a| AttestationCursor::from_trailing(a.asserted_at, a.attestation_id.clone()))
     } else {
@@ -314,23 +327,58 @@ pub(crate) async fn list_attestations_naming_by_dimension_planned(
     })
 }
 
-/// v61.1.0 (#1190, #1163) — the most prefixes one narrowed serve read
-/// takes, dimension and type together. Edge's decision queue names eleven.
+/// v61.1.0 (#1190) — the most family prefixes one narrowed serve read takes.
+/// Edge's decision queue names eleven.
 pub(crate) const MAX_SERVE_PREFIXES: usize = 64;
+
+/// v61.1.0 (#1190) — the largest page the family read serves (the bound of
+/// every other paged read here).
+pub(crate) const MAX_SERVE_PAGE: i64 = MAX_PAGE;
+
+/// v61.1.0 (#1163 review M5) — the largest page the owner-binding feed
+/// serves. Each node a page touches costs one `announced_owner_state` fold
+/// (a live-delegation walk, the owner fold, a self-roster lookup per granter:
+/// several directory reads), so the page bounds the call's fold work, not
+/// just its rows. 500 is the fold page every other walk here takes
+/// (`attestation_query::FOLD_PAGE`), keeps a page well inside one capsule
+/// round trip, and at the canonical's announced-relay cadence (a pass a
+/// minute) still drains a backlog of tens of thousands of candidate rows in
+/// minutes.
+pub(crate) const MAX_OWNER_FEED_PAGE: i64 = 500;
+
+/// v61.1.0 (#1190, #1163 review D19) — the stable token a serve-stream read's
+/// refused page size leads its message with.
+pub(crate) const SERVE_LIMIT_OUT_OF_RANGE: &str = "serve_limit_out_of_range";
+
+/// v61.1.0 (#1190 review D19) — the stable token a refused family-prefix
+/// list (none, an empty prefix, too many) leads its message with.
+pub(crate) const SERVE_PREFIXES_REFUSED: &str = "serve_prefixes_refused";
+
+/// A serve-stream read's page bound: refused outside `[1, max]`, the message
+/// led by [`SERVE_LIMIT_OUT_OF_RANGE`].
+fn check_serve_limit(door: &str, limit: i64, max: i64) -> Result<(), Error> {
+    if (1..=max).contains(&limit) {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument(format!(
+            "{SERVE_LIMIT_OUT_OF_RANGE}: {door}: limit must be in [1, {max}], got {limit}"
+        )))
+    }
+}
 
 /// v61.1.0 (#1190, #1163) — what narrows a read of the attestation serve
 /// stream. The serve rule, the cursor and the order are the stream's own;
 /// only the selection differs.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ServeNarrowing<'a> {
-    /// The rows whose `dimension` starts with one of `dimension_prefixes` or
-    /// whose `attestation_type` starts with one of `type_prefixes` (#1190).
-    /// Byte prefixes, case-sensitive, as half-open ranges: no `LIKE`.
-    Prefixes {
-        /// Dimension prefixes.
-        dimension_prefixes: &'a [String],
-        /// `attestation_type` prefixes.
-        type_prefixes: &'a [String],
+    /// The rows whose FAMILY starts with one of `family_prefixes` (#1190):
+    /// the family as [`super::row_type::claim_token`] defines it, a `scores`
+    /// row's envelope `dimension` and any other row's `attestation_type` (a
+    /// composer's verb included). Byte prefixes, case-sensitive, as
+    /// half-open ranges: no `LIKE`.
+    Families {
+        /// Family prefixes.
+        family_prefixes: &'a [String],
     },
     /// The rows that can change a node's owner binding (#1163): every
     /// owner-binding `delegates_to` (the ownership dimension or the
@@ -349,52 +397,59 @@ pub(crate) struct ServedRows {
     /// The rows, in serve order, at most the fetch asked for.
     pub(crate) rows: Vec<ServedAttestation>,
     /// The greatest serve position over every held row, before the page.
-    pub(crate) head: Option<(chrono::DateTime<chrono::Utc>, String)>,
+    pub(crate) head: Option<ServePosition>,
+    /// The executor's commit-safe watermark, read before the head
+    /// ([`serve_settled_before`]): `None` where the head is exact (sqlite).
+    pub(crate) settled_before: Option<chrono::DateTime<chrono::Utc>>,
     /// Envelope bytes decoded.
     pub(crate) bytes: u64,
     /// The backend that ran the statement.
     pub(crate) backend: crate::observe::StoreBackend,
 }
 
-/// The dialect-specific spellings the serve-stream statements read.
-struct ServeSpelling {
-    /// `FROM` target, with its alias when it has one.
-    from: &'static str,
-    /// How the outer row is named inside the predicate.
-    outer: &'static str,
-    /// Schema prefix for the tables the serve rule reads.
-    prefix: &'static str,
-    /// The serve position expression (the V130 index's).
-    pos: &'static str,
-    /// The id as the cursor compares it.
-    id: &'static str,
-    /// The selected columns, the row mapper's names plus `_pos`.
-    columns: &'static str,
-    /// The text-comparison collation suffix a byte range needs.
-    collate: &'static str,
-    /// The serve filter's dialect.
-    row_type: super::row_type::SqlDialect,
+/// v61.1.0 (#1190, #1163 review D3) — **THE serve rule**, as the predicates
+/// over the held row `alias` (tables under the schema `prefix`): the
+/// federation tier (E5: a local-tier row never reaches the serve surface),
+/// the row-type serve filter (v53.0.0 #975, CC 2.4: under enforcement an
+/// unregistered type is neither served nor replicated) and the purge plane
+/// (v54.1.0 #1046: a tombstoned row is not served unless the tombstone is
+/// void for it). `list_attestations_since` on both backends, the #1225
+/// subject read and [`serve_stream_statement`] AND these in; none spells its
+/// own. The row-type filter reads the enforcement in force on the calling
+/// task, so build on the task, before a closure moves to a pool.
+#[must_use]
+pub(crate) fn serve_rule_parts(dialect: Dialect, alias: &str, prefix: &str) -> Vec<String> {
+    let mut parts = vec![format!(
+        "{alias}.tier = '{}'",
+        super::types::attestation_tier::FEDERATION
+    )];
+    parts.extend(super::row_type::serve_filter_sql(
+        &format!("{alias}.attestation_type"),
+        dialect.row_type(),
+    ));
+    parts.push(super::steward_purge::served_under_purge_sql(alias, prefix));
+    parts
 }
 
-/// The sqlite spelling: no alias, so the position expression is the V130
-/// `federation_attestations_admitted` index's, character for character, and
-/// the walk is pinned to that index (`INDEXED BY`): unpinned and without
-/// statistics, a prefix narrowing can take a dimension index and sort the
-/// family's whole history on every poll.
+/// The dialect-specific spellings the serve-stream statements read. The
+/// served row is aliased `fa` on both.
+struct ServeSpelling {
+    /// `FROM` target, with its alias and, on sqlite, its index pin.
+    from: &'static str,
+    /// The serve position expression (the V130 index's).
+    pos: &'static str,
+}
+
+/// The sqlite spelling. The position expression is the V130
+/// `federation_attestations_admitted` index's (sqlite matches an indexed
+/// expression by the columns it resolves to, so the `fa.` qualifier is the
+/// index's own expression), and the walk is pinned to that index
+/// (`INDEXED BY`): unpinned and without statistics, a prefix narrowing can
+/// take a dimension index and sort the family's whole history on every poll.
+/// I1579 EXPLAINs both statements.
 const SQLITE_SERVE: ServeSpelling = ServeSpelling {
-    from: "federation_attestations INDEXED BY federation_attestations_admitted",
-    outer: "federation_attestations",
-    prefix: "",
-    pos: "COALESCE(admitted_at, promoted_at, asserted_at)",
-    id: "attestation_id",
-    columns: "attestation_id, attesting_key_id, attested_key_id, attestation_type, \
-              weight, asserted_at, expires_at, attestation_envelope, \
-              original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-              scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-              subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
-              additional_scrubs, COALESCE(admitted_at, promoted_at, asserted_at) AS _pos",
-    collate: "",
-    row_type: super::row_type::SqlDialect::Sqlite,
+    from: "federation_attestations fa INDEXED BY federation_attestations_admitted",
+    pos: "COALESCE(fa.admitted_at, fa.promoted_at, fa.asserted_at)",
 };
 
 /// The postgres spelling: `admitted_at` is NOT NULL (V130), and
@@ -402,20 +457,7 @@ const SQLITE_SERVE: ServeSpelling = ServeSpelling {
 /// index.
 const POSTGRES_SERVE: ServeSpelling = ServeSpelling {
     from: "cirislens.federation_attestations fa",
-    outer: "fa",
-    prefix: "cirislens.",
     pos: "fa.admitted_at",
-    id: "fa.attestation_id",
-    columns: "fa.attestation_id::text AS attestation_id, fa.attesting_key_id, \
-              fa.attested_key_id, fa.attestation_type, fa.weight::float8 AS weight, \
-              fa.asserted_at, fa.expires_at, fa.attestation_envelope, \
-              fa.original_content_hash, fa.scrub_signature_classical, \
-              fa.scrub_signature_pqc, fa.scrub_key_id, fa.scrub_timestamp, \
-              fa.pqc_completed_at, fa.persist_row_hash, fa.subject_key_ids, \
-              fa.withdraws_admission_rule, fa.cohort_scope, fa.tier, fa.promoted_at, \
-              fa.additional_scrubs, fa.admitted_at AS _pos",
-    collate: " COLLATE \"C\"",
-    row_type: super::row_type::SqlDialect::Postgres,
 };
 
 fn serve_spelling(dialect: Dialect) -> &'static ServeSpelling {
@@ -425,44 +467,51 @@ fn serve_spelling(dialect: Dialect) -> &'static ServeSpelling {
     }
 }
 
-fn placeholder(dialect: Dialect, binds: &[Bind]) -> String {
-    match dialect {
-        Dialect::Sqlite => format!("?{}", binds.len()),
-        Dialect::Postgres => format!("${}", binds.len()),
-    }
-}
-
-/// `column` starts with `prefix`, byte for byte: the half-open range
-/// `[prefix, successor)` when a successor is representable (an index range,
-/// and no `LIKE`, so `%` and `_` are ordinary bytes and case is kept),
-/// `substr` otherwise. The #817/#818 rule `attestation_query` spells.
-fn serve_prefix_clause(
+/// v61.1.0 (#1190 review D13) — "the row `o`'s family starts with one of
+/// `prefixes`" as SQL, the family as [`super::row_type::claim_token`] reads
+/// it: a `scores` row by its `dimension`, every other row by its
+/// `attestation_type`. Each prefix is one half-open range per arm
+/// ([`prefix_range_clause`]). An empty list selects nothing.
+pub(crate) fn family_prefix_sql(
     dialect: Dialect,
-    column: &str,
-    prefix: &str,
+    o: &str,
+    prefixes: &[String],
     binds: &mut Vec<Bind>,
 ) -> String {
-    let collate = serve_spelling(dialect).collate;
-    match crate::ceg::list::federation::dimension_prefix_bounds(prefix) {
-        Some((lo, hi)) => {
-            binds.push(Bind::Text(lo));
-            let a = placeholder(dialect, binds);
-            binds.push(Bind::Text(hi));
-            let b = placeholder(dialect, binds);
-            format!("({column}{collate} >= {a} AND {column}{collate} < {b})")
-        }
-        None => {
-            binds.push(Bind::Text(prefix.to_owned()));
-            let a = placeholder(dialect, binds);
-            format!("substr({column}, 1, {}) = {a}", prefix.chars().count())
-        }
+    use super::types::attestation_type as at;
+    if prefixes.is_empty() {
+        return "1 = 0".to_owned();
     }
+    let mut by_dimension = Vec::with_capacity(prefixes.len());
+    let mut by_type = Vec::with_capacity(prefixes.len());
+    for p in prefixes {
+        by_dimension.push(prefix_range_clause(
+            dialect,
+            &format!("{o}.dimension"),
+            p,
+            binds,
+        ));
+        by_type.push(prefix_range_clause(
+            dialect,
+            &format!("{o}.attestation_type"),
+            p,
+            binds,
+        ));
+    }
+    format!(
+        "(({o}.attestation_type = '{scores}' AND ({dims})) \
+          OR ({o}.attestation_type <> '{scores}' AND ({types})))",
+        scores = at::SCORES,
+        dims = by_dimension.join(" OR "),
+        types = by_type.join(" OR "),
+    )
 }
 
 /// `t` is an owner-binding row by its envelope, as
 /// `admission::is_owner_binding_envelope` reads it: the ownership dimension,
-/// or the CC 2.4.1.2 `delegation_purpose` marker.
-fn owner_binding_marker_sql(dialect: Dialect, t: &str) -> String {
+/// or the CC 2.4.1.2 `delegation_purpose` marker. I1674 holds the two equal
+/// over a set of envelopes on both backends.
+pub(crate) fn owner_binding_marker_sql(dialect: Dialect, t: &str) -> String {
     use super::types::owner_binding;
     let purpose = match dialect {
         Dialect::Sqlite => {
@@ -480,87 +529,57 @@ fn owner_binding_marker_sql(dialect: Dialect, t: &str) -> String {
 }
 
 /// v61.1.0 (#1190, #1163) — THE serve-stream page statement, both dialects:
-/// `narrowing`'s rows under `list_attestations_since`'s serve rule (the
-/// federation tier, [`super::row_type::serve_filter_sql`],
-/// [`super::steward_purge::served_under_purge_sql`]), strictly after `since`
-/// on `(serve position, attestation_id)`, ascending, `LIMIT fetch`. It walks
-/// the V130 `federation_attestations_admitted` index from the cursor.
+/// `narrowing`'s rows under the serve rule ([`serve_rule_parts`]), strictly
+/// after `since` on `(serve position, attestation_id)` ([`ServePosition`];
+/// the origin reads from the start), ascending, `LIMIT fetch`. It walks the
+/// V130 `federation_attestations_admitted` index from the cursor.
 pub(crate) fn serve_stream_statement(
     dialect: Dialect,
     narrowing: ServeNarrowing<'_>,
-    since: Option<&(chrono::DateTime<chrono::Utc>, String)>,
+    since: Option<&ServePosition>,
     fetch: i64,
 ) -> Statement {
     use super::types::attestation_type as at;
     let sp = serve_spelling(dialect);
-    let o = sp.outer;
+    let prefix = dialect.schema_prefix();
     let mut binds: Vec<Bind> = Vec::new();
     let mut parts: Vec<String> = Vec::new();
     match narrowing {
-        ServeNarrowing::Prefixes {
-            dimension_prefixes,
-            type_prefixes,
-        } => {
-            let mut arms: Vec<String> = Vec::new();
-            for p in dimension_prefixes {
-                arms.push(serve_prefix_clause(
-                    dialect,
-                    &format!("{o}.dimension"),
-                    p,
-                    &mut binds,
-                ));
-            }
-            for p in type_prefixes {
-                arms.push(serve_prefix_clause(
-                    dialect,
-                    &format!("{o}.attestation_type"),
-                    p,
-                    &mut binds,
-                ));
-            }
-            // An empty narrowing never reaches here (`check_serve_prefixes`);
+        ServeNarrowing::Families { family_prefixes } => {
+            // An empty list never reaches here (`check_serve_prefixes`);
             // were it to, it selects nothing rather than everything.
-            if arms.is_empty() {
-                arms.push("1 = 0".to_owned());
-            }
-            parts.push(format!("({})", arms.join(" OR ")));
+            parts.push(family_prefix_sql(
+                dialect,
+                "fa",
+                family_prefixes,
+                &mut binds,
+            ));
         }
         ServeNarrowing::OwnerBindingChanges => {
             parts.push(format!(
-                "{o}.attestation_type IN ('{}', '{}', '{}', '{}')",
+                "fa.attestation_type IN ('{}', '{}', '{}', '{}')",
                 at::DELEGATES_TO,
                 at::SUPERSEDES,
                 at::WITHDRAWS,
                 at::RECANTS
             ));
             parts.push(format!(
-                "(({o}.attestation_type = '{dt}' AND {own}) \
-                  OR ({o}.attestation_type <> '{dt}' AND EXISTS ( \
+                "((fa.attestation_type = '{dt}' AND {own}) \
+                  OR (fa.attestation_type <> '{dt}' AND EXISTS ( \
                       SELECT 1 FROM {prefix}federation_attestations ob \
-                       WHERE ob.attested_key_id = {o}.attested_key_id \
+                       WHERE ob.attested_key_id = fa.attested_key_id \
                          AND ob.attestation_type = '{dt}' AND {ob})))",
                 dt = at::DELEGATES_TO,
-                own = owner_binding_marker_sql(dialect, o),
-                prefix = sp.prefix,
+                own = owner_binding_marker_sql(dialect, "fa"),
                 ob = owner_binding_marker_sql(dialect, "ob"),
             ));
         }
     }
-    // E5 — a local-tier row never reaches the serve surface.
-    parts.push(format!("{o}.tier = 'federation'"));
-    // v53.0.0 (#975, CC 2.4) — under enforcement, an unregistered type is
-    // neither served nor replicated.
-    parts.extend(super::row_type::serve_filter_sql(
-        &format!("{o}.attestation_type"),
-        sp.row_type,
-    ));
-    // v54.1.0 (#1046) — a tombstoned row is not served, unless the tombstone
-    // is void for it.
-    parts.push(super::steward_purge::served_under_purge_sql(o, sp.prefix));
-    if let Some((at_, id)) = since {
-        binds.push(Bind::Time(*at_));
+    parts.extend(serve_rule_parts(dialect, "fa", prefix));
+    if let Some((at_, id)) = ServePosition::resume_after(since) {
+        binds.push(Bind::Time(at_));
         let a = placeholder(dialect, &binds);
-        binds.push(Bind::Text(id.clone()));
+        binds.push(Bind::Text(id));
         let b = placeholder(dialect, &binds);
         parts.push(match dialect {
             // `list_attestations_since`'s OR form, over the index's own
@@ -568,23 +587,22 @@ pub(crate) fn serve_stream_statement(
             // alone is not a range, and the walk would start at the oldest
             // row on every page.
             Dialect::Sqlite => format!(
-                "({pos} >= {a} AND ({pos} > {a} OR {id} > {b}))",
+                "({pos} >= {a} AND ({pos} > {a} OR fa.attestation_id > {b}))",
                 pos = sp.pos,
-                id = sp.id
             ),
-            Dialect::Postgres => format!("({}, {}) > ({a}, {b})", sp.pos, sp.id),
+            Dialect::Postgres => format!("({}, fa.attestation_id) > ({a}, {b})", sp.pos),
         });
     }
     binds.push(Bind::Int(fetch));
     let limit = placeholder(dialect, &binds);
     Statement {
         sql: format!(
-            "SELECT {columns} FROM {from} WHERE {} ORDER BY {pos} ASC, {id} ASC LIMIT {limit}",
+            "SELECT {columns}, {pos} AS _pos FROM {from} WHERE {} \
+             ORDER BY {pos} ASC, fa.attestation_id ASC LIMIT {limit}",
             parts.join(" AND "),
-            columns = sp.columns,
+            columns = dialect.fa_columns(),
             from = sp.from,
             pos = sp.pos,
-            id = sp.id,
         ),
         binds,
     }
@@ -596,96 +614,134 @@ pub(crate) fn serve_stream_statement(
 pub(crate) fn serve_stream_head_statement(dialect: Dialect) -> Statement {
     let sp = serve_spelling(dialect);
     let selected_id = match dialect {
-        Dialect::Sqlite => "attestation_id",
+        Dialect::Sqlite => "fa.attestation_id",
         Dialect::Postgres => "fa.attestation_id::text",
     };
     Statement {
         sql: format!(
             "SELECT {pos} AS _pos, {selected_id} AS attestation_id FROM {from} \
-             ORDER BY {pos} DESC, {id} DESC LIMIT 1",
+             ORDER BY {pos} DESC, fa.attestation_id DESC LIMIT 1",
             pos = sp.pos,
-            id = sp.id,
             from = sp.from,
         ),
         binds: Vec::new(),
     }
 }
 
-/// The narrowed serve read's refusals: no prefix at all (that read is
-/// `list_attestations_since`), an empty prefix (it would select every row),
-/// or more than [`MAX_SERVE_PREFIXES`].
-fn check_serve_prefixes(
-    dimension_prefixes: &[String],
-    type_prefixes: &[String],
-) -> Result<(), Error> {
-    let n = dimension_prefixes.len() + type_prefixes.len();
+/// v61.1.0 (#1190, #1163 review R2/H4) — on postgres, how long a serve
+/// position may stay in flight: a writer assigns it
+/// (`next_plane_position`: `MAX(admitted_at)`, then its clock) BEFORE its
+/// write transaction, and commits it some time later, so a row can commit
+/// below a head a reader has already seen. A position assigned more than
+/// this long before the read is taken as committed.
+///
+/// WHY A LAG WINDOW, not the minimum position in flight: the in-flight
+/// positions are not visible to a reader (they are uncommitted rows, and the
+/// position is assigned before the transaction even begins), so the minimum
+/// could only come from a registry every writer, in every process sharing
+/// the database, joins before it reads `MAX(admitted_at)`: a migration and a
+/// change to every write door. The position is the writer's wall clock (or
+/// just above the committed maximum, which only moves it later), so "assigned
+/// more than LAG ago" is readable from the position itself. The span it must
+/// cover is the write door's: the in-process delegation lock is taken before
+/// the position, so it is the transaction (the advisory cycle lock, the
+/// cycle re-check, the insert and its projections), normally milliseconds.
+/// 30 s is three orders of magnitude above that and costs an idle poller one
+/// re-read of the last 30 s of the stream (at most a page). The window
+/// assumes writer clocks within it of the reader's. BELIEVED, not enforced:
+/// a write transaction held open past it can still commit below a high
+/// water; a `statement_timeout` / `idle_in_transaction_session_timeout`
+/// under it would make the bound hard.
+pub(crate) const PG_SERVE_COMMIT_LAG_SECS: i64 = 30;
+
+/// v61.1.0 (#1190, #1163 review R2/H4) — the executor's commit-safe
+/// watermark at `now` (its clock, read BEFORE the head and the page):
+/// `None` on sqlite, whose head is exact (its one writer assigns the
+/// position inside the write transaction, above every committed position);
+/// `now − PG_SERVE_COMMIT_LAG_SECS` on postgres.
+#[must_use]
+pub(crate) fn serve_settled_before(
+    dialect: Dialect,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    match dialect {
+        Dialect::Sqlite => None,
+        Dialect::Postgres => Some(now - chrono::TimeDelta::seconds(PG_SERVE_COMMIT_LAG_SECS)),
+    }
+}
+
+/// v61.1.0 (#1190, #1163 review R2/H4) — the head a resume may start from:
+/// the head itself when it is below the watermark (or there is none), else
+/// the watermark as a position before every row at its instant. Every
+/// position below what this returns was settled when the read ran.
+#[must_use]
+pub(crate) fn commit_safe_head(
+    head: Option<ServePosition>,
+    settled_before: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<ServePosition> {
+    match (head, settled_before) {
+        (Some(h), Some(w)) if h.admitted_at >= w => Some(ServePosition::new(w, String::new())),
+        (head, _) => head,
+    }
+}
+
+/// The narrowed serve read's refusals, led by [`SERVE_PREFIXES_REFUSED`]: no
+/// prefix at all (that read is `list_attestations_since`), an empty prefix
+/// (it would select every row), or more than [`MAX_SERVE_PREFIXES`].
+fn check_serve_prefixes(family_prefixes: &[String]) -> Result<(), Error> {
+    let door = "list_attestations_since_by_prefixes";
+    let n = family_prefixes.len();
     if n == 0 {
-        return Err(Error::InvalidArgument(
-            "list_attestations_since_by_prefixes: name at least one dimension or type prefix; \
-             the unnarrowed stream is list_attestations_since"
-                .into(),
-        ));
+        return Err(Error::InvalidArgument(format!(
+            "{SERVE_PREFIXES_REFUSED}: {door}: name at least one family prefix; the \
+             unnarrowed stream is list_attestations_since"
+        )));
     }
     if n > MAX_SERVE_PREFIXES {
         return Err(Error::InvalidArgument(format!(
-            "list_attestations_since_by_prefixes: {n} prefixes, at most {MAX_SERVE_PREFIXES}"
+            "{SERVE_PREFIXES_REFUSED}: {door}: {n} prefixes, at most {MAX_SERVE_PREFIXES}"
         )));
     }
-    if dimension_prefixes
-        .iter()
-        .chain(type_prefixes)
-        .any(String::is_empty)
-    {
-        return Err(Error::InvalidArgument(
-            "list_attestations_since_by_prefixes: an empty prefix matches every row; refused"
-                .into(),
-        ));
+    if family_prefixes.iter().any(String::is_empty) {
+        return Err(Error::InvalidArgument(format!(
+            "{SERVE_PREFIXES_REFUSED}: {door}: an empty prefix matches every row"
+        )));
     }
     Ok(())
 }
 
-/// Cut a serve-stream page fetched one row past `limit`: `next_cursor` is
-/// `Some` exactly when that row exists, and `high_water` is the furthest
-/// position this read examined (see [`ServedAttestationPage::high_water`]).
-#[allow(clippy::type_complexity)]
-fn cut_serve_page(
+/// Cut a serve-stream page fetched one row past `limit` ([`cut_one_past`]):
+/// `next_cursor` is `Some` exactly when that row exists, and `high_water`
+/// is the furthest position this read examined that is safe to resume from
+/// ([`super::types::ServePage::high_water`]).
+pub(crate) fn cut_serve_page(
     rows: &mut Vec<ServedAttestation>,
     limit: i64,
-    since: Option<&(chrono::DateTime<chrono::Utc>, String)>,
-    head: Option<(chrono::DateTime<chrono::Utc>, String)>,
+    since: Option<&ServePosition>,
+    head: Option<ServePosition>,
+    settled_before: Option<chrono::DateTime<chrono::Utc>>,
     door: &str,
-) -> Result<
-    (
-        Option<(chrono::DateTime<chrono::Utc>, String)>,
-        Option<(chrono::DateTime<chrono::Utc>, String)>,
-    ),
-    Error,
-> {
-    let page = usize::try_from(limit).map_err(|_| Error::Backend("page size".into()))?;
-    // An executor that returned more than one row past the page dropped its
-    // LIMIT: its read was as wide as the stream.
-    if rows.len() > page + 1 {
-        return Err(Error::Backend(format!(
-            "{door}: {} rows for a page of {page}",
-            rows.len()
-        )));
-    }
-    if rows.len() > page {
-        rows.truncate(page);
-        let next = rows.last().map(ServedAttestation::resume_pair);
-        return Ok((next.clone(), next));
+) -> Result<(Option<ServePosition>, ServePosition), Error> {
+    if cut_one_past(rows, limit, door)? {
+        let next = rows
+            .last()
+            .map(ServedAttestation::serve_position)
+            .ok_or_else(|| Error::Backend(format!("{door}: more past an empty page")))?;
+        return Ok((Some(next.clone()), next));
     }
     // Nothing remains past the page: every held row up to the head read
     // before it was examined, so a resume from the head skips nothing this
-    // read could have served.
+    // read could have served, once the head is clamped below any position
+    // still in flight.
     let high_water = [
         since.cloned(),
-        rows.last().map(ServedAttestation::resume_pair),
-        head,
+        rows.last().map(ServedAttestation::serve_position),
+        commit_safe_head(head, settled_before),
     ]
     .into_iter()
     .flatten()
-    .max();
+    .max()
+    .unwrap_or_else(ServePosition::origin);
     Ok((None, high_water))
 }
 
@@ -694,35 +750,28 @@ fn cut_serve_page(
 /// `next_cursor` is `Some` exactly when another matching row exists.
 pub(crate) async fn list_attestations_since_by_prefixes_planned(
     dir: &impl ReadPlanStore,
-    since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-    dimension_prefixes: &[String],
-    type_prefixes: &[String],
+    since: Option<ServePosition>,
+    family_prefixes: &[String],
     limit: i64,
-) -> Result<ServedAttestationPage, Error> {
-    check_page_limit(limit)?;
-    check_serve_prefixes(dimension_prefixes, type_prefixes)?;
+) -> Result<ServePage<ServedAttestation>, Error> {
+    let door = "list_attestations_since_by_prefixes";
+    check_serve_limit(door, limit, MAX_SERVE_PAGE)?;
+    check_serve_prefixes(family_prefixes)?;
     let ServedRows {
         mut rows,
         head,
+        settled_before,
         bytes,
         backend,
     } = dir
         .read_serve_stream_page(
-            ServeNarrowing::Prefixes {
-                dimension_prefixes,
-                type_prefixes,
-            },
+            ServeNarrowing::Families { family_prefixes },
             since.as_ref(),
             limit + 1,
         )
         .await?;
-    let (next_cursor, high_water) = cut_serve_page(
-        &mut rows,
-        limit,
-        since.as_ref(),
-        head,
-        "list_attestations_since_by_prefixes",
-    )?;
+    let (next_cursor, high_water) =
+        cut_serve_page(&mut rows, limit, since.as_ref(), head, settled_before, door)?;
     crate::observe::record_read(
         backend,
         crate::observe::Door::ListAttestationsSinceByPrefixes,
@@ -730,28 +779,70 @@ pub(crate) async fn list_attestations_since_by_prefixes_planned(
         &rows,
         bytes,
     );
-    Ok(ServedAttestationPage {
+    Ok(ServePage {
         items: rows,
         next_cursor,
         high_water,
     })
 }
 
+/// v61.1.0 (#1163 review M5) — the owner-binding feed's items: each node the
+/// page's `rows` touch, at its LAST row in the page, in that order, with
+/// `fold`'s answer for it. A fold that fails for a node is that node's item
+/// ([`AnnouncedOwnerState::Unresolved`]), never the page's failure: one node
+/// whose fold errors must not stall the cursor for every other node.
+pub(crate) async fn owner_binding_items<'r, F, Fut>(
+    rows: &'r [ServedAttestation],
+    fold: F,
+) -> Vec<OwnerBindingChange>
+where
+    F: Fn(&'r str) -> Fut,
+    Fut: std::future::Future<Output = Result<AnnouncedOwnerState, Error>>,
+{
+    let mut last: std::collections::BTreeMap<&'r str, usize> = std::collections::BTreeMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        let node = r.attestation.attested_key_id.as_str();
+        if !node.is_empty() {
+            last.insert(node, i);
+        }
+    }
+    let mut order: Vec<(usize, &'r str)> = last.into_iter().map(|(n, i)| (i, n)).collect();
+    order.sort_unstable();
+    let mut items = Vec::with_capacity(order.len());
+    for (i, node) in order {
+        let state = match fold(node).await {
+            Ok(state) => state,
+            Err(e) => AnnouncedOwnerState::Unresolved {
+                reason: e.to_string(),
+            },
+        };
+        items.push(OwnerBindingChange {
+            node_key_id: node.to_owned(),
+            state,
+            position: rows[i].serve_position(),
+        });
+    }
+    items
+}
+
 /// The read: every backend's `list_owner_bindings_since` (v61.1.0,
 /// CIRISPersist#1163, CC 5.4.6). The page is the stream's candidate rows
-/// ([`ServeNarrowing::OwnerBindingChanges`]); each node they touch is folded
-/// once, NOW, by [`super::admission::announced_owner_state`], and reported
-/// at its last row in the page. The fold is the verdict: the SQL only says
-/// which nodes to ask about.
+/// ([`ServeNarrowing::OwnerBindingChanges`]), at most
+/// [`MAX_OWNER_FEED_PAGE`]; each node they touch is folded once, NOW, by
+/// [`super::admission::announced_owner_state`], and reported at its last row
+/// in the page ([`owner_binding_items`]). The fold is the verdict: the SQL
+/// only says which nodes to ask about.
 pub(crate) async fn list_owner_bindings_since_planned(
     dir: &impl ReadPlanStore,
-    since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+    since: Option<ServePosition>,
     limit: i64,
-) -> Result<OwnerBindingPage, Error> {
-    check_page_limit(limit)?;
+) -> Result<ServePage<OwnerBindingChange>, Error> {
+    let door = "list_owner_bindings_since";
+    check_serve_limit(door, limit, MAX_OWNER_FEED_PAGE)?;
     let ServedRows {
         mut rows,
         head,
+        settled_before,
         bytes,
         backend,
     } = dir
@@ -761,13 +852,8 @@ pub(crate) async fn list_owner_bindings_since_planned(
             limit + 1,
         )
         .await?;
-    let (next_cursor, high_water) = cut_serve_page(
-        &mut rows,
-        limit,
-        since.as_ref(),
-        head,
-        "list_owner_bindings_since",
-    )?;
+    let (next_cursor, high_water) =
+        cut_serve_page(&mut rows, limit, since.as_ref(), head, settled_before, door)?;
     crate::observe::record_read(
         backend,
         crate::observe::Door::ListOwnerBindingsSince,
@@ -775,26 +861,11 @@ pub(crate) async fn list_owner_bindings_since_planned(
         &rows,
         bytes,
     );
-    // Each node at its LAST row in the page, in that order.
-    let mut last: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-    for (i, r) in rows.iter().enumerate() {
-        let node = r.attestation.attested_key_id.as_str();
-        if !node.is_empty() {
-            last.insert(node, i);
-        }
-    }
-    let mut order: Vec<(usize, &str)> = last.into_iter().map(|(n, i)| (i, n)).collect();
-    order.sort_unstable();
-    let mut items = Vec::with_capacity(order.len());
-    for (i, node) in order {
-        let state = super::admission::announced_owner_state(dir, node).await?;
-        items.push(OwnerBindingChange {
-            node_key_id: node.to_owned(),
-            state,
-            position: rows[i].resume_pair(),
-        });
-    }
-    Ok(OwnerBindingPage {
+    let items = owner_binding_items(&rows, |node| {
+        super::admission::announced_owner_state(dir, node)
+    })
+    .await;
+    Ok(ServePage {
         items,
         next_cursor,
         high_water,

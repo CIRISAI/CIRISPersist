@@ -3077,8 +3077,8 @@ class Engine:
     def list_attestations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) empirical — v21.1.0 (CIRISPersist#507c) — bulk-list Attestation rows since a cursor, as a JSON array, federation tier only (the E5 invariant — a local-tier row..."""
 
-    def list_attestations_since_by_prefixes(self, since_rfc3339: str | None, since_id: str | None, dimension_prefixes: list[str], type_prefixes: list[str], limit: int) -> str:
-        """(derived) empirical — v61.1.0 (CIRISPersist#1190) — list_attestations_since narrowed by prefix: the federation-tier rows whose dimension starts with one of dimension_pre..."""
+    def list_attestations_since_by_prefixes(self, since_rfc3339: str | None, since_id: str | None, family_prefixes: list[str], limit: int) -> str:
+        """(derived) empirical — v61.1.0 (CIRISPersist#1190) — list_attestations_since narrowed by family: the federation-tier rows whose family (row_type::claim_token: a scores ro..."""
 
     def list_canonical_servers(self) -> str:
         """(derived) empirical — v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the canonical / founding bootstrap servers as a JSON array of KeyRecords (federation_keys rows w..."""
@@ -3187,7 +3187,7 @@ class Engine:
         """(derived) empirical — v0.4.0 — List outbound rows with optional filters. Returns a list of dicts. All filter parameters are optional; combine with AND."""
 
     def list_owner_bindings_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
-        """(derived) empirical — v61.1.0 (CIRISPersist#1163, CC 5.4.6) — the announced-roster change feed: after the (admitted_at, attestation_id) pair cursor, one item per node wh..."""
+        """(derived) empirical — v61.1.0 (CIRISPersist#1163, CC 5.4.6) — the announced-roster change feed: after the serve position (since_rfc3339, since_id), one item per node who..."""
 
     def list_retention(self) -> str:
         """(derived) empirical — v6.0.1 (CIRISPersist#218) — All stored retention policies as a JSON-encoded array of RetentionPolicyRow ({table_name, policy})."""

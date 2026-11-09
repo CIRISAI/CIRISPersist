@@ -25,6 +25,10 @@
 //!   `substrate_persist` key's `system:*` row about another key is refused
 //!   (`substrate_self_report_names_another_party`); about itself it is
 //!   admitted; an `agent` key about itself is refused as the emitter.
+//!   v61.1.0 (as ruled): refused at this node's own write door; **I1607**
+//!   (sqlite, postgres) a peer-offered or replicated such row is admitted and
+//!   reported (counted, logged with the token) until v62, and the local-tier
+//!   door refuses it.
 //! - **I1594** (sqlite, postgres) `trace_summary:` — a summary whose signer is
 //!   not among its `subject_key_ids` is refused (`trace_dimension_invalid`);
 //!   one naming its signer is admitted.
@@ -292,14 +296,25 @@ pub(crate) mod bodies {
         register(d, &other, &[it::USER]).await;
         let score = serde_json::json!({ "score": 1.0 });
         for form in FORMS {
-            refused(
-                d,
-                row(form, FAMILY, &persist, &other, &[], &score, None),
+            // v61.1.0 (as ruled) — refused at this node's own write door; a
+            // peer's such row is reported, not refused, until v62 (I1607).
+            let r = row(form, FAMILY, &persist, &other, &[], &score, None);
+            let id = r.attestation_id.clone();
+            let err = d
+                .put_attestation_authored(SignedAttestation { attestation: r })
+                .await
+                .expect_err("I1593: this node's own substrate self-report about another key");
+            assert_eq!(
+                err.kind(),
                 "federation_dimension_rejected",
-                crate::federation::admission::SUBSTRATE_SELF_REPORT_SUBJECT_REASON,
-                &format!("I1593 {form:?}: a substrate self-report about another key"),
-            )
-            .await;
+                "I1593 {form:?}: {err}"
+            );
+            assert!(
+                err.to_string()
+                    .contains(crate::federation::admission::SUBSTRATE_SELF_REPORT_SUBJECT_REASON),
+                "I1593 {form:?}: {err}"
+            );
+            assert!(!held(d, &id).await, "I1593 {form:?}: not stored");
             admitted(
                 d,
                 row(form, FAMILY, &persist, &persist, &[], &score, None),
@@ -315,6 +330,82 @@ pub(crate) mod bodies {
             )
             .await;
         }
+    }
+
+    /// I1607 (v61.1.0, as ruled) — a substrate self-report about another key
+    /// that a PEER offers (`put_attestation`) or that replicates
+    /// (`apply_replicated_attestation`) is admitted under report: held, and
+    /// counted under `persist_substrate_self_report_would_refuse_total`
+    /// (logged with `substrate_self_report_names_another_party`). This node's
+    /// own write of the same row is refused (I1593), and so is the local-tier
+    /// door's.
+    pub(crate) async fn i1607_a_peers_self_report_is_reported_not_refused(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        const FAMILY: &str = "system:health:n_eff_measurable:v1";
+        let persist = format!("i1607-persist-{tag}");
+        let other = format!("i1607-other-{tag}");
+        register(d, &persist, &[it::SUBSTRATE_PERSIST]).await;
+        register(d, &other, &[it::USER]).await;
+        let score = serde_json::json!({ "score": 1.0 });
+        let stem = crate::federation::row_type::type_stem(FAMILY);
+        let count = || {
+            crate::federation::row_type::substrate_self_report_would_refuse_total()
+                .into_iter()
+                .find(|(l, _)| *l == stem)
+                .map_or(0, |(_, n)| n)
+        };
+        for form in FORMS {
+            let before = count();
+            let r = row(form, FAMILY, &persist, &other, &[], &score, None);
+            let id = r.attestation_id.clone();
+            put(d, r)
+                .await
+                .unwrap_or_else(|e| panic!("I1607 {form:?}: a peer's row is admitted: {e}"));
+            assert!(held(d, &id).await, "I1607 {form:?}: held");
+            let r = row(form, FAMILY, &persist, &other, &[], &score, None);
+            let id = r.attestation_id.clone();
+            let outcome = d
+                .apply_replicated_attestation(SignedAttestation { attestation: r })
+                .await
+                .unwrap_or_else(|e| panic!("I1607 {form:?}: a replicated row is admitted: {e}"));
+            assert_eq!(
+                outcome,
+                crate::federation::attestation_apply::ReplicatedAttestationOutcome::Inserted,
+                "I1607 {form:?}"
+            );
+            assert!(held(d, &id).await, "I1607 {form:?}: held");
+            assert!(
+                count() >= before + 2,
+                "I1607 {form:?}: both admissions are counted as reported"
+            );
+        }
+        // The local-tier door is this node's own write: refused.
+        let err = d
+            .attestation_insert_local(crate::federation::types::LocalAttestationInput {
+                attestation_id: None,
+                attesting_key_id: persist.clone(),
+                attested_key_id: Some(other.clone()),
+                attestation_type: attestation_type::SCORES.to_owned(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    serde_json::json!({ "dimension": FAMILY, "score": 1.0 }),
+                )
+                .expect("envelope"),
+                subject_key_ids: Vec::new(),
+                cohort_scope: cohort_scope::SELF.to_owned(),
+                scrub_signature_classical: None,
+                scrub_signature_pqc: None,
+            })
+            .await
+            .expect_err("I1607: the local-tier door refuses it");
+        assert!(
+            err.to_string()
+                .contains(crate::federation::admission::SUBSTRATE_SELF_REPORT_SUBJECT_REASON),
+            "I1607: refused by the self-report rule at the local door: {err}"
+        );
     }
 
     /// I1594 — `trace_summary:` is its producer's own, in both forms.
@@ -473,6 +564,10 @@ mod tests {
     on_every_backend!(
         i1593,
         bodies::i1593_substrate_self_report_attester_in_both_forms
+    );
+    on_every_backend!(
+        i1607,
+        bodies::i1607_a_peers_self_report_is_reported_not_refused
     );
     on_every_backend!(
         i1594,

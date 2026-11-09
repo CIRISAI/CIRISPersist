@@ -857,6 +857,51 @@ pub fn check_substrate_self_report_attester(row: &super::Attestation) -> Result<
     })
 }
 
+/// v61.1.0 (CIRISPersist#1174 item 3, as ruled for 61.1) — which door asks
+/// [`check_substrate_self_report_attester`], and so whether it refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfReportDoor {
+    /// This node's own write: the local-tier door, the authored put
+    /// (`put_attestation_authored`) and the promotion that crosses a local row.
+    /// The rule is ENFORCED.
+    Local,
+    /// A row offered by a peer or replicated (`put_attestation`,
+    /// `apply_replicated_attestation`, a sync). The rule REPORTS until v62:
+    /// the row is admitted, logged with
+    /// [`SUBSTRATE_SELF_REPORT_SUBJECT_REASON`] and counted
+    /// (`persist_substrate_self_report_would_refuse_total`), so a peer on an
+    /// earlier version that emits such rows is not cut off mid-rollout.
+    Replicated,
+}
+
+impl SelfReportDoor {
+    /// The door a put's origin names.
+    #[must_use]
+    pub fn of(origin: &super::replication::admission::WriteOrigin) -> Self {
+        match origin {
+            super::replication::admission::WriteOrigin::Authored => Self::Local,
+            super::replication::admission::WriteOrigin::Wire
+            | super::replication::admission::WriteOrigin::Sync { .. } => Self::Replicated,
+        }
+    }
+}
+
+/// v61.1.0 (as ruled) — [`check_substrate_self_report_attester`] at `door`:
+/// its refusal at [`SelfReportDoor::Local`]; at
+/// [`SelfReportDoor::Replicated`] the refusal is reported and the row admitted.
+pub fn check_substrate_self_report_attester_at(
+    row: &super::Attestation,
+    door: SelfReportDoor,
+) -> Result<(), Error> {
+    match (check_substrate_self_report_attester(row), door) {
+        (Err(e), SelfReportDoor::Replicated) => {
+            crate::federation::row_type::record_substrate_self_report_would_refuse(row, &e);
+            Ok(())
+        }
+        (verdict, _) => verdict,
+    }
+}
+
 /// **The declared exceptions.** Family stems persist governs that CC's Part 3
 /// does **not** catalogue — so R2 has nothing to check them against, and
 /// refusing them under R2(b) would reject traffic the Constitution never spoke
@@ -3273,6 +3318,8 @@ pub async fn check_promotion_admission(
     // `put_attestation` does: a SELF-attested capacity row must be reported as
     // self-emission, not shadowed by "no consent".
     check_reserved_prefix_admission(directory, row).await?;
+    // v61.1.0 — a promoted row is this node's own write: enforced.
+    check_substrate_self_report_attester_at(row, SelfReportDoor::Local)?;
 
     // CC 3.4.5 — CONSENT BEFORE SCORING. The MUST this issue is rated on.
     // v44.8.0 (CIRISPersist#866 C1) — the scope-token gate at the promotion
@@ -11057,12 +11104,11 @@ pub async fn check_withdraws_admission_at(
 
 /// v61.1.0 (CIRISPersist#1218) — the held-target half of
 /// [`check_withdraws_admission_at`]: the verdict on `row` (a `withdraws`)
-/// against `target`, the row it names, as if `target` were held. The write
-/// door asks it with the held target; the attestation plan asks it again for
-/// every DEFERRED `withdraws` naming a row it is about to store
-/// (`PlannedAttestation::restamped_withdraws`), so the rule a deferred
-/// `withdraws` carries is the one this door would have stamped had the rows
-/// arrived in order, never one a peer supplied.
+/// against `target`, the row it names, now held. Only the write door stamps
+/// the rule this returns, at admission; a held row is never re-stamped (FSD
+/// 5.8), so a `withdraws` admitted before its target keeps no rule and the
+/// fold honours it only from the target's producer
+/// (`precedence::retraction_entitled`).
 pub(crate) async fn check_withdraws_admission_against(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
@@ -19356,9 +19402,10 @@ pub async fn check_reserved_prefix_admission(
         "",
     )?;
     // v61.1.0 (CIRISPersist#1174 item 3, CC 3.4.3) — the substrate
-    // self-report families describe the substrate that signs them. Pure, so
-    // it sits with the other attester==attested arms.
-    check_substrate_self_report_attester(row)?;
+    // self-report attester is NOT asked here: its verdict depends on the door
+    // (enforced for this node's own writes, reported for a peer's until v62),
+    // and this gate does not know the door. Each caller asks
+    // [`check_substrate_self_report_attester_at`] beside it.
 
     // (CIRISPersist#590) — CC 3.1.7 R2(b): a governed family with no
     // registry row is a CONFORMANCE FAILURE, never an admit-and-wait.

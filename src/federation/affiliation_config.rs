@@ -97,6 +97,13 @@ pub const AFFILIATION_COUNTERSIGN_MISSING: &str = "affiliation_countersign_missi
 /// reconsideration proposal" path has no held state: both are follow-ups;
 /// this refuses instead.
 ///
+/// v61.1.0 (D15; CIRISPersist#1198, CC 4.5.13) — "outside the seat" is asked
+/// of PERSONS ([`key_person`](super::key_person)), as every room vote now
+/// is: an official key that is a device of the seat's own person is not
+/// outside it, and a countersign counts only when its signer speaks for a
+/// person who holds no seat. The seat holder's second device naming itself an
+/// official is still one voice. Judged as the keys stood at `at`.
+///
 /// # Errors
 ///
 /// [`Error::RosterAuthorityUnauthorized`] with [`AFFILIATION_COUNTERSIGN_MISSING`];
@@ -128,14 +135,32 @@ where
     if seats.len() != 1 {
         return Ok(());
     }
-    let outside: BTreeSet<String> = affiliation_config_of(community)?
+    let officials: BTreeSet<String> = affiliation_config_of(community)?
         .and_then(|c| c.designated_officials)
         .unwrap_or_default()
         .into_iter()
         .map(|o| o.key_id)
-        .filter(|k| !seats.contains(k))
         .collect();
-    if signers.iter().any(|s| outside.contains(s)) {
+    let selves = super::key_person::KeySelves::read(
+        dir,
+        seats
+            .iter()
+            .chain(&officials)
+            .chain(signers)
+            .cloned()
+            .collect(),
+    )
+    .await?;
+    let persons = selves.at(at);
+    let seat_persons: BTreeSet<&str> = seats.iter().map(|k| persons.seat_person(k)).collect();
+    let outside: BTreeSet<&str> = officials
+        .iter()
+        .filter(|k| !seats.contains(*k) && !seat_persons.contains(persons.seat_person(k)))
+        .map(String::as_str)
+        .collect();
+    if signers.iter().any(|s| {
+        outside.contains(s.as_str()) && persons.voice(s).is_some_and(|p| !seat_persons.contains(p))
+    }) {
         return Ok(());
     }
     Err(Error::RosterAuthorityUnauthorized {

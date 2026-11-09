@@ -160,7 +160,7 @@ A host uses it in one of two ways.
 
 2. By debuglink: put the file, unrenamed, beside the `.so` (`$(dirname "$so")/`) or in a `.debug/` directory beside it. gdb finds it by the name in `.gnu_debuglink` and checks its CRC.
 
-Then `perf report` / `perf script` and gdb backtraces name persist's functions instead of an offset in `ciris_persist.abi3.so`. Wheels from earlier releases are stripped at link time and have no companion. A wheel rebuilt by `reregister-manifests.yml` is stripped at link time too, so this release's debug file does not match it.
+Then `perf report` / `perf script` and gdb backtraces name persist's functions instead of an offset in `ciris_persist.abi3.so`. Wheels from earlier releases are stripped at link time and have no companion. A wheel rebuilt by `reregister-manifests.yml` from a 61.1.0-or-later tag is built and split the same way (the rebuild job uses the tag's own `scripts/split_wheel_debuginfo.py`), but it is a different link, so nothing promises its build-id is the release's and the release's debug file is not its companion; the rebuild keeps no debug file of its own.
 
 Releases before 53.2.0 carry no attestations. The wheel build clears `target/wheels/` first and selects only `ciris_persist-<v>-*.whl`, so a stale wheel restored from the build cache can never be signed or registered; the hashes of the stale wheels that some 53.x releases registered are listed in `evidence/manifest_remediation/known_stale_hashes.txt`, which the bits-changed gate refuses.
 

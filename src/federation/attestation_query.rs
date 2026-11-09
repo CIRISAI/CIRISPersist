@@ -834,11 +834,19 @@ pub(crate) fn lifecycle_predicate(
             ),
         ),
     };
+    // v61.1.0 (CIRISPersist#1218 review M1, CC 2.4.1.1) — a stamped rule is
+    // the only non-producer authority the fold counts
+    // (`precedence::retraction_entitled`), and against a target the subject
+    // carve-out denies (an adverse class or a cosigned act, not on its own
+    // plane) only rules 1 and 5 count: a legacy stamp 2, 3 or 4 there hides
+    // nothing, here as in the fold.
+    let carved = subject_withdraws_carved_out_sql(dialect, outer);
     Some((
         format!(
             "NOT EXISTS (SELECT 1 FROM {table} c{pin} \
                WHERE (c.attesting_key_id = {outer}.attesting_key_id \
-                      OR c.withdraws_admission_rule IS NOT NULL) \
+                      OR (c.withdraws_admission_rule IS NOT NULL \
+                          AND (c.withdraws_admission_rule IN ({rules}) OR NOT {carved}))) \
                  AND c.attestation_type IN ({list}) \
                  AND {target} = {id}) \
              AND NOT EXISTS (SELECT 1 FROM {table} r{pin} \
@@ -848,10 +856,75 @@ pub(crate) fn lifecycle_predicate(
                  AND {rank_ref} = {outer_ref} \
                  AND r.cohort_scope = {outer}.cohort_scope \
                  AND {null_eq} \
-                 AND {older})"
+                 AND {older})",
+            rules = CARVED_OUT_ADMITTING_RULES
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
         ),
         hide.iter().map(|t| (*t).to_owned()).collect(),
     ))
+}
+
+/// v61.1.0 (CIRISPersist#1218 review M1) — the `withdraws_admission_rule`
+/// stamps that still count against a target the subject carve-out denies:
+/// rule 1 (the producer's principal) and rule 5 (the CC 3.2 recovery
+/// ceremony), as `precedence::retraction_entitled`'s `Some(1 | 5)`. I1673
+/// pins the two against each other for every rule.
+pub(crate) const CARVED_OUT_ADMITTING_RULES: [u8; 2] = [1, 5];
+
+/// v61.1.0 (CIRISPersist#1218 review M1, CC 2.4.1.1) — "the held row `t`
+/// denies the subject-side withdrawal rules 2-4" as SQL: the fold's
+/// [`subject_withdraws_carved_out`](super::precedence::subject_withdraws_carved_out)
+/// (an envelope `dimension` under one of
+/// [`SUBJECT_WITHDRAWS_CARVE_OUT`](super::admission::SUBJECT_WITHDRAWS_CARVE_OUT),
+/// generated from that same list, or a co-signature by another key that is
+/// not a tier-crossing co-scrub), less the rows whose `withdraws` is decided
+/// on their own plane (a group-plane row, an `identity:occurrence:v1` row,
+/// both by their `scores` dimension). An occurrence row is matched by its
+/// family here and by a parsed object in the fold; the door refuses an
+/// occurrence row that does not parse (`check_canonical_plane_row`), so on
+/// a held row the two agree.
+#[must_use]
+pub(crate) fn subject_withdraws_carved_out_sql(dialect: Dialect, t: &str) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let adverse: Vec<String> = super::admission::SUBJECT_WITHDRAWS_CARVE_OUT
+        .iter()
+        .map(|p| {
+            format!(
+                "substr({t}.dimension, 1, {}) = {}",
+                p.chars().count(),
+                quote(p)
+            )
+        })
+        .collect();
+    let cosigned = match dialect {
+        Dialect::Sqlite => format!(
+            "EXISTS (SELECT 1 FROM json_each({t}.additional_scrubs) sc \
+               WHERE json_extract(sc.value, '$.cosigned_at') IS NULL \
+                 AND json_extract(sc.value, '$.scrub_key_id') <> {t}.attesting_key_id)"
+        ),
+        Dialect::Postgres => format!(
+            "EXISTS (SELECT 1 FROM jsonb_array_elements({t}.additional_scrubs::jsonb) sc(v) \
+               WHERE sc.v->>'cosigned_at' IS NULL \
+                 AND sc.v->>'scrub_key_id' <> {t}.attesting_key_id)"
+        ),
+    };
+    let own_plane: Vec<String> = super::group_plane::GroupPlaneFamily::ALL
+        .iter()
+        .map(|f| f.dimension())
+        .chain([super::key_plane::KeyPlaneFamily::IdentityOccurrence.dimension()])
+        .map(quote)
+        .collect();
+    format!(
+        "((COALESCE(({adverse}), FALSE) OR {cosigned}) \
+          AND NOT COALESCE(({t}.attestation_type = '{scores}' \
+                            AND {t}.dimension IN ({own_plane})), FALSE))",
+        adverse = adverse.join(" OR "),
+        scores = super::types::attestation_type::SCORES,
+        own_plane = own_plane.join(", "),
+    )
 }
 
 /// The SQL dialect a statement is rendered for.
@@ -862,6 +935,106 @@ pub enum Dialect {
     /// `$N` placeholders; `timestamptz` `asserted_at`, `uuid` ids compared
     /// as `text COLLATE "C"`.
     Postgres,
+}
+
+/// v61.1.0 — the `federation_attestations` columns the attestation row
+/// mappers read, the table aliased `fa`, sqlite's spelling. The ONE list: the
+/// scores reads, the #1225 subject read and the serve-stream reads select it.
+pub(crate) const SQLITE_FA_COLUMNS: &str = "fa.attestation_id, fa.attesting_key_id, \
+     fa.attested_key_id, fa.attestation_type, fa.weight, fa.asserted_at, fa.expires_at, \
+     fa.attestation_envelope, fa.original_content_hash, fa.scrub_signature_classical, \
+     fa.scrub_signature_pqc, fa.scrub_key_id, fa.scrub_timestamp, fa.pqc_completed_at, \
+     fa.persist_row_hash, fa.subject_key_ids, fa.withdraws_admission_rule, fa.cohort_scope, \
+     fa.tier, fa.promoted_at, fa.additional_scrubs";
+
+/// v61.1.0 — [`SQLITE_FA_COLUMNS`], postgres's spelling (the id as text, the
+/// `NUMERIC` weight as `float8`).
+pub(crate) const POSTGRES_FA_COLUMNS: &str = "fa.attestation_id::text AS attestation_id, \
+     fa.attesting_key_id, fa.attested_key_id, fa.attestation_type, \
+     fa.weight::float8 AS weight, fa.asserted_at, fa.expires_at, fa.attestation_envelope, \
+     fa.original_content_hash, fa.scrub_signature_classical, fa.scrub_signature_pqc, \
+     fa.scrub_key_id, fa.scrub_timestamp, fa.pqc_completed_at, fa.persist_row_hash, \
+     fa.subject_key_ids, fa.withdraws_admission_rule, fa.cohort_scope, fa.tier, \
+     fa.promoted_at, fa.additional_scrubs";
+
+impl Dialect {
+    /// The `fa`-aliased attestation column list ([`SQLITE_FA_COLUMNS`] /
+    /// [`POSTGRES_FA_COLUMNS`]).
+    #[must_use]
+    pub(crate) const fn fa_columns(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => SQLITE_FA_COLUMNS,
+            Dialect::Postgres => POSTGRES_FA_COLUMNS,
+        }
+    }
+
+    /// The collation suffix a byte-ordered text comparison needs: none on
+    /// sqlite (BINARY is its default), `COLLATE "C"` on postgres.
+    #[must_use]
+    pub(crate) const fn byte_collate(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => "",
+            Dialect::Postgres => " COLLATE \"C\"",
+        }
+    }
+
+    /// The schema prefix of the lens tables: none on sqlite, `cirislens.`
+    /// on postgres.
+    #[must_use]
+    pub(crate) const fn schema_prefix(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => "",
+            Dialect::Postgres => "cirislens.",
+        }
+    }
+
+    /// The same dialect, as the row-type serve filter names it.
+    #[must_use]
+    pub(crate) const fn row_type(self) -> super::row_type::SqlDialect {
+        match self {
+            Dialect::Sqlite => super::row_type::SqlDialect::Sqlite,
+            Dialect::Postgres => super::row_type::SqlDialect::Postgres,
+        }
+    }
+}
+
+/// The placeholder of the bind just pushed onto `binds`: `?N` on sqlite,
+/// `$N` on postgres, `N = binds.len()`.
+#[must_use]
+pub(crate) fn placeholder(dialect: Dialect, binds: &[Bind]) -> String {
+    match dialect {
+        Dialect::Sqlite => format!("?{}", binds.len()),
+        Dialect::Postgres => format!("${}", binds.len()),
+    }
+}
+
+/// `column` starts with `prefix`, byte for byte (the #817/#818 rule): the
+/// half-open range `[prefix, successor)` when a successor is representable
+/// (an index range, never `LIKE`, so `%` and `_` are ordinary bytes and case
+/// is kept), `substr` otherwise. Pushes its binds; returns the clause. The
+/// ONE spelling [`render_sql`]'s two prefix arms and the serve-stream reads
+/// (`read_plan`) use.
+pub(crate) fn prefix_range_clause(
+    dialect: Dialect,
+    column: &str,
+    prefix: &str,
+    binds: &mut Vec<Bind>,
+) -> String {
+    match crate::ceg::list::federation::dimension_prefix_bounds(prefix) {
+        Some((lo, hi)) => {
+            let collate = dialect.byte_collate();
+            binds.push(Bind::Text(lo));
+            let a = placeholder(dialect, binds);
+            binds.push(Bind::Text(hi));
+            let b = placeholder(dialect, binds);
+            format!("({column}{collate} >= {a} AND {column}{collate} < {b})")
+        }
+        None => {
+            binds.push(Bind::Text(prefix.to_owned()));
+            let a = placeholder(dialect, binds);
+            format!("substr({column}, 1, {}) = {a}", prefix.chars().count())
+        }
+    }
 }
 
 /// One bind value of a rendered statement.
@@ -898,17 +1071,10 @@ pub struct Statement {
 #[must_use]
 pub fn render_sql(q: &AttestationQuery, dialect: Dialect, table: &str, columns: &str) -> Statement {
     let mut binds: Vec<Bind> = Vec::new();
-    let ph = |binds: &Vec<Bind>| match dialect {
-        Dialect::Sqlite => format!("?{}", binds.len()),
-        Dialect::Postgres => format!("${}", binds.len()),
-    };
+    let ph = |binds: &Vec<Bind>| placeholder(dialect, binds);
     let dim = match dialect {
         Dialect::Sqlite => "dimension",
         Dialect::Postgres => "dimension COLLATE \"C\"",
-    };
-    let ty = match dialect {
-        Dialect::Sqlite => "attestation_type",
-        Dialect::Postgres => "attestation_type COLLATE \"C\"",
     };
     let id = match dialect {
         Dialect::Sqlite => "attestation_id",
@@ -939,23 +1105,7 @@ pub fn render_sql(q: &AttestationQuery, dialect: Dialect, table: &str, columns: 
     match &q.dimension {
         DimensionFilter::Any => {}
         DimensionFilter::Prefix(p) => {
-            match crate::ceg::list::federation::dimension_prefix_bounds(p) {
-                Some((lo, hi)) => {
-                    binds.push(Bind::Text(lo));
-                    let a = ph(&binds);
-                    binds.push(Bind::Text(hi));
-                    let b = ph(&binds);
-                    parts.push(format!("({dim} >= {a} AND {dim} < {b})"));
-                }
-                None => {
-                    binds.push(Bind::Text(p.clone()));
-                    parts.push(format!(
-                        "substr(dimension, 1, {}) = {}",
-                        p.chars().count(),
-                        ph(&binds)
-                    ));
-                }
-            }
+            parts.push(prefix_range_clause(dialect, "dimension", p, &mut binds));
         }
         DimensionFilter::Exact(x) => {
             binds.push(Bind::Text(x.clone()));
@@ -1001,23 +1151,12 @@ pub fn render_sql(q: &AttestationQuery, dialect: Dialect, table: &str, columns: 
         parts.push(format!("attestation_type IN ({})", phs.join(", ")));
     }
     if let Some(p) = &q.type_prefix {
-        match crate::ceg::list::federation::dimension_prefix_bounds(p) {
-            Some((lo, hi)) => {
-                binds.push(Bind::Text(lo));
-                let a = ph(&binds);
-                binds.push(Bind::Text(hi));
-                let b = ph(&binds);
-                parts.push(format!("({ty} >= {a} AND {ty} < {b})"));
-            }
-            None => {
-                binds.push(Bind::Text(p.clone()));
-                parts.push(format!(
-                    "substr(attestation_type, 1, {}) = {}",
-                    p.chars().count(),
-                    ph(&binds)
-                ));
-            }
-        }
+        parts.push(prefix_range_clause(
+            dialect,
+            "attestation_type",
+            p,
+            &mut binds,
+        ));
     }
     if !q.excluded_dimensions.is_empty() {
         let phs: Vec<String> = q

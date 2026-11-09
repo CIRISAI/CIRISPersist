@@ -40,7 +40,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::verify::canonical::canonicalize_envelope_for_signing_v1_pinned;
-use crate::verify::hybrid::{verify_hybrid, HybridPolicy};
+use crate::verify::hybrid::{verify_hybrid_with_policy, HybridPolicy};
 
 use super::types::AuditEntry;
 use super::Error;
@@ -111,9 +111,11 @@ pub fn truncate_to_micros(dt: chrono::DateTime<chrono::Utc>) -> chrono::DateTime
 /// (CC 5.3.1; CC's reading on CIRISPersist#1233). The audit chain is this
 /// holder's own per-tenant log. What carries its accountability across a
 /// node boundary is the head the holder signs over it, and
-/// `audit::merkle_store` signs every head with a `HybridSignature` and
-/// refuses to store, serve or verify one without its ML-DSA-65 half
-/// (`merkle_store::require_hybrid_sth`, `merkle_store::verify_audit_sth`). An
+/// `audit::merkle_store` signs every head with a `HybridSignature`, refuses
+/// to store a new one without its ML-DSA-65 half
+/// (`merkle_store::require_hybrid_sth`), and verifies one only hybrid-Strict
+/// (`merkle_store::verify_audit_sth`). A head stored by an earlier build is
+/// served as itself (CC 2.6.1.8) and refused by that verify. An
 /// [`AuditEntry`] is a leaf, authenticated by inclusion under a hybrid-signed
 /// head at a tree size; its Ed25519 signature is an **inner** signature that
 /// binds the row to its actor and chain position. It is not the federation
@@ -141,7 +143,9 @@ pub fn verify_entry_signature(entry: &AuditEntry) -> Result<(), Error> {
         return Err(Error::InvalidArgument("actor_id missing".into()));
     }
     let canonical = canonical_bytes_for_entry(entry)?;
-    verify_hybrid(
+    // v61.1.0 (CIRISPersist#1233) — the crate-private policy-taking twin: the
+    // public `verify_hybrid` refuses every policy but `Strict`.
+    verify_hybrid_with_policy(
         &canonical,
         &entry.signature,
         None, // AuditEntry has no PQC half — see the PINNED policy note

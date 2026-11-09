@@ -96,5 +96,7 @@ def test_a_self_removal_carries_no_cosignature(tmp_path) -> None:
         with pytest.raises(ValueError) as info:
             e.cohort_revoke_member("self", "ident", "occ", _spec(cosignatures=[COSIGNATURE]))
         assert "revoke_spec_json" not in str(info.value), info.value
+        # D19 — the refusal is led by its stable token.
+        assert "self_removal_cosignatures_refused" in str(info.value), info.value
     finally:
         ciris_persist.reset_engine()

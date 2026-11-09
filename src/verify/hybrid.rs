@@ -95,11 +95,14 @@ pub enum HybridPolicy {
     ///
     /// # v61.1.0 (CIRISPersist#1233) — not reachable from any caller surface
     ///
-    /// The Python doors and the capsule's `VerifyHybridViaDirectory` refuse
+    /// The public Rust [`verify_hybrid`] and [`verify_hybrid_via_directory`],
+    /// the Python doors and the capsule's `VerifyHybridViaDirectory` refuse
     /// this variant (and `SoftFreshness`) with [`VERIFY_POLICY_VIOLATION`]
-    /// (CC 5.3.2.4.3.1). Per CC's reading, the audit pin is not a gap (the
-    /// audit plane's gate is its hybrid-signed tree head, CC 5.3.1); the
-    /// cirisnode pin is, and closes in v62 with the variant itself.
+    /// (CC 5.3.2.4.3.1). The two pins above reach it through the
+    /// crate-private twin `verify_hybrid_with_policy`. Per CC's reading, the
+    /// audit pin is not a gap (the audit plane's gate is its hybrid-signed
+    /// tree head, CC 5.3.1); the cirisnode pin is, and closes in v62 with the
+    /// variant itself.
     Ed25519Fallback,
 }
 
@@ -176,6 +179,22 @@ pub enum VerifyError {
     /// boundaries cleanly.
     #[error("crypto: {0}")]
     Crypto(String),
+
+    /// v61.1.0 (CIRISPersist#1233, CC 5.3.2.4.3.1) — a caller handed a
+    /// public verify door ([`verify_hybrid`], [`verify_hybrid_via_directory`],
+    /// [`crate::verify::ed25519::verify_trace_hybrid`], the PyO3 doors, the
+    /// capsule op) a policy other than [`HybridPolicy::Strict`]. Refused by
+    /// [`require_strict_policy`] before any decode, lookup or crypto. The
+    /// message leads with [`VERIFY_POLICY_VIOLATION`].
+    #[error(
+        "{}: policy {policy:?} refused; hybrid-required (Strict) \
+         is the only verifier policy (CC 5.3.2.4.3.1; CIRISPersist#1233)",
+        VERIFY_POLICY_VIOLATION
+    )]
+    PolicyViolation {
+        /// The refused policy, as the caller passed it.
+        policy: HybridPolicy,
+    },
 }
 
 impl VerifyError {
@@ -190,6 +209,7 @@ impl VerifyError {
             Self::Base64 { .. } => "verify_hybrid_base64",
             Self::InvalidLength { .. } => "verify_hybrid_invalid_length",
             Self::Crypto(_) => "verify_hybrid_crypto",
+            Self::PolicyViolation { .. } => VERIFY_POLICY_VIOLATION,
         }
     }
 }
@@ -200,35 +220,43 @@ impl VerifyError {
 ///
 /// CC 5.3.2.4.3.1: "no classical-only, no hybrid-pending accommodation … a
 /// verifier's hybrid-required check is always-on, never an operator toggle".
-/// The doors that still carry a `policy` argument (`Engine.verify_hybrid`,
+/// Every door that still carries a `policy` argument keeps it until v62
+/// removes it, and refuses every value except `"strict"` /
+/// [`HybridPolicy::Strict`] with this token BEFORE any decode, lookup or
+/// crypto runs: the public Rust [`verify_hybrid`],
+/// [`verify_hybrid_via_directory`] and
+/// [`crate::verify::ed25519::verify_trace_hybrid`] (which calls
+/// `verify_hybrid`), `Engine.verify_hybrid`,
 /// `Engine.verify_hybrid_via_directory` and the three `verify_signed_*`
 /// methods that route through it, and the directory capsule's
-/// `VerifyHybridViaDirectory` op) keep the argument until v62 removes it, and
-/// refuse every value except `"strict"` / [`HybridPolicy::Strict`] with this
-/// token BEFORE any lookup or crypto runs.
+/// `VerifyHybridViaDirectory` op. All of them ask [`require_strict_policy`].
 pub const VERIFY_POLICY_VIOLATION: &str = "verify_policy_violation";
 
-/// v61.1.0 (CIRISPersist#1233) — the one gate the capsule door asks:
-/// `Strict` passes, every other variant is refused with
-/// [`VERIFY_POLICY_VIOLATION`] leading the message. The PyO3 doors take the
-/// policy as a string and refuse every string except `"strict"` with the same
-/// token (`ffi::pyo3::parse_hybrid_policy`).
+/// v61.1.0 (CIRISPersist#1233) — **the one hybrid-required check.**
+/// `Strict` passes; every other variant is refused with
+/// [`VerifyError::PolicyViolation`], whose message and
+/// [`kind`](VerifyError::kind) lead with [`VERIFY_POLICY_VIOLATION`].
+///
+/// Every caller-facing verify path passes through it: the public
+/// [`verify_hybrid`] and [`verify_hybrid_via_directory`] call it first (so
+/// the capsule's `VerifyHybridViaDirectory` arm, which calls the latter,
+/// meets it before the directory lookup), `verify_trace_hybrid` calls it
+/// before canonicalizing, and the PyO3 `parse_hybrid_policy` calls it on the
+/// policy it decodes from the string (an unknown string is a malformed
+/// policy and is refused with the same token before it gets that far).
 ///
 /// Persist's own two classical-only planes (`audit::verify` and
-/// `cirisnode::verify`) call [`verify_hybrid`] directly and do not pass
-/// through this gate; see their PINNED notes.
+/// `cirisnode::verify`) do NOT pass through it: they call the crate-private
+/// twin `verify_hybrid_with_policy`; see their PINNED notes.
 ///
 /// # Errors
 ///
-/// The refusal message, `verify_policy_violation: …`, for any policy other
-/// than [`HybridPolicy::Strict`].
-pub fn require_strict_policy(policy: &HybridPolicy) -> Result<(), String> {
+/// [`VerifyError::PolicyViolation`] for any policy other than
+/// [`HybridPolicy::Strict`].
+pub fn require_strict_policy(policy: &HybridPolicy) -> Result<(), VerifyError> {
     match policy {
         HybridPolicy::Strict => Ok(()),
-        other => Err(format!(
-            "{VERIFY_POLICY_VIOLATION}: policy {other:?} refused; hybrid-required (Strict) \
-             is the only verifier policy (CC 5.3.2.4.3.1; CIRISPersist#1233)"
-        )),
+        other => Err(VerifyError::PolicyViolation { policy: *other }),
     }
 }
 
@@ -260,8 +288,15 @@ fn decode_b64_fixed(
 }
 
 /// v0.3.6 (CIRISPersist#14) — Verify a hybrid Ed25519 + ML-DSA-65
-/// signature over arbitrary canonical bytes, with policy-aware
-/// handling of hybrid-pending rows.
+/// signature over arbitrary canonical bytes.
+///
+/// # v61.1.0 (CIRISPersist#1233, CC 5.3.2.4.3.1) — `Strict` only
+///
+/// `policy` must be [`HybridPolicy::Strict`]: any other variant is refused
+/// with [`VerifyError::PolicyViolation`] ([`VERIFY_POLICY_VIOLATION`]) by
+/// [`require_strict_policy`], before any decode or crypto. The argument stays
+/// until v62 removes it. A hybrid-pending input (both PQC arguments `None`)
+/// is then refused as [`VerifyError::HybridPendingRejected`].
 ///
 /// `ml_dsa_65_sig_b64` and `ml_dsa_65_pubkey_b64` are paired: either
 /// both Some (full hybrid verify) or both None (the row is
@@ -273,6 +308,37 @@ fn decode_b64_fixed(
 /// inputs); SoftFreshness will then reject as
 /// `SoftFreshnessExpired { row_age: None }`.
 pub fn verify_hybrid(
+    canonical_bytes: &[u8],
+    ed25519_sig_b64: &str,
+    ml_dsa_65_sig_b64: Option<&str>,
+    ed25519_pubkey_b64: &str,
+    ml_dsa_65_pubkey_b64: Option<&str>,
+    policy: HybridPolicy,
+    row_age: Option<Duration>,
+) -> Result<VerifyOutcome, VerifyError> {
+    require_strict_policy(&policy)?;
+    verify_hybrid_with_policy(
+        canonical_bytes,
+        ed25519_sig_b64,
+        ml_dsa_65_sig_b64,
+        ed25519_pubkey_b64,
+        ml_dsa_65_pubkey_b64,
+        policy,
+        row_age,
+    )
+}
+
+/// v61.1.0 (CIRISPersist#1233) — the policy-taking twin of [`verify_hybrid`],
+/// crate-private. It does NOT ask [`require_strict_policy`]: `policy` decides
+/// how a hybrid-pending input is treated (see [`HybridPolicy`]).
+///
+/// Exactly two production callers pass anything but `Strict`, and both are
+/// PINNED classical-only planes whose PQC pubkey argument is a hardcoded
+/// `None`: `audit::verify::verify_entry_signature` (an entry's inner
+/// signature; the audit plane's gate is the hybrid-signed head, CC 5.3.1)
+/// and `cirisnode::verify::verify_envelope_signed` (non-conformant until
+/// v62). No caller surface reaches this function with a policy of its own.
+pub(crate) fn verify_hybrid_with_policy(
     canonical_bytes: &[u8],
     ed25519_sig_b64: &str,
     ml_dsa_65_sig_b64: Option<&str>,
@@ -354,9 +420,14 @@ pub fn verify_hybrid(
 /// `signing_key_id` resolution: looks up the row in `federation_keys`
 /// via `FederationDirectory::lookup_public_key`. Both pubkeys
 /// (Ed25519 mandatory, ML-DSA-65 optional during hybrid-pending
-/// window) are pulled from the row. The caller's `ml_dsa_65_sig`
-/// nullability + `policy` decide whether the verify succeeds when
-/// the row is hybrid-pending (see [`HybridPolicy`]).
+/// window) are pulled from the row.
+///
+/// v61.1.0 (CIRISPersist#1233, CC 5.3.2.4.3.1) — `policy` must be
+/// [`HybridPolicy::Strict`]: any other variant is refused with
+/// [`VerifyError::PolicyViolation`] by [`require_strict_policy`] BEFORE the
+/// directory lookup, so an unknown key under a non-strict policy is a policy
+/// refusal, not `verify_unknown_key`. A hybrid-pending row is then refused as
+/// [`VerifyError::HybridPendingRejected`].
 pub async fn verify_hybrid_via_directory<F>(
     directory: &F,
     canonical_bytes: &[u8],
@@ -373,13 +444,16 @@ where
     // callers are unaffected.
     F: crate::federation::FederationDirectory + ?Sized,
 {
+    require_strict_policy(&policy)?;
     let key_record = directory
         .lookup_public_key(signing_key_id)
         .await
         .map_err(|e| VerifyError::Crypto(format!("federation directory lookup: {e}")))?
         .ok_or_else(|| VerifyError::Crypto("verify_unknown_key".to_string()))?;
 
-    verify_hybrid(
+    // The policy was asked above, before the lookup; the twin does not ask
+    // again.
+    verify_hybrid_with_policy(
         canonical_bytes,
         ed25519_sig_b64,
         ml_dsa_65_sig_b64,
@@ -461,6 +535,95 @@ mod tests {
         B64.encode(sk.sign(canonical).to_bytes())
     }
 
+    // v61.1.0 (CIRISPersist#1233) — the `Ed25519Fallback` / `SoftFreshness`
+    // tests below exercise the policy machinery through the crate-private
+    // twin, which the two PINNED classical-only planes call; the public
+    // `verify_hybrid` refuses those policies (I1568 below).
+
+    /// v61.1.0 (CIRISPersist#1233, CC 5.3.2.4.3.1) — **I1568 (unit leg): the
+    /// public `verify_hybrid` refuses every policy but `Strict`.** A VALID
+    /// classical-only signature is exactly the input `Ed25519Fallback` and an
+    /// in-window `SoftFreshness` accept through the twin, so the refusal is
+    /// the policy gate. Garbage base64 under a non-strict policy is refused
+    /// with the policy token, not `verify_hybrid_base64`: the gate runs
+    /// before any decode. Under `Strict` the same garbage reaches the
+    /// decoder (the control).
+    #[test]
+    fn i1568_public_verify_hybrid_refuses_every_policy_but_strict() {
+        let canonical = b"CIRISPersist#1233 I1568";
+        for policy in [
+            HybridPolicy::Ed25519Fallback,
+            HybridPolicy::SoftFreshness {
+                window: Duration::from_secs(86_400),
+            },
+        ] {
+            let accepted_by_the_twin = verify_hybrid_with_policy(
+                canonical,
+                &ed25519_sig_b64(canonical),
+                None,
+                &ed25519_pubkey_b64(),
+                None,
+                policy,
+                Some(Duration::from_secs(1)),
+            );
+            assert!(
+                accepted_by_the_twin.is_ok(),
+                "I1568 fixture: the twin accepts {policy:?}: {accepted_by_the_twin:?}"
+            );
+            let err = verify_hybrid(
+                canonical,
+                &ed25519_sig_b64(canonical),
+                None,
+                &ed25519_pubkey_b64(),
+                None,
+                policy,
+                Some(Duration::from_secs(1)),
+            )
+            .expect_err("I1568: the public verify_hybrid refuses a non-strict policy");
+            assert!(
+                matches!(err, VerifyError::PolicyViolation { policy: p } if p == policy),
+                "I1568: {policy:?} is a policy violation: {err:?}"
+            );
+            assert_eq!(err.kind(), VERIFY_POLICY_VIOLATION);
+            assert!(
+                err.to_string().starts_with(VERIFY_POLICY_VIOLATION),
+                "I1568: the message leads with the token: {err}"
+            );
+
+            let err = verify_hybrid(
+                canonical,
+                "!!!not-base64!!!",
+                None,
+                "!!!",
+                None,
+                policy,
+                None,
+            )
+            .expect_err("I1568: garbage under a non-strict policy");
+            assert_eq!(
+                err.kind(),
+                VERIFY_POLICY_VIOLATION,
+                "I1568: {policy:?} is refused before any decode: {err:?}"
+            );
+        }
+        let err = verify_hybrid(
+            canonical,
+            "!!!not-base64!!!",
+            None,
+            "!!!",
+            None,
+            HybridPolicy::Strict,
+            None,
+        )
+        .expect_err("I1568: garbage under Strict");
+        assert_eq!(
+            err.kind(),
+            "verify_hybrid_base64",
+            "I1568: under Strict the garbage reaches the decoder"
+        );
+        assert!(require_strict_policy(&HybridPolicy::Strict).is_ok());
+    }
+
     /// v0.3.6 — hybrid-pending row + Strict policy → rejects.
     #[test]
     fn strict_rejects_hybrid_pending() {
@@ -483,7 +646,7 @@ mod tests {
     #[test]
     fn fallback_accepts_hybrid_pending() {
         let canonical = b"some-canonical-bytes";
-        let outcome = verify_hybrid(
+        let outcome = verify_hybrid_with_policy(
             canonical,
             &ed25519_sig_b64(canonical),
             None,
@@ -500,7 +663,7 @@ mod tests {
     #[test]
     fn soft_freshness_within_window_accepts() {
         let canonical = b"some-canonical-bytes";
-        let outcome = verify_hybrid(
+        let outcome = verify_hybrid_with_policy(
             canonical,
             &ed25519_sig_b64(canonical),
             None,
@@ -522,7 +685,7 @@ mod tests {
     #[test]
     fn soft_freshness_past_window_rejects() {
         let canonical = b"some-canonical-bytes";
-        let err = verify_hybrid(
+        let err = verify_hybrid_with_policy(
             canonical,
             &ed25519_sig_b64(canonical),
             None,
@@ -542,7 +705,7 @@ mod tests {
     #[test]
     fn soft_freshness_no_row_age_rejects() {
         let canonical = b"some-canonical-bytes";
-        let err = verify_hybrid(
+        let err = verify_hybrid_with_policy(
             canonical,
             &ed25519_sig_b64(canonical),
             None,

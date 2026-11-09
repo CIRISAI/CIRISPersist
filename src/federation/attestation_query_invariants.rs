@@ -1024,8 +1024,13 @@ mod lifecycle_predicate {
                 sql.contains("c.attesting_key_id = fa.attesting_key_id"),
                 "{sql}"
             );
+            // v61.1.0 (#1218 review M1) — a stamp counts, but against a
+            // carved-out target only rules 1 and 5 do (I1673).
             assert!(
-                sql.contains("OR c.withdraws_admission_rule IS NOT NULL"),
+                sql.contains(
+                    "OR (c.withdraws_admission_rule IS NOT NULL \
+                     AND (c.withdraws_admission_rule IN (1, 5) OR NOT ((COALESCE(("
+                ),
                 "{sql}"
             );
             // v61 — the affinity-stripped compare and the pinned seek.

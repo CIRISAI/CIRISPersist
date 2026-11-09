@@ -236,11 +236,14 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("list_owner_bindings_since_planned", Class::Plan),
     // Caller input: no prefix, an empty prefix, too many prefixes.
     ("check_serve_prefixes", Class::Gate),
+    // v61.1.0 (review D19) — caller input: a page size outside the serve
+    // read's bound (10_000 for the family read, 500 for the owner feed).
+    ("check_serve_limit", Class::Gate),
     // The page cut: fails only when the executor dropped its LIMIT.
     ("cut_serve_page", Class::Plumbing),
-    // The per-node fold the owner-binding feed reports (a read of the one
-    // live-delegation fold; it refuses nothing about the caller's input).
-    ("announced_owner_state", Class::Plumbing),
+    // v61.1.0 (review D6) — the one-past cut the #1225 subject read and the
+    // serve cut share: fails only when the executor dropped its LIMIT.
+    ("cut_one_past", Class::Plumbing),
     ("list_key_registration_history_planned", Class::Plan),
     ("list_derived_hex_planned", Class::Plan),
     // The erasure doors' shared planner (same-file helper of both plans): the attester gate and the erasure plan.
@@ -545,13 +548,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // Inside the shared plan: its two same-file halves.
     ("plan_put_attestation", Class::Delegates),
     ("execute_planned", Class::Delegates),
-    // v61.1.0 (CIRISPersist#1218) — same-file helper of the plan: the held
-    // deferred `withdraws` naming the row, re-asked of the door against it.
-    // Its door verdicts do not propagate (a refusal leaves a row unstamped);
-    // its two directory reads are doors, followed like `get_attestation`.
-    ("deferred_withdraws_restamps", Class::Delegates),
-    ("list_attestations_referencing", Class::Delegates),
-    ("withdraws_admission_depth", Class::Delegates),
     // The executor's storage steps, called by the shared plan. Each is itself
     // an `AttestationStore` door, compared across backends on its own.
     ("store_planned_attestation", Class::Plumbing),
@@ -878,6 +874,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_reseal_admission", Class::Gate),
     ("check_reseal_seal_admission", Class::Gate),
     ("check_reserved_prefix_admission", Class::Gate),
+    // v61.1.0 (CIRISPersist#1174 item 3, as ruled) — the CC 3.4.3 substrate
+    // self-report attester, asked beside the reserved-prefix gate with its
+    // door: a refusal at the local door, reported at a peer's.
+    ("check_substrate_self_report_attester_at", Class::Gate),
     ("check_revocation_anti_rollback", Class::Gate),
     ("check_revocation_authority", Class::Gate),
     ("check_revocation_bound", Class::Gate),
@@ -3483,6 +3483,14 @@ mod tests {
             "plan_put_attestation",
             "check_community_trust_grant_admission",
             Reads::FoldAt,
+        ),
+        // v61.1.0 (CIRISPersist#1198, CIRISPersist#1220) — the one first-held
+        // instant both receipt windows (V213, V199) open at: this node's
+        // receipt, never a signed instant.
+        (
+            "plan_put_attestation",
+            "first_held_instant",
+            Reads::ReceivedAt,
         ),
         // The executor's re-ask under its lock: the same instant as the plan's.
         (

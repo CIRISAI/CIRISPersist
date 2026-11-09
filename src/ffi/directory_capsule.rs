@@ -1088,15 +1088,13 @@ pub enum DirectoryOp {
     },
     /// v61.1.0 (CIRISPersist#1190) —
     /// [`FederationDirectory::list_attestations_since_by_prefixes`]: the
-    /// serve stream narrowed by dimension or type prefix. Result rides
+    /// serve stream narrowed by family prefix. Result rides
     /// `ServedAttestationPage`. APPEND-ONLY (Growth).
     ListAttestationsSinceByPrefixes {
-        /// The `(admitted_at, attestation_id)` serve position, exclusive.
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Dimension prefixes.
-        dimension_prefixes: Vec<String>,
-        /// `attestation_type` prefixes.
-        type_prefixes: Vec<String>,
+        /// The serve position, exclusive.
+        since: Option<crate::federation::types::ServePosition>,
+        /// Family prefixes (`row_type::claim_token`'s family).
+        family_prefixes: Vec<String>,
         /// Page size (1..=10_000).
         limit: i64,
     },
@@ -1105,9 +1103,9 @@ pub enum DirectoryOp {
     /// roster's change feed. Result rides `OwnerBindingPage`. APPEND-ONLY
     /// (Growth).
     ListOwnerBindingsSince {
-        /// The `(admitted_at, attestation_id)` serve position, exclusive.
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page size (1..=10_000).
+        /// The serve position, exclusive.
+        since: Option<crate::federation::types::ServePosition>,
+        /// Page size (1..=500).
         limit: i64,
     },
 }
@@ -1335,10 +1333,14 @@ pub enum DirectoryOpResult {
     IdentityOccurrences(Vec<IdentityOccurrence>),
     /// v61.1.0 (CIRISPersist#1190) — `list_attestations_since_by_prefixes`.
     /// APPEND-ONLY (Growth).
-    ServedAttestationPage(crate::federation::types::ServedAttestationPage),
+    ServedAttestationPage(
+        crate::federation::types::ServePage<crate::federation::types::ServedAttestation>,
+    ),
     /// v61.1.0 (CIRISPersist#1163) — `list_owner_bindings_since`.
     /// APPEND-ONLY (Growth).
-    OwnerBindingPage(crate::federation::types::OwnerBindingPage),
+    OwnerBindingPage(
+        crate::federation::types::ServePage<crate::federation::types::OwnerBindingChange>,
+    ),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -1576,11 +1578,10 @@ pub async fn dispatch_directory_op(
         },
         DirectoryOp::ListAttestationsSinceByPrefixes {
             since,
-            dimension_prefixes,
-            type_prefixes,
+            family_prefixes,
             limit,
         } => match dir
-            .list_attestations_since_by_prefixes(since, &dimension_prefixes, &type_prefixes, limit)
+            .list_attestations_since_by_prefixes(since, &family_prefixes, limit)
             .await
         {
             Ok(v) => DirectoryOpResult::ServedAttestationPage(v),
@@ -1811,30 +1812,28 @@ pub async fn dispatch_directory_op(
             row_age,
         } => {
             // v61.1.0 (CIRISPersist#1233, CC 5.3.2.4.3.1) — Strict is the
-            // only policy this door accepts. Any other variant is refused
-            // INSIDE HybridVerify (the verdict slot, like every other verify
-            // refusal) with `verify_policy_violation`, before the directory
-            // lookup or any crypto. The field stays on the wire until v62.
-            if let Err(refusal) = crate::verify::hybrid::require_strict_policy(&policy) {
-                DirectoryOpResult::HybridVerify(Err(refusal))
-            } else {
-                // The verify runs entirely here — inside persist's `.so`,
-                // against persist's own vtable — so no consumer-side vtable
-                // skew can reach the signature-check lookups. The
-                // VerifyOutcome verdict is preserved intact; a VerifyError
-                // flattens INSIDE HybridVerify.
-                let outcome = crate::verify::hybrid::verify_hybrid_via_directory(
-                    dir,
-                    &canonical_bytes,
-                    &signing_key_id,
-                    &ed25519_sig_b64,
-                    ml_dsa_65_sig_b64.as_deref(),
-                    policy,
-                    row_age,
-                )
-                .await;
-                DirectoryOpResult::HybridVerify(outcome.map_err(|e| e.to_string()))
-            }
+            // only policy this door accepts. `verify_hybrid_via_directory`
+            // asks `require_strict_policy` (the one hybrid-required check)
+            // FIRST, so any other variant is refused INSIDE HybridVerify (the
+            // verdict slot, like every other verify refusal) with
+            // `verify_policy_violation`, before the directory lookup or any
+            // crypto. The field stays on the wire until v62.
+            //
+            // The verify runs entirely here — inside persist's `.so`, against
+            // persist's own vtable — so no consumer-side vtable skew can reach
+            // the signature-check lookups. The VerifyOutcome verdict is
+            // preserved intact; a VerifyError flattens INSIDE HybridVerify.
+            let outcome = crate::verify::hybrid::verify_hybrid_via_directory(
+                dir,
+                &canonical_bytes,
+                &signing_key_id,
+                &ed25519_sig_b64,
+                ml_dsa_65_sig_b64.as_deref(),
+                policy,
+                row_age,
+            )
+            .await;
+            DirectoryOpResult::HybridVerify(outcome.map_err(|e| e.to_string()))
         }
         DirectoryOp::BuildDelegationGraph {
             from_key,
@@ -3681,16 +3680,17 @@ impl FederationDirectory for OpsDirectory {
     /// v61.1.0 (CIRISPersist#1190) — the narrowed serve read, proxied.
     async fn list_attestations_since_by_prefixes(
         &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        dimension_prefixes: &[String],
-        type_prefixes: &[String],
+        since: Option<crate::federation::types::ServePosition>,
+        family_prefixes: &[String],
         limit: i64,
-    ) -> Result<crate::federation::types::ServedAttestationPage, Error> {
+    ) -> Result<
+        crate::federation::types::ServePage<crate::federation::types::ServedAttestation>,
+        Error,
+    > {
         match self
             .run_op(&DirectoryOp::ListAttestationsSinceByPrefixes {
                 since,
-                dimension_prefixes: dimension_prefixes.to_vec(),
-                type_prefixes: type_prefixes.to_vec(),
+                family_prefixes: family_prefixes.to_vec(),
                 limit,
             })
             .await?
@@ -3706,9 +3706,12 @@ impl FederationDirectory for OpsDirectory {
     /// v61.1.0 (CIRISPersist#1163) — the owner-binding feed, proxied.
     async fn list_owner_bindings_since(
         &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        since: Option<crate::federation::types::ServePosition>,
         limit: i64,
-    ) -> Result<crate::federation::types::OwnerBindingPage, Error> {
+    ) -> Result<
+        crate::federation::types::ServePage<crate::federation::types::OwnerBindingChange>,
+        Error,
+    > {
         match self
             .run_op(&DirectoryOp::ListOwnerBindingsSince { since, limit })
             .await?
@@ -4624,7 +4627,9 @@ mod tests {
     #[test]
     fn i1578_serve_feeds_round_trip_the_capsule() {
         use crate::federation::serve_feeds_1163_1190_invariants::bodies as f;
-        use crate::federation::types::{cohort_scope, AnnouncedOwnerState};
+        use crate::federation::types::{
+            cohort_scope, AnnouncedOwnerState, ServePage, ServedAttestation,
+        };
         let rt = test_runtime();
         let (dir, directory) = test_directory();
         let (ids, owner, node) = rt.block_on(async {
@@ -4639,19 +4644,18 @@ mod tests {
         });
         let dims = vec!["i1578:".to_owned()];
         let direct = rt
-            .block_on(dir.list_attestations_since_by_prefixes(None, &dims, &[], 2))
+            .block_on(dir.list_attestations_since_by_prefixes(None, &dims, 2))
             .expect("direct");
         let op = |since| DirectoryOp::ListAttestationsSinceByPrefixes {
             since,
-            dimension_prefixes: dims.clone(),
-            type_prefixes: Vec::new(),
+            family_prefixes: dims.clone(),
             limit: 2,
         };
         let first = match run_op(&rt, &directory, &op(None)) {
             DirectoryOpResult::ServedAttestationPage(p) => p,
             other => panic!("I1578: expected ServedAttestationPage, got {other:?}"),
         };
-        let page_ids = |p: &crate::federation::types::ServedAttestationPage| -> Vec<String> {
+        let page_ids = |p: &ServePage<ServedAttestation>| -> Vec<String> {
             p.items
                 .iter()
                 .map(|r| r.attestation.attestation_id.clone())
@@ -4671,7 +4675,7 @@ mod tests {
             DirectoryOpResult::ServedAttestationPage(p) => {
                 assert_eq!(page_ids(&p), ids[2..].to_vec(), "I1578: the last page");
                 assert!(p.next_cursor.is_none(), "I1578: nothing past");
-                assert!(p.high_water.is_some(), "I1578: a high water");
+                assert!(!p.high_water.is_origin(), "I1578: a high water");
             }
             other => panic!("I1578: expected ServedAttestationPage, got {other:?}"),
         }
@@ -4680,12 +4684,14 @@ mod tests {
             &directory,
             &DirectoryOp::ListAttestationsSinceByPrefixes {
                 since: None,
-                dimension_prefixes: Vec::new(),
-                type_prefixes: Vec::new(),
+                family_prefixes: Vec::new(),
                 limit: 2,
             },
         ) {
-            DirectoryOpResult::Err(_) => {}
+            DirectoryOpResult::Err(e) => assert!(
+                e.contains(crate::federation::read_plan::SERVE_PREFIXES_REFUSED),
+                "I1578: the refusal's token crosses the capsule: {e}"
+            ),
             other => panic!("I1578: no prefix is refused through the capsule, got {other:?}"),
         }
 
@@ -4715,16 +4721,22 @@ mod tests {
                     }),
             "I1578: the announced node crosses with its owner: {through:?}"
         );
-        match run_op(
-            &rt,
-            &directory,
-            &DirectoryOp::ListOwnerBindingsSince {
-                since: None,
-                limit: 0,
-            },
-        ) {
-            DirectoryOpResult::Err(_) => {}
-            other => panic!("I1578: a page of 0 is refused through the capsule, got {other:?}"),
+        // v61.1.0 (#1163 review M5, D19) — the feed's page is at most 500,
+        // and the refusal's token crosses the capsule.
+        for limit in [0, 501] {
+            match run_op(
+                &rt,
+                &directory,
+                &DirectoryOp::ListOwnerBindingsSince { since: None, limit },
+            ) {
+                DirectoryOpResult::Err(e) => assert!(
+                    e.contains(crate::federation::read_plan::SERVE_LIMIT_OUT_OF_RANGE),
+                    "I1578: a page of {limit} is refused with its token: {e}"
+                ),
+                other => {
+                    panic!("I1578: a page of {limit} is refused through the capsule, got {other:?}")
+                }
+            }
         }
     }
 

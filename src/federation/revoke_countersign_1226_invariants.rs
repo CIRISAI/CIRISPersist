@@ -30,7 +30,13 @@
 //! - **I1615** — the family arm carries the co-signatures too: a `unanimous`
 //!   family of two founders removes a member through the cohort door only
 //!   with both; and a `self` removal carrying a co-signature is refused
-//!   (no gate there counts it).
+//!   (no gate there counts it), led by `self_removal_cosignatures_refused`.
+//! - **I1616** (D15) — the countersign is a second PERSON: an official key
+//!   that is a device on the seat holder's own self roster is one voice with
+//!   the seat, refused `affiliation_countersign_missing`.
+//! - **I1617** (L5) — the removed member's own verified co-signature makes the
+//!   removal their leave: admitted without an official; a co-signature naming
+//!   them but signed by another key is refused.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -39,6 +45,7 @@ pub(crate) mod bodies {
         active, affiliation, ms, rule, seat,
     };
     use crate::federation::cohort::{Cohort, RevokeSpec};
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::federation::membership_acceptance_invariants::bodies::{
         found_family, found_room_with_blob, reg,
     };
@@ -232,6 +239,114 @@ pub(crate) mod bodies {
         assert!(!active(d, &solo, &m).await, "I1614: removed");
     }
 
+    /// **I1616** (D15) — the countersign is a second PERSON. The affiliation's
+    /// designated official is `f2`, a device on the seat holder `f`'s own self
+    /// roster: `f` co-signed by `f2` is one voice, refused
+    /// `affiliation_countersign_missing`. The same removal co-signed by an
+    /// official who is another person is admitted (the control).
+    pub(crate) async fn i1616_the_seats_own_device_is_not_a_countersign(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        let k = |x: &str| format!("i1616-{x}-{s}");
+        let (f, f2, m, n, solo) = (k("f"), k("f2"), k("m"), k("n"), k("solo"));
+        reg(d, &[&f, &f2, &m, &n, &solo]).await;
+        // f2 joins f's self roster: f's second device.
+        d.put_identity_occurrence(
+            ts::signed_content_only_occurrence(&f, &f, &f2, ms(Utc::now() - Duration::seconds(5)))
+                .await,
+        )
+        .await
+        .expect("I1616: f's second device");
+        let at = Utc::now() - Duration::hours(1);
+        sole_practice(d, &solo, &f, &f2, &m, &n, at).await;
+        let e = d
+            .revoke_member(
+                Cohort::Affiliations,
+                &solo,
+                &m,
+                spec(Cohort::Affiliations, &solo, &[&f, &f2], &m, ms(Utc::now())),
+            )
+            .await
+            .expect_err("I1616: the seat's own device is not a second voice");
+        assert_eq!(rule(&e), AFFILIATION_COUNTERSIGN_MISSING, "I1616: {e}");
+        assert!(active(d, &solo, &m).await, "I1616: still a member");
+
+        // Control: an official who is another person countersigns.
+        let (g, official, p, q, other) = (k("g"), k("official"), k("p"), k("q"), k("other"));
+        reg(d, &[&g, &official, &p, &q, &other]).await;
+        sole_practice(d, &other, &g, &official, &p, &q, at).await;
+        d.revoke_member(
+            Cohort::Affiliations,
+            &other,
+            &p,
+            spec(
+                Cohort::Affiliations,
+                &other,
+                &[&g, &official],
+                &p,
+                ms(Utc::now()),
+            ),
+        )
+        .await
+        .expect("I1616: another person's countersign");
+        assert!(!active(d, &other, &p).await, "I1616: removed");
+    }
+
+    /// **I1617** (L5) — a removal the removed member co-signed is their own
+    /// leave: the seat with the member's verified co-signature removes them
+    /// with no official's countersign (CC rc14 4.4.3.2.8 governs an act
+    /// AGAINST a member; this is the member's act). A co-signature that names
+    /// the member but was signed by another key is refused at verification
+    /// and removes no one.
+    pub(crate) async fn i1617_a_removed_members_own_cosignature_is_a_leave(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        let k = |x: &str| format!("i1617-{x}-{s}");
+        let (f, official, m, n, solo) = (k("f"), k("official"), k("m"), k("n"), k("solo"));
+        reg(d, &[&f, &official, &m, &n, &solo]).await;
+        let at = Utc::now() - Duration::hours(1);
+        sole_practice(d, &solo, &f, &official, &m, &n, at).await;
+
+        // A forged co-signature naming m, signed by n: refused, m stays.
+        let mut forged = spec(
+            Cohort::Affiliations,
+            &solo,
+            &[&f, &n],
+            &m,
+            at + Duration::minutes(5),
+        );
+        forged.cosignatures[0].authority_key_id = m.clone();
+        let e = d
+            .revoke_member(Cohort::Affiliations, &solo, &m, forged)
+            .await
+            .expect_err("I1617: a forged leave is verified, not stored");
+        assert!(
+            !matches!(e, Error::RosterAuthorityUnauthorized { .. }),
+            "I1617: refused at verification, before standing: {e:?}"
+        );
+        assert!(active(d, &solo, &m).await, "I1617: still a member");
+
+        // m's own verified co-signature: their leave, admitted.
+        d.revoke_member(
+            Cohort::Affiliations,
+            &solo,
+            &m,
+            spec(
+                Cohort::Affiliations,
+                &solo,
+                &[&f, &m],
+                &m,
+                at + Duration::minutes(6),
+            ),
+        )
+        .await
+        .expect("I1617: the member's own co-signature is a leave");
+        assert!(!active(d, &solo, &m).await, "I1617: m left");
+        assert!(active(d, &solo, &n).await, "I1617: only m");
+    }
+
     async fn active_in_family(d: &dyn FederationDirectory, fid: &str, k: &str) -> bool {
         d.active_family_members(fid)
             .await
@@ -246,9 +361,25 @@ pub(crate) mod bodies {
         let k = |x: &str| format!("i1615-{x}-{s}");
         let (a, b, u, fam) = (k("a"), k("b"), k("u"), k("fam"));
         reg(d, &[&a, &b, &u, &fam]).await;
-        found_family(d, &fam, "unanimous", &[&a, &b], &[&u])
+        // Every member a founding record lists signs it (CC 3.2, the
+        // founding rule), so `u` joins the two founders the way a member
+        // does: by a widening both founders sign, after u's consent.
+        found_family(d, &fam, "unanimous", &[&a, &b], &[])
             .await
             .expect("I1615: a two-founder unanimous family");
+        let row = crate::federation::types::FamilyMember {
+            key_id: u.clone(),
+            joined_at: ms(Utc::now() - Duration::hours(1)),
+            role: None,
+        };
+        let admit = ts::family_widening_admit_spec_by_consensus(d, &fam, &row).await;
+        assert_eq!(admit.cosignatures.len(), 1, "I1615: both founders sign");
+        assert!(
+            d.add_family_member_consented(&fam, row, &admit)
+                .await
+                .expect("I1615: u joins by the founders' widening"),
+            "I1615: the widening seated u"
+        );
         assert!(active_in_family(d, &fam, &u).await, "I1615: u is a member");
         let at = Utc::now() - Duration::minutes(30);
 
@@ -293,7 +424,11 @@ pub(crate) mod bodies {
             .await
             .expect_err("I1615: a self removal carries no co-signature");
         assert!(
-            matches!(e, Error::InvalidArgument(ref m) if m.contains("co-signatures")),
+            matches!(
+                e,
+                Error::InvalidArgument(ref m)
+                    if m.starts_with(crate::federation::cohort::SELF_REMOVAL_COSIGNATURES_REFUSED)
+            ),
             "I1615: {e:?}"
         );
     }
@@ -349,4 +484,12 @@ mod tests {
     );
     on_every_backend!(i1614, bodies::i1614_the_python_payload_round_trips);
     on_every_backend!(i1615, bodies::i1615_family_arm_and_self_refusal);
+    on_every_backend!(
+        i1616,
+        bodies::i1616_the_seats_own_device_is_not_a_countersign
+    );
+    on_every_backend!(
+        i1617,
+        bodies::i1617_a_removed_members_own_cosignature_is_a_leave
+    );
 }

@@ -1,20 +1,31 @@
-//! v61.1.0 (CIRISPersist#1218, CIRISPersist#1220) — **I1600–I1602: a
-//! retraction's verdict does not depend on arrival order, and a roster
+//! v61.1.0 (CIRISPersist#1218, CIRISPersist#1220) — **I1600–I1604: who a
+//! retraction speaks for, whatever order it arrived in, and a roster
 //! proposal is never held without its window.**
+//!
+//! The #1218 ruling: a held row is never rewritten (FSD 5.8), so a
+//! `withdraws` admitted before its target keeps no rule; the door ignores an
+//! offered rule; and an UNSTAMPED `withdraws` is entitled only through arm 1
+//! (its signer is the target's producer). The stamp is the only non-producer
+//! authority, and only this node's door writes one, at admission, with the
+//! target held. So an honest non-producer `withdraws` that arrived first
+//! retires nothing on that node, while an in-order node retires. That order
+//! dependence is named and owned by v62 (its fold derives entitlement); these
+//! witnesses assert it as it is, not as it will be.
 //!
 //! - **I1600** (pure: the fold) — against each of the eight adverse classes
 //!   of CC 2.4.1.1 and a cosigned act, a subject's `withdraws` retires
-//!   nothing, whether it arrived first (admitted deferred, no rule), was
-//!   refused at the door (absent), or carries a subject rule 2-4 some earlier
-//!   door stamped. The producer's own `withdraws` retires in both orders, and
-//!   so does a rule the door stamps that is not a subject rule (1, the
-//!   producer's principal; 5, the recovery ceremony). Controls: a subject's
-//!   `withdraws` of a plain row retires in both orders; a node's tier-crossing
-//!   co-scrub (`cosigned_at` stamped) does not make a row cosigned; a
-//!   cosigned group-plane row keeps its own plane's quorum rule (4). The
-//!   retired set is the same for every permutation of the rows. The door's
-//!   carve-out and the fold's are one predicate
-//!   (`precedence::subject_withdraws_carved_out`).
+//!   nothing, whether it arrived first (no rule), was refused at the door
+//!   (absent), or carries a subject rule 2-4 an earlier door stamped. The
+//!   producer's own `withdraws` retires in both orders, and so does a rule the
+//!   door stamps that is not a subject rule (1, the producer's principal; 5,
+//!   the recovery ceremony). On a plain row the subject's stamped rule 2
+//!   retires and its unstamped early row does not; the same for a stranger's
+//!   unstamped row, and for a node named as the subject of its own
+//!   owner-binding (H1). Controls: a node's tier-crossing co-scrub
+//!   (`cosigned_at` stamped) does not make a row cosigned; a cosigned
+//!   group-plane row keeps its own plane's quorum rule (4); a type-slot
+//!   `capacity:*` row is carved out as its `scores` twin is (D12). The
+//!   retired set is the same for every permutation of the rows.
 //! - **I1601** (sqlite, postgres) — through the real door, in both arrival
 //!   orders: a room member's `withdraws` of a `moderation:*` act naming them,
 //!   and of a cosigned act naming them, retires neither, and four readers
@@ -23,9 +34,11 @@
 //!   (`migration::fold_retractions`), the read-time re-derivation
 //!   (`blob_tombstone::retiring_composer`) and the SQL Live listing
 //!   (`list_scores`, `LifecycleView::Live`). The act's signer's `withdraws`
-//!   retires it in both orders for all four; so does the member's `withdraws`
-//!   of a peer's plain row, which holds rule 2 whichever arrived first (the
-//!   target's transaction stamps a deferred `withdraws`).
+//!   retires it in both orders for all four. The member's `withdraws` of a
+//!   peer's plain row is stamped rule 2 in order and retires for all four;
+//!   withdraws first it is held with no rule, and the three readers of the
+//!   stored rule keep the row live, while the bytes plane's re-derivation
+//!   (which asks the door again at read time, I150) retires it.
 //! - **I1602** (sqlite, postgres) — a self-roster proposal's receipt (V199) is
 //!   written in the row's transaction: with the receipt's INSERT made to fail,
 //!   the proposal row is refused by `put_attestation`, by
@@ -36,8 +49,15 @@
 //!   offered row's: a `withdraws` offered with a forged rule 1 or 5, through
 //!   `put_attestation` or `apply_replicated_attestation`, in either arrival
 //!   order, against a moderation act, a cosigned act, or (from a stranger) a
-//!   plain row, is refused in order and held unstamped when early; its
-//!   target's arrival stamps nothing; every reader keeps the target live.
+//!   plain row, is refused in order and held unstamped when early; it stays
+//!   unstamped once its target lands; every reader keeps the target live.
+//! - **I1604** (sqlite, postgres; H1) — a node named as the subject of its
+//!   own owner-binding cannot shed its owner by sending its `withdraws` ahead
+//!   of the binding. In order the door sends it to the CC 3.2 ceremony and
+//!   refuses it; withdraws first it is held unstamped, and once the binding
+//!   lands the fold, the Live listing's rule, the owner-binding walk and
+//!   `owner_of` all keep the owner. The owner's own `withdraws` ends the
+//!   binding in either order (the control).
 
 /// I1600 — the fold, pure.
 #[cfg(test)]
@@ -51,6 +71,8 @@ mod fold {
     const SUBJECT: &str = "i1600-subject";
     const COSIGNER: &str = "i1600-cosigner";
     const STRANGER: &str = "i1600-stranger";
+    /// The node [`PRODUCER`]'s owner-binding binds, named as its subject.
+    const NODE: &str = "i1600-node";
 
     /// The eight adverse classes, spelled here and not read from the
     /// constant, so a class dropped from it reds this witness.
@@ -72,6 +94,20 @@ mod fold {
         r.attestation_type = attestation_type::SCORES.into();
         r.weight = None;
         r.subject_key_ids = vec![SUBJECT.to_owned()];
+        r
+    }
+
+    /// [`PRODUCER`]'s owner-binding over [`NODE`], naming the node in
+    /// `subject_key_ids` (the rc3-conformant shape, CC 3.2).
+    fn owner_binding(id: &str) -> Attestation {
+        let env = serde_json::json!({
+            "kind": "delegates_to",
+            "dimension": crate::federation::types::owner_binding::DIMENSION,
+            "delegation_purpose": crate::federation::types::owner_binding::PURPOSE,
+        });
+        let mut r = ts::bare_attestation(id, PRODUCER, NODE, &env);
+        r.attestation_type = attestation_type::DELEGATES_TO.into();
+        r.subject_key_ids = vec![NODE.to_owned()];
         r
     }
 
@@ -154,7 +190,7 @@ mod fold {
     }
 
     #[test]
-    fn i1600_the_carve_out_holds_whatever_the_arrival_order() {
+    fn i1600_only_the_producer_or_a_stamp_retires() {
         assert_eq!(
             ADVERSE,
             crate::federation::admission::SUBJECT_WITHDRAWS_CARVE_OUT,
@@ -207,15 +243,28 @@ mod fold {
             }
         }
 
-        // Control: a plain row's subject withdraws it in both orders.
+        // A plain row: the subject's rule 2, stamped in order, retires it;
+        // the same `withdraws` arrived first is unstamped and retires nothing
+        // on this node (#1218 H1: past the producer, only the stamp entitles).
+        // v62's fold owns the order dependence; this pins it as it is.
         let plain = target("t-plain", "expertise:i1600:v1");
         assert!(!subject_withdraws_carved_out(&plain), "I1600 control");
         assert_eq!(
             both_orders(&plain, SUBJECT, Some(2), "plain"),
-            (true, true),
-            "I1600: a subject withdraws a plain row in both orders"
+            (true, false),
+            "I1600: a subject's stamped withdraws retires a plain row; its unstamped one does not"
         );
-        // Control: a node's tier-crossing co-scrub is custody, not a voice.
+        // A stranger's unstamped `withdraws` retires nothing either.
+        let early = vec![
+            withdraws("w-stranger", STRANGER, &plain, None),
+            plain.clone(),
+        ];
+        assert!(
+            !retired_in_every_order(&early, "stranger").contains(&plain.attestation_id),
+            "I1600: a stranger's unstamped withdraws retires nothing"
+        );
+        // A node's tier-crossing co-scrub is custody, not a voice: the row is
+        // not carved out, so the subject's stamped rule 2 retires it.
         let custody = cosigned_by(
             target("t-custody", "expertise:i1600:v1"),
             COSIGNER,
@@ -224,8 +273,56 @@ mod fold {
         assert!(!subject_withdraws_carved_out(&custody), "I1600 custody");
         assert_eq!(
             both_orders(&custody, SUBJECT, Some(2), "co-scrubbed"),
-            (true, true),
+            (true, false),
             "I1600: a co-scrub does not make a row cosigned"
+        );
+        // H1 — a node named as the subject of its own owner-binding. In order
+        // the door sends its `withdraws` to the CC 3.2 ceremony and refuses it
+        // (not held); arrived first it is unstamped. Neither retires the
+        // binding; the owner's own `withdraws` does, in both orders.
+        let binding = owner_binding("t-owner-binding");
+        assert_eq!(
+            both_orders(&binding, NODE, None, "owner-binding"),
+            (false, false),
+            "I1600 H1: a node's withdraws of its own owner-binding retires nothing"
+        );
+        assert_eq!(
+            both_orders(&binding, PRODUCER, Some(1), "owner-binding"),
+            (true, true),
+            "I1600 H1: the owner withdraws its binding in both orders"
+        );
+        // The ceremony's rule (5), stamped by the door, retires it.
+        let rows = vec![
+            binding.clone(),
+            withdraws("w-ceremony", NODE, &binding, Some(5)),
+        ];
+        assert!(
+            retired_in_every_order(&rows, "owner-binding").contains(&binding.attestation_id),
+            "I1600 H1: a ceremony-admitted withdraws retires the binding"
+        );
+        // D12 — a type-slot `capacity:*` row is carved out as its `scores`
+        // twin is: the family is the claim token, not the envelope dimension.
+        let mut type_slot = target("t-type-slot", "expertise:i1600:v1");
+        type_slot.attestation_type = "capacity:i1600:v1".into();
+        assert!(
+            subject_withdraws_carved_out(&type_slot),
+            "I1600 D12: a type-slot capacity row is carved out"
+        );
+        let rows = vec![
+            type_slot.clone(),
+            withdraws("w-type-slot", SUBJECT, &type_slot, Some(2)),
+        ];
+        assert!(
+            !retired_in_every_order(&rows, "type slot").contains(&type_slot.attestation_id),
+            "I1600 D12: a stamped subject rule does not retire a type-slot capacity row"
+        );
+        // ...and a `scores` row whose envelope dimension is plain is not
+        // carved out by a non-`scores` reading of the envelope.
+        let mut plain_type = target("t-plain-type", "capacity:i1600:v1");
+        plain_type.attestation_type = "expertise:i1600:v1".into();
+        assert!(
+            !subject_withdraws_carved_out(&plain_type),
+            "I1600 D12: a non-scores row's family is its type, not its envelope dimension"
         );
         // Control: a group-plane row is cosigned by construction and is
         // retracted under its group's protocol (rule 4), not the carve-out.
@@ -261,13 +358,16 @@ mod fold {
         }
         all.push(plain.clone());
         all.push(withdraws("w-s-plain", SUBJECT, &plain, None));
+        let stamped = target("t-plain-stamped", "expertise:i1600:v1");
+        all.push(stamped.clone());
+        all.push(withdraws("w-s-stamped", SUBJECT, &stamped, Some(2)));
         let forward = retired(&all);
         all.reverse();
         assert_eq!(retired(&all), forward, "I1600: the whole slice, reversed");
         assert_eq!(
             forward,
-            HashSet::from([plain.attestation_id.clone()]),
-            "I1600: only the plain row is retired by its subject"
+            HashSet::from([stamped.attestation_id.clone()]),
+            "I1600: only the plain row whose subject's withdraws the door stamped is retired"
         );
     }
 }
@@ -492,28 +592,37 @@ pub(crate) mod bodies {
                 "I1601 {what}: the producer's withdraws retires for every reader"
             );
 
-            // Control: the subject withdraws a peer's plain row about them,
-            // and every reader, the Live listing included, retires it in
-            // both orders. Withdraws first, the target's own transaction
-            // stamps the deferred row with the rule the door gives it (2).
+            // The subject withdraws a peer's plain row about them. In order
+            // the door stamps rule 2 and every reader retires it. Withdraws
+            // first, the held row is never re-stamped (FSD 5.8): it keeps no
+            // rule, so the three readers of the stored rule keep the row live
+            // on this node (#1218 H1: past the producer, only a stamp
+            // entitles), while the bytes plane, which asks the door again at
+            // read time (I150), retires it. The order dependence is v62's to
+            // close; this asserts it as it is.
             let peer_row = about(&member, PLAIN, &author, &room, None);
             let w = withdraws(&author, &peer_row);
             arrive(d, order, &peer_row, &w)
                 .await
                 .expect("I1601: the subject withdraws a plain row");
+            let (rule, readers_say) = match order {
+                Order::TargetFirst => (Some(2), [true; 4]),
+                Order::WithdrawsFirst => (None, [false, false, true, false]),
+            };
             assert_eq!(
                 d.get_attestation(&w.attestation_id)
                     .await
                     .unwrap()
                     .expect("held")
                     .withdraws_admission_rule,
-                Some(2),
-                "I1601 {what}: the subject's rule, whichever arrived first"
+                rule,
+                "I1601 {what}: stamped only when the door saw the target"
             );
             assert_eq!(
                 readers(d, &author, &peer_row.attestation_id, &w.attestation_id).await,
-                [true; 4],
-                "I1601 {what}: a plain row is retired by its subject for every reader"
+                readers_say,
+                "I1601 {what}: a plain row's subject withdraws it on the in-order node only \
+                 ([fold, Live rule, bytes-plane re-derivation, SQL Live])"
             );
         }
     }
@@ -544,7 +653,7 @@ pub(crate) mod bodies {
     /// a carved-out act, offered with a forged rule 1 or 5, through either
     /// door and in either arrival order: in order the door refuses it
     /// (the stamp is the door's, not the row's); withdraws first it is held
-    /// with NO rule, its target's arrival stamps none, and every reader keeps
+    /// with NO rule and stays so once its target lands, and every reader keeps
     /// the act live. A forged rule on a plain row's early `withdraws` by a
     /// stranger is cleared the same way (a stranger is entitled to nothing).
     pub(crate) async fn i1603_a_forged_stamp_is_never_kept(d: &dyn FederationDirectory, s: &str) {
@@ -598,7 +707,7 @@ pub(crate) mod bodies {
                                         .expect("held")
                                         .withdraws_admission_rule,
                                     None,
-                                    "I1603 {what}: the arrived target stamps no rule"
+                                    "I1603 {what}: the held row is never re-stamped"
                                 );
                             }
                         }
@@ -611,6 +720,96 @@ pub(crate) mod bodies {
                     }
                 }
             }
+        }
+    }
+
+    /// **I1604** (H1) — a node cannot shed its owner by sending its
+    /// `withdraws` of its own owner-binding ahead of the binding. The binding
+    /// names the node in `subject_key_ids` (the rc3-conformant shape), so the
+    /// pre-ruling fold's subject arm retired it once both were held.
+    pub(crate) async fn i1604_a_node_cannot_outrun_its_owner(d: &dyn FederationDirectory, s: &str) {
+        use crate::federation::admission::{owner_of, DelegationEdgeFilter};
+        for order in [Order::TargetFirst, Order::WithdrawsFirst] {
+            let tag = format!("{s}-{order:?}");
+            let (owner, node) = (format!("i1604-owner-{tag}"), format!("i1604-node-{tag}"));
+            ts::register_hybrid_key_as(d, &owner, &owner, identity_type::USER).await;
+            ts::register_hybrid_key_as(d, &node, &node, identity_type::NODE).await;
+            let mut binding =
+                ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &owner, &node);
+            binding.subject_key_ids = vec![node.clone()];
+            ts::reseal(&mut binding);
+            let w = withdraws(&node, &binding);
+            match order {
+                Order::TargetFirst => {
+                    put(d, &binding).await.expect("I1604: the binding lands");
+                    let e = put(d, &w)
+                        .await
+                        .expect_err("I1604: in order the door refuses it (CC 3.2 ceremony)");
+                    assert!(
+                        matches!(e, Error::OwnershipReclaimRefused { .. }),
+                        "I1604: refused by the recovery gate: {e:?}"
+                    );
+                }
+                Order::WithdrawsFirst => {
+                    put(d, &w)
+                        .await
+                        .expect("I1604: a withdraws whose target is not held is admitted");
+                    put(d, &binding).await.expect("I1604: the binding lands");
+                    assert_eq!(
+                        d.get_attestation(&w.attestation_id)
+                            .await
+                            .unwrap()
+                            .expect("held")
+                            .withdraws_admission_rule,
+                        None,
+                        "I1604: held unstamped"
+                    );
+                }
+            }
+            let what = format!("{order:?}");
+            let mut rows = vec![d
+                .get_attestation(&binding.attestation_id)
+                .await
+                .unwrap()
+                .expect("the binding is held")];
+            rows.extend(d.get_attestation(&w.attestation_id).await.unwrap());
+            let refs: Vec<&Attestation> = rows.iter().collect();
+            assert!(
+                !crate::federation::precedence::retired_ids(&refs)
+                    .contains(&binding.attestation_id),
+                "I1604 {what}: the fold keeps the binding"
+            );
+            assert!(
+                !crate::federation::migration::fold_retractions(&rows)
+                    .is_retracted(&binding.attestation_id),
+                "I1604 {what}: the Live listing's rule keeps the binding"
+            );
+            assert!(
+                crate::federation::admission::live_delegation_granters(
+                    d,
+                    &node,
+                    DelegationEdgeFilter::OwnerBindingOnly,
+                )
+                .await
+                .expect("granters")
+                .contains(&owner),
+                "I1604 {what}: the owner-binding walk keeps the owner"
+            );
+            assert_eq!(
+                owner_of(d, &node).await.expect("owner_of"),
+                Some(owner.clone()),
+                "I1604 {what}: the node is still owned"
+            );
+
+            // Control: the owner's own `withdraws` ends the binding.
+            put(d, &withdraws(&owner, &binding))
+                .await
+                .expect("I1604: the owner withdraws its binding");
+            assert_eq!(
+                owner_of(d, &node).await.expect("owner_of"),
+                None,
+                "I1604 {what}: the owner's withdraws ends the binding"
+            );
         }
     }
 
@@ -812,6 +1011,7 @@ mod runners {
 
     on_sqlite_and_postgres!(i1601, bodies::i1601_both_arrival_orders_agree);
     on_sqlite_and_postgres!(i1603, bodies::i1603_a_forged_stamp_is_never_kept);
+    on_sqlite_and_postgres!(i1604, bodies::i1604_a_node_cannot_outrun_its_owner);
 
     /// The receipt's INSERT is made to fail by a trigger, so every read of
     /// the ledger (the self-roster plan's) still works.

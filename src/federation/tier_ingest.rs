@@ -4270,45 +4270,23 @@ pub mod test_support {
         reason: Option<String>,
         witness_set: Vec<String>,
     ) -> crate::federation::cohort::RevokeSpec {
-        use crate::federation::cohort::Cohort;
-        let (scrub_signature_classical, scrub_signature_pqc) = match cohort {
-            Cohort::Family => {
-                let rec = crate::federation::types::FamilyMembershipRevocation {
-                    family_key_id: group_key_id.to_owned(),
-                    removed_identity_key_id: removed_key_id.to_owned(),
-                    removed_at: effective_at,
-                    effective_at,
-                    reason: reason.clone(),
-                    witness_set: witness_set.clone(),
-                    persist_row_hash: String::new(),
-                };
-                let (_hash, c, p) = sign_envelope(authority_key_id, &rec.signing_envelope());
-                (c, p)
-            }
-            Cohort::Community | Cohort::Affiliations => {
-                let rec = crate::federation::types::CommunityMembershipRevocation {
-                    community_key_id: group_key_id.to_owned(),
-                    removed_identity_key_id: removed_key_id.to_owned(),
-                    removed_at: effective_at,
-                    effective_at,
-                    reason: reason.clone(),
-                    witness_set: witness_set.clone(),
-                    persist_row_hash: String::new(),
-                };
-                let (_hash, c, p) = sign_envelope(authority_key_id, &rec.signing_envelope());
-                (c, p)
-            }
-            Cohort::SelfId => (String::new(), None),
-        };
-        crate::federation::cohort::RevokeSpec {
+        let mut spec = crate::federation::cohort::RevokeSpec {
             effective_at,
             reason,
             witness_set,
             authority_key_id: authority_key_id.to_owned(),
-            scrub_signature_classical,
-            scrub_signature_pqc,
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             cosignatures: Vec::new(),
+        };
+        // v61.1.0 (D7) — over the spec's own envelope, the one `revoke_member`
+        // builds; `SelfId` signs nothing.
+        if let Some(envelope) = spec.signing_envelope(cohort, group_key_id, removed_key_id) {
+            let (_hash, classical, pqc) = sign_envelope(authority_key_id, &envelope);
+            spec.scrub_signature_classical = classical;
+            spec.scrub_signature_pqc = pqc;
         }
+        spec
     }
 
     /// v61.1.0 (CIRISPersist#1226) — add `cosigner`'s co-signature to a
@@ -4324,32 +4302,11 @@ pub mod test_support {
         removed_key_id: &str,
         cosigner: &str,
     ) {
-        use crate::federation::cohort::Cohort;
-        let envelope = match cohort {
-            Cohort::Family => crate::federation::types::FamilyMembershipRevocation {
-                family_key_id: group_key_id.to_owned(),
-                removed_identity_key_id: removed_key_id.to_owned(),
-                removed_at: spec.effective_at,
-                effective_at: spec.effective_at,
-                reason: spec.reason.clone(),
-                witness_set: spec.witness_set.clone(),
-                persist_row_hash: String::new(),
-            }
-            .signing_envelope(),
-            Cohort::Community | Cohort::Affiliations => {
-                crate::federation::types::CommunityMembershipRevocation {
-                    community_key_id: group_key_id.to_owned(),
-                    removed_identity_key_id: removed_key_id.to_owned(),
-                    removed_at: spec.effective_at,
-                    effective_at: spec.effective_at,
-                    reason: spec.reason.clone(),
-                    witness_set: spec.witness_set.clone(),
-                    persist_row_hash: String::new(),
-                }
-                .signing_envelope()
-            }
-            Cohort::SelfId => serde_json::Value::Null,
-        };
+        // v61.1.0 (D7) — the spec's own envelope (`SelfId`: none, so the
+        // co-signature covers `null` and the door refuses it unread).
+        let envelope = spec
+            .signing_envelope(cohort, group_key_id, removed_key_id)
+            .unwrap_or(serde_json::Value::Null);
         let (_hash, classical, pqc) = sign_envelope(cosigner, &envelope);
         spec.cosignatures
             .push(crate::federation::types::RosterCosignature {

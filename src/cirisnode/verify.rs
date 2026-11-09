@@ -93,7 +93,7 @@
 use serde::Serialize;
 
 use crate::verify::canonical::canonicalize_envelope_for_signing;
-use crate::verify::hybrid::{verify_hybrid, HybridPolicy};
+use crate::verify::hybrid::{verify_hybrid_with_policy, HybridPolicy};
 
 use super::types::HybridSignature;
 use super::Error;
@@ -133,7 +133,9 @@ pub fn verify_envelope_signed<T: Serialize>(
         return Err(Error::Signature("ed25519 signature missing".into()));
     }
     let canonical = canonical_bytes_for_envelope(envelope)?;
-    verify_hybrid(
+    // v61.1.0 (CIRISPersist#1233) — the crate-private policy-taking twin: the
+    // public `verify_hybrid` refuses every policy but `Strict`.
+    verify_hybrid_with_policy(
         &canonical,
         &sig.ed25519,
         sig.ml_dsa_65.as_deref(),

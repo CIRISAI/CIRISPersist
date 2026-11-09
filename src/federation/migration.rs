@@ -231,11 +231,33 @@ pub fn fold_retractions(rows: &[Attestation]) -> RetractionFold {
         .filter(|r| super::precedence::is_structural_composer(&r.attestation_type))
         .cloned()
         .collect();
-    let authors: BTreeMap<String, String> = rows
+    let authors: BTreeMap<String, RetractionTarget> = rows
         .iter()
-        .map(|r| (r.attestation_id.clone(), r.attesting_key_id.clone()))
+        .map(|r| (r.attestation_id.clone(), RetractionTarget::of(r)))
         .collect();
     fold_retractions_from(&composers, &authors)
+}
+
+/// v61.1.0 (61.1 review M1) — what [`fold_retractions_from`] keeps of a
+/// target while it streams the corpus: its author (the same-attester arm) and
+/// its [`StampPolicy`](super::precedence::StampPolicy) (the stamped arm).
+#[derive(Debug, Clone)]
+pub struct RetractionTarget {
+    /// The target's `attesting_key_id`.
+    pub author: String,
+    /// Which stamps entitle a non-producer retraction of it.
+    pub policy: super::precedence::StampPolicy,
+}
+
+impl RetractionTarget {
+    /// The target summary of `row`.
+    #[must_use]
+    pub fn of(row: &Attestation) -> Self {
+        Self {
+            author: row.attesting_key_id.clone(),
+            policy: super::precedence::stamp_policy(row),
+        }
+    }
 }
 
 /// [`fold_retractions`] over the two things it actually needs: every structural
@@ -249,7 +271,7 @@ pub fn fold_retractions(rows: &[Attestation]) -> RetractionFold {
 #[must_use]
 pub fn fold_retractions_from(
     composers: &[Attestation],
-    authors: &BTreeMap<String, String>,
+    authors: &BTreeMap<String, RetractionTarget>,
 ) -> RetractionFold {
     use super::precedence::{precedence_winner, references_attestation_id_from_envelope};
 
@@ -292,7 +314,12 @@ pub fn fold_retractions_from(
         let Some(target_author) = authors.get(target) else {
             continue;
         };
-        if *target_author != winner.attesting_key_id && winner.withdraws_admission_rule.is_none() {
+        // v61.1.0 (61.1 review M1) — the non-producer arm asks the same
+        // policy `precedence::retraction_entitled` asks, so this fold and the
+        // read fold cannot disagree on a legacy stamp.
+        if target_author.author != winner.attesting_key_id
+            && !super::precedence::stamp_entitles(winner, target_author.policy)
+        {
             continue;
         }
         retracted.insert(target.to_owned(), winner.attestation_id.clone());
@@ -1355,7 +1382,7 @@ impl Default for MigrationOptions {
 struct CorpusScan {
     pending: Vec<Attestation>,
     composers: Vec<Attestation>,
-    authors: BTreeMap<String, String>,
+    authors: BTreeMap<String, RetractionTarget>,
     visited: usize,
     conformant: usize,
     budget_exhausted: bool,
@@ -1386,7 +1413,7 @@ async fn scan_corpus(
         after = page.last().map(|r| r.attestation_id.clone());
         for row in page {
             scan.authors
-                .insert(row.attestation_id.clone(), row.attesting_key_id.clone());
+                .insert(row.attestation_id.clone(), RetractionTarget::of(&row));
             if super::precedence::is_structural_composer(&row.attestation_type) {
                 scan.composers.push(row.clone());
             }

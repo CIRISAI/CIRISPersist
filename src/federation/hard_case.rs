@@ -765,6 +765,147 @@ pub fn hard_case_attestation_id(event_id: &str) -> String {
     uuid::Uuid::from_bytes(b).to_string()
 }
 
+/// v61.1.0 (61.1 review H3, as ruled) — the token logged (and counted) when
+/// this node's hard_case record finds its event's v1 id
+/// ([`hard_case_attestation_id`]) already held by a row ANOTHER key signed:
+/// a peer's row for the same observation (two nodes derive the same
+/// `event_id` for one membership removal), a pre-claim, or this node's own
+/// row under a key it has since rotated. The record is then written under
+/// [`hard_case_attestation_id_for_emitter`] and the act commits; the foreign
+/// row stays where it is for an operator to purge.
+pub const HARD_CASE_ID_HELD_BY_FOREIGN_ROW: &str = "hard_case_id_held_by_foreign_row";
+
+/// v61.1.0 (H3, as ruled) — **the emitter-bound fallback id**: the row id of
+/// `emitter_key_id`'s record of `event_id` when the v1 id is held by a row
+/// another key signed. Its preimage is domain-separated from the v1
+/// derivation (`ciris:hard-case:emitter:v1:`, the emitter, a NUL, the event
+/// id), so neither can produce the other, and it is bound to the signer, so
+/// no other key can pre-claim it. Readers ask both ([`hard_case_ids_for`]).
+/// The v1 derivation is unchanged (v62 moves every record to an
+/// emitter-bound id, CIRISPersist#1237).
+#[must_use]
+pub fn hard_case_attestation_id_for_emitter(emitter_key_id: &str, event_id: &str) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(b"ciris:hard-case:emitter:v1:");
+    h.update(emitter_key_id.as_bytes());
+    h.update([0u8]);
+    h.update(event_id.as_bytes());
+    let digest = h.finalize();
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&digest[..16]);
+    uuid::Uuid::from_bytes(b).to_string()
+}
+
+/// v61.1.0 (H3, as ruled) — the ids `emitter_key_id`'s record of `event_id`
+/// can be held under, in the order a reader asks them: the v1 id, then the
+/// emitter-bound fallback.
+#[must_use]
+pub fn hard_case_ids_for(emitter_key_id: &str, event_id: &str) -> [String; 2] {
+    [
+        hard_case_attestation_id(event_id),
+        hard_case_attestation_id_for_emitter(emitter_key_id, event_id),
+    ]
+}
+
+/// v61.1.0 (H3, as ruled) — `emitter_key_id`'s held record of `event_id`, by
+/// the symmetric lookup: the v1 id when the row there is this emitter's, else
+/// the emitter-bound fallback. `None` when neither holds one.
+///
+/// # Errors
+///
+/// The directory's.
+pub async fn held_record_of<D>(
+    dir: &D,
+    emitter_key_id: &str,
+    event_id: &str,
+) -> Result<Option<super::types::Attestation>, super::Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    for id in hard_case_ids_for(emitter_key_id, event_id) {
+        if let Some(row) = dir.get_attestation(&id).await? {
+            if row.attesting_key_id == emitter_key_id {
+                return Ok(Some(row));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// v61.1.0 (H3, as ruled) — what a hard_case writer does once its v1 insert
+/// found the id held: nothing (`AlreadyHeld`) when the held row is this
+/// attester's or has vanished, write the emitter-bound fallback
+/// (`WriteFallback`) when another key signed it. Both backends ask this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldOccupant {
+    /// An idempotent re-record (or a row gone since the insert).
+    AlreadyHeld,
+    /// Another key holds the v1 id: write this node's record under
+    /// [`hard_case_attestation_id_for_emitter`].
+    WriteFallback,
+}
+
+/// See [`HeldOccupant`].
+#[must_use]
+pub fn held_occupant(held_attesting_key_id: Option<&str>, attester: &str) -> HeldOccupant {
+    match held_attesting_key_id {
+        Some(held) if held != attester => HeldOccupant::WriteFallback,
+        _ => HeldOccupant::AlreadyHeld,
+    }
+}
+
+static FOREIGN_OCCUPANT_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// v61.1.0 (H3, as ruled) — log and count one fallback write: this node's
+/// record of `event_id` landed under the emitter-bound id because `held_by`
+/// signed the row at the v1 id.
+pub fn record_foreign_occupant_fallback(
+    event_id: &str,
+    v1_id: &str,
+    held_by: &str,
+    attester: &str,
+) {
+    FOREIGN_OCCUPANT_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::warn!(
+        metric = "persist_hard_case_foreign_occupant_fallback_total",
+        token = HARD_CASE_ID_HELD_BY_FOREIGN_ROW,
+        event_id,
+        v1_attestation_id = v1_id,
+        held_by,
+        attester,
+        "{HARD_CASE_ID_HELD_BY_FOREIGN_ROW}: this node's hard_case record was written under its \
+         emitter-bound id; the row at the v1 id is another key's and is left for an operator"
+    );
+}
+
+/// `persist_hard_case_foreign_occupant_fallback_total` since process start.
+#[must_use]
+pub fn foreign_occupant_fallbacks_total() -> u64 {
+    FOREIGN_OCCUPANT_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// v61.1.0 (H3, as ruled) — which of two rows projecting the same `event_id`
+/// into `hard_case_events` (keyed on it) the table holds, decided from the
+/// rows alone so the live write and the rebuild agree in every arrival order:
+/// an emitter-bound row (id ≠ the v1 id) over the v1 row, which any key could
+/// have filed first; between rows of the same kind, the lower id. `held` is
+/// the projected row's `attestation_id` (`None`: a pre-v57 silo row, which
+/// the candidate replaces).
+#[must_use]
+pub fn projection_outranks(event_id: &str, candidate: &str, held: Option<&str>) -> bool {
+    let Some(held) = held else {
+        return true;
+    };
+    let v1 = hard_case_attestation_id(event_id);
+    let (cand_bound, held_bound) = (candidate != v1, held != v1);
+    if cand_bound != held_bound {
+        return cand_bound;
+    }
+    candidate < held
+}
+
 /// v57.0.0 (CIRISPersist#988 item 2) — the signed envelope of the row an event
 /// is written as: `{dimension, hard_case: <the event>}`. The event rides whole,
 /// as serde writes it, so the projection reads back exactly what the emitter
@@ -809,9 +950,12 @@ pub fn project_hard_case_row(row: &super::types::Attestation) -> Option<HardCase
     let body = row.attestation_envelope.get(BODY_MEMBER)?;
     let mut event: HardCaseEvent = serde_json::from_value(body.clone()).ok()?;
     // The body must be the event the dimension and the id name: a row whose
-    // three disagree is not one this door wrote.
+    // three disagree is not one this door wrote. v61.1.0 (H3) — the id is the
+    // v1 id or the signer's emitter-bound fallback.
     if hard_case_dimension(&event.kind) != dimension
-        || hard_case_attestation_id(&event.event_id) != row.attestation_id
+        || !(hard_case_attestation_id(&event.event_id) == row.attestation_id
+            || hard_case_attestation_id_for_emitter(&row.attesting_key_id, &event.event_id)
+                == row.attestation_id)
     {
         return None;
     }
