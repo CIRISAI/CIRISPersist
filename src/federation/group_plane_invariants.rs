@@ -594,6 +594,7 @@ pub(crate) mod bodies {
     /// I1532 (CIRISPersist#1198, CC 4.5.13) — a cosigned `withdraws` of a
     /// roster event counts persons under `quorum:2/3`: ann's two keys are one
     /// voice, and ann's unseated device with ben's seat are two.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn i1532_a_retraction_counts_persons<D>(d: &D, tag: &str)
     where
         D: FederationDirectory + GroupPlaneStore + AttestationStore,

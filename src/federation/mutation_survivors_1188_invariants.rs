@@ -19,7 +19,7 @@
 //!   mismatch each name the group's key; a head naming the held version (by
 //!   proof and by `prev_head_digest`) passes.
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod pure {
     use crate::federation::group_supersede_admit::{
         held_head_verdict, PlannedHead, PlannedSupersede,

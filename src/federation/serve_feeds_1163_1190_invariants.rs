@@ -1312,8 +1312,9 @@ mod tests {
     }
 }
 
-/// The plan-level cases of the review pass: no backend.
-#[cfg(test)]
+/// The plan-level cases of the review pass: no backend run, but the plan
+/// module itself exists only with a backend feature.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod plan_units {
     use crate::federation::attestation_query::Dialect;
     use crate::federation::read_plan::{
