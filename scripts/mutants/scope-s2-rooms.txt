@@ -19,6 +19,15 @@
 # - CIRISPersist#1161: `subject_within_audience` (I1516).
 # - CIRISPersist#1143: `check_one_voice_countersign`, `community_dissolved_at`,
 #   `refuse_if_community_dissolved` (I1513, I1514).
+# - v61.1.0 (CIRISPersist#1188) — the first run's survivors here: I1621
+#   (`founders_hold_authority`, `is_canonical_form`, pure), I1623
+#   (`community_dissolved_at`: an unstamped withdraws dissolves nothing),
+#   I1624 (`live_standing_proposal`, re-judged at the read), I1625 and
+#   I1521 (`record_names_its_audience`'s family arm; I1521 already
+#   carried a family record to a node that did not hold it, but this
+#   filter did not select it), I1620 (the record's dissolution leg).
+#   The match guard in `community_dissolved_at` is allow-listed as
+#   equivalent (scripts/mutants/allowed_survivors.txt).
 # - Not in scope: the one-line call sites of these predicates inside the
 #   large doors (`may_receive`, `apply_planned`, `widen_audience`,
 #   `check_community_roster_authority`, `prepare_roster_events`): a mutant
@@ -26,7 +35,7 @@
 #   call is caught by the witness that names its predicate.
 #
 # Grammar: docs/MUTATION_TESTING.md "Scope files".
-tests: test(/i150[0-9]|i151[0-4]|i1516|consensus::tests|i712_|i713_|i1320|i1340|attestation_apply::tests|infrastructure_protocol_must_be_quorum|widen_audience_writes_a_supersedes/)
+tests: test(/i150[0-9]|i151[0-4]|i1516|i1521|i162[0-5]|consensus::tests|i712_|i713_|i1320|i1340|attestation_apply::tests|infrastructure_protocol_must_be_quorum|widen_audience_writes_a_supersedes/)
 
 src/federation/consensus.rs evaluate evaluate_open_self_admit
 src/federation/types.rs founders_hold_authority is_canonical_form

@@ -88,6 +88,105 @@ fn hop_failed(join: &tokio::task::JoinError) -> tokio_postgres::Error {
         .expect_err("an unknown option never parses")
 }
 
+/// v61.1.0 (CIRISPersist#1231): persist's runtime, reached only through a
+/// vtable that persist's `.so` wrote.
+///
+/// Until v61.0.5 the backend kept a raw `tokio::runtime::Handle` for its
+/// checkout timer. `checkout_bounded` is monomorphic code, so a consumer that
+/// links persist as an rlib (Edge) compiles its OWN copy of it against its OWN
+/// tokio. When that copy ran on a thread with none of its tokio (persist's
+/// executor worker polling an Edge future), it called `rt.spawn(...)` on
+/// the persist-built `Handle`: Edge's tokio walking another tokio's layout,
+/// a SIGSEGV inside `OwnedTasks`. Marking a function `#[inline(never)]` or
+/// non-generic does not fix this. The foreign crate compiles its own copy of
+/// every such function, so only a pointer written at construction time
+/// leads back into persist's code.
+///
+/// The backend therefore holds an `Arc<dyn PersistRuntimeTimer>` that
+/// [`capture_persist_timer`] builds where the backend is built. Every call
+/// through it, and the `poll` and `drop` of the future it returns, run the
+/// code at the vtable persist's `.so` wrote. That code runs on persist's
+/// tokio, against the `Handle` that same tokio built. The fix for #705
+/// ([`PersistRuntimeConnect`], reached as deadpool's `Box<dyn Connect>`) has
+/// the same shape.
+pub(crate) trait PersistRuntimeTimer: Send + Sync {
+    /// A future that completes once `wait` has elapsed on persist's runtime.
+    /// It also completes early if persist's runtime stops the timer (the
+    /// runtime shutting down). Dropping it before then cancels the timer
+    /// task.
+    fn sleep(&self, wait: std::time::Duration) -> TimerFuture;
+}
+
+/// The future a [`PersistRuntimeTimer`] hands back. It is boxed so that its
+/// `poll` and `drop` are entries in the vtable the timer's own code wrote.
+pub(crate) type TimerFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+
+/// What [`super::postgres::PostgresBackend`] holds instead of a `Handle`.
+pub(crate) type PersistTimer = Arc<dyn PersistRuntimeTimer>;
+
+/// Timers this process started on persist's runtime through a
+/// [`PersistRuntimeTimer`]. The I1550-series witnesses read it, and nothing
+/// else does, so it exists only in test builds.
+#[cfg(test)]
+pub(crate) static TIMER_STARTS: AtomicUsize = AtomicUsize::new(0);
+
+/// The one [`PersistRuntimeTimer`]: the runtime captured on the
+/// constructing thread. Its `Handle` is never read from outside this impl.
+struct CapturedRuntime {
+    rt: tokio::runtime::Handle,
+}
+
+/// Aborts the timer task when the [`TimerFuture`] holding it is dropped.
+/// A checkout that wins the race must not leave a sleeping task on
+/// persist's runtime for the rest of the wait.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl PersistRuntimeTimer for CapturedRuntime {
+    fn sleep(&self, wait: std::time::Duration) -> TimerFuture {
+        #[cfg(test)]
+        TIMER_STARTS.fetch_add(1, Ordering::Relaxed);
+        // The `Sleep` is built INSIDE the task. Building it here would ask
+        // the polling thread for a timer it does not have.
+        let task = AbortOnDrop(self.rt.spawn(async move { tokio::time::sleep(wait).await }));
+        Box::pin(async move {
+            let mut task = task;
+            // A `JoinError` (cancelled by runtime shutdown) also ends the
+            // wait: nothing is left to time it.
+            let _ = (&mut task.0).await;
+        })
+    }
+}
+
+/// The timer a backend keeps: persist's runtime on the constructing thread,
+/// or `None` when that thread has no runtime (then nothing can run a timer).
+pub(crate) fn capture_persist_timer() -> Option<PersistTimer> {
+    tokio::runtime::Handle::try_current()
+        .ok()
+        .map(|rt| Arc::new(CapturedRuntime { rt }) as PersistTimer)
+}
+
+/// v61.1.0 (CIRISPersist#1231): a pause on the checkout path that never
+/// asks a thread for a reactor it lacks. On a thread with a runtime of the
+/// running copy's tokio it is `tokio::time::sleep`. Otherwise it goes
+/// through persist's timer, or returns at once when there is none (no
+/// runtime anywhere can time it). `get_client`'s retry backoff used to call
+/// `tokio::time::sleep` directly, which panicked off-runtime ("no reactor
+/// running").
+pub(crate) async fn pause(wait: std::time::Duration, timer: Option<&dyn PersistRuntimeTimer>) {
+    match (tokio::runtime::Handle::try_current(), timer) {
+        (Ok(_), _) => tokio::time::sleep(wait).await,
+        (Err(_), Some(timer)) => timer.sleep(wait).await,
+        (Err(_), None) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::Future;

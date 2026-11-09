@@ -537,8 +537,8 @@ impl TelemetryService for SqliteTelemetryBackend {
         let conn = self.conn.clone();
         (move || -> Result<u64, Error> {
             let mut guard = conn.lock();
-            let tx = guard
-                .transaction()
+            // CIRISPersist#1238 — IMMEDIATE: the write lock before the read.
+            let tx = crate::store::sqlite_conn_model::write_tx(&mut guard)
                 .map_err(|e| map_sqlite_error(e, "prune_summaries begin"))?;
 
             let mut victim_ids: Vec<String> = {

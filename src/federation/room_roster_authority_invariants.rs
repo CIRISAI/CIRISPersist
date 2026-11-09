@@ -949,6 +949,7 @@ pub mod bodies {
             subkind: None,
             policy_blob: None,
             node_bearing: &crate::federation::NO_NODE_BEARING_SEATS,
+            persons: &crate::federation::key_person::NO_KEY_SELVES,
         };
         let record = vec![member("a", Some("founder")), member("b", None)];
         let roster = crate::federation::authorized_roster_at(&record, rules, &[held], t1);
@@ -992,6 +993,7 @@ pub mod bodies {
             subkind: None,
             policy_blob: None,
             node_bearing: &crate::federation::NO_NODE_BEARING_SEATS,
+            persons: &crate::federation::key_person::NO_KEY_SELVES,
         };
         let roster = crate::federation::authorized_roster_at(&record, rules, &[legacy], t1);
         assert_eq!(

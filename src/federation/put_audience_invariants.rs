@@ -12,6 +12,11 @@
 //! of the room's row is verified first and refused
 //! `federation_federation_tier_unverified` on the non-member's node, never
 //! `not_in_audience` (the verdict is not asked of unverified bytes).
+//!
+//! I1625 (v61.1.0, CIRISPersist#1188) — a family's record names its own
+//! audience: on a node that holds nothing of the family, a node owned by a
+//! member the record lists may receive it (`Cohort`) and its replicated door
+//! admits it; a stranger's node may not.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -532,6 +537,70 @@ pub(crate) mod family_events {
             "I1521: Q's fold drops R"
         );
     }
+
+    /// The node key `n` of `tag`'s I1625 fixture.
+    pub(crate) fn i1625_node(tag: &str, n: &str) -> String {
+        format!("i1625-{n}-node-{tag}")
+    }
+
+    /// **I1625** (v61.1.0, CIRISPersist#1188, the `record_names_its_audience`
+    /// survivor; CIRISPersist#1148, CC 6.1.5.3) — **a family's record names
+    /// its own audience**, as a community's does. Node B holds nothing of the
+    /// family and has declared its node key, a node owned by a member the
+    /// record lists (not a key the row names, so no refers-to arm answers
+    /// first): the record is in that node's audience by the record alone
+    /// (`Cohort`), and B's replicated door admits it. A stranger's node is
+    /// not in it. Red if the record arm forgets the family kind (B then asks
+    /// the stored family, which it does not hold).
+    pub(crate) async fn i1625_a_family_record_names_its_audience(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::replication_audience::{may_receive, Reason, Verdict};
+        use crate::federation::types::identity_type::NODE;
+        let k = |n: &str| format!("i1625-{n}-{tag}");
+        let (p, q, x, fam) = (k("p"), k("q"), k("x"), k("fam"));
+        let (q_node, x_node) = (i1625_node(tag, "q"), i1625_node(tag, "x"));
+        for d in [a, b] {
+            reg(d, &[&p, &q, &x, &fam]).await;
+        }
+        for (owner, node) in [(&q, &q_node), (&x, &x_node)] {
+            ts::register_identity_key(b, node, NODE).await;
+            ts::put_owner_binding(b, owner, node).await;
+        }
+        found_family(a, &fam, "founder_only", &[&p, &q], &[])
+            .await
+            .unwrap();
+        let record = plane_row(a, &fam, GROUP_ROSTER_DIMENSION).await;
+        assert!(
+            b.lookup_family(&fam).await.unwrap().is_none(),
+            "I1625 precondition: B holds nothing of the family"
+        );
+        assert!(
+            !record.subject_key_ids.iter().any(|s| s == &q_node)
+                && record.attested_key_id != q_node,
+            "I1625 precondition: the row does not name q's node"
+        );
+        assert_eq!(
+            may_receive(b, &q_node, &record).await.unwrap(),
+            Verdict::Yes(Reason::Cohort),
+            "I1625: a listed member's node is in the family record's own audience"
+        );
+        assert!(
+            !may_receive(b, &x_node, &record).await.unwrap().allowed(),
+            "I1625: a stranger's node is not"
+        );
+        assert_eq!(
+            carry(b, &record).await,
+            ReplicatedAttestationOutcome::Inserted,
+            "I1625: B's replicated door admits the record on its own audience"
+        );
+        assert!(
+            b.lookup_family(&fam).await.unwrap().is_some(),
+            "I1625: B holds the family"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -640,6 +709,44 @@ mod runners {
         r.set_node_key_id(member(&tag, "r"));
         super::family_events::i1521_a_family_removal_reaches_every_holder(&p, &q, &r, &tag).await;
         eprintln!("i1521 postgres: RAN");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i1625_a_family_record_names_its_audience_sqlite() {
+        use crate::store::Backend as _;
+        async fn fresh() -> crate::store::sqlite::SqliteBackend {
+            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .unwrap();
+            b.run_migrations().await.unwrap();
+            b
+        }
+        let tag = suffix();
+        let (a, b) = (fresh().await, fresh().await);
+        b.set_node_key_id(super::family_events::i1625_node(&tag, "q"));
+        super::family_events::i1625_a_family_record_names_its_audience(&a, &b, &tag).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i1625_a_family_record_names_its_audience_postgres() {
+        use crate::store::Backend as _;
+        async fn fresh() -> Option<crate::store::postgres::PostgresBackend> {
+            let dsn = crate::test_pg::empty_dsn()?;
+            let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+                .await
+                .unwrap();
+            b.run_migrations().await.unwrap();
+            Some(b)
+        }
+        let tag = suffix();
+        let (Some(a), Some(b)) = (fresh().await, fresh().await) else {
+            return;
+        };
+        b.set_node_key_id(super::family_events::i1625_node(&tag, "q"));
+        super::family_events::i1625_a_family_record_names_its_audience(&a, &b, &tag).await;
+        eprintln!("i1625 postgres: RAN");
     }
 
     #[cfg(feature = "postgres")]

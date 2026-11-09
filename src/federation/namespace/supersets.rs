@@ -1807,7 +1807,11 @@ mod tests {
         // (5.3) at the owner-announced predicate, CLM-canonicalization (2.6.2) at
         // the signed-instant form predicate.
         // CIRISPersist#1187: -2 for the dropped rows CC holds under other ids.
-        const EXPECTED: usize = 363;
+        // CIRISPersist#1198: +3, CLM-vote-once-per-person at the ballot fold,
+        // the evaluator's persons and the key-to-person rule.
+        // CIRISPersist#1233 (v61.1.0): +2, CLM-admission-pqc at the
+        // hybrid-required verify doors.
+        const EXPECTED: usize = 368;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

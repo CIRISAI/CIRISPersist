@@ -221,12 +221,12 @@ pub const INVARIANT_SELF_EMISSION_REASON: &str = "invariant_registry_self_emissi
 /// sqlite / postgres), so this rides that existing wiring rather than adding
 /// a second call site.
 ///
-/// `dimension` is the row's `attestation_type` (the same value
-/// `check_reserved_prefix_admission` calls `at` internally — see that
-/// function's own `Error::DimensionRejected { dimension: at.to_owned(), .. }`
-/// use for precedent that this codebase's `dimension` field names the
-/// attestation_type axis at this chokepoint, not the nested `scores`
-/// envelope `dimension`). `identity_types` is reserved for a FUTURE
+/// `dimension` is the row's FAMILY token,
+/// [`row_type::claim_token`](super::row_type::claim_token): the envelope
+/// `dimension` of a `scores` row, else its `attestation_type`. v61.1.0
+/// (CIRISPersist#1174 item 1) — it was the `attestation_type` alone, so a
+/// `scores` row on `health:liveness:v1` signed by its own subject met no ban.
+/// `identity_types` is reserved for a FUTURE
 /// identity-type-based invariant enforced at this same call site; today's
 /// one newly-enforced invariant is a pure attester==attested check and does
 /// not consult it (no directory lookup is spent — the "cheapest-most-
@@ -616,12 +616,28 @@ mod tests {
                 fact.manifest_marker
             );
 
+            // v61.1.0 (CIRISPersist#1174, CC 3.4.3) — a substrate self-report
+            // describes its own signer, so both legs of those families are
+            // self-attested: a third-party row is refused by the attester rule
+            // first, and the legs would then measure that neighbouring gate
+            // instead of the identity reservation this witness is about.
+            let self_report = crate::federation::admission::SUBSTRATE_SELF_REPORT_PREFIXES
+                .iter()
+                .any(|p| fact.sample_attestation_type.starts_with(p));
+            let about = |signer: &str| {
+                if self_report {
+                    signer.to_owned()
+                } else {
+                    "wia-target".to_owned()
+                }
+            };
+
             // (b) persist's REAL gate rejects the wrong identity...
             let wrong = fix_attestation(
                 "wia-att",
                 fact.sample_attestation_type,
                 "wia-wrong-agent",
-                "wia-target",
+                &about("wia-wrong-agent"),
             );
             check_reserved_prefix_admission(&backend, &wrong)
                 .await
@@ -667,7 +683,7 @@ mod tests {
                 "wia-att",
                 fact.sample_attestation_type,
                 &right_key,
-                "wia-target",
+                &about(right_key.as_str()),
             );
             check_reserved_prefix_admission(&backend, &right)
                 .await

@@ -37,6 +37,10 @@
 //!   PyO3 wraps, integration tests covering the chain-break / replay
 //!   / cross-tenant rejection paths.
 
+/// v61.1.0 (CIRISPersist#1233) — I1564–I1566: the audit gate is the
+/// hybrid-signed head.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod hybrid_head_1233_invariants;
 pub mod merkle_leaf;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub mod merkle_store;

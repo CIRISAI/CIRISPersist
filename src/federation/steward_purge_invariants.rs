@@ -4820,14 +4820,30 @@ mod run {
                 assert!(!gated, "I661 {backend}: {door} consults no purge gate");
             }
             let serve = body(&src, "async fn list_attestations_since(");
+            // v61.1.0 (review D3) — the serve read ANDs in THE serve rule
+            // (`read_plan::serve_rule_parts`), which carries the purge plane
+            // through `steward_purge::served_under_purge_sql`. Follow the one
+            // indirection; both hops are asked, so neither can drop it.
             assert!(
-                serve.contains("purge_tombstones"),
+                serve.contains("read_plan::serve_rule_parts("),
+                "I661 {backend}: the serve read ANDs in the one serve rule"
+            );
+            let read_plan = strip(include_str!("read_plan.rs"));
+            let rule = body(&read_plan, "pub(crate) fn serve_rule_parts(");
+            assert!(
+                rule.contains("steward_purge::served_under_purge_sql("),
+                "I661: the serve rule carries the purge plane"
+            );
+            let purge = strip(include_str!("steward_purge.rs"));
+            let served = body(&purge, "pub fn served_under_purge_sql(");
+            assert!(
+                served.contains("purge_tombstones"),
                 "I661 {backend}: the serve read withholds tombstoned rows"
             );
             // Codex on PR #1057 (I697): except the accountability record, by
             // the one shared list.
             assert!(
-                serve.contains("migration::accountability_record_"),
+                served.contains("migration::accountability_record_"),
                 "I661 {backend}: the serve read never withholds the accountability record"
             );
             // #1043 ruled: a row refused today is purged, never filtered at

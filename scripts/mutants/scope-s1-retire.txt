@@ -11,7 +11,11 @@
 #   (a withdraws of a group's record is its dissolution, refused by name).
 #   I1487 drives it three ways; I1492 holds the retraction's direction (a
 #   widening's withdraws takes a member off, a removal's puts one back),
-#   the `==` the first run (2026-11-01) left missed without it.
+#   the `==` the first run (2026-11-01) left missed without it. I1620
+#   (v61.1.0, CIRISPersist#1188) holds the retraction's subject: the
+#   `subject` `!=` -> `==` the nightly left missed four nights running (a
+#   unanimous widening retracted by every OTHER member, and a public room's
+#   record withdrawn by two founders, naming no member).
 # - The two backends' `insert_known_wire_hash`, the advertisement door that
 #   calls the refusal.
 # - Removed, not mutated: dc76dbe0 deleted the listing's plan, executors,
@@ -22,7 +26,7 @@
 # migration, not a mutated function, so it is not in the filter.
 #
 # Grammar: docs/MUTATION_TESTING.md "Scope files".
-tests: test(/i1150|i1487|i1492|replication_policy::tests/)
+tests: test(/i1150|i1487|i1492|i1620|replication_policy::tests/)
 
 src/federation/replication_policy.rs refuse_retired_framed
 src/federation/group_plane.rs check_cosigned_withdraws

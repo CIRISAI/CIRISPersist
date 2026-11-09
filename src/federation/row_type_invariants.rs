@@ -473,13 +473,22 @@ mod pure {
                 "async fn read_attestation_log_page(",
             ] {
                 let b = body(&s, read);
+                // v61.1.0 (review D3) — `list_attestations_since` ANDs in
+                // the one serve rule, which carries the filter (below).
                 assert!(
                     b.contains("row_type::serve_filter_sql")
-                        || b.contains("row_type::served_under_enforcement"),
+                        || b.contains("row_type::served_under_enforcement")
+                        || b.contains("read_plan::serve_rule_parts("),
                     "{name} {read}: the serve read carries the row-type filter"
                 );
             }
         }
+        let read_plan = strip(include_str!("read_plan.rs"));
+        let rule = body(&read_plan, "pub(crate) fn serve_rule_parts(");
+        assert!(
+            rule.contains("row_type::serve_filter_sql("),
+            "the one serve rule carries the row-type filter"
+        );
         let admit = strip(include_str!("attestation_admit.rs"));
         let plan = body(&admit, "pub(crate) async fn plan_put_attestation<");
         let bind = "crate::federation::admission::check_row_column_binding(&row)?;";

@@ -29,6 +29,25 @@
 //! whose envelope names another dimension) counts the bytes it decoded, which
 //! is the cost; `rows` is always what it returned.
 //!
+//! - **Per caller** (v61.1.0, CIRISPersist#1235): a host names the caller a
+//!   read is made for with a bounded [`Caller`] label, through
+//!   [`caller_scope`] (a task-local, for Rust hosts) or a
+//!   [`ThreadCallerScope`] (a thread scope, for a synchronous boundary such
+//!   as the PyO3 surface, whose `block_on` polls the read on the calling
+//!   thread). Every door read made under a scope is credited to
+//!   `(backend, door, caller)` as well as to `(backend, door)`. The
+//!   **innermost scope wins**: a nested scope replaces the label for its
+//!   extent, and a task scope wins over a thread scope. A read under no
+//!   scope is reported as [`CALLER_UNATTRIBUTED`], derived at [`snapshot`]
+//!   time as the door's total minus its attributed reads, so a read with no
+//!   scope set costs one task-local probe and one thread-local `Cell` read,
+//!   and no atomic. Labels are validated (see [`Caller::new`]) and interned
+//!   per counter set; past [`MAX_CALLER_LABELS`] distinct labels every new
+//!   label is counted under [`CALLER_OTHER`]. The per-caller rows are a
+//!   [`snapshot`] field only (`callers`): host-chosen labels are not a
+//!   closed set, so they are not catalogued metric labels and
+//!   [`emit_metrics`] does not write them.
+//!
 //! The counters are process-wide: two Engines in one process share them, as a
 //! `metrics` recorder would. [`snapshot`] (and `Engine::telemetry_snapshot`)
 //! reads them; [`catalog::TELEMETRY_CATALOG`] names every metric they back.
@@ -37,7 +56,9 @@
 //! scrape, so the read path stays free of the facade. The catalogue's source
 //! is the OpenTelemetry Weaver registry in `telemetry/registry/`.
 
+use std::cell::Cell;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 pub mod catalog;
@@ -127,6 +148,13 @@ label_set! {
         /// v61.0.5 (CIRISPersist#1225) —
         /// `FederationDirectory::list_attestations_naming_by_dimension`.
         ListAttestationsNamingByDimension => "list_attestations_naming_by_dimension",
+        /// v61.1.0 (CIRISPersist#1190) —
+        /// `FederationDirectory::list_attestations_since_by_prefixes`.
+        ListAttestationsSinceByPrefixes => "list_attestations_since_by_prefixes",
+        /// v61.1.0 (CIRISPersist#1163) —
+        /// `FederationDirectory::list_owner_bindings_since` (its candidate
+        /// rows; the per-node fold's reads count under their own doors).
+        ListOwnerBindingsSince => "list_owner_bindings_since",
         /// v56.0.0 (CIRISPersist#1001) — `AttestationReads::query_attestations`,
         /// the typed bounded read; recorded once, in its shared wrapper. It
         /// replaces the `list_attestations_{by,for}` doors and their six
@@ -219,10 +247,20 @@ impl Tally {
     }
 }
 
+/// One tally per interned caller label, plus [`CALLER_OTHER`]'s at
+/// [`OTHER_SLOT`].
+type CallerTallies = [Tally; CALLER_SLOTS];
+
 pub(crate) struct Counters {
     doors: [[Tally; Door::COUNT]; StoreBackend::COUNT],
     fold_reads: [Tally; Fold::COUNT],
     fold_calls: [AtomicU64; Fold::COUNT],
+    /// v61.1.0 (CIRISPersist#1235) — `(backend, door, caller slot)`.
+    callers: [[CallerTallies; Door::COUNT]; StoreBackend::COUNT],
+    /// The interned caller labels, slot `i` at index `i`; never longer than
+    /// [`MAX_CALLER_LABELS`]. Locked only when a [`Caller`] is made and at
+    /// [`snapshot`], never on the read path.
+    caller_labels: std::sync::Mutex<Vec<String>>,
 }
 
 impl Counters {
@@ -231,13 +269,64 @@ impl Counters {
             doors: [const { [const { Tally::new() }; Door::COUNT] }; StoreBackend::COUNT],
             fold_reads: [const { Tally::new() }; Fold::COUNT],
             fold_calls: [const { AtomicU64::new(0) }; Fold::COUNT],
+            callers: [const { [const { [const { Tally::new() }; CALLER_SLOTS] }; Door::COUNT] };
+                StoreBackend::COUNT],
+            caller_labels: std::sync::Mutex::new(Vec::new()),
         }
     }
 
+    fn labels(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+        self.caller_labels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The slot `label` (already validated) is counted under: its own when
+    /// it is interned or there is room to intern it, else [`OTHER_SLOT`].
+    fn intern(&self, label: &str) -> u8 {
+        if label == CALLER_OTHER {
+            return OTHER_SLOT;
+        }
+        let mut labels = self.labels();
+        if let Some(i) = labels.iter().position(|l| l == label) {
+            return i as u8;
+        }
+        if labels.len() < MAX_CALLER_LABELS {
+            labels.push(label.to_owned());
+            return (labels.len() - 1) as u8;
+        }
+        OTHER_SLOT
+    }
+
+    /// The label slot `slot` renders as.
+    fn slot_label(labels: &[String], slot: usize) -> String {
+        if slot == OTHER_SLOT as usize {
+            return CALLER_OTHER.to_owned();
+        }
+        labels
+            .get(slot)
+            .cloned()
+            .unwrap_or_else(|| CALLER_OTHER.to_owned())
+    }
+
     fn snapshot(&self) -> TelemetrySnapshot {
+        let labels = self.labels().clone();
         let mut reads = Vec::new();
+        let mut callers = Vec::new();
         for backend in StoreBackend::ALL {
             for door in Door::ALL {
+                // The caller tallies are read BEFORE the door's total, and a
+                // read adds to the total first: a read racing this snapshot
+                // can show as unattributed for one snapshot, but an
+                // attributed share is never larger than the total it is
+                // subtracted from (and the subtraction saturates).
+                let per_caller = &self.callers[*backend as usize][*door as usize];
+                let attributed: Vec<(usize, (u64, u64, u64))> = per_caller
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, t)| (slot, t.load()))
+                    .filter(|(_, (n, _, _))| *n > 0)
+                    .collect();
                 let (n, rows, bytes) = self.doors[*backend as usize][*door as usize].load();
                 if n > 0 {
                     reads.push(DoorReads {
@@ -246,6 +335,31 @@ impl Counters {
                         reads: n,
                         rows,
                         bytes,
+                    });
+                }
+                let (mut a_reads, mut a_rows, mut a_bytes) = (0u64, 0u64, 0u64);
+                for (slot, (c_reads, c_rows, c_bytes)) in attributed {
+                    a_reads += c_reads;
+                    a_rows += c_rows;
+                    a_bytes += c_bytes;
+                    callers.push(CallerReads {
+                        backend: backend.label(),
+                        door: door.label(),
+                        caller: Self::slot_label(&labels, slot),
+                        reads: c_reads,
+                        rows: c_rows,
+                        bytes: c_bytes,
+                    });
+                }
+                let unattributed = n.saturating_sub(a_reads);
+                if unattributed > 0 {
+                    callers.push(CallerReads {
+                        backend: backend.label(),
+                        door: door.label(),
+                        caller: CALLER_UNATTRIBUTED.to_owned(),
+                        reads: unattributed,
+                        rows: rows.saturating_sub(a_rows),
+                        bytes: bytes.saturating_sub(a_bytes),
                     });
                 }
             }
@@ -263,7 +377,11 @@ impl Counters {
                 }
             })
             .collect();
-        TelemetrySnapshot { reads, folds }
+        TelemetrySnapshot {
+            reads,
+            folds,
+            callers,
+        }
     }
 }
 
@@ -289,6 +407,219 @@ fn counters() -> &'static Counters {
 tokio::task_local! {
     /// The folds the current task is inside, one bit per [`Fold`].
     static ACTIVE_FOLDS: u32;
+}
+
+// ── v61.1.0 (CIRISPersist#1235) — caller attribution ─────────────────────
+
+/// The most distinct caller labels one counter set interns. Every label
+/// past them is counted under [`CALLER_OTHER`].
+pub const MAX_CALLER_LABELS: usize = 32;
+
+/// The longest caller label, in bytes.
+pub const MAX_CALLER_LABEL_LEN: usize = 48;
+
+/// The bucket every caller label past [`MAX_CALLER_LABELS`] is counted under.
+/// A host may also name it directly.
+pub const CALLER_OTHER: &str = "other";
+
+/// What the snapshot names the reads made under no caller scope. Reserved: a
+/// host cannot set it as a label.
+pub const CALLER_UNATTRIBUTED: &str = "unattributed";
+
+/// The tally slots per `(backend, door)`: one per label, then `other`.
+const CALLER_SLOTS: usize = MAX_CALLER_LABELS + 1;
+
+/// [`CALLER_OTHER`]'s slot.
+const OTHER_SLOT: u8 = MAX_CALLER_LABELS as u8;
+
+const _: () = assert!(CALLER_SLOTS <= u8::MAX as usize, "a caller slot is a u8");
+
+/// Why a caller label was refused. A malformed label is a refusal, never a
+/// read counted as unattributed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallerLabelError {
+    /// The label is empty.
+    Empty,
+    /// The label is longer than [`MAX_CALLER_LABEL_LEN`] bytes.
+    TooLong {
+        /// Its length in bytes.
+        len: usize,
+    },
+    /// The byte at `at` is outside the charset: the first byte is `a-z`, the
+    /// rest are `a-z`, `0-9`, `_`, `.`, `:` or `-`.
+    BadByte {
+        /// The byte's offset.
+        at: usize,
+    },
+    /// The label is [`CALLER_UNATTRIBUTED`], which the snapshot reserves.
+    Reserved,
+}
+
+impl std::fmt::Display for CallerLabelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallerLabelError::Empty => write!(f, "caller label is empty"),
+            CallerLabelError::TooLong { len } => write!(
+                f,
+                "caller label is {len} bytes, longer than {MAX_CALLER_LABEL_LEN}"
+            ),
+            CallerLabelError::BadByte { at } => {
+                write!(f, "caller label byte {at} is outside [a-z][a-z0-9_.:-]*")
+            }
+            CallerLabelError::Reserved => {
+                write!(f, "caller label {CALLER_UNATTRIBUTED:?} is reserved")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CallerLabelError {}
+
+/// Check `label` against the caller-label grammar: 1 to
+/// [`MAX_CALLER_LABEL_LEN`] bytes, `[a-z][a-z0-9_.:-]*`, not
+/// [`CALLER_UNATTRIBUTED`].
+///
+/// # Errors
+/// The [`CallerLabelError`] naming the first rule `label` breaks.
+pub fn validate_caller_label(label: &str) -> Result<(), CallerLabelError> {
+    let b = label.as_bytes();
+    if b.is_empty() {
+        return Err(CallerLabelError::Empty);
+    }
+    if b.len() > MAX_CALLER_LABEL_LEN {
+        return Err(CallerLabelError::TooLong { len: b.len() });
+    }
+    for (at, &c) in b.iter().enumerate() {
+        let ok = c.is_ascii_lowercase()
+            || (at > 0 && (c.is_ascii_digit() || matches!(c, b'_' | b'.' | b':' | b'-')));
+        if !ok {
+            return Err(CallerLabelError::BadByte { at });
+        }
+    }
+    if label == CALLER_UNATTRIBUTED {
+        return Err(CallerLabelError::Reserved);
+    }
+    Ok(())
+}
+
+/// A validated, interned caller label: who a read is made for. Cheap to copy;
+/// make one per label and reuse it (making one takes a short lock, reading
+/// under one takes none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Caller {
+    slot: u8,
+}
+
+impl Caller {
+    /// Validate and intern `label`. A label past the [`MAX_CALLER_LABELS`]
+    /// cap is accepted and counted under [`CALLER_OTHER`].
+    ///
+    /// # Errors
+    /// [`validate_caller_label`]'s refusal.
+    pub fn new(label: &str) -> Result<Self, CallerLabelError> {
+        validate_caller_label(label)?;
+        Ok(Caller {
+            slot: counters().intern(label),
+        })
+    }
+
+    /// The label this caller is counted under: its own, or [`CALLER_OTHER`]
+    /// when the cap bucketed it.
+    #[must_use]
+    pub fn label(self) -> String {
+        Counters::slot_label(&counters().labels(), self.slot as usize)
+    }
+}
+
+tokio::task_local! {
+    /// The caller slot the current task's reads are credited to.
+    static ACTIVE_CALLER: u8;
+}
+
+thread_local! {
+    /// The caller slot this thread's reads are credited to when no task scope
+    /// is in force ([`ThreadCallerScope`], [`set_thread_caller`]).
+    static THREAD_CALLER: Cell<Option<u8>> = const { Cell::new(None) };
+}
+
+/// The caller slot in force here: the innermost task scope, else this
+/// thread's scope. With neither set this is one failed task-local probe and
+/// one `Cell` read.
+#[inline]
+fn active_caller() -> Option<u8> {
+    match ACTIVE_CALLER.try_with(|s| *s) {
+        Ok(slot) => Some(slot),
+        Err(_) => THREAD_CALLER.with(Cell::get),
+    }
+}
+
+/// The caller in force here (the innermost task scope, else this thread's
+/// scope), so a host can carry it into a task it spawns:
+/// `caller_scope(c, fut)`.
+#[must_use]
+pub fn current_caller() -> Option<Caller> {
+    active_caller().map(|slot| Caller { slot })
+}
+
+/// Run `fut` with every door read it makes (on its task) credited to
+/// `caller`. Nested scopes: the innermost wins for its extent. A task the
+/// future spawns does not inherit the scope; carry it with
+/// [`current_caller`].
+pub fn caller_scope<F: Future>(caller: Caller, fut: F) -> impl Future<Output = F::Output> {
+    ACTIVE_CALLER.scope(caller.slot, fut)
+}
+
+/// Run `fut` under the caller in force where this is CALLED (not where `fut`
+/// is polled): the hop for a future persist builds on the caller's thread and
+/// polls on its own worker (the directory capsule's `build_op`).
+pub(crate) fn carry_caller<F: Future>(fut: F) -> impl Future<Output = F::Output> {
+    let slot = active_caller();
+    async move {
+        match slot {
+            Some(slot) => ACTIVE_CALLER.scope(slot, fut).await,
+            None => fut.await,
+        }
+    }
+}
+
+/// Set this thread's caller scope to `caller` (`None` clears it) and return
+/// the one it replaces. The set/clear form of [`ThreadCallerScope`], for a
+/// boundary that cannot hold a guard (the PyO3 `set_caller_scope`).
+///
+/// A thread scope is for a thread that drives persist's futures itself
+/// (`block_on`); setting one on an async runtime's worker would credit every
+/// task that worker polls.
+pub fn set_thread_caller(caller: Option<Caller>) -> Option<Caller> {
+    THREAD_CALLER
+        .with(|c| c.replace(caller.map(|c| c.slot)))
+        .map(|slot| Caller { slot })
+}
+
+/// A thread caller scope: while it lives, door reads polled on this thread
+/// with no task scope in force are credited to its caller; on drop the
+/// previous thread scope is restored, so guards nest innermost-wins. Not
+/// `Send`, so it cannot be held across an `.await` in a spawned task.
+#[must_use = "the scope ends when the guard is dropped"]
+pub struct ThreadCallerScope {
+    previous: Option<Caller>,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl ThreadCallerScope {
+    /// Enter `caller`'s scope on this thread (`None` clears the scope for
+    /// the guard's life).
+    pub fn enter(caller: Option<Caller>) -> Self {
+        ThreadCallerScope {
+            previous: set_thread_caller(caller),
+            _not_send: PhantomData,
+        }
+    }
+}
+
+impl Drop for ThreadCallerScope {
+    fn drop(&mut self) {
+        set_thread_caller(self.previous);
+    }
 }
 
 /// Record one door read: `rows` returned, `bytes` of envelope decoded (see
@@ -322,6 +653,11 @@ pub fn record_read<R: ReadRow>(
 fn count_read(backend: StoreBackend, door: Door, n: u64, bytes: u64) {
     let c = counters();
     c.doors[backend as usize][door as usize].add(n, bytes);
+    // v61.1.0 (CIRISPersist#1235) — after the door's total (the snapshot
+    // reads them in the other order). No scope set: no atomic here.
+    if let Some(slot) = active_caller() {
+        c.callers[backend as usize][door as usize][slot as usize].add(n, bytes);
+    }
     if let Ok(mut mask) = ACTIVE_FOLDS.try_with(|m| *m) {
         for _ in 0..mask.count_ones() {
             let i = mask.trailing_zeros() as usize;
@@ -436,6 +772,30 @@ pub struct TelemetrySnapshot {
     pub reads: Vec<DoorReads>,
     /// One entry per [`Fold`], every fold listed.
     pub folds: Vec<FoldReads>,
+    /// v61.1.0 (CIRISPersist#1235) — per `(backend, door)` that served a
+    /// read, one entry per caller label its reads were credited to, then one
+    /// [`CALLER_UNATTRIBUTED`] entry for the reads made under no scope (each
+    /// listed only when it counts a read). A door's entries sum to its
+    /// `reads` entry. Additive: `reads` and `folds` keep their shape.
+    pub callers: Vec<CallerReads>,
+}
+
+/// v61.1.0 (CIRISPersist#1235) — the counters of one `(backend, door,
+/// caller)`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CallerReads {
+    /// [`StoreBackend::label`].
+    pub backend: &'static str,
+    /// [`Door::label`].
+    pub door: &'static str,
+    /// The caller label, [`CALLER_OTHER`], or [`CALLER_UNATTRIBUTED`].
+    pub caller: String,
+    /// Reads served.
+    pub reads: u64,
+    /// Rows returned.
+    pub rows: u64,
+    /// Envelope bytes decoded.
+    pub bytes: u64,
 }
 
 /// The counters of one `(backend, door)`.
@@ -489,6 +849,17 @@ impl TelemetrySnapshot {
             .map_or((0, 0, 0), |r| (r.reads, r.rows, r.bytes))
     }
 
+    /// v61.1.0 (CIRISPersist#1235) — the counters of `(backend, door,
+    /// caller)` as `(reads, rows, bytes)`; zeros when none. `caller` is a
+    /// label, [`CALLER_OTHER`] or [`CALLER_UNATTRIBUTED`].
+    #[must_use]
+    pub fn caller(&self, backend: StoreBackend, door: Door, caller: &str) -> (u64, u64, u64) {
+        self.callers
+            .iter()
+            .find(|r| r.backend == backend.label() && r.door == door.label() && r.caller == caller)
+            .map_or((0, 0, 0), |r| (r.reads, r.rows, r.bytes))
+    }
+
     /// The counters of `fold` as `(calls, reads, rows, bytes)`.
     #[must_use]
     pub fn fold(&self, fold: Fold) -> (u64, u64, u64, u64) {
@@ -498,7 +869,8 @@ impl TelemetrySnapshot {
             .map_or((0, 0, 0, 0), |f| (f.calls, f.reads, f.rows, f.bytes))
     }
 
-    /// The snapshot as metric samples, named per the catalogue.
+    /// The snapshot as metric samples, named per the catalogue. The
+    /// per-caller rows are not samples (see the module doc).
     #[must_use]
     pub fn samples(&self) -> Vec<Sample> {
         let mut out = Vec::with_capacity(self.reads.len() * 3 + self.folds.len() * 4);
@@ -571,3 +943,6 @@ impl Drop for LocalCounters {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod caller_1235_tests;

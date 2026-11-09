@@ -17,10 +17,12 @@
 //! **Signatures are the caller's job.** This module counts *who signed*; the
 //! caller has already hybrid-verified every signature it passes in.
 
-use std::collections::BTreeSet;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
+use super::key_person::PersonsAt;
 use super::types::consensus_protocol as cp;
 
 /// The role tag that marks a founder (CC §5.6.8.9); re-exported so the
@@ -95,6 +97,12 @@ pub struct Ballot<'a> {
     /// the joiner's own signature is the group's side of their admission, and
     /// the member a removal names is never one of its voices.
     pub subject: Option<&'a str>,
+    /// CIRISPersist#1198 (CC 4.5.13, `CLM-vote-once-per-person`) — the persons
+    /// behind the keys, at the change's instant. A tally counts fedIDs: two
+    /// seats of one self are one voice of the denominator and of the
+    /// numerator, and any live key of a seated person signs for them. Resolved
+    /// by the caller, so the evaluator stays pure.
+    pub persons: PersonsAt<'a>,
 }
 
 /// v61 (CIRISPersist#1123; CC 4.5.13 "never fewer than two voices in a
@@ -146,20 +154,47 @@ impl Verdict {
 /// re-mint, never a reason the fold stops applying (the CC 3.4.7.3 Clause B
 /// posture). A dropped seat is not eligible, so its signature counts for
 /// nothing and it does not enlarge the denominator either.
+///
+/// CIRISPersist#1198 (CC 4.5.13) — one seat per person: a founder's, else the
+/// lowest key. The set is a denominator of persons, and a person's role is
+/// the highest of their seats.
 fn eligible<'a>(b: &Ballot<'a>) -> Vec<&'a Seat> {
     let founders_only = b.subkind == Some("infrastructure");
-    b.roster
+    let mut one_per_person: BTreeMap<&str, &'a Seat> = BTreeMap::new();
+    for seat in b
+        .roster
         .iter()
         .filter(|s| !founders_only || (s.is_founder() && !s.node_bearing))
-        .collect()
+    {
+        let held = one_per_person
+            .entry(b.persons.seat_person(&seat.key_id))
+            .or_insert(seat);
+        if (seat.is_founder(), Reverse(&seat.key_id)) > (held.is_founder(), Reverse(&held.key_id)) {
+            *held = seat;
+        }
+    }
+    one_per_person.into_values().collect()
 }
 
-fn counted<'a>(eligible: &[&'a Seat], signers: &BTreeSet<String>) -> Vec<&'a Seat> {
+/// The eligible persons who signed, by any key of theirs that has a voice.
+fn counted<'a>(b: &Ballot<'a>, eligible: &[&'a Seat]) -> Vec<&'a Seat> {
+    let voices: BTreeSet<&str> = b
+        .signers
+        .iter()
+        .filter_map(|k| b.persons.voice(k))
+        .collect();
     eligible
         .iter()
         .copied()
-        .filter(|s| signers.contains(&s.key_id))
+        .filter(|s| voices.contains(b.persons.seat_person(&s.key_id)))
         .collect()
+}
+
+/// Is this seat the person a change names? A removal's voices never include
+/// them, on any of their devices.
+fn is_subject(b: &Ballot<'_>, seat: &Seat) -> bool {
+    b.subject
+        .is_some_and(|subject| b.persons.same_person(subject, &seat.key_id))
 }
 
 fn insufficient(detail: String) -> Verdict {
@@ -177,7 +212,7 @@ fn unevaluable(reason: impl Into<String>) -> Verdict {
 /// protocol admits a change that no eligible member signed.
 pub fn evaluate(b: &Ballot<'_>) -> Verdict {
     let elig = eligible(b);
-    let got = counted(&elig, b.signers);
+    let got = counted(b, &elig);
     let n = elig.len();
     if b.protocol == cp::OPEN_SELF_ADMIT {
         return evaluate_open_self_admit(b, &got);
@@ -214,9 +249,9 @@ pub fn evaluate(b: &Ballot<'_>) -> Verdict {
         // active member and is a strict majority of the roster. The two
         // coincide above two members; at two nobody is removable, and
         // resignation is the exit.
-        if let (Direction::Remove, Some(removed)) = (b.direction, b.subject) {
-            let voices = got.iter().filter(|s| s.key_id != removed).count();
-            let others = elig.iter().filter(|s| s.key_id != removed).count();
+        if b.direction == Direction::Remove && b.subject.is_some() {
+            let voices = got.iter().filter(|s| !is_subject(b, s)).count();
+            let others = elig.iter().filter(|s| !is_subject(b, s)).count();
             return if voices == others && 2 * voices > n {
                 Verdict::Admit
             } else {
@@ -330,10 +365,7 @@ fn evaluate_open_self_admit(b: &Ballot<'_>, got: &[&Seat]) -> Verdict {
             Some(_) | None => {}
         }
     }
-    let voices = got
-        .iter()
-        .filter(|s| Some(s.key_id.as_str()) != b.subject)
-        .count();
+    let voices = got.iter().filter(|s| !is_subject(b, s)).count();
     if voices >= OPEN_SELF_ADMIT_REMOVAL_FLOOR {
         Verdict::Admit
     } else {
@@ -535,6 +567,7 @@ mod tests {
             signers: &signers(s),
             direction: d,
             subject: None,
+            persons: PersonsAt::each_key(),
         })
     }
 
@@ -554,6 +587,7 @@ mod tests {
             signers: &signers(s),
             direction: d,
             subject: Some(subject),
+            persons: PersonsAt::each_key(),
         })
     }
 
@@ -589,6 +623,7 @@ mod tests {
                 signers: &signers(s),
                 direction: Add,
                 subject: None,
+                persons: PersonsAt::each_key(),
             })
             .admits()
         };
@@ -757,6 +792,7 @@ mod tests {
             signers: &signers(&["a", "c", "d"]),
             direction: Direction::Add,
             subject: None,
+            persons: PersonsAt::each_key(),
         });
         assert!(
             !v.admits(),
@@ -788,6 +824,7 @@ mod tests {
             signers: &signers(&["install"]),
             direction: Direction::Add,
             subject: None,
+            persons: PersonsAt::each_key(),
         };
         let elig: Vec<&str> = eligible(&b).iter().map(|s| s.key_id.as_str()).collect();
         assert_eq!(

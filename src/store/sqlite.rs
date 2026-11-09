@@ -80,6 +80,8 @@ use super::backend::{Backend, InsertReport, PublicKeySample};
 use super::types::{TraceEventRow, TraceLlmCallRow};
 use super::Error;
 use crate::schema::ReasoningEventType;
+// CIRISPersist#1238 — every write transaction begins IMMEDIATE.
+use crate::store::sqlite_conn_model::write_tx;
 
 mod embedded {
     refinery::embed_migrations!("migrations/sqlite/lens");
@@ -235,7 +237,7 @@ fn rewrite_portable_defaults_in_tx(
     fault: Option<RepairFault>,
 ) -> Result<RewriteOutcome, rusqlite::Error> {
     use crate::store::migration_immutability as mi;
-    let tx = conn.transaction()?;
+    let tx = write_tx(conn)?;
     let version: i64 = tx.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
     if fault != Some(RepairFault::SkipWritableSchemaOn) {
         tx.execute_batch("PRAGMA writable_schema = ON")?;
@@ -540,7 +542,7 @@ impl SqliteBackend {
     ) -> Result<usize, Error> {
         let node = node_key_id.map(str::to_owned);
         let n = self.write(move |conn| -> Result<usize, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let mut n = 0usize;
             if let Some(node) = &node {
                 for table in [
@@ -1224,7 +1226,7 @@ impl Backend for SqliteBackend {
 
         let inserted = self
             .write(move |conn| -> Result<usize, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let mut inserted = 0usize;
 
                 // v32.1.0 (CIRISPersist#606) — ONE admission instant for the whole
@@ -1469,7 +1471,7 @@ impl Backend for SqliteBackend {
         let owned: Vec<TraceLlmCallRow> = rows.to_vec();
         let inserted = self
             .write(move |conn| -> Result<usize, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let mut inserted = 0usize;
 
                 const SQL: &str = "INSERT INTO trace_llm_calls (\
@@ -2270,7 +2272,7 @@ impl SqliteBackend {
                 if batch.is_empty() {
                     break;
                 }
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 {
                     let mut up =
                         tx.prepare("UPDATE trace_events SET shard_key = ?1 WHERE event_id = ?2")?;
@@ -3379,7 +3381,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let (deleted, buckets) = self
             .write(
                 move |conn| -> Result<((u64, u64), Vec<String>), rusqlite::Error> {
-                    let tx = conn.transaction()?;
+                    let tx = write_tx(conn)?;
                     let tombstoned: bool = tx
                         .query_row(
                             "SELECT 1 FROM purge_tombstones WHERE plane = 'trace' \
@@ -4822,7 +4824,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let id = attestation_id.to_owned();
         self.write(move |guard| -> Result<(), rusqlite::Error> {
             // One transaction: every projection leaves together.
-            let tx = guard.transaction()?;
+            let tx = write_tx(guard)?;
             tx.execute(
                 "DELETE FROM signed_wire_index WHERE kind = 'Attestation' AND record_key = ?1",
                 rusqlite::params![record_key],
@@ -5848,7 +5850,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         received_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::federation::self_roster::SelfRosterReceipt, crate::federation::Error> {
         let (id, identity) = (proposal_id.to_owned(), identity_key_id.to_owned());
-        let at = self_roster_instant_text(received_at);
+        let at = first_held_instant_text(received_at);
         let held = self
             .write(
                 move |conn| -> Result<Option<SelfRosterRow>, rusqlite::Error> {
@@ -5877,6 +5879,30 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ))
         })?
         .into_receipt()
+    }
+
+    async fn vote_window_first_held(
+        &self,
+        action_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::Error> {
+        let id = action_id.to_owned();
+        let held = self
+            .read(move |conn| -> Result<Option<String>, rusqlite::Error> {
+                conn.query_row(
+                    "SELECT first_held_at FROM federation_vote_windows WHERE action_id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("vote window: {e}")))?;
+        held.map(|t| {
+            chrono::DateTime::parse_from_rfc3339(&t)
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .map_err(|e| crate::federation::Error::Backend(format!("vote window: {e}")))
+        })
+        .transpose()
     }
 
     async fn list_open_self_roster_proposals(
@@ -5930,7 +5956,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         settled_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), crate::federation::Error> {
         let (id, outcome) = (proposal_id.to_owned(), outcome.to_owned());
-        let at = self_roster_instant_text(settled_at);
+        let at = first_held_instant_text(settled_at);
         self.write(move |conn| {
             conn.execute(
                 "UPDATE federation_self_roster_proposals SET settled_at = ?2, outcome = ?3 \
@@ -7288,34 +7314,23 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Vec<crate::federation::ServedAttestation>, crate::federation::Error> {
         let since_at = since.as_ref().map(|(t, _)| t.to_rfc3339());
         let since_id = since.as_ref().map(|(_, id)| id.clone());
-        // v53.0.0 (#975, CC 2.4) — under enforcement a held row of an
-        // unregistered type is neither served nor replicated. Read on the
-        // calling task, before the closure moves to the pool.
-        let row_type_filter = crate::federation::row_type::serve_filter_sql(
-            "attestation_type",
-            crate::federation::row_type::SqlDialect::Sqlite,
+        // v61.1.0 (review D3) — THE serve rule (`read_plan::serve_rule_parts`):
+        // E5, the federation tier only (a local-tier row never reaches the
+        // advertise/serve wire surface); v53.0.0 (#975, CC 2.4), under
+        // enforcement a held row of an unregistered type is neither served
+        // nor replicated; v54.1.0 (#1046), a tombstoned row is not served
+        // unless the tombstone is void for it (the accountability record,
+        // a person-subject row: Codex rounds 1 and 4 on PR #1057). Built on
+        // the calling task (the row-type filter reads its enforcement),
+        // before the closure moves to the pool.
+        let serve_rule = crate::federation::read_plan::serve_rule_parts(
+            crate::federation::attestation_query::Dialect::Sqlite,
+            "federation_attestations",
+            "",
         )
-        .map(|p| format!(" AND {p}"))
-        .unwrap_or_default();
-        // Codex rounds 1 and 4 on PR #1057 — a tombstone is void for the
-        // accountability record and (interim) for a row a person is the
-        // subject of: both are served.
-        let accountability = format!(
-            "{} OR {}",
-            crate::federation::migration::accountability_record_sql(
-                "federation_attestations.dimension"
-            ),
-            crate::federation::steward_purge::person_subject_sql("federation_attestations", "")
-        );
+        .join(" AND ");
         let (read, bytes) = self
             .read_measured(move |conn| -> Result<Vec<_>, rusqlite::Error> {
-                // E5 invariant: `tier = 'federation'` only — a local-tier row
-                // must never reach the advertise/serve wire surface.
-                //
-                // v54.1.0 (CIRISPersist#1046) — a tombstoned row is never
-                // served; excluded in the SQL, before the page is cut. Unless
-                // it is the accountability record (Codex on PR #1057): a
-                // tombstone is void for it.
                 let mut stmt = conn.prepare(&format!(
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
@@ -7325,14 +7340,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     additional_scrubs, {pos} AS _pos \
                  FROM federation_attestations \
                  WHERE (?1 IS NULL OR {pos} > ?1 OR ({pos} = ?1 AND attestation_id > ?2)) \
-                   AND tier = 'federation'{row_type_filter} \
-                   AND (NOT EXISTS (SELECT 1 FROM purge_tombstones pt \
-                                    WHERE pt.plane = 'attestation' \
-                                      AND pt.record_ref = federation_attestations.attestation_id) \
-                        OR {accountability}) \
+                   AND {serve_rule} \
                  ORDER BY {pos} ASC, attestation_id ASC LIMIT ?3",
                     pos = POS_ATTESTATION,
-                    accountability = accountability,
                 ))?;
                 let rows = stmt.query_map(rusqlite::params![since_at, since_id, limit], |row| {
                     let pos: String = row.get("_pos")?;
@@ -7633,6 +7643,35 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             limit,
         )
         .await
+    }
+
+    async fn list_attestations_since_by_prefixes(
+        &self,
+        since: Option<crate::federation::types::ServePosition>,
+        family_prefixes: &[String],
+        limit: i64,
+    ) -> Result<
+        crate::federation::types::ServePage<crate::federation::ServedAttestation>,
+        crate::federation::Error,
+    > {
+        crate::federation::read_plan::list_attestations_since_by_prefixes_planned(
+            self,
+            since,
+            family_prefixes,
+            limit,
+        )
+        .await
+    }
+
+    async fn list_owner_bindings_since(
+        &self,
+        since: Option<crate::federation::types::ServePosition>,
+        limit: i64,
+    ) -> Result<
+        crate::federation::types::ServePage<crate::federation::types::OwnerBindingChange>,
+        crate::federation::Error,
+    > {
+        crate::federation::read_plan::list_owner_bindings_since_planned(self, since, limit).await
     }
 
     async fn record_announced_peer(
@@ -8082,7 +8121,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let outcome = self
             .write(
                 move |conn| -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
-                    let tx = conn.transaction()?;
+                    let tx = write_tx(conn)?;
 
                     // Live-row gate. removed_at TEXT — IS NULL means live.
                     let live: Option<i64> = tx
@@ -8476,7 +8515,7 @@ async fn sqlite_update_peer_field(
     let outcome = backend
         .write(
             move |conn| -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
 
                 // Fetch live-row tuple; PeerNotFound on missing or
                 // soft-removed.
@@ -8969,7 +9008,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         self.write(move |conn| -> Result<usize, rusqlite::Error> {
             // #848 (§13) — one transaction, a UNION (`DO NOTHING` per row);
             // no blob row is required (order independence).
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let mut inserted = 0usize;
             for w in &wraps {
                 inserted += tx.execute(
@@ -9532,7 +9571,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
             // #848 (§13) — ONE transaction, a UNION: every row is
             // `DO NOTHING` on the key, so nothing already admitted is
             // touched and a re-applied set writes zero rows.
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let mut inserted = 0usize;
             for w in &wraps {
                 inserted += tx.execute(
@@ -10086,7 +10125,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let destroying = state == DekKeyState::Destroyed;
         let enabling = state == DekKeyState::Enabled;
         let applied = self.write(move |conn| -> Result<bool, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let n = if destroying {
                 // v43.0.0 (§11.4) — DESTROY IS ONE STATEMENT, CONDITIONED ON
                 // ZERO BOUND OBJECTS, AND IT DELETES THE KEY. The NOT EXISTS
@@ -10395,7 +10434,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let stamp = now.to_rfc3339();
         let n = self
             .write(move |conn| -> Result<usize, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 tx.execute(
                     "DELETE FROM federation_blob_key_grants WHERE at_rest_sha256 IN ( \
                     SELECT at_rest_sha256 FROM federation_community_blob_epoch \
@@ -11258,7 +11297,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         }
         let out = self
             .write(move |conn| -> Result<Rec, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 for (sha, missing) in [(&root, Rec::RootMissing), (&child, Rec::ChildMissing)] {
                     let is_held: bool = tx.query_row(
                         "SELECT EXISTS (SELECT 1 FROM federation_blobs WHERE sha256 = ?1)",
@@ -11319,7 +11358,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         }
         let out = self
             .write(move |conn| -> Result<Ab, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let head: Option<(Option<String>, Option<String>)> = tx
                     .query_row(
                         "SELECT owner_key_id, abandoned_at FROM federation_streams \
@@ -11623,7 +11662,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
             .collect();
         want.sort();
         self.write(move |conn| -> Result<bool, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let held: Vec<(i64, Vec<u8>)> = {
                 let mut stmt = tx.prepare(
                     "SELECT seq, chunk_sha FROM federation_stream_chunks \
@@ -11759,7 +11798,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         }
         let outcome = self
             .write(move |conn| -> Result<Promote, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let row: Option<(String, String)> = tx
                     .query_row(
                         "SELECT storage_kind, crypto_tier FROM federation_blobs WHERE sha256 = ?1",
@@ -11962,7 +12001,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let manifest_sha = self
             .write(
                 move |conn| -> Result<[u8; 32], crate::federation::BlobError> {
-                    let tx = conn.transaction().map_err(|e| {
+                    let tx = write_tx(conn).map_err(|e| {
                         crate::federation::BlobError::Backend(format!("seal_stream tx: {e}"))
                     })?;
 
@@ -12312,7 +12351,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         );
         let row_opt = self
             .write(move |conn| -> Result<Option<GetBlobRow>, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let row_opt = tx
                     .query_row(
                         "SELECT storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
@@ -12407,7 +12446,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         }
         let outcome = self
             .write(move |conn| -> Result<RangeDecision, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 // 1. Fetch storage_kind + size (+ external metadata) to do the
                 //    bounds check before pulling any bytes.
                 let head_opt = tx
@@ -12533,7 +12572,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // treated as evidence the blob is still hot.
         let now_iso = chrono::Utc::now().to_rfc3339();
         self.write(move |conn| -> Result<bool, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let count: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM federation_blobs WHERE sha256 = ?1",
                 rusqlite::params![sha_vec],
@@ -13193,7 +13232,7 @@ impl SqliteBackend {
         // already held; no key_grant set is re-applied. A tombstone is judged
         // at the read and serve doors (#853), never by deleting a grant here.
         self.write(move |conn| -> Result<usize, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // v52.0.0 (#954) — a v3 root's children die with it (found by
             // the relation, never by opening the root).
             //
@@ -13401,7 +13440,7 @@ impl crate::federation::BlackholeRules for SqliteBackend {
         let outcome = self
             .write(
                 move |conn| -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
-                    let tx = conn.transaction()?;
+                    let tx = write_tx(conn)?;
                     let existing_added_at_text: Option<String> = tx
                         .query_row(
                             "SELECT added_at FROM blackhole_rules WHERE identity_hash = ?1",
@@ -13620,7 +13659,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         let rows = self
             .write(
                 move |conn| -> Result<Vec<crate::outbound::OutboundRow>, rusqlite::Error> {
-                    let tx = conn.transaction()?;
+                    let tx = write_tx(conn)?;
                     let queue_ids: Vec<String> = {
                         let mut stmt = tx.prepare(
                             "SELECT queue_id FROM edge_outbound_queue \
@@ -13714,7 +13753,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         let outcome = self
             .write(
                 move |conn| -> Result<crate::outbound::OutboundFailureOutcome, rusqlite::Error> {
-                    let tx = conn.transaction()?;
+                    let tx = write_tx(conn)?;
                     let (attempt_count, max_attempts, enqueued_at_str, ttl_seconds): (
                         i32,
                         i32,
@@ -13856,7 +13895,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
     async fn sweep_ack_timeouts(&self) -> Result<i64, crate::outbound::Error> {
         let now = chrono::Utc::now();
         self.write(move |conn| -> rusqlite::Result<i64> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // Walk awaiting_ack rows; per-row TTL/timeout checks in Rust
             // (sqlite has no interval arithmetic).
             // (queue_id, transport_delivered_at, ack_timeout_seconds,
@@ -13937,7 +13976,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
     async fn sweep_ttl_expired(&self) -> Result<i64, crate::outbound::Error> {
         let now = chrono::Utc::now();
         self.write(move |conn| -> rusqlite::Result<i64> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // Pull non-terminal rows; check ttl in Rust.
             let candidates: Vec<(String, String, i64)> = {
                 let mut stmt = tx.prepare(
@@ -14402,7 +14441,9 @@ fn sqlite_factor_rollup_upsert_sql(source_filter: &str) -> String {
 
 /// v59.0.0 (CIRISPersist#1099) — the V199 instant spelling: fixed-width
 /// RFC 3339 at microseconds, so `ORDER BY received_at` orders as time does.
-fn self_roster_instant_text(t: chrono::DateTime<chrono::Utc>) -> String {
+/// v61.1.0 — also V213's (`federation_vote_windows.first_held_at`): one
+/// spelling for every first-held instant (`attestation_admit::first_held_instant`).
+fn first_held_instant_text(t: chrono::DateTime<chrono::Utc>) -> String {
     t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
@@ -14985,7 +15026,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         } = planned;
         let attesting_key_id = row.attesting_key_id.clone();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             if replace {
                 // Upsert-replace: drop any prior local row for this
                 // (occurrence, dimension). History is carried by the
@@ -15032,7 +15073,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         planned: crate::federation::attestation_admit::PlannedHardCase,
     ) -> Result<(), crate::federation::Error> {
         self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             sqlite_store_hard_case(&tx, &planned)?;
             tx.commit()
         })
@@ -15065,7 +15106,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         }
         let attester = attester.clone();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let legacy: Vec<crate::federation::HardCaseEvent> = {
                 let mut stmt = tx.prepare(
                     "SELECT event_id, kind, target_key_id, subject_key_id, detail, emitted_at, \
@@ -15173,7 +15214,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         planned: crate::federation::attestation_admit::PlannedDetection,
     ) -> Result<bool, crate::federation::Error> {
         self.write(move |conn| -> Result<bool, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             if sqlite_insert_local_attestation_row(&tx, &planned.row, None)? == 0 {
                 return Ok(false);
             }
@@ -15261,7 +15302,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             };
             let detection_id = body.detection_id.to_string();
             self.write(move |conn| -> Result<(), rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 tx.execute(
                     "DELETE FROM cirislens_derived_detection_events \
                       WHERE detection_id = ?1 AND attestation_id IS NULL",
@@ -15301,7 +15342,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         let node = crate::federation::FederationDirectory::node_key_id(self);
         self.write(
             move |conn| -> Result<crate::federation::silo_projection::ProjectionRebuild, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let (live_table, scratch, order, family) = match projection {
                     SiloProjection::HardCaseEvents => (
                         "hard_case_events",
@@ -15444,7 +15485,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         let sealed = self
             .write(move |conn| -> Result<Option<crate::federation::Attestation>, Error> {
                 let db = |e: rusqlite::Error| Error::Backend(format!("reseal_attestation_v31: {e}"));
-                let tx = conn.transaction().map_err(db)?;
+                let tx = write_tx(conn).map_err(db)?;
                 // The row as it is NOW, inside the transaction that writes it.
                 let found = tx
                     .query_row(
@@ -15571,7 +15612,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         let (member, value) = (member.to_owned(), value.to_owned());
         let at = at.to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
         self.write(move |conn| -> Result<bool, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let gone = tx.execute(
                 "DELETE FROM federation_attestations \
                  WHERE attestation_id = ?1 AND persist_row_hash = ?2",
@@ -15644,6 +15685,8 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             projected_hard_case,
             projected_ledger,
             projected_goal,
+            vote_window,
+            self_roster_receipt,
             wire_index_key,
             ..
         } = planned;
@@ -15655,7 +15698,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             .write(move |conn| -> Result<bool, rusqlite::Error> {
                 // v50.0.0 (review H2, final check) — ONE transaction for the
                 // row, its projections and its admission depth.
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 // v36.0.0 (#668) — THIS node's serve position (V130).
                 let admitted_at =
                     sqlite_next_plane_position(&tx, "federation_attestations", POS_ATTESTATION)?;
@@ -15751,6 +15794,30 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                         rusqlite::params![row.attestation_id, depth],
                     )?;
                 }
+                // CIRISPersist#1198 (V213) — first-held wins, in the row's
+                // transaction: no objection is held without its window.
+                if let Some((action_id, first_held_at)) = &vote_window {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO federation_vote_windows \
+                         (action_id, first_held_at) VALUES (?1, ?2)",
+                        rusqlite::params![action_id, first_held_instant_text(*first_held_at)],
+                    )?;
+                }
+                // v61.1.0 (CIRISPersist#1220, V199) — a proposal's receipt,
+                // first-seen wins, in the row's transaction: a failed write
+                // rolls the row back, so no proposal is held without its
+                // window.
+                if let Some((identity_key_id, received_at)) = &self_roster_receipt {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO federation_self_roster_proposals \
+                         (attestation_id, identity_key_id, received_at) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![
+                            row.attestation_id,
+                            identity_key_id,
+                            first_held_instant_text(*received_at)
+                        ],
+                    )?;
+                }
                 tx.commit()?;
                 Ok(true)
             })
@@ -15818,12 +15885,7 @@ impl SqliteBackend {}
 /// `scores` read handles (JOINed to `attestation_subjects s`). Column NAMES
 /// are unprefixed, so [`sqlite_row_to_attestation`] (which reads by name)
 /// resolves them unchanged.
-const SCORES_FA_COLS: &str = "fa.attestation_id, fa.attesting_key_id, fa.attested_key_id, \
-     fa.attestation_type, fa.weight, fa.asserted_at, fa.expires_at, \
-     fa.attestation_envelope, fa.original_content_hash, fa.scrub_signature_classical, \
-     fa.scrub_signature_pqc, fa.scrub_key_id, fa.scrub_timestamp, fa.pqc_completed_at, \
-     fa.persist_row_hash, fa.subject_key_ids, fa.withdraws_admission_rule, fa.cohort_scope, \
-     fa.tier, fa.promoted_at, fa.additional_scrubs";
+const SCORES_FA_COLS: &str = crate::federation::attestation_query::SQLITE_FA_COLUMNS;
 
 /// v17.4.0 — shared WHERE predicate builder for the sqlite `scores` read
 /// handles. Emits the subject / dimension(exact+prefix) / type / attester /
@@ -16587,14 +16649,12 @@ fn sqlite_naming_page_sql(
     let mut parts: Vec<String> = vec![
         "s.subject_key_id = ?1".to_owned(),
         "s.dimension = ?2".to_owned(),
-        "fa.tier = 'federation'".to_owned(),
     ];
-    parts.extend(crate::federation::row_type::serve_filter_sql(
-        "fa.attestation_type",
-        crate::federation::row_type::SqlDialect::Sqlite,
-    ));
-    parts.push(crate::federation::steward_purge::served_under_purge_sql(
-        "fa", "",
+    // v61.1.0 (review D3) — the one serve rule.
+    parts.extend(crate::federation::read_plan::serve_rule_parts(
+        crate::federation::attestation_query::Dialect::Sqlite,
+        "fa",
+        "",
     ));
     if let Some(c) = cursor {
         binds.push(SqlValue::Text(c.last_asserted_at.to_rfc3339()));
@@ -17809,12 +17869,43 @@ fn sqlite_record_hard_case_in_tx(
 /// v57.0.0 (CIRISPersist#988 item 2) — **the hard_case writer**, inside
 /// `tx`: the planned row (insert-if-absent on its event-derived id) and,
 /// when it landed, its projection. A re-recorded event writes nothing.
+///
+/// v61.1.0 (61.1 review H3, as ruled) — when the v1 id is held by a row
+/// ANOTHER key signed, this node's record is written under its emitter-bound
+/// id instead ([`HeldOccupant`](crate::federation::hard_case::HeldOccupant)),
+/// logged and counted with `hard_case_id_held_by_foreign_row`, and the act
+/// commits. The foreign row is left as it is.
 fn sqlite_store_hard_case(
     tx: &rusqlite::Transaction<'_>,
     planned: &crate::federation::attestation_admit::PlannedHardCase,
 ) -> Result<(), rusqlite::Error> {
+    use crate::federation::hard_case::{held_occupant, HeldOccupant};
     if sqlite_insert_local_attestation_row(tx, &planned.row, None)? == 0 {
-        return Ok(());
+        let held = sqlite_hard_case_signer(tx, &planned.row.attestation_id)?;
+        if held_occupant(held.as_deref(), &planned.row.attesting_key_id)
+            == HeldOccupant::AlreadyHeld
+        {
+            return Ok(());
+        }
+        let Some(bound) = planned.emitter_bound.as_deref() else {
+            return Ok(());
+        };
+        if sqlite_insert_local_attestation_row(tx, &bound.row, None)? == 0 {
+            // This node's fallback record is already held: a re-record.
+            return Ok(());
+        }
+        crate::federation::hard_case::record_foreign_occupant_fallback(
+            &bound.projection.event_id,
+            &planned.row.attestation_id,
+            held.as_deref().unwrap_or(""),
+            &bound.row.attesting_key_id,
+        );
+        return sqlite_project_hard_case(
+            tx,
+            "hard_case_events",
+            &bound.row.attestation_id,
+            &bound.projection,
+        );
     }
     sqlite_project_hard_case(
         tx,
@@ -17822,6 +17913,19 @@ fn sqlite_store_hard_case(
         &planned.row.attestation_id,
         &planned.projection,
     )
+}
+
+/// v61.1.0 (H3) — the signer of the row held at `attestation_id`, if any.
+fn sqlite_hard_case_signer(
+    tx: &rusqlite::Transaction<'_>,
+    attestation_id: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    tx.query_row(
+        "SELECT attesting_key_id FROM federation_attestations WHERE attestation_id = ?1",
+        [attestation_id],
+        |r| r.get(0),
+    )
+    .optional()
 }
 
 /// v57.0.0 (CIRISPersist#988 item 2) — one `hard_case_events`-shaped row into
@@ -17835,6 +17939,30 @@ fn sqlite_project_hard_case(
 ) -> Result<(), rusqlite::Error> {
     let detail = serde_json::to_string(&event.detail)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    // v61.1.0 (H3, as ruled) — two rows can now project one `event_id` (a
+    // peer's v1 row and this node's emitter-bound record): the table keeps the
+    // one `projection_outranks` names, in the live write and the rebuild alike
+    // (the rebuild's scratch table carries no key, so this is asked in Rust).
+    let held: Option<Option<String>> = tx
+        .query_row(
+            &format!("SELECT attestation_id FROM {table} WHERE event_id = ?1"),
+            [&event.event_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(held) = held {
+        if !crate::federation::hard_case::projection_outranks(
+            &event.event_id,
+            attestation_id,
+            held.as_deref(),
+        ) {
+            return Ok(());
+        }
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE event_id = ?1"),
+            [&event.event_id],
+        )?;
+    }
     tx.execute(
         &format!(
             "INSERT INTO {table} \
@@ -22163,9 +22291,7 @@ impl SqliteBackend {
     ) -> Result<(), crate::read::Error> {
         let since_text = since.map(|s| s.to_rfc3339());
         self.write(move |conn| -> Result<(), crate::read::Error> {
-            let tx = conn
-                .transaction()
-                .map_err(sqlite_read_err("rollup refresh begin"))?;
+            let tx = write_tx(conn).map_err(sqlite_read_err("rollup refresh begin"))?;
 
             // Re-fold floor: explicit `since`, else watermark - 1h, else
             // all-time (first run). SQLite stores ts as RFC3339 TEXT;
@@ -22616,7 +22742,7 @@ impl crate::derived::DerivedSchema for SqliteBackend {
             // calibration_bundles_one_current makes "at most one
             // current bundle" DB-enforced; the transaction makes the
             // transition race-free.
-            let tx = conn.transaction().map_err(sqlite_derived_err("begin tx"))?;
+            let tx = write_tx(conn).map_err(sqlite_derived_err("begin tx"))?;
             if bundle.is_current {
                 tx.execute(
                     "UPDATE cirislens_derived_calibration_bundles \
@@ -22883,7 +23009,7 @@ impl SqliteBackend {
             .map_err(|e| crate::federation::Error::Backend(format!("rehome key plane: {e}")))?;
         if !keys.is_empty() || !revocations.is_empty() || !occurrences.is_empty() {
             self.write(move |conn| -> Result<(), rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 for key_id in &keys {
                     sqlite_sync_key_record_row(&tx, key_id)?;
                 }
@@ -23033,7 +23159,7 @@ impl crate::federation::group_plane::GroupPlaneStore for SqliteBackend {
         let n = binds.len();
         let linked = self
             .write(move |conn| -> Result<Option<bool>, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let current: Option<Option<String>> = tx
                     .query_row(
                         &format!("SELECT attestation_id FROM {table} WHERE {pk}"),
@@ -23266,7 +23392,7 @@ impl crate::federation::sweep_plan::RoomEvictionStore for SqliteBackend {
         use crate::federation::sweep_plan::RoomEpochRow;
         let stamp = format_ledger_instant(eviction.now);
         self.write(move |conn| -> Result<u64, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let rows: Vec<RoomEpochRow> = {
                 let mut stmt = tx.prepare(
                     "SELECT d.stream_id, d.epoch, d.cohort_scope, d.room_epoch, \
@@ -23339,7 +23465,7 @@ impl super::backend_plan::BackendStore for SqliteBackend {
                 let agent = planned.agent_id_hash.as_str();
                 let key = planned.signature_key_id();
                 let received_s = planned.received_at.to_rfc3339();
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let strings = |sql: &str,
                                p: &[&dyn rusqlite::ToSql]|
                  -> Result<Vec<String>, rusqlite::Error> {
@@ -23474,7 +23600,7 @@ impl super::backend_plan::BackendStore for SqliteBackend {
             )
         });
         self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // The manifest: idempotent. Never evicted.
             tx.execute(
                 "INSERT INTO content_manifest (\
@@ -23711,6 +23837,71 @@ impl crate::federation::read_plan::ReadPlanStore for SqliteBackend {
         })
     }
 
+    async fn read_serve_stream_page(
+        &self,
+        narrowing: crate::federation::read_plan::ServeNarrowing<'_>,
+        since: Option<&crate::federation::types::ServePosition>,
+        fetch: i64,
+    ) -> Result<crate::federation::read_plan::ServedRows, crate::federation::Error> {
+        use crate::federation::attestation_query::Dialect;
+        use crate::federation::types::ServePosition;
+        use crate::federation::Error;
+        // `None`: sqlite's head is exact (its one writer assigns the serve
+        // position inside the write transaction).
+        let settled_before =
+            crate::federation::read_plan::serve_settled_before(Dialect::Sqlite, chrono::Utc::now());
+        let head_stmt = crate::federation::read_plan::serve_stream_head_statement(Dialect::Sqlite);
+        let page_stmt = crate::federation::read_plan::serve_stream_statement(
+            Dialect::Sqlite,
+            narrowing,
+            since,
+            fetch,
+        );
+        let head_sql = head_stmt.sql;
+        let page_sql = page_stmt.sql;
+        let binds = sqlite_binds(page_stmt.binds);
+        type Head = Option<ServePosition>;
+        let (read, bytes) = self
+            .read_measured(
+                move |conn| -> Result<(Head, Vec<crate::federation::ServedAttestation>), Error> {
+                    // The head FIRST: a row admitted between the two reads sits
+                    // above it, so a resume from the head cannot skip it.
+                    let head: Head = conn
+                        .query_row(&head_sql, [], |r| {
+                            let pos: String = r.get(0)?;
+                            let id: String = r.get(1)?;
+                            Ok(ServePosition::new(parse_rfc3339(&pos), id))
+                        })
+                        .optional()
+                        .map_err(|e| Error::Backend(format!("serve stream head: {e}")))?;
+                    let mut stmt = conn
+                        .prepare(&page_sql)
+                        .map_err(|e| Error::Backend(format!("serve stream prepare: {e}")))?;
+                    let rows = stmt
+                        .query_map(params_from_iter(binds.iter()), |row| {
+                            let pos: String = row.get("_pos")?;
+                            Ok(crate::federation::ServedAttestation {
+                                attestation: sqlite_row_to_attestation(row)?,
+                                admitted_at: parse_rfc3339(&pos),
+                            })
+                        })
+                        .map_err(|e| Error::Backend(format!("serve stream query: {e}")))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| Error::Backend(format!("serve stream row: {e}")))?;
+                    Ok((head, rows))
+                },
+            )
+            .await;
+        let (head, rows) = read?;
+        Ok(crate::federation::read_plan::ServedRows {
+            rows,
+            head,
+            settled_before,
+            bytes,
+            backend: crate::observe::StoreBackend::Sqlite,
+        })
+    }
+
     async fn read_key_registration_history(
         &self,
         key_id: &str,
@@ -23839,7 +24030,7 @@ impl crate::federation::directory_admit::DirectoryStore for SqliteBackend {
         let admitted_at = self.next_key_admission_position().await?.to_rfc3339();
         self.write(move |conn| -> Result<(), Error> {
             let (key, meta) = (&planned.key, &planned.meta);
-            let tx = conn.transaction().map_err(db)?;
+            let tx = write_tx(conn).map_err(db)?;
             tx.execute(
                 "INSERT INTO federation_keys (\
                     key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
@@ -23997,7 +24188,7 @@ impl crate::federation::directory_admit::DirectoryStore for SqliteBackend {
                     crate::federation::steward_purge::PurgePutOutcome,
                     rusqlite::Error,
                 > {
-                    let tx = conn.transaction()?;
+                    let tx = write_tx(conn)?;
                     let held: bool = tx
                         .query_row(
                             "SELECT 1 FROM purge_executions WHERE notice_id = ?1",
@@ -24122,7 +24313,7 @@ impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
         let now_iso = chrono::Utc::now().to_rfc3339();
         self.write(
             move |conn| -> Result<Vec<(usize, ItemAppended)>, BlobError> {
-                let mut tx = conn.transaction().map_err(db)?;
+                let mut tx = write_tx(conn).map_err(db)?;
                 // #957 — every floor statement is a cached prepared statement, so
                 // its SQLite VM-step cost can be read back (I286 measures it).
                 let mut steps: u64 = 0;
@@ -24242,7 +24433,7 @@ impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
         let producer = sth.producer_key_id.to_owned();
         let (signature_blob, witness_json) = (sth.signature_blob, sth.witness_json);
         self.write(move |conn| -> Result<Option<Vec<u8>>, BlobError> {
-            let tx = conn.transaction().map_err(db)?;
+            let tx = write_tx(conn).map_err(db)?;
             let inserted = tx
                 .execute(
                     "INSERT INTO federation_stream_sth (\
@@ -24292,7 +24483,7 @@ impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
         let signature_blob = planned.signature_blob;
         let received_at = planned.received_at.to_rfc3339();
         self.write(move |conn| -> Result<ReceiptWrite, BlobError> {
-            let tx = conn.transaction().map_err(db)?;
+            let tx = write_tx(conn).map_err(db)?;
             let published: i64 = tx
                 .query_row(
                     "SELECT COUNT(*) FROM federation_stream_sth \
@@ -24351,7 +24542,7 @@ impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
         let sha_vec = sha256.to_vec();
         let held = self
             .write(move |conn| -> Result<bool, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 // §11.5 / I28 — an announcement never stores; an evicted
                 // binding is an eviction RECORD, not a held row.
                 let held: bool = tx.query_row(
@@ -24403,7 +24594,7 @@ impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
         let r = record.clone();
         self.write(
             move |conn| -> Result<crate::federation::StreamDekRecord, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 tx.execute(
                     "INSERT INTO federation_stream_deks \
                         (stream_id, epoch, owner_key_id, cohort_scope, group_key_id, \
@@ -24450,7 +24641,7 @@ impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
         let ep = epoch as i64;
         let wraps = wraps.to_vec();
         self.write(move |conn| -> Result<usize, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let mut inserted = 0usize;
             for w in &wraps {
                 inserted += tx.execute(
@@ -24533,7 +24724,7 @@ impl crate::federation::blob_admit::BlobWriteStore for SqliteBackend {
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             let r = &planned.row;
             let sha_vec = r.sha256.to_vec();
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // v60.1.0 (#1070) — the tombstone again, under the write.
             sqlite_refuse_tombstoned_at_write(&tx, &sha_vec, &planned.tombstones)?;
             // #846 (§5) / #984 (V177) — the row records its author and group;
@@ -24612,7 +24803,7 @@ impl crate::federation::blob_admit::BlobWriteStore for SqliteBackend {
         let held = self
             .write(move |conn| -> Result<bool, rusqlite::Error> {
                 let sha_vec = planned.sha256.to_vec();
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 // §11.5 / I28 — a sealed-tier token announces a row a cascade
                 // already stored and bound; #833 — an evicted binding is an
                 // eviction RECORD, not a bound row. The connection mutex is
@@ -24657,7 +24848,7 @@ impl crate::federation::blob_admit::BlobWriteStore for SqliteBackend {
     ) -> Result<(), crate::federation::BlobError> {
         let now_iso = chrono::Utc::now().to_rfc3339();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             for row in &planned.rows {
                 let sha_vec = row.sha256.to_vec();
                 // v60.1.0 (#1070) — the tombstone again, under the write.
@@ -24698,7 +24889,7 @@ impl crate::federation::blob_admit::BlobWriteStore for SqliteBackend {
             |e: rusqlite::Error| BlobError::Backend(format!("put_dag_manifest_over_held: {e}"));
         let now_iso = chrono::Utc::now().to_rfc3339();
         self.write(move |conn| -> Result<(), BlobError> {
-            let tx = conn.transaction().map_err(db)?;
+            let tx = write_tx(conn).map_err(db)?;
             for (idx, (chunk_sha, size)) in planned.held_chunks.iter().enumerate() {
                 let held: Option<(String, String, i64)> = tx
                     .query_row(
@@ -24756,7 +24947,7 @@ impl crate::federation::blob_admit::BlobWriteStore for SqliteBackend {
         let now_iso = chrono::Utc::now().to_rfc3339();
         self.write(move |conn| -> Result<SealWrite, rusqlite::Error> {
             let p = &planned;
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // #954 — an abandoned stream is never sealed.
             let abandoned: bool = tx
                 .query_row(
@@ -25186,7 +25377,7 @@ impl crate::federation::occurrence_admit::OccurrenceStore for SqliteBackend {
                 // A stale/equal replay is a safe no-op (#418 anti-first-writer).
                 // v36.0.0 (#668) — THIS node's serve position (V130): the INSERT
                 // stamps it and a supersede re-stamps it.
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let admitted_at = sqlite_next_plane_position(
                     &tx,
                     "federation_identity_occurrences",
@@ -25304,7 +25495,7 @@ impl crate::federation::occurrence_admit::OccurrenceStore for SqliteBackend {
         } = planned;
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             // v36.0.0 (#668) — serve position (V130), unsigned rows only.
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let admitted_at =
                 sqlite_next_plane_position(&tx, "federation_identity_occurrences", POS_ASSERTED)?;
             tx.execute(
@@ -25411,7 +25602,7 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for SqliteBac
                 let members_json = serde_json::to_string(&new_fam.members)
                     .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
                 self.write(move |conn| -> Result<u32, rusqlite::Error> {
-                    let tx = conn.transaction()?;
+                    let tx = write_tx(conn)?;
                     let prior = tx
                         .query_row(
                             "SELECT version, family_key_id, family_name, members, founded_at, \
@@ -25519,7 +25710,7 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for SqliteBac
                     None => None,
                 };
                 self.write(move |conn| -> Result<u32, rusqlite::Error> {
-                    let tx = conn.transaction()?;
+                    let tx = write_tx(conn)?;
                     let prior = tx
                         .query_row(
                             "SELECT version, community_key_id, community_name, members, \
@@ -25703,7 +25894,7 @@ impl crate::federation::family_admit::FamilyStore for SqliteBackend {
             let row = &r.family_membership_revocation;
             // v47.1.0 (CIRISPersist#861) — one transaction, so a repeat leaves
             // NOTHING behind (the serve position included).
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // v36.0.0 (#668) — THIS node's serve position (V130).
             let admitted_at = sqlite_next_plane_position(
                 &tx,
@@ -25857,7 +26048,7 @@ impl crate::federation::accord_admit::AccordStore for SqliteBackend {
             // transaction. IMMEDIATE: the write lock is taken BEFORE the
             // held-digest read, so a second backend on the file waits on the
             // busy timeout instead of failing a read-to-write lock upgrade.
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let tx = write_tx(conn)?;
             // Codex round 4 on PR #1057 — a HELD digest is an idempotent
             // replay, accepted before the claim is asked.
             let held: bool = tx
@@ -26198,7 +26389,7 @@ impl crate::federation::evidence_admit::EvidenceStore for SqliteBackend {
         let claim_namespaces = planned.claim_namespaces.to_string();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             let w = &planned.stored;
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // Idempotent on (peer_id, epoch_id, observed_at_unix_ms).
             tx.execute(
                 "INSERT INTO wholeness_witness_corpus \
@@ -26474,7 +26665,7 @@ impl crate::federation::key_plane::KeyPlaneStore for SqliteBackend {
         let plane_id = plane.attestation_id.clone();
         self.rehome_legacy_key_plane().await?;
         self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // THIS node's admission position (V123), strictly after the last
             // one handed out (`monotonic_admission_instant`), allocated inside
             // the write so the read and the INSERT are one step.
@@ -26588,7 +26779,7 @@ impl crate::federation::key_plane::KeyPlaneStore for SqliteBackend {
         self.rehome_legacy_key_plane().await?;
         let kid = key_id.clone();
         self.write(move |conn| -> Result<Result<(), Error>, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let position = sqlite_next_key_serve_position(&tx)?.to_rfc3339();
             let rows: usize = match (&planned, &columns) {
                 (P::Insert { record: r, .. }, Some(c)) => {
@@ -26946,7 +27137,7 @@ impl crate::federation::community_admit::CommunityStore for SqliteBackend {
         // under a single lock acquisition: a bump failure after the INSERT
         // must NOT leave a durable un-rotated revocation.
         self.write(move |conn| -> Result<bool, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // v36.0.0 (#668) — THIS node's serve position (V130), allocated
             // inside the same transaction as the write.
             let admitted_at = sqlite_next_plane_position(
@@ -40294,10 +40485,14 @@ mod tests {
             })
             .await
             .unwrap();
+        // v61.1.0 (CIRISPersist#1174, CC 3.4.3) — a substrate self-report is
+        // about the substrate that signs it; one about `k-a` is refused at
+        // this node's own write door and reported from a peer until v62
+        // (`admission::check_substrate_self_report_attester_at`, I1593, I1607).
         let att = scores_attestation_with_dimension(
             "att-sys-2",
             "persist-self",
-            "k-a",
+            "persist-self",
             "persist-self",
             "system:health:n_eff_measurable:v1",
         );
@@ -43299,6 +43494,71 @@ mod tests {
                 "#1225 {tag}: the index gives the order, no sort: {plan:?}"
             );
         }
+    }
+
+    /// v61.1.0 (CIRISPersist#1190, #1163) — **I1579: the narrowed serve
+    /// reads walk V130's `federation_attestations_admitted`**, seeking on the
+    /// cursor when there is one, with the order the index gives (no sort),
+    /// for both narrowings; and the head read is one step of the same index.
+    #[tokio::test]
+    async fn i1579_serve_stream_walks_the_admitted_index() {
+        use crate::federation::attestation_query::Dialect;
+        use crate::federation::read_plan::{
+            serve_stream_head_statement, serve_stream_statement, ServeNarrowing,
+        };
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let since = crate::federation::types::ServePosition::new(
+            chrono::Utc::now(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let families = vec![
+            "membership:proposal:".to_owned(),
+            "objection:".to_owned(),
+            "accord:invoke:".to_owned(),
+        ];
+        for (tag, narrowing) in [
+            (
+                "families",
+                ServeNarrowing::Families {
+                    family_prefixes: &families,
+                },
+            ),
+            ("owner bindings", ServeNarrowing::OwnerBindingChanges),
+        ] {
+            for (at, c) in [("head", None), ("cursor", Some(&since))] {
+                let stmt = serve_stream_statement(Dialect::Sqlite, narrowing, c, 51);
+                let plan = sqlite_plan(&backend, &stmt.sql, sqlite_binds(stmt.binds)).await;
+                eprintln!("#1190/#1163 {tag} ({at}) plan: {plan:?}");
+                let walk = plan
+                    .iter()
+                    .find(|l| l.contains("federation_attestations_admitted"))
+                    .unwrap_or_else(|| {
+                        panic!("I1579 {tag} {at}: walks the admitted index: {plan:?}")
+                    });
+                if c.is_some() {
+                    assert!(
+                        walk.starts_with("SEARCH"),
+                        "I1579 {tag} {at}: the cursor is a seek, not a scan from the oldest row: \
+                         {plan:?}"
+                    );
+                }
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|l| l.contains("USE TEMP B-TREE FOR ORDER BY")),
+                    "I1579 {tag} {at}: the index gives the order, no sort: {plan:?}"
+                );
+            }
+        }
+        let head = serve_stream_head_statement(Dialect::Sqlite);
+        let plan = sqlite_plan(&backend, &head.sql, sqlite_binds(head.binds)).await;
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("federation_attestations_admitted"))
+                && !plan.iter().any(|l| l.contains("TEMP B-TREE")),
+            "I1579 head: one step of the admitted index: {plan:?}"
+        );
     }
 
     /// v61 — `list_scores` under the Live view shares the lifecycle

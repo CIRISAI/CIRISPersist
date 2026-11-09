@@ -3166,8 +3166,26 @@ mod run {
             );
         }
         let admission = read("src/federation/admission.rs");
+        // v61.1.0 (CIRISPersist#1218) — the door's held-target half lives in
+        // `check_withdraws_admission_against`: the gate asks that the door
+        // reaches it on a held target, and that it asks the holder rule.
+        fn body_of<'a>(src: &'a str, sig: &str) -> &'a str {
+            let i = src
+                .find(sig)
+                .unwrap_or_else(|| panic!("I794: {sig} is in admission.rs"));
+            &src[i..i + src[i..].find("\n}\n").expect("its end")]
+        }
+        let door = body_of(&admission, "pub async fn check_withdraws_admission_at(");
         assert!(
-            admission.contains("custody_ack::check_custody_withdraws_signer(row, &target)?"),
+            door.contains("check_withdraws_admission_against(directory, row, &target, depth)"),
+            "I794: the withdraws door decides a held target in its held-target half"
+        );
+        let against = body_of(
+            &admission,
+            "pub(crate) async fn check_withdraws_admission_against(",
+        );
+        assert!(
+            against.contains("custody_ack::check_custody_withdraws_signer(row, target)?"),
             "I794: the withdraws door asks the holder rule (CC 3.1.3.3 rule 4)"
         );
     }

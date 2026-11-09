@@ -1923,9 +1923,24 @@ pub mod test_support {
         occurrence: &str,
         asserted_at: chrono::DateTime<chrono::Utc>,
     ) -> crate::federation::SignedIdentityOccurrence {
-        let asserted_at =
-            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(asserted_at.timestamp_millis())
-                .expect("ms instant");
+        signed_content_only_occurrence_until(signer, identity, occurrence, asserted_at, None).await
+    }
+
+    /// CIRISPersist#1198 — [`signed_content_only_occurrence`] with a
+    /// `valid_until`, truncated to the millisecond as `asserted_at` is.
+    pub async fn signed_content_only_occurrence_until(
+        signer: &str,
+        identity: &str,
+        occurrence: &str,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+        valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> crate::federation::SignedIdentityOccurrence {
+        let ms = |t: chrono::DateTime<chrono::Utc>| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis())
+                .expect("ms instant")
+        };
+        let asserted_at = ms(asserted_at);
+        let valid_until = valid_until.map(ms);
         let x_pub = ciris_crypto::x25519::public_from_secret(&seed_for(occurrence));
         let (_sk, ml_pub) = ciris_crypto::ml_kem::generate_keypair().expect("ml-kem keypair");
         let enc = crate::federation::EncryptionPubkeys {
@@ -1942,7 +1957,8 @@ pub mod test_support {
                 "ml_kem_768_base64": enc.ml_kem_768_base64,
             },
             "asserted_at": asserted_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            "valid_until": serde_json::Value::Null,
+            "valid_until": valid_until
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
             "hardware_attestation": serde_json::Value::Null,
         });
         let id = Box::new(
@@ -1966,7 +1982,7 @@ pub mod test_support {
                 device_class: crate::federation::types::device_class::SERVER.to_owned(),
                 hardware_attestation: None,
                 asserted_at,
-                valid_until: None,
+                valid_until,
                 encryption_pubkeys: Some(enc),
                 transport_binding: None,
                 persist_row_hash: String::new(),
@@ -4254,44 +4270,50 @@ pub mod test_support {
         reason: Option<String>,
         witness_set: Vec<String>,
     ) -> crate::federation::cohort::RevokeSpec {
-        use crate::federation::cohort::Cohort;
-        let (scrub_signature_classical, scrub_signature_pqc) = match cohort {
-            Cohort::Family => {
-                let rec = crate::federation::types::FamilyMembershipRevocation {
-                    family_key_id: group_key_id.to_owned(),
-                    removed_identity_key_id: removed_key_id.to_owned(),
-                    removed_at: effective_at,
-                    effective_at,
-                    reason: reason.clone(),
-                    witness_set: witness_set.clone(),
-                    persist_row_hash: String::new(),
-                };
-                let (_hash, c, p) = sign_envelope(authority_key_id, &rec.signing_envelope());
-                (c, p)
-            }
-            Cohort::Community | Cohort::Affiliations => {
-                let rec = crate::federation::types::CommunityMembershipRevocation {
-                    community_key_id: group_key_id.to_owned(),
-                    removed_identity_key_id: removed_key_id.to_owned(),
-                    removed_at: effective_at,
-                    effective_at,
-                    reason: reason.clone(),
-                    witness_set: witness_set.clone(),
-                    persist_row_hash: String::new(),
-                };
-                let (_hash, c, p) = sign_envelope(authority_key_id, &rec.signing_envelope());
-                (c, p)
-            }
-            Cohort::SelfId => (String::new(), None),
-        };
-        crate::federation::cohort::RevokeSpec {
+        let mut spec = crate::federation::cohort::RevokeSpec {
             effective_at,
             reason,
             witness_set,
             authority_key_id: authority_key_id.to_owned(),
-            scrub_signature_classical,
-            scrub_signature_pqc,
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            cosignatures: Vec::new(),
+        };
+        // v61.1.0 (D7) — over the spec's own envelope, the one `revoke_member`
+        // builds; `SelfId` signs nothing.
+        if let Some(envelope) = spec.signing_envelope(cohort, group_key_id, removed_key_id) {
+            let (_hash, classical, pqc) = sign_envelope(authority_key_id, &envelope);
+            spec.scrub_signature_classical = classical;
+            spec.scrub_signature_pqc = pqc;
         }
+        spec
+    }
+
+    /// v61.1.0 (CIRISPersist#1226) — add `cosigner`'s co-signature to a
+    /// [`sign_revoke_spec`] spec: a hybrid scrub over the SAME revocation
+    /// `signing_envelope()` the primary covers, rebuilt exactly as
+    /// `FederationDirectory::revoke_member` builds the row (`removed_at` =
+    /// `effective_at`). The companion of
+    /// [`cosign_community_membership_revocation`] for the cohort door.
+    pub fn cosign_revoke_spec(
+        spec: &mut crate::federation::cohort::RevokeSpec,
+        cohort: crate::federation::cohort::Cohort,
+        group_key_id: &str,
+        removed_key_id: &str,
+        cosigner: &str,
+    ) {
+        // v61.1.0 (D7) — the spec's own envelope (`SelfId`: none, so the
+        // co-signature covers `null` and the door refuses it unread).
+        let envelope = spec
+            .signing_envelope(cohort, group_key_id, removed_key_id)
+            .unwrap_or(serde_json::Value::Null);
+        let (_hash, classical, pqc) = sign_envelope(cosigner, &envelope);
+        spec.cosignatures
+            .push(crate::federation::types::RosterCosignature {
+                authority_key_id: cosigner.to_owned(),
+                scrub_signature_classical: classical,
+                scrub_signature_pqc: pqc,
+            });
     }
 
     /// #371 — register `key_id` with its REAL deterministic hybrid pubkeys

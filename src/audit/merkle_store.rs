@@ -82,6 +82,126 @@ pub(crate) fn log_id_for_tenant(tenant_id: &str) -> String {
     format!("tenant:{tenant_id}")
 }
 
+/// v61.1.0 (CIRISPersist#1233, CC 5.3.1) — the stable token leading every
+/// refusal of an audit signed tree head that is not hybrid-signed.
+pub const AUDIT_STH_NOT_HYBRID: &str = "audit_sth_not_hybrid";
+
+/// v61.1.0 (CIRISPersist#1233) — the stable token leading a refusal of an
+/// audit signed tree head whose hybrid signature does not verify against the
+/// pinned signer.
+pub const AUDIT_STH_SIGNATURE_INVALID: &str = "audit_sth_signature_invalid";
+
+/// v61.1.0 (CIRISPersist#1233, CC 5.3.1 / CC 5.3.2.4.3.1) — **the audit
+/// gate is the hybrid-signed head.**
+///
+/// An [`AuditEntry`](crate::audit::types::AuditEntry) is a leaf: its Ed25519
+/// signature is an inner signature, and what carries the log's accountability
+/// across a node boundary is the signed tree head plus an inclusion proof
+/// under it. So the head must carry its ML-DSA-65 half: a NEW head without
+/// one is refused where it would be stored (`store_sth`, both backends), and
+/// [`verify_audit_sth`] refuses one wherever a verifier checks it.
+///
+/// It is NOT asked where a stored head is served (`latest_sth`, and so
+/// `AuditService::current_sth`): a stored head is served as itself (CC
+/// 2.6.1.8: an earlier form verifies as itself for rows anchored before the
+/// cutover), so a tenant whose head was stored by an earlier build keeps its
+/// proofs and can still append. The only head this node's store would refuse
+/// today is one written after the gate, which `store_sth` makes impossible by
+/// construction.
+///
+/// `HybridSignature` makes the half structurally REQUIRED (its `pqc` field
+/// has no serde default, so a blob with the half removed does not decode),
+/// but not NON-EMPTY: an empty or wrong-length `pqc.signature` /
+/// `pqc.public_key`, another PQC algorithm, or `mode: ClassicalOnly` all
+/// decode. This is the shape check that refuses those. It is shape only, not
+/// crypto: [`verify_audit_sth`] is the crypto check against a pinned signer.
+///
+/// # Errors
+///
+/// [`TransparencyError::Storage`] led by [`AUDIT_STH_NOT_HYBRID`].
+pub fn require_hybrid_sth(sth: &SignedTreeHead) -> Result<(), TransparencyError> {
+    use ciris_crypto::{PqcAlgorithm, SignatureMode};
+    let sig = &sth.signature;
+    let ml_dsa = PqcAlgorithm::MlDsa65;
+    let missing = if sig.mode != SignatureMode::HybridRequired {
+        Some(format!("signature mode {:?}, not HybridRequired", sig.mode))
+    } else if sig.pqc.algorithm != ml_dsa {
+        Some(format!(
+            "PQC algorithm {:?}, not ML-DSA-65",
+            sig.pqc.algorithm
+        ))
+    } else if sig.pqc.signature.len() != ml_dsa.signature_size() {
+        Some(format!(
+            "ML-DSA-65 signature is {} bytes, not {}",
+            sig.pqc.signature.len(),
+            ml_dsa.signature_size()
+        ))
+    } else if sig.pqc.public_key.len() != ml_dsa.public_key_size() {
+        Some(format!(
+            "ML-DSA-65 public key is {} bytes, not {}",
+            sig.pqc.public_key.len(),
+            ml_dsa.public_key_size()
+        ))
+    } else {
+        None
+    };
+    match missing {
+        None => Ok(()),
+        Some(why) => Err(TransparencyError::Storage(format!(
+            "{AUDIT_STH_NOT_HYBRID}: the signed tree head of {} at tree_size {} has no \
+             ML-DSA-65 half ({why}); the audit gate is the hybrid-signed head \
+             (CC 5.3.1; CIRISPersist#1233)",
+            sth.log_id, sth.tree_size
+        ))),
+    }
+}
+
+/// v61.1.0 (CIRISPersist#1233, CC 5.3.1) — **verify an audit signed tree
+/// head** against the signer a verifier has pinned, hybrid-Strict.
+///
+/// The head must first pass [`require_hybrid_sth`]; then both halves verify
+/// over [`SignedTreeHead::signing_bytes_of`] through persist's one hybrid
+/// policy layer ([`verify_hybrid`](crate::verify::hybrid::verify_hybrid),
+/// `Strict`), against the PINNED pubkeys passed in. The pubkeys embedded in
+/// the signature are never trusted (a forged head carrying its own keypair
+/// would otherwise self-certify): the gate asks about the signer the
+/// verifier pinned, not the one the head names.
+///
+/// # Errors
+///
+/// [`TransparencyError::Storage`] led by [`AUDIT_STH_NOT_HYBRID`] for a head
+/// without its ML-DSA-65 half; [`TransparencyError::Signing`] led by
+/// [`AUDIT_STH_SIGNATURE_INVALID`] when either half fails against the pinned
+/// signer.
+pub fn verify_audit_sth(
+    sth: &SignedTreeHead,
+    signer_ed25519_pubkey_b64: &str,
+    signer_ml_dsa_65_pubkey_b64: &str,
+) -> Result<(), TransparencyError> {
+    require_hybrid_sth(sth)?;
+    let (ed25519_sig_b64, ml_dsa_65_sig_b64) =
+        crate::federation::stream_sth::hybrid_signature_b64_parts(&sth.signature);
+    crate::verify::hybrid::verify_hybrid(
+        &sth.signing_bytes_of(),
+        &ed25519_sig_b64,
+        ml_dsa_65_sig_b64.as_deref(),
+        signer_ed25519_pubkey_b64,
+        Some(signer_ml_dsa_65_pubkey_b64),
+        crate::verify::hybrid::HybridPolicy::Strict,
+        None,
+    )
+    .map(|_outcome| ())
+    .map_err(|e| {
+        TransparencyError::Signing(format!(
+            "{AUDIT_STH_SIGNATURE_INVALID}: {} ({e}) for the signed tree head of {} at \
+             tree_size {}",
+            e.kind(),
+            sth.log_id,
+            sth.tree_size
+        ))
+    })
+}
+
 /// JSON-serialize the `HybridSignature` for the `signature_blob`
 /// column. Storage is JSON-as-bytes (vs JSONB) so PG and SQLite share
 /// the exact same encoding.
@@ -180,8 +300,9 @@ pub use pg_impl::PgMerkleStore;
 mod pg_impl {
     use super::{
         deserialize_signature, hash_leaf, leaf_hash_from_bytes, log_id_for_tenant,
-        root_hash_from_bytes, serialize_signature, serialize_witness_signatures, AuditLeaf,
-        DateTime, Handle, SignedTreeHead, TransparencyError, TransparencyStore, Utc,
+        require_hybrid_sth, root_hash_from_bytes, serialize_signature,
+        serialize_witness_signatures, AuditLeaf, DateTime, Handle, SignedTreeHead,
+        TransparencyError, TransparencyStore, Utc,
     };
     use crate::store::postgres::PostgresBackend;
     use ciris_verify_core::transparency::TransparencyLeaf;
@@ -460,18 +581,27 @@ mod pg_impl {
                 let signature = deserialize_signature(&sig_blob)?;
                 let witness_signatures = serde_json::from_value(witnesses_json)
                     .map_err(|e| pg_storage_err("decode witness vec", e))?;
-                Ok(Some(SignedTreeHead {
+                let sth = SignedTreeHead {
                     log_id: log_id_for_tenant(&tenant),
                     tree_size: u64::try_from(tree_size_i).unwrap_or(u64::MAX),
                     root_hash: root_hash_from_bytes(&root_bytes)?,
                     timestamp,
                     signature,
                     witness_signatures,
-                }))
+                };
+                // v61.1.0 (CIRISPersist#1233, CC 2.6.1.8) — a stored head is
+                // served AS ITSELF, with no shape gate: `store_sth` gates NEW
+                // heads, and `verify_audit_sth` is the hybrid-Strict check a
+                // verifier asks. A head stored before the gate (an earlier
+                // build) keeps its proofs, and the tenant can still append.
+                Ok(Some(sth))
             })
         }
 
         fn store_sth(&self, sth: &SignedTreeHead) -> Result<(), TransparencyError> {
+            // v61.1.0 (CIRISPersist#1233) — a head without its ML-DSA-65 half
+            // is refused before anything is written.
+            require_hybrid_sth(sth)?;
             let tenant = self.tenant_id.clone();
             let pool = self.pool.clone();
             let wait = self.checkout_wait;
@@ -553,8 +683,9 @@ pub use sqlite_impl::SqliteMerkleStore;
 mod sqlite_impl {
     use super::{
         deserialize_signature, deserialize_witness_signatures, hash_leaf, leaf_hash_from_bytes,
-        log_id_for_tenant, root_hash_from_bytes, serialize_signature, serialize_witness_signatures,
-        AuditLeaf, DateTime, Handle, SignedTreeHead, TransparencyError, TransparencyStore, Utc,
+        log_id_for_tenant, require_hybrid_sth, root_hash_from_bytes, serialize_signature,
+        serialize_witness_signatures, AuditLeaf, DateTime, Handle, SignedTreeHead,
+        TransparencyError, TransparencyStore, Utc,
     };
     use ciris_verify_core::transparency::TransparencyLeaf;
     use parking_lot::Mutex;
@@ -767,19 +898,29 @@ mod sqlite_impl {
                     let timestamp = parse_signed_at(&signed_at_str)?;
                     let signature = deserialize_signature(&sig_blob)?;
                     let witness_signatures = deserialize_witness_signatures(&witness_str)?;
-                    Ok(Some(SignedTreeHead {
+                    let sth = SignedTreeHead {
                         log_id: log_id_for_tenant(&tenant),
                         tree_size: u64::try_from(tree_size_i).unwrap_or(u64::MAX),
                         root_hash: root_hash_from_bytes(&root_bytes)?,
                         timestamp,
                         signature,
                         witness_signatures,
-                    }))
+                    };
+                    // v61.1.0 (CIRISPersist#1233, CC 2.6.1.8) — a stored head
+                    // is served AS ITSELF, with no shape gate: `store_sth`
+                    // gates NEW heads, and `verify_audit_sth` is the
+                    // hybrid-Strict check a verifier asks. A head stored before
+                    // the gate (an earlier build) keeps its proofs, and the
+                    // tenant can still append.
+                    Ok(Some(sth))
                 })()
             })
         }
 
         fn store_sth(&self, sth: &SignedTreeHead) -> Result<(), TransparencyError> {
+            // v61.1.0 (CIRISPersist#1233) — a head without its ML-DSA-65 half
+            // is refused before anything is written.
+            require_hybrid_sth(sth)?;
             let tenant = self.tenant_id.clone();
             let conn_arc = self.conn.clone();
             let tree_size = i64::try_from(sth.tree_size)

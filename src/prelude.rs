@@ -103,7 +103,7 @@ pub use crate::signing::{LocalSigner, LocalSignerConfig, LocalSignerError};
 pub use crate::verify::{
     body_sha256, canonical_payload_value, canonicalize_envelope_for_signing,
     ceg_produce_canonicalize, verify_hybrid, verify_hybrid_via_directory, verify_trace,
-    verify_trace_via_directory, Canonicalizer, HybridPolicy, HybridVerifyError, PublicKeyDirectory,
+    Canonicalizer, HybridPolicy, HybridVerifyError, PublicKeyDirectory,
     PythonJsonDumpsCanonicalizer, VerifyOutcome,
 };
 

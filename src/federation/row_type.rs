@@ -392,18 +392,89 @@ pub fn composer_dimension_would_refuse_total() -> Vec<(String, u64)> {
         .collect()
 }
 
-/// The claim token a row carries for the readers that predate CC 2.4 — age
-/// and capacity assurance: the envelope `dimension` of a `scores` row (CC's
-/// shape), else the `attestation_type` itself (the type-slot shape rows
-/// already held were written in). Both shapes resolve identically, so an
-/// emitter can move to `scores` without its subject's band changing.
+static SUBSTRATE_SELF_REPORT_WOULD_REFUSE: Mutex<BTreeMap<String, u64>> =
+    Mutex::new(BTreeMap::new());
+
+/// v61.1.0 (CIRISPersist#1174 item 3, as ruled) — a peer's or replicated
+/// substrate self-report row about another key
+/// (`admission::check_substrate_self_report_attester`) was admitted under
+/// report. Counted by family stem (bounded as every peer-chosen label is) and
+/// logged with the refusal's token,
+/// `substrate_self_report_names_another_party`.
+pub(crate) fn record_substrate_self_report_would_refuse(row: &Attestation, refusal: &Error) {
+    let family = claim_token(row).unwrap_or("");
+    let stem = type_stem(family);
+    bump(&SUBSTRATE_SELF_REPORT_WOULD_REFUSE, stem.clone());
+    tracing::warn!(
+        metric = "persist_substrate_self_report_would_refuse_total",
+        reason = super::admission::SUBSTRATE_SELF_REPORT_SUBJECT_REASON,
+        type_stem = %stem,
+        attestation_id = %row.attestation_id,
+        attesting_key_id = %row.attesting_key_id,
+        attested_key_id = %row.attested_key_id,
+        error = %refusal,
+        "admitted a replicated substrate self-report about another key \
+         (substrate_self_report_names_another_party; CC 3.4.3): this node refuses its own such \
+         writes, and reports a peer's until v62 refuses them"
+    );
+}
+
+/// `persist_substrate_self_report_would_refuse_total{type_stem}` since
+/// process start.
+#[must_use]
+pub fn substrate_self_report_would_refuse_total() -> Vec<(String, u64)> {
+    SUBSTRATE_SELF_REPORT_WOULD_REFUSE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect()
+}
+
+/// **The row's family, in either form** — the one classifier every
+/// family-keyed reader and gate asks: the envelope `dimension` of a `scores`
+/// row (CC 2.4's shape), else the `attestation_type` itself (the type-slot
+/// shape rows already held were written in, which `ROW_TYPE_ENFORCEMENT =
+/// Report` still admits). Both shapes resolve identically, so an emitter can
+/// move to `scores` without its subject's band changing — and without the row
+/// slipping past a gate that names its family.
+///
+/// v61.1.0 (CIRISPersist#1174) — four admission gates keyed on the type slot
+/// (or a dimension prefix) alone, so a `scores` row met none of them: the
+/// `health:liveness:` self-emission ban, the `hard_case:` emitter rule, the
+/// CC 3.4.3 substrate self-report attester, and `trace_summary:`. Each now
+/// asks this function (or [`claim_token_of`] where the door holds no row
+/// yet), so both forms meet the same gate. A composer's verb is its token,
+/// which names no family: a `dimension` label on a composer is the dimension
+/// gate's to judge under the CC 2.4 ask 3 Report latch, not these gates'.
 #[must_use]
 pub fn claim_token(row: &Attestation) -> Option<&str> {
-    if row.attestation_type == crate::federation::types::attestation_type::SCORES {
-        super::admission::envelope_dimension(&row.attestation_envelope)
+    claim_token_of(
+        &row.attestation_type,
+        super::admission::envelope_dimension(&row.attestation_envelope),
+    )
+}
+
+/// [`claim_token`] over a row's two parts, for a door that holds them before
+/// there is a row (the local write).
+#[must_use]
+pub fn claim_token_of<'a>(
+    attestation_type: &'a str,
+    dimension: Option<&'a str>,
+) -> Option<&'a str> {
+    if attestation_type == crate::federation::types::attestation_type::SCORES {
+        dimension
     } else {
-        Some(row.attestation_type.as_str())
+        Some(attestation_type)
     }
+}
+
+/// v61.1.0 (CIRISPersist#1174) — the row's [`claim_token`] when it lies under
+/// `prefix` (a literal, trailing-colon-significant stem such as
+/// `"hard_case:"`), in either form; `None` otherwise.
+#[must_use]
+pub fn claim_token_under<'r>(row: &'r Attestation, prefix: &str) -> Option<&'r str> {
+    claim_token(row).filter(|t| t.starts_with(prefix))
 }
 
 // ── the serve filter ─────────────────────────────────────────────────
@@ -609,6 +680,10 @@ pub struct RowTypeReport {
     pub admitted_unregistered: Vec<LabelCount>,
     /// `persist_composer_dimension_would_refuse_total{label}`.
     pub composer_dimension_would_refuse: Vec<LabelCount>,
+    /// v61.1.0 — `persist_substrate_self_report_would_refuse_total{type_stem}`:
+    /// replicated substrate self-reports about another key, admitted under
+    /// report (CC 3.4.3; refused from v62).
+    pub substrate_self_report_would_refuse: Vec<LabelCount>,
 }
 
 /// Build the [`RowTypeReport`] from `dir`'s census and this process's
@@ -641,5 +716,6 @@ pub async fn row_type_report(dir: &dyn FederationDirectory) -> Result<RowTypeRep
         held_unregistered,
         admitted_unregistered: counts(unregistered_admitted_total()),
         composer_dimension_would_refuse: counts(composer_dimension_would_refuse_total()),
+        substrate_self_report_would_refuse: counts(substrate_self_report_would_refuse_total()),
     })
 }

@@ -1060,6 +1060,8 @@ where
         signers: &signers,
         direction: super::consensus::Direction::Add,
         subject: None,
+        // The trust root's chain keeps the per-key count (CIRISPersist#1198).
+        persons: super::key_person::PersonsAt::each_key(),
     });
     if !verdict.admits() {
         return Err(Error::RosterAuthorityUnauthorized {
@@ -3915,6 +3917,8 @@ where
         signers: &signers,
         direction: super::consensus::Direction::Add,
         subject: None,
+        // The trust root's chain keeps the per-key count (CIRISPersist#1198).
+        persons: super::key_person::PersonsAt::each_key(),
     });
     match verdict {
         super::consensus::Verdict::Admit => Ok(Ok(signers)),

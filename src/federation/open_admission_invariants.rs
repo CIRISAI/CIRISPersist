@@ -31,6 +31,12 @@
 //!   door, the requester accepts on their own node, and the member's node
 //!   admits the acceptance and the requester's own widening. A withdrawn
 //!   proposal is no longer live; a private room has none.
+//! - **I1624** (v61.1.0, CIRISPersist#1188) — the live standing proposal is
+//!   re-judged at the read: a public room not under `open:self_admit` serves
+//!   none (even holding a founder's, stored before the room was); an
+//!   invitation is not one; a resigned founder's is not live; a founder's
+//!   occurrence key signs a live one; a stranger's `withdraws`, held before
+//!   the proposal, retires nothing.
 //! - **I1505** (CIRISPersist#1100 item 2(i)) — under `reverse_quorum` a
 //!   WIDENING is reversible by the same objection fold as a removal: `m`
 //!   distinct in-window objectors take the added member back off; one
@@ -1091,6 +1097,196 @@ pub(crate) mod two_node {
             .unwrap();
         assert!(live_standing_proposal(a, &private).await.unwrap().is_none());
     }
+
+    /// A standing proposal (no invitee) by `signer` into `cid`, at `at`.
+    fn standing(
+        signer: &str,
+        cid: &str,
+        at: chrono::DateTime<Utc>,
+    ) -> crate::federation::Attestation {
+        let mut p = proposal(
+            signer,
+            COMMUNITY,
+            cid,
+            "",
+            None,
+            at,
+            Some(Duration::days(7)),
+        );
+        p.subject_key_ids.clear();
+        ts::seal_row_in_place(signer, &mut p);
+        p
+    }
+
+    /// **I1624** (CIRISPersist#1188, the six `live_standing_proposal`
+    /// survivors; CIRISPersist#1063, CC 3.2) — **the live standing proposal
+    /// is re-judged at the read.** What the door admitted is asked again
+    /// against the room as it is now:
+    ///
+    /// - a `public` room that is not under `open:self_admit` serves none,
+    ///   even holding a founder's standing proposal (one held before the room
+    ///   was, which the door could not judge);
+    /// - an invitation (a proposal naming its invitee) is not a standing
+    ///   proposal;
+    /// - a standing proposal whose founder has since resigned is not live;
+    /// - a founder's standing proposal signed on the founder's occurrence
+    ///   key is live (the proposer is the founder, not the key);
+    /// - only the proposer's own `withdraws` retires one: a stranger's,
+    ///   held before the proposal arrived, does not.
+    pub(crate) async fn i1624_a_standing_proposal_is_judged_at_the_read(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        let k = |n: &str| format!("i1624-{n}-{s}");
+        let (f, f2, dv, x, j, cid, quorum_room) = (
+            k("f"),
+            k("f2"),
+            k("dv"),
+            k("x"),
+            k("j"),
+            k("pub"),
+            k("pubq"),
+        );
+        reg(d, &[&f, &f2, &dv, &x, &j, &cid, &quorum_room]).await;
+        let at = Utc::now() - Duration::hours(1);
+
+        // A public room under quorum:1/1, its founder's standing proposal held
+        // before the room was: not an open room, so none is served.
+        let early = standing(&f, &quorum_room, at);
+        put(d, &early)
+            .await
+            .expect("I1624: a proposal for a group not held here is stored");
+        found_public_room(d, &quorum_room, "quorum:1/1", &[&f], &[])
+            .await
+            .expect("I1624: a public room under quorum:1/1");
+        assert!(
+            d.get_attestation(&early.attestation_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "I1624: the founder's standing proposal is held"
+        );
+        assert!(
+            live_standing_proposal(d, &quorum_room)
+                .await
+                .unwrap()
+                .is_none(),
+            "I1624: a public room that is not open serves no standing proposal"
+        );
+
+        found_public_room(d, &cid, OPEN_SELF_ADMIT, &[&f, &f2], &[])
+            .await
+            .unwrap();
+        // An invitation is not a standing proposal.
+        put(
+            d,
+            &proposal(&f, COMMUNITY, &cid, &j, None, at, Some(Duration::days(7))),
+        )
+        .await
+        .expect("I1624: a founder's invitation");
+        assert!(
+            live_standing_proposal(d, &cid).await.unwrap().is_none(),
+            "I1624: an invitation is not served as the standing proposal"
+        );
+
+        // A founder's standing proposal, then the founder resigns.
+        let by_f2 = standing(&f2, &cid, at + Duration::minutes(1));
+        put(d, &by_f2).await.expect("I1624: f2's standing proposal");
+        assert_eq!(
+            live_standing_proposal(d, &cid)
+                .await
+                .unwrap()
+                .map(|p| p.attestation_id),
+            Some(by_f2.attestation_id.clone()),
+            "I1624: f2's standing proposal is live while f2 is a founder"
+        );
+        let resigned_at = chrono::DateTime::<Utc>::from_timestamp_millis(
+            (Utc::now() - Duration::minutes(30)).timestamp_millis(),
+        )
+        .expect("ms instant");
+        d.put_community_membership_revocation(ts::sign_community_membership_revocation(
+            &f2,
+            crate::federation::types::CommunityMembershipRevocation {
+                community_key_id: cid.clone(),
+                removed_identity_key_id: f2.clone(),
+                removed_at: resigned_at,
+                effective_at: resigned_at,
+                reason: None,
+                witness_set: Vec::new(),
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .expect("I1624: f2 resigns");
+        assert!(
+            live_standing_proposal(d, &cid).await.unwrap().is_none(),
+            "I1624: a resigned founder's standing proposal is not live"
+        );
+
+        // The founder's occurrence key signs one: the proposer is the founder.
+        let t = |secs: i64| {
+            chrono::DateTime::<Utc>::from_timestamp_millis(
+                (Utc::now() - Duration::seconds(secs)).timestamp_millis(),
+            )
+            .expect("ms instant")
+        };
+        for (signer, when) in [(&f, t(3)), (&dv, t(1))] {
+            d.put_identity_occurrence(
+                ts::signed_content_only_occurrence(signer, &f, &dv, when).await,
+            )
+            .await
+            .expect("I1624: the occurrence binding, both halves");
+        }
+        let by_device = standing(&dv, &cid, at + Duration::minutes(2));
+        put(d, &by_device)
+            .await
+            .expect("I1624: the founder's standing proposal on its occurrence key");
+        assert_eq!(
+            live_standing_proposal(d, &cid)
+                .await
+                .unwrap()
+                .map(|p| p.attestation_id),
+            Some(by_device.attestation_id.clone()),
+            "I1624: a founder's occurrence-signed standing proposal is live"
+        );
+
+        // A stranger's withdraws, held before the proposal it names.
+        let later = standing(&f, &cid, at + Duration::minutes(3));
+        let mut w = ts::bare_attestation(
+            &uuid::Uuid::new_v4().to_string(),
+            &x,
+            &x,
+            &serde_json::json!({
+                "references_attestation_id": later.attestation_id,
+                "withdrawal_reason": "I1624",
+            }),
+        );
+        w.attestation_type = attestation_type::WITHDRAWS.into();
+        w.weight = None;
+        ts::seal_row_in_place(&x, &mut w);
+        put(d, &w)
+            .await
+            .expect("I1624: a withdraws whose target is not held is admitted deferred");
+        put(d, &later)
+            .await
+            .expect("I1624: f's later standing proposal");
+        assert!(
+            d.list_attestations_referencing(&later.attestation_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|c| c.attestation_id == w.attestation_id),
+            "I1624: the stranger's withdraws references the proposal (else this proves nothing)"
+        );
+        assert_eq!(
+            live_standing_proposal(d, &cid)
+                .await
+                .unwrap()
+                .map(|p| p.attestation_id),
+            Some(later.attestation_id.clone()),
+            "I1624: a stranger's withdraws retires no standing proposal"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -1121,6 +1317,16 @@ mod runners {
                 case!(i1515_removal_window_under_open_self_admit);
                 case!(i1518_founder_only_admits_only_its_escape);
                 case!(i1505_a_widening_is_reversible_under_reverse_quorum);
+
+                #[tokio::test]
+                async fn i1624_a_standing_proposal_is_judged_at_the_read() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::two_node::i1624_a_standing_proposal_is_judged_at_the_read(
+                        &d as &dyn FederationDirectory,
+                        &suffix(),
+                    )
+                    .await
+                }
 
                 #[tokio::test]
                 async fn i1518b_the_escape_replicates() {

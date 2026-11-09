@@ -772,7 +772,26 @@ class Engine:
         """(derived) deontic — #249 Cut G3.5 (§5) — build the canonical membership-change payload for a roster change on group_key_id (verify v6.9.0's build_membership_change, wi..."""
 
     def cohort_revoke_member(self, cohort: str, group_key_id: str, removed_key_id: str, revoke_spec_json: str) -> None:
-        """(derived) deontic — #249 Cut G1 (§1) — remove removed_key_id from a cohort roster via the append-only revocation table. revoke_spec_json is a [crate::federation::cohor..."""
+        """#249 Cut G1 (§1) — remove ``removed_key_id`` from a cohort roster via
+        the append-only revocation table.
+
+        ``revoke_spec_json`` is a ``RevokeSpec``: ``{effective_at, reason?,
+        witness_set?, authority_key_id, scrub_signature_classical,
+        scrub_signature_pqc?, cosignatures?}``. The primary signature is over
+        the revocation's ``signing_envelope()`` with ``removed_at ==
+        effective_at``.
+
+        v61.1.0 (CIRISPersist#1226; CC rc14 4.4.3.2.8,
+        ``CLM-affiliation-one-voice-countersign``) — ``cosignatures`` is a list
+        of ``{authority_key_id, scrub_signature_classical,
+        scrub_signature_pqc?}``, each over the SAME envelope (the shape
+        ``put_community_json`` takes). A one-founder affiliation removes a
+        member only with a countersign from a designated official outside the
+        seat; that countersign rides here. Each co-signature is verified
+        against its signer's registered keys and only verified signers count.
+        Absent = none; a malformed list raises ``ValueError``; a ``self``
+        removal carrying one raises ``ValueError``.
+        """
 
     def cohort_supersede_group(self, cohort: str, new_group_json: str, authorization_json: str | None = None) -> int:
         """(derived) deontic — #249 Cut G2 (§3) — supersede a family/community with new content (new_group_json is the raw Family/Community object, like put_family_json) as a new..."""
@@ -1658,20 +1677,59 @@ class Engine:
         ed25519_pubkey_b64: str,
         ml_dsa_65_pubkey_b64: str | None,
         policy: str,
-    ) -> None:
+        soft_freshness_window_seconds: float | None = None,
+        row_age_seconds: float | None = None,
+    ) -> dict[str, Any]:
         """Verify a hybrid (Ed25519 + ML-DSA-65) signature over
-        ``canonical_bytes`` against caller-supplied pubkeys. ``policy``
-        is one of ``"strict"`` (both signatures required) /
-        ``"either"`` (one or the other) / ``"prefer_pqc"`` (PQC if
-        present, fall back to classical).
+        ``canonical_bytes`` against caller-supplied pubkeys. Both halves
+        are required.
+
+        ``policy`` accepts only ``"strict"`` (v61.1.0, CIRISPersist#1233,
+        CC 5.3.2.4.3.1: a verifier's hybrid-required check is always-on,
+        never an operator toggle). Any other value, including the former
+        ``"ed25519_fallback"`` and ``"soft_freshness"``, raises
+        ``ValueError("verify_policy_violation")`` before any decode or
+        crypto runs. The argument is removed in v62;
+        ``soft_freshness_window_seconds`` and ``row_age_seconds`` are
+        ignored.
+
+        Returns ``{"outcome": "hybrid_verified", "row_age_seconds": None}``.
 
         Raises:
-            ValueError: ``verify_signature_invalid`` /
-                ``verify_unknown_algorithm`` / ``verify_policy_violation``.
+            ValueError: ``verify_policy_violation`` /
+                ``verify_hybrid_pending_rejected`` (no PQC half) /
+                ``verify_hybrid_pqc_fields_mismatch`` /
+                ``verify_hybrid_base64`` / ``verify_hybrid_invalid_length`` /
+                ``verify_hybrid_crypto``.
         """
 
-    def verify_hybrid_via_directory(self, canonical_bytes: bytes, signature_key_id: str, ed25519_sig_b64: str, ml_dsa_65_sig_b64: str | None, policy: str, soft_freshness_window_seconds: float | None = None, row_age_seconds: float | None = None) -> dict[str, Any]:
-        """(derived) deontic — v0.4.0 / v0.4.1 — Hybrid verify with internal directory lookup. v0.4.1 backs onto the Rust free function crate::verify::verify_hybrid_via_directory..."""
+    def verify_hybrid_via_directory(
+        self,
+        canonical_bytes: bytes,
+        signature_key_id: str,
+        ed25519_sig_b64: str,
+        ml_dsa_65_sig_b64: str | None,
+        policy: str,
+        soft_freshness_window_seconds: float | None = None,
+        row_age_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """Hybrid verify against the pubkeys ``signature_key_id`` resolves to
+        in ``federation_keys``.
+
+        ``policy`` accepts only ``"strict"`` (v61.1.0, CIRISPersist#1233,
+        CC 5.3.2.4.3.1). Any other value raises
+        ``ValueError("verify_policy_violation")`` before the directory
+        lookup or any crypto runs. The argument is removed in v62. The
+        same rule applies to ``verify_signed_key_record``,
+        ``verify_signed_attestation`` and ``verify_signed_revocation``,
+        which route through this method.
+
+        Returns ``{"outcome": "hybrid_verified", "row_age_seconds": None}``.
+
+        Raises:
+            ValueError: ``verify_policy_violation`` / ``verify_unknown_key``
+                / the ``verify_hybrid_*`` tokens of ``verify_hybrid``.
+        """
 
     def verify_signed_attestation(self, signed_attestation_json: str, policy: str, soft_freshness_window_seconds: float | None = None, row_age_seconds: float | None = None) -> dict[str, Any]:
         """(derived) deontic — v0.4.0 — Verify a SignedAttestation envelope. Same shape as verify_signed_key_record; canonical bytes come from attestation_envelope."""
@@ -2463,7 +2521,7 @@ class Engine:
         """(derived) epistemic — Temporal drift between two windows for one agent. Returns JSON array of TemporalDriftRow."""
 
     def verify_trace(self, complete_trace_json: str) -> dict[str, Any]:
-        """(derived) epistemic — v0.4.0 — Verify a CompleteTrace envelope end-to-end. Looks up signature_key_id via the federation directory, reconstructs canonical bytes per trace..."""
+        """(derived) epistemic — v0.4.0 — Verify a CompleteTrace envelope end-to-end, WITHOUT storing it (dry-run validation, pre-storage check, audit replay)."""
 
 
     # ==============================================================
@@ -3019,6 +3077,9 @@ class Engine:
     def list_attestations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) empirical — v21.1.0 (CIRISPersist#507c) — bulk-list Attestation rows since a cursor, as a JSON array, federation tier only (the E5 invariant — a local-tier row..."""
 
+    def list_attestations_since_by_prefixes(self, since_rfc3339: str | None, since_id: str | None, family_prefixes: list[str], limit: int) -> str:
+        """(derived) empirical — v61.1.0 (CIRISPersist#1190) — list_attestations_since narrowed by family: the federation-tier rows whose family (row_type::claim_token: a scores ro..."""
+
     def list_canonical_servers(self) -> str:
         """(derived) empirical — v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the canonical / founding bootstrap servers as a JSON array of KeyRecords (federation_keys rows w..."""
 
@@ -3124,6 +3185,9 @@ class Engine:
 
     def list_outbound(self, limit: int = 100, status: str | None = None, destination_key_id: str | None = None, sender_key_id: str | None = None, message_type: str | None = None, enqueued_after_rfc3339: str | None = None) -> list[Any]:
         """(derived) empirical — v0.4.0 — List outbound rows with optional filters. Returns a list of dicts. All filter parameters are optional; combine with AND."""
+
+    def list_owner_bindings_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
+        """(derived) empirical — v61.1.0 (CIRISPersist#1163, CC 5.4.6) — the announced-roster change feed: after the serve position (since_rfc3339, since_id), one item per node who..."""
 
     def list_retention(self) -> str:
         """(derived) empirical — v6.0.1 (CIRISPersist#218) — All stored retention policies as a JSON-encoded array of RetentionPolicyRow ({table_name, policy})."""
@@ -4368,6 +4432,15 @@ def transform_algebra_hash() -> str:
 
     Axiomatic: cross-checked against the other processors' pinned copies.
     """
+
+
+# ==================================================================
+# EMPIRICAL  (descriptive)
+# Varying one of these makes a checkable, re-derivable world-fact wrong.
+# ==================================================================
+
+def set_caller_scope(label: str | None = None) -> str | None:
+    """(derived) empirical — v61.1.0 (CIRISPersist#1235) — set the caller label this thread's door reads are credited to in Engine.telemetry_snapshot()["callers"], and return t..."""
 
 
 # ==================================================================

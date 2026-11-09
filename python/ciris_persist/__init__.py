@@ -25,6 +25,9 @@ The scrubber MUST NOT alter ``trace_schema_version`` /
 Engine rejects schema-altering scrubber output.
 """
 
+import contextlib
+from collections.abc import Iterator
+
 from .ciris_persist import (
     Conflict,
     Engine,
@@ -50,6 +53,7 @@ from .ciris_persist import (
     namespace_manifest_version,
     persist_field_conformance,
     reset_engine,
+    set_caller_scope,
     transform_algebra_hash,
 )
 
@@ -100,7 +104,29 @@ __all__ = [
     "accord_threshold_for",
     "dimension_rejection_is_retryable",
     "key_grant_refusal_is_retryable",
+    # v61.1.0 (CIRISPersist#1235) — read attribution: the caller label this
+    # thread's reads are credited to, and its context manager.
+    "set_caller_scope",
+    "caller_scope",
 ]
+
+
+@contextlib.contextmanager
+def caller_scope(label: str | None) -> Iterator[None]:
+    """v61.1.0 (CIRISPersist#1235) — credit the door reads this thread makes
+    inside the block to ``label`` in ``Engine.telemetry_snapshot()["callers"]``.
+
+    Nested blocks: the innermost label wins, and leaving a block restores the
+    label of the one around it. ``None`` clears the label for the block. The
+    scope is per OS thread (an ``asyncio.to_thread`` call runs on another
+    thread and carries no label unless it enters its own block). A malformed
+    label raises ``ValueError`` on entry; see :func:`set_caller_scope`.
+    """
+    previous = set_caller_scope(label)
+    try:
+        yield
+    finally:
+        set_caller_scope(previous)
 
 # v3.12.2 (CIRISPersist#156) — diagnostic harness surface. Re-exported
 # only when the underlying Rust wheel was built with `--features

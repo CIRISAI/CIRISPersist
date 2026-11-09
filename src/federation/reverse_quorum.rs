@@ -202,7 +202,8 @@
 use chrono::{DateTime, Duration, Utc};
 
 use super::attestation_query::{AttestationQuery, FOLD_PAGE};
-use super::types::Attestation;
+use super::key_person::{KeySelves, PersonsAt, NO_KEY_SELVES};
+use super::types::{attestation_type, Attestation};
 use super::{cohort::Cohort, Error, FederationDirectory};
 
 /// The `scores` dimension an objection carries: *"I, a member of this cohort,
@@ -716,10 +717,8 @@ pub const OBJECTION_THRESHOLD: usize = 1;
 /// what makes this the correct reading of "1-of-N to protect" rather than a
 /// hole in it.
 ///
-/// This is also the only retraction path a member has. The ordinary
-/// `withdraws` grammar names a KEY (`attested_key_id`), not a specific
-/// attestation, so it cannot single out one objection among several against
-/// the same actor.
+/// A `withdraws` naming the objection by `references_attestation_id` retracts
+/// it too, from any key of the same fedID (CC 4.5.13).
 #[must_use]
 pub fn dismissal_required(
     policy: &ReverseQuorumPolicy,
@@ -760,14 +759,6 @@ pub enum ObjectionRefusalReason {
     /// that declared neither is exactly the "stored label nobody consumes"
     /// failure #574 was filed about, one layer deeper.
     NotGoverned,
-    /// The signer is not on the cohort's revocation-folded active roster. The
-    /// ONLY test the 1-of-N protective gate applies — and the reason a
-    /// non-member's objection never becomes a marker others might honour.
-    NotACohortMember,
-    /// The objected-to `attestation_id` is not held by this node. Nothing can
-    /// object to a row that is not here; the objection would be uncountable
-    /// and its window unresolvable.
-    TargetActionUnknown,
     /// The row's envelope `dimension` is not the one this door admits
     /// ([`DIMENSION_OBJECTION`] / [`DIMENSION_DISMISSAL`]). Wrong door.
     DimensionMismatch,
@@ -778,12 +769,6 @@ pub enum ObjectionRefusalReason {
     /// The row's own scrub signature did not verify against the signer's
     /// pubkeys as registered on THIS node.
     UnverifiableSignature,
-    /// This member already holds a live objection against this action. One
-    /// member is one objection: without this, a single member could raise `m`
-    /// of them and reach the reversal threshold alone. (The fold counts
-    /// DISTINCT objectors regardless — this refusal keeps the corpus clean;
-    /// the distinctness in [`fold_reverse_quorum`] is what makes it safe.)
-    DuplicateObjection,
     /// The row's `attested_key_id` is not the objected-to action's AUTHOR.
     ///
     /// Objections and dismissals are found by
@@ -793,16 +778,6 @@ pub enum ObjectionRefusalReason {
     /// instead: the preserve set must equal the verified set, and a marker
     /// nobody can find is not a marker.
     NotFiledAgainstActor,
-    /// A dismissal's [`field::DISMISSES`] does not resolve to an objection
-    /// this node holds against the SAME action — the row is absent, is not an
-    /// [`DIMENSION_OBJECTION`] row, or objects to something else. Tested here
-    /// exactly as [`resolve_reverse_quorum`] tests it at read time, so a
-    /// dismissal cannot be admitted under one rule and re-priced under another.
-    ObjectionUnknown,
-    /// A dismissal carried fewer distinct verified roster co-signatures than
-    /// [`ReverseQuorumPolicy::dismissal_threshold`] demands. The shortfall's
-    /// numbers ride on the accompanying [`DismissalQuorum`].
-    DismissalQuorumShort,
     /// CIRISPersist#591 — a BALLOT ([`DIMENSION_UPHELD`] /
     /// [`DIMENSION_OVERRULED`]) named a cohort whose `consensus_protocol`
     /// declares a `reverse_quorum:*` but no `+escalate:` steward tier. There is
@@ -838,15 +813,10 @@ impl ObjectionRefusalReason {
         match self {
             Self::CohortUnknown => "cohort_unknown",
             Self::NotGoverned => "not_governed",
-            Self::NotACohortMember => "not_a_cohort_member",
-            Self::TargetActionUnknown => "target_action_unknown",
             Self::DimensionMismatch => "dimension_mismatch",
             Self::MalformedEnvelope => "malformed_envelope",
             Self::UnverifiableSignature => "unverifiable_signature",
-            Self::DuplicateObjection => "duplicate_objection",
             Self::NotFiledAgainstActor => "not_filed_against_actor",
-            Self::ObjectionUnknown => "objection_unknown",
-            Self::DismissalQuorumShort => "dismissal_quorum_short",
             Self::StewardTierNotAdopted => "steward_tier_not_adopted",
             Self::ActorRecused => "actor_recused",
             Self::BallotPredatesAction => "ballot_predates_action",
@@ -857,15 +827,10 @@ impl ObjectionRefusalReason {
     pub const ALL: &'static [Self] = &[
         Self::CohortUnknown,
         Self::NotGoverned,
-        Self::NotACohortMember,
-        Self::TargetActionUnknown,
         Self::DimensionMismatch,
         Self::MalformedEnvelope,
         Self::UnverifiableSignature,
-        Self::DuplicateObjection,
         Self::NotFiledAgainstActor,
-        Self::ObjectionUnknown,
-        Self::DismissalQuorumShort,
         Self::StewardTierNotAdopted,
         Self::ActorRecused,
         Self::BallotPredatesAction,
@@ -1150,9 +1115,9 @@ pub struct ObjectionEscalation {
     pub respondents: usize,
     /// [`escalated_dismissal_required`] for that respondent count.
     pub required: usize,
-    /// Distinct respondents whose governing ballot upholds.
+    /// Distinct persons whose voice upholds.
     pub uphold_ballots: usize,
-    /// Distinct respondents whose governing ballot overrules.
+    /// Distinct persons whose voice overrules.
     pub overrule_ballots: usize,
     /// The `attestation_id`s of the GOVERNING ballots — one per respondent,
     /// sorted. A member who balloted twice contributes only the ballot that
@@ -1287,6 +1252,14 @@ pub struct ReverseQuorumInputs<'a> {
     pub policy: Option<ReverseQuorumPolicy>,
     /// The read-time instant every window is compared against.
     pub now: DateTime<Utc>,
+    /// CIRISPersist#1198 (CC 4.5.13) — the persons behind the keys, at the
+    /// count. A tally counts fedIDs, so `roster` and `duty_holders` are read
+    /// as the persons they seat. [`PersonsAt::each_key`] is the per-key count.
+    pub persons: PersonsAt<'a>,
+    /// When THIS node first held a vote on the action: the steward window's
+    /// start (V213). `None` is a node with no receipt, which reads the
+    /// action's signed instant.
+    pub first_held: Option<DateTime<Utc>>,
 }
 
 /// The **pure fold**: a function of `(action, objections, dismissals, roster,
@@ -1348,6 +1321,8 @@ pub fn fold_reverse_quorum(
         duty_holders: &[],
         policy,
         now,
+        persons: PersonsAt::each_key(),
+        first_held: None,
     })
 }
 
@@ -1372,30 +1347,30 @@ pub fn fold_reverse_quorum(
 ///    moderator is the actor folds to
 ///    [`StewardTierStanding::NoDutyHolders`] and escalates, rather than letting
 ///    that moderator rule on the objection to their own act.
-/// 2. **The duty-holders' ruling**, over ballots asserted at or before the
-///    deadline. An upholding ruling at
+/// 2. **The duty-holders' ruling**, over every held ballot of theirs: a held
+///    row beats a window. An upholding ruling at
 ///    [`ReverseQuorumPolicy::steward_ruling_threshold`] closes escalation; an
 ///    overruling one is recorded and does not, because it is an undo.
 /// 3. **The respondent pool**, over every ballot from a roster member, with no
 ///    deadline — a bounded ballot window would recreate the exact
-///    lapse-without-a-judgement failure #591 is about, one layer down. A
-///    duty-holder who turns up after the deadline participates here as an
-///    ordinary member; silence at the deadline is a fact of the record and is
-///    not undone by arriving late.
+///    lapse-without-a-judgement failure #591 is about, one layer down.
 ///
-/// Ballots are counted **one per author**, by the same `(asserted_at,
-/// protective-side-wins, attestation_id)` ordering
-/// [`fold_quarantine`](super::quarantine::fold_quarantine) uses — so a member
-/// may change their mind (the latest ballot governs) and a same-instant
-/// contradiction resolves fail-secure to UPHELD, deterministically, on every
-/// node.
+/// **The tier is a window; the tally is not** (CC's ruling on #1198). The
+/// numbers are the same on every node holding the same rows. Whether the tier
+/// is still `Awaiting` is this node's: the deadline runs from its first-held
+/// instant ([`ReverseQuorumInputs::first_held`]), so it closes once and never
+/// reopens, and nodes converge once every window has closed.
 ///
-/// A ballot must be dated at or after the action it judges and at or before
-/// `now`. The `now` bound is the one asymmetry with the objection count, and it
-/// is deliberate: an objection's `asserted_at` is already bounded above by the
-/// objection window, so a future-dated one cannot count, while a ballot has no
-/// upper window — without this bound three ballots dated 2099 would resolve an
-/// escalation today.
+/// Ballots are counted **one voice per person** (CC 4.5.13, see [`voices`]):
+/// a person's agreeing rows are one voice and rows that disagree are none. A
+/// member changes their mind by withdrawing the row they no longer stand by;
+/// no instant orders one person's rows, so every node holding the same rows
+/// reaches the same count. [`resolve_reverse_quorum`] drops withdrawn rows
+/// before this fold sees them.
+///
+/// A ballot must be dated at or after the action it judges. No clock bounds
+/// it above: the universal signed-instant gate at the door refuses a row dated
+/// past its skew, and a row held is counted (CC's ruling on #1198, item 1).
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuorumFold {
@@ -1408,14 +1383,17 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
         duty_holders,
         policy,
         now,
+        persons,
+        first_held,
     } = inputs;
+    let seated = persons.seated(roster);
     let Some(policy) = policy else {
         return ReverseQuorumFold {
             standing: ReverseQuorumStanding::NotGoverned,
             policy: None,
             distinct_objectors: 0,
             required: 0,
-            roster_size: roster.len(),
+            roster_size: seated.len(),
             window_opens_at: action.asserted_at,
             window_closes_at: action.asserted_at,
             window_open: false,
@@ -1428,8 +1406,8 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
     };
 
     let (opens, closes) = policy.window(action.asserted_at);
-    let required = policy.reversal_threshold(roster.len());
-    let steward_deadline = policy.steward_deadline(action.asserted_at);
+    let required = policy.reversal_threshold(seated.len());
+    let steward_deadline = policy.steward_deadline(first_held.unwrap_or(action.asserted_at));
 
     // Which objections has a (pre-verified) dismissal named?
     let mut dismissed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -1442,8 +1420,9 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
         }
     }
 
-    let mut counted_ids: Vec<String> = Vec::new();
-    let mut objectors: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    // One person, one objection, however many rows: the lowest id stands for
+    // the voice, so the report does not depend on row order.
+    let mut objectors: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
     let mut dismissed_ids: Vec<String> = Vec::new();
     let mut escalated_ids: Vec<String> = Vec::new();
     let mut escalation: Vec<ObjectionEscalation> = Vec::new();
@@ -1454,9 +1433,12 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
         if envelope_str(o, field::OBJECTS_TO) != Some(action.action_id) {
             continue;
         }
-        if !roster.iter().any(|k| k == &o.attesting_key_id) {
+        let Some(person) = persons
+            .voice(&o.attesting_key_id)
+            .filter(|person| seated.contains(person))
+        else {
             continue;
-        }
+        };
         if o.asserted_at < opens || o.asserted_at > closes {
             continue;
         }
@@ -1468,7 +1450,16 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
             continue;
         }
         if policy.steward.is_some() {
-            let record = escalate_objection(action, o, ballots, roster, duty_holders, &policy, now);
+            let record = escalate_objection(
+                action,
+                o,
+                ballots,
+                roster,
+                duty_holders,
+                &policy,
+                steward_deadline.is_some_and(|d| now >= d),
+                persons,
+            );
             let overruled = record.outcome == EscalationOutcome::Dismissed;
             escalation.push(record);
             if overruled {
@@ -1476,12 +1467,14 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
                 continue;
             }
         }
-        // DISTINCT objectors — one member is one objection, however many rows
-        // that member authored.
-        if objectors.insert(o.attesting_key_id.as_str()) {
-            counted_ids.push(o.attestation_id.clone());
-        }
+        // DISTINCT objectors — one person is one objection, however many rows
+        // that person authored, on however many devices.
+        objectors
+            .entry(person)
+            .and_modify(|id| *id = (*id).min(o.attestation_id.as_str()))
+            .or_insert(o.attestation_id.as_str());
     }
+    let mut counted_ids: Vec<String> = objectors.values().map(|id| (*id).to_owned()).collect();
     counted_ids.sort();
     dismissed_ids.sort();
     escalated_ids.sort();
@@ -1501,7 +1494,7 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
         policy: Some(policy.to_protocol_string()),
         distinct_objectors: objectors.len(),
         required,
-        roster_size: roster.len(),
+        roster_size: seated.len(),
         window_opens_at: opens,
         window_closes_at: closes,
         window_open,
@@ -1513,63 +1506,69 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
     }
 }
 
-/// Is this row a ballot on `objection`, cast about `action`, dated sanely
-/// relative to both the action and `now`?
-fn is_ballot_on(
-    row: &Attestation,
-    action: ActionRef<'_>,
-    objection: &Attestation,
-    now: DateTime<Utc>,
-) -> bool {
+/// Is this row a ballot on `objection`, cast about `action`, and not dated
+/// before it? No clock: CC's ruling on #1198, item 1 ("the clock gates
+/// admission and never the count").
+fn is_ballot_on(row: &Attestation, action: ActionRef<'_>, objection: &Attestation) -> bool {
     matches!(
         envelope_str(row, "dimension"),
         Some(DIMENSION_UPHELD | DIMENSION_OVERRULED)
     ) && envelope_str(row, field::BALLOT_ON) == Some(objection.attestation_id.as_str())
         && envelope_str(row, field::OBJECTS_TO) == Some(action.action_id)
         && row.asserted_at >= action.asserted_at
-        && row.asserted_at <= now
 }
 
-/// One ballot per author — the GOVERNING one, by the `(asserted_at,
-/// protective-side-wins, attestation_id)` ordering
-/// [`fold_quarantine`](super::quarantine::fold_quarantine) uses.
-///
-/// Sorts ASCENDING and the last write per author wins, so `uphold_rank` is 1
-/// for an upholding ballot and 0 for an overruling one: the protective side
-/// sorts LAST, i.e. a member whose two ballots share an instant is counted as
-/// having upheld. Fail-secure, deterministic, and identical on every node.
-fn governing_ballots<'a>(
+/// **One voice per person** (CC 4.5.13, `CLM-vote-once-per-person`): a fold
+/// over the held rows, permutation-invariant and clock-free. Each row speaks
+/// for the person its key belongs to at the count; a row from a key with no
+/// voice, or for a person not in `eligible`, is held and counts for nothing.
+/// A person's rows that agree are one voice (the lowest id stands for it, so
+/// the result never depends on row order); rows that disagree are no voice,
+/// since a person at odds with themself has not spoken.
+fn voices<'a, 'e>(
     candidates: &[&'a Attestation],
-    eligible: &[String],
-    not_after: Option<DateTime<Utc>>,
-) -> std::collections::BTreeMap<&'a str, &'a Attestation> {
-    let mut rows: Vec<&'a Attestation> = candidates
-        .iter()
-        .copied()
-        .filter(|b| eligible.iter().any(|k| k == &b.attesting_key_id))
-        .filter(|b| not_after.is_none_or(|t| b.asserted_at <= t))
-        .collect();
-    let uphold_rank =
-        |b: &Attestation| u8::from(envelope_str(b, "dimension") == Some(DIMENSION_UPHELD));
-    rows.sort_by(|a, b| {
-        a.asserted_at
-            .cmp(&b.asserted_at)
-            .then_with(|| uphold_rank(a).cmp(&uphold_rank(b)))
-            .then_with(|| a.attestation_id.cmp(&b.attestation_id))
-    });
-    let mut out: std::collections::BTreeMap<&'a str, &'a Attestation> =
+    eligible: &std::collections::BTreeSet<&'e str>,
+    persons: PersonsAt<'_>,
+) -> std::collections::BTreeMap<String, &'a Attestation> {
+    let mut by_person: std::collections::BTreeMap<&'e str, Vec<&'a Attestation>> =
         std::collections::BTreeMap::new();
-    for b in rows {
-        out.insert(b.attesting_key_id.as_str(), b);
+    for b in candidates.iter().copied() {
+        if let Some(person) = person_of_row(b, eligible, persons) {
+            by_person.entry(person).or_default().push(b);
+        }
     }
-    out
+    by_person
+        .into_iter()
+        .filter_map(|(person, rows)| {
+            let answer = envelope_str(rows[0], "dimension");
+            rows.iter()
+                .all(|b| envelope_str(b, "dimension") == answer)
+                .then(|| {
+                    rows.into_iter()
+                        .min_by(|a, b| a.attestation_id.cmp(&b.attestation_id))
+                })
+                .flatten()
+                .map(|b| (person.to_owned(), b))
+        })
+        .collect()
 }
 
-/// How many of these governing ballots uphold, and how many overrule.
-fn tally(governing: &std::collections::BTreeMap<&str, &Attestation>) -> (usize, usize) {
+/// The eligible person this row speaks for, if any. The name is borrowed from
+/// the eligible set, so it outlives the view that resolved it.
+fn person_of_row<'e>(
+    row: &Attestation,
+    eligible: &std::collections::BTreeSet<&'e str>,
+    persons: PersonsAt<'_>,
+) -> Option<&'e str> {
+    let person = persons.voice(&row.attesting_key_id)?;
+    eligible.get(person).copied()
+}
+
+/// How many of these voices uphold, and how many overrule.
+fn tally(voices: &std::collections::BTreeMap<String, &Attestation>) -> (usize, usize) {
     let mut uphold = 0usize;
     let mut overrule = 0usize;
-    for b in governing.values() {
+    for b in voices.values() {
         match envelope_str(b, "dimension") {
             Some(DIMENSION_UPHELD) => uphold += 1,
             Some(DIMENSION_OVERRULED) => overrule += 1,
@@ -1581,6 +1580,7 @@ fn tally(governing: &std::collections::BTreeMap<&str, &Attestation>) -> (usize, 
 
 /// The steward-tier and escalation record for ONE objection — see
 /// [`fold_reverse_quorum_over`] for the ordering and the reasoning.
+#[allow(clippy::too_many_arguments)]
 fn escalate_objection(
     action: ActionRef<'_>,
     objection: &Attestation,
@@ -1588,40 +1588,39 @@ fn escalate_objection(
     roster: &[String],
     duty_holders: &[String],
     policy: &ReverseQuorumPolicy,
-    now: DateTime<Utc>,
+    deadline_passed: bool,
+    persons: PersonsAt<'_>,
 ) -> ObjectionEscalation {
-    // Re-derived here rather than passed in: the deadline is a function of the
-    // action and the declaration, so there is no version of it a caller could
-    // supply that this could not compute — and one that disagreed would be a
-    // silent escalation-clock bypass.
-    let steward_deadline = policy.steward_deadline(action.asserted_at);
     // ── RECUSAL. The actor has a guaranteed conflict on their own action; the
     //    objector has one on their own objection. A recusal removes the seat
     //    from BOTH sides of the fraction, which is what makes it a recusal and
     //    not a veto.
-    let actor = action.actor_key_id;
-    let objector = objection.attesting_key_id.as_str();
-    let seated_duty: Vec<String> = duty_holders
+    //    CC 4.5.13: both are persons, so every device of theirs recuses too.
+    let actor = persons.seat_person(action.actor_key_id);
+    let objector = persons.seat_person(&objection.attesting_key_id);
+    let seated_duty: std::collections::BTreeSet<&str> = duty_holders
         .iter()
-        .filter(|k| k.as_str() != actor && k.as_str() != objector)
-        .cloned()
+        .map(|k| persons.seat_person(k))
+        .filter(|person| *person != actor && *person != objector)
         .collect();
-    let seated_roster: Vec<String> = roster
-        .iter()
-        .filter(|k| k.as_str() != actor)
-        .cloned()
+    let seated_roster: std::collections::BTreeSet<&str> = persons
+        .seated(roster)
+        .into_iter()
+        .filter(|person| *person != actor)
         .collect();
 
     let relevant: Vec<&Attestation> = ballots
         .iter()
-        .filter(|b| is_ballot_on(b, action, objection, now))
+        .filter(|b| is_ballot_on(b, action, objection))
         .collect();
 
-    // ── (2) THE DUTY-HOLDERS' RULING, in time.
+    // ── (2) THE DUTY-HOLDERS' RULING. A held row beats a window (CC's ruling
+    //    on #1198): the ruling decides whatever this node's window said, so
+    //    no instant selects its rows. `deadline_passed` is this node's answer
+    //    and reaches only the tier below.
     let ruling_required = policy.steward_ruling_threshold(seated_duty.len());
-    let ruling = governing_ballots(&relevant, &seated_duty, steward_deadline);
+    let ruling = voices(&relevant, &seated_duty, persons);
     let (ruled_uphold, ruled_overrule) = tally(&ruling);
-    let deadline_passed = steward_deadline.is_some_and(|d| now >= d);
     let steward = if ruled_uphold >= ruling_required {
         StewardTierStanding::Upheld
     } else if ruled_overrule >= ruling_required {
@@ -1637,7 +1636,7 @@ fn escalate_objection(
     // ── (3) THE RESPONDENT POOL. Counted (and reported) whether or not
     //    escalation opened — the ballots are held rows and the numbers are
     //    facts about them; only the OUTCOME is conditional.
-    let pool = governing_ballots(&relevant, &seated_roster, None);
+    let pool = voices(&relevant, &seated_roster, persons);
     let (uphold_ballots, overrule_ballots) = tally(&pool);
     let respondents = pool.len();
     let required = escalated_dismissal_required(policy, respondents);
@@ -1861,6 +1860,76 @@ where
     counted
 }
 
+/// CIRISPersist#1198 (CC 4.5.13) — [`count_distinct_roster_scrubs`] in
+/// persons: the seated persons whose keys signed `envelope`, a second device
+/// signing for its person. Each signature is re-verified the same way.
+async fn count_distinct_voices<F>(
+    directory: &F,
+    envelope: &serde_json::Value,
+    scrubs: &[super::types::ScrubSig],
+    roster: &[String],
+    persons: PersonsAt<'_>,
+) -> std::collections::BTreeSet<String>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let keys = persons.roster_with_devices(roster, scrubs.iter().map(|s| s.scrub_key_id.as_str()));
+    let seated = persons.seated(roster);
+    count_distinct_roster_scrubs(directory, envelope, scrubs, &keys)
+        .await
+        .iter()
+        .filter_map(|k| persons.voice(k))
+        .filter(|person| seated.contains(person))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The actor and instant of the action a vote row names, when this node holds
+/// it: the caller's, if it is the one the row names, else the held row. `None`
+/// is no refusal, since what is not held yet may be (CC's ruling on #1198).
+async fn named_action<F>(
+    directory: &F,
+    supplied: Option<ActionRef<'_>>,
+    action_id: &str,
+) -> Result<Option<(String, DateTime<Utc>)>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if let Some(a) = supplied.filter(|a| a.action_id == action_id) {
+        return Ok(Some((a.actor_key_id.to_owned(), a.asserted_at)));
+    }
+    Ok(directory
+        .get_attestation(action_id)
+        .await?
+        .map(|row| (row.attesting_key_id, row.asserted_at)))
+}
+
+/// The action a cohort objection names: the row that opens a vote window. The
+/// attestation plan writes the window in the row's transaction (V213).
+#[must_use]
+pub(crate) fn objection_action(row: &Attestation) -> Option<String> {
+    (envelope_str(row, "dimension") == Some(DIMENSION_OBJECTION) && is_vote_row(row))
+        .then(|| envelope_str(row, field::OBJECTS_TO).map(str::to_owned))
+        .flatten()
+}
+
+/// Is this row a vote of a cohort: a ballot or an objection? A retraction of
+/// one is admitted from any verifiable signer and judged by the fold (CC's
+/// ruling on #1198, item 2). The self roster's objections are not: there the
+/// keys are the voters and the write gate stands.
+///
+/// v61.1.0 (D12) — the family is the row's claim token
+/// ([`row_type::claim_token`](super::row_type::claim_token): a `scores` row's
+/// `dimension`, any other row's type), the one classifier every family gate
+/// asks (CIRISPersist#1174), not the envelope `dimension` of whatever type.
+#[must_use]
+pub fn is_vote_row(row: &Attestation) -> bool {
+    matches!(
+        super::row_type::claim_token(row),
+        Some(DIMENSION_UPHELD | DIMENSION_OVERRULED | DIMENSION_OBJECTION)
+    ) && envelope_str(row, field::COHORT) != Some(Cohort::SelfId.as_str())
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 //  The two admission doors
 // ─────────────────────────────────────────────────────────────────────────
@@ -1874,8 +1943,8 @@ where
 /// count, no quorum, and no co-signature requirement, on purpose: protection
 /// must be cheap and unilateral or it is not protection. What IS checked is
 /// that the objector is genuinely a member of the cohort whose commons this
-/// is, that the action objected to is a row this node actually holds, and that
-/// the objection's own signature verifies. Everything else about it —
+/// is at read time, that the action objected to is a row this node actually
+/// holds, and that the objection's own signature verifies. Everything else about it —
 /// including whether the grounds are any good — is the reader's business, not
 /// the substrate's.
 ///
@@ -1904,13 +1973,10 @@ where
 /// objected-to action comes from — the caller supplies its [`ActionRef`]
 /// instead of this door reading it by id.
 ///
-/// The objection's own [`field::OBJECTS_TO`] must name `action.action_id`
-/// byte-for-byte, or the row is refused with
-/// [`ObjectionRefusalReason::TargetActionUnknown`]: the one action this door
-/// was told about is not the one the objection names. The objection must be
-/// filed against `action.actor_key_id`
+/// The objection must be filed against `action.actor_key_id`
 /// ([`ObjectionRefusalReason::NotFiledAgainstActor`] otherwise), which is where
-/// [`resolve_reverse_quorum_for`] looks for it.
+/// [`resolve_reverse_quorum_for`] looks for it. One that names another action
+/// is held and counts on that action, not this one.
 pub async fn record_objection_against<F>(
     directory: &F,
     objection: &Attestation,
@@ -1949,36 +2015,27 @@ where
         return refused(ObjectionRefusalReason::MalformedEnvelope);
     }
 
-    let Some((roster, policy)) = cohort_state(directory, cohort, &cohort_key_id).await? else {
+    let Some((_, policy)) = cohort_state(directory, cohort, &cohort_key_id).await? else {
         return refused(ObjectionRefusalReason::CohortUnknown);
     };
     if policy.is_none() {
         return refused(ObjectionRefusalReason::NotGoverned);
     }
 
-    // ── THE 1-of-N GATE, in full. One member is enough; a non-member is not.
-    if !roster.iter().any(|k| k == &objection.attesting_key_id) {
-        return refused(ObjectionRefusalReason::NotACohortMember);
-    }
+    // ── NO MEMBERSHIP GATE (CC's ruling on #1198, item 2). Every verifiable
+    //    vote row is admitted and the fold voids it: a door that asked who the
+    //    signer is would answer by arrival order, since a second device's
+    //    objection can land before its occurrence row.
 
-    // The objected-to row must be held here (or, on the `_against` door, be
-    // the action the caller named), or the objection names nothing this node
-    // can fold.
-    let held;
-    let action: ActionRef<'_> = match supplied {
-        Some(a) if a.action_id == action_id => a,
-        Some(_) => return refused(ObjectionRefusalReason::TargetActionUnknown),
-        None => {
-            let Some(row) = directory.get_attestation(&action_id).await? else {
-                return refused(ObjectionRefusalReason::TargetActionUnknown);
-            };
-            held = row;
-            ActionRef::from(&held)
-        }
-    };
+    // The action, when this node holds it. A row naming something not yet held
+    // is held, and counts once the fold can resolve it (CC's ruling on #1198).
+    let held = named_action(directory, supplied, &action_id).await?;
     // The row must be FILED where the fold looks for it (see
     // `objections_against`), or it would be stored and never counted.
-    if objection.attested_key_id != action.actor_key_id {
+    if held
+        .as_ref()
+        .is_some_and(|(actor, _)| objection.attested_key_id != *actor)
+    {
         return refused(ObjectionRefusalReason::NotFiledAgainstActor);
     }
 
@@ -1997,24 +2054,6 @@ where
         return refused(ObjectionRefusalReason::UnverifiableSignature);
     }
 
-    // One member, one objection (the fold counts distinct objectors anyway —
-    // this keeps the corpus honest rather than being the safety property).
-    //
-    // Scoped to OBJECTION rows specifically. `objections_against` returns both
-    // dimensions, and matching on the author alone would refuse an objection
-    // from anyone who had previously authored a DISMISSAL against this action —
-    // i.e. it would silently take the brake away from a member for having once
-    // helped lift it. That is the wrong direction on the one axis this module
-    // may not get wrong.
-    for prior in objections_against(directory, action).await? {
-        if envelope_str(&prior, "dimension") == Some(DIMENSION_OBJECTION)
-            && prior.attesting_key_id == objection.attesting_key_id
-            && prior.attestation_id != objection.attestation_id
-        {
-            return refused(ObjectionRefusalReason::DuplicateObjection);
-        }
-    }
-
     directory
         .put_attestation(super::SignedAttestation {
             attestation: objection.clone(),
@@ -2029,11 +2068,11 @@ where
 /// [`ReverseQuorumPolicy::dismissal_threshold`] distinct roster members
 /// co-signing the SAME canonical [`dismissal_envelope`] — counted through
 /// [`count_distinct_roster_scrubs`], i.e. re-verified against this node's
-/// registered pubkeys. A quorum-short dismissal is REFUSED with
-/// [`ObjectionRefusalReason::DismissalQuorumShort`] and the returned
-/// [`DismissalQuorum`] names the shortfall (`counted` / `required` /
-/// `roster_size`), so the caller learns how far short they were rather than
-/// merely that something said no.
+/// registered pubkeys. That price is paid at READ: [`resolve_reverse_quorum`]
+/// re-counts every held dismissal, and one short of its floor has no force.
+/// This door holds the row whatever the count (CC's ruling on #1198: a
+/// cosigner's standing may not be held yet) and the returned [`DismissalQuorum`]
+/// reports `counted` / `required` / `roster_size` as this node reads them.
 ///
 /// This is NOT "objecting to the objection" — deliberately out of scope, one
 /// level only.
@@ -2075,69 +2114,84 @@ where
     let Some((roster, policy)) = cohort_state(directory, cohort, &cohort_key_id).await? else {
         return Ok(refuse(ObjectionRefusalReason::CohortUnknown, empty));
     };
+    // CIRISPersist#1198 (CC 4.5.13) — the m-of-n counts persons.
+    let scrubs = dismissal.scrubs();
+    let selves = KeySelves::read(
+        directory,
+        roster
+            .iter()
+            .chain(scrubs.iter().map(|s| &s.scrub_key_id))
+            .chain([&dismissal.attesting_key_id])
+            .cloned()
+            .collect(),
+    )
+    .await?;
+    let persons = selves.held();
+    let roster_size = persons.seated(&roster).len();
     let Some(policy) = policy else {
         return Ok(refuse(
             ObjectionRefusalReason::NotGoverned,
             DismissalQuorum {
                 counted: 0,
                 required: 0,
-                roster_size: roster.len(),
+                roster_size,
             },
         ));
     };
-    // Resolve the objection FIRST — whether this is a self-retraction (cheap)
-    // or an undo of somebody else's protection (m-of-n) is a property of the
-    // objection's author, not of anything the dismissal claims about itself.
-    //
-    // It must be an OBJECTION row, not merely some row this node holds: the
-    // read-time re-derivation resolves `self_dismissal` against the objection
-    // set, so admitting on a laxer test than the one the fold applies would let
-    // a dismissal be admitted at 1 and then silently re-priced at m-of-n on
-    // every subsequent read. Same test both sides, or the two disagree.
-    let named = directory.get_attestation(&objection_id).await?;
-    let Some(objection) = named.filter(|row| {
-        envelope_str(row, "dimension") == Some(DIMENSION_OBJECTION)
-            && envelope_str(row, field::OBJECTS_TO) == envelope_str(dismissal, field::OBJECTS_TO)
-    }) else {
-        return Ok(refuse(
-            ObjectionRefusalReason::ObjectionUnknown,
-            DismissalQuorum {
-                counted: 0,
-                required: policy.dismissal_threshold(roster.len()),
-                roster_size: roster.len(),
-            },
-        ));
-    };
-    if dismissal.attested_key_id != objection.attested_key_id {
+    // The objection, when this node holds it: a self-retraction (cheap) or an
+    // undo of somebody else's protection (m-of-n) is a property of its author,
+    // not of anything the dismissal claims about itself. Where it is not yet
+    // held, the row is held and waits (CC's ruling on #1198).
+    let named = directory
+        .get_attestation(&objection_id)
+        .await?
+        .filter(|row| {
+            envelope_str(row, "dimension") == Some(DIMENSION_OBJECTION)
+                && envelope_str(row, field::OBJECTS_TO)
+                    == envelope_str(dismissal, field::OBJECTS_TO)
+        });
+    if named
+        .as_ref()
+        .is_some_and(|o| dismissal.attested_key_id != o.attested_key_id)
+    {
         return Ok(refuse(
             ObjectionRefusalReason::NotFiledAgainstActor,
             DismissalQuorum {
                 counted: 0,
-                required: policy.dismissal_threshold(roster.len()),
-                roster_size: roster.len(),
+                required: policy.dismissal_threshold(roster_size),
+                roster_size,
             },
         ));
     }
-    let self_dismissal = objection.attesting_key_id == dismissal.attesting_key_id;
-    let required = dismissal_required(&policy, roster.len(), self_dismissal);
+    let mut selves = selves;
+    if let Some(o) = &named {
+        selves
+            .add(directory, vec![o.attesting_key_id.clone()])
+            .await?;
+    }
+    let persons = selves.held();
+    let self_dismissal = named
+        .as_ref()
+        .is_some_and(|o| persons.same_person(&o.attesting_key_id, &dismissal.attesting_key_id));
+    let required = dismissal_required(&policy, roster_size, self_dismissal);
 
-    // ── THE m-of-n GATE. Distinct roster members, each signature re-verified
-    //    against pubkeys resolved from this node's own directory.
-    let counted = count_distinct_roster_scrubs(
+    // ── THE m-of-n, REPORTED AND NOT ENFORCED HERE. A door that refused on a
+    //    count would answer by arrival order, since a cosigner's standing may
+    //    not be held yet. The fold re-counts every held dismissal at every
+    //    read, so the row is held and has no force until it clears.
+    let counted = count_distinct_voices(
         directory,
         &dismissal.attestation_envelope,
-        &dismissal.scrubs(),
+        &scrubs,
         &roster,
+        persons,
     )
     .await;
     let quorum = DismissalQuorum {
         counted: counted.len(),
         required,
-        roster_size: roster.len(),
+        roster_size,
     };
-    if quorum.counted < quorum.required {
-        return Ok(refuse(ObjectionRefusalReason::DismissalQuorumShort, quorum));
-    }
 
     directory
         .put_attestation(super::SignedAttestation {
@@ -2164,7 +2218,7 @@ where
 ///
 /// # What IS checked
 ///
-/// The same membership and filing gates [`record_objection`] applies, plus
+/// The same filing gates [`record_objection`] applies, plus
 /// three of this plane's own:
 ///
 /// - [`ObjectionRefusalReason::StewardTierNotAdopted`] — the cohort declared no
@@ -2174,14 +2228,18 @@ where
 /// - [`ObjectionRefusalReason::BallotPredatesAction`] — the ballot is dated
 ///   before the thing it judges.
 ///
-/// # A member may change their mind
+/// # Every vote row is admitted and kept
 ///
-/// There is deliberately NO duplicate-ballot refusal (contrast
-/// [`ObjectionRefusalReason::DuplicateObjection`]). Reconsidering is legitimate
-/// — it is most of what deliberation IS — and the fold already counts one
-/// ballot per author, the latest one governing. Refusing the second row would
-/// freeze a member's first reaction as their final answer, which on a plane
-/// built to make judgement possible would be the wrong direction.
+/// There is deliberately NO duplicate refusal. CC 4.5.13: nothing is
+/// refused for arriving second, since two devices that sign offline would
+/// otherwise leave each node holding whichever arrived first. The count is a
+/// fold over the rows held: a person's agreeing rows are one voice, rows that
+/// disagree are none until a withdrawal by any key of the same fedID leaves one
+/// ([`voices`]). A member changes their answer by withdrawing the old row.
+///
+/// Who the signer is, is the fold's question and never this door's: a row from
+/// a stranger or an evicted device is held and counts for nothing, and a second
+/// device's row counts the moment its occurrence row is held.
 pub async fn record_objection_ballot<F>(
     directory: &F,
     ballot: &Attestation,
@@ -2193,12 +2251,8 @@ where
 }
 
 /// v49.0.0 — [`record_objection_ballot`] on an objection to an action that is
-/// NOT a held [`Attestation`]; the twin of [`record_objection_against`], with
-/// the same rule: the ballot's [`field::OBJECTS_TO`] must name
-/// `action.action_id` byte-for-byte or it is refused with
-/// [`ObjectionRefusalReason::TargetActionUnknown`]. Every other gate —
-/// membership, filing, recusal, dating, signature, the named objection — is
-/// [`record_objection_ballot`]'s, unchanged.
+/// NOT a held [`Attestation`]; the twin of [`record_objection_against`]. Every
+/// gate (filing, recusal, dating, signature) is [`record_objection_ballot`]'s.
 pub async fn record_objection_ballot_against<F>(
     directory: &F,
     ballot: &Attestation,
@@ -2240,7 +2294,7 @@ where
         return refused(ObjectionRefusalReason::MalformedEnvelope);
     }
 
-    let Some((roster, policy)) = cohort_state(directory, cohort, &cohort_key_id).await? else {
+    let Some((_, policy)) = cohort_state(directory, cohort, &cohort_key_id).await? else {
         return refused(ObjectionRefusalReason::CohortUnknown);
     };
     let Some(policy) = policy else {
@@ -2252,51 +2306,31 @@ where
         return refused(ObjectionRefusalReason::StewardTierNotAdopted);
     }
 
-    // The respondent pool is a SUBSET of the roster and never a widening of it
-    // — the same gate `record_objection` applies.
-    //
-    // **THIS DOOR IS THE ONLY ENFORCEMENT, and the manifest confers nothing
-    // here.** CC registered [`NAMESPACE_FAMILY`] per CC 3.1.7 R2(a) and
-    // DEFERRED the emitter rule: the row carries no `reserved_rule`, and
-    // [`registry`](super::namespace::registry) reads only that key (the
-    // manifest's `reserved` bool is explicitly ignored by its serde shape), so
-    // `authority_for("objection:upheld:v1")` resolves to
-    // `ProducerSteward` with `reserved: None` — before AND after the rc3
-    // re-vendor. Persist enforcing cohort-member-only on a family the manifest
-    // calls open is a divergence to close in CC (the elaboration rides
-    // CIRISConstitution#67), not a second belt to lean on. Nothing on this
-    // plane reads `.reserved`, and nothing should start until the rule is on
-    // the row — a hand-written gate that believes it is backed by a manifest
-    // entry that does not exist is the split-truth shape #590 was filed about.
-    if !roster.iter().any(|k| k == &ballot.attesting_key_id) {
-        return refused(ObjectionRefusalReason::NotACohortMember);
-    }
+    // The respondent pool is a SUBSET of the roster, and the FOLD holds that
+    // line: every verifiable vote row is admitted (CC's ruling on #1198, item
+    // 2) and a row from no seated person counts for nothing. A door that asked
+    // who the signer is would answer by arrival order.
 
-    let held;
-    let action: ActionRef<'_> = match supplied {
-        Some(a) if a.action_id == action_id => a,
-        Some(_) => return refused(ObjectionRefusalReason::TargetActionUnknown),
-        None => {
-            let Some(row) = directory.get_attestation(&action_id).await? else {
-                return refused(ObjectionRefusalReason::TargetActionUnknown);
-            };
-            held = row;
-            ActionRef::from(&held)
+    // The action, when this node holds it. Where it is not yet held, the ballot
+    // is held and waits for the fold (CC's ruling on #1198, rule 3).
+    if let Some((actor, asserted_at)) = named_action(directory, supplied, &action_id).await? {
+        // Filed where the fold looks (see `objections_against`), or stored and
+        // never counted.
+        if ballot.attested_key_id != actor {
+            return refused(ObjectionRefusalReason::NotFiledAgainstActor);
         }
-    };
-    // Filed where the fold looks (see `objections_against`), or stored and
-    // never counted.
-    if ballot.attested_key_id != action.actor_key_id {
-        return refused(ObjectionRefusalReason::NotFiledAgainstActor);
-    }
-    // RECUSAL, at the door: the actor does not vote on the objection to their
-    // own act. Refused rather than silently dropped by the fold, so a producer
-    // learns it instead of believing it participated.
-    if ballot.attesting_key_id == action.actor_key_id {
-        return refused(ObjectionRefusalReason::ActorRecused);
-    }
-    if ballot.asserted_at < action.asserted_at {
-        return refused(ObjectionRefusalReason::BallotPredatesAction);
+        // RECUSAL, at the door: the actor does not vote on the objection to
+        // their own act. Refused rather than silently dropped by the fold, so a
+        // producer learns it instead of believing it participated. The exact
+        // key only, read from the row and its held target: the actor's other
+        // devices are recused by the fold, which knows them whatever order the
+        // rows arrived in.
+        if ballot.attesting_key_id == actor {
+            return refused(ObjectionRefusalReason::ActorRecused);
+        }
+        if ballot.asserted_at < asserted_at {
+            return refused(ObjectionRefusalReason::BallotPredatesAction);
+        }
     }
 
     if super::verify_envelope_hybrid_signature(
@@ -2310,21 +2344,6 @@ where
     .is_err()
     {
         return refused(ObjectionRefusalReason::UnverifiableSignature);
-    }
-
-    // The named objection must be an OBJECTION row against the SAME action —
-    // the identical test `record_objection_dismissal` applies, and the identical
-    // one the fold applies at read time, so a ballot cannot be admitted under
-    // one reading of "which objection" and counted under another.
-    let named = directory.get_attestation(&objection_id).await?;
-    if named
-        .filter(|row| {
-            envelope_str(row, "dimension") == Some(DIMENSION_OBJECTION)
-                && envelope_str(row, field::OBJECTS_TO) == Some(action_id.as_str())
-        })
-        .is_none()
-    {
-        return refused(ObjectionRefusalReason::ObjectionUnknown);
     }
 
     directory
@@ -2463,6 +2482,7 @@ pub async fn resolve_reverse_quorum_for(
         roster,
         policy,
         None,
+        &NO_KEY_SELVES,
         action,
         now,
     )
@@ -2476,7 +2496,9 @@ pub async fn resolve_reverse_quorum_for(
 /// recursion. The caller passes the roster with no reversals applied (the
 /// members who could object) and, for a declared steward tier, the moderators
 /// that roster's founders appoint. Everything else — objections, dismissals
-/// re-counted against `roster`, ballots, escalation — is identical.
+/// re-counted against `roster`, ballots, escalation — is identical. `known`
+/// is what the caller already read about the keys, so a fold over many events
+/// reads each key once.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_reverse_quorum_with(
     directory: &dyn FederationDirectory,
@@ -2485,6 +2507,7 @@ pub(crate) async fn resolve_reverse_quorum_with(
     roster: Vec<String>,
     policy: Option<ReverseQuorumPolicy>,
     duty_holders: Option<Vec<String>>,
+    known: &KeySelves,
     action: ActionRef<'_>,
     now: DateTime<Utc>,
 ) -> Result<ReverseQuorumFold, Error> {
@@ -2524,6 +2547,45 @@ pub(crate) async fn resolve_reverse_quorum_with(
         _ => Vec::new(),
     };
 
+    // CIRISPersist#1198 (CC 4.5.13) — who these keys are, and which vote rows
+    // still stand: a retracted row is not live, whoever of the same fedID
+    // signed the retraction. Over every held row, with no clock (CC's ruling,
+    // item 1).
+    let retractions = vote_retractions(directory, &ballot_rows, &objection_rows).await?;
+    let dismissal_scrubs: Vec<String> = dismissal_rows
+        .iter()
+        .flat_map(Attestation::scrubs)
+        .map(|s| s.scrub_key_id)
+        .collect();
+    let mut selves = KeySelves::default();
+    let keys = roster
+        .iter()
+        .chain(duty_holders.iter())
+        .chain(
+            ballot_rows
+                .iter()
+                .chain(&objection_rows)
+                .map(|r| &r.attesting_key_id),
+        )
+        .chain(retractions.iter().map(|(_, issuer)| issuer))
+        .chain(dismissal_scrubs.iter())
+        .map(String::as_str)
+        .chain([action.actor_key_id])
+        .filter(|k| !known.holds(k))
+        .map(str::to_owned)
+        .collect::<Vec<String>>();
+    selves.add(directory, keys).await?;
+    let persons = known.held_with(&selves);
+    // The window's start, if this node noted one (a read with no receipt reads
+    // the action's signed instant).
+    let first_held = match directory.vote_window_first_held(action.action_id).await {
+        Ok(at) => at,
+        Err(Error::Unsupported { .. }) => None,
+        Err(e) => return Err(e),
+    };
+    let ballot_rows = standing_votes(ballot_rows, &retractions, persons);
+    let objection_rows = standing_votes(objection_rows, &retractions, persons);
+
     // Re-derive each dismissal's threshold against the LIVE roster before it is
     // allowed to suppress an objection. The self-retraction case is resolved
     // the same way the admission door resolves it — from the OBJECTION's
@@ -2533,16 +2595,19 @@ pub(crate) async fn resolve_reverse_quorum_with(
     if let Some(policy) = policy {
         for d in dismissal_rows {
             let self_dismissal = envelope_str(&d, field::DISMISSES).is_some_and(|oid| {
-                objection_rows
-                    .iter()
-                    .any(|o| o.attestation_id == oid && o.attesting_key_id == d.attesting_key_id)
+                objection_rows.iter().any(|o| {
+                    o.attestation_id == oid
+                        && persons.same_person(&o.attesting_key_id, &d.attesting_key_id)
+                })
             });
-            let required = dismissal_required(&policy, roster.len(), self_dismissal);
-            let counted = count_distinct_roster_scrubs(
+            let required =
+                dismissal_required(&policy, persons.seated(&roster).len(), self_dismissal);
+            let counted = count_distinct_voices(
                 directory,
                 &d.attestation_envelope,
                 &d.scrubs(),
                 &roster,
+                persons,
             )
             .await;
             if counted.len() >= required {
@@ -2560,7 +2625,56 @@ pub(crate) async fn resolve_reverse_quorum_with(
         duty_holders: &duty_holders,
         policy,
         now,
+        persons,
+        first_held,
     }))
+}
+
+/// Every retraction held against each vote row, as `(row id, issuer)`.
+async fn vote_retractions<F>(
+    directory: &F,
+    ballots: &[Attestation],
+    objections: &[Attestation],
+) -> Result<Vec<(String, String)>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut out = Vec::new();
+    for b in ballots.iter().chain(objections) {
+        for w in directory
+            .list_attestations_referencing(&b.attestation_id)
+            .await?
+        {
+            if matches!(
+                w.attestation_type.as_str(),
+                attestation_type::WITHDRAWS | attestation_type::RECANTS
+            ) {
+                out.push((b.attestation_id.clone(), w.attesting_key_id));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The vote rows no retraction reaches. A retraction counts when its signer
+/// is the row's author or any key with the voice of the same person (CC
+/// 4.5.13, CC 2.4.1.1 rule 1); its instant plays no part. CC's ruling on #1198,
+/// item 5: a `recants` retracts as a `withdraws` does.
+fn standing_votes(
+    votes: Vec<Attestation>,
+    retractions: &[(String, String)],
+    persons: PersonsAt<'_>,
+) -> Vec<Attestation> {
+    votes
+        .into_iter()
+        .filter(|b| {
+            !retractions.iter().any(|(id, issuer)| {
+                *id == b.attestation_id
+                    && (*issuer == b.attesting_key_id
+                        || persons.voice(issuer) == Some(persons.seat_person(&b.attesting_key_id)))
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -3215,6 +3329,8 @@ mod tests {
             duty_holders: duty,
             policy: Some(escalating(2, 9, 3600, 600, 3)),
             now,
+            persons: PersonsAt::each_key(),
+            first_held: None,
         })
     }
 
@@ -3223,9 +3339,7 @@ mod tests {
     }
 
     /// Comfortably past the objection window (3600) and the steward window
-    /// (600), i.e. past the `t0 + 4200` deadline — and past the `t0 + 5000` the
-    /// post-escalation ballots below are dated at, since a ballot after `now`
-    /// does not count yet.
+    /// (600), i.e. past the `t0 + 4200` deadline.
     fn after_deadline() -> DateTime<Utc> {
         t0() + Duration::seconds(9000)
     }
@@ -3611,22 +3725,36 @@ mod tests {
         );
     }
 
-    /// A member may change their mind; the latest ballot governs, and a
-    /// same-instant contradiction resolves fail-secure to UPHELD — the
-    /// `fold_quarantine` ordering, verbatim.
+    /// A self roster's objection stays outside the cohort-vote rule.
     #[test]
-    fn the_latest_ballot_governs_and_a_tied_instant_upholds() {
+    fn a_self_roster_objection_is_no_cohort_vote() {
+        let mut env = objection_envelope(Cohort::SelfId, "f", "p", "no");
+        let row_of = |env: serde_json::Value| row("x", "k", env, t0());
+        assert!(
+            !is_vote_row(&row_of(env.clone())),
+            "the keys are the voters"
+        );
+        env[field::COHORT] = serde_json::json!(Cohort::Community.as_str());
+        assert!(is_vote_row(&row_of(env)));
+    }
+
+    /// CC 4.5.13 retires the latest-instant fold.
+    #[test]
+    fn a_persons_rows_are_one_voice_or_none_and_no_instant_decides() {
         let action = action_row(t0());
         let duty = vec!["m0".to_string()];
         let t = t0() + Duration::seconds(5000);
         let ballots = vec![
-            // m1 overrules, then thinks better of it a second later.
+            // m1 overrules, then thinks better of it a second later, with no
+            // withdrawal: at odds with themself.
             ballot("b0", "m1", "o1", false, t),
             ballot("b1", "m1", "o1", true, t + Duration::seconds(1)),
-            // m2 signs both in the SAME instant — protection wins.
+            // m2 signs both in the SAME instant.
             ballot("b2", "m2", "o1", false, t),
             ballot("b3", "m2", "o1", true, t),
-            ballot("b4", "m3", "o1", false, t),
+            // m3 says the same thing twice: one voice, the lowest id.
+            ballot("b5", "m3", "o1", false, t),
+            ballot("b4", "m3", "o1", false, t + Duration::seconds(1)),
         ];
         let f = fold_nine(
             &[objection("o1", "m4", t0())],
@@ -3638,22 +3766,164 @@ mod tests {
         let e = &f.escalation[0];
         assert_eq!(
             (e.respondents, e.uphold_ballots, e.overrule_ballots),
-            (3, 2, 1),
-            "three members, three ballots counted — one each: {e:?}"
+            (1, 0, 1),
+            "only m3 has spoken: {e:?}"
         );
-        assert_eq!(
-            e.counted_ballot_ids,
-            vec!["b1".to_string(), "b3".into(), "b4".into()]
-        );
-        assert_eq!(e.outcome, EscalationOutcome::Unresolved);
+        assert_eq!(e.counted_ballot_ids, vec!["b4".to_string()]);
     }
 
-    /// The two bounds a ballot's date must satisfy. The `now` bound is the one
-    /// asymmetry with the objection count and it is load-bearing: an
-    /// objection's date is bounded above by its window, a ballot's is not, so
-    /// without it three ballots dated 2099 would resolve an escalation today.
+    /// Who a persons fixture says the keys are: `m1b` is a live device of
+    /// `m1`, `e1` a device that left `m1`, `a1` a device of the actor `m4`,
+    /// and `m5b` a device of `m5`.
+    fn fixture_selves() -> KeySelves {
+        KeySelves::of_devices(&[
+            ("m1", "m1b", false),
+            ("m1", "e1", true),
+            ("m4", "a1", false),
+            ("m5", "m5b", false),
+        ])
+    }
+
+    /// **I1531 (the fold).** Every order of six rows folds to one answer: two
+    /// devices that disagree, two that agree, one seated member, a voiceless
+    /// device.
     #[test]
-    fn a_ballot_dated_in_the_future_or_before_the_action_never_counts() {
+    fn no_permutation_of_the_rows_changes_the_count() {
+        let selves = fixture_selves();
+        let action = action_row(t0());
+        let duty = vec!["m0".to_string()];
+        let t = t0() + Duration::seconds(5000);
+        let roster = names(9);
+        let rows = [
+            ballot("b0", "m1", "o1", true, t),
+            ballot("b1", "m1b", "o1", false, t + Duration::seconds(1)),
+            ballot("b2", "m5", "o1", false, t + Duration::seconds(2)),
+            ballot("b3", "m5b", "o1", false, t + Duration::seconds(3)),
+            ballot("b4", "m2", "o1", true, t + Duration::seconds(4)),
+            ballot("b5", "e1", "o1", true, t + Duration::seconds(5)),
+        ];
+        let mut indices: Vec<usize> = (0..rows.len()).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        permute(&mut indices, 0, &mut |order| {
+            let ballots: Vec<Attestation> = order.iter().map(|i| rows[*i].clone()).collect();
+            let f = fold_reverse_quorum_over(&ReverseQuorumInputs {
+                action: (&action).into(),
+                objections: &[objection("o1", "m3", t0())],
+                dismissals: &[],
+                ballots: &ballots,
+                roster: &roster,
+                duty_holders: &duty,
+                policy: Some(escalating(2, 9, 3600, 600, 3)),
+                now: after_deadline(),
+                persons: selves.at(after_deadline()),
+                first_held: None,
+            });
+            let e = &f.escalation[0];
+            seen.insert((
+                e.respondents,
+                e.uphold_ballots,
+                e.overrule_ballots,
+                e.counted_ballot_ids.clone(),
+            ));
+        });
+        assert_eq!(
+            seen,
+            std::collections::BTreeSet::from([(2, 1, 1, vec!["b2".to_string(), "b4".to_string()])]),
+            "720 orders, one answer"
+        );
+    }
+
+    fn permute(items: &mut Vec<usize>, from: usize, visit: &mut impl FnMut(&[usize])) {
+        if from == items.len() {
+            visit(items);
+            return;
+        }
+        for i in from..items.len() {
+            items.swap(from, i);
+            permute(items, from + 1, visit);
+            items.swap(from, i);
+        }
+    }
+
+    /// I1525 on the bench: the objector's other device does not rule on their
+    /// objection, the actor's does not either, and two seats of one
+    /// duty-holder are one seat of the ruling.
+    #[test]
+    fn recusal_and_the_bench_are_persons() {
+        let selves = fixture_selves();
+        let action = action_row(t0());
+        let mut roster = names(9);
+        roster.push("m1b".to_string());
+        let inputs = |duty: &[String], ballots: &[Attestation], objector: &str| {
+            let f = fold_reverse_quorum_over(&ReverseQuorumInputs {
+                action: (&action).into(),
+                objections: &[objection("o1", objector, t0())],
+                dismissals: &[],
+                ballots,
+                roster: &roster,
+                duty_holders: duty,
+                policy: Some(escalating(2, 9, 3600, 600, 3)),
+                now: after_deadline(),
+                persons: selves.at(after_deadline()),
+                first_held: None,
+            });
+            f.escalation[0].clone()
+        };
+        // m1 objects; m1's device m1b is a duty-holder: recused, an empty bench.
+        let e = inputs(&["m1b".to_string()], &[], "m1");
+        assert_eq!(e.steward, StewardTierStanding::NoDutyHolders, "{e:?}");
+        // And the other way round: the objection is signed on the device.
+        let e = inputs(&["m1".to_string()], &[], "m1b");
+        assert_eq!(e.steward, StewardTierStanding::NoDutyHolders, "{e:?}");
+        // Two seats of one self are one duty-holder.
+        let e = inputs(&["m1".to_string(), "m1b".to_string()], &[], "m3");
+        assert_eq!((e.duty_holders, e.steward_ruling_required), (1, 1), "{e:?}");
+        // The actor signed on a device: the person's seated key is recused.
+        let f = fold_reverse_quorum_over(&ReverseQuorumInputs {
+            action: ActionRef {
+                actor_key_id: "a1",
+                action_id: "action-1",
+                asserted_at: t0(),
+            },
+            objections: &[objection("o1", "m3", t0())],
+            dismissals: &[],
+            ballots: &[ballot(
+                "b0",
+                "m4",
+                "o1",
+                false,
+                t0() + Duration::seconds(5000),
+            )],
+            roster: &roster,
+            duty_holders: &[],
+            policy: Some(escalating(2, 9, 3600, 600, 3)),
+            now: after_deadline(),
+            persons: selves.at(after_deadline()),
+            first_held: None,
+        });
+        assert_eq!(f.escalation[0].respondents, 0, "{f:?}");
+        // The denominator of the pool: ten seats, nine persons.
+        let f = fold_reverse_quorum_over(&ReverseQuorumInputs {
+            action: (&action).into(),
+            objections: &[],
+            dismissals: &[],
+            ballots: &[],
+            roster: &roster,
+            duty_holders: &[],
+            policy: Some(escalating(2, 9, 3600, 600, 3)),
+            now: after_deadline(),
+            persons: selves.at(after_deadline()),
+            first_held: None,
+        });
+        assert_eq!(f.roster_size, 9);
+    }
+
+    /// A ballot dated before the action never counts, and no clock bounds it
+    /// above (CC's ruling on #1198, item 1): `now` is not an input to the
+    /// tally, and the universal signed-instant gate is what refuses a row
+    /// dated past its skew at the door.
+    #[test]
+    fn a_ballot_dated_before_the_action_never_counts_and_now_is_no_input() {
         let action = action_row(t0());
         let duty = vec!["m0".to_string()];
         let ballots = vec![
@@ -3687,12 +3957,11 @@ mod tests {
             after_deadline(),
             &action,
         );
+        // Three rows dated a year on count now, and the row dated before the
+        // action does not; a later `now` changes nothing.
         let e = &f.escalation[0];
-        assert_eq!((e.respondents, e.overrule_ballots), (0, 0));
-        assert_eq!(e.outcome, EscalationOutcome::Unresolved);
-        assert_eq!(f.counted_objection_ids, vec!["o1".to_string()]);
-        // …and once `now` catches up, the SAME rows resolve. Nothing was
-        // discarded; the fold simply did not count them yet.
+        assert_eq!((e.respondents, e.overrule_ballots), (3, 3));
+        assert_eq!(e.outcome, EscalationOutcome::Dismissed);
         let later = fold_nine(
             &[objection("o1", "m4", t0())],
             &ballots,
@@ -3708,8 +3977,7 @@ mod tests {
     /// it.** A non-member's ballot is not merely outvoted — it is not in the
     /// denominator at all.
     ///
-    /// This test and [`record_objection_ballot`]'s roster gate ARE the
-    /// enforcement of that property. The manifest does not supply it: CC
+    /// This test and the fold's persons ARE the enforcement of that property. The manifest does not supply it: CC
     /// registered the family and deferred its emitter rule, so
     /// `authority_for` resolves these dimensions to `ProducerSteward` with no
     /// reserved rule. See the note on the door.
@@ -3766,6 +4034,8 @@ mod tests {
             duty_holders: &["m0".to_string()],
             policy: Some(escalating(2, 9, 3600, 600, 3)),
             now: after_deadline(),
+            persons: PersonsAt::each_key(),
+            first_held: None,
         });
         assert!(f.escalation.is_empty());
         assert_eq!(f.dismissed_objection_ids, vec!["o1".to_string()]);
@@ -3863,7 +4133,7 @@ pub(crate) mod test_support {
     /// admit. A `user`-role key satisfies both structurally, so the witness
     /// exercises the reverse-quorum gates rather than fighting the community
     /// gates that guard them.
-    async fn register_user_key<D: FederationDirectory + ?Sized>(dir: &D, key_id: &str) {
+    pub(crate) async fn register_user_key<D: FederationDirectory + ?Sized>(dir: &D, key_id: &str) {
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
         let now = Utc::now();
         dir.put_public_key(crate::federation::SignedKeyRecord {
@@ -3895,10 +4165,56 @@ pub(crate) mod test_support {
         .expect("register user key");
     }
 
+    /// CIRISPersist#1198 (V213) — hold `objection` exactly as the live door's
+    /// `put_attestation` holds it (the shared plan, `WriteOrigin::Wire`, then
+    /// this backend's executor), except that THIS node's receipt instant is
+    /// `received_at` instead of the door's clock read. The window is not
+    /// seeded: the plan derives it from the row (`objection_action`) and the
+    /// executor writes it, insert-if-absent, in the row's own transaction. So
+    /// a window held earlier still wins, and every admission gate (the
+    /// signed-instant skew bound against `received_at` included) still runs.
+    ///
+    /// This is how a witness back-dates a window now that no trait method
+    /// writes one (`note_vote_window` was removed: a host-writable window
+    /// start is the clock CC's ruling on #1198 forbids).
+    pub(crate) async fn hold_objection_at<D>(
+        dir: &D,
+        objection: &Attestation,
+        received_at: DateTime<Utc>,
+    ) where
+        D: crate::federation::attestation_admit::AttestationStore,
+    {
+        use crate::federation::attestation_admit as aa;
+        let plan = aa::plan_put_attestation(
+            dir,
+            crate::federation::SignedAttestation {
+                attestation: objection.clone(),
+            },
+            &crate::federation::replication::admission::WriteOrigin::Wire,
+            aa::PlanInstants {
+                fold_at: objection.asserted_at,
+                received_at,
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("hold_objection_at: the plan admits the objection: {e}"));
+        let aa::AttestationPlan::Insert(planned) = plan else {
+            panic!("hold_objection_at: expected an insert plan (is the objection already held?)");
+        };
+        assert_eq!(
+            planned.vote_window.as_ref().map(|(_, at)| *at),
+            Some(aa::first_held_instant(received_at)),
+            "hold_objection_at: the plan opens the window at this node's receipt"
+        );
+        dir.store_planned_attestation(*planned)
+            .await
+            .unwrap_or_else(|e| panic!("hold_objection_at: the executor stores it: {e}"));
+    }
+
     /// A federation-tier row carrying `envelope`, authored + scrubbed by
     /// `author`, about `subject`. `co_signers` add REAL additional scrubs over
     /// the SAME canonical envelope — the m-of-n input.
-    fn signed_row(
+    pub(crate) fn signed_row(
         id: &str,
         author: &str,
         subject: &str,
@@ -3987,7 +4303,7 @@ pub(crate) mod test_support {
 
     /// Seed a community over `members` (founder = `members[0]`) declaring
     /// `protocol`, and nothing else.
-    async fn seed_community<D: FederationDirectory + ?Sized>(
+    pub(crate) async fn seed_community<D: FederationDirectory + ?Sized>(
         dir: &D,
         community_key_id: &str,
         members: &[String],
@@ -4037,11 +4353,17 @@ pub(crate) mod test_support {
     ///   on the passed deadline, the respondent pool dismisses the objection
     ///   3-to-1, and the removal STANDS — its uphold counted only as one
     ///   respondent ballot.
-    pub(crate) async fn exercise_node_bearing_founder_is_no_reverse_quorum_duty_holder(
-        dir: &dyn FederationDirectory,
+    ///
+    /// Generic over the backend (CIRISPersist#1198): the objection is held
+    /// through [`hold_objection_at`], so this node's window opens at `t`.
+    pub(crate) async fn exercise_node_bearing_founder_is_no_reverse_quorum_duty_holder<D>(
+        store: &D,
         suffix: &str,
-    ) {
+    ) where
+        D: crate::federation::attestation_admit::AttestationStore,
+    {
         use crate::federation::tier_ingest::test_support as ts;
+        let dir: &dyn FederationDirectory = store;
         let node_identity = format!("p3node-{suffix}");
         ts::register_hybrid_key_as(
             dir,
@@ -4156,6 +4478,21 @@ pub(crate) mod test_support {
                 t + Duration::seconds(10),
                 &[],
             );
+            // This node first held the objection at `t`: the window has run.
+            // The receipt is the executor's, written with the row (V213).
+            hold_objection_at(store, &o, t).await;
+            // Stored at the substrate's microsecond resolution.
+            let held = dir
+                .vote_window_first_held(&row_hash)
+                .await
+                .expect("window")
+                .expect("the objection opened this node's window");
+            assert!(
+                (held - t).num_microseconds().is_some_and(|d| d.abs() <= 1),
+                "({suffix}) P3 {leg}: the window opened at t, got {held}"
+            );
+            // The door re-offered the held row: its gates still run, and it
+            // reports the objection recorded.
             assert!(
                 matches!(
                     record_objection_against(dir, &o, action)
@@ -4378,10 +4715,10 @@ pub(crate) mod test_support {
     /// [`content_hash_of`](crate::federation::wire_index::content_hash_of)
     /// takes), and whose actor is a member. Then:
     ///
-    /// 1. the attestation door refuses an objection naming it —
-    ///    `TargetActionUnknown`, because no held row has that id (which is why
-    ///    [`record_objection_against`] exists);
-    /// 2. the `_against` door refuses an objection naming a DIFFERENT id;
+    /// 1. the attestation door holds an objection naming it, though no held
+    ///    row has that id (the fold resolves it);
+    /// 2. the `_against` door holds an objection naming a DIFFERENT id, and it
+    ///    counts on that action only;
     /// 3. one member's in-window objection is admitted and counted — the
     ///    action is not reversed;
     /// 4. an objection asserted BEFORE the action's instant is stored (store
@@ -4460,15 +4797,13 @@ pub(crate) mod test_support {
             action_at + Duration::minutes(5),
         );
         assert_eq!(
-            record_objection(dir, &o_alice)
-                .await
-                .expect("record")
-                .refusal(),
-            Some(ObjectionRefusalReason::TargetActionUnknown),
-            "({suffix}) no held attestation carries a roster row's id"
+            record_objection(dir, &o_alice).await.expect("record"),
+            ObjectionOutcome::Admitted,
+            "({suffix}) no held attestation carries a roster row's id, and the \
+             row is held all the same"
         );
 
-        // ── (2) The `_against` door refuses an objection naming another action.
+        // ── (2) The `_against` door holds an objection naming another action.
         let elsewhere = object(
             &uuid::Uuid::new_v4().to_string(),
             &bob,
@@ -4478,10 +4813,9 @@ pub(crate) mod test_support {
         assert_eq!(
             record_objection_against(dir, &elsewhere, action)
                 .await
-                .expect("record")
-                .refusal(),
-            Some(ObjectionRefusalReason::TargetActionUnknown),
-            "({suffix}) the objection must name the action the door was told about"
+                .expect("record"),
+            ObjectionOutcome::Admitted,
+            "({suffix}) held, and it counts on the action it names"
         );
 
         // ── (3) One member objects: counted, not reversed.
@@ -4565,7 +4899,7 @@ pub(crate) mod test_support {
     /// The #574 witness:
     ///
     /// 1. a SINGLE member's objection is admitted and visible (1-of-N);
-    /// 2. a non-member's objection is REFUSED naming `not_a_cohort_member`;
+    /// 2. a non-member's objection is admitted and counts for nothing;
     /// 3. a quorum-SHORT dismissal is REFUSED naming the shortfall;
     /// 4. a quorum-MET dismissal succeeds and the fold drops the objection;
     /// 5. `m` distinct members reverse the action, and persist mutated nothing;
@@ -4687,12 +5021,9 @@ pub(crate) mod test_support {
             &[],
         );
         assert_eq!(
-            record_objection(dir, &outsider)
-                .await
-                .expect("record")
-                .refusal(),
-            Some(ObjectionRefusalReason::NotACohortMember),
-            "({suffix}) 1-of-N means one MEMBER, not one anybody"
+            record_objection(dir, &outsider).await.expect("record"),
+            ObjectionOutcome::Admitted,
+            "({suffix}) a verifiable row is admitted; the fold voids it"
         );
 
         // ── (2b) …and an objection filed against the WRONG key is refused
@@ -4746,9 +5077,9 @@ pub(crate) mod test_support {
             .await
             .expect("dismissal decision");
         assert_eq!(
-            short.outcome.refusal(),
-            Some(ObjectionRefusalReason::DismissalQuorumShort),
-            "({suffix}) undoing protection costs strictly more than applying it"
+            short.outcome,
+            ObjectionOutcome::Admitted,
+            "({suffix}) held; the price is paid at read"
         );
         assert_eq!(
             (
@@ -4757,14 +5088,7 @@ pub(crate) mod test_support {
                 short.quorum.roster_size
             ),
             (2, 3, 5),
-            "({suffix}) the refusal names the shortfall, not merely that it refused"
-        );
-        assert!(
-            dir.get_attestation(&d_short_id)
-                .await
-                .expect("read")
-                .is_none(),
-            "({suffix}) a refused dismissal writes NOTHING (verify-before-mutation)"
+            "({suffix}) the decision names the shortfall"
         );
 
         // ── (3b) …and a NON-MEMBER co-signature buys nothing. bob + carol +
@@ -4783,11 +5107,6 @@ pub(crate) mod test_support {
         let padded = record_objection_dismissal(dir, &d_padded)
             .await
             .expect("dismissal decision");
-        assert_eq!(
-            padded.outcome.refusal(),
-            Some(ObjectionRefusalReason::DismissalQuorumShort),
-            "({suffix}) padding the scrub set with an outsider is not a quorum"
-        );
         assert_eq!(
             (padded.quorum.counted, padded.quorum.required),
             (2, 3),
@@ -4884,7 +5203,9 @@ pub(crate) mod test_support {
         //    the same signed rows and folds to the SAME standing. An objection
         //    that only lived as an API call could not do this.
         let peer = crate::store::test_backend::test_backend();
-        for k in [&alice, &bob, &carol, &dave, &erin, &actor, &community] {
+        for k in [
+            &alice, &bob, &carol, &dave, &erin, &stranger, &actor, &community,
+        ] {
             register_user_key(&peer, k).await;
         }
         let peer_community = Community {
@@ -5109,11 +5430,12 @@ pub(crate) mod test_support {
     /// carrying the duty, and that person is asleep.
     #[allow(clippy::too_many_lines)]
     #[cfg(feature = "sqlite")]
-    pub(crate) async fn exercise_escalation_on_silence(
-        dir: &dyn FederationDirectory,
-        suffix: &str,
-    ) {
+    pub(crate) async fn exercise_escalation_on_silence<D>(store: &D, suffix: &str)
+    where
+        D: crate::federation::attestation_admit::AttestationStore,
+    {
         use crate::federation::attestation_query::test_support::AllAttestations as _;
+        let dir: &dyn FederationDirectory = store;
         let founder = format!("esc-founder-{suffix}");
         let members: Vec<String> = (0..7).map(|i| format!("esc-m{i}-{suffix}")).collect();
         // The actor is a MEMBER — the recusal cases only exist when the person
@@ -5168,17 +5490,30 @@ pub(crate) mod test_support {
             Utc::now(),
             &[],
         );
+        // This node first held the objection at the action's instant: the
+        // instants below are the window's. The receipt is the executor's,
+        // written with the row (V213); the door then re-offers the held row,
+        // every one of its gates running.
+        hold_objection_at(store, &o1, t0).await;
         assert_eq!(
             record_objection(dir, &o1).await.expect("record"),
             ObjectionOutcome::Admitted,
             "({suffix}) the 1-of-N protective door is untouched by #591"
         );
+        assert_eq!(
+            dir.vote_window_first_held(&action_id)
+                .await
+                .expect("window"),
+            Some(t0),
+            "({suffix}) the first objection opened this node's window at its receipt"
+        );
         let early = fold(action.clone(), t0 + Duration::seconds(1)).await;
         assert_eq!(
             early.steward_deadline,
             Some(deadline),
-            "({suffix}) the deadline is the action's asserted_at + both declared \
-             windows and nothing else — no objector can move it"
+            "({suffix}) the deadline is this node's first-held instant (here the \
+             action's) + both declared windows and nothing else — no objector \
+             can move it"
         );
         let e_early = &early.escalation[0];
         assert_eq!(e_early.steward, StewardTierStanding::Awaiting, "({suffix})");
@@ -5208,26 +5543,16 @@ pub(crate) mod test_support {
             )
         };
 
-        // ── (3) THE DOOR. Five refusals, each naming its own branch, each
-        //    writing nothing.
+        // ── (3) THE DOOR. What it refuses reads the row and its held target,
+        //    and writes nothing; what would depend on arrival order is held.
         let outsider = ballot_row(&stranger, false, &o1_id);
         assert_eq!(
             record_objection_ballot(dir, &outsider)
                 .await
-                .expect("ballot")
-                .refusal(),
-            Some(ObjectionRefusalReason::NotACohortMember),
-            "({suffix}) the respondent pool is a SUBSET of the roster and never \
-             a widening of it. This door is the ONLY thing enforcing that — the \
-             manifest registers objection:{{state}} and defers its emitter rule, \
-             so nothing upstream refuses an outsider's ballot on persist's behalf"
-        );
-        assert!(
-            dir.get_attestation(&outsider.attestation_id)
-                .await
-                .expect("read")
-                .is_none(),
-            "({suffix}) a refused ballot writes NOTHING"
+                .expect("ballot"),
+            ObjectionOutcome::Admitted,
+            "({suffix}) a verifiable row is admitted; the fold voids it (CC's \
+             ruling on #1198, item 2)"
         );
 
         let self_dealing = ballot_row(&actor, false, &o1_id);
@@ -5245,11 +5570,10 @@ pub(crate) mod test_support {
         assert_eq!(
             record_objection_ballot(dir, &phantom)
                 .await
-                .expect("ballot")
-                .refusal(),
-            Some(ObjectionRefusalReason::ObjectionUnknown),
-            "({suffix}) a ballot must name an objection this node holds against \
-             this action — the SAME test the fold applies at read time"
+                .expect("ballot"),
+            ObjectionOutcome::Admitted,
+            "({suffix}) a ballot naming nothing held is held; the fold finds \
+             no objection for it to count on"
         );
 
         let mut misfiled = ballot_row(&members[1], false, &o1_id);

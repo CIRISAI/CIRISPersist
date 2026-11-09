@@ -471,7 +471,10 @@ pub enum DirectoryOp {
         ed25519_sig_b64: String,
         /// Base64 ML-DSA-65 signature (absent for classical-only rows).
         ml_dsa_65_sig_b64: Option<String>,
-        /// The hybrid-verification policy.
+        /// The hybrid-verification policy. v61.1.0 (CIRISPersist#1233,
+        /// CC 5.3.2.4.3.1): only [`HybridPolicy::Strict`](crate::verify::hybrid::HybridPolicy::Strict)
+        /// is accepted; any other variant is refused inside `HybridVerify`
+        /// with `verify_policy_violation`. The field is removed in v62.
         policy: crate::verify::hybrid::HybridPolicy,
         /// Optional row age for the replay / freshness window.
         row_age: Option<std::time::Duration>,
@@ -1083,6 +1086,28 @@ pub enum DirectoryOp {
         /// Page size (1..=10_000).
         limit: i64,
     },
+    /// v61.1.0 (CIRISPersist#1190) —
+    /// [`FederationDirectory::list_attestations_since_by_prefixes`]: the
+    /// serve stream narrowed by family prefix. Result rides
+    /// `ServedAttestationPage`. APPEND-ONLY (Growth).
+    ListAttestationsSinceByPrefixes {
+        /// The serve position, exclusive.
+        since: Option<crate::federation::types::ServePosition>,
+        /// Family prefixes (`row_type::claim_token`'s family).
+        family_prefixes: Vec<String>,
+        /// Page size (1..=10_000).
+        limit: i64,
+    },
+    /// v61.1.0 (CIRISPersist#1163) —
+    /// [`FederationDirectory::list_owner_bindings_since`]: the announced
+    /// roster's change feed. Result rides `OwnerBindingPage`. APPEND-ONLY
+    /// (Growth).
+    ListOwnerBindingsSince {
+        /// The serve position, exclusive.
+        since: Option<crate::federation::types::ServePosition>,
+        /// Page size (1..=500).
+        limit: i64,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -1306,6 +1331,16 @@ pub enum DirectoryOpResult {
     /// v59.1.2 (CIRISPersist#1162) —
     /// `list_identity_occurrences_by_occurrence_key`. APPEND-ONLY (Growth).
     IdentityOccurrences(Vec<IdentityOccurrence>),
+    /// v61.1.0 (CIRISPersist#1190) — `list_attestations_since_by_prefixes`.
+    /// APPEND-ONLY (Growth).
+    ServedAttestationPage(
+        crate::federation::types::ServePage<crate::federation::types::ServedAttestation>,
+    ),
+    /// v61.1.0 (CIRISPersist#1163) — `list_owner_bindings_since`.
+    /// APPEND-ONLY (Growth).
+    OwnerBindingPage(
+        crate::federation::types::ServePage<crate::federation::types::OwnerBindingChange>,
+    ),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -1541,6 +1576,23 @@ pub async fn dispatch_directory_op(
             Ok(v) => DirectoryOpResult::Scores(v),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
+        DirectoryOp::ListAttestationsSinceByPrefixes {
+            since,
+            family_prefixes,
+            limit,
+        } => match dir
+            .list_attestations_since_by_prefixes(since, &family_prefixes, limit)
+            .await
+        {
+            Ok(v) => DirectoryOpResult::ServedAttestationPage(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::ListOwnerBindingsSince { since, limit } => {
+            match dir.list_owner_bindings_since(since, limit).await {
+                Ok(v) => DirectoryOpResult::OwnerBindingPage(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
         DirectoryOp::RecordAnnouncedPeer {
             key_id,
             pubkey_ed25519_base64,
@@ -1759,9 +1811,17 @@ pub async fn dispatch_directory_op(
             policy,
             row_age,
         } => {
+            // v61.1.0 (CIRISPersist#1233, CC 5.3.2.4.3.1) — Strict is the
+            // only policy this door accepts. `verify_hybrid_via_directory`
+            // asks `require_strict_policy` (the one hybrid-required check)
+            // FIRST, so any other variant is refused INSIDE HybridVerify (the
+            // verdict slot, like every other verify refusal) with
+            // `verify_policy_violation`, before the directory lookup or any
+            // crypto. The field stays on the wire until v62.
+            //
             // The verify runs entirely here — inside persist's `.so`, against
-            // persist's own vtable — so no consumer-side vtable skew can
-            // reach the signature-check lookups. The VerifyOutcome verdict is
+            // persist's own vtable — so no consumer-side vtable skew can reach
+            // the signature-check lookups. The VerifyOutcome verdict is
             // preserved intact; a VerifyError flattens INSIDE HybridVerify.
             let outcome = crate::verify::hybrid::verify_hybrid_via_directory(
                 dir,
@@ -2207,7 +2267,11 @@ unsafe extern "C" fn persist_directory_build_op(
         ctx: result_ctx,
     };
 
-    let fut: BoxedFut = Box::pin(async move {
+    // v61.1.0 (CIRISPersist#1235) — the op is polled on persist's worker, not
+    // on the task that built it: carry the caller scope in force HERE (the
+    // proxy's `run_op` calls this synchronously, inside the caller's poll) so
+    // the op's door reads are credited to it.
+    let fut: BoxedFut = Box::pin(crate::observe::carry_caller(async move {
         // Keep the cloned Arc + completion bundle alive across the await.
         let dir = dir;
         let completion = completion;
@@ -2236,7 +2300,7 @@ unsafe extern "C" fn persist_directory_build_op(
         unsafe {
             (completion.cb)(completion.ctx, bytes.as_ptr(), bytes.len());
         }
-    });
+    }));
 
     // Double-box to a thin pointer, byte-identical to the shape
     // `executor_capsule::persist_spawn` reconstructs.
@@ -3613,6 +3677,53 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
+    /// v61.1.0 (CIRISPersist#1190) — the narrowed serve read, proxied.
+    async fn list_attestations_since_by_prefixes(
+        &self,
+        since: Option<crate::federation::types::ServePosition>,
+        family_prefixes: &[String],
+        limit: i64,
+    ) -> Result<
+        crate::federation::types::ServePage<crate::federation::types::ServedAttestation>,
+        Error,
+    > {
+        match self
+            .run_op(&DirectoryOp::ListAttestationsSinceByPrefixes {
+                since,
+                family_prefixes: family_prefixes.to_vec(),
+                limit,
+            })
+            .await?
+        {
+            DirectoryOpResult::ServedAttestationPage(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v61.1.0 (CIRISPersist#1163) — the owner-binding feed, proxied.
+    async fn list_owner_bindings_since(
+        &self,
+        since: Option<crate::federation::types::ServePosition>,
+        limit: i64,
+    ) -> Result<
+        crate::federation::types::ServePage<crate::federation::types::OwnerBindingChange>,
+        Error,
+    > {
+        match self
+            .run_op(&DirectoryOp::ListOwnerBindingsSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::OwnerBindingPage(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
     /// v17.8.0 (#469) — route the seeder-bridge bookmark write through the
     /// capsule so edge's `resolve_announce_cold_start` Advisory admit path can
     /// record LAN-announced peers without an admission.
@@ -4462,6 +4573,173 @@ mod tests {
         }
     }
 
+    /// v61.1.0 (CIRISPersist#1235) — **I1587: the caller scope crosses the
+    /// capsule's worker hop.** `build_op` runs on the caller's thread and the
+    /// op is polled on persist's worker, where neither the caller's task scope
+    /// nor its thread scope is in force; the read must still be credited to
+    /// the caller in force when `build_op` ran. The worker records into the
+    /// process-wide counters, so the witness reads those under a label no other
+    /// test sets.
+    #[test]
+    fn i1587_the_caller_scope_crosses_the_capsule() {
+        use crate::observe::{self, Caller, ThreadCallerScope};
+        let rt = test_runtime();
+        let (_dir, directory) = test_directory();
+        let label = "i1587.capsule";
+        let caller = Caller::new(label).expect("a legal label");
+        let at = || {
+            observe::snapshot().caller(
+                observe::StoreBackend::Sqlite,
+                observe::Door::ListAttestationsSince,
+                label,
+            )
+        };
+        let before = at();
+        let op = DirectoryOp::ListAttestationsSince {
+            since: None,
+            limit: 10,
+        };
+        {
+            let _scope = ThreadCallerScope::enter(Some(caller));
+            match run_op(&rt, &directory, &op) {
+                DirectoryOpResult::Attestations(rows) => assert!(rows.is_empty()),
+                other => panic!("I1587: expected Attestations, got {other:?}"),
+            }
+        }
+        // Outside the scope: not credited to the label.
+        match run_op(&rt, &directory, &op) {
+            DirectoryOpResult::Attestations(_) => {}
+            other => panic!("I1587: expected Attestations, got {other:?}"),
+        }
+        let after = at();
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+            (1, 0, 0),
+            "I1587: the one scoped read through the capsule is the caller's"
+        );
+    }
+
+    /// v61.1.0 (CIRISPersist#1190, #1163) — **I1578: both narrowed serve
+    /// reads cross the capsule.** The prefix read and the owner-binding feed
+    /// come back through the C-ABI as the same page, cursor and high water as
+    /// the direct trait call, the cursor resumes through the op, and a refused
+    /// input is refused through the capsule too.
+    #[test]
+    fn i1578_serve_feeds_round_trip_the_capsule() {
+        use crate::federation::serve_feeds_1163_1190_invariants::bodies as f;
+        use crate::federation::types::{
+            cohort_scope, AnnouncedOwnerState, ServePage, ServedAttestation,
+        };
+        let rt = test_runtime();
+        let (dir, directory) = test_directory();
+        let (ids, owner, node) = rt.block_on(async {
+            let (a, k) = f::attester(dir.as_ref(), "cap").await;
+            let mut ids = Vec::new();
+            for i in 0..3 {
+                ids.push(f::put_dim(dir.as_ref(), &a, &k, &format!("i1578:{i}:v1")).await);
+            }
+            let (owner, node) = f::owner_and_node(dir.as_ref(), "cap1578").await;
+            f::bind(dir.as_ref(), &owner, &node, cohort_scope::FEDERATION).await;
+            (ids, owner, node)
+        });
+        let dims = vec!["i1578:".to_owned()];
+        let direct = rt
+            .block_on(dir.list_attestations_since_by_prefixes(None, &dims, 2))
+            .expect("direct");
+        let op = |since| DirectoryOp::ListAttestationsSinceByPrefixes {
+            since,
+            family_prefixes: dims.clone(),
+            limit: 2,
+        };
+        let first = match run_op(&rt, &directory, &op(None)) {
+            DirectoryOpResult::ServedAttestationPage(p) => p,
+            other => panic!("I1578: expected ServedAttestationPage, got {other:?}"),
+        };
+        let page_ids = |p: &ServePage<ServedAttestation>| -> Vec<String> {
+            p.items
+                .iter()
+                .map(|r| r.attestation.attestation_id.clone())
+                .collect()
+        };
+        assert_eq!(
+            (page_ids(&first), &first.next_cursor, &first.high_water),
+            (page_ids(&direct), &direct.next_cursor, &direct.high_water),
+            "I1578: the same page through the capsule"
+        );
+        assert_eq!(page_ids(&first), ids[..2].to_vec(), "I1578: serve order");
+        let cursor = first
+            .next_cursor
+            .clone()
+            .expect("I1578: more past the page");
+        match run_op(&rt, &directory, &op(Some(cursor))) {
+            DirectoryOpResult::ServedAttestationPage(p) => {
+                assert_eq!(page_ids(&p), ids[2..].to_vec(), "I1578: the last page");
+                assert!(p.next_cursor.is_none(), "I1578: nothing past");
+                assert!(!p.high_water.is_origin(), "I1578: a high water");
+            }
+            other => panic!("I1578: expected ServedAttestationPage, got {other:?}"),
+        }
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::ListAttestationsSinceByPrefixes {
+                since: None,
+                family_prefixes: Vec::new(),
+                limit: 2,
+            },
+        ) {
+            DirectoryOpResult::Err(e) => assert!(
+                e.contains(crate::federation::read_plan::SERVE_PREFIXES_REFUSED),
+                "I1578: the refusal's token crosses the capsule: {e}"
+            ),
+            other => panic!("I1578: no prefix is refused through the capsule, got {other:?}"),
+        }
+
+        let direct = rt
+            .block_on(dir.list_owner_bindings_since(None, 100))
+            .expect("direct feed");
+        let through = match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::ListOwnerBindingsSince {
+                since: None,
+                limit: 100,
+            },
+        ) {
+            DirectoryOpResult::OwnerBindingPage(p) => p,
+            other => panic!("I1578: expected OwnerBindingPage, got {other:?}"),
+        };
+        assert_eq!(
+            through, direct,
+            "I1578: the same feed page through the capsule"
+        );
+        assert!(
+            through.items.iter().any(|c| c.node_key_id == node
+                && c.state
+                    == AnnouncedOwnerState::Announced {
+                        owner_key_id: owner.clone()
+                    }),
+            "I1578: the announced node crosses with its owner: {through:?}"
+        );
+        // v61.1.0 (#1163 review M5, D19) — the feed's page is at most 500,
+        // and the refusal's token crosses the capsule.
+        for limit in [0, 501] {
+            match run_op(
+                &rt,
+                &directory,
+                &DirectoryOp::ListOwnerBindingsSince { since: None, limit },
+            ) {
+                DirectoryOpResult::Err(e) => assert!(
+                    e.contains(crate::federation::read_plan::SERVE_LIMIT_OUT_OF_RANGE),
+                    "I1578: a page of {limit} is refused with its token: {e}"
+                ),
+                other => {
+                    panic!("I1578: a page of {limit} is refused through the capsule, got {other:?}")
+                }
+            }
+        }
+    }
+
     /// v17.4.0 — the `scores` read ops (ListScores + ResolveScores) round-trip
     /// through the full C-ABI: serialize op → dispatch inside the `.so` →
     /// result variant back across the seam. Proves the composite-op wiring
@@ -4908,9 +5186,12 @@ mod tests {
         // for #991's removals, not for this.
         // v61 (CIRISPersist#991) — `ListSignedCommunityMembershipListingsSince`
         // removed with the member listing (a BREAK, inside ABI 12).
+        // v61.1.0 (CIRISPersist#1190, #1163) — GROWTH:
+        // `ListAttestationsSinceByPrefixes` and `ListOwnerBindingsSince`
+        // APPENDED.
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "7105f22d1f3b2922a1931c34fbb79d5d79291cc7ce7f8005493de2f3ff499af6",
+            "e45b6cbcc46f5817301a94f8f289bff42dcb4f64d32729782d9bf835bd26e8a3",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -4964,9 +5245,11 @@ mod tests {
         // `IdentityOccurrences` APPENDED.
         // v61 (CIRISPersist#991) — `SignedCommunityMembershipListings` removed
         // with the member listing (a BREAK, inside ABI 12).
+        // v61.1.0 (CIRISPersist#1190, #1163) — GROWTH:
+        // `ServedAttestationPage` and `OwnerBindingPage` APPENDED.
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "072218ce981010c91c962f75e2939a33814e2f179d9da3a178a4f2dbb0ef951b",
+            "4aff512102f2ba2aadd4bbbbccbfac5472302f3c1c7c81a689812e64bd021420",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );
@@ -5629,6 +5912,83 @@ mod tests {
                 }
             }
             other => panic!("expected HybridVerify, got {other:?}"),
+        }
+
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+    }
+
+    /// v61.1.0 (CIRISPersist#1233, CC 5.3.2.4.3.1) — **I1562: the capsule's
+    /// verify door accepts only `Strict`.** A genuine hybrid signature from a
+    /// registered hybrid key verifies under `Strict` (the control: the gate is
+    /// not a blanket refusal), and the SAME signature under `Ed25519Fallback`
+    /// or `SoftFreshness` is refused inside `HybridVerify` with
+    /// `verify_policy_violation`. A classical-only signature from an UNKNOWN
+    /// key under `Ed25519Fallback` is refused with the policy token too, not
+    /// `verify_unknown_key`: the refusal runs before the directory lookup.
+    #[test]
+    fn i1562_capsule_verify_hybrid_refuses_every_policy_but_strict() {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::verify::hybrid::{HybridPolicy, VerifyOutcome, VERIFY_POLICY_VIOLATION};
+        let rt = test_runtime();
+        let (dir, directory) = test_directory();
+        let key = "i1562-capsule-signer";
+        rt.block_on(ts::register_hybrid_key(dir.as_ref(), key));
+        let msg = b"CIRISPersist#1233 I1562 capsule".to_vec();
+        let sig = ts::threshold_sign(key, &msg);
+        let op = |key_id: &str, pqc: Option<String>, policy: HybridPolicy| {
+            DirectoryOp::VerifyHybridViaDirectory {
+                canonical_bytes: msg.clone(),
+                signing_key_id: key_id.into(),
+                ed25519_sig_b64: sig.ed25519_signature_base64.clone(),
+                ml_dsa_65_sig_b64: pqc,
+                policy,
+                row_age: Some(std::time::Duration::from_secs(1)),
+            }
+        };
+
+        match run_op(
+            &rt,
+            &directory,
+            &op(
+                key,
+                sig.mldsa65_signature_base64.clone(),
+                HybridPolicy::Strict,
+            ),
+        ) {
+            DirectoryOpResult::HybridVerify(Ok(VerifyOutcome::HybridVerified)) => {}
+            other => panic!("I1562: a genuine hybrid signature verifies under Strict: {other:?}"),
+        }
+
+        for policy in [
+            HybridPolicy::Ed25519Fallback,
+            HybridPolicy::SoftFreshness {
+                window: std::time::Duration::from_secs(86_400),
+            },
+        ] {
+            match run_op(
+                &rt,
+                &directory,
+                &op(key, sig.mldsa65_signature_base64.clone(), policy),
+            ) {
+                DirectoryOpResult::HybridVerify(Err(s)) => assert!(
+                    s.starts_with(VERIFY_POLICY_VIOLATION),
+                    "I1562: {policy:?} over a VALID signature is refused by policy: {s}"
+                ),
+                other => panic!("I1562: {policy:?} must be refused, got {other:?}"),
+            }
+        }
+
+        match run_op(
+            &rt,
+            &directory,
+            &op("i1562-no-such-key", None, HybridPolicy::Ed25519Fallback),
+        ) {
+            DirectoryOpResult::HybridVerify(Err(s)) => assert!(
+                s.starts_with(VERIFY_POLICY_VIOLATION) && !s.contains("verify_unknown_key"),
+                "I1562: the policy refusal precedes the directory lookup: {s}"
+            ),
+            other => panic!("I1562: expected the policy refusal, got {other:?}"),
         }
 
         // SAFETY: single-drop, matched vtable.
@@ -6490,6 +6850,10 @@ mod tests {
         ("list_open_self_roster_proposals", INHERITED_DEFAULT),
         ("list_settled_self_roster_proposals", INHERITED_DEFAULT),
         ("settle_self_roster_proposal", INHERITED_DEFAULT),
+        (
+            "vote_window_first_held",
+            "node-local receipt; a proxy has no store of its own, and the fold reads the action's signed instant",
+        ),
         ("family_roster_signers", INHERITED_DEFAULT),
         ("community_roster_signers", INHERITED_DEFAULT),
         ("purge_scan_attestations", INHERITED_DEFAULT),

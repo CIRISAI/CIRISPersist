@@ -614,6 +614,16 @@ fn with_signed_run_kind(canonical: &mut serde_json::Value, trace: &CompleteTrace
 /// ([`CompleteTrace::pubkey_ml_dsa_65`]) and bound into the hybrid
 /// verify — a forged PQC pubkey fails the signature check and cannot by
 /// itself confer trust.
+///
+/// # v61.1.0 (CIRISPersist#1233, CC 5.3.2.4.3.1) — `Strict` is enforced here
+///
+/// The first thing this asks is
+/// [`crate::verify::hybrid::require_strict_policy`], the same check the public
+/// [`crate::verify::hybrid::verify_hybrid`] asks, so `policy` other than
+/// `Strict` is refused with
+/// [`crate::verify::hybrid::VerifyError::PolicyViolation`]
+/// (`verify_policy_violation`) before the trace is canonicalized or any
+/// signature is checked. The argument stays until v62 removes it.
 pub fn verify_trace_hybrid<C>(
     trace: &CompleteTrace,
     canonicalizer: &C,
@@ -624,10 +634,12 @@ pub fn verify_trace_hybrid<C>(
 where
     C: Canonicalizer + ?Sized,
 {
-    use crate::verify::hybrid::{verify_hybrid, VerifyError};
+    use crate::verify::hybrid::{require_strict_policy, verify_hybrid_with_policy, VerifyError};
+    require_strict_policy(&policy)?;
     let canonical_bytes = canonical_bytes_for_trace(trace, canonicalizer)
         .map_err(|e| VerifyError::Crypto(format!("canonicalize: {e}")))?;
-    verify_hybrid(
+    // The policy was asked above; the twin does not ask again.
+    verify_hybrid_with_policy(
         &canonical_bytes,
         &trace.signature,
         trace.signature_ml_dsa_65.as_deref(),
@@ -682,12 +694,19 @@ pub fn canon_version_for_trace_schema(wire: &str) -> crate::verify::canonical::C
     CanonVersion::V1Python
 }
 
-/// Convenience wrapper: verify with a [`PublicKeyDirectory`] in front
-/// (looks up the key by id, then defers to [`verify_trace`]). Useful
-/// for the standalone-verifier test path; production ingest looks up
-/// the key from the Backend asynchronously and calls [`verify_trace`]
-/// directly.
-pub fn verify_trace_via_directory<C, K>(
+/// Test helper: verify the Ed25519 half with a [`PublicKeyDirectory`] in
+/// front (looks up the key by id, then defers to [`verify_trace`]).
+///
+/// v61.1.0 (CIRISPersist#1239, CC 5.3.2.4.3.1) — **no longer public API, and
+/// compiled only under `cfg(test)`.** It checks the classical half only, so it
+/// accepts a trace with no PQC half. Its one production caller was
+/// `Engine.verify_trace`, the dry-run, which therefore said VERIFIED about
+/// traces ingest refuses; the dry-run now runs ingest's own verify step
+/// ([`crate::ingest::verify_trace_for_admission`]: hybrid, `Strict`). It stays
+/// for the unit tests below, which pin the classical half's canonical-shape
+/// dispatch.
+#[cfg(test)]
+pub(crate) fn verify_trace_via_directory<C, K>(
     trace: &CompleteTrace,
     canonicalizer: &C,
     keys: &K,
@@ -828,6 +847,52 @@ mod tests {
 
         verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys)
             .expect("known-good trace must verify");
+    }
+
+    /// v61.1.0 (CIRISPersist#1233, CC 5.3.2.4.3.1) — **I1568 (trace leg):
+    /// the public `verify_trace_hybrid` refuses every policy but `Strict`.**
+    /// A classical-only trace with a VALID Ed25519 signature is exactly the
+    /// input `Ed25519Fallback` / `SoftFreshness` would accept, so a refusal
+    /// here is the policy gate and nothing else. Under `Strict` the same
+    /// trace reaches the verify and is refused as hybrid-pending (the
+    /// control: the gate is not a blanket refusal).
+    #[test]
+    fn i1568_verify_trace_hybrid_refuses_every_policy_but_strict() {
+        use crate::verify::hybrid::{HybridPolicy, VerifyError, VERIFY_POLICY_VIOLATION};
+        let sk = fixed_signing_key();
+        let trace = make_trace(&sk, "test-key:i1568");
+        let ed_pk = BASE64.encode(sk.verifying_key().to_bytes());
+        for policy in [
+            HybridPolicy::Ed25519Fallback,
+            HybridPolicy::SoftFreshness {
+                window: std::time::Duration::from_secs(86_400),
+            },
+        ] {
+            let err =
+                verify_trace_hybrid(&trace, &PythonJsonDumpsCanonicalizer, &ed_pk, None, policy)
+                    .expect_err("I1568: a non-strict policy must be refused");
+            assert!(
+                matches!(err, VerifyError::PolicyViolation { policy: p } if p == policy),
+                "I1568: {policy:?} is refused as a policy violation: {err:?}"
+            );
+            assert_eq!(
+                err.kind(),
+                VERIFY_POLICY_VIOLATION,
+                "I1568: the stable token"
+            );
+        }
+        let err = verify_trace_hybrid(
+            &trace,
+            &PythonJsonDumpsCanonicalizer,
+            &ed_pk,
+            None,
+            HybridPolicy::Strict,
+        )
+        .expect_err("I1568: a classical-only trace is refused under Strict");
+        assert!(
+            matches!(err, VerifyError::HybridPendingRejected),
+            "I1568: under Strict the valid classical half reaches the verify: {err:?}"
+        );
     }
 
     /// THREAT_MODEL.md AV-4 (production-bug shape, v0.1.15):

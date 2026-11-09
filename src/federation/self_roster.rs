@@ -351,16 +351,27 @@ where
         .list_identity_occurrence_revocations_for(identity)
         .await?
         .into_iter()
-        .filter(|r| r.occurrence_key_id == key && r.effective_at <= at)
+        .filter(|r| r.occurrence_key_id == key)
         .map(|r| r.effective_at)
         .collect();
-    Ok(asserted.iter().any(|(asserted_at, valid_until)| {
+    Ok(roster_assertion_live(&asserted, &revocations, at))
+}
+
+/// **The roster rule, pure** (the #421 rule, read at `at`): some assertion
+/// signed by `at` and unexpired at `at`, with no revocation in effect at `at`
+/// that came after it.
+pub(crate) fn roster_assertion_live(
+    asserted: &[(DateTime<Utc>, Option<DateTime<Utc>>)],
+    revocations: &[DateTime<Utc>],
+    at: DateTime<Utc>,
+) -> bool {
+    asserted.iter().any(|(asserted_at, valid_until)| {
         *asserted_at <= at
             && valid_until.is_none_or(|v| v > at)
             && !revocations
                 .iter()
-                .any(|effective| *effective >= *asserted_at)
-    }))
+                .any(|effective| *effective <= at && *effective >= *asserted_at)
+    })
 }
 
 /// **THE steward predicate** (CC 3.3.6.3, `CLM-self-roster-authority`;
@@ -415,8 +426,21 @@ pub async fn genesis_evicted_at<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    // The held rows of the eviction's shape, signed by `at`…
-    let mut candidates = BTreeSet::new();
+    Ok(genesis_evicted_since(dir, identity)
+        .await?
+        .is_some_and(|since| since <= at))
+}
+
+/// The earliest instant [`genesis_evicted_at`] answers yes, if any.
+pub(crate) async fn genesis_evicted_since<D>(
+    dir: &D,
+    identity: &str,
+) -> Result<Option<DateTime<Utc>>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    // The held rows of the eviction's shape…
+    let mut candidates = std::collections::BTreeMap::new();
     let mut pages = super::attestation_query::AttestationQuery::to(
         identity,
         super::attestation_query::FOLD_PAGE,
@@ -426,21 +450,21 @@ where
     while let Some(page) = pages.next(dir).await? {
         for w in page {
             if w.attesting_key_id != identity
-                && w.asserted_at <= at
                 && genesis_withdrawal_of(dir, &w).await?.as_deref() == Some(identity)
             {
-                candidates.insert(w.attestation_id);
+                candidates.insert(w.attestation_id, w.asserted_at);
             }
         }
     }
     if candidates.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     // …that THIS node's door landed (a pre-door one has no landed receipt).
     let landed = [
         landed_outcome(LandingPath::Quorum),
         landed_outcome(LandingPath::Lone),
     ];
+    let mut since: Option<DateTime<Utc>> = None;
     for r in dir.list_settled_self_roster_proposals(identity).await? {
         if !r.outcome.as_deref().is_some_and(|o| landed.contains(&o)) {
             continue;
@@ -449,12 +473,12 @@ where
             continue;
         };
         if let Ok(Carried::Withdraws { row, .. }) = carried_of_row(dir, &proposal).await {
-            if candidates.contains(&row.attestation_id) {
-                return Ok(true);
+            if let Some(asserted) = candidates.get(&row.attestation_id) {
+                since = Some(since.map_or(*asserted, |s| s.min(*asserted)));
             }
         }
     }
-    Ok(false)
+    Ok(since)
 }
 
 /// The self whose genesis key `row` would evict, when it is that shape: a
@@ -1287,9 +1311,18 @@ where
 // ─────────────────────────────────────────────────────────────────────────
 
 /// After a proposal or an answer row is admitted (the attestation door's
-/// hook): record a proposal's arrival on this node's clock, then execute what
-/// lands for its self. Never fails the admission that called it: the row is
-/// stored; a failure to execute is logged and the sweep retries.
+/// hook): execute what lands for its self. Never fails the admission that
+/// called it: the row is stored; a failure to execute is logged and the sweep
+/// retries.
+///
+/// v61.1.0 (CIRISPersist#1220) — a proposal's receipt is NOT this hook's:
+/// the attestation plan carries it (`PlannedAttestation::self_roster_receipt`)
+/// and the executor writes it in the row's transaction, so a failed receipt
+/// fails the row and a re-offer lands both. The note here is first-seen-wins
+/// and so a no-op for every row this version stores; it remains only to heal
+/// a proposal an earlier version held without its receipt (an after-commit
+/// write that failed), at its re-offer — the one way such a row ever had to
+/// recover.
 pub(crate) async fn after_admission<D>(dir: &D, row: &Attestation)
 where
     D: FederationDirectory + ?Sized,
@@ -1299,8 +1332,7 @@ where
             .note_self_roster_proposal(&row.attestation_id, &row.attested_key_id, roster_clock())
             .await
         {
-            tracing::warn!(proposal_id = %row.attestation_id, error = %e, "roster proposal receipt");
-            return;
+            tracing::warn!(proposal_id = %row.attestation_id, error = %e, "roster proposal receipt (heal)");
         }
         row.attested_key_id.clone()
     } else if let Some(identity) = answer_identity(row) {

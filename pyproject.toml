@@ -182,7 +182,11 @@ module-name = "ciris_persist"
 # abi3-py310: one wheel covers Python 3.10+ (lowered from 3.11 for
 # BeeWare iOS compatibility). PLATFORM_ARCHITECTURE.md §3.5.
 python-source = "python"
-strip = true
+# No `strip = true` (CIRISPersist#1234): maturin ORs it with `--strip`, so it
+# could not be turned off for the linux wheel, which is built unstripped and
+# split by scripts/split_wheel_debuginfo.py. Every other build still strips:
+# Cargo.toml's `[profile.release] strip = "symbols"`, and ci.yml passes
+# `--strip` to the macOS / Windows wheel builds.
 
 # v0.5.4 (CIRISPersist#29) — pytest discovery scoped to tests/python/.
 # CI builds the wheel with `--features test-panic,pyo3`, then runs

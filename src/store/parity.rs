@@ -231,6 +231,19 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("resolve_scores_planned", Class::Plan),
     ("list_attestation_log_planned", Class::Plan),
     ("list_attestations_naming_by_dimension_planned", Class::Plan),
+    // v61.1.0 (CIRISPersist#1190, #1163) — the narrowed serve reads.
+    ("list_attestations_since_by_prefixes_planned", Class::Plan),
+    ("list_owner_bindings_since_planned", Class::Plan),
+    // Caller input: no prefix, an empty prefix, too many prefixes.
+    ("check_serve_prefixes", Class::Gate),
+    // v61.1.0 (review D19) — caller input: a page size outside the serve
+    // read's bound (10_000 for the family read, 500 for the owner feed).
+    ("check_serve_limit", Class::Gate),
+    // The page cut: fails only when the executor dropped its LIMIT.
+    ("cut_serve_page", Class::Plumbing),
+    // v61.1.0 (review D6) — the one-past cut the #1225 subject read and the
+    // serve cut share: fails only when the executor dropped its LIMIT.
+    ("cut_one_past", Class::Plumbing),
     ("list_key_registration_history_planned", Class::Plan),
     ("list_derived_hex_planned", Class::Plan),
     // The erasure doors' shared planner (same-file helper of both plans): the attester gate and the erasure plan.
@@ -247,6 +260,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("read_score_composers", Class::Plumbing),
     ("read_attestation_log_page", Class::Plumbing),
     ("read_naming_page", Class::Plumbing),
+    ("read_serve_stream_page", Class::Plumbing),
     ("read_key_registration_history", Class::Plumbing),
     ("query_attestations", Class::Plumbing),
     // The erasure executors' string-column collector (a row decode).
@@ -860,6 +874,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_reseal_admission", Class::Gate),
     ("check_reseal_seal_admission", Class::Gate),
     ("check_reserved_prefix_admission", Class::Gate),
+    // v61.1.0 (CIRISPersist#1174 item 3, as ruled) — the CC 3.4.3 substrate
+    // self-report attester, asked beside the reserved-prefix gate with its
+    // door: a refusal at the local door, reported at a peer's.
+    ("check_substrate_self_report_attester_at", Class::Gate),
     ("check_revocation_anti_rollback", Class::Gate),
     ("check_revocation_authority", Class::Gate),
     ("check_revocation_bound", Class::Gate),
@@ -913,9 +931,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // tombstone (NULL the linkage, stamp `erased_at`) both trace-removal doors
     // run inside their transaction. A write; it refuses nothing about input.
     ("sqlite_tombstone_detection_events", Class::Plumbing),
-    // v54.1.0 (Codex round 4 on PR #1057) — Plumbing: the accord proposal's
-    // IMMEDIATE transaction (the write lock before the held-digest read).
-    ("transaction_with_behavior", Class::Plumbing),
+    // v61.1.0 (CIRISPersist#1238) — Plumbing: sqlite's one way to begin a
+    // write transaction, `BEGIN IMMEDIATE` (the write lock before the first
+    // read). It replaced the accord proposal's own `transaction_with_behavior`
+    // (v54.1.0, Codex round 4 on PR #1057) and every deferred `transaction`.
+    ("write_tx", Class::Plumbing),
     ("pg_tombstone_detection_events", Class::Plumbing),
     // v54.1.0 (Codex round 4 sweep) — Plumbing: the orphaned thought-signature
     // cleanup both trace-removal doors run in their transaction.
@@ -1561,7 +1581,7 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 73] = [
+    const SHARED_PLANS: [(&str, &str); 75] = [
         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance.
         (
             "src/federation/transport_admit.rs",
@@ -1677,6 +1697,14 @@ mod tests {
         (
             "src/federation/read_plan.rs",
             "list_attestations_naming_by_dimension_planned",
+        ),
+        (
+            "src/federation/read_plan.rs",
+            "list_attestations_since_by_prefixes_planned",
+        ),
+        (
+            "src/federation/read_plan.rs",
+            "list_owner_bindings_since_planned",
         ),
         (
             "src/federation/read_plan.rs",
@@ -1832,7 +1860,7 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 83] = [
+    const SHARED_DOORS: [(&str, &str, &str); 85] = [
         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance,
         // decoded by the row mapper both doors read through.
         (
@@ -2012,6 +2040,16 @@ mod tests {
             "FederationDirectory",
             "list_attestations_naming_by_dimension",
             "list_attestations_naming_by_dimension_planned",
+        ),
+        (
+            "FederationDirectory",
+            "list_attestations_since_by_prefixes",
+            "list_attestations_since_by_prefixes_planned",
+        ),
+        (
+            "FederationDirectory",
+            "list_owner_bindings_since",
+            "list_owner_bindings_since_planned",
         ),
         (
             "FederationDirectory",
@@ -3447,6 +3485,14 @@ mod tests {
             "plan_put_attestation",
             "check_community_trust_grant_admission",
             Reads::FoldAt,
+        ),
+        // v61.1.0 (CIRISPersist#1198, CIRISPersist#1220) — the one first-held
+        // instant both receipt windows (V213, V199) open at: this node's
+        // receipt, never a signed instant.
+        (
+            "plan_put_attestation",
+            "first_held_instant",
+            Reads::ReceivedAt,
         ),
         // The executor's re-ask under its lock: the same instant as the plan's.
         (

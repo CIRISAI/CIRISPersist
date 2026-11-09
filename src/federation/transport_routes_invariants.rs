@@ -231,6 +231,73 @@ pub(crate) mod bodies {
         );
     }
 
+    /// I1626 (CIRISPersist#1188, the three `displaces` survivors; CC 3.4.7.3)
+    /// — **a route displaces only its own kind.** Two node keys with one live
+    /// owner on one destination string, each announcing a different
+    /// `transport_kind`, the second strictly newer: neither displaces the
+    /// other, on every read, because a route is one per (destination, kind)
+    /// and these are two. Red if the kind guard is lost to `&&` at any of the
+    /// three `||` that join the same-key, kind, destination and retired
+    /// clauses (the destination is always shared on the fold's listing and a
+    /// listed route is never retired, so each of those mutants reduces the
+    /// guard to the instant comparison and the owner tie). The control: the
+    /// same two keys on one kind, I1122-B, where the newer displaces.
+    pub(crate) async fn i1626_a_route_displaces_only_its_own_kind(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let owner = format!("{tag}-owner");
+        let old_node = format!("{tag}-oldnode");
+        let new_node = format!("{tag}-newnode");
+        ts::register_identity_key(d, &owner, USER).await;
+        for k in [&old_node, &new_node] {
+            ts::register_identity_key(d, k, NODE).await;
+        }
+        ts::put_owner_binding(d, &owner, &old_node).await;
+        ts::put_owner_binding(d, &owner, &new_node).await;
+        let dest = format!("{tag}kinds");
+        let older = route(&old_node, &dest, 1, "2026-10-22T00:00:00.000Z");
+        let mut newer = route(&new_node, &dest, 2, "2026-10-23T00:00:00.000Z");
+        newer.transport_kind = "websocket".into();
+        for r in [&older, &newer] {
+            d.put_signed_transport_destination(&signed(r).await)
+                .await
+                .expect("I1626: each route is admitted");
+        }
+        let both = {
+            let mut v = vec![new_node.clone(), old_node.clone()];
+            v.sort();
+            v
+        };
+        assert_eq!(
+            keys(
+                &d.list_transport_destinations_by_destination(&dest)
+                    .await
+                    .unwrap()
+            ),
+            both,
+            "I1626: a newer route of another kind displaces nothing"
+        );
+        assert_eq!(
+            d.list_transport_destinations_for(&old_node)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "I1626: the older key keeps its route"
+        );
+        let mut reloaded: Vec<String> = d
+            .list_all_transport_destinations()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.destination == dest)
+            .map(|r| r.occurrence_key_id)
+            .collect();
+        reloaded.sort();
+        assert_eq!(reloaded, both, "I1626: the boot reload keeps both");
+    }
+
     /// I1122-C — **a route an agent key published before v61 is swept.** A
     /// route admitted while its key was not held (so it could not be typed),
     /// then the key arrives as an agent: the sweep deletes it and counts one;
@@ -342,6 +409,15 @@ mod tests {
                     let Some(b) = $make.await else { return };
                     super::super::bodies::i1122_b_a_tied_newer_route_displaces(&b, &super::tag())
                         .await;
+                }
+                #[tokio::test]
+                async fn i1626_a_route_displaces_only_its_own_kind() {
+                    let Some(b) = $make.await else { return };
+                    super::super::bodies::i1626_a_route_displaces_only_its_own_kind(
+                        &b,
+                        &super::tag(),
+                    )
+                    .await;
                 }
                 #[tokio::test]
                 async fn i1122_d_an_agent_occurrence_projects_no_route() {

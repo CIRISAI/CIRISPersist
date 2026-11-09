@@ -1357,11 +1357,23 @@ pub(crate) async fn check_cosigned_withdraws(
             })
             .chain(row.additional_scrubs.iter().cloned())
             .collect();
+            // CIRISPersist#1198 (CC 4.5.13) — the evaluator counts persons; a
+            // seated person's second device signs for them.
+            let persons = super::key_person::KeySelves::read(
+                directory,
+                ids.iter()
+                    .chain(scrubs.iter().map(|s| &s.scrub_key_id))
+                    .chain(std::iter::once(&target.attested_key_id))
+                    .cloned()
+                    .collect(),
+            )
+            .await?;
+            let persons = persons.at(row.asserted_at);
             let counted = super::reverse_quorum::count_distinct_roster_scrubs(
                 directory,
                 &row.attestation_envelope,
                 &scrubs,
-                &ids,
+                &persons.roster_with_devices(&ids, scrubs.iter().map(|s| s.scrub_key_id.as_str())),
             )
             .await;
             // Retracting a widening takes a member off; retracting a removal
@@ -1390,6 +1402,7 @@ pub(crate) async fn check_cosigned_withdraws(
                 signers: &counted,
                 direction,
                 subject,
+                persons,
             });
             if verdict.admits() {
                 Ok(Some(rule))

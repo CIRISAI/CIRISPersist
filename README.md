@@ -239,6 +239,7 @@ that are merged, clean, unlocked, idle and cold for an hour.
 | [MISSION.md](MISSION.md) | What persist is for, and the rules every change is held to |
 | [FSD/CIRIS_PERSIST.md](FSD/CIRIS_PERSIST.md) | Functional specification; the other files in [FSD/](FSD) specify individual surfaces |
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | Threat model: the `AV-*` attack vectors and their mitigations |
+| [docs/ADVERSARIAL_REVIEW_CHECKLIST.md](docs/ADVERSARIAL_REVIEW_CHECKLIST.md) | Federation trust and admission for an auditor: each question tied to its CC rule, the witnesses that hold it, and the gaps |
 | [docs/PUBLIC_SCHEMA_CONTRACT.md](docs/PUBLIC_SCHEMA_CONTRACT.md) | The stable schema contract for readers of the database |
 | [docs/FEDERATION_DIRECTORY.md](docs/FEDERATION_DIRECTORY.md) | The federation directory: keys, attestations, trust anchors |
 | [docs/COHABITATION.md](docs/COHABITATION.md) | Sharing one `Engine` between components in a process |

@@ -53,6 +53,12 @@ pub mod postgres;
 #[cfg(feature = "postgres")]
 pub(crate) mod postgres_runtime_connect;
 // v54.0.0 (Codex round 2 on PR #1050) — every door on a one-connection pool.
+/// v61.1.0 (CIRISPersist#1231): I1550–I1557. No raw tokio runtime type
+/// built in persist's `.so` is walked by a foreign copy of persist's code.
+/// The from-disk gates run under every feature set. The runtime legs need
+/// `postgres`.
+#[cfg(test)]
+mod foreign_runtime_1231_invariants;
 #[cfg(all(test, feature = "postgres"))]
 mod one_connection_pool_invariants;
 /// v61 (CIRISPersist#1166) — from disk: every Postgres checkout is the
@@ -77,6 +83,11 @@ pub mod sqlite_conn_model;
 /// per process: the SQLite genesis scratch and the test constructor.
 #[cfg(feature = "sqlite")]
 pub(crate) mod sqlite_scratch;
+/// v61.1.0 (CIRISPersist#1238): I1660–I1663. Every SQLite write transaction
+/// begins `IMMEDIATE`. The from-disk gate runs under every feature set; the
+/// two-connection witness needs `sqlite`.
+#[cfg(test)]
+mod sqlite_write_tx_1238_invariants;
 #[cfg(feature = "sqlite")]
 pub mod test_backend;
 /// v50.0.0 (PR #921 review) — test-only hooks inside a backend's own door.

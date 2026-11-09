@@ -1391,8 +1391,8 @@ impl SecretsService for SqliteSecretsBackend {
         software_keys_put(new_key_ref.clone(), key_bytes)?;
         let outcome = (move || -> Result<RotateOutcome, SecretsError> {
             let mut guard = conn.lock();
-            let tx = guard
-                .transaction()
+            // CIRISPersist#1238 — IMMEDIATE: the write lock before the read.
+            let tx = crate::store::sqlite_conn_model::write_tx(&mut guard)
                 .map_err(|e| map_sqlite_error(e, "begin rotate tx"))?;
             tx.execute(
                 "INSERT INTO cirislens_secrets_master_key_meta (\

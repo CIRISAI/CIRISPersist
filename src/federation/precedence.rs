@@ -183,48 +183,146 @@ fn wins(a: &Attestation, b: &Attestation) -> bool {
 ///
 /// 1. the target's own attester (self-retraction — §6.1 rule 1);
 /// 2. a member of the target's `subject_key_ids` (subject-side revocation —
-///    rule 2);
+///    rule 2) — **retired as an arm of its own in v61.1.0** (below): the door
+///    stamps rule 2 when it admits one, so arm 3 carries it;
 /// 3. a key the WRITE door already resolved authority for
-///    (`withdraws_admission_rule.is_some()` — the BFS-derived rules 3/4 that
-///    no sync fold can recompute).
+///    (`withdraws_admission_rule.is_some()` — rule 2, and the BFS-derived
+///    rules 3/4 that no sync fold can recompute).
 ///
-/// `withdraws_admission_rule` is `None` for several distinct reasons
-/// (deferred out-of-order admission, malformed, non-`withdraws`), so arm 3
-/// is only ever an ADMITTING arm, never the sole test.
+/// v61.1.0 (CIRISPersist#1218, as ruled) — **an unstamped `withdraws` is
+/// entitled only through arm 1.** The stamp arm 3 reads is always this node's
+/// door's: the door overwrites any offered value, and writes one only at
+/// admission, with the target held. A held row is never rewritten (FSD 5.8),
+/// so a `withdraws` admitted before its target stays unstamped, and arm 2 no
+/// longer admits it on its own: `subject_key_ids` naming the signer is not
+/// standing the door has checked (a node named by its own owner-binding is
+/// such a subject, and the door sends that `withdraws` to the CC 3.2
+/// ceremony). So arms 2-4 are all one arm now, the stamp, and the stamp is
+/// the only authority over a target besides its producer. An honest
+/// non-producer `withdraws` that arrived first retires nothing on this node
+/// until v62's fold derives entitlement for it (fail-closed; the in-order
+/// node holds it stamped and retires).
 pub fn retraction_entitled(g: &Attestation, target: &Attestation) -> bool {
     if g.attesting_key_id == target.attesting_key_id {
         return true;
     }
-    // v53.1.2 (CIRISPersist#984 row 13) — a registered CARRIER row (a
-    // `key_grant` set; the retired `holds_bytes` claim) is the holder's self-attestation
-    // and only the holder retracts it: a carrier has no subjects, and a
-    // resolved consent-revocation rule (arm 3) is about a Contribution, never
-    // about a holder's claim. Without this a replicated `withdraws` carrying a
-    // forged `withdraws_admission_rule` retired a holder's claim in this fold
-    // while `list_holders` — which folds the holder's own retractions only —
-    // still listed it.
+    stamp_entitles(g, stamp_policy(target))
+}
+
+/// v61.1.0 (61.1 review M1) — **which stamps, if any, entitle a non-producer
+/// retraction of `target`.** The ONE answer [`retraction_entitled`], the
+/// v31 migration fold (`migration::fold_retractions_from`, which keeps only a
+/// policy per target while it streams the corpus) and the Live listing's SQL
+/// (`attestation_query`, generated from the same carve-out list) all give,
+/// so none of them can retire what another keeps live.
+///
+/// - [`StampPolicy::Never`]: a registered CARRIER row (v53.1.2,
+///   CIRISPersist#984 row 13 — the holder's self-attestation; a forged
+///   `withdraws_admission_rule` must not retire a holder's claim) and the
+///   holding claim `custody:ack:v1` (v55.0.0, CIRISPersist#989, CC 3.1.3.3
+///   rule 4: "nobody withdraws another device's report").
+/// - [`StampPolicy::ProducerSide`]: a target the subject carve-out covers
+///   ([`subject_withdraws_carved_out`], CIRISPersist#1218, CC 2.4.1.1) and
+///   whose `withdraws` is not decided on its own plane: only rule 1 (the
+///   producer's principal) or 5 (the CC 3.2 recovery ceremony). A version
+///   before the class joined the carve-out stamped 2-4; such a stamp does
+///   not reopen it.
+/// - [`StampPolicy::Any`]: every other target — any stamp this node's door
+///   wrote at admission with the target held.
+#[must_use]
+pub fn stamp_policy(target: &Attestation) -> StampPolicy {
     if matches!(
         super::row_type::classify(&target.attestation_type),
         super::row_type::RowTypeClass::Carrier(_)
-    ) {
+    ) || super::custody_ack::is_custody_row(target)
+    {
+        return StampPolicy::Never;
+    }
+    if subject_withdraws_carved_out(target) && !withdraws_decided_on_own_plane(target) {
+        return StampPolicy::ProducerSide;
+    }
+    StampPolicy::Any
+}
+
+/// v61.1.0 (61.1 review M1) — see [`stamp_policy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StampPolicy {
+    /// No stamp entitles: only the producer retracts.
+    Never,
+    /// Only rule 1 or rule 5 entitles.
+    ProducerSide,
+    /// Any stamp entitles.
+    Any,
+}
+
+/// v61.1.0 (CIRISPersist#1218 H1, as ruled) — does a non-producer composer
+/// `g` retract a target under `policy`? Only a `withdraws` (a `recants` is
+/// the attester's act alone, v53.1.2 CIRISPersist#984 row 12, CC 2.4.1.1),
+/// and only through the stamp this node's door wrote at admission: an
+/// unstamped `withdraws` (admitted before its target; malformed; a vote
+/// row's, which its own plane's fold decides) retires nothing, whoever its
+/// subjects name. A held row is never rewritten (FSD 5.8), so an honest
+/// non-producer `withdraws` that arrived first retires nothing on this node
+/// until v62's fold derives entitlement for it (fail-closed; the in-order
+/// node holds it stamped and retires).
+#[must_use]
+pub fn stamp_entitles(g: &Attestation, policy: StampPolicy) -> bool {
+    if g.attestation_type != attestation_type::WITHDRAWS {
         return false;
     }
-    // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 4) — the holding claim is
-    // `custody:ack:v1`, and it too is retracted by its signer alone: "nobody
-    // withdraws another device's report" (the door refuses it,
-    // `custody_ack::check_custody_withdraws_signer`; this fold never honours
-    // one that arrived some other way).
-    if super::custody_ack::is_custody_row(target) {
+    let Some(rule) = g.withdraws_admission_rule else {
         return false;
+    };
+    match policy {
+        StampPolicy::Never => false,
+        StampPolicy::ProducerSide => matches!(rule, 1 | 5),
+        StampPolicy::Any => true,
     }
-    // v53.1.2 (CIRISPersist#984 row 12, CC 2.4.1.1) — a `recants` is the
-    // ATTESTER's act alone (a falsity admission about one's own statement);
-    // the subject's path is `withdraws` (rule 2) or a contradicting `scores`.
-    // Arms 2 and 3 are `withdraws` entitlements, so they admit `withdraws`
-    // only — here, and therefore at the door that runs this predicate.
-    g.attestation_type == attestation_type::WITHDRAWS
-        && (target.subject_key_ids.contains(&g.attesting_key_id)
-            || g.withdraws_admission_rule.is_some())
+}
+
+/// v61.1.0 (CIRISPersist#1218; CC 2.4.1.1, CIRISConstitution#164, CC rc15
+/// standing rules) — **does `target` deny the subject-side withdrawal rules
+/// 2-4?** The ONE spelling the write door
+/// ([`resolve_withdraws_admission_rule_at`](super::admission::resolve_withdraws_admission_rule_at))
+/// and the read fold ([`retraction_entitled`]) both ask, so neither can admit
+/// what the other refuses, whatever order the rows arrived in.
+///
+/// True for a row whose claim token lies on one of the adverse classes
+/// ([`SUBJECT_WITHDRAWS_CARVE_OUT`](super::admission::SUBJECT_WITHDRAWS_CARVE_OUT):
+/// `capacity:`, `detection:`, `licensure:`, `revocation:`, `moderation:`,
+/// `hard_case:`, `slashing:`, `takedown_notice:`), and for a cosigned act: a
+/// co-signature by a key other than the attester that is not a node's
+/// tier-crossing co-scrub (stamped `cosigned_at`, CC 2.6.7, custody and not a
+/// voice in the act).
+#[must_use]
+pub fn subject_withdraws_carved_out(target: &Attestation) -> bool {
+    // v61.1.0 (D12) — the family by the one classifier
+    // ([`row_type::claim_token`](super::row_type::claim_token): a `scores`
+    // row's `dimension`, any other row's type), so a type-slot `capacity:*`
+    // row is carved out as its `scores`-form twin is (CIRISPersist#1174).
+    let adverse_class = super::row_type::claim_token(target).is_some_and(|t| {
+        super::admission::SUBJECT_WITHDRAWS_CARVE_OUT
+            .iter()
+            .any(|p| t.starts_with(p))
+    });
+    let cosigned_act = target
+        .additional_scrubs
+        .iter()
+        .any(|sc| sc.cosigned_at.is_none() && sc.scrub_key_id != target.attesting_key_id);
+    adverse_class || cosigned_act
+}
+
+/// v61.1.0 (CIRISPersist#1218) — is `target` a row whose `withdraws` the door
+/// decides on its own plane, BEFORE the subject carve-out is asked
+/// (`admission::check_withdraws_admission_at`)? An `identity:occurrence:v1`
+/// row (the identity or a live occurrence of it, rules 1/2/4) and a
+/// group-plane row (a cosigned roster event, retracted under its group's
+/// protocol, rules 1/4). A group-plane row is cosigned by construction
+/// (`additional_scrubs[]` is its quorum carrier), so without this the
+/// carve-out's cosigned arm would void every quorum retraction of one.
+fn withdraws_decided_on_own_plane(target: &Attestation) -> bool {
+    super::group_plane::is_group_plane_row(target)
+        || super::key_plane::occurrence_of_row(target).is_some()
 }
 
 /// v36.0.0 (CIRISPersist#686) — **THE consolidated retraction fold.**

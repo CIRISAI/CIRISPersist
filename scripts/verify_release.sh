@@ -14,6 +14,13 @@
 #    not as release assets. GitHub expires artifacts after 90 days, so
 #    VERIFY_SKIP_WHEELS=1 skips them for an older release, and says so;
 # 3. fetches `evidence/cc_impl.tsv` at the tag;
+# 3b. (61.1.0 on, CIRISPersist#1234) downloads the two linux wheels' split
+#    debuginfo assets `ciris_persist-<ver>-linux-{x86_64,aarch64}.abi3.so.debug`
+#    and the release's SHA256SUMS. Each debug file is a provenance subject in
+#    step 4; SHA256SUMS must list it with its sha256; and, when the wheels were
+#    downloaded, its GNU build-id must be the build-id of the .so inside that
+#    target's wheel and the .so's `.gnu_debuglink` must name it — the debug
+#    file describes THESE shipped bytes, not some other link;
 # 4. runs `gh attestation verify` on each, bound to this repo, to ci.yml as the
 #    signing workflow and to `refs/tags/v<ver>` as the source ref, so an
 #    attestation from a branch or PR run does not count;
@@ -52,6 +59,22 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 n=$(find "$tmp/release" -name '*.tar.gz' | wc -l)
 [ "$n" -eq 3 ] || { echo "DOWNLOAD FAILED: expected 3 release tarballs for $tag, found $n"; exit 3; }
 
+# 3b. The linux debuginfo (#1234): releases from 61.1.0 carry it.
+debug_labels=(linux-x86_64 linux-aarch64)
+has_debug=0
+[ "$(printf '%s\n' 61.1.0 "$v" | sort -V | head -1)" = 61.1.0 ] && has_debug=1
+if [ "$has_debug" = 1 ]; then
+  "$GH" release download "$tag" -R "$repo" -p "ciris_persist-$v-linux-*.abi3.so.debug" -p SHA256SUMS -D "$tmp/debug" \
+    || { echo "DOWNLOAD FAILED: debuginfo assets / SHA256SUMS of $tag"; exit 3; }
+  for label in "${debug_labels[@]}"; do
+    [ -s "$tmp/debug/ciris_persist-$v-$label.abi3.so.debug" ] \
+      || { echo "DOWNLOAD FAILED: ciris_persist-$v-$label.abi3.so.debug is not an asset of $tag"; exit 3; }
+  done
+  [ -s "$tmp/debug/SHA256SUMS" ] || { echo "DOWNLOAD FAILED: SHA256SUMS of $tag"; exit 3; }
+else
+  echo "SKIP  linux debuginfo: $tag predates 61.1.0 (#1234), which first shipped it"
+fi
+
 if [ "${VERIFY_SKIP_WHEELS:-0}" = 1 ]; then
   echo "SKIP  desktop wheels (VERIFY_SKIP_WHEELS=1) — their provenance is NOT checked"
 else
@@ -84,7 +107,46 @@ while IFS= read -r f; do
   else
     echo "FAIL  provenance  $(basename "$f"): $(tail -1 "$tmp/err")"; fails=$((fails + 1))
   fi
-done < <(find "$tmp/release" "$tmp/wheels" -type f \( -name '*.tar.gz' -o -name '*.whl' \) 2>/dev/null | sort)
+done < <(find "$tmp/release" "$tmp/wheels" "$tmp/debug" -type f \( -name '*.tar.gz' -o -name '*.whl' -o -name '*.abi3.so.debug' \) 2>/dev/null | sort)
+
+# 3b. Each debug file: listed in SHA256SUMS with its hash, and the companion of
+# the .so its target's wheel ships (same build-id, debuglink names it).
+build_id() { readelf -n -W "$1" 2>/dev/null | sed -n 's/.*Build ID: *\([0-9a-f]*\).*/\1/p' | head -1; }
+if [ "$has_debug" = 1 ]; then
+  for label in "${debug_labels[@]}"; do
+    name="ciris_persist-$v-$label.abi3.so.debug"; f="$tmp/debug/$name"
+    want=$(sha256sum "$f" | cut -d' ' -f1)
+    listed=$(awk -v n="$name" '{ f = $2; sub(/^\*/, "", f) } f == n { print $1 }' "$tmp/debug/SHA256SUMS")
+    if [ "$listed" = "$want" ]; then
+      echo "ok    sha256sums  $name"
+    else
+      echo "FAIL  sha256sums  $name: SHA256SUMS lists '${listed:-nothing}', the asset is $want"; fails=$((fails + 1))
+    fi
+    if [ "${VERIFY_SKIP_WHEELS:-0}" = 1 ]; then
+      echo "SKIP  debuginfo   $name: no wheel to match its build-id against (VERIFY_SKIP_WHEELS=1)"
+      continue
+    fi
+    if ! command -v readelf >/dev/null; then
+      echo "FAIL  debuginfo   $name: no readelf to read build-ids with"; fails=$((fails + 1)); continue
+    fi
+    whl=$(find "$tmp/wheels/ciris_persist-wheel-$label" -name "ciris_persist-$v-*.whl" | head -1)
+    mkdir -p "$tmp/so/$label"
+    if [ -z "$whl" ] || ! python3 -c 'import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1]); m = [n for n in z.namelist() if n.endswith(".abi3.so")]
+assert len(m) == 1, m
+open(sys.argv[2], "wb").write(z.read(m[0]))' "$whl" "$tmp/so/$label/shipped.so" 2>"$tmp/err"; then
+      echo "FAIL  debuginfo   $name: cannot read the .so of the $label wheel: $(tail -1 "$tmp/err")"; fails=$((fails + 1)); continue
+    fi
+    so_id=$(build_id "$tmp/so/$label/shipped.so"); dbg_id=$(build_id "$f")
+    link=$(readelf --string-dump=.gnu_debuglink "$tmp/so/$label/shipped.so" 2>/dev/null | sed -n 's/^ *\[ *0\] *//p' | head -1)
+    if [ -n "$so_id" ] && [ "$so_id" = "$dbg_id" ] && [ "$link" = "$name" ]; then
+      echo "ok    debuginfo   $name: build-id $so_id is the $label wheel's .so, whose debuglink names it"
+    else
+      echo "FAIL  debuginfo   $name: build-id '${dbg_id:-none}' vs the $label wheel's .so '${so_id:-none}', debuglink '${link:-none}'"
+      fails=$((fails + 1))
+    fi
+  done
+fi
 
 if pred=$("$GH" attestation verify "$tmp/cc_impl.tsv" "${bind[@]}" --predicate-type "$cc_type" \
             --format json --jq '.[0].verificationResult.statement.predicate' 2>"$tmp/err"); then

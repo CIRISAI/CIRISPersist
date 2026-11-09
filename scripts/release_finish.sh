@@ -16,9 +16,12 @@
 #    refs/release-finish/v<version>; a different local tag is refused) and
 #    asserts its BYTES;
 # 5. runs scripts/verify_release.sh: every attestation tag CI's `attest` job
-#    signed (wheels, release tarballs, evidence/cc_impl.tsv) verifies with
-#    `gh attestation verify` (CIRISPersist#1028), and each desktop wheel's
-#    registered row carries that wheel (scripts/bits_changed.sh, #1029).
+#    signed (wheels, release tarballs, the two linux wheels' split debuginfo
+#    `ciris_persist-<v>-linux-*.abi3.so.debug`, evidence/cc_impl.tsv)
+#    verifies with `gh attestation verify` (CIRISPersist#1028, #1234), each
+#    debug file is in SHA256SUMS and carries its wheel's .so build-id, and
+#    each desktop wheel's registered row carries that wheel
+#    (scripts/bits_changed.sh, #1029).
 #    Needs gh 2.49+ (GH=...).
 #
 # Idempotent: re-run the same command after a kill or a timeout; it picks the
@@ -27,7 +30,8 @@
 # Exit codes: 2 bad arguments / run is not this tag's CI run · 11 tag CI not
 # green · 12 tag CI timeout · 13 release never appeared · 14 release edit
 # failed · 15 release body too short · 17 an attestation did not verify, a
-# wheel's bits check failed, or either could not be checked (gh too old, a
+# wheel's bits check failed, a debug file is not its wheel's companion, or
+# one could not be checked (gh too old, a
 # download failed) · 18 a local tag v<version> is not origin's tag object
 # (stale; delete it and re-run) · 19 origin's tag could not be fetched.
 set -uo pipefail

@@ -479,8 +479,8 @@ impl SharedRuntime {
         }
     }
 
-    /// A bare `Arc<Runtime>` for the two consumers that genuinely need
-    /// one (`TraceKeyDirectory`, the ABI-stable executor capsule).
+    /// A bare `Arc<Runtime>` for the one consumer that genuinely needs
+    /// one (the ABI-stable executor capsule).
     fn arc(&self) -> Arc<Runtime> {
         self.rt.as_ref().expect(RUNTIME_RETIRED).clone()
     }
@@ -4209,10 +4209,13 @@ impl PyEngine {
 
     /// v53.1.8 (CIRISPersist#1014) — [`crate::Engine::telemetry_snapshot`]
     /// as a dict: `{"reads": [{backend, door, reads, rows, bytes}, ...],
-    /// "folds": [{fold, calls, reads, rows, bytes}, ...]}`. `reads` lists
-    /// each `(backend, door)` that served a read; `folds` lists every fold.
-    /// Process-wide counters (`crate::observe`); names per
-    /// `TELEMETRY_CATALOG`.
+    /// "folds": [{fold, calls, reads, rows, bytes}, ...], "callers":
+    /// [{backend, door, caller, reads, rows, bytes}, ...]}`. `reads` lists
+    /// each `(backend, door)` that served a read; `folds` lists every fold;
+    /// `callers` (v61.1.0, CIRISPersist#1235, additive) splits each door's
+    /// reads by the caller label set with `set_caller_scope`, with
+    /// `"unattributed"` for reads made under none. Process-wide counters
+    /// (`crate::observe`); names per `TELEMETRY_CATALOG`.
     fn telemetry_snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         self.ensure_usable()?;
         let snap = crate::observe::snapshot();
@@ -4236,9 +4239,21 @@ impl PyEngine {
             d.set_item("bytes", f.bytes)?;
             folds.append(d)?;
         }
+        let callers = pyo3::types::PyList::empty(py);
+        for c in &snap.callers {
+            let d = PyDict::new(py);
+            d.set_item("backend", c.backend)?;
+            d.set_item("door", c.door)?;
+            d.set_item("caller", c.caller.as_str())?;
+            d.set_item("reads", c.reads)?;
+            d.set_item("rows", c.rows)?;
+            d.set_item("bytes", c.bytes)?;
+            callers.append(d)?;
+        }
         let dict = PyDict::new(py);
         dict.set_item("reads", reads)?;
         dict.set_item("folds", folds)?;
+        dict.set_item("callers", callers)?;
         Ok(dict)
     }
 
@@ -6105,48 +6120,7 @@ impl PyEngine {
                 //
                 //   kind = e.args[0]
                 //   detail = e.args[1] if len(e.args) > 1 else None
-                Err(e) => {
-                    let kind = e.kind();
-                    let detail = e.detail();
-                    tracing::warn!(
-                        error = %e, kind = kind, detail = detail.as_deref(),
-                        "ingest rejected"
-                    );
-                    match e {
-                        // Schema / verify / scrub → ValueError (caller-fault; 4xx).
-                        // v1.1.0 (CIRISPersist#33 part 3) — PipelineInvariant
-                        // is also caller-fault (FSD §4.3 shape violation
-                        // signalled by the edge); maps to lens-side HTTP 422.
-                        // v4.0 (FSD §4.6) — AV-45 write-path cohort_scope
-                        // refusal is caller-fault (the writer stamped a
-                        // cohort it isn't a member of); lens-side HTTP 403.
-                        // v32.0.0 (CIRISPersist#690) — a batch whose treatment
-                        // does not match its label is caller-fault and belongs
-                        // here, NOT with Sign/Store: nothing on this node is
-                        // broken. The sender downgrades the level and relabels,
-                        // or loads a model. Lens-side HTTP 422, and `detail`
-                        // carries which level it was actually treated at so the
-                        // sender can tell those two remedies apart.
-                        IngestError::Schema(_)
-                        | IngestError::Verify(_)
-                        | IngestError::Scrub(_)
-                        | IngestError::ScrubTreatmentMismatch { .. }
-                        | IngestError::ScopeRefused(_)
-                        | IngestError::PipelineInvariant { .. }
-                        | IngestError::TraceRefused { .. } => Err(match detail {
-                            Some(d) => PyValueError::new_err((kind, d)),
-                            None => PyValueError::new_err(kind),
-                        }),
-                        // Store / Sign → RuntimeError (server-fault; 5xx).
-                        // AV-25: signing failure is operator-side
-                        // (keyring locked, hardware unavailable, etc.) —
-                        // never the agent's fault, never a 4xx.
-                        IngestError::Store(_) | IngestError::Sign(_) => Err(match detail {
-                            Some(d) => PyRuntimeError::new_err((kind, d)),
-                            None => PyRuntimeError::new_err(kind),
-                        }),
-                    }
-                }
+                Err(e) => Err(ingest_err_to_py(e, "receive_and_persist")),
             }
         })
     }
@@ -8943,6 +8917,111 @@ impl PyEngine {
                             serde_json::to_string(&rows).map_err(|e| {
                                 PyRuntimeError::new_err(format!(
                                     "attestation list JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v61.1.0 (CIRISPersist#1190) — `list_attestations_since` narrowed by
+    /// family: the federation-tier rows whose family (`row_type::claim_token`:
+    /// a `scores` row's `dimension`, any other row's `attestation_type`)
+    /// starts with one of `family_prefixes`, after the serve position
+    /// `(since_rfc3339, since_id)`, as a JSON serve page (`items`,
+    /// `next_cursor`, `high_water`; a position is `{admitted_at,
+    /// attestation_id}`). `next_cursor` is present exactly when more remain;
+    /// resume from `high_water` once none does (its id may be empty: pass
+    /// it as given). Served as `list_attestations_since` serves. `limit` in
+    /// [1, 10000]. A refusal's message is led by `serve_prefixes_refused` or
+    /// `serve_limit_out_of_range`.
+    #[pyo3(signature = (since_rfc3339, since_id, family_prefixes, limit))]
+    fn list_attestations_since_by_prefixes(
+        &self,
+        py: Python<'_>,
+        since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
+        family_prefixes: Vec<String>,
+        limit: i64,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = parse_serve_position(
+            "list_attestations_since_by_prefixes",
+            since_rfc3339,
+            since_id,
+        )?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let page = b
+                                .list_attestations_since_by_prefixes(since, &family_prefixes, limit)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&page).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "served attestation page JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v61.1.0 (CIRISPersist#1163, CC 5.4.6) — the announced-roster change
+    /// feed: after the serve position `(since_rfc3339, since_id)`, one item
+    /// per node whose owner-binding rows moved, each with its state folded
+    /// now (`announced` with the owner, `not_announced`, `ambiguous_owner`,
+    /// or `unresolved` with the fold's `reason`: keep what you held for that
+    /// node and re-ask), as a JSON serve page (`items`, `next_cursor`,
+    /// `high_water`). A withdrawn or recanted binding arrives through the
+    /// same cursor as `not_announced`. `limit` in [1, 500]; a refused page
+    /// size's message is led by `serve_limit_out_of_range`.
+    #[pyo3(signature = (since_rfc3339, since_id, limit))]
+    fn list_owner_bindings_since(
+        &self,
+        py: Python<'_>,
+        since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = parse_serve_position("list_owner_bindings_since", since_rfc3339, since_id)?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let page = b
+                                .list_owner_bindings_since(since, limit)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&page).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "owner binding page JSON encode: {e}"
                                 ))
                             })
                         }};
@@ -17217,31 +17296,32 @@ impl PyEngine {
     /// for arbitrary canonical bytes. CIRISEdge OQ-11 day-1 posture
     /// unblocker.
     ///
-    /// `policy` is one of `"strict"`, `"ed25519_fallback"`, or
-    /// `"soft_freshness"`. When `"soft_freshness"`,
-    /// `soft_freshness_window_seconds` is required; `row_age_seconds`
-    /// MAY be passed by the caller (caller-side lookup of
-    /// `pqc_completed_at`). Other policies ignore both.
+    /// **`policy` accepts only `"strict"`** (v61.1.0, CIRISPersist#1233,
+    /// CC 5.3.2.4.3.1: a verifier's hybrid-required check is always-on, never
+    /// an operator toggle). Every other value, including the former
+    /// `"ed25519_fallback"` and `"soft_freshness"`, raises `ValueError`
+    /// `verify_policy_violation` before any decode or crypto runs. The
+    /// argument stays in the signature until v62 removes it;
+    /// `soft_freshness_window_seconds` and `row_age_seconds` are ignored.
     ///
-    /// `ml_dsa_65_sig_b64` and `ml_dsa_65_pubkey_b64` are paired:
-    /// either both Some (full hybrid verify) or both None (the row
-    /// is hybrid-pending; acceptance depends on `policy`).
+    /// `ml_dsa_65_sig_b64` and `ml_dsa_65_pubkey_b64` are paired and both
+    /// required: both `None` (a hybrid-pending row) is refused as
+    /// `verify_hybrid_pending_rejected`, one without the other as
+    /// `verify_hybrid_pqc_fields_mismatch`.
     ///
     /// Returns a dict:
     ///
     /// ```text
     /// {
-    ///   "outcome": str,        # "hybrid_verified" | "ed25519_hybrid_pending" | "ed25519_fallback"
-    ///   "row_age_seconds": float|None,  # echoed back when SoftFreshness matches
+    ///   "outcome": "hybrid_verified",
+    ///   "row_age_seconds": None,
     /// }
     /// ```
     ///
-    /// On verify failure raises `ValueError` with the persist
-    /// error-token (`verify_hybrid_pending_rejected`,
-    /// `verify_hybrid_soft_freshness_expired`,
-    /// `verify_hybrid_pqc_fields_mismatch`,
-    /// `verify_hybrid_base64`, `verify_hybrid_invalid_length`,
-    /// `verify_hybrid_crypto`).
+    /// On refusal raises `ValueError` with the persist error-token
+    /// (`verify_policy_violation`, `verify_hybrid_pending_rejected`,
+    /// `verify_hybrid_pqc_fields_mismatch`, `verify_hybrid_base64`,
+    /// `verify_hybrid_invalid_length`, `verify_hybrid_crypto`).
     ///
     /// Same error-token discipline as the rest of persist's PyO3
     /// surface — structured detail in tracing logs, stable token in
@@ -17323,33 +17403,35 @@ impl PyEngine {
 
     // ─── Verify surface for federation peer cutover (v0.4.0) ────
 
-    /// v0.4.0 — Verify a CompleteTrace envelope end-to-end.
-    /// Looks up `signature_key_id` via the federation directory,
-    /// reconstructs canonical bytes per `trace_schema_version`
-    /// (deterministic field-layout dispatch — 2.7.0 / 2.7.9 / 3.0.0),
-    /// verifies the Ed25519 signature.
+    /// v0.4.0 — Verify a CompleteTrace envelope end-to-end, WITHOUT storing
+    /// it (dry-run validation, pre-storage check, audit replay).
     ///
-    /// **v37.0.0 — the CANONICALIZER is resolved from the trace's own
-    /// signed schema epoch too**, via
-    /// [`canon_version_for_trace_schema`](crate::verify::ed25519::canon_version_for_trace_schema)
-    /// (major ≥ 3 ⇒ RFC 8785 JCS, else Python-compat) — the identical
-    /// expression `src/ingest.rs` uses on the production
-    /// `receive_and_persist` path. Until v36.x this method hard-coded
-    /// the Python-compat rule, so a `3.0.0` trace carrying non-ASCII
-    /// was stored by `receive_and_persist` and rejected here.
+    /// **v61.1.0 (CIRISPersist#1239, CC 5.3.2.4.3.1) — this runs ingest's
+    /// verify step, the same function.** `receive_and_persist` verifies each
+    /// trace through
+    /// [`crate::ingest::verify_trace_for_admission`] before anything is
+    /// written, and this method calls exactly that function and nothing else:
+    /// the Ed25519 key resolved by `signature_key_id`, the canonicalizer chosen
+    /// by the trace's signed `trace_schema_version` (major ≥ 3 ⇒ RFC 8785 JCS,
+    /// else Python-compat), the ML-DSA-65 key resolved from the federation
+    /// directory by `pqc_key_id`, and both halves verified under
+    /// `HybridPolicy::Strict`. Until v61.1.0 this called
+    /// `verify_trace_via_directory`, which checked the Ed25519 half only, so it
+    /// accepted a trace with no PQC half, or a bad one, that ingest refuses.
     ///
     /// Returns `{"verified": True, "schema_version": "2.7.0"|"2.7.9"|"3.0.0"}`
-    /// on success. Raises `ValueError` with a stable verify
-    /// error-token (`verify_signature_mismatch`,
-    /// `verify_unknown_key`, `verify_invalid_signature`,
-    /// `verify_canonicalization_internal`,
-    /// `verify_unsupported_schema_version`) on failure.
+    /// on success. On failure raises the exception `receive_and_persist`
+    /// raises for the same cause, with the same stable token in `args[0]`:
+    /// `ValueError` with `verify_unknown_key` (signer or PQC key not in the
+    /// directory), `verify_hybrid_required` (no PQC half: the #225 hard cut),
+    /// `verify_hybrid_failed` (either half does not verify, or a malformed PQC
+    /// field, or a failed read of the PQC key); `RuntimeError` with a
+    /// `store_*` token if the signer-key read itself fails. A `CompleteTrace`
+    /// JSON that does not decode is a
+    /// `ValueError` (`CompleteTrace JSON decode: ...`).
     ///
-    /// Use this when a peer wants to verify a CompleteTrace WITHOUT
-    /// storing it (dry-run validation, pre-storage check, audit
-    /// replay). Persistence still goes through
-    /// `receive_and_persist` (which verifies internally before
-    /// storing) — and the two now agree by construction.
+    /// Stores nothing: the function it runs only reads the key directory.
+    /// The GIL is released for the whole verify.
     fn verify_trace<'py>(
         &self,
         py: Python<'py>,
@@ -17358,66 +17440,54 @@ impl PyEngine {
         self.ensure_usable()?;
         catch_panic(|| {
             use crate::schema::CompleteTrace;
-            use crate::verify::verify_trace_via_directory;
+            use sha2::Digest as _;
             let trace: CompleteTrace = serde_json::from_str(complete_trace_json)
                 .map_err(|e| PyValueError::new_err(format!("CompleteTrace JSON decode: {e}")))?;
             let runtime = self.runtime.clone();
             // Read off the one field the response needs BEFORE the trace moves
             // into the detached closure.
             let schema_version = trace.trace_schema_version.as_str().to_owned();
-            // v37.0.0 — SIGNED-BYTES-BOUND, NOT HARD-CODED. Until v36.x this
-            // surface handed `verify_trace_via_directory` a hard-coded
-            // `PythonJsonDumpsCanonicalizer` and never consulted the signed
-            // schema epoch, while `receive_and_persist` resolved it from the
-            // trace's own `trace_schema_version`. See [`trace_canonicalizer`]
-            // for the defect, the #176 downgrade guard, and why the GIL note
-            // below still covers both arms of the gate.
-            let canon = trace_canonicalizer(&schema_version);
+            // Ingest's refusal breadcrumbs join on the sha256 of the body they
+            // were handed; here that body is the trace JSON.
+            let body_sha256 = hex::encode(sha2::Sha256::digest(complete_trace_json.as_bytes()));
             // v25.x (CIRISPersist#580) — the whole verify runs with the GIL
-            // RELEASED. `TraceKeyDirectory::lookup` bridges the sync
-            // `PublicKeyDirectory` trait to the async backend with
-            // `runtime.block_on`, and until this detach existed that wait
-            // happened while CPython held the GIL: a stalled connection wedged
-            // the entire interpreter, not one thread, with no Rust-side error
-            // — and no watchdog could fire through it, because a watchdog needs
-            // the GIL to be scheduled. Same class as #572's teardown wedge, on
-            // the read path.
-            //
-            // The ENTIRE verify is inside the detach, not merely the lookup.
-            // #580 predicted that would deadlock, on the grounds that
-            // `PythonJsonDumpsCanonicalizer` needs the GIL inside the same
-            // call. It does not: that name describes the OUTPUT FORMAT it
-            // emulates (CPython's `json.dumps` escaping), not a call into
-            // CPython — it is a pure-Rust byte writer, and `src/verify/`
-            // contains no pyo3 reference at all. So the blocking half and the
-            // canonicalizing half are both GIL-free and neither needs hoisting.
-            // This is exactly the shape the sibling
-            // [`Self::verify_hybrid_via_directory`] already uses.
+            // RELEASED. The key-directory reads block on the runtime, and a
+            // blocking wait under the GIL wedges the entire interpreter, not
+            // one thread, with no Rust-side error, and no watchdog can fire
+            // through it. The canonicalizers are pure-Rust byte writers (see
+            // [`crate::ingest::trace_canonicalizer`]), so nothing inside needs
+            // the GIL.
             let verified = py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
-                    let key_dir = TraceKeyDirectory {
-                        backend: pg.clone(),
-                        runtime,
-                    };
-                    verify_trace_via_directory(&trace, canon, &key_dir)
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::ingest::verify_trace_for_admission(
+                            &*backend,
+                            &trace,
+                            &body_sha256,
+                            &PythonJsonDumpsCanonicalizer,
+                        )
+                        .await
+                    })
                 }
                 #[cfg(feature = "sqlite")]
                 BackendDispatch::Sqlite(sq) => {
-                    let key_dir = TraceKeyDirectory {
-                        backend: sq.clone(),
-                        runtime,
-                    };
-                    verify_trace_via_directory(&trace, canon, &key_dir)
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::ingest::verify_trace_for_admission(
+                            &*backend,
+                            &trace,
+                            &body_sha256,
+                            &PythonJsonDumpsCanonicalizer,
+                        )
+                        .await
+                    })
                 }
             });
             // Error mapping stays OUTSIDE the detach: building a `PyErr` is
-            // CPython work, and doing it under a released GIL is the mirror of
-            // the bug being fixed.
-            verified.map_err(|e| {
-                tracing::warn!(error = %e, kind = e.kind(), "verify_trace rejected");
-                PyValueError::new_err(e.kind())
-            })?;
+            // CPython work. It is `receive_and_persist`'s mapping.
+            verified.map_err(|e| ingest_err_to_py(e, "verify_trace"))?;
             let dict = PyDict::new(py);
             dict.set_item("verified", true)?;
             dict.set_item("schema_version", schema_version)?;
@@ -17433,13 +17503,17 @@ impl PyEngine {
     /// pattern).
     ///
     /// Saves the caller from doing a separate `lookup_public_key`
-    /// call before each verify. Same `policy` semantics as
-    /// `verify_hybrid` (Strict / SoftFreshness / Ed25519Fallback).
-    /// Same return shape (`{"outcome", "row_age_seconds"}`).
+    /// call before each verify. Same `policy` rule as `verify_hybrid`:
+    /// **only `"strict"` is accepted** (v61.1.0, CIRISPersist#1233,
+    /// CC 5.3.2.4.3.1); any other value raises `ValueError`
+    /// `verify_policy_violation` before the directory lookup or any
+    /// crypto runs. The argument stays until v62 removes it. Same return
+    /// shape (`{"outcome": "hybrid_verified", "row_age_seconds": None}`).
     ///
-    /// Raises `ValueError` with `verify_unknown_key` if
-    /// `signature_key_id` doesn't resolve in federation_keys, or
-    /// the standard `verify_hybrid_*` tokens for crypto failures.
+    /// Raises `ValueError` with `verify_policy_violation` for a non-strict
+    /// policy, `verify_unknown_key` if `signature_key_id` doesn't resolve
+    /// in federation_keys, or the standard `verify_hybrid_*` tokens for
+    /// crypto failures.
     #[pyo3(signature = (
         canonical_bytes,
         signature_key_id,
@@ -17600,6 +17674,12 @@ impl PyEngine {
     /// federation directory's `put_public_key` does its own write-
     /// path verification; this primitive lets a peer verify-without-
     /// storing for dry-runs or trust-graph audits.
+    ///
+    /// v61.1.0 (CIRISPersist#1233) — `policy` accepts only `"strict"`, as
+    /// for `verify_hybrid_via_directory`; any other value raises
+    /// `ValueError` `verify_policy_violation` before the envelope is
+    /// decoded. The same holds for `verify_signed_attestation` and
+    /// `verify_signed_revocation`.
     #[pyo3(signature = (
         signed_key_record_json,
         policy,
@@ -17616,6 +17696,9 @@ impl PyEngine {
     ) -> PyResult<Bound<'py, PyDict>> {
         self.ensure_usable()?;
         catch_panic(|| {
+            // v61.1.0 (CIRISPersist#1233) — the policy refusal comes first,
+            // before the envelope is even decoded.
+            parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
             let signed: crate::federation::SignedKeyRecord =
                 serde_json::from_str(signed_key_record_json).map_err(|e| {
                     PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}"))
@@ -17653,6 +17736,9 @@ impl PyEngine {
     ) -> PyResult<Bound<'py, PyDict>> {
         self.ensure_usable()?;
         catch_panic(|| {
+            // v61.1.0 (CIRISPersist#1233) — the policy refusal comes first,
+            // before the envelope is even decoded.
+            parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
             let signed: crate::federation::SignedAttestation =
                 serde_json::from_str(signed_attestation_json).map_err(|e| {
                     PyValueError::new_err(format!("SignedAttestation JSON decode: {e}"))
@@ -17690,6 +17776,9 @@ impl PyEngine {
     ) -> PyResult<Bound<'py, PyDict>> {
         self.ensure_usable()?;
         catch_panic(|| {
+            // v61.1.0 (CIRISPersist#1233) — the policy refusal comes first,
+            // before the envelope is even decoded.
+            parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
             let signed: crate::federation::SignedRevocation =
                 serde_json::from_str(signed_revocation_json).map_err(|e| {
                     PyValueError::new_err(format!("SignedRevocation JSON decode: {e}"))
@@ -23579,7 +23668,19 @@ impl PyEngine {
     /// #249 Cut G1 (§1) — remove `removed_key_id` from a `cohort` roster via the
     /// append-only revocation table. `revoke_spec_json` is a
     /// [`crate::federation::cohort::RevokeSpec`] (`{effective_at, reason?,
-    /// witness_set?}`); `effective_at` may be future-dated.
+    /// witness_set?, authority_key_id, scrub_signature_classical,
+    /// scrub_signature_pqc?, cosignatures?}`); `effective_at` may be
+    /// future-dated.
+    ///
+    /// v61.1.0 (CIRISPersist#1226; CC rc14 4.4.3.2.8,
+    /// `CLM-affiliation-one-voice-countersign`) — `cosignatures` is a list of
+    /// `{authority_key_id, scrub_signature_classical, scrub_signature_pqc?}`,
+    /// each over the SAME revocation `signing_envelope()` the primary signs
+    /// (the shape `put_community_json` takes). It is how a one-founder
+    /// affiliation's removal carries its designated official's countersign:
+    /// the door verifies each against its signer's registered keys and
+    /// counts only verified signers. Absent = none; malformed is refused
+    /// (`ValueError`); a `self` removal carrying one is refused.
     fn cohort_revoke_member(
         &self,
         py: Python<'_>,
@@ -32534,37 +32635,43 @@ fn outbound_rows_to_pylist<'py>(
     Ok(list)
 }
 
-/// v0.4.1 — Parse the policy string + optional soft_freshness window
-/// into a `HybridPolicy`. Shared by `Engine.verify_hybrid` and
-/// `Engine.verify_hybrid_via_directory` so the parsing rules are
-/// declared in one place.
+/// v0.4.1 — Parse the policy string into a `HybridPolicy`. Shared by
+/// `Engine.verify_hybrid` and `Engine.verify_hybrid_via_directory` (and so by
+/// the three `verify_signed_*` methods that route through the latter) so the
+/// rule is declared in one place.
+///
+/// v61.1.0 (CIRISPersist#1233, CC 5.3.2.4.3.1) — **`"strict"` is the only
+/// policy.** Every other value — `"ed25519_fallback"`, `"soft_freshness"`, an
+/// unknown string, the empty string — is refused with
+/// [`VERIFY_POLICY_VIOLATION`](crate::verify::hybrid::VERIFY_POLICY_VIOLATION)
+/// as a `ValueError`, and the callers run this BEFORE any decode, directory
+/// lookup or crypto. `soft_freshness_window_seconds` is no longer read: the
+/// argument stays in the signature until v62 drops `policy` and both windows
+/// together.
+///
+/// The string is first DECODED to the [`HybridPolicy`](crate::verify::HybridPolicy)
+/// it names (an unknown name is a malformed policy, refused with the same
+/// token), and the decoded policy is then asked
+/// [`require_strict_policy`](crate::verify::hybrid::require_strict_policy) —
+/// the one hybrid-required check the Rust API and the capsule ask too.
 fn parse_hybrid_policy(
     policy: &str,
     soft_freshness_window_seconds: Option<f64>,
 ) -> PyResult<crate::verify::HybridPolicy> {
+    use crate::verify::hybrid::{require_strict_policy, VERIFY_POLICY_VIOLATION};
     use crate::verify::HybridPolicy;
-    match policy {
-        "strict" => Ok(HybridPolicy::Strict),
-        "ed25519_fallback" => Ok(HybridPolicy::Ed25519Fallback),
-        "soft_freshness" => {
-            let secs = soft_freshness_window_seconds.ok_or_else(|| {
-                PyValueError::new_err(
-                    "soft_freshness policy requires soft_freshness_window_seconds",
-                )
-            })?;
-            if !secs.is_finite() || secs < 0.0 {
-                return Err(PyValueError::new_err(
-                    "soft_freshness_window_seconds must be a non-negative finite float",
-                ));
-            }
-            Ok(HybridPolicy::SoftFreshness {
-                window: std::time::Duration::from_secs_f64(secs),
-            })
-        }
-        other => Err(PyValueError::new_err(format!(
-            "unknown policy {other:?} (expected strict / ed25519_fallback / soft_freshness)"
-        ))),
-    }
+    let _ = soft_freshness_window_seconds; // v62 removes it with `policy`
+    let named = match policy {
+        "strict" => HybridPolicy::Strict,
+        "ed25519_fallback" => HybridPolicy::Ed25519Fallback,
+        // The window is never read: the policy is refused below.
+        "soft_freshness" => HybridPolicy::SoftFreshness {
+            window: std::time::Duration::ZERO,
+        },
+        _ => return Err(PyValueError::new_err(VERIFY_POLICY_VIOLATION)),
+    };
+    require_strict_policy(&named).map_err(|e| PyValueError::new_err(e.kind()))?;
+    Ok(named)
 }
 
 /// v1.3.0 (CIRISPersist#46 + #47) — Wire shape for the `TrustFilter`
@@ -32608,49 +32715,6 @@ fn goal_row_id(json: String) -> PyResult<String> {
         .map_err(|e| PyRuntimeError::new_err(format!("goal row id decode: {e}")))
 }
 
-/// v0.4.0 — Adapter implementing `PublicKeyDirectory` against the
-/// PyO3 Engine's backend + tokio runtime. Used by `Engine.verify_trace`
-/// and `Engine.verify_hybrid_via_directory` to drive
-/// `verify_*_via_directory` without requiring the caller to look up
-/// the key separately.
-///
-/// v1.5.1 — generic over the concrete backend type so the same adapter
-/// drives both PG and SQLite arms. Each call site passes its
-/// dispatch-arm Arc; no enum wrapper needed because the lookup signature
-/// is synchronous.
-struct TraceKeyDirectory<B>
-where
-    B: crate::store::Backend + Send + Sync + 'static,
-{
-    backend: Arc<B>,
-    /// v24.3.0 (CIRISPersist#572) — a [`SharedRuntime`], not a bare
-    /// `Arc<Runtime>`: this short-lived helper is one more place the
-    /// last reference could land, and every such place has to be
-    /// GIL-safe to drop.
-    runtime: SharedRuntime,
-}
-
-impl<B> crate::verify::PublicKeyDirectory for TraceKeyDirectory<B>
-where
-    B: crate::store::Backend + Send + Sync + 'static,
-{
-    fn lookup(
-        &self,
-        key_id: &str,
-    ) -> Result<Option<ed25519_dalek::VerifyingKey>, Box<dyn std::error::Error + Send + Sync>> {
-        let backend = self.backend.clone();
-        let key_id = key_id.to_owned();
-        // verify_trace_via_directory's PublicKeyDirectory trait is
-        // synchronous; bridge to the async backend via block_on on
-        // the engine's tokio runtime. Same shape used by
-        // receive_and_persist's internal verify path.
-        let key_opt = self
-            .runtime
-            .block_on(async move { backend.lookup_public_key(&key_id).await });
-        key_opt.map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
-    }
-}
-
 /// v0.4.0 — Canonicalize a federation envelope value (registration_
 /// envelope / attestation_envelope / revocation_envelope) **through the
 /// produce gate** ([`crate::verify::canonical::ceg_produce_canonicalize`]).
@@ -32682,45 +32746,6 @@ fn canonicalize_envelope_value(envelope: &serde_json::Value) -> PyResult<Vec<u8>
         .map_err(|e| PyRuntimeError::new_err(format!("canonicalize_envelope_value: {e}")))
 }
 
-/// v37.0.0 — **the trace canonicalizer is resolved from the trace's own
-/// SIGNED schema epoch**, exactly as the production ingest path resolves it.
-///
-/// One expression, delegating to
-/// [`canon_version_for_trace_schema`](crate::verify::ed25519::canon_version_for_trace_schema)
-/// (major ≥ 3 ⇒ RFC 8785 JCS, else Python-compat) through
-/// [`canonicalizer_for`](crate::verify::canonical::canonicalizer_for) — the
-/// IDENTICAL expression `IngestPipeline::verify_complete_trace` uses in
-/// `src/ingest.rs`, where it is documented as *"signed-bytes-bound, not
-/// caller-selectable"*. This is a seam for the witness, not a second rule: if
-/// the two ever disagree, `verify_trace_and_ingest_agree_on_the_canon_gate`
-/// reds.
-///
-/// # The FIFTH instance of the #714 / #716 / #735 class
-///
-/// [`PyEngine::verify_trace`] hard-coded
-/// [`PythonJsonDumpsCanonicalizer`](crate::verify::PythonJsonDumpsCanonicalizer)
-/// and never consulted the epoch. `"3.0.0"` is a SUPPORTED schema
-/// ([`crate::schema::version::SUPPORTED_VERSIONS`]) and IS the JCS cutover
-/// epoch, so a 3.0.0 trace carrying one non-ASCII character was ADMITTED by
-/// `receive_and_persist` and REJECTED by `Engine.verify_trace` — the same
-/// trace, two answers, from one library, with the dry-run primitive (the one a
-/// peer consults BEFORE storing) giving the wrong one.
-///
-/// # GIL
-///
-/// Returns a `&'static dyn Canonicalizer`; [`Canonicalizer`](crate::verify::canonical::Canonicalizer)
-/// is `Send + Sync`, so the handle crosses `py.detach` exactly as the unit
-/// struct did. Neither arm touches CPython — `PythonJsonDumpsCanonicalizer`
-/// names the OUTPUT FORMAT it emulates and `JcsCanonicalizer` delegates to
-/// `ciris_verify_core::jcs` — so the #580 no-hoisting argument covers both.
-fn trace_canonicalizer(
-    schema_version: &str,
-) -> &'static dyn crate::verify::canonical::Canonicalizer {
-    crate::verify::canonical::canonicalizer_for(
-        crate::verify::ed25519::canon_version_for_trace_schema(schema_version),
-    )
-}
-
 /// v0.3.5 — TraceLevel → wire-format string. Same shape as the
 /// trace_level_str helper in `src/store/postgres.rs` but free-standing
 /// for use from this FFI module without re-exposing storage internals.
@@ -32729,6 +32754,62 @@ fn trace_level_str(t: crate::schema::TraceLevel) -> &'static str {
         crate::schema::TraceLevel::Generic => "generic",
         crate::schema::TraceLevel::Detailed => "detailed",
         crate::schema::TraceLevel::FullTraces => "full_traces",
+    }
+}
+
+/// THREAT_MODEL.md AV-15 — an [`IngestError`] → `PyErr` at the FFI boundary.
+///
+/// v61.1.0 (CIRISPersist#1239) — one mapping for the two surfaces that run
+/// ingest's code: `Engine.receive_and_persist` and `Engine.verify_trace`, the
+/// dry-run, which runs ingest's verify step
+/// ([`crate::ingest::verify_trace_for_admission`]). So the same cause raises
+/// the same exception type with the same token from both.
+///
+/// Verbose `Display` (which may include attacker-supplied content) goes to
+/// tracing logs; the Python exception carries only the stable kind token and,
+/// when [`IngestError::detail`] is `Some`, the 2-tuple `(kind, detail)`
+/// (v0.4.6, CIRISPersist#22). Lens consumers read `kind = e.args[0]`,
+/// `detail = e.args[1] if len(e.args) > 1 else None`.
+fn ingest_err_to_py(e: IngestError, what: &'static str) -> PyErr {
+    let kind = e.kind();
+    let detail = e.detail();
+    tracing::warn!(
+        error = %e, kind = kind, detail = detail.as_deref(), surface = what,
+        "ingest rejected"
+    );
+    match e {
+        // Schema / verify / scrub → ValueError (caller-fault; 4xx).
+        // v1.1.0 (CIRISPersist#33 part 3) — PipelineInvariant
+        // is also caller-fault (FSD §4.3 shape violation
+        // signalled by the edge); maps to lens-side HTTP 422.
+        // v4.0 (FSD §4.6) — AV-45 write-path cohort_scope
+        // refusal is caller-fault (the writer stamped a
+        // cohort it isn't a member of); lens-side HTTP 403.
+        // v32.0.0 (CIRISPersist#690) — a batch whose treatment
+        // does not match its label is caller-fault and belongs
+        // here, NOT with Sign/Store: nothing on this node is
+        // broken. The sender downgrades the level and relabels,
+        // or loads a model. Lens-side HTTP 422, and `detail`
+        // carries which level it was actually treated at so the
+        // sender can tell those two remedies apart.
+        IngestError::Schema(_)
+        | IngestError::Verify(_)
+        | IngestError::Scrub(_)
+        | IngestError::ScrubTreatmentMismatch { .. }
+        | IngestError::ScopeRefused(_)
+        | IngestError::PipelineInvariant { .. }
+        | IngestError::TraceRefused { .. } => match detail {
+            Some(d) => PyValueError::new_err((kind, d)),
+            None => PyValueError::new_err(kind),
+        },
+        // Store / Sign → RuntimeError (server-fault; 5xx).
+        // AV-25: signing failure is operator-side
+        // (keyring locked, hardware unavailable, etc.) —
+        // never the agent's fault, never a 4xx.
+        IngestError::Store(_) | IngestError::Sign(_) => match detail {
+            Some(d) => PyRuntimeError::new_err((kind, d)),
+            None => PyRuntimeError::new_err(kind),
+        },
     }
 }
 
@@ -32979,6 +33060,32 @@ fn parse_pair_cursor(
             "{method}: the cursor is the PAIR (#668) — supply both since_rfc3339 and since_id, \
              or neither. Half a cursor would page from the start of that instant and re-serve \
              every row tied at it."
+        ))),
+    }
+}
+
+/// v61.1.0 (CIRISPersist#1190, #1163) — a serve-stream read's cursor, a
+/// [`ServePosition`](crate::federation::types::ServePosition) given as its
+/// two parts: both or neither, as [`parse_pair_cursor`], except that the id
+/// may be EMPTY (a `high_water` clamped below the rows still in flight, and
+/// the origin, carry no id: "before every row at this instant").
+fn parse_serve_position(
+    method: &str,
+    since_rfc3339: Option<&str>,
+    since_id: Option<&str>,
+) -> PyResult<Option<crate::federation::types::ServePosition>> {
+    match (since_rfc3339.filter(|s| !s.is_empty()), since_id) {
+        (Some(s), Some(id)) => Ok(Some(crate::federation::types::ServePosition::new(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
+                .with_timezone(&chrono::Utc),
+            id,
+        ))),
+        (None, None) => Ok(None),
+        (None, Some("")) => Ok(None),
+        _ => Err(PyValueError::new_err(format!(
+            "{method}: the cursor is a serve position — supply since_rfc3339 and since_id \
+             together (since_id may be empty, as a high_water gives it), or neither"
         ))),
     }
 }
@@ -33558,7 +33665,14 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
             PyValueError::new_err((token, body.to_string()))
         }
         // Server-fault → RuntimeError (5xx).
-        crate::federation::Error::Backend(_) => PyRuntimeError::new_err(kind),
+        // v61.1.0 (CIRISPersist#1238) — the detail rides the kind. The
+        // `tracing::warn!` above has no subscriber on a PyO3 host, so a
+        // kind-only message left Edge reading `federation_backend` for a
+        // SQLITE_BUSY with nothing to say which. The message still STARTS
+        // with the kind token, and the type is unchanged.
+        crate::federation::Error::Backend(detail) => {
+            PyRuntimeError::new_err(format!("{kind}: {detail}"))
+        }
         // v59.1.2 — carved out of `Backend`: a RuntimeError subclass, the
         // kind and the wait in the message.
         crate::federation::Error::PoolExhausted { .. } => PoolExhausted::new_err(e.to_string()),
@@ -33637,6 +33751,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
             reason,
             detail,
         } => PyValueError::new_err(format!("{kind}: {revocation_id} {reason} — {detail}")),
+        // v61.1.0 (CIRISPersist#1226) — typed out of `InvalidArgument`
+        // (ValueError), so it keeps that type; the refusal token rides.
+        crate::federation::Error::RevokeMemberRefused { reason, .. } => {
+            PyValueError::new_err(format!("{kind}: {reason}"))
+        }
         // CIRISPersist#592 (AV-84) — caller-fixable, and the branch token
         // rides in the message for the same reason the two above do: a Python
         // consumer must be able to tell "the row names a third party" from a
@@ -35276,29 +35395,36 @@ async fn build_audit_chain_proof(
         }
     };
 
-    // Step 3 — surface the current STH if one exists (stretch goal).
-    // We tolerate `NotImplemented` / `None` cleanly — UIs that don't
-    // need the proof can ignore the field.
+    // Step 3 — surface the current STH if one exists. `None` when no head
+    // has been signed yet (Merkle hook disabled, or chain empty).
+    //
+    // v61.1.0 (CIRISPersist#1233) — refuse only a real error. A stored head
+    // is served AS ITSELF (CC 2.6.1.8; `latest_sth` asks no shape gate, and
+    // `verify_audit_sth` is the hybrid-Strict check a verifier asks of it),
+    // so what reaches here as an `Err` is a head the store could not read: a
+    // blob that does not decode, or a storage failure. That is an error, not
+    // `None` — until v61.0.5 every `Err` folded to `None`, and malformed is a
+    // refusal, not absence. The one `Err` that IS absence is
+    // `Error::NotImplemented`: an audit backend with no Merkle head surface
+    // has no head to serve, the case the old fold was written for.
+    fn head_json(
+        got: Result<Option<ciris_verify_core::transparency::SignedTreeHead>, crate::audit::Error>,
+    ) -> Result<Option<String>, String> {
+        match got {
+            Ok(Some(sth)) => serde_json::to_string(&sth)
+                .map(Some)
+                .map_err(|e| format!("SignedTreeHead encode: {e}")),
+            Ok(None) | Err(crate::audit::Error::NotImplemented(_)) => Ok(None),
+            Err(e) => Err(format!("current_sth: {e}")),
+        }
+    }
     let head_signature: Option<String> = match backend {
         #[cfg(feature = "postgres")]
-        BackendDispatch::Postgres(pg) => match pg.current_sth(&tenant_id).await {
-            Ok(Some(sth)) => Some(
-                serde_json::to_string(&sth).map_err(|e| format!("SignedTreeHead encode: {e}"))?,
-            ),
-            Ok(None) => None,
-            Err(_) => None,
-        },
+        BackendDispatch::Postgres(pg) => head_json(pg.current_sth(&tenant_id).await)?,
         #[cfg(feature = "sqlite")]
         BackendDispatch::Sqlite(sq) => {
             let audit = crate::audit::sqlite::SqliteAuditBackend::new(sq.conn_handle());
-            match audit.current_sth(&tenant_id).await {
-                Ok(Some(sth)) => Some(
-                    serde_json::to_string(&sth)
-                        .map_err(|e| format!("SignedTreeHead encode: {e}"))?,
-                ),
-                Ok(None) => None,
-                Err(_) => None,
-            }
+            head_json(audit.current_sth(&tenant_id).await)?
         }
     };
 
@@ -35312,6 +35438,39 @@ async fn build_audit_chain_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **I1662 (CIRISPersist#1238)** — a backend error reaches Python with
+    /// its detail. Before v61.1.0 the message was the bare kind and the detail
+    /// went only to `tracing::warn!`, which has no subscriber on a PyO3 host:
+    /// Edge's SQLITE_BUSY read `federation_backend` and nothing else. The
+    /// type is still `RuntimeError` (and not the `PoolExhausted` subclass), and
+    /// the message still STARTS with the kind, so a host matching
+    /// `str(e).startswith("federation_backend")` still matches.
+    #[test]
+    fn i1662_a_backend_error_carries_its_detail_to_python_1238() {
+        Python::initialize();
+        // The shape the sqlite key-record door raises on a locked file.
+        let detail = "key record write k-1238: database is locked";
+        let e = crate::federation::Error::Backend(detail.to_owned());
+        assert_eq!(e.kind(), "federation_backend");
+        let py_err = federation_err_to_py(e);
+        Python::attach(|py| {
+            assert!(
+                py_err.is_instance_of::<PyRuntimeError>(py),
+                "I1662: still a RuntimeError"
+            );
+            assert!(
+                !py_err.is_instance_of::<PoolExhausted>(py),
+                "I1662: a backend error is not a starved pool"
+            );
+            let text = py_err.value(py).to_string();
+            assert_eq!(text, format!("federation_backend: {detail}"), "I1662");
+            assert!(
+                text.starts_with("federation_backend"),
+                "I1662: led by the kind"
+            );
+        });
+    }
 
     /// v59.1.2 — a starved pool reaches Python as `PoolExhausted`, a
     /// `RuntimeError` subclass (the type the backend arm it was carved from
@@ -37129,8 +37288,14 @@ mod tests {
     // The same blind spot covers `accord_dispatch!`, whose `block_on` lives
     // in the macro DEFINITION so every call site looks clean.
     //
-    // So the gate is stated over the whole file with two named exceptions,
-    // and each exception is PAID FOR by its own clause below.
+    // So the gate is stated over the whole file with named exceptions, and
+    // each exception is PAID FOR by its own clause below.
+    //
+    // v61.1.0 (CIRISPersist#1239) — the `TraceKeyDirectory` shim is gone:
+    // `verify_trace` now runs ingest's async verify step and its `block_on`
+    // is written inside the method's own `py.detach`, so clause 1 covers it
+    // directly. Its exception and the clause that paid for it went with it;
+    // keeping either would exempt a span that no longer exists.
 
     /// Blank out comments, string literals and char literals, preserving
     /// length and newlines so byte offsets and line numbers stay valid.
@@ -37297,23 +37462,22 @@ mod tests {
     /// `block_on` reachable from the PyO3 boundary must run with the GIL
     /// released.
     ///
-    /// Three clauses. The first states the rule; the other two exist to pay
-    /// for the first one's two exceptions, so the exceptions cannot quietly
-    /// become holes:
+    /// Two clauses. The first states the rule; the second pays for the
+    /// first one's exception, so the exception cannot quietly become a hole:
     ///
     /// 1. every non-test `block_on` is lexically inside a `py.detach`,
-    ///    EXCEPT inside the `TraceKeyDirectory` sync-trait shim (which holds
-    ///    no `Python` token and so cannot detach) and inside the
-    ///    `accord_dispatch!` macro definition (whose `block_on` is expanded
-    ///    at each call site, not executed where it is written);
-    /// 2. every `TraceKeyDirectory` CONSTRUCTION is inside a `py.detach` —
-    ///    this is what makes exception (1a) sound, and it is the clause that
-    ///    fails on pre-#580 code;
-    /// 3. every `accord_dispatch!` CALL SITE is inside a `py.detach` — what
-    ///    makes exception (1b) sound.
+    ///    EXCEPT inside the `accord_dispatch!` macro definition (whose
+    ///    `block_on` is expanded at each call site, not executed where it is
+    ///    written);
+    /// 2. every `accord_dispatch!` CALL SITE is inside a `py.detach` — what
+    ///    makes that exception sound.
     ///
-    /// Verified to discriminate: run against `main` before the #580 fix,
-    /// clause 2 reports both construction sites as unguarded.
+    /// Until v61.1.0 there was a second exception, the `TraceKeyDirectory`
+    /// sync-trait shim `verify_trace` reached its `block_on` through, and a
+    /// clause that its construction sites were detached (the clause that
+    /// reported both sites as unguarded on pre-#580 `main`). #1239 removed the
+    /// shim: `verify_trace`'s `block_on` is now written inside its own
+    /// `py.detach`, which clause 1 checks.
     #[test]
     fn no_block_on_reaches_the_pyo3_boundary_holding_the_gil() {
         let raw = include_str!("pyo3.rs");
@@ -37365,11 +37529,6 @@ mod tests {
             }
             v
         };
-        let shim = spans_of(
-            &s,
-            &stripped,
-            "impl<B> crate::verify::PublicKeyDirectory for TraceKeyDirectory<B>",
-        );
         let macro_def = spans_of(&s, &stripped, "macro_rules! accord_dispatch");
 
         let inside =
@@ -37380,11 +37539,7 @@ mod tests {
         let mut from = 0usize;
         while let Some(rel) = stripped[from..].find("block_on(") {
             let at = stripped[..from + rel].chars().count();
-            if !inside(&test_mods, at)
-                && !inside(&detaches, at)
-                && !inside(&shim, at)
-                && !inside(&macro_def, at)
-            {
+            if !inside(&test_mods, at) && !inside(&detaches, at) && !inside(&macro_def, at) {
                 offenders.push(line_at(&s, at));
             }
             from += rel + "block_on(".len();
@@ -37397,26 +37552,7 @@ mod tests {
              watchdog can fire through it. Wrap the call in `py.detach(...)`."
         );
 
-        // ── clause 2 — pays for exception (1a) ──
-        let mut ctor = Vec::new();
-        let mut from = 0usize;
-        while let Some(rel) = stripped[from..].find("TraceKeyDirectory {") {
-            let at = stripped[..from + rel].chars().count();
-            if !inside(&test_mods, at) && !inside(&detaches, at) {
-                ctor.push(line_at(&s, at));
-            }
-            from += rel + 1;
-        }
-        assert!(
-            ctor.is_empty(),
-            "CIRISPersist#580 clause 2 — `TraceKeyDirectory` built OUTSIDE a \
-             `py.detach` at pyo3.rs lines {ctor:?}. Its `lookup` blocks on the \
-             runtime and it holds no `Python` token, so the ONLY place the GIL \
-             can be released is around its construction and use. This is the \
-             clause that fails on pre-#580 `verify_trace`."
-        );
-
-        // ── clause 3 — pays for exception (1b) ──
+        // ── clause 2 — pays for the exception ──
         let mut sites = Vec::new();
         let mut from = 0usize;
         while let Some(rel) = stripped[from..].find("accord_dispatch!") {
@@ -37428,7 +37564,7 @@ mod tests {
         }
         assert!(
             sites.is_empty(),
-            "CIRISPersist#580 clause 3 — `accord_dispatch!` invoked OUTSIDE a \
+            "CIRISPersist#580 clause 2 — `accord_dispatch!` invoked OUTSIDE a \
              `py.detach` at pyo3.rs lines {sites:?}. The macro expands to \
              `runtime.block_on(...)`, so a call site that does not detach blocks \
              under the GIL even though its body mentions no `block_on`."
@@ -37869,6 +38005,28 @@ fn engine_teardown_wait(py: Python<'_>, timeout_seconds: f64) -> &'static str {
             TeardownOutcome::TimedOut.token()
         }
     })
+}
+
+/// v61.1.0 (CIRISPersist#1235) — set the caller label this thread's door
+/// reads are credited to in `Engine.telemetry_snapshot()["callers"]`, and
+/// return the label it replaces (`None` when none was set). `label=None`
+/// clears it. Restore with the returned value: the `ciris_persist.caller_scope`
+/// context manager does exactly that.
+///
+/// The scope is per OS thread: every Engine method polls its read on the
+/// calling thread, so the label covers the calls this thread makes until it
+/// is changed. A label is 1 to 48 bytes of `[a-z][a-z0-9_.:-]*` and not
+/// `"unattributed"`; anything else raises `ValueError` and leaves the scope
+/// unchanged. Past 32 distinct labels per process every new label is counted
+/// under `"other"`.
+#[pyfunction]
+#[pyo3(signature = (label=None))]
+fn set_caller_scope(label: Option<&str>) -> PyResult<Option<String>> {
+    let caller = label
+        .map(crate::observe::Caller::new)
+        .transpose()
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(crate::observe::set_thread_caller(caller).map(crate::observe::Caller::label))
 }
 
 /// v24.3.0 (CIRISPersist#572) — how many engine teardowns are still
@@ -38342,6 +38500,8 @@ pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // `engine_teardowns_in_flight` says whether anything still is.
     m.add_function(pyo3::wrap_pyfunction!(engine_teardown_wait, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(engine_teardowns_in_flight, m)?)?;
+    // v61.1.0 (CIRISPersist#1235) — this thread's read-attribution caller.
+    m.add_function(pyo3::wrap_pyfunction!(set_caller_scope, m)?)?;
     // v21.7.0 (CIRISPersist#519 / CIRISConformance#83) — the manifest-driven
     // field-conformance surface: a shared harness drives the real wheel
     // against the fields persist is tagged to own in the shared table.
@@ -38738,8 +38898,9 @@ mod canonicalizer_parity_735 {
 /// rebuilt under another. This one is *verify*-side and worse in a specific
 /// way — it does not corrupt a row, it makes **one library give two answers**.
 /// [`super::PyEngine::verify_trace`] hard-coded
-/// [`PythonJsonDumpsCanonicalizer`] while `IngestPipeline::verify_complete_trace`
-/// resolves the canonicalizer from the trace's own signed
+/// [`PythonJsonDumpsCanonicalizer`] while ingest's verify step (since
+/// v61.1.0 `crate::ingest::verify_trace_for_admission`) resolves the
+/// canonicalizer from the trace's own signed
 /// `trace_schema_version` (`src/ingest.rs`, *"signed-bytes-bound, not
 /// caller-selectable"*). `"3.0.0"` is a supported schema
 /// ([`crate::schema::version::SUPPORTED_VERSIONS`]) and IS the JCS cutover
@@ -38756,6 +38917,12 @@ mod canonicalizer_parity_735 {
 /// And the fix is a GATE, not a flip: the 2.7.0 leg below asserts a pre-cutover
 /// Python-signed trace still verifies. A "fix" that hard-coded JCS instead
 /// would pass every 3.0.0 assertion here and red that one.
+///
+/// v61.1.0 (CIRISPersist#1239) — the dry-run no longer chooses a
+/// canonicalizer: it runs ingest's verify step, which calls
+/// `crate::ingest::trace_canonicalizer`. These tests pin that one rule on the
+/// classical half; the hybrid verdict parity is `verify_trace_1239_tests`
+/// (I1569).
 #[cfg(test)]
 mod verify_trace_canon_parity_class {
     use crate::schema::{
@@ -38772,8 +38939,7 @@ mod verify_trace_canon_parity_class {
     use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
     use std::collections::HashMap;
 
-    /// In-memory [`PublicKeyDirectory`], the shape
-    /// [`super::super::TraceKeyDirectory`] wraps around a backend.
+    /// In-memory [`PublicKeyDirectory`] for the classical-half checks below.
     struct MemKeys(HashMap<String, VerifyingKey>);
     impl PublicKeyDirectory for MemKeys {
         fn lookup(
@@ -38881,7 +39047,7 @@ mod verify_trace_canon_parity_class {
     fn verify_trace_and_ingest_agree_on_the_canon_gate() {
         let payload = canonical_payload_value_v279(&unsigned_trace("3.0.0"));
         for schema in crate::schema::version::SUPPORTED_VERSIONS {
-            let ffi = super::trace_canonicalizer(schema)
+            let ffi = crate::ingest::trace_canonicalizer(schema)
                 .canonicalize_value(&payload)
                 .expect("ffi canonicalize");
             let ingest = canonicalizer_for(canon_version_for_trace_schema(schema))
@@ -38924,7 +39090,7 @@ mod verify_trace_canon_parity_class {
         // The FFI's verdict — what `Engine.verify_trace` reports. Same answer.
         verify_trace_via_directory(
             &trace,
-            super::trace_canonicalizer(trace.trace_schema_version.as_str()),
+            crate::ingest::trace_canonicalizer(trace.trace_schema_version.as_str()),
             &keys,
         )
         .expect(
@@ -38955,7 +39121,7 @@ mod verify_trace_canon_parity_class {
 
         verify_trace_via_directory(
             &trace,
-            super::trace_canonicalizer(trace.trace_schema_version.as_str()),
+            crate::ingest::trace_canonicalizer(trace.trace_schema_version.as_str()),
             &keys,
         )
         .expect("a pre-cutover 2.7.9 trace MUST keep verifying under Python-compat");
@@ -38971,3 +39137,14 @@ mod verify_trace_canon_parity_class {
 /// v61 (CC 2.6.2) — I-IFP-10: the Python open settles stored instant forms.
 #[cfg(test)]
 mod instant_form_open_tests;
+
+/// v61.1.0 (CIRISPersist#1233) — I1560, I1561, I1567: the Python verify doors
+/// accept only `"strict"`; `audit_chain_proof` does not serve a refused head.
+#[cfg(test)]
+mod hybrid_policy_1233_tests;
+
+/// v61.1.0 (CIRISPersist#1239) — I1569: `Engine.verify_trace`, the dry-run,
+/// gives ingest's verdict (it runs ingest's verify step) on sqlite and
+/// postgres.
+#[cfg(test)]
+mod verify_trace_1239_tests;

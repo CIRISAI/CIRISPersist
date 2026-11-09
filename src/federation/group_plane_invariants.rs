@@ -24,6 +24,12 @@
 //! byte-equal); a resignation is withdrawn only by its signer; a group's
 //! record is never withdrawn.
 //!
+//! I1620 (v61.1.0, CIRISPersist#1188) — a retraction names the member its
+//! row names, and a record's names no one: under `unanimous` every OTHER
+//! member retracts a widening without the member it seated; under
+//! `open:self_admit` two founders dissolve a public room by withdrawing its
+//! record, and one does not.
+//!
 //! I1488 — the rows are served to the group's membership-plane audience: a
 //! private family's rows reach a member and the member a row names, never a
 //! stranger.
@@ -583,6 +589,53 @@ pub(crate) mod bodies {
         d.put_attestation(crate::federation::SignedAttestation { attestation: row })
             .await
             .map(|_| ())
+    }
+
+    /// I1532 (CIRISPersist#1198, CC 4.5.13) — a cosigned `withdraws` of a
+    /// roster event counts persons under `quorum:2/3`: ann's two keys are one
+    /// voice, and ann's unseated device with ben's seat are two.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) async fn i1532_a_retraction_counts_persons<D>(d: &D, tag: &str)
+    where
+        D: FederationDirectory + GroupPlaneStore + AttestationStore,
+    {
+        let dd: &dyn FederationDirectory = d;
+        for n in ["ann", "ben", "cat", "dan"] {
+            user(dd, &format!("{n}-{tag}")).await;
+        }
+        let device = format!("ann2-{tag}");
+        user(dd, &device).await;
+        let (fam, [ann, ben, _, dan]) = family_with_history(d, tag).await;
+        crate::federation::self_roster_invariants::bodies::add(
+            dd,
+            &ann,
+            &ann,
+            &device,
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now()),
+        )
+        .await
+        .expect("ann's second device");
+        let widening = one(
+            d,
+            &fam,
+            gp::MEMBERSHIP_WIDENING_DIMENSION,
+            GroupPlaneTable::FamilyWidenings,
+        )
+        .await;
+        let e = put_row(dd, withdraws_of(&ann, &[&device], &widening))
+            .await
+            .expect_err("I1532: one person's two keys are one voice");
+        assert!(
+            matches!(e, Error::RosterAuthorityUnauthorized { .. }),
+            "{tag}: I1532: {e}"
+        );
+        put_row(dd, withdraws_of(&ben, &[&device], &widening))
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: I1532: two persons: {e}"));
+        assert!(
+            !sorted_active(dd, &fam).await.contains(&dan),
+            "{tag}: I1532: the retracted widening seats nobody"
+        );
     }
 
     /// I1487 — a cosigned row is retracted by a cosigned `withdraws`.
@@ -1312,6 +1365,185 @@ pub(crate) mod bodies {
         );
     }
 
+    /// I1620 (CIRISPersist#1188, the nightly survivor at
+    /// `check_cosigned_withdraws`' `subject`; CC 3.1.3.2, CC 4.5.13) — **a
+    /// retraction names the member its row names, and a record's names no
+    /// one.** Two protocols read the subject, and each leg is red under
+    /// `!=` -> `==` there:
+    ///
+    /// - under `unanimous`, retracting a widening is a removal of the member
+    ///   it seated, so it is signed by every OTHER member: ann, ben and cat
+    ///   retract dan's widening without dan (read as a whole-roster change it
+    ///   would need dan too); two of the three others are refused;
+    /// - under `open:self_admit`, withdrawing a public room's record (its
+    ///   dissolution) names no member, so it takes the two-voice floor: its
+    ///   two founders dissolve it (read as naming the room's key it would be
+    ///   an admission of an unseated joiner who never signed); one founder is
+    ///   refused.
+    pub(crate) async fn i1620_a_retraction_names_its_member<D>(d: &D, tag: &str)
+    where
+        D: FederationDirectory + GroupPlaneStore + AttestationStore,
+    {
+        let dd: &dyn FederationDirectory = d;
+        let [ann, ben, cat, dan] = ["ann", "ben", "cat", "dan"].map(|n| format!("{n}-{tag}"));
+        for k in [&ann, &ben, &cat, &dan] {
+            user(dd, k).await;
+        }
+        // The widening leg: a unanimous family of ann (founder), ben and cat.
+        let fam = format!("fam-{tag}");
+        let founded = at("2026-01-01T00:00:00Z");
+        d.put_family(ts::sign_family(
+            &ann,
+            Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                family_key_id: fam.clone(),
+                family_name: "household".into(),
+                members: [&ann, &ben, &cat]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| FamilyMember {
+                        key_id: (*k).clone(),
+                        joined_at: founded,
+                        role: (i == 0).then(|| "founder".to_owned()),
+                    })
+                    .collect(),
+                founded_at: founded,
+                consensus_protocol: "unanimous".to_owned(),
+                consensus_protocol_entrenched: false,
+                dissolved_at: None,
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .expect("I1620: the family admitted");
+        let mut w = ts::sign_family_membership_widening(
+            &ann,
+            FamilyMembershipWidening {
+                family_key_id: fam.clone(),
+                member_key_id: dan.clone(),
+                joined_at: at("2026-02-01T00:00:00Z"),
+                effective_at: at("2026-02-01T00:00:00Z"),
+                role: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        ts::cosign_family_membership_widening(&mut w, &ben);
+        ts::cosign_family_membership_widening(&mut w, &cat);
+        d.put_family_membership_widening_consented(w)
+            .await
+            .expect("I1620: 3 of 3 widen");
+        assert_eq!(
+            sorted_active(dd, &fam).await,
+            {
+                let mut v = vec![ann.clone(), ben.clone(), cat.clone(), dan.clone()];
+                v.sort();
+                v
+            },
+            "{tag}: I1620: dan seated, four members"
+        );
+        let widening = one(
+            d,
+            &fam,
+            gp::MEMBERSHIP_WIDENING_DIMENSION,
+            GroupPlaneTable::FamilyWidenings,
+        )
+        .await;
+        // Two of the three others: not every other member.
+        let short = withdraws_of(&ann, &[&ben], &widening);
+        let e = put_row(dd, short.clone())
+            .await
+            .expect_err("I1620: two of the three others are short of unanimous");
+        assert!(
+            matches!(e, Error::RosterAuthorityUnauthorized { .. }),
+            "{tag}: I1620: {e}"
+        );
+        assert!(
+            dd.get_attestation(&short.attestation_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "{tag}: I1620: a refused retraction stores nothing"
+        );
+        // Every other member, the member it seated not among them.
+        let retraction = withdraws_of(&ann, &[&ben, &cat], &widening);
+        put_row(dd, retraction.clone()).await.unwrap_or_else(|e| {
+            panic!(
+                "{tag}: I1620: every other member retracts the widening that seated dan, \
+                 without dan (the retraction names dan): {e}"
+            )
+        });
+        assert!(
+            !sorted_active(dd, &fam).await.contains(&dan),
+            "{tag}: I1620: the retracted widening seats nobody"
+        );
+
+        // The record leg: a public room of two founders under open:self_admit.
+        let room = format!("room-{tag}");
+        user(dd, &room).await;
+        d.put_community(ts::sign_community(
+            &ann,
+            Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                community_key_id: room.clone(),
+                community_name: "public room".into(),
+                members: [&ann, &ben]
+                    .iter()
+                    .map(|k| CommunityMember {
+                        key_id: (*k).clone(),
+                        joined_at: founded,
+                        role: Some("founder".to_owned()),
+                    })
+                    .collect(),
+                founded_at: founded,
+                consensus_protocol: crate::federation::types::consensus_protocol::OPEN_SELF_ADMIT
+                    .to_owned(),
+                policy_blob: Some(serde_json::json!({
+                    "cohort_subkind": crate::federation::public_room::COHORT_SUBKIND_PUBLIC,
+                })),
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .expect("I1620: the public room admitted");
+        let record = rows(d, GroupPlaneTable::Communities, gp::GROUP_ROSTER_DIMENSION)
+            .await
+            .into_iter()
+            .find(|r| r.attested_key_id == room)
+            .expect("I1620: the room's record row");
+        let one_voice = withdraws_of(&ann, &[], &record);
+        let e = put_row(dd, one_voice)
+            .await
+            .expect_err("I1620: one founder does not dissolve a public room");
+        assert!(
+            matches!(e, Error::RosterAuthorityUnauthorized { .. }),
+            "{tag}: I1620: {e}"
+        );
+        assert!(
+            gp::community_dissolved_at(dd, &room)
+                .await
+                .unwrap()
+                .is_none(),
+            "{tag}: I1620: one voice dissolves nothing"
+        );
+        put_row(dd, withdraws_of(&ann, &[&ben], &record))
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{tag}: I1620: two founders dissolve the public room (its record's \
+                     withdrawal names no member): {e}"
+                )
+            });
+        assert!(
+            gp::community_dissolved_at(dd, &room)
+                .await
+                .unwrap()
+                .is_some(),
+            "{tag}: I1620: dissolved"
+        );
+    }
+
     /// I1489, last: after the runner clears every widening's pointer, the
     /// rehome links each back and counts it (and still counts the
     /// Ed25519-only record).
@@ -1542,6 +1774,18 @@ mod run {
                 async fn i1492() {
                     let Some(d) = $fresh.await else { return };
                     super::super::bodies::i1492_a_retraction_has_a_direction(&d, &super::tag())
+                        .await;
+                }
+                #[tokio::test]
+                async fn i1620() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i1620_a_retraction_names_its_member(&d, &super::tag())
+                        .await;
+                }
+                #[tokio::test]
+                async fn i1532() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i1532_a_retraction_counts_persons(&d, &super::tag())
                         .await;
                 }
                 #[tokio::test]

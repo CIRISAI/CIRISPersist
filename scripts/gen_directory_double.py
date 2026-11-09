@@ -17,20 +17,29 @@ trait gains a `;`-terminated method and nobody regenerates, the double fails to
 COMPILE, loud and at the right moment. A method added with a DEFAULT BODY is
 different: the double silently inherits the default, so a backend that
 overrides it is not reached even when no fault was requested, and nothing
-fails. Found on PR #786 (CIRISPersist#785); the trait currently declares ~200
-methods against 81 delegations here, so the silent set is large.
+fails. Found on PR #786 (CIRISPersist#785), and again on #1232.
 
-Blanket-delegating every default would be WRONG, which is why this is an
-explicit list rather than a parser change. Some defaults are PROVIDED
+Blanket-delegating every default would be WRONG. Some defaults are PROVIDED
 COMPOSITIONS — `active_family_key_ids_for` calls `list_families_for_member`
 through `self`. Delegated to the inner backend, that composition runs where
 this wrapper's fault table does not exist, so a fault injected on the inner
 call is silently not observed. That would break fault injection in the double
 whose entire purpose is fault injection.
 
-So a default belongs in DELEGATED_DEFAULTS when it is a LEAF backend operation
-(backends override it; it composes no other trait method through `self`), and
-stays out when it is a provided composition.
+So a default is delegated when it is a LEAF backend operation (backends
+override it; it composes no other trait method through `self`), and stays out
+when it is a provided composition.
+
+v61.1.0 (D9) — LEAVES ARE FOUND, NOT LISTED. A default whose body is exactly
+`Err(Error::Unsupported { .. })`, optionally after `let _ = ...;` statements
+that consume the arguments, composes nothing through `self` by construction,
+so it is a leaf and is delegated automatically (`is_unsupported_leaf`). The
+hand lists are now overrides only: DELEGATED_DEFAULTS names the leaves whose
+default is NOT an `Unsupported` refusal (a no-op, `None`, "none held"), which
+the parser cannot tell from a composition; NOT_DELEGATED names an
+`Unsupported`-bodied default the double must still not delegate (empty today;
+each entry needs its reason). #1232 was exactly the gap this closes: 61.0.5's
+`list_attestations_naming_by_dimension` was a leaf nobody listed.
 
 Run:  python3 scripts/gen_directory_double.py
 Check: python3 scripts/gen_directory_double.py --check   (CI: fails if stale)
@@ -42,64 +51,25 @@ import re
 import sys
 from pathlib import Path
 
-# Defaulted trait methods that MUST be delegated anyway — see the module
-# docstring for the rule. Each is a leaf backend operation: backends override
-# it, it composes no other trait method through `self`, and a consumer wrapping
-# a backend in this double must reach the override rather than the default.
+# v61.1.0 (D9) — OVERRIDES ONLY. Every defaulted method whose body is an
+# `Err(Error::Unsupported { .. })` refusal is a leaf and is delegated without
+# being listed (`is_unsupported_leaf`); 24 names left this list when that
+# landed, among them #1225's `list_attestations_naming_by_dimension`, the one
+# #1232 found missing. `parse_defaults` refuses a name here that the parser
+# already finds, so the list cannot regrow its redundant half.
 #
-# The wire-hash family is listed as a family on purpose. #785's separation is a
-# statement about how `list_known_wire_hashes_since` and `list_wire_hashes_since`
-# relate; delegating one and not the other would make that relationship differ
-# through the double from what it is against a bare backend, which is exactly
-# the class of divergence a test double must not introduce.
-#
-# The remaining defaulted methods are NOT audited here — that is a standing gap
-# predating this list, tracked separately rather than resolved by a sweep that
-# cannot tell a leaf from a composition.
+# DELEGATED_DEFAULTS — leaves whose default is NOT an `Unsupported` refusal, so
+# the parser cannot tell them from a composition. Each is a leaf backend
+# operation: backends override it, it composes no other trait method through
+# `self`, and a consumer wrapping a backend in this double must reach the
+# override rather than the default.
 DELEGATED_DEFAULTS = (
-    # v59.0.0 (#1099) — defaulted `Unsupported`, overridden by every backend:
-    # the V199 self-roster proposal ledger.
-    "note_self_roster_proposal",
-    "list_open_self_roster_proposals",
-    "list_settled_self_roster_proposals",
-    "settle_self_roster_proposal",
-    # v53.1.6 — defaulted `Unsupported`, overridden by every backend (the
-    # V150 cohort_target seek has no unbounded twin to compose).
-    "list_targeted_by_dimension_prefix",
-    # v53.1.5 — NOT here: `list_attestations_by_dimension_prefix`,
-    # `list_attestations_for_dimension_prefix` and
-    # `list_composers_referencing_any` are provided COMPOSITIONS over the
-    # delegated leaves (`list_attestations_by` / `_for` / `_referencing`),
-    # so through the double they run the pin-compatible default — which is
-    # exactly the pre-53.1.5 implementor I539 witnesses, and a fault on a
-    # leaf is observed. v53.1.6's `list_attestations_for_type` /
-    # `list_attestations_by_type` / `list_attestations_by_dimension_citing`
-    # are compositions too, and stay out for the same reason.
-    "insert_known_wire_hash",
-    "known_wire_hash_contains",
-    "list_known_wire_hashes_since",
-    "evict_known_wire_hashes",
-    "list_wire_hashes_since",
+    # The wire-hash family's one non-`Unsupported` member (its default is a
+    # generic `Backend` "not implemented"); the rest of the family is found.
+    # #785's separation is a statement about how the family's reads relate;
+    # delegating one and not another would make that relationship differ
+    # through the double from what it is against a bare backend.
     "lookup_signed_record_by_content_hash",
-    # v44.7.0 (#864) — defaulted `Unsupported`, overridden by every backend.
-    "store_rebound_key_record",
-    "list_key_registration_history",
-    # v54.1.0 (#1044) — defaulted `Unsupported`, overridden by every backend.
-    "store_invalid_replaced_key_record",
-    # v45.0.0 (#871) — defaulted `Unsupported`, overridden by every backend.
-    # (`list_holders_sized` left this list in v55.0.0, CIRISPersist#989: it is
-    # now a provided COMPOSITION over `list_attestations_citing_by_dimension`
-    # and the custody fold, so through the double it runs the default and a
-    # fault on the leaf is observed.)
-    "list_derived_hex",
-    # v55.0.0 (#989) — defaulted `Unsupported`, overridden by every backend;
-    # the holder directory's candidate seek.
-    "list_attestations_citing_by_dimension",
-    # v49.0.0 (#908) — defaulted `Unsupported`, overridden by every backend;
-    # the authorized roster fold reads it through the double.
-    "community_roster_signers",
-    # v49.0.0 (#910) — the family twin, same shape and same reason.
-    "family_roster_signers",
     # v50.0.0 (#916) — defaulted no-op, overridden by sqlite/postgres (the
     # receive doors' re-wrap); through the double it must reach the override.
     "rewrap_own_epochs_for_device",
@@ -108,11 +78,6 @@ DELEGATED_DEFAULTS = (
     # projection into the grant tables); neither composes a trait method.
     "key_grant_held_owner",
     "project_key_grant_row",
-    # v50.0.0 (#926) — defaulted `Unsupported`, overridden by every backend;
-    # the trust-root reads re-derive the accord quorum from it.
-    "lookup_signed_community",
-    "store_lineage_head_cosign",
-    "list_lineage_head_cosigns_for",
     # v50.0.0 (PR #921 review, F1) — defaulted `None`, overridden by every
     # backend. A SYNC accessor (emitted by name in `render`): the double hands
     # out the INNER backend's cache, so a verdict read through the double is
@@ -125,6 +90,17 @@ DELEGATED_DEFAULTS = (
     # through the double it must reach the backend's held set.
     "trust_direction_held_among",
 )
+
+# NOT_DELEGATED — an `Unsupported`-bodied default the double must NOT delegate,
+# each with its reason. Empty: such a body names no trait method, so it
+# composes nothing through `self`, and delegating it can only reach a
+# backend's override. (v53.1.5's compositions — `list_attestations_by_
+# dimension_prefix`, `list_attestations_for_dimension_prefix`,
+# `list_composers_referencing_any`, and v55's `list_holders_sized` — are not
+# `Unsupported`-bodied, so they are not found and stay out on their own:
+# through the double they run the default over the delegated leaves, and a
+# fault on a leaf is observed.)
+NOT_DELEGATED: tuple[str, ...] = ()
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src" / "federation" / "mod.rs"
@@ -184,41 +160,169 @@ def terminates(line: str) -> bool:
     return False
 
 
-def parse_defaults(body: str):
-    """Yield (name, args_src, ret) for each DELEGATED_DEFAULTS method.
+RAW_OPEN = re.compile(r'r(#*)"')
+CHAR_LIT = re.compile(r"'(\\.[^']*|[^\\'])'")
 
-    Signatures with a default body, so the terminator is `{` rather than `;`.
-    Only names in the allowlist are returned — see the module docstring for why
-    this is not "every default".
+
+def sanitize(text: str) -> str:
+    """`text` with every comment and the CONTENTS of every string and char
+    literal blanked to spaces, same length and same newlines, so brace and
+    paren counting sees only code. A doc comment naming `Error::Unsupported {
+    method }`, or a `"{"` in a format string, would otherwise skew the depth.
+
+    A `'` starts a char literal only when it closes one char (or one escape)
+    later; otherwise it is a lifetime (`&'a str`, `'static`) and is kept.
     """
+    out = list(text)
+    n, i = len(text), 0
+
+    def blank(a: int, b: int) -> None:
+        for k in range(a, b):
+            if out[k] != "\n":
+                out[k] = " "
+
+    while i < n:
+        c = text[i]
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+        elif text.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif text.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            blank(i, j)
+            i = j
+        elif c == "r" and RAW_OPEN.match(text, i) and not (
+            i > 0 and (text[i - 1].isalnum() or text[i - 1] == "_")
+        ):
+            hashes = len(RAW_OPEN.match(text, i).group(1))
+            open_end = i + 1 + hashes + 1
+            close = text.find('"' + "#" * hashes, open_end)
+            close = n if close < 0 else close
+            blank(open_end, close)
+            i = close + 1 + hashes
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            blank(i + 1, j)
+            i = j + 1
+        elif c == "'":
+            m = CHAR_LIT.match(text, i)
+            if m:
+                blank(i + 1, m.end() - 1)
+                i = m.end()
+            else:
+                i += 1  # a lifetime
+        else:
+            i += 1
+    return "".join(out)
+
+
+def matching(s: str, i: int, open_ch: str, close_ch: str) -> int:
+    """Index of the `close_ch` matching the `open_ch` at `s[i]` (sanitized)."""
+    depth = 0
+    for k in range(i, len(s)):
+        if s[k] == open_ch:
+            depth += 1
+        elif s[k] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return k
+    sys.exit(f"unbalanced {open_ch!r} at offset {i}")
+
+
+# A leaf's whole body: any `let _ = <args>;` statements, then the refusal.
+LEAF_BODY = re.compile(
+    r"(?:let_=(?:\([a-z0-9_,]*\)|[a-z0-9_]+);)*"
+    r"Err\(Error::Unsupported\{[^{}]*\}\)"
+)
+
+
+def is_unsupported_leaf(sanitized_body: str) -> bool:
+    """True iff a default body is exactly `Err(Error::Unsupported { .. })`,
+    optionally after `let _ = x;` / `let _ = (x, y);` (the argument
+    consumption that silences unused-variable lints). Such a body names no
+    trait method, so it composes nothing through `self`: a leaf."""
+    return LEAF_BODY.fullmatch("".join(sanitized_body.split())) is not None
+
+
+def default_methods(body: str):
+    """Yield (name, args_src, ret, is_unsupported_leaf) for every DEFAULTED
+    trait method (a depth-0 `fn` whose signature ends in `{`, not `;`)."""
+    s = sanitize(body)
+    depth_at, depth = [0] * (len(s) + 1), 0
+    for k, ch in enumerate(s):
+        depth_at[k] = depth
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
     found = []
-    depth, buf = 0, ""
-    for line in body.split("\n"):
-        if depth == 0:
-            buf += line + "\n"
-            if re.search(r"\bfn\s+[a-z0-9_]+", buf) and "{" in line:
-                one = " ".join(buf.split())
-                m = re.match(
-                    r".*?\bfn\s+([a-z0-9_]+)\s*\((.*?)\)\s*(?:->\s*(.+?))?\s*\{", one
-                )
-                if m and m.group(1) in DELEGATED_DEFAULTS:
-                    found.append(
-                        (m.group(1), m.group(2), (m.group(3) or "()").strip())
-                    )
-                buf = ""
-            elif terminates(line):
-                buf = ""
-        depth += line.count("{") - line.count("}")
-        if depth < 0:
-            depth = 0
-    missing = set(DELEGATED_DEFAULTS) - {n for n, _, _ in found}
+    for m in re.finditer(r"\bfn\s+([a-z0-9_]+)\s*\(", s):
+        if depth_at[m.start()] != 0:
+            continue
+        p_open = m.end() - 1
+        p_close = matching(s, p_open, "(", ")")
+        # The signature ends at the first `{` or `;` outside brackets: a
+        # return type may carry `[u8; 32]`, and `->` is not a closing `>`.
+        k, nest = p_close + 1, 0
+        while k < len(s):
+            if s.startswith("->", k):
+                k += 2
+                continue
+            if s[k] in "([<":
+                nest += 1
+            elif s[k] in ")]>":
+                nest -= 1
+            elif s[k] in "{;" and nest <= 0:
+                break
+            k += 1
+        if k >= len(s) or s[k] == ";":
+            continue  # required — `parse` emits it
+        b_close = matching(s, k, "{", "}")
+        args = " ".join(s[p_open + 1 : p_close].split())
+        sig_tail = " ".join(s[p_close + 1 : k].split())
+        ret = sig_tail[2:].strip() if sig_tail.startswith("->") else "()"
+        found.append((m.group(1), args, ret, is_unsupported_leaf(s[k + 1 : b_close])))
+    return found
+
+
+def parse_defaults(body: str):
+    """Yield (name, args_src, ret) for each defaulted method the double
+    delegates: every `Unsupported` leaf (found), plus DELEGATED_DEFAULTS,
+    minus NOT_DELEGATED. See the module docstring for the rule."""
+    defaults = default_methods(body)
+    by_name = {n: (n, a, r) for n, a, r, _ in defaults}
+    leaves = {n for n, _, _, leaf in defaults if leaf}
+    missing = set(DELEGATED_DEFAULTS) - set(by_name)
     if missing:
         sys.exit(
             f"DELEGATED_DEFAULTS names not found as defaulted trait methods: "
             f"{sorted(missing)} — the trait changed, or one became required "
             f"(in which case drop it from the list; it is generated anyway)"
         )
-    return found
+    redundant = set(DELEGATED_DEFAULTS) & leaves
+    if redundant:
+        sys.exit(
+            f"DELEGATED_DEFAULTS names found automatically as Unsupported leaves: "
+            f"{sorted(redundant)} — drop them from the list (it holds overrides only)"
+        )
+    stray = set(NOT_DELEGATED) - leaves
+    if stray:
+        sys.exit(
+            f"NOT_DELEGATED names that are not Unsupported leaves: {sorted(stray)} "
+            f"— a non-leaf default is not delegated anyway; drop it from the list"
+        )
+    chosen = (leaves | set(DELEGATED_DEFAULTS)) - set(NOT_DELEGATED)
+    return [by_name[n] for n in sorted(chosen)]
 
 
 def parse(body: str):

@@ -17,9 +17,13 @@
 #   occurrence whose identity is not its occurrence re-wraps this node's
 #   epochs to it). The first runner left `!=` -> `==` there MISSED because
 #   this filter did not select I188; hand-applied, T3 is red on both backends.
+# - I1622 (v61.1.0, CIRISPersist#1188, pure): `held_head_verdict` reads the
+#   head's proof and names its group; it kills the first run's three
+#   `PlannedHead::{group_key_id, supersede_proof}` survivors, which reach
+#   only the verdict and its refusal text.
 #
 # Grammar: docs/MUTATION_TESTING.md "Scope files".
-tests: test(/transport|destination|provenance|self_at_login|occurrence|family|roster|group_plane|group_amendment|hard_case|supersede|lineage_head|roster_head|rc5_adopts|cohort|amend|dissol|^store::parity::|ast_gate_parity::|device_readd_invariants::/)
+tests: test(/transport|destination|provenance|self_at_login|occurrence|family|roster|group_plane|group_amendment|hard_case|supersede|lineage_head|roster_head|rc5_adopts|cohort|amend|dissol|^store::parity::|ast_gate_parity::|device_readd_invariants::|i1622/)
 features: postgres,sqlite,server,cirisaudit
 
 src/federation/transport_admit.rs

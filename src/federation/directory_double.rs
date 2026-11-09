@@ -134,9 +134,19 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 93 delegations, generated. Every one: fault first, then delegate.
+// 135 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
+    async fn adopt_genesis_reanchor(
+        &self,
+        record: SignedKeyRecord,
+        bundle: &genesis::GenesisBundle,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("adopt_genesis_reanchor") {
+            return Err(e);
+        }
+        self.inner.adopt_genesis_reanchor(record, bundle).await
+    }
     async fn apply_replicated_accord_evidence(
         &self,
         evidence: &accord_carriage::AccordQuorumEvidence,
@@ -145,6 +155,15 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.apply_replicated_accord_evidence(evidence).await
+    }
+    async fn apply_replicated_community(
+        &self,
+        community: types::SignedCommunity,
+    ) -> Result<ReplicatedCommunityOutcome, Error> {
+        if let Some(e) = self.faulted("apply_replicated_community") {
+            return Err(e);
+        }
+        self.inner.apply_replicated_community(community).await
     }
     fn as_dyn_directory(&self) -> &dyn FederationDirectory {
         self
@@ -401,6 +420,25 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_accord_proposals_by_anchor(action, prior_family_digest)
             .await
     }
+    async fn list_announced_peers(&self) -> Result<Vec<types::AnnouncedPeer>, Error> {
+        if let Some(e) = self.faulted("list_announced_peers") {
+            return Err(e);
+        }
+        self.inner.list_announced_peers().await
+    }
+    async fn list_attestation_log(
+        &self,
+        subject_key_id: Option<&str>,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::ScoresPage, Error> {
+        if let Some(e) = self.faulted("list_attestation_log") {
+            return Err(e);
+        }
+        self.inner
+            .list_attestation_log(subject_key_id, cursor, limit)
+            .await
+    }
     async fn list_attestations_by_dimension_citing(
         &self,
         attesting_key_id: &str,
@@ -426,6 +464,32 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_attestations_citing_by_dimension(dimension, evidence_ref)
             .await
     }
+    async fn list_attestations_for_migration(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Attestation>, Error> {
+        if let Some(e) = self.faulted("list_attestations_for_migration") {
+            return Err(e);
+        }
+        self.inner
+            .list_attestations_for_migration(after_attestation_id, limit)
+            .await
+    }
+    async fn list_attestations_naming_by_dimension(
+        &self,
+        subject_key_id: &str,
+        dimension: &str,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::ScoresPage, Error> {
+        if let Some(e) = self.faulted("list_attestations_naming_by_dimension") {
+            return Err(e);
+        }
+        self.inner
+            .list_attestations_naming_by_dimension(subject_key_id, dimension, cursor, limit)
+            .await
+    }
     async fn list_attestations_referencing(
         &self,
         target_attestation_id: &str,
@@ -446,6 +510,19 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.list_attestations_since(since, limit).await
+    }
+    async fn list_attestations_since_by_prefixes(
+        &self,
+        since: Option<types::ServePosition>,
+        family_prefixes: &[String],
+        limit: i64,
+    ) -> Result<types::ServePage<types::ServedAttestation>, Error> {
+        if let Some(e) = self.faulted("list_attestations_since_by_prefixes") {
+            return Err(e);
+        }
+        self.inner
+            .list_attestations_since_by_prefixes(since, family_prefixes, limit)
+            .await
     }
     async fn list_communities_for_member(
         &self,
@@ -480,6 +557,21 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_community_membership_widenings_for(community_key_id)
             .await
     }
+    async fn list_consent_peers(&self, node_key_id: &str) -> Result<Vec<String>, Error> {
+        if let Some(e) = self.faulted("list_consent_peers") {
+            return Err(e);
+        }
+        self.inner.list_consent_peers(node_key_id).await
+    }
+    async fn list_consent_peers_for(
+        &self,
+        for_key_id: &str,
+    ) -> Result<Vec<(String, String)>, Error> {
+        if let Some(e) = self.faulted("list_consent_peers_for") {
+            return Err(e);
+        }
+        self.inner.list_consent_peers_for(for_key_id).await
+    }
     async fn list_derived_hex(
         &self,
         original_sha256_hex: &str,
@@ -488,6 +580,19 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.list_derived_hex(original_sha256_hex).await
+    }
+    async fn list_expired_attestation_ids(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<String>, Error> {
+        if let Some(e) = self.faulted("list_expired_attestation_ids") {
+            return Err(e);
+        }
+        self.inner
+            .list_expired_attestation_ids(now, limit, offset)
+            .await
     }
     async fn list_families_for_member(
         &self,
@@ -602,6 +707,19 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_identity_occurrences_for(identity_key_id)
             .await
     }
+    async fn list_key_plane_wire_hashes_since(
+        &self,
+        family: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, Error> {
+        if let Some(e) = self.faulted("list_key_plane_wire_hashes_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_key_plane_wire_hashes_since(family, after_content_hash, limit)
+            .await
+    }
     async fn list_key_registration_history(
         &self,
         key_id: &str,
@@ -644,6 +762,36 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_lineage_head_cosigns_for(lineage_key_id)
             .await
     }
+    async fn list_live_consent_grants_by(
+        &self,
+        node_key_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        if let Some(e) = self.faulted("list_live_consent_grants_by") {
+            return Err(e);
+        }
+        self.inner.list_live_consent_grants_by(node_key_id).await
+    }
+    async fn list_live_consent_grants_for(
+        &self,
+        for_key_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        if let Some(e) = self.faulted("list_live_consent_grants_for") {
+            return Err(e);
+        }
+        self.inner.list_live_consent_grants_for(for_key_id).await
+    }
+    async fn list_local_tier_attestations(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Attestation>, Error> {
+        if let Some(e) = self.faulted("list_local_tier_attestations") {
+            return Err(e);
+        }
+        self.inner
+            .list_local_tier_attestations(after_attestation_id, limit)
+            .await
+    }
     async fn list_location_proofs_for(
         &self,
         subject_key_id: &str,
@@ -662,6 +810,40 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .list_open_self_roster_proposals(identity_key_id)
+            .await
+    }
+    async fn list_owner_bindings_since(
+        &self,
+        since: Option<types::ServePosition>,
+        limit: i64,
+    ) -> Result<types::ServePage<types::OwnerBindingChange>, Error> {
+        if let Some(e) = self.faulted("list_owner_bindings_since") {
+            return Err(e);
+        }
+        self.inner.list_owner_bindings_since(since, limit).await
+    }
+    async fn list_purge_executions_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<steward_purge::PurgeExecution>, Error> {
+        if let Some(e) = self.faulted("list_purge_executions_since") {
+            return Err(e);
+        }
+        self.inner.list_purge_executions_since(since, limit).await
+    }
+    async fn list_scores(
+        &self,
+        caller_occurrence_key_id: &str,
+        filter: crate::read::AttestationFilter,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::ScoresPage, Error> {
+        if let Some(e) = self.faulted("list_scores") {
+            return Err(e);
+        }
+        self.inner
+            .list_scores(caller_occurrence_key_id, filter, cursor, limit)
             .await
     }
     async fn list_settled_self_roster_proposals(
@@ -685,6 +867,74 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .list_signed_accord_quorum_evidence_since(since, limit)
+            .await
+    }
+    async fn list_signed_communities_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedCommunity>, Error> {
+        if let Some(e) = self.faulted("list_signed_communities_since") {
+            return Err(e);
+        }
+        self.inner.list_signed_communities_since(since, limit).await
+    }
+    async fn list_signed_community_membership_revocations_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedCommunityMembershipRevocation>, Error> {
+        if let Some(e) = self.faulted("list_signed_community_membership_revocations_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_signed_community_membership_revocations_since(since, limit)
+            .await
+    }
+    async fn list_signed_community_membership_widenings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedCommunityMembershipWidening>, Error> {
+        if let Some(e) = self.faulted("list_signed_community_membership_widenings_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_signed_community_membership_widenings_since(since, limit)
+            .await
+    }
+    async fn list_signed_families_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedFamily>, Error> {
+        if let Some(e) = self.faulted("list_signed_families_since") {
+            return Err(e);
+        }
+        self.inner.list_signed_families_since(since, limit).await
+    }
+    async fn list_signed_family_membership_revocations_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedFamilyMembershipRevocation>, Error> {
+        if let Some(e) = self.faulted("list_signed_family_membership_revocations_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_signed_family_membership_revocations_since(since, limit)
+            .await
+    }
+    async fn list_signed_family_membership_widenings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedFamilyMembershipWidening>, Error> {
+        if let Some(e) = self.faulted("list_signed_family_membership_widenings_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_signed_family_membership_widenings_since(since, limit)
             .await
     }
     async fn list_signed_location_proofs_since(
@@ -722,6 +972,18 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .list_targeted_by_dimension_prefix(cohort_scopes, cohort_target, dimension_prefix)
+            .await
+    }
+    async fn list_widening_candidates(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Attestation>, Error> {
+        if let Some(e) = self.faulted("list_widening_candidates") {
+            return Err(e);
+        }
+        self.inner
+            .list_widening_candidates(after_attestation_id, limit)
             .await
     }
     async fn list_wire_hashes_since(
@@ -811,6 +1073,128 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.project_key_grant_row(row).await
+    }
+    async fn purge_attestation_v31(&self, attestation_id: &str) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("purge_attestation_v31") {
+            return Err(e);
+        }
+        self.inner.purge_attestation_v31(attestation_id).await
+    }
+    async fn purge_delete_tombstoned_attestation(
+        &self,
+        attestation_id: &str,
+    ) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("purge_delete_tombstoned_attestation") {
+            return Err(e);
+        }
+        self.inner
+            .purge_delete_tombstoned_attestation(attestation_id)
+            .await
+    }
+    async fn purge_delete_tombstoned_trace(&self, trace_id: &str) -> Result<(u64, u64), Error> {
+        if let Some(e) = self.faulted("purge_delete_tombstoned_trace") {
+            return Err(e);
+        }
+        self.inner.purge_delete_tombstoned_trace(trace_id).await
+    }
+    async fn purge_execution(
+        &self,
+        notice_id: &str,
+    ) -> Result<Option<steward_purge::PurgeExecution>, Error> {
+        if let Some(e) = self.faulted("purge_execution") {
+            return Err(e);
+        }
+        self.inner.purge_execution(notice_id).await
+    }
+    async fn purge_genesis_delegation_row_v31(
+        &self,
+        attestation_id: &str,
+        expected_persist_row_hash: &str,
+        authority: &genesis::bundle::GenesisPurgeAuthority<'_>,
+    ) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("purge_genesis_delegation_row_v31") {
+            return Err(e);
+        }
+        self.inner
+            .purge_genesis_delegation_row_v31(attestation_id, expected_persist_row_hash, authority)
+            .await
+    }
+    async fn purge_mark_finalized(
+        &self,
+        notice_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("purge_mark_finalized") {
+            return Err(e);
+        }
+        self.inner.purge_mark_finalized(notice_id, at).await
+    }
+    async fn purge_put_execution(
+        &self,
+        execution: &steward_purge::PurgeExecution,
+        tombstones: &[steward_purge::PurgeTombstone],
+    ) -> Result<steward_purge::PurgePutOutcome, Error> {
+        if let Some(e) = self.faulted("purge_put_execution") {
+            return Err(e);
+        }
+        self.inner.purge_put_execution(execution, tombstones).await
+    }
+    async fn purge_scan_attestations(
+        &self,
+        after_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Attestation>, Error> {
+        if let Some(e) = self.faulted("purge_scan_attestations") {
+            return Err(e);
+        }
+        self.inner.purge_scan_attestations(after_id, limit).await
+    }
+    async fn purge_tombstone_notices(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Vec<String>, Error> {
+        if let Some(e) = self.faulted("purge_tombstone_notices") {
+            return Err(e);
+        }
+        self.inner.purge_tombstone_notices(plane, record_ref).await
+    }
+    async fn purge_tombstoned(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Option<String>, Error> {
+        if let Some(e) = self.faulted("purge_tombstoned") {
+            return Err(e);
+        }
+        self.inner.purge_tombstoned(plane, record_ref).await
+    }
+    async fn purge_tombstones_of(
+        &self,
+        notice_id: &str,
+    ) -> Result<Vec<steward_purge::PurgeTombstone>, Error> {
+        if let Some(e) = self.faulted("purge_tombstones_of") {
+            return Err(e);
+        }
+        self.inner.purge_tombstones_of(notice_id).await
+    }
+    async fn purge_trace_ids_for_llm_model(&self, model: &str) -> Result<Vec<String>, Error> {
+        if let Some(e) = self.faulted("purge_trace_ids_for_llm_model") {
+            return Err(e);
+        }
+        self.inner.purge_trace_ids_for_llm_model(model).await
+    }
+    async fn purge_trace_ids_signed_by(&self, key_id: &str) -> Result<Vec<String>, Error> {
+        if let Some(e) = self.faulted("purge_trace_ids_signed_by") {
+            return Err(e);
+        }
+        self.inner.purge_trace_ids_signed_by(key_id).await
+    }
+    async fn purge_trace_row_counts(&self, trace_ids: &[String]) -> Result<(u64, u64), Error> {
+        if let Some(e) = self.faulted("purge_trace_row_counts") {
+            return Err(e);
+        }
+        self.inner.purge_trace_row_counts(trace_ids).await
     }
     async fn put_accord_decision(
         &self,
@@ -936,6 +1320,47 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.put_revocation(revocation).await
     }
+    async fn record_announced_peer(
+        &self,
+        key_id: &str,
+        pubkey_ed25519_base64: &str,
+        pubkey_ml_dsa_65_base64: Option<&str>,
+        claimed_identity_type: Option<&str>,
+        last_seen: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("record_announced_peer") {
+            return Err(e);
+        }
+        self.inner
+            .record_announced_peer(
+                key_id,
+                pubkey_ed25519_base64,
+                pubkey_ml_dsa_65_base64,
+                claimed_identity_type,
+                last_seen,
+            )
+            .await
+    }
+    async fn reseal_attestation_v31(&self, resealed: &Attestation) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("reseal_attestation_v31") {
+            return Err(e);
+        }
+        self.inner.reseal_attestation_v31(resealed).await
+    }
+    async fn resolve_scores(
+        &self,
+        caller_occurrence_key_id: &str,
+        filter: crate::read::AttestationFilter,
+        policy: String,
+        trace: bool,
+    ) -> Result<crate::read::ComposedVerdict, Error> {
+        if let Some(e) = self.faulted("resolve_scores") {
+            return Err(e);
+        }
+        self.inner
+            .resolve_scores(caller_occurrence_key_id, filter, policy, trace)
+            .await
+    }
     async fn revocations_for_subject(
         &self,
         revoked_key_sha256_ed25519_raw: &str,
@@ -1039,6 +1464,15 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     fn trust_root_standing_cache(&self) -> Option<&canonical_community::StandingCache> {
         self.inner.trust_root_standing_cache()
+    }
+    async fn vote_window_first_held(
+        &self,
+        action_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, Error> {
+        if let Some(e) = self.faulted("vote_window_first_held") {
+            return Err(e);
+        }
+        self.inner.vote_window_first_held(action_id).await
     }
     async fn withdraw_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error> {
         if let Some(e) = self.faulted("withdraw_location_proof") {

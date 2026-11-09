@@ -11,6 +11,11 @@
 //! (`ciris_persist_read_rows_total`). The label value lists are written out
 //! here by hand on purpose: a door added to [`super::Door`] is not catalogued
 //! until someone adds it below.
+//!
+//! v61.1.0 (CIRISPersist#1235) — the per-caller split of the door counters
+//! (`TelemetrySnapshot::callers`) is NOT catalogued: its label is chosen by
+//! the host, so it has no closed value set to list here, and
+//! [`super::emit_metrics`] does not write it.
 
 /// What a metric is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +107,8 @@ pub const DOOR_VALUES: &[&str] = &[
     "list_attestations_since",
     "list_attestation_log",
     "list_attestations_naming_by_dimension",
+    "list_attestations_since_by_prefixes",
+    "list_owner_bindings_since",
     "attestation_query",
 ];
 

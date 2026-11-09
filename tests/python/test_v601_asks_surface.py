@@ -66,6 +66,7 @@ def test_dimension_rejection_retryability_is_persists_answer_1064() -> None:
         "morally_charged_stem",
         "ledger_l1_binding_violation",
         "invariant_registry_self_emission_forbidden",
+        "substrate_self_report_names_another_party",
     ):
         assert ciris_persist.dimension_rejection_is_retryable(terminal) is False, terminal
     with pytest.raises(ValueError):
