@@ -153,13 +153,12 @@ where
     .await?;
     let persons = selves.at(at);
     let seat_persons: BTreeSet<&str> = seats.iter().map(|k| persons.seat_person(k)).collect();
-    let outside: BTreeSet<&str> = officials
-        .iter()
-        .filter(|k| !seats.contains(*k) && !seat_persons.contains(persons.seat_person(k)))
-        .map(String::as_str)
-        .collect();
+    // One check, on the signer's voice: an official countersigns only when it
+    // speaks for a person who is not the seat's. `voice(k)` is `Some` only
+    // where it equals `seat_person(k)`, so a seat key, or another device of
+    // the seat's person, is refused here; no second filter on the officials.
     if signers.iter().any(|s| {
-        outside.contains(s.as_str()) && persons.voice(s).is_some_and(|p| !seat_persons.contains(p))
+        officials.contains(s) && persons.voice(s).is_some_and(|p| !seat_persons.contains(p))
     }) {
         return Ok(());
     }
