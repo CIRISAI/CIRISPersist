@@ -5,6 +5,19 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [61.2.1] - UNRELEASED
+
+CI and release tooling only; the crate and the wheel do not change.
+
+### Changed
+
+- **A tag run takes its PR run as the receipt for its test legs.** The v61.1.0 tag run took 3h19m, and its longest job ran 71 min. The rest was runner queue: on the runner pool the CIRIS repos share, its Linux test legs waited 95–124 min for a runner and stood in front of the wheel (93 min wait), android (118–124 min) and darwin wheel (135 min) builds the release needs, re-testing bytes the PR run had already passed. CI's `tree` job (#1021) now also runs on `v*` tags. When the tagged commit is a merge whose tree equals its PR head's, and that PR run passed, the tag run skips the nine `linux-x86_64` rows other than `core-1`, `darwin-aarch64 (no postgres)` and the sqlite portability leg. The matrix `exclude` is derived from the workflow's own rows by `scripts/ci_tag_receipt.py`, and the PR `lint` job checks that it still derives. The tag run still runs everything a release needs, from its own run: `core-1` (the only Linux CIRISCache save, #895), every wheel, iOS and android build, `lint` and `license-audit` (mobile-release requires them, and an advisory can publish between the PR run and the tag, as RUSTSEC-2026-0459 did before v61.1.0), the manifest sign + register and the attestations. Provenance names the run that built the bytes, so no artifact is taken from the PR run. Any error falls back to the full run. A main push run's whole-run skip is unchanged.
+- **`release_finish.sh` waits up to 360 min for the tag run** (`FINISH_TIMEOUT_MIN`, was 180). The v61.1.0 finish exited 12 with nothing wrong.
+
+### Removed
+
+- **Five `deny.toml` advisory ignores that matched no crate** (all features, every target): RUSTSEC-2026-0190 (anyhow 1.0.103 carries the fix), RUSTSEC-2025-0134 (rustls-pemfile), and RUSTSEC-2026-0098 / 0099 / 0104 (rustls-webpki). An ignore that matches nothing would silently cover a later advisory reusing its crate.
+
 ## [61.2.0] - 2026-11-09
 
 ### Security
