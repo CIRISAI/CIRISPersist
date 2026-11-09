@@ -16,7 +16,7 @@ CI and release tooling only; the crate and the wheel do not change.
 
 ### Removed
 
-- **Five `deny.toml` advisory ignores that matched no crate** (all features, every target): RUSTSEC-2026-0190 (anyhow 1.0.103 carries the fix), RUSTSEC-2025-0134 (rustls-pemfile), and RUSTSEC-2026-0098 / 0099 / 0104 (rustls-webpki). An ignore that matches nothing would silently cover a later advisory reusing its crate.
+- **Five `deny.toml` advisory ignores that matched no crate** (all features, every target): RUSTSEC-2026-0190 (anyhow 1.0.103 carries the fix), RUSTSEC-2025-0134 (rustls-pemfile), and RUSTSEC-2026-0098 / 0099 / 0104 (rustls-webpki). A stale ignore would silently re-cover its advisory if a dependency change brought an affected version back.
 
 ## [61.2.0] - 2026-11-09
 
