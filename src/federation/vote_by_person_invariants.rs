@@ -1714,7 +1714,11 @@ mod run {
                 async fn postgres() {
                     use crate::store::Backend as _;
                     let Some(dsn) = crate::test_pg::empty_dsn() else {
-                        panic!("no CIRIS_PERSIST_TEST_PG base DSN");
+                        eprintln!(
+                            "{} postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED",
+                            stringify!($name)
+                        );
+                        return;
                     };
                     let b = crate::store::postgres::PostgresBackend::connect(&dsn)
                         .await
@@ -1801,11 +1805,17 @@ mod run {
     #[tokio::test(flavor = "multi_thread")]
     async fn i1534b_postgres() {
         use crate::store::Backend as _;
-        let dsn = || crate::test_pg::empty_dsn().expect("no CIRIS_PERSIST_TEST_PG base DSN");
-        let a = crate::store::postgres::PostgresBackend::connect(&dsn())
+        // Each `empty_dsn()` is a fresh database: every backend is its own node.
+        let Some(a_dsn) = crate::test_pg::empty_dsn() else {
+            eprintln!("I1534b postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+            return;
+        };
+        let dsn = || crate::test_pg::empty_dsn().expect("the base DSN was present");
+        let b_dsn = dsn();
+        let a = crate::store::postgres::PostgresBackend::connect(&a_dsn)
             .await
             .unwrap();
-        let b = crate::store::postgres::PostgresBackend::connect(&dsn())
+        let b = crate::store::postgres::PostgresBackend::connect(&b_dsn)
             .await
             .unwrap();
         a.run_migrations().await.unwrap();
@@ -1882,7 +1892,10 @@ mod run {
     #[tokio::test(flavor = "multi_thread")]
     async fn i1541_postgres() {
         use crate::store::Backend as _;
-        let dsn = crate::test_pg::empty_dsn().expect("no CIRIS_PERSIST_TEST_PG base DSN");
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            eprintln!("I1541 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+            return;
+        };
         let b = crate::store::postgres::PostgresBackend::connect(&dsn)
             .await
             .unwrap();
@@ -1920,7 +1933,10 @@ mod run {
     #[tokio::test(flavor = "multi_thread")]
     async fn i1542_postgres() {
         use crate::store::Backend as _;
-        let dsn = crate::test_pg::empty_dsn().expect("no CIRIS_PERSIST_TEST_PG base DSN");
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            eprintln!("I1542 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+            return;
+        };
         let b = crate::store::postgres::PostgresBackend::connect(&dsn)
             .await
             .unwrap();
