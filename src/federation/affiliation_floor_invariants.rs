@@ -13,6 +13,11 @@
 //!   members), a new seat is refused `federation_group_dissolved`, and the
 //!   record stands. A family's record withdraws stays refused (a family
 //!   dissolves by its own amendment).
+//! - **I1623** (v61.1.0, CIRISPersist#1188 / #1218 H1) — an UNSTAMPED
+//!   `withdraws` of a room's record (a stranger's, held before the record
+//!   arrived, so the door stored it with no rule) dissolves nothing once the
+//!   record lands; the founders' cosigned one, stamped by that node's door,
+//!   does. Two nodes.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -269,6 +274,107 @@ pub(crate) mod bodies {
             .await
             .expect_err("I1514: a family dissolves by its amendment");
     }
+
+    /// **I1623** (CIRISPersist#1188, the `&&` survivor in
+    /// `community_dissolved_at`; CIRISPersist#1218 H1; CC rc14 4.4.3.2.8) — **an
+    /// unstamped `withdraws` of a room's record dissolves nothing.** Node B
+    /// holds a stranger's `withdraws` of the room's record row before the row
+    /// arrives, so B's door could not ask the room's protocol and stored it
+    /// with no rule. Once the record lands on B the room is not dissolved, and
+    /// its seats stand. Only a `withdraws` this node's door stamped dissolves:
+    /// the founders' cosigned one, offered on B after the record (the
+    /// control), does. Red if the stamp test becomes `type == withdraws ||
+    /// stamped`.
+    pub(crate) async fn i1623_an_unstamped_withdraws_dissolves_nothing(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        let k = |n: &str| format!("i1623-{n}-{s}");
+        let (f, g, stranger, room) = (k("f"), k("g"), k("stranger"), k("room"));
+        for n in [a, b] {
+            reg(n, &[&f, &g, &stranger, &room]).await;
+        }
+        found_community(a, &room, "unanimous", &[&f, &g], &[])
+            .await
+            .unwrap();
+        let rec = record_row(a, &room, cohort_scope::COMMUNITY).await;
+        // The stranger's `withdraws` reaches B first: no target, no rule.
+        let mut early = ts::bare_attestation(
+            &uuid::Uuid::new_v4().to_string(),
+            &stranger,
+            &stranger,
+            &serde_json::json!({
+                "references_attestation_id": rec.attestation_id,
+                "withdrawal_reason": "I1623",
+            }),
+        );
+        early.attestation_type = attestation_type::WITHDRAWS.into();
+        early.weight = None;
+        ts::seal_row_in_place(&stranger, &mut early);
+        put(b, &early)
+            .await
+            .expect("I1623: a withdraws whose target is not held is admitted deferred");
+        assert_eq!(
+            b.get_attestation(&early.attestation_id)
+                .await
+                .unwrap()
+                .expect("I1623: the early withdraws is held")
+                .withdraws_admission_rule,
+            None,
+            "I1623: deferred, no rule"
+        );
+        let out = b
+            .apply_replicated_attestation(crate::federation::SignedAttestation {
+                attestation: rec.clone(),
+            })
+            .await
+            .expect("I1623: B takes the room's record row");
+        assert!(
+            matches!(
+                out,
+                crate::federation::attestation_apply::ReplicatedAttestationOutcome::Inserted
+            ),
+            "I1623: the record row lands on B: {out:?}"
+        );
+        assert!(
+            b.lookup_community(&room).await.unwrap().is_some(),
+            "I1623: B holds the room"
+        );
+        assert!(
+            b.list_attestations_referencing(&rec.attestation_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|w| w.attestation_id == early.attestation_id),
+            "I1623: the early withdraws references the record on B (else the test proves nothing)"
+        );
+        assert!(
+            crate::federation::group_plane::community_dissolved_at(b, &room)
+                .await
+                .unwrap()
+                .is_none(),
+            "I1623: an unstamped withdraws dissolves nothing"
+        );
+        assert!(
+            active(b, &room, &f).await && active(b, &room, &g).await,
+            "I1623: the seats stand"
+        );
+        // The control: the founders' cosigned withdraws, stamped by B's door.
+        put(
+            b,
+            &withdraw(&rec, &room, cohort_scope::COMMUNITY, &[&f, &g]),
+        )
+        .await
+        .expect("I1623: the room's protocol dissolves it on B");
+        assert!(
+            crate::federation::group_plane::community_dissolved_at(b, &room)
+                .await
+                .unwrap()
+                .is_some(),
+            "I1623: a stamped withdraws dissolves"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -296,6 +402,17 @@ mod runners {
                     let Some(d) = $fresh.await else { return };
                     super::super::bodies::i1514_dissolution_is_the_records_withdraws(
                         &d as &dyn FederationDirectory,
+                        &suffix(),
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i1623_an_unstamped_withdraws_dissolves_nothing() {
+                    let Some(a) = $fresh.await else { return };
+                    let Some(b) = $fresh.await else { return };
+                    super::super::bodies::i1623_an_unstamped_withdraws_dissolves_nothing(
+                        &a as &dyn FederationDirectory,
+                        &b as &dyn FederationDirectory,
                         &suffix(),
                     )
                     .await

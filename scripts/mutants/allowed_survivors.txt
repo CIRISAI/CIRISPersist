@@ -24,3 +24,11 @@
 # verdict) and an owner-binding with an empty attested key, which the
 # delegates_to admission never stores. No reachable state tells them apart.
 src/federation/admission.rs:10972 replace && with || in nodes_owned_by #1109 equivalent: owner_of is the verdict; an empty attested key is refused at admission
+#
+# v61.1.0 (CIRISPersist#1188) — equivalent by construction. The listing
+# community_dissolved_at walks is the `group:roster:v1` rows at `community`
+# scope whose cohort_target is the community, and a group-plane row is a pure
+# function of its object (check_canonical_group_row: one byte off is a
+# refusal), so the community record a listed row carries always names that
+# community. `true` admits no row the guard refuses.
+src/federation/group_plane.rs:1219 replace match guard c.community.community_key_id == community_key_id with true in community_dissolved_at #1188 equivalent: a listed row's record is the listed community's (check_canonical_group_row)

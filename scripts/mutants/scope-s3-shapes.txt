@@ -15,11 +15,13 @@
 #   I1101 (the walk's filter lives in `live_delegation_granter_instants`, a
 #   function whose other mutants belong to the owner-binding scopes).
 # - #1122: `src/federation/transport_routes.rs`. Witnesses I1122-A/B/C.
+#   I1626 (v61.1.0, CIRISPersist#1188): a route displaces only its own kind,
+#   the three `||` -> `&&` in `displaces` the first run left missed.
 # - #1146: `self_registration_unchanged`. Witness I1146.
 # - #1156: the storage summary's column resolution and quoting.
 #
 # Grammar: docs/MUTATION_TESTING.md "Scope files".
-tests: test(/instant_form|trust_doors_refuse_the_unproven_721|happy_path_full_pipeline|i1494|revocation_binding|revocation_instants|subject_binding|bound_tests|i978|trust_grant|trust_revocation|i659|i1146|i1122|i1101|node_seat|partnership|1126|1156|storage_summary|scrub_signature/)
+tests: test(/instant_form|trust_doors_refuse_the_unproven_721|happy_path_full_pipeline|i1494|revocation_binding|revocation_instants|subject_binding|bound_tests|i978|trust_grant|trust_revocation|i659|i1146|i1122|i1626|i1101|node_seat|partnership|1126|1156|storage_summary|scrub_signature/)
 
 src/federation/admission.rs signed_instant_form_violation signed_instant_form_violation_in local_write_instant_form_violation revocation_binding check_revocation_envelope_binding verify_envelope_binds_subject render_exact_signed_instant trust_grant_signing_bytes trust_revocation_signing_bytes verify_trust_plane_signature serve_seat_owner_announced
 src/federation/register.rs check_revocation_bound self_registration_unchanged

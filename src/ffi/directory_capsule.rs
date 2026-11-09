@@ -5186,9 +5186,12 @@ mod tests {
         // for #991's removals, not for this.
         // v61 (CIRISPersist#991) — `ListSignedCommunityMembershipListingsSince`
         // removed with the member listing (a BREAK, inside ABI 12).
+        // v61.1.0 (CIRISPersist#1190, #1163) — GROWTH:
+        // `ListAttestationsSinceByPrefixes` and `ListOwnerBindingsSince`
+        // APPENDED.
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "7105f22d1f3b2922a1931c34fbb79d5d79291cc7ce7f8005493de2f3ff499af6",
+            "e45b6cbcc46f5817301a94f8f289bff42dcb4f64d32729782d9bf835bd26e8a3",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -5242,9 +5245,11 @@ mod tests {
         // `IdentityOccurrences` APPENDED.
         // v61 (CIRISPersist#991) — `SignedCommunityMembershipListings` removed
         // with the member listing (a BREAK, inside ABI 12).
+        // v61.1.0 (CIRISPersist#1190, #1163) — GROWTH:
+        // `ServedAttestationPage` and `OwnerBindingPage` APPENDED.
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "072218ce981010c91c962f75e2939a33814e2f179d9da3a178a4f2dbb0ef951b",
+            "4aff512102f2ba2aadd4bbbbccbfac5472302f3c1c7c81a689812e64bd021420",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );
