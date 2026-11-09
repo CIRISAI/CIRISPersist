@@ -25,7 +25,9 @@
 #    Needs gh 2.49+ (GH=...).
 #
 # Idempotent: re-run the same command after a kill or a timeout; it picks the
-# run up wherever it is. FINISH_TIMEOUT_MIN (default 180) bounds the tag-CI wait.
+# run up wherever it is. FINISH_TIMEOUT_MIN (default 360) bounds the tag-CI wait. v61.2.1: 180 was
+# shorter than the v61.1.0 tag run (3h19m, almost all of it runner queue on the
+# shared CIRIS pool), so the first finish exited 12 with nothing wrong.
 #
 # Exit codes: 2 bad arguments / run is not this tag's CI run · 11 tag CI not
 # green · 12 tag CI timeout · 13 release never appeared · 14 release edit
@@ -58,7 +60,7 @@ git for-each-ref --format='%(contents)' "$tref" > "$tmp/tagbody.md"
 in_bytes=$(wc -c < "$tmp/tagbody.md")
 [ "$in_bytes" -gt 64 ] || { echo "tag v$ver annotation is $in_bytes bytes — not a CHANGELOG section"; exit 2; }
 
-limit=$(( ${FINISH_TIMEOUT_MIN:-180} * 60 )); waited=0; st=none
+limit=$(( ${FINISH_TIMEOUT_MIN:-360} * 60 )); waited=0; st=none
 while [ "$waited" -lt "$limit" ]; do
   st=$(gh run view "$rid" --json status,conclusion --jq '"\(.status)/\(.conclusion)"' 2>/dev/null || echo unknown)
   echo "tag CI $rid: $st ($(( waited / 60 )) min)"
@@ -72,7 +74,7 @@ while [ "$waited" -lt "$limit" ]; do
   esac
   sleep 60; waited=$(( waited + 60 ))
 done
-[ "$st" = "completed/success" ] || { echo "tag CI timeout after ${FINISH_TIMEOUT_MIN:-180} min (last: $st) — re-run this command to keep waiting"; exit 12; }
+[ "$st" = "completed/success" ] || { echo "tag CI timeout after ${FINISH_TIMEOUT_MIN:-360} min (last: $st) — re-run this command to keep waiting"; exit 12; }
 
 for i in $(seq 1 30); do gh release view "v$ver" >/dev/null 2>&1 && break; sleep 10; done
 gh release view "v$ver" >/dev/null 2>&1 || { echo "release v$ver never appeared (5 min after tag CI)"; exit 13; }

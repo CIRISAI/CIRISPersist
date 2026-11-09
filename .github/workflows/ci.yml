@@ -58,6 +58,11 @@ jobs:
   #     exists to prevent.
   #   * And it buys nothing: the matrix legs run in PARALLEL (no
   #     `max-parallel`), so nine legs cost about one leg of wall clock.
+  #     (v61.2.1: the first point still holds and `core-1` still runs on every
+  #     tag; the second does not. The pool is shared, the legs queue for up
+  #     to two hours in front of the release's builds, and a tag whose PR run
+  #     passed the same tree now skips the OTHER test legs. See the `tree`
+  #     job.)
   #     Skipping six of nine saves machine time and ~zero wall.
   #
   # `scripts/release_ship.sh` removes the redundant wait instead: when the
@@ -66,25 +71,55 @@ jobs:
   #
   # Tree equality gates one run here (CIRISPersist#1021): the `tree` job below
   # skips MAIN's run of a merge commit whose tree equals its PR head's tree,
-  # when that PR head has a successful CI run. It never skips a tag run, so
-  # the tag still publishes the versioned CIRISCache blob. Without it, main
+  # when that PR head has a successful CI run. It never skips a tag run's
+  # builds or `core-1`, so the tag still publishes the versioned CIRISCache
+  # blob (a tag's receipt skips only its other test legs: v61.2.1, below). Without it, main
   # runs hold runners for bytes the PR run already certified, only to be
   # cancelled by the tag push on the same SHA (#397's group) or the next
   # merge.
+  #
+  # CIRISPersist v61.2.1 — the TAG run takes a receipt too, for its test legs
+  # only. #895 (below the `jobs:` line) declined to skip a tag's matrix because
+  # the legs "run in parallel, so nine legs cost about one leg of wall clock".
+  # The v61.1.0 tag run measured otherwise: its Linux legs waited 95–124 min
+  # for a runner and ran 28–53 min, the linux-x86_64 wheel waited 93 min, the
+  # android builds 118–124 min and the darwin wheel 135 min, for a 3h19m run
+  # whose longest job was 71 min. The runner pool is shared across the CIRIS
+  # repos, so past the slot ceiling a leg runs LATER, in front of the builds
+  # the release waits on (the lesson the `secrets` partition note below
+  # already draws). So when the tagged commit's tree equals its PR head's and
+  # that PR run passed, the tag run skips the tests those bytes already
+  # passed, and keeps everything a release needs from ITS OWN run:
+  #   * `core-1` still runs: it carries the only Linux CIRISCache save, and the
+  #     released version's blob must exist (#895's first point, still true);
+  #   * every build (wheels, iOS, android), package, manifest sign + register
+  #     and attest job: provenance names the run that built the bytes, so the
+  #     artifacts are never taken from the PR run;
+  #   * `lint` and `license-audit`: mobile-release requires them, and an
+  #     advisory can publish between the PR run and the tag (v61.1.0's
+  #     RUSTSEC-2026-0459 did).
+  # Skipped on a receipt: the other nine `linux-x86_64` rows (matrix `exclude`
+  # from `linux_exclude`), `darwin-aarch64 (no postgres)` and the sqlite
+  # portability leg.
   tree:
-    name: tree equality (main merges only)
-    # Runs ONLY for a push to main. Everywhere else it is skipped, and the
-    # dependents' `!cancelled() && needs.tree.outputs.skip != 'true'` reads an
-    # empty output as "run" — so PR and tag runs do not wait for a runner for
-    # this job.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    name: tree equality (main merges and tags)
+    # Runs for a push to main or a `v*` tag. On a PR it is skipped, and the
+    # dependents read its empty outputs as "run everything" — so a PR run does
+    # not wait for a runner for this job.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
       actions: read   # list the PR head's CI runs
     outputs:
+      # main only: skip the whole run (#1021) / iOS too (#1019). Never set on a tag.
       skip: ${{ steps.cmp.outputs.skip }}
       skip_ios: ${{ steps.cmp.outputs.skip_ios }}
+      # tag only (v61.2.1): the PR run is this tag's receipt for its test legs.
+      receipt: ${{ steps.cmp.outputs.receipt }}
+      # JSON `strategy.matrix.exclude` for `linux-x86_64-test`: every row but
+      # `core-1` on a receipt, else `[]`.
+      linux_exclude: ${{ steps.cmp.outputs.linux_exclude }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -132,13 +167,34 @@ jobs:
           else
             echo "HEAD has no second parent — not a merge commit; running everything."
           fi
-          echo "skip=$skip skip_ios=$skip_ios"
-          { echo "skip=$skip"; echo "skip_ios=$skip_ios"; } >> "$GITHUB_OUTPUT"
+          # The same three conditions are a TAG's receipt, for its test legs
+          # only (see above the job): a tag run never skips a build, and never
+          # skips iOS (the release carries the iOS artifacts it builds).
+          receipt=false; linux_exclude='[]'
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              if [ "$skip" = true ]; then
+                # Every matrix row but core-1, read from THIS file so the
+                # exclude entries are the rows themselves (an exclude entry
+                # must equal the row's object). Fails open to `[]`.
+                if linux_exclude="$(python3 scripts/ci_tag_receipt.py linux-exclude .github/workflows/ci.yml)"; then
+                  receipt=true
+                else
+                  echo "could not derive the matrix exclude — the tag runs every leg"; linux_exclude='[]'
+                fi
+              fi
+              skip=false; skip_ios=false ;;
+          esac
+          echo "skip=$skip skip_ios=$skip_ios receipt=$receipt linux_exclude=$linux_exclude"
+          { echo "skip=$skip"; echo "skip_ios=$skip_ios"; echo "receipt=$receipt"; echo "linux_exclude=$linux_exclude"; } >> "$GITHUB_OUTPUT"
           if [ "$skip" = true ]; then
             echo "::notice title=main run skipped::merge tree equals PR head $head2, whose CI run passed. Nothing new to test."
           fi
           if [ "$skip" = true ] && [ "$skip_ios" != true ]; then
             echo "::notice title=iOS runs on main::the PR run did not build iOS (paths filter), so main builds it."
+          fi
+          if [ "$receipt" = true ]; then
+            echo "::notice title=tag run takes the PR run as its test receipt::tree equals PR head $head2, whose CI run passed. core-1 (the cache save), every build, lint, license-audit, sign and attest still run here."
           fi
 
   # The iOS build runs on a PR only when the diff can break it
@@ -238,6 +294,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # v61.2.1 — a tag run with a receipt (the `tree` job) runs `core-1`
+        # only; everywhere else `tree` is skipped or finds none and this is
+        # `[]`. The entries are these rows, parsed from this file by
+        # scripts/ci_tag_receipt.py.
+        exclude: ${{ fromJSON(needs.tree.outputs.linux_exclude || '[]') }}
         # CIRISPersist#543 — `gauntlet` controls whether this entry
         # runs the `substrate_machine` stateful-proptest gauntlet. It runs on
         # `core` ONLY, and the exclusion on the other five is deliberate.
@@ -678,7 +739,8 @@ jobs:
   darwin-aarch64-test:
     name: darwin-aarch64 (no postgres)
     needs: tree
-    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
+    # v61.2.1 — also skipped on a tag run with a receipt (the `tree` job).
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' && needs.tree.outputs.receipt != 'true' }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v6
@@ -1512,6 +1574,14 @@ jobs:
       # discover it. Omission is an error, not silence.
       - name: feature-matrix coverage gate
         run: python3 scripts/ci_feature_matrix.py check
+      # v61.2.1 — the tag receipt's matrix exclude is derived at TAG time and
+      # fails open (every leg runs) when the rows stop parsing. Checked here on
+      # every PR so a matrix edit that breaks it is red where it is made, not a
+      # silent full tag run months later.
+      - name: tag-receipt matrix exclude derives (every row but core-1)
+        run: |
+          python3 scripts/ci_tag_receipt.py self-test
+          python3 scripts/ci_tag_receipt.py linux-exclude .github/workflows/ci.yml
       # CIRISPersist#710 — the wheel-coverage gate, same shape and
       # same reason as the feature-matrix gate above, one artifact further
       # downstream: the wheel pytest tests must be a SUPERSET of the wheel
@@ -1725,7 +1795,8 @@ jobs:
   sqlite-portability:
     name: sqlite portability (debian bookworm, libsqlite3 3.40.1)
     needs: tree
-    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
+    # v61.2.1 — also skipped on a tag run with a receipt (the `tree` job).
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' && needs.tree.outputs.receipt != 'true' }}
     runs-on: ubuntu-latest
     container: debian:bookworm-slim
     steps:
