@@ -745,7 +745,7 @@ ort                  = { version = "=2.0.0-rc.10", optional = true, default-feat
 ndarray              = { version = "0.16", optional = true }
 
 # v0.1.21 — sqlite backend (Phase 1 parity).
-# v0.1.9 — pinned to 0.31 to match ciris-verify-core's transitive
+# v0.1.9 — pinned to match ciris-verify-core's transitive
 # rusqlite. Both crates declare `links = "sqlite3"`, so cargo's
 # resolver requires a single libsqlite3-sys version across the
 # workspace. `chrono` adds DateTime<Utc> ToSql/FromSql impls (TEXT
@@ -765,6 +765,9 @@ ndarray              = { version = "0.16", optional = true }
 # v60.0.0 (CIRISPersist#1002) — `backup` (the safe wrapper over
 # `sqlite3_backup_*`, present in every SQLite build) clones the migrated
 # template behind `store::test_backend::test_backend()`.
+#
+# v61.2.0 (CIRISPersist#1241, RUSTSEC-2026-0459) — 0.31 → 0.41 in lockstep
+# with CIRISVerify v22.2.0 (still one `links = "sqlite3"` per graph).
 rusqlite = { version = "0.41", features = ["backup", "chrono", "serde_json", "functions"], optional = true }
 
 # Phase 1 robustness — local journal for outage tolerance (FSD §3.4)
