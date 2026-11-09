@@ -74,6 +74,14 @@ pub mod outbound_queue_capsule;
 
 pub mod signer_capsule;
 
+// v61.2.0 (CIRISPersist#1242) — the versioned names of the raw-layout
+// capsules (`outbound_queue`, `federation_directory`, `keyring_signer`,
+// `runtime_handle`, `blob_storage`, `local_signer`, `trust_scoring`) and
+// `checked_pointer`, the consumer's unwrap that refuses a capsule laid out by
+// another persist build before any dereference.
+#[cfg(feature = "_pyffi")]
+pub mod capsule_names;
+
 #[cfg(feature = "_pyffi")]
 pub mod pyo3;
 

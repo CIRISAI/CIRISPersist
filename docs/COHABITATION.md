@@ -310,6 +310,21 @@ by the compiler — CIRISPersist#320). Prefer them:
 | `outbound_queue_capsule` | outbound-queue substrate (raw; use `outbound_queue_ops_capsule`) | #109 |
 | `keyring_signer_capsule` | `KeyringSignerHandle`, reusing the host's signer per rule 1 (raw; use `signer_ops_capsule`) | #109 |
 
+The seven capsules that are not ABI-stable (`runtime_handle`, `local_signer`,
+`trust_scoring`, `blob_storage`, `federation_directory`, `outbound_queue`,
+`keyring_signer`) hand over a raw Rust value that the consumer reads with its
+own compiled copy of persist's layout. Since 61.2.0 (CIRISPersist#1242) each
+is named `ciris_persist::<capsule>@<CARGO_PKG_VERSION>`
+(`ffi::capsule_names`), and a consumer unwraps one with
+`ffi::capsule_names::checked_pointer(&cap, ffi::capsule_names::<CONST>)`.
+That call refuses, with a `TypeError` led by `capsule_version_skew`, a capsule
+built by any other persist version, before any dereference. Passing the
+capsule's own name back to `pointer_checked` checks nothing. The version
+binds persist's own types and, through the one pinned CIRISVerify tag,
+`ciris-keyring`'s. It does not bind the consumer's `tokio` or `rustc`, so the
+`*_ops` / `executor` capsules (whose `_v1` names are unchanged) remain the
+sound path.
+
 ### Rust-native consumers
 
 A Rust caller that compiles `ciris-persist` as a Cargo dependency in the same

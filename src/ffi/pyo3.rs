@@ -31358,7 +31358,8 @@ impl PyEngine {
     /// // Now call FederationDirectory trait methods directly in Rust.
     /// ```
     ///
-    /// Name tag: `ciris_persist::federation_directory`.
+    /// Name tag: `ciris_persist::federation_directory@<CARGO_PKG_VERSION>`
+    /// ([`crate::ffi::capsule_names::FEDERATION_DIRECTORY`], CIRISPersist#1242).
     ///
     /// # DEPRECATED (CIRISPersist#320) — vtable-skew hazard
     ///
@@ -31386,10 +31387,12 @@ impl PyEngine {
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => b.clone(),
         };
-        pyo3::types::PyCapsule::new_with_value(py, arc, c"ciris_persist::federation_directory")
-            .map_err(|e| {
-                PyErr::new::<LensQueryError, _>(format!("federation_directory_capsule: {e}"))
-            })
+        pyo3::types::PyCapsule::new_with_value(
+            py,
+            arc,
+            crate::ffi::capsule_names::FEDERATION_DIRECTORY,
+        )
+        .map_err(|e| PyErr::new::<LensQueryError, _>(format!("federation_directory_capsule: {e}")))
     }
 
     /// v11.6.0 (CIRISPersist#320) — the ABI-stable replacement for
@@ -31446,7 +31449,8 @@ impl PyEngine {
     /// compile. Wrapping `BackendDispatch` is the same dispatch-enum
     /// pattern the Option-B pub-fn (#95) uses.
     ///
-    /// Name tag: `ciris_persist::outbound_queue`.
+    /// Name tag: `ciris_persist::outbound_queue@<CARGO_PKG_VERSION>`
+    /// ([`crate::ffi::capsule_names::OUTBOUND_QUEUE`], CIRISPersist#1242).
     ///
     /// # Deprecation (v11.7.0, CIRISPersist#320 audit)
     ///
@@ -31473,8 +31477,12 @@ impl PyEngine {
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
         };
-        pyo3::types::PyCapsule::new_with_value(py, dispatch, c"ciris_persist::outbound_queue")
-            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("outbound_queue_capsule: {e}")))
+        pyo3::types::PyCapsule::new_with_value(
+            py,
+            dispatch,
+            crate::ffi::capsule_names::OUTBOUND_QUEUE,
+        )
+        .map_err(|e| PyErr::new::<LensQueryError, _>(format!("outbound_queue_capsule: {e}")))
     }
 
     /// v11.7.0 (CIRISPersist#320 audit) — the ABI-stable replacement for
@@ -31526,7 +31534,8 @@ impl PyEngine {
     /// already-loaded signer rather than re-bootstrapping the keyring
     /// (docs/COHABITATION.md rule 1).
     ///
-    /// Name tag: `ciris_persist::keyring_signer`.
+    /// Name tag: `ciris_persist::keyring_signer@<CARGO_PKG_VERSION>`
+    /// ([`crate::ffi::capsule_names::KEYRING_SIGNER`], CIRISPersist#1242).
     ///
     /// # Deprecation (v11.7.0, CIRISPersist#320 audit) — SECURITY-CRITICAL
     ///
@@ -31557,8 +31566,12 @@ impl PyEngine {
             pqc_signer: self.local_signer.as_ref().and_then(|ls| ls.pqc_signer()),
             key_id: self.signer_key_id.clone(),
         };
-        pyo3::types::PyCapsule::new_with_value(py, handle, c"ciris_persist::keyring_signer")
-            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("keyring_signer_capsule: {e}")))
+        pyo3::types::PyCapsule::new_with_value(
+            py,
+            handle,
+            crate::ffi::capsule_names::KEYRING_SIGNER,
+        )
+        .map_err(|e| PyErr::new::<LensQueryError, _>(format!("keyring_signer_capsule: {e}")))
     }
 
     /// v11.7.0 (CIRISPersist#320 audit) — the **SECURITY-CRITICAL**
@@ -31625,18 +31638,21 @@ impl PyEngine {
     /// let cap: Bound<PyCapsule> = engine
     ///     .call_method0("runtime_handle_capsule")?
     ///     .downcast_into()?;
-    /// // SAFETY: persist v2.8.0+'s runtime_handle_capsule wraps
-    /// // tokio::runtime::Handle with name tag
-    /// // "ciris_persist::runtime_handle"; the Cargo pin floor enforces.
+    /// // SAFETY: `checked_pointer` refuses a capsule named for another
+    /// // persist build (CIRISPersist#1242) before anything is dereferenced.
     /// let handle: &tokio::runtime::Handle = unsafe {
-    ///     cap.pointer_checked(Some(c"ciris_persist::runtime_handle"))?
+    ///     ciris_persist::ffi::capsule_names::checked_pointer(
+    ///         &cap,
+    ///         ciris_persist::ffi::capsule_names::RUNTIME_HANDLE,
+    ///     )?
     ///         .cast()
     ///         .as_ref()
     /// };
     /// let _enter = handle.enter();
     /// ```
     ///
-    /// Name tag: `ciris_persist::runtime_handle`.
+    /// Name tag: `ciris_persist::runtime_handle@<CARGO_PKG_VERSION>`
+    /// ([`crate::ffi::capsule_names::RUNTIME_HANDLE`], CIRISPersist#1242).
     ///
     /// # Deprecation (v3.13.0, CIRISPersist#157)
     ///
@@ -31673,8 +31689,12 @@ impl PyEngine {
         // outright, fail fast with `EngineClosed` instead.
         self.ensure_usable()?;
         let handle: tokio::runtime::Handle = self.runtime.handle().clone();
-        pyo3::types::PyCapsule::new_with_value(py, handle, c"ciris_persist::runtime_handle")
-            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("runtime_handle_capsule: {e}")))
+        pyo3::types::PyCapsule::new_with_value(
+            py,
+            handle,
+            crate::ffi::capsule_names::RUNTIME_HANDLE,
+        )
+        .map_err(|e| PyErr::new::<LensQueryError, _>(format!("runtime_handle_capsule: {e}")))
     }
 
     /// v3.13.0 (CIRISPersist#157) — ABI-stable async-executor capsule.
@@ -31795,7 +31815,8 @@ impl PyEngine {
     /// wrapper) — same cross-module identity problem the rest of the
     /// capsule family solves.
     ///
-    /// Name tag: `ciris_persist::blob_storage`.
+    /// Name tag: `ciris_persist::blob_storage@<CARGO_PKG_VERSION>`
+    /// ([`crate::ffi::capsule_names::BLOB_STORAGE`], CIRISPersist#1242).
     #[pyo3(name = "blob_storage_capsule")]
     fn blob_storage_capsule_py<'py>(
         &self,
@@ -31807,8 +31828,12 @@ impl PyEngine {
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
         };
-        pyo3::types::PyCapsule::new_with_value(py, dispatch, c"ciris_persist::blob_storage")
-            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("blob_storage_capsule: {e}")))
+        pyo3::types::PyCapsule::new_with_value(
+            py,
+            dispatch,
+            crate::ffi::capsule_names::BLOB_STORAGE,
+        )
+        .map_err(|e| PyErr::new::<LensQueryError, _>(format!("blob_storage_capsule: {e}")))
     }
 
     /// v3.1.1 (CIRISPersist#119) — cross-cdylib accessor for the
@@ -31828,7 +31853,8 @@ impl PyEngine {
     /// older cohabitation init paths predating 2.12.0 (#112) don't
     /// propagate `LocalSigner` across the cross-cdylib boundary.
     ///
-    /// Name tag: `ciris_persist::local_signer`.
+    /// Name tag: `ciris_persist::local_signer@<CARGO_PKG_VERSION>`
+    /// ([`crate::ffi::capsule_names::LOCAL_SIGNER`], CIRISPersist#1242).
     #[pyo3(name = "local_signer_capsule")]
     fn local_signer_capsule_py<'py>(
         &self,
@@ -31837,8 +31863,12 @@ impl PyEngine {
         let Some(local_signer) = self.local_signer.clone() else {
             return Err(PyValueError::new_err("local_signer_unavailable"));
         };
-        pyo3::types::PyCapsule::new_with_value(py, local_signer, c"ciris_persist::local_signer")
-            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("local_signer_capsule: {e}")))
+        pyo3::types::PyCapsule::new_with_value(
+            py,
+            local_signer,
+            crate::ffi::capsule_names::LOCAL_SIGNER,
+        )
+        .map_err(|e| PyErr::new::<LensQueryError, _>(format!("local_signer_capsule: {e}")))
     }
 
     /// v3.5.1 (CIRISPersist#129) — cross-cdylib accessor for the
@@ -31857,7 +31887,8 @@ impl PyEngine {
     /// the unavailable case (cohab consumers fall back to a no-op
     /// scorer when this raises).
     ///
-    /// Name tag: `ciris_persist::trust_scoring`.
+    /// Name tag: `ciris_persist::trust_scoring@<CARGO_PKG_VERSION>`
+    /// ([`crate::ffi::capsule_names::TRUST_SCORING`], CIRISPersist#1242).
     #[pyo3(name = "trust_scoring_capsule")]
     fn trust_scoring_capsule_py<'py>(
         &self,
@@ -31872,8 +31903,12 @@ impl PyEngine {
         let scoring = gate
             .map(|g| g.scoring_arc())
             .ok_or_else(|| PyValueError::new_err("trust_scoring_unavailable"))?;
-        pyo3::types::PyCapsule::new_with_value(py, scoring, c"ciris_persist::trust_scoring")
-            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("trust_scoring_capsule: {e}")))
+        pyo3::types::PyCapsule::new_with_value(
+            py,
+            scoring,
+            crate::ffi::capsule_names::TRUST_SCORING,
+        )
+        .map_err(|e| PyErr::new::<LensQueryError, _>(format!("trust_scoring_capsule: {e}")))
     }
 
     // ── v3.8.0 (CIRISPersist#151) — CIRISVerify v4.7.0 wheel surfaces ──
@@ -39148,3 +39183,9 @@ mod hybrid_policy_1233_tests;
 /// postgres.
 #[cfg(test)]
 mod verify_trace_1239_tests;
+
+/// v61.2.0 (CIRISPersist#1242) — I1703: every raw-layout capsule `PyEngine`
+/// hands out is named `ciris_persist::<base>@<CARGO_PKG_VERSION>`, on sqlite
+/// and postgres.
+#[cfg(test)]
+mod capsule_names_1242_tests;

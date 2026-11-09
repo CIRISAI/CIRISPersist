@@ -49,6 +49,13 @@
 //!   table whose self-roster row is outside the self corridor every roster
 //!   change is refused `federation_governance_policy_refused` and nothing is
 //!   held; under the vendored table the same changes land or are held.
+//! - **I1710–I1712 (CIRISPersist#1159, T10)** — the in-order holder, a fresh
+//!   node fed the whole stream, and a late joiner that held its own
+//!   occurrence first reach one roster; the late joiner's interim verdict is
+//!   its own (CC 3.3.6.3) and converges after its own `W_self`.
+//! - **I1713 (a backdated add)** — an addition signed at an instant when its
+//!   proposer was the only key is decided on the roster as it stands, never
+//!   on the roster at its signed instant.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -1265,6 +1272,233 @@ pub(crate) mod bodies {
             "I1139: B landed the delivered proposal by the delivered assent"
         );
     }
+
+    /// Every attestation row `a` holds, in its stream order.
+    async fn stream_of(a: &dyn FederationDirectory) -> Vec<Attestation> {
+        let mut out = Vec::new();
+        let mut since = None;
+        loop {
+            let page = a
+                .list_attestations_since(since.clone(), 1_000)
+                .await
+                .unwrap();
+            let Some(last) = page.last() else { break };
+            since = Some(last.resume_pair());
+            out.extend(page.iter().map(|s| s.attestation.clone()));
+            if page.len() < 1_000 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Offer every row to `b` through the replication apply door, in order.
+    /// A refusal is the door's verdict on that row, not the witness's.
+    async fn deliver(b: &dyn FederationDirectory, rows: &[Attestation]) {
+        for r in rows {
+            let _ = b
+                .apply_replicated_attestation(SignedAttestation {
+                    attestation: r.clone(),
+                })
+                .await;
+        }
+    }
+
+    async fn pause() {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    /// **I1710–I1712** (CIRISPersist#1159, CSD/4 T10) — three holders of one
+    /// self's rows reach one roster.
+    ///
+    /// The shape: genesis key `f`; `d2` added at one key (lands at once); `d3`
+    /// added by quorum (`f` proposes, `d2` assents); `f` proposes evicting
+    /// `d3` and `d2` co-signs (2 of 3).
+    ///
+    /// - **I1710 (in order)** — on `a`, where every row was decided as it was
+    ///   signed, the eviction lands: the roster is `{f, d2}`.
+    /// - **I1711 (a fresh node, the whole stream)** — `c` receives `a`'s
+    ///   stream in `a`'s order and lands the same roster at once.
+    /// - **I1712 (the late joiner, #1159)** — `b` is `d3`'s own device: it
+    ///   holds its own occurrence BEFORE the stream (the pairing flow), so it
+    ///   decided `d3`'s add at one key (`{f}`) and then `d2`'s add at two
+    ///   (`{f, d3}`): pending, which leaves `f` an open proposal ahead of the
+    ///   eviction (`proposer_has_open_proposal`). CC 3.3.6.3: thresholds are
+    ///   counted over the roster "as it stands when the decision is made",
+    ///   and "a landing is a node's own verdict" — so `b`'s interim verdict
+    ///   is its own. The property is that it is BOUNDED: once `b`'s own
+    ///   `W_self` has run, its sweep lands `d2`'s add by the lone path (no
+    ///   objector; an addition asks no silence), then the eviction by quorum,
+    ///   and `b` holds `a`'s roster.
+    ///
+    /// Mutations that turn this red:
+    /// - `decide_all` without the one-open-per-proposer block: `b`'s interim
+    ///   eviction decision is `Pending` (needs 1: `d2`'s assent is void on
+    ///   `{f, d3}`), not `proposer_has_open_proposal` (I1712 interim).
+    /// - the gate judging an addition on the roster at its signed
+    ///   `asserted_at` (the issue's proposed reading): `d2` lands on `b` at
+    ///   once (I1712 interim `!active(d2)`); that reading is the backdating
+    ///   hole I1713 pins shut.
+    /// - a lone path whose window never closes, or one that asks an
+    ///   addition's target for silence it cannot give after arrival: `b`
+    ///   never converges (I1712 final).
+    /// - an executor that stops after its first landing: `b` lands `d2` but
+    ///   not the eviction (I1712 final).
+    pub(crate) async fn i1710_every_holder_reaches_one_roster(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+        c: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::two_path::{ProposalKind, TwoPathDecision, TwoPathRefusal};
+        let (f, d2, d3) = (format!("f-{tag}"), format!("d2-{tag}"), format!("d3-{tag}"));
+        for d in [a, b, c] {
+            keys(d, &[&f, &d2, &d3]).await;
+        }
+
+        // I1710 — `a`, in order.
+        add(a, &f, &f, &d2, ms_now())
+            .await
+            .expect("I1710: at one key d2's add lands at once");
+        pause().await;
+        let p3 = pending(add(a, &f, &f, &d3, ms_now()).await, "I1710: f adds d3");
+        vote(a, &d2, &f, &p3, true).await;
+        assert!(active(a, &f, &d3).await, "I1710: d3 landed by quorum");
+        pause().await;
+        let w = ts::occurrence_withdrawal(a, &f, &f, &d3, ms_now()).await;
+        let pe = pending(
+            a.put_attestation(w).await.map(|_| ()),
+            "I1710: f proposes evicting d3",
+        );
+        vote(a, &d2, &f, &pe, true).await;
+        assert!(
+            !active(a, &f, &d3).await,
+            "I1710: f and d2 are 2 of 3; the eviction landed"
+        );
+        let want = sr::roster_now(a, &f).await.unwrap();
+        assert_eq!(
+            want,
+            [f.clone(), d2.clone()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<String>>(),
+            "I1710: the in-order roster"
+        );
+        let rows = stream_of(a).await;
+
+        // I1711 — `c`, a fresh node, the whole stream in `a`'s order.
+        deliver(c, &rows).await;
+        settle(c, &f).await;
+        assert_eq!(
+            sr::roster_now(c, &f).await.unwrap(),
+            want,
+            "I1711: a fresh node fed a's stream folds a's roster"
+        );
+
+        // I1712 — `b`, d3's own device: its own occurrence first.
+        let own = rows
+            .iter()
+            .find(|r| {
+                crate::federation::key_plane::occurrence_of_row(r).is_some_and(|s| {
+                    s.identity_occurrence.identity_key_id == f
+                        && s.identity_occurrence.occurrence_key_id == d3
+                })
+            })
+            .expect("I1712: a holds d3's occurrence row")
+            .clone();
+        deliver(b, std::slice::from_ref(&own)).await;
+        assert!(
+            active(b, &f, &d3).await,
+            "I1712: b's own occurrence landed on b's one-key roster"
+        );
+        deliver(b, &rows).await;
+        settle(b, &f).await;
+        // The interim: b's own verdict, decided over b's roster as it stood.
+        assert!(
+            !active(b, &f, &d2).await,
+            "I1712: d2's add was decided on b's two-key roster {{f, d3}}: held, not landed"
+        );
+        let standing = sr::standing(b, &f).await.unwrap();
+        let of = |kind: ProposalKind, target: &str| {
+            standing
+                .iter()
+                .find(|s| s.proposal.kind == kind && s.proposal.target == target)
+                .map(|s| s.decision)
+                .unwrap_or_else(|| panic!("I1712: no {kind:?} of {target} held: {standing:?}"))
+        };
+        assert!(
+            matches!(
+                of(ProposalKind::Add, &d2),
+                TwoPathDecision::Pending { needs: 1, .. }
+            ),
+            "I1712: {standing:?}"
+        );
+        assert_eq!(
+            of(ProposalKind::Evict, &d3),
+            TwoPathDecision::Refused {
+                reason: TwoPathRefusal::ProposerHasOpenProposal
+            },
+            "I1712: f's earlier open add blocks its eviction on b"
+        );
+        // Bounded: after b's own window, b's sweep converges on a's roster.
+        advance(sr::W_SELF_SECS + 60);
+        let landed = sr::execute_due(b).await;
+        reset_clock();
+        let landed = landed.expect("I1712: the sweep");
+        assert!(
+            landed >= 2,
+            "I1712: d2's add (lone) and the eviction (quorum) landed: {landed}"
+        );
+        assert_eq!(
+            sr::roster_now(b, &f).await.unwrap(),
+            want,
+            "I1712: after its window the late joiner holds a's roster"
+        );
+    }
+
+    /// **I1713** (CIRISPersist#1159) — why I1712's interim is not "fixed" by
+    /// judging an addition on the roster at its signed `asserted_at`: that
+    /// instant is the signer's. A thief holding `f` (still live) signs a key
+    /// of its own in, backdated to before `d1` joined, when `f` was the only
+    /// key. Judged at that instant it would land at one key — and a replay in
+    /// signed order would then re-judge `d1`'s own add on `{f, thief}` and
+    /// drop it. On the roster as it stands (three keys) it is a proposal,
+    /// pending, and nothing lands.
+    ///
+    /// Mutation: `gate`/`plan` deciding on the roster at the proposal's
+    /// `asserted_at` (or `decide_all` replaying adds in signed order from the
+    /// genesis roster) lands the thief's key — red.
+    pub(crate) async fn i1713_a_backdated_add_is_decided_on_the_roster_now(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let (f, d1, d2, thief) = (
+            format!("f-{tag}"),
+            format!("d1-{tag}"),
+            format!("d2-{tag}"),
+            format!("t-{tag}"),
+        );
+        let before = ms_now() - chrono::Duration::hours(1);
+        keys(d, &[&thief]).await;
+        three(d, &f, &d1, &d2).await;
+        let r = add(d, &f, &f, &thief, before).await;
+        match r {
+            Err(Error::SelfRosterNotLanded {
+                decision: "pending",
+                needs: 1,
+                ..
+            }) => {}
+            other => panic!("I1713: a backdated add at three keys must be held: {other:?}"),
+        }
+        settle(d, &f).await;
+        assert!(
+            !active(d, &f, &thief).await,
+            "I1713: the backdated add landed at one key"
+        );
+        assert!(
+            active(d, &f, &d1).await && active(d, &f, &d2).await,
+            "I1713: the roster's own keys stay"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -1505,6 +1739,66 @@ mod tests {
             b.run_migrations().await.unwrap();
             bodies::i1139_two_nodes_land_alike(&a, &b, &tag("p")).await;
             eprintln!("i1139: RAN");
+        }
+    }
+
+    on_every_backend!(
+        i1713,
+        bodies::i1713_a_backdated_add_is_decided_on_the_roster_now
+    );
+
+    /// I1710–I1712 need three nodes: the in-order holder, a fresh node fed
+    /// the whole stream, and the late joiner that held its own row first.
+    mod i1710 {
+        use super::*;
+
+        #[cfg(feature = "sqlite")]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn sqlite() {
+            use crate::store::Backend as _;
+            let mut nodes = Vec::new();
+            for _ in 0..3 {
+                let n = crate::store::sqlite::SqliteBackend::open_in_memory()
+                    .await
+                    .unwrap();
+                n.run_migrations().await.unwrap();
+                nodes.push(n);
+            }
+            bodies::i1710_every_holder_reaches_one_roster(
+                &nodes[0],
+                &nodes[1],
+                &nodes[2],
+                &tag("s"),
+            )
+            .await;
+            bodies::reset_clock();
+        }
+
+        #[cfg(feature = "postgres")]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn postgres() {
+            use crate::store::Backend as _;
+            let mut nodes = Vec::new();
+            for _ in 0..3 {
+                let Some(dsn) = crate::test_pg::empty_dsn() else {
+                    eprintln!("i1710 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+                    return;
+                };
+                let n = crate::store::postgres::PostgresBackend::connect(&dsn)
+                    .await
+                    .unwrap();
+                n.run_migrations().await.unwrap();
+                nodes.push(n);
+            }
+            bodies::i1710_every_holder_reaches_one_roster(
+                &nodes[0],
+                &nodes[1],
+                &nodes[2],
+                &tag("p"),
+            )
+            .await;
+            bodies::reset_clock();
+            eprintln!("i1710: RAN");
         }
     }
 }

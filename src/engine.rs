@@ -1452,14 +1452,8 @@ impl Engine {
                 return;
             }
             let fut = std::pin::pin!(self.local_derived_key_id());
-            // `Waker::noop` is 1.85 (the MSRV is 1.83) and the crate denies
-            // `unsafe`: a `Wake` impl that does nothing. One poll never wakes.
-            struct NoWake;
-            impl std::task::Wake for NoWake {
-                fn wake(self: Arc<Self>) {}
-            }
-            let waker = std::task::Waker::from(Arc::new(NoWake));
-            let mut cx = std::task::Context::from_waker(&waker);
+            // One poll that never wakes (`Waker::noop`, stable since 1.85).
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
             match std::future::Future::poll(fut, &mut cx) {
                 std::task::Poll::Ready(Ok(k)) => self.set_backend_node_key_id(&k),
                 std::task::Poll::Ready(Err(e)) => tracing::warn!(
