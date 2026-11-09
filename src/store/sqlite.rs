@@ -7662,6 +7662,23 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .await
     }
 
+    async fn list_attestations_naming_by_dimension(
+        &self,
+        subject_key_id: &str,
+        dimension: &str,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::ScoresPage, crate::federation::Error> {
+        crate::federation::read_plan::list_attestations_naming_by_dimension_planned(
+            self,
+            subject_key_id,
+            dimension,
+            cursor,
+            limit,
+        )
+        .await
+    }
+
     async fn record_announced_peer(
         &self,
         key_id: &str,
@@ -16604,6 +16621,56 @@ fn sqlite_list_scores_sql(
     (sql, binds)
 }
 
+/// v61.0.5 (CIRISPersist#1225) — the subject read's one statement: V106's
+/// `attestation_subjects_seek` `(subject_key_id, dimension, asserted_at DESC,
+/// attestation_id)` pins its two equality columns and walks `asserted_at`,
+/// with the row-value cursor on the projection's own columns (copies of the
+/// parent's). The serve rule is `list_attestations_since`'s. One row per
+/// attestation: the projection's key is `(subject_key_id, attestation_id)`.
+/// The plan witness EXPLAINs this builder.
+fn sqlite_naming_page_sql(
+    subject_key_id: &str,
+    dimension: &str,
+    cursor: Option<&crate::read::AttestationCursor>,
+    fetch: i64,
+) -> (String, Vec<SqlValue>) {
+    let mut binds: Vec<SqlValue> = vec![
+        SqlValue::Text(subject_key_id.to_owned()),
+        SqlValue::Text(dimension.to_owned()),
+    ];
+    let mut parts: Vec<String> = vec![
+        "s.subject_key_id = ?1".to_owned(),
+        "s.dimension = ?2".to_owned(),
+        "fa.tier = 'federation'".to_owned(),
+    ];
+    parts.extend(crate::federation::row_type::serve_filter_sql(
+        "fa.attestation_type",
+        crate::federation::row_type::SqlDialect::Sqlite,
+    ));
+    parts.push(crate::federation::steward_purge::served_under_purge_sql(
+        "fa", "",
+    ));
+    if let Some(c) = cursor {
+        binds.push(SqlValue::Text(c.last_asserted_at.to_rfc3339()));
+        let p_at = binds.len();
+        binds.push(SqlValue::Text(c.last_attestation_id.clone()));
+        let p_id = binds.len();
+        parts.push(format!(
+            "(s.asserted_at, s.attestation_id) < (?{p_at}, ?{p_id})"
+        ));
+    }
+    binds.push(SqlValue::Integer(fetch));
+    let sql = format!(
+        "SELECT {SCORES_FA_COLS} FROM attestation_subjects s \
+         JOIN federation_attestations fa ON fa.attestation_id = s.attestation_id \
+         WHERE {} \
+         ORDER BY s.asserted_at DESC, s.attestation_id DESC LIMIT ?{}",
+        parts.join(" AND "),
+        binds.len()
+    );
+    (sql, binds)
+}
+
 /// v53.1.5 — the #817/#818 dimension-prefix predicate over V106's generated
 /// column: a half-open byte range when an upper bound is representable
 /// (index-served), `substr` otherwise. Never `LIKE` (case-folding, and
@@ -23646,6 +23713,47 @@ impl crate::federation::read_plan::ReadPlanStore for SqliteBackend {
                         .map_err(|e| Error::Backend(format!("list_attestation_log query: {e}")))?
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|e| Error::Backend(format!("list_attestation_log row: {e}")));
+                    rows
+                },
+            )
+            .await;
+        Ok(crate::federation::attestation_query::QueryRows {
+            rows: rows?,
+            bytes,
+            backend: crate::observe::StoreBackend::Sqlite,
+        })
+    }
+
+    async fn read_naming_page(
+        &self,
+        subject_key_id: &str,
+        dimension: &str,
+        cursor: Option<&crate::read::AttestationCursor>,
+        fetch: i64,
+    ) -> Result<crate::federation::attestation_query::QueryRows, crate::federation::Error> {
+        use crate::federation::Error;
+        let (sql, binds) = sqlite_naming_page_sql(subject_key_id, dimension, cursor, fetch);
+        let (rows, bytes) = self
+            .read_measured(
+                move |conn| -> Result<Vec<crate::federation::Attestation>, Error> {
+                    let mut stmt = conn.prepare(&sql).map_err(|e| {
+                        Error::Backend(format!(
+                            "list_attestations_naming_by_dimension prepare: {e}"
+                        ))
+                    })?;
+                    let rows = stmt
+                        .query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)
+                        .map_err(|e| {
+                            Error::Backend(format!(
+                                "list_attestations_naming_by_dimension query: {e}"
+                            ))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| {
+                            Error::Backend(format!(
+                                "list_attestations_naming_by_dimension row: {e}"
+                            ))
+                        });
                     rows
                 },
             )
@@ -43209,6 +43317,42 @@ mod tests {
             !plan.iter().any(|l| l == "SCAN federation_attestations"),
             "{what}: never a table scan: {plan:?}"
         );
+    }
+
+    /// v61.0.5 (CIRISPersist#1225) — the subject read seeks V106's
+    /// `attestation_subjects_seek` on its two equality columns, with and
+    /// without a cursor, and never scans the projection or the parent table.
+    #[tokio::test]
+    async fn i1225_subject_read_seeks_the_subject_dimension_index() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let cursor = crate::read::AttestationCursor::from_trailing(
+            chrono::Utc::now(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        for (tag, c) in [("head", None), ("cursor", Some(&cursor))] {
+            let (sql, binds) = sqlite_naming_page_sql("k", "membership:proposal:v1", c, 51);
+            let plan = sqlite_plan(&backend, &sql, binds).await;
+            eprintln!("#1225 subject read ({tag}) plan: {plan:?}");
+            assert!(
+                plan.iter().any(|l| l.contains("attestation_subjects_seek")
+                    && l.contains("subject_key_id=?")
+                    && l.contains("dimension=?")),
+                "#1225 {tag}: seeks the (subject, dimension) prefix: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|l| l == "SCAN s"
+                    || l == "SCAN fa"
+                    || l.starts_with("SCAN federation_attestations")),
+                "#1225 {tag}: never a scan: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|l| l.contains("USE TEMP B-TREE FOR ORDER BY")),
+                "#1225 {tag}: the index gives the order, no sort: {plan:?}"
+            );
+        }
     }
 
     /// v61 — `list_scores` under the Live view shares the lifecycle

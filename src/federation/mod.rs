@@ -783,6 +783,10 @@ mod signed_object_1098_invariants;
 // v60.1.0 (docs/V61_TASK_PLAN.md §2 slice B) — the consumer asks, I1360+.
 #[cfg(test)]
 mod v601_asks_invariants;
+// v61.0.5 (CIRISPersist#1225) — I1544–I1547: the read of rows naming a key,
+// one dimension, on every backend.
+#[cfg(test)]
+pub(crate) mod subject_read_1225_invariants;
 // v60.1.0 (CIRISPersist#1113, CC 4.5.3) — I1366/I1367: a reversed
 // reconsideration reverses a takedown; withheld is computed at read.
 #[cfg(test)]
@@ -5255,6 +5259,45 @@ pub trait FederationDirectory: Send + Sync {
         let _ = (subject_key_id, cursor, limit);
         Err(Error::Unsupported {
             method: "list_attestation_log",
+        })
+    }
+
+    /// v61.0.5 (CIRISPersist#1225) — the federation-tier rows whose
+    /// `subject_key_ids` name `subject_key_id`, under exactly `dimension`:
+    /// a relayed `membership:proposal:v1` reaching its invitee, which names
+    /// the invitee only as a subject. A seek over V106's
+    /// `attestation_subjects_seek` `(subject_key_id, dimension, asserted_at
+    /// DESC, attestation_id)`; no migration.
+    ///
+    /// Ordered `(asserted_at DESC, attestation_id DESC)` and resumed after
+    /// `cursor` (exclusive), at most `limit` (1..=10_000) per page.
+    /// `next_cursor` is `Some` exactly when another row exists past the page
+    /// (the executor fetches one row past it), so it is also the "more"
+    /// answer.
+    ///
+    /// The order is the SIGNER's `asserted_at`, not receipt: a row that
+    /// arrives later dated earlier than a cursor already passed sorts behind
+    /// it, so a caller that must see late rows reads from the head each time
+    /// rather than resuming a high-water cursor. Anyone can name a key as a
+    /// subject, so a page can be flooded; a caller pages to a budget.
+    ///
+    /// A plain read: no caller gate and no lifecycle folding (the caller's
+    /// serve gate runs after it). It serves what
+    /// [`Self::list_attestations_since`] serves: federation tier only, no
+    /// unregistered type under row-type enforcement, and no purge-tombstoned
+    /// row except those the tombstone is void for (the accountability
+    /// record, a person-subject row). Default = `Unsupported`; the sqlite
+    /// and postgres backends and the capsule proxy override.
+    async fn list_attestations_naming_by_dimension(
+        &self,
+        subject_key_id: &str,
+        dimension: &str,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::ScoresPage, Error> {
+        let _ = (subject_key_id, dimension, cursor, limit);
+        Err(Error::Unsupported {
+            method: "list_attestations_naming_by_dimension",
         })
     }
 

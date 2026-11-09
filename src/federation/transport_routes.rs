@@ -97,11 +97,41 @@ async fn single_owner<F: FederationDirectory + ?Sized>(
     }
 }
 
+/// Each key's single owner, read once per fold. `owner_of` costs two
+/// attestation queries, and a destination anyone can mint may carry thousands
+/// of keys, so a fold pays for distinct keys and never for pairs.
+struct Owners<'d, F: ?Sized> {
+    dir: &'d F,
+    known: std::collections::HashMap<String, Option<String>>,
+    reads: usize,
+}
+
+impl<'d, F: FederationDirectory + ?Sized> Owners<'d, F> {
+    fn new(dir: &'d F) -> Self {
+        Self {
+            dir,
+            known: std::collections::HashMap::new(),
+            reads: 0,
+        }
+    }
+
+    async fn of(&mut self, key_id: &str) -> Result<Option<String>, Error> {
+        if let Some(owner) = self.known.get(key_id) {
+            return Ok(owner.clone());
+        }
+        self.reads += 1;
+        let owner = single_owner(self.dir, key_id).await?;
+        self.known.insert(key_id.to_owned(), owner.clone());
+        Ok(owner)
+    }
+}
+
 /// Is `older` displaced by `newer`: the same destination and kind, a
 /// different key, a strictly newer `(epoch, asserted_at)`, and the two keys
-/// share one live owner?
+/// share one live owner? `older`'s owner is read first: one key with none
+/// costs one read, however many keys claim its destination.
 async fn displaces<F: FederationDirectory + ?Sized>(
-    dir: &F,
+    owners: &mut Owners<'_, F>,
     newer: &TransportDestination,
     older: &TransportDestination,
 ) -> Result<bool, Error> {
@@ -113,19 +143,15 @@ async fn displaces<F: FederationDirectory + ?Sized>(
     {
         return Ok(false);
     }
-    let Some(a) = single_owner(dir, &newer.occurrence_key_id).await? else {
+    let Some(owner) = owners.of(&older.occurrence_key_id).await? else {
         return Ok(false);
     };
-    Ok(single_owner(dir, &older.occurrence_key_id).await? == Some(a))
+    Ok(owners.of(&newer.occurrence_key_id).await? == Some(owner))
 }
 
-/// The routes of `rows` no other route displaces, judged against every live
-/// route this node holds on each row's destination. Order is kept.
-///
-/// # Errors
-/// A directory read error.
-pub async fn fold_one_live_key<F: FederationDirectory + ?Sized>(
+async fn fold_with<F: FederationDirectory + ?Sized>(
     dir: &F,
+    owners: &mut Owners<'_, F>,
     rows: Vec<TransportDestination>,
 ) -> Result<Vec<TransportDestination>, Error> {
     let mut by_destination: std::collections::HashMap<String, Vec<TransportDestination>> =
@@ -140,7 +166,7 @@ pub async fn fold_one_live_key<F: FederationDirectory + ?Sized>(
         }
         let mut displaced = false;
         for other in &by_destination[&row.destination] {
-            if displaces(dir, other, &row).await? {
+            if displaces(owners, other, &row).await? {
                 displaced = true;
                 break;
             }
@@ -150,6 +176,30 @@ pub async fn fold_one_live_key<F: FederationDirectory + ?Sized>(
         }
     }
     Ok(out)
+}
+
+/// The routes of `rows` no other route displaces, judged against every live
+/// route this node holds on each row's destination. Order is kept. Costs at
+/// most one owner read per distinct key in the fold.
+///
+/// # Errors
+/// A directory read error.
+pub async fn fold_one_live_key<F: FederationDirectory + ?Sized>(
+    dir: &F,
+    rows: Vec<TransportDestination>,
+) -> Result<Vec<TransportDestination>, Error> {
+    fold_with(dir, &mut Owners::new(dir), rows).await
+}
+
+/// [`fold_one_live_key`] and how many owner reads it took.
+#[cfg(test)]
+pub(crate) async fn fold_counting_owner_reads<F: FederationDirectory + ?Sized>(
+    dir: &F,
+    rows: Vec<TransportDestination>,
+) -> Result<(Vec<TransportDestination>, usize), Error> {
+    let mut owners = Owners::new(dir);
+    let kept = fold_with(dir, &mut owners, rows).await?;
+    Ok((kept, owners.reads))
 }
 
 /// Delete every stored route whose key is `agent`-typed; the count deleted.

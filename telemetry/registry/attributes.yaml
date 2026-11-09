@@ -66,6 +66,9 @@ groups:
           - id: list_attestation_log
             value: "list_attestation_log"
             stability: development
+          - id: list_attestations_naming_by_dimension
+            value: "list_attestations_naming_by_dimension"
+            stability: development
           - id: attestation_query
             value: "attestation_query"
             stability: development

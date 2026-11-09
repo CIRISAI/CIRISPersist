@@ -288,6 +288,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("store_planned_trace_erasure", ConnClass::Write),
     ("store_planned_fountain_content", ConnClass::Write),
     ("read_attestation_log_page", ConnClass::Read),
+    ("read_naming_page", ConnClass::Read),
     ("read_key_registration_history", ConnClass::Read),
     ("read_renditions", ConnClass::Read),
     ("read_attestations", ConnClass::Read),

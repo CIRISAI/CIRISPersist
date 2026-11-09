@@ -5,10 +5,9 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
-## [61.0.4] - UNRELEASED
+## [61.1.0] - UNRELEASED
 
 ### Fixed
-- **SQLite attestation reads reuse their prepared statement.** `execute_attestation_query` and the referencing read now use the statement cache, and each reader holds 128 statements. Bridge profiled a production-sized copy of the 0.5.245 candidate at 24% of CPU in `sqlite3_prepare_v2`. The call rate behind it is a separate question.
 
 - **A room counted keys, not people** (CIRISPersist#1198, CC 4.5.13, CC 3.3.6.3, `CLM-vote-once-per-person`). A tally now counts fedIDs: `federation::key_person` resolves a key to the self whose roster it belongs to, and every room vote reads that. On the reverse-quorum plane this covers ballots, objections, dismissals, recusal, the duty-holders' bench and every threshold's denominator. On the roster plane it covers `consensus::evaluate` in every protocol, for communities and families, `verify_membership_quorum` and the cosigned `withdraws` of a roster event. Two seats held by one self are one voice in the numerator and the denominator, and any key of a seated person votes and signs for them, seated or not. A key of another self counts for nothing, and neither does a key with a held revocation. An evicted device's seat stays its person's, so the person's other keys keep the voice. The trust-root chain and the licence quorum stay per key.
 
@@ -30,6 +29,25 @@ I1525–I1539 cover both planes on sqlite and postgres through the doors, and 72
 - **`roster_size`, `required`, `distinct_objectors`, `respondents`, `duty_holders` and `DismissalQuorum` count persons.** The fields keep their names and JSON shape; a room with two seats for one self reports fewer. `counted_ballot_ids` and `counted_objection_ids` hold one row per person, the lowest id.
 - **Public Rust shapes changed.** `consensus::Ballot`, `ReverseQuorumInputs` and `RosterRules` gained `persons` (`RosterRules::of_community` and `of_family` default to the per-key count; add `.with_persons`). `community_roster_events` and `family_roster_events` take the persons as an argument. New: `community_key_selves`, `family_key_selves`, `reverse_quorum::is_vote_row`.
 - **Roster events already held stay in the fold.** One admitted under the per-key count stands, and a new one is judged by persons at the door. A node on 61.0.4 refuses such an event arriving from an older node, so the two can hold different rosters until the room acts under its protocol.
+
+## [61.0.5] - 2026-11-08
+
+### Added
+
+- **A read of the rows naming a key, under one dimension (CIRISPersist#1225, Edge, agent 2.20).** `FederationDirectory::list_attestations_naming_by_dimension(subject_key_id, dimension, cursor, limit)` returns the federation-tier rows whose `subject_key_ids` name the key, newest first by `(asserted_at, attestation_id)`, one page at a time; `next_cursor` is present exactly when another row exists. A relayed `membership:proposal:v1` names its invitee only as a subject, so a waking invitee could not find it except by a paced history read. It serves what `list_attestations_since` serves (federation tier, no unregistered type under enforcement, no purge-tombstoned row the tombstone is not void for), with no caller gate and no lifecycle folding: the caller's serve gate runs after it. It seeks V106's `attestation_subjects_seek`; no migration.
+
+### Adoption
+
+- **New read: `list_attestations_naming_by_dimension`, and its capsule op `DirectoryOp::ListAttestationsNamingByDimension` (result `Scores`).** Append-only op growth; `DIRECTORY_ABI_VERSION` is unchanged at 12. A directory that does not override the method answers `Unsupported`.
+- **Order by the signer's instant.** A row dated behind a cursor already passed is found only by a read from the head, so a caller that must see late rows reads from the head each time. Anyone can name a key, so a page can be flooded: page to a budget, and treat one page as incomplete.
+- **New telemetry door label** `list_attestations_naming_by_dimension` on the read counters.
+
+## [61.0.4] - 2026-11-06
+
+### Fixed
+
+- **SQLite attestation reads reuse their prepared statement.** `execute_attestation_query` and the referencing read now use the statement cache, and each reader holds 128 statements. Bridge profiled a production-sized copy of the 0.5.245 candidate at 24% of CPU in `sqlite3_prepare_v2`.
+- **The one-live-key route fold costs one owner read per key (Edge).** `fold_one_live_key` read `owner_of` for both keys of every pair on a destination, two attestation queries each, so a destination shared by k keys cost about k² read pairs. Production holds one with 3,281 live routes. The fold now keeps each key's owner for the call, and an ownerless row ends after its own read. Verdicts do not change.
 
 ## [61.0.3] - 2026-11-05
 

@@ -1233,6 +1233,24 @@ impl crate::federation::read_plan::ReadPlanStore for PostgresBackend {
         })
     }
 
+    async fn read_naming_page(
+        &self,
+        subject_key_id: &str,
+        dimension: &str,
+        cursor: Option<&crate::read::AttestationCursor>,
+        fetch: i64,
+    ) -> Result<crate::federation::attestation_query::QueryRows, crate::federation::Error> {
+        let (sql, params) = pg_naming_page_sql(subject_key_id, dimension, cursor, fetch);
+        let (rows, bytes) = self
+            .query_attestations("list_attestations_naming_by_dimension", &sql, &params)
+            .await?;
+        Ok(crate::federation::attestation_query::QueryRows {
+            rows,
+            bytes,
+            backend: crate::observe::StoreBackend::Postgres,
+        })
+    }
+
     async fn read_key_registration_history(
         &self,
         key_id: &str,
@@ -14157,6 +14175,23 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         .await
     }
 
+    async fn list_attestations_naming_by_dimension(
+        &self,
+        subject_key_id: &str,
+        dimension: &str,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::ScoresPage, crate::federation::Error> {
+        crate::federation::read_plan::list_attestations_naming_by_dimension_planned(
+            self,
+            subject_key_id,
+            dimension,
+            cursor,
+            limit,
+        )
+        .await
+    }
+
     async fn record_announced_peer(
         &self,
         key_id: &str,
@@ -22055,6 +22090,59 @@ pub(crate) fn pg_composers_referencing_any_sql(attested: bool, attesting: bool) 
            AND (attestation_envelope::jsonb->>'references_attestation_id') = ANY($1){axes} \
          ORDER BY asserted_at DESC"
     )
+}
+
+/// v61.0.5 (CIRISPersist#1225) — the subject read's one statement, the
+/// postgres twin of `sqlite_naming_page_sql`: V106's `attestation_subjects_seek`
+/// `(subject_key_id, dimension, asserted_at DESC, attestation_id)` pins its two
+/// equality columns, and the row-value cursor runs on the projection's own
+/// `(asserted_at, attestation_id)`, both of the projection's own type (the id
+/// is `text` here since a later migration), so the seek serves it. The serve rule is `list_attestations_since`'s.
+pub(crate) fn pg_naming_page_sql(
+    subject_key_id: &str,
+    dimension: &str,
+    cursor: Option<&crate::read::AttestationCursor>,
+    fetch: i64,
+) -> (
+    String,
+    Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+) {
+    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+        Box::new(subject_key_id.to_owned()),
+        Box::new(dimension.to_owned()),
+    ];
+    let mut parts: Vec<String> = vec![
+        "s.subject_key_id = $1".to_owned(),
+        "s.dimension = $2".to_owned(),
+        "fa.tier = 'federation'".to_owned(),
+    ];
+    parts.extend(crate::federation::row_type::serve_filter_sql(
+        "fa.attestation_type",
+        crate::federation::row_type::SqlDialect::Postgres,
+    ));
+    parts.push(crate::federation::steward_purge::served_under_purge_sql(
+        "fa",
+        "cirislens.",
+    ));
+    if let Some(c) = cursor {
+        params.push(Box::new(c.last_asserted_at));
+        let p_at = params.len();
+        params.push(Box::new(c.last_attestation_id.clone()));
+        let p_id = params.len();
+        parts.push(format!(
+            "(s.asserted_at, s.attestation_id) < (${p_at}, ${p_id})"
+        ));
+    }
+    params.push(Box::new(fetch));
+    let sql = format!(
+        "SELECT {PG_SCORES_FA_COLS} FROM cirislens.attestation_subjects s \
+         JOIN cirislens.federation_attestations fa ON fa.attestation_id = s.attestation_id \
+         WHERE {} \
+         ORDER BY s.asserted_at DESC, s.attestation_id DESC LIMIT ${}",
+        parts.join(" AND "),
+        params.len()
+    );
+    (sql, params)
 }
 
 /// v61 — `list_scores`' statement and params: the read-plan executor's
