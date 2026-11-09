@@ -277,6 +277,12 @@ class Engine:
         at the C level — CIRISPersist#320 was exactly this class (a raw
         ``Arc<dyn>`` vtable whose order the compiler does not guarantee, which
         hung the process rather than erroring).
+
+        Named ``ciris_persist::blob_storage@<version>`` (v61.2.0, CIRISPersist#1242):
+        the payload is a raw Rust layout, sound only between identical
+        persist builds, so the consumer unwraps it with
+        ``ffi::capsule_names::checked_pointer``, which refuses another
+        build's capsule before any dereference.
         """
 
     def close(self, force: bool = False) -> None:
@@ -380,6 +386,12 @@ class Engine:
         at the C level — CIRISPersist#320 was exactly this class (a raw
         ``Arc<dyn>`` vtable whose order the compiler does not guarantee, which
         hung the process rather than erroring).
+
+        Named ``ciris_persist::federation_directory@<version>`` (v61.2.0, CIRISPersist#1242):
+        the payload is a raw Rust layout, sound only between identical
+        persist builds, so the consumer unwraps it with
+        ``ffi::capsule_names::checked_pointer``, which refuses another
+        build's capsule before any dereference.
         """
 
     @property
@@ -397,6 +409,12 @@ class Engine:
         at the C level — CIRISPersist#320 was exactly this class (a raw
         ``Arc<dyn>`` vtable whose order the compiler does not guarantee, which
         hung the process rather than erroring).
+
+        Named ``ciris_persist::keyring_signer@<version>`` (v61.2.0, CIRISPersist#1242):
+        the payload is a raw Rust layout, sound only between identical
+        persist builds, so the consumer unwraps it with
+        ``ffi::capsule_names::checked_pointer``, which refuses another
+        build's capsule before any dereference.
         """
 
     def list_consumers(self) -> str:
@@ -420,6 +438,12 @@ class Engine:
         at the C level — CIRISPersist#320 was exactly this class (a raw
         ``Arc<dyn>`` vtable whose order the compiler does not guarantee, which
         hung the process rather than erroring).
+
+        Named ``ciris_persist::local_signer@<version>`` (v61.2.0, CIRISPersist#1242):
+        the payload is a raw Rust layout, sound only between identical
+        persist builds, so the consumer unwraps it with
+        ``ffi::capsule_names::checked_pointer``, which refuses another
+        build's capsule before any dereference.
         """
 
     def outbound_queue_capsule(self) -> Any:
@@ -432,6 +456,12 @@ class Engine:
         at the C level — CIRISPersist#320 was exactly this class (a raw
         ``Arc<dyn>`` vtable whose order the compiler does not guarantee, which
         hung the process rather than erroring).
+
+        Named ``ciris_persist::outbound_queue@<version>`` (v61.2.0, CIRISPersist#1242):
+        the payload is a raw Rust layout, sound only between identical
+        persist builds, so the consumer unwraps it with
+        ``ffi::capsule_names::checked_pointer``, which refuses another
+        build's capsule before any dereference.
         """
 
     def outbound_queue_ops_capsule(self) -> Any:
@@ -495,6 +525,12 @@ class Engine:
         at the C level — CIRISPersist#320 was exactly this class (a raw
         ``Arc<dyn>`` vtable whose order the compiler does not guarantee, which
         hung the process rather than erroring).
+
+        Named ``ciris_persist::runtime_handle@<version>`` (v61.2.0, CIRISPersist#1242):
+        the payload is a raw Rust layout, sound only between identical
+        persist builds, so the consumer unwraps it with
+        ``ffi::capsule_names::checked_pointer``, which refuses another
+        build's capsule before any dereference.
         """
 
     def set_perceptual_hash_matcher(self, matcher: Any) -> None:
@@ -561,6 +597,12 @@ class Engine:
         at the C level — CIRISPersist#320 was exactly this class (a raw
         ``Arc<dyn>`` vtable whose order the compiler does not guarantee, which
         hung the process rather than erroring).
+
+        Named ``ciris_persist::trust_scoring@<version>`` (v61.2.0, CIRISPersist#1242):
+        the payload is a raw Rust layout, sound only between identical
+        persist builds, so the consumer unwraps it with
+        ``ffi::capsule_names::checked_pointer``, which refuses another
+        build's capsule before any dereference.
         """
 
     def unsubscribe(self, subscription_id: int) -> bool:

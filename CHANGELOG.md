@@ -5,6 +5,18 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [61.2.0] - UNRELEASED
+
+<!-- #1241 entry: lead -->
+
+### Changed
+
+- **A raw-layout capsule is named for the persist build that laid it out (CIRISPersist#1242).** Seven `PyEngine` capsules hand the consumer a raw Rust value that it reads with its own compiled copy of persist: `outbound_queue_capsule` and `blob_storage_capsule` (an `engine::BackendDispatch`, so `Arc<SqliteBackend>` / `Arc<PostgresBackend>`), `local_signer_capsule` (`Arc<LocalSigner>`), `keyring_signer_capsule` (`KeyringSignerHandle`), `federation_directory_capsule` and `trust_scoring_capsule` (`Arc<dyn FederationDirectory>` / `Arc<dyn TrustScoring>`, whose vtables are persist's build's), and `runtime_handle_capsule` (a `tokio::runtime::Handle`). Between two persist builds a moved private field is undefined behaviour that raises no error, and 61.1.0 moved one (`PostgresBackend`, #1231). Each is now named `ciris_persist::<capsule>@<CARGO_PKG_VERSION>`, for example `ciris_persist::outbound_queue@61.2.0`, from the constants in the new `ffi::capsule_names` (`OUTBOUND_QUEUE`, `BLOB_STORAGE`, `LOCAL_SIGNER`, `KEYRING_SIGNER`, `FEDERATION_DIRECTORY`, `TRUST_SCORING`, `RUNTIME_HANDLE`; `RAW_LAYOUT_CAPSULES` maps each method to its name). `ffi::capsule_names::checked_pointer(&capsule, expected)` is the consumer's unwrap: it returns the payload pointer only for a capsule named exactly `expected`, and otherwise raises a `TypeError` led by `capsule_version_skew` that names the consumer's persist version, the name it asked for and the name the capsule carries, before anything is dereferenced. A consumer that compiled persist 61.2.0 and runs beside a 61.3.0 wheel is refused at the unwrap instead of reading the wrong offsets. The version binds persist's types and, through the one CIRISVerify tag persist pins, `ciris-keyring`'s; it does not bind the consumer's `tokio` or `rustc`. The ABI-versioned capsules (`directory_ops_capsule`, `outbound_queue_ops_capsule`, `signer_ops_capsule`, `executor_capsule`) are unchanged, `_v1` names included. **A consumer that asks for the old unversioned name is refused, and one that passes the capsule's own name back to `pointer_checked` is not protected at all.** I1700 (every name carries the version), I1701 (another version, the unversioned name and a sibling's name are refused before any dereference), I1702 (the exact name is accepted), I1703 (every raw-layout capsule `PyEngine` builds carries its name, on sqlite and postgres), I1704 (no build site spells an unversioned name).
+
+#### Adoption
+
+- **Edge:** a raw-layout capsule unwraps only against the persist version Edge compiled. Build Edge against the same ciris-persist version as the wheel it runs beside, and unwrap with `ciris_persist::ffi::capsule_names::checked_pointer(&cap, ciris_persist::ffi::capsule_names::<CONST>)` (or `pointer_checked(Some(<CONST>))`) in place of passing `cap.name()` back, or move to `outbound_queue_ops_capsule` (CIRISEdge#960), which dispatches inside persist's `.so` and is not version-bound.
+
 ## [61.1.0] - 2026-11-09
 
 ### Added
