@@ -430,7 +430,10 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     },
     PersistFamilyRule {
         prefix: "hard_case:",
-        rule: "substrate-emitted — substrate_persist only",
+        rule: "substrate-emitted — substrate_persist or the node key (identity_type ∋ \
+               substrate_persist | node), and a row ABOUT ANOTHER PARTY only with \
+               infra:record_hard_case conferred from a root this node trusts; on the row's \
+               family in either form, the attestation_type or a scores dimension (#1174)",
         enforced_at: &["federation::admission::check_reserved_prefix_admission"],
         gap: RowRuleGap::NoRuleOnTheRow,
         minted_by_persist: false,
@@ -515,9 +518,12 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     //    covers the family. Safe direction, still two predicates. ───────────
     PersistFamilyRule {
         prefix: "audit_chain:",
-        rule: "substrate_persist-only emitter, for the WHOLE family (CC 3.4.3 \
-               substrate-self-report)",
-        enforced_at: &["federation::admission::check_reserved_prefix_admission"],
+        rule: "substrate_persist-only emitter, for the WHOLE family, about itself \
+               (attesting_key_id == attested_key_id) (CC 3.4.3 substrate-self-report)",
+        enforced_at: &[
+            "federation::admission::check_reserved_prefix_admission",
+            "federation::admission::check_substrate_self_report_attester",
+        ],
         gap: RowRuleGap::RuleOnCataloguedLeavesOnly,
         minted_by_persist: false,
         cc_ask: "CIRISConstitution#67 (catalogue the rule at the family, not on \
@@ -525,27 +531,36 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     },
     PersistFamilyRule {
         prefix: "corpus_health:",
-        rule: "substrate_persist-only emitter, for the WHOLE family (CC 3.4.3 \
-               substrate-self-report)",
-        enforced_at: &["federation::admission::check_reserved_prefix_admission"],
+        rule: "substrate_persist-only emitter, for the WHOLE family, about itself \
+               (attesting_key_id == attested_key_id) (CC 3.4.3 substrate-self-report)",
+        enforced_at: &[
+            "federation::admission::check_reserved_prefix_admission",
+            "federation::admission::check_substrate_self_report_attester",
+        ],
         gap: RowRuleGap::RuleOnCataloguedLeavesOnly,
         minted_by_persist: false,
         cc_ask: "CIRISConstitution#67 (family-level rule)",
     },
     PersistFamilyRule {
         prefix: "federation_directory:",
-        rule: "substrate_persist-only emitter, for the WHOLE family (CC 3.4.3 \
-               substrate-self-report)",
-        enforced_at: &["federation::admission::check_reserved_prefix_admission"],
+        rule: "substrate_persist-only emitter, for the WHOLE family, about itself \
+               (attesting_key_id == attested_key_id) (CC 3.4.3 substrate-self-report)",
+        enforced_at: &[
+            "federation::admission::check_reserved_prefix_admission",
+            "federation::admission::check_substrate_self_report_attester",
+        ],
         gap: RowRuleGap::RuleOnCataloguedLeavesOnly,
         minted_by_persist: false,
         cc_ask: "CIRISConstitution#67 (family-level rule)",
     },
     PersistFamilyRule {
         prefix: "identity_continuity:",
-        rule: "substrate_persist-only emitter, for the WHOLE family (CC 3.4.3 \
-               substrate-self-report)",
-        enforced_at: &["federation::admission::check_reserved_prefix_admission"],
+        rule: "substrate_persist-only emitter, for the WHOLE family, about itself \
+               (attesting_key_id == attested_key_id) (CC 3.4.3 substrate-self-report)",
+        enforced_at: &[
+            "federation::admission::check_reserved_prefix_admission",
+            "federation::admission::check_substrate_self_report_attester",
+        ],
         gap: RowRuleGap::RuleOnCataloguedLeavesOnly,
         minted_by_persist: false,
         cc_ask: "CIRISConstitution#67 (family-level rule)",

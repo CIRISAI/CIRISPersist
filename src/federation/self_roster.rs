@@ -1311,9 +1311,18 @@ where
 // ─────────────────────────────────────────────────────────────────────────
 
 /// After a proposal or an answer row is admitted (the attestation door's
-/// hook): record a proposal's arrival on this node's clock, then execute what
-/// lands for its self. Never fails the admission that called it: the row is
-/// stored; a failure to execute is logged and the sweep retries.
+/// hook): execute what lands for its self. Never fails the admission that
+/// called it: the row is stored; a failure to execute is logged and the sweep
+/// retries.
+///
+/// v61.1.0 (CIRISPersist#1220) — a proposal's receipt is NOT this hook's:
+/// the attestation plan carries it (`PlannedAttestation::self_roster_receipt`)
+/// and the executor writes it in the row's transaction, so a failed receipt
+/// fails the row and a re-offer lands both. The note here is first-seen-wins
+/// and so a no-op for every row this version stores; it remains only to heal
+/// a proposal an earlier version held without its receipt (an after-commit
+/// write that failed), at its re-offer — the one way such a row ever had to
+/// recover.
 pub(crate) async fn after_admission<D>(dir: &D, row: &Attestation)
 where
     D: FederationDirectory + ?Sized,
@@ -1323,8 +1332,7 @@ where
             .note_self_roster_proposal(&row.attestation_id, &row.attested_key_id, roster_clock())
             .await
         {
-            tracing::warn!(proposal_id = %row.attestation_id, error = %e, "roster proposal receipt");
-            return;
+            tracing::warn!(proposal_id = %row.attestation_id, error = %e, "roster proposal receipt (heal)");
         }
         row.attested_key_id.clone()
     } else if let Some(identity) = answer_identity(row) {

@@ -105,37 +105,34 @@ pub fn truncate_to_micros(dt: chrono::DateTime<chrono::Utc>) -> chrono::DateTime
 /// `actor_id` (which IS the pubkey, per the v0.7.1 self-signed
 /// identity model).
 ///
-/// # Policy: `Ed25519Fallback`, PINNED — do NOT "tighten" this to `Strict`
+/// # Policy: `Ed25519Fallback`, PINNED — and why that is not a gap
 ///
-/// Audit entries are classical-only: [`AuditEntry`] has exactly one
-/// `signature` field and NO PQC half, and `actor_id` IS the Ed25519
-/// pubkey (the v0.7.1 self-signed identity model) — there is no
-/// per-actor ML-DSA-65 pubkey anywhere to verify against. Both PQC
-/// arguments below are therefore passed as a hardcoded `None`.
+/// **The audit plane's hybrid gate is the signed tree head, not the entry**
+/// (CC 5.3.1; CC's reading on CIRISPersist#1233). The audit chain is this
+/// holder's own per-tenant log. What carries its accountability across a
+/// node boundary is the head the holder signs over it, and
+/// `audit::merkle_store` signs every head with a `HybridSignature` and
+/// refuses to store, serve or verify one without its ML-DSA-65 half
+/// (`merkle_store::require_hybrid_sth`, `merkle_store::verify_audit_sth`). An
+/// [`AuditEntry`] is a leaf, authenticated by inclusion under a hybrid-signed
+/// head at a tree size; its Ed25519 signature is an **inner** signature that
+/// binds the row to its actor and chain position. It is not the federation
+/// gate, and the hybrid-required mandate (CC 5.3.2.4.3.1) is met at the head.
 ///
-/// That makes `Strict` **unconditionally unsatisfiable here**, not
-/// merely stricter: with `ml_dsa_65_sig_b64 = None`, `verify_hybrid`
-/// reaches [`verify_ed25519_only_with_policy`] and `Strict` returns
-/// `HybridPendingRejected` for EVERY input. No audit entry — past,
-/// present, or future — could verify. `verify_chain` re-derives and
-/// re-checks signatures from STORED rows and the RFC 6962 Merkle leaves
-/// hash the same bytes, so the entire stored audit corpus would go dark
-/// on the first read.
+/// So this check stays classical. [`AuditEntry`] has exactly one `signature`
+/// field and no PQC half, and `actor_id` IS the Ed25519 pubkey (the v0.7.1
+/// self-signed identity model), so both PQC arguments below are a hardcoded
+/// `None` and `Strict` would refuse every entry: `verify_chain` re-checks
+/// stored rows and the RFC 6962 leaves hash the same bytes, so the stored
+/// chain and Merkle corpus would go dark (measured in v37.0.0: 19 reds across
+/// `audit::sqlite` and `audit::verify`). v37's flip to Strict per entry was
+/// the wrong place for the gate.
 ///
-/// **This was measured, not assumed** (v37.0.0): flipping this single
-/// argument to `Strict` reds 19 tests across `audit::sqlite` and
-/// `audit::verify` — every test that asserts a successful verify —
-/// with `hybrid-pending row rejected by Strict policy`.
-///
-/// The v37.0.0 flag day therefore deliberately SKIPPED this site while
-/// flipping the four sites where a hybrid verify is actually reachable
-/// (pipeline ingest, secrets routes, and both `put_delivery_attestation`
-/// backends). Tightening this plane is not a policy edit at all: it
-/// requires giving audit actors PQC keys and a per-row version gate, the
-/// same shape as the V1-canonicalization pin in the module doc above.
+/// The one case that WOULD need the PQC half: an audit entry that leaves the
+/// node as a bare row, outside a head plus inclusion proof, is a
+/// federation-tier row and must carry it like any other (CIRISPersist#1233).
 ///
 /// [`AuditEntry`]: crate::audit::types::AuditEntry
-/// [`verify_ed25519_only_with_policy`]: crate::verify::hybrid
 pub fn verify_entry_signature(entry: &AuditEntry) -> Result<(), Error> {
     if entry.signature.is_empty() {
         return Err(Error::Signature("signature missing".into()));
@@ -150,9 +147,10 @@ pub fn verify_entry_signature(entry: &AuditEntry) -> Result<(), Error> {
         None, // AuditEntry has no PQC half — see the PINNED policy note
         &entry.actor_id,
         None, // no per-actor ML-DSA-65 pubkey exists to verify against
-        // PINNED. `Strict` here rejects EVERY audit entry (both PQC args
-        // are None), taking the stored chain + Merkle corpus dark. See
-        // the doc comment above; measured at 19 reds in v37.0.0.
+        // PINNED. This is the entry's INNER signature; the plane's hybrid
+        // gate is the signed tree head (CC 5.3.1, `merkle_store`). `Strict`
+        // here would refuse every entry (both PQC args are None) and take
+        // the stored chain + Merkle corpus dark (19 reds in v37.0.0).
         HybridPolicy::Ed25519Fallback,
         None,
     )

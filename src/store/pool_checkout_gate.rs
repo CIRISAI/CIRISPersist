@@ -32,7 +32,7 @@ const BARE: [&str; 3] = ["pool().get()", ".pool.get()", "pool.get()"];
 
 /// `src` with comments and string/char literal contents blanked (byte
 /// length and newlines kept). A lifetime's `'` is not a quote.
-fn blank(src: &str) -> String {
+pub(super) fn blank(src: &str) -> String {
     let b = src.as_bytes();
     let mut out = b.to_vec();
     let mut i = 0usize;
@@ -108,7 +108,7 @@ fn blank(src: &str) -> String {
 
 /// The byte range of the body of the first `fn` whose signature starts at
 /// `sig` in `code`, braces included.
-fn fn_body(code: &str, sig: &str) -> Option<(usize, usize)> {
+pub(super) fn fn_body(code: &str, sig: &str) -> Option<(usize, usize)> {
     let at = code.find(sig)?;
     let open = at + code[at..].find('{')?;
     let mut depth = 0usize;
@@ -166,7 +166,7 @@ fn bare_checkouts(code: &str) -> Vec<usize> {
     hits
 }
 
-fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+pub(super) fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read src") {
         let path = entry.expect("dir entry").path();
         if path.is_dir() {

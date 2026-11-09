@@ -1311,7 +1311,9 @@ impl Engine {
 
     /// v53.1.8 (CIRISPersist#1014) — the read-telemetry counters: every
     /// attestation door read by `(backend, door)` and every fold entry, with
-    /// the rows and envelope bytes attributed to it ([`crate::observe`]).
+    /// the rows and envelope bytes attributed to it ([`crate::observe`]),
+    /// and (v61.1.0, CIRISPersist#1235) each door's reads split by the
+    /// caller scope they ran under ([`crate::observe::caller_scope`]).
     /// Process-wide: every Engine in the process reads the same counters.
     #[must_use]
     pub fn telemetry_snapshot(&self) -> crate::observe::TelemetrySnapshot {
@@ -20663,6 +20665,7 @@ mod tests {
                 authority_key_id: String::new(),
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
+                cosignatures: Vec::new(),
             },
         )
         .await

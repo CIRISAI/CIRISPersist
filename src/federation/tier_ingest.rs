@@ -4307,7 +4307,56 @@ pub mod test_support {
             authority_key_id: authority_key_id.to_owned(),
             scrub_signature_classical,
             scrub_signature_pqc,
+            cosignatures: Vec::new(),
         }
+    }
+
+    /// v61.1.0 (CIRISPersist#1226) — add `cosigner`'s co-signature to a
+    /// [`sign_revoke_spec`] spec: a hybrid scrub over the SAME revocation
+    /// `signing_envelope()` the primary covers, rebuilt exactly as
+    /// `FederationDirectory::revoke_member` builds the row (`removed_at` =
+    /// `effective_at`). The companion of
+    /// [`cosign_community_membership_revocation`] for the cohort door.
+    pub fn cosign_revoke_spec(
+        spec: &mut crate::federation::cohort::RevokeSpec,
+        cohort: crate::federation::cohort::Cohort,
+        group_key_id: &str,
+        removed_key_id: &str,
+        cosigner: &str,
+    ) {
+        use crate::federation::cohort::Cohort;
+        let envelope = match cohort {
+            Cohort::Family => crate::federation::types::FamilyMembershipRevocation {
+                family_key_id: group_key_id.to_owned(),
+                removed_identity_key_id: removed_key_id.to_owned(),
+                removed_at: spec.effective_at,
+                effective_at: spec.effective_at,
+                reason: spec.reason.clone(),
+                witness_set: spec.witness_set.clone(),
+                persist_row_hash: String::new(),
+            }
+            .signing_envelope(),
+            Cohort::Community | Cohort::Affiliations => {
+                crate::federation::types::CommunityMembershipRevocation {
+                    community_key_id: group_key_id.to_owned(),
+                    removed_identity_key_id: removed_key_id.to_owned(),
+                    removed_at: spec.effective_at,
+                    effective_at: spec.effective_at,
+                    reason: spec.reason.clone(),
+                    witness_set: spec.witness_set.clone(),
+                    persist_row_hash: String::new(),
+                }
+                .signing_envelope()
+            }
+            Cohort::SelfId => serde_json::Value::Null,
+        };
+        let (_hash, classical, pqc) = sign_envelope(cosigner, &envelope);
+        spec.cosignatures
+            .push(crate::federation::types::RosterCosignature {
+                authority_key_id: cosigner.to_owned(),
+                scrub_signature_classical: classical,
+                scrub_signature_pqc: pqc,
+            });
     }
 
     /// #371 — register `key_id` with its REAL deterministic hybrid pubkeys

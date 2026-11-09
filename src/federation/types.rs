@@ -4317,6 +4317,74 @@ impl ServedAttestation {
     }
 }
 
+/// v61.1.0 (CIRISPersist#1190) — one page of the serve stream narrowed by
+/// prefix ([`super::FederationDirectory::list_attestations_since_by_prefixes`]).
+///
+/// The cursor is the `(admitted_at, attestation_id)` serve position of
+/// [`super::FederationDirectory::list_attestations_since`], exclusive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedAttestationPage {
+    /// The matching rows, oldest serve position first.
+    pub items: Vec<ServedAttestation>,
+    /// `Some` exactly when another matching row exists past the page: the
+    /// last item's serve position.
+    pub next_cursor: Option<(DateTime<Utc>, String)>,
+    /// Where to resume so that no row this read already examined is
+    /// examined again. Equal to `next_cursor` when more remain. When none
+    /// remain it is the stream's head at the read (or the last item, or the
+    /// `since` passed in, whichever is furthest), so a sparse narrowing does
+    /// not rescan every non-matching row since its last match on each poll.
+    /// `None` only when the stream is empty and no `since` was given.
+    pub high_water: Option<(DateTime<Utc>, String)>,
+}
+
+/// v61.1.0 (CIRISPersist#1163, CC 5.4.6) — whether a node is on the
+/// announced (public) roster, by the one live-delegation fold, at the
+/// read's clock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AnnouncedOwnerState {
+    /// A live owner binding is carried at `cohort_scope: federation`
+    /// (directly, or by its granter's live widening `supersedes`), and the
+    /// node has exactly one live owner: this one.
+    Announced {
+        /// The node's owner, as `owner_of` names it.
+        owner_key_id: String,
+    },
+    /// Not on the roster: no live owner binding, or none carried at
+    /// federation. The owner of a binding that is not announced is not
+    /// named here.
+    NotAnnounced,
+    /// Announced, but more than one live owner: not a resolvable owner, so
+    /// not on the roster (fail closed, as `owner_of`).
+    AmbiguousOwner,
+}
+
+/// v61.1.0 (CIRISPersist#1163) — one node whose announced-owner state may
+/// have changed, with that state NOW.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerBindingChange {
+    /// The node (the owner binding's `attested_key_id`).
+    pub node_key_id: String,
+    /// The node's state, folded at the read.
+    pub state: AnnouncedOwnerState,
+    /// The serve position of the node's last row in this page.
+    pub position: (DateTime<Utc>, String),
+}
+
+/// v61.1.0 (CIRISPersist#1163) — one page of
+/// [`super::FederationDirectory::list_owner_bindings_since`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerBindingPage {
+    /// One entry per node the page's rows touch, in the order of each
+    /// node's last row in the page.
+    pub items: Vec<OwnerBindingChange>,
+    /// `Some` exactly when another candidate row exists past the page.
+    pub next_cursor: Option<(DateTime<Utc>, String)>,
+    /// As [`ServedAttestationPage::high_water`].
+    pub high_water: Option<(DateTime<Utc>, String)>,
+}
+
 // ─── Freshness floor (v21.6.0, CIRISPersist#519 item 2a-iii) ───────
 //
 // `namespace_supersets.json` § `freshness_floor`: a SIGNED temporal LOWER

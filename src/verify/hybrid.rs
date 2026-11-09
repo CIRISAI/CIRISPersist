@@ -92,6 +92,14 @@ pub enum HybridPolicy {
     /// Both carry the reasoning at their definition. Tightening either is
     /// a plumbing change (give the plane a PQC pubkey source) first and a
     /// policy change second — never a one-line edit here.
+    ///
+    /// # v61.1.0 (CIRISPersist#1233) — not reachable from any caller surface
+    ///
+    /// The Python doors and the capsule's `VerifyHybridViaDirectory` refuse
+    /// this variant (and `SoftFreshness`) with [`VERIFY_POLICY_VIOLATION`]
+    /// (CC 5.3.2.4.3.1). Per CC's reading, the audit pin is not a gap (the
+    /// audit plane's gate is its hybrid-signed tree head, CC 5.3.1); the
+    /// cirisnode pin is, and closes in v62 with the variant itself.
     Ed25519Fallback,
 }
 
@@ -183,6 +191,44 @@ impl VerifyError {
             Self::InvalidLength { .. } => "verify_hybrid_invalid_length",
             Self::Crypto(_) => "verify_hybrid_crypto",
         }
+    }
+}
+
+/// v61.1.0 (CIRISPersist#1233, CC 5.3.2.4.3.1) — the stable token every
+/// caller-facing verify door raises when it is handed a policy other than
+/// hybrid-required.
+///
+/// CC 5.3.2.4.3.1: "no classical-only, no hybrid-pending accommodation … a
+/// verifier's hybrid-required check is always-on, never an operator toggle".
+/// The doors that still carry a `policy` argument (`Engine.verify_hybrid`,
+/// `Engine.verify_hybrid_via_directory` and the three `verify_signed_*`
+/// methods that route through it, and the directory capsule's
+/// `VerifyHybridViaDirectory` op) keep the argument until v62 removes it, and
+/// refuse every value except `"strict"` / [`HybridPolicy::Strict`] with this
+/// token BEFORE any lookup or crypto runs.
+pub const VERIFY_POLICY_VIOLATION: &str = "verify_policy_violation";
+
+/// v61.1.0 (CIRISPersist#1233) — the one gate the capsule door asks:
+/// `Strict` passes, every other variant is refused with
+/// [`VERIFY_POLICY_VIOLATION`] leading the message. The PyO3 doors take the
+/// policy as a string and refuse every string except `"strict"` with the same
+/// token (`ffi::pyo3::parse_hybrid_policy`).
+///
+/// Persist's own two classical-only planes (`audit::verify` and
+/// `cirisnode::verify`) call [`verify_hybrid`] directly and do not pass
+/// through this gate; see their PINNED notes.
+///
+/// # Errors
+///
+/// The refusal message, `verify_policy_violation: …`, for any policy other
+/// than [`HybridPolicy::Strict`].
+pub fn require_strict_policy(policy: &HybridPolicy) -> Result<(), String> {
+    match policy {
+        HybridPolicy::Strict => Ok(()),
+        other => Err(format!(
+            "{VERIFY_POLICY_VIOLATION}: policy {other:?} refused; hybrid-required (Strict) \
+             is the only verifier policy (CC 5.3.2.4.3.1; CIRISPersist#1233)"
+        )),
     }
 }
 

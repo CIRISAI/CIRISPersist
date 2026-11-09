@@ -28,11 +28,11 @@ pub(crate) mod bodies {
     use crate::federation::{Attestation, Error, FederationDirectory};
     use chrono::{DateTime, Duration, Utc};
 
-    fn ms(t: DateTime<Utc>) -> DateTime<Utc> {
+    pub(crate) fn ms(t: DateTime<Utc>) -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp_millis(t.timestamp_millis()).expect("ms instant")
     }
 
-    fn rule(e: &Error) -> String {
+    pub(crate) fn rule(e: &Error) -> String {
         match e {
             Error::RosterAuthorityUnauthorized { rule, .. }
             | Error::MembershipAcceptanceRefused { rule, .. } => (*rule).to_owned(),
@@ -40,7 +40,7 @@ pub(crate) mod bodies {
         }
     }
 
-    async fn active(d: &dyn FederationDirectory, cid: &str, k: &str) -> bool {
+    pub(crate) async fn active(d: &dyn FederationDirectory, cid: &str, k: &str) -> bool {
         d.active_community_members(cid)
             .await
             .unwrap()
@@ -48,7 +48,7 @@ pub(crate) mod bodies {
             .any(|m| m.key_id == k)
     }
 
-    async fn seat(
+    pub(crate) async fn seat(
         d: &dyn FederationDirectory,
         cid: &str,
         founder: &str,
@@ -98,7 +98,7 @@ pub(crate) mod bodies {
         d.put_community_membership_revocation(r).await
     }
 
-    fn affiliation(official: Option<&str>) -> serde_json::Value {
+    pub(crate) fn affiliation(official: Option<&str>) -> serde_json::Value {
         let mut b = serde_json::json!({
             crate::federation::affiliation_config::POLICY_COHORT_FIELD: "affiliations",
         });

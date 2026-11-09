@@ -1952,11 +1952,28 @@ jobs:
       # wheels earlier releases built, every later step globs
       # `target/wheels/*.whl`, and a stale wheel there can be signed and
       # registered under this release's version.
+      #
+      # #1234 — on LINUX the wheel is built UNSTRIPPED with line tables, and
+      # the split step after auditwheel derives the stripped .so the wheel
+      # ships and its `.debug` companion from that one link (see
+      # scripts/split_wheel_debuginfo.py for why it cannot be two links). The
+      # rustc flags after `--` reach the ciris_persist crate only (`cargo
+      # rustc`), so no dependency's fingerprint changes and the warm cache
+      # still serves them; they come after the profile's `-C strip=symbols`
+      # and override it. `--build-id=sha1` makes the id the debug file is
+      # found by explicit rather than the host cc's default. maturin's own
+      # strip is off on linux (pyproject.toml carries no `strip = true`;
+      # `--strip` is passed on macOS/Windows only).
       - name: maturin build
         shell: bash
         run: |
           rm -rf target/wheels
-          maturin build --release --strip --auditwheel skip
+          if [ "${{ runner.os }}" = Linux ]; then
+            maturin build --release --auditwheel skip -- \
+              -C strip=none -C debuginfo=line-tables-only -C link-arg=-Wl,--build-id=sha1
+          else
+            maturin build --release --strip --auditwheel skip
+          fi
       # CIRISPersist#136 — explicit auditwheel-repair with
       # libsqlite3 excluded from the bundling pass. This is the same
       # pattern `pyarrow` uses (excludes libssl/libcrypto/libz) and
@@ -1997,6 +2014,38 @@ jobs:
           done
           mv target/wheels/repaired/*.whl target/wheels/
           rmdir target/wheels/repaired
+      # CIRISPersist#1234 — split debuginfo. The wheel's .so is replaced by its
+      # stripped form (`objcopy --strip-all` + a `.gnu_debuglink`) and the
+      # debug sections go to `ciris_persist-<v>-<label>.abi3.so.debug`. BEFORE
+      # the gates below and the upload, so everything after — the libsqlite3
+      # gate, the artifact, build-manifest's sign + register and the attest
+      # job — sees the bytes that ship. The script refuses a wheel built
+      # stripped, a shipped .so that still carries `.symtab`/`.debug_*`,
+      # differing build-ids, or a moved loadable segment.
+      - name: split debuginfo (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist/debuginfo
+          n=0
+          for whl in target/wheels/ciris_persist-*linux_*.whl; do
+            [ -e "$whl" ] || continue
+            python3 scripts/split_wheel_debuginfo.py "$whl" dist/debuginfo --label "${{ matrix.label }}"
+            n=$((n + 1))
+          done
+          [ "$n" -eq 1 ] || { echo "::error::expected 1 linux wheel to split, found $n"; ls -la target/wheels; exit 1; }
+          ls -la dist/debuginfo
+      # Uploaded on tags only (mobile-release, the one reader, is tag-gated);
+      # the split above runs on every event, so a PR still proves it works.
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Linux' && startsWith(github.ref, 'refs/tags/v')
+        with:
+          # NOT `ciris_persist-wheel-*`: build-manifest and attest download that
+          # pattern and count the wheels in it.
+          name: ciris_persist-debuginfo-${{ matrix.label }}
+          path: dist/debuginfo/*.abi3.so.debug
+          if-no-files-found: error
       # CIRISPersist#133 — wheel-tier libsqlite3 dynamic-link
       # verification. The source-tier #132 fix (Cargo.toml target-
       # narrowed `bundled`) requires libsqlite3-dev present at build
@@ -2392,12 +2441,18 @@ jobs:
   # Android archive layout:
   #   android/arm64-v8a/libciris_persist.so
   #   android/x86_64/libciris_persist.so
+  # CIRISPersist#1234 — and the two linux wheels' split debuginfo,
+  #   ciris_persist-<version>-linux-{x86_64,aarch64}.abi3.so.debug
+  # (pyo3-wheel's `ciris_persist-debuginfo-<label>` artifacts), in the same
+  # SHA256SUMS. That is why this job needs pyo3-wheel: one job writes
+  # SHA256SUMS. Host use: docs/RELEASE.md "Symbolizing persist frames".
   mobile-release:
     name: Upload mobile artifacts to GitHub Release (tag-gated)
     runs-on: ubuntu-latest
     needs:
       - ios-package
       - android-package
+      - pyo3-wheel
       - lint
       - license-audit
     # Explicit result check, because `tree` (an ANCESTOR) is skipped on
@@ -2407,6 +2462,7 @@ jobs:
     if: >-
       ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled()
           && needs.ios-package.result == 'success' && needs.android-package.result == 'success'
+          && needs.pyo3-wheel.result == 'success'
           && needs.lint.result == 'success' && needs.license-audit.result == 'success' }}
     permissions:
       contents: write
@@ -2476,6 +2532,30 @@ jobs:
             echo "::warning::Android wheels download attempt $attempt failed; retrying in $((attempt * 10))s"
             sleep $((attempt * 10))
           done
+      - name: download the linux wheels' split debuginfo (with retry, #1234)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            rm -rf dist/debuginfo
+            if gh run download "$GITHUB_RUN_ID" \
+                --repo "$GITHUB_REPOSITORY" \
+                --pattern 'ciris_persist-debuginfo-*' \
+                --dir dist/debuginfo; then
+              echo "✓ debuginfo download succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" = "5" ]; then
+              echo "::error::debuginfo download failed 5 times"
+              exit 1
+            fi
+            echo "::warning::debuginfo download attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          # Flat: release assets have no directories.
+          find dist/debuginfo -name '*.abi3.so.debug' -exec mv {} dist/ \;
+          rm -rf dist/debuginfo
       - name: verify artifacts
         run: |
           echo "=== dist/ ==="
@@ -2483,7 +2563,9 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           for ASSET in "ciris-persist-v${VERSION}-ios.tar.gz" \
                        "ciris-persist-v${VERSION}-android.tar.gz" \
-                       "ciris-persist-v${VERSION}-android-wheels.tar.gz"; do
+                       "ciris-persist-v${VERSION}-android-wheels.tar.gz" \
+                       "ciris_persist-${VERSION}-linux-x86_64.abi3.so.debug" \
+                       "ciris_persist-${VERSION}-linux-aarch64.abi3.so.debug"; do
             if [ ! -f "dist/${ASSET}" ]; then
               echo "::error::Missing expected asset: ${ASSET}"
               exit 1
@@ -2493,7 +2575,10 @@ jobs:
       - name: generate SHA256SUMS
         run: |
           cd dist
-          sha256sum ciris-persist-v*.tar.gz > SHA256SUMS
+          VERSION="${{ steps.version.outputs.version }}"
+          n=$(ls ciris_persist-*.abi3.so.debug | wc -l)
+          [ "$n" -eq 2 ] || { echo "::error::expected 2 .abi3.so.debug files, found $n"; ls -la; exit 1; }
+          sha256sum ciris-persist-v*.tar.gz "ciris_persist-${VERSION}"-linux-*.abi3.so.debug > SHA256SUMS
           cat SHA256SUMS
       - name: create GitHub Release + upload assets
         env:
@@ -2521,15 +2606,18 @@ jobs:
             "dist/ciris-persist-v${VERSION}-ios.tar.gz" \
             "dist/ciris-persist-v${VERSION}-android.tar.gz" \
             "dist/ciris-persist-v${VERSION}-android-wheels.tar.gz" \
+            "dist/ciris_persist-${VERSION}-linux-x86_64.abi3.so.debug" \
+            "dist/ciris_persist-${VERSION}-linux-aarch64.abi3.so.debug" \
             "dist/SHA256SUMS"
 
-          echo "✓ uploaded iOS + Android assets to ${TAG}"
+          echo "✓ uploaded iOS + Android assets and the linux debuginfo to ${TAG}"
           {
             echo "## Mobile release assets"
             echo ""
             echo "- \`ciris-persist-v${VERSION}-ios.tar.gz\`"
             echo "- \`ciris-persist-v${VERSION}-android.tar.gz\`"
             echo "- \`ciris-persist-v${VERSION}-android-wheels.tar.gz\` (Chaquopy abi3 wheels: arm64, x86_64, armeabi-v7a)"
+            echo "- \`ciris_persist-${VERSION}-linux-{x86_64,aarch64}.abi3.so.debug\` (split debuginfo of the linux wheels, #1234)"
             echo "- \`SHA256SUMS\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -2540,8 +2628,9 @@ jobs:
   # public; stored by subject digest, read back with `gh attestation verify`):
   #
   #   * SLSA build provenance (`https://slsa.dev/provenance/v1`) over the four
-  #     abi3 desktop wheels (this run's `ciris_persist-wheel-*` artifacts) and
-  #     the three release tarballs, as DOWNLOADED FROM THE RELEASE, so the
+  #     abi3 desktop wheels (this run's `ciris_persist-wheel-*` artifacts), the
+  #     three release tarballs and the two linux `.abi3.so.debug` files
+  #     (#1234), the last five as DOWNLOADED FROM THE RELEASE, so the
   #     subject digests are the bytes a consumer fetches. There is no sdist:
   #     consumers build from the git tag, and nothing builds one.
   #   * `https://ciris.ai/attestation/cc-conformance/v1` over
@@ -2550,7 +2639,7 @@ jobs:
   #
   # Its own job so the two elevated permissions (`id-token`, `attestations`)
   # are granted here and nowhere else. `scripts/verify_release.sh v<ver>`
-  # checks all eight, and `release_finish.sh` refuses RELEASE_SHIP_DONE until
+  # checks all ten, and `release_finish.sh` refuses RELEASE_SHIP_DONE until
   # it passes. Release procedure: docs/RELEASE.md "Verifying a release".
   attest:
     name: Attest wheels, release assets and cc_impl.tsv (tag-gated)
@@ -2633,13 +2722,24 @@ jobs:
           done
           n=$(find dist/release -name '*.tar.gz' | wc -l)
           [ "$n" -eq 3 ] || { echo "::error::expected 3 release tarballs, found $n"; ls -la dist/release; exit 1; }
-          sha256sum dist/wheels/*/ciris_persist-"${VERSION}"-*.whl dist/release/*.tar.gz
-      - name: attest build provenance (wheels + release tarballs)
+          # #1234 — the linux wheels' split debuginfo, from the release too.
+          for attempt in 1 2 3 4 5; do
+            rm -rf dist/debuginfo
+            if gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+                --pattern "ciris_persist-${VERSION}-linux-*.abi3.so.debug" --dir dist/debuginfo; then break; fi
+            [ "$attempt" = 5 ] && { echo "::error::debuginfo asset download failed 5 times"; exit 1; }
+            sleep $((attempt * 10))
+          done
+          n=$(find dist/debuginfo -name '*.abi3.so.debug' | wc -l)
+          [ "$n" -eq 2 ] || { echo "::error::expected 2 .abi3.so.debug assets, found $n"; ls -la dist/debuginfo; exit 1; }
+          sha256sum dist/wheels/*/ciris_persist-"${VERSION}"-*.whl dist/release/*.tar.gz dist/debuginfo/*.abi3.so.debug
+      - name: attest build provenance (wheels + release tarballs + linux debuginfo)
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/wheels/*/ciris_persist-${{ steps.predicate.outputs.version }}-*.whl
             dist/release/*.tar.gz
+            dist/debuginfo/ciris_persist-${{ steps.predicate.outputs.version }}-linux-*.abi3.so.debug
       - name: attest CC conformance evidence (evidence/cc_impl.tsv)
         uses: actions/attest@v4
         with:
@@ -2651,7 +2751,7 @@ jobs:
           {
             echo "## Attestations"
             echo ""
-            echo "- SLSA provenance: 4 wheels + 3 release tarballs"
+            echo "- SLSA provenance: 4 wheels + 3 release tarballs + 2 linux debuginfo files"
             echo "- \`https://ciris.ai/attestation/cc-conformance/v1\` over \`evidence/cc_impl.tsv\` ($(sha256sum evidence/cc_impl.tsv | cut -d' ' -f1))"
             echo ""
             echo '```json'

@@ -127,6 +127,16 @@ DELEGATED_DEFAULTS = (
     # the trust-root reads ask it for every unlabelled `delegates_to`, so
     # through the double it must reach the backend's held set.
     "trust_direction_held_among",
+    # v61.0.5 (#1225) — defaulted `Unsupported`, overridden by every backend
+    # (and the capsule proxy); the invitee's subject-naming seek over V106.
+    # Missed at 61.0.5, so the double answered `Unsupported` (#1232).
+    "list_attestations_naming_by_dimension",
+    # v61.1.0 (#1190, #1163) — defaulted `Unsupported`, overridden by every
+    # backend: the narrowed serve-stream reads. The owner-binding feed's
+    # per-node fold runs inside the backend's plan, as every planned door's
+    # does; its default composes nothing through `self`.
+    "list_attestations_since_by_prefixes",
+    "list_owner_bindings_since",
 )
 
 ROOT = Path(__file__).resolve().parent.parent

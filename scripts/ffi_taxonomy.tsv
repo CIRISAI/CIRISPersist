@@ -399,6 +399,7 @@ Engine	list_attestations	empirical
 Engine	list_attestations_by	empirical	
 Engine	list_attestations_for	empirical	
 Engine	list_attestations_since	empirical	
+Engine	list_attestations_since_by_prefixes	empirical	
 Engine	list_canonical_servers	empirical	
 Engine	list_canonical_withdrawals	empirical	
 Engine	list_communities_for_member_active_json	empirical	
@@ -438,6 +439,7 @@ Engine	list_live_occurrences	ontological
 Engine	list_llm_calls	empirical	
 Engine	list_local_holders_json	empirical	
 Engine	list_outbound	empirical	
+Engine	list_owner_bindings_since	empirical	
 Engine	list_retention	empirical	
 Engine	list_revocations	empirical	
 Engine	list_scores	axiotic	
@@ -716,6 +718,7 @@ MODULE	namespace_manifest_version	axiomatic
 MODULE	panic_count	structural	
 MODULE	persist_field_conformance	axiomatic	
 MODULE	reset_engine	structural	
+MODULE	set_caller_scope	empirical	
 MODULE	transform_algebra_hash	axiomatic	
 ReconsiderDosGuard	__init__	structural	
 ReconsiderDosGuard	__repr__	structural	

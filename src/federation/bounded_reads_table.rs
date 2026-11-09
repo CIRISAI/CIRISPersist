@@ -79,6 +79,7 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         Bound::Schema("every holder's claims under one exact dimension about ONE blob: one fold row per holder"),
     ),
     ("list_attestations_since", Bound::Paged),
+    ("list_attestations_since_by_prefixes", Bound::Paged),
     (
         "list_canonical_withdrawals",
         Bound::Schema("one tombstone per withdrawn canonical-role key; the canonical roster is a constitutional set"),
@@ -223,6 +224,9 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         "list_location_proofs_for",
         Bound::Open("one subject's full location-proof history"),
     ),
+    // v61.1.0 (CIRISPersist#1163) — the owner-binding feed: a page of
+    // candidate rows, one fold per node they touch.
+    ("list_owner_bindings_since", Bound::Paged),
     ("list_purge_executions_since", Bound::Paged),
     ("list_scores", Bound::Paged),
     ("list_signed_accord_quorum_evidence_since", Bound::Paged),

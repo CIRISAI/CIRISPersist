@@ -39,8 +39,26 @@
 //!
 //! # Policy
 //!
-//! [`HybridPolicy::Ed25519Fallback`], **PINNED** — classical-only
-//! envelopes verify against Ed25519.
+//! [`HybridPolicy::Ed25519Fallback`], **PINNED**, and **non-conformant until
+//! v62** (CIRISPersist#1233). Classical-only envelopes verify against
+//! Ed25519.
+//!
+//! ## Why this is a gap, and where it closes
+//!
+//! These are federation-consensus envelopes read by other consumers, so they
+//! are federation-tier rows and CC 5.3.2.4.3.1 binds them with no
+//! accommodation (CC's reading on CIRISPersist#1233). Unlike the audit
+//! plane, whose hybrid gate is the signed tree head over its log, nothing
+//! here carries an ML-DSA-65 half across the boundary: this check IS the
+//! gate, and it is classical. It is a classical-only accommodation, kept only
+//! because persist has nothing yet to verify a PQC half against.
+//!
+//! v62 makes it conformant: a `ContributorId` becomes a key id that resolves
+//! to a hybrid `federation_keys` record (the substrate already takes
+//! `federation_keys` writes only at `algorithm: hybrid`), the envelope must
+//! carry its `signature_pqc` half (the canonicalizer already strips it, so
+//! the wire slot exists), and a contributor with no hybrid key is confined to
+//! local-tier. Until then this policy argument stays as it is.
 //!
 //! ## Correction (v37.0.0): hybrid envelopes are NOT accepted here
 //!
@@ -54,7 +72,7 @@
 //! per-contributor ML-DSA-65 pubkey directory on the cirisnode track for
 //! it to check against.
 //!
-//! ## Why v37.0.0's flag day skipped this site
+//! ## Why a policy flip alone is an outage, not a fix
 //!
 //! Because `ml_dsa_65_pubkey_b64` is always `None`, `Strict` is
 //! **unconditionally unsatisfiable** here rather than merely stricter:
@@ -65,13 +83,12 @@
 //! accepts-a-good-signature witness) with `hybrid-pending row rejected by
 //! Strict policy`.
 //!
-//! So tightening this plane is not a policy edit. It needs a
-//! per-contributor PQC pubkey source plumbed into
-//! [`verify_envelope_signed`] FIRST; only then does `Strict` become a
-//! gate rather than an outage. Contrast the delivery-attestation path in
-//! `super::sqlite` / `super::postgres`, which resolves BOTH pubkeys from
-//! `federation_keys` via `verify_hybrid_via_directory` and therefore DID
-//! flip to `Strict` in v37.0.0.
+//! So the v62 fix is the key model first (a per-contributor PQC pubkey
+//! source plumbed into [`verify_envelope_signed`]) and `Strict` second.
+//! Contrast the delivery-attestation path in `super::sqlite` /
+//! `super::postgres`, which resolves BOTH pubkeys from `federation_keys` via
+//! `verify_hybrid_via_directory` and therefore DID flip to `Strict` in
+//! v37.0.0.
 
 use serde::Serialize;
 
@@ -128,11 +145,12 @@ pub fn verify_envelope_signed<T: Serialize>(
         // NOT hybrid-verified (the module doc used to claim otherwise;
         // corrected in v37.0.0).
         None,
-        // PINNED. With the pubkey above always `None`, `Strict` refuses
-        // EVERY envelope on both branches — it is an outage, not a
-        // tightening. v37.0.0's flag day skipped this site for that
-        // reason; see the module doc. A real tightening needs a
-        // per-contributor PQC pubkey source plumbed in first.
+        // PINNED, and non-conformant until v62 (CIRISPersist#1233): these
+        // are federation-tier envelopes and CC 5.3.2.4.3.1 binds them. With
+        // the pubkey above always `None`, `Strict` refuses EVERY envelope on
+        // both branches — an outage, not a tightening. v62 resolves a
+        // ContributorId to a hybrid `federation_keys` record first; see the
+        // module doc.
         HybridPolicy::Ed25519Fallback,
         None,
     )

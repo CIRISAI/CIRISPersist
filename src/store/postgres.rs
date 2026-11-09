@@ -1251,6 +1251,60 @@ impl crate::federation::read_plan::ReadPlanStore for PostgresBackend {
         })
     }
 
+    async fn read_serve_stream_page(
+        &self,
+        narrowing: crate::federation::read_plan::ServeNarrowing<'_>,
+        since: Option<&(chrono::DateTime<chrono::Utc>, String)>,
+        fetch: i64,
+    ) -> Result<crate::federation::read_plan::ServedRows, crate::federation::Error> {
+        use crate::federation::attestation_query::Dialect;
+        let head_stmt =
+            crate::federation::read_plan::serve_stream_head_statement(Dialect::Postgres);
+        let page_stmt = crate::federation::read_plan::serve_stream_statement(
+            Dialect::Postgres,
+            narrowing,
+            since,
+            fetch,
+        );
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        // The head FIRST: a row admitted between the two reads sits above it,
+        // so a resume from the head cannot skip it.
+        let head_rows = pg_query_statement(&**client, head_stmt)
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("serve stream head: {e}")))?;
+        let head: Option<(chrono::DateTime<chrono::Utc>, String)> =
+            match head_rows.into_iter().next() {
+                Some(r) => Some((
+                    r.safe_get_with("_pos", crate::federation::Error::Backend)?,
+                    r.safe_get_with("attestation_id", crate::federation::Error::Backend)?,
+                )),
+                None => None,
+            };
+        let rows = pg_query_statement(&**client, page_stmt)
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("serve stream page: {e}")))?;
+        let bytes = pg_envelope_bytes(&rows);
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                let admitted_at = row.safe_get_with("_pos", crate::federation::Error::Backend)?;
+                Ok(crate::federation::ServedAttestation {
+                    attestation: pg_row_to_attestation(row)?,
+                    admitted_at,
+                })
+            })
+            .collect::<Result<Vec<_>, crate::federation::Error>>()?;
+        Ok(crate::federation::read_plan::ServedRows {
+            rows,
+            head,
+            bytes,
+            backend: crate::observe::StoreBackend::Postgres,
+        })
+    }
+
     async fn read_key_registration_history(
         &self,
         key_id: &str,
@@ -5343,28 +5397,36 @@ fn available_cpus() -> usize {
 /// starved pool hangs it instead of answering [`CheckoutError::Exhausted`].
 ///
 /// The timer runs where persist's tokio has a reactor: inline on a runtime
-/// thread, else on `persist_rt`, raced against the checkout polled here (a
+/// thread, else on `persist_timer`, raced against the checkout polled here (a
 /// waker, no reactor needed: the #705 shape, where Edge polls this pool from
 /// its own tokio copy).
+///
+/// v61.1.0 (CIRISPersist#1231): `persist_timer` is a trait object, never a
+/// raw `tokio::runtime::Handle`. A foreign crate that links persist as an
+/// rlib compiles its own copy of this function against its own tokio. That
+/// copy may only reach persist's runtime through the vtable persist's `.so`
+/// wrote ([`PersistRuntimeTimer`](super::postgres_runtime_connect::PersistRuntimeTimer)).
+/// It must never spawn on a `Handle` that a different tokio built. The
+/// from-disk gate `store::foreign_runtime_1231_invariants` refuses a
+/// `Handle` here.
 pub(crate) async fn checkout_bounded(
     pool: &Pool,
     wait: std::time::Duration,
-    persist_rt: Option<&tokio::runtime::Handle>,
+    persist_timer: Option<&dyn super::postgres_runtime_connect::PersistRuntimeTimer>,
 ) -> Result<deadpool_postgres::Object, CheckoutError> {
-    let got = match (tokio::runtime::Handle::try_current(), persist_rt) {
+    let got = match (tokio::runtime::Handle::try_current(), persist_timer) {
         (Ok(_), _) => tokio::time::timeout(wait, pool.get()).await.ok(),
-        (Err(_), Some(rt)) => {
-            // The `Sleep` is built INSIDE the task: constructing it here would
-            // ask this thread for a timer it does not have.
-            let mut timer = rt.spawn(async move { tokio::time::sleep(wait).await });
-            tokio::select! {
+        (Err(_), Some(timer)) => {
+            // Started on persist's runtime by persist's own code. Dropping it
+            // (below, when the checkout wins) aborts the timer task there.
+            let mut fired = timer.sleep(wait);
+            let raced = tokio::select! {
                 biased;
-                r = pool.get() => {
-                    timer.abort();
-                    Some(r)
-                }
-                _ = &mut timer => None,
-            }
+                r = pool.get() => Some(r),
+                _ = &mut fired => None,
+            };
+            drop(fired);
+            raced
         }
         // No persist runtime anywhere: nothing can run a timer.
         (Err(_), None) => Some(pool.get().await),
@@ -5560,10 +5622,12 @@ pub struct PostgresBackend {
     delegation_write_lock: tokio::sync::Mutex<()>,
     /// v59.1.2 — how long [`Self::checkout`] waits for a connection.
     checkout_wait: std::time::Duration,
-    /// v59.1.2 — persist's runtime, captured where the backend was built:
-    /// the checkout's timer runs there when the polling thread has none of
-    /// persist's (Edge's thread, #705).
-    persist_rt: Option<tokio::runtime::Handle>,
+    /// v59.1.2: persist's runtime, captured where the backend was built.
+    /// The checkout's timer runs there when the polling thread has none of
+    /// persist's (Edge's thread, #705). v61.1.0 (#1231): it is held as a
+    /// trait object that persist's `.so` built, never as a raw `Handle`,
+    /// because a foreign copy of [`checkout_bounded`] reads this field.
+    persist_timer: Option<super::postgres_runtime_connect::PersistTimer>,
     /// v54.0.0 (Codex on PR #1050) — the per-record stripe a
     /// `signed_wire_index` re-index holds from its read of the stored bytes
     /// through the replacement ([`crate::store::record_locks`]).
@@ -6322,7 +6386,7 @@ impl PostgresBackend {
             ),
             minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
             checkout_wait: wait,
-            persist_rt: tokio::runtime::Handle::try_current().ok(),
+            persist_timer: super::postgres_runtime_connect::capture_persist_timer(),
             key_plane_rehomed: std::sync::atomic::AtomicBool::new(false),
             pre_purge_schema: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
@@ -6385,7 +6449,7 @@ impl PostgresBackend {
             ),
             minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
             checkout_wait: POOL_WAIT_TIMEOUT,
-            persist_rt: tokio::runtime::Handle::try_current().ok(),
+            persist_timer: super::postgres_runtime_connect::capture_persist_timer(),
             key_plane_rehomed: std::sync::atomic::AtomicBool::new(false),
             pre_purge_schema: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
@@ -6606,7 +6670,12 @@ impl PostgresBackend {
     /// raced against the checkout polled here (a waker, no reactor needed:
     /// the #705 shape, where Edge polls this pool from its own tokio copy).
     pub(crate) async fn checkout(&self) -> Result<deadpool_postgres::Object, CheckoutError> {
-        checkout_bounded(&self.pool, self.checkout_wait, self.persist_rt.as_ref()).await
+        checkout_bounded(
+            &self.pool,
+            self.checkout_wait,
+            self.persist_timer.as_deref(),
+        )
+        .await
     }
 
     /// Acquire a pooled connection, with a **bounded retry on transient
@@ -6635,9 +6704,12 @@ impl PostgresBackend {
                 Err(CheckoutError::Failed(e)) => {
                     last_err = Some(e);
                     if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            u64::from(attempt) * 50,
-                        ))
+                        // v61.1.0 (#1231): off-runtime this pauses on
+                        // persist's timer; `tokio::time::sleep` panicked there.
+                        super::postgres_runtime_connect::pause(
+                            std::time::Duration::from_millis(u64::from(attempt) * 50),
+                            self.persist_timer.as_deref(),
+                        )
                         .await;
                     }
                 }
@@ -14171,6 +14243,31 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         .await
     }
 
+    async fn list_attestations_since_by_prefixes(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        dimension_prefixes: &[String],
+        type_prefixes: &[String],
+        limit: i64,
+    ) -> Result<crate::federation::types::ServedAttestationPage, crate::federation::Error> {
+        crate::federation::read_plan::list_attestations_since_by_prefixes_planned(
+            self,
+            since,
+            dimension_prefixes,
+            type_prefixes,
+            limit,
+        )
+        .await
+    }
+
+    async fn list_owner_bindings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: i64,
+    ) -> Result<crate::federation::types::OwnerBindingPage, crate::federation::Error> {
+        crate::federation::read_plan::list_owner_bindings_since_planned(self, since, limit).await
+    }
+
     async fn record_announced_peer(
         &self,
         key_id: &str,
@@ -21520,6 +21617,45 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                 .await
                 .map_err(|e| crate::federation::Error::Backend(format!("vote window: {e}")))?;
             }
+            // v61.1.0 (CIRISPersist#1220, V199) — a proposal's receipt,
+            // first-seen wins, in the row's transaction: a failed write rolls
+            // the row back, so no proposal is held without its window.
+            if let Some((identity_key_id, received_at)) = &planned.self_roster_receipt {
+                tx.execute(
+                    "INSERT INTO cirislens.federation_self_roster_proposals \
+                     (attestation_id, identity_key_id, received_at) VALUES ($1, $2, $3) \
+                     ON CONFLICT (attestation_id) DO NOTHING",
+                    &[&row.attestation_id, identity_key_id, received_at],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("self-roster receipt: {e}"))
+                })?;
+            }
+            // v61.1.0 (CIRISPersist#1218) — the deferred `withdraws` naming
+            // this row, stamped with the rule the door gives them now, in the
+            // row's transaction: the folds and the Live listing read the same
+            // rule whatever order the two arrived in. Guarded on each still
+            // being unstamped under the hash the plan read.
+            for r in &planned.restamped_withdraws {
+                let rule = i16::from(r.rule);
+                tx.execute(
+                    "UPDATE cirislens.federation_attestations \
+                        SET withdraws_admission_rule = $2, persist_row_hash = $3 \
+                      WHERE attestation_id = $1 AND withdraws_admission_rule IS NULL \
+                        AND persist_row_hash = $4",
+                    &[
+                        &r.attestation_id,
+                        &rule,
+                        &r.persist_row_hash,
+                        &r.held_persist_row_hash,
+                    ],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("deferred withdraws stamp: {e}"))
+                })?;
+            }
         }
         // PR #943 review (Codex): project ONLY a row this statement stored. An
         // occupied id (`ON CONFLICT DO NOTHING`, 0 rows) stored nothing, so its
@@ -21643,6 +21779,15 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         if let Some(wire_index_key) = &planned.wire_index_key {
             self.index_stored_record("Attestation", wire_index_key)
                 .await?;
+        }
+        // v61.1.0 (CIRISPersist#1218) — a restamped `withdraws` changed its
+        // row hash; its index entry follows the stored row.
+        for key in planned
+            .restamped_withdraws
+            .iter()
+            .filter_map(|r| r.wire_index_key.as_deref())
+        {
+            self.index_stored_record("Attestation", key).await?;
         }
         Ok(StoredAttestation::Inserted)
     }
@@ -42403,9 +42548,12 @@ mod tests {
             })
             .await
             .unwrap();
+        // v61.1.0 (CIRISPersist#1174, CC 3.4.3) — a substrate self-report is
+        // about the substrate that signs it; one about `agent_k` is refused
+        // (`admission::check_substrate_self_report_attester`, I1593).
         let att = pg_scores_attestation(
             &persist_self,
-            &agent_k,
+            &persist_self,
             &persist_self,
             "system:health:n_eff_measurable:v1",
         );

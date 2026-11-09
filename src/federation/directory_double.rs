@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 94 delegations, generated. Every one: fault first, then delegate.
+// 97 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -426,6 +426,20 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_attestations_citing_by_dimension(dimension, evidence_ref)
             .await
     }
+    async fn list_attestations_naming_by_dimension(
+        &self,
+        subject_key_id: &str,
+        dimension: &str,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::ScoresPage, Error> {
+        if let Some(e) = self.faulted("list_attestations_naming_by_dimension") {
+            return Err(e);
+        }
+        self.inner
+            .list_attestations_naming_by_dimension(subject_key_id, dimension, cursor, limit)
+            .await
+    }
     async fn list_attestations_referencing(
         &self,
         target_attestation_id: &str,
@@ -446,6 +460,20 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.list_attestations_since(since, limit).await
+    }
+    async fn list_attestations_since_by_prefixes(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        dimension_prefixes: &[String],
+        type_prefixes: &[String],
+        limit: i64,
+    ) -> Result<types::ServedAttestationPage, Error> {
+        if let Some(e) = self.faulted("list_attestations_since_by_prefixes") {
+            return Err(e);
+        }
+        self.inner
+            .list_attestations_since_by_prefixes(since, dimension_prefixes, type_prefixes, limit)
+            .await
     }
     async fn list_communities_for_member(
         &self,
@@ -663,6 +691,16 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .list_open_self_roster_proposals(identity_key_id)
             .await
+    }
+    async fn list_owner_bindings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: i64,
+    ) -> Result<types::OwnerBindingPage, Error> {
+        if let Some(e) = self.faulted("list_owner_bindings_since") {
+            return Err(e);
+        }
+        self.inner.list_owner_bindings_since(since, limit).await
     }
     async fn list_settled_self_roster_proposals(
         &self,

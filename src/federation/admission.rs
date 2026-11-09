@@ -266,6 +266,7 @@ impl DimensionRejectionReason {
 pub mod dimension_rejected_reason {
     use super::{
         DimensionRejectionReason, LEDGER_BINDING_REASON, REGISTERED_FAMILY_HELD_SHUT_REASON,
+        SUBSTRATE_SELF_REPORT_SUBJECT_REASON,
     };
 
     /// Every token `Error::DimensionRejected` carries.
@@ -282,6 +283,9 @@ pub mod dimension_rejected_reason {
         crate::federation::group_plane::GROUP_PLANE_ROW_SHAPE_REASON,
         // v61 (CIRISPersist#1126) — a bare-`scores` partnership half.
         crate::federation::self_at_login::PARTNERSHIP_SHAPE_RETIRED_REASON,
+        // v61.1.0 (CIRISPersist#1174, CC 3.4.3) — a substrate self-report
+        // about another party.
+        SUBSTRATE_SELF_REPORT_SUBJECT_REASON,
     ];
 
     /// The tokens a later re-offer of the same row can turn into an
@@ -780,6 +784,78 @@ pub const HARD_CODED_RESERVED_STEMS: &[&str] = &[
     // CC 3.4.11 — the self rung's `{band}`-not-`{level}` shape rule.
     "age_self_declared:",
 ];
+
+/// v61.1.0 (CIRISPersist#1174) — the `hard_case:{kind}` family stem
+/// (CC 3.1.9.4), as [`check_reserved_prefix_admission`]'s hand-written arm
+/// matches it on the row's family in either form
+/// ([`row_type::claim_token_under`](crate::federation::row_type::claim_token_under)).
+pub const HARD_CASE_FAMILY_PREFIX: &str = crate::federation::hard_case::DIMENSION_PREFIX;
+
+/// v61.1.0 (CIRISPersist#1174) — the identity types that may sign a
+/// `hard_case:*` row, as a set-membership test (CC 3.4.7.1).
+///
+/// `substrate_persist` is the type-slot rule's emitter since v10.3.0
+/// (#288). `node` is the attester persist's own hard_case door has signed with
+/// since v57 (CLM-hard-case-on-base: *"attester = the node key"*), and those
+/// rows cross and replicate (v60), so a gate on the family that refused `node`
+/// would refuse this node's own audit trail at its first crossing. Neither type
+/// is conferred: a row ABOUT ANOTHER PARTY is authorised by the
+/// `infra:record_hard_case` conferral the arm resolves, never by the type.
+pub const HARD_CASE_EMITTER_IDENTITY_TYPES: &[&str] = &[
+    crate::federation::types::identity_type::SUBSTRATE_PERSIST,
+    crate::federation::types::identity_type::NODE,
+];
+
+/// v61.1.0 (CIRISPersist#1174 item 3, CC 3.4.3) — the substrate self-report
+/// families persist's rule table reserves to `substrate_persist`. Spelled
+/// once more here because the attester rule below is pure (no directory read)
+/// and runs ahead of the table; I1595
+/// (`scores_form_family_1174_invariants::unit::i1595_substrate_self_report_prefixes_are_the_tables`)
+/// pins it equal to the table's `substrate_persist`-only rows.
+pub const SUBSTRATE_SELF_REPORT_PREFIXES: &[&str] = &[
+    "system:",
+    "audit_chain:",
+    "corpus_health:",
+    "identity_continuity:",
+    "federation_directory:",
+];
+
+/// v61.1.0 (CIRISPersist#1174) — the [`Error::DimensionRejected`] reason a
+/// substrate self-report row about another party is refused under. Terminal:
+/// the rule is pure over the signed row.
+pub const SUBSTRATE_SELF_REPORT_SUBJECT_REASON: &str = "substrate_self_report_names_another_party";
+
+/// v61.1.0 (CIRISPersist#1174 item 3, CC 3.4.3 substrate-self-report) — **a
+/// substrate self-report describes the substrate that signs it.**
+///
+/// The table half of the rule (`identity_type ∋ substrate_persist`) asks what
+/// KIND of key signs; it never asked WHICH substrate the row is about, so a
+/// `substrate_persist` key could file `system:*` telemetry about any key it
+/// named. `substrate_persist` is self-assertable precisely because its rows
+/// describe only the node itself (`identity_type::conferral_mode`: *"if a
+/// `system:*` row ever becomes an input to a decision ABOUT ANOTHER PARTY,
+/// this must move"*), so a row naming another `attested_key_id` is refused
+/// here rather than letting the type carry an authority it was never given.
+///
+/// Keyed on the row's family in either form
+/// ([`row_type::claim_token`](crate::federation::row_type::claim_token)).
+/// Pure; a no-op for every other family.
+pub fn check_substrate_self_report_attester(row: &super::Attestation) -> Result<(), Error> {
+    let Some(family) = crate::federation::row_type::claim_token(row) else {
+        return Ok(());
+    };
+    if row.attesting_key_id == row.attested_key_id
+        || !SUBSTRATE_SELF_REPORT_PREFIXES
+            .iter()
+            .any(|p| family.starts_with(p))
+    {
+        return Ok(());
+    }
+    Err(Error::DimensionRejected {
+        dimension: family.to_owned(),
+        reason: SUBSTRATE_SELF_REPORT_SUBJECT_REASON,
+    })
+}
 
 /// **The declared exceptions.** Family stems persist governs that CC's Part 3
 /// does **not** catalogue — so R2 has nothing to check them against, and
@@ -3347,6 +3423,32 @@ pub fn lift_envelope_attested_roles(row: &mut super::KeyRecord) {
 /// machine-checkable interim, the same posture as the CC#38 size cap.
 pub const TRACE_DIMENSION_PREFIX: &str = "trace:";
 
+/// v61.1.0 (CIRISPersist#1174 item 4) — the `trace_summary:{kind}` family
+/// stem (CC 3.1.5: *"Post-scrub digest of a trace for cross-node
+/// consumption"*). Its registry row carries the same reserved rule as
+/// `trace:{form}:{version}` (CC 3.4.5, "reserved (see table)"), and CC 3.3.7's
+/// trailing-colon-significant matching means [`TRACE_DIMENSION_PREFIX`] never
+/// covers it — which is how it met no gate.
+pub const TRACE_SUMMARY_DIMENSION_PREFIX: &str = "trace_summary:";
+
+/// v61.1.0 (CIRISPersist#1174) — the token [`check_trace_dimension_admission`]
+/// judges: the row's family ([`row_type::claim_token_of`](crate::federation::row_type::claim_token_of))
+/// when it is a `trace:*` / `trace_summary:*` token, so a row carrying the
+/// family in its TYPE slot meets the gate as its `scores` twin does; else the
+/// envelope `dimension`, whatever the row type (the #473 reach, unchanged — a
+/// composer or typed row labelled `trace:*` is still held to it).
+#[must_use]
+pub fn trace_family_token<'a>(
+    attestation_type: &'a str,
+    dimension: Option<&'a str>,
+) -> Option<&'a str> {
+    crate::federation::row_type::claim_token_of(attestation_type, dimension)
+        .filter(|t| {
+            t.starts_with(TRACE_DIMENSION_PREFIX) || t.starts_with(TRACE_SUMMARY_DIMENSION_PREFIX)
+        })
+        .or(dimension)
+}
+
 /// CIRISPersist#579 (CC 3.1.5 → CC 2.6.3) — is `s` a well-formed sha256 digest
 /// token: the literal `"sha256:"` followed by **exactly 64 lowercase hex
 /// digits**?
@@ -3391,6 +3493,13 @@ fn is_sha256_digest_token(s: &str) -> bool {
 /// admits is guaranteed parseable by every consumer. PROVENANCE rides the
 /// producer signature inside the envelope (verified at promotion/read);
 /// neither half substitutes for the other.
+///
+/// v61.1.0 (CIRISPersist#1174 item 4) — `trace_summary:*` meets rule 1, the
+/// reserved half its registry row shares with `trace:*` (CC 3.4.5): the
+/// summary is its producer's own, so `attesting_key_id` MUST appear in
+/// `subject_key_ids`. Rules 2–3 are the inline-trace / manifest shape, which a
+/// digest does not carry. Callers pass [`trace_family_token`], so the gate is
+/// met by the family in either form.
 pub fn check_trace_dimension_admission(
     dimension: Option<&str>,
     attesting_key_id: &str,
@@ -3400,10 +3509,19 @@ pub fn check_trace_dimension_admission(
     let Some(dim) = dimension else {
         return Ok(());
     };
+    let refuse = |detail: String| Err(Error::TraceDimensionInvalid { detail });
+    if dim.starts_with(TRACE_SUMMARY_DIMENSION_PREFIX) {
+        if !subject_key_ids.iter().any(|s| s == attesting_key_id) {
+            return refuse(format!(
+                "trace_summary:* is self-emitted: attesting_key_id {attesting_key_id} must \
+                 appear in subject_key_ids (a summary is its own producer's trace digest)"
+            ));
+        }
+        return Ok(());
+    }
     if !dim.starts_with(TRACE_DIMENSION_PREFIX) {
         return Ok(());
     }
-    let refuse = |detail: String| Err(Error::TraceDimensionInvalid { detail });
 
     // 1. Self-emission.
     if !subject_key_ids.iter().any(|s| s == attesting_key_id) {
@@ -10553,14 +10671,10 @@ pub async fn resolve_withdraws_admission_rule_at(
     // voices are not the subject's to take back. A node's tier-crossing
     // co-scrub (stamped `cosigned_at`, CC 2.6.7) is custody, not a voice in
     // the act, and does not make a row cosigned.
-    let cosigned_act = target
-        .additional_scrubs
-        .iter()
-        .any(|sc| sc.cosigned_at.is_none() && sc.scrub_key_id != target.attesting_key_id);
-    let target_denies_subject_revocation = envelope_dimension(&target.attestation_envelope)
-        .is_some_and(|d| SUBJECT_WITHDRAWS_CARVE_OUT.iter().any(|p| d.starts_with(p)))
-        || cosigned_act;
-    if target_denies_subject_revocation {
+    // v61.1.0 (CIRISPersist#1218) — asked through the ONE predicate the read
+    // fold asks too (`precedence::retraction_entitled`), so a `withdraws` that
+    // arrived before its target cannot retire what this refuses.
+    if crate::federation::precedence::subject_withdraws_carved_out(target) {
         return Err(Error::WithdrawsNotAdmitted {
             issuer: issuer.to_string(),
             target_attestation_id: target.attestation_id.clone(),
@@ -10938,6 +11052,23 @@ pub async fn check_withdraws_admission_at(
         }
         return Ok(None);
     };
+    check_withdraws_admission_against(directory, row, &target, depth).await
+}
+
+/// v61.1.0 (CIRISPersist#1218) — the held-target half of
+/// [`check_withdraws_admission_at`]: the verdict on `row` (a `withdraws`)
+/// against `target`, the row it names, as if `target` were held. The write
+/// door asks it with the held target; the attestation plan asks it again for
+/// every DEFERRED `withdraws` naming a row it is about to store
+/// (`PlannedAttestation::restamped_withdraws`), so the rule a deferred
+/// `withdraws` carries is the one this door would have stamped had the rows
+/// arrived in order, never one a peer supplied.
+pub(crate) async fn check_withdraws_admission_against(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+    target: &super::Attestation,
+    depth: usize,
+) -> Result<Option<u8>, Error> {
     // CC 3 (CIRISPersist#851 / the CC 2.3 audit) — a `withdraws` naming a
     // `key_grant:*` row is REFUSED, not admitted inert. The Constitution is
     // explicit that a shared key cannot be retroactively un-shared, so
@@ -10952,7 +11083,7 @@ pub async fn check_withdraws_admission_at(
     // v58.0.0 (CIRISPersist#991, CC 2.4.1.1 rule 0, CC 3.1.3) — a
     // `key:revocation:v1` row is withdrawn by nobody, its revoker included:
     // revocation is non-rollbackable (CC 3.1.1). Refused, never admitted inert.
-    if crate::federation::key_plane::is_never_withdrawn(&target) {
+    if crate::federation::key_plane::is_never_withdrawn(target) {
         return Err(Error::InvalidArgument(format!(
             "withdraws names a key:revocation:v1 row ({}) — a key-plane revocation is never \
              withdrawn (CC 2.4.1.1 rule 0); lower its bound with a new revocation instead",
@@ -10967,7 +11098,7 @@ pub async fn check_withdraws_admission_at(
     // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the genesis key's eviction is
     // one of these: a `withdraws` of the self pair `(fedID, fedID)`'s row by
     // another roster key, which the self-roster door then decides.
-    if let Some(signed) = crate::federation::key_plane::occurrence_of_row(&target) {
+    if let Some(signed) = crate::federation::key_plane::occurrence_of_row(target) {
         let identity = &signed.identity_occurrence.identity_key_id;
         check_signer_acts_for(
             directory,
@@ -10984,7 +11115,7 @@ pub async fn check_withdraws_admission_at(
             4
         }));
     }
-    if crate::federation::key_grant::is_key_grant_row(&target)
+    if crate::federation::key_grant::is_key_grant_row(target)
         || crate::federation::key_grant::is_retired_key_grant_set_type(&target.attestation_type)
     {
         return Err(Error::InvalidArgument(format!(
@@ -11003,11 +11134,11 @@ pub async fn check_withdraws_admission_at(
     // roster event) is retracted by a cosigned `withdraws` under the same
     // protocol; rules 1-4 do not decide it.
     if let Some(rule) =
-        crate::federation::group_plane::check_cosigned_withdraws(directory, row, &target).await?
+        crate::federation::group_plane::check_cosigned_withdraws(directory, row, target).await?
     {
         return Ok(Some(rule));
     }
-    super::custody_ack::check_custody_withdraws_signer(row, &target)?;
+    super::custody_ack::check_custody_withdraws_signer(row, target)?;
     // v25.x (CIRISPersist#578, CIRISConstitution rc3 CC 3.2) — **the recovery
     // gate, in BOTH directions.**
     //
@@ -11029,20 +11160,19 @@ pub async fn check_withdraws_admission_at(
     // whether its signer speaks for the author, which a door could only answer
     // by arrival order. No rule is recorded, so no reader of the plane honours
     // it as an admitted retraction.
-    if crate::federation::reverse_quorum::is_vote_row(&target)
+    if crate::federation::reverse_quorum::is_vote_row(target)
         && row.attesting_key_id != target.attesting_key_id
     {
         return Ok(None);
     }
-    match resolve_withdraws_admission_rule_at(directory, &row.attesting_key_id, &target, depth)
-        .await
+    match resolve_withdraws_admission_rule_at(directory, &row.attesting_key_id, target, depth).await
     {
         Ok(rule) => {
             // Rule 1 is the producer's own retraction and is never a reclaim.
             // Rules 2/3/4 against a LIVE owner-binding are exactly what rc3
             // gates.
             if matches!(rule, 2..=4) && is_owner_binding_envelope(&target.attestation_envelope) {
-                if let Some(outcome) = run_recovery_ceremony_gate(directory, row, &target).await? {
+                if let Some(outcome) = run_recovery_ceremony_gate(directory, row, target).await? {
                     return outcome.map(Some);
                 }
             }
@@ -11054,7 +11184,7 @@ pub async fn check_withdraws_admission_at(
             // whose owner is merely quiet is not up for grabs). CC 3.2 also
             // forbids a PERMANENT ownerless lock, and the four-step ceremony
             // is the sanctioned exception: recorded as rule 5.
-            match run_recovery_ceremony_gate(directory, row, &target).await? {
+            match run_recovery_ceremony_gate(directory, row, target).await? {
                 Some(outcome) => outcome.map(Some),
                 None => Err(err),
             }
@@ -12375,6 +12505,42 @@ pub async fn serve_seat_owner_announced<F: super::FederationDirectory + ?Sized>(
     )
     .await?
     .is_empty())
+}
+
+/// v61.1.0 (CIRISPersist#1163, CC 5.4.6) — **is `node_key_id` on the
+/// announced roster, and whose node is it?** The one question the CC 5.4.6
+/// public roster asks of a node: [`serve_seat_owner_announced`] (a live owner
+/// binding carried at `cohort_scope: federation`) and then [`owner_of`] (the
+/// single live owner, named as the self its granter signed as). Both are the
+/// one live-delegation fold; nothing here re-decides liveness.
+///
+/// Judged at the caller's clock, so an expired binding answers
+/// [`types::AnnouncedOwnerState::NotAnnounced`] the moment it lapses, with no
+/// row marking it. A caller holding a roster asks this again for a node it
+/// holds when it needs a clock-correct answer
+/// ([`super::FederationDirectory::list_owner_bindings_since`] reports a node
+/// only when a row about it is admitted). An ambiguous owner is
+/// [`types::AnnouncedOwnerState::AmbiguousOwner`], not an error: one poisoned
+/// node must not stop a roster read; every other error propagates.
+///
+/// [`types::AnnouncedOwnerState::NotAnnounced`]: super::types::AnnouncedOwnerState::NotAnnounced
+/// [`types::AnnouncedOwnerState::AmbiguousOwner`]: super::types::AnnouncedOwnerState::AmbiguousOwner
+pub async fn announced_owner_state<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    node_key_id: &str,
+) -> Result<super::types::AnnouncedOwnerState, Error> {
+    use super::types::AnnouncedOwnerState as S;
+    if !serve_seat_owner_announced(directory, node_key_id).await? {
+        return Ok(S::NotAnnounced);
+    }
+    match owner_of(directory, node_key_id).await {
+        Ok(Some(owner)) => Ok(S::Announced {
+            owner_key_id: owner,
+        }),
+        Ok(None) => Ok(S::NotAnnounced),
+        Err(Error::AmbiguousNodeOwner { .. }) => Ok(S::AmbiguousOwner),
+        Err(e) => Err(e),
+    }
 }
 
 async fn live_owner_binding_granters<F: super::FederationDirectory + ?Sized>(
@@ -19027,7 +19193,14 @@ pub fn check_envelope_size_admission(envelope: &serde_json::Value) -> Result<(),
 ///   asymmetry).
 /// - `system:*` / `audit_chain:*` / `corpus_health:*` / … → per the
 ///   [`default_reserved_prefix_rules`] table (CC 3.4.3 — substrate-self-report).
-/// - `hard_case:*` → `substrate_persist` only (substrate-emitted).
+/// - `hard_case:*` → `substrate_persist` or the node key (substrate-emitted),
+///   and a row about another party only with `infra:record_hard_case`
+///   conferred.
+/// - v61.1.0 (CIRISPersist#1174) — `hard_case:*`, the `health:liveness:*`
+///   self-emission ban and the CC 3.4.3 substrate self-report attester
+///   ([`check_substrate_self_report_attester`]) are asked of the row's family
+///   in EITHER form ([`row_type::claim_token`](super::row_type::claim_token)):
+///   the type slot, or a `scores` row's `dimension`.
 /// - `capacity:*` → MUST NOT be self-emitted (`attesting_key_id ==
 ///   attested_key_id`) — CC 3.4.5's "Critical enforcement" anti-Goodhart rule
 ///   (an `identity_type`-independent attester==attested check).
@@ -19170,12 +19343,22 @@ pub async fn check_reserved_prefix_admission(
     // (`health:liveness:*` self-emission); every identity-type-reserved
     // invariant the manifest declares is already enforced by the rest of
     // this function, per the module's consistency witness.
+    //
+    // v61.1.0 (CIRISPersist#1174 item 1) — asked of the row's FAMILY
+    // (`row_type::claim_token`), not its type slot: a `scores` row on
+    // `health:liveness:v1` carries the family in its dimension and met
+    // nothing here before.
+    let family = super::row_type::claim_token(row);
     crate::federation::invariant::enforce_admission_invariants(
-        at,
+        family.unwrap_or(""),
         &row.attesting_key_id,
         &row.attested_key_id,
         "",
     )?;
+    // v61.1.0 (CIRISPersist#1174 item 3, CC 3.4.3) — the substrate
+    // self-report families describe the substrate that signs them. Pure, so
+    // it sits with the other attester==attested arms.
+    check_substrate_self_report_attester(row)?;
 
     // (CIRISPersist#590) — CC 3.1.7 R2(b): a governed family with no
     // registry row is a CONFORMANCE FAILURE, never an admit-and-wait.
@@ -19307,7 +19490,13 @@ pub async fn check_reserved_prefix_admission(
     // `DimensionAdmissionPolicy::check` asks. No emitter in any repo writes the
     // dimension shape yet, so nothing held is newly refused.
     let is_accord = at.starts_with("accord:");
-    let is_hard_case = at.starts_with("hard_case:");
+    // v61.1.0 (CIRISPersist#1174 item 2) — the `hard_case:` family in EITHER
+    // form. Persist's own hard_case door writes `scores` + `hard_case:{kind}:v1`
+    // (v57), so keying on the type slot alone left that form — the one
+    // `project_hard_case_row` projects into `hard_case_events` — under no
+    // emitter rule at all.
+    let hard_case_family = super::row_type::claim_token_under(row, HARD_CASE_FAMILY_PREFIX);
+    let is_hard_case = hard_case_family.is_some();
     let rule_ns = (at == super::types::attestation_type::SCORES)
         .then(|| envelope_dimension(&row.attestation_envelope))
         .flatten()
@@ -19337,12 +19526,24 @@ pub async fn check_reserved_prefix_admission(
             identity_type: got,
         });
     }
-    if is_hard_case {
-        if got != identity_type::SUBSTRATE_PERSIST {
+    if let Some(hard_case_family) = hard_case_family {
+        // v61.1.0 (CIRISPersist#1174) — set membership over the family's two
+        // emitter classes (CC 3.4.7.1): `substrate_persist`, and the node key
+        // persist's own hard_case door signs with (CLM-hard-case-on-base:
+        // "attester = the node key", a `node` identity). Both are
+        // self-assertable, so neither is the authority for a row ABOUT ANOTHER
+        // PARTY — the conferral below is.
+        if !HARD_CASE_EMITTER_IDENTITY_TYPES
+            .iter()
+            .any(|t| identity_type::set_contains(&got, t))
+        {
             return Err(Error::ReservedPrefixEmitterMismatch {
-                dimension: at.to_owned(),
-                prefix: "hard_case:".to_owned(),
-                required: vec![identity_type::SUBSTRATE_PERSIST.to_owned()],
+                dimension: hard_case_family.to_owned(),
+                prefix: HARD_CASE_FAMILY_PREFIX.to_owned(),
+                required: HARD_CASE_EMITTER_IDENTITY_TYPES
+                    .iter()
+                    .map(|t| (*t).to_owned())
+                    .collect(),
                 got_identity_type: got,
             });
         }
@@ -19365,18 +19566,19 @@ pub async fn check_reserved_prefix_admission(
         // fail-closed edge — a node unable to enter its own incident on the
         // attestation plane.
         //
-        // Note what this door does NOT govern: persist's own `hard_case:*`
-        // telemetry (the at-rest cascade, the community-DEK recipient
-        // exclusions, the consent-SLA watcher) is written through
-        // `FederationDirectory::record_hard_case` into `hard_case_events`, a
-        // different table on a different surface. Persist emits no `hard_case:`
-        // ATTESTATION at all. The traffic here is a host's — CIRISServer's
-        // graded admin ladder — which is exactly the third-party case.
+        // v61.1.0 (CIRISPersist#1174) — persist's own `hard_case:*` rows (the
+        // at-rest cascade, the community-DEK recipient exclusions, the
+        // consent-SLA watcher; v57 put them on the attestation plane) are
+        // `scores` rows attested by the node key ABOUT ITSELF
+        // (`attestation_admit::plan_hard_case_row`), so they cross and
+        // replicate through the self-attested branch. A third-party row — a
+        // host's, CIRISServer's graded admin ladder — needs the conferral, in
+        // either form.
         if row.attested_key_id != row.attesting_key_id {
             let Some(node) = directory.node_key_id() else {
                 return Err(Error::ReservedPrefixEmitterMismatch {
-                    dimension: at.to_owned(),
-                    prefix: "hard_case:".to_owned(),
+                    dimension: hard_case_family.to_owned(),
+                    prefix: HARD_CASE_FAMILY_PREFIX.to_owned(),
                     required: vec![format!(
                         "delegated scope {} — but this directory has no node identity, so \
                          conferral cannot be verified. Call set_node_key_id().",
@@ -19394,8 +19596,8 @@ pub async fn check_reserved_prefix_admission(
             .await?;
             if conferred.is_none() {
                 return Err(Error::ReservedPrefixEmitterMismatch {
-                    dimension: at.to_owned(),
-                    prefix: "hard_case:".to_owned(),
+                    dimension: hard_case_family.to_owned(),
+                    prefix: HARD_CASE_FAMILY_PREFIX.to_owned(),
                     required: vec![format!(
                         "delegated scope {} from a root this node trusts (this row is ABOUT \
                          another party)",
@@ -22128,7 +22330,9 @@ mod tests {
     ///   purpose-built gates elsewhere in this file, not in a prefix→role table.
     ///   `config:`'s is [`check_config_self_or_owner_admission`] (v38.7.0,
     ///   #778); `ownership:`'s is [`check_single_node_owner_admission`];
-    ///   `trace:`'s is [`check_trace_dimension_admission`]. Naming them is not
+    ///   `trace:`'s is [`check_trace_dimension_admission`], and so is
+    ///   `trace_summary:`'s (v61.1.0, #1174: until then this line named no
+    ///   gate for it, and none existed). Naming them is not
     ///   decoration: #778 was exactly the case where this line asserted a
     ///   purpose-built gate that did not exist, and a reader had no way to
     ///   notice from here.

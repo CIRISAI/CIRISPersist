@@ -392,18 +392,50 @@ pub fn composer_dimension_would_refuse_total() -> Vec<(String, u64)> {
         .collect()
 }
 
-/// The claim token a row carries for the readers that predate CC 2.4 — age
-/// and capacity assurance: the envelope `dimension` of a `scores` row (CC's
-/// shape), else the `attestation_type` itself (the type-slot shape rows
-/// already held were written in). Both shapes resolve identically, so an
-/// emitter can move to `scores` without its subject's band changing.
+/// **The row's family, in either form** — the one classifier every
+/// family-keyed reader and gate asks: the envelope `dimension` of a `scores`
+/// row (CC 2.4's shape), else the `attestation_type` itself (the type-slot
+/// shape rows already held were written in, which `ROW_TYPE_ENFORCEMENT =
+/// Report` still admits). Both shapes resolve identically, so an emitter can
+/// move to `scores` without its subject's band changing — and without the row
+/// slipping past a gate that names its family.
+///
+/// v61.1.0 (CIRISPersist#1174) — four admission gates keyed on the type slot
+/// (or a dimension prefix) alone, so a `scores` row met none of them: the
+/// `health:liveness:` self-emission ban, the `hard_case:` emitter rule, the
+/// CC 3.4.3 substrate self-report attester, and `trace_summary:`. Each now
+/// asks this function (or [`claim_token_of`] where the door holds no row
+/// yet), so both forms meet the same gate. A composer's verb is its token,
+/// which names no family: a `dimension` label on a composer is the dimension
+/// gate's to judge under the CC 2.4 ask 3 Report latch, not these gates'.
 #[must_use]
 pub fn claim_token(row: &Attestation) -> Option<&str> {
-    if row.attestation_type == crate::federation::types::attestation_type::SCORES {
-        super::admission::envelope_dimension(&row.attestation_envelope)
+    claim_token_of(
+        &row.attestation_type,
+        super::admission::envelope_dimension(&row.attestation_envelope),
+    )
+}
+
+/// [`claim_token`] over a row's two parts, for a door that holds them before
+/// there is a row (the local write).
+#[must_use]
+pub fn claim_token_of<'a>(
+    attestation_type: &'a str,
+    dimension: Option<&'a str>,
+) -> Option<&'a str> {
+    if attestation_type == crate::federation::types::attestation_type::SCORES {
+        dimension
     } else {
-        Some(row.attestation_type.as_str())
+        Some(attestation_type)
     }
+}
+
+/// v61.1.0 (CIRISPersist#1174) — the row's [`claim_token`] when it lies under
+/// `prefix` (a literal, trailing-colon-significant stem such as
+/// `"hard_case:"`), in either form; `None` otherwise.
+#[must_use]
+pub fn claim_token_under<'r>(row: &'r Attestation, prefix: &str) -> Option<&'r str> {
+    claim_token(row).filter(|t| t.starts_with(prefix))
 }
 
 // ── the serve filter ─────────────────────────────────────────────────

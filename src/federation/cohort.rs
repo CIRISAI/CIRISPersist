@@ -633,6 +633,18 @@ pub struct RevokeSpec {
     /// `canonical ‖ ed25519_sig`. `None` ⇒ hybrid-Strict verify rejects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrub_signature_pqc: Option<String>,
+    /// v61.1.0 (CIRISPersist#1226; CC rc14 4.4.3.2.8,
+    /// `CLM-affiliation-one-voice-countersign`) — co-signatures over the SAME
+    /// revocation `signing_envelope()` the primary covers, the
+    /// [`AdmitSpec::cosignatures`] mirror. `revoke_member` carries them onto
+    /// the `SignedFamilyMembershipRevocation` /
+    /// `SignedCommunityMembershipRevocation` it builds, whose door verifies
+    /// each against its signer's REGISTERED keys and counts the verified
+    /// signers against the group's standing (the one-voice countersign
+    /// included). Absent = none; a `self` removal carries none (it has no
+    /// gate to count them), so `revoke_member` refuses one that does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cosignatures: Vec<crate::federation::types::RosterCosignature>,
 }
 
 /// A group identity, uniform across the three cohorts (the `lookup_group` /

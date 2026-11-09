@@ -787,6 +787,27 @@ mod v601_asks_invariants;
 // one dimension, on every backend.
 #[cfg(test)]
 pub(crate) mod subject_read_1225_invariants;
+// v61.1.0 (CIRISPersist#1232) — I1650/I1651: the fault-injecting double
+// reaches the backend's `list_attestations_naming_by_dimension`.
+#[cfg(test)]
+mod directory_double_1232_invariants;
+// v61.1.0 (CIRISPersist#1226) — I1610–I1615: the cohort revoke door carries
+// the one-voice countersign, verified, on every backend.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod revoke_countersign_1226_invariants;
+// v61.1.0 (CIRISPersist#1174) — I1590–I1596: a `scores`-form row meets every
+// gate its classic-form twin meets, on every backend.
+#[cfg(test)]
+mod scores_form_family_1174_invariants;
+// v61.1.0 (CIRISPersist#1218, #1220) — I1600–I1602: a retraction's verdict
+// does not depend on arrival order; a roster proposal is never held without
+// its window, on every backend.
+#[cfg(test)]
+mod withdraws_order_roster_receipt_invariants;
+// v61.1.0 (CIRISPersist#1163, #1190) — I1570–I1579: the narrowed serve
+// read and the owner-binding feed, on every backend.
+#[cfg(test)]
+pub(crate) mod serve_feeds_1163_1190_invariants;
 // v60.1.0 (CIRISPersist#1113, CC 4.5.3) — I1366/I1367: a reversed
 // reconsideration reverses a takedown; withheld is computed at read.
 #[cfg(test)]
@@ -5301,6 +5322,99 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
+    /// v61.1.0 (CIRISPersist#1190, Edge v44 / CIRISConstitution#198 §5) —
+    /// [`Self::list_attestations_since`] narrowed by prefix: the
+    /// federation-tier rows whose `dimension` starts with one of
+    /// `dimension_prefixes`, or whose `attestation_type` starts with one of
+    /// `type_prefixes`, so a consumer rebuilding a queue of one family of
+    /// rows (Edge's pending-decision rows) does not page the whole plane.
+    ///
+    /// The cursor is the same `(admitted_at, attestation_id)` serve position,
+    /// exclusive, ascending; a tie on `admitted_at` is broken by id. At most
+    /// `limit` (1..=10_000) per page; `next_cursor` is `Some` exactly when
+    /// another matching row exists past the page (the executor fetches one
+    /// row past it). `high_water` is where to resume once nothing remains:
+    /// the stream's head at the read, so a sparse family does not rescan the
+    /// rows of every other family on each poll.
+    ///
+    /// A prefix is a byte prefix, case-sensitive, matched as a half-open
+    /// range (never `LIKE`: `%` and `_` are ordinary characters). Refused:
+    /// no prefix at all, an empty prefix, more than 64 prefixes, a page size
+    /// outside the bound.
+    ///
+    /// It serves exactly what [`Self::list_attestations_since`] serves:
+    /// federation tier only, no unregistered type under row-type
+    /// enforcement (CC 2.4), and no purge-tombstoned row except those the
+    /// tombstone is void for. A plain read: no caller gate and no lifecycle
+    /// folding. Default = `Unsupported`; the sqlite and postgres backends and
+    /// the capsule proxy override.
+    async fn list_attestations_since_by_prefixes(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        dimension_prefixes: &[String],
+        type_prefixes: &[String],
+        limit: i64,
+    ) -> Result<types::ServedAttestationPage, Error> {
+        let _ = (since, dimension_prefixes, type_prefixes, limit);
+        Err(Error::Unsupported {
+            method: "list_attestations_since_by_prefixes",
+        })
+    }
+
+    /// v61.1.0 (CIRISPersist#1163, CC 5.4.6) — **a since-cursor feed of the
+    /// nodes whose announced-owner state may have changed**, so a consumer
+    /// keeps the CC 5.4.6 public roster (every node with a live owner binding
+    /// at `cohort_scope: federation`, and its owner) by applying changes
+    /// rather than walking every person each pass.
+    ///
+    /// # The cursor
+    ///
+    /// The attestation serve stream's `(admitted_at, attestation_id)`
+    /// position, as [`Self::list_attestations_since`], exclusive and
+    /// ascending, over the rows that can change an owner binding's liveness:
+    /// every owner-binding `delegates_to`, and every `withdraws` / `recants`
+    /// / `supersedes` attested to a node some owner binding names (the rows
+    /// the live-delegation fold reads). At most `limit` (1..=10_000) such
+    /// rows per page; `next_cursor` is `Some` exactly when another exists;
+    /// `high_water` is where to resume once none remains.
+    ///
+    /// # What an item says
+    ///
+    /// One item per node the page's rows touch, at that node's last row in
+    /// the page, carrying the node's state folded NOW by
+    /// [`admission::announced_owner_state`]: `Announced { owner }`,
+    /// `NotAnnounced`, or `AmbiguousOwner`. It is a state, not a delta, so a
+    /// consumer upserts by node (last item wins) and drops a node that is
+    /// not `Announced`; replaying from an older cursor is harmless.
+    ///
+    /// # Removal
+    ///
+    /// A binding stops being live by a row: a `withdraws` or `recants` naming
+    /// it (by anyone the write gate admitted), a granter's retraction against
+    /// the node, or a `supersedes` that moves its audience. That row is
+    /// admitted at a new serve position, so it reaches this feed through the
+    /// same cursor, and the node's item then says `NotAnnounced`. What no row
+    /// marks: a binding's `expires_at` or `valid_until` passing, and a change
+    /// to the granter's key record (its `user` role) or roster. Those change
+    /// the fold's answer without a row; a consumer re-asks
+    /// [`admission::announced_owner_state`] for the nodes it holds when it
+    /// needs a clock-correct roster (a few per pass, not every person).
+    ///
+    /// A plain read: no caller gate; it serves rows
+    /// [`Self::list_attestations_since`] serves, and names no owner of a
+    /// binding that is not announced. Default = `Unsupported`; the sqlite
+    /// and postgres backends and the capsule proxy override.
+    async fn list_owner_bindings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: i64,
+    ) -> Result<types::OwnerBindingPage, Error> {
+        let _ = (since, limit);
+        Err(Error::Unsupported {
+            method: "list_owner_bindings_since",
+        })
+    }
+
     /// v17.8.0 (CIRISPersist#469) — the **seeder bridge**: record a peer
     /// learned from a self-consistent (but not directory-rooted) LAN announce
     /// as a **non-canonical, untrusted discovery bookmark**.
@@ -7186,7 +7300,18 @@ pub trait FederationDirectory: Send + Sync {
             authority_key_id,
             scrub_signature_classical,
             scrub_signature_pqc,
+            cosignatures,
         } = spec;
+        // v61.1.0 (CIRISPersist#1226) — a `self` removal takes the trusted-
+        // local path: no gate counts a co-signature there, so one handed in
+        // is refused rather than dropped unread.
+        if cohort == cohort::Cohort::SelfId && !cosignatures.is_empty() {
+            return Err(Error::InvalidArgument(
+                "revoke_member: a `self` removal carries no co-signatures (the \
+                 occurrence revocation has no gate to count them)"
+                    .to_string(),
+            ));
+        }
         // #249 Cut G4 (§9) — `kind` of the membership-change "removed" event to
         // emit after a family/community revocation (`self` uses the occurrence
         // path, which carries its own events). `None` ⇒ no membership event.
@@ -7221,7 +7346,9 @@ pub trait FederationDirectory: Send + Sync {
                     authority_key_id,
                     scrub_signature_classical,
                     scrub_signature_pqc,
-                    cosignatures: Vec::new(),
+                    // v61.1.0 (CIRISPersist#1226) — the spec's co-signatures,
+                    // verified and counted by the door.
+                    cosignatures,
                 })
                 .await?;
             }
@@ -7246,7 +7373,9 @@ pub trait FederationDirectory: Send + Sync {
                         authority_key_id,
                         scrub_signature_classical,
                         scrub_signature_pqc,
-                        cosignatures: Vec::new(),
+                        // v61.1.0 (CIRISPersist#1226; CC rc14 4.4.3.2.8) —
+                        // the one-voice countersign rides here.
+                        cosignatures,
                     },
                 )
                 .await?;

@@ -4209,10 +4209,13 @@ impl PyEngine {
 
     /// v53.1.8 (CIRISPersist#1014) — [`crate::Engine::telemetry_snapshot`]
     /// as a dict: `{"reads": [{backend, door, reads, rows, bytes}, ...],
-    /// "folds": [{fold, calls, reads, rows, bytes}, ...]}`. `reads` lists
-    /// each `(backend, door)` that served a read; `folds` lists every fold.
-    /// Process-wide counters (`crate::observe`); names per
-    /// `TELEMETRY_CATALOG`.
+    /// "folds": [{fold, calls, reads, rows, bytes}, ...], "callers":
+    /// [{backend, door, caller, reads, rows, bytes}, ...]}`. `reads` lists
+    /// each `(backend, door)` that served a read; `folds` lists every fold;
+    /// `callers` (v61.1.0, CIRISPersist#1235, additive) splits each door's
+    /// reads by the caller label set with `set_caller_scope`, with
+    /// `"unattributed"` for reads made under none. Process-wide counters
+    /// (`crate::observe`); names per `TELEMETRY_CATALOG`.
     fn telemetry_snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         self.ensure_usable()?;
         let snap = crate::observe::snapshot();
@@ -4236,9 +4239,21 @@ impl PyEngine {
             d.set_item("bytes", f.bytes)?;
             folds.append(d)?;
         }
+        let callers = pyo3::types::PyList::empty(py);
+        for c in &snap.callers {
+            let d = PyDict::new(py);
+            d.set_item("backend", c.backend)?;
+            d.set_item("door", c.door)?;
+            d.set_item("caller", c.caller.as_str())?;
+            d.set_item("reads", c.reads)?;
+            d.set_item("rows", c.rows)?;
+            d.set_item("bytes", c.bytes)?;
+            callers.append(d)?;
+        }
         let dict = PyDict::new(py);
         dict.set_item("reads", reads)?;
         dict.set_item("folds", folds)?;
+        dict.set_item("callers", callers)?;
         Ok(dict)
     }
 
@@ -8943,6 +8958,112 @@ impl PyEngine {
                             serde_json::to_string(&rows).map_err(|e| {
                                 PyRuntimeError::new_err(format!(
                                     "attestation list JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v61.1.0 (CIRISPersist#1190) — `list_attestations_since` narrowed by
+    /// prefix: the federation-tier rows whose `dimension` starts with one of
+    /// `dimension_prefixes` or whose `attestation_type` starts with one of
+    /// `type_prefixes`, after the `(admitted_at, attestation_id)` pair cursor,
+    /// as a JSON `ServedAttestationPage` (`items`, `next_cursor`,
+    /// `high_water`). `next_cursor` is present exactly when more remain;
+    /// resume from `high_water` once none does. Served as
+    /// `list_attestations_since` serves. `limit` in [1, 10000].
+    #[pyo3(signature = (since_rfc3339, since_id, dimension_prefixes, type_prefixes, limit))]
+    fn list_attestations_since_by_prefixes(
+        &self,
+        py: Python<'_>,
+        since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
+        dimension_prefixes: Vec<String>,
+        type_prefixes: Vec<String>,
+        limit: i64,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = parse_pair_cursor(
+            "list_attestations_since_by_prefixes",
+            since_rfc3339,
+            since_id,
+        )?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let page = b
+                                .list_attestations_since_by_prefixes(
+                                    since,
+                                    &dimension_prefixes,
+                                    &type_prefixes,
+                                    limit,
+                                )
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&page).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "served attestation page JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v61.1.0 (CIRISPersist#1163, CC 5.4.6) — the announced-roster change
+    /// feed: after the `(admitted_at, attestation_id)` pair cursor, one item
+    /// per node whose owner-binding rows moved, each with its state folded
+    /// now (`announced` with the owner, `not_announced`, or
+    /// `ambiguous_owner`), as a JSON `OwnerBindingPage` (`items`,
+    /// `next_cursor`, `high_water`). A withdrawn or recanted binding arrives
+    /// through the same cursor as `not_announced`. `limit` in [1, 10000].
+    #[pyo3(signature = (since_rfc3339, since_id, limit))]
+    fn list_owner_bindings_since(
+        &self,
+        py: Python<'_>,
+        since_rfc3339: Option<&str>,
+        since_id: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = parse_pair_cursor("list_owner_bindings_since", since_rfc3339, since_id)?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let page = b
+                                .list_owner_bindings_since(since, limit)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&page).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "owner binding page JSON encode: {e}"
                                 ))
                             })
                         }};
@@ -17217,31 +17338,32 @@ impl PyEngine {
     /// for arbitrary canonical bytes. CIRISEdge OQ-11 day-1 posture
     /// unblocker.
     ///
-    /// `policy` is one of `"strict"`, `"ed25519_fallback"`, or
-    /// `"soft_freshness"`. When `"soft_freshness"`,
-    /// `soft_freshness_window_seconds` is required; `row_age_seconds`
-    /// MAY be passed by the caller (caller-side lookup of
-    /// `pqc_completed_at`). Other policies ignore both.
+    /// **`policy` accepts only `"strict"`** (v61.1.0, CIRISPersist#1233,
+    /// CC 5.3.2.4.3.1: a verifier's hybrid-required check is always-on, never
+    /// an operator toggle). Every other value, including the former
+    /// `"ed25519_fallback"` and `"soft_freshness"`, raises `ValueError`
+    /// `verify_policy_violation` before any decode or crypto runs. The
+    /// argument stays in the signature until v62 removes it;
+    /// `soft_freshness_window_seconds` and `row_age_seconds` are ignored.
     ///
-    /// `ml_dsa_65_sig_b64` and `ml_dsa_65_pubkey_b64` are paired:
-    /// either both Some (full hybrid verify) or both None (the row
-    /// is hybrid-pending; acceptance depends on `policy`).
+    /// `ml_dsa_65_sig_b64` and `ml_dsa_65_pubkey_b64` are paired and both
+    /// required: both `None` (a hybrid-pending row) is refused as
+    /// `verify_hybrid_pending_rejected`, one without the other as
+    /// `verify_hybrid_pqc_fields_mismatch`.
     ///
     /// Returns a dict:
     ///
     /// ```text
     /// {
-    ///   "outcome": str,        # "hybrid_verified" | "ed25519_hybrid_pending" | "ed25519_fallback"
-    ///   "row_age_seconds": float|None,  # echoed back when SoftFreshness matches
+    ///   "outcome": "hybrid_verified",
+    ///   "row_age_seconds": None,
     /// }
     /// ```
     ///
-    /// On verify failure raises `ValueError` with the persist
-    /// error-token (`verify_hybrid_pending_rejected`,
-    /// `verify_hybrid_soft_freshness_expired`,
-    /// `verify_hybrid_pqc_fields_mismatch`,
-    /// `verify_hybrid_base64`, `verify_hybrid_invalid_length`,
-    /// `verify_hybrid_crypto`).
+    /// On refusal raises `ValueError` with the persist error-token
+    /// (`verify_policy_violation`, `verify_hybrid_pending_rejected`,
+    /// `verify_hybrid_pqc_fields_mismatch`, `verify_hybrid_base64`,
+    /// `verify_hybrid_invalid_length`, `verify_hybrid_crypto`).
     ///
     /// Same error-token discipline as the rest of persist's PyO3
     /// surface — structured detail in tracing logs, stable token in
@@ -17433,13 +17555,17 @@ impl PyEngine {
     /// pattern).
     ///
     /// Saves the caller from doing a separate `lookup_public_key`
-    /// call before each verify. Same `policy` semantics as
-    /// `verify_hybrid` (Strict / SoftFreshness / Ed25519Fallback).
-    /// Same return shape (`{"outcome", "row_age_seconds"}`).
+    /// call before each verify. Same `policy` rule as `verify_hybrid`:
+    /// **only `"strict"` is accepted** (v61.1.0, CIRISPersist#1233,
+    /// CC 5.3.2.4.3.1); any other value raises `ValueError`
+    /// `verify_policy_violation` before the directory lookup or any
+    /// crypto runs. The argument stays until v62 removes it. Same return
+    /// shape (`{"outcome": "hybrid_verified", "row_age_seconds": None}`).
     ///
-    /// Raises `ValueError` with `verify_unknown_key` if
-    /// `signature_key_id` doesn't resolve in federation_keys, or
-    /// the standard `verify_hybrid_*` tokens for crypto failures.
+    /// Raises `ValueError` with `verify_policy_violation` for a non-strict
+    /// policy, `verify_unknown_key` if `signature_key_id` doesn't resolve
+    /// in federation_keys, or the standard `verify_hybrid_*` tokens for
+    /// crypto failures.
     #[pyo3(signature = (
         canonical_bytes,
         signature_key_id,
@@ -17600,6 +17726,12 @@ impl PyEngine {
     /// federation directory's `put_public_key` does its own write-
     /// path verification; this primitive lets a peer verify-without-
     /// storing for dry-runs or trust-graph audits.
+    ///
+    /// v61.1.0 (CIRISPersist#1233) — `policy` accepts only `"strict"`, as
+    /// for `verify_hybrid_via_directory`; any other value raises
+    /// `ValueError` `verify_policy_violation` before the envelope is
+    /// decoded. The same holds for `verify_signed_attestation` and
+    /// `verify_signed_revocation`.
     #[pyo3(signature = (
         signed_key_record_json,
         policy,
@@ -17616,6 +17748,9 @@ impl PyEngine {
     ) -> PyResult<Bound<'py, PyDict>> {
         self.ensure_usable()?;
         catch_panic(|| {
+            // v61.1.0 (CIRISPersist#1233) — the policy refusal comes first,
+            // before the envelope is even decoded.
+            parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
             let signed: crate::federation::SignedKeyRecord =
                 serde_json::from_str(signed_key_record_json).map_err(|e| {
                     PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}"))
@@ -17653,6 +17788,9 @@ impl PyEngine {
     ) -> PyResult<Bound<'py, PyDict>> {
         self.ensure_usable()?;
         catch_panic(|| {
+            // v61.1.0 (CIRISPersist#1233) — the policy refusal comes first,
+            // before the envelope is even decoded.
+            parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
             let signed: crate::federation::SignedAttestation =
                 serde_json::from_str(signed_attestation_json).map_err(|e| {
                     PyValueError::new_err(format!("SignedAttestation JSON decode: {e}"))
@@ -17690,6 +17828,9 @@ impl PyEngine {
     ) -> PyResult<Bound<'py, PyDict>> {
         self.ensure_usable()?;
         catch_panic(|| {
+            // v61.1.0 (CIRISPersist#1233) — the policy refusal comes first,
+            // before the envelope is even decoded.
+            parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
             let signed: crate::federation::SignedRevocation =
                 serde_json::from_str(signed_revocation_json).map_err(|e| {
                     PyValueError::new_err(format!("SignedRevocation JSON decode: {e}"))
@@ -23579,7 +23720,19 @@ impl PyEngine {
     /// #249 Cut G1 (§1) — remove `removed_key_id` from a `cohort` roster via the
     /// append-only revocation table. `revoke_spec_json` is a
     /// [`crate::federation::cohort::RevokeSpec`] (`{effective_at, reason?,
-    /// witness_set?}`); `effective_at` may be future-dated.
+    /// witness_set?, authority_key_id, scrub_signature_classical,
+    /// scrub_signature_pqc?, cosignatures?}`); `effective_at` may be
+    /// future-dated.
+    ///
+    /// v61.1.0 (CIRISPersist#1226; CC rc14 4.4.3.2.8,
+    /// `CLM-affiliation-one-voice-countersign`) — `cosignatures` is a list of
+    /// `{authority_key_id, scrub_signature_classical, scrub_signature_pqc?}`,
+    /// each over the SAME revocation `signing_envelope()` the primary signs
+    /// (the shape `put_community_json` takes). It is how a one-founder
+    /// affiliation's removal carries its designated official's countersign:
+    /// the door verifies each against its signer's registered keys and
+    /// counts only verified signers. Absent = none; malformed is refused
+    /// (`ValueError`); a `self` removal carrying one is refused.
     fn cohort_revoke_member(
         &self,
         py: Python<'_>,
@@ -32534,37 +32687,30 @@ fn outbound_rows_to_pylist<'py>(
     Ok(list)
 }
 
-/// v0.4.1 — Parse the policy string + optional soft_freshness window
-/// into a `HybridPolicy`. Shared by `Engine.verify_hybrid` and
-/// `Engine.verify_hybrid_via_directory` so the parsing rules are
-/// declared in one place.
+/// v0.4.1 — Parse the policy string into a `HybridPolicy`. Shared by
+/// `Engine.verify_hybrid` and `Engine.verify_hybrid_via_directory` (and so by
+/// the three `verify_signed_*` methods that route through the latter) so the
+/// rule is declared in one place.
+///
+/// v61.1.0 (CIRISPersist#1233, CC 5.3.2.4.3.1) — **`"strict"` is the only
+/// policy.** Every other value — `"ed25519_fallback"`, `"soft_freshness"`, an
+/// unknown string, the empty string — is refused with
+/// [`VERIFY_POLICY_VIOLATION`](crate::verify::hybrid::VERIFY_POLICY_VIOLATION)
+/// as a `ValueError`, and the callers run this BEFORE any decode, directory
+/// lookup or crypto. `soft_freshness_window_seconds` is no longer read: the
+/// argument stays in the signature until v62 drops `policy` and both windows
+/// together.
 fn parse_hybrid_policy(
     policy: &str,
     soft_freshness_window_seconds: Option<f64>,
 ) -> PyResult<crate::verify::HybridPolicy> {
-    use crate::verify::HybridPolicy;
-    match policy {
-        "strict" => Ok(HybridPolicy::Strict),
-        "ed25519_fallback" => Ok(HybridPolicy::Ed25519Fallback),
-        "soft_freshness" => {
-            let secs = soft_freshness_window_seconds.ok_or_else(|| {
-                PyValueError::new_err(
-                    "soft_freshness policy requires soft_freshness_window_seconds",
-                )
-            })?;
-            if !secs.is_finite() || secs < 0.0 {
-                return Err(PyValueError::new_err(
-                    "soft_freshness_window_seconds must be a non-negative finite float",
-                ));
-            }
-            Ok(HybridPolicy::SoftFreshness {
-                window: std::time::Duration::from_secs_f64(secs),
-            })
-        }
-        other => Err(PyValueError::new_err(format!(
-            "unknown policy {other:?} (expected strict / ed25519_fallback / soft_freshness)"
-        ))),
+    let _ = soft_freshness_window_seconds; // v62 removes it with `policy`
+    if policy != "strict" {
+        return Err(PyValueError::new_err(
+            crate::verify::hybrid::VERIFY_POLICY_VIOLATION,
+        ));
     }
+    Ok(crate::verify::HybridPolicy::Strict)
 }
 
 /// v1.3.0 (CIRISPersist#46 + #47) — Wire shape for the `TrustFilter`
@@ -35276,28 +35422,39 @@ async fn build_audit_chain_proof(
         }
     };
 
-    // Step 3 — surface the current STH if one exists (stretch goal).
-    // We tolerate `NotImplemented` / `None` cleanly — UIs that don't
-    // need the proof can ignore the field.
+    // Step 3 — surface the current STH if one exists. `None` when no head
+    // has been signed yet (Merkle hook disabled, or chain empty).
+    //
+    // v61.1.0 (CIRISPersist#1233, CC 5.3.1) — a head the store REFUSES (one
+    // without its ML-DSA-65 half, `audit_sth_not_hybrid`) or cannot read is an
+    // error here, not `None`. Until v61.0.5 every `Err` folded to `None`, so a
+    // refused head became the chain served with no head at all — the refusal
+    // read as absence. Malformed is a refusal, not absence.
     let head_signature: Option<String> = match backend {
         #[cfg(feature = "postgres")]
-        BackendDispatch::Postgres(pg) => match pg.current_sth(&tenant_id).await {
-            Ok(Some(sth)) => Some(
+        BackendDispatch::Postgres(pg) => match pg
+            .current_sth(&tenant_id)
+            .await
+            .map_err(|e| format!("current_sth: {e}"))?
+        {
+            Some(sth) => Some(
                 serde_json::to_string(&sth).map_err(|e| format!("SignedTreeHead encode: {e}"))?,
             ),
-            Ok(None) => None,
-            Err(_) => None,
+            None => None,
         },
         #[cfg(feature = "sqlite")]
         BackendDispatch::Sqlite(sq) => {
             let audit = crate::audit::sqlite::SqliteAuditBackend::new(sq.conn_handle());
-            match audit.current_sth(&tenant_id).await {
-                Ok(Some(sth)) => Some(
+            match audit
+                .current_sth(&tenant_id)
+                .await
+                .map_err(|e| format!("current_sth: {e}"))?
+            {
+                Some(sth) => Some(
                     serde_json::to_string(&sth)
                         .map_err(|e| format!("SignedTreeHead encode: {e}"))?,
                 ),
-                Ok(None) => None,
-                Err(_) => None,
+                None => None,
             }
         }
     };
@@ -37871,6 +38028,28 @@ fn engine_teardown_wait(py: Python<'_>, timeout_seconds: f64) -> &'static str {
     })
 }
 
+/// v61.1.0 (CIRISPersist#1235) — set the caller label this thread's door
+/// reads are credited to in `Engine.telemetry_snapshot()["callers"]`, and
+/// return the label it replaces (`None` when none was set). `label=None`
+/// clears it. Restore with the returned value: the `ciris_persist.caller_scope`
+/// context manager does exactly that.
+///
+/// The scope is per OS thread: every Engine method polls its read on the
+/// calling thread, so the label covers the calls this thread makes until it
+/// is changed. A label is 1 to 48 bytes of `[a-z][a-z0-9_.:-]*` and not
+/// `"unattributed"`; anything else raises `ValueError` and leaves the scope
+/// unchanged. Past 32 distinct labels per process every new label is counted
+/// under `"other"`.
+#[pyfunction]
+#[pyo3(signature = (label=None))]
+fn set_caller_scope(label: Option<&str>) -> PyResult<Option<String>> {
+    let caller = label
+        .map(crate::observe::Caller::new)
+        .transpose()
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(crate::observe::set_thread_caller(caller).map(crate::observe::Caller::label))
+}
+
 /// v24.3.0 (CIRISPersist#572) — how many engine teardowns are still
 /// winding down. `0` means the process is quiesced.
 ///
@@ -38342,6 +38521,8 @@ pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // `engine_teardowns_in_flight` says whether anything still is.
     m.add_function(pyo3::wrap_pyfunction!(engine_teardown_wait, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(engine_teardowns_in_flight, m)?)?;
+    // v61.1.0 (CIRISPersist#1235) — this thread's read-attribution caller.
+    m.add_function(pyo3::wrap_pyfunction!(set_caller_scope, m)?)?;
     // v21.7.0 (CIRISPersist#519 / CIRISConformance#83) — the manifest-driven
     // field-conformance surface: a shared harness drives the real wheel
     // against the fields persist is tagged to own in the shared table.
@@ -38971,3 +39152,8 @@ mod verify_trace_canon_parity_class {
 /// v61 (CC 2.6.2) — I-IFP-10: the Python open settles stored instant forms.
 #[cfg(test)]
 mod instant_form_open_tests;
+
+/// v61.1.0 (CIRISPersist#1233) — I1560, I1561, I1567: the Python verify doors
+/// accept only `"strict"`; `audit_chain_proof` does not serve a refused head.
+#[cfg(test)]
+mod hybrid_policy_1233_tests;

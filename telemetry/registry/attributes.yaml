@@ -69,6 +69,12 @@ groups:
           - id: list_attestations_naming_by_dimension
             value: "list_attestations_naming_by_dimension"
             stability: development
+          - id: list_attestations_since_by_prefixes
+            value: "list_attestations_since_by_prefixes"
+            stability: development
+          - id: list_owner_bindings_since
+            value: "list_owner_bindings_since"
+            stability: development
           - id: attestation_query
             value: "attestation_query"
             stability: development

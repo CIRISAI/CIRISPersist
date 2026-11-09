@@ -53,6 +53,12 @@ pub mod postgres;
 #[cfg(feature = "postgres")]
 pub(crate) mod postgres_runtime_connect;
 // v54.0.0 (Codex round 2 on PR #1050) — every door on a one-connection pool.
+/// v61.1.0 (CIRISPersist#1231): I1550–I1557. No raw tokio runtime type
+/// built in persist's `.so` is walked by a foreign copy of persist's code.
+/// The from-disk gates run under every feature set. The runtime legs need
+/// `postgres`.
+#[cfg(test)]
+mod foreign_runtime_1231_invariants;
 #[cfg(all(test, feature = "postgres"))]
 mod one_connection_pool_invariants;
 /// v61 (CIRISPersist#1166) — from disk: every Postgres checkout is the

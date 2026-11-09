@@ -7659,6 +7659,31 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .await
     }
 
+    async fn list_attestations_since_by_prefixes(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        dimension_prefixes: &[String],
+        type_prefixes: &[String],
+        limit: i64,
+    ) -> Result<crate::federation::types::ServedAttestationPage, crate::federation::Error> {
+        crate::federation::read_plan::list_attestations_since_by_prefixes_planned(
+            self,
+            since,
+            dimension_prefixes,
+            type_prefixes,
+            limit,
+        )
+        .await
+    }
+
+    async fn list_owner_bindings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: i64,
+    ) -> Result<crate::federation::types::OwnerBindingPage, crate::federation::Error> {
+        crate::federation::read_plan::list_owner_bindings_since_planned(self, since, limit).await
+    }
+
     async fn record_announced_peer(
         &self,
         key_id: &str,
@@ -15669,10 +15694,16 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             projected_ledger,
             projected_goal,
             vote_window,
+            self_roster_receipt,
+            restamped_withdraws,
             wire_index_key,
             ..
         } = planned;
         let id_for_compare = row.attestation_id.clone();
+        let restamped_index_keys: Vec<String> = restamped_withdraws
+            .iter()
+            .filter_map(|r| r.wire_index_key.clone())
+            .collect();
         // v38.5.0 (#771) — ABSORB, then RE-READ: `OR IGNORE` makes a
         // re-delivered row stop raising a UNIQUE violation, and the plan's
         // caller resolves the zero-row result against the STORED hash.
@@ -15785,6 +15816,41 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                         rusqlite::params![action_id, self_roster_instant_text(*first_held_at)],
                     )?;
                 }
+                // v61.1.0 (CIRISPersist#1220, V199) — a proposal's receipt,
+                // first-seen wins, in the row's transaction: a failed write
+                // rolls the row back, so no proposal is held without its
+                // window.
+                if let Some((identity_key_id, received_at)) = &self_roster_receipt {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO federation_self_roster_proposals \
+                         (attestation_id, identity_key_id, received_at) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![
+                            row.attestation_id,
+                            identity_key_id,
+                            self_roster_instant_text(*received_at)
+                        ],
+                    )?;
+                }
+                // v61.1.0 (CIRISPersist#1218) — the deferred `withdraws`
+                // naming this row, stamped with the rule the door gives them
+                // now, in the row's transaction: the folds and the Live
+                // listing read the same rule whatever order the two arrived
+                // in. Guarded on each still being unstamped under the hash
+                // the plan read.
+                for r in &restamped_withdraws {
+                    tx.execute(
+                        "UPDATE federation_attestations \
+                            SET withdraws_admission_rule = ?2, persist_row_hash = ?3 \
+                          WHERE attestation_id = ?1 AND withdraws_admission_rule IS NULL \
+                            AND persist_row_hash = ?4",
+                        rusqlite::params![
+                            r.attestation_id,
+                            i64::from(r.rule),
+                            r.persist_row_hash,
+                            r.held_persist_row_hash
+                        ],
+                    )?;
+                }
                 tx.commit()?;
                 Ok(true)
             })
@@ -15822,6 +15888,11 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         if let Some(wire_index_key) = &wire_index_key {
             self.index_stored_record("Attestation", wire_index_key)
                 .await?;
+        }
+        // v61.1.0 (CIRISPersist#1218) — a restamped `withdraws` changed its
+        // row hash; its index entry follows the stored row.
+        for key in &restamped_index_keys {
+            self.index_stored_record("Attestation", key).await?;
         }
         // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
         // `trace:complete:v1` attestation materializes its `trace_events` rows
@@ -23740,6 +23811,65 @@ impl crate::federation::read_plan::ReadPlanStore for SqliteBackend {
             .await;
         Ok(crate::federation::attestation_query::QueryRows {
             rows: rows?,
+            bytes,
+            backend: crate::observe::StoreBackend::Sqlite,
+        })
+    }
+
+    async fn read_serve_stream_page(
+        &self,
+        narrowing: crate::federation::read_plan::ServeNarrowing<'_>,
+        since: Option<&(chrono::DateTime<chrono::Utc>, String)>,
+        fetch: i64,
+    ) -> Result<crate::federation::read_plan::ServedRows, crate::federation::Error> {
+        use crate::federation::attestation_query::Dialect;
+        use crate::federation::Error;
+        let head_stmt = crate::federation::read_plan::serve_stream_head_statement(Dialect::Sqlite);
+        let page_stmt = crate::federation::read_plan::serve_stream_statement(
+            Dialect::Sqlite,
+            narrowing,
+            since,
+            fetch,
+        );
+        let head_sql = head_stmt.sql;
+        let page_sql = page_stmt.sql;
+        let binds = sqlite_binds(page_stmt.binds);
+        type Head = Option<(chrono::DateTime<chrono::Utc>, String)>;
+        let (read, bytes) = self
+            .read_measured(
+                move |conn| -> Result<(Head, Vec<crate::federation::ServedAttestation>), Error> {
+                    // The head FIRST: a row admitted between the two reads sits
+                    // above it, so a resume from the head cannot skip it.
+                    let head: Head = conn
+                        .query_row(&head_sql, [], |r| {
+                            let pos: String = r.get(0)?;
+                            let id: String = r.get(1)?;
+                            Ok((parse_rfc3339(&pos), id))
+                        })
+                        .optional()
+                        .map_err(|e| Error::Backend(format!("serve stream head: {e}")))?;
+                    let mut stmt = conn
+                        .prepare(&page_sql)
+                        .map_err(|e| Error::Backend(format!("serve stream prepare: {e}")))?;
+                    let rows = stmt
+                        .query_map(params_from_iter(binds.iter()), |row| {
+                            let pos: String = row.get("_pos")?;
+                            Ok(crate::federation::ServedAttestation {
+                                attestation: sqlite_row_to_attestation(row)?,
+                                admitted_at: parse_rfc3339(&pos),
+                            })
+                        })
+                        .map_err(|e| Error::Backend(format!("serve stream query: {e}")))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| Error::Backend(format!("serve stream row: {e}")))?;
+                    Ok((head, rows))
+                },
+            )
+            .await;
+        let (head, rows) = read?;
+        Ok(crate::federation::read_plan::ServedRows {
+            rows,
+            head,
             bytes,
             backend: crate::observe::StoreBackend::Sqlite,
         })
@@ -40328,10 +40458,13 @@ mod tests {
             })
             .await
             .unwrap();
+        // v61.1.0 (CIRISPersist#1174, CC 3.4.3) — a substrate self-report is
+        // about the substrate that signs it; one about `k-a` is refused
+        // (`admission::check_substrate_self_report_attester`, I1593).
         let att = scores_attestation_with_dimension(
             "att-sys-2",
             "persist-self",
-            "k-a",
+            "persist-self",
             "persist-self",
             "system:health:n_eff_measurable:v1",
         );
@@ -43333,6 +43466,66 @@ mod tests {
                 "#1225 {tag}: the index gives the order, no sort: {plan:?}"
             );
         }
+    }
+
+    /// v61.1.0 (CIRISPersist#1190, #1163) — **I1579: the narrowed serve
+    /// reads walk V130's `federation_attestations_admitted`**, seeking on the
+    /// cursor when there is one, with the order the index gives (no sort),
+    /// for both narrowings; and the head read is one step of the same index.
+    #[tokio::test]
+    async fn i1579_serve_stream_walks_the_admitted_index() {
+        use crate::federation::attestation_query::Dialect;
+        use crate::federation::read_plan::{
+            serve_stream_head_statement, serve_stream_statement, ServeNarrowing,
+        };
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let since = (chrono::Utc::now(), uuid::Uuid::new_v4().to_string());
+        let dims = vec!["membership:proposal:".to_owned(), "objection:".to_owned()];
+        let types = vec!["accord:invoke:".to_owned()];
+        for (tag, narrowing) in [
+            (
+                "prefixes",
+                ServeNarrowing::Prefixes {
+                    dimension_prefixes: &dims,
+                    type_prefixes: &types,
+                },
+            ),
+            ("owner bindings", ServeNarrowing::OwnerBindingChanges),
+        ] {
+            for (at, c) in [("head", None), ("cursor", Some(&since))] {
+                let stmt = serve_stream_statement(Dialect::Sqlite, narrowing, c, 51);
+                let plan = sqlite_plan(&backend, &stmt.sql, sqlite_binds(stmt.binds)).await;
+                eprintln!("#1190/#1163 {tag} ({at}) plan: {plan:?}");
+                let walk = plan
+                    .iter()
+                    .find(|l| l.contains("federation_attestations_admitted"))
+                    .unwrap_or_else(|| {
+                        panic!("I1579 {tag} {at}: walks the admitted index: {plan:?}")
+                    });
+                if c.is_some() {
+                    assert!(
+                        walk.starts_with("SEARCH"),
+                        "I1579 {tag} {at}: the cursor is a seek, not a scan from the oldest row: \
+                         {plan:?}"
+                    );
+                }
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|l| l.contains("USE TEMP B-TREE FOR ORDER BY")),
+                    "I1579 {tag} {at}: the index gives the order, no sort: {plan:?}"
+                );
+            }
+        }
+        let head = serve_stream_head_statement(Dialect::Sqlite);
+        let plan = sqlite_plan(&backend, &head.sql, sqlite_binds(head.binds)).await;
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("federation_attestations_admitted"))
+                && !plan.iter().any(|l| l.contains("TEMP B-TREE")),
+            "I1579 head: one step of the admitted index: {plan:?}"
+        );
     }
 
     /// v61 — `list_scores` under the Live view shares the lifecycle

@@ -17381,6 +17381,29 @@
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v61-s3",
     "witness": "I-IFP-2 (unit): the predicate reads every rfc3339-ms member of CC 2.6.1.7; I1494 (sqlite, postgres): CC's refuse_timestamp_form vector is refused envelope_member_invalid; I-IFP-1 (sqlite, postgres): the open-time pass settles a v60 node"
+   },
+   {
+    "decimal_id": "5.3.2.4.3.1",
+    "claim_id": "CLM-admission-pqc",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/verify/hybrid.rs#require_strict_policy",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61.1-1233",
+    "tsv_comment_before": [
+     "",
+     "# v61.1.0 (CIRISPersist#1233) — the verifier's hybrid-required check is always-on: the",
+     "# caller verify doors accept only strict, and the audit plane's gate is its hybrid-signed head."
+    ],
+    "witness": "I1560, I1561 (sqlite, postgres): Engine.verify_hybrid / verify_hybrid_via_directory / verify_signed_* refuse every policy but strict with verify_policy_violation before decode, lookup or crypto; I1562 (capsule): VerifyHybridViaDirectory refuses every HybridPolicy but Strict; I1563 (wheel)"
+   },
+   {
+    "decimal_id": "5.3.2.4.3.1",
+    "claim_id": "CLM-admission-pqc",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/audit/merkle_store.rs#require_hybrid_sth",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v61.1-1233",
+    "witness": "I1564, I1565 (sqlite, postgres): a signed tree head without its ML-DSA-65 half is refused at store_sth, latest_sth and current_sth; I1566 (unit): verify_audit_sth refuses it and verifies only against the pinned signer; I1567 (sqlite, postgres): audit_chain_proof refuses rather than serving no head"
    }
   ],
   "CIRISServer": [

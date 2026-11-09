@@ -231,6 +231,16 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("resolve_scores_planned", Class::Plan),
     ("list_attestation_log_planned", Class::Plan),
     ("list_attestations_naming_by_dimension_planned", Class::Plan),
+    // v61.1.0 (CIRISPersist#1190, #1163) — the narrowed serve reads.
+    ("list_attestations_since_by_prefixes_planned", Class::Plan),
+    ("list_owner_bindings_since_planned", Class::Plan),
+    // Caller input: no prefix, an empty prefix, too many prefixes.
+    ("check_serve_prefixes", Class::Gate),
+    // The page cut: fails only when the executor dropped its LIMIT.
+    ("cut_serve_page", Class::Plumbing),
+    // The per-node fold the owner-binding feed reports (a read of the one
+    // live-delegation fold; it refuses nothing about the caller's input).
+    ("announced_owner_state", Class::Plumbing),
     ("list_key_registration_history_planned", Class::Plan),
     ("list_derived_hex_planned", Class::Plan),
     // The erasure doors' shared planner (same-file helper of both plans): the attester gate and the erasure plan.
@@ -247,6 +257,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("read_score_composers", Class::Plumbing),
     ("read_attestation_log_page", Class::Plumbing),
     ("read_naming_page", Class::Plumbing),
+    ("read_serve_stream_page", Class::Plumbing),
     ("read_key_registration_history", Class::Plumbing),
     ("query_attestations", Class::Plumbing),
     // The erasure executors' string-column collector (a row decode).
@@ -534,6 +545,13 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // Inside the shared plan: its two same-file halves.
     ("plan_put_attestation", Class::Delegates),
     ("execute_planned", Class::Delegates),
+    // v61.1.0 (CIRISPersist#1218) — same-file helper of the plan: the held
+    // deferred `withdraws` naming the row, re-asked of the door against it.
+    // Its door verdicts do not propagate (a refusal leaves a row unstamped);
+    // its two directory reads are doors, followed like `get_attestation`.
+    ("deferred_withdraws_restamps", Class::Delegates),
+    ("list_attestations_referencing", Class::Delegates),
+    ("withdraws_admission_depth", Class::Delegates),
     // The executor's storage steps, called by the shared plan. Each is itself
     // an `AttestationStore` door, compared across backends on its own.
     ("store_planned_attestation", Class::Plumbing),
@@ -1561,7 +1579,7 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 73] = [
+    const SHARED_PLANS: [(&str, &str); 75] = [
         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance.
         (
             "src/federation/transport_admit.rs",
@@ -1677,6 +1695,14 @@ mod tests {
         (
             "src/federation/read_plan.rs",
             "list_attestations_naming_by_dimension_planned",
+        ),
+        (
+            "src/federation/read_plan.rs",
+            "list_attestations_since_by_prefixes_planned",
+        ),
+        (
+            "src/federation/read_plan.rs",
+            "list_owner_bindings_since_planned",
         ),
         (
             "src/federation/read_plan.rs",
@@ -1832,7 +1858,7 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 83] = [
+    const SHARED_DOORS: [(&str, &str, &str); 85] = [
         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance,
         // decoded by the row mapper both doors read through.
         (
@@ -2012,6 +2038,16 @@ mod tests {
             "FederationDirectory",
             "list_attestations_naming_by_dimension",
             "list_attestations_naming_by_dimension_planned",
+        ),
+        (
+            "FederationDirectory",
+            "list_attestations_since_by_prefixes",
+            "list_attestations_since_by_prefixes_planned",
+        ),
+        (
+            "FederationDirectory",
+            "list_owner_bindings_since",
+            "list_owner_bindings_since_planned",
         ),
         (
             "FederationDirectory",

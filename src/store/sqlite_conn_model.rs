@@ -289,6 +289,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("store_planned_fountain_content", ConnClass::Write),
     ("read_attestation_log_page", ConnClass::Read),
     ("read_naming_page", ConnClass::Read),
+    // v61.1.0 (CIRISPersist#1163, #1190) — the narrowed serve-stream page.
+    ("read_serve_stream_page", ConnClass::Read),
     ("read_key_registration_history", ConnClass::Read),
     ("read_renditions", ConnClass::Read),
     ("read_attestations", ConnClass::Read),

@@ -107,7 +107,7 @@ Tag CI's `attest` job (CIRISPersist#1028) signs two kinds of GitHub artifact att
 
 | predicate type | subjects | predicate |
 |---|---|---|
-| `https://slsa.dev/provenance/v1` (SLSA Build L2) | the four abi3 desktop wheels `ciris_persist-<v>-cp310-abi3-*.whl` (tag-run artifacts, not release assets) and the three release tarballs `ciris-persist-v<v>-{ios,android,android-wheels}.tar.gz`, as downloaded from the release | GitHub's build provenance: repo, workflow, ref, commit, run |
+| `https://slsa.dev/provenance/v1` (SLSA Build L2) | the four abi3 desktop wheels `ciris_persist-<v>-cp310-abi3-*.whl` (tag-run artifacts, not release assets), the three release tarballs `ciris-persist-v<v>-{ios,android,android-wheels}.tar.gz` and, from 61.1.0, the two linux debuginfo files `ciris_persist-<v>-linux-{x86_64,aarch64}.abi3.so.debug`, as downloaded from the release | GitHub's build provenance: repo, workflow, ref, commit, run |
 | `https://ciris.ai/attestation/cc-conformance/v1` | `evidence/cc_impl.tsv` at the tag | `{"cc_tag", "registry_sha256", "crate_version", "merge_sha"}`: the vendored CC tag (`"v" + VENDORED_CC_VERSION`), `VENDORED_REGISTRY_SHA256` (CC's grammar hash), the Cargo version, and the tagged commit |
 
 There is no sdist: consumers build from the git tag and nothing builds one.
@@ -128,6 +128,39 @@ gh attestation verify evidence/cc_impl.tsv -R CIRISAI/CIRISPersist \
 ```
 
 `verify_release.sh` also runs `scripts/bits_changed.sh` on each desktop wheel (below), against the registry. Its `ok    bits` and `ok    bits (registered)` lines are per target.
+
+From 61.1.0 it also checks each linux debug file (CIRISPersist#1234): `SHA256SUMS` lists it with its sha256 (`ok    sha256sums`), and its GNU build-id is the build-id of the `.so` inside that target's wheel, whose `.gnu_debuglink` names it (`ok    debuginfo`). With `VERIFY_SKIP_WHEELS=1` the build-id match is skipped and says so; the provenance and `SHA256SUMS` checks still run. An older release prints `SKIP  linux debuginfo`.
+
+## Symbolizing persist frames (split debuginfo, CIRISPersist#1234)
+
+The linux wheels ship a stripped `ciris_persist/ciris_persist.abi3.so`, so a profiler sees one opaque frame. Each release from 61.1.0 carries its debug sections as a release asset, one per linux wheel:
+
+```
+ciris_persist-<v>-linux-x86_64.abi3.so.debug
+ciris_persist-<v>-linux-aarch64.abi3.so.debug
+```
+
+Each holds the full symbol table (every function, persist's and its dependencies') and line tables for persist's own code (`-C debuginfo=line-tables-only` on the persist crate only; dependency frames resolve to a function name, without a line). It is listed in the release's `SHA256SUMS` and carries SLSA provenance.
+
+How it is made: the linux wheel is built once, unstripped, and `scripts/split_wheel_debuginfo.py` derives both files from that one link before the wheel is uploaded, signed or registered: `objcopy --only-keep-debug` for the debug file, and `objcopy --strip-all --add-gnu-debuglink=<debug file>` for the `.so` the wheel ships. Both keep the link's GNU build-id. The wheel stays stripped, its registered and attested sha256 is the sha256 of the wheel that ships, and the script refuses to write a wheel whose `.so` still carries `.symtab` or `.debug_*`, whose build-ids differ, or whose loadable segments moved.
+
+A host uses it in one of two ways.
+
+1. By build-id, which perf, gdb, eu-stack and debuginfod clients all read:
+
+   ```
+   so=$(python -c 'import ciris_persist, pathlib; print(next(pathlib.Path(ciris_persist.__file__).parent.glob("*.abi3.so")))')
+   id=$(readelf -n "$so" | sed -n 's/.*Build ID: *//p')
+   gh release download v<v> -R CIRISAI/CIRISPersist -p 'ciris_persist-<v>-linux-x86_64.abi3.so.debug'
+   gh attestation verify ciris_persist-<v>-linux-x86_64.abi3.so.debug -R CIRISAI/CIRISPersist --source-ref refs/tags/v<v>
+   sudo install -D -m0644 ciris_persist-<v>-linux-x86_64.abi3.so.debug "/usr/lib/debug/.build-id/${id:0:2}/${id:2}.debug"
+   ```
+
+   For perf without root, `perf buildid-cache --add ciris_persist-<v>-linux-x86_64.abi3.so.debug` puts it in `~/.debug` under the same id. A debug file whose build-id differs from the `.so`'s is not the companion of that wheel; the tools ignore it.
+
+2. By debuglink: put the file, unrenamed, beside the `.so` (`$(dirname "$so")/`) or in a `.debug/` directory beside it. gdb finds it by the name in `.gnu_debuglink` and checks its CRC.
+
+Then `perf report` / `perf script` and gdb backtraces name persist's functions instead of an offset in `ciris_persist.abi3.so`. Wheels from earlier releases are stripped at link time and have no companion. A wheel rebuilt by `reregister-manifests.yml` is stripped at link time too, so this release's debug file does not match it.
 
 Releases before 53.2.0 carry no attestations. The wheel build clears `target/wheels/` first and selects only `ciris_persist-<v>-*.whl`, so a stale wheel restored from the build cache can never be signed or registered; the hashes of the stale wheels that some 53.x releases registered are listed in `evidence/manifest_remediation/known_stale_hashes.txt`, which the bits-changed gate refuses.
 

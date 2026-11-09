@@ -139,6 +139,18 @@ pub(crate) struct PlannedAttestation {
     /// in the row's transaction, so no objection is ever held without one and
     /// a later row can never set a later start.
     pub(crate) vote_window: Option<(String, chrono::DateTime<chrono::Utc>)>,
+    /// v61.1.0 (CIRISPersist#1220, V199) — a self-roster proposal row's self
+    /// and this node's receipt instant: the window's start, written
+    /// first-seen-wins in the row's transaction, so a failed receipt fails the
+    /// row and no proposal is ever held without its window (the #1198 shape
+    /// for vote windows).
+    pub(crate) self_roster_receipt: Option<(String, chrono::DateTime<chrono::Utc>)>,
+    /// v61.1.0 (CIRISPersist#1218) — the held `withdraws` rows naming this
+    /// row that were admitted deferred (no rule), each with the rule the door
+    /// gives it now that its target is known ([`deferred_withdraws_restamps`]).
+    /// The executor writes each stamp, and the row hash it changes, in this
+    /// row's transaction, then re-indexes each.
+    pub(crate) restamped_withdraws: Vec<RestampedWithdraws>,
     /// The signed-wire-index locator (#507b), federation tier only; the hash
     /// comes from the stored row (#646).
     pub(crate) wire_index_key: Option<String>,
@@ -166,6 +178,96 @@ impl PlannedAttestation {
         }
         super::admission::check_delegation_cycle_admission(graph, &self.row, self.received_at).await
     }
+}
+
+/// v61.1.0 (CIRISPersist#1218) — one deferred `withdraws` stamped when its
+/// target arrives: the rule the write door gives it against the target, and
+/// the row hash that rule makes. The executor's UPDATE is guarded on the row
+/// still being unstamped under the hash the plan read, so a row changed since
+/// is left as it is.
+#[derive(Debug, Clone)]
+pub(crate) struct RestampedWithdraws {
+    /// The `withdraws` row's id.
+    pub(crate) attestation_id: String,
+    /// The rule the door gives it now.
+    pub(crate) rule: u8,
+    /// Its stored `persist_row_hash` when the plan read it.
+    pub(crate) held_persist_row_hash: String,
+    /// Its `persist_row_hash` with the rule stamped.
+    pub(crate) persist_row_hash: String,
+    /// Its signed-wire-index locator (federation tier only), re-derived after
+    /// the commit as the row's own is.
+    pub(crate) wire_index_key: Option<String>,
+}
+
+/// v61.1.0 (CIRISPersist#1218) — **a deferred `withdraws` is decided when its
+/// target arrives.** A `withdraws` whose target was not held was admitted
+/// with no rule (the door could not ask), and the folds and the Live listing
+/// read a missing rule as "not admitted", so the verdict depended on arrival
+/// order: in order, a subject's rule-2 `withdraws` retires its target; the
+/// same rows the other way round left the target Live. For every held
+/// `withdraws` naming `target` that carries no rule, this asks the write door
+/// again, against `target` as it is about to be stored and at the depth the
+/// `withdraws` was admitted under, and returns the stamps to write. A refusal
+/// leaves the row unstamped (it retires nothing, as in order it would not
+/// have been held); a backend failure fails the plan.
+///
+/// Key-plane and group-plane rows are stored by their own doors and never
+/// reach this plan, so a `withdraws` that arrived ahead of one of those is not
+/// stamped here.
+pub(crate) async fn deferred_withdraws_restamps<D>(
+    dir: &D,
+    target: &Attestation,
+) -> Result<Vec<RestampedWithdraws>, Error>
+where
+    D: AttestationStore,
+{
+    let mut out = Vec::new();
+    for mut w in dir
+        .list_attestations_referencing(&target.attestation_id)
+        .await?
+    {
+        if w.attestation_type != super::types::attestation_type::WITHDRAWS
+            || w.withdraws_admission_rule.is_some()
+            || super::precedence::references_attestation_id_from_envelope(&w.attestation_envelope)
+                != Some(target.attestation_id.as_str())
+        {
+            continue;
+        }
+        let depth = dir
+            .withdraws_admission_depth(&w.attestation_id)
+            .await?
+            .unwrap_or(super::admission::MAX_WITHDRAWS_DELEGATION_DEPTH);
+        let rule = match super::admission::check_withdraws_admission_against(dir, &w, target, depth)
+            .await
+        {
+            Ok(Some(rule)) => rule,
+            Ok(None) => continue,
+            Err(e @ Error::Backend(_)) => return Err(e),
+            Err(e) => {
+                tracing::debug!(
+                    withdraws_id = %w.attestation_id,
+                    target_id = %target.attestation_id,
+                    error = %e,
+                    "deferred withdraws not entitled against its arrived target"
+                );
+                continue;
+            }
+        };
+        let held_persist_row_hash = w.persist_row_hash.clone();
+        w.withdraws_admission_rule = Some(rule);
+        let persist_row_hash = super::types::compute_persist_row_hash(&w)?;
+        let wire_index_key = (w.tier == super::types::attestation_tier::FEDERATION)
+            .then(|| super::wire_index::record_key(&[("attestation_id", &w.attestation_id)]));
+        out.push(RestampedWithdraws {
+            attestation_id: w.attestation_id,
+            rule,
+            held_persist_row_hash,
+            persist_row_hash,
+            wire_index_key,
+        });
+    }
+    Ok(out)
 }
 
 /// What the executor's store step found.
@@ -856,8 +958,13 @@ where
     // Information-Type validator: self-emission polarity
     // (`attesting_key_id` ∈ `subject_key_ids`) plus the inline-trace /
     // manifest shape. No-op for every non-`trace:` dimension.
+    // v61.1.0 (CIRISPersist#1174 item 4) — and `trace_summary:*`'s
+    // self-emission half, on the row's family in either form.
     crate::federation::admission::check_trace_dimension_admission(
-        crate::federation::admission::envelope_dimension(&row.attestation_envelope),
+        crate::federation::admission::trace_family_token(
+            &row.attestation_type,
+            crate::federation::admission::envelope_dimension(&row.attestation_envelope),
+        ),
         &row.attesting_key_id,
         &row.subject_key_ids,
         &row.attestation_envelope,
@@ -1103,9 +1210,15 @@ where
     // AFTER the §6.1 dedup (an idempotent replay short-circuits before
     // the walk) and BEFORE persist_row_hash, so a refused withdraws
     // leaves no trace and the recorded rule is covered by the row hash.
-    if let Some(rule) = crate::federation::admission::check_withdraws_admission(dir, &row).await? {
-        row.withdraws_admission_rule = Some(rule);
-    }
+    //
+    // v61.1.0 (CIRISPersist#1218) — the stamp is ALWAYS this door's, never the
+    // offered row's: `withdraws_admission_rule` is persist-local audit
+    // metadata no signature covers, so a peer cannot supply it. A deferred
+    // `withdraws` (its target not held) and every non-`withdraws` row store
+    // it unset; a deferred one is stamped later, in its target's own
+    // transaction ([`deferred_withdraws_restamps`]).
+    row.withdraws_admission_rule =
+        crate::federation::admission::check_withdraws_admission(dir, &row).await?;
 
     // v8.7.1 (CIRISPersist#233, CEG §11.10) — FULL moderation gate for
     // the report→`scores` half (moderation:* / reconsideration:*).
@@ -1362,6 +1475,18 @@ where
         .then(|| dir.withdraws_delegation_depth());
     let cycle_gated = crate::federation::admission::delegation_cycle_gated(&row);
     let vote_window = super::reverse_quorum::objection_action(&row).map(|a| (a, received_at));
+    // v61.1.0 (CIRISPersist#1220, V199) — a proposal row's receipt, on the
+    // door's own clock (`roster_clock`, the instant the after-commit hook
+    // used to read), stored by the executor in the row's transaction.
+    let self_roster_receipt = super::self_roster::is_proposal_row(&row).then(|| {
+        (
+            row.attested_key_id.clone(),
+            super::self_roster::roster_clock(),
+        )
+    });
+    // v61.1.0 (CIRISPersist#1218) — the deferred `withdraws` naming this row,
+    // decided now that it is about to be held.
+    let restamped_withdraws = deferred_withdraws_restamps(dir, &row).await?;
     Ok(AttestationPlan::Insert(Box::new(PlannedAttestation {
         row,
         withdraws_depth,
@@ -1371,6 +1496,8 @@ where
         projected_ledger,
         projected_goal,
         vote_window,
+        self_roster_receipt,
+        restamped_withdraws,
         wire_index_key,
         cycle_gated,
         received_at,
@@ -1522,8 +1649,12 @@ where
         &input.attestation_type,
         &envelope_value,
     )?;
+    // v61.1.0 (CIRISPersist#1174 item 4) — the row's family in either form.
     crate::federation::admission::check_trace_dimension_admission(
-        input.dimension(),
+        crate::federation::admission::trace_family_token(
+            &input.attestation_type,
+            input.dimension(),
+        ),
         &input.attesting_key_id,
         &input.subject_key_ids,
         &envelope_value,
@@ -1565,9 +1696,15 @@ where
     // v57.0.0 (CIRISPersist#988 item 2) — a `hard_case:*` row is written by
     // the substrate's hard_case door alone (`record_hard_case`, attester = the
     // node key), so the projection holds only what that door decided.
-    if super::hard_case::is_hard_case_dimension(&dimension) {
+    //
+    // v61.1.0 (CIRISPersist#1174) — in either form: a row carrying the
+    // `hard_case:` family in its TYPE slot is the same family.
+    let hard_case_token = [input.attestation_type.as_str(), dimension.as_str()]
+        .into_iter()
+        .find(|t| super::hard_case::is_hard_case_dimension(t));
+    if let Some(token) = hard_case_token {
         return Err(Error::InvalidArgument(format!(
-            "{dimension}: a hard_case row is written by the substrate's hard_case door \
+            "{token}: a hard_case row is written by the substrate's hard_case door \
              (record_hard_case), not the local door"
         )));
     }

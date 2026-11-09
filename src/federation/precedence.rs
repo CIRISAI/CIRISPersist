@@ -191,6 +191,11 @@ fn wins(a: &Attestation, b: &Attestation) -> bool {
 /// `withdraws_admission_rule` is `None` for several distinct reasons
 /// (deferred out-of-order admission, malformed, non-`withdraws`), so arm 3
 /// is only ever an ADMITTING arm, never the sole test.
+///
+/// v61.1.0 (CIRISPersist#1218) — the stamp arm 3 reads is always this node's
+/// door's: the door overwrites any offered value, and a deferred `withdraws`
+/// is stamped in its target's transaction when the target arrives
+/// (`attestation_admit::deferred_withdraws_restamps`).
 pub fn retraction_entitled(g: &Attestation, target: &Attestation) -> bool {
     if g.attesting_key_id == target.attesting_key_id {
         return true;
@@ -222,9 +227,67 @@ pub fn retraction_entitled(g: &Attestation, target: &Attestation) -> bool {
     // the subject's path is `withdraws` (rule 2) or a contradicting `scores`.
     // Arms 2 and 3 are `withdraws` entitlements, so they admit `withdraws`
     // only — here, and therefore at the door that runs this predicate.
-    g.attestation_type == attestation_type::WITHDRAWS
-        && (target.subject_key_ids.contains(&g.attesting_key_id)
-            || g.withdraws_admission_rule.is_some())
+    if g.attestation_type != attestation_type::WITHDRAWS {
+        return false;
+    }
+    // v61.1.0 (CIRISPersist#1218, CC 2.4.1.1) — the subject carve-out, in
+    // this fold and not only at the door. The door refuses the subject rules
+    // 2-4 against an adverse class or a cosigned act
+    // ([`subject_withdraws_carved_out`]), but only when the target is held; a
+    // `withdraws` that arrived first was admitted deferred (no rule) and arm 2
+    // below retired the target once both were held, so the answer depended on
+    // arrival order. Here the same predicate leaves only what the door admits
+    // against such a target: the producer (arm 1 above), and a rule the door
+    // stamped that is not a subject rule — 1 (the producer's principal,
+    // `issuer_owned_the_producer_when`) or 5 (the CC 3.2 recovery ceremony).
+    // The two planes whose door decides a `withdraws` before the carve-out is
+    // asked are left to their own rule (see [`withdraws_decided_on_own_plane`]).
+    if subject_withdraws_carved_out(target) && !withdraws_decided_on_own_plane(target) {
+        return matches!(g.withdraws_admission_rule, Some(1 | 5));
+    }
+    target.subject_key_ids.contains(&g.attesting_key_id) || g.withdraws_admission_rule.is_some()
+}
+
+/// v61.1.0 (CIRISPersist#1218; CC 2.4.1.1, CIRISConstitution#164, CC rc15
+/// standing rules) — **does `target` deny the subject-side withdrawal rules
+/// 2-4?** The ONE spelling the write door
+/// ([`resolve_withdraws_admission_rule_at`](super::admission::resolve_withdraws_admission_rule_at))
+/// and the read fold ([`retraction_entitled`]) both ask, so neither can admit
+/// what the other refuses, whatever order the rows arrived in.
+///
+/// True for a row on one of the adverse classes
+/// ([`SUBJECT_WITHDRAWS_CARVE_OUT`](super::admission::SUBJECT_WITHDRAWS_CARVE_OUT):
+/// `capacity:`, `detection:`, `licensure:`, `revocation:`, `moderation:`,
+/// `hard_case:`, `slashing:`, `takedown_notice:`), and for a cosigned act: a
+/// co-signature by a key other than the attester that is not a node's
+/// tier-crossing co-scrub (stamped `cosigned_at`, CC 2.6.7, custody and not a
+/// voice in the act).
+#[must_use]
+pub fn subject_withdraws_carved_out(target: &Attestation) -> bool {
+    let adverse_class = super::admission::envelope_dimension(&target.attestation_envelope)
+        .is_some_and(|d| {
+            super::admission::SUBJECT_WITHDRAWS_CARVE_OUT
+                .iter()
+                .any(|p| d.starts_with(p))
+        });
+    let cosigned_act = target
+        .additional_scrubs
+        .iter()
+        .any(|sc| sc.cosigned_at.is_none() && sc.scrub_key_id != target.attesting_key_id);
+    adverse_class || cosigned_act
+}
+
+/// v61.1.0 (CIRISPersist#1218) — is `target` a row whose `withdraws` the door
+/// decides on its own plane, BEFORE the subject carve-out is asked
+/// (`admission::check_withdraws_admission_at`)? An `identity:occurrence:v1`
+/// row (the identity or a live occurrence of it, rules 1/2/4) and a
+/// group-plane row (a cosigned roster event, retracted under its group's
+/// protocol, rules 1/4). A group-plane row is cosigned by construction
+/// (`additional_scrubs[]` is its quorum carrier), so without this the
+/// carve-out's cosigned arm would void every quorum retraction of one.
+fn withdraws_decided_on_own_plane(target: &Attestation) -> bool {
+    super::group_plane::is_group_plane_row(target)
+        || super::key_plane::occurrence_of_row(target).is_some()
 }
 
 /// v36.0.0 (CIRISPersist#686) — **THE consolidated retraction fold.**

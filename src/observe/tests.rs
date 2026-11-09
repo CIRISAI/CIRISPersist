@@ -207,6 +207,9 @@ const SHARED_FOLD_DOORS: &[(&str, &str)] = &[
         "ListAttestationsNamingByDimension",
         "federation/read_plan.rs",
     ),
+    // v61.1.0 (CIRISPersist#1190, #1163) — the narrowed serve reads' page cut.
+    ("ListAttestationsSinceByPrefixes", "federation/read_plan.rs"),
+    ("ListOwnerBindingsSince", "federation/read_plan.rs"),
 ];
 
 /// v60.0.0 — each shared-fold door is recorded in its fold's file.
@@ -308,6 +311,7 @@ fn i551_samples_carry_exactly_the_catalogued_names_and_labels() {
                 bytes: 1,
             })
             .collect(),
+        callers: Vec::new(),
     };
     let samples = full.samples();
     let names: BTreeSet<&str> = samples.iter().map(|s| s.name).collect();
