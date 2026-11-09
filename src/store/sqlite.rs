@@ -80,6 +80,8 @@ use super::backend::{Backend, InsertReport, PublicKeySample};
 use super::types::{TraceEventRow, TraceLlmCallRow};
 use super::Error;
 use crate::schema::ReasoningEventType;
+// CIRISPersist#1238 — every write transaction begins IMMEDIATE.
+use crate::store::sqlite_conn_model::write_tx;
 
 mod embedded {
     refinery::embed_migrations!("migrations/sqlite/lens");
@@ -235,7 +237,7 @@ fn rewrite_portable_defaults_in_tx(
     fault: Option<RepairFault>,
 ) -> Result<RewriteOutcome, rusqlite::Error> {
     use crate::store::migration_immutability as mi;
-    let tx = conn.transaction()?;
+    let tx = write_tx(conn)?;
     let version: i64 = tx.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
     if fault != Some(RepairFault::SkipWritableSchemaOn) {
         tx.execute_batch("PRAGMA writable_schema = ON")?;
@@ -540,7 +542,7 @@ impl SqliteBackend {
     ) -> Result<usize, Error> {
         let node = node_key_id.map(str::to_owned);
         let n = self.write(move |conn| -> Result<usize, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let mut n = 0usize;
             if let Some(node) = &node {
                 for table in [
@@ -1224,7 +1226,7 @@ impl Backend for SqliteBackend {
 
         let inserted = self
             .write(move |conn| -> Result<usize, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let mut inserted = 0usize;
 
                 // v32.1.0 (CIRISPersist#606) — ONE admission instant for the whole
@@ -1469,7 +1471,7 @@ impl Backend for SqliteBackend {
         let owned: Vec<TraceLlmCallRow> = rows.to_vec();
         let inserted = self
             .write(move |conn| -> Result<usize, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let mut inserted = 0usize;
 
                 const SQL: &str = "INSERT INTO trace_llm_calls (\
@@ -2270,7 +2272,7 @@ impl SqliteBackend {
                 if batch.is_empty() {
                     break;
                 }
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 {
                     let mut up =
                         tx.prepare("UPDATE trace_events SET shard_key = ?1 WHERE event_id = ?2")?;
@@ -3379,7 +3381,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let (deleted, buckets) = self
             .write(
                 move |conn| -> Result<((u64, u64), Vec<String>), rusqlite::Error> {
-                    let tx = conn.transaction()?;
+                    let tx = write_tx(conn)?;
                     let tombstoned: bool = tx
                         .query_row(
                             "SELECT 1 FROM purge_tombstones WHERE plane = 'trace' \
@@ -4822,7 +4824,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let id = attestation_id.to_owned();
         self.write(move |guard| -> Result<(), rusqlite::Error> {
             // One transaction: every projection leaves together.
-            let tx = guard.transaction()?;
+            let tx = write_tx(guard)?;
             tx.execute(
                 "DELETE FROM signed_wire_index WHERE kind = 'Attestation' AND record_key = ?1",
                 rusqlite::params![record_key],
@@ -8119,7 +8121,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let outcome = self
             .write(
                 move |conn| -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
-                    let tx = conn.transaction()?;
+                    let tx = write_tx(conn)?;
 
                     // Live-row gate. removed_at TEXT — IS NULL means live.
                     let live: Option<i64> = tx
@@ -8513,7 +8515,7 @@ async fn sqlite_update_peer_field(
     let outcome = backend
         .write(
             move |conn| -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
 
                 // Fetch live-row tuple; PeerNotFound on missing or
                 // soft-removed.
@@ -9006,7 +9008,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         self.write(move |conn| -> Result<usize, rusqlite::Error> {
             // #848 (§13) — one transaction, a UNION (`DO NOTHING` per row);
             // no blob row is required (order independence).
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let mut inserted = 0usize;
             for w in &wraps {
                 inserted += tx.execute(
@@ -9569,7 +9571,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
             // #848 (§13) — ONE transaction, a UNION: every row is
             // `DO NOTHING` on the key, so nothing already admitted is
             // touched and a re-applied set writes zero rows.
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let mut inserted = 0usize;
             for w in &wraps {
                 inserted += tx.execute(
@@ -10123,7 +10125,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let destroying = state == DekKeyState::Destroyed;
         let enabling = state == DekKeyState::Enabled;
         let applied = self.write(move |conn| -> Result<bool, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let n = if destroying {
                 // v43.0.0 (§11.4) — DESTROY IS ONE STATEMENT, CONDITIONED ON
                 // ZERO BOUND OBJECTS, AND IT DELETES THE KEY. The NOT EXISTS
@@ -10432,7 +10434,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let stamp = now.to_rfc3339();
         let n = self
             .write(move |conn| -> Result<usize, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 tx.execute(
                     "DELETE FROM federation_blob_key_grants WHERE at_rest_sha256 IN ( \
                     SELECT at_rest_sha256 FROM federation_community_blob_epoch \
@@ -11295,7 +11297,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         }
         let out = self
             .write(move |conn| -> Result<Rec, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 for (sha, missing) in [(&root, Rec::RootMissing), (&child, Rec::ChildMissing)] {
                     let is_held: bool = tx.query_row(
                         "SELECT EXISTS (SELECT 1 FROM federation_blobs WHERE sha256 = ?1)",
@@ -11356,7 +11358,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         }
         let out = self
             .write(move |conn| -> Result<Ab, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let head: Option<(Option<String>, Option<String>)> = tx
                     .query_row(
                         "SELECT owner_key_id, abandoned_at FROM federation_streams \
@@ -11660,7 +11662,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
             .collect();
         want.sort();
         self.write(move |conn| -> Result<bool, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let held: Vec<(i64, Vec<u8>)> = {
                 let mut stmt = tx.prepare(
                     "SELECT seq, chunk_sha FROM federation_stream_chunks \
@@ -11796,7 +11798,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         }
         let outcome = self
             .write(move |conn| -> Result<Promote, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let row: Option<(String, String)> = tx
                     .query_row(
                         "SELECT storage_kind, crypto_tier FROM federation_blobs WHERE sha256 = ?1",
@@ -11999,7 +12001,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let manifest_sha = self
             .write(
                 move |conn| -> Result<[u8; 32], crate::federation::BlobError> {
-                    let tx = conn.transaction().map_err(|e| {
+                    let tx = write_tx(conn).map_err(|e| {
                         crate::federation::BlobError::Backend(format!("seal_stream tx: {e}"))
                     })?;
 
@@ -12349,7 +12351,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         );
         let row_opt = self
             .write(move |conn| -> Result<Option<GetBlobRow>, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let row_opt = tx
                     .query_row(
                         "SELECT storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
@@ -12444,7 +12446,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         }
         let outcome = self
             .write(move |conn| -> Result<RangeDecision, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 // 1. Fetch storage_kind + size (+ external metadata) to do the
                 //    bounds check before pulling any bytes.
                 let head_opt = tx
@@ -12570,7 +12572,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // treated as evidence the blob is still hot.
         let now_iso = chrono::Utc::now().to_rfc3339();
         self.write(move |conn| -> Result<bool, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let count: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM federation_blobs WHERE sha256 = ?1",
                 rusqlite::params![sha_vec],
@@ -13230,7 +13232,7 @@ impl SqliteBackend {
         // already held; no key_grant set is re-applied. A tombstone is judged
         // at the read and serve doors (#853), never by deleting a grant here.
         self.write(move |conn| -> Result<usize, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // v52.0.0 (#954) — a v3 root's children die with it (found by
             // the relation, never by opening the root).
             //
@@ -13438,7 +13440,7 @@ impl crate::federation::BlackholeRules for SqliteBackend {
         let outcome = self
             .write(
                 move |conn| -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
-                    let tx = conn.transaction()?;
+                    let tx = write_tx(conn)?;
                     let existing_added_at_text: Option<String> = tx
                         .query_row(
                             "SELECT added_at FROM blackhole_rules WHERE identity_hash = ?1",
@@ -13657,7 +13659,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         let rows = self
             .write(
                 move |conn| -> Result<Vec<crate::outbound::OutboundRow>, rusqlite::Error> {
-                    let tx = conn.transaction()?;
+                    let tx = write_tx(conn)?;
                     let queue_ids: Vec<String> = {
                         let mut stmt = tx.prepare(
                             "SELECT queue_id FROM edge_outbound_queue \
@@ -13751,7 +13753,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         let outcome = self
             .write(
                 move |conn| -> Result<crate::outbound::OutboundFailureOutcome, rusqlite::Error> {
-                    let tx = conn.transaction()?;
+                    let tx = write_tx(conn)?;
                     let (attempt_count, max_attempts, enqueued_at_str, ttl_seconds): (
                         i32,
                         i32,
@@ -13893,7 +13895,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
     async fn sweep_ack_timeouts(&self) -> Result<i64, crate::outbound::Error> {
         let now = chrono::Utc::now();
         self.write(move |conn| -> rusqlite::Result<i64> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // Walk awaiting_ack rows; per-row TTL/timeout checks in Rust
             // (sqlite has no interval arithmetic).
             // (queue_id, transport_delivered_at, ack_timeout_seconds,
@@ -13974,7 +13976,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
     async fn sweep_ttl_expired(&self) -> Result<i64, crate::outbound::Error> {
         let now = chrono::Utc::now();
         self.write(move |conn| -> rusqlite::Result<i64> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // Pull non-terminal rows; check ttl in Rust.
             let candidates: Vec<(String, String, i64)> = {
                 let mut stmt = tx.prepare(
@@ -15024,7 +15026,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         } = planned;
         let attesting_key_id = row.attesting_key_id.clone();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             if replace {
                 // Upsert-replace: drop any prior local row for this
                 // (occurrence, dimension). History is carried by the
@@ -15071,7 +15073,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         planned: crate::federation::attestation_admit::PlannedHardCase,
     ) -> Result<(), crate::federation::Error> {
         self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             sqlite_store_hard_case(&tx, &planned)?;
             tx.commit()
         })
@@ -15104,7 +15106,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         }
         let attester = attester.clone();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let legacy: Vec<crate::federation::HardCaseEvent> = {
                 let mut stmt = tx.prepare(
                     "SELECT event_id, kind, target_key_id, subject_key_id, detail, emitted_at, \
@@ -15212,7 +15214,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         planned: crate::federation::attestation_admit::PlannedDetection,
     ) -> Result<bool, crate::federation::Error> {
         self.write(move |conn| -> Result<bool, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             if sqlite_insert_local_attestation_row(&tx, &planned.row, None)? == 0 {
                 return Ok(false);
             }
@@ -15300,7 +15302,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             };
             let detection_id = body.detection_id.to_string();
             self.write(move |conn| -> Result<(), rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 tx.execute(
                     "DELETE FROM cirislens_derived_detection_events \
                       WHERE detection_id = ?1 AND attestation_id IS NULL",
@@ -15340,7 +15342,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         let node = crate::federation::FederationDirectory::node_key_id(self);
         self.write(
             move |conn| -> Result<crate::federation::silo_projection::ProjectionRebuild, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let (live_table, scratch, order, family) = match projection {
                     SiloProjection::HardCaseEvents => (
                         "hard_case_events",
@@ -15483,7 +15485,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         let sealed = self
             .write(move |conn| -> Result<Option<crate::federation::Attestation>, Error> {
                 let db = |e: rusqlite::Error| Error::Backend(format!("reseal_attestation_v31: {e}"));
-                let tx = conn.transaction().map_err(db)?;
+                let tx = write_tx(conn).map_err(db)?;
                 // The row as it is NOW, inside the transaction that writes it.
                 let found = tx
                     .query_row(
@@ -15610,7 +15612,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         let (member, value) = (member.to_owned(), value.to_owned());
         let at = at.to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
         self.write(move |conn| -> Result<bool, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let gone = tx.execute(
                 "DELETE FROM federation_attestations \
                  WHERE attestation_id = ?1 AND persist_row_hash = ?2",
@@ -15696,7 +15698,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             .write(move |conn| -> Result<bool, rusqlite::Error> {
                 // v50.0.0 (review H2, final check) — ONE transaction for the
                 // row, its projections and its admission depth.
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 // v36.0.0 (#668) — THIS node's serve position (V130).
                 let admitted_at =
                     sqlite_next_plane_position(&tx, "federation_attestations", POS_ATTESTATION)?;
@@ -22289,9 +22291,7 @@ impl SqliteBackend {
     ) -> Result<(), crate::read::Error> {
         let since_text = since.map(|s| s.to_rfc3339());
         self.write(move |conn| -> Result<(), crate::read::Error> {
-            let tx = conn
-                .transaction()
-                .map_err(sqlite_read_err("rollup refresh begin"))?;
+            let tx = write_tx(conn).map_err(sqlite_read_err("rollup refresh begin"))?;
 
             // Re-fold floor: explicit `since`, else watermark - 1h, else
             // all-time (first run). SQLite stores ts as RFC3339 TEXT;
@@ -22742,7 +22742,7 @@ impl crate::derived::DerivedSchema for SqliteBackend {
             // calibration_bundles_one_current makes "at most one
             // current bundle" DB-enforced; the transaction makes the
             // transition race-free.
-            let tx = conn.transaction().map_err(sqlite_derived_err("begin tx"))?;
+            let tx = write_tx(conn).map_err(sqlite_derived_err("begin tx"))?;
             if bundle.is_current {
                 tx.execute(
                     "UPDATE cirislens_derived_calibration_bundles \
@@ -23009,7 +23009,7 @@ impl SqliteBackend {
             .map_err(|e| crate::federation::Error::Backend(format!("rehome key plane: {e}")))?;
         if !keys.is_empty() || !revocations.is_empty() || !occurrences.is_empty() {
             self.write(move |conn| -> Result<(), rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 for key_id in &keys {
                     sqlite_sync_key_record_row(&tx, key_id)?;
                 }
@@ -23159,7 +23159,7 @@ impl crate::federation::group_plane::GroupPlaneStore for SqliteBackend {
         let n = binds.len();
         let linked = self
             .write(move |conn| -> Result<Option<bool>, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let current: Option<Option<String>> = tx
                     .query_row(
                         &format!("SELECT attestation_id FROM {table} WHERE {pk}"),
@@ -23392,7 +23392,7 @@ impl crate::federation::sweep_plan::RoomEvictionStore for SqliteBackend {
         use crate::federation::sweep_plan::RoomEpochRow;
         let stamp = format_ledger_instant(eviction.now);
         self.write(move |conn| -> Result<u64, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let rows: Vec<RoomEpochRow> = {
                 let mut stmt = tx.prepare(
                     "SELECT d.stream_id, d.epoch, d.cohort_scope, d.room_epoch, \
@@ -23465,7 +23465,7 @@ impl super::backend_plan::BackendStore for SqliteBackend {
                 let agent = planned.agent_id_hash.as_str();
                 let key = planned.signature_key_id();
                 let received_s = planned.received_at.to_rfc3339();
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let strings = |sql: &str,
                                p: &[&dyn rusqlite::ToSql]|
                  -> Result<Vec<String>, rusqlite::Error> {
@@ -23600,7 +23600,7 @@ impl super::backend_plan::BackendStore for SqliteBackend {
             )
         });
         self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // The manifest: idempotent. Never evicted.
             tx.execute(
                 "INSERT INTO content_manifest (\
@@ -24030,7 +24030,7 @@ impl crate::federation::directory_admit::DirectoryStore for SqliteBackend {
         let admitted_at = self.next_key_admission_position().await?.to_rfc3339();
         self.write(move |conn| -> Result<(), Error> {
             let (key, meta) = (&planned.key, &planned.meta);
-            let tx = conn.transaction().map_err(db)?;
+            let tx = write_tx(conn).map_err(db)?;
             tx.execute(
                 "INSERT INTO federation_keys (\
                     key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
@@ -24188,7 +24188,7 @@ impl crate::federation::directory_admit::DirectoryStore for SqliteBackend {
                     crate::federation::steward_purge::PurgePutOutcome,
                     rusqlite::Error,
                 > {
-                    let tx = conn.transaction()?;
+                    let tx = write_tx(conn)?;
                     let held: bool = tx
                         .query_row(
                             "SELECT 1 FROM purge_executions WHERE notice_id = ?1",
@@ -24313,7 +24313,7 @@ impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
         let now_iso = chrono::Utc::now().to_rfc3339();
         self.write(
             move |conn| -> Result<Vec<(usize, ItemAppended)>, BlobError> {
-                let mut tx = conn.transaction().map_err(db)?;
+                let mut tx = write_tx(conn).map_err(db)?;
                 // #957 — every floor statement is a cached prepared statement, so
                 // its SQLite VM-step cost can be read back (I286 measures it).
                 let mut steps: u64 = 0;
@@ -24433,7 +24433,7 @@ impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
         let producer = sth.producer_key_id.to_owned();
         let (signature_blob, witness_json) = (sth.signature_blob, sth.witness_json);
         self.write(move |conn| -> Result<Option<Vec<u8>>, BlobError> {
-            let tx = conn.transaction().map_err(db)?;
+            let tx = write_tx(conn).map_err(db)?;
             let inserted = tx
                 .execute(
                     "INSERT INTO federation_stream_sth (\
@@ -24483,7 +24483,7 @@ impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
         let signature_blob = planned.signature_blob;
         let received_at = planned.received_at.to_rfc3339();
         self.write(move |conn| -> Result<ReceiptWrite, BlobError> {
-            let tx = conn.transaction().map_err(db)?;
+            let tx = write_tx(conn).map_err(db)?;
             let published: i64 = tx
                 .query_row(
                     "SELECT COUNT(*) FROM federation_stream_sth \
@@ -24542,7 +24542,7 @@ impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
         let sha_vec = sha256.to_vec();
         let held = self
             .write(move |conn| -> Result<bool, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 // §11.5 / I28 — an announcement never stores; an evicted
                 // binding is an eviction RECORD, not a held row.
                 let held: bool = tx.query_row(
@@ -24594,7 +24594,7 @@ impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
         let r = record.clone();
         self.write(
             move |conn| -> Result<crate::federation::StreamDekRecord, rusqlite::Error> {
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 tx.execute(
                     "INSERT INTO federation_stream_deks \
                         (stream_id, epoch, owner_key_id, cohort_scope, group_key_id, \
@@ -24641,7 +24641,7 @@ impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
         let ep = epoch as i64;
         let wraps = wraps.to_vec();
         self.write(move |conn| -> Result<usize, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let mut inserted = 0usize;
             for w in &wraps {
                 inserted += tx.execute(
@@ -24724,7 +24724,7 @@ impl crate::federation::blob_admit::BlobWriteStore for SqliteBackend {
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             let r = &planned.row;
             let sha_vec = r.sha256.to_vec();
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // v60.1.0 (#1070) — the tombstone again, under the write.
             sqlite_refuse_tombstoned_at_write(&tx, &sha_vec, &planned.tombstones)?;
             // #846 (§5) / #984 (V177) — the row records its author and group;
@@ -24803,7 +24803,7 @@ impl crate::federation::blob_admit::BlobWriteStore for SqliteBackend {
         let held = self
             .write(move |conn| -> Result<bool, rusqlite::Error> {
                 let sha_vec = planned.sha256.to_vec();
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 // §11.5 / I28 — a sealed-tier token announces a row a cascade
                 // already stored and bound; #833 — an evicted binding is an
                 // eviction RECORD, not a bound row. The connection mutex is
@@ -24848,7 +24848,7 @@ impl crate::federation::blob_admit::BlobWriteStore for SqliteBackend {
     ) -> Result<(), crate::federation::BlobError> {
         let now_iso = chrono::Utc::now().to_rfc3339();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             for row in &planned.rows {
                 let sha_vec = row.sha256.to_vec();
                 // v60.1.0 (#1070) — the tombstone again, under the write.
@@ -24889,7 +24889,7 @@ impl crate::federation::blob_admit::BlobWriteStore for SqliteBackend {
             |e: rusqlite::Error| BlobError::Backend(format!("put_dag_manifest_over_held: {e}"));
         let now_iso = chrono::Utc::now().to_rfc3339();
         self.write(move |conn| -> Result<(), BlobError> {
-            let tx = conn.transaction().map_err(db)?;
+            let tx = write_tx(conn).map_err(db)?;
             for (idx, (chunk_sha, size)) in planned.held_chunks.iter().enumerate() {
                 let held: Option<(String, String, i64)> = tx
                     .query_row(
@@ -24947,7 +24947,7 @@ impl crate::federation::blob_admit::BlobWriteStore for SqliteBackend {
         let now_iso = chrono::Utc::now().to_rfc3339();
         self.write(move |conn| -> Result<SealWrite, rusqlite::Error> {
             let p = &planned;
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // #954 — an abandoned stream is never sealed.
             let abandoned: bool = tx
                 .query_row(
@@ -25377,7 +25377,7 @@ impl crate::federation::occurrence_admit::OccurrenceStore for SqliteBackend {
                 // A stale/equal replay is a safe no-op (#418 anti-first-writer).
                 // v36.0.0 (#668) — THIS node's serve position (V130): the INSERT
                 // stamps it and a supersede re-stamps it.
-                let tx = conn.transaction()?;
+                let tx = write_tx(conn)?;
                 let admitted_at = sqlite_next_plane_position(
                     &tx,
                     "federation_identity_occurrences",
@@ -25495,7 +25495,7 @@ impl crate::federation::occurrence_admit::OccurrenceStore for SqliteBackend {
         } = planned;
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             // v36.0.0 (#668) — serve position (V130), unsigned rows only.
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let admitted_at =
                 sqlite_next_plane_position(&tx, "federation_identity_occurrences", POS_ASSERTED)?;
             tx.execute(
@@ -25602,7 +25602,7 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for SqliteBac
                 let members_json = serde_json::to_string(&new_fam.members)
                     .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
                 self.write(move |conn| -> Result<u32, rusqlite::Error> {
-                    let tx = conn.transaction()?;
+                    let tx = write_tx(conn)?;
                     let prior = tx
                         .query_row(
                             "SELECT version, family_key_id, family_name, members, founded_at, \
@@ -25710,7 +25710,7 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for SqliteBac
                     None => None,
                 };
                 self.write(move |conn| -> Result<u32, rusqlite::Error> {
-                    let tx = conn.transaction()?;
+                    let tx = write_tx(conn)?;
                     let prior = tx
                         .query_row(
                             "SELECT version, community_key_id, community_name, members, \
@@ -25894,7 +25894,7 @@ impl crate::federation::family_admit::FamilyStore for SqliteBackend {
             let row = &r.family_membership_revocation;
             // v47.1.0 (CIRISPersist#861) — one transaction, so a repeat leaves
             // NOTHING behind (the serve position included).
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // v36.0.0 (#668) — THIS node's serve position (V130).
             let admitted_at = sqlite_next_plane_position(
                 &tx,
@@ -26048,7 +26048,7 @@ impl crate::federation::accord_admit::AccordStore for SqliteBackend {
             // transaction. IMMEDIATE: the write lock is taken BEFORE the
             // held-digest read, so a second backend on the file waits on the
             // busy timeout instead of failing a read-to-write lock upgrade.
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let tx = write_tx(conn)?;
             // Codex round 4 on PR #1057 — a HELD digest is an idempotent
             // replay, accepted before the claim is asked.
             let held: bool = tx
@@ -26389,7 +26389,7 @@ impl crate::federation::evidence_admit::EvidenceStore for SqliteBackend {
         let claim_namespaces = planned.claim_namespaces.to_string();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             let w = &planned.stored;
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // Idempotent on (peer_id, epoch_id, observed_at_unix_ms).
             tx.execute(
                 "INSERT INTO wholeness_witness_corpus \
@@ -26665,7 +26665,7 @@ impl crate::federation::key_plane::KeyPlaneStore for SqliteBackend {
         let plane_id = plane.attestation_id.clone();
         self.rehome_legacy_key_plane().await?;
         self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // THIS node's admission position (V123), strictly after the last
             // one handed out (`monotonic_admission_instant`), allocated inside
             // the write so the read and the INSERT are one step.
@@ -26779,7 +26779,7 @@ impl crate::federation::key_plane::KeyPlaneStore for SqliteBackend {
         self.rehome_legacy_key_plane().await?;
         let kid = key_id.clone();
         self.write(move |conn| -> Result<Result<(), Error>, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             let position = sqlite_next_key_serve_position(&tx)?.to_rfc3339();
             let rows: usize = match (&planned, &columns) {
                 (P::Insert { record: r, .. }, Some(c)) => {
@@ -27137,7 +27137,7 @@ impl crate::federation::community_admit::CommunityStore for SqliteBackend {
         // under a single lock acquisition: a bump failure after the INSERT
         // must NOT leave a durable un-rotated revocation.
         self.write(move |conn| -> Result<bool, rusqlite::Error> {
-            let tx = conn.transaction()?;
+            let tx = write_tx(conn)?;
             // v36.0.0 (#668) — THIS node's serve position (V130), allocated
             // inside the same transaction as the write.
             let admitted_at = sqlite_next_plane_position(

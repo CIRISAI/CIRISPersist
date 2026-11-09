@@ -33742,7 +33742,14 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
             PyValueError::new_err((token, body.to_string()))
         }
         // Server-fault → RuntimeError (5xx).
-        crate::federation::Error::Backend(_) => PyRuntimeError::new_err(kind),
+        // v61.1.0 (CIRISPersist#1238) — the detail rides the kind. The
+        // `tracing::warn!` above has no subscriber on a PyO3 host, so a
+        // kind-only message left Edge reading `federation_backend` for a
+        // SQLITE_BUSY with nothing to say which. The message still STARTS
+        // with the kind token, and the type is unchanged.
+        crate::federation::Error::Backend(detail) => {
+            PyRuntimeError::new_err(format!("{kind}: {detail}"))
+        }
         // v59.1.2 — carved out of `Backend`: a RuntimeError subclass, the
         // kind and the wait in the message.
         crate::federation::Error::PoolExhausted { .. } => PoolExhausted::new_err(e.to_string()),
@@ -35503,6 +35510,39 @@ async fn build_audit_chain_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **I1662 (CIRISPersist#1238)** — a backend error reaches Python with
+    /// its detail. Before v61.1.0 the message was the bare kind and the detail
+    /// went only to `tracing::warn!`, which has no subscriber on a PyO3 host:
+    /// Edge's SQLITE_BUSY read `federation_backend` and nothing else. The
+    /// type is still `RuntimeError` (and not the `PoolExhausted` subclass), and
+    /// the message still STARTS with the kind, so a host matching
+    /// `str(e).startswith("federation_backend")` still matches.
+    #[test]
+    fn i1662_a_backend_error_carries_its_detail_to_python_1238() {
+        Python::initialize();
+        // The shape the sqlite key-record door raises on a locked file.
+        let detail = "key record write k-1238: database is locked";
+        let e = crate::federation::Error::Backend(detail.to_owned());
+        assert_eq!(e.kind(), "federation_backend");
+        let py_err = federation_err_to_py(e);
+        Python::attach(|py| {
+            assert!(
+                py_err.is_instance_of::<PyRuntimeError>(py),
+                "I1662: still a RuntimeError"
+            );
+            assert!(
+                !py_err.is_instance_of::<PoolExhausted>(py),
+                "I1662: a backend error is not a starved pool"
+            );
+            let text = py_err.value(py).to_string();
+            assert_eq!(text, format!("federation_backend: {detail}"), "I1662");
+            assert!(
+                text.starts_with("federation_backend"),
+                "I1662: led by the kind"
+            );
+        });
+    }
 
     /// v59.1.2 — a starved pool reaches Python as `PoolExhausted`, a
     /// `RuntimeError` subclass (the type the backend arm it was carved from

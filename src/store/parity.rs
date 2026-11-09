@@ -931,9 +931,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // tombstone (NULL the linkage, stamp `erased_at`) both trace-removal doors
     // run inside their transaction. A write; it refuses nothing about input.
     ("sqlite_tombstone_detection_events", Class::Plumbing),
-    // v54.1.0 (Codex round 4 on PR #1057) — Plumbing: the accord proposal's
-    // IMMEDIATE transaction (the write lock before the held-digest read).
-    ("transaction_with_behavior", Class::Plumbing),
+    // v61.1.0 (CIRISPersist#1238) — Plumbing: sqlite's one way to begin a
+    // write transaction, `BEGIN IMMEDIATE` (the write lock before the first
+    // read). It replaced the accord proposal's own `transaction_with_behavior`
+    // (v54.1.0, Codex round 4 on PR #1057) and every deferred `transaction`.
+    ("write_tx", Class::Plumbing),
     ("pg_tombstone_detection_events", Class::Plumbing),
     // v54.1.0 (Codex round 4 sweep) — Plumbing: the orphaned thought-signature
     // cleanup both trace-removal doors run in their transaction.

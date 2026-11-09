@@ -83,6 +83,11 @@ pub mod sqlite_conn_model;
 /// per process: the SQLite genesis scratch and the test constructor.
 #[cfg(feature = "sqlite")]
 pub(crate) mod sqlite_scratch;
+/// v61.1.0 (CIRISPersist#1238): I1660–I1663. Every SQLite write transaction
+/// begins `IMMEDIATE`. The from-disk gate runs under every feature set; the
+/// two-connection witness needs `sqlite`.
+#[cfg(test)]
+mod sqlite_write_tx_1238_invariants;
 #[cfg(feature = "sqlite")]
 pub mod test_backend;
 /// v50.0.0 (PR #921 review) — test-only hooks inside a backend's own door.

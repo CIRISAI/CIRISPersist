@@ -481,7 +481,12 @@ pub(crate) mod bodies {
         let (a, k) = attester(d, tag).await;
         let person = format!("i1572-person-{tag}");
         ts::register_hybrid_key_as(d, &person, &person, it::USER).await;
-        let dims = ["i1572:"];
+        // v61.1.0 (review D13) — the read matches by FAMILY (a `scores` row's
+        // dimension, any other row's type), so the two retyped rows below
+        // keep their type inside a family the read asks for: otherwise their
+        // exclusion would be the family's, not the serve filter's, and the
+        // legs would pass vacuously.
+        let dims = ["i1572:", "holds_bytes:sha256:5a5a5a5a"];
         let kept = put_dim(d, &a, &k, "i1572:k:v1").await;
         let doomed = put_dim(d, &a, &k, "i1572:d:v1").await;
         // Names a PERSON: a tombstone is void for it.
@@ -508,7 +513,7 @@ pub(crate) mod bodies {
         .expect("I1572 the local row is written");
         let table = raw.attestations_table();
         raw.exec(&format!(
-            "UPDATE {table} SET attestation_type = 'i1572x:unregistered' \
+            "UPDATE {table} SET attestation_type = 'i1572:x:unregistered' \
              WHERE attestation_id = '{unregistered}'"
         ))
         .await;

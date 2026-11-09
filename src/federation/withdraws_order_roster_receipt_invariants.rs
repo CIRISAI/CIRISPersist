@@ -730,7 +730,9 @@ pub(crate) mod bodies {
     pub(crate) async fn i1604_a_node_cannot_outrun_its_owner(d: &dyn FederationDirectory, s: &str) {
         use crate::federation::admission::{owner_of, DelegationEdgeFilter};
         for order in [Order::TargetFirst, Order::WithdrawsFirst] {
-            let tag = format!("{s}-{order:?}");
+            // Key ids are canonical lowercase (CC 2.3.2.1): the order's
+            // `Debug` name is folded before it reaches one.
+            let tag = format!("{s}-{order:?}").to_ascii_lowercase();
             let (owner, node) = (format!("i1604-owner-{tag}"), format!("i1604-node-{tag}"));
             ts::register_hybrid_key_as(d, &owner, &owner, identity_type::USER).await;
             ts::register_hybrid_key_as(d, &node, &node, identity_type::NODE).await;

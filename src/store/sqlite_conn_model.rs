@@ -215,6 +215,34 @@ where
     }
 }
 
+// ── the write transaction ─────────────────────────────────────────────────
+
+/// CIRISPersist#1238 — **the one way a SQLite write transaction begins:
+/// `BEGIN IMMEDIATE`.**
+///
+/// rusqlite's `Connection::transaction()` is `BEGIN DEFERRED`: the
+/// transaction takes no lock until its first statement, and a read-then-write
+/// body (`store_planned_key_record` reads `sqlite_next_key_serve_position`,
+/// then INSERTs) holds a SHARED read snapshot when it reaches the write.
+/// SQLite does not run the busy handler for that read-to-write upgrade (a
+/// waiting reader could deadlock the writer it waits on), so when another
+/// PROCESS on the same file holds the write lock the upgrade fails
+/// `SQLITE_BUSY` at once and `busy_timeout = 30000` never applies. Edge saw
+/// every multi-process writer on one file fail in 1–3 ms.
+///
+/// `BEGIN IMMEDIATE` takes the write lock at `BEGIN`, before any read, and a
+/// `BEGIN` that finds the lock held DOES run the busy handler: the second
+/// writer waits up to the busy timeout instead of failing.
+///
+/// Read-only transactions stay deferred (`unchecked_transaction` on the read
+/// door, where the connection is `SQLITE_OPEN_READ_ONLY`). The from-disk gate
+/// `every_sqlite_write_transaction_is_immediate_1238` refuses a bare
+/// `.transaction()` anywhere a rusqlite connection is in scope, and names
+/// each deferred read-only site with its reason.
+pub fn write_tx(conn: &mut Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+}
+
 // ── the classification table and its gate ─────────────────────────────────
 
 /// Which connection a production `fn` in `sqlite.rs` is allowed to reach.
@@ -756,6 +784,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
         ConnClass::HelperWrite,
     ),
     ("sqlite_store_hard_case", ConnClass::HelperWrite),
+    // v61.1.0 (61.1 review H3) — reads the occupant's signer inside the
+    // hard_case write transaction it is handed (a helper over that `tx`).
+    ("sqlite_hard_case_signer", ConnClass::HelperRead),
     ("sqlite_record_hard_case_in_tx", ConnClass::HelperWrite),
     ("sqlite_project_hard_case", ConnClass::HelperWrite),
     ("sqlite_project_detection", ConnClass::HelperWrite),
@@ -993,6 +1024,10 @@ mod gate {
         "VACUUM",
         ".execute(",
         ".transaction(",
+        // CIRISPersist#1238 — the IMMEDIATE write transaction, by the helper
+        // every write body now begins with and by the driver's own spelling.
+        "write_tx(",
+        ".transaction_with_behavior(",
         "execute_batch(",
         // NOT `unchecked_transaction(`: it is the `&Connection` form of
         // BEGIN, and on the reader path the connection is
@@ -1197,6 +1232,164 @@ mod gate {
             }
         }
         assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    // ── I1663 (CIRISPersist#1238): no write runs on a read connection ───
+
+    /// Whether `recv` (blanked text, trailing whitespace trimmed) ends in the
+    /// whole identifier `name`, not the tail of a longer one.
+    fn ends_with_ident(recv: &str, name: &str) -> bool {
+        recv.strip_suffix(name).is_some_and(|head| {
+            !head
+                .chars()
+                .next_back()
+                .is_some_and(|c| c == '_' || c.is_ascii_alphanumeric())
+        })
+    }
+
+    /// Every closure handed to the read door in `code`: the 1-based line of
+    /// the call and the text of its parenthesised argument. Comments and
+    /// string contents are blanked (byte offsets kept) for the parenthesis
+    /// count only; the text returned is `code`'s own, SQL included, so a
+    /// write verb in a string is seen. rustfmt's `self\n.read(` is one call.
+    pub(super) fn read_door_closures(code: &str) -> Vec<(usize, String)> {
+        let blanked = crate::store::pool_checkout_gate::blank(code);
+        let bytes = blanked.as_bytes();
+        let mut out = Vec::new();
+        for door in [".read(", ".read_measured("] {
+            let mut from = 0;
+            while let Some(p) = blanked[from..].find(door) {
+                let at = from + p;
+                from = at + door.len();
+                let recv = blanked[..at].trim_end();
+                if !(ends_with_ident(recv, "self") || ends_with_ident(recv, "backend")) {
+                    continue;
+                }
+                let open = at + door.len() - 1;
+                let mut depth = 0i64;
+                let mut close = None;
+                for (k, &c) in bytes.iter().enumerate().skip(open) {
+                    match c {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(k);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let close = close.unwrap_or_else(|| {
+                    panic!("unbalanced read-door call at byte {at}: the scanner is broken")
+                });
+                let line = code[..at].matches('\n').count() + 1;
+                out.push((line, code[open..=close].to_owned()));
+            }
+        }
+        out.sort_by_key(|(line, _)| *line);
+        out
+    }
+
+    /// **I1663 (the dispatcher half).** The read door hands its closure a
+    /// reader, `SQLITE_OPEN_READ_ONLY` with `query_only = ON`, so a write
+    /// there fails at run time — but only on the run that reaches it. The
+    /// partition above files a whole `fn` by its class and lets a `Write`
+    /// take a read-door pre-check, which means nothing yet asked what runs
+    /// INSIDE that pre-check. This does: no closure handed to `self.read(`,
+    /// `self.read_measured(` or `backend.read(` anywhere in `sqlite.rs`'s
+    /// production text carries a write verb, the write transaction helper or
+    /// a call to a `HelperWrite`.
+    #[test]
+    fn no_read_door_closure_in_sqlite_rs_writes_1238() {
+        // Comment-only lines blanked to empty, so line numbers stay true.
+        let code: String = production_text(&sqlite_rs())
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with("//") {
+                    "\n".to_owned()
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        let closures = read_door_closures(&code);
+        // 237 read-door closures when this gate was written.
+        assert!(
+            closures.len() >= 150,
+            "parser floor: found only {} read-door closures in sqlite.rs",
+            closures.len()
+        );
+        let helper_writes: Vec<&str> = SQLITE_CONN_CLASSES
+            .iter()
+            .filter(|(_, c)| *c == ConnClass::HelperWrite)
+            .map(|(n, _)| *n)
+            .collect();
+        let mut bad = Vec::new();
+        for (line, text) in &closures {
+            if let Some(v) = write_verb_in(text) {
+                bad.push(format!(
+                    "  sqlite.rs:{line} runs `{}` on a reader",
+                    v.trim()
+                ));
+            }
+            let squashed = squash(text);
+            for h in &helper_writes {
+                if squashed.contains(&format!("{h}(")) {
+                    bad.push(format!(
+                        "  sqlite.rs:{line} calls HelperWrite `{h}` on a reader"
+                    ));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "CIRISPersist#1238: {} read-door closure(s) in sqlite.rs write; a reader is \
+             read-only, so the write fails on the first run that reaches it. Move it to \
+             `self.write(…)`:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// I1663 — the closure scanner sees a split call and its SQL, ignores a
+    /// mention in a comment or a string and a receiver that only ends in
+    /// `self`, and returns the whole argument however it nests.
+    #[test]
+    fn the_read_door_closure_scanner_reads_calls_1238() {
+        let planted = "fn f() {\n    let x = self\n        .read(move |conn| {\n            \
+                       conn.execute(\"INSERT INTO t (a) VALUES (?1)\", p(1))\n        })\n        \
+                       .await;\n}\n";
+        let got = read_door_closures(planted);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, 3, "the line of `.read(`");
+        assert!(
+            got[0].1.ends_with("})"),
+            "the whole argument: {:?}",
+            got[0].1
+        );
+        assert_eq!(write_verb_in(&got[0].1), Some("INSERT "));
+
+        let measured =
+            "fn g() { backend.read_measured(|c| c.query_row(\"SELECT 1\", [], |r| r.get(0))) }";
+        let got = read_door_closures(measured);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(write_verb_in(&got[0].1), None, "a SELECT is a read");
+
+        let not_calls = "fn h() {\n    // self.read(|c| c.execute(\"DELETE \"))\n    \
+                         let s = \"self.read(\";\n    myself.read(|c| c.execute(\"DELETE \"));\n}\n";
+        assert!(read_door_closures(not_calls).is_empty());
+
+        // A `)` inside the closure's SQL does not end the argument early.
+        let paren_in_sql = "fn k() { self.read(|c| c.query_row(\"SELECT ')'\", [], f)); self.write(|c| c.execute(\"UPDATE t\")); }";
+        let got = read_door_closures(paren_in_sql);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(
+            write_verb_in(&got[0].1),
+            None,
+            "the write door is not the read door"
+        );
     }
 
     /// The four classes are the whole alphabet; the table may use nothing
@@ -1696,7 +1889,7 @@ mod witnesses {
             backend.run_migrations().await.unwrap();
             backend
                 .write(move |conn| -> rusqlite::Result<()> {
-                    let tx = conn.transaction()?;
+                    let tx = super::write_tx(conn)?;
                     for k in ["bench-attester", "occ"] {
                         tx.execute(
                             "INSERT INTO federation_keys (\
