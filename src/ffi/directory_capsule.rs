@@ -6491,10 +6491,6 @@ mod tests {
         ("list_settled_self_roster_proposals", INHERITED_DEFAULT),
         ("settle_self_roster_proposal", INHERITED_DEFAULT),
         (
-            "note_vote_window",
-            "node-local receipt; a proxy has no store of its own, and the fold reads the action's signed instant",
-        ),
-        (
             "vote_window_first_held",
             "node-local receipt; a proxy has no store of its own, and the fold reads the action's signed instant",
         ),

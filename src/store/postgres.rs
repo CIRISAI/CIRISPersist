@@ -12193,27 +12193,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
-    async fn note_vote_window(
-        &self,
-        action_id: &str,
-        first_held_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        // V213 — first-held wins.
-        client
-            .execute(
-                "INSERT INTO cirislens.federation_vote_windows (action_id, first_held_at) \
-                 VALUES ($1, $2) ON CONFLICT (action_id) DO NOTHING",
-                &[&action_id, &first_held_at],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("vote window: {e}")))?;
-        Ok(())
-    }
-
     async fn vote_window_first_held(
         &self,
         action_id: &str,

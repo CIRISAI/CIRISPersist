@@ -725,7 +725,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v59.0.0 (#1099) — the V199 self-roster receipts.
     ("note_self_roster_proposal", ConnClass::Write),
     // CIRISPersist#1198 — the V213 vote windows.
-    ("note_vote_window", ConnClass::Write),
     ("vote_window_first_held", ConnClass::Read),
     // v59.0.0 (sealed-transport floor) — the eager key-plane rehome at open.
     ("rehome_key_plane_at_open", ConnClass::Read),

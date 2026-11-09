@@ -4160,6 +4160,52 @@ pub(crate) mod test_support {
         .expect("register user key");
     }
 
+    /// CIRISPersist#1198 (V213) — hold `objection` exactly as the live door's
+    /// `put_attestation` holds it (the shared plan, `WriteOrigin::Wire`, then
+    /// this backend's executor), except that THIS node's receipt instant is
+    /// `received_at` instead of the door's clock read. The window is not
+    /// seeded: the plan derives it from the row (`objection_action`) and the
+    /// executor writes it, insert-if-absent, in the row's own transaction. So
+    /// a window held earlier still wins, and every admission gate (the
+    /// signed-instant skew bound against `received_at` included) still runs.
+    ///
+    /// This is how a witness back-dates a window now that no trait method
+    /// writes one (`note_vote_window` was removed: a host-writable window
+    /// start is the clock CC's ruling on #1198 forbids).
+    pub(crate) async fn hold_objection_at<D>(
+        dir: &D,
+        objection: &Attestation,
+        received_at: DateTime<Utc>,
+    ) where
+        D: crate::federation::attestation_admit::AttestationStore,
+    {
+        use crate::federation::attestation_admit as aa;
+        let plan = aa::plan_put_attestation(
+            dir,
+            crate::federation::SignedAttestation {
+                attestation: objection.clone(),
+            },
+            &crate::federation::replication::admission::WriteOrigin::Wire,
+            aa::PlanInstants {
+                fold_at: objection.asserted_at,
+                received_at,
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("hold_objection_at: the plan admits the objection: {e}"));
+        let aa::AttestationPlan::Insert(planned) = plan else {
+            panic!("hold_objection_at: expected an insert plan (is the objection already held?)");
+        };
+        assert_eq!(
+            planned.vote_window.as_ref().map(|(_, at)| *at),
+            Some(received_at),
+            "hold_objection_at: the plan opens the window at this node's receipt"
+        );
+        dir.store_planned_attestation(*planned)
+            .await
+            .unwrap_or_else(|e| panic!("hold_objection_at: the executor stores it: {e}"));
+    }
+
     /// A federation-tier row carrying `envelope`, authored + scrubbed by
     /// `author`, about `subject`. `co_signers` add REAL additional scrubs over
     /// the SAME canonical envelope — the m-of-n input.
@@ -4302,11 +4348,17 @@ pub(crate) mod test_support {
     ///   on the passed deadline, the respondent pool dismisses the objection
     ///   3-to-1, and the removal STANDS — its uphold counted only as one
     ///   respondent ballot.
-    pub(crate) async fn exercise_node_bearing_founder_is_no_reverse_quorum_duty_holder(
-        dir: &dyn FederationDirectory,
+    ///
+    /// Generic over the backend (CIRISPersist#1198): the objection is held
+    /// through [`hold_objection_at`], so this node's window opens at `t`.
+    pub(crate) async fn exercise_node_bearing_founder_is_no_reverse_quorum_duty_holder<D>(
+        store: &D,
         suffix: &str,
-    ) {
+    ) where
+        D: crate::federation::attestation_admit::AttestationStore,
+    {
         use crate::federation::tier_ingest::test_support as ts;
+        let dir: &dyn FederationDirectory = store;
         let node_identity = format!("p3node-{suffix}");
         ts::register_hybrid_key_as(
             dir,
@@ -4413,8 +4465,6 @@ pub(crate) mod test_support {
                 action_id: &row_hash,
                 asserted_at: t,
             };
-            // This node first held it at `t`: the window has run.
-            dir.note_vote_window(&row_hash, t).await.expect("window");
             let o = signed_row(
                 &uuid::Uuid::new_v4().to_string(),
                 &objector,
@@ -4423,6 +4473,21 @@ pub(crate) mod test_support {
                 t + Duration::seconds(10),
                 &[],
             );
+            // This node first held the objection at `t`: the window has run.
+            // The receipt is the executor's, written with the row (V213).
+            hold_objection_at(store, &o, t).await;
+            // Stored at the substrate's microsecond resolution.
+            let held = dir
+                .vote_window_first_held(&row_hash)
+                .await
+                .expect("window")
+                .expect("the objection opened this node's window");
+            assert!(
+                (held - t).num_microseconds().is_some_and(|d| d.abs() <= 1),
+                "({suffix}) P3 {leg}: the window opened at t, got {held}"
+            );
+            // The door re-offered the held row: its gates still run, and it
+            // reports the objection recorded.
             assert!(
                 matches!(
                     record_objection_against(dir, &o, action)
@@ -5360,11 +5425,12 @@ pub(crate) mod test_support {
     /// carrying the duty, and that person is asleep.
     #[allow(clippy::too_many_lines)]
     #[cfg(feature = "sqlite")]
-    pub(crate) async fn exercise_escalation_on_silence(
-        dir: &dyn FederationDirectory,
-        suffix: &str,
-    ) {
+    pub(crate) async fn exercise_escalation_on_silence<D>(store: &D, suffix: &str)
+    where
+        D: crate::federation::attestation_admit::AttestationStore,
+    {
         use crate::federation::attestation_query::test_support::AllAttestations as _;
+        let dir: &dyn FederationDirectory = store;
         let founder = format!("esc-founder-{suffix}");
         let members: Vec<String> = (0..7).map(|i| format!("esc-m{i}-{suffix}")).collect();
         // The actor is a MEMBER — the recusal cases only exist when the person
@@ -5392,8 +5458,6 @@ pub(crate) mod test_support {
         let action = seed(dir, &community, &actor, &roster, &action_id, protocol).await;
         let t0 = action.asserted_at;
         let deadline = t0 + Duration::seconds(4200);
-        // This node first held it then: the instants below are the window's.
-        dir.note_vote_window(&action_id, t0).await.expect("window");
         let after = deadline + Duration::seconds(3600);
 
         let fold = |a: Attestation, when: DateTime<Utc>| {
@@ -5421,17 +5485,30 @@ pub(crate) mod test_support {
             Utc::now(),
             &[],
         );
+        // This node first held the objection at the action's instant: the
+        // instants below are the window's. The receipt is the executor's,
+        // written with the row (V213); the door then re-offers the held row,
+        // every one of its gates running.
+        hold_objection_at(store, &o1, t0).await;
         assert_eq!(
             record_objection(dir, &o1).await.expect("record"),
             ObjectionOutcome::Admitted,
             "({suffix}) the 1-of-N protective door is untouched by #591"
         );
+        assert_eq!(
+            dir.vote_window_first_held(&action_id)
+                .await
+                .expect("window"),
+            Some(t0),
+            "({suffix}) the first objection opened this node's window at its receipt"
+        );
         let early = fold(action.clone(), t0 + Duration::seconds(1)).await;
         assert_eq!(
             early.steward_deadline,
             Some(deadline),
-            "({suffix}) the deadline is the action's asserted_at + both declared \
-             windows and nothing else — no objector can move it"
+            "({suffix}) the deadline is this node's first-held instant (here the \
+             action's) + both declared windows and nothing else — no objector \
+             can move it"
         );
         let e_early = &early.escalation[0];
         assert_eq!(e_early.steward, StewardTierStanding::Awaiting, "({suffix})");

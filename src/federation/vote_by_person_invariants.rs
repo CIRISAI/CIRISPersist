@@ -66,7 +66,7 @@ pub(crate) mod bodies {
         found_community, found_family, found_public_room, reg,
     };
     use crate::federation::reverse_quorum::test_support::{
-        register_user_key, seed_community, signed_row,
+        hold_objection_at, register_user_key, seed_community, signed_row,
     };
     use crate::federation::reverse_quorum::{
         ballot_envelope, dismissal_envelope, objection_envelope, record_objection_against,
@@ -969,12 +969,20 @@ pub(crate) mod bodies {
     }
 
     /// **I1537 (two nodes)** — one tally, each node's own tier, and they
-    /// converge. The rows are the same; `early` first held them a day ago.
-    pub(crate) async fn i1537b_the_tally_is_shared_the_tier_is_not(
-        early: &dyn FederationDirectory,
+    /// converge. The rows are the same; `early` first held the objection the
+    /// moment it was signed (nearly two hours ago), `late` only now.
+    ///
+    /// `early` is generic over the backend (CIRISPersist#1198): its receipt
+    /// instant is chosen through the attestation executor
+    /// ([`hold_objection_at`]), the one writer of a window.
+    pub(crate) async fn i1537b_the_tally_is_shared_the_tier_is_not<E>(
+        early_store: &E,
         late: &dyn FederationDirectory,
         tag: &str,
-    ) {
+    ) where
+        E: crate::federation::attestation_admit::AttestationStore,
+    {
+        let early: &dyn FederationDirectory = early_store;
         let [f, p, q, r, actor] = ["f", "p", "q", "r", "actor"].map(|n| format!("{tag}-{n}"));
         let room = format!("{tag}-room");
         let action_id = crate::federation::wire_index::content_hash_of_bytes(tag.as_bytes());
@@ -989,16 +997,23 @@ pub(crate) mod bodies {
         let objection = objection_row(&c, &q, &c.objection, action_at + Duration::minutes(5));
         c.objection = objection.attestation_id.clone();
         let ballot = c.ballot(&p, false, ms(Utc::now()));
-        early
-            .note_vote_window(&c.action_id, Utc::now() - Duration::days(1))
-            .await
-            .expect("window");
-        for d in [early, late] {
+        for (d, is_early) in [(early, true), (late, false)] {
             for k in [&f, &p, &q, &r, &actor] {
                 register_user_key(d, k).await;
             }
             let seats = [&f, &p, &q, &r, &actor].map(|k| k.clone());
             seed_community(d, &room, &seats, ESCALATING).await;
+            if is_early {
+                // `early` held the objection when it was signed: its window
+                // opened then, and has run. The door below re-offers the held
+                // row, every gate running.
+                hold_objection_at(early_store, &objection, objection.asserted_at).await;
+                assert_eq!(
+                    early.vote_window_first_held(&c.action_id).await.unwrap(),
+                    Some(objection.asserted_at),
+                    "I1537: early's window opened at its receipt"
+                );
+            }
             record_objection_against(d, &objection, c.action())
                 .await
                 .expect("door");

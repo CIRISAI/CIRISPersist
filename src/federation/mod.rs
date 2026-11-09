@@ -5665,23 +5665,12 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
-    /// CIRISPersist#1198 (V213; CC's ruling on the ticket) — record that this
-    /// node first held a vote on `action_id` at `first_held_at` (THIS node's
-    /// clock: the window's start). Insert-if-absent: the first instant stands,
-    /// so a window closes and never reopens.
-    async fn note_vote_window(
-        &self,
-        action_id: &str,
-        first_held_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), Error> {
-        let _ = (action_id, first_held_at);
-        Err(Error::Unsupported {
-            method: "note_vote_window",
-        })
-    }
-
-    /// CIRISPersist#1198 (V213) — the instant [`Self::note_vote_window`] held
-    /// for `action_id`, if any.
+    /// CIRISPersist#1198 (V213; CC's ruling on the ticket) — the instant this
+    /// node first held a vote on `action_id` (THIS node's clock: the steward
+    /// window's start), if any. There is no writer on this trait: the receipt
+    /// is written only by the attestation plan's executor, in the transaction
+    /// of the first objection naming `action_id`, insert-if-absent, so the
+    /// first instant stands and a window closes and never reopens.
     async fn vote_window_first_held(
         &self,
         action_id: &str,

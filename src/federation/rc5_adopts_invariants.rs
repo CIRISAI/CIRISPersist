@@ -808,12 +808,16 @@ pub mod bodies {
 
     /// **#925 review M2/P3** — `node_bearing_founder_is_no_reverse_quorum_duty_holder`:
     /// the body lives beside the reverse-quorum fold's own witnesses (it needs
-    /// their signed-row and objection helpers).
-    pub async fn node_bearing_founder_is_no_reverse_quorum_duty_holder(
-        d: &dyn FederationDirectory,
+    /// their signed-row and objection helpers). Generic over the backend
+    /// (CIRISPersist#1198): it holds its objection through the attestation
+    /// executor at a chosen receipt instant, so this node's window has run.
+    pub(crate) async fn node_bearing_founder_is_no_reverse_quorum_duty_holder<D>(
+        d: &D,
         tag: &str,
         _host: &str,
-    ) {
+    ) where
+        D: crate::federation::attestation_admit::AttestationStore,
+    {
         crate::federation::reverse_quorum::test_support::exercise_node_bearing_founder_is_no_reverse_quorum_duty_holder(
             d, tag,
         )
@@ -2346,8 +2350,11 @@ mod runners {
                             // own node (its key is the member's).
                             let host = format!("human-{}-{}", stringify!($name), s);
                             d.set_node_key_id(host.clone());
+                            // `&d` coerces to `&dyn FederationDirectory` for
+                            // the dyn bodies; a body generic over the backend
+                            // (`AttestationStore`) takes it as itself.
                             super::super::bodies::$name(
-                                &d as &dyn FederationDirectory,
+                                &d,
                                 &format!("{}-{}", stringify!($name), s),
                                 &host,
                             )
