@@ -168,6 +168,7 @@ arrived (CC 2.4.1.1, CIRISPersist#1218).
 | I1531, I1534b, I1538 | `vote_by_person_invariants.rs` | sqlite+pg, pure | Vote rows in any order fold to one count |
 | I1486 `i1486_rows_replicate` | `group_plane_invariants.rs` | sqlite+pg | A second node fed only the first node's rows folds the same record and roster, and its projections rebuild byte-equal |
 | I1139 `i1139_two_nodes_land_alike` | `self_roster_invariants.rs` | sqlite+pg | Two nodes land the same self-roster |
+| I1710–I1712 `i1710_every_holder_reaches_one_roster`, I1713 `i1713_a_backdated_add_is_decided_on_the_roster_now` | `self_roster_invariants.rs` | sqlite+pg | Three holders of one self's rows (in order, a fresh node fed the stream, a late joiner that held its own row first) reach one roster, the late joiner after its own window; an addition backdated to a one-key roster is decided on the roster as it stands (CIRISPersist#1159) |
 | I165 `i165_order_does_not_matter` | `src/federation/room_roster_invariants.rs` | sqlite+pg | Room roster events admit in every order |
 | I656 `i656_the_tombstone_replicates_re_verified`, I697 `i697_a_tombstone_never_reaches_the_accountability_record` | `steward_purge_invariants.rs` | sqlite+pg | A tombstone replicates and is re-verified. Replication order cannot purge the accountability record |
 | `the_fold_is_invariant_under_every_permutation_of_the_roots` | `src/federation/mesh_config.rs` | pure | The mesh fold is the same in every order of its roots |
