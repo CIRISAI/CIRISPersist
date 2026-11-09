@@ -1626,7 +1626,8 @@ no defense — the adversary hashes their own forgery. The corpus is kept for
 posterity, so it outlives the classical primitive.
 
 **Mitigation (#225)**: on `VerifyMode::Full`,
-`IngestPipeline::verify_complete_trace` verifies **both** signature halves
+`ingest::verify_trace_for_admission` (since v61.1.0, #1239; also the
+`Engine.verify_trace` dry-run) verifies **both** signature halves
 via `verify_hybrid` (`HybridPolicy::Strict`) — `verify_trace_hybrid` replaces
 the Ed25519-only `verify_trace`. A Full-mode classical-only trace (missing
 the ML-DSA-65 half) is **rejected at admission** (`Verify(HybridRequired)`,

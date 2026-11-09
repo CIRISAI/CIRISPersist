@@ -727,7 +727,13 @@ where
                 for event in &env.events {
                     match event {
                         BatchEvent::CompleteTrace { trace, .. } => {
-                            self.verify_complete_trace(trace, &body_sha256).await?;
+                            verify_trace_for_admission(
+                                self.backend,
+                                trace,
+                                &body_sha256,
+                                self.canonicalizer,
+                            )
+                            .await?;
                             signatures_verified += 1;
                         }
                     }
@@ -1417,227 +1423,254 @@ where
         // Safe: just populated above when the key didn't match.
         Ok(&cache.as_ref().expect("writer admission populated").1)
     }
+}
 
-    async fn verify_complete_trace(
-        &self,
-        trace: &CompleteTrace,
-        body_sha256: &str,
-    ) -> Result<(), IngestError> {
-        let key_id = &trace.signature_key_id;
-        // v18.0.0 (#473) — fully-qualified: the pipeline's B is now bound by
-        // BOTH `Backend` and `FederationDirectory`, which each expose a
-        // `lookup_public_key`. The verify path wants the store-trait one
-        // (unchanged pre-18.0 semantics).
-        let lookup = Backend::lookup_public_key(self.backend, key_id)
-            .await
-            .map_err(IngestError::Store)?;
+/// v61.1.0 (CIRISPersist#1239, CC 5.3.2.4.3.1) — **the canonicalizer a
+/// trace's signature is checked under, resolved from the trace's own SIGNED
+/// schema epoch.**
+///
+/// One expression:
+/// [`canonicalizer_for`](crate::verify::canonical::canonicalizer_for) over
+/// [`canon_version_for_trace_schema`](crate::verify::ed25519::canon_version_for_trace_schema)
+/// (major ≥ 3 ⇒ RFC 8785 JCS, else Python-compat). Signed-bytes-bound, not
+/// caller-selectable (#176): `trace_schema_version` is inside the signed
+/// bytes, so a forged epoch changes the canonical and fails the signature.
+///
+/// Until v61.1.0 this lived in `src/ffi/pyo3.rs` as a "seam" spelling the
+/// same expression ingest used, for `Engine.verify_trace`. It moved here
+/// because the dry-run no longer chooses a canonicalizer at all: it calls
+/// [`verify_trace_for_admission`], which calls this.
+///
+/// # GIL
+///
+/// Returns a `&'static dyn Canonicalizer`; `Canonicalizer` is `Send + Sync`,
+/// and neither arm touches CPython (`PythonJsonDumpsCanonicalizer` names the
+/// OUTPUT FORMAT it emulates; `JcsCanonicalizer` delegates to
+/// `ciris_verify_core::jcs`), so `Engine.verify_trace` runs it with the GIL
+/// released (CIRISPersist#580).
+pub(crate) fn trace_canonicalizer(schema_version: &str) -> &'static dyn Canonicalizer {
+    crate::verify::canonical::canonicalizer_for(
+        crate::verify::ed25519::canon_version_for_trace_schema(schema_version),
+    )
+}
 
-        let key = match lookup {
-            Some(k) => k,
-            None => {
-                // v0.1.17 — verify-unknown-key breadcrumb
-                // (CIRISPersist#6). When the backend reports
-                // `Ok(None)` for a key the agent claims to have
-                // signed under, surface lookup-time observables.
-                let sample = self.backend.sample_public_keys(5).await.ok();
-                tracing::warn!(
-                    envelope_signer_id = %key_id,
-                    looked_up_id_bytes_hex = %hex::encode(key_id.as_bytes()),
-                    looked_up_id_byte_len = key_id.len(),
-                    wire_body_sha256 = %body_sha256,
-                    accord_public_keys_size = ?sample.as_ref().map(|s| s.size),
-                    accord_public_keys_sample = ?sample.as_ref().map(|s| &s.sample),
-                    "ciris-persist: verify_unknown_key — lookup miss"
-                );
-                return Err(IngestError::Verify(VerifyError::UnknownKey(key_id.clone())));
-            }
+/// v61.1.0 (CIRISPersist#1239, CC 5.3.2.4.3.1) — **step 2 of
+/// [`IngestPipeline::receive_and_persist_with`]: the verify a
+/// [`VerifyMode::Full`] trace must pass before anything is written.** It is
+/// also the whole of `Engine.verify_trace`, the dry-run, so the two give one
+/// verdict for one trace because they run one function.
+///
+/// In order: resolve the Ed25519 key by `signature_key_id` through
+/// [`Backend::lookup_public_key`] (a miss is `verify_unknown_key`); choose the
+/// canonicalizer by [`trace_canonicalizer`]; resolve the ML-DSA-65 key from
+/// the federation directory by `pqc_key_id` when the trace carries a PQC
+/// signature (#789; a missing or unresolvable one is `verify_unknown_key`);
+/// verify both halves through
+/// [`verify_trace_hybrid`](crate::verify::ed25519::verify_trace_hybrid) under
+/// [`HybridPolicy::Strict`](crate::verify::HybridPolicy::Strict). A trace with
+/// no PQC half is refused `verify_hybrid_required` (the #225 hard cut); any
+/// other hybrid failure is `verify_hybrid_failed`.
+///
+/// Until v61.1.0 the dry-run called `verify_trace_via_directory`, which
+/// checked the Ed25519 half only, so it accepted a classical-only trace this
+/// function refuses. CC 5.3.2.4.3.1 has no classical-only accommodation on a
+/// federation-tier object.
+///
+/// `body_sha256` and `diag_canonicalizer` feed only the refusal breadcrumbs
+/// (`tracing::warn!`); neither changes the verdict. Reads only: nothing is
+/// written, so a dry-run caller stores nothing.
+pub(crate) async fn verify_trace_for_admission<B, D>(
+    backend: &B,
+    trace: &CompleteTrace,
+    body_sha256: &str,
+    diag_canonicalizer: &D,
+) -> Result<(), IngestError>
+where
+    B: Backend + crate::federation::FederationDirectory + ?Sized,
+    D: Canonicalizer + ?Sized,
+{
+    let key_id = &trace.signature_key_id;
+    // v18.0.0 (#473) — fully-qualified: the pipeline's B is now bound by
+    // BOTH `Backend` and `FederationDirectory`, which each expose a
+    // `lookup_public_key`. The verify path wants the store-trait one
+    // (unchanged pre-18.0 semantics).
+    let lookup = Backend::lookup_public_key(backend, key_id)
+        .await
+        .map_err(IngestError::Store)?;
+
+    let key = match lookup {
+        Some(k) => k,
+        None => {
+            // v0.1.17 — verify-unknown-key breadcrumb
+            // (CIRISPersist#6). When the backend reports
+            // `Ok(None)` for a key the agent claims to have
+            // signed under, surface lookup-time observables.
+            let sample = backend.sample_public_keys(5).await.ok();
+            tracing::warn!(
+                envelope_signer_id = %key_id,
+                looked_up_id_bytes_hex = %hex::encode(key_id.as_bytes()),
+                looked_up_id_byte_len = key_id.len(),
+                wire_body_sha256 = %body_sha256,
+                accord_public_keys_size = ?sample.as_ref().map(|s| s.size),
+                accord_public_keys_sample = ?sample.as_ref().map(|s| &s.sample),
+                "ciris-persist: verify_unknown_key — lookup miss"
+            );
+            return Err(IngestError::Verify(VerifyError::UnknownKey(key_id.clone())));
+        }
+    };
+
+    // v0.1.18 — verify_signature_mismatch breadcrumb. Mirrors
+    // the v0.1.17 unknown-key breadcrumb on the canonicalization-
+    // failure branch. Both 9-field spec AND 2-field legacy were
+    // tried in `verify_trace` and neither verified. Surfaces:
+    //
+    // - wire_body_sha256: joins lens-side body_sha256_prefix
+    // - canonical_9field_sha256 / canonical_2field_sha256: hex
+    //   sha256 of each canonical-bytes shape persist computed
+    // - canonical_*_bytes_len: length, easy eyeball
+    // - signature_b64_prefix: first 16 chars of the agent's
+    //   signature for cross-correlation against capture logs
+    //
+    // The diagnostic computation is best-effort. If
+    // canonicalization itself fails (which is essentially
+    // impossible — same code path verify_trace just exercised
+    // and bubbled SignatureMismatch from), we still emit the
+    // warn with `None` for the canonical fields and return
+    // the typed SignatureMismatch error.
+    // v4.6 (#176) — select the canonicalizer by the trace's SIGNED
+    // schema epoch (Python-compat 1.x/2.x, JCS 3.x+), not the
+    // struct's injected default. Signed-bytes-bound, not
+    // caller-selectable. (The caller's `diag_canonicalizer` remains
+    // the best-effort diagnostic canonicalizer below; in production
+    // it equals the gate's V1 result for current 1.x/2.x traffic.)
+    let canon = trace_canonicalizer(trace.trace_schema_version.as_str());
+    // v7.2.0 (CIRISPersist#225) — the trace-tier hybrid HARD CUT.
+    // In ingest this runs only for VerifyMode::Full (the
+    // TrustPreVerified / `2.7.legacy` carve-out skips step 2 entirely
+    // upstream in `receive_and_persist_with`); `Engine.verify_trace`
+    // always runs it (#1239). We verify BOTH halves
+    // via `verify_trace_hybrid` under `HybridPolicy::Strict`: a
+    // classical-only trace (`signature_ml_dsa_65 == None`) is
+    // REJECTED AT ADMISSION — no `require_hybrid: false` posture
+    // (CEG 1.0-RC7 §10.1.5.1.1 + CIRISVerify#75; HNDL forge-later on
+    // the durable, replicated, kept-for-posterity corpus).
+    //
+    // The Ed25519 pubkey came from `accord_public_keys`
+    // (`lookup_public_key` above); that directory is Ed25519-only, so
+    // the producer's ML-DSA-65 pubkey rides the trace envelope
+    // (`trace.pubkey_ml_dsa_65`) and is bound into the hybrid verify.
+    //
+    // Ordering invariant (MISSION §4, AV-9): this is step 2,
+    // verify-before-mutation; it MUST NOT be reordered behind dedup
+    // (dedup-first would be a suppression/probe oracle). The
+    // throughput lever is the per-batch verify loop, NOT dedup-first.
+    let ed25519_pubkey_b64 = BASE64.encode(key.to_bytes());
+    // CIRISPersist#789 — the PQC pubkey comes from the DIRECTORY, by
+    // `pqc_key_id`. It is not read off the payload, and there is no
+    // fallback to the payload's copy.
+    //
+    // THE ASYMMETRY THIS CLOSES. The Ed25519 half above is resolved
+    // through `lookup_public_key` — a key this node already vouches for.
+    // The PQC half was taken from the trace itself, so one leg proved "a
+    // key the directory vouches for signed this" and the other proved only
+    // "the keypair named in this payload signed this payload", which any
+    // submitter can satisfy by generating one. A hybrid verify is only as
+    // strong as its weakest identity binding, so the PQC leg was carrying
+    // post-quantum durability and no present identity assurance at all.
+    //
+    // FAIL-CLOSED, with no warn-then-enforce step. A missing `pqc_key_id`,
+    // an unresolvable one, or a directory row without a PQC pubkey is a
+    // REFUSAL. A fallback would leave the gate bypassable by omitting a
+    // field — the caller would choose which key verifies them, which is
+    // the property being removed. The usual argument for a soft landing
+    // (an unregistered producer goes dark on deploy) does not apply here:
+    // the fleet is 100% PQC, so there is no unregistered-producer
+    // population to migrate, and a warn period would only preserve the
+    // bypass for whoever wanted it.
+    //
+    // ORDERING PRESERVED. This is a READ placed before the verify it
+    // feeds, so step 2 remains verify-before-mutation; nothing is
+    // reordered behind dedup and no suppression/probe oracle is created.
+    // ONLY for a trace that actually carries a PQC half.
+    //
+    // A classical-only trace must still be refused by the #225 hard cut
+    // with `HybridRequired` — that refusal is a documented contract with
+    // its own tests and its own operator meaning ("this producer sent
+    // classical-only; it must not"). Resolving the key first made a
+    // classical-only trace fail as `UnknownKey` instead, which is a true
+    // statement about a missing key and the WRONG answer to the question
+    // the operator is actually asking. A refusal's identity is part of its
+    // contract, so the hard cut keeps its own error and this lookup runs
+    // only where a PQC signature exists to verify.
+    let pqc_pubkey_b64 = if trace.signature_ml_dsa_65.is_some() {
+        let Some(pqc_key_id) = trace.pqc_key_id.as_deref() else {
+            return Err(IngestError::Verify(VerifyError::UnknownKey(
+                "trace carries a PQC signature but no pqc_key_id — the \
+                 pubkey is resolved from the directory and is never taken \
+                 from the payload (#789)"
+                    .to_owned(),
+            )));
         };
-
-        // v0.1.18 — verify_signature_mismatch breadcrumb. Mirrors
-        // the v0.1.17 unknown-key breadcrumb on the canonicalization-
-        // failure branch. Both 9-field spec AND 2-field legacy were
-        // tried in `verify_trace` and neither verified. Surfaces:
-        //
-        // - wire_body_sha256: joins lens-side body_sha256_prefix
-        // - canonical_9field_sha256 / canonical_2field_sha256: hex
-        //   sha256 of each canonical-bytes shape persist computed
-        // - canonical_*_bytes_len: length, easy eyeball
-        // - signature_b64_prefix: first 16 chars of the agent's
-        //   signature for cross-correlation against capture logs
-        //
-        // The diagnostic computation is best-effort. If
-        // canonicalization itself fails (which is essentially
-        // impossible — same code path verify_trace just exercised
-        // and bubbled SignatureMismatch from), we still emit the
-        // warn with `None` for the canonical fields and return
-        // the typed SignatureMismatch error.
-        // v4.6 (#176) — select the canonicalizer by the trace's SIGNED
-        // schema epoch (Python-compat 1.x/2.x, JCS 3.x+), not the
-        // struct's injected default. Signed-bytes-bound, not
-        // caller-selectable. (The injected `self.canonicalizer` remains
-        // the best-effort diagnostic canonicalizer below; in production
-        // it equals the gate's V1 result for current 1.x/2.x traffic.)
-        let canon = crate::verify::canonical::canonicalizer_for(
-            crate::verify::ed25519::canon_version_for_trace_schema(
-                trace.trace_schema_version.as_str(),
-            ),
-        );
-        // v7.2.0 (CIRISPersist#225) — the trace-tier hybrid HARD CUT.
-        // This method only runs for VerifyMode::Full (the
-        // TrustPreVerified / `2.7.legacy` carve-out skips step 2 entirely
-        // upstream in `receive_and_persist_with`). We verify BOTH halves
-        // via `verify_trace_hybrid` under `HybridPolicy::Strict`: a
-        // classical-only trace (`signature_ml_dsa_65 == None`) is
-        // REJECTED AT ADMISSION — no `require_hybrid: false` posture
-        // (CEG 1.0-RC7 §10.1.5.1.1 + CIRISVerify#75; HNDL forge-later on
-        // the durable, replicated, kept-for-posterity corpus).
-        //
-        // The Ed25519 pubkey came from `accord_public_keys`
-        // (`lookup_public_key` above); that directory is Ed25519-only, so
-        // the producer's ML-DSA-65 pubkey rides the trace envelope
-        // (`trace.pubkey_ml_dsa_65`) and is bound into the hybrid verify.
-        //
-        // Ordering invariant (MISSION §4, AV-9): this is step 2,
-        // verify-before-mutation; it MUST NOT be reordered behind dedup
-        // (dedup-first would be a suppression/probe oracle). The
-        // throughput lever is the per-batch verify loop, NOT dedup-first.
-        let ed25519_pubkey_b64 = BASE64.encode(key.to_bytes());
-        // CIRISPersist#789 — the PQC pubkey comes from the DIRECTORY, by
-        // `pqc_key_id`. It is no longer read off the payload, and there is no
-        // fallback to the payload's copy.
-        //
-        // THE ASYMMETRY THIS FIXES. The Ed25519 half above is resolved through
-        // `lookup_public_key` — a key this node already knows. The PQC half
-        // was taken from the trace itself. So one half proved "a key the
-        // directory vouches for signed this" and the other proved only "the
-        // keypair named in this payload signed this payload", which any
-        // submitter can satisfy by generating a keypair. A hybrid verify is
-        // only as strong as its weakest identity binding, so the PQC half was
-        // contributing confidentiality-era future-proofing and no present
-        // identity assurance at all. Sourcing both halves from the directory
-        // makes the two legs say the same thing about WHO.
-        //
-        // FAIL-CLOSED, deliberately. A missing `pqc_key_id`, an unresolvable
-        // one, or a directory row without a PQC pubkey is a REFUSAL, never a
-        // fallback to `trace.pubkey_ml_dsa_65`. A fallback would leave the
-        // whole gate bypassable by omitting a field — the caller would choose
-        // which key verifies them, which is the property just removed.
-        // #789's measurement is what makes this safe to switch on: `pqc_key_id`
-        // resolves for 100% of live rows and the directory's key is
-        // byte-identical to the inline copy on every one, so no trace that
-        // verifies today stops verifying.
-        //
-        // ORDERING PRESERVED. This is a READ, placed before the verify it
-        // feeds, so step 2 remains verify-before-mutation; nothing is
-        // reordered behind dedup and no suppression/probe oracle is created.
-        // CIRISPersist#789 — the PQC pubkey comes from the DIRECTORY, by
-        // `pqc_key_id`. It is not read off the payload, and there is no
-        // fallback to the payload's copy.
-        //
-        // THE ASYMMETRY THIS CLOSES. The Ed25519 half above is resolved
-        // through `lookup_public_key` — a key this node already vouches for.
-        // The PQC half was taken from the trace itself, so one leg proved "a
-        // key the directory vouches for signed this" and the other proved only
-        // "the keypair named in this payload signed this payload", which any
-        // submitter can satisfy by generating one. A hybrid verify is only as
-        // strong as its weakest identity binding, so the PQC leg was carrying
-        // post-quantum durability and no present identity assurance at all.
-        //
-        // FAIL-CLOSED, with no warn-then-enforce step. A missing `pqc_key_id`,
-        // an unresolvable one, or a directory row without a PQC pubkey is a
-        // REFUSAL. A fallback would leave the gate bypassable by omitting a
-        // field — the caller would choose which key verifies them, which is
-        // the property being removed. The usual argument for a soft landing
-        // (an unregistered producer goes dark on deploy) does not apply here:
-        // the fleet is 100% PQC, so there is no unregistered-producer
-        // population to migrate, and a warn period would only preserve the
-        // bypass for whoever wanted it.
-        //
-        // ORDERING PRESERVED. This is a READ placed before the verify it
-        // feeds, so step 2 remains verify-before-mutation; nothing is
-        // reordered behind dedup and no suppression/probe oracle is created.
-        // ONLY for a trace that actually carries a PQC half.
-        //
-        // A classical-only trace must still be refused by the #225 hard cut
-        // with `HybridRequired` — that refusal is a documented contract with
-        // its own tests and its own operator meaning ("this producer sent
-        // classical-only; it must not"). Resolving the key first made a
-        // classical-only trace fail as `UnknownKey` instead, which is a true
-        // statement about a missing key and the WRONG answer to the question
-        // the operator is actually asking. A refusal's identity is part of its
-        // contract, so the hard cut keeps its own error and this lookup runs
-        // only where a PQC signature exists to verify.
-        let pqc_pubkey_b64 = if trace.signature_ml_dsa_65.is_some() {
-            let Some(pqc_key_id) = trace.pqc_key_id.as_deref() else {
-                return Err(IngestError::Verify(VerifyError::UnknownKey(
-                    "trace carries a PQC signature but no pqc_key_id — the \
-                     pubkey is resolved from the directory and is never taken \
-                     from the payload (#789)"
-                        .to_owned(),
-                )));
-            };
-            let pqc_record =
-                crate::federation::FederationDirectory::lookup_public_key(self.backend, pqc_key_id)
-                    .await
-                    .map_err(|e| {
-                        IngestError::Verify(VerifyError::HybridVerify(format!(
-                            "pqc pubkey directory read failed for {pqc_key_id}: {e}"
-                        )))
-                    })?;
-            let Some(found) = pqc_record.and_then(|r| r.pubkey_ml_dsa_65_base64) else {
-                return Err(IngestError::Verify(VerifyError::UnknownKey(format!(
-                    "pqc_key_id {pqc_key_id} has no ML-DSA-65 pubkey in the \
-                     federation directory — refusing rather than falling back \
-                     to the pubkey the payload nominates (#789)"
-                ))));
-            };
-            Some(found)
-        } else {
-            // No PQC half: fall through so `verify_trace_hybrid` produces the
-            // #225 hard cut under `HybridPolicy::Strict`.
-            None
+        let pqc_record =
+            crate::federation::FederationDirectory::lookup_public_key(backend, pqc_key_id)
+                .await
+                .map_err(|e| {
+                    IngestError::Verify(VerifyError::HybridVerify(format!(
+                        "pqc pubkey directory read failed for {pqc_key_id}: {e}"
+                    )))
+                })?;
+        let Some(found) = pqc_record.and_then(|r| r.pubkey_ml_dsa_65_base64) else {
+            return Err(IngestError::Verify(VerifyError::UnknownKey(format!(
+                "pqc_key_id {pqc_key_id} has no ML-DSA-65 pubkey in the \
+                 federation directory — refusing rather than falling back \
+                 to the pubkey the payload nominates (#789)"
+            ))));
         };
-        match crate::verify::ed25519::verify_trace_hybrid(
-            trace,
-            canon,
-            &ed25519_pubkey_b64,
-            pqc_pubkey_b64.as_deref(),
-            crate::verify::HybridPolicy::Strict,
-        ) {
-            Ok(_outcome) => Ok(()),
-            Err(crate::verify::HybridVerifyError::HybridPendingRejected) => {
-                // The hard cut: a Full-mode trace arrived classical-only.
-                tracing::warn!(
-                    envelope_signer_id = %key_id,
-                    wire_body_sha256 = %body_sha256,
-                    trace_id = %trace.trace_id,
-                    "ciris-persist: verify_hybrid_required — Full-mode classical-only trace REJECTED at admission (#225 trace-tier hard cut)"
-                );
-                Err(IngestError::Verify(VerifyError::HybridRequired))
-            }
-            Err(e) => {
-                // Cryptographic mismatch on a half, or a malformed PQC
-                // field. Emit the same canonical-shape diagnostic the
-                // Ed25519-only path emitted, plus the hybrid error token.
-                let diag =
-                    crate::verify::ed25519::canonical_payload_sha256s(trace, self.canonicalizer)
-                        .ok();
-                let sig_b64_prefix: String = trace.signature.chars().take(16).collect();
-                tracing::warn!(
-                    envelope_signer_id = %key_id,
-                    wire_body_sha256 = %body_sha256,
-                    hybrid_error = %e.kind(),
-                    canonical_9field_sha256 = ?diag.as_ref().map(|d| &d.nine_field_sha256),
-                    canonical_2field_sha256 = ?diag.as_ref().map(|d| &d.two_field_sha256),
-                    canonical_9field_bytes_len = ?diag.as_ref().map(|d| d.nine_field_bytes.len()),
-                    canonical_2field_bytes_len = ?diag.as_ref().map(|d| d.two_field_bytes.len()),
-                    signature_b64_prefix = %sig_b64_prefix,
-                    "ciris-persist: verify_hybrid_failed — hybrid (Ed25519 + ML-DSA-65) verify rejected the trace"
-                );
-                Err(IngestError::Verify(VerifyError::HybridVerify(
-                    e.kind().to_owned(),
-                )))
-            }
+        Some(found)
+    } else {
+        // No PQC half: fall through so `verify_trace_hybrid` produces the
+        // #225 hard cut under `HybridPolicy::Strict`.
+        None
+    };
+    match crate::verify::ed25519::verify_trace_hybrid(
+        trace,
+        canon,
+        &ed25519_pubkey_b64,
+        pqc_pubkey_b64.as_deref(),
+        crate::verify::HybridPolicy::Strict,
+    ) {
+        Ok(_outcome) => Ok(()),
+        Err(crate::verify::HybridVerifyError::HybridPendingRejected) => {
+            // The hard cut: a Full-mode trace arrived classical-only.
+            tracing::warn!(
+                envelope_signer_id = %key_id,
+                wire_body_sha256 = %body_sha256,
+                trace_id = %trace.trace_id,
+                "ciris-persist: verify_hybrid_required — Full-mode classical-only trace REJECTED at admission (#225 trace-tier hard cut)"
+            );
+            Err(IngestError::Verify(VerifyError::HybridRequired))
+        }
+        Err(e) => {
+            // Cryptographic mismatch on a half, or a malformed PQC
+            // field. Emit the same canonical-shape diagnostic the
+            // Ed25519-only path emitted, plus the hybrid error token.
+            let diag =
+                crate::verify::ed25519::canonical_payload_sha256s(trace, diag_canonicalizer).ok();
+            let sig_b64_prefix: String = trace.signature.chars().take(16).collect();
+            tracing::warn!(
+                envelope_signer_id = %key_id,
+                wire_body_sha256 = %body_sha256,
+                hybrid_error = %e.kind(),
+                canonical_9field_sha256 = ?diag.as_ref().map(|d| &d.nine_field_sha256),
+                canonical_2field_sha256 = ?diag.as_ref().map(|d| &d.two_field_sha256),
+                canonical_9field_bytes_len = ?diag.as_ref().map(|d| d.nine_field_bytes.len()),
+                canonical_2field_bytes_len = ?diag.as_ref().map(|d| d.two_field_bytes.len()),
+                signature_b64_prefix = %sig_b64_prefix,
+                "ciris-persist: verify_hybrid_failed — hybrid (Ed25519 + ML-DSA-65) verify rejected the trace"
+            );
+            Err(IngestError::Verify(VerifyError::HybridVerify(
+                e.kind().to_owned(),
+            )))
         }
     }
 }

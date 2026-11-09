@@ -479,8 +479,8 @@ impl SharedRuntime {
         }
     }
 
-    /// A bare `Arc<Runtime>` for the two consumers that genuinely need
-    /// one (`TraceKeyDirectory`, the ABI-stable executor capsule).
+    /// A bare `Arc<Runtime>` for the one consumer that genuinely needs
+    /// one (the ABI-stable executor capsule).
     fn arc(&self) -> Arc<Runtime> {
         self.rt.as_ref().expect(RUNTIME_RETIRED).clone()
     }
@@ -6120,48 +6120,7 @@ impl PyEngine {
                 //
                 //   kind = e.args[0]
                 //   detail = e.args[1] if len(e.args) > 1 else None
-                Err(e) => {
-                    let kind = e.kind();
-                    let detail = e.detail();
-                    tracing::warn!(
-                        error = %e, kind = kind, detail = detail.as_deref(),
-                        "ingest rejected"
-                    );
-                    match e {
-                        // Schema / verify / scrub → ValueError (caller-fault; 4xx).
-                        // v1.1.0 (CIRISPersist#33 part 3) — PipelineInvariant
-                        // is also caller-fault (FSD §4.3 shape violation
-                        // signalled by the edge); maps to lens-side HTTP 422.
-                        // v4.0 (FSD §4.6) — AV-45 write-path cohort_scope
-                        // refusal is caller-fault (the writer stamped a
-                        // cohort it isn't a member of); lens-side HTTP 403.
-                        // v32.0.0 (CIRISPersist#690) — a batch whose treatment
-                        // does not match its label is caller-fault and belongs
-                        // here, NOT with Sign/Store: nothing on this node is
-                        // broken. The sender downgrades the level and relabels,
-                        // or loads a model. Lens-side HTTP 422, and `detail`
-                        // carries which level it was actually treated at so the
-                        // sender can tell those two remedies apart.
-                        IngestError::Schema(_)
-                        | IngestError::Verify(_)
-                        | IngestError::Scrub(_)
-                        | IngestError::ScrubTreatmentMismatch { .. }
-                        | IngestError::ScopeRefused(_)
-                        | IngestError::PipelineInvariant { .. }
-                        | IngestError::TraceRefused { .. } => Err(match detail {
-                            Some(d) => PyValueError::new_err((kind, d)),
-                            None => PyValueError::new_err(kind),
-                        }),
-                        // Store / Sign → RuntimeError (server-fault; 5xx).
-                        // AV-25: signing failure is operator-side
-                        // (keyring locked, hardware unavailable, etc.) —
-                        // never the agent's fault, never a 4xx.
-                        IngestError::Store(_) | IngestError::Sign(_) => Err(match detail {
-                            Some(d) => PyRuntimeError::new_err((kind, d)),
-                            None => PyRuntimeError::new_err(kind),
-                        }),
-                    }
-                }
+                Err(e) => Err(ingest_err_to_py(e, "receive_and_persist")),
             }
         })
     }
@@ -17444,33 +17403,35 @@ impl PyEngine {
 
     // ─── Verify surface for federation peer cutover (v0.4.0) ────
 
-    /// v0.4.0 — Verify a CompleteTrace envelope end-to-end.
-    /// Looks up `signature_key_id` via the federation directory,
-    /// reconstructs canonical bytes per `trace_schema_version`
-    /// (deterministic field-layout dispatch — 2.7.0 / 2.7.9 / 3.0.0),
-    /// verifies the Ed25519 signature.
+    /// v0.4.0 — Verify a CompleteTrace envelope end-to-end, WITHOUT storing
+    /// it (dry-run validation, pre-storage check, audit replay).
     ///
-    /// **v37.0.0 — the CANONICALIZER is resolved from the trace's own
-    /// signed schema epoch too**, via
-    /// [`canon_version_for_trace_schema`](crate::verify::ed25519::canon_version_for_trace_schema)
-    /// (major ≥ 3 ⇒ RFC 8785 JCS, else Python-compat) — the identical
-    /// expression `src/ingest.rs` uses on the production
-    /// `receive_and_persist` path. Until v36.x this method hard-coded
-    /// the Python-compat rule, so a `3.0.0` trace carrying non-ASCII
-    /// was stored by `receive_and_persist` and rejected here.
+    /// **v61.1.0 (CIRISPersist#1239, CC 5.3.2.4.3.1) — this runs ingest's
+    /// verify step, the same function.** `receive_and_persist` verifies each
+    /// trace through
+    /// [`crate::ingest::verify_trace_for_admission`] before anything is
+    /// written, and this method calls exactly that function and nothing else:
+    /// the Ed25519 key resolved by `signature_key_id`, the canonicalizer chosen
+    /// by the trace's signed `trace_schema_version` (major ≥ 3 ⇒ RFC 8785 JCS,
+    /// else Python-compat), the ML-DSA-65 key resolved from the federation
+    /// directory by `pqc_key_id`, and both halves verified under
+    /// `HybridPolicy::Strict`. Until v61.1.0 this called
+    /// `verify_trace_via_directory`, which checked the Ed25519 half only, so it
+    /// accepted a trace with no PQC half, or a bad one, that ingest refuses.
     ///
     /// Returns `{"verified": True, "schema_version": "2.7.0"|"2.7.9"|"3.0.0"}`
-    /// on success. Raises `ValueError` with a stable verify
-    /// error-token (`verify_signature_mismatch`,
-    /// `verify_unknown_key`, `verify_invalid_signature`,
-    /// `verify_canonicalization_internal`,
-    /// `verify_unsupported_schema_version`) on failure.
+    /// on success. On failure raises the exception `receive_and_persist`
+    /// raises for the same cause, with the same stable token in `args[0]`:
+    /// `ValueError` with `verify_unknown_key` (signer or PQC key not in the
+    /// directory), `verify_hybrid_required` (no PQC half: the #225 hard cut),
+    /// `verify_hybrid_failed` (either half does not verify, or a malformed PQC
+    /// field, or a failed read of the PQC key); `RuntimeError` with a
+    /// `store_*` token if the signer-key read itself fails. A `CompleteTrace`
+    /// JSON that does not decode is a
+    /// `ValueError` (`CompleteTrace JSON decode: ...`).
     ///
-    /// Use this when a peer wants to verify a CompleteTrace WITHOUT
-    /// storing it (dry-run validation, pre-storage check, audit
-    /// replay). Persistence still goes through
-    /// `receive_and_persist` (which verifies internally before
-    /// storing) — and the two now agree by construction.
+    /// Stores nothing: the function it runs only reads the key directory.
+    /// The GIL is released for the whole verify.
     fn verify_trace<'py>(
         &self,
         py: Python<'py>,
@@ -17479,66 +17440,54 @@ impl PyEngine {
         self.ensure_usable()?;
         catch_panic(|| {
             use crate::schema::CompleteTrace;
-            use crate::verify::verify_trace_via_directory;
+            use sha2::Digest as _;
             let trace: CompleteTrace = serde_json::from_str(complete_trace_json)
                 .map_err(|e| PyValueError::new_err(format!("CompleteTrace JSON decode: {e}")))?;
             let runtime = self.runtime.clone();
             // Read off the one field the response needs BEFORE the trace moves
             // into the detached closure.
             let schema_version = trace.trace_schema_version.as_str().to_owned();
-            // v37.0.0 — SIGNED-BYTES-BOUND, NOT HARD-CODED. Until v36.x this
-            // surface handed `verify_trace_via_directory` a hard-coded
-            // `PythonJsonDumpsCanonicalizer` and never consulted the signed
-            // schema epoch, while `receive_and_persist` resolved it from the
-            // trace's own `trace_schema_version`. See [`trace_canonicalizer`]
-            // for the defect, the #176 downgrade guard, and why the GIL note
-            // below still covers both arms of the gate.
-            let canon = trace_canonicalizer(&schema_version);
+            // Ingest's refusal breadcrumbs join on the sha256 of the body they
+            // were handed; here that body is the trace JSON.
+            let body_sha256 = hex::encode(sha2::Sha256::digest(complete_trace_json.as_bytes()));
             // v25.x (CIRISPersist#580) — the whole verify runs with the GIL
-            // RELEASED. `TraceKeyDirectory::lookup` bridges the sync
-            // `PublicKeyDirectory` trait to the async backend with
-            // `runtime.block_on`, and until this detach existed that wait
-            // happened while CPython held the GIL: a stalled connection wedged
-            // the entire interpreter, not one thread, with no Rust-side error
-            // — and no watchdog could fire through it, because a watchdog needs
-            // the GIL to be scheduled. Same class as #572's teardown wedge, on
-            // the read path.
-            //
-            // The ENTIRE verify is inside the detach, not merely the lookup.
-            // #580 predicted that would deadlock, on the grounds that
-            // `PythonJsonDumpsCanonicalizer` needs the GIL inside the same
-            // call. It does not: that name describes the OUTPUT FORMAT it
-            // emulates (CPython's `json.dumps` escaping), not a call into
-            // CPython — it is a pure-Rust byte writer, and `src/verify/`
-            // contains no pyo3 reference at all. So the blocking half and the
-            // canonicalizing half are both GIL-free and neither needs hoisting.
-            // This is exactly the shape the sibling
-            // [`Self::verify_hybrid_via_directory`] already uses.
+            // RELEASED. The key-directory reads block on the runtime, and a
+            // blocking wait under the GIL wedges the entire interpreter, not
+            // one thread, with no Rust-side error, and no watchdog can fire
+            // through it. The canonicalizers are pure-Rust byte writers (see
+            // [`crate::ingest::trace_canonicalizer`]), so nothing inside needs
+            // the GIL.
             let verified = py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
-                    let key_dir = TraceKeyDirectory {
-                        backend: pg.clone(),
-                        runtime,
-                    };
-                    verify_trace_via_directory(&trace, canon, &key_dir)
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::ingest::verify_trace_for_admission(
+                            &*backend,
+                            &trace,
+                            &body_sha256,
+                            &PythonJsonDumpsCanonicalizer,
+                        )
+                        .await
+                    })
                 }
                 #[cfg(feature = "sqlite")]
                 BackendDispatch::Sqlite(sq) => {
-                    let key_dir = TraceKeyDirectory {
-                        backend: sq.clone(),
-                        runtime,
-                    };
-                    verify_trace_via_directory(&trace, canon, &key_dir)
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::ingest::verify_trace_for_admission(
+                            &*backend,
+                            &trace,
+                            &body_sha256,
+                            &PythonJsonDumpsCanonicalizer,
+                        )
+                        .await
+                    })
                 }
             });
             // Error mapping stays OUTSIDE the detach: building a `PyErr` is
-            // CPython work, and doing it under a released GIL is the mirror of
-            // the bug being fixed.
-            verified.map_err(|e| {
-                tracing::warn!(error = %e, kind = e.kind(), "verify_trace rejected");
-                PyValueError::new_err(e.kind())
-            })?;
+            // CPython work. It is `receive_and_persist`'s mapping.
+            verified.map_err(|e| ingest_err_to_py(e, "verify_trace"))?;
             let dict = PyDict::new(py);
             dict.set_item("verified", true)?;
             dict.set_item("schema_version", schema_version)?;
@@ -32766,49 +32715,6 @@ fn goal_row_id(json: String) -> PyResult<String> {
         .map_err(|e| PyRuntimeError::new_err(format!("goal row id decode: {e}")))
 }
 
-/// v0.4.0 — Adapter implementing `PublicKeyDirectory` against the
-/// PyO3 Engine's backend + tokio runtime. Used by `Engine.verify_trace`
-/// and `Engine.verify_hybrid_via_directory` to drive
-/// `verify_*_via_directory` without requiring the caller to look up
-/// the key separately.
-///
-/// v1.5.1 — generic over the concrete backend type so the same adapter
-/// drives both PG and SQLite arms. Each call site passes its
-/// dispatch-arm Arc; no enum wrapper needed because the lookup signature
-/// is synchronous.
-struct TraceKeyDirectory<B>
-where
-    B: crate::store::Backend + Send + Sync + 'static,
-{
-    backend: Arc<B>,
-    /// v24.3.0 (CIRISPersist#572) — a [`SharedRuntime`], not a bare
-    /// `Arc<Runtime>`: this short-lived helper is one more place the
-    /// last reference could land, and every such place has to be
-    /// GIL-safe to drop.
-    runtime: SharedRuntime,
-}
-
-impl<B> crate::verify::PublicKeyDirectory for TraceKeyDirectory<B>
-where
-    B: crate::store::Backend + Send + Sync + 'static,
-{
-    fn lookup(
-        &self,
-        key_id: &str,
-    ) -> Result<Option<ed25519_dalek::VerifyingKey>, Box<dyn std::error::Error + Send + Sync>> {
-        let backend = self.backend.clone();
-        let key_id = key_id.to_owned();
-        // verify_trace_via_directory's PublicKeyDirectory trait is
-        // synchronous; bridge to the async backend via block_on on
-        // the engine's tokio runtime. Same shape used by
-        // receive_and_persist's internal verify path.
-        let key_opt = self
-            .runtime
-            .block_on(async move { backend.lookup_public_key(&key_id).await });
-        key_opt.map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
-    }
-}
-
 /// v0.4.0 — Canonicalize a federation envelope value (registration_
 /// envelope / attestation_envelope / revocation_envelope) **through the
 /// produce gate** ([`crate::verify::canonical::ceg_produce_canonicalize`]).
@@ -32840,45 +32746,6 @@ fn canonicalize_envelope_value(envelope: &serde_json::Value) -> PyResult<Vec<u8>
         .map_err(|e| PyRuntimeError::new_err(format!("canonicalize_envelope_value: {e}")))
 }
 
-/// v37.0.0 — **the trace canonicalizer is resolved from the trace's own
-/// SIGNED schema epoch**, exactly as the production ingest path resolves it.
-///
-/// One expression, delegating to
-/// [`canon_version_for_trace_schema`](crate::verify::ed25519::canon_version_for_trace_schema)
-/// (major ≥ 3 ⇒ RFC 8785 JCS, else Python-compat) through
-/// [`canonicalizer_for`](crate::verify::canonical::canonicalizer_for) — the
-/// IDENTICAL expression `IngestPipeline::verify_complete_trace` uses in
-/// `src/ingest.rs`, where it is documented as *"signed-bytes-bound, not
-/// caller-selectable"*. This is a seam for the witness, not a second rule: if
-/// the two ever disagree, `verify_trace_and_ingest_agree_on_the_canon_gate`
-/// reds.
-///
-/// # The FIFTH instance of the #714 / #716 / #735 class
-///
-/// [`PyEngine::verify_trace`] hard-coded
-/// [`PythonJsonDumpsCanonicalizer`](crate::verify::PythonJsonDumpsCanonicalizer)
-/// and never consulted the epoch. `"3.0.0"` is a SUPPORTED schema
-/// ([`crate::schema::version::SUPPORTED_VERSIONS`]) and IS the JCS cutover
-/// epoch, so a 3.0.0 trace carrying one non-ASCII character was ADMITTED by
-/// `receive_and_persist` and REJECTED by `Engine.verify_trace` — the same
-/// trace, two answers, from one library, with the dry-run primitive (the one a
-/// peer consults BEFORE storing) giving the wrong one.
-///
-/// # GIL
-///
-/// Returns a `&'static dyn Canonicalizer`; [`Canonicalizer`](crate::verify::canonical::Canonicalizer)
-/// is `Send + Sync`, so the handle crosses `py.detach` exactly as the unit
-/// struct did. Neither arm touches CPython — `PythonJsonDumpsCanonicalizer`
-/// names the OUTPUT FORMAT it emulates and `JcsCanonicalizer` delegates to
-/// `ciris_verify_core::jcs` — so the #580 no-hoisting argument covers both.
-fn trace_canonicalizer(
-    schema_version: &str,
-) -> &'static dyn crate::verify::canonical::Canonicalizer {
-    crate::verify::canonical::canonicalizer_for(
-        crate::verify::ed25519::canon_version_for_trace_schema(schema_version),
-    )
-}
-
 /// v0.3.5 — TraceLevel → wire-format string. Same shape as the
 /// trace_level_str helper in `src/store/postgres.rs` but free-standing
 /// for use from this FFI module without re-exposing storage internals.
@@ -32887,6 +32754,62 @@ fn trace_level_str(t: crate::schema::TraceLevel) -> &'static str {
         crate::schema::TraceLevel::Generic => "generic",
         crate::schema::TraceLevel::Detailed => "detailed",
         crate::schema::TraceLevel::FullTraces => "full_traces",
+    }
+}
+
+/// THREAT_MODEL.md AV-15 — an [`IngestError`] → `PyErr` at the FFI boundary.
+///
+/// v61.1.0 (CIRISPersist#1239) — one mapping for the two surfaces that run
+/// ingest's code: `Engine.receive_and_persist` and `Engine.verify_trace`, the
+/// dry-run, which runs ingest's verify step
+/// ([`crate::ingest::verify_trace_for_admission`]). So the same cause raises
+/// the same exception type with the same token from both.
+///
+/// Verbose `Display` (which may include attacker-supplied content) goes to
+/// tracing logs; the Python exception carries only the stable kind token and,
+/// when [`IngestError::detail`] is `Some`, the 2-tuple `(kind, detail)`
+/// (v0.4.6, CIRISPersist#22). Lens consumers read `kind = e.args[0]`,
+/// `detail = e.args[1] if len(e.args) > 1 else None`.
+fn ingest_err_to_py(e: IngestError, what: &'static str) -> PyErr {
+    let kind = e.kind();
+    let detail = e.detail();
+    tracing::warn!(
+        error = %e, kind = kind, detail = detail.as_deref(), surface = what,
+        "ingest rejected"
+    );
+    match e {
+        // Schema / verify / scrub → ValueError (caller-fault; 4xx).
+        // v1.1.0 (CIRISPersist#33 part 3) — PipelineInvariant
+        // is also caller-fault (FSD §4.3 shape violation
+        // signalled by the edge); maps to lens-side HTTP 422.
+        // v4.0 (FSD §4.6) — AV-45 write-path cohort_scope
+        // refusal is caller-fault (the writer stamped a
+        // cohort it isn't a member of); lens-side HTTP 403.
+        // v32.0.0 (CIRISPersist#690) — a batch whose treatment
+        // does not match its label is caller-fault and belongs
+        // here, NOT with Sign/Store: nothing on this node is
+        // broken. The sender downgrades the level and relabels,
+        // or loads a model. Lens-side HTTP 422, and `detail`
+        // carries which level it was actually treated at so the
+        // sender can tell those two remedies apart.
+        IngestError::Schema(_)
+        | IngestError::Verify(_)
+        | IngestError::Scrub(_)
+        | IngestError::ScrubTreatmentMismatch { .. }
+        | IngestError::ScopeRefused(_)
+        | IngestError::PipelineInvariant { .. }
+        | IngestError::TraceRefused { .. } => match detail {
+            Some(d) => PyValueError::new_err((kind, d)),
+            None => PyValueError::new_err(kind),
+        },
+        // Store / Sign → RuntimeError (server-fault; 5xx).
+        // AV-25: signing failure is operator-side
+        // (keyring locked, hardware unavailable, etc.) —
+        // never the agent's fault, never a 4xx.
+        IngestError::Store(_) | IngestError::Sign(_) => match detail {
+            Some(d) => PyRuntimeError::new_err((kind, d)),
+            None => PyRuntimeError::new_err(kind),
+        },
     }
 }
 
@@ -37360,8 +37283,14 @@ mod tests {
     // The same blind spot covers `accord_dispatch!`, whose `block_on` lives
     // in the macro DEFINITION so every call site looks clean.
     //
-    // So the gate is stated over the whole file with two named exceptions,
-    // and each exception is PAID FOR by its own clause below.
+    // So the gate is stated over the whole file with named exceptions, and
+    // each exception is PAID FOR by its own clause below.
+    //
+    // v61.1.0 (CIRISPersist#1239) — the `TraceKeyDirectory` shim is gone:
+    // `verify_trace` now runs ingest's async verify step and its `block_on`
+    // is written inside the method's own `py.detach`, so clause 1 covers it
+    // directly. Its exception and the clause that paid for it went with it;
+    // keeping either would exempt a span that no longer exists.
 
     /// Blank out comments, string literals and char literals, preserving
     /// length and newlines so byte offsets and line numbers stay valid.
@@ -37528,23 +37457,22 @@ mod tests {
     /// `block_on` reachable from the PyO3 boundary must run with the GIL
     /// released.
     ///
-    /// Three clauses. The first states the rule; the other two exist to pay
-    /// for the first one's two exceptions, so the exceptions cannot quietly
-    /// become holes:
+    /// Two clauses. The first states the rule; the second pays for the
+    /// first one's exception, so the exception cannot quietly become a hole:
     ///
     /// 1. every non-test `block_on` is lexically inside a `py.detach`,
-    ///    EXCEPT inside the `TraceKeyDirectory` sync-trait shim (which holds
-    ///    no `Python` token and so cannot detach) and inside the
-    ///    `accord_dispatch!` macro definition (whose `block_on` is expanded
-    ///    at each call site, not executed where it is written);
-    /// 2. every `TraceKeyDirectory` CONSTRUCTION is inside a `py.detach` —
-    ///    this is what makes exception (1a) sound, and it is the clause that
-    ///    fails on pre-#580 code;
-    /// 3. every `accord_dispatch!` CALL SITE is inside a `py.detach` — what
-    ///    makes exception (1b) sound.
+    ///    EXCEPT inside the `accord_dispatch!` macro definition (whose
+    ///    `block_on` is expanded at each call site, not executed where it is
+    ///    written);
+    /// 2. every `accord_dispatch!` CALL SITE is inside a `py.detach` — what
+    ///    makes that exception sound.
     ///
-    /// Verified to discriminate: run against `main` before the #580 fix,
-    /// clause 2 reports both construction sites as unguarded.
+    /// Until v61.1.0 there was a second exception, the `TraceKeyDirectory`
+    /// sync-trait shim `verify_trace` reached its `block_on` through, and a
+    /// clause that its construction sites were detached (the clause that
+    /// reported both sites as unguarded on pre-#580 `main`). #1239 removed the
+    /// shim: `verify_trace`'s `block_on` is now written inside its own
+    /// `py.detach`, which clause 1 checks.
     #[test]
     fn no_block_on_reaches_the_pyo3_boundary_holding_the_gil() {
         let raw = include_str!("pyo3.rs");
@@ -37596,11 +37524,6 @@ mod tests {
             }
             v
         };
-        let shim = spans_of(
-            &s,
-            &stripped,
-            "impl<B> crate::verify::PublicKeyDirectory for TraceKeyDirectory<B>",
-        );
         let macro_def = spans_of(&s, &stripped, "macro_rules! accord_dispatch");
 
         let inside =
@@ -37611,11 +37534,7 @@ mod tests {
         let mut from = 0usize;
         while let Some(rel) = stripped[from..].find("block_on(") {
             let at = stripped[..from + rel].chars().count();
-            if !inside(&test_mods, at)
-                && !inside(&detaches, at)
-                && !inside(&shim, at)
-                && !inside(&macro_def, at)
-            {
+            if !inside(&test_mods, at) && !inside(&detaches, at) && !inside(&macro_def, at) {
                 offenders.push(line_at(&s, at));
             }
             from += rel + "block_on(".len();
@@ -37628,26 +37547,7 @@ mod tests {
              watchdog can fire through it. Wrap the call in `py.detach(...)`."
         );
 
-        // ── clause 2 — pays for exception (1a) ──
-        let mut ctor = Vec::new();
-        let mut from = 0usize;
-        while let Some(rel) = stripped[from..].find("TraceKeyDirectory {") {
-            let at = stripped[..from + rel].chars().count();
-            if !inside(&test_mods, at) && !inside(&detaches, at) {
-                ctor.push(line_at(&s, at));
-            }
-            from += rel + 1;
-        }
-        assert!(
-            ctor.is_empty(),
-            "CIRISPersist#580 clause 2 — `TraceKeyDirectory` built OUTSIDE a \
-             `py.detach` at pyo3.rs lines {ctor:?}. Its `lookup` blocks on the \
-             runtime and it holds no `Python` token, so the ONLY place the GIL \
-             can be released is around its construction and use. This is the \
-             clause that fails on pre-#580 `verify_trace`."
-        );
-
-        // ── clause 3 — pays for exception (1b) ──
+        // ── clause 2 — pays for the exception ──
         let mut sites = Vec::new();
         let mut from = 0usize;
         while let Some(rel) = stripped[from..].find("accord_dispatch!") {
@@ -37659,7 +37559,7 @@ mod tests {
         }
         assert!(
             sites.is_empty(),
-            "CIRISPersist#580 clause 3 — `accord_dispatch!` invoked OUTSIDE a \
+            "CIRISPersist#580 clause 2 — `accord_dispatch!` invoked OUTSIDE a \
              `py.detach` at pyo3.rs lines {sites:?}. The macro expands to \
              `runtime.block_on(...)`, so a call site that does not detach blocks \
              under the GIL even though its body mentions no `block_on`."
@@ -38993,8 +38893,9 @@ mod canonicalizer_parity_735 {
 /// rebuilt under another. This one is *verify*-side and worse in a specific
 /// way — it does not corrupt a row, it makes **one library give two answers**.
 /// [`super::PyEngine::verify_trace`] hard-coded
-/// [`PythonJsonDumpsCanonicalizer`] while `IngestPipeline::verify_complete_trace`
-/// resolves the canonicalizer from the trace's own signed
+/// [`PythonJsonDumpsCanonicalizer`] while ingest's verify step (since
+/// v61.1.0 `crate::ingest::verify_trace_for_admission`) resolves the
+/// canonicalizer from the trace's own signed
 /// `trace_schema_version` (`src/ingest.rs`, *"signed-bytes-bound, not
 /// caller-selectable"*). `"3.0.0"` is a supported schema
 /// ([`crate::schema::version::SUPPORTED_VERSIONS`]) and IS the JCS cutover
@@ -39011,6 +38912,12 @@ mod canonicalizer_parity_735 {
 /// And the fix is a GATE, not a flip: the 2.7.0 leg below asserts a pre-cutover
 /// Python-signed trace still verifies. A "fix" that hard-coded JCS instead
 /// would pass every 3.0.0 assertion here and red that one.
+///
+/// v61.1.0 (CIRISPersist#1239) — the dry-run no longer chooses a
+/// canonicalizer: it runs ingest's verify step, which calls
+/// `crate::ingest::trace_canonicalizer`. These tests pin that one rule on the
+/// classical half; the hybrid verdict parity is `verify_trace_1239_tests`
+/// (I1569).
 #[cfg(test)]
 mod verify_trace_canon_parity_class {
     use crate::schema::{
@@ -39027,8 +38934,7 @@ mod verify_trace_canon_parity_class {
     use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
     use std::collections::HashMap;
 
-    /// In-memory [`PublicKeyDirectory`], the shape
-    /// [`super::super::TraceKeyDirectory`] wraps around a backend.
+    /// In-memory [`PublicKeyDirectory`] for the classical-half checks below.
     struct MemKeys(HashMap<String, VerifyingKey>);
     impl PublicKeyDirectory for MemKeys {
         fn lookup(
@@ -39136,7 +39042,7 @@ mod verify_trace_canon_parity_class {
     fn verify_trace_and_ingest_agree_on_the_canon_gate() {
         let payload = canonical_payload_value_v279(&unsigned_trace("3.0.0"));
         for schema in crate::schema::version::SUPPORTED_VERSIONS {
-            let ffi = super::trace_canonicalizer(schema)
+            let ffi = crate::ingest::trace_canonicalizer(schema)
                 .canonicalize_value(&payload)
                 .expect("ffi canonicalize");
             let ingest = canonicalizer_for(canon_version_for_trace_schema(schema))
@@ -39179,7 +39085,7 @@ mod verify_trace_canon_parity_class {
         // The FFI's verdict — what `Engine.verify_trace` reports. Same answer.
         verify_trace_via_directory(
             &trace,
-            super::trace_canonicalizer(trace.trace_schema_version.as_str()),
+            crate::ingest::trace_canonicalizer(trace.trace_schema_version.as_str()),
             &keys,
         )
         .expect(
@@ -39210,7 +39116,7 @@ mod verify_trace_canon_parity_class {
 
         verify_trace_via_directory(
             &trace,
-            super::trace_canonicalizer(trace.trace_schema_version.as_str()),
+            crate::ingest::trace_canonicalizer(trace.trace_schema_version.as_str()),
             &keys,
         )
         .expect("a pre-cutover 2.7.9 trace MUST keep verifying under Python-compat");
@@ -39231,3 +39137,9 @@ mod instant_form_open_tests;
 /// accept only `"strict"`; `audit_chain_proof` does not serve a refused head.
 #[cfg(test)]
 mod hybrid_policy_1233_tests;
+
+/// v61.1.0 (CIRISPersist#1239) — I1569: `Engine.verify_trace`, the dry-run,
+/// gives ingest's verdict (it runs ingest's verify step) on sqlite and
+/// postgres.
+#[cfg(test)]
+mod verify_trace_1239_tests;

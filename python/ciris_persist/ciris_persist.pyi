@@ -2521,7 +2521,7 @@ class Engine:
         """(derived) epistemic — Temporal drift between two windows for one agent. Returns JSON array of TemporalDriftRow."""
 
     def verify_trace(self, complete_trace_json: str) -> dict[str, Any]:
-        """(derived) epistemic — v0.4.0 — Verify a CompleteTrace envelope end-to-end. Looks up signature_key_id via the federation directory, reconstructs canonical bytes per trace..."""
+        """(derived) epistemic — v0.4.0 — Verify a CompleteTrace envelope end-to-end, WITHOUT storing it (dry-run validation, pre-storage check, audit replay)."""
 
 
     # ==============================================================

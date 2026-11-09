@@ -694,12 +694,19 @@ pub fn canon_version_for_trace_schema(wire: &str) -> crate::verify::canonical::C
     CanonVersion::V1Python
 }
 
-/// Convenience wrapper: verify with a [`PublicKeyDirectory`] in front
-/// (looks up the key by id, then defers to [`verify_trace`]). Useful
-/// for the standalone-verifier test path; production ingest looks up
-/// the key from the Backend asynchronously and calls [`verify_trace`]
-/// directly.
-pub fn verify_trace_via_directory<C, K>(
+/// Test helper: verify the Ed25519 half with a [`PublicKeyDirectory`] in
+/// front (looks up the key by id, then defers to [`verify_trace`]).
+///
+/// v61.1.0 (CIRISPersist#1239, CC 5.3.2.4.3.1) — **no longer public API, and
+/// compiled only under `cfg(test)`.** It checks the classical half only, so it
+/// accepts a trace with no PQC half. Its one production caller was
+/// `Engine.verify_trace`, the dry-run, which therefore said VERIFIED about
+/// traces ingest refuses; the dry-run now runs ingest's own verify step
+/// ([`crate::ingest::verify_trace_for_admission`]: hybrid, `Strict`). It stays
+/// for the unit tests below, which pin the classical half's canonical-shape
+/// dispatch.
+#[cfg(test)]
+pub(crate) fn verify_trace_via_directory<C, K>(
     trace: &CompleteTrace,
     canonicalizer: &C,
     keys: &K,
