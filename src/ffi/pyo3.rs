@@ -33751,6 +33751,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
             reason,
             detail,
         } => PyValueError::new_err(format!("{kind}: {revocation_id} {reason} — {detail}")),
+        // v61.1.0 (CIRISPersist#1226) — typed out of `InvalidArgument`
+        // (ValueError), so it keeps that type; the refusal token rides.
+        crate::federation::Error::RevokeMemberRefused { reason, .. } => {
+            PyValueError::new_err(format!("{kind}: {reason}"))
+        }
         // CIRISPersist#592 (AV-84) — caller-fixable, and the branch token
         // rides in the message for the same reason the two above do: a Python
         // consumer must be able to tell "the row names a third party" from a

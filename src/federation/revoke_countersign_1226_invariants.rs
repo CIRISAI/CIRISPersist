@@ -426,8 +426,8 @@ pub(crate) mod bodies {
         assert!(
             matches!(
                 e,
-                Error::InvalidArgument(ref m)
-                    if m.starts_with(crate::federation::cohort::SELF_REMOVAL_COSIGNATURES_REFUSED)
+                Error::RevokeMemberRefused { reason, .. }
+                    if reason == crate::federation::cohort::SELF_REMOVAL_COSIGNATURES_REFUSED
             ),
             "I1615: {e:?}"
         );

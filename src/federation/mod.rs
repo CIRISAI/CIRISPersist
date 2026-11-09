@@ -7337,11 +7337,12 @@ pub trait FederationDirectory: Send + Sync {
         // local path: no gate counts a co-signature there, so one handed in
         // is refused rather than dropped unread.
         if cohort == cohort::Cohort::SelfId && !cosignatures.is_empty() {
-            return Err(Error::InvalidArgument(format!(
-                "{}: revoke_member: a `self` removal carries no co-signatures (the \
-                 occurrence revocation has no gate to count them)",
-                cohort::SELF_REMOVAL_COSIGNATURES_REFUSED
-            )));
+            return Err(Error::RevokeMemberRefused {
+                reason: cohort::SELF_REMOVAL_COSIGNATURES_REFUSED,
+                detail: "a `self` removal carries no co-signatures (the occurrence \
+                         revocation has no gate to count them)"
+                    .to_owned(),
+            });
         }
         // #249 Cut G4 (§9) — `kind` of the membership-change "removed" event to
         // emit after a family/community revocation (`self` uses the occurrence
@@ -10613,6 +10614,20 @@ pub enum Error {
         detail: String,
     },
 
+    /// v61.1.0 (CIRISPersist#1226) — a `revoke_member` spec the door refuses
+    /// before any gate runs, led by a stable token in
+    /// [`cohort`](crate::federation::cohort) (today:
+    /// [`cohort::SELF_REMOVAL_COSIGNATURES_REFUSED`], a `self` removal handed
+    /// co-signatures no gate would count). Typed out of `InvalidArgument` so the
+    /// token reaches a Python caller; the Python type stays `ValueError`.
+    #[error("{reason}: revoke_member: {detail}")]
+    RevokeMemberRefused {
+        /// The stable refusal token.
+        reason: &'static str,
+        /// Why, in words.
+        detail: String,
+    },
+
     /// v17.9.0 (CIRISConstitution#38 interim) — the attestation envelope's
     /// canonical (JCS) bytes exceed
     /// [`admission::MAX_ATTESTATION_ENVELOPE_BYTES`]. The CEG had NO size
@@ -12803,6 +12818,7 @@ impl Error {
             Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",
             Error::RevocationEnvelopeUnbound { .. } => "federation_revocation_envelope_unbound",
             Error::RevocationSubjectRefused { .. } => "federation_revocation_subject_refused",
+            Error::RevokeMemberRefused { .. } => "federation_revoke_member_refused",
             Error::EnvelopeTooLarge { .. } => "federation_envelope_too_large",
             Error::TraceDimensionInvalid { .. } => "federation_trace_dimension_invalid",
             Error::CharterInvalid { .. } => "federation_charter_invalid",
