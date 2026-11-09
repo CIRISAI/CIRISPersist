@@ -803,8 +803,13 @@ pub(crate) mod bodies {
                 "I1604 {what}: the node is still owned"
             );
 
-            // Control: the owner's own `withdraws` ends the binding.
-            put(d, &withdraws(&owner, &binding))
+            // Control: the owner's own `withdraws` ends the binding. It is
+            // attested to the node, as a binding's retraction is: the
+            // owner-binding walk reads the retractions about its subject.
+            let mut by_owner = withdraws(&owner, &binding);
+            by_owner.attested_key_id = node.clone();
+            ts::seal_row_in_place(&owner, &mut by_owner);
+            put(d, &by_owner)
                 .await
                 .expect("I1604: the owner withdraws its binding");
             assert_eq!(
