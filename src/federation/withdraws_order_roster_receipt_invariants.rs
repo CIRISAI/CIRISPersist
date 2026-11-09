@@ -1022,15 +1022,19 @@ mod runners {
 
     /// The receipt's INSERT is made to fail by a trigger, so every read of
     /// the ledger (the self-roster plan's) still works.
+    #[cfg(feature = "sqlite")]
     const BREAK_SQLITE: &str = "CREATE TRIGGER i1602_receipt_fails \
         BEFORE INSERT ON federation_self_roster_proposals \
         BEGIN SELECT RAISE(ABORT, 'I1602 injected receipt failure'); END;";
+    #[cfg(feature = "sqlite")]
     const MEND_SQLITE: &str = "DROP TRIGGER i1602_receipt_fails;";
+    #[cfg(feature = "postgres")]
     const BREAK_PG: &str = "CREATE FUNCTION cirislens.i1602_receipt_fails() RETURNS trigger \
         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'I1602 injected receipt failure'; END $$; \
         CREATE TRIGGER i1602_receipt_fails \
         BEFORE INSERT ON cirislens.federation_self_roster_proposals \
         FOR EACH ROW EXECUTE FUNCTION cirislens.i1602_receipt_fails();";
+    #[cfg(feature = "postgres")]
     const MEND_PG: &str = "DROP TRIGGER i1602_receipt_fails \
         ON cirislens.federation_self_roster_proposals; \
         DROP FUNCTION cirislens.i1602_receipt_fails();";

@@ -957,6 +957,7 @@ pub(crate) mod bodies {
     /// armed at `delegation_cycle_before_insert` on `d`: the `delegates_to`
     /// below takes its serve position, opens its transaction and waits there
     /// while a later row commits ABOVE it and the family read runs.
+    #[cfg(feature = "postgres")]
     pub(crate) async fn i1671_high_water_waits_for_a_write_in_flight(
         d: &dyn FederationDirectory,
         pause: std::sync::Arc<crate::store::test_hooks::Pause>,

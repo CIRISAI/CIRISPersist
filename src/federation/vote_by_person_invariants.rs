@@ -1825,17 +1825,25 @@ mod run {
 
     on_every_backend!(i1540, bodies::i1540_a_replicated_objection_opens_the_window);
 
+    #[cfg(feature = "sqlite")]
     const RENAME_AWAY_SQLITE: &str = "ALTER TABLE federation_vote_windows RENAME TO vw_broken;";
+    #[cfg(feature = "sqlite")]
     const RENAME_BACK_SQLITE: &str = "ALTER TABLE vw_broken RENAME TO federation_vote_windows;";
+    #[cfg(feature = "postgres")]
     const RENAME_AWAY_PG: &str =
         "ALTER TABLE cirislens.federation_vote_windows RENAME TO vw_broken;";
+    #[cfg(feature = "postgres")]
     const RENAME_BACK_PG: &str =
         "ALTER TABLE cirislens.vw_broken RENAME TO federation_vote_windows;";
+    #[cfg(feature = "sqlite")]
     const STAND_IN_SQLITE: &str = "CREATE TABLE federation_vote_windows \
         (action_id TEXT PRIMARY KEY, first_held_at TEXT NOT NULL);";
+    #[cfg(feature = "postgres")]
     const STAND_IN_PG: &str = "CREATE TABLE cirislens.federation_vote_windows \
         (action_id TEXT PRIMARY KEY, first_held_at TIMESTAMPTZ NOT NULL);";
+    #[cfg(feature = "sqlite")]
     const DROP_SQLITE: &str = "DROP TABLE federation_vote_windows;";
+    #[cfg(feature = "postgres")]
     const DROP_PG: &str = "DROP TABLE cirislens.federation_vote_windows;";
 
     #[cfg(feature = "sqlite")]
