@@ -34,7 +34,7 @@ scripts/release_finish.sh <version> <tag-run-id>                    # tag CI →
 | 9 | ship | `release_ship.sh <pr> <version> <head7> "<subject>" <merge-body>`: merge, tag at the merge commit, push the tag once main's run is visible, and print `TAG_RUN_ID`. | `ship.done` + `tag_run` |
 | 10 | stop | Prints `scripts/release_finish.sh <version> <tag-run-id>`. | — |
 
-Then run `release_finish.sh`. It checks that the run id is this tag's CI push run, waits for it (`FINISH_TIMEOUT_MIN`, default 180) and re-runs it if the same-SHA dedup cancelled it. It then waits for the release to exist, sets the body from the annotation of origin's tag (never a local copy; a different local tag is refused), asserts the body is at least the tag body's bytes minus 64, runs `scripts/verify_release.sh` (below), and prints `RELEASE_SHIP_DONE`.
+Then run `release_finish.sh`. It checks that the run id is this tag's CI push run, waits for it (`FINISH_TIMEOUT_MIN`, default 360; tag runs are mostly runner queue on the shared pool) and re-runs it if the same-SHA dedup cancelled it. It then waits for the release to exist, sets the body from the annotation of origin's tag (never a local copy; a different local tag is refused), asserts the body is at least the tag body's bytes minus 64, runs `scripts/verify_release.sh` (below), and prints `RELEASE_SHIP_DONE`.
 
 ### Why the tag is pushed once main's run exists (#1008)
 
@@ -42,7 +42,7 @@ The tag run and main's push run on the merge commit share one concurrency group 
 
 ### Main's run after a tree-equal merge
 
-On a push to main, CI's `tree equality (main merges only)` job skips the whole run when the merge tree equals a PR head whose CI passed. Tag runs are never skipped. `release_ship.sh` treats any visible main run as the signal to push the tag, including one that already completed with most jobs skipped. When the trees differ, the full main run happens and ship waits for it to succeed.
+On a push to main, CI's `tree equality (main merges and tags)` job skips the whole run when the merge tree equals a PR head whose CI passed. On a tag push the same three conditions are a **receipt for the test legs only** (v61.2.1): the tag run skips the nine `linux-x86_64` rows other than `core-1`, `darwin-aarch64 (no postgres)` and the sqlite portability leg, and still runs `core-1` (the Linux CIRISCache save), every wheel, iOS and android build, lint, license-audit, the manifest sign + register and the attestations, all from its own run. Any error on the way runs everything. `release_ship.sh` treats any visible main run as the signal to push the tag, including one that already completed with most jobs skipped. When the trees differ, the full main run happens and ship waits for it to succeed.
 
 `scripts/certify.sh prebuild` compiles every certify leg (`nextest --no-run`), both clippy invocations and the dev wheel, under the same RUSTFLAGS, and runs no tests. It exits 0, 1 or 3 like `full`. It can be run by hand before `release.sh` to warm the cache. `release.sh` does not call it.
 

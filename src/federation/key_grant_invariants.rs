@@ -1774,8 +1774,13 @@ pub mod two_node {
             .unwrap();
         assert!(first.granted.contains(&x_occ), "{tag} I71: X granted at e0");
         // The removal is RECORDED now and takes EFFECT shortly (skew window).
+        // The window was 400 ms until 61.2.2; under certify's co-tenant load
+        // the admit + bump + seal below outran it, so `between` was minted
+        // AFTER `effective_at` and the premise assertion went red. 3 s sits
+        // well inside COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS (60 s); the
+        // sleep below waits for this instant, not a fixed duration.
         let removed_at = chrono::Utc::now();
-        let effective_at = removed_at + chrono::Duration::milliseconds(400);
+        let effective_at = removed_at + chrono::Duration::seconds(3);
         let rev = ts::sign_community_membership_revocation(
             &xavier, /* v49.0.0 (#908): the member leaves on their own signature */
             crate::federation::types::CommunityMembershipRevocation {
@@ -1816,8 +1821,16 @@ pub mod two_node {
             .await
             .unwrap()
             .expect("minted_at");
-        assert!(between_minted > removed_at && between_minted < effective_at);
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            between_minted > removed_at && between_minted < effective_at,
+            "{tag} I71: the in-between epoch is minted inside the window \
+             ({removed_at} < {between_minted} < {effective_at})"
+        );
+        let until_effect = (effective_at - chrono::Utc::now())
+            .to_std()
+            .unwrap_or_default()
+            + std::time::Duration::from_millis(200);
+        tokio::time::sleep(until_effect).await;
         // The removal is in effect: the next seal must rotate the in-between
         // epoch (its mint predates `effective_at`), disable it, and exclude X.
         let after = encrypt_and_cascade_community(a.backend, &comm, b"after", None, Some(&a.key))

@@ -70,10 +70,9 @@ ignore = [
                            # ciris-verify-core → hickory-resolver (reqwest's plain resolver);
                            # persist does NOT enable DNSSEC/NSEC3 validation, so the vulnerable
                            # path is unreachable. No patched version exists (patched=[]).
-    "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained — transitive via reqwest/rustls
-    "RUSTSEC-2026-0098",  # rustls-webpki URI-name constraint (we don't validate URI SANs)
-    "RUSTSEC-2026-0099",  # rustls-webpki wildcard-DNS constraint (no name-constraint certs)
-    "RUSTSEC-2026-0104",  # rustls-webpki CRL parse panic (we don't parse CRLs)
+    # v61.2.1 — RUSTSEC-2025-0134 (rustls-pemfile) and RUSTSEC-2026-0098 /
+    # 0099 / 0104 (rustls-webpki) are CLEARED: cargo deny (all features, every
+    # target) reported each ignore matched no crate. The ignores are gone.
 
     # v0.6.0-α4 — restored heavy ML deps (candle / tokenizers / hf-hub
     # / ort / ndarray) for the post-ingest filter pipeline's NER stage.
@@ -92,7 +91,8 @@ ignore = [
     # ingest hot path, not exploitable here. Remove when anyhow ships the
     # fix and cargo picks it up. Was blocking pre-push cargo-deny → forcing
     # `--no-verify` bypasses (which let a rustfmt slip reach CI on #323).
-    "RUSTSEC-2026-0190",  # anyhow downcast_mut unsound — transitive via candle NER stack
+    # v61.2.1 — CLEARED: the lockfile carries anyhow 1.0.103, which has the
+    # fix; cargo deny reported the ignore matched no crate. The ignore is gone.
     # v58.0.0 — two advisories published after v57.0.0, neither upgradable from
     # persist. `zip` < 9 keeps SUID/SGID bits on EXTRACTION; it is transitive
     # only via candle-core (model-weight loading) and ciris-verify-core, both

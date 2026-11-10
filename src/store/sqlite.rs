@@ -1072,16 +1072,25 @@ impl SqliteBackend {
     /// empty database.
     pub async fn open_with_readers(path: impl Into<String>, readers: usize) -> Result<Self, Error> {
         let path = path.into();
+        // CIRISPersist#1246 — resolved before anything opens, so a malformed
+        // CIRIS_PERSIST_SQLITE_MMAP_BYTES / _CACHE_KIB refuses the open
+        // instead of running on a default nobody asked for.
+        let tuning = crate::store::sqlite_conn_model::tuning_from_env()
+            .map_err(|e| Error::Backend(format!("sqlite open: {e}")))?;
         let writer =
             Connection::open(&path).map_err(|e| Error::Backend(format!("sqlite open: {e}")))?;
         let writer = Self::apply_connection_settings(writer)?;
         let in_memory = path == ":memory:"
             || path.is_empty()
             || (path.starts_with("file:") && path.contains("mode=memory"));
+        if !in_memory {
+            crate::store::sqlite_conn_model::apply_tuning(&writer, &tuning)
+                .map_err(|e| Error::Backend(format!("sqlite open tuning: {e}")))?;
+        }
         let pool = if in_memory || readers == 0 {
             crate::store::sqlite_conn_model::ReadPool::empty()
         } else {
-            crate::store::sqlite_conn_model::ReadPool::open(&path, readers)
+            crate::store::sqlite_conn_model::ReadPool::open(&path, readers, &tuning)
                 .map_err(|e| Error::Backend(format!("sqlite open readers: {e}")))?
         };
         Ok(Self::from_handles(Arc::new(Mutex::new(writer)), pool))

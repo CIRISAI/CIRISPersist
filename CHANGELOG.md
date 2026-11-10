@@ -5,6 +5,24 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [61.2.2] - 2026-11-10
+
+61.2.1 was not tagged. Its CI and release-tooling changes ship here, together with #1246. The one change to the shipped crate is the SQLite connection tuning.
+
+### Changed
+
+- **SQLite connections get a 32 MiB page cache and memory-mapped reads (CIRISPersist#1246).** Every file-backed `SqliteBackend` connection now runs `PRAGMA cache_size = -32768` and `PRAGMA mmap_size`: the writer and each reader (`available_parallelism().clamp(2, 8)` of them, so 4 on a 4-vCPU host). Before this, each connection ran with SQLite's default page cache of about 2 MB and no mmap. On canonical-1 (a multi-GB store, 4 vCPU) `sqlite3_step` re-read pages from the OS page cache through `pread`, and `__x64_sys_pread64` took 11–15% of CPU. The mmap default is 1 GiB, or a quarter of the process's cgroup memory limit when that is smaller (512 MiB in canonical-1's 2 GiB container). Mapped pages are the same page cache a `pread` fills, and the container is charged for them either way. The page cache is allocated as it fills, up to `(readers + 1) × 32 MiB`, which is 160 MiB on 4 vCPU. Two knobs override the defaults: `CIRIS_PERSIST_SQLITE_MMAP_BYTES` (bytes, `0` turns mmap off) and `CIRIS_PERSIST_SQLITE_CACHE_KIB` (KiB, at least 1). A value that does not parse refuses the open rather than falling back to a default. In-memory databases are unchanged, and postgres sizes its cache server-side. With mmap on, an I/O error on the database file is a `SIGBUS` rather than `SQLITE_IOERR`; set `CIRIS_PERSIST_SQLITE_MMAP_BYTES=0` on storage where that matters. Measured at the SQLite level (system SQLite 3.45.1, a synthetic 1.7 GB attestation-shaped store, 7 rows per indexed lookup, warm OS cache, three interleaved rounds, a loaded host): read syscalls per query went from 14 to 3 with 1 GiB of mmap and to 5 with 512 MiB, and the median query from 29–36 µs to 22–23 µs (1 GiB) and 25–26 µs (512 MiB). This does not measure persist's row decoding, which does not change. I1720 (defaults, the cgroup scaling, malformed knobs refused), I1721 (a file-backed open tunes the writer and every reader, which still read the writer's commit), I1722 (`apply_tuning` sets exactly what it is given; in-memory is untouched).
+- **A tag run takes its PR run as the receipt for its test legs.** The v61.1.0 tag run took 3h19m, and its longest job ran 71 min. The rest was runner queue: on the runner pool the CIRIS repos share, its Linux test legs waited 95–124 min for a runner and stood in front of the wheel (93 min wait), android (118–124 min) and darwin wheel (135 min) builds the release needs, re-testing bytes the PR run had already passed. CI's `tree` job (#1021) now also runs on `v*` tags. When the tagged commit is a merge whose tree equals its PR head's, and that PR run passed, the tag run skips the nine `linux-x86_64` rows other than `core-1`, `darwin-aarch64 (no postgres)` and the sqlite portability leg. The matrix `exclude` is derived from the workflow's own rows by `scripts/ci_tag_receipt.py`, and the PR `lint` job checks that it still derives. The tag run still runs everything a release needs, from its own run: `core-1` (the only Linux CIRISCache save, #895), every wheel, iOS and android build, `lint` and `license-audit` (mobile-release requires them, and an advisory can publish between the PR run and the tag, as RUSTSEC-2026-0459 did before v61.1.0), the manifest sign + register and the attestations. Provenance names the run that built the bytes, so no artifact is taken from the PR run. Any error falls back to the full run. A main push run's whole-run skip is unchanged.
+- **`release_finish.sh` waits up to 360 min for the tag run** (`FINISH_TIMEOUT_MIN`, was 180). The v61.1.0 finish exited 12 with nothing wrong.
+
+### Removed
+
+- **Five `deny.toml` advisory ignores that matched no crate** (all features, every target): RUSTSEC-2026-0190 (anyhow 1.0.103 carries the fix), RUSTSEC-2025-0134 (rustls-pemfile), and RUSTSEC-2026-0098 / 0099 / 0104 (rustls-webpki). A stale ignore would silently re-cover its advisory if a dependency change brought an affected version back.
+
+### Tested
+
+- **I71's removal window no longer races a loaded box.** `i71_rotation_keys_on_effective_at` (sqlite, postgres) needs one epoch minted after a removal is recorded and before it takes effect. The window was 400 ms; under certify's co-tenant load the admit, bump and seal outran it and the premise assertion went red on postgres. The window is now 3 s, inside `COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS` (60 s), and the test sleeps until `effective_at` rather than a fixed 500 ms. What it witnesses is unchanged.
+
 ## [61.2.0] - 2026-11-09
 
 ### Security
