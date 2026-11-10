@@ -18,6 +18,10 @@ CI and release tooling only; the crate and the wheel do not change.
 
 - **Five `deny.toml` advisory ignores that matched no crate** (all features, every target): RUSTSEC-2026-0190 (anyhow 1.0.103 carries the fix), RUSTSEC-2025-0134 (rustls-pemfile), and RUSTSEC-2026-0098 / 0099 / 0104 (rustls-webpki). A stale ignore would silently re-cover its advisory if a dependency change brought an affected version back.
 
+### Tested
+
+- **I71's removal window no longer races a loaded box.** `i71_rotation_keys_on_effective_at` (sqlite, postgres) needs one epoch minted after a removal is recorded and before it takes effect. The window was 400 ms; under certify's co-tenant load the admit, bump and seal outran it and the premise assertion went red on postgres. The window is now 3 s, inside `COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS` (60 s), and the test sleeps until `effective_at` rather than a fixed 500 ms. What it witnesses is unchanged.
+
 ## [61.2.0] - 2026-11-09
 
 ### Security
