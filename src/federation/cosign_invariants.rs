@@ -472,8 +472,9 @@ pub(crate) mod bodies {
     }
 
     /// **I1735** — the audience of a cosign row. Mutation: drop the first arm
-    /// of `may_receive` → the invitee is served its pending row (it is the
-    /// row's `attested_key_id`): red.
+    /// of `may_receive` → a non-member is served the pending row (the
+    /// federation-scoped row falls to the generic arms; the invitee, its
+    /// `attested_key_id`, would be too): red.
     pub(crate) async fn i1735_a_hold_reaches_members_only<D: Node>(d: &D, tag: &str) {
         use crate::federation::replication_audience::may_receive;
         let r = room(d, tag, "i1735", "unanimous", 3).await;
@@ -659,8 +660,8 @@ pub(crate) mod bodies {
     }
 
     /// **I1737** — expiry. Mutation: `execute_for` drops the rows but does
-    /// not settle the receipt `expired` → the pending row's re-offer is held
-    /// again: red.
+    /// not settle the receipt `expired` → the receipt reads open (and a
+    /// re-offer would be held again): red.
     pub(crate) async fn i1737_expiry_drops_only_the_hold<D: Node>(d: &D, tag: &str) {
         let r = room(d, tag, "i1737", "unanimous", 3).await;
         let (w, qk) = hold(d, &r).await;
@@ -908,8 +909,8 @@ pub(crate) mod bodies {
     /// **I1741** — the executor. Mutations: `execute_for` skips `offer` (the
     /// merged event is never re-offered) → nothing lands by the hook or the
     /// sweep: red; `check_open_self_admit_removal_window` reads the clock
-    /// instead of `executing_received_at` → the late-cosigned removal is
-    /// refused at the window: red.
+    /// instead of `executing_received_at` → the window gate refuses the
+    /// executor's re-offer judged at the hold's receipt: red.
     pub(crate) async fn i1741_the_executor_lands<D: Node>(d: &D, tag: &str) {
         // Through the hook.
         let r = room(d, tag, "i1741h", "unanimous", 3).await;
@@ -1007,6 +1008,43 @@ pub(crate) mod bodies {
             "I1741: the window is read at the hold's receipt"
         );
         assert!(!active(d, &p, &z).await);
+        // The window gate itself: a removal re-offered by the executor long
+        // after its window from `removed_at` is judged at the hold's first
+        // receipt (inside it), and refused when judged at the door's clock.
+        let t = ms(Utc::now() - Duration::minutes(1));
+        let removal = ts::sign_community_membership_revocation(
+            &x,
+            CommunityMembershipRevocation {
+                community_key_id: p.clone(),
+                removed_identity_key_id: y.clone(),
+                removed_at: t,
+                effective_at: t,
+                reason: None,
+                witness_set: Vec::new(),
+                persist_row_hash: String::new(),
+            },
+        );
+        let late = Utc::now()
+            + Duration::seconds(
+                crate::federation::consensus::OPEN_SELF_ADMIT_REMOVAL_WINDOW_SECS + 60,
+            );
+        let at_door = crate::federation::community_admit::check_open_self_admit_removal_window(
+            d, &removal, late,
+        )
+        .await
+        .expect_err("I1741: judged at the door's clock, outside the window");
+        assert_eq!(
+            rule(&at_door),
+            crate::federation::ROSTER_REMOVAL_OUTSIDE_WINDOW
+        );
+        cosign::test_executing(
+            Utc::now(),
+            crate::federation::community_admit::check_open_self_admit_removal_window(
+                d, &removal, late,
+            ),
+        )
+        .await
+        .expect("I1741: judged at the hold's first receipt, inside the window");
     }
 
     /// **I1742** — withdraws by id. Mutation: `resolve_withdraws_target`

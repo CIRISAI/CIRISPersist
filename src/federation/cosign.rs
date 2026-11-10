@@ -718,6 +718,16 @@ pub(crate) fn executing_received_at() -> Option<DateTime<Utc>> {
     EXECUTING.try_with(|t| *t).ok()
 }
 
+/// Test-only: run `f` as the executor runs a held event's door (its hold
+/// first received at `received_at`).
+#[cfg(test)]
+pub(crate) async fn test_executing<F: std::future::Future>(
+    received_at: DateTime<Utc>,
+    f: F,
+) -> F::Output {
+    EXECUTING.scope(received_at, f).await
+}
+
 /// The window of a group's holds, in seconds (CC 3.3.4, 4.5.13).
 ///
 /// # Errors

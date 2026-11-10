@@ -474,7 +474,7 @@ where
 /// A resignation (the removed member among the signers) is a member's own
 /// act, not a counted removal, and is not bounded. Any other protocol, and a
 /// room this node does not hold, pass.
-async fn check_open_self_admit_removal_window<D>(
+pub(crate) async fn check_open_self_admit_removal_window<D>(
     dir: &D,
     revocation: &SignedCommunityMembershipRevocation,
     received_at: chrono::DateTime<chrono::Utc>,
