@@ -38,6 +38,134 @@ pub const READERS_ENV: &str = "CIRIS_PERSIST_SQLITE_READERS";
 /// CPU, because the hot attestation reads re-parsed the same text on each call.
 const READER_STATEMENT_CACHE: usize = 128;
 
+// ── page cache and mmap (CIRISPersist#1246) ────────────────────────────────
+
+/// Environment override for every connection's `PRAGMA mmap_size`, in bytes.
+/// `0` turns memory-mapped reads off. A value that does not parse as a `u64`
+/// refuses the open: a typo must not silently become the default.
+pub const MMAP_BYTES_ENV: &str = "CIRIS_PERSIST_SQLITE_MMAP_BYTES";
+
+/// Environment override for every connection's page cache, in KiB (applied
+/// as `PRAGMA cache_size = -<KiB>`). Must parse as a `u32` of at least 1;
+/// anything else refuses the open.
+pub const CACHE_KIB_ENV: &str = "CIRIS_PERSIST_SQLITE_CACHE_KIB";
+
+/// The mmap ceiling when the process has no tighter memory limit: 1 GiB.
+pub const DEFAULT_MMAP_BYTES: u64 = 1 << 30;
+
+/// The page cache per connection: 32 MiB. SQLite's default is about 2 MB,
+/// so on canonical-1 (a multi-GB store, 4 readers) `sqlite3_step` re-read
+/// its pages from the OS page cache through `pread`: 11–15% of CPU in
+/// `__x64_sys_pread64` (#1246). The cache is allocated as pages are read,
+/// not at open; the ceiling is `(readers + 1) × 32 MiB`.
+pub const DEFAULT_CACHE_KIB: u32 = 32 * 1024;
+
+/// The tuning every SqliteBackend connection (each reader and the writer)
+/// applies at open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqliteTuning {
+    /// `PRAGMA mmap_size`, bytes. SQLite clamps it to its compile-time
+    /// `SQLITE_MAX_MMAP_SIZE` and to the file's size.
+    pub mmap_bytes: u64,
+    /// `PRAGMA cache_size = -cache_kib`.
+    pub cache_kib: u32,
+}
+
+/// The default mmap size for a process whose memory limit is `limit` bytes:
+/// [`DEFAULT_MMAP_BYTES`], or a quarter of the limit when that is smaller.
+/// Mapped pages are page cache, which a pread-based read also fills and the
+/// container is charged for either way; the quarter keeps a small container
+/// (canonical-1 runs in 2 GiB: 512 MiB) from holding most of its limit in
+/// mapped pages it has to reclaim from.
+pub fn default_mmap_bytes(limit: Option<u64>) -> u64 {
+    match limit {
+        Some(l) => DEFAULT_MMAP_BYTES.min(l / 4),
+        None => DEFAULT_MMAP_BYTES,
+    }
+}
+
+/// This process's cgroup memory limit, if it has one: cgroup v2
+/// `memory.max` for its own cgroup (or the namespace root, as inside a
+/// container), else cgroup v1 `memory.limit_in_bytes`. `None` on non-Linux,
+/// when unlimited, or when nothing can be read.
+pub fn cgroup_memory_limit() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        fn read_limit(path: &str) -> Option<u64> {
+            let text = std::fs::read_to_string(path).ok()?;
+            let t = text.trim();
+            if t == "max" {
+                return None;
+            }
+            let n: u64 = t.parse().ok()?;
+            // cgroup v1 reports "unlimited" as a page-rounded i64::MAX.
+            (n < (1u64 << 62)).then_some(n)
+        }
+        if let Ok(cg) = std::fs::read_to_string("/proc/self/cgroup") {
+            if let Some(rel) = cg.lines().find_map(|l| l.strip_prefix("0::")) {
+                let rel = rel.trim().trim_end_matches('/');
+                if !rel.is_empty() {
+                    if let Some(n) = read_limit(&format!("/sys/fs/cgroup{rel}/memory.max")) {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+        read_limit("/sys/fs/cgroup/memory.max")
+            .or_else(|| read_limit("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Resolve the tuning from the two knobs (`mmap` for [`MMAP_BYTES_ENV`],
+/// `cache` for [`CACHE_KIB_ENV`]) and the process memory limit. Pure, so the
+/// rules are witnessed without touching the environment.
+pub fn resolve_tuning(
+    mmap: Option<&str>,
+    cache: Option<&str>,
+    limit: Option<u64>,
+) -> Result<SqliteTuning, String> {
+    let mmap_bytes = match mmap {
+        None => default_mmap_bytes(limit),
+        Some(v) => v.trim().parse::<u64>().map_err(|_| {
+            format!("{MMAP_BYTES_ENV}={v:?} is not a byte count (a u64; 0 turns mmap off)")
+        })?,
+    };
+    let cache_kib = match cache {
+        None => DEFAULT_CACHE_KIB,
+        Some(v) => match v.trim().parse::<u32>() {
+            Ok(n) if n >= 1 => n,
+            _ => {
+                return Err(format!(
+                    "{CACHE_KIB_ENV}={v:?} is not a page-cache size (a KiB count of at least 1)"
+                ))
+            }
+        },
+    };
+    Ok(SqliteTuning {
+        mmap_bytes,
+        cache_kib,
+    })
+}
+
+/// [`resolve_tuning`] from this process's environment and cgroup limit.
+pub fn tuning_from_env() -> Result<SqliteTuning, String> {
+    let mmap = std::env::var(MMAP_BYTES_ENV).ok();
+    let cache = std::env::var(CACHE_KIB_ENV).ok();
+    resolve_tuning(mmap.as_deref(), cache.as_deref(), cgroup_memory_limit())
+}
+
+/// Apply `t` to one connection. Both are per-connection state.
+pub fn apply_tuning(conn: &Connection, t: &SqliteTuning) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(&format!(
+        "PRAGMA mmap_size = {};\nPRAGMA cache_size = -{};",
+        t.mmap_bytes, t.cache_kib
+    ))
+}
+
 /// FSD §3.2 — `available_parallelism().clamp(2, 8)`, or [`READERS_ENV`].
 pub fn default_reader_count() -> usize {
     if let Some(n) = std::env::var(READERS_ENV)
@@ -95,7 +223,7 @@ impl ReadPool {
     /// Per-connection PRAGMAs are re-applied here because they are
     /// per-connection state (`foreign_keys` is the one people forget);
     /// `query_only = ON` is a second fence behind `SQLITE_OPEN_READ_ONLY`.
-    pub fn open(path: &str, n: usize) -> Result<Arc<Self>, rusqlite::Error> {
+    pub fn open(path: &str, n: usize, tuning: &SqliteTuning) -> Result<Arc<Self>, rusqlite::Error> {
         let mut free = Vec::with_capacity(n);
         for _ in 0..n {
             let conn = Connection::open_with_flags(
@@ -109,6 +237,8 @@ impl ReadPool {
                  PRAGMA busy_timeout = 30000;\n\
                  PRAGMA query_only = ON;",
             )?;
+            // #1246 — page cache and mmap, the same as the writer's.
+            apply_tuning(&conn, tuning)?;
             // #784 — per-connection state, like the pragmas above.
             crate::federation::key_digest::register_sqlite_fn(&conn)?;
             // A rendered attestation query varies by shape, not by value, so
@@ -2055,5 +2185,155 @@ mod witnesses {
             let backend = SqliteBackend::open(&path).await.unwrap();
             assert_eq!(backend.read_pool_handle().size(), n);
         }
+    }
+}
+
+// ── CIRISPersist#1246: page cache and mmap ────────────────────────────────
+
+#[cfg(test)]
+mod tuning_1246_tests {
+    use super::{
+        apply_tuning, default_mmap_bytes, resolve_tuning, tuning_from_env, SqliteTuning,
+        DEFAULT_CACHE_KIB, DEFAULT_MMAP_BYTES,
+    };
+    use crate::store::sqlite::SqliteBackend;
+
+    const GIB: u64 = 1 << 30;
+
+    /// I1720 — the defaults, the memory-limit scaling, and the knobs:
+    /// a malformed knob is refused, never read as the default.
+    #[test]
+    fn i1720_tuning_rules() {
+        let d = resolve_tuning(None, None, None).unwrap();
+        assert_eq!(
+            d,
+            SqliteTuning {
+                mmap_bytes: GIB,
+                cache_kib: 32 * 1024
+            }
+        );
+        assert_eq!(DEFAULT_MMAP_BYTES, GIB);
+        assert_eq!(DEFAULT_CACHE_KIB, 32 * 1024);
+        // canonical-1's 2 GiB container: a quarter of it.
+        assert_eq!(default_mmap_bytes(Some(2 * GIB)), GIB / 2);
+        assert_eq!(
+            resolve_tuning(None, None, Some(2 * GIB))
+                .unwrap()
+                .mmap_bytes,
+            GIB / 2
+        );
+        // A large limit does not raise the ceiling.
+        assert_eq!(default_mmap_bytes(Some(64 * GIB)), GIB);
+        // The knobs win over the default and over the limit.
+        let t = resolve_tuning(Some("0"), Some("65536"), Some(2 * GIB)).unwrap();
+        assert_eq!(t.mmap_bytes, 0, "0 turns mmap off");
+        assert_eq!(t.cache_kib, 65536);
+        assert_eq!(
+            resolve_tuning(Some(" 268435456 "), None, None)
+                .unwrap()
+                .mmap_bytes,
+            256 << 20
+        );
+        for bad in ["1G", "-1", "", "abc", "1.5"] {
+            let e = resolve_tuning(Some(bad), None, None).unwrap_err();
+            assert!(
+                e.contains("CIRIS_PERSIST_SQLITE_MMAP_BYTES"),
+                "{bad:?}: {e}"
+            );
+        }
+        for bad in ["0", "-5", "", "32M", "4294967296"] {
+            let e = resolve_tuning(None, Some(bad), None).unwrap_err();
+            assert!(e.contains("CIRIS_PERSIST_SQLITE_CACHE_KIB"), "{bad:?}: {e}");
+        }
+    }
+
+    /// `PRAGMA mmap_size` returns no row on a database with no file (an
+    /// in-memory one), so that reads back as `None`.
+    fn read_mmap(conn: &rusqlite::Connection) -> Option<u64> {
+        use rusqlite::OptionalExtension;
+        conn.query_row("PRAGMA mmap_size", [], |r| r.get::<_, i64>(0))
+            .optional()
+            .unwrap()
+            .map(|n| n as u64)
+    }
+
+    fn read_tuning(conn: &rusqlite::Connection) -> (u64, i64) {
+        let mmap = read_mmap(conn).expect("a file-backed connection reports mmap_size");
+        let cache: i64 = conn
+            .query_row("PRAGMA cache_size", [], |r| r.get(0))
+            .unwrap();
+        (mmap, cache)
+    }
+
+    /// I1721 — a file-backed open applies the tuning to the writer and to
+    /// EVERY reader (all held at once, so no reader is read twice), and the
+    /// pool still reads what the writer committed.
+    #[tokio::test]
+    async fn i1721_open_applies_tuning_to_writer_and_every_reader() {
+        let want = tuning_from_env().expect("this process's knobs parse");
+        let path = super::witnesses::temp_db_path("1246");
+        let backend = SqliteBackend::open_with_readers(&path, 3).await.unwrap();
+        {
+            let w = backend.conn_handle();
+            let w = w.lock();
+            assert_eq!(
+                read_tuning(&w),
+                (want.mmap_bytes, -(want.cache_kib as i64)),
+                "writer"
+            );
+            w.execute_batch("CREATE TABLE t1246 (x INTEGER); INSERT INTO t1246 VALUES (1246);")
+                .unwrap();
+        }
+        let pool = backend.read_pool_handle();
+        assert_eq!(pool.size(), 3);
+        let guards: Vec<_> = (0..3).map(|_| pool.acquire()).collect();
+        for (i, g) in guards.iter().enumerate() {
+            assert_eq!(
+                read_tuning(g),
+                (want.mmap_bytes, -(want.cache_kib as i64)),
+                "reader {i}"
+            );
+            let x: i64 = g
+                .query_row("SELECT x FROM t1246", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(x, 1246, "reader {i} sees the writer's commit with mmap on");
+        }
+    }
+
+    /// I1722 — `apply_tuning` sets exactly what it is given (both pragmas,
+    /// mmap off included), and an in-memory open is left at SQLite's
+    /// defaults: mmap does not apply to a private in-memory database.
+    #[tokio::test]
+    async fn i1722_apply_tuning_is_exact_and_in_memory_is_untouched() {
+        let conn = rusqlite::Connection::open(super::witnesses::temp_db_path("1246b")).unwrap();
+        let t = SqliteTuning {
+            mmap_bytes: 64 << 20,
+            cache_kib: 4096,
+        };
+        apply_tuning(&conn, &t).unwrap();
+        assert_eq!(read_tuning(&conn), (64 << 20, -4096));
+        apply_tuning(
+            &conn,
+            &SqliteTuning {
+                mmap_bytes: 0,
+                cache_kib: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(read_tuning(&conn), (0, -1));
+
+        let mem = SqliteBackend::open_in_memory().await.unwrap();
+        let w = mem.conn_handle();
+        let w = w.lock();
+        assert!(
+            matches!(read_mmap(&w), None | Some(0)),
+            "in-memory: no mmap"
+        );
+        let cache: i64 = w.query_row("PRAGMA cache_size", [], |r| r.get(0)).unwrap();
+        assert_ne!(
+            cache,
+            -(DEFAULT_CACHE_KIB as i64),
+            "in-memory: SQLite's default cache"
+        );
     }
 }
