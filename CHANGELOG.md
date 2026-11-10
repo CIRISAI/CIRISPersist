@@ -5,7 +5,7 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
-## [61.2.2] - UNRELEASED
+## [61.2.2] - 2026-11-10
 
 61.2.1 was not tagged. Its CI and release-tooling changes ship here, together with #1246. The one change to the shipped crate is the SQLite connection tuning.
 
