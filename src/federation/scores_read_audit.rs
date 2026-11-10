@@ -1705,8 +1705,11 @@ mod tests {
 
     /// **The measurement behind `RetainedCell::open_contradictions`'s doc.**
     ///
-    /// Retaining the contradiction count pins 163 of the registry's 189
-    /// families; withholding it pins 17. (162 of 188 / 17 until the rc14
+    /// Retaining the contradiction count pins 165 of the registry's 192
+    /// families; withholding it pins 17. (163 of 189 / 17 until the rc18
+    /// re-vendor (CIRISPersist#1252): of its three new families the two
+    /// moderator-ballot leaves join the retained side and `cosign:{state}`,
+    /// `positive-only`, pins on neither. 162 of 188 / 17 until the rc14
     /// re-vendor: its one new family, the `signed` evidence family, joins the
     /// retained side. 150 of 176 / 16 until the rc12
     /// re-vendor: its twelve new families all join the retained side, and the
@@ -1748,11 +1751,11 @@ mod tests {
         let withheld = pinned_families(false).len();
         assert_eq!(
             (retained, withheld),
-            (163, 17),
+            (165, 17),
             "the contradiction-count contrast moved (retained={retained}, \
              withheld={withheld})"
         );
-        assert_eq!(vendored_family_polarities().len(), 189);
+        assert_eq!(vendored_family_polarities().len(), 192);
     }
 
     /// **The signed fold's escape hatch is a zero-confidence row — and that is

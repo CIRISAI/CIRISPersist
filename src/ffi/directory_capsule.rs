@@ -6732,6 +6732,9 @@ mod tests {
     /// reason, never a silent one.
     const PRE_1162: &str = "pre-existing at v59.1.1: no DirectoryOp carries it; not \
                             audited by #1162 — routing it is appending an op";
+    const COSIGN_1252: &str = "v61.3.0 (#1252): a node-local cosign ledger or projection read; \
+                               a proxy holds no store of its own, and every caller treats \
+                               Unsupported as nothing held";
     const INHERITED_DEFAULT: &str = "the trait DEFAULT answers Unsupported for any backend that \
                                      does not override it; the proxy inherits it (pre-existing \
                                      at v59.1.1)";
@@ -6861,6 +6864,17 @@ mod tests {
         ("list_open_self_roster_proposals", INHERITED_DEFAULT),
         ("list_settled_self_roster_proposals", INHERITED_DEFAULT),
         ("settle_self_roster_proposal", INHERITED_DEFAULT),
+        // v61.3.0 (CIRISPersist#1252) — the cosign hold's node-local ledgers
+        // and the group pointer read: a proxy has no store of its own, so no
+        // hold is taken behind one (`cosign::hold` needs the receipt).
+        ("cosign_receipt", COSIGN_1252),
+        ("list_open_cosign_receipts", COSIGN_1252),
+        ("settle_cosign_receipt", COSIGN_1252),
+        ("list_cosign_signatures", COSIGN_1252),
+        ("drop_cosign_rows", COSIGN_1252),
+        ("note_cosign_alias", COSIGN_1252),
+        ("cosign_alias", COSIGN_1252),
+        ("read_group_plane_object", COSIGN_1252),
         (
             "vote_window_first_held",
             "node-local receipt; a proxy has no store of its own, and the fold reads the action's signed instant",

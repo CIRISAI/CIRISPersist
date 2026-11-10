@@ -22474,6 +22474,13 @@ mod tests {
         // type expresses. The gate is
         // `identity_amendment::check_identity_amendment_admission` (#1120).
         "identity_amendment",
+        // rc18 re-vendor (CIRISPersist#1252, CC 3.1.3) — per-leaf: a pending
+        // row by the event's primary signer, a signature row by the member
+        // whose signature it carries, each an ACTIVE member of the group at
+        // the event's signed instant, which no identity type expresses. The
+        // gate is `cosign::admit_row` (and `cosign::read_row`'s canonical-row
+        // rule); the audience is `cosign::may_receive`.
+        "cosign:",
     ];
 
     /// Manifest-reserved families persist has **no gate for yet** — a different
@@ -22530,6 +22537,13 @@ mod tests {
         // rc12 re-vendor (CC 3.1.4) — self: attester == subject == the
         // period's fresh rendezvous key. Persist has no emitter and no gate.
         ("rendezvous:route", "CIRISPersist#1149"),
+        // rc18 re-vendor (CIRISPersist#1252 vendored the registry pair at the
+        // v1.0-rc18 tag) — the moderator ballot and its acceptance, CC 3.1.3,
+        // substrate self-reports. Persist has no door for either yet.
+        (
+            "ballot:moderator",
+            "CIRISPersist#1252 (rc18 re-vendor; door not built)",
+        ),
     ];
 
     /// **CC 3.1.7 R2(a) — the mint gate.** Every family persist declares itself

@@ -175,6 +175,15 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         "list_open_self_roster_proposals",
         Bound::Open("every open roster proposal of one self, or of every self for the sweep: a refused one stays open until the roster lets it land"),
     ),
+    // v61.3.0 (CIRISPersist#1252, V214) — the cosign ledgers.
+    (
+        "list_open_cosign_receipts",
+        Bound::Open("every open cosign hold on this node, for the sweep: at most one per proposer per group (V214's partial UNIQUE), each closed by its window"),
+    ),
+    (
+        "list_cosign_signatures",
+        Bound::Schema("the signature rows of one hold: at most one per signer (UNIQUE (quorum_key, signer)), so at most the group's roster"),
+    ),
     (
         "list_settled_self_roster_proposals",
         Bound::Open("every settled roster proposal of one self: grows with each roster change the self makes"),

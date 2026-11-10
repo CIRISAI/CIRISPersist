@@ -884,6 +884,17 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("repair_withdraws_depth", ConnClass::Write),
     // v59.0.0 (#1099) — the V199 self-roster receipts.
     ("note_self_roster_proposal", ConnClass::Write),
+    // v61.3.0 (CIRISPersist#1252) — the V214 cosign ledgers, the group
+    // pointer read, and the I1739 test seam (a `#[cfg(test)]` method).
+    ("cosign_receipt", ConnClass::Read),
+    ("list_open_cosign_receipts", ConnClass::Read),
+    ("settle_cosign_receipt", ConnClass::Write),
+    ("list_cosign_signatures", ConnClass::Read),
+    ("drop_cosign_rows", ConnClass::Write),
+    ("note_cosign_alias", ConnClass::Write),
+    ("cosign_alias", ConnClass::Read),
+    ("read_group_plane_object", ConnClass::Read),
+    ("test_seed_wire_index", ConnClass::Write),
     // CIRISPersist#1198 — the V213 vote windows.
     ("vote_window_first_held", ConnClass::Read),
     // v59.0.0 (sealed-transport floor) — the eager key-plane rehome at open.

@@ -1274,7 +1274,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // event (both refuse the caller's input).
     ("check_founder_only_escape", Class::Gate),
     ("refuse_membership_event_under_founder_only", Class::Gate),
-    ("reload_record_bytes", Class::Plumbing),
     // #840 (I44) — the V070 checksum repair. PLUMBING, and the reason is
     // that it cannot refuse anything: one conditional UPDATE whose entire
     // predicate is this crate's own constants (version 70, that name, one
@@ -1398,11 +1397,25 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
         Class::Gate,
     ),
     ("reject_future_dated_community_widening", Class::Gate),
-    // v49.0.0 (#908) — the standing gate both membership doors run.
-    ("check_community_roster_authority", Class::Gate),
-    // v49.0.0 (#910) — the family doors' standing gate, signature gate and
-    // future-dating gate (the family twins of the three room gates above).
-    ("check_family_roster_authority", Class::Gate),
+    // v49.0.0 (#908) — the standing gate both membership doors run (v61.3.0:
+    // as its `_verdict` form, below).
+    // v61.3.0 (#1252) — the cosign hold: the cosign rows' own gates, a
+    // withdraws of a signature row refused, the record's window policy, the
+    // hold's answer (`RosterChangeNotLanded` or the shortfall refusal); the
+    // pointer read and the act-ref reload (storage), the at-open re-index.
+    ("admit_row", Class::Gate),
+    ("check_withdraws_target", Class::Gate),
+    ("check_community_record_window", Class::Gate),
+    ("hold_if_short", Class::Gate),
+    ("read_group_object", Class::Plumbing),
+    ("reload_record_hashed", Class::Plumbing),
+    ("reindex_cosigned_group_rows_at_open", Class::Plumbing),
+    // v61.3.0 (#1252) — the same standing gate with the shortfall split out.
+    ("check_community_roster_authority_verdict", Class::Gate),
+    ("check_family_roster_authority_verdict", Class::Gate),
+    // v49.0.0 (#910) — the family doors' standing gate (v61.3.0: its
+    // `_verdict` form, above), signature gate and future-dating gate (the
+    // family twins of the three room gates above).
     ("verify_family_membership_widening_admission", Class::Gate),
     ("reject_future_dated_family_widening", Class::Gate),
     // v53.1.2 (#984 row 16) — the withdrawal check every backend's
@@ -3594,7 +3607,7 @@ mod tests {
         ),
         (
             "plan_put_community_membership_revocation",
-            "check_community_roster_authority",
+            "check_community_roster_authority_verdict",
             Reads::FoldAt,
         ),
         (
@@ -3609,7 +3622,7 @@ mod tests {
         ),
         (
             "plan_put_community_membership_widening",
-            "check_community_roster_authority",
+            "check_community_roster_authority_verdict",
             Reads::FoldAt,
         ),
         (

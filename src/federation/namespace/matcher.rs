@@ -1019,9 +1019,9 @@ mod tests {
         let vs = vectors();
         assert_eq!(
             vs.len(),
-            1244,
-            "the rc15 vectors file (v1.0-rc15) carries 1244 dimension vectors (rc14: 1244, rc12: 1236; \
-             the evidence family adds eight)"
+            1264,
+            "the rc18 vectors file (v1.0-rc18) carries 1264 dimension vectors (rc15: 1244, rc14: \
+             1244, rc12: 1236; the evidence family adds eight; rc18's three families add twenty)"
         );
         let oracle: serde_json::Value = serde_json::from_str(BINDS_JSON).unwrap();
         let oracle = oracle["binds"].as_array().unwrap();

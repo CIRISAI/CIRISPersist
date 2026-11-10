@@ -135,24 +135,21 @@ pub(crate) async fn put_family_membership_revocation_planned<D: FamilyStore>(
     // `consensus_protocol` at the row's instant (the #908 family half).
     // v61.3.0 (CIRISPersist#1252) — the sole refusal is the shortfall: held
     // for its cosignatures (or refused as before). No later check follows.
-    if let super::RosterAuthority::ConsensusShort(shortfall) =
-        super::check_family_roster_authority_verdict(
-            dir,
-            &row.family_key_id,
-            &revocation.authority_key_id,
-            &super::roster_row_signer_set(&revocation.authority_key_id, &revocation.cosignatures),
-            FamilyMember {
-                key_id: row.removed_identity_key_id.clone(),
-                joined_at: row.effective_at,
-                role: None,
-            },
-            true,
-            row.effective_at,
-        )
-        .await?
-    {
-        return Err(super::cosign::hold(dir, offered, shortfall).await);
-    }
+    let standing = super::check_family_roster_authority_verdict(
+        dir,
+        &row.family_key_id,
+        &revocation.authority_key_id,
+        &super::roster_row_signer_set(&revocation.authority_key_id, &revocation.cosignatures),
+        FamilyMember {
+            key_id: row.removed_identity_key_id.clone(),
+            joined_at: row.effective_at,
+            role: None,
+        },
+        true,
+        row.effective_at,
+    )
+    .await?;
+    let offered = super::cosign::hold_if_short(dir, standing.into_short(), offered).await?;
     let hash = super::types::compute_persist_row_hash(row)?;
     revocation.family_membership_revocation.persist_row_hash = hash;
     let row = &revocation.family_membership_revocation;
@@ -194,20 +191,17 @@ pub(crate) async fn put_family_membership_widening_planned<D: FamilyStore>(
     super::reject_future_dated_family_widening(row.effective_at)?;
     // v61.3.0 (CIRISPersist#1252) — the sole refusal is the shortfall: held
     // for its cosignatures (or refused as before).
-    if let super::RosterAuthority::ConsensusShort(shortfall) =
-        super::check_family_roster_authority_verdict(
-            dir,
-            &row.family_key_id,
-            &widening.authority_key_id,
-            &super::roster_row_signer_set(&widening.authority_key_id, &widening.cosignatures),
-            row.member(),
-            false,
-            row.effective_at,
-        )
-        .await?
-    {
-        return Err(super::cosign::hold(dir, offered, shortfall).await);
-    }
+    let standing = super::check_family_roster_authority_verdict(
+        dir,
+        &row.family_key_id,
+        &widening.authority_key_id,
+        &super::roster_row_signer_set(&widening.authority_key_id, &widening.cosignatures),
+        row.member(),
+        false,
+        row.effective_at,
+    )
+    .await?;
+    let offered = super::cosign::hold_if_short(dir, standing.into_short(), offered).await?;
     if dir.lookup_family(&row.family_key_id).await?.is_none() {
         return Err(Error::InvalidArgument(format!(
             "{} does not exist in federation_families",

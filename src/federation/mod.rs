@@ -2700,6 +2700,15 @@ impl RosterAuthority {
             Self::ConsensusShort(e) => Err(e),
         }
     }
+
+    /// The carried shortfall refusal, if the verdict was short.
+    #[must_use]
+    pub fn into_short(self) -> Option<Error> {
+        match self {
+            Self::Admitted => None,
+            Self::ConsensusShort(e) => Some(e),
+        }
+    }
 }
 
 /// v49.0.0 (CIRISPersist#908, FSD §4) — the door's standing check for one

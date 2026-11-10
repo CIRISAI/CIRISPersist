@@ -24,7 +24,7 @@ A widening or removal of a quorum room or family no longer needs every signature
 
 - **`DIRECTORY_ABI_VERSION` 12 → 13**: `HeldEquivalent` is a new variant of a payload enum.
 - **`may_receive` asks a new first arm for `cosign:*` rows**: served to the group's active members at the event's signed instant only, in public rooms too. The invitee of a widening is not served it; the member a removal names is.
-- **The namespace registry pair is re-vendored from CIRISConstitution rc18 at `c2a6cc64` (untagged)**: `cosign:{state}`, `ballot:moderator`, `ballot:moderator_acceptance` (192 families). The other CC manifests stay at rc15 `ace6b74` until the re-vendor at the rc18 tag.
+- **The namespace registry pair is re-vendored from the CIRISConstitution `v1.0-rc18` tag (`646df978`)**: `cosign:{state}`, `ballot:moderator`, `ballot:moderator_acceptance` (192 families; the grammar hash equals rc18's at `c2a6cc64`, which this release was built against). `VENDORED_REGISTRY_CC_COMMIT` pins it; the other CC manifests stay at rc15 `ace6b74` (`VENDORED_MANIFESTS_CC_VERSION`) until the full re-vendor at rc18. `ballot:moderator*` are registered with no door (`RESERVED_AND_NOT_YET_GATED`).
 
 ### Adoption notes (CIRISEdge)
 

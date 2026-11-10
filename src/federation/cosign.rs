@@ -886,15 +886,30 @@ where
     }))
 }
 
-/// A door's later checks under a short verdict: a short event that any later
-/// check refuses keeps the shortfall refusal it met first before the split.
-pub(crate) fn later_check(
-    short: &mut Option<Error>,
-    result: Result<(), Error>,
-) -> Result<(), Error> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) => Err(short.take().unwrap_or(e)),
+/// A door's later check refused under a short verdict: the short event keeps
+/// the shortfall refusal it met first before the split (`e` otherwise).
+pub(crate) fn keep_shortfall(short: &mut Option<Error>, e: Error) -> Error {
+    short.take().unwrap_or(e)
+}
+
+/// The door's step after its plan: with no shortfall, the event goes on to
+/// the write (`Ok(signed)`); with one, it is [`hold`]'s answer
+/// (`RosterChangeNotLanded`, or the shortfall refusal unchanged).
+///
+/// # Errors
+///
+/// [`hold`]'s answer.
+pub(crate) async fn hold_if_short<D>(
+    dir: &D,
+    short: Option<Error>,
+    signed: GroupSigned,
+) -> Result<GroupSigned, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    match short {
+        None => Ok(signed),
+        Some(shortfall) => Err(hold(dir, signed, shortfall).await),
     }
 }
 

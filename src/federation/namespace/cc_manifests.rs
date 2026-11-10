@@ -125,8 +125,8 @@ mod tests {
     //! **I1300–I1302, I1308** — every vendored CC byte is the pinned byte,
     //! the pin is the tag's, and the refusal tokens at the pin.
     use super::super::registry::{
-        VENDORED_CC_COMMIT, VENDORED_CC_VERSION, VENDORED_REGISTRY_FILE_SHA256,
-        VENDORED_VECTORS_FILE_SHA256,
+        VENDORED_CC_COMMIT, VENDORED_CC_VERSION, VENDORED_MANIFESTS_CC_VERSION,
+        VENDORED_REGISTRY_CC_COMMIT, VENDORED_REGISTRY_FILE_SHA256, VENDORED_VECTORS_FILE_SHA256,
     };
     use super::*;
     use sha2::{Digest, Sha256};
@@ -348,23 +348,39 @@ mod tests {
     /// is the networked ship gate for the same property.
     #[test]
     fn i1302_the_pins_are_the_tags_bytes_when_cc_is_present() {
-        let tag = format!("v{VENDORED_CC_VERSION}");
         let Some(repo) = cc_repo() else {
             eprintln!(
                 "I1302: no CIRISConstitution checkout (CIRIS_CC_REPO or a sibling) — SKIPPED"
             );
             return;
         };
-        let Some(commit) = git(&repo, &["rev-parse", &format!("{tag}^{{commit}}")]) else {
-            eprintln!("I1302: {repo:?} carries no tag {tag} — SKIPPED (fetch the tags to run it)");
-            return;
-        };
-        assert_eq!(
-            String::from_utf8_lossy(&commit).trim(),
-            VENDORED_CC_COMMIT,
-            "{tag} is not the commit VENDORED_CC_COMMIT names"
-        );
+        // v61.3.0 (CIRISPersist#1252) — the registry pair is vendored at the
+        // registry's tag, every other file at the manifests' tag (one tag
+        // again after the full re-vendor).
+        let reg_tag = format!("v{VENDORED_CC_VERSION}");
+        let tag = format!("v{VENDORED_MANIFESTS_CC_VERSION}");
+        for (t, pinned) in [
+            (&reg_tag, VENDORED_REGISTRY_CC_COMMIT),
+            (&tag, VENDORED_CC_COMMIT),
+        ] {
+            let Some(commit) = git(&repo, &["rev-parse", &format!("{t}^{{commit}}")]) else {
+                eprintln!(
+                    "I1302: {repo:?} carries no tag {t} — SKIPPED (fetch the tags to run it)"
+                );
+                return;
+            };
+            assert_eq!(
+                String::from_utf8_lossy(&commit).trim(),
+                pinned,
+                "{t} is not the commit its pin names"
+            );
+        }
         for (cc_path, local, pin) in every_pinned_file() {
+            let tag = if cc_path.starts_with("manifests/namespace_") {
+                &reg_tag
+            } else {
+                &tag
+            };
             let upstream = git(&repo, &["show", &format!("{tag}:{cc_path}")])
                 .unwrap_or_else(|| panic!("{tag} carries no {cc_path}"));
             assert_eq!(

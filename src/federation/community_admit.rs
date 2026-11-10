@@ -326,13 +326,25 @@ where
         fold_at: revocation.community_membership_revocation.effective_at,
         received_at: chrono::Utc::now(),
     };
-    let mut planned = plan_put_community_membership_revocation(dir, revocation, instants).await?;
+    let planned = plan_put_community_membership_revocation(dir, revocation, instants).await?;
     // v61.3.0 (CIRISPersist#1252) — the sole refusal is the shortfall: held
     // for its cosignatures (or refused as before).
-    if let Some(shortfall) = planned.short.take() {
-        let event = super::group_plane::GroupSigned::CommunityRevocation(planned.revocation);
-        return Err(super::cosign::hold(dir, event, shortfall).await);
-    }
+    let planned = match super::cosign::hold_if_short(
+        dir,
+        planned.short,
+        super::group_plane::GroupSigned::CommunityRevocation(planned.revocation),
+    )
+    .await?
+    {
+        super::group_plane::GroupSigned::CommunityRevocation(revocation) => {
+            PlannedCommunityRevocation {
+                revocation,
+                removal_event: planned.removal_event,
+                short: None,
+            }
+        }
+        _ => unreachable!("hold_if_short returns the event it was handed"),
+    };
     // v61 (CIRISPersist#991) — the removal's (or resignation's) row.
     let offered = super::group_plane::GroupSigned::CommunityRevocation(planned.revocation.clone());
     dir.store_planned_community_revocation(planned).await?;
@@ -415,7 +427,7 @@ where
                 .cosignatures
                 .iter()
                 .any(|c| c.authority_key_id == row.removed_identity_key_id);
-        let counted = super::admission::check_infrastructure_founder_count_unchanged(
+        super::admission::check_infrastructure_founder_count_unchanged(
             dir,
             &stored,
             &row.removed_identity_key_id,
@@ -424,8 +436,8 @@ where
             self_leave,
             fold_at,
         )
-        .await;
-        super::cosign::later_check(&mut short, counted)?;
+        .await
+        .map_err(|e| super::cosign::keep_shortfall(&mut short, e))?;
     }
     let mut revocation = revocation;
     let row = &mut revocation.community_membership_revocation;
@@ -519,13 +531,22 @@ where
         fold_at: widening.community_membership_widening.effective_at,
         received_at: chrono::Utc::now(),
     };
-    let mut planned = plan_put_community_membership_widening(dir, widening, instants).await?;
+    let planned = plan_put_community_membership_widening(dir, widening, instants).await?;
     // v61.3.0 (CIRISPersist#1252) — the sole refusal is the shortfall: held
     // for its cosignatures (or refused as before).
-    if let Some(shortfall) = planned.short.take() {
-        let event = super::group_plane::GroupSigned::CommunityWidening(planned.widening);
-        return Err(super::cosign::hold(dir, event, shortfall).await);
-    }
+    let planned = match super::cosign::hold_if_short(
+        dir,
+        planned.short,
+        super::group_plane::GroupSigned::CommunityWidening(planned.widening),
+    )
+    .await?
+    {
+        super::group_plane::GroupSigned::CommunityWidening(widening) => PlannedCommunityWidening {
+            widening,
+            short: None,
+        },
+        _ => unreachable!("hold_if_short returns the event it was handed"),
+    };
     // v61 (CIRISPersist#991) — the widening's row.
     let offered = super::group_plane::GroupSigned::CommunityWidening(planned.widening.clone());
     dir.store_planned_community_widening(planned).await?;
@@ -592,12 +613,12 @@ where
     };
     // v50.0.0 (CIRISPersist#925) — a widening that seats a node-bearing key as
     // founder of an infrastructure community is refused.
-    let not_node =
-        super::admission::check_infrastructure_founders_not_node(dir, &probe, fold_at).await;
-    super::cosign::later_check(&mut short, not_node)?;
+    super::admission::check_infrastructure_founders_not_node(dir, &probe, fold_at)
+        .await
+        .map_err(|e| super::cosign::keep_shortfall(&mut short, e))?;
     // v50.0.0 (review, M1 loophole) — adding, promoting or demoting a founder
     // of a conformant infrastructure room would leave N stale.
-    let counted = super::admission::check_infrastructure_founder_count_unchanged(
+    super::admission::check_infrastructure_founder_count_unchanged(
         dir,
         &stored_for_count,
         &row.member_key_id,
@@ -606,10 +627,11 @@ where
         false,
         fold_at,
     )
-    .await;
-    super::cosign::later_check(&mut short, counted)?;
-    let bound = super::admission::check_community_membership_steward_binding(dir, &probe).await;
-    super::cosign::later_check(&mut short, bound)?;
+    .await
+    .map_err(|e| super::cosign::keep_shortfall(&mut short, e))?;
+    super::admission::check_community_membership_steward_binding(dir, &probe)
+        .await
+        .map_err(|e| super::cosign::keep_shortfall(&mut short, e))?;
     let mut widening = widening;
     let row = &mut widening.community_membership_widening;
     row.persist_row_hash = super::types::compute_persist_row_hash(&*row)?;
