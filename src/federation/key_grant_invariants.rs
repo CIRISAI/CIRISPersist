@@ -1774,7 +1774,7 @@ pub mod two_node {
             .unwrap();
         assert!(first.granted.contains(&x_occ), "{tag} I71: X granted at e0");
         // The removal is RECORDED now and takes EFFECT shortly (skew window).
-        // v61.2.1: the window was 400 ms, and under certify's co-tenant load
+        // The window was 400 ms until 61.2.2; under certify's co-tenant load
         // the admit + bump + seal below outran it, so `between` was minted
         // AFTER `effective_at` and the premise assertion went red. 3 s sits
         // well inside COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS (60 s); the

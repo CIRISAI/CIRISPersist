@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "61.2.1"
+version = "61.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
