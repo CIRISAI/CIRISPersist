@@ -230,6 +230,14 @@ pub enum ReplicatedAttestationOutcome {
     /// silent `Ok`), so an apply loop reported an insert that never
     /// happened.
     Deduplicated,
+    /// v61.3.0 (CIRISPersist#1252) — this node holds the SAME ACT under
+    /// another row: an assembled widening or removal carrying a different
+    /// sufficient subset of its cosignatures (or other randomised ML-DSA
+    /// bytes), or the same signer's other signature on a `cosign:*` row. The
+    /// act is held, so nothing was written (for an assembled row, its id is
+    /// recorded as an alias of the act) and no refusal is booked: a sender
+    /// stops re-offering it. APPENDED (`DIRECTORY_ABI_VERSION` 13).
+    HeldEquivalent,
     /// The row was NOT applied and the existing corpus is untouched.
     /// `reason` names the branch that fired — a closed enum, not a message
     /// string.
@@ -495,6 +503,7 @@ where
             {
                 GroupPlaneApplied::Changed => Outcome::Inserted,
                 GroupPlaneApplied::Unchanged => Outcome::Unchanged,
+                GroupPlaneApplied::HeldEquivalent => Outcome::HeldEquivalent,
                 GroupPlaneApplied::Refused(reason) => {
                     tracing::info!(attestation_id = %attestation_id, reason, "group-plane row refused");
                     Outcome::Refused {
@@ -503,6 +512,20 @@ where
                 }
             },
         );
+    }
+    // v61.3.0 (CIRISPersist#1252) — a cosign row whose id this node holds:
+    // the same pending act, or the same signer's cosignature (its ML-DSA half
+    // randomised). Held, never a conflict.
+    if super::cosign::is_cosign_row(incoming) {
+        if let Some(held) = dir.get_attestation(&attestation_id).await? {
+            return Ok(
+                if held.persist_row_hash == super::types::compute_persist_row_hash(incoming)? {
+                    Outcome::Unchanged
+                } else {
+                    Outcome::HeldEquivalent
+                },
+            );
+        }
     }
     // v50.0.0 (CIRISPersist#916) — an owner-binding is the moment a minter
     // learns a member has a device; read before the row is moved.

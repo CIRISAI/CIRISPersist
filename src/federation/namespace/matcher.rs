@@ -1236,7 +1236,7 @@ mod tests {
         let binds: serde_json::Value = serde_json::from_str(BINDS_JSON).unwrap();
         assert_eq!(
             binds["_meta"]["cc_commit"],
-            super::super::registry::VENDORED_CC_COMMIT
+            super::super::registry::VENDORED_REGISTRY_CC_COMMIT
         );
         assert_eq!(
             binds["_meta"]["vectors_sha256"],

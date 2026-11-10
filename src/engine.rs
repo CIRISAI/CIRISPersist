@@ -10001,6 +10001,16 @@ impl Engine {
         crate::federation::self_roster::execute_due(self.federation_directory().as_ref()).await
     }
 
+    /// v61.3.0 (CIRISPersist#1252, CC 3.3.4) — the cosign sweep: execute
+    /// every open hold on this node (a merged event that meets its protocol
+    /// lands through its typed door; a lapsed hold expires; a withdrawn one
+    /// ends). Returns how many landed. See
+    /// [`cosign::execute_due`](crate::federation::cosign::execute_due).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn execute_cosign_due(&self) -> Result<usize, crate::federation::Error> {
+        crate::federation::cosign::execute_due(self.federation_directory().as_ref()).await
+    }
+
     /// v46.3.0 (CIRISPersist#884, `FSD/SELF_COLLECTIVE_TRANSFER.md` §4) — the
     /// send set of `key_id` for a record at `cohort_scope`: the consent peers
     /// plus, for `self` / `family`, the NODES the key's principals own (and

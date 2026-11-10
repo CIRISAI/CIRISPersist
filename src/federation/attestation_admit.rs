@@ -159,6 +159,13 @@ pub(crate) struct PlannedAttestation {
     /// row and no proposal is ever held without its window (the #1198 shape
     /// for vote windows).
     pub(crate) self_roster_receipt: Option<(String, chrono::DateTime<chrono::Utc>)>,
+    /// v61.3.0 (CIRISPersist#1252, V214) — a `cosign:pending:v1` row's
+    /// receipt: written first-seen-wins in the row's transaction, so no hold
+    /// is held without its window.
+    pub(crate) cosign_receipt: Option<super::cosign::ReceiptSeed>,
+    /// v61.3.0 (CIRISPersist#1252, V214) — a `cosign:signature:v1` row's
+    /// `(quorum key, signer)`, recorded in the row's transaction.
+    pub(crate) cosign_signature: Option<(String, String)>,
     /// The signed-wire-index locator (#507b), federation tier only; the hash
     /// comes from the stored row (#646).
     pub(crate) wire_index_key: Option<String>,
@@ -455,13 +462,40 @@ where
             .await?
         {
             GroupPlaneApplied::Changed => Ok(AttestationOutcome::Inserted),
-            GroupPlaneApplied::Unchanged => Ok(AttestationOutcome::AlreadyHeld),
+            // v61.3.0 (CIRISPersist#1252) — the same act under another row.
+            GroupPlaneApplied::Unchanged | GroupPlaneApplied::HeldEquivalent => {
+                Ok(AttestationOutcome::AlreadyHeld)
+            }
             GroupPlaneApplied::Refused(reason) => Err(Error::Conflict(format!(
                 "group-plane row {} not applied: {reason}",
                 attestation.attestation.attestation_id
             ))),
         };
     }
+    // v61.3.0 (CIRISPersist#1252) — a cosign row's own gates, ahead of the
+    // generic plan: a held id settles as held (one act, one pending row; one
+    // signer, one signature row), a settled hold is not held again, and its
+    // signer is an active member at the event's instant.
+    if super::cosign::is_cosign_row(&attestation.attestation)
+        && super::cosign::admit_row(dir, &attestation.attestation).await?
+            == super::cosign::CosignAdmit::Held
+    {
+        return Ok(AttestationOutcome::AlreadyHeld);
+    }
+    // v61.3.0 (CIRISPersist#1252) — a cosignature already sent is
+    // irrevocable: a `withdraws` naming a `cosign:signature:v1` row is refused.
+    if attestation.attestation.attestation_type == super::types::attestation_type::WITHDRAWS {
+        if let Some(target_id) = super::precedence::references_attestation_id_from_envelope(
+            &attestation.attestation.attestation_envelope,
+        ) {
+            if let Some(target) = dir.get_attestation(target_id).await? {
+                super::cosign::check_withdraws_target(&target)?;
+            }
+        }
+    }
+    let cosign_row = (super::cosign::is_cosign_row(&attestation.attestation)
+        || attestation.attestation.attestation_type == super::types::attestation_type::WITHDRAWS)
+        .then(|| attestation.attestation.clone());
     // v53.0.0 (#963) — a row that changes an owner's cohort allow list for
     // one of its nodes (a `consent:replication` grant FOR the node, or the
     // owner's retraction of one): read before the row moves, acted on only
@@ -536,6 +570,11 @@ where
         (&outcome, &roster_row)
     {
         super::self_roster::after_admission(dir, row).await;
+    }
+    // v61.3.0 (CIRISPersist#1252) — a cosign row (or the proposer's
+    // `withdraws` of a pending row) executes the hold it concerns.
+    if let (Ok(AttestationOutcome::Inserted), Some(row)) = (&outcome, &cosign_row) {
+        super::cosign::after_admission(dir, row).await;
     }
     if let (Ok(AttestationOutcome::Inserted | AttestationOutcome::AlreadyHeld), Some(row)) =
         (&outcome, &rebind_row)
@@ -1412,6 +1451,8 @@ where
     let vote_window = super::reverse_quorum::objection_action(&row).map(|a| (a, first_held_at));
     let self_roster_receipt = super::self_roster::is_proposal_row(&row)
         .then(|| (row.attested_key_id.clone(), first_held_at));
+    let cosign_receipt = super::cosign::receipt_seed_of(&row, first_held_at);
+    let cosign_signature = super::cosign::signature_seed_of(&row);
     Ok(AttestationPlan::Insert(Box::new(PlannedAttestation {
         row,
         withdraws_depth,
@@ -1422,6 +1463,8 @@ where
         projected_goal,
         vote_window,
         self_roster_receipt,
+        cosign_receipt,
+        cosign_signature,
         wire_index_key,
         cycle_gated,
         received_at,

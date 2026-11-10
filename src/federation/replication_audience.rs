@@ -711,6 +711,15 @@ pub async fn may_receive<D>(dir: &D, recipient: &str, row: &Attestation) -> Resu
 where
     D: FederationDirectory + ?Sized,
 {
+    // v61.3.0 (CIRISPersist#1252; CC 3.3.4, CC 3.1.3 `cosign:{state}`) — the
+    // FIRST arm: a held event and its cosignatures reach the group's ACTIVE
+    // members at the event's signed instant, and nobody else — no public-group
+    // shortcut, no refers-to (the invitee of a widening is not served it; the
+    // member a removal names is a member, and is). Once admitted, the
+    // assembled row has the roster's ordinary audience (below).
+    if let Some(v) = Box::pin(super::cosign::may_receive(dir, recipient, row)).await? {
+        return Ok(v);
+    }
     if row.attesting_key_id == recipient {
         return Ok(Verdict::Yes(Reason::Origin));
     }

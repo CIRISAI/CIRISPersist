@@ -1,9 +1,9 @@
 {
  "_meta": {
-  "cc_commit": "ace6b74217b4496a67e47aef2258461517e4493c",
+  "cc_commit": "c2a6cc64c91003047ed9e05b630ead733206793c",
   "generator": "scripts/gen_namespace_match_binds.py",
   "reference": "tools/cc_namespace_match.py",
-  "vectors_sha256": "64078f4623d82df7df23c2a2ace6267709308f88b4ddefed4b9a4cfe2477fb09"
+  "vectors_sha256": "c457126ebf9df0f192bd4762eb09469bd981abf6c06097e1ee7c16d81276ec76"
  },
  "binds": [
   {
@@ -886,6 +886,82 @@
    "dimension": "autonomy:SAMPLE:v1",
    "family": "autonomy:{aspect}",
    "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "ballot:moderator:v1",
+   "family": "ballot:moderator",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "ballot:moderator:V1",
+   "family": "ballot:moderator",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "ballot:moderator:v1:v2",
+   "family": "ballot:moderator",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "ballot:moderator:v1beta",
+   "family": "ballot:moderator",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Ballot:moderator:v1",
+   "family": "ballot:moderator",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "ballot:moderator",
+   "family": "ballot:moderator",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "ballot:moderator_acceptance:v1",
+   "family": "ballot:moderator_acceptance",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "ballot:moderator_acceptance:V1",
+   "family": "ballot:moderator_acceptance",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "ballot:moderator_acceptance:v1:v2",
+   "family": "ballot:moderator_acceptance",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "ballot:moderator_acceptance:v1beta",
+   "family": "ballot:moderator_acceptance",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Ballot:moderator_acceptance:v1",
+   "family": "ballot:moderator_acceptance",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "ballot:moderator_acceptance",
+   "family": "ballot:moderator_acceptance",
+   "refusal": "missing_version_segment"
   },
   {
    "binds": {
@@ -3013,6 +3089,63 @@
    "dimension": "corpus_health:n_eff_measurable",
    "family": "corpus_health:n_eff_measurable",
    "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "state": "pending",
+    "version": "v1"
+   },
+   "dimension": "cosign:pending:v1",
+   "family": "cosign:{state}",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "cosign:pending:V1",
+   "family": "cosign:{state}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "cosign:pending:v1:v2",
+   "family": "cosign:{state}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "cosign:pending:v1beta",
+   "family": "cosign:{state}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Cosign:pending:v1",
+   "family": "cosign:{state}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "state": "pending"
+   },
+   "dimension": "cosign:pending",
+   "family": "cosign:{state}",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "state": "PENDING"
+   },
+   "dimension": "cosign:PENDING:v1",
+   "family": "cosign:{state}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "state": "not_a_listed_value"
+   },
+   "dimension": "cosign:not_a_listed_value:v1",
+   "family": "cosign:{state}",
+   "refusal": "namespace_vocab_value_unregistered"
   },
   {
    "binds": {

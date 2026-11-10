@@ -4685,6 +4685,7 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         let crate::federation::community_admit::PlannedCommunityRevocation {
             revocation,
             removal_event,
+            ..
         } = planned;
         let row = revocation.community_membership_revocation;
         let witness = serde_json::json!(row.witness_set);
@@ -4825,7 +4826,7 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         &self,
         planned: crate::federation::community_admit::PlannedCommunityWidening,
     ) -> Result<(), crate::federation::Error> {
-        let crate::federation::community_admit::PlannedCommunityWidening { widening } = planned;
+        let crate::federation::community_admit::PlannedCommunityWidening { widening, .. } = planned;
         let row = widening.community_membership_widening;
         let authority_key_id = widening.authority_key_id;
         let scrub_signature_classical = widening.scrub_signature_classical;
@@ -6898,6 +6899,32 @@ impl PostgresBackend {
         Ok(())
     }
 
+    /// v61.3.0 (CIRISPersist#1252) — at open: re-index every held
+    /// cosignable group row that carries a cosignature, so its ref moves once
+    /// from `sha256(bytes)` to the act's
+    /// ([`attestation_wire_hash`](crate::federation::wire_index::attestation_wire_hash)).
+    /// The upsert drops the old mapping; a row already under the new ref is
+    /// rewritten to itself. Ids are not re-keyed.
+    /// Test-only (CIRISPersist#1252, I1739): write one wire-index mapping as
+    /// a pre-v61.3.0 node wrote it (the upsert drops the record's others).
+    #[cfg(test)]
+    pub(crate) async fn test_seed_wire_index(&self, kind: &str, hash: &str, record_key: &str) {
+        let client = self.get_client().await.expect("a client");
+        pg_upsert_wire_index(&**client, kind, hash, record_key)
+            .await
+            .expect("seed the wire index");
+    }
+
+    pub(crate) async fn reindex_cosigned_group_rows_at_open(
+        &self,
+    ) -> Result<(), crate::federation::Error> {
+        for id in crate::federation::cosign::cosigned_group_row_ids(self).await? {
+            let key = crate::federation::wire_index::record_key(&[("attestation_id", &id)]);
+            self.index_stored_record("Attestation", &key).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn index_stored_record(
         &self,
         kind: &str,
@@ -8029,6 +8056,11 @@ impl Backend for PostgresBackend {
             crate::federation::group_plane::rehome_group_records(self)
                 .await
                 .map_err(|e| Error::Backend(format!("group-plane rehome at open: {e}")))?;
+            // v61.3.0 (CIRISPersist#1252) — a cosigned widening's or removal's
+            // ref moves once to the act's (`attestation_wire_hash`); its id stays.
+            self.reindex_cosigned_group_rows_at_open()
+                .await
+                .map_err(|e| Error::Backend(format!("cosigned group-row re-index at open: {e}")))?;
             // v59.0.0 (CIRISPersist#1096) — count, never rewrite.
             self.legacy_community_trust_grants_at_open()
                 .await
@@ -8208,6 +8240,11 @@ impl Backend for PostgresBackend {
         crate::federation::group_plane::rehome_group_records(self)
             .await
             .map_err(|e| Error::Backend(format!("group-plane rehome at open: {e}")))?;
+        // v61.3.0 (CIRISPersist#1252) — a cosigned widening's or removal's
+        // ref moves once to the act's (`attestation_wire_hash`); its id stays.
+        self.reindex_cosigned_group_rows_at_open()
+            .await
+            .map_err(|e| Error::Backend(format!("cosigned group-row re-index at open: {e}")))?;
         // v59.0.0 (CIRISPersist#1096) — count, never rewrite, the held
         // node-authored capture grants in the v52 shape.
         self.legacy_community_trust_grants_at_open()
@@ -12402,6 +12439,228 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(format!("self-roster settle: {e}")))
     }
 
+    // ─── v61.3.0 (CIRISPersist#1252, V214) — the cosign hold's ledgers.
+
+    async fn cosign_receipt(
+        &self,
+        quorum_key: &str,
+    ) -> Result<Option<crate::federation::cosign::CosignReceipt>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let row = client
+            .query_opt(
+                "SELECT quorum_key, group_kind, group_key_id, proposer_key_id, received_at, \
+                        settled_at, outcome \
+                   FROM cirislens.federation_cosign_pending WHERE quorum_key = $1",
+                &[&quorum_key],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("cosign receipt: {e}")))?;
+        row.as_ref().map(pg_cosign_receipt).transpose()
+    }
+
+    async fn list_open_cosign_receipts(
+        &self,
+    ) -> Result<Vec<crate::federation::cosign::CosignReceipt>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let rows = client
+            .query(
+                "SELECT quorum_key, group_kind, group_key_id, proposer_key_id, received_at, \
+                        settled_at, outcome \
+                   FROM cirislens.federation_cosign_pending WHERE settled_at IS NULL \
+                  ORDER BY received_at, quorum_key",
+                &[],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("cosign receipts: {e}")))?;
+        rows.iter().map(pg_cosign_receipt).collect()
+    }
+
+    async fn settle_cosign_receipt(
+        &self,
+        quorum_key: &str,
+        outcome: &str,
+        settled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        client
+            .execute(
+                "UPDATE cirislens.federation_cosign_pending SET settled_at = $2, outcome = $3 \
+                  WHERE quorum_key = $1 AND settled_at IS NULL",
+                &[&quorum_key, &settled_at, &outcome],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| crate::federation::Error::Backend(format!("cosign settle: {e}")))
+    }
+
+    async fn list_cosign_signatures(
+        &self,
+        quorum_key: &str,
+    ) -> Result<Vec<(String, String)>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let rows = client
+            .query(
+                "SELECT attestation_id, signer_key_id FROM cirislens.federation_cosign_signatures \
+                  WHERE quorum_key = $1 ORDER BY signer_key_id",
+                &[&quorum_key],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("cosign signatures: {e}")))?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get::<_, String>(0)
+                        .map_err(|e| crate::federation::Error::Backend(format!("V214: {e}")))?,
+                    r.try_get::<_, String>(1)
+                        .map_err(|e| crate::federation::Error::Backend(format!("V214: {e}")))?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn drop_cosign_rows(&self, quorum_key: &str) -> Result<u64, crate::federation::Error> {
+        let backend = |e: tokio_postgres::Error| {
+            crate::federation::Error::Backend(format!("cosign drop: {e}"))
+        };
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let tx = client.transaction().await.map_err(backend)?;
+        let mut ids: Vec<String> = tx
+            .query(
+                "SELECT attestation_id FROM cirislens.federation_cosign_signatures \
+                  WHERE quorum_key = $1",
+                &[&quorum_key],
+            )
+            .await
+            .map_err(backend)?
+            .iter()
+            .map(|r| r.try_get::<_, String>(0))
+            .collect::<Result<_, _>>()
+            .map_err(backend)?;
+        ids.push(quorum_key.to_owned());
+        let mut dropped = 0;
+        for id in &ids {
+            let rk = crate::federation::wire_index::record_key(&[("attestation_id", id)]);
+            tx.execute(
+                "DELETE FROM cirislens.signed_wire_index \
+                  WHERE kind = 'Attestation' AND record_key = $1",
+                &[&rk],
+            )
+            .await
+            .map_err(backend)?;
+            dropped += tx
+                .execute(
+                    "DELETE FROM cirislens.federation_attestations WHERE attestation_id = $1",
+                    &[id],
+                )
+                .await
+                .map_err(backend)?;
+        }
+        tx.execute(
+            "DELETE FROM cirislens.federation_cosign_signatures WHERE quorum_key = $1",
+            &[&quorum_key],
+        )
+        .await
+        .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(dropped)
+    }
+
+    async fn note_cosign_alias(
+        &self,
+        alias_attestation_id: &str,
+        quorum_key: &str,
+        held_attestation_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_cosign_aliases \
+                 (alias_attestation_id, quorum_key, held_attestation_id) VALUES ($1, $2, $3) \
+                 ON CONFLICT (alias_attestation_id) DO NOTHING",
+                &[&alias_attestation_id, &quorum_key, &held_attestation_id],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| crate::federation::Error::Backend(format!("cosign alias: {e}")))
+    }
+
+    async fn cosign_alias(
+        &self,
+        attestation_id: &str,
+    ) -> Result<Option<(String, String)>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let row = client
+            .query_opt(
+                "SELECT quorum_key, held_attestation_id FROM cirislens.federation_cosign_aliases \
+                  WHERE alias_attestation_id = $1",
+                &[&attestation_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("cosign alias: {e}")))?;
+        row.map(|r| {
+            Ok((
+                r.try_get::<_, String>(0)
+                    .map_err(|e| crate::federation::Error::Backend(format!("V214: {e}")))?,
+                r.try_get::<_, String>(1)
+                    .map_err(|e| crate::federation::Error::Backend(format!("V214: {e}")))?,
+            ))
+        })
+        .transpose()
+    }
+
+    async fn read_group_plane_object(
+        &self,
+        link: &crate::federation::group_plane::GroupRowLink,
+    ) -> Result<
+        Option<(crate::federation::group_plane::GroupSigned, Option<String>)>,
+        crate::federation::Error,
+    > {
+        use crate::federation::group_plane::GroupPlaneStore as _;
+        let Some(object) = self.read_group_object(link).await? else {
+            return Ok(None);
+        };
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let (pk, binds) = pg_group_link_where(link, 1);
+        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            binds.iter().map(|b| b.as_ref() as _).collect();
+        let id: Option<String> = client
+            .query_opt(
+                &format!(
+                    "SELECT attestation_id FROM cirislens.{} WHERE {pk}",
+                    link.table.as_str()
+                ),
+                &refs,
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("group pointer: {e}")))?
+            .and_then(|r| r.try_get::<_, Option<String>>(0).ok().flatten());
+        Ok(Some((object, id)))
+    }
+
     async fn put_family_membership_revocation(
         &self,
         revocation: crate::federation::SignedFamilyMembershipRevocation,
@@ -13943,12 +14202,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             row.safe_get_with("record_key", crate::federation::Error::Backend)?;
         // v59.1.2 — the reload reads through the directory (its own clients).
         drop(client);
-        let bytes =
-            crate::federation::wire_index::reload_record_bytes(self, kind, &record_key).await?;
-        let Some(bytes) = bytes else {
+        // v61.3.0 (CIRISPersist#1252) — the self-check asks the write path's
+        // own derivation (`attestation_wire_hash` for an Attestation entry).
+        let reloaded =
+            crate::federation::wire_index::reload_record_hashed(self, kind, &record_key).await?;
+        let Some((bytes, recomputed)) = reloaded else {
             return Ok(None);
         };
-        let recomputed = crate::federation::wire_index::content_hash_of_bytes(&bytes);
         if recomputed != content_hash {
             tracing::warn!(
                 kind,
@@ -21636,6 +21896,36 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                     crate::federation::Error::Backend(format!("self-roster receipt: {e}"))
                 })?;
             }
+            // v61.3.0 (CIRISPersist#1252, V214) — a hold's receipt, first-seen
+            // wins, in the row's transaction. A second OPEN hold of the same
+            // proposer in the group violates the partial UNIQUE index and rolls
+            // the row back.
+            if let Some(seed) = &planned.cosign_receipt {
+                tx.execute(
+                    "INSERT INTO cirislens.federation_cosign_pending \
+                     (quorum_key, group_kind, group_key_id, proposer_key_id, received_at) \
+                     VALUES ($1, $2, $3, $4, $5) ON CONFLICT (quorum_key) DO NOTHING",
+                    &[
+                        &row.attestation_id,
+                        &seed.group_kind,
+                        &seed.group_key_id,
+                        &seed.proposer_key_id,
+                        &seed.received_at,
+                    ],
+                )
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("cosign receipt: {e}")))?;
+            }
+            if let Some((quorum_key, signer)) = &planned.cosign_signature {
+                tx.execute(
+                    "INSERT INTO cirislens.federation_cosign_signatures \
+                     (attestation_id, quorum_key, signer_key_id) VALUES ($1, $2, $3) \
+                     ON CONFLICT DO NOTHING",
+                    &[&row.attestation_id, quorum_key, signer],
+                )
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("cosign signature: {e}")))?;
+            }
         }
         // PR #943 review (Codex): project ONLY a row this statement stored. An
         // occupied id (`ON CONFLICT DO NOTHING`, 0 rows) stored nothing, so its
@@ -23058,6 +23348,23 @@ async fn pg_insert_plane_row(
 }
 
 /// v59.0.0 (CIRISPersist#1099) — one V199 row as the receipt it is.
+fn pg_cosign_receipt(
+    r: &tokio_postgres::Row,
+) -> Result<crate::federation::cosign::CosignReceipt, crate::federation::Error> {
+    let col = |e: tokio_postgres::Error| {
+        crate::federation::Error::Backend(format!("V214 row decode: {e}"))
+    };
+    Ok(crate::federation::cosign::CosignReceipt {
+        quorum_key: r.try_get(0).map_err(col)?,
+        group_kind: r.try_get(1).map_err(col)?,
+        group_key_id: r.try_get(2).map_err(col)?,
+        proposer_key_id: r.try_get(3).map_err(col)?,
+        received_at: r.try_get(4).map_err(col)?,
+        settled_at: r.try_get(5).map_err(col)?,
+        outcome: r.try_get(6).map_err(col)?,
+    })
+}
+
 fn pg_self_roster_receipt(
     r: &tokio_postgres::Row,
 ) -> Result<crate::federation::self_roster::SelfRosterReceipt, crate::federation::Error> {

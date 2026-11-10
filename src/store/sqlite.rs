@@ -1675,6 +1675,11 @@ impl Backend for SqliteBackend {
         crate::federation::group_plane::rehome_group_records(self)
             .await
             .map_err(|e| Error::Backend(format!("group-plane rehome at open: {e}")))?;
+        // v61.3.0 (CIRISPersist#1252) — a cosigned widening's or removal's
+        // ref moves once to the act's (`attestation_wire_hash`); its id stays.
+        self.reindex_cosigned_group_rows_at_open()
+            .await
+            .map_err(|e| Error::Backend(format!("cosigned group-row re-index at open: {e}")))?;
         // v59.0.0 (CIRISPersist#1096) — count, never rewrite, the held
         // node-authored capture grants in the v52 shape.
         self.legacy_community_trust_grants_at_open()
@@ -2847,6 +2852,32 @@ impl SqliteBackend {
                     "holding claim {attestation_id}: signed_wire_index: {e}"
                 ))
             })
+    }
+
+    /// v61.3.0 (CIRISPersist#1252) — at open: re-index every held
+    /// cosignable group row that carries a cosignature, so its ref moves once
+    /// from `sha256(bytes)` to the act's
+    /// ([`attestation_wire_hash`](crate::federation::wire_index::attestation_wire_hash)).
+    /// The upsert drops the old mapping; a row already under the new ref is
+    /// rewritten to itself. Ids are not re-keyed.
+    /// Test-only (CIRISPersist#1252, I1739): write one wire-index mapping as
+    /// a pre-v61.3.0 node wrote it (the upsert drops the record's others).
+    #[cfg(test)]
+    pub(crate) async fn test_seed_wire_index(&self, kind: &str, hash: &str, record_key: &str) {
+        let (k, h, r) = (kind.to_owned(), hash.to_owned(), record_key.to_owned());
+        self.write(move |conn| sqlite_upsert_wire_index(conn, &k, &h, &r))
+            .await
+            .expect("seed the wire index");
+    }
+
+    pub(crate) async fn reindex_cosigned_group_rows_at_open(
+        &self,
+    ) -> Result<(), crate::federation::Error> {
+        for id in crate::federation::cosign::cosigned_group_row_ids(self).await? {
+            let key = crate::federation::wire_index::record_key(&[("attestation_id", &id)]);
+            self.index_stored_record("Attestation", &key).await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn index_stored_record(
@@ -5978,6 +6009,198 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("self-roster settle: {e}")))
     }
 
+    // ─── v61.3.0 (CIRISPersist#1252, V214) — the cosign hold's ledgers.
+
+    async fn cosign_receipt(
+        &self,
+        quorum_key: &str,
+    ) -> Result<Option<crate::federation::cosign::CosignReceipt>, crate::federation::Error> {
+        let qk = quorum_key.to_owned();
+        let row = self
+            .read(move |conn| -> Result<Option<CosignRow>, rusqlite::Error> {
+                conn.query_row(
+                    "SELECT quorum_key, group_kind, group_key_id, proposer_key_id, received_at, \
+                            settled_at, outcome \
+                       FROM federation_cosign_pending WHERE quorum_key = ?1",
+                    rusqlite::params![qk],
+                    cosign_row,
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("cosign receipt: {e}")))?;
+        row.map(CosignRow::into_receipt).transpose()
+    }
+
+    async fn list_open_cosign_receipts(
+        &self,
+    ) -> Result<Vec<crate::federation::cosign::CosignReceipt>, crate::federation::Error> {
+        let rows = self
+            .read(move |conn| -> Result<Vec<CosignRow>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT quorum_key, group_kind, group_key_id, proposer_key_id, received_at, \
+                            settled_at, outcome \
+                       FROM federation_cosign_pending WHERE settled_at IS NULL \
+                      ORDER BY received_at, quorum_key",
+                )?;
+                let rows = stmt.query_map([], cosign_row)?;
+                rows.collect()
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("cosign receipts: {e}")))?;
+        rows.into_iter().map(CosignRow::into_receipt).collect()
+    }
+
+    async fn settle_cosign_receipt(
+        &self,
+        quorum_key: &str,
+        outcome: &str,
+        settled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        let (qk, outcome) = (quorum_key.to_owned(), outcome.to_owned());
+        let at = first_held_instant_text(settled_at);
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE federation_cosign_pending SET settled_at = ?2, outcome = ?3 \
+                  WHERE quorum_key = ?1 AND settled_at IS NULL",
+                rusqlite::params![qk, at, outcome],
+            )
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| crate::federation::Error::Backend(format!("cosign settle: {e}")))
+    }
+
+    async fn list_cosign_signatures(
+        &self,
+        quorum_key: &str,
+    ) -> Result<Vec<(String, String)>, crate::federation::Error> {
+        let qk = quorum_key.to_owned();
+        self.read(
+            move |conn| -> Result<Vec<(String, String)>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT attestation_id, signer_key_id FROM federation_cosign_signatures \
+                  WHERE quorum_key = ?1 ORDER BY signer_key_id",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![qk], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("cosign signatures: {e}")))
+    }
+
+    async fn drop_cosign_rows(&self, quorum_key: &str) -> Result<u64, crate::federation::Error> {
+        let qk = quorum_key.to_owned();
+        let n = self
+            .write(move |conn| -> Result<usize, rusqlite::Error> {
+                let tx = write_tx(conn)?;
+                let mut ids: Vec<String> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT attestation_id FROM federation_cosign_signatures \
+                          WHERE quorum_key = ?1",
+                    )?;
+                    let rows = stmt.query_map(rusqlite::params![qk], |r| r.get(0))?;
+                    rows.collect::<Result<_, _>>()?
+                };
+                ids.push(qk.clone());
+                let mut dropped = 0;
+                for id in &ids {
+                    let rk = crate::federation::wire_index::record_key(&[("attestation_id", id)]);
+                    tx.execute(
+                        "DELETE FROM signed_wire_index WHERE kind = 'Attestation' AND record_key = ?1",
+                        rusqlite::params![rk],
+                    )?;
+                    dropped += tx.execute(
+                        "DELETE FROM federation_attestations WHERE attestation_id = ?1",
+                        rusqlite::params![id],
+                    )?;
+                }
+                tx.execute(
+                    "DELETE FROM federation_cosign_signatures WHERE quorum_key = ?1",
+                    rusqlite::params![qk],
+                )?;
+                tx.commit()?;
+                Ok(dropped)
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("cosign drop: {e}")))?;
+        Ok(n as u64)
+    }
+
+    async fn note_cosign_alias(
+        &self,
+        alias_attestation_id: &str,
+        quorum_key: &str,
+        held_attestation_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let (a, q, h) = (
+            alias_attestation_id.to_owned(),
+            quorum_key.to_owned(),
+            held_attestation_id.to_owned(),
+        );
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT INTO federation_cosign_aliases \
+                 (alias_attestation_id, quorum_key, held_attestation_id) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (alias_attestation_id) DO NOTHING",
+                rusqlite::params![a, q, h],
+            )
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| crate::federation::Error::Backend(format!("cosign alias: {e}")))
+    }
+
+    async fn cosign_alias(
+        &self,
+        attestation_id: &str,
+    ) -> Result<Option<(String, String)>, crate::federation::Error> {
+        let a = attestation_id.to_owned();
+        self.read(
+            move |conn| -> Result<Option<(String, String)>, rusqlite::Error> {
+                conn.query_row(
+                    "SELECT quorum_key, held_attestation_id FROM federation_cosign_aliases \
+                  WHERE alias_attestation_id = ?1",
+                    rusqlite::params![a],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("cosign alias: {e}")))
+    }
+
+    async fn read_group_plane_object(
+        &self,
+        link: &crate::federation::group_plane::GroupRowLink,
+    ) -> Result<
+        Option<(crate::federation::group_plane::GroupSigned, Option<String>)>,
+        crate::federation::Error,
+    > {
+        use crate::federation::group_plane::GroupPlaneStore as _;
+        let Some(object) = self.read_group_object(link).await? else {
+            return Ok(None);
+        };
+        let table = link.table.as_str();
+        let (pk, binds) = sqlite_group_link_where(link);
+        let id = self
+            .read(
+                move |conn| -> Result<Option<Option<String>>, rusqlite::Error> {
+                    conn.query_row(
+                        &format!("SELECT attestation_id FROM {table} WHERE {pk}"),
+                        params_from_iter(binds.iter()),
+                        |r| r.get(0),
+                    )
+                    .optional()
+                },
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("group pointer: {e}")))?;
+        Ok(Some((object, id.flatten())))
+    }
+
     async fn put_family_membership_revocation(
         &self,
         revocation: crate::federation::SignedFamilyMembershipRevocation,
@@ -7401,12 +7624,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let Some(record_key) = record_key else {
             return Ok(None);
         };
-        let bytes =
-            crate::federation::wire_index::reload_record_bytes(self, kind, &record_key).await?;
-        let Some(bytes) = bytes else {
+        // v61.3.0 (CIRISPersist#1252) — the self-check asks the write path's
+        // own derivation (`attestation_wire_hash` for an Attestation entry).
+        let reloaded =
+            crate::federation::wire_index::reload_record_hashed(self, kind, &record_key).await?;
+        let Some((bytes, recomputed)) = reloaded else {
             return Ok(None);
         };
-        let recomputed = crate::federation::wire_index::content_hash_of_bytes(&bytes);
         if recomputed != content_hash {
             tracing::warn!(
                 kind,
@@ -14456,6 +14680,50 @@ fn first_held_instant_text(t: chrono::DateTime<chrono::Utc>) -> String {
     t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
+/// One V214 receipt as stored.
+struct CosignRow {
+    quorum_key: String,
+    group_kind: String,
+    group_key_id: String,
+    proposer_key_id: String,
+    received_at: String,
+    settled_at: Option<String>,
+    outcome: Option<String>,
+}
+
+fn cosign_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CosignRow> {
+    Ok(CosignRow {
+        quorum_key: r.get(0)?,
+        group_kind: r.get(1)?,
+        group_key_id: r.get(2)?,
+        proposer_key_id: r.get(3)?,
+        received_at: r.get(4)?,
+        settled_at: r.get(5)?,
+        outcome: r.get(6)?,
+    })
+}
+
+impl CosignRow {
+    fn into_receipt(
+        self,
+    ) -> Result<crate::federation::cosign::CosignReceipt, crate::federation::Error> {
+        let instant = |s: &str| {
+            parse_sqlite_instant(s).ok_or_else(|| {
+                crate::federation::Error::Backend(format!("V214 instant {s:?} does not parse"))
+            })
+        };
+        Ok(crate::federation::cosign::CosignReceipt {
+            received_at: instant(&self.received_at)?,
+            settled_at: self.settled_at.as_deref().map(instant).transpose()?,
+            quorum_key: self.quorum_key,
+            group_kind: self.group_kind,
+            group_key_id: self.group_key_id,
+            proposer_key_id: self.proposer_key_id,
+            outcome: self.outcome,
+        })
+    }
+}
+
 /// One V199 row as stored.
 struct SelfRosterRow {
     proposal_id: String,
@@ -15696,6 +15964,8 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             projected_goal,
             vote_window,
             self_roster_receipt,
+            cosign_receipt,
+            cosign_signature,
             wire_index_key,
             ..
         } = planned;
@@ -15825,6 +16095,32 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                             identity_key_id,
                             first_held_instant_text(*received_at)
                         ],
+                    )?;
+                }
+                // v61.3.0 (CIRISPersist#1252, V214) — a hold's receipt,
+                // first-seen wins, in the row's transaction. A second OPEN
+                // hold of the same proposer in the group violates the partial
+                // UNIQUE index and rolls the row back.
+                if let Some(seed) = &cosign_receipt {
+                    tx.execute(
+                        "INSERT INTO federation_cosign_pending \
+                         (quorum_key, group_kind, group_key_id, proposer_key_id, received_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (quorum_key) DO NOTHING",
+                        rusqlite::params![
+                            row.attestation_id,
+                            seed.group_kind,
+                            seed.group_key_id,
+                            seed.proposer_key_id,
+                            first_held_instant_text(seed.received_at)
+                        ],
+                    )?;
+                }
+                if let Some((quorum_key, signer)) = &cosign_signature {
+                    tx.execute(
+                        "INSERT INTO federation_cosign_signatures \
+                         (attestation_id, quorum_key, signer_key_id) VALUES (?1, ?2, ?3) \
+                         ON CONFLICT DO NOTHING",
+                        rusqlite::params![row.attestation_id, quorum_key, signer],
                     )?;
                 }
                 tx.commit()?;
@@ -27118,6 +27414,7 @@ impl crate::federation::community_admit::CommunityStore for SqliteBackend {
         let crate::federation::community_admit::PlannedCommunityRevocation {
             revocation,
             removal_event,
+            ..
         } = planned;
         let row = revocation.community_membership_revocation;
         let witness = serde_json::to_string(&row.witness_set)
@@ -27239,7 +27536,7 @@ impl crate::federation::community_admit::CommunityStore for SqliteBackend {
         &self,
         planned: crate::federation::community_admit::PlannedCommunityWidening,
     ) -> Result<(), crate::federation::Error> {
-        let crate::federation::community_admit::PlannedCommunityWidening { widening } = planned;
+        let crate::federation::community_admit::PlannedCommunityWidening { widening, .. } = planned;
         let row = widening.community_membership_widening;
         let authority_key_id = widening.authority_key_id;
         let scrub_signature_classical = widening.scrub_signature_classical;

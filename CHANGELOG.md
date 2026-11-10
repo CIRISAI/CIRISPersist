@@ -5,6 +5,39 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [61.3.0] - UNRELEASED
+
+A widening or removal of a quorum room or family no longer needs every signature in one offer: the door holds it and collects the rest (CIRISPersist#1252, CC 3.3.4). Until this cut a room of three or more could not widen or remove inside the mesh.
+
+### Added
+
+- **The cosign hold (CIRISPersist#1252, CC 3.3.4 step 2, CC 3.1.3 `cosign:{state}`).** A community or family widening or removal whose ONLY refusal is the consensus shortfall is held instead of refused. The verdict is read structurally: `roster_event_verdict` returns `StandingVerdict::{Admit, ConsensusShort, Refuse}`, and `ConsensusShort` means every signer is an active member at the event's signed instant and the last-founder rule holds as if the event were admitted. Every later check of the door still runs (the invitee's acceptance, the infrastructure founder gates, the steward binding). Only the local door of the node that speaks for the primary signer holds; a replicated under-signed event, and the same event at another node's local door, are refused exactly as before. The door returns the new `Error::RosterChangeNotLanded` (`federation_roster_change_not_landed`, Python `ValueError`).
+- **`cosign:pending:v1` and `cosign:signature:v1` rows (CC 3.1.3, CC 2.4).** The pending row carries the event with no cosignature; its id is the quorum key, `sha256("ciris-persist/cosign-pending/v1" ‖ JCS(the event with no signature))`, and its scrub is the primary's own signature. A cosignature travels alone as a signature row: one signer, one `additional_scrubs` entry over the event's signing bytes, id `sha256("ciris-persist/cosign-signature/v1" ‖ quorum key ‖ signer)`. A stranger, the invitee or a removed member cannot fill a hold (`cosign_signer_not_member`), one proposer holds one open hold per group (`cosign_open_pending_exists`), and a self-roster `objection:assent` row is never read as a cosignature. Builders: `cosign::pending_row`, `cosign::signature_row`.
+- **The cosign executor.** The admission hook and the sweep `Engine::execute_cosign_due` (pyo3 `execute_cosign_due`) union the held signature rows by signer and offer the merged event through the same typed door; it lands as the ordinary widening or removal row. The hold window is the governance table's `community_invite` / `community_remove` number (259 200 s) unless the community record sets `policy_blob.cosign_window_secs`; a value under 259 200 s is refused as policy (`GovernancePolicyRefused`, `cosign_window_below_floor`, CC 4.5.13). Families take the default. The window counts from THIS node's first receipt; expiry drops only the pending and signature rows, and the typed door never reads the window. An `open:self_admit` removal's receipt window is read against the hold's first receipt.
+- **Withdrawal.** The proposer's `withdraws` of the pending row ends the hold (`withdrawn`); a settled hold is not held again (`cosign_settled`). A `withdraws` naming a signature row is refused (`cosign_signature_irrevocable`).
+- **`wire_index::attestation_wire_hash(&Attestation) -> [u8; 32]`, the one ref rule for every attestation-plane row** (pyo3 `attestation_wire_hash(row_json)`). A cosigned widening or removal row is named by its act: the hash is over the row `plan_group_row` builds from the object with no cosignatures. Every other row keeps `sha256(bytes)`. The write path, both backends' point-read self-checks (`reload_record_hashed`), the rebuild and the subject refs use it. Assembled rows keep their `attestation_id`; their ref moves once, at open.
+- **`ReplicatedAttestationOutcome::HeldEquivalent` (`"held_equivalent"`).** An assembled act this node holds under another row (another sufficient subset, other ML-DSA bytes), or the same signer's cosign row, settles held and books no refusal. Its id is recorded as an alias of the act, so a cosigned `withdraws` naming it retracts the row held here (CC 2.4.1.1 rule 0).
+- **`Error::WithdrawsTargetUnheld` (`federation_withdraws_target_unheld`, Python `ValueError`).** A cosigned `withdraws` whose target is neither held nor an alias is refused retryably (the #858 ordering gap, beside `federation_attester_key_unknown`), never admitted inert.
+- **V214** (sqlite and postgres): `federation_cosign_pending` (one open hold per proposer per group, partial UNIQUE), `federation_cosign_signatures`, `federation_cosign_aliases`.
+
+### Changed
+
+- **`DIRECTORY_ABI_VERSION` 12 → 13**: `HeldEquivalent` is a new variant of a payload enum.
+- **`may_receive` asks a new first arm for `cosign:*` rows**: served to the group's active members at the event's signed instant only, in public rooms too. The invitee of a widening is not served it; the member a removal names is.
+- **The namespace registry pair is re-vendored from CIRISConstitution rc18 at `c2a6cc64` (untagged)**: `cosign:{state}`, `ballot:moderator`, `ballot:moderator_acceptance` (192 families). The other CC manifests stay at rc15 `ace6b74` until the re-vendor at the rc18 tag.
+
+### Adoption notes (CIRISEdge)
+
+- Take every attestation ref from `wire_index::attestation_wire_hash`; never `sha256(wire_bytes)` of your own.
+- Handle `ReplicatedAttestationOutcome::HeldEquivalent` (settled, nothing to re-offer).
+- Park and re-offer `federation_withdraws_target_unheld` as you do `federation_attester_key_unknown`.
+- Re-pin `DIRECTORY_ABI_VERSION` 13.
+- The `cosign:*` dimensions are `cosign:pending:v1` and `cosign:signature:v1`; `may_receive` already scopes them.
+
+### Tested
+
+- **I1730–I1743** (sqlite and postgres): the shortfall holds; another refusal still refuses; only the primary's local door holds; one open hold per proposer; a stranger cannot fill a hold; the hold's audience; two nodes with different subsets land alike under one ref and settle each other's rows held; expiry; withdrawal; a pre-upgrade row's ref moves once; one hash derivation (from disk and round trip); the executor through the hook, through the sweep, and the open-room removal window; withdraws by id through the alias and its retryable gap; the window policy.
+
 ## [61.2.2] - 2026-11-10
 
 61.2.1 was not tagged. Its CI and release-tooling changes ship here, together with #1246. The one change to the shipped crate is the SQLite connection tuning.

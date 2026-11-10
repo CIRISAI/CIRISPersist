@@ -216,14 +216,14 @@
         "note": "A family ending in `*` covers every dimension sharing its stem segments with at least one further segment: `accord:*` covers `accord:invoke:notify:{notify_id}`. A consumer that requires len(segments) == len(parts) for a wildcard family has misread the registry. The segments below the wildcard are classed by the leaf's own row where one exists, else `vocab` unless the leaf row says otherwise."
       }
     },
-    "cc_version": "1.0-rc15",
+    "cc_version": "1.0-rc18",
     "components_outside_normative": [
       "cirisbench"
     ],
     "generator": "tools/build_cc_namespace.py",
     "n_components": 9,
     "n_components_normative": 8,
-    "n_families": 189,
+    "n_families": 192,
     "per_component": {
       "accord-agent": 36,
       "anti-sybil": 6,
@@ -231,7 +231,7 @@
       "cirisbench": 1,
       "lens": 15,
       "node": 51,
-      "persist": 31,
+      "persist": 34,
       "registry": 21,
       "transport-delivery": 7
     },
@@ -293,7 +293,7 @@
       }
     },
     "private_use_prefix": "x_private:",
-    "registry_sha256": "df79a1dde30a380380da83f0d776737e580705b6305741f037a5a78c2bef9898",
+    "registry_sha256": "3ba2096fd5f60c22131cb6743c0acb5cbb892fc739e6cedc15c4e68011f763a6",
     "row_types": {
       "carriers": [],
       "cc_ref": "CC 2.4",
@@ -308,7 +308,7 @@
       ]
     },
     "source": "constitution/part_3_the_namespace.md",
-    "source_sha256": "a930a011bd6dc0767f21a5589bb5181f6a189158b247a9d374868293af33999b"
+    "source_sha256": "354b67dd505e1703db89345cfe3633fe03e3f9d06f225402e048a2a536d4b81f"
   },
   "families": [
     {
@@ -862,6 +862,52 @@
         {
           "class": "vocab",
           "segment": "{aspect}"
+        }
+      ]
+    },
+    {
+      "cc_section": "3.1.3",
+      "description": "A member's ballot in a moderator election (CC 4.5.13): community_id, the election id (digest of community id, roster head and last seating), ranks (up to three member keys in order); one ballot per person, folded as a vote is (CC 4.5.13: ag",
+      "owning_component": "persist",
+      "owning_repo": "CIRISPersist",
+      "polarity": "signed",
+      "prefix": "ballot:moderator",
+      "reserved": true,
+      "reserved_rule": {
+        "cc_ref": "CC 3.4.3",
+        "rule": "substrate-self-report"
+      },
+      "segments": [
+        {
+          "class": "literal",
+          "segment": "ballot"
+        },
+        {
+          "class": "literal",
+          "segment": "moderator"
+        }
+      ]
+    },
+    {
+      "cc_section": "3.1.3",
+      "description": "The winner's acceptance, binding the ballot set it was seated on: community_id, the election id, the digest of the ballot and withdrawal rows counted and the signer's own key; admitted only when the node holds that set, the count over it yi",
+      "owning_component": "persist",
+      "owning_repo": "CIRISPersist",
+      "polarity": "signed",
+      "prefix": "ballot:moderator_acceptance",
+      "reserved": true,
+      "reserved_rule": {
+        "cc_ref": "CC 3.4.3",
+        "rule": "substrate-self-report"
+      },
+      "segments": [
+        {
+          "class": "literal",
+          "segment": "ballot"
+        },
+        {
+          "class": "literal",
+          "segment": "moderator_acceptance"
         }
       ]
     },
@@ -2022,6 +2068,34 @@
         {
           "class": "literal",
           "segment": "n_eff_measurable"
+        }
+      ]
+    },
+    {
+      "cc_section": "3.1.3",
+      "description": "The collection of cosignatures for an event its protocol has not yet admitted (registered under CC 3.1.7 R2(a); the hold of CC 3.3.4, general to any cosigned row of CC 2.4): {state} \u2208 pending | signature \u2014 closed; wire cosign:pending:v1, co",
+      "owning_component": "persist",
+      "owning_repo": "CIRISPersist",
+      "polarity": "positive-only",
+      "prefix": "cosign:{state}",
+      "reserved": true,
+      "reserved_rule": {
+        "cc_ref": "CC 3.1.3",
+        "rule": "per-leaf: pending = the event's primary signer, an active member of the group at the event's signed instant; signature = the member whose signature it carries; served to the group's active members only; only the proposer withdraws a pending row; a signature row is never withdrawn"
+      },
+      "segments": [
+        {
+          "class": "literal",
+          "segment": "cosign"
+        },
+        {
+          "class": "vocab",
+          "open": false,
+          "segment": "{state}",
+          "values": [
+            "pending",
+            "signature"
+          ]
         }
       ]
     },
@@ -3478,7 +3552,7 @@
     },
     {
       "cc_section": "3.1.9.2",
-      "description": "Mesh-configuration row (CC 4.2.1): trust-root-emitted on the delegation plane; relieve-never-expand; most-restrictive-across-roots; a key naming no consumer processor is refused at admission; emergency form TTL \u2264 72 h.",
+      "description": "Mesh-configuration row (CC 4.2.1): trust-root-emitted, a scores row authored under the root's trust:confers:v1 edge on the delegation plane (a delegates_to needs a delegate; a configuration names none); relieve-never-expand; most-restrictiv",
       "owning_component": "node",
       "owning_repo": "CIRISNodeCore",
       "polarity": "signed",

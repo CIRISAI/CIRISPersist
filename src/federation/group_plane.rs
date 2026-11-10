@@ -593,6 +593,51 @@ impl GroupSigned {
         (signed.family() == family).then_some(signed)
     }
 
+    /// v61.3.0 (CIRISPersist#1252) — the bytes every signer of a roster event
+    /// signs (the primary and each cosigner alike): the inner row's
+    /// `signing_envelope()`. `None` for a group record (no cosign hold).
+    #[must_use]
+    pub fn plane_signing_envelope(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Family(_) | Self::Community(_) => None,
+            Self::FamilyRevocation(s) => Some(s.family_membership_revocation.signing_envelope()),
+            Self::CommunityRevocation(s) => {
+                Some(s.community_membership_revocation.signing_envelope())
+            }
+            Self::FamilyWidening(s) => Some(s.family_membership_widening.signing_envelope()),
+            Self::CommunityWidening(s) => Some(s.community_membership_widening.signing_envelope()),
+        }
+    }
+
+    /// v61.3.0 (CIRISPersist#1252) — the primary signer of the object.
+    #[must_use]
+    pub fn authority_key_id(&self) -> &str {
+        self.base().authority_key_id
+    }
+
+    /// v61.3.0 (CIRISPersist#1252) — the cosignatures the object carries.
+    #[must_use]
+    pub fn cosignatures(&self) -> &[RosterCosignature] {
+        self.base().cosignatures
+    }
+
+    /// v61.3.0 (CIRISPersist#1252) — the same object carrying `cosignatures`
+    /// instead of its own (the cosign executor's union; the hold's pending
+    /// event carries none).
+    #[must_use]
+    pub fn with_cosignatures(&self, cosignatures: Vec<RosterCosignature>) -> Self {
+        let mut out = self.clone();
+        match &mut out {
+            Self::Family(s) => s.cosignatures = cosignatures,
+            Self::Community(s) => s.cosignatures = cosignatures,
+            Self::FamilyRevocation(s) => s.cosignatures = cosignatures,
+            Self::CommunityRevocation(s) => s.cosignatures = cosignatures,
+            Self::FamilyWidening(s) => s.cosignatures = cosignatures,
+            Self::CommunityWidening(s) => s.cosignatures = cosignatures,
+        }
+        out
+    }
+
     /// Is `other` this object, every instant compared at the substrate's
     /// microsecond resolution?
     #[must_use]
@@ -1015,6 +1060,11 @@ pub enum GroupPlaneApplied {
     Changed,
     /// This node already holds exactly this row.
     Unchanged,
+    /// v61.3.0 (CIRISPersist#1252) — this node holds the same act (the same
+    /// event, the same quorum key) under another row: a different sufficient
+    /// subset of its cosignatures, or other randomised signature bytes.
+    /// Nothing was written but the alias.
+    HeldEquivalent,
     /// Well-formed, not applied; the held state is untouched. The token is
     /// the typed door's own refusal reason.
     Refused(&'static str),
@@ -1037,8 +1087,27 @@ where
     let Some(signed) = canonical_object_of_row(row)? else {
         return Ok(false);
     };
+    verify_signed_object(directory, &signed).await?;
+    Ok(true)
+}
+
+/// v61.3.0 (CIRISPersist#1252) — a signed group object's own verification
+/// (its base scrub and every co-signature over its own signed bytes), the
+/// typed door's, apart from any row: the cosign pending row's statement is
+/// verified through it.
+///
+/// # Errors
+///
+/// The typed verification's refusal.
+pub(crate) async fn verify_signed_object<F>(
+    directory: &F,
+    signed: &GroupSigned,
+) -> Result<(), Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
     use super::tier_ingest as ti;
-    match &signed {
+    match signed {
         GroupSigned::Family(s) => ti::verify_family_admission(directory, s).await?,
         GroupSigned::Community(s) => ti::verify_community_admission(directory, s).await?,
         GroupSigned::FamilyRevocation(s) => {
@@ -1054,7 +1123,7 @@ where
             ti::verify_community_membership_widening_admission(directory, s).await?;
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 /// v61 (CIRISPersist#991) — **the group-plane door on the attestation
@@ -1091,6 +1160,24 @@ where
             row.attestation_id
         )));
     };
+    // v61.3.0 (CIRISPersist#1252) — **an assembled act this node already
+    // holds, offered under another id** (a different sufficient subset of its
+    // cosignatures, other randomised ML-DSA bytes, or a 61.2 peer's offer under
+    // the hash with scrubs) settles as held, with no refusal booked. Its
+    // signatures verify first; its id is then recorded as an alias of the
+    // act, so a `withdraws` naming it resolves to the row held here.
+    if super::cosign::is_cosignable(&signed) {
+        if let Some(held) = super::cosign::held_equivalent(dir, &signed, row).await? {
+            verify_signed_object(dir, &signed).await?;
+            dir.note_cosign_alias(
+                &row.attestation_id,
+                &super::cosign::quorum_key_of(&signed)?,
+                &held,
+            )
+            .await?;
+            return Ok(GroupPlaneApplied::HeldEquivalent);
+        }
+    }
     match signed {
         GroupSigned::Family(s) => dir.put_family(s).await?,
         GroupSigned::Community(s) => match door {
@@ -1115,19 +1202,32 @@ where
                 }
             }
         },
-        GroupSigned::FamilyRevocation(s) => dir.put_family_membership_revocation(s).await?,
         // v61 S2 — the removal window binds the local door only
         // (`community_admit::check_open_self_admit_removal_window`).
-        GroupSigned::CommunityRevocation(s) => match door {
-            GroupRowDoor::Local => dir.put_community_membership_revocation(s).await?,
-            GroupRowDoor::Replicated => {
-                REPLICATED_GROUP_ROW
-                    .scope((), dir.put_community_membership_revocation(s))
-                    .await?;
+        // v61.3.0 (CIRISPersist#1252) — and the cosign hold is the local
+        // door's alone: a replicated under-signed event keeps its refusal, so
+        // every roster event is applied under the replicated marker.
+        plane => {
+            let put = async {
+                match plane {
+                    GroupSigned::FamilyRevocation(s) => {
+                        dir.put_family_membership_revocation(s).await
+                    }
+                    GroupSigned::CommunityRevocation(s) => {
+                        dir.put_community_membership_revocation(s).await
+                    }
+                    GroupSigned::FamilyWidening(s) => dir.put_family_membership_widening(s).await,
+                    GroupSigned::CommunityWidening(s) => {
+                        dir.put_community_membership_widening(s).await
+                    }
+                    GroupSigned::Family(_) | GroupSigned::Community(_) => Ok(()),
+                }
+            };
+            match door {
+                GroupRowDoor::Local => put.await?,
+                GroupRowDoor::Replicated => REPLICATED_GROUP_ROW.scope((), put).await?,
             }
-        },
-        GroupSigned::FamilyWidening(s) => dir.put_family_membership_widening(s).await?,
-        GroupSigned::CommunityWidening(s) => dir.put_community_membership_widening(s).await?,
+        }
     }
     // The typed door stored the object and synced its row from the stored
     // bytes: this row, unless the store kept a different object under the
@@ -1444,7 +1544,9 @@ where
     else {
         return Ok(());
     };
-    let Some(target) = dir.get_attestation(target_id).await? else {
+    // v61.3.0 (CIRISPersist#1252) — through an alias, the same act held here
+    // under another id.
+    let Some(target) = super::cosign::resolve_withdraws_target(dir, target_id).await? else {
         return Ok(());
     };
     if GroupPlaneFamily::of_row(&target).is_none_or(|f| f == GroupPlaneFamily::Roster) {

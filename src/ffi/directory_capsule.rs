@@ -299,6 +299,14 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// `ListSignedCommunityMembershipListingsSince` and its result
 /// `SignedCommunityMembershipListings` are REMOVED.
 ///
+/// v13 (v61.3.0, CIRISPersist#1252, CC 3.3.4) — `ReplicatedAttestationOutcome`
+/// (the payload of the existing attestation-apply result) gains
+/// `HeldEquivalent` (`"held_equivalent"`): this node holds the same act under
+/// another row (an assembled widening or removal with a different sufficient
+/// subset of cosignatures, other randomised ML-DSA bytes, or a `cosign:*` row
+/// of the same signer). A consumer built against 12 fails to decode it on the
+/// hot path (the v6 / v8 / v10 payload-type form).
+///
 /// Consumers MUST check the field at capsule-receive time:
 ///
 /// ```ignore
@@ -311,7 +319,7 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 ///     "persist directory_capsule ABI version mismatch — pin floor too low"
 /// );
 /// ```
-pub const DIRECTORY_ABI_VERSION: u32 = 12;
+pub const DIRECTORY_ABI_VERSION: u32 = 13;
 
 /// A `FederationDirectory` operation, serialized by the consumer and
 /// dispatched inside persist's `.so`.
@@ -5063,10 +5071,13 @@ mod tests {
     /// puts in the vtable a consumer reads at runtime. A single assertion
     /// comparing them to each other would hold trivially while both drifted.
     #[test]
-    fn abi_version_pinned_at_12() {
+    fn abi_version_pinned_at_13() {
         assert_eq!(
-            DIRECTORY_ABI_VERSION, 12,
-            "v61 (CIRISPersist#991): the six group kinds retired — the signed group cursors \
+            DIRECTORY_ABI_VERSION, 13,
+            "v61.3.0 (CIRISPersist#1252): ReplicatedAttestationOutcome gained HeldEquivalent \
+             (the same act held under another row) — a consumer built against 12 fails to \
+             decode it on the hot path. Previous move: \
+             v61 (CIRISPersist#991): the six group kinds retired — the signed group cursors \
              and ApplyReplicatedCommunity and their results are removed from the op and result \
              wire; the rows ride ApplyReplicatedAttestation, so a consumer built against 11 \
              sends ops this host no longer decodes; AttestationRefusalReason gains \
@@ -5105,7 +5116,7 @@ mod tests {
              built for"
         );
         assert_eq!(
-            PERSIST_DIRECTORY_VTABLE.abi_version, 12,
+            PERSIST_DIRECTORY_VTABLE.abi_version, 13,
             "the shipped vtable must advertise what consumers pin against"
         );
     }

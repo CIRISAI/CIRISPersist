@@ -11081,7 +11081,20 @@ pub async fn check_withdraws_admission_at(
         // Malformed withdraws (no target ref) — unresolvable authority.
         return Ok(None);
     };
-    let Some(target) = directory.get_attestation(target_id).await? else {
+    // v61.3.0 (CIRISPersist#1252, CC 2.4.1.1 rule 0) — the id resolves
+    // through an alias: the same act held here under another id.
+    let resolved =
+        crate::federation::cosign::resolve_withdraws_target(directory, target_id).await?;
+    // v61.3.0 — a COSIGNED withdraws is a group's retraction of a cosigned
+    // event; with neither the row nor an alias held it is the retryable
+    // ordering gap, never admitted inert (nothing would recheck it).
+    if resolved.is_none() && !row.additional_scrubs.is_empty() {
+        return Err(Error::WithdrawsTargetUnheld {
+            attestation_id: row.attestation_id.clone(),
+            target_attestation_id: target_id.to_owned(),
+        });
+    }
+    let Some(target) = resolved else {
         // Target not locally present — defer authority to read side. Except
         // for the one verdict that does not depend on the target's contents
         // (PR #852 review): a withdraws whose OWN envelope declares a
