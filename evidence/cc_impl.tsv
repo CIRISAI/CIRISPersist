@@ -432,3 +432,17 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 # caller verify doors accept only strict, and the audit plane's gate is its hybrid-signed head.
 5.3.2.4.3.1	CLM-admission-pqc	CIRISPersist	src/verify/hybrid.rs#require_strict_policy	ciris-persist@61.2.2
 5.3.2.4.3.1	CLM-admission-pqc	CIRISPersist	src/audit/merkle_store.rs#require_hybrid_sth	ciris-persist@61.2.2
+# v61.3.0 (CIRISPersist#1252, CC 3.3.4) — the cosign hold: held on the sole shortfall,
+# collected as cosign:signature rows served to members only, landed through its own door
+# under the quorum key; a cosigned withdraws resolves on every node; a sent signature is not recalled.
+3.3.4	CLM-cosign-collection-held	CIRISPersist	src/federation/mod.rs#roster_event_verdict	ciris-persist@61.2.2
+3.3.4	CLM-cosign-collection-held	CIRISPersist	src/federation/cosign.rs#hold	ciris-persist@61.2.2
+3.3.4	CLM-cosign-collection-held	CIRISPersist	src/federation/cosign.rs#quorum_key_of	ciris-persist@61.2.2
+3.3.4	CLM-cosign-collection-held	CIRISPersist	src/federation/cosign.rs#signature_row	ciris-persist@61.2.2
+3.3.4	CLM-cosign-collection-held	CIRISPersist	src/federation/cosign.rs#admit_row	ciris-persist@61.2.2
+3.3.4	CLM-cosign-collection-held	CIRISPersist	src/federation/cosign.rs#execute_for	ciris-persist@61.2.2
+3.3.4	CLM-cosign-collection-held	CIRISPersist	src/federation/cosign.rs#may_receive	ciris-persist@61.2.2
+3.3.4	CLM-cosign-collection-held	CIRISPersist	src/federation/cosign.rs#check_withdraws_target	ciris-persist@61.2.2
+3.3.4	CLM-cosign-collection-held	CIRISPersist	src/federation/cosign.rs#resolve_withdraws_target	ciris-persist@61.2.2
+3.3.4	CLM-cosign-collection-held	CIRISPersist	src/federation/wire_index.rs#attestation_wire_hash	ciris-persist@61.2.2
+3.3.4	CLM-cosign-collection-held	CIRISPersist	src/federation/group_plane.rs#apply_group_plane_row	ciris-persist@61.2.2

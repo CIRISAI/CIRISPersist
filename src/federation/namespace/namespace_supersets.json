@@ -17404,6 +17404,99 @@
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v61.1-1233",
     "witness": "I1564 (sqlite, postgres): store_sth refuses a new signed tree head without its ML-DSA-65 half and writes nothing; I1565 (sqlite, postgres): a stored head without its half is served as itself by latest_sth and current_sth (CC 2.6.1.8) and refused by verify_audit_sth, and a stored head that does not decode is refused; I1566 (unit): verify_audit_sth refuses a head without its half and verifies only against the pinned signer; I1567 (sqlite, postgres): audit_chain_proof serves the stored head as itself, verify_audit_sth refuses it, and an undecodable head is an error rather than no head"
+   },
+   {
+    "decimal_id": "3.3.4",
+    "claim_id": "CLM-cosign-collection-held",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/mod.rs#roster_event_verdict",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc18-1252",
+    "tsv_comment_before": [
+     "# v61.3.0 (CIRISPersist#1252, CC 3.3.4) — the cosign hold: held on the sole shortfall,",
+     "# collected as cosign:signature rows served to members only, landed through its own door",
+     "# under the quorum key; a cosigned withdraws resolves on every node; a sent signature is not recalled."
+    ]
+   },
+   {
+    "decimal_id": "3.3.4",
+    "claim_id": "CLM-cosign-collection-held",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/cosign.rs#hold",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc18-1252"
+   },
+   {
+    "decimal_id": "3.3.4",
+    "claim_id": "CLM-cosign-collection-held",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/cosign.rs#quorum_key_of",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc18-1252"
+   },
+   {
+    "decimal_id": "3.3.4",
+    "claim_id": "CLM-cosign-collection-held",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/cosign.rs#signature_row",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc18-1252"
+   },
+   {
+    "decimal_id": "3.3.4",
+    "claim_id": "CLM-cosign-collection-held",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/cosign.rs#admit_row",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc18-1252"
+   },
+   {
+    "decimal_id": "3.3.4",
+    "claim_id": "CLM-cosign-collection-held",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/cosign.rs#execute_for",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc18-1252"
+   },
+   {
+    "decimal_id": "3.3.4",
+    "claim_id": "CLM-cosign-collection-held",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/cosign.rs#may_receive",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc18-1252"
+   },
+   {
+    "decimal_id": "3.3.4",
+    "claim_id": "CLM-cosign-collection-held",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/cosign.rs#check_withdraws_target",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc18-1252"
+   },
+   {
+    "decimal_id": "3.3.4",
+    "claim_id": "CLM-cosign-collection-held",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/cosign.rs#resolve_withdraws_target",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc18-1252"
+   },
+   {
+    "decimal_id": "3.3.4",
+    "claim_id": "CLM-cosign-collection-held",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/wire_index.rs#attestation_wire_hash",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc18-1252"
+   },
+   {
+    "decimal_id": "3.3.4",
+    "claim_id": "CLM-cosign-collection-held",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/group_plane.rs#apply_group_plane_row",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc18-1252"
    }
   ],
   "CIRISServer": [
