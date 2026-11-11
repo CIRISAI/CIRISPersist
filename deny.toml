@@ -70,6 +70,18 @@ ignore = [
                            # ciris-verify-core → hickory-resolver (reqwest's plain resolver);
                            # persist does NOT enable DNSSEC/NSEC3 validation, so the vulnerable
                            # path is unreachable. No patched version exists (patched=[]).
+    "RUSTSEC-2026-0491",  # v61.3.0 — hickory-proto 0.25.2 sizes decode Vecs from the DNS
+                           # header's record counts (memory amplification on a spoofed
+                           # response). Transitive ONLY via ciris-verify-core v22.2.0 →
+                           # hickory-resolver 0.25 (its dns.rs / DoH fallback). persist calls
+                           # no ciris_verify_core::dns / http_client / mobile_http path, so it
+                           # never decodes a DNS message. Fix is hickory 0.26.2 (semver-major,
+                           # upstream-only); remove when a TAGGED Verify carries it.
+    "RUSTSEC-2026-0487",  # v61.3.0 — hickory-proto zone-file lexer panic on a ≥4096-char token
+    "RUSTSEC-2026-0489",  # v61.3.0 — hickory-proto SVCB/HTTPS text parse panic (malformed alpn)
+    "RUSTSEC-2026-0490",  # v61.3.0 — hickory-proto SVCB/HTTPS text parse panic (lone quote)
+                           # All three: TEXT/zone-file parsers, same transitive path and same
+                           # fix (0.26.2) as 0491 above; persist parses no DNS text or zone file.
     # v61.2.1 — RUSTSEC-2025-0134 (rustls-pemfile) and RUSTSEC-2026-0098 /
     # 0099 / 0104 (rustls-webpki) are CLEARED: cargo deny (all features, every
     # target) reported each ignore matched no crate. The ignores are gone.
