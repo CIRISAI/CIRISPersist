@@ -5,7 +5,7 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
-## [61.3.0] - UNRELEASED
+## [61.3.0] - 2026-11-11
 
 A widening or removal of a quorum room or family no longer needs every signature in one offer: the door holds it and collects the rest (CIRISPersist#1252, CC 3.3.4). Until this cut a room of three or more could not widen or remove inside the mesh.
 
