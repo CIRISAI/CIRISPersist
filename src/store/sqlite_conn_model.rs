@@ -893,6 +893,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("drop_cosign_rows", ConnClass::Write),
     ("note_cosign_alias", ConnClass::Write),
     ("cosign_alias", ConnClass::Read),
+    ("list_cosign_aliases", ConnClass::Read),
     ("read_group_plane_object", ConnClass::Read),
     ("test_seed_wire_index", ConnClass::Write),
     // CIRISPersist#1198 — the V213 vote windows.

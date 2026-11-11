@@ -12602,6 +12602,35 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(format!("cosign alias: {e}")))
     }
 
+    async fn list_cosign_aliases(
+        &self,
+        quorum_key: &str,
+    ) -> Result<Vec<(String, String)>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let rows = client
+            .query(
+                "SELECT alias_attestation_id, held_attestation_id \
+                   FROM cirislens.federation_cosign_aliases \
+                  WHERE quorum_key = $1 ORDER BY alias_attestation_id",
+                &[&quorum_key],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("cosign aliases: {e}")))?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get::<_, String>(0)
+                        .map_err(|e| crate::federation::Error::Backend(format!("V214: {e}")))?,
+                    r.try_get::<_, String>(1)
+                        .map_err(|e| crate::federation::Error::Backend(format!("V214: {e}")))?,
+                ))
+            })
+            .collect()
+    }
+
     async fn cosign_alias(
         &self,
         attestation_id: &str,

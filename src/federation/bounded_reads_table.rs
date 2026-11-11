@@ -181,6 +181,10 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         Bound::Open("every open cosign hold on this node, for the sweep: at most one per proposer per group (V214's partial UNIQUE), each closed by its window"),
     ),
     (
+        "list_cosign_aliases",
+        Bound::Open("the other nodes' ids of one cosigned act this node settled as held: one per distinct sufficient subset or signature bytes offered"),
+    ),
+    (
         "list_cosign_signatures",
         Bound::Schema("the signature rows of one hold: at most one per signer (UNIQUE (quorum_key, signer)), so at most the group's roster"),
     ),

@@ -6152,6 +6152,25 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("cosign alias: {e}")))
     }
 
+    async fn list_cosign_aliases(
+        &self,
+        quorum_key: &str,
+    ) -> Result<Vec<(String, String)>, crate::federation::Error> {
+        let q = quorum_key.to_owned();
+        self.read(
+            move |conn| -> Result<Vec<(String, String)>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                "SELECT alias_attestation_id, held_attestation_id FROM federation_cosign_aliases \
+                  WHERE quorum_key = ?1 ORDER BY alias_attestation_id",
+            )?;
+                let rows = stmt.query_map(rusqlite::params![q], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("cosign aliases: {e}")))
+    }
+
     async fn cosign_alias(
         &self,
         attestation_id: &str,

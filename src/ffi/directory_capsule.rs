@@ -6874,6 +6874,7 @@ mod tests {
         ("drop_cosign_rows", COSIGN_1252),
         ("note_cosign_alias", COSIGN_1252),
         ("cosign_alias", COSIGN_1252),
+        ("list_cosign_aliases", COSIGN_1252),
         ("read_group_plane_object", COSIGN_1252),
         (
             "vote_window_first_held",

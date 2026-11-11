@@ -6123,6 +6123,16 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
+    /// v61.3.0 (CIRISPersist#1252, V214) — every alias recorded for the act
+    /// `quorum_key`, as `(alias_attestation_id, held_attestation_id)`, ordered
+    /// by alias id: the ids a `withdraws` of that act may name on this node.
+    async fn list_cosign_aliases(&self, quorum_key: &str) -> Result<Vec<(String, String)>, Error> {
+        let _ = quorum_key;
+        Err(Error::Unsupported {
+            method: "list_cosign_aliases",
+        })
+    }
+
     /// v61.3.0 (CIRISPersist#1252, V214) — the alias `attestation_id` names,
     /// as `(quorum_key, held_attestation_id)`.
     async fn cosign_alias(&self, attestation_id: &str) -> Result<Option<(String, String)>, Error> {

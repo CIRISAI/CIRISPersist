@@ -1327,6 +1327,86 @@ where
     }
 }
 
+/// v61.3.0 (CIRISPersist#1252, CC 2.4.1.1 rule 0) — **is the act `signed`
+/// names retracted on this node?** A held `withdraws` names ANY row of the
+/// act this node knows of: a held row of the same act (any subset of its
+/// cosignatures, withdrawn rows included), an alias of the act (another
+/// node's id for it, recorded at a held-equivalent settle), or `offered_id`.
+/// Asked from stored rows, never from the order rows arrived in, so every
+/// node that holds the act reads its retraction alike — the admission's
+/// `after_withdraws` (which resolves through [`resolve_withdraws_target`]),
+/// a later offer of another subset, and the projection rebuild.
+///
+/// # Errors
+///
+/// The reads'.
+pub async fn act_retracted<D>(
+    dir: &D,
+    signed: &GroupSigned,
+    offered_id: &str,
+) -> Result<bool, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    if !is_cosignable(signed) {
+        return Ok(false);
+    }
+    let mut ids = vec![offered_id.to_owned()];
+    for row in held_rows_of_act(dir, signed).await? {
+        ids.push(row.attestation_id);
+    }
+    match dir.list_cosign_aliases(&quorum_key_of(signed)?).await {
+        Ok(aliases) => {
+            for (alias, held) in aliases {
+                ids.push(alias);
+                ids.push(held);
+            }
+        }
+        Err(Error::Unsupported { .. }) => {}
+        Err(e) => return Err(e),
+    }
+    ids.sort();
+    ids.dedup();
+    Ok(dir
+        .list_composers_referencing_any(&ids, None, None)
+        .await?
+        .iter()
+        .any(|w| w.attestation_type == attestation_type::WITHDRAWS))
+}
+
+/// Every held group-plane row of `signed`'s act (withdrawn ones included):
+/// the rows of its family placed at its group whose object names the same
+/// act.
+pub(crate) async fn held_rows_of_act<D>(
+    dir: &D,
+    signed: &GroupSigned,
+) -> Result<Vec<Attestation>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let rows = match dir
+        .list_targeted_by_dimension_prefix(
+            &[signed.kind().as_str()],
+            signed.group_key_id(),
+            signed.family().dimension(),
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(Error::Unsupported { .. }) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        if let Ok(Some(held)) = super::group_plane::group_signed_of_row(&row) {
+            if same_act(&held, signed)? {
+                out.push(row);
+            }
+        }
+    }
+    Ok(out)
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 //  At open: the ref of a cosigned row moves once
 // ─────────────────────────────────────────────────────────────────────────

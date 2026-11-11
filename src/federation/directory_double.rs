@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 143 delegations, generated. Every one: fault first, then delegate.
+// 144 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn adopt_genesis_reanchor(
@@ -592,6 +592,12 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.list_consent_peers_for(for_key_id).await
+    }
+    async fn list_cosign_aliases(&self, quorum_key: &str) -> Result<Vec<(String, String)>, Error> {
+        if let Some(e) = self.faulted("list_cosign_aliases") {
+            return Err(e);
+        }
+        self.inner.list_cosign_aliases(quorum_key).await
     }
     async fn list_cosign_signatures(
         &self,

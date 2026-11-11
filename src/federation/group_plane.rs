@@ -1167,6 +1167,25 @@ where
     // signatures verify first; its id is then recorded as an alias of the
     // act, so a `withdraws` naming it resolves to the row held here.
     if super::cosign::is_cosignable(&signed) {
+        // v61.3.0 (CIRISPersist#1252, CC 2.4.1.1 rule 0) — a row of an act
+        // this node holds RETRACTED (whichever subset or id the withdraws
+        // named) is that act, held: it never lands the act again.
+        if super::cosign::act_retracted(dir, &signed, &row.attestation_id).await? {
+            verify_signed_object(dir, &signed).await?;
+            if let Some(held) = super::cosign::held_rows_of_act(dir, &signed)
+                .await?
+                .into_iter()
+                .find(|h| h.attestation_id != row.attestation_id)
+            {
+                dir.note_cosign_alias(
+                    &row.attestation_id,
+                    &super::cosign::quorum_key_of(&signed)?,
+                    &held.attestation_id,
+                )
+                .await?;
+            }
+            return Ok(GroupPlaneApplied::HeldEquivalent);
+        }
         if let Some(held) = super::cosign::held_equivalent(dir, &signed, row).await? {
             verify_signed_object(dir, &signed).await?;
             dir.note_cosign_alias(
@@ -1621,11 +1640,18 @@ where
     // A roster event retracted by an admitted `withdraws` is not projected.
     let mut rows = Vec::with_capacity(read.rows.len());
     for row in read.rows {
-        let withdrawn = dir
+        let mut withdrawn = dir
             .list_attestations_referencing(&row.attestation_id)
             .await?
             .iter()
             .any(|w| w.attestation_type == attestation_type::WITHDRAWS);
+        // v61.3.0 (CIRISPersist#1252) — a cosigned roster event retracted
+        // under another id of its act (an alias, another subset's row).
+        if !withdrawn {
+            if let Some(signed) = group_signed_of_row(&row)? {
+                withdrawn = super::cosign::act_retracted(dir, &signed, &row.attestation_id).await?;
+            }
+        }
         if !withdrawn {
             rows.push(row);
         }

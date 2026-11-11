@@ -65,7 +65,11 @@ pub(crate) mod bodies {
     use chrono::{DateTime, Duration, Utc};
 
     /// A backend whose node identity a witness can set.
-    pub(crate) trait Node: FederationDirectory {
+    pub(crate) trait Node:
+        FederationDirectory
+        + crate::federation::group_plane::GroupPlaneStore
+        + crate::read::ReadEngine
+    {
         fn set_node(&self, key_id: &str);
     }
 
@@ -1142,9 +1146,12 @@ pub(crate) mod bodies {
         .expect("I1741: judged at the hold's first receipt, inside the window");
     }
 
-    /// **I1742** — withdraws by id. Mutation: `resolve_withdraws_target`
-    /// ignores the alias table → the withdraws stays the retryable gap after
-    /// the alias lands, and the act is never retracted here: red.
+    /// **I1742** — withdraws by id, and the retraction from stored rows.
+    /// Mutations: `resolve_withdraws_target` ignores the alias table → the
+    /// withdraws stays the retryable gap after the alias lands: red;
+    /// `act_retracted` ignores the aliases (the rebuild bypasses the alias) →
+    /// the rebuild disagrees with the live table: red; the lifecycle
+    /// predicate's alias clause removed → the read fold serves B's row: red.
     pub(crate) async fn i1742_withdraws_by_id<D: Node>(a: &D, b: &D, tag: &str) {
         let r = room(a, tag, "i1742", "majority", 4).await;
         room_again(b, &r, "majority").await;
@@ -1157,7 +1164,13 @@ pub(crate) mod bodies {
         a.put_community_membership_widening(on_a.clone())
             .await
             .expect("A");
-        b.put_community_membership_widening(on_b).await.expect("B");
+        b.put_community_membership_widening(on_b.clone())
+            .await
+            .expect("B");
+        let row_b = group_plane::plan_group_row(&GroupSigned::CommunityWidening(on_b))
+            .unwrap()
+            .unwrap();
+        assert!(held(b, &row_b.attestation_id).await);
         let row_a = group_plane::plan_group_row(&GroupSigned::CommunityWidening(on_a))
             .unwrap()
             .unwrap();
@@ -1200,6 +1213,66 @@ pub(crate) mod bodies {
             .await
             .expect("I1742: the withdraws lands on B");
         assert!(!active(b, &r.cid, &r.m).await, "I1742: B retracts the act");
+        // The retraction holds whatever B recomputes from its stored rows.
+        // (1) The projection rebuild from rows agrees with the live table.
+        let rebuilt =
+            group_plane::projection_rebuild(b, group_plane::GroupPlaneTable::CommunityWidenings)
+                .await
+                .unwrap();
+        assert_eq!(
+            rebuilt.live, rebuilt.rebuilt,
+            "I1742: the rebuild keeps the retraction"
+        );
+        // (2) The at-open pass brings nothing back.
+        group_plane::rehome_group_records(b).await.unwrap();
+        assert!(
+            !active(b, &r.cid, &r.m).await,
+            "I1742: still retracted after open"
+        );
+        // (3) Every row of the act offered again settles held: B's own, A's,
+        // and a third subset nobody named.
+        let third = group_plane::plan_group_row(&GroupSigned::CommunityWidening(cosigned(
+            &w,
+            &[&f[2], &f[3]],
+        )))
+        .unwrap()
+        .unwrap();
+        for row in [row_b.clone(), row_a.clone(), third] {
+            let o = b
+                .apply_replicated_attestation(SignedAttestation { attestation: row })
+                .await
+                .expect("I1742: a row of the retracted act settles");
+            assert!(
+                matches!(o, Outcome::HeldEquivalent | Outcome::Unchanged),
+                "I1742: {o:?}"
+            );
+        }
+        assert!(
+            !active(b, &r.cid, &r.m).await,
+            "I1742: no offer re-lands the act"
+        );
+        // (4) The read fold (the CEG list, `Live`) hides the withdrawn row on
+        // both nodes: A's by its own id, B's through the alias.
+        for (node, row) in [(a, &row_a), (b, &row_b)] {
+            let filter = crate::read::AttestationFilter {
+                attested_key_id: Some(r.m.clone()),
+                ..Default::default()
+            };
+            let scope = crate::scope::caller_scope_from_directory(node, &f[1])
+                .await
+                .expect("caller scope");
+            let page = node
+                .list_attestations(filter, None, 1000, scope)
+                .await
+                .expect("live read");
+            assert!(
+                !page
+                    .items
+                    .iter()
+                    .any(|i| i.attestation_id == row.attestation_id),
+                "I1742: the read fold resolves the withdraws (through the alias on B)"
+            );
+        }
     }
 
     /// **I1744** — freshness W on cosign rows (CC 2.6.7, rc18). Mutation: drop
