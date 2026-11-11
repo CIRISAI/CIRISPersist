@@ -117,14 +117,9 @@ mod tests {
     /// that cut.
     #[test]
     fn i1499_the_rc14_text_not_built_here_is_not_built() {
-        // v61.3.0 (CIRISPersist#1252) — the registry pair moved to rc18 alone;
-        // the text this table reads is the manifests' cut, re-read at the full
-        // re-vendor.
-        assert_eq!(
-            crate::federation::namespace::registry::VENDORED_MANIFESTS_CC_VERSION,
-            "1.0-rc15",
-            "the table is read at rc15"
-        );
+        // v61.3.0 (CIRISPersist#1252) — every CC file is vendored at rc18; the
+        // table's rows were re-read there (none of them is built).
+        assert_eq!(VENDORED_CC_VERSION, "1.0-rc18", "the table is read at rc18");
         let tsv = std::fs::read_to_string(root().join("evidence/cc_impl.tsv")).expect("cc_impl");
         let claims: Vec<&str> = tsv
             .lines()

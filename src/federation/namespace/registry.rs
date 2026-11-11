@@ -55,38 +55,22 @@ pub const VENDORED_N_FAMILIES: usize = 192;
 /// vendored bytes the way `tools/build_cc_namespace.py` does.
 ///
 /// Vendored byte-for-byte from CIRISConstitution commit [`VENDORED_CC_COMMIT`]
-/// (CC 1.0-rc15; see [`VENDORED_CC_COMMIT`] for the tag), together with
+/// (CC 1.0-rc18; see [`VENDORED_CC_COMMIT`] for the tag), together with
 /// `namespace_match_vectors.json` from the same commit. JSON carries no
 /// comments, so this doc is the vendored files' header.
 pub const VENDORED_REGISTRY_SHA256: &str =
     "3ba2096fd5f60c22131cb6743c0acb5cbb892fc739e6cedc15c4e68011f763a6";
 
 /// The CIRISConstitution commit every vendored CC manifest was copied from: the
-/// commit the `v1.0-rc15` tag names (`ace6b74`, tag object `6869eb10`), copied
-/// from the tag with `git show v1.0-rc15:manifests/<file>`, never a branch tip
-/// (CIRISPersist#753). The files are also pinned by their own SHA-256
+/// commit the `v1.0-rc18` tag names (`646df978`, tag object `ae5a2a01`), copied
+/// from the tag with `git show v1.0-rc18:manifests/<file>`, never a branch tip
+/// (CIRISPersist#753; v61.3.0, CIRISPersist#1252, from rc15 `ace6b74`). The
+/// files are also pinned by their own SHA-256
 /// ([`VENDORED_REGISTRY_FILE_SHA256`], [`VENDORED_VECTORS_FILE_SHA256`], and the
-/// files in [`super::cc_manifests`]), and `scripts/check_vendored_cc.sh v1.0-rc15`
+/// files in [`super::cc_manifests`]), and `scripts/check_vendored_cc.sh v1.0-rc18`
 /// byte-compares all of them against the tag before a persist release that
-/// names rc15 is tagged.
-pub const VENDORED_CC_COMMIT: &str = "ace6b74217b4496a67e47aef2258461517e4493c";
-
-/// v61.3.0 (CIRISPersist#1252) — the CC version the manifests OTHER than the
-/// registry pair (the files in [`super::cc_manifests`] and the self-roster
-/// traces) were vendored at, the tag [`VENDORED_CC_COMMIT`] names. It equals
-/// [`VENDORED_CC_VERSION`] again once every file is re-vendored at one tag.
-pub const VENDORED_MANIFESTS_CC_VERSION: &str = "1.0-rc15";
-
-/// v61.3.0 (CIRISPersist#1252) — the CIRISConstitution commit the REGISTRY
-/// PAIR (`namespace_registry.json` and `namespace_match_vectors.json`, which
-/// share `registry_sha256`, and the persist-generated
-/// `namespace_match_binds.json`) was copied from: the `v1.0-rc18` tag
-/// (`646df978`), for the `cosign:{state}` family (its grammar is the one
-/// CIRISPersist#1252 was built against at `c2a6cc64`: `registry_sha256` equal). Every other CC file stays at
-/// [`VENDORED_CC_COMMIT`] until the release lead re-vendors the whole set at
-/// the rc18 tag; until then `scripts/check_vendored_cc.sh` at one tag cannot
-/// pass for both halves, and says so.
-pub const VENDORED_REGISTRY_CC_COMMIT: &str = "646df97853efeb1c068db2719ae70ffc342a2247";
+/// names rc18 is tagged.
+pub const VENDORED_CC_COMMIT: &str = "646df97853efeb1c068db2719ae70ffc342a2247";
 
 /// SHA-256 of the vendored `namespace_registry.json` FILE bytes (the whole file,
 /// unlike [`VENDORED_REGISTRY_SHA256`], which is CC's hash of the grammar).
@@ -1150,9 +1134,7 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     // rc18 (CIRISConstitution v1.0-rc18 @ 646df978; CIRISPersist#1252) —
     // three families added, none retired: the cosign hold (CC 3.1.3, persist's
     // `federation::cosign`) and the two moderator-ballot families (CC 3.1.3).
-    // The registry pair alone is vendored at that commit
-    // ([`VENDORED_REGISTRY_CC_COMMIT`]); the release lead re-vendors every CC
-    // file at the rc18 tag.
+    // Every CC file is vendored at the tag (CIRISPersist#1252).
     "ballot:moderator",
     "ballot:moderator_acceptance",
     "cosign:{state}",

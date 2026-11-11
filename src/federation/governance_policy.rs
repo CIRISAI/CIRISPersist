@@ -555,7 +555,11 @@ mod tests {
                 "moderation_action",
                 "accord_halt",
                 "custodian_replace",
-                "affiliation_member_action"
+                "affiliation_member_action",
+                // rc18 (CIRISPersist#1252 re-vendor): a `ranked` row persist
+                // has no door for (the `ballot:moderator` families are
+                // registered and not gated); read as not two-path.
+                "moderator_election"
             ]
         );
         // A door may decide only a standing-base row: the community rows'
