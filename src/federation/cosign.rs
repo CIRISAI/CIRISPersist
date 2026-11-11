@@ -94,7 +94,12 @@ pub const POLICY_BLOB_WINDOW: &str = "cosign_window_secs";
 /// The governance reason a window under the floor is refused with.
 pub const WINDOW_BELOW_FLOOR: &str = "cosign_window_below_floor";
 /// The refusal token of a re-offer of a settled hold.
-pub const COSIGN_SETTLED: &str = "cosign_settled";
+pub const COSIGN_PENDING_SETTLED: &str = "cosign_pending_settled";
+/// The refusal token of a pending row this node would BEGIN to hold whose
+/// event was signed more than one hold window before this node's receipt
+/// (CC 3.3.4, rc18): stateless, beside [`COSIGN_PENDING_SETTLED`], so no node
+/// holds a change later than two windows after its signed instant.
+pub const COSIGN_PENDING_TOO_OLD: &str = "cosign_pending_too_old";
 /// The refusal token of a second open pending event by one proposer.
 pub const COSIGN_OPEN_PENDING_EXISTS: &str = "cosign_open_pending_exists";
 /// The refusal token of a `withdraws` naming a signature row.
@@ -614,7 +619,7 @@ fn not_member(group: &str, signer: &str) -> Error {
 
 fn settled_refusal(quorum_key: &str, outcome: &str) -> Error {
     Error::InvalidArgument(format!(
-        "{COSIGN_SETTLED}: the hold {quorum_key} was settled `{outcome}` on this node — a \
+        "{COSIGN_PENDING_SETTLED}: the hold {quorum_key} was settled `{outcome}` on this node — a \
          settled hold is not held again (CIRISPersist#1252)"
     ))
 }
@@ -635,9 +640,13 @@ pub(crate) enum CosignAdmit {
 /// - a held id settles as held (one act, one pending row; one signer, one
 ///   signature row), never as a conflict;
 /// - the row is exactly what its object mints (a re-wrap is refused);
-/// - a settled hold is not held again ([`COSIGN_SETTLED`]);
+/// - a settled hold is not held again ([`COSIGN_PENDING_SETTLED`]);
 /// - the signer is an ACTIVE member of the group at the event's signed
-///   instant (a stranger, or a removed member, cannot fill a hold);
+///   instant (a stranger, or a removed member, cannot fill a hold), and a
+///   signer who is no member at receipt signed inside W (CC 2.6.7:
+///   [`Error::AssertedAtStale`]);
+/// - a pending row: its event was signed within one hold window of this
+///   node's receipt ([`COSIGN_PENDING_TOO_OLD`]);
 /// - a pending row: its proposer holds no other open hold in the group
 ///   ([`COSIGN_OPEN_PENDING_EXISTS`]);
 /// - a signature row: its pending row is held (an ordering gap is the
@@ -662,17 +671,53 @@ where
         }
     }
     let group = read.event.group_key_id().to_owned();
-    let members =
-        active_members_at(dir, read.event.kind(), &group, read.event.signed_instant()).await?;
+    let signed_at = read.event.signed_instant();
+    let now = super::self_roster::roster_clock();
+    let members = active_members_at(dir, read.event.kind(), &group, signed_at).await?;
     let signer = match &read.cosignature {
         Some(c) => c.authority_key_id.clone(),
         None => read.event.authority_key_id().to_owned(),
     };
+    // rc18 (CC 2.6.7 W, in the form CC 3.3.6.3 gives it) — a signer who is no
+    // longer an active member at receipt counts only while the signed instant
+    // is inside W: an evicted member cannot sign into the window in which it
+    // was still a member. A member still standing signs at any age.
+    if super::self_roster::outside_past_freshness_window(signed_at, now)
+        && !active_members_at(dir, read.event.kind(), &group, now)
+            .await?
+            .contains(&signer)
+    {
+        return Err(Error::AssertedAtStale {
+            author: signer,
+            standing_for: group,
+            plane: "cosign",
+            asserted_at: signed_at,
+            w_secs: super::self_roster::PAST_FRESHNESS_W_SECS,
+        });
+    }
     if !members.contains(&signer) {
         return Err(not_member(&group, &signer));
     }
     match read.kind {
         CosignRow::Pending => {
+            // rc18 (CC 3.3.4) — no hold BEGINS for an event signed more than
+            // one hold window before this node's receipt.
+            let blob = match read.event.kind() {
+                GroupKind::Community => dir
+                    .lookup_community(&group)
+                    .await?
+                    .and_then(|c| c.policy_blob),
+                GroupKind::Family => None,
+            };
+            let window = window_secs(read.event.kind(), read.event.family(), blob.as_ref())?;
+            if now - signed_at > chrono::Duration::seconds(window) {
+                return Err(Error::InvalidArgument(format!(
+                    "{COSIGN_PENDING_TOO_OLD}: the event of hold {} was signed at {signed_at}, \
+                     more than its {window} s window before this node's receipt — a proposer \
+                     that still wants the change signs it anew (CIRISPersist#1252, CC 3.3.4)",
+                    read.quorum_key
+                )));
+            }
             let open = dir.list_open_cosign_receipts().await?;
             if open.iter().any(|r| {
                 r.group_key_id == group
@@ -1197,8 +1242,9 @@ pub fn is_short(standing: &StandingVerdict) -> bool {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// **Who receives a cosign row** — [`may_receive`](super::replication_audience::may_receive)'s
-/// first arm: a recipient whose principals (and itself) contain an ACTIVE
-/// member of the group at the event's signed instant. Every kind of group,
+/// first arm: a recipient whose principals (and itself) contain a member of
+/// the group ACTIVE at the event's signed instant and still active now (CC
+/// 3.3.4, rc18). A restriction only: it never admits anything else. Every kind of group,
 /// public ones included; the invitee of a widening is not a member, the
 /// target of a removal is. `Ok(None)` for a row that is not a cosign row.
 ///
@@ -1220,13 +1266,25 @@ where
     let Ok(Some(read)) = read_row(row) else {
         return Ok(Some(Verdict::No(Reason::Malformed)));
     };
-    let members = active_members_at(
+    // rc18 (CC 3.3.4) — a member at the event's signed instant who is a
+    // member still: a member removed since is served nothing.
+    let now_members = active_members_at(
+        dir,
+        read.event.kind(),
+        read.event.group_key_id(),
+        chrono::Utc::now(),
+    )
+    .await?;
+    let members: Vec<String> = active_members_at(
         dir,
         read.event.kind(),
         read.event.group_key_id(),
         read.event.signed_instant(),
     )
-    .await?;
+    .await?
+    .into_iter()
+    .filter(|m| now_members.contains(m))
+    .collect();
     let mut principals: std::collections::HashSet<String> =
         super::self_collective::principals_of(dir, recipient)
             .await?

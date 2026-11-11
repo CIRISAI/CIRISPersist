@@ -40,6 +40,9 @@
 //!   alias it is the retryable `federation_withdraws_target_unheld`.
 //! - **I1743** the window policy: under the floor refused, the default
 //!   applies.
+//! - **I1744** freshness W on cosign rows: a since-removed member's row
+//!   signed more than W before receipt is `asserted_at_stale`; inside W it is
+//!   judged as any member's; a member still standing signs at any age.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -122,6 +125,55 @@ pub(crate) mod bodies {
             .await
             .expect("the room founds on the second node");
         d.set_node(&r.founders[0]);
+    }
+
+    /// A widening of `member` into `r.cid` signed by `signer` at `t`.
+    fn widening_by(
+        r: &Room,
+        signer: &str,
+        member: &str,
+        t: DateTime<Utc>,
+    ) -> SignedCommunityMembershipWidening {
+        ts::sign_community_membership_widening(
+            signer,
+            CommunityMembershipWidening {
+                community_key_id: r.cid.clone(),
+                member_key_id: member.to_owned(),
+                joined_at: t,
+                effective_at: t,
+                role: None,
+                persist_row_hash: String::new(),
+            },
+        )
+    }
+
+    /// Remove `target` from `r.cid` at `t`, signed by every other founder.
+    async fn remove_founder(d: &dyn FederationDirectory, r: &Room, target: &str, t: DateTime<Utc>) {
+        let others: Vec<&str> = r
+            .founders
+            .iter()
+            .map(String::as_str)
+            .filter(|f| *f != target)
+            .collect();
+        let mut removal = ts::sign_community_membership_revocation(
+            others[0],
+            CommunityMembershipRevocation {
+                community_key_id: r.cid.clone(),
+                removed_identity_key_id: target.to_owned(),
+                removed_at: t,
+                effective_at: t,
+                reason: None,
+                witness_set: Vec::new(),
+                persist_row_hash: String::new(),
+            },
+        );
+        for o in &others[1..] {
+            ts::cosign_community_membership_revocation(&mut removal, o);
+        }
+        d.put_community_membership_revocation(removal)
+            .await
+            .expect("the founder is removed by the rest");
+        assert!(!active(d, &r.cid, target).await);
     }
 
     fn at() -> DateTime<Utc> {
@@ -471,7 +523,9 @@ pub(crate) mod bodies {
         assert!(!active(d, &r.cid, &r.m).await);
     }
 
-    /// **I1735** — the audience of a cosign row. Mutation: drop the first arm
+    /// **I1735** — the audience of a cosign row. Mutations: drop the current-
+    /// member filter in `cosign::may_receive` → the since-removed member is
+    /// served: red; drop the first arm
     /// of `may_receive` → a non-member is served the pending row (the
     /// federation-scoped row falls to the generic arms; the invitee, its
     /// `attested_key_id`, would be too): red.
@@ -543,6 +597,22 @@ pub(crate) mod bodies {
             "I1735: a public room's hold is not public"
         );
         assert!(may_receive(d, r.a(), &pending).await.unwrap().allowed());
+        // rc18 — a member at the signed instant who was removed since is
+        // served nothing (a member still is).
+        let q = room(d, tag, "i1735q", "majority", 4).await;
+        let w = widening(&q, &q.m, at());
+        let pending = cosign::pending_row(&GroupSigned::CommunityWidening(w)).unwrap();
+        let gone = q.founders[3].clone();
+        assert!(may_receive(d, &gone, &pending).await.unwrap().allowed());
+        remove_founder(d, &q, &gone, ms(Utc::now() - Duration::minutes(10))).await;
+        assert!(
+            !may_receive(d, &gone, &pending).await.unwrap().allowed(),
+            "I1735: a member removed after the signed instant is refused"
+        );
+        assert!(may_receive(d, &q.founders[1], &pending)
+            .await
+            .unwrap()
+            .allowed());
     }
 
     /// **I1736** — two nodes, different subsets and different ML-DSA bytes.
@@ -659,7 +729,9 @@ pub(crate) mod bodies {
         );
     }
 
-    /// **I1737** — expiry. Mutation: `execute_for` drops the rows but does
+    /// **I1737** — expiry and the re-hold bound. Mutations: the too-old test in
+    /// `admit_row` dropped → the stale pending row begins a hold: red;
+    /// `execute_for` drops the rows but does
     /// not settle the receipt `expired` → the receipt reads open (and a
     /// re-offer would be held again): red.
     pub(crate) async fn i1737_expiry_drops_only_the_hold<D: Node>(d: &D, tag: &str) {
@@ -699,7 +771,30 @@ pub(crate) mod bodies {
         let e = put(d, pending)
             .await
             .expect_err("I1737: a settled re-offer");
-        assert!(e.to_string().contains(cosign::COSIGN_SETTLED), "I1737: {e}");
+        assert!(
+            e.to_string().contains(cosign::COSIGN_PENDING_SETTLED),
+            "I1737: {e}"
+        );
+        // rc18 — no hold BEGINS for an event signed more than one window
+        // before this node's receipt (its signer still a member).
+        let m2 = format!("i1737-m2-{tag}");
+        reg(d, &[&m2]).await;
+        let stale = widening(&r, &m2, ms(Utc::now() - Duration::seconds(window + 3600)));
+        let e = put(
+            d,
+            cosign::pending_row(&GroupSigned::CommunityWidening(stale.clone())).unwrap(),
+        )
+        .await
+        .expect_err("I1737: too old to begin holding");
+        assert!(
+            e.to_string().contains(cosign::COSIGN_PENDING_TOO_OLD),
+            "I1737: {e}"
+        );
+        assert!(d
+            .cosign_receipt(&quorum_key(&stale))
+            .await
+            .unwrap()
+            .is_none());
         // The assembled event lands though the hold lapsed: the door never
         // asks the window.
         let f = &r.founders;
@@ -1107,6 +1202,50 @@ pub(crate) mod bodies {
         assert!(!active(b, &r.cid, &r.m).await, "I1742: B retracts the act");
     }
 
+    /// **I1744** — freshness W on cosign rows (CC 2.6.7, rc18). Mutation: drop
+    /// the W test in `admit_row` → the since-removed member's backdated row
+    /// meets `cosign_pending_too_old` instead of `asserted_at_stale`: red.
+    pub(crate) async fn i1744_freshness_w_on_cosign_rows<D: Node>(d: &D, tag: &str) {
+        let r = room(d, tag, "i1744", "majority", 4).await;
+        let gone = r.founders[3].clone();
+        let t0 = ms(Utc::now() - Duration::hours(2));
+        // `gone` signs at t0, a member then; removed at t1 > t0.
+        let w_gone = widening_by(&r, &gone, &r.m, t0);
+        remove_founder(d, &r, &gone, ms(Utc::now() - Duration::minutes(20))).await;
+        let pending = cosign::pending_row(&GroupSigned::CommunityWidening(w_gone.clone())).unwrap();
+        let w_secs = crate::federation::self_roster::PAST_FRESHNESS_W_SECS;
+        // Backdated past W at receipt: refused asserted_at_stale.
+        crate::federation::steward_purge::test_clock::set(Some(
+            Utc::now() + Duration::seconds(w_secs),
+        ));
+        let stale = put(d, pending.clone()).await;
+        crate::federation::steward_purge::test_clock::set(None);
+        let e = stale.expect_err("I1744: a since-removed member's backdated row");
+        assert!(
+            matches!(&e, Error::AssertedAtStale { author, plane: "cosign", .. } if *author == gone),
+            "I1744: {e:?}"
+        );
+        assert!(e.to_string().contains("asserted_at_stale"), "I1744: {e}");
+        assert!(!held(d, &pending.attestation_id).await);
+        // The same member's row inside W is judged normally (a member at the
+        // signed instant): admitted.
+        put(d, pending.clone())
+            .await
+            .expect("I1744: inside W, judged as any member's row");
+        assert!(held(d, &pending.attestation_id).await);
+        // A still-active member's row older than W is admitted.
+        let sig = signature_row(&w_gone, &r.founders[1]);
+        cosign::test_hook::suppress(true);
+        crate::federation::steward_purge::test_clock::set(Some(
+            Utc::now() + Duration::seconds(w_secs),
+        ));
+        let late = put(d, sig.clone()).await;
+        crate::federation::steward_purge::test_clock::set(None);
+        cosign::test_hook::suppress(false);
+        late.expect("I1744: a member still standing signs at any age");
+        assert!(held(d, &sig.attestation_id).await);
+    }
+
     /// **I1743** — the window policy. Mutation: `check_window_value` admits
     /// any integer → the record under the floor is admitted: red.
     pub(crate) async fn i1743_the_window_policy<D: Node>(d: &D, tag: &str) {
@@ -1345,6 +1484,7 @@ mod tests {
     on_every_backend!(i1741, bodies::i1741_the_executor_lands);
     on_two_nodes!(i1742, bodies::i1742_withdraws_by_id);
     on_every_backend!(i1743, bodies::i1743_the_window_policy);
+    on_every_backend!(i1744, bodies::i1744_freshness_w_on_cosign_rows);
 
     mod i1739 {
         use super::*;
