@@ -1811,7 +1811,9 @@ mod tests {
         // the evaluator's persons and the key-to-person rule.
         // CIRISPersist#1233 (v61.1.0): +2, CLM-admission-pqc at the
         // hybrid-required verify doors.
-        const EXPECTED: usize = 368;
+        // CIRISPersist#1252 (v61.3.0): +11, CLM-cosign-collection-held at the
+        // cosign hold's doors.
+        const EXPECTED: usize = 379;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \
