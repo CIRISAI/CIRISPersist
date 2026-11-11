@@ -865,10 +865,11 @@ pub(crate) fn lifecycle_predicate(
                  AND c.attestation_type IN ({list}) \
                  AND {target} = {id}) \
              AND NOT EXISTS (SELECT 1 FROM {aliases} a \
-               JOIN {table} c2 ON {alias_target} = a.alias_attestation_id \
                WHERE a.held_attestation_id = {id} \
-                 AND c2.withdraws_admission_rule IS NOT NULL \
-                 AND c2.attestation_type IN ({list})) \
+                 AND EXISTS (SELECT 1 FROM {table} c2{pin} \
+                   WHERE c2.attestation_type IN ({list}) \
+                     AND c2.withdraws_admission_rule IS NOT NULL \
+                     AND {alias_target} = a.alias_attestation_id)) \
              AND NOT EXISTS (SELECT 1 FROM {table} r{pin} \
                WHERE r.attestation_type = {outer}.attestation_type \
                  AND r.attestation_type IN ({list}) \

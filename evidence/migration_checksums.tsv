@@ -401,3 +401,5 @@ sqlite	213	vote_windows	8316476967903385376
 postgres	213	vote_windows	17683476335550697423
 sqlite	214	cosign_hold	1720451589950938537
 postgres	214	cosign_hold	846735043445654734
+sqlite	215	cosign_alias_held_index	8942902581568388975
+postgres	215	cosign_alias_held_index	10412532197534795789
