@@ -614,6 +614,7 @@ fn not_member(group: &str, signer: &str) -> Error {
         group_key_id: group.to_owned(),
         offered_authority_key_id: signer.to_owned(),
         rule: COSIGN_SIGNER_NOT_MEMBER,
+        shortfall: None,
     }
 }
 
@@ -737,6 +738,7 @@ where
                     group_key_id: group,
                     offered_authority_key_id: signer,
                     rule: super::ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED,
+                    shortfall: None,
                 });
             }
         }

@@ -1530,6 +1530,7 @@ pub(crate) async fn check_cosigned_withdraws(
                     group_key_id: group.to_owned(),
                     offered_authority_key_id: issuer.to_owned(),
                     rule: super::ROSTER_CONSENSUS_INSUFFICIENT,
+                    shortfall: verdict.shortfall().cloned(),
                 })
             }
         }

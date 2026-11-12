@@ -35892,13 +35892,33 @@ mod tests {
                     group_key_id: "g".into(),
                     offered_authority_key_id: "a".into(),
                     rule: crate::federation::ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED,
+                    shortfall: None,
                 },
                 "federation_roster_authority_unauthorized: roster_authority_not_established",
+            ),
+            // v61.4.0 (CIRISPersist#1250) — the count rides the Rust error
+            // only: the Python type and message are the arm's, unchanged.
+            (
+                crate::federation::Error::RosterAuthorityUnauthorized {
+                    group_key_id: "g".into(),
+                    offered_authority_key_id: "a".into(),
+                    rule: crate::federation::ROSTER_CONSENSUS_INSUFFICIENT,
+                    shortfall: Some(crate::federation::consensus::ConsensusShortfall {
+                        have: 1,
+                        need: 2,
+                        eligible_signer_key_ids: vec!["a".into(), "b".into()],
+                    }),
+                },
+                "federation_roster_authority_unauthorized: roster_consensus_insufficient",
             ),
         ] {
             let py_err = federation_err_to_py(e);
             pyo3::Python::attach(|py| {
                 assert_eq!(py_err.value(py).to_string(), want);
+                assert!(
+                    py_err.is_instance_of::<PyValueError>(py),
+                    "the arm's Python type (ValueError) is unchanged"
+                );
             });
         }
     }

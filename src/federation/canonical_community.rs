@@ -468,6 +468,9 @@ fn insufficient(signed: &SignedCommunity) -> Error {
         group_key_id: signed.community.community_key_id.clone(),
         offered_authority_key_id: signed.authority_key_id.clone(),
         rule: super::ROSTER_CONSENSUS_INSUFFICIENT,
+        // The accord's charter quorum counts holders, not this record's
+        // ballot.
+        shortfall: None,
     }
 }
 
@@ -1068,6 +1071,7 @@ where
             group_key_id: id.to_owned(),
             offered_authority_key_id: next.authority_key_id.clone(),
             rule: super::ROSTER_CONSENSUS_INSUFFICIENT,
+            shortfall: verdict.shortfall().cloned(),
         });
     }
     if !signers.contains(&next.authority_key_id) {
@@ -3922,7 +3926,7 @@ where
     });
     match verdict {
         super::consensus::Verdict::Admit => Ok(Ok(signers)),
-        super::consensus::Verdict::Insufficient { detail } => Ok(Err((
+        super::consensus::Verdict::Insufficient { detail, .. } => Ok(Err((
             why::QUORUM_NOT_MET,
             format!(
                 "the trust root's consensus_protocol {:?} is not met: {detail}",

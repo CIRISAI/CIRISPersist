@@ -1684,7 +1684,9 @@ pub fn roster_event_standing(
 ) -> Result<(), (&'static str, String)> {
     match roster_event_verdict(rules, state, e) {
         StandingVerdict::Admit => Ok(()),
-        StandingVerdict::ConsensusShort { detail } => Err((ROSTER_CONSENSUS_INSUFFICIENT, detail)),
+        StandingVerdict::ConsensusShort { detail, .. } => {
+            Err((ROSTER_CONSENSUS_INSUFFICIENT, detail))
+        }
         StandingVerdict::Refuse { rule, detail } => Err((rule, detail)),
     }
 }
@@ -1704,6 +1706,9 @@ pub enum StandingVerdict {
     ConsensusShort {
         /// The evaluator's detail.
         detail: String,
+        /// v61.4.0 (CIRISPersist#1250) — the evaluator's count, when the
+        /// protocol is a count of voices.
+        shortfall: Option<consensus::ConsensusShortfall>,
     },
     /// Any other refusal: the rule token and its detail, exactly as
     /// [`roster_event_standing`] returned before the split.
@@ -1748,6 +1753,7 @@ pub fn roster_event_verdict(
     let standing_without_protocol = e.signers.is_empty()
         || (!e.is_add && e.signers.contains(&e.member.key_id))
         || moderator_may_act;
+    let mut counted: Option<consensus::ConsensusShortfall> = None;
     let admitted = if standing_without_protocol {
         Ok(())
     } else {
@@ -1778,7 +1784,8 @@ pub fn roster_event_verdict(
             consensus::Verdict::Unevaluable { reason } => {
                 Err((ROSTER_CONSENSUS_UNEVALUABLE, reason))
             }
-            consensus::Verdict::Insufficient { detail } => {
+            consensus::Verdict::Insufficient { detail, shortfall } => {
+                counted = shortfall;
                 if e.signers.iter().any(|s| !state.contains_key(s)) {
                     Err((ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED, detail))
                 } else {
@@ -1833,7 +1840,10 @@ pub fn roster_event_verdict(
     }
     match shortfall {
         None => StandingVerdict::Admit,
-        Some(detail) => StandingVerdict::ConsensusShort { detail },
+        Some(detail) => StandingVerdict::ConsensusShort {
+            detail,
+            shortfall: counted,
+        },
     }
 }
 
@@ -2635,21 +2645,24 @@ where
         moderator_roots,
         reversed: false,
     };
-    let refusal = |rule: &'static str, detail: &str| {
-        tracing::debug!(group_key_id, primary, rule, detail = %detail, "roster change refused");
-        Error::RosterAuthorityUnauthorized {
-            group_key_id: group_key_id.to_owned(),
-            offered_authority_key_id: primary.to_owned(),
-            rule,
-        }
-    };
+    let refusal =
+        |rule: &'static str, detail: &str, shortfall: Option<consensus::ConsensusShortfall>| {
+            tracing::debug!(group_key_id, primary, rule, detail = %detail, "roster change refused");
+            Error::RosterAuthorityUnauthorized {
+                group_key_id: group_key_id.to_owned(),
+                offered_authority_key_id: primary.to_owned(),
+                rule,
+                shortfall,
+            }
+        };
     // v61.3.0 (CIRISPersist#1252) — the verdict, the shortfall split out.
+    // v61.4.0 (CIRISPersist#1250) — the refusal carries the count.
     let short = match roster_event_verdict(rules, &state, &e) {
         StandingVerdict::Admit => None,
-        StandingVerdict::ConsensusShort { detail } => {
-            Some(refusal(ROSTER_CONSENSUS_INSUFFICIENT, &detail))
+        StandingVerdict::ConsensusShort { detail, shortfall } => {
+            Some(refusal(ROSTER_CONSENSUS_INSUFFICIENT, &detail, shortfall))
         }
-        StandingVerdict::Refuse { rule, detail } => return Err(refusal(rule, &detail)),
+        StandingVerdict::Refuse { rule, detail } => return Err(refusal(rule, &detail, None)),
     };
     // v52.0.0 (CIRISPersist#955) — a GROWTH (a key not active before this
     // instant) needs the member's own acceptance, under every protocol. The
@@ -8234,7 +8247,7 @@ pub trait FederationDirectory: Send + Sync {
                 persons,
             }) {
                 consensus::Verdict::Admit => {}
-                consensus::Verdict::Insufficient { detail } => {
+                consensus::Verdict::Insufficient { detail, .. } => {
                     return Err(refuse(format!(
                         "consensus_protocol not met ({direction:?}): {detail}"
                     )))
@@ -11343,6 +11356,17 @@ pub enum Error {
         offered_authority_key_id: String,
         /// Which clause refused; one of the rule tokens above.
         rule: &'static str,
+        /// v61.4.0 (CIRISPersist#1250; CC 4.4.3.4.2) — under
+        /// [`ROSTER_CONSENSUS_INSUFFICIENT`], the door's own count: the voices
+        /// counted (`have`), the voices the protocol needs at this roster
+        /// (`need`) and the keys whose signature would count
+        /// ([`consensus::ConsensusShortfall`]). `None` under every other rule,
+        /// under a protocol whose tally is not a count (a weighted rubric), for
+        /// a short event that would also leave no founder (more signatures do
+        /// not mend it), and for the accord charter quorum a trust root's
+        /// birth is judged by (it counts accord holders, not this record's
+        /// ballot).
+        shortfall: Option<consensus::ConsensusShortfall>,
     },
 
     /// v52.0.0 (CIRISPersist#956) — a write naming a family that a

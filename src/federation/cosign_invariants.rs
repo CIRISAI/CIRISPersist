@@ -43,6 +43,9 @@
 //! - **I1744** freshness W on cosign rows: a since-removed member's row
 //!   signed more than W before receipt is `asserted_at_stale`; inside W it is
 //!   judged as any member's; a member still standing signs at any age.
+//! - **I1748** (v61.4.0, CIRISPersist#1250) a short refusal carries the
+//!   door's count: `have`, `need` and the eligible signers, under
+//!   `roster_consensus_insufficient` only.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -1278,6 +1281,95 @@ pub(crate) mod bodies {
     /// **I1744** — freshness W on cosign rows (CC 2.6.7, rc18). Mutation: drop
     /// the W test in `admit_row` → the since-removed member's backdated row
     /// meets `cosign_pending_too_old` instead of `asserted_at_stale`: red.
+    /// **I1748** (CIRISPersist#1250; CC 4.4.3.4.2) — a short refusal carries
+    /// the door's count. At a node that does not speak for the primary (the
+    /// door refuses rather than holds), a `unanimous` room of three founders:
+    /// one signature is `have 1, need 3`, two are `have 2, need 3`, every
+    /// eligible founder named; the third lands it. A `majority` room of four:
+    /// one signature is `have 1, need 3`. A refusal under another rule (a
+    /// stranger's widening, `roster_authority_not_established`) carries no
+    /// count. Mutation: the door's `refusal` drops the shortfall → red.
+    pub(crate) async fn i1748_a_short_refusal_carries_the_count<D: Node>(d: &D, tag: &str) {
+        use crate::federation::consensus::ConsensusShortfall;
+        fn short_of(e: &Error) -> (&'static str, Option<ConsensusShortfall>) {
+            match e {
+                Error::RosterAuthorityUnauthorized {
+                    rule, shortfall, ..
+                } => (rule, shortfall.clone()),
+                other => panic!("I1748: a roster standing refusal, got {other:?}"),
+            }
+        }
+        let sorted = |v: &[String]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v
+        };
+
+        let r = room(d, tag, "i1748", "unanimous", 3).await;
+        let w = widening(&r, &r.m, at());
+        consent(d, &w).await;
+        d.set_node(&r.founders[1]);
+        for (signers, have) in [(vec![], 1), (vec![r.founders[1].as_str()], 2)] {
+            let e = d
+                .put_community_membership_widening(cosigned(&w, &signers))
+                .await
+                .expect_err("I1748: short");
+            assert_eq!(
+                short_of(&e),
+                (
+                    ROSTER_CONSENSUS_INSUFFICIENT,
+                    Some(ConsensusShortfall {
+                        have,
+                        need: 3,
+                        eligible_signer_key_ids: sorted(&r.founders),
+                    })
+                ),
+                "I1748 unanimous, {have} signed"
+            );
+            assert_eq!(
+                e.kind(),
+                "federation_roster_authority_unauthorized",
+                "I1748: the kind() token is unchanged"
+            );
+        }
+        d.put_community_membership_widening(cosigned(&w, &[&r.founders[1], &r.founders[2]]))
+            .await
+            .expect("I1748: every founder signs, and it lands");
+        assert!(active(d, &r.cid, &r.m).await);
+
+        let r4 = room(d, tag, "i1748m", "majority", 4).await;
+        let w4 = widening(&r4, &r4.m, at());
+        consent(d, &w4).await;
+        d.set_node(&r4.founders[1]);
+        let e = d
+            .put_community_membership_widening(w4)
+            .await
+            .expect_err("I1748: one of four");
+        assert_eq!(
+            short_of(&e),
+            (
+                ROSTER_CONSENSUS_INSUFFICIENT,
+                Some(ConsensusShortfall {
+                    have: 1,
+                    need: 3,
+                    eligible_signer_key_ids: sorted(&r4.founders),
+                })
+            ),
+            "I1748 majority of four"
+        );
+
+        let stranger = format!("i1748-x-{tag}");
+        reg(d, &[&stranger]).await;
+        let by_stranger = widening_by(&r4, &stranger, &stranger, at());
+        let e = d
+            .put_community_membership_widening(by_stranger)
+            .await
+            .expect_err("I1748: a stranger's widening");
+        let (rule, shortfall) = short_of(&e);
+        assert_ne!(rule, ROSTER_CONSENSUS_INSUFFICIENT, "I1748: {e:?}");
+        assert_eq!(shortfall, None, "I1748: another rule carries no count");
+    }
+
     pub(crate) async fn i1744_freshness_w_on_cosign_rows<D: Node>(d: &D, tag: &str) {
         let r = room(d, tag, "i1744", "majority", 4).await;
         let gone = r.founders[3].clone();
@@ -1558,6 +1650,7 @@ mod tests {
     on_two_nodes!(i1742, bodies::i1742_withdraws_by_id);
     on_every_backend!(i1743, bodies::i1743_the_window_policy);
     on_every_backend!(i1744, bodies::i1744_freshness_w_on_cosign_rows);
+    on_every_backend!(i1748, bodies::i1748_a_short_refusal_carries_the_count);
 
     mod i1739 {
         use super::*;

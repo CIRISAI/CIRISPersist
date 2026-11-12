@@ -511,6 +511,7 @@ where
             group_key_id: row.community_key_id.clone(),
             offered_authority_key_id: revocation.authority_key_id.clone(),
             rule: super::ROSTER_REMOVAL_OUTSIDE_WINDOW,
+            shortfall: None,
         });
     }
     Ok(())
