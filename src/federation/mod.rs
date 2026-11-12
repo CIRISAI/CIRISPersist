@@ -846,6 +846,10 @@ mod vote_by_person_invariants;
 // purge's tombstone row (CC 4.5.3 step 2, CC 4.5.5).
 #[cfg(test)]
 pub(crate) mod doors_takedown_invariants;
+// v61.4.0 (CIRISPersist#1260; CC 4.5.3) — I1746/I1747: a room moderator
+// takes down content placed in the room by a `supersedes` widening.
+#[cfg(test)]
+mod room_takedown_invariants;
 #[cfg(test)]
 mod steward_purge_invariants;
 pub mod takedown_tombstone;
@@ -5129,6 +5133,43 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         content_sha256: &str,
     ) -> Result<Vec<Attestation>, Error>;
+
+    /// v61.4.0 (CIRISPersist#1260; CC 4.5.3, CC 4.5.5, CC 4.4.3.3.1) — the
+    /// rows that bind `content_sha256` **for the duty question**: every row
+    /// [`Self::attestations_binding_content`] returns, and also every
+    /// federation-tier `supersedes` row at `community` or `affiliations` scope
+    /// whose envelope binds the digest (the same
+    /// [`admission::envelope_binds_content`] predicate). One scan, newest
+    /// first.
+    ///
+    /// A room's message or file reaches its room as a `supersedes` widening
+    /// of the author's `self` row (CC 4.4.3.3.1): the widening reuses the
+    /// body, `evidence_refs` included, at the room's scope. The `self` row
+    /// never replicates, so a member's node holds the widening alone. Read
+    /// without it, room content binds to no community and no room moderator
+    /// holds `takedown` or `review` over it.
+    ///
+    /// Only the takedown binding
+    /// ([`takedown_tombstone::content_binding`](super::takedown_tombstone::content_binding))
+    /// reads this. The bytes plane and `subject_of_content` keep
+    /// [`Self::attestations_binding_content`].
+    ///
+    /// # Default impl rationale
+    ///
+    /// `Unsupported`, as the 61.1.0 reads are, so a directory implemented
+    /// outside this crate (a host's wrapper) still compiles on a minor
+    /// release and answers loudly rather than with a binding that silently
+    /// omits the room. sqlite and postgres override it, each with its own
+    /// prefilter and the shared predicate.
+    async fn attestations_binding_content_with_placements(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        let _ = content_sha256;
+        Err(Error::Unsupported {
+            method: "attestations_binding_content_with_placements",
+        })
+    }
 
     /// v53.1.0 (CIRISPersist#979, CC 2.3) — **the sealed manifests a held
     /// chunk belongs to**: every manifest the V176 relation names for

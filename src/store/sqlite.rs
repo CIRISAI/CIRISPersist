@@ -5009,6 +5009,59 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
+    async fn attestations_binding_content_with_placements(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        // v61.4.0 (CIRISPersist#1260) — `attestations_binding_content` plus the
+        // `supersedes` placements into a room, in one scan. The same LIKE
+        // prefilter, then the shared predicate in Rust.
+        let sha = content_sha256.to_owned();
+        let like = format!("%{sha}%");
+        let (read, bytes) = self.read_measured(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                        weight, asserted_at, expires_at, attestation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                        subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
+                     FROM federation_attestations \
+                     WHERE tier = 'federation' \
+                        AND (attestation_type = 'scores' \
+                             OR (attestation_type = 'supersedes' \
+                                 AND cohort_scope IN ('community', 'affiliations'))) \
+                        AND attestation_envelope LIKE ?1 \
+                     ORDER BY asserted_at DESC",
+            )?;
+            let rows = stmt.query_map([&like], sqlite_row_to_attestation)?;
+            rows.collect::<Result<Vec<_>, _>>()
+        }).await;
+        read.map(|atts| {
+            atts.into_iter()
+                .filter(|a| {
+                    crate::federation::admission::envelope_binds_content(
+                        &a.attestation_envelope,
+                        &sha,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "attestations_binding_content_with_placements: {e}"
+            ))
+        })
+        .inspect(|rows| {
+            crate::observe::record_read(
+                crate::observe::StoreBackend::Sqlite,
+                crate::observe::Door::AttestationsBindingContentWithPlacements,
+                content_sha256,
+                rows,
+                bytes,
+            )
+        })
+    }
+
     async fn put_revocation(
         &self,
         revocation: crate::federation::SignedRevocation,

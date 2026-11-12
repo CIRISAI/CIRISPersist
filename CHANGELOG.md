@@ -7,16 +7,27 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
 ## [61.4.0] - 2026-11-12
 
-Every room duty door is witnessed asking for an appointment, never for membership (CIRISPersist#1195).
+Room moderation for rooms larger than two: a room moderator can take down a message or a file placed in the room (CIRISPersist#1260), and every room duty door is witnessed asking for an appointment, never for membership (CIRISPersist#1195).
 
 ### Added
+
+- **`FederationDirectory::attestations_binding_content_with_placements(content_sha256)`** (CIRISPersist#1260). The rows that bind a content digest for the duty question: what `attestations_binding_content` returns, plus every federation-tier `supersedes` row at `community` or `affiliations` scope that binds the digest (the same `envelope_binds_content` predicate). One scan, newest first, on sqlite and postgres. The default body answers `Unsupported`, as the 61.1.0 reads do, so a directory implemented outside the crate still compiles; the capsule directory answers `Unsupported`. New read-counter door label `attestations_binding_content_with_placements`.
 
 ### Changed
 
 ### Fixed
 
+- **A room moderator could not take down room content** (CIRISPersist#1260, CC 4.5.3, CC 4.5.5). A message or file reaches its room as a `supersedes` widening of the author's `self` row (CC 4.4.3.3.1), and the takedown binding read only `scores` rows. So the only binding row was the author's original at `self` scope, the content bound into no community, and every founder and appointed moderator was refused `takedown_unauthorised` with `"communities": []`. A member's node, which holds only the widening, answered `takedown_content_unbound`. The review-holder read behind a takedown's reversal had the same gap. `takedown_tombstone::content_binding` now reads `FederationDirectory::attestations_binding_content_with_placements`: the `scores` rows as before, and the live federation-tier `supersedes` rows at `community` or `affiliations` scope binding the digest. A placement binds the content into the room it places it in, under the same liveness rule as any binding row (a `withdraws` of the widening takes it out). Its subjects are the original's (the widening door refuses a widening that changes them). The bytes plane and `subject_of_content` keep `attestations_binding_content`, unchanged. The capsule directory answers `Unsupported`, as it does for the read beside it.
+
+### Adoption notes (CIRISEdge, CIRISServer)
+
+- A directory wrapper that implements `FederationDirectory` itself (Edge's test-only `CountingDirectory`) delegates `attestations_binding_content_with_placements`; without it, the takedown and reversal doors answer `Unsupported` through the wrapper.
+- CIRISServer's `feat/room-takedown` (4d3f50b6) files the shape I1746 witnesses: a founder's or an appointed moderator's takedown of a room message or file, applied on each member's node that holds the placement. Not yet run against that branch.
+
 ### Tested
 
+- **I1746** (two nodes; sqlite and postgres; CIRISPersist#1260): room content in CIRISEdge's row shape (a `chat:message:v1` message and a `file:v1` file, authored at `self` and `local` tier with a `community_dek` pointer and `evidence_refs`, entered into the mesh and placed by the author's `supersedes` widening). A is the author's node; B is the founder's and receives only the widenings, through `apply_replicated_attestation`. On B the founder takes the message down and its `takedown` deputy the file (`community_standards`); the same notices apply on A; both are tombstoned and withheld on both nodes. A plain member and another room's founder are refused `takedown_unauthorised` on both nodes. The `review` deputy's `reversed` ruling, placed at the room's scope, lifts the message's withholding; a plain member's is refused. A placement the author withdraws (the room-born `withdraws` delivered to B) binds no room on either node, and the founder is refused.
+- **I1747** (sqlite and postgres; CIRISPersist#1260): `attestations_binding_content_with_placements` returns the author's row and its room placement, and not a widening to `federation` scope; `attestations_binding_content` returns no `supersedes` row.
 - **I1745** (sqlite and postgres; CIRISPersist#1195, CC 4.5.4): in a `majority` room a plain member, who may still sign for the room, is refused at the `moderation:*` act door, the takedown door and the takedown-reversal door; the founder and its `takedown`/`review` deputy pass all three. I1522 (61.0.2) covers the helpers and the community-scoped reconsideration door.
 
 ## [61.3.0] - 2026-11-11

@@ -3290,6 +3290,16 @@ impl FederationDirectory for OpsDirectory {
             method: "attestations_binding_content",
         })
     }
+    /// v61.4.0 (CIRISPersist#1260) — unsupported, as the binding query
+    /// beside it is.
+    async fn attestations_binding_content_with_placements(
+        &self,
+        _content_sha256: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        Err(Error::Unsupported {
+            method: "attestations_binding_content_with_placements",
+        })
+    }
     /// v53.1.0 (#979) — a capsule host stores no blobs through this surface;
     /// unsupported, as the binding query beside it is.
     async fn dag_manifests_of_chunk(
@@ -6777,6 +6787,11 @@ mod tests {
             "v47.2.0 (#853): not proxied, as its siblings",
         ),
         ("attestations_binding_content", PRE_1162),
+        (
+            "attestations_binding_content_with_placements",
+            "v61.4.0 (#1260): the takedown binding read, unproxied as \
+          attestations_binding_content is",
+        ),
         (
             "dag_manifests_of_chunk",
             "v53.1.0 (#979): a capsule host stores no blobs through this \
