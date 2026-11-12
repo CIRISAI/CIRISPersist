@@ -599,11 +599,18 @@ other row. The rule "a row a clock or a fold causes is emitted by the door the c
 3. Each round adds rows whose ids are drawn from the finite set `rules × subsets of held rows`, and only causes
    that are new this round produce new drafts.
 
-So the fixpoint is reached in at most `depth(emit graph)` rounds. **CC checked this ("no halting edges"):** there
-are no cycles between families in the typed rules, the **longest emission chain is 3**, and the **9 in-family
-self-loops descend by leaf**, so each terminates on its leaf order [T as reported by CC under Eric's delegation;
-this corrects my earlier "1", which checked only the effect list]. The kernel re-checks the same property at load
-and refuses a table that breaks it. Persist asserts ≤ 3 rounds per batch.
+So the fixpoint is reached in at most `depth(emit graph)` rounds. **Termination is a CI check in CC:
+`tools/check_termination.py`, at rc19 `c3bf559` ("A check holds that no conclusion runs on without end")** [T, file
+and commit present]. It works at **leaf** grain and finds **31 causes among 36 leaves, no cycle, and a longest
+chain of two**. All **17 waiting families have a clock or an expiry**, so no wait is without a deadline (§5.3).
+
+This corrects the earlier "chain 3, plus 9 in-family self-loops", which was an artefact of checking at family
+grain. The consent decay stages run off the revocation's clock, not off each other. A key grant is caused by the
+node's own sealed write, which is not a row, so it has no row cause to cycle through.
+
+The kernel runs the same leaf-grain check at load and refuses a table that breaks it. Persist keeps its **≤ 3
+rounds per batch** assert as headroom over the checked bound of 2, so a table change that lengthens a chain trips
+CI before it trips a node.
 
 ### 5.8 Rule version
 
@@ -796,9 +803,16 @@ There are six harnesses. They are named here and not built.
    `DropOnRefuse`, `StampAtDoor`, `LastProcessedWarmStart` (a cache that remembers its last update), and
    `MissingInvalidationEdge` (drop a `Slot` key from `reads`). The must-not-move set has to leave every digest
    equal: `ReverseInput`, `ShardFolds`, `ColdCache`. Only the two halves together are evidence.
-6. **Set-encoding equivalence** (CC's law for set objects, §13.6a). The digest of `fold(held ∪ {item})` must
-   equal the digest of `fold(held ∪ leaves(item))` under shuffles and partial leaf sets. A family that fails it is
-   not a set family.
+6. **Set-encoding equivalence** (CC's law for set objects, §13.6a; model `formal/set_item`). The digest of
+   `fold(held ∪ {item})` must equal the digest of `fold(held ∪ leaves(item))` under shuffles and partial leaf
+   sets, where each separately held leaf row is first held at `max(first_held(header), first_held(leaf))`. A family
+   that fails it is not a set family. **Must-convict mutations** (CC's counterexamples):
+   - `LeafOwnInstant`, which judges a leaf by its own first-held instant. Leaf held at 0, header at 3, W = 2: the
+     leaf counts where its row would be stale.
+   - `HeaderInstant`, which judges a leaf by the header's instant. A leaf arriving long after the header counts
+     where its row would be stale.
+
+   The must-not-move control: the order in which the leaves and the header arrive.
 
 The SQL `lifecycle_predicate` (FINAL_REFACTOR §6.2) joins harness 2: the predicate and the kernel's `view` run
 over the same rows, and any difference is reported.
@@ -1419,7 +1433,7 @@ order-free:
    the header with the leaves it sends. Persist's settle (`settle_if_held`) settles at the leaf: a re-sent leaf
    whose root is held is idempotent success.
 
-### 13.6a The set object: CC's five conditions (DERIVED, rc19 `6453665`)
+### 13.6a The set object: CC's five conditions (DERIVED, rc19 `6453665`; the law modelled at `4748397`)
 
 A set object is admitted **only as an encoding of rows**, under five conditions. Each one maps to a kernel check:
 
@@ -1429,7 +1443,25 @@ A set object is admitted **only as an encoding of rows**, under five conditions.
 | **enumerated**: it lists its leaves, never "all who…" | the leaf list is explicit; the audience is the kernel's to compute (`audience`, §5.9), never the item's to state |
 | **one signer, one signed instant, one family** | the header carries all three; a leaf naming another is malformed |
 | **leaf verdicts independent of siblings** | per-leaf `Verdict`; a headerless leaf is held `Inert`, waiting with a lapse (§5.9a); two headers make the item `forked`, and both are held (§13.6 rules 1-3) |
-| **THE LAW: the fold over the set equals the fold over its leaves as separate rows** | this is the **admission test for every proposed item**: harness 6 in §6.2 below. It is the merge law (§4.1 #1) applied to encodings: an item is admissible iff exploding it changes no digest |
+| **THE LAW: the fold over the set equals the fold over its leaves as separate rows** | this is the **admission test for every proposed item**: harness 6 in §6.2. It is the merge law (§4.1 #1) applied to encodings: an item is admissible iff exploding it changes no digest |
+
+**The law is a model now: `formal/set_item`** (CC `4748397`, "A set of rows as one item has a law"; 7 properties
+S1-S7 over 16,807 cases [T, read the README]). It **decides** what §13.5 and §13.6 left open:
+
+> **A leaf is first held at `max(first_held(header), first_held(leaf))`.**
+
+That is the only one of three readings that holds the law (S1). Judging a leaf by its own instant, or by the
+header's, each lets a leaf count where its separate row would be stale. Consequences for persist:
+
+- **The index entry for a leaf carries that derived instant.** Persist explodes a set item's leaves into index
+  entries (§13.5), and each entry stores `max(first_held(header), first_held(leaf))`, not the leaf's arrival. CC
+  3.3.4's freshness test (`first_held − asserted_at ≤ W`, §1) reads that stored instant. A leaf that arrives
+  before its header gets its effective instant when the header arrives, and that is written once, then.
+- **It fits §5.9a's lapse.** A headerless leaf parked until `asserted_at + W` loses nothing by lapsing. A header
+  arriving later would give the leaf an effective first-held past W anyway, so it would be stale.
+- **It fits §13.6.** S3 (a leaf held before its header counts as soon as the header is held) is rule 1. S6
+  (under a forked header no leaf counts, whichever came first) is rule 3. S2 (sibling independence) is the per-leaf
+  verdict.
 
 **Chained items** (`prev_root`, e.g. set-claim deltas) are allowed with a bound: a **full claim at a stated
 interval**, so no fold walks an unbounded chain. For I1 that is a full set claim at least every W (72 h, the
