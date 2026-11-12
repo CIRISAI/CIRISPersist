@@ -5,6 +5,18 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [61.4.0] - 2026-11-12
+
+### Changed
+
+- **A key-grant emission folds the room once, not once per row.** One minter seating a 50-member x 3-device room emitted its 150 `key_grant:epoch:v1` rows in 17.8 s (sqlite) / 36.9 s (postgres) (medians of 3, `kg_burst`): each row re-folded the roster and listed every member's occurrences, in the planner (`recipient_may_hold_key`) and again at admission (`check_key_grant_row_admission`, `check_sealer` -> `is_active_member_at`, the AV-45 write-scope gate). The emitter now stamps every row of one emission with ONE signed instant, judges the sealer rule once at that instant, reads the audience once (`AudienceSnapshot`), and puts the rows inside that emission's fold (`EmissionFold`, task-scoped): admission answers a row of the emission's own signer, axis and instant from the fold, and every other row (a peer's included, and one past the freshness window) takes the per-row path unchanged. The roster READS are shared across the emission's gates (`with_roster_read_memo`); each gate still folds at its own instant. Refusals, reasons and instants are unchanged. The re-emission's "already held" check is one walk of the signer's rows in the room since the epoch's mint instead of one query per recipient, and `ensure_epoch_dek` writes a mint's member grants in one transaction (`community_dek_put_member_grants`).
+
+### Tested
+
+- **I1800** (sqlite, postgres): over a room with a removed member, a keyless member and a device-revoked occurrence, every candidate row's verdict inside the emission fold is the per-row verdict (reason included), the fold answers every row of its own signer and instant and never another signer's or another instant's.
+- **I1801** (sqlite, postgres): the folded emission emits exactly the wraps the per-row audience rule admits, withholds the rest, stamps one instant, and re-emits nothing.
+- **I1802** (sqlite, postgres): one roster-read memo folds a before-removal and an after-removal instant to the unmemoized rosters, in either order.
+
 ## [61.3.0] - 2026-11-11
 
 A widening or removal of a quorum room or family no longer needs every signature in one offer: the door holds it and collects the rest (CIRISPersist#1252, CC 3.3.4). Until this cut a room of three or more could not widen or remove inside the mesh.

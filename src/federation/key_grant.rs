@@ -832,9 +832,91 @@ pub async fn recipient_may_hold_key<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    use crate::federation::replication_audience::{
-        occurrence_may_hold_key, occurrence_may_hold_room_key, OwnerCohort,
-    };
+    let (room, members) = audience_members(dir, scope, group).await?;
+    for member in &members {
+        for o in dir.list_identity_occurrences_active(member).await? {
+            if o.occurrence_key_id != recipient {
+                continue;
+            }
+            if occurrence_in_audience(dir, scope, group, room, member, &o).await? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// v61.4.0 — **the audience of `(scope, group)` read ONCE**: the members
+/// [`recipient_may_hold_key`] walks and each member's active occurrences.
+/// [`AudienceSnapshot::admits`] then asks exactly
+/// [`recipient_may_hold_key`]'s question of one recipient over these reads
+/// (the per-occurrence rule, the owner's allow list, is read only for the
+/// occurrences that ARE the recipient). The emitter judges every row of one
+/// emission against one snapshot instead of re-folding the roster per row
+/// (the O(rows x members) burst a 50-member room's seat paid), and judges
+/// only the recipients it has to.
+#[derive(Debug)]
+pub(crate) struct AudienceSnapshot {
+    scope: String,
+    group: String,
+    room: bool,
+    members: Vec<(String, Vec<crate::federation::types::IdentityOccurrence>)>,
+}
+
+impl AudienceSnapshot {
+    /// Read the audience of `(scope, group)` now.
+    pub(crate) async fn read<D>(dir: &D, scope: &str, group: &str) -> Result<Self, Error>
+    where
+        D: FederationDirectory + ?Sized,
+    {
+        let (room, members) = audience_members(dir, scope, group).await?;
+        let mut out = Vec::with_capacity(members.len());
+        for member in members {
+            let occ = dir.list_identity_occurrences_active(&member).await?;
+            out.push((member, occ));
+        }
+        Ok(Self {
+            scope: scope.to_owned(),
+            group: group.to_owned(),
+            room,
+            members: out,
+        })
+    }
+
+    /// [`recipient_may_hold_key`] for `recipient`, over this snapshot.
+    pub(crate) async fn admits<D>(&self, dir: &D, recipient: &str) -> Result<bool, Error>
+    where
+        D: FederationDirectory + ?Sized,
+    {
+        for (member, occurrences) in &self.members {
+            for o in occurrences {
+                if o.occurrence_key_id != recipient {
+                    continue;
+                }
+                if occurrence_in_audience(dir, &self.scope, &self.group, self.room, member, o)
+                    .await?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// The members whose occurrences [`recipient_may_hold_key`] and
+/// [`AudienceSnapshot`] walk, and whether `scope` is a room scope: the owner
+/// (`self`), the active family members (`family`), the authorized community
+/// roster now (`community` / `affiliations`). One body, so the per-row rule
+/// and the fold cannot drift.
+async fn audience_members<D>(
+    dir: &D,
+    scope: &str,
+    group: &str,
+) -> Result<(bool, Vec<String>), Error>
+where
+    D: FederationDirectory + ?Sized,
+{
     let room = matches!(scope, cohort_scope::COMMUNITY | cohort_scope::AFFILIATIONS);
     let members: Vec<String> = match scope {
         cohort_scope::SELF => vec![group.to_owned()],
@@ -855,30 +937,37 @@ where
         },
         _ => Vec::new(),
     };
-    for member in &members {
-        for o in dir.list_identity_occurrences_active(member).await? {
-            if o.occurrence_key_id != recipient {
-                continue;
-            }
-            let may = if room {
-                occurrence_may_hold_room_key(dir, member, &o, group).await?
-            } else {
-                let cohort = if scope == cohort_scope::SELF {
-                    OwnerCohort::SelfContent
-                } else {
-                    OwnerCohort::Group {
-                        scope,
-                        target: group,
-                    }
-                };
-                occurrence_may_hold_key(dir, member, &o, cohort).await?
-            };
-            if may {
-                return Ok(true);
-            }
-        }
+    Ok((room, members))
+}
+
+/// May `member`'s active occurrence `o` hold the key of `scope` content in
+/// `group`? The room variant for a room; the owner's allow list otherwise.
+async fn occurrence_in_audience<D>(
+    dir: &D,
+    scope: &str,
+    group: &str,
+    room: bool,
+    member: &str,
+    o: &crate::federation::types::IdentityOccurrence,
+) -> Result<bool, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    use crate::federation::replication_audience::{
+        occurrence_may_hold_key, occurrence_may_hold_room_key, OwnerCohort,
+    };
+    if room {
+        return occurrence_may_hold_room_key(dir, member, o, group).await;
     }
-    Ok(false)
+    let cohort = if scope == cohort_scope::SELF {
+        OwnerCohort::SelfContent
+    } else {
+        OwnerCohort::Group {
+            scope,
+            target: group,
+        }
+    };
+    occurrence_may_hold_key(dir, member, o, cohort).await
 }
 
 /// §12 / §20.1 — is `signer` an ACTIVE member of `community_key_id` at
@@ -1181,6 +1270,13 @@ pub async fn check_key_grant_row_admission(
             ),
         ));
     }
+    // v61.4.0 — a row of THIS task's own emission, at the emission's one
+    // instant, is judged against the emission's one fold (the sealer leg at
+    // that instant, the audience folded once); every other row, a peer's
+    // included, takes the per-row path below.
+    if let Some(verdict) = judged_by_emission_fold(signer, &parsed, row, chrono::Utc::now()) {
+        return verdict;
+    }
     check_sealer(
         dir,
         signer,
@@ -1217,19 +1313,152 @@ pub async fn check_key_grant_row_admission(
     )
     .await?
     {
-        return Err(refuse(
-            KeyGrantRefusalReason::RecipientNotInAudience,
-            format!(
-                "recipient {:?} is not an occurrence that may hold the key of {} content in \
-                 {:?} on this node (the one audience rule, #963); re-offer once its occurrence, \
-                 the roster and its owner's allow list have landed",
-                parsed.recipient(),
-                parsed.axis.emission_cohort_scope(),
-                parsed.axis.group_key_id()
-            ),
-        ));
+        return Err(recipient_not_in_audience(&parsed));
     }
     Ok(())
+}
+
+/// The `recipient_not_in_audience` refusal for `parsed`: one text for the
+/// per-row path and the emission fold.
+fn recipient_not_in_audience(parsed: &KeyGrantRow) -> Error {
+    refuse(
+        KeyGrantRefusalReason::RecipientNotInAudience,
+        format!(
+            "recipient {:?} is not an occurrence that may hold the key of {} content in \
+             {:?} on this node (the one audience rule, #963); re-offer once its occurrence, \
+             the roster and its owner's allow list have landed",
+            parsed.recipient(),
+            parsed.axis.emission_cohort_scope(),
+            parsed.axis.group_key_id()
+        ),
+    )
+}
+
+/// v61.4.0 — **one emission's fold**: what [`check_key_grant_row_admission`]
+/// would re-derive for every row of one emission, derived once.
+///
+/// The emitter ([`emit_planned`]) stamps every row it emits with ONE signed
+/// instant, `at`, and judged the sealer rule ([`check_sealer`]) for `signer`
+/// on `axis` at `at` (its `grant` chain at `at` too:
+/// [`grant_chain_instant`](crate::federation::admission::grant_chain_instant)
+/// is the row's `asserted_at`) before it built this; a fold exists only when
+/// that passed. `judged` is [`recipient_may_hold_key`]'s verdict on each
+/// recipient the plan judged, over one [`AudienceSnapshot`]. The per-row
+/// gate asks exactly these two questions of every row (the stale leg aside,
+/// which the fold never answers), so a row of this emission gets the per-row
+/// verdict without the per-row re-fold; a recipient the plan did not judge
+/// takes the per-row path.
+///
+/// Scoped to the emitting task ([`EMISSION_FOLD`]), and consulted only for a
+/// row whose signer, axis and signed instant are the fold's: a row received
+/// from a peer is never put inside an emission's scope, and one that were
+/// would not match unless it is exactly a row this emission could sign.
+#[derive(Debug)]
+pub(crate) struct EmissionFold {
+    signer: String,
+    axis: KeyGrantAxis,
+    at: chrono::DateTime<chrono::Utc>,
+    judged: std::collections::BTreeMap<String, bool>,
+    served: std::sync::atomic::AtomicUsize,
+}
+
+impl EmissionFold {
+    /// How many rows this fold has judged (the witnesses' proof that the
+    /// fold path, not the per-row path, answered).
+    #[cfg(test)]
+    pub(crate) fn served(&self) -> usize {
+        self.served.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The emission's one signed instant.
+    pub(crate) fn at(&self) -> chrono::DateTime<chrono::Utc> {
+        self.at
+    }
+
+    /// Run `f` with this fold as the current task's emission fold.
+    pub(crate) async fn scope<F: std::future::Future>(
+        self: std::sync::Arc<Self>,
+        f: F,
+    ) -> F::Output {
+        EMISSION_FOLD.scope(self, f).await
+    }
+
+    /// Test-only: the fold an emission by `signer` on `axis` at `at` would
+    /// judge `recipients` by (the plan's own pieces: [`check_sealer`] at
+    /// `at`, one [`AudienceSnapshot`], [`AudienceSnapshot::admits`] per
+    /// recipient), for any recipient set a witness names, or the sealer
+    /// refusal that stops an emission building one.
+    #[cfg(test)]
+    pub(crate) async fn for_witness<B>(
+        backend: &B,
+        signer: &str,
+        axis: &KeyGrantAxis,
+        at: chrono::DateTime<chrono::Utc>,
+        recipients: &[&str],
+    ) -> Result<Self, Error>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        check_sealer(backend.as_dyn_directory(), signer, axis, at, at).await?;
+        let snapshot =
+            AudienceSnapshot::read(backend, axis.emission_cohort_scope(), axis.group_key_id())
+                .await?;
+        let mut judged = std::collections::BTreeMap::new();
+        for r in recipients {
+            judged.insert((*r).to_owned(), snapshot.admits(backend, r).await?);
+        }
+        Ok(Self {
+            signer: signer.to_owned(),
+            axis: axis.clone(),
+            at,
+            judged,
+            served: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Test-only: the per-recipient verdicts, for a witness to corrupt.
+    #[cfg(test)]
+    pub(crate) fn judged_mut(&mut self) -> &mut std::collections::BTreeMap<String, bool> {
+        &mut self.judged
+    }
+}
+
+tokio::task_local! {
+    /// v61.4.0 — set while [`emit_planned`] puts the rows of one emission:
+    /// the fold [`check_key_grant_row_admission`] judges those rows by.
+    static EMISSION_FOLD: std::sync::Arc<EmissionFold>;
+}
+
+/// The emission fold's verdict on `parsed` (signed by `signer`), or `None`
+/// when the per-row path must judge it: no fold in scope, a row that is not
+/// this emission's (another signer, axis or instant), or a row the stale leg
+/// would have to re-judge at receipt (signed more than W before `now`).
+fn judged_by_emission_fold(
+    signer: &str,
+    parsed: &KeyGrantRow,
+    row: &Attestation,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Result<(), Error>> {
+    EMISSION_FOLD
+        .try_with(|f| {
+            if f.signer != signer
+                || f.axis != parsed.axis
+                || f.at != row.asserted_at
+                || crate::federation::admission::grant_chain_instant(row) != f.at
+                || crate::federation::self_roster::outside_past_freshness_window(f.at, now)
+            {
+                return None;
+            }
+            let admitted = *f.judged.get(parsed.recipient())?;
+            f.served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(if admitted {
+                Ok(())
+            } else {
+                Err(recipient_not_in_audience(parsed))
+            })
+        })
+        .ok()
+        .flatten()
 }
 
 fn check_wrap_algorithm(wrap: &GrantWrap) -> Result<(), Error> {
@@ -1487,6 +1716,25 @@ pub async fn plan_key_grant_emission<B>(
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
+    Ok(Box::pin(plan_with_fold(backend, signer, axis))
+        .await?
+        .map(|(plan, _)| plan))
+}
+
+/// [`plan_key_grant_emission`], and the [`EmissionFold`] its rows are judged
+/// by when they are put (`None` when the sealer rule refused: nothing is
+/// emitted). v61.4.0: the sealer rule is judged ONCE, at the emission's one
+/// instant (the instant every row is stamped with), and the audience is read
+/// ONCE ([`AudienceSnapshot`]); every wrap not yet held is judged against
+/// that one read, where each wrap used to re-fold the roster.
+pub(crate) async fn plan_with_fold<B>(
+    backend: &B,
+    signer: &str,
+    axis: &KeyGrantAxis,
+) -> Result<Option<(KeyGrantEmissionPlan, Option<std::sync::Arc<EmissionFold>>)>, Error>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
     let watermark = watermark_for_axis(backend, axis).await?;
     let Some(set) = build_set_for_axis(backend, axis)
         .await
@@ -1494,7 +1742,9 @@ where
     else {
         return Ok(None);
     };
-    let now = chrono::Utc::now();
+    // The emission's one instant, at the signed-instant resolution so the
+    // rows' `asserted_at` reads back exactly this value.
+    let at = crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
     let mut plan = KeyGrantEmissionPlan {
         axis: axis.clone(),
         rows: Vec::new(),
@@ -1505,27 +1755,35 @@ where
         watermark,
         misbuilt: None,
     };
-    match check_sealer(backend.as_dyn_directory(), signer, axis, now, now).await {
+    match check_sealer(backend.as_dyn_directory(), signer, axis, at, at).await {
         Ok(()) => {}
         Err(e @ (Error::KeyGrantRefused { .. } | Error::SignerDoesNotActFor { .. })) => {
             plan.sealer_refused = Some(e.to_string());
-            return Ok(Some(plan));
+            return Ok(Some((plan, None)));
         }
         Err(e) => return Err(e),
     }
-    for row in set.rows() {
-        if key_grant_row_held(backend, signer, &row).await? {
+    let rows = set.rows();
+    let held = held_recipients(backend, signer, axis, &rows).await?;
+    // Read only when a wrap is not yet held: a re-emission that owes
+    // nothing reads no audience.
+    let mut audience: Option<AudienceSnapshot> = None;
+    let mut judged = std::collections::BTreeMap::new();
+    for row in rows {
+        if held.contains(row.recipient()) {
             plan.already_emitted.push(row.recipient().to_owned());
             continue;
         }
-        if !recipient_may_hold_key(
-            backend,
-            axis.emission_cohort_scope(),
-            axis.group_key_id(),
-            row.recipient(),
-        )
-        .await?
-        {
+        let snapshot = match &audience {
+            Some(a) => a,
+            None => audience.insert(
+                AudienceSnapshot::read(backend, axis.emission_cohort_scope(), axis.group_key_id())
+                    .await?,
+            ),
+        };
+        let admitted = snapshot.admits(backend, row.recipient()).await?;
+        judged.insert(row.recipient().to_owned(), admitted);
+        if !admitted {
             plan.withheld.push(row.recipient().to_owned());
             continue;
         }
@@ -1553,7 +1811,74 @@ where
             axis.group_key_id()
         ));
     }
-    Ok(Some(plan))
+    let fold = std::sync::Arc::new(EmissionFold {
+        signer: signer.to_owned(),
+        axis: axis.clone(),
+        at,
+        judged,
+        served: std::sync::atomic::AtomicUsize::new(0),
+    });
+    Ok(Some((plan, Some(fold))))
+}
+
+/// v61.4.0 — the recipients among `rows` this node already holds a row for,
+/// signed by `signer` on `axis` ([`key_grant_row_held`], asked of the whole
+/// set). On the epoch axis ONE walk of `signer`'s rows in the room, newest
+/// first, stopping below the epoch's mint (no row of an epoch predates its
+/// DEK; a one-second margin covers the signed instant's coarser resolution),
+/// where a room's re-emission used to issue one query per recipient. Every
+/// other axis, and an epoch whose mint this node does not record, asks per
+/// recipient.
+async fn held_recipients<B>(
+    backend: &B,
+    signer: &str,
+    axis: &KeyGrantAxis,
+    rows: &[KeyGrantRow],
+) -> Result<std::collections::BTreeSet<String>, Error>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    let mut held = std::collections::BTreeSet::new();
+    let minted = match axis {
+        KeyGrantAxis::Epoch {
+            community_key_id,
+            minter_key_id,
+            epoch,
+        } => backend
+            .community_dek_minted_at(community_key_id, minter_key_id, *epoch)
+            .await
+            .map_err(map_blob_err)?,
+        _ => None,
+    };
+    let Some(minted) = minted else {
+        for row in rows {
+            if key_grant_row_held(backend, signer, row).await? {
+                held.insert(row.recipient().to_owned());
+            }
+        }
+        return Ok(held);
+    };
+    let floor = minted - chrono::Duration::seconds(1);
+    let mut pages = AttestationQuery::by(signer, FOLD_PAGE)
+        .dimension_prefix(axis.dimension())
+        .scope(axis.emission_cohort_scope(), Some(axis.group_key_id()))
+        .pages();
+    'walk: while let Some(page) = pages.next(backend).await? {
+        for a in &page {
+            if a.asserted_at < floor {
+                break 'walk;
+            }
+            if !is_key_grant_row(a) {
+                continue;
+            }
+            if let Ok(r) = KeyGrantRow::from_attestation(a) {
+                if r.axis == *axis {
+                    held.insert(r.recipient().to_owned());
+                }
+            }
+        }
+    }
+    Ok(held)
 }
 
 /// Does this node hold a key-grant row signed by `signer` with `row`'s
@@ -1589,6 +1914,27 @@ async fn emit_planned<B, F, Fut>(
     backend: &B,
     signer: &str,
     axis: &KeyGrantAxis,
+    emit_one: F,
+) -> Result<Option<KeyGrantEmission>, Error>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+    F: FnMut(EmitAttestationInput) -> Fut,
+    Fut: std::future::Future<Output = Result<String, Error>>,
+{
+    // v61.4.0 — the plan and every put share one task's roster reads
+    // (`with_roster_read_memo`): each gate still folds at its own instant.
+    // Boxed: the put path each row takes is deep; the scopes must not
+    // inline it into a caller's future (2 MiB worker stacks).
+    crate::federation::with_roster_read_memo(Box::pin(emit_planned_body(
+        backend, signer, axis, emit_one,
+    )))
+    .await
+}
+
+async fn emit_planned_body<B, F, Fut>(
+    backend: &B,
+    signer: &str,
+    axis: &KeyGrantAxis,
     mut emit_one: F,
 ) -> Result<Option<KeyGrantEmission>, Error>
 where
@@ -1596,16 +1942,32 @@ where
     F: FnMut(EmitAttestationInput) -> Fut,
     Fut: std::future::Future<Output = Result<String, Error>>,
 {
-    let Some(plan) = plan_key_grant_emission(backend, signer, axis).await? else {
+    let Some((plan, fold)) = Box::pin(plan_with_fold(backend, signer, axis)).await? else {
         return Ok(None);
     };
     let mut ids = Vec::with_capacity(plan.rows.len());
     let mut skipped = false;
-    for row in &plan.rows {
-        match emission_outcome(emit_one(row.emit_input()?).await)? {
-            Some(id) => ids.push(id),
-            None => skipped = true,
+    // v61.4.0 — every row carries the emission's one instant, and is put
+    // inside the emission's fold scope (`EmissionFold`): admission judges it
+    // against the fold the plan was judged by.
+    let at = fold.as_ref().map(|f| f.at());
+    let body = async {
+        for row in &plan.rows {
+            let mut input = row.emit_input()?;
+            if let Some(at) = at {
+                input.attestation_envelope.asserted_at =
+                    Some(crate::federation::admission::render_signed_instant(at));
+            }
+            match emission_outcome(Box::pin(emit_one(input)).await)? {
+                Some(id) => ids.push(id),
+                None => skipped = true,
+            }
         }
+        Ok::<(), Error>(())
+    };
+    match fold {
+        Some(f) => f.scope(Box::pin(body)).await?,
+        None => Box::pin(body).await?,
     }
     if !skipped && plan.deferred.is_empty() && plan.misbuilt.is_none() {
         if let Some(watermark) = plan.watermark {

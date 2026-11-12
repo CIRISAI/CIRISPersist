@@ -720,22 +720,26 @@ pub mod orchestrate {
             .into_iter()
             .collect();
         let (targets, report) = partition_roster(members);
+        // v61.4.0 — the new wraps land in ONE transaction (the batch door's
+        // per-row `ON CONFLICT DO NOTHING` is the single put's), where a
+        // 150-recipient mint used to issue 150 writes.
+        let mut fresh = Vec::new();
         for (occ_key_id, k) in targets {
             if !already.contains(&occ_key_id) {
                 let wrapped = wrap_dek_v2(&k.x25519_base64, &k.ml_kem_768_base64, &dek)
                     .map_err(map_at_rest_err)?;
-                backend
-                    .community_dek_put_member_grant(
-                        community_key_id,
-                        minter_key_id,
-                        epoch,
-                        &occ_key_id,
-                        WRAP_ALGORITHM_V2,
-                        &wrapped,
-                    )
-                    .await?;
-                changed = true;
+                fresh.push(crate::federation::GrantWrap {
+                    recipient_key_id: occ_key_id,
+                    wrap_algorithm: WRAP_ALGORITHM_V2.to_owned(),
+                    wrapped_dek: wrapped,
+                });
             }
+        }
+        if !fresh.is_empty() {
+            backend
+                .community_dek_put_member_grants(community_key_id, minter_key_id, epoch, &fresh)
+                .await?;
+            changed = true;
         }
         Ok(EnsuredEpoch {
             epoch,
