@@ -491,6 +491,15 @@ mod key_id_fingerprint_invariants;
 // consumers can drive them against their own backends.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod key_grant_invariants;
+// MEASUREMENT ONLY (kg-burst-measure) — the seat-door burst cost.
+#[cfg(test)]
+mod kg_burst_measure;
+// v61.4.0 — I1800–I1802: one emission, one fold (the key-grant burst).
+#[cfg(test)]
+mod key_grant_fold_invariants;
+// v61.4.0 — I1803–I1807: the seat door (CC C559, DERIVED, pending text).
+#[cfg(test)]
+mod seat_door_invariants;
 // v55.0.0 (CIRISPersist#989) — I742–I745: the key-grant SET retired, one
 // `scores` row per recipient (the upgraded node included).
 #[cfg(test)]
@@ -2613,17 +2622,51 @@ pub async fn authorized_community_roster_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    let reads = match roster_read_memo_get(community) {
+        Some(r) => r,
+        None => {
+            let r =
+                std::sync::Arc::new(Box::pin(read_community_roster(directory, community)).await?);
+            roster_read_memo_put(community, &r);
+            r
+        }
+    };
     // v61 S2 (CIRISPersist#1143; CC rc14 4.4.3.2.8) — seats lapse at the
     // dissolution: from its instant the room seats nobody.
-    if Box::pin(group_plane::community_dissolved_at(
+    if reads.dissolved_at.is_some_and(|at| at <= as_of) {
+        return Ok(Vec::new());
+    }
+    Ok(authorized_roster_at(
+        &community.members,
+        RosterRules::of_community(community, &reads.nodes).with_persons(&reads.persons),
+        &reads.events,
+        as_of,
+    ))
+}
+
+/// v61.4.0 — the directory reads [`authorized_community_roster_at`] folds:
+/// everything it reads, nothing that depends on the instant. The fold itself
+/// ([`authorized_roster_at`]) is pure over these and `as_of`.
+#[derive(Debug)]
+pub(crate) struct CommunityRosterReads {
+    dissolved_at: Option<chrono::DateTime<chrono::Utc>>,
+    nodes: NodeBearingSeats,
+    persons: key_person::KeySelves,
+    events: Vec<RosterEvent>,
+}
+
+async fn read_community_roster<F>(
+    directory: &F,
+    community: &Community,
+) -> Result<CommunityRosterReads, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let dissolved_at = Box::pin(group_plane::community_dissolved_at(
         directory,
         &community.community_key_id,
     ))
-    .await?
-    .is_some_and(|at| at <= as_of)
-    {
-        return Ok(Vec::new());
-    }
+    .await?;
     // Boxed: the replay nests the moderator walk and the reverse-quorum
     // fold; a caller's future must not inline all of it (2 MiB worker stacks).
     let nodes = Box::pin(community_node_bearing_seats(directory, community)).await?;
@@ -2632,12 +2675,69 @@ where
         directory, community, &nodes, &persons,
     ))
     .await?;
-    Ok(authorized_roster_at(
-        &community.members,
-        RosterRules::of_community(community, &nodes).with_persons(&persons),
-        &events,
-        as_of,
-    ))
+    Ok(CommunityRosterReads {
+        dissolved_at,
+        nodes,
+        persons,
+        events,
+    })
+}
+
+/// v61.4.0 — **one key-grant emission's roster reads, read once.** While a
+/// memo is in scope ([`with_roster_read_memo`]), [`authorized_community_roster_at`]
+/// reads a STORED record's roster state (keyed by the record's id and row
+/// hash) once and folds every later call from those reads at the call's own
+/// `as_of`: the instant every gate asks at is unchanged, only the directory
+/// reads are shared. Scoped to one task by its caller, the key-grant emitter
+/// ([`key_grant`]'s `emit_planned`), whose own puts (key-grant rows) change
+/// no roster state. A record with no row hash (one in flight, not stored) is
+/// never memoized.
+type RosterReadMemo = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<(String, String), std::sync::Arc<CommunityRosterReads>>,
+    >,
+>;
+
+tokio::task_local! {
+    static ROSTER_READ_MEMO: RosterReadMemo;
+}
+
+/// Run `f` with a fresh roster-read memo in scope (see [`RosterReadMemo`]).
+pub(crate) async fn with_roster_read_memo<T>(f: impl std::future::Future<Output = T>) -> T {
+    ROSTER_READ_MEMO.scope(RosterReadMemo::default(), f).await
+}
+
+fn roster_read_memo_key(community: &Community) -> Option<(String, String)> {
+    (!community.persist_row_hash.is_empty()).then(|| {
+        (
+            community.community_key_id.clone(),
+            community.persist_row_hash.clone(),
+        )
+    })
+}
+
+fn roster_read_memo_get(community: &Community) -> Option<std::sync::Arc<CommunityRosterReads>> {
+    let key = roster_read_memo_key(community)?;
+    ROSTER_READ_MEMO
+        .try_with(|m| {
+            m.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .cloned()
+        })
+        .ok()
+        .flatten()
+}
+
+fn roster_read_memo_put(community: &Community, reads: &std::sync::Arc<CommunityRosterReads>) {
+    let Some(key) = roster_read_memo_key(community) else {
+        return;
+    };
+    let _ = ROSTER_READ_MEMO.try_with(|m| {
+        m.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, reads.clone());
+    });
 }
 
 /// CIRISPersist#1201 (CC 4.4.3.4.2.1) — **the one read of a community's
