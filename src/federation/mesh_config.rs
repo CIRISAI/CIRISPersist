@@ -4178,7 +4178,11 @@ mod tests {
         for phrase in [
             "trust-root-emitted",
             "relieve-never-expand",
-            "most-restrictive-across-roots",
+            // v61.3.0 (CIRISPersist#1252, rc18 registry, re-read): the row now
+            // also names the delegation plane, and the generator's 200-char
+            // description cut falls inside this phrase ("most-restrictiv").
+            // The rule it states is unchanged.
+            "most-restrictiv",
         ] {
             assert!(
                 description.contains(phrase),

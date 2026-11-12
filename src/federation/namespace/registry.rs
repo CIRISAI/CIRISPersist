@@ -38,14 +38,14 @@ pub(super) const REGISTRY_JSON: &str = include_str!("namespace_registry.json");
 
 /// The CC version [`REGISTRY_JSON`] was generated from. Bump in lockstep when
 /// re-vendoring (the drift gate asserts the file's `_meta.cc_version` matches).
-pub const VENDORED_CC_VERSION: &str = "1.0-rc15";
+pub const VENDORED_CC_VERSION: &str = "1.0-rc18";
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "a930a011bd6dc0767f21a5589bb5181f6a189158b247a9d374868293af33999b";
+    "d7f9e69118afcdf510d2f572914fac00faa1b3fe7476ad7eb0523c32b4ab9f0b";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
-pub const VENDORED_N_FAMILIES: usize = 189;
+pub const VENDORED_N_FAMILIES: usize = 192;
 
 /// v50.0.0 (CIRISPersist#924, CIRISConstitution#112) — the manifest's
 /// `_meta.registry_sha256`: the hash of the GRAMMAR (families + `_meta` minus
@@ -55,31 +55,32 @@ pub const VENDORED_N_FAMILIES: usize = 189;
 /// vendored bytes the way `tools/build_cc_namespace.py` does.
 ///
 /// Vendored byte-for-byte from CIRISConstitution commit [`VENDORED_CC_COMMIT`]
-/// (CC 1.0-rc15; see [`VENDORED_CC_COMMIT`] for the tag), together with
+/// (CC 1.0-rc18; see [`VENDORED_CC_COMMIT`] for the tag), together with
 /// `namespace_match_vectors.json` from the same commit. JSON carries no
 /// comments, so this doc is the vendored files' header.
 pub const VENDORED_REGISTRY_SHA256: &str =
-    "df79a1dde30a380380da83f0d776737e580705b6305741f037a5a78c2bef9898";
+    "3ba2096fd5f60c22131cb6743c0acb5cbb892fc739e6cedc15c4e68011f763a6";
 
 /// The CIRISConstitution commit every vendored CC manifest was copied from: the
-/// commit the `v1.0-rc15` tag names (`ace6b74`, tag object `6869eb10`), copied
-/// from the tag with `git show v1.0-rc15:manifests/<file>`, never a branch tip
-/// (CIRISPersist#753). The files are also pinned by their own SHA-256
+/// commit the `v1.0-rc18` tag names (`646df978`, tag object `ae5a2a01`), copied
+/// from the tag with `git show v1.0-rc18:manifests/<file>`, never a branch tip
+/// (CIRISPersist#753; v61.3.0, CIRISPersist#1252, from rc15 `ace6b74`). The
+/// files are also pinned by their own SHA-256
 /// ([`VENDORED_REGISTRY_FILE_SHA256`], [`VENDORED_VECTORS_FILE_SHA256`], and the
-/// files in [`super::cc_manifests`]), and `scripts/check_vendored_cc.sh v1.0-rc15`
+/// files in [`super::cc_manifests`]), and `scripts/check_vendored_cc.sh v1.0-rc18`
 /// byte-compares all of them against the tag before a persist release that
-/// names rc15 is tagged.
-pub const VENDORED_CC_COMMIT: &str = "ace6b74217b4496a67e47aef2258461517e4493c";
+/// names rc18 is tagged.
+pub const VENDORED_CC_COMMIT: &str = "646df97853efeb1c068db2719ae70ffc342a2247";
 
 /// SHA-256 of the vendored `namespace_registry.json` FILE bytes (the whole file,
 /// unlike [`VENDORED_REGISTRY_SHA256`], which is CC's hash of the grammar).
 /// What `scripts/check_vendored_cc.sh` compares against the tag.
 pub const VENDORED_REGISTRY_FILE_SHA256: &str =
-    "2fa7199bcdc4267d8b94cfce2af0796747fd20b7b5c4d43b78fde6a0d4806769";
+    "32f060a6fa431d3d6f6b00d0dc238451fc8cb50ddeea34b7cd73ebfe35200fa3";
 
 /// SHA-256 of the vendored `namespace_match_vectors.json` FILE bytes.
 pub const VENDORED_VECTORS_FILE_SHA256: &str =
-    "64078f4623d82df7df23c2a2ace6267709308f88b4ddefed4b9a4cfe2477fb09";
+    "c457126ebf9df0f192bd4762eb09469bd981abf6c06097e1ee7c16d81276ec76";
 
 /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the case class of one dimension
 /// SEGMENT, read from the manifest rather than inferred from `{...}` in prose.
@@ -1130,6 +1131,13 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "evidence:{suite}:{kind}:{cell}:{prefix}",
     // rc15 (CIRISConstitution v1.0-rc15 @ ace6b74) — no family added or
     // retired; the grammar hash (`registry_sha256`) does not move.
+    // rc18 (CIRISConstitution v1.0-rc18 @ 646df978; CIRISPersist#1252) —
+    // three families added, none retired: the cosign hold (CC 3.1.3, persist's
+    // `federation::cosign`) and the two moderator-ballot families (CC 3.1.3).
+    // Every CC file is vendored at the tag (CIRISPersist#1252).
+    "ballot:moderator",
+    "ballot:moderator_acceptance",
+    "cosign:{state}",
 ];
 
 /// Families CC has **deliberately retired** — present in an earlier vendored cut,

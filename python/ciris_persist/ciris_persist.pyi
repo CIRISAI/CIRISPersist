@@ -4260,6 +4260,15 @@ class Engine:
         """(derived) pragmatic — v16 (CIRISPersist#431) — pure §19.1 root builder: the WW-scheme Merkle root (lexicographic leaf order, odd-duplication, WW-v1-empty empty sentinel)..."""
 
 
+    # ==============================================================
+    # CONTINGENT  (descriptive)
+    # Varying one of these out of scope by construction — see `report` for why this is empty.
+    # ==============================================================
+
+    def execute_cosign_due(self) -> int:
+        """(derived) contingent — v61.3.0 (CIRISPersist#1252, CC 3.3.4) — execute every open cosign hold (a merged widening or removal that meets its protocol lands; a lapsed hold e..."""
+
+
 class ScoringFactorStream:
 
     # ==============================================================
@@ -4495,5 +4504,14 @@ def dimension_rejection_is_retryable(reason: str) -> bool:
 
 def key_grant_refusal_is_retryable(reason: str) -> bool:
     """(derived) procedural — v60.1.0 (CIRISPersist#1064, CIRISEdge) — may a later re-offer of the row a federation_key_grant_refused refusal named succeed? reason is the refusa..."""
+
+
+# ==================================================================
+# CONTINGENT  (descriptive)
+# Varying one of these out of scope by construction — see `report` for why this is empty.
+# ==================================================================
+
+def attestation_wire_hash(row_json: str) -> str:
+    """(derived) contingent — v61.3.0 (CIRISPersist#1252) — THE ref rule for an attestation-plane row (wire_index::attestation_wire_hash): the lowercase-hex wire-index content h..."""
 
 # --- pyi_surface: END GENERATED REGION ---

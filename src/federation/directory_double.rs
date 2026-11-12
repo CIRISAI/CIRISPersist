@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 135 delegations, generated. Every one: fault first, then delegate.
+// 144 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn adopt_genesis_reanchor(
@@ -255,6 +255,21 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.community_roster_signers(community_key_id).await
     }
+    async fn cosign_alias(&self, attestation_id: &str) -> Result<Option<(String, String)>, Error> {
+        if let Some(e) = self.faulted("cosign_alias") {
+            return Err(e);
+        }
+        self.inner.cosign_alias(attestation_id).await
+    }
+    async fn cosign_receipt(
+        &self,
+        quorum_key: &str,
+    ) -> Result<Option<cosign::CosignReceipt>, Error> {
+        if let Some(e) = self.faulted("cosign_receipt") {
+            return Err(e);
+        }
+        self.inner.cosign_receipt(quorum_key).await
+    }
     async fn dag_manifests_of_chunk(
         &self,
         chunk_sha256: &[u8; 32],
@@ -263,6 +278,12 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.dag_manifests_of_chunk(chunk_sha256).await
+    }
+    async fn drop_cosign_rows(&self, quorum_key: &str) -> Result<u64, Error> {
+        if let Some(e) = self.faulted("drop_cosign_rows") {
+            return Err(e);
+        }
+        self.inner.drop_cosign_rows(quorum_key).await
     }
     async fn enter_mesh(
         &self,
@@ -572,6 +593,21 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.list_consent_peers_for(for_key_id).await
     }
+    async fn list_cosign_aliases(&self, quorum_key: &str) -> Result<Vec<(String, String)>, Error> {
+        if let Some(e) = self.faulted("list_cosign_aliases") {
+            return Err(e);
+        }
+        self.inner.list_cosign_aliases(quorum_key).await
+    }
+    async fn list_cosign_signatures(
+        &self,
+        quorum_key: &str,
+    ) -> Result<Vec<(String, String)>, Error> {
+        if let Some(e) = self.faulted("list_cosign_signatures") {
+            return Err(e);
+        }
+        self.inner.list_cosign_signatures(quorum_key).await
+    }
     async fn list_derived_hex(
         &self,
         original_sha256_hex: &str,
@@ -800,6 +836,12 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.list_location_proofs_for(subject_key_id).await
+    }
+    async fn list_open_cosign_receipts(&self) -> Result<Vec<cosign::CosignReceipt>, Error> {
+        if let Some(e) = self.faulted("list_open_cosign_receipts") {
+            return Err(e);
+        }
+        self.inner.list_open_cosign_receipts().await
     }
     async fn list_open_self_roster_proposals(
         &self,
@@ -1053,6 +1095,19 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .lookup_signed_record_by_content_hash(kind, content_hash)
+            .await
+    }
+    async fn note_cosign_alias(
+        &self,
+        alias_attestation_id: &str,
+        quorum_key: &str,
+        held_attestation_id: &str,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("note_cosign_alias") {
+            return Err(e);
+        }
+        self.inner
+            .note_cosign_alias(alias_attestation_id, quorum_key, held_attestation_id)
             .await
     }
     async fn note_self_roster_proposal(
@@ -1320,6 +1375,15 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.put_revocation(revocation).await
     }
+    async fn read_group_plane_object(
+        &self,
+        link: &group_plane::GroupRowLink,
+    ) -> Result<Option<(group_plane::GroupSigned, Option<String>)>, Error> {
+        if let Some(e) = self.faulted("read_group_plane_object") {
+            return Err(e);
+        }
+        self.inner.read_group_plane_object(link).await
+    }
     async fn record_announced_peer(
         &self,
         key_id: &str,
@@ -1399,6 +1463,19 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.set_consent_role(key_id, consent_role).await
+    }
+    async fn settle_cosign_receipt(
+        &self,
+        quorum_key: &str,
+        outcome: &str,
+        settled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("settle_cosign_receipt") {
+            return Err(e);
+        }
+        self.inner
+            .settle_cosign_receipt(quorum_key, outcome, settled_at)
+            .await
     }
     async fn settle_self_roster_proposal(
         &self,

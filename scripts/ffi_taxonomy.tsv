@@ -790,3 +790,8 @@ Engine	finalize_blob_chunks_signing_json	deontic
 # run_pqc_sweep: a maintenance pass that re-signs this node's own rows; what
 # stands is decided by the pass, not by calling it.
 Engine	settle_instant_forms_json	procedural
+# v61.3.0 (CIRISPersist#1252) — the cosign sweep acts (lands, expires, ends a
+# hold): deontic, as execute_self_roster_due. The wire ref is a derivation
+# rule (the act's bytes, their hash): nomological, as ledger_derive_id.
+Engine	execute_cosign_due	deontic	
+MODULE	attestation_wire_hash	nomological	

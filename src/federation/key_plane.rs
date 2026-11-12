@@ -496,6 +496,36 @@ pub(crate) fn minted_row_placed(
     let mut object = object;
     super::canonical_at_rest::canonicalize_in_place(&mut object)?;
     let attestation_id = minted_attestation_id(family.id_domain, &object)?;
+    minted_row_named(
+        family,
+        attesting_key_id,
+        attested_key_id,
+        object,
+        asserted_at,
+        signature,
+        placement,
+        attestation_id,
+    )
+}
+
+/// v61.3.0 (CIRISPersist#1252) — [`minted_row_placed`] under an id the
+/// family derives itself (the cosign rows: the pending row is named by its
+/// quorum key, the digest of the event with no signature in it, and a
+/// cosignature by `quorum key ‖ signer`), not by `sha256(domain ‖ JCS(object))`.
+/// The object is canonicalized here as there.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn minted_row_named(
+    family: MintedFamily,
+    attesting_key_id: &str,
+    attested_key_id: &str,
+    object: serde_json::Value,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    signature: PlaneSignature,
+    placement: MintedPlacement,
+    attestation_id: String,
+) -> Result<Attestation, Error> {
+    let mut object = object;
+    super::canonical_at_rest::canonicalize_in_place(&mut object)?;
     let mut members = placement.members;
     members.insert("dimension".to_owned(), family.dimension.into());
     members.insert("score".to_owned(), family.score.into());

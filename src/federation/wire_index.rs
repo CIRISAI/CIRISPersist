@@ -107,6 +107,56 @@ pub fn content_hash_of_bytes(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
+/// v61.3.0 (CIRISPersist#1252; CC 3.3.4, CC 2.6.1.8) — **THE ref rule for
+/// an attestation-plane row, for every kind of row**: the wire-index content
+/// hash of `row`, the value every advertisement, fetch and diff of the
+/// `Attestation` kind keys on. A consumer that holds served bytes takes its ref
+/// HERE, never as its own `sha256(bytes)`.
+///
+/// - A cosignable group row (a `membership:widening:v1` or
+///   `membership:removal:v1` row) is named by its ACT, not by the signatures
+///   it happens to carry: the hash is over the row exactly as
+///   [`plan_group_row`](super::group_plane::plan_group_row) builds it from the
+///   object with NO cosignatures. The cosignatures sit inside the signed object
+///   (so inside `attestation_id`, `original_content_hash` and
+///   `persist_row_hash`), not only in `additional_scrubs`, so stripping the
+///   sidecar alone would not do. Two nodes that assembled one act from
+///   different sufficient subsets, or kept different randomised ML-DSA bytes,
+///   advertise the same ref and stay quiet on a diff. The row keeps its
+///   `attestation_id` (a 61.2 peer re-derives it), so only the ref moves.
+/// - Every other row: `sha256(serde_json::to_vec(row))`, unchanged — the
+///   lockstep bytes this module was built on.
+///
+/// Used by [`entry_as_stored`] (the write path), the point read's
+/// self-check ([`reload_record_hashed`]), [`all_kind_hash_keys`] (the
+/// rebuild) and [`wire_refs_for_subject`]: one derivation.
+#[must_use]
+pub fn attestation_wire_hash(row: &super::types::Attestation) -> [u8; 32] {
+    use sha2::Digest as _;
+    let act = act_ref_row(row);
+    let named = act.as_ref().unwrap_or(row);
+    // `Attestation` serializes infallibly (strings, numbers, a JSON value).
+    let bytes = serde_json::to_vec(named).unwrap_or_default();
+    sha2::Sha256::digest(&bytes).into()
+}
+
+/// [`attestation_wire_hash`] as the lowercase hex the index stores.
+#[must_use]
+pub fn attestation_wire_hash_hex(row: &super::types::Attestation) -> String {
+    hex::encode(attestation_wire_hash(row))
+}
+
+/// The row a cosignable group row's ref is taken over: its object with no
+/// cosignatures, re-planned. `None` for any other row, and for one that
+/// carries no cosignature (its ref is its own bytes, as before).
+fn act_ref_row(row: &super::types::Attestation) -> Option<super::types::Attestation> {
+    let signed = super::group_plane::group_signed_of_row(row).ok()??;
+    if !super::cosign::is_cosignable(&signed) || signed.cosignatures().is_empty() {
+        return None;
+    }
+    super::group_plane::plan_group_row(&signed.with_cosignatures(Vec::new())).ok()?
+}
+
 /// v31.0.0 (CIRISPersist#646) — the microsecond-truncated RFC-3339 spelling
 /// used for the ONE `record_key` field that is not a byte-transparent TEXT id:
 /// `LocationProof.asserted_at`.
@@ -202,9 +252,36 @@ pub(crate) async fn entry_as_stored(
     kind: &str,
     record_key_json: &str,
 ) -> Result<Option<String>, Error> {
-    Ok(reload_record_bytes(dir, kind, record_key_json)
+    Ok(reload_record_hashed(dir, kind, record_key_json)
         .await?
-        .map(|bytes| content_hash_of_bytes(&bytes)))
+        .map(|(_, hash)| hash))
+}
+
+/// v61.3.0 (CIRISPersist#1252) — [`reload_record_bytes`] with the ref its
+/// bytes stand for: [`attestation_wire_hash`] for an `Attestation` entry,
+/// `sha256(bytes)` for every other kind. The write path ([`entry_as_stored`])
+/// and every backend's point-read self-check ask THIS, so the derivation and
+/// the resolution are one function.
+///
+/// # Errors
+///
+/// [`reload_record_bytes`]'s.
+pub async fn reload_record_hashed(
+    dir: &dyn super::FederationDirectory,
+    kind: &str,
+    record_key_json: &str,
+) -> Result<Option<(Vec<u8>, String)>, Error> {
+    let Some(bytes) = reload_record_bytes(dir, kind, record_key_json).await? else {
+        return Ok(None);
+    };
+    let hash = if kind == "Attestation" {
+        let row: super::types::Attestation = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Backend(format!("signed_wire_index reload Attestation: {e}")))?;
+        attestation_wire_hash_hex(&row)
+    } else {
+        content_hash_of_bytes(&bytes)
+    };
+    Ok(Some((bytes, hash)))
 }
 
 /// v21.1.0 (CIRISPersist#507b) — the shared per-kind reload dispatcher every
@@ -396,7 +473,7 @@ pub async fn wire_refs_for_subject(
     while let Some(page) = pages.next(dir).await? {
         for a in page {
             let rk = record_key(&[("attestation_id", &a.attestation_id)]);
-            out.push(("Attestation", content_hash_of(&a)?, rk));
+            out.push(("Attestation", attestation_wire_hash_hex(&a), rk));
         }
     }
     // v31.1.0 (CIRISPersist#655, PR review P1) — the key-level revocation
@@ -416,7 +493,7 @@ pub async fn wire_refs_for_subject(
         let row_id = super::key_plane::revocation_row(&revocation)?.attestation_id;
         if let Some(row) = dir.get_attestation(&row_id).await? {
             let row_rk = record_key(&[("attestation_id", &row.attestation_id)]);
-            out.push(("Attestation", content_hash_of(&row)?, row_rk));
+            out.push(("Attestation", attestation_wire_hash_hex(&row), row_rk));
         }
     }
     // Transport destinations hang off the OCCURRENCE, so the subject's
@@ -463,7 +540,7 @@ pub async fn all_kind_hash_keys(
     // same rule applies to every Served* plane below.
     for a in dir.list_attestations_since(None, u32::MAX).await? {
         let rk = record_key(&[("attestation_id", &a.attestation.attestation_id)]);
-        out.push(("Attestation", content_hash_of(&a.attestation)?, rk));
+        out.push(("Attestation", attestation_wire_hash_hex(&a.attestation), rk));
     }
     for r in dir
         .list_signed_transport_destinations_since(None, u32::MAX)

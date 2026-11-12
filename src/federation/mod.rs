@@ -825,6 +825,12 @@ mod takedown_reversal_invariants;
 // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the key roster of a self: the
 // two-path door its additions and evictions go through, and the steward
 // predicate (a live roster key signs as the fedID).
+// v61.3.0 (CIRISPersist#1252; CC 3.3.4 step 2, CC 3.1.3 `cosign:{state}`) —
+// the hold of a short widening or removal for its cosignatures.
+pub mod cosign;
+// CIRISPersist#1252 — I1730–I1743: the cosign hold on every backend.
+#[cfg(test)]
+mod cosign_invariants;
 pub mod self_roster;
 // CIRISPersist#1099 — I1130–I1139: the self-roster door and the steward
 // predicate on every backend.
@@ -1672,6 +1678,51 @@ pub fn roster_event_standing(
     state: &RosterState,
     e: &RosterEvent,
 ) -> Result<(), (&'static str, String)> {
+    match roster_event_verdict(rules, state, e) {
+        StandingVerdict::Admit => Ok(()),
+        StandingVerdict::ConsensusShort { detail } => Err((ROSTER_CONSENSUS_INSUFFICIENT, detail)),
+        StandingVerdict::Refuse { rule, detail } => Err((rule, detail)),
+    }
+}
+
+/// v61.3.0 (CIRISPersist#1252; CC 3.3.4 step 2) — **the standing verdict,
+/// split.** [`roster_event_standing`]'s one answer, with the consensus
+/// shortfall told apart STRUCTURALLY from every other refusal, so a door can
+/// hold a short event for its cosignatures without reading an error's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StandingVerdict {
+    /// The event has standing.
+    Admit,
+    /// The ONLY reason it has none is the protocol's count: every signer is an
+    /// ACTIVE member of the group immediately before the event, the protocol is
+    /// evaluable and not met, and the last-founder rule, evaluated as if the
+    /// event were admitted, holds. More cosignatures from members can mend it.
+    ConsensusShort {
+        /// The evaluator's detail.
+        detail: String,
+    },
+    /// Any other refusal: the rule token and its detail, exactly as
+    /// [`roster_event_standing`] returned before the split.
+    Refuse {
+        /// The refusing rule token.
+        rule: &'static str,
+        /// A human-readable detail.
+        detail: String,
+    },
+}
+
+/// v61.3.0 (CIRISPersist#1252) — [`roster_event_standing`]'s body: the verdict
+/// with the shortfall split out ([`StandingVerdict`]). The order and every
+/// token are the pre-split ones; a short event that ALSO breaks the
+/// last-founder rule is a [`StandingVerdict::Refuse`] carrying the shortfall
+/// token it was refused with before (the count is checked first), never a
+/// hold.
+#[must_use]
+pub fn roster_event_verdict(
+    rules: RosterRules<'_>,
+    state: &RosterState,
+    e: &RosterEvent,
+) -> StandingVerdict {
     // v50.0.0 (CIRISPersist#925 review M2) — a `node`-bearing seat (at this
     // event's instant) holds no founder power in an infrastructure group,
     // the last-founder rule included: it is not a founder that could be lost,
@@ -1732,7 +1783,18 @@ pub fn roster_event_standing(
             }
         }
     };
-    admitted?;
+    // v61.3.0 (CIRISPersist#1252) — the shortfall, told apart structurally:
+    // the evaluator's count alone, every signer an ACTIVE member (a removed
+    // member's signature is no cosignature that more members could mend).
+    let short = matches!(&admitted, Err((rule, _)) if *rule == ROSTER_CONSENSUS_INSUFFICIENT)
+        && e.signers
+            .iter()
+            .all(|s| matches!(state.get(s), Some((true, _))));
+    let shortfall = match admitted {
+        Ok(()) => None,
+        Err((_, detail)) if short => Some(detail),
+        Err((rule, detail)) => return StandingVerdict::Refuse { rule, detail },
+    };
     // The last-founder rule: a removal — or a role change that demotes — that
     // leaves members but no founder.
     let loses_founder = is_active_founder(&e.member.key_id)
@@ -1747,16 +1809,28 @@ pub fn roster_event_standing(
             .filter(|(k, (active, _))| *active && k.as_str() != e.member.key_id)
             .count();
         if founders_after == 0 && others_after > 0 {
-            return Err((
-                ROSTER_LAST_FOUNDER,
-                format!(
+            // v61.3.0 (CIRISPersist#1252) — evaluated as if admitted: a short
+            // event that would also leave no founder is refused, with the
+            // shortfall token it carried before (the count is asked first).
+            if let Some(detail) = shortfall {
+                return StandingVerdict::Refuse {
+                    rule: ROSTER_CONSENSUS_INSUFFICIENT,
+                    detail,
+                };
+            }
+            return StandingVerdict::Refuse {
+                rule: ROSTER_LAST_FOUNDER,
+                detail: format!(
                     "removing or demoting {} would leave {others_after} member(s) and no founder",
                     e.member.key_id
                 ),
-            ));
+            };
         }
     }
-    Ok(())
+    match shortfall {
+        None => StandingVerdict::Admit,
+        Some(detail) => StandingVerdict::ConsensusShort { detail },
+    }
 }
 
 fn sort_roster_events(events: &mut [RosterEvent]) {
@@ -2515,7 +2589,7 @@ async fn check_roster_authority_over<F>(
     incoming: types::CommunityMember,
     is_revocation: bool,
     effective_at: chrono::DateTime<chrono::Utc>,
-) -> Result<(), Error>
+) -> Result<RosterAuthority, Error>
 where
     F: FederationDirectory + ?Sized,
 {
@@ -2557,20 +2631,31 @@ where
         moderator_roots,
         reversed: false,
     };
-    roster_event_standing(rules, &state, &e).map_err(|(rule, detail)| {
+    let refusal = |rule: &'static str, detail: &str| {
         tracing::debug!(group_key_id, primary, rule, detail = %detail, "roster change refused");
         Error::RosterAuthorityUnauthorized {
             group_key_id: group_key_id.to_owned(),
             offered_authority_key_id: primary.to_owned(),
             rule,
         }
-    })?;
+    };
+    // v61.3.0 (CIRISPersist#1252) — the verdict, the shortfall split out.
+    let short = match roster_event_verdict(rules, &state, &e) {
+        StandingVerdict::Admit => None,
+        StandingVerdict::ConsensusShort { detail } => {
+            Some(refusal(ROSTER_CONSENSUS_INSUFFICIENT, &detail))
+        }
+        StandingVerdict::Refuse { rule, detail } => return Err(refusal(rule, &detail)),
+    };
     // v52.0.0 (CIRISPersist#955) — a GROWTH (a key not active before this
     // instant) needs the member's own acceptance, under every protocol. The
     // group's standing above is its decision; this is the member's consent.
     // A role change of an active member is not a growth.
+    // v61.3.0 (CIRISPersist#1252) — run for a short event too: a hold needs
+    // every later check met. A short event it refuses keeps the shortfall
+    // refusal it met first before the split.
     if !is_revocation && !matches!(state.get(&e.member.key_id), Some((true, _))) {
-        membership_acceptance::check_growth_accepted(
+        let accepted = membership_acceptance::check_growth_accepted(
             directory,
             scope,
             group_key_id,
@@ -2578,9 +2663,52 @@ where
             e.member.role.as_deref(),
             effective_at,
         )
-        .await?;
+        .await;
+        if let Err(err) = accepted {
+            return Err(short.unwrap_or(err));
+        }
     }
-    Ok(())
+    Ok(match short {
+        None => RosterAuthority::Admitted,
+        Some(refusal) => RosterAuthority::ConsensusShort(refusal),
+    })
+}
+
+/// v61.3.0 (CIRISPersist#1252) — what a roster door's standing check found
+/// when it did not refuse.
+#[derive(Debug)]
+pub enum RosterAuthority {
+    /// The event has standing.
+    Admitted,
+    /// Its ONLY refusal is the consensus shortfall
+    /// ([`StandingVerdict::ConsensusShort`]), and the member's acceptance of a
+    /// growth is met. Carries the refusal the door returns when it does not
+    /// hold the event ([`Error::RosterAuthorityUnauthorized`],
+    /// `roster_consensus_insufficient`: the pre-#1252 error, unchanged).
+    ConsensusShort(Error),
+}
+
+impl RosterAuthority {
+    /// The pre-#1252 answer: the shortfall is a refusal.
+    ///
+    /// # Errors
+    ///
+    /// The carried shortfall refusal.
+    pub fn into_result(self) -> Result<(), Error> {
+        match self {
+            Self::Admitted => Ok(()),
+            Self::ConsensusShort(e) => Err(e),
+        }
+    }
+
+    /// The carried shortfall refusal, if the verdict was short.
+    #[must_use]
+    pub fn into_short(self) -> Option<Error> {
+        match self {
+            Self::Admitted => None,
+            Self::ConsensusShort(e) => Some(e),
+        }
+    }
 }
 
 /// v49.0.0 (CIRISPersist#908, FSD §4) — the door's standing check for one
@@ -2600,8 +2728,36 @@ pub async fn check_community_roster_authority<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    Box::pin(check_community_roster_authority_verdict(
+        directory,
+        community_key_id,
+        primary,
+        signers,
+        incoming,
+        is_revocation,
+        effective_at,
+    ))
+    .await?
+    .into_result()
+}
+
+/// v61.3.0 (CIRISPersist#1252) — [`check_community_roster_authority`] with
+/// the consensus shortfall returned as [`RosterAuthority::ConsensusShort`]
+/// instead of refused: the door decides whether to hold it.
+pub async fn check_community_roster_authority_verdict<F>(
+    directory: &F,
+    community_key_id: &str,
+    primary: &str,
+    signers: &std::collections::BTreeSet<String>,
+    incoming: types::CommunityMember,
+    is_revocation: bool,
+    effective_at: chrono::DateTime<chrono::Utc>,
+) -> Result<RosterAuthority, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     let Some(community) = directory.lookup_community(community_key_id).await? else {
-        return Ok(());
+        return Ok(RosterAuthority::Admitted);
     };
     // v61 S2 (CIRISPersist#1143) — a dissolved room admits no seat and no
     // removal: no new seat or grant is issued, and the DEK rotates no more.
@@ -2688,8 +2844,35 @@ pub async fn check_family_roster_authority<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    Box::pin(check_family_roster_authority_verdict(
+        directory,
+        family_key_id,
+        primary,
+        signers,
+        incoming,
+        is_revocation,
+        effective_at,
+    ))
+    .await?
+    .into_result()
+}
+
+/// v61.3.0 (CIRISPersist#1252) — the family twin of
+/// [`check_community_roster_authority_verdict`].
+pub async fn check_family_roster_authority_verdict<F>(
+    directory: &F,
+    family_key_id: &str,
+    primary: &str,
+    signers: &std::collections::BTreeSet<String>,
+    incoming: types::FamilyMember,
+    is_revocation: bool,
+    effective_at: chrono::DateTime<chrono::Utc>,
+) -> Result<RosterAuthority, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     let Some(family) = directory.lookup_family(family_key_id).await? else {
-        return Ok(());
+        return Ok(RosterAuthority::Admitted);
     };
     // v52.0.0 (CIRISPersist#956) — no roster change on a dissolved family.
     family_dissolution::refuse_if_dissolved(&family)?;
@@ -5861,6 +6044,115 @@ pub trait FederationDirectory: Send + Sync {
         let _ = (proposal_id, outcome, settled_at);
         Err(Error::Unsupported {
             method: "settle_self_roster_proposal",
+        })
+    }
+
+    /// v61.3.0 (CIRISPersist#1252, V214) — this node's receipt for the
+    /// `cosign:pending:v1` row `quorum_key`, if it ever held it (a settled
+    /// receipt outlives the rows it describes).
+    async fn cosign_receipt(
+        &self,
+        quorum_key: &str,
+    ) -> Result<Option<cosign::CosignReceipt>, Error> {
+        let _ = quorum_key;
+        Err(Error::Unsupported {
+            method: "cosign_receipt",
+        })
+    }
+
+    /// v61.3.0 (CIRISPersist#1252, V214) — this node's OPEN cosign receipts,
+    /// ordered `(received_at, quorum_key)`.
+    async fn list_open_cosign_receipts(&self) -> Result<Vec<cosign::CosignReceipt>, Error> {
+        Err(Error::Unsupported {
+            method: "list_open_cosign_receipts",
+        })
+    }
+
+    /// v61.3.0 (CIRISPersist#1252, V214) — settle an open cosign receipt
+    /// (`landed`, `expired`, `withdrawn`). Write-once: a settled or unknown
+    /// receipt is left as it is.
+    async fn settle_cosign_receipt(
+        &self,
+        quorum_key: &str,
+        outcome: &str,
+        settled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        let _ = (quorum_key, outcome, settled_at);
+        Err(Error::Unsupported {
+            method: "settle_cosign_receipt",
+        })
+    }
+
+    /// v61.3.0 (CIRISPersist#1252, V214) — the `cosign:signature:v1` rows this
+    /// node holds for `quorum_key`, as `(attestation_id, signer_key_id)`,
+    /// ordered by signer.
+    async fn list_cosign_signatures(
+        &self,
+        quorum_key: &str,
+    ) -> Result<Vec<(String, String)>, Error> {
+        let _ = quorum_key;
+        Err(Error::Unsupported {
+            method: "list_cosign_signatures",
+        })
+    }
+
+    /// v61.3.0 (CIRISPersist#1252, V214) — drop the pending row `quorum_key`
+    /// and every signature row held for it, with their wire-index entries and
+    /// signature ledger rows, in one transaction. The receipt stays. Returns
+    /// how many attestation rows went.
+    async fn drop_cosign_rows(&self, quorum_key: &str) -> Result<u64, Error> {
+        let _ = quorum_key;
+        Err(Error::Unsupported {
+            method: "drop_cosign_rows",
+        })
+    }
+
+    /// v61.3.0 (CIRISPersist#1252, V214) — record `alias_attestation_id` (an
+    /// assembled act another node holds under another id) as an alias of
+    /// `quorum_key`, whose assembled row this node holds as
+    /// `held_attestation_id`. First write wins.
+    async fn note_cosign_alias(
+        &self,
+        alias_attestation_id: &str,
+        quorum_key: &str,
+        held_attestation_id: &str,
+    ) -> Result<(), Error> {
+        let _ = (alias_attestation_id, quorum_key, held_attestation_id);
+        Err(Error::Unsupported {
+            method: "note_cosign_alias",
+        })
+    }
+
+    /// v61.3.0 (CIRISPersist#1252, V214) — every alias recorded for the act
+    /// `quorum_key`, as `(alias_attestation_id, held_attestation_id)`, ordered
+    /// by alias id: the ids a `withdraws` of that act may name on this node.
+    async fn list_cosign_aliases(&self, quorum_key: &str) -> Result<Vec<(String, String)>, Error> {
+        let _ = quorum_key;
+        Err(Error::Unsupported {
+            method: "list_cosign_aliases",
+        })
+    }
+
+    /// v61.3.0 (CIRISPersist#1252, V214) — the alias `attestation_id` names,
+    /// as `(quorum_key, held_attestation_id)`.
+    async fn cosign_alias(&self, attestation_id: &str) -> Result<Option<(String, String)>, Error> {
+        let _ = attestation_id;
+        Err(Error::Unsupported {
+            method: "cosign_alias",
+        })
+    }
+
+    /// v61.3.0 (CIRISPersist#1252) — the signed object the group projection
+    /// row `link` holds, as stored (the group-plane executor's own read, on
+    /// the trait), and the `attestation_id` of the row it points at: the
+    /// held-equivalent settle compares an offered assembled act with it.
+    async fn read_group_plane_object(
+        &self,
+        link: &group_plane::GroupRowLink,
+    ) -> Result<Option<(group_plane::GroupSigned, Option<String>)>, Error> {
+        let _ = link;
+        Err(Error::Unsupported {
+            method: "read_group_plane_object",
         })
     }
 
@@ -10316,6 +10608,63 @@ pub enum Error {
         needs: usize,
     },
 
+    /// v61.3.0 (CIRISPersist#1252; CC 3.3.4 step 2, CC 3.1.3 `cosign:{state}`)
+    /// — **a widening or removal is HELD for its cosignatures.** The typed
+    /// door's SOLE refusal was the consensus shortfall (the structural
+    /// [`StandingVerdict::ConsensusShort`]: every signer an active member, the
+    /// last-founder rule and every later check met), the door is the LOCAL door
+    /// of the node that speaks for the primary signer, and so the event is held
+    /// as a `cosign:pending:v1` row named by its `quorum_key`. Each member's
+    /// cosignature travels alone as a `cosign:signature:v1` row; the executor
+    /// ([`cosign::execute_due`]) offers the merged event through the same door
+    /// once the protocol is met, and it lands as the existing widening or
+    /// removal row. Nothing changed on the roster. Stable `kind()` token
+    /// `federation_roster_change_not_landed`; Python `ValueError`, the type of
+    /// the [`Error::RosterAuthorityUnauthorized`] arm a short event refused
+    /// with before.
+    #[error(
+        "roster {direction} of {member_key_id:?} in group {group_key_id:?} did not land: held \
+         for cosignatures (quorum key {quorum_key}; {signers} signer(s) held) — CC 3.3.4: the \
+         protocol is not met yet"
+    )]
+    RosterChangeNotLanded {
+        /// The family or community whose roster the event changes.
+        group_key_id: String,
+        /// The member added or removed.
+        member_key_id: String,
+        /// `widening` or `removal`.
+        direction: &'static str,
+        /// The pending row's `attestation_id`: the digest of the event with no
+        /// signature in it.
+        quorum_key: String,
+        /// The signers this node holds for it (the primary included).
+        signers: usize,
+    },
+
+    /// v61.3.0 (CIRISPersist#1252; CC 2.4.1.1 rule 0, CIRISEdge#858) — **a
+    /// cosigned `withdraws` names a row this node does not hold YET.** A
+    /// cosigned retraction is a group's act (it retracts a cosigned roster
+    /// event), and the event it names may be held here under another id (a
+    /// different sufficient subset of its cosignatures): that id resolves only
+    /// once the alias (a held-equivalent settle of the named row) or the row
+    /// itself arrives. Nothing is stored; the SAME row is admitted when it is
+    /// re-offered after that. **Retryable** — the #858 ordering-gap class,
+    /// beside [`Error::AttesterKeyUnknown`] and [`Error::SignerDoesNotActFor`]:
+    /// a park-and-release path parks it and re-offers it. Stable `kind()` token
+    /// `federation_withdraws_target_unheld`; Python `ValueError`, the type of
+    /// the sibling ordering gaps.
+    #[error(
+        "withdraws {attestation_id} names {target_attestation_id}, which this node does not hold \
+         yet (nor any alias of it) — an ordering gap, not a refusal; re-offer the row after its \
+         target arrives (CIRISPersist#1252)"
+    )]
+    WithdrawsTargetUnheld {
+        /// The `withdraws` row.
+        attestation_id: String,
+        /// The id it names.
+        target_attestation_id: String,
+    },
+
     /// v60.0.0 (S6v; CC 4.5.13 / 4.2.1.1 `CLM-policy-corridor`) — **the door
     /// refuses to decide under its family's policy row.** A two-path door
     /// reads its policy from the vendored CC governance policy table
@@ -12800,6 +13149,8 @@ impl Error {
             Error::SignerDoesNotActFor { .. } => "federation_signer_not_acting_for",
             Error::SelfRosterNotLanded { .. } => "federation_self_roster_not_landed",
             Error::GovernancePolicyRefused { .. } => "federation_governance_policy_refused",
+            Error::RosterChangeNotLanded { .. } => "federation_roster_change_not_landed",
+            Error::WithdrawsTargetUnheld { .. } => "federation_withdraws_target_unheld",
             Error::AssertedAtStale { .. } => "federation_invalid_argument",
             Error::EnvelopeKindRetired { .. } => replication_policy::ENVELOPE_KIND_RETIRED,
             Error::MalformedRow { .. } => "federation_malformed_row",

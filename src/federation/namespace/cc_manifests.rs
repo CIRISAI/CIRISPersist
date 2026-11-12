@@ -1,10 +1,10 @@
 //! **The CC manifests persist vendors beside the namespace registry, pinned
-//! at the CIRISConstitution `v1.0-rc15` tag.**
+//! at the CIRISConstitution `v1.0-rc18` tag.**
 //!
 //! [`registry`](super::registry) carries the namespace registry and its match
 //! vectors; this module carries the other five CC `manifests/` files persist
-//! reads, copied byte for byte with `git show v1.0-rc15:manifests/<file>` at
-//! [`VENDORED_CC_COMMIT`](super::registry::VENDORED_CC_COMMIT) (`ace6b74`):
+//! reads, copied byte for byte with `git show v1.0-rc18:manifests/<file>` at
+//! [`VENDORED_CC_COMMIT`](super::registry::VENDORED_CC_COMMIT) (`646df978`):
 //!
 //! | file | CC | read by |
 //! |---|---|---|
@@ -33,20 +33,20 @@ pub(crate) const GOVERNANCE_POLICY_JSON: &str = include_str!("governance_policy.
 
 /// SHA-256 of the vendored `governance_policy.json` FILE bytes.
 pub const VENDORED_GOVERNANCE_POLICY_FILE_SHA256: &str =
-    "e5b8961f149576f24dc52d13c964091e6b4704b2ad4dad650b42aa90c55411d5";
+    "c224471f93a18f0f5fc21636cd0222eab1ed4c5a318c6c4670210fde3c894adf";
 
 /// The table's own `_meta.policy_sha256` (CC's hash over the rows; the
 /// vectors carry the same value, so a vector set is tied to its table).
 pub const VENDORED_GOVERNANCE_POLICY_SHA256: &str =
-    "418c1aa616170b612c2cc7999ae362b69d3931e20d5b8afb85a865e175ee1837";
+    "40920bcb494ab7e0984a650ba5251075210bc74403a6bc48bac83500e5fa9c41";
 
 /// SHA-256 of the vendored `governance_policy_vectors.json` FILE bytes.
 pub const VENDORED_GOVERNANCE_POLICY_VECTORS_FILE_SHA256: &str =
-    "24bb0cda064216c0c38564d5c673e5af5411812166ebe0c4e231a69649097033";
+    "7d1dcdde6273f920416374846feee25b5d1e4757ea4b1464e48db9a0282ebff5";
 
 /// SHA-256 of the vendored `csd4_chain.json` FILE bytes.
 pub const VENDORED_CSD4_CHAIN_FILE_SHA256: &str =
-    "d4cd9d169a7ddca2c91a2c237228a78d2c5475df02275cd43aa551a413ac5448";
+    "5fb59208616d616583aa39bf376cf42125703fddcf37bea2f90fa32f04c1b463";
 
 /// SHA-256 of the vendored `topology_vocabulary.json` FILE bytes. The chain's
 /// `_meta.pins.vocabulary_sha256` and CIRISServer's catalogue pin
@@ -67,7 +67,7 @@ pub const VENDORED_SIGNED_OBJECT_VECTORS_FILE_SHA256: &str =
 /// stays where it is. This is the tag's file hash, so a re-vendor sees the
 /// document move; I1302 checks it against the CC checkout.
 pub const VENDORED_WIRE_VOCABULARY_FILE_SHA256: &str =
-    "baf75371f6f25c83c7cd2f6cd0774677f47e9fca5c9c555a09e662249e40a3ff";
+    "72d7f38bf2cfb31dd04098737011b51f606b7a4719142b4f52bdc1661c39d175";
 
 /// The five files, `(file under src/federation/namespace/, pinned sha256)`,
 /// in the order `scripts/check_vendored_cc.sh` compares them.
@@ -348,13 +348,13 @@ mod tests {
     /// is the networked ship gate for the same property.
     #[test]
     fn i1302_the_pins_are_the_tags_bytes_when_cc_is_present() {
-        let tag = format!("v{VENDORED_CC_VERSION}");
         let Some(repo) = cc_repo() else {
             eprintln!(
                 "I1302: no CIRISConstitution checkout (CIRIS_CC_REPO or a sibling) — SKIPPED"
             );
             return;
         };
+        let tag = format!("v{VENDORED_CC_VERSION}");
         let Some(commit) = git(&repo, &["rev-parse", &format!("{tag}^{{commit}}")]) else {
             eprintln!("I1302: {repo:?} carries no tag {tag} — SKIPPED (fetch the tags to run it)");
             return;

@@ -133,7 +133,9 @@ pub(crate) async fn put_family_membership_revocation_planned<D: FamilyStore>(
     let row = &revocation.family_membership_revocation;
     // v49.0.0 (CIRISPersist#910.3) — standing, by the family's own
     // `consensus_protocol` at the row's instant (the #908 family half).
-    super::check_family_roster_authority(
+    // v61.3.0 (CIRISPersist#1252) — the sole refusal is the shortfall: held
+    // for its cosignatures (or refused as before). No later check follows.
+    let standing = super::check_family_roster_authority_verdict(
         dir,
         &row.family_key_id,
         &revocation.authority_key_id,
@@ -147,6 +149,7 @@ pub(crate) async fn put_family_membership_revocation_planned<D: FamilyStore>(
         row.effective_at,
     )
     .await?;
+    let offered = super::cosign::hold_if_short(dir, standing.into_short(), offered).await?;
     let hash = super::types::compute_persist_row_hash(row)?;
     revocation.family_membership_revocation.persist_row_hash = hash;
     let row = &revocation.family_membership_revocation;
@@ -186,7 +189,9 @@ pub(crate) async fn put_family_membership_widening_planned<D: FamilyStore>(
     let offered = GroupSigned::FamilyWidening(widening.clone());
     let row = &widening.family_membership_widening;
     super::reject_future_dated_family_widening(row.effective_at)?;
-    super::check_family_roster_authority(
+    // v61.3.0 (CIRISPersist#1252) — the sole refusal is the shortfall: held
+    // for its cosignatures (or refused as before).
+    let standing = super::check_family_roster_authority_verdict(
         dir,
         &row.family_key_id,
         &widening.authority_key_id,
@@ -196,6 +201,7 @@ pub(crate) async fn put_family_membership_widening_planned<D: FamilyStore>(
         row.effective_at,
     )
     .await?;
+    let offered = super::cosign::hold_if_short(dir, standing.into_short(), offered).await?;
     if dir.lookup_family(&row.family_key_id).await?.is_none() {
         return Err(Error::InvalidArgument(format!(
             "{} does not exist in federation_families",

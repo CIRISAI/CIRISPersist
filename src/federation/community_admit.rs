@@ -92,12 +92,17 @@ pub(crate) struct PlannedCommunityRevocation {
     pub(crate) revocation: SignedCommunityMembershipRevocation,
     /// The CEG §7.8 removal event, written in the same transaction.
     pub(crate) removal_event: HardCaseEvent,
+    /// v61.3.0 (CIRISPersist#1252) — the shortfall refusal when the ONLY
+    /// refusal was the consensus count: the door holds the event or returns it.
+    pub(crate) short: Option<Error>,
 }
 
 /// An admitted community-membership widening, exactly as stored.
 pub(crate) struct PlannedCommunityWidening {
     /// The signed row, its `persist_row_hash` stamped.
     pub(crate) widening: SignedCommunityMembershipWidening,
+    /// v61.3.0 (CIRISPersist#1252) — as [`PlannedCommunityRevocation::short`].
+    pub(crate) short: Option<Error>,
 }
 
 /// The community-plane executor: what a backend does for the shared plans.
@@ -277,6 +282,9 @@ where
     // a config rides only on an affiliation, and an affiliation's config
     // validates against its roster.
     super::affiliation_config::check_community_record(row)?;
+    // v61.3.0 (CIRISPersist#1252, CC 4.5.13) — a record that sets its cosign
+    // window sets it at or above the floor.
+    super::cosign::check_community_record_window(row)?;
     // v4.11.0 (#154 Ask 4) — geographic cohort_subkind admission: every member
     // holds an in-force contained location_proof. No-op for non-geographic
     // communities.
@@ -319,6 +327,24 @@ where
         received_at: chrono::Utc::now(),
     };
     let planned = plan_put_community_membership_revocation(dir, revocation, instants).await?;
+    // v61.3.0 (CIRISPersist#1252) — the sole refusal is the shortfall: held
+    // for its cosignatures (or refused as before).
+    let planned = match super::cosign::hold_if_short(
+        dir,
+        planned.short,
+        super::group_plane::GroupSigned::CommunityRevocation(planned.revocation),
+    )
+    .await?
+    {
+        super::group_plane::GroupSigned::CommunityRevocation(revocation) => {
+            PlannedCommunityRevocation {
+                revocation,
+                removal_event: planned.removal_event,
+                short: None,
+            }
+        }
+        _ => unreachable!("hold_if_short returns the event it was handed"),
+    };
     // v61 (CIRISPersist#991) — the removal's (or resignation's) row.
     let offered = super::group_plane::GroupSigned::CommunityRevocation(planned.revocation.clone());
     dir.store_planned_community_revocation(planned).await?;
@@ -372,7 +398,10 @@ where
     }
     // v49.0.0 (CIRISPersist#908) — standing, before the epoch rotates: a
     // stranger's valid signature does not remove a member.
-    super::check_community_roster_authority(
+    // v61.3.0 (CIRISPersist#1252) — the shortfall split out: every later
+    // check still runs, and a short event one of them refuses keeps the
+    // shortfall refusal.
+    let mut short = match super::check_community_roster_authority_verdict(
         dir,
         &row.community_key_id,
         &revocation.authority_key_id,
@@ -385,7 +414,11 @@ where
         true,
         fold_at,
     )
-    .await?;
+    .await?
+    {
+        super::RosterAuthority::Admitted => None,
+        super::RosterAuthority::ConsensusShort(e) => Some(e),
+    };
     // v50.0.0 (review, M1 loophole) — removing a founder of a conformant
     // infrastructure room would leave its declared N stale.
     if let Some(stored) = dir.lookup_community(&row.community_key_id).await? {
@@ -403,7 +436,8 @@ where
             self_leave,
             fold_at,
         )
-        .await?;
+        .await
+        .map_err(|e| super::cosign::keep_shortfall(&mut short, e))?;
     }
     let mut revocation = revocation;
     let row = &mut revocation.community_membership_revocation;
@@ -419,6 +453,7 @@ where
     Ok(PlannedCommunityRevocation {
         revocation,
         removal_event,
+        short,
     })
 }
 
@@ -439,7 +474,7 @@ where
 /// A resignation (the removed member among the signers) is a member's own
 /// act, not a counted removal, and is not bounded. Any other protocol, and a
 /// room this node does not hold, pass.
-async fn check_open_self_admit_removal_window<D>(
+pub(crate) async fn check_open_self_admit_removal_window<D>(
     dir: &D,
     revocation: &SignedCommunityMembershipRevocation,
     received_at: chrono::DateTime<chrono::Utc>,
@@ -460,6 +495,10 @@ where
         return Ok(());
     }
     let window = chrono::Duration::seconds(super::consensus::OPEN_SELF_ADMIT_REMOVAL_WINDOW_SECS);
+    // v61.3.0 (CIRISPersist#1252) — a held removal is bounded on THIS node's
+    // first receipt of it (the hold's received_at), not on the instant its
+    // executor re-offers the assembled event.
+    let received_at = super::cosign::executing_received_at().unwrap_or(received_at);
     let skew = received_at - row.removed_at;
     if skew > window || -skew > window {
         tracing::debug!(
@@ -493,6 +532,21 @@ where
         received_at: chrono::Utc::now(),
     };
     let planned = plan_put_community_membership_widening(dir, widening, instants).await?;
+    // v61.3.0 (CIRISPersist#1252) — the sole refusal is the shortfall: held
+    // for its cosignatures (or refused as before).
+    let planned = match super::cosign::hold_if_short(
+        dir,
+        planned.short,
+        super::group_plane::GroupSigned::CommunityWidening(planned.widening),
+    )
+    .await?
+    {
+        super::group_plane::GroupSigned::CommunityWidening(widening) => PlannedCommunityWidening {
+            widening,
+            short: None,
+        },
+        _ => unreachable!("hold_if_short returns the event it was handed"),
+    };
     // v61 (CIRISPersist#991) — the widening's row.
     let offered = super::group_plane::GroupSigned::CommunityWidening(planned.widening.clone());
     dir.store_planned_community_widening(planned).await?;
@@ -528,7 +582,8 @@ where
     .await?;
     // v49.0.0 (CIRISPersist#908) — whose signature, not just whether: the
     // signer must have standing in the room at the row's instant.
-    super::check_community_roster_authority(
+    // v61.3.0 (CIRISPersist#1252) — the shortfall split out, as on removal.
+    let mut short = match super::check_community_roster_authority_verdict(
         dir,
         &row.community_key_id,
         &widening.authority_key_id,
@@ -537,7 +592,11 @@ where
         false,
         fold_at,
     )
-    .await?;
+    .await?
+    {
+        super::RosterAuthority::Admitted => None,
+        super::RosterAuthority::ConsensusShort(e) => Some(e),
+    };
     let community = dir
         .lookup_community(&row.community_key_id)
         .await?
@@ -554,7 +613,9 @@ where
     };
     // v50.0.0 (CIRISPersist#925) — a widening that seats a node-bearing key as
     // founder of an infrastructure community is refused.
-    super::admission::check_infrastructure_founders_not_node(dir, &probe, fold_at).await?;
+    super::admission::check_infrastructure_founders_not_node(dir, &probe, fold_at)
+        .await
+        .map_err(|e| super::cosign::keep_shortfall(&mut short, e))?;
     // v50.0.0 (review, M1 loophole) — adding, promoting or demoting a founder
     // of a conformant infrastructure room would leave N stale.
     super::admission::check_infrastructure_founder_count_unchanged(
@@ -566,10 +627,13 @@ where
         false,
         fold_at,
     )
-    .await?;
-    super::admission::check_community_membership_steward_binding(dir, &probe).await?;
+    .await
+    .map_err(|e| super::cosign::keep_shortfall(&mut short, e))?;
+    super::admission::check_community_membership_steward_binding(dir, &probe)
+        .await
+        .map_err(|e| super::cosign::keep_shortfall(&mut short, e))?;
     let mut widening = widening;
     let row = &mut widening.community_membership_widening;
     row.persist_row_hash = super::types::compute_persist_row_hash(&*row)?;
-    Ok(PlannedCommunityWidening { widening })
+    Ok(PlannedCommunityWidening { widening, short })
 }

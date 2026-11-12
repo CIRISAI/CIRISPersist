@@ -412,6 +412,27 @@ pub const ATTESTATION_PROJECTIONS: &[(&str, &str, ProjectionRemoval)] = &[
         "attestation_id",
         ProjectionRemoval::ForeignKeyCascade,
     ),
+    // v61.3.0 (CIRISPersist#1252; V214) — the cosign hold's signature
+    // ledger and its aliases index rows this node holds; the hard delete of
+    // a row removes the entries naming it (the helper, by column). No
+    // foreign key: the hold's receipt (`federation_cosign_pending`, keyed by
+    // the quorum key) must outlive the rows it settled, and an alias names an
+    // id this node does not hold.
+    (
+        "federation_cosign_signatures",
+        "attestation_id",
+        ProjectionRemoval::Helper,
+    ),
+    (
+        "federation_cosign_aliases",
+        "alias_attestation_id",
+        ProjectionRemoval::Helper,
+    ),
+    (
+        "federation_cosign_aliases",
+        "held_attestation_id",
+        ProjectionRemoval::Helper,
+    ),
     // v60.0.0 (CIRISPersist#988 item 1; V203) — the credits and expertise
     // ledgers are projections of this node's balance rows and leave with the
     // row they project.

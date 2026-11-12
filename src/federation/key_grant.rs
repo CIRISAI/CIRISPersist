@@ -2408,6 +2408,7 @@ where
         ReplicatedAttestationOutcome::Inserted
         | ReplicatedAttestationOutcome::Unchanged
         | ReplicatedAttestationOutcome::Deduplicated
+        | ReplicatedAttestationOutcome::HeldEquivalent
         | ReplicatedAttestationOutcome::Refused {
             reason: AttestationRefusalReason::AlreadyPresentIdentical,
         } => {}

@@ -841,6 +841,21 @@ pub(crate) fn lifecycle_predicate(
     // plane) only rules 1 and 5 count: a legacy stamp 2, 3 or 4 there hides
     // nothing, here as in the fold.
     let carved = subject_withdraws_carved_out_sql(dialect, outer);
+    // v61.3.0 (CIRISPersist#1252, CC 2.4.1.1 rule 0) — a composer naming the
+    // row through an ALIAS: another node's id for the same cosigned act,
+    // recorded at its held-equivalent settle (V214). Such a composer was
+    // admitted against this row (its stamped rule), so the fold honours it as
+    // it honours one naming the row's own id.
+    let (aliases, alias_target) = match dialect {
+        Dialect::Sqlite => (
+            "federation_cosign_aliases",
+            format!("json_extract(c2.attestation_envelope, '$.{path}')"),
+        ),
+        Dialect::Postgres => (
+            "cirislens.federation_cosign_aliases",
+            format!("c2.attestation_envelope::jsonb->>'{path}'"),
+        ),
+    };
     Some((
         format!(
             "NOT EXISTS (SELECT 1 FROM {table} c{pin} \
@@ -849,6 +864,12 @@ pub(crate) fn lifecycle_predicate(
                           AND (c.withdraws_admission_rule IN ({rules}) OR NOT {carved}))) \
                  AND c.attestation_type IN ({list}) \
                  AND {target} = {id}) \
+             AND NOT EXISTS (SELECT 1 FROM {aliases} a \
+               WHERE a.held_attestation_id = {id} \
+                 AND EXISTS (SELECT 1 FROM {table} c2{pin} \
+                   WHERE c2.attestation_type IN ({list}) \
+                     AND c2.withdraws_admission_rule IS NOT NULL \
+                     AND {alias_target} = a.alias_attestation_id)) \
              AND NOT EXISTS (SELECT 1 FROM {table} r{pin} \
                WHERE r.attestation_type = {outer}.attestation_type \
                  AND r.attestation_type IN ({list}) \

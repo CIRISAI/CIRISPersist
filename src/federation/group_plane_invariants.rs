@@ -117,7 +117,9 @@ pub(crate) mod bodies {
                 .await
                 .unwrap()
                 .unwrap_or_else(|| panic!("{tag}: row {id} is held"));
-            let hash = crate::federation::wire_index::content_hash_of(&row).unwrap();
+            // v61.3.0 (CIRISPersist#1252) — the one ref rule: a cosigned
+            // roster event is named by its act.
+            let hash = crate::federation::wire_index::attestation_wire_hash_hex(&row);
             assert!(
                 d.lookup_signed_record_by_content_hash("Attestation", &hash)
                     .await

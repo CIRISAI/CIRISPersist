@@ -187,6 +187,11 @@ where
     if super::self_roster::verify_proposal_row(directory, row).await? {
         return Ok(());
     }
+    // v61.3.0 (CIRISPersist#1252) — a cosign row is minted from the event it
+    // carries; its one statement is over the event's own signing bytes.
+    if super::cosign::verify_row(directory, row).await? {
+        return Ok(());
+    }
     // v59.0.0 (CIRISPersist#1104) — a legacy occurrence revocation's carrier
     // is minted from the framed object it carries; its admission is
     // structural (`occurrence_revocation_carrier`).

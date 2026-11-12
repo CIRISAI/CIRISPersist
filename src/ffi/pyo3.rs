@@ -24579,6 +24579,22 @@ impl PyEngine {
         })
     }
 
+    /// v61.3.0 (CIRISPersist#1252, CC 3.3.4) — execute every open cosign
+    /// hold (a merged widening or removal that meets its protocol lands; a
+    /// lapsed hold expires; a withdrawn one ends); returns how many landed.
+    /// Run it on a schedule beside `execute_self_roster_due`.
+    fn execute_cosign_due(&self, py: Python<'_>) -> PyResult<usize> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                self.runtime
+                    .block_on(engine.execute_cosign_due())
+                    .map_err(federation_err_to_py)
+            })
+        })
+    }
+
     /// v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the envelope of an answer to
     /// a self-roster proposal (`assent=True`: an assent; `False`: an
     /// objection), for a roster key of `identity_key_id` to sign and put as a
@@ -33348,6 +33364,17 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
             ref proposal_id,
             ..
         } => PyValueError::new_err(format!("{kind}: {decision}: {proposal_id}")),
+        // v61.3.0 (CIRISPersist#1252) — held for cosignatures: the type of
+        // the short refusal it replaces (ValueError); the quorum key rides.
+        crate::federation::Error::RosterChangeNotLanded { ref quorum_key, .. } => {
+            PyValueError::new_err(format!("{kind}: {quorum_key}"))
+        }
+        // v61.3.0 (CIRISPersist#1252) — the #858 ordering gap's type; the
+        // target id rides.
+        crate::federation::Error::WithdrawsTargetUnheld {
+            ref target_attestation_id,
+            ..
+        } => PyValueError::new_err(format!("{kind}: {target_attestation_id}")),
         // v60.0.0 (S6v) — the door's policy row is outside its corridor (or
         // unreadable); the family and the reason token ride the kind.
         crate::federation::Error::GovernancePolicyRefused { ref family, reason } => {
@@ -38476,6 +38503,22 @@ fn dimension_rejection_is_retryable(reason: &str) -> PyResult<bool> {
     })
 }
 
+/// v61.3.0 (CIRISPersist#1252) — THE ref rule for an attestation-plane row
+/// (`wire_index::attestation_wire_hash`): the lowercase-hex wire-index
+/// content hash of the row whose JSON is `row_json`. A cosignable group row
+/// (a widening or removal) is named by its act, not its signatures; every
+/// other row by `sha256` of its bytes. A host takes its refs here, never as
+/// its own `sha256(bytes)`. Raises `ValueError` when `row_json` is not an
+/// attestation row.
+#[pyfunction]
+fn attestation_wire_hash(row_json: &str) -> PyResult<String> {
+    let row: crate::federation::Attestation = serde_json::from_str(row_json)
+        .map_err(|e| PyValueError::new_err(format!("attestation_wire_hash: not a row: {e}")))?;
+    Ok(crate::federation::wire_index::attestation_wire_hash_hex(
+        &row,
+    ))
+}
+
 /// Mirrors `ciris-lens-core`'s `pub fn register`. The `#[pymodule]` entry
 /// point below (the standalone `ciris_persist` wheel) simply delegates
 /// here, so the two paths register an identical surface.
@@ -38548,6 +38591,8 @@ pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // v60.1.0 (CIRISPersist#1064) — persist's own retryability answers.
     m.add_function(pyo3::wrap_pyfunction!(key_grant_refusal_is_retryable, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(dimension_rejection_is_retryable, m)?)?;
+    // v61.3.0 (CIRISPersist#1252) — the one ref rule.
+    m.add_function(pyo3::wrap_pyfunction!(attestation_wire_hash, m)?)?;
     // v0.5.4 (CIRISPersist#29) — feature-gated panic injector for the
     // Python regression suite. Off in release wheels.
     #[cfg(feature = "test-panic")]
