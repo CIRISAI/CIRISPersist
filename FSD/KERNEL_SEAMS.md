@@ -813,6 +813,8 @@ There are six harnesses. They are named here and not built.
    - `HeaderInstant`, which judges a leaf by the header's instant. A leaf arriving long after the header counts
      where its row would be stale.
 
+   - `HeaderOnlyFact`: a header member that no leaf carries (the header rule, §13.6a).
+
    The must-not-move control: the order in which the leaves and the header arrive.
 
 The SQL `lifecycle_predicate` (FINAL_REFACTOR §6.2) joins harness 2: the predicate and the kernel's `view` run
@@ -1386,7 +1388,7 @@ else.
 
 | # | replaces | item | bytes | admit cost | kernel fold |
 |---|---|---|---|---|---|
-| **I1** (A1) | B per-blob custody rows per device per day | **set claim**: one signed row per device per scope per day, `{ root = Merkle(sorted blob digests), count, bytes, prev_root }` with the digest list (32 B per blob) or a daily **delta** (added/removed) chained by `prev_root` | 10,000 blobs: 4.5 KB signature + 320 KB list (or a delta of a few KB) against ~53 MB | one sign, one verify; the leaves become index entries, not rows | **ONE item.** `touches` = `{Content(d)}` for each listed digest; `pick=chain(prev_root)` (CC already has `chain` picks [T]). "Who holds X" is a probe of persist's index. It also removes A1's 12,000 ceiling |
+| **I1** (A1) | B per-blob custody rows per device per day | **set claim**: one signed row per device per scope per day, a header `{ root = Merkle(sorted leaves), scope, holder, period, prev_root }`, where each leaf is a `custody:ack`-shaped row `{ blob digest, size }` (32 B + size per blob); `count` and `bytes` are **folded from the leaves**, not stated in the header (the header rule, §13.6a) or a daily **delta** (added/removed) chained by `prev_root` | 10,000 blobs: 4.5 KB signature + 320 KB list (or a delta of a few KB) against ~53 MB | one sign, one verify; the leaves become index entries, not rows | **ONE item.** `touches` = `{Content(d)}` for each listed digest; `pick=chain(prev_root)` (CC already has `chain` picks [T]). "Who holds X" is a probe of persist's index. It also removes A1's 12,000 ceiling |
 | **I2** (A2) | R `key_grant:content` rows per write | **group key-wrapping key (KEK)**, as the community epoch already does ("one shared per `(community, epoch)`… O(1) per emission", `community_dek.rs` doc table [T]): each member device holds the group KEK of the epoch through one grant per device per epoch; a write wraps its DEK once to the KEK, **inside the content row**, and signs no `key_grant` row at all | 15 rows / 115 KB per write → ~60 B per write, plus 15 rows once per epoch | no extra sign per write | **ONE item** (the content row). Read set `{Roster(group), Keys(member devices)}` for the epoch grants |
 | **I3** (A3) | O(H) × D rows per join | **history grant**: the newcomer device gets one wrap of a **history key** that wraps the group's past epoch KEKs (or the epoch chain), and not one wrap per blob | 3,000 rows / 23 MB → D rows (~23 KB) | D signs | **ONE item per device**: a draft of one row, read set `{Roster(group)}`. The O(H) walk leaves the hot path |
 | **I4** (A4) | members × devices rows per minter per removal | **sign-once wrap set**: header (DEK id, epoch, minter, group) + per-device wrap leaves + one root signature; each leaf ships to its recipient with its path (log₂ 150 ≈ 8 × 32 B) | 150 rows / 1.15 MB → 4.5 KB + 150 × ~1.5 KB ≈ 230 KB (~80% fewer; CC estimated ~60%) [B: the leaf size assumes 1,088 B of ML-KEM-768 ciphertext + 32 B X25519 + AEAD of the DEK, base64] | one sign per removal per minter instead of 150 | **ONE item with per-leaf verdicts** (`Answer<Vec<LeafVerdict>>`), read set `{Roster(group), Keys(recipients)}`. **Constraint:** CC rc7 retired the key-grant *set* carrier (`KeyGrantRefusalReason::SetRetired`, `key_grant.rs:17-18`, `:305`) [T]. A wrap set returns only if CC re-admits it in this per-leaf-addressable form. W19 asks |
@@ -1407,6 +1409,10 @@ rotating on member removal **and** device revocation, with **one history key** f
 walk (I2 + I3). Edge confirmed in code that the per-recipient grant is paid on self and family **file** writes,
 not on chat or community. CC will model it in `formal/key_plane` before the text moves. **Signer batching (S5) is
 the same set object (§13.6a), not a new family.**
+
+**Every item here obeys the header rule** (§13.6a): its header holds only the leaves' digest and the members
+common to all leaves. For I1, the scope, holder, period and `prev_root` are common, so they factor; each blob is a leaf. An earlier draft put `count` and `bytes` in the header, but they are facts no leaf carries, so the rule moves them into the fold. For
+I4, the DEK id, epoch, minter and group are common; each wrap is a leaf.
 
 **Can the kernel fold each as ONE item?** Yes, for all four items, under one rule. An item is folded as one held
 row when its leaves share **one signer, one signed instant and one family**, and each leaf is checkable against the
@@ -1463,6 +1469,17 @@ header's, each lets a leaf count where its separate row would be stale. Conseque
 - **It fits §13.6.** S3 (a leaf held before its header counts as soon as the header is held) is rule 1. S6
   (under a forked header no leaf counts, whichever came first) is rule 3. S2 (sibling independence) is the per-leaf
   verdict.
+
+**The header rule (CC).** A header holds **only** (a) the digest over the leaves, and (b) members that **every**
+leaf carries in common, factored out so that exploding the item restores complete rows. It may **not** carry a
+fact that no leaf carries, or the rows side of the law would lack it. This is "flat and enumerated" seen from the
+header's side.
+
+- **Kernel check.** At parse, `explode(item)` must produce rows, each with the header's factored members restored,
+  such that `encode(explode(item))` reproduces the header byte for byte. Any header member that is not a common
+  leaf member, other than the leaves' digest, is malformed (`set_header_carries_fact`).
+- **Harness 6 mutation `HeaderOnlyFact`**, which must convict: add a member to the header that no leaf carries.
+  The exploded rows then lack it, the two sides of the law differ, and a digest moves.
 
 **Chained items** (`prev_root`, e.g. set-claim deltas) are allowed with a bound: a **full claim at a stated
 interval**, so no fold walks an unbounded chain. For I1 that is a full set claim at least every W (72 h, the
@@ -1603,7 +1620,7 @@ Prio3 parameters are whatever CC's registered `aggregation_algorithm_id` names, 
 ### 13.8a The ranked finish over published round totals (persist's specification; layout confirmed by CC, DERIVED)
 
 **The per-round linear map.** Let the poll's cells be the rankings `c` (plus `none`), and `S_t` the public standing
-set in round t (`S_0` = all options). For each cell, `first(c, S_t)` is the first option of `c` that is in `S_t`,
+set in elimination round t (`S_1` = all options; round 0 is the commitment round, below). For each cell, `first(c, S_t)` is the first option of `c` that is in `S_t`,
 or `exhausted` if there is none (`none` is always `exhausted`). The round map
 
 ```
@@ -1619,21 +1636,25 @@ member computes its share of the totals from its share alone.
 - `first(c, S_t)` comes from the cell's stable id (§13.8 item 2) and the standing set, so the map is a pure
   function of public data. Both members, and every verifier, derive the same `M_t`.
 
-**The rows: one set item per tally member, with the rounds as leaves (CONFIRMED by CC, DERIVED).**
-`ballot:round:{poll_id}:v1` is a set item (§13.6a). CC confirmed it by the law itself: exploded, each leaf is
-"member X's share of round t's totals", which is admissible alone. The chain `S_{t+1} = S_t − eliminated(t)` is a
-fold over **both** members' items, and that fold is the verifier, not a leaf's admission.
+**The rows: one set item per tally member, with the rounds as leaves (CONFIRMED by CC, DERIVED).** The family is
+the **leaf's**: `ballot:round:{poll_id}:v1`. The item is the generic set encoding (§13.6a), not a family of its
+own. CC confirmed it by the law: exploded, each leaf is "member X's share of round t", which is admissible alone,
+and the chain `S_{t+1} = S_t − eliminated(t)` is a fold over **both** members' rows, which is the verifier.
 
-- **The header** (signed once by the tally member):
-  - `poll_id`;
-  - `closing_period`, fixed by the poll's signed `closes_at` (§13.8 item 6(b));
-  - `declared_order`, the poll's option order, which the tie-break reads;
-  - `member_commitment_hex` and `source_count`, as in the period's partials;
-  - `share_commitment`: 32 B, `H("ciris/poll-share/v1" ‖ poll_id ‖ salt ‖ the member's final share vector in
-    canonical cell order)`, fixed before round 0 is computed;
-  - the leaves' Merkle root.
-- **A leaf** (round t): `round`, `standing` (the option ids of `S_t`, sorted by id), `totals_share` (`option_id →
-  field element` over `S_t`) and `exhausted_share`, with its inclusion proof.
+Under the **header rule** (§13.6a), the header holds only the leaves' digest and the members every leaf carries:
+
+- **Header** (signed once by the tally member): the leaves' Merkle root, plus the factored common members
+  `poll_id`, `closing_period` (from the poll's signed `closes_at`, §13.8 item 6(b)), `declared_order` (which the
+  tie-break reads), `member_commitment_hex` and `source_count`.
+- **Exploded**, every `ballot:round:{poll_id}:v1` row carries those five members itself, and the verifier's first
+  check reads them from there. Nothing a row needs lives only in the header.
+- **Leaf, round 0: the commitment round.** It carries `round = 0` and `share_commitment` = `H("ciris/poll-share/v1"
+  ‖ poll_id ‖ salt ‖ the member's final share vector in canonical cell order)`, and no totals. The commitment is
+  not common to all rounds, so by the header rule it is a leaf, not a header member. It is fixed before round 1 is
+  computed.
+- **Leaf, round t ≥ 1: an elimination round.** It carries `round`, `standing` (the option ids of `S_t`, sorted by
+  id), `totals_share` (`option_id → field element` over `S_t`) and `exhausted_share`, each with its inclusion proof.
+  `S_1` is the whole option set.
 - **Rounds are sequential.** Round t+1's map needs round t's elimination, which needs both members' shares. So the
   members exchange each round's share privately over the addressed channel, then each publishes its one item at the
   end.
@@ -1642,33 +1663,37 @@ fold over **both** members' items, and that fold is the verifier, not a leaf's a
     incomplete;
   - each leaf's first-held instant is `max(first_held(leaf), first_held(header))` (`formal/set_item`).
 
-**Bytes per member per poll**, Field128 assumed (16 B per element) [B, as in §13.8]. Round t carries
-`|S_t| + 1` elements, and in the worst case `|S_t| = k − t`, with k − 1 rounds. One item costs one 4.5 KB
-signature plus a 32 B commitment, whatever k is:
+**Bytes per member per poll**, Field128 assumed (16 B per element) [B, as in §13.8]. Elimination round t carries
+`|S_t| + 1` elements; in the worst case `|S_t| = k − t + 1`, with k − 1 elimination rounds. The commitment leaf
+is 32 B plus its proof. Proofs are about ⌈log₂ k⌉ × 32 B per leaf, and the header's factored members are about
+0.3 KB plus `declared_order` at 32 B per option (both not counted below):
 
-| k | share elements over all rounds (worst case) | share bytes | one row per round would cost (signatures) | one item (signature + commitment) |
-|---:|---:|---:|---:|---:|
-| 3 | 7 | 112 B | 9.0 KB | 4.5 KB + 32 B |
-| 4 | 12 | 192 B | 13.5 KB | 4.5 KB + 32 B |
-| 5 | 18 | 288 B | 18.0 KB | 4.5 KB + 32 B |
-| 6 | 25 | 400 B | 22.5 KB | 4.5 KB + 32 B |
-| 7 | 33 | 528 B | 27.0 KB | 4.5 KB + 32 B |
-| 8 | 42 | 672 B | 31.5 KB | 4.5 KB + 32 B |
+| k | share elements, elimination rounds (worst case) | share bytes | commitment leaf | one row per round would cost (k signatures, incl. round 0) | one item (one signature) |
+|---:|---:|---:|---:|---:|---:|
+| 3 | 7 | 112 B | 32 B | 13.5 KB | 4.5 KB |
+| 4 | 12 | 192 B | 32 B | 18.0 KB | 4.5 KB |
+| 5 | 18 | 288 B | 32 B | 22.5 KB | 4.5 KB |
+| 6 | 25 | 400 B | 32 B | 27.0 KB | 4.5 KB |
+| 7 | 33 | 528 B | 32 B | 31.5 KB | 4.5 KB |
+| 8 | 42 | 672 B | 32 B | 36.0 KB | 4.5 KB |
 
 **The verifier**: the kernel's `Finish` (§11.2), run over published round totals instead of a summary.
 
 ```rust
-pub struct RankedItem<'a> {
-    pub poll_id: PollId, pub closing_period: u64, pub declared_order: &'a [OptionId],
-    pub source_count: u64, pub member_commitment: [u8; 32], pub share_commitment: [u8; 32],
-    pub rounds: &'a [RoundLeaf<'a>],          // the leaves HELD, in any order
+/// The verifier reads exploded rows. Each `ballot:round` row carries the factored common members itself.
+pub struct RoundRow<'a> {
+    pub member: KeyId<'a>, pub poll_id: PollId, pub closing_period: u64, pub declared_order: &'a [OptionId],
+    pub source_count: u64, pub member_commitment: [u8; 32],
+    pub body: RoundBody<'a>,
 }
-pub struct RoundLeaf<'a> { pub round: u32, pub standing: &'a [OptionId],
-                           pub totals: &'a [(OptionId, F128)], pub exhausted: F128 }
+pub enum RoundBody<'a> {
+    Commitment { share_commitment: [u8; 32] },                       // round 0
+    Totals { round: u32, standing: &'a [OptionId],                   // round t >= 1
+             totals: &'a [(OptionId, F128)], exhausted: F128 },
+}
 
 /// Integer arithmetic over public rows. O(k²), independent of the electorate.
-pub fn verify_ranked_rounds(a: Option<&RankedItem>, b: Option<&RankedItem>, poll: &PollRecord)
-    -> Answer<RankedOutcome>;
+pub fn verify_ranked_rounds(rows: &[RoundRow], poll: &PollRecord) -> Answer<RankedOutcome>;  // rows HELD, any order
 
 pub enum RankedOutcome {
     Winner { option: OptionId, rounds: u32 },
@@ -1676,7 +1701,7 @@ pub enum RankedOutcome {
     /// Not yet. The rows held are consistent so far, but a round or a member's item has not arrived.
     /// This is an Inert with a cure and a lapse (§5.3, §5.9a), and it MUST become Winner when the missing
     /// leaf arrives, in any order.
-    Incomplete { have: u32, of: u32, missing: SmallVec<Missing> },   // Missing::Item(member) | Missing::Round(member, t)
+    Incomplete { have: u32, of: u32, missing: SmallVec<Missing> },   // Missing::Round(member, t); t = 0 is the commitment
     /// Invalid. Only when the HELD rows contradict each other or the rule.
     Refused { reason: Token, round: Option<u32> },
 }
@@ -1689,24 +1714,26 @@ actually held. A gap is never a contradiction.
 Checks, in order. A check that needs a row not yet held contributes to `Incomplete`; a check whose rows are held
 and disagree gives `Refused`:
 
-1. **Same poll.** The two members' items name the same `poll_id`, the same `closing_period` and the same
+1. **Same poll.** Every held row, from either member, names the same `poll_id`, `closing_period` and
    `declared_order`, and these match the poll record (the tie-break reads the order) (`Refused`).
+1a. **Commitment.** Each member's round 0 is held, else `Incomplete { missing: Round(member, 0) }`. A member
+   with two different round-0 commitments is `Refused`.
 2. **The floor.** `source_count ≥ 10`, else `BelowFloor`.
-3. **Agreement.** Both items carry the same `source_count` and `member_commitment`; for each round t that both
-   hold, both leaves name the same `standing` (`census_composite_partials_mismatch`, per round).
+3. **Agreement.** All rows carry the same `source_count` and `member_commitment`; for each round t ≥ 1 that both
+   members hold, both rows name the same `standing` (`census_composite_partials_mismatch`, per round).
 4. **Totals.** For each round both hold, `T_t = a_t + b_t` in the field, element-wise, and each element read as a
    whole number ≤ `source_count`.
 5. **Mass.** `Σ_o T_t[o] + T_t[exhausted] = source_count` (`census_composite_mass_total_mismatch`, per round).
-6. **Start.** `S_0` is the poll record's whole option set.
+6. **Start.** `S_1` is the poll record's whole option set.
 7. **Live ballots never increase.** With `live_t = Σ_o T_t[o]`, `live_{t+1} ≤ live_t` over consecutive held
    rounds.
 8. **Each step follows from its totals.** If some `o` has `2 · T_t[o] > live_t`, then round t is the last round and
    `o` is the winner: a held later round is `Refused`. Otherwise the eliminated option is `argmin T_t`, with a tie
    going against the option later in `declared_order` (CC 4.5.13), and `S_{t+1} = S_t − {that option}` must equal
    round t+1's `standing` whenever round t+1 is held.
-9. **Length.** Fewer rounds than k. A held round index ≥ k − 1 is `Refused`.
-10. **Done.** If every round up to the deciding round is held from both members, the answer is `Winner`. Otherwise
-    it is `Incomplete`, with the missing items and rounds.
+9. **Length.** Fewer elimination rounds than k. A held round index ≥ k is `Refused`.
+10. **Done.** If round 0 and every round up to the deciding round are held from both members, the answer is
+    `Winner`. Otherwise it is `Incomplete`, with the missing rounds.
 
 **Order-independence.** The outcome is a function of the leaves held and their first-held instants, never of
 their order. `Incomplete` turns into `Winner` once the last leaf arrives, whichever arrived last. Harness 6
@@ -1714,7 +1741,7 @@ their order. `Incomplete` turns into `Winner` once the last leaf arrives, whiche
 `Incomplete` (never `Refused`) when the full set gives `Winner`, and checks that the full set gives the same
 `Winner`. Cost class `Finish`: O(k²), independent of the electorate.
 
-**The share commitment (TAKEN, DERIVED by CC).** It is 32 B inside a 4.5 KB header. It turns tally trust from
+**The share commitment (TAKEN, DERIVED by CC).** It is a 32 B leaf (round 0) under the item's one signature. It turns tally trust from
 unfalsifiable into **auditable after the fact**: given a member's revealed final share and salt, anyone recomputes
 `M_t(share)` for every round and checks it against that member's published leaves.
 
