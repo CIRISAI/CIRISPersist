@@ -430,8 +430,10 @@ pub(crate) mod bodies {
     /// **I1750** — the two-person room (CC 4.5.5): a room of a founder and
     /// one other member. The founder's node receives the member's placement
     /// and takes the member's message down there; the notice applies on the
-    /// author's node too. The member, who is no moderator, cannot take down
-    /// the founder's message (they are its author's peer, not its subject).
+    /// author's node too. The member takes down their own placed message on
+    /// the founder's node, as its subject (C536 (a), CC 4.5.5 (a)); the member,
+    /// who is no moderator, cannot take down the founder's message (they are
+    /// its author's peer, not its subject).
     pub(crate) async fn i1750_a_founder_takes_down_in_a_room_of_two(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
@@ -489,6 +491,23 @@ pub(crate) mod bodies {
         for d in [a, b] {
             assert!(purge_withheld(d, &sha_bytes(&sha)).await.unwrap().is_some());
         }
+
+        // C536 (a) (CC 4.5.5 (a), "the target content's own subject"): the
+        // author takes down their own placed message, on the founder's node,
+        // which holds only the placement: its signed subjects are the
+        // author's.
+        let sha_own = sha_hex(&format!("{tag}-own"));
+        let (_, placed_own) = write_and_place(
+            a,
+            edge_room_row(member, &room, &sha_own, false),
+            room_audience(&room),
+        )
+        .await;
+        deliver(b, &placed_own).await;
+        let own = td::takedown_tombstone(b, &notice(&who(member), &sha_own, BASIS), NODE)
+            .await
+            .expect("I1750: the content's subject takes it down where only the placement is held");
+        assert!(own.tombstoned);
 
         // The other way round: the founder's message, the member's notice.
         let sha_f = sha_hex(&format!("{tag}-founder"));
