@@ -348,7 +348,8 @@ shuffled folds of the resolved ballots give equal summaries by struct equality.
     the declared order;
   - it refolds the ballots every round, where CC finishes from the summary.
 
-  §7's convergence fixes all three.
+  §7's convergence fixes all three. CC's `formal/ranked_choice` R8 (last ballot per signer) and R5 (lexicographic
+  tie) mutations are ready-made vectors for the first two (§13.8a).
 
 What does **not** transfer: the f64 tiers, conditioning, rent decay as physics, and MPS truncation. Every kernel
 verdict is integer arithmetic over signed inputs (FINAL_REFACTOR §5.3). `RentLedger`'s tolerance law
@@ -1574,19 +1575,125 @@ Prio3 parameters are whatever CC's registered `aggregation_algorithm_id` names, 
   cells are used. That is likely at k = 8 with few voters, so the published tally should be sparse; the shares
   cannot be, because their size must not depend on the ballot.
 
-**6. Open for CC.**
+**6. CC's answers (DERIVED; CC `334bb1b`, "A secret ranked poll can publish its rounds from shares";
+`formal/ranked_choice` R11 [T, read the README]).**
 
-- **The k-floor against small cells.** CC 6.1.9 withholds a cell under k = 10 owners. A ranking histogram at
-  k = 8 has 401 cells, and most will be small, but instant runoff cannot finish from a tally with cells
-  withheld. Persist sees two options. (a) The floor applies to the poll's `source_count` only, and the full
-  ranking histogram is published, which is secrecy against tally members but not against small-cell inference.
-  (b) The two tally members also compute the runoff jointly and publish only the per-round standing totals
-  (each a sum over cells, so more of them clear the floor) and the result. That costs every member the ability to
-  recompute the rounds from cells. CC should rule.
-- **One ballot per person (`pick=agree`).** Census counts owners, not nodes, and one accepted cell per owner per
-  period. A poll open over several periods needs a rule for which period's cell counts. Persist proposes **the
-  closing period's composite only**, with members re-emitting their ballot each period while the poll is open.
-  That keeps one cell per owner without linking per-period tokens.
+- **(a) Publish round-by-round standing totals, never the histogram.** Given the public standing set, a round's
+  totals are a **linear** function of the histogram. So each tally member applies the round's fixed map to its own
+  additive share and publishes its share of the totals. No tally member ever holds the histogram. §13.8a specifies
+  the map, the rows and the verifier.
+  - **The floor is on `source_count`:** a ranked secret poll below k = 10 owners is not counted secretly. A
+    room that small votes by identified ballots (`moderator_election`'s form).
+  - **The privacy residue** (a small per-option round total is visible as a count, never as a person) has gone
+    to Eric.
+- **(b) Only the closing period's composite counts**, and the **device** re-emits its ballot each period while the
+  poll is open.
+  - **The closing period is fixed by the poll's own signed window:** the census period that contains the poll
+    record's signed `closes_at`. It is never fixed by any node's clock.
+  - **The cost, stated:** a ballot from a device that is unreachable in the closing period is not counted. A voter
+    who voted early and is offline at the close loses the vote.
+  - **Mitigation, persist's proposal:** keep the ballot as a sealed `self`-scope row, so **any** live device of the
+    owner can emit the owner's cell. The census's existing rule of one accepted cell per owner per period dedups
+    them. The vote is then lost only if **none** of the owner's devices is reachable in the closing period.
+  - **Re-emission costs no bytes:** every member emits the fixed-size poll field every period anyway (§13.8 item
+    3), so a re-emitted ballot replaces padding.
+
+### 13.8a The ranked finish over published round totals (persist's specification)
+
+**The per-round linear map.** Let the poll's cells be the rankings `c` (plus `none`), and `S_t` the public standing
+set in round t (`S_0` = all options). For each cell, `first(c, S_t)` is the first option of `c` that is in `S_t`,
+or `exhausted` if there is none (`none` is always `exhausted`). The round map
+
+```
+M_t : F^L → F^{|S_t| + 1}        (M_t h)[o] = Σ_{c : first(c, S_t) = o} h[c],     (M_t h)[exhausted] = the rest
+```
+
+is a 0/1 matrix in which every cell's column has exactly one 1. It **partitions** the cells among the standing
+options and `exhausted`. It is linear over the field, so `M_t(share_a) + M_t(share_b) = M_t(h)`, and each tally
+member computes its share of the totals from its share alone.
+
+- **Cost per member per round:** one pass over the L cells. Rounds are fewer than k, so O(k · L) in all, which is
+  about 2,800 cell visits at k = 8.
+- `first(c, S_t)` comes from the cell's stable id (§13.8 item 2) and the standing set, so the map is a pure
+  function of public data. Both members, and every verifier, derive the same `M_t`.
+
+**The rows.** One per tally member per round: `ballot:round:{poll_id}:v1`. Members:
+
+- `poll_id`, `round` t;
+- `standing`: the option ids of `S_t`, sorted by id;
+- `member_commitment_hex` and `source_count`, the same as the period's partials;
+- `totals_share`: a map `option_id → field element` over `S_t`, plus `exhausted_share`.
+
+Each row is signed by its tally member and placed in the room, like the partials. Rounds are sequential: round
+t+1's map needs round t's elimination, which needs **both** members' shares. So the members exchange each round's
+share privately over the addressed channel and publish once at the end.
+
+- **Option A:** one row per round, (k−1) × 2 rows at most.
+- **Option B:** one **set item** per member (§13.6a), its leaves the rounds, one signature each.
+
+Option B meets CC's five conditions: flat, enumerated, one signer, instant and family. Each leaf's own verdict
+(is it a well-formed share of totals over its stated `S_t`?) is independent of its siblings. The chain check
+`S_{t+1} = S_t − eliminated(t)` is the verifier's fold over the leaves, not a leaf's admission. **CC should confirm
+that reading.**
+
+**Bytes per member per poll**, Field128 assumed (16 B per element) [B, as in §13.8]. Round t carries
+`|S_t| + 1` elements, and in the worst case `|S_t| = k − t`, with k − 1 rounds:
+
+| k | share elements over all rounds (worst case) | share bytes | Option A signatures (k−1 rows) | Option B signature (one item) |
+|---:|---:|---:|---:|---:|
+| 3 | 7 | 112 B | 9.0 KB | 4.5 KB |
+| 4 | 12 | 192 B | 13.5 KB | 4.5 KB |
+| 5 | 18 | 288 B | 18.0 KB | 4.5 KB |
+| 6 | 25 | 400 B | 22.5 KB | 4.5 KB |
+| 7 | 33 | 528 B | 27.0 KB | 4.5 KB |
+| 8 | 42 | 672 B | 31.5 KB | 4.5 KB |
+
+The totals themselves are tiny. The signatures are the cost, so **Option B is persist's recommendation**: about 7×
+fewer bytes at k = 8, against the 6.4 KB a dense histogram would have published (§13.8 item 5) and now does not.
+
+**The verifier**: the kernel's `Finish` (§11.2), run over published round totals instead of a summary:
+
+```rust
+pub struct RoundShare<'a> { pub round: u32, pub standing: &'a [OptionId], pub totals: &'a [(OptionId, F128)],
+                            pub exhausted: F128, pub source_count: u64, pub member_commitment: [u8; 32] }
+
+/// Every step is integer arithmetic over public rows; O(k²) in all.
+pub fn verify_ranked_rounds(a: &[RoundShare], b: &[RoundShare], poll: &PollRecord) -> Answer<RankedOutcome>;
+
+pub enum RankedOutcome {
+    Winner { option: OptionId, rounds: u32 },
+    BelowFloor,                         // source_count < k (10): not counted secretly
+    Refused { reason: Token, round: u32 },
+}
+```
+
+Checks, in order. Each failure is a `Refused` with a round number, and the existing tokens carry over per round:
+
+1. **The floor.** `source_count ≥ 10`, else `BelowFloor`.
+2. **Agreement.** Both members' rows for round t name the same `standing`, `source_count` and `member_commitment`
+   (`census_composite_partials_mismatch`, per round).
+3. **Totals.** `T_t = a_t + b_t` in the field, element-wise, and each element read as a whole number ≤
+   `source_count`.
+4. **Mass.** `Σ_o T_t[o] + T_t[exhausted] = source_count` (`census_composite_mass_total_mismatch`, per round).
+5. **Start.** `S_0` is the poll record's whole option set.
+6. **Live ballots never increase.** With `live_t = Σ_o T_t[o]`, `live_{t+1} ≤ live_t`.
+7. **Each step follows from its totals.** If some `o` has `2 · T_t[o] > live_t`, then round t is the last round and
+   `o` is the winner. Otherwise the eliminated option is `argmin T_t`, with a tie going against the option later in
+   the poll's declared order (CC 4.5.13), and `S_{t+1} = S_t − {that option}` must equal round t+1's `standing`.
+8. **Length.** The number of rounds is fewer than k.
+
+**What the verifier cannot check, stated.** It checks consistency, not that each member applied `M_t` honestly to
+its true share. A member that lies about its share moves the totals, within the mass and agreement checks. That is
+the same trust CC 6.1.9 already places in two non-colluding tally members for the partials ("Two colluding
+aggregators can drop returns…"), and a wrong winner remains possible against a single malicious member if its
+lie preserves mass. The Prio-style robustness proof covers a ballot's validity, not the aggregator's arithmetic.
+Persist suggests that each member also publish a commitment to its final share at the end of the period, before
+round 0, so that a later audit with both shares can check every `M_t` application. CC to decide whether that
+audit is worth its bytes.
+
+**Vectors for Edge.** `formal/ranked_choice` fails each property when its line of the count is changed. Its R8
+(last ballot per signer) and R5 (lexicographic tie) mutations are exactly cewp-kernel's two departures (§4.3), so
+Edge can take them as vectors for cewp-kernel's `irv`.
 
 ---
 
