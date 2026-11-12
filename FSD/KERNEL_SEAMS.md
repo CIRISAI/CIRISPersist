@@ -1507,8 +1507,8 @@ cell per ranking is the smallest summary from which the count finishes.
 - Neither tally member sees a vector. Each sums the shares it accepts into a **partial** keyed by `cell_id`,
   deletes the shares, and publishes `census:member:partial:v1`. `ballot:tally:{poll_id}:v1` is
   `partial_a + partial_b` element-wise, and every member recomputes it.
-- **Fixed size.** The field a poll fills must be the same size in every period and every community, whether or
-  not a poll is open. So the community record declares `poll_k_max` (and r), and the poll field is always
+- **Fixed size.** The field a poll fills must be the same size in every period of a community, whether or not a
+  poll is open (it may differ between communities, which reveals only their declared `poll_k_max`). So the community record declares `poll_k_max` (and r), and the poll field is always
   L(k_max, r) cells. A smaller poll uses the k_max enumeration with its k options (sorted by id) in
   the first k slots and k_max − k **phantom** slots that no ballot may rank. The rankings that touch a phantom
   slot are valid one-hot space that stays zero.
