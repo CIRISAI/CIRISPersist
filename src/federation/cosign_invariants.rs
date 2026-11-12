@@ -1286,9 +1286,12 @@ pub(crate) mod bodies {
     /// door refuses rather than holds), a `unanimous` room of three founders:
     /// one signature is `have 1, need 3`, two are `have 2, need 3`, every
     /// eligible founder named; the third lands it. A `majority` room of four:
-    /// one signature is `have 1, need 3`. A refusal under another rule (a
-    /// stranger's widening, `roster_authority_not_established`) carries no
-    /// count. Mutation: the door's `refusal` drops the shortfall → red.
+    /// one signature is `have 1, need 3`. A member removed from that room who
+    /// signs alone is told `have 0, need 2` and NOT the eligible signers (CC
+    /// 5.2: roster information goes to members only). A refusal under another
+    /// rule (a stranger's widening, `roster_authority_not_established`)
+    /// carries no count. Mutation: the door's `refusal` drops the shortfall →
+    /// red; the door tells every caller the list → red.
     pub(crate) async fn i1748_a_short_refusal_carries_the_count<D: Node>(d: &D, tag: &str) {
         use crate::federation::consensus::ConsensusShortfall;
         fn short_of(e: &Error) -> (&'static str, Option<ConsensusShortfall>) {
@@ -1321,7 +1324,7 @@ pub(crate) mod bodies {
                     Some(ConsensusShortfall {
                         have,
                         need: 3,
-                        eligible_signer_key_ids: sorted(&r.founders),
+                        eligible_signer_key_ids: Some(sorted(&r.founders)),
                     })
                 ),
                 "I1748 unanimous, {have} signed"
@@ -1352,10 +1355,38 @@ pub(crate) mod bodies {
                 Some(ConsensusShortfall {
                     have: 1,
                     need: 3,
-                    eligible_signer_key_ids: sorted(&r4.founders),
+                    eligible_signer_key_ids: Some(sorted(&r4.founders)),
                 })
             ),
             "I1748 majority of four"
+        );
+
+        // An outsider (CC 5.2): a member removed from the room signs a
+        // widening alone. The counts are told; the eligible signers, roster
+        // information, are not.
+        let gone = r4.founders[3].clone();
+        remove_founder(d, &r4, &gone, at()).await;
+        d.set_node(&r4.founders[1]);
+        let e = d
+            .put_community_membership_widening(widening_by(
+                &r4,
+                &gone,
+                &r4.m,
+                at() + Duration::minutes(1),
+            ))
+            .await
+            .expect_err("I1748: a removed member's widening");
+        assert_eq!(
+            short_of(&e),
+            (
+                ROSTER_CONSENSUS_INSUFFICIENT,
+                Some(ConsensusShortfall {
+                    have: 0,
+                    need: 2,
+                    eligible_signer_key_ids: None,
+                })
+            ),
+            "I1748: an outsider is told the count, never the roster"
         );
 
         let stranger = format!("i1748-x-{tag}");

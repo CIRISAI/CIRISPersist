@@ -177,7 +177,23 @@ pub struct ConsensusShortfall {
     /// vote on (`unanimous`, `open:self_admit`), that member is left out.
     /// Includes the persons who already signed; `have` counts them. Any
     /// live key of a listed person also signs for them.
-    pub eligible_signer_key_ids: Vec<String>,
+    ///
+    /// Roster information (CC 5.2): `None` when the refusal goes to a caller
+    /// who is not an active member of the group ([`Self::for_caller`]). The
+    /// counts go to anyone.
+    pub eligible_signer_key_ids: Option<Vec<String>>,
+}
+
+impl ConsensusShortfall {
+    /// v61.4.0 (CIRISPersist#1250; CC 5.2) — the shortfall as told to a
+    /// caller: the eligible signers withheld unless `caller_is_member`.
+    #[must_use]
+    pub fn for_caller(mut self, caller_is_member: bool) -> Self {
+        if !caller_is_member {
+            self.eligible_signer_key_ids = None;
+        }
+        self
+    }
 }
 
 /// The eligible set: founders only for `cohort_subkind: infrastructure`
@@ -256,7 +272,7 @@ fn short<'s>(
         shortfall: Some(ConsensusShortfall {
             have,
             need,
-            eligible_signer_key_ids,
+            eligible_signer_key_ids: Some(eligible_signer_key_ids),
         }),
     }
 }
@@ -722,9 +738,13 @@ mod tests {
     fn i1749_a_short_verdict_carries_its_count() {
         use Direction::{Add, Remove};
         let sf = |v: Verdict| {
-            v.shortfall()
-                .cloned()
-                .map(|s| (s.have, s.need, s.eligible_signer_key_ids))
+            v.shortfall().cloned().map(|s| {
+                (
+                    s.have,
+                    s.need,
+                    s.eligible_signer_key_ids.unwrap_or_default(),
+                )
+            })
         };
         let ks = |v: &[&str]| v.iter().map(|k| (*k).to_owned()).collect::<Vec<_>>();
         let four = seats(&[

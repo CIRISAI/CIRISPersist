@@ -35906,7 +35906,7 @@ mod tests {
                     shortfall: Some(crate::federation::consensus::ConsensusShortfall {
                         have: 1,
                         need: 2,
-                        eligible_signer_key_ids: vec!["a".into(), "b".into()],
+                        eligible_signer_key_ids: Some(vec!["a".into(), "b".into()]),
                     }),
                 },
                 "federation_roster_authority_unauthorized: roster_consensus_insufficient",

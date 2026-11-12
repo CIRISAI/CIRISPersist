@@ -1687,7 +1687,7 @@ pub fn roster_event_standing(
         StandingVerdict::ConsensusShort { detail, .. } => {
             Err((ROSTER_CONSENSUS_INSUFFICIENT, detail))
         }
-        StandingVerdict::Refuse { rule, detail } => Err((rule, detail)),
+        StandingVerdict::Refuse { rule, detail, .. } => Err((rule, detail)),
     }
 }
 
@@ -1717,6 +1717,11 @@ pub enum StandingVerdict {
         rule: &'static str,
         /// A human-readable detail.
         detail: String,
+        /// v61.4.0 (CIRISPersist#1250) — under
+        /// [`ROSTER_CONSENSUS_INSUFFICIENT`] from the count (a signer who is no
+        /// active member, so the hold does not apply), the evaluator's count;
+        /// `None` otherwise.
+        shortfall: Option<consensus::ConsensusShortfall>,
     },
 }
 
@@ -1804,7 +1809,15 @@ pub fn roster_event_verdict(
     let shortfall = match admitted {
         Ok(()) => None,
         Err((_, detail)) if short => Some(detail),
-        Err((rule, detail)) => return StandingVerdict::Refuse { rule, detail },
+        // v61.4.0 (CIRISPersist#1250) — a count the extra signer cannot mend
+        // (a removed member's signature) still states the count.
+        Err((rule, detail)) => {
+            return StandingVerdict::Refuse {
+                rule,
+                detail,
+                shortfall: counted.filter(|_| rule == ROSTER_CONSENSUS_INSUFFICIENT),
+            }
+        }
     };
     // The last-founder rule: a removal — or a role change that demotes — that
     // leaves members but no founder.
@@ -1827,9 +1840,12 @@ pub fn roster_event_verdict(
                 return StandingVerdict::Refuse {
                     rule: ROSTER_CONSENSUS_INSUFFICIENT,
                     detail,
+                    // More signatures do not mend it: no count to show.
+                    shortfall: None,
                 };
             }
             return StandingVerdict::Refuse {
+                shortfall: None,
                 rule: ROSTER_LAST_FOUNDER,
                 detail: format!(
                     "removing or demoting {} would leave {others_after} member(s) and no founder",
@@ -2645,8 +2661,16 @@ where
         moderator_roots,
         reversed: false,
     };
+    // v61.4.0 (CIRISPersist#1250; CC 5.2) — the eligible signers are roster
+    // information: told only to a primary signer who is (or acts for) an
+    // active member immediately before the event.
+    let primary_identity = directory.active_identity_for_occurrence(primary).await?;
+    let primary_is_member = [primary, primary_identity.as_str()]
+        .iter()
+        .any(|k| matches!(state.get(*k), Some((true, _))));
     let refusal =
         |rule: &'static str, detail: &str, shortfall: Option<consensus::ConsensusShortfall>| {
+            let shortfall = shortfall.map(|s| s.for_caller(primary_is_member));
             tracing::debug!(group_key_id, primary, rule, detail = %detail, "roster change refused");
             Error::RosterAuthorityUnauthorized {
                 group_key_id: group_key_id.to_owned(),
@@ -2662,7 +2686,11 @@ where
         StandingVerdict::ConsensusShort { detail, shortfall } => {
             Some(refusal(ROSTER_CONSENSUS_INSUFFICIENT, &detail, shortfall))
         }
-        StandingVerdict::Refuse { rule, detail } => return Err(refusal(rule, &detail, None)),
+        StandingVerdict::Refuse {
+            rule,
+            detail,
+            shortfall,
+        } => return Err(refusal(rule, &detail, shortfall)),
     };
     // v52.0.0 (CIRISPersist#955) — a GROWTH (a key not active before this
     // instant) needs the member's own acceptance, under every protocol. The
