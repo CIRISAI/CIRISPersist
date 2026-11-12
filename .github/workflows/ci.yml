@@ -739,8 +739,11 @@ jobs:
   darwin-aarch64-test:
     name: darwin-aarch64 (no postgres)
     needs: tree
-    # v61.2.1 — also skipped on a tag run with a receipt (the `tree` job).
-    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' && needs.tree.outputs.receipt != 'true' }}
+    # v61.2.3 (CIRISPersist#1261) — NOT skipped by a tag receipt any more.
+    # The receipt is a LOCAL certify, and certify runs on Linux only: it
+    # cannot vouch for darwin. 61.2.1 skipped this job on v61.2.2's tag run
+    # and the macOS file-backed open shipped broken.
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v6
@@ -785,6 +788,13 @@ jobs:
           cargo --version
       - name: cargo test (no postgres feature)
         run: cargo test --features server
+      # v61.2.3 (CIRISPersist#1261) — `server` does not include `sqlite`, so
+      # until now no darwin job compiled SQLite at all, and macOS's SYSTEM
+      # SQLite (no `bundled` off Android) was never exercised. These open
+      # file-backed stores with the read pool: I1723-I1725 and the #829
+      # connection-model witnesses.
+      - name: cargo test sqlite file-backed opens (system SQLite)
+        run: cargo test --lib --features sqlite -- store::sqlite_conn_model::witnesses
 
       # Save the warmed cache (main only; PRs restore but never save).
       # CIRISPersist#458 — push once (tar+gzip+push of target/), then `alias-keys`
