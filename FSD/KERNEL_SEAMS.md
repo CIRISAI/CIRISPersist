@@ -104,6 +104,21 @@ second**. Its `Inert` verdict names the cure: a current member's vouch for the p
 rebuild a group's past from old signatures… Events inside a vouched past are held on that vouch", `part_3`
 around line 1568 [T]). That is a convergence of answers by a row that can be signed, not by a clock.
 
+**Landed in CC rc19 at `8694fc1`** ("A verdict is read from the rows held, in whatever order they came") [T, read
+the commit]:
+
+- **CC 3.3.4 (standing).** A signer's standing is "judged at the event's signed instant, over the rows a node
+  holds, and never at the instant the event reached the node", and the signed instant is trusted only where the
+  node first held the event within W.
+- **CC 4.5.13 (the lift window).** The window is "read on signed instants, the objection's against the act's",
+  and an objection counts only where it was first held within W.
+- **CC 4.5.3 (takedown).** A reversal or a lift voids the notice even when it arrives ahead of the notice. A node
+  that already destroyed the bytes shows "not held here" and may fetch them again.
+
+The model is `formal/kernel_world/KernelWorldSigned.tla`, with configs `KernelWorldSigned.cfg`, `_late.cfg` and
+`_late_rest.cfg` [T, `ls`]. This closes the C565 mismatch noted earlier: both the standing reading and the lift
+reading are ruled, and by the same rule.
+
 ---
 
 ## 2. Question 1: the seams
@@ -200,11 +215,11 @@ three plus the new ones found here:
 
 | id | class | anchor | what goes wrong | computed form |
 |---|---|---|---|---|
-| B1 | a, k | owner binding: `admission.rs:13091` [T]; C557 | a new owner's binding that arrives ahead of the old owner's withdrawal is lost; two nodes read different owners (`formal/owner_binding` O6) | **RULED (C557, Eric): the fold decides.** Hold every binding. Only bindings **this node's own key cosigned** count. If exactly one counts, it is the owner; any other count (zero, or two or more) is **unowned**; a binding the node did not cosign (a stranger's) is held and `Inert`. This is the model's `fold/unowned` reading, and it gives up O4. **Deltas from today:** `check_single_node_owner_admission`'s `NodeAlreadyOwned` refusal (`admission.rs:13129-13133`) [T] goes; `owner_of`'s `AmbiguousNodeOwner` error for two owners (`admission.rs:12702`) [T] becomes the verdict `unowned`, not an `Err`; and today a node's cosignature is demanded only after a reclaim (`check_post_reclaim_rebinding_admission`, `admission.rs:13140`) [T], whereas the ruling makes it the condition for **every** counted binding |
+| B1 | a, k | owner binding: `admission.rs:13091` [T]; C557 | a new owner's binding that arrives ahead of the old owner's withdrawal is lost; two nodes read different owners (`formal/owner_binding` O6) | **RULED (C557, Eric; CC 3.2 at rc19 `8694fc1`): the fold decides.** Hold every binding; "no binding is refused and forgotten". Only bindings **this node's own key cosigned** count, **or the one the node's genesis record carries** (CC 3.2 "The first binding") [T]. If exactly one counts, it is the owner; any other count (zero, or two or more) is **unowned**; a binding the node did not cosign (a stranger's) is held and `Inert`. This is the model's `fold/unowned` reading, and it gives up O4. **Deltas from today:** `check_single_node_owner_admission`'s `NodeAlreadyOwned` refusal (`admission.rs:13129-13133`) [T] goes; `owner_of`'s `AmbiguousNodeOwner` error for two owners (`admission.rs:12702`) [T] becomes the verdict `unowned`, not an `Err`; and today a node's cosignature is demanded only after a reclaim (`check_post_reclaim_rebinding_admission`, `admission.rs:13140`) [T], whereas the ruling makes it the condition for **every** counted binding |
 | B2 | a, f | `withdraws` stamp: `attestation_admit.rs:1163-1181`, `precedence.rs:258-280` [T] | entitlement depends on whether the target was held at the `withdraws`'s arrival | entitlement is a fold over (target, `withdraws`, the signer's standing at the `withdraws`'s signed instant); the stamp column is deleted. The release lead confirmed this independently (`attestation_admit.rs:1170-1181`, TESTED by them): the same rows in a different arrival order give a different retraction verdict, on the retraction path Edge reads. It is C557's class |
 | B3 | a | delegation cycle `admission.rs:18517` [T] | the edge that closes a cycle depends on order | the cycle is a view; its closing edge is chosen by `max(asserted_at), max(id)` and is inert. Same on every node |
 | B4 | a, i | gates 5, 11, 12, 14, 15 in §2.2 [T] | a row that arrives before its key record, consent, standing or subject is dropped; the peer may never re-offer it | **no gate drops.** The row is held with verdict `Inert { reason, retry: WhenAny(keys) }`. When a key in `retry` changes, its verdict is recomputed for free through the read-set index (§5.4). This is `formal/owner_binding`'s `again` reading applied to every door |
-| B5 | c, a, k | W at receipt: `self_roster.rs:556-575`, `key_grant.rs:1197-1210`, `admission.rs:13032`, `admission.rs:5301` [T] | "a signer stands at its signed instant; past W it must also stand **at receipt**." Standing at receipt is the held set at receipt, so an eviction that arrives after the row admits it on one node and refuses it on another, for good | **RULED (W4 / C565, Eric):** judge standing at the row's **signed** instant over all rows held, ordering the eviction by its own signed instant. Trust that instant only when `first_held − asserted_at ≤ W` (row-local). The four `now` reads go (`self_roster.rs:567`, `key_grant.rs:1197`, `admission.rs:13032`, `:5301`). **Residue (pinned by CC's model, accepted):** a row first held within W on one node and past W on another counts on the first and is `Inert { reason: asserted_at_stale, missing: vouch }` on the second. The cure is a current member's vouched past (CC 3.3.4), which is a row, so the two nodes converge once it is held (§1) |
+| B5 | c, a, k | W at receipt: `self_roster.rs:556-575`, `key_grant.rs:1197-1210`, `admission.rs:13032`, `admission.rs:5301` [T] | "a signer stands at its signed instant; past W it must also stand **at receipt**." Standing at receipt is the held set at receipt, so an eviction that arrives after the row admits it on one node and refuses it on another, for good | **RULED (W4 / C565, Eric; CC 3.3.4 at rc19 `8694fc1`):** judge standing at the row's **signed** instant over all rows held, ordering the eviction by its own signed instant. Trust that instant only when `first_held − asserted_at ≤ W` (row-local). The four `now` reads go (`self_roster.rs:567`, `key_grant.rs:1197`, `admission.rs:13032`, `:5301`). **Residue (pinned by CC's model, accepted):** a row first held within W on one node and past W on another counts on the first and is `Inert { reason: asserted_at_stale, missing: vouch }` on the second. The cure is a current member's vouched past (CC 3.3.4), which is a row, so the two nodes converge once it is held (§1) |
 | B6 | a, c, e | cosign hold: `cosign.rs:853`, `:1199`, V214 partial UNIQUE [T, doc] | expiry deletes held rows on a sweep; one open proposal per proposer refuses the second | pending, assembled and lapsed are views over held `cosign:*` rows; the reaction `drop_held` (`reactions.json` [T]) becomes the view `lapsed` plus an optional storage reap (§3.1) |
 | B7 | e, c | community DEK epoch: `store/sqlite.rs:9654-9684`, `community_dek.rs:557-575` [T] | a mutable counter; it rotates when a signed `removed_at` exceeds a **local** `minted_at`; bumping twice for one removal gives two epochs [B] | epoch identity = `H(community, minter, the departure rows since the previous epoch)`. Rotation is due when the held departure set grows (`formal/key_plane` K6: "the epoch changes only after a departure or a rotation falling due" [T]). The minted DEK is still persist's secret |
 | B8 | c | takedown `content_binding` `takedown_tombstone.rs:602-611` [T] | the subject set is read against `Utc::now()` | read at the notice's first-held instant |
@@ -814,10 +829,10 @@ numbers come from `transitions.json` and `family_model.json` `_meta` and cells a
 
 | # | item | today | ask |
 |---|---|---|---|
-| W1 | **C557 owner binding: RULED** | Eric: the fold decides | only bindings the node's own key cosigned count; exactly one is the owner; any other count is unowned; a stranger's binding is inert (B1). Remaining for CC: type it as a fold cell on the owner-binding family, so the kernel reads it from the table |
+| W1 | **C557 owner binding: RULED, landed** | Eric; CC 3.2 at rc19 `8694fc1` [T] | only bindings the node's own key cosigned count; exactly one is the owner; any other count is unowned; a stranger's binding is inert (B1). Remaining for CC: type it as a fold cell on the owner-binding family, so the kernel reads it from the table |
 | W2 | **uniqueness guards that refuse** | 8 `no X@admitted … else refuse` clauses in 5 families [T] | a `tie_break` cell for each (CC#203), so the duplicate is held and inert |
 | W3 | **guards** | 26 of 459 transitions typed; 433 `generic` [T] | type the 21 non-set-function sites in §2.2 first: 5-7, 9, 11, 12, 14, 15, 19-24, 26-30, 33, 34. Each names a persist anchor to read |
-| W4 | **W / C565: RULED** | Eric: standing at the signed instant, trusted only when `first_held − asserted_at ≤ W` | remaining for CC: type the freshness cell (174 `generic` today [T]) with that test, and name the vouched past (CC 3.3.4) as the `Inert` cure so the kernel can put it in `missing` (§1, B5) |
+| W4 | **W / C565: RULED, landed** | CC 3.3.4 (standing), 4.5.13 (lift window), 4.5.3 (reversal ahead of notice; "not held here" + refetch) at rc19 `8694fc1`; model `KernelWorldSigned.tla` [T] | remaining for CC: type the freshness cell (174 `generic` today [T]) with that test, and name the vouched past (CC 3.3.4) as the `Inert` cure so the kernel can put it in `missing` (§1, B5) |
 | W5 | **folds and counts** | fold: 76 `cc-table`, 108 `generic`; count: 16 `cc-table`, 164 `generic`, 4 `gap` [T] | type the folds the kernel needs first: `owner_of`, epoch identity (W7), group head chain, cosign pending/assembled/lapsed, peer record conflict |
 | W6 | **emit or notice: DERIVED** | 25 emits, including 15 `hard_case:*` [T]; 7 `not_yet_by_origin_door` [T] | the rule: what every node can read from rows plus its clock is a notice; a signed row remains only where someone outside the node must be told or held to it (key grants, `consent:state:expired`, `consent:decay:*`, the CC 3.4.13 safeguarding escalation, the takedown/purge tombstone). CC will type all fifteen kinds |
 | W7 | **epoch identity** | `formal/key_plane` K6 states when an epoch changes, not what names it [T] | name an epoch by the digest of its departure rows, not a counter |
@@ -1027,8 +1042,12 @@ replace N signed rows with one.
 
 ### 13.1 Data, and what it is not
 
-No production store was available; Server has been asked for a read-only copy of a real node. Until it arrives,
-every number here is **test-shaped**, taken from stores that other sessions' test runs left on this machine. I
+**Eric's standing rule: no production data, only aggregates.** Server correctly refused a store copy. The
+production numbers will come as an **aggregate table** from the bridge session, taken from the 0.5.246
+offline-boot snapshot: per `attestation_type` × dimension family × `cohort_scope` × `tier`, the count, the
+envelope bytes (total and average), the signature lengths, the first and last month, and a per-month count, with
+groups of n < 5 suppressed. §13.2a is its placeholder. Until it arrives, every number here is **test-shaped**,
+taken from stores that other sessions' test runs left on this machine. I
 copied each one into my scratch directory first (`sqlite3 -readonly src ".backup dst"` for the seeded store; `cp`
 of `.db` + `-wal` for the mesh stores) and ran SELECTs on the copies only.
 
@@ -1040,7 +1059,7 @@ of `.db` + `-wal` for the mesh stores) and ran SELECTs on the copies only.
 
 None of S or M holds a single `key_grant` row, and S holds 21 blobs [T, `count(*)`]. So the key-plane rows are
 priced from K and from the code, not from a store. "Rows per day" cannot be read from a 23-minute seed, so it is
-given as the seed's rate, and production rates wait for Server's copy.
+given as the seed's rate, and production rates wait for the aggregate table (§13.2a).
 
 ### 13.2 Per family: bytes (store S)
 
@@ -1080,6 +1099,23 @@ the first two segments of `dimension`.
   (9.9 MB), `federation_identity_occurrence_history` (9.3 MB) **and** `identity:occurrence` attestations
   (15.5 MB) [T, `dbstat`]. FINAL_REFACTOR's "one row" removes that, with the typed tables becoming indexes over the
   row. It is a storage saving and the largest single one visible in S.
+
+### 13.2a PLACEHOLDER: production aggregates (0.5.246 offline-boot snapshot)
+
+> **NOT YET FILLED.** This takes the bridge session's aggregate table (§13.1): per `attestation_type` ×
+> dimension family × `cohort_scope` × `tier`, the count, the envelope bytes (total, average), the signature
+> lengths, the first and last month, and the per-month counts. Groups with n < 5 are suppressed. No row-level
+> data.
+>
+> When it lands, it fills:
+>
+> - the ten families by bytes;
+> - rows per month per family, the production replacement for "rows per day";
+> - the signature share of bytes per family;
+> - the custody holding claims per month, which sizes A1 against its ~12,000-claim ceiling;
+> - `key_grant:content` and `key_grant:epoch` volumes, which sizes A2 and A4. No test store holds a single one.
+>
+> Every test-shaped figure in §13.2-13.4 that it contradicts gets struck through, not deleted.
 
 ### 13.3 Per family: time to admit (store S, an upper bound)
 
