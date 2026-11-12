@@ -5,6 +5,26 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [61.2.3] - UNRELEASED
+
+A macOS and iOS fix for 61.2.2. Every file-backed `SqliteBackend::open` with readers failed on Apple's system SQLite.
+
+### Fixed
+
+- **A file-backed SQLite store opens on macOS and iOS again (CIRISPersist#1261).** 61.2.2 refused it with `sqlite open readers: unable to open database file`. On Apple's SQLite, a read-only connection cannot create a WAL database's `-wal` and `-shm` files: its first access to the file fails with `SQLITE_CANTOPEN` (errno ENOENT; measured on macos-15 with SQLite 3.43.2, under rusqlite 0.31 and 0.41 alike). `journal_mode = WAL` does not create those files; the first connection to touch the database does. Before 61.2.2 the readers never touched the file while opening, and migrations on the writer created the files first. #1246's per-reader `PRAGMA cache_size` moved that first access into `ReadPool::open`. The writer now runs one read (`materialize_wal`) before any reader opens, so both files exist for as long as the writer is open. Hosts that set `CIRIS_PERSIST_SQLITE_READERS=0` as a stopgap can drop it.
+- **The `sqlite open readers` error names the reader, the step that failed, SQLite's extended result code and the path.**
+
+### Changed
+
+- **CI: the darwin test job runs on every tag and opens file-backed SQLite stores.** 61.2.1's tag receipt skipped it on v61.2.2's tag run, but the receipt is a local certify, which runs only on Linux. The job built `--features server` only, which does not include `sqlite`, so no darwin job had ever compiled SQLite. It now also runs the SQLite connection-model witnesses against macOS's system SQLite.
+- **`deny.toml` ignores RUSTSEC-2026-0487, 0489, 0490 and 0491 (hickory-proto 0.25.2).** They reach persist only through ciris-verify-core v22.2.0 → hickory-resolver 0.25, and persist calls none of Verify's DNS or HTTP paths. The fix (0.26.2) has to come from Verify (CIRISVerify#335).
+
+### Tested
+
+- **I1723:** the writer creates `-wal` and `-shm` before any reader opens; its first half shows that `journal_mode = WAL` alone does not. A no-op `materialize_wal` turns it red.
+- **I1724:** a file-backed open with three readers succeeds, and every reader reads, on a new file and again on restart. This is the reproduction on the darwin job.
+- **I1725:** a reader that cannot open reports extended code 14 and the path.
+
 ## [61.2.2] - 2026-11-10
 
 61.2.1 was not tagged. Its CI and release-tooling changes ship here, together with #1246. The one change to the shipped crate is the SQLite connection tuning.
