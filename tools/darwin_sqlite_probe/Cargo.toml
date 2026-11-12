@@ -1,0 +1,15 @@
+[package]
+name = "darwin_sqlite_probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone: not a member of persist's workspace.
+[workspace]
+
+[dependencies]
+# The workflow rewrites this line per matrix entry (0.31 = persist 61.0.5,
+# 0.41 = persist 61.2.x). No `bundled`: macOS links the system SQLite,
+# exactly as persist does on every non-Android target.
+rusqlite = { version = "0.41" }
+tempfile = "3"

@@ -1,0 +1,26 @@
+name: darwin sqlite probe (#1261)
+on:
+  push:
+    branches: ['debug/darwin-sqlite-1261']
+  workflow_dispatch:
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-14, ubuntu-24.04]
+        rusqlite: ["0.41", "0.31"]
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }} rusqlite ${{ matrix.rusqlite }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - name: probe
+        working-directory: tools/darwin_sqlite_probe
+        shell: bash
+        run: |
+          sed -i.bak 's/^rusqlite = { version = "0.41" }/rusqlite = { version = "${{ matrix.rusqlite }}" }/' Cargo.toml
+          grep '^rusqlite' Cargo.toml
+          if [ "$RUNNER_OS" = Linux ]; then sudo apt-get install -y libsqlite3-dev >/dev/null; fi
+          cargo run -q 2>&1 | tee probe.txt
+          otool -L target/debug/darwin_sqlite_probe 2>/dev/null | grep -i sqlite || ldd target/debug/darwin_sqlite_probe | grep -i sqlite || true
