@@ -1090,6 +1090,10 @@ impl SqliteBackend {
         let pool = if in_memory || readers == 0 {
             crate::store::sqlite_conn_model::ReadPool::empty()
         } else {
+            // CIRISPersist#1261 — the writer creates -wal/-shm first: Apple's
+            // SQLite will not let a read-only reader create them.
+            crate::store::sqlite_conn_model::materialize_wal(&writer)
+                .map_err(|e| Error::Backend(format!("sqlite open materialize wal: {e}")))?;
             crate::store::sqlite_conn_model::ReadPool::open(&path, readers, &tuning)
                 .map_err(|e| Error::Backend(format!("sqlite open readers: {e}")))?
         };
