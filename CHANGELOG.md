@@ -5,6 +5,20 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [61.4.0] - 2026-11-12
+
+Every room duty door is witnessed asking for an appointment, never for membership (CIRISPersist#1195).
+
+### Added
+
+### Changed
+
+### Fixed
+
+### Tested
+
+- **I1745** (sqlite and postgres; CIRISPersist#1195, CC 4.5.4): in a `majority` room a plain member, who may still sign for the room, is refused at the `moderation:*` act door, the takedown door and the takedown-reversal door; the founder and its `takedown`/`review` deputy pass all three. I1522 (61.0.2) covers the helpers and the community-scoped reconsideration door.
+
 ## [61.3.0] - 2026-11-11
 
 A widening or removal of a quorum room or family no longer needs every signature in one offer: the door holds it and collects the rest (CIRISPersist#1252, CC 3.3.4). Until this cut a room of three or more could not widen or remove inside the mesh.
