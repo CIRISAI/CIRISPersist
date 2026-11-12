@@ -285,7 +285,7 @@ Two notes on where things live. `INTERFACE.md` is empty (0 bytes [T]); the inter
 |---|---|---|---|
 | 1 | **One merge law as a trait** | `MergeLedger { empty, merge }` and `fold` (`holon/src/merge.rs:15-18`, `:62-64`) [T]. One generic law test compares a forward fold with a reversed one, then checks identity (`holon/tests/laws.rs:11-20`) [T]. In Lean a run is a `Multiset`, so "two schedules of the same work are the same multiset" (`lean/CIRISHolon/MergeLaw.lean:14-16`), and `shardedFold_invariant` is at `:62` [T]. "This replaces ACID wholesale" (`DATA_OBJECT.md:168-174`) [T] | the kernel's input is a multiset of rows. Every accumulation (count, roster, holder set, latest-wins pick) is a `MergeLedger` instance. **This is the census's test:** a rule that cannot be written as one is an order-dependent door. Every B-row in §3 fails it, and that is the reason it is a breaker |
 | 2 | **Order-independent bytes** | `mesh::canonicalize` (`holon/src/mesh.rs:111`) [T]. The test at `holon/tests/mesh.rs:440-466` asserts that the forward and reversed folds are **not** struct-equal, that they are value-equal, and that canonicalised they are equal. Its message says to retire the test once the ledger grows a canonical form [T] | kernel outputs are canonicalised before they are compared or hashed. Sets are sorted by `RowId`; maps are `BTreeMap`. A test pins every place where canonicalisation is still load-bearing |
-| 3 | **Integers only; refuse on overflow** | `holon-scene/src/lib.rs:19-20`: "Integers only. No float appears in this crate, so a native build and a wasm build agree bit for bit by construction" [T]. `holon/src/ledger.rs:11-17`: the ring "REFUSES (panics) on overflow rather than wrapping" [T] | scores, weights and thresholds are exact: integer fixed-point or a rational `(num, den)` in `u64`/`i128`, using checked arithmetic. Overflow is a **verdict** (`Unserved { cell }` with an overflow reason), never a panic and never a wrap, because a kernel must not abort a node. This is also CC's open COSE float gap (§10 W16). Persist carries floats into verdicts today. `Attestation.weight` is `Option<f64>` (`types.rs:1645`) [T], and the weighted-rubric arm of `consensus::evaluate` sums `f64` weights (`consensus.rs:38`, `:418`, `:436`) [T]. An `f64` sum is order-dependent past exactness, which is Holon's `RentLedger` warning (§4). CC#203 drops `weighted:{rubric}` (FINAL_REFACTOR §5.8), and that removes this arm |
+| 3 | **Integers only; refuse on overflow** | `holon-scene/src/lib.rs:19-20`: "Integers only. No float appears in this crate, so a native build and a wasm build agree bit for bit by construction" [T]. `holon/src/ledger.rs:11-17`: the ring "REFUSES (panics) on overflow rather than wrapping" [T] | scores, weights and thresholds are exact: integer fixed-point or a rational `(num, den)` in `u64`/`i128`, using checked arithmetic. Overflow is a **verdict** (`Unserved { cell }` with an overflow reason), never a panic and never a wrap, because a kernel must not abort a node. This is also CC's open COSE float gap (§10 W16). Persist carries floats into verdicts today. `Attestation.weight` is `Option<f64>` (`types.rs:1645`) [T], and the weighted-rubric arm of `consensus::evaluate` sums `f64` weights (`consensus.rs:38`, `:418`, `:436`) [T]. An `f64` sum is order-dependent past exactness, which is Holon's `RentLedger` warning (§4). **DERIVED at CC rc19 `6453665`** ("A group's protocol is a closed list of counts"): `weighted:{rubric}` **stays**, but every weight and the threshold are **whole numbers** on the group's signed record (CC 3.3.4). So the arm keeps its meaning and loses its floats (`u64` weights, a `u64` threshold, compared exactly). `custom:` is removed (§5.3a) |
 | 4 | **An exact digest as the certificate** | `Digest([u64; 4])`, merged by lane-wise `wrapping_add` (`holon-tables/src/digest.rs:39-64`) [T]. `digest_commutes` (`MergeLaw.lean:77`) and `digest_convicts` (`:88`) [T] | `Answer` carries a `Digest`: each output element is hashed with its stable id into four lanes, and the lanes are summed. The sum is order-free by construction. Two nodes compare one digest of their views; the differential compares digests per fixture |
 | 5 | **The permutation is a test input** | `p2_a_scrambled_fold_order_changes_nothing` runs two scrambles and asserts that each **is a permutation** and **is not the identity** ("P2 plant is vacuous", `holon/tests/mesh_clifford_plants.rs:519-543`) [T] | every kernel vector runs under N shuffles of its row multiset, and the harness asserts that each shuffle differs from the identity (§6.2) |
 | 6 | **Rights and unknowns as types** | `Transported { value, cert: None }` unless a `CertWitness` is supplied (`holon/src/transport.rs:15-48`) [T]. Unserved is `Option`, never 0 (`holon-closure/src/lib.rs:28-34`) [T] | a `Standing` value can be constructed only with its granting chain (`Standing { roles, chain: SmallVec<RowId> }`, private constructor). A row that is not held is `Unknown`, never `false`. `Answer<T>` has no path into a stored row |
@@ -398,7 +398,10 @@ pub enum Verdict {
     /// No typed rule decides this: a CC gap/prose cell. Not refused, not admitted.
     Unserved { cell: CellRef },
 }
-pub enum Retry { Never, WhenAny(KeySet), At(Micros) }
+pub enum Retry { Never, WhenAny { keys: KeySet, lapse: Micros }, At(Micros) }
+// No halting edges (CC, under Eric's delegation): an Inert that waits for a row MUST carry a lapse. There is no
+// wait without a deadline. On lapse persist drops its local copy (a storage act, not a verdict), and the row stays
+// re-offerable. Deadlines per origin are §5.9a.
 // Holon's four values (§4.1 #7): Live = Pass, Inert = Fail (with the curing row), a policy Branch rides in
 // Live.to (enacted | cancelled | lapsed), Unserved = Void. Overflow in any count is Unserved, never a wrap.
 pub struct Missing { pub roles: SmallVec<Role>, pub voices: Option<(u32, u32)>, pub rows: SmallVec<Need> }
@@ -407,6 +410,21 @@ pub struct Missing { pub roles: SmallVec<Role>, pub voices: Option<(u32, u32)>, 
 `Token` is the public refusal contract (FINAL_REFACTOR §5.6). Today's tokens are kept byte for byte, so
 `federation_*` kinds and Python types do not move in a mechanical step. `Retry::Never` is terminal and the rest
 are retryable, which is what Edge's retry schedule reads.
+
+### 5.3a The protocol vocabulary is closed (DERIVED, CC rc19 `6453665`)
+
+Eric delegated four open questions to CC under two goals: "1) fold the rows and end up with the same conclusion
+2) do so efficiently and without any halting edges". On group protocols CC derived:
+
+- **`custom:` is removed.** A declaration of it is refused outright, as malformed at the codec, not held inert. Today
+  persist evaluates `custom:{id}` from `policy_blob.custom`, nested up to `MAX_CUSTOM_DEPTH` = 8
+  (`consensus.rs:41`, `:317-324`) [T]. That arm, its depth limit and its tests go.
+- **`weighted:{rubric}` stays**, with whole-number weights and threshold on the signed group record (CC 3.3.4).
+  This closes W16 for protocols.
+- **An operator `cohort_subkind` is a label with no predicate** (CC 4.4.3.2.3). The kernel never branches on it.
+- **A growing quorum is `majority`.**
+- **The list is closed:** five canonical protocols plus `open:self_admit`. The kernel's `Rule` is then a closed
+  enum with no `Prose` arm for protocols. That removes cewp-kernel's `Rule::Prose` path for this column (§7).
 
 **What a refusal looks like.** The only write that is refused outright is one persist refuses before the kernel:
 malformed, unverifiable, over quota, or not placeable (§5.9). Everything else is held and gets a `Verdict`:
@@ -546,9 +564,11 @@ other row. The rule "a row a clock or a fold causes is emitted by the door the c
 3. Each round adds rows whose ids are drawn from the finite set `rules × subsets of held rows`, and only causes
    that are new this round produce new drafts.
 
-So the fixpoint is reached in at most `depth(emit graph)` rounds. Today that is 1 [B: no emitted family in
-`reactions.json` is itself an `on` trigger of an `emit`; I checked the effect list, not the closure]. Persist
-asserts the bound per batch.
+So the fixpoint is reached in at most `depth(emit graph)` rounds. **CC checked this ("no halting edges"):** there
+are no cycles between families in the typed rules, the **longest emission chain is 3**, and the **9 in-family
+self-loops descend by leaf**, so each terminates on its leaf order [T as reported by CC under Eric's delegation;
+this corrects my earlier "1", which checked only the effect list]. The kernel re-checks the same property at load
+and refuses a table that breaks it. Persist asserts ≤ 3 rounds per batch.
 
 ### 5.8 Rule version
 
@@ -652,6 +672,44 @@ only when the fold says so and `Park` while a deciding row could still arrive.
 5. `REPLICATION_POLICY_HASH` becomes the hash of the kernel's routing tables, so the triple pin persist, Edge and
    Server already share (`replication_policy.rs` module doc [T]) pins the rules themselves.
 
+### 5.9a Park deadlines per origin (persist's proposal, for CC to type as the placement cell, W8)
+
+Every `Park` and every waiting `Inert` carries a lapse (§5.3). CC asked what deadline persist wants per origin.
+The proposal below starts from the release lead's draft and changes two things: the member-peer deadline is tied
+to the row, and the quotas are sized from the canonical.
+
+**The facts that size it.**
+
+- **W is the natural maximum.** Under the rc19 W rule (§1), a row first held more than W after its signed
+  instant does not count without a vouched past. A parked row dropped and re-offered later gets a **new**
+  first-held instant (the old one died with the copy). So past `asserted_at + W`, a re-offer re-admits a
+  standing-dependent row only with a vouch, and holding it longer buys nothing. That corrects the draft's "a later
+  re-offer re-admits": it does so only within W, or with a vouch.
+- **Intake (canonical, §13.2a).** Peak month Oct: ~17.4k admitted rows across the five largest families. The mean
+  row is ~11 KB (6.6 KB average envelope + 4.5 KB signature). That is ~580 rows/day and ~6.4 MB/day at peak.
+  Free space never returned is 333 MB (§13.2b), so any parked-copy budget must also be reclaimable (S1).
+- **The existing write quota.** 600 writes per peer per 60 s (`PER_PEER_ATTESTATION_WRITES_PER_WINDOW`,
+  `replication/admission.rs:198`, `:212`) [T]. It bounds rate, not parked bytes.
+- **R1's shadow count is not yet measured.** These are bounds that hold whatever it shows. The count then tunes
+  the quotas, never the deadlines.
+
+| origin of the parked or waiting row | lapse | quota | reason |
+|---|---|---|---|
+| a peer **in the row's audience** (a member) | **`asserted_at + W`** (W = 72 h, CC 2.6.7), and never less than first-held + 1 h | per origin 32 MB (~5 days of the canonical's peak intake) | a member's row is normally ours too, and its parent is normally in flight from the same mesh. Past `asserted_at + W` the row needs a vouch anyway, so keeping it longer is dead weight. The 1 h floor lets an old row that arrives with its parent in one sync round settle |
+| a **known** peer that is not in the row's audience (a relay, a mesh server) | **first-held + 24 h** | per origin 16 MB | covers the daily re-ack and reconnect cadence (`HOLDING_CLAIM_REACK_AFTER_SECS` = 24 h [T]). A non-member is carrying rows for others, so if the parent hasn't come in a day the row isn't ours to keep |
+| a **stranger** (no registered key) | **first-held + 1 h** | per origin 1 MB (~90 rows); a pool of 8 MB across all strangers | one sync round for a parent in flight (typically the key record itself). Strangers can't be told apart, so their pool is shared and small |
+| **global** | | a park inbox of 128 MB (~20 days of peak intake; ~7% of the canonical file) | an operator setting that decides storage, never a verdict (FINAL_REFACTOR §5.1 tier 3) |
+
+**On lapse:** drop the local copy, count it as `persist_park_lapsed_total{origin_class, token}`, and keep nothing
+but the counter. Dropping is a storage act, not a verdict. The row stays re-offerable, and a re-offer is a new
+arrival with a new first-held instant. **On quota:** the oldest parked row of that origin lapses first. It is
+never refused at the door, so a flood ages its own rows out.
+
+**Terminal `Inert`** (`Retry::Never`, e.g. a stranger's owner binding that counts for nothing, CC 3.2) is not
+waiting, so it needs no lapse. It is held only where `route(row, Me)` says `Hold` (party and audience). Otherwise
+it is `Discard`. That keeps CC 3.2's "held and counts for nothing" for rows the node is party to, without letting
+strangers fill the store with permanently inert rows.
+
 `CC`'s `placement` column is a gap for 156 of 184 families [T, `_meta.coverage.placement`], so today almost every
 family takes the default (§10 W8).
 
@@ -674,7 +732,7 @@ not appear as a gate diff.
 
 ### 6.2 Testing storage against the kernel
 
-There are five harnesses. They are named here and not built.
+There are six harnesses. They are named here and not built.
 
 1. **Vectors.** CC's `mesh_story_trace.json`, `governance_policy_vectors.json`, `namespace_match_vectors.json`,
    and one vector file per `formal/` model's checked traces (each model already enumerates its runs, e.g. 47,296
@@ -694,6 +752,9 @@ There are five harnesses. They are named here and not built.
    `DropOnRefuse`, `StampAtDoor`, `LastProcessedWarmStart` (a cache that remembers its last update), and
    `MissingInvalidationEdge` (drop a `Slot` key from `reads`). The must-not-move set has to leave every digest
    equal: `ReverseInput`, `ShardFolds`, `ColdCache`. Only the two halves together are evidence.
+6. **Set-encoding equivalence** (CC's law for set objects, §13.6a). The digest of `fold(held ∪ {item})` must
+   equal the digest of `fold(held ∪ leaves(item))` under shuffles and partial leaf sets. A family that fails it is
+   not a set family.
 
 The SQL `lifecycle_predicate` (FINAL_REFACTOR §6.2) joins harness 2: the predicate and the kernel's `view` run
 over the same rows, and any difference is reported.
@@ -844,10 +905,10 @@ numbers come from `transitions.json` and `family_model.json` `_meta` and cells a
 | W13 | **the ruled column** | roles 146 / policy 146 `code-v61`; signer_rule 122, subject_rule 164, cosign_rule 169, lifecycle 181 `code-v61`; undo 30 `gap`; roles 2 `gap` [T] | as FINAL_REFACTOR §5.5: each `code-v61` cell is step 1 (state today). The differential gives step 2 for free |
 | W14 | **reader trust set** | 32 folds `by=reader` [T] | specify the input: reader key and accepted roots, or the reader's own trust rows |
 | W15 | **CEWP tables** | rc17, no guards, no reactions [T] | one tag for both kernels (§7) |
-| W16 | **exact numbers (COSE float gap)** | `weight: Option<f64>` (`types.rs:1645`) and f64 rubric sums (`consensus.rs:418`) [T] | type every score, weight and threshold as an integer fixed-point or a rational on the wire, so the kernel never sees a float (§4.1 #3) |
+| W16 | **exact numbers (COSE float gap)**: **protocol half DONE** at rc19 `6453665` (whole-number weights and threshold; `custom:` removed). Open for row `weight`/`score` | `weight: Option<f64>` (`types.rs:1645`) and f64 rubric sums (`consensus.rs:418`) [T] | type every score, weight and threshold as an integer fixed-point or a rational on the wire, so the kernel never sees a float (§4.1 #3) |
 | W17 | **cost classes** | none published | per-transition and per-fold `CostClass` via `tools/kernel_cost.py`; the build refuses a mismatch (§11.2) |
 | W18 | **the census-family guards still refuse** | `census:*` folds already carry `pick=once(…)` tie-breaks [T, fold cells], but their guards still say `no … else refuse` (B18) [T] | make the guard defer to the fold's `once` tie-break, so the table stops stating the rule twice |
-| W19 | **multi-row items** | the key-grant set carrier was retired at rc7 (`key_grant.rs:17-18`) [T]; custody is one row per blob per day [T] | rule on I1-I4 (§13.5): a set claim for custody, a group KEK for self/family that rotates on member removal and device revocation, a history grant on join, and a re-admitted, per-leaf-addressable wrap set |
+| W19 | **multi-row items: YES, as a set object** (rc19 `6453665`; five conditions, §13.6a). Open: CC's `key_plane` model of the group key before the text moves | the key-grant set carrier was retired at rc7 (`key_grant.rs:17-18`) [T]; custody is one row per blob per day [T] | rule on I1-I4 (§13.5): a set claim for custody, a group KEK for self/family that rotates on member removal and device revocation, a history grant on join, and a re-admitted, per-leaf-addressable wrap set |
 
 ---
 
@@ -1281,6 +1342,12 @@ of a member who stays kept the epoch key until the next rotation (K8, C558) [T].
 removal **or** device revocation (K6 already names "a rotation falling due"). For a family that writes more often
 than it loses members or devices (the normal case), the KEK wins by the write/removal ratio.
 
+**CC's ruling on the KEK and the history key (DERIVED, rc19).** For self/family **files**: yes, a group key,
+rotating on member removal **and** device revocation, with **one history key** for a newcomer instead of the
+walk (I2 + I3). Edge confirmed in code that the per-recipient grant is paid on self and family **file** writes,
+not on chat or community. CC will model it in `formal/key_plane` before the text moves. **Signer batching (S5) is
+the same set object (§13.6a), not a new family.**
+
 **Can the kernel fold each as ONE item?** Yes, for all four items, under one rule. An item is folded as one held
 row when its leaves share **one signer, one signed instant and one family**, and each leaf is checkable against the
 signed root. `touches(item)` is the union of its leaves' keys, and the verdict is per leaf. Persist explodes leaves
@@ -1306,6 +1373,27 @@ order-free:
 5. **Transport ships items, routing ships leaves.** `route(item leaf, Peer)` (§5.9) decides per leaf; Edge batches
    the header with the leaves it sends. Persist's settle (`settle_if_held`) settles at the leaf: a re-sent leaf
    whose root is held is idempotent success.
+
+### 13.6a The set object: CC's five conditions (DERIVED, rc19 `6453665`)
+
+A set object is admitted **only as an encoding of rows**, under five conditions. Each one maps to a kernel check:
+
+| condition | kernel check |
+|---|---|
+| **flat**: no set holds a set | a leaf's family may not be a set family; a load-time and parse-time check |
+| **enumerated**: it lists its leaves, never "all who…" | the leaf list is explicit; the audience is the kernel's to compute (`audience`, §5.9), never the item's to state |
+| **one signer, one signed instant, one family** | the header carries all three; a leaf naming another is malformed |
+| **leaf verdicts independent of siblings** | per-leaf `Verdict`; a headerless leaf is held `Inert`, waiting with a lapse (§5.9a); two headers make the item `forked`, and both are held (§13.6 rules 1-3) |
+| **THE LAW: the fold over the set equals the fold over its leaves as separate rows** | this is the **admission test for every proposed item**: harness 6 in §6.2 below. It is the merge law (§4.1 #1) applied to encodings: an item is admissible iff exploding it changes no digest |
+
+**Chained items** (`prev_root`, e.g. set-claim deltas) are allowed with a bound: a **full claim at a stated
+interval**, so no fold walks an unbounded chain. For I1 that is a full set claim at least every W (72 h, the
+custody freshness already in force, `CUSTODY_LIVE_SECS` [T]), with daily deltas between. The fold reads the last
+full claim plus at most `interval / delta period` deltas (3 for I1).
+
+**Harness 6 (added to §6.2's list): set-encoding equivalence.** For every set family and generated item, the
+digest of `fold(held ∪ {item})` equals the digest of `fold(held ∪ leaves(item))` under every shuffle, and with any
+proper subset of leaves (the headerless and partial cases). A family that fails it is not a set family.
 
 ### 13.7 What to optimise first
 
