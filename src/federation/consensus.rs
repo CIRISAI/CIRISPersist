@@ -103,6 +103,15 @@ pub struct Ballot<'a> {
     /// numerator, and any live key of a seated person signs for them. Resolved
     /// by the caller, so the evaluator stays pure.
     pub persons: PersonsAt<'a>,
+    /// CIRISPersist#1201 (CC 4.4.3.4.2.1, "below `M`, a room counts its
+    /// whole roster") — the largest roster this group's lineage has reached
+    /// before the change ([`crate::federation::authorized_roster_high_water_at`]),
+    /// when the caller folded it. Under `quorum:M/N`, while both it and the
+    /// roster are below `M` the gate counts every live member; once the
+    /// lineage has reached `M`, `M` binds for good (the latch: a room never
+    /// shrinks `M` this way). `None` reads absolute `M`, the pre-#1201 rule:
+    /// a caller that has not folded the lineage never relaxes the count.
+    pub high_water: Option<usize>,
 }
 
 /// v61 (CIRISPersist#1123; CC 4.5.13 "never fewer than two voices in a
@@ -426,13 +435,25 @@ fn evaluate_counted<'a>(b: &Ballot<'a>, elig: &[&'a Seat], got: &[&'a Seat]) -> 
         let Some((m, _n)) = parse_quorum_tail(tail) else {
             return unevaluable(format!("malformed quorum form {p:?}"));
         };
-        // Absolute M (CC 4.4.3.4.2.1); at least one signer regardless.
-        let need = (m as usize).max(1);
+        let need = quorum_need(m as usize, n, b.high_water, b.subkind);
         return if got.len() >= need {
             Verdict::Admit
         } else {
+            let stalled = n < m as usize && need > n;
             short(
-                format!("quorum: {} of {need} signatures", got.len()),
+                if stalled {
+                    // CIRISPersist#1201 — the latch: this lineage reached M
+                    // and has shrunk below it. M still binds, so the room is
+                    // stalled until it grows back.
+                    format!(
+                        "quorum: stalled — this group once reached M = {m} and now has {n} \
+                         eligible member(s); M stays absolute and is not met ({} of {need} \
+                         signatures) (CC 4.4.3.4.2.1)",
+                        got.len()
+                    )
+                } else {
+                    format!("quorum: {} of {need} signatures", got.len())
+                },
                 got.len(),
                 need,
                 elig,
@@ -663,7 +684,37 @@ fn eval_expr(b: &Ballot<'_>, elig: &[&Seat], got: &[&Seat], expr: &Value, depth:
 /// which applies its own #557 floor on top). `None` for forms whose answer is
 /// not a count (`founder_only` — a founder, not a number; `weighted:`;
 /// `custom:`) or that do not parse; such callers read `None` FAIL-SECURE.
+/// CIRISPersist#1201 (CC 4.4.3.4.2.1) — THE `quorum:M/N` count, shared by
+/// [`evaluate`] and [`required_signatures`]. Absolute `M` (at least one),
+/// except while the lineage has never reached `M` (`high_water < M`) and the
+/// roster `n` is below it: then every live member (`n`, at least one). An
+/// `infrastructure` group never relaxes (CC 3.2 T7: founded at `N ≥ M + 1`).
+/// `high_water: None` is absolute `M`.
+#[must_use]
+pub fn quorum_need(m: usize, n: usize, high_water: Option<usize>, subkind: Option<&str>) -> usize {
+    let absolute = m.max(1);
+    match high_water {
+        Some(hw) if hw < m && n < m && subkind != Some("infrastructure") => n.max(1),
+        _ => absolute,
+    }
+}
+
+///
+/// CIRISPersist#1201 — `quorum:M/N` reads absolute `M` here; a caller that
+/// folded the lineage asks [`required_signatures_at`], which agrees with
+/// [`evaluate`] through [`quorum_need`].
 pub fn required_signatures(protocol: &str, roster_size: usize) -> Option<usize> {
+    required_signatures_at(protocol, roster_size, None)
+}
+
+/// [`required_signatures`] with the lineage's high-water roster size
+/// (CIRISPersist#1201, CC 4.4.3.4.2.1): the same count [`evaluate`] asks of a
+/// `quorum:M/N` ballot carrying `high_water`.
+pub fn required_signatures_at(
+    protocol: &str,
+    roster_size: usize,
+    high_water: Option<usize>,
+) -> Option<usize> {
     if protocol == cp::UNANIMOUS {
         return Some(roster_size.max(1));
     }
@@ -675,7 +726,8 @@ pub fn required_signatures(protocol: &str, roster_size: usize) -> Option<usize> 
             .map(|p| p.dismissal_threshold(roster_size));
     }
     if let Some(tail) = protocol.strip_prefix(cp::QUORUM_PREFIX) {
-        return parse_quorum_tail(tail).map(|(m, _)| (m as usize).max(1));
+        return parse_quorum_tail(tail)
+            .map(|(m, _)| quorum_need(m as usize, roster_size, high_water, None));
     }
     None
 }
@@ -706,6 +758,7 @@ mod tests {
             direction: d,
             subject: None,
             persons: PersonsAt::each_key(),
+            high_water: None,
         })
     }
 
@@ -726,7 +779,59 @@ mod tests {
             direction: d,
             subject: Some(subject),
             persons: PersonsAt::each_key(),
+            high_water: None,
         })
+    }
+
+    /// **I1752** (v61.4.0, CIRISPersist#1201; CC 4.4.3.4.2.1) — the latch, pure.
+    /// Below `M` with a lineage that never reached it, every live member; at
+    /// or past `M`, or once the lineage reached it, absolute `M`; `None` (no
+    /// lineage folded) and `infrastructure` never relax. `required_signatures_at`
+    /// and the evaluator agree on every case.
+    #[test]
+    fn i1752_quorum_below_m_and_the_latch() {
+        let cases = [
+            (3, 1, Some(1), None, 1),
+            (3, 2, Some(2), None, 2),
+            (3, 3, Some(3), None, 3),
+            (3, 4, Some(4), None, 3),
+            (3, 2, Some(4), None, 3),
+            (3, 2, None, None, 3),
+            (3, 1, Some(1), Some("infrastructure"), 3),
+        ];
+        for (m, n, hw, sub, want) in cases {
+            assert_eq!(quorum_need(m, n, hw, sub), want, "{m} {n} {hw:?} {sub:?}");
+            if sub.is_none() {
+                assert_eq!(
+                    required_signatures_at(&format!("quorum:{m}/{}", m + 1), n, hw),
+                    Some(want)
+                );
+            }
+            let roster: Vec<Seat> = (0..n)
+                .map(|i| Seat {
+                    key_id: format!("k{i}"),
+                    role: (i == 0).then(|| "founder".to_owned()),
+                    node_bearing: false,
+                })
+                .collect();
+            let all: Vec<&str> = roster.iter().map(|s| s.key_id.as_str()).collect();
+            let v = evaluate(&Ballot {
+                protocol: &format!("quorum:{m}/{}", m + 1),
+                subkind: sub,
+                policy_blob: None,
+                roster: &roster,
+                signers: &signers(&all[..want.min(n)]),
+                direction: Direction::Add,
+                subject: None,
+                persons: PersonsAt::each_key(),
+                high_water: hw,
+            });
+            assert_eq!(
+                v.admits(),
+                want <= n,
+                "evaluate agrees: {m} {n} {hw:?} {sub:?}"
+            );
+        }
     }
 
     /// **I1749** (v61.4.0, CIRISPersist#1250) — each count arm states the count
@@ -851,6 +956,7 @@ mod tests {
                 direction: Add,
                 subject: None,
                 persons: PersonsAt::each_key(),
+                high_water: None,
             })
             .admits()
         };
@@ -1020,6 +1126,7 @@ mod tests {
             direction: Direction::Add,
             subject: None,
             persons: PersonsAt::each_key(),
+            high_water: None,
         });
         assert!(
             !v.admits(),
@@ -1052,6 +1159,7 @@ mod tests {
             direction: Direction::Add,
             subject: None,
             persons: PersonsAt::each_key(),
+            high_water: None,
         };
         let elig: Vec<&str> = eligible(&b).iter().map(|s| s.key_id.as_str()).collect();
         assert_eq!(

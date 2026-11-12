@@ -1401,6 +1401,114 @@ pub(crate) mod bodies {
         assert_eq!(shortfall, None, "I1748: another rule carries no count");
     }
 
+    /// **I1751** (CIRISPersist#1201; CC 4.4.3.4.2.1) — below `M` a room
+    /// counts its whole roster, and `M` latches once reached. A room founded
+    /// alone at `quorum:3/4` seats its second member on the founder's
+    /// signature (plus the acceptance), its third on both members'
+    /// (one alone is `have 1, need 2`); at three members `M` binds, so the
+    /// fourth needs three (two are `have 2, need 3`). Two members then resign;
+    /// the room of two that once reached `M` is stalled: both signatures are
+    /// `have 2, need 3` and the refusal says stalled. The high-water read
+    /// answers 4. The node is not the primary's, so a short event is refused
+    /// rather than held. Mutation: `quorum_need` ignores the high water (a
+    /// roster below `M` always counts itself) → the stalled room admits: red.
+    pub(crate) async fn i1751_below_m_counts_the_roster_and_m_latches<D: Node>(d: &D, tag: &str) {
+        let r = room(d, tag, "i1751", "quorum:3/4", 1).await;
+        let f0 = r.founders[0].clone();
+        let mk: Vec<String> = (1..=4).map(|i| format!("i1751-m{i}-{tag}")).collect();
+        reg(d, &mk.iter().map(String::as_str).collect::<Vec<_>>()).await;
+        d.set_node(&format!("i1751-elsewhere-{tag}"));
+        let t0 = ms(Utc::now() - Duration::hours(3));
+        let at_i = |i: i64| t0 + Duration::minutes(i);
+        let count = |e: &Error| match e {
+            Error::RosterAuthorityUnauthorized {
+                rule, shortfall, ..
+            } => (*rule, shortfall.as_ref().map(|s| (s.have, s.need))),
+            other => panic!("I1751: a standing refusal, got {other:?}"),
+        };
+        let seat = |member: &str, signers: &[&str], i: i64| {
+            let w = widening_by(&r, signers[0], member, at_i(i));
+            cosigned(&w, &signers[1..])
+        };
+        // The second member: the founder alone, the room being one.
+        let w = seat(&mk[0], &[&f0], 1);
+        consent(d, &w).await;
+        d.put_community_membership_widening(w)
+            .await
+            .expect("I1751: a room of one seats its second on the founder's word");
+        // The third: one of two is short; both seat.
+        let w = seat(&mk[1], &[&f0], 2);
+        consent(d, &w).await;
+        let e = d
+            .put_community_membership_widening(w)
+            .await
+            .expect_err("I1751: one of two");
+        assert_eq!(
+            count(&e),
+            (ROSTER_CONSENSUS_INSUFFICIENT, Some((1, 2))),
+            "{e:?}"
+        );
+        let w = seat(&mk[1], &[&f0, &mk[0]], 3);
+        consent(d, &w).await;
+        d.put_community_membership_widening(w)
+            .await
+            .expect("I1751: both members seat the third");
+        // At three members M binds: two are short of three.
+        let w = seat(&mk[2], &[&f0, &mk[0]], 4);
+        consent(d, &w).await;
+        let e = d
+            .put_community_membership_widening(w)
+            .await
+            .expect_err("I1751: M binds at three");
+        assert_eq!(
+            count(&e),
+            (ROSTER_CONSENSUS_INSUFFICIENT, Some((2, 3))),
+            "{e:?}"
+        );
+        let w = seat(&mk[2], &[&f0, &mk[0], &mk[1]], 5);
+        consent(d, &w).await;
+        d.put_community_membership_widening(w)
+            .await
+            .expect("I1751: three seat the fourth");
+        // Two resign: the room of two once reached M.
+        for (i, k) in [(6, &mk[1]), (7, &mk[2])] {
+            d.put_community_membership_revocation(ts::sign_community_membership_revocation(
+                k,
+                CommunityMembershipRevocation {
+                    community_key_id: r.cid.clone(),
+                    removed_identity_key_id: k.clone(),
+                    removed_at: at_i(i),
+                    effective_at: at_i(i),
+                    reason: None,
+                    witness_set: Vec::new(),
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .expect("I1751: a resignation needs no one");
+        }
+        let w = seat(&mk[3], &[&f0, &mk[0]], 8);
+        consent(d, &w).await;
+        let e = d
+            .put_community_membership_widening(w)
+            .await
+            .expect_err("I1751: a room that reached M and shrank is stalled");
+        assert_eq!(
+            count(&e),
+            (ROSTER_CONSENSUS_INSUFFICIENT, Some((2, 3))),
+            "{e:?}"
+        );
+        assert!(!active(d, &r.cid, &mk[3]).await);
+        let record = d.lookup_community(&r.cid).await.unwrap().unwrap();
+        assert_eq!(
+            crate::federation::community_roster_high_water_at(d, &record, Utc::now())
+                .await
+                .unwrap(),
+            4,
+            "I1751: the high water is the largest roster the lineage held"
+        );
+    }
+
     pub(crate) async fn i1744_freshness_w_on_cosign_rows<D: Node>(d: &D, tag: &str) {
         let r = room(d, tag, "i1744", "majority", 4).await;
         let gone = r.founders[3].clone();
@@ -1682,6 +1790,7 @@ mod tests {
     on_every_backend!(i1743, bodies::i1743_the_window_policy);
     on_every_backend!(i1744, bodies::i1744_freshness_w_on_cosign_rows);
     on_every_backend!(i1748, bodies::i1748_a_short_refusal_carries_the_count);
+    on_every_backend!(i1751, bodies::i1751_below_m_counts_the_roster_and_m_latches);
 
     mod i1739 {
         use super::*;

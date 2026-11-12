@@ -1522,6 +1522,7 @@ pub(crate) async fn check_cosigned_withdraws(
                 direction,
                 subject,
                 persons,
+                high_water: None,
             });
             if verdict.admits() {
                 Ok(Some(rule))

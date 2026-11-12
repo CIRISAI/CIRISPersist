@@ -1677,12 +1677,17 @@ pub struct RosterEvent {
 /// the event's instant; otherwise the room's `consensus_protocol` through the
 /// ONE evaluator ([`consensus::evaluate`]). Every admitted change must also
 /// leave a founder whenever it leaves members (the last-founder rule).
+///
+/// `high_water` (CIRISPersist#1201): the largest active roster the lineage
+/// reached before `e`, from the same fold that built `state`
+/// ([`authorized_roster_high_water_at`]).
 pub fn roster_event_standing(
     rules: RosterRules<'_>,
     state: &RosterState,
+    high_water: usize,
     e: &RosterEvent,
 ) -> Result<(), (&'static str, String)> {
-    match roster_event_verdict(rules, state, e) {
+    match roster_event_verdict(rules, state, high_water, e) {
         StandingVerdict::Admit => Ok(()),
         StandingVerdict::ConsensusShort { detail, .. } => {
             Err((ROSTER_CONSENSUS_INSUFFICIENT, detail))
@@ -1735,6 +1740,7 @@ pub enum StandingVerdict {
 pub fn roster_event_verdict(
     rules: RosterRules<'_>,
     state: &RosterState,
+    high_water: usize,
     e: &RosterEvent,
 ) -> StandingVerdict {
     // v50.0.0 (CIRISPersist#925 review M2) — a `node`-bearing seat (at this
@@ -1784,6 +1790,7 @@ pub fn roster_event_verdict(
             },
             subject: Some(e.member.key_id.as_str()),
             persons: rules.persons.at(e.effective_at),
+            high_water: Some(high_water),
         }) {
             consensus::Verdict::Admit => Ok(()),
             consensus::Verdict::Unevaluable { reason } => {
@@ -1917,7 +1924,7 @@ fn fold_roster(
     rules: RosterRules<'_>,
     events: &[RosterEvent],
     as_of: chrono::DateTime<chrono::Utc>,
-) -> (RosterState, RosterSpans) {
+) -> (RosterState, RosterSpans, usize) {
     let mut ordered: Vec<RosterEvent> = events
         .iter()
         .filter(|e| e.effective_at <= as_of)
@@ -1932,6 +1939,7 @@ fn fold_roster(
         .iter()
         .map(|m| (m.key_id.clone(), None))
         .collect();
+    let mut high_water = active_count(&state);
     for e in ordered {
         if e.reversed {
             continue;
@@ -1940,8 +1948,8 @@ fn fold_roster(
         // already held under the per-key count stays in the fold: an admitted
         // row is not unsaid by a later gate (the #1200 posture). Nothing new
         // arrives that way, since every door refuses it.
-        if roster_event_standing(rules, &state, &e).is_ok()
-            || roster_event_standing(rules.counting_keys(), &state, &e).is_ok()
+        if roster_event_standing(rules, &state, high_water, &e).is_ok()
+            || roster_event_standing(rules.counting_keys(), &state, high_water, &e).is_ok()
         {
             let was_active = matches!(state.get(&e.member.key_id), Some((true, _)));
             if !e.is_add {
@@ -1950,9 +1958,40 @@ fn fold_roster(
                 spans.insert(e.member.key_id.clone(), Some(e.effective_at));
             }
             state.insert(e.member.key_id.clone(), (e.is_add, e.member));
+            high_water = high_water.max(active_count(&state));
         }
     }
-    (state, spans)
+    (state, spans, high_water)
+}
+
+/// The active members of a fold state.
+fn active_count(state: &RosterState) -> usize {
+    state.values().filter(|(active, _)| *active).count()
+}
+
+/// CIRISPersist#1201 (CC 4.4.3.4.2.1) — **the lineage's high-water roster
+/// size at `as_of`**: the largest number of active members the group has held
+/// at once, over the record and every event the authorized fold admits up to
+/// `as_of`. A fold over persisted rows, never a stored flag: the same replay
+/// as [`authorized_roster_state_at`] (one loop, so the two cannot disagree).
+/// The `quorum:M/N` gate reads it as the latch "has this group ever reached
+/// `M`" ([`consensus::quorum_need`]); as a size it also answers a later change
+/// of `M`.
+///
+/// Counted by key, where the gate counts persons: a person seated under two
+/// keys raises the high water early, which only latches `M` sooner (the
+/// stricter direction).
+///
+/// TODO(CIRISPersist#1253): carry the high water on the signed `group:roster`
+/// head, so a node that holds the head and not the whole lineage can read it.
+#[must_use]
+pub fn authorized_roster_high_water_at(
+    record_members: &[types::CommunityMember],
+    rules: RosterRules<'_>,
+    events: &[RosterEvent],
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    fold_roster(record_members, rules, events, as_of).2
 }
 
 /// v49.0.0 (CIRISPersist#908) — the active members of
@@ -2045,11 +2084,13 @@ fn root_authority_intervals(
         .filter(|r| is_f(&state, r))
         .map(|r| (r.clone(), chrono::DateTime::<chrono::Utc>::MIN_UTC))
         .collect();
+    let mut high_water = active_count(&state);
     for e in ordered {
-        if e.reversed || roster_event_standing(rules, &state, &e).is_err() {
+        if e.reversed || roster_event_standing(rules, &state, high_water, &e).is_err() {
             continue;
         }
         state.insert(e.member.key_id.clone(), (e.is_add, e.member.clone()));
+        high_water = high_water.max(active_count(&state));
         let k = &e.member.key_id;
         if !roots.contains(k) {
             continue;
@@ -2599,6 +2640,32 @@ where
     ))
 }
 
+/// CIRISPersist#1201 (CC 4.4.3.4.2.1) — **the one read of a community's
+/// high-water roster size**: [`authorized_roster_high_water_at`] over the
+/// community's record and roster events, as [`authorized_community_roster_at`]
+/// folds them. `quorum:M/N` binds absolutely once this reaches `M`.
+pub async fn community_roster_high_water_at<F>(
+    directory: &F,
+    community: &Community,
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Result<usize, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let nodes = Box::pin(community_node_bearing_seats(directory, community)).await?;
+    let persons = Box::pin(community_key_selves(directory, community)).await?;
+    let events = Box::pin(community_roster_events(
+        directory, community, &nodes, &persons,
+    ))
+    .await?;
+    Ok(authorized_roster_high_water_at(
+        &community.members,
+        RosterRules::of_community(community, &nodes).with_persons(&persons),
+        &events,
+        as_of,
+    ))
+}
+
 /// v49.0.0 (CIRISPersist#908; group-generic since #910) — judge one incoming
 /// roster row against the group's authorized state at `effective_at`, built
 /// from `events` WITHOUT the row itself (an exact retry of a stored row — the
@@ -2635,7 +2702,7 @@ where
     // retry of a held row is not a new removal.
     let held_retry = events.iter().any(is_this_row);
     let events: Vec<RosterEvent> = events.into_iter().filter(|e| !is_this_row(e)).collect();
-    let state = authorized_roster_state_at(record_members, rules, &events, effective_at);
+    let (state, _, high_water) = fold_roster(record_members, rules, &events, effective_at);
     let moderator_roots = match moderation_roots {
         Some(mut roots) if !is_revocation || held_retry => {
             if !is_revocation && incoming.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER) {
@@ -2681,7 +2748,7 @@ where
         };
     // v61.3.0 (CIRISPersist#1252) — the verdict, the shortfall split out.
     // v61.4.0 (CIRISPersist#1250) — the refusal carries the count.
-    let short = match roster_event_verdict(rules, &state, &e) {
+    let short = match roster_event_verdict(rules, &state, high_water, &e) {
         StandingVerdict::Admit => None,
         StandingVerdict::ConsensusShort { detail, shortfall } => {
             Some(refusal(ROSTER_CONSENSUS_INSUFFICIENT, &detail, shortfall))
@@ -8273,6 +8340,7 @@ pub trait FederationDirectory: Send + Sync {
                 direction,
                 subject: None,
                 persons,
+                high_water: None,
             }) {
                 consensus::Verdict::Admit => {}
                 consensus::Verdict::Insufficient { detail, .. } => {

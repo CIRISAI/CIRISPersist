@@ -1065,6 +1065,7 @@ where
         subject: None,
         // The trust root's chain keeps the per-key count (CIRISPersist#1198).
         persons: super::key_person::PersonsAt::each_key(),
+        high_water: None,
     });
     if !verdict.admits() {
         return Err(Error::RosterAuthorityUnauthorized {
@@ -3923,6 +3924,7 @@ where
         subject: None,
         // The trust root's chain keeps the per-key count (CIRISPersist#1198).
         persons: super::key_person::PersonsAt::each_key(),
+        high_water: None,
     });
     match verdict {
         super::consensus::Verdict::Admit => Ok(Ok(signers)),

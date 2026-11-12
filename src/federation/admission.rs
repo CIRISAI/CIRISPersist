@@ -4681,6 +4681,7 @@ async fn community_quorum_cosigned_at(
         subject: None,
         // Read at every licence walk over rows already held: left per key.
         persons: super::key_person::PersonsAt::each_key(),
+        high_water: None,
     })
     .admits())
 }
