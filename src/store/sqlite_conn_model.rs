@@ -204,6 +204,34 @@ impl std::fmt::Debug for ReadPool {
     }
 }
 
+/// CIRISPersist#1261 — make the writer create the WAL's `-wal` and `-shm`
+/// files before any read-only reader opens. `journal_mode = WAL` alone does
+/// not create them; the first connection to TOUCH the database does. On
+/// Linux a read-only reader may create them itself, but Apple's SQLite
+/// (macOS, iOS) refuses: the reader's first file access fails with
+/// SQLITE_CANTOPEN, errno ENOENT. 61.2.2 made that access happen inside
+/// [`ReadPool::open`] (#1246's per-reader `cache_size`), so every
+/// file-backed open failed on macOS. One read on the writer opens the WAL
+/// index and leaves both files in place for as long as the writer lives.
+pub fn materialize_wal(writer: &Connection) -> rusqlite::Result<()> {
+    writer
+        .query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map(|_| ())
+}
+
+/// The `sqlite open readers` error: reader index, step, SQLite's extended
+/// result code, path. (The OS errno would need `sqlite3_system_errno` on the
+/// raw handle, which is `unsafe`; persist is `#![deny(unsafe_code)]`.)
+fn reader_open_error(reader: usize, step: &str, path: &str, e: &rusqlite::Error) -> String {
+    let ext = match e {
+        rusqlite::Error::SqliteFailure(f, _) => f.extended_code.to_string(),
+        _ => "n/a".to_string(),
+    };
+    format!("reader {reader} {step}: {e} (extended code {ext}, path {path:?})")
+}
+
 impl ReadPool {
     /// A pool with no readers. Reads on a backend holding this pool go to
     /// the writer.
@@ -223,24 +251,41 @@ impl ReadPool {
     /// Per-connection PRAGMAs are re-applied here because they are
     /// per-connection state (`foreign_keys` is the one people forget);
     /// `query_only = ON` is a second fence behind `SQLITE_OPEN_READ_ONLY`.
-    pub fn open(path: &str, n: usize, tuning: &SqliteTuning) -> Result<Arc<Self>, rusqlite::Error> {
+    ///
+    /// CIRISPersist#1261 — the caller must also have run
+    /// [`materialize_wal`] on the writer: a read-only connection cannot
+    /// create the `-wal`/`-shm` files on Apple's SQLite.
+    ///
+    /// The error names the reader, the step that failed, SQLite's extended
+    /// result code and the path.
+    pub fn open(path: &str, n: usize, tuning: &SqliteTuning) -> Result<Arc<Self>, String> {
         let mut free = Vec::with_capacity(n);
-        for _ in 0..n {
+        for i in 0..n {
             let conn = Connection::open_with_flags(
                 path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY
                     | OpenFlags::SQLITE_OPEN_NO_MUTEX
                     | OpenFlags::SQLITE_OPEN_URI,
-            )?;
-            conn.execute_batch(
-                "PRAGMA foreign_keys = ON;\n\
-                 PRAGMA busy_timeout = 30000;\n\
-                 PRAGMA query_only = ON;",
+            )
+            .map_err(|e| reader_open_error(i, "open", path, &e))?;
+            let step = |what: &'static str, r: rusqlite::Result<()>| {
+                r.map_err(|e| reader_open_error(i, what, path, &e))
+            };
+            step(
+                "pragmas",
+                conn.execute_batch(
+                    "PRAGMA foreign_keys = ON;\n\
+                     PRAGMA busy_timeout = 30000;\n\
+                     PRAGMA query_only = ON;",
+                ),
             )?;
             // #1246 — page cache and mmap, the same as the writer's.
-            apply_tuning(&conn, tuning)?;
+            step("tuning", apply_tuning(&conn, tuning))?;
             // #784 — per-connection state, like the pragmas above.
-            crate::federation::key_digest::register_sqlite_fn(&conn)?;
+            step(
+                "key_digest fn",
+                crate::federation::key_digest::register_sqlite_fn(&conn),
+            )?;
             // A rendered attestation query varies by shape, not by value, so
             // its text repeats. The cache must hold every live shape or a
             // cycling read re-parses each call; rusqlite's default is 16.
@@ -1605,6 +1650,87 @@ mod witnesses {
         let dir = std::env::temp_dir().join(format!("ciris-829-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("store.db").to_string_lossy().into_owned()
+    }
+
+    fn wal_files(path: &str) -> (bool, bool) {
+        (
+            std::path::Path::new(&format!("{path}-wal")).exists(),
+            std::path::Path::new(&format!("{path}-shm")).exists(),
+        )
+    }
+
+    /// I1723 (CIRISPersist#1261) — `journal_mode = WAL` alone leaves no
+    /// `-wal`/`-shm` on disk; [`super::materialize_wal`] on the writer
+    /// creates both. Apple's SQLite will not let a read-only reader create
+    /// them, so they must exist before `ReadPool::open` runs. The "before"
+    /// half pins that the property is measured, not vacuous.
+    #[test]
+    fn i1723_the_writer_creates_the_wal_files_before_any_reader() {
+        let path = temp_db_path("i1723");
+        let w = rusqlite::Connection::open(&path).unwrap();
+        let w = SqliteBackend::apply_connection_settings(w).unwrap();
+        assert_eq!(
+            wal_files(&path),
+            (false, false),
+            "journal_mode = WAL already created -wal/-shm: the witness measures nothing"
+        );
+        super::materialize_wal(&w).unwrap();
+        assert_eq!(
+            wal_files(&path),
+            (true, true),
+            "the writer must leave -wal and -shm for the read-only readers (#1261)"
+        );
+    }
+
+    /// I1724 (CIRISPersist#1261) — a file-backed open with readers succeeds
+    /// on a NEW file and again on RESTART, and every reader reads. On macOS
+    /// (the darwin CI job) this is the reproduction: 61.2.2 refused both
+    /// with "sqlite open readers: unable to open database file".
+    #[tokio::test]
+    async fn i1724_a_file_backed_open_with_readers_succeeds_fresh_and_on_restart() {
+        let path = temp_db_path("i1724");
+        for round in ["fresh", "restart"] {
+            let b = SqliteBackend::open_with_readers(path.clone(), 3)
+                .await
+                .unwrap_or_else(|e| panic!("{round} open: {e}"));
+            assert_eq!(b.read_pool_handle().size(), 3, "{round}");
+            for _ in 0..3 {
+                let n: rusqlite::Result<i64> = b
+                    .read(|c| c.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0)))
+                    .await;
+                n.unwrap_or_else(|e| panic!("{round} read: {e}"));
+            }
+            drop(b);
+        }
+    }
+
+    /// I1725 (CIRISPersist#1261 ask 2) — a reader that cannot open says
+    /// which step failed, SQLite's extended result code and the path.
+    #[test]
+    fn i1725_a_reader_open_failure_names_the_step_the_code_and_the_path() {
+        let dir = std::env::temp_dir().join(format!("ciris-1725-{}", uuid::Uuid::new_v4()));
+        let path = dir
+            .join("absent")
+            .join("store.db")
+            .to_string_lossy()
+            .into_owned();
+        let e = match super::ReadPool::open(
+            &path,
+            1,
+            &super::SqliteTuning {
+                mmap_bytes: super::DEFAULT_MMAP_BYTES,
+                cache_kib: super::DEFAULT_CACHE_KIB,
+            },
+        ) {
+            Ok(_) => panic!("a read-only open of a path in a missing directory succeeded"),
+            Err(e) => e,
+        };
+        assert!(e.contains("reader 0 open:"), "{e}");
+        assert!(
+            e.contains("extended code 14"),
+            "SQLITE_CANTOPEN's code: {e}"
+        );
+        assert!(e.contains(&format!("{path:?}")), "the path: {e}");
     }
 
     /// Hold the WRITER mutex from a plain thread for `hold`, signalling once
