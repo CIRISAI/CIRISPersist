@@ -8353,6 +8353,62 @@ impl Engine {
         }
     }
 
+    /// v61.4.0 — **the seat door (CC C559, DERIVED, pending text)**: call it
+    /// when this node's roster fold gains `member_key_id` in
+    /// `community_key_id`. Where THIS node is a minter in the room it gives
+    /// the newcomer the current epoch key now, without a content write:
+    /// nothing due → its current epoch DEK is wrapped to the newcomer's live
+    /// devices (no mint); a rotation due (a removal effective after its
+    /// current epoch was minted) → its own counter rotates at the seat, the
+    /// new epoch is minted with no content and wrapped to every current
+    /// member's live devices. Either way the epoch-axis `key_grant` rows are
+    /// emitted through the path a seal uses ([`Self::emit_key_grant`]).
+    /// A keyless device is excluded (never a plaintext fallback); an epoch
+    /// another node minted is reported, never touched; a re-run adds nothing.
+    /// See [`community_dek::orchestrate::seat_community_member`](crate::federation::community_dek::orchestrate::seat_community_member).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn seat_community_member(
+        &self,
+        community_key_id: &str,
+        member_key_id: &str,
+    ) -> Result<
+        crate::federation::community_dek::orchestrate::SeatOutcome,
+        crate::federation::BlobError,
+    > {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        use crate::federation::community_dek::orchestrate::seat_community_member;
+        let minter = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("local derived key id: {e}"))
+        })?;
+        let now = chrono::Utc::now();
+        let seat = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                seat_community_member(arc.as_ref(), community_key_id, &minter, member_key_id, now)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                seat_community_member(arc.as_ref(), community_key_id, &minter, member_key_id, now)
+                    .await
+            }
+        }?;
+        let emission = match (seat.emit, seat.epoch) {
+            (true, Some(epoch)) => {
+                self.emit_key_grant(&crate::federation::key_grant::KeyGrantAxis::Epoch {
+                    community_key_id: community_key_id.to_owned(),
+                    minter_key_id: minter.clone(),
+                    epoch,
+                })
+                .await?
+            }
+            _ => None,
+        };
+        Ok(crate::federation::community_dek::orchestrate::SeatOutcome { seat, emission })
+    }
+
     /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **a member's
     /// new device receives exactly what the member holds**: every retained
     /// `(community, minter, epoch)` DEK the member holds a grant on is

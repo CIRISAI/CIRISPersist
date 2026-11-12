@@ -24479,6 +24479,42 @@ impl PyEngine {
         })
     }
 
+    /// v61.4.0 — **the seat door (CC C559, DERIVED, pending text)**: call it
+    /// when this node's roster fold gains `member_key_id` in
+    /// `community_key_id`. Where this node is a minter in the room it wraps
+    /// its current epoch key to the newcomer's live devices now (nothing
+    /// due: no mint), or rotates its own counter at the seat (a removal
+    /// effective after its current epoch was minted: the new epoch is minted
+    /// with no content and wrapped to every current member's live devices),
+    /// and emits the epoch-axis `key_grant` rows. A keyless device is
+    /// excluded; an epoch another node minted is reported, never touched; a
+    /// re-run adds nothing. JSON `{seat: {community_key_id, minter_key_id,
+    /// skipped, epoch, minted, rotated_from, granted, newcomer_granted,
+    /// excluded, minted_elsewhere: [[minter, epoch]], emit}, emission:
+    /// null | {axis, attestation_ids, already_emitted, withheld, deferred,
+    /// sealer_refused, misbuilt}}`; `skipped` is `not_a_member` or
+    /// `not_a_minter` when nothing was done.
+    fn seat_community_member_json(
+        &self,
+        py: Python<'_>,
+        community_key_id: &str,
+        member_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let (comm, member) = (community_key_id.to_owned(), member_key_id.to_owned());
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let r = self
+                    .runtime
+                    .block_on(engine.seat_community_member(&comm, &member))
+                    .map_err(blob_err_to_py)?;
+                serde_json::to_string(&r)
+                    .map_err(|e| PyRuntimeError::new_err(format!("seat encode: {e}")))
+            })
+        })
+    }
+
     /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **the minter
     /// side of the second device, on demand**: re-wrap every retained epoch
     /// THIS node minted to each device of an active member that does not hold

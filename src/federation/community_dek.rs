@@ -755,6 +755,169 @@ pub mod orchestrate {
         })
     }
 
+    /// v61.4.0 (CC C559, DERIVED, pending text) — what one
+    /// [`seat_community_member`] did in one room.
+    #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+    pub struct SeatReport {
+        /// The room.
+        pub community_key_id: String,
+        /// This node's minter key (its own counter is the only one touched).
+        pub minter_key_id: String,
+        /// Why nothing was done, when nothing was: `not_a_member` (the
+        /// member is not on the room's authorized roster now) or
+        /// `not_a_minter` (this node has minted no epoch in the room; its
+        /// first seal mints one).
+        pub skipped: Option<&'static str>,
+        /// This node's current epoch after the seat.
+        pub epoch: Option<u64>,
+        /// The seat minted `epoch` (a rotation was due). Never true when
+        /// nothing was due.
+        pub minted: bool,
+        /// This node's newest epoch BEFORE the seat, when the seat rotated
+        /// past it.
+        pub rotated_from: Option<u64>,
+        /// Every occurrence this call wrote a grant for at `epoch`.
+        pub granted: Vec<String>,
+        /// The newcomer's own occurrences among `granted`.
+        pub newcomer_granted: Vec<String>,
+        /// Occurrences excluded fail-secure (no usable content-KEM keys):
+        /// no grant, never a plaintext fallback.
+        pub excluded: Vec<String>,
+        /// Other minters' newest epochs this node knows in the room (by a
+        /// grant to this node): REPORTED, never touched. Each minter seats
+        /// the newcomer into its own epoch.
+        pub minted_elsewhere: Vec<(String, u64)>,
+        /// The epoch's `key_grant:epoch:v1` rows are owed (a grant was
+        /// written, the DEK minted, or the set is dirty per the V146 ledger).
+        pub emit: bool,
+    }
+
+    /// v61.4.0 — **the seat door (CC C559, DERIVED, pending text)**: a host
+    /// calls it when its roster fold gains `member_key_id` in
+    /// `community_key_id`; THIS node, where it is a minter in the room,
+    /// gives the newcomer its current epoch key without waiting for a seal.
+    ///
+    /// The one path a seal uses ([`ensure_epoch_dek`]), with no content:
+    ///
+    /// 1. nothing due: this node's CURRENT epoch DEK is recovered and
+    ///    wrapped to every current member occurrence not yet holding it (the
+    ///    newcomer's live devices) — no mint, no epoch bump;
+    /// 2. rotation due (§15: a removal effective after the current epoch was
+    ///    minted; #963: a holder left the fan-out; or this node's counter was
+    ///    already bumped past its newest minted epoch by a removal): the
+    ///    rotation happens at the seat — this minter's own counter is bumped,
+    ///    the new epoch is minted with NO content, and wrapped to every
+    ///    current member's live devices, the newcomer included. "Due" clears
+    ///    at the mint, so a second seat mints nothing.
+    ///
+    /// Fail-secure: a keyless occurrence is excluded and reported, never
+    /// wrapped in the clear. Only this node's own counter moves; an epoch
+    /// another node minted is reported in
+    /// [`SeatReport::minted_elsewhere`] and never touched. Idempotent: a
+    /// re-run writes nothing. The caller emits the epoch's rows when
+    /// [`SeatReport::emit`] says so (`Engine::seat_community_member` does).
+    pub async fn seat_community_member<B>(
+        backend: &B,
+        community_key_id: &str,
+        minter_key_id: &str,
+        member_key_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<SeatReport, BlobError>
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        let mut report = SeatReport {
+            community_key_id: community_key_id.to_owned(),
+            minter_key_id: minter_key_id.to_owned(),
+            ..SeatReport::default()
+        };
+        let community = backend
+            .lookup_community(community_key_id)
+            .await
+            .map_err(map_dir_err)?
+            .ok_or_else(|| {
+                BlobError::InvalidArgument(format!(
+                    "seat_community_member names unknown community {community_key_id:?}"
+                ))
+            })?;
+        // Other minters' epochs this node holds a grant of: reported only.
+        let me = vec![minter_key_id.to_owned()];
+        let mut elsewhere: std::collections::BTreeMap<String, u64> = Default::default();
+        for (m, e) in backend
+            .community_dek_member_grant_epochs(community_key_id, &me)
+            .await?
+        {
+            if m != minter_key_id {
+                let slot = elsewhere.entry(m).or_insert(e);
+                *slot = (*slot).max(e);
+            }
+        }
+        report.minted_elsewhere = elsewhere.into_iter().collect();
+        if !crate::federation::authorized_community_roster_at(backend, &community, now)
+            .await
+            .map_err(map_dir_err)?
+            .iter()
+            .any(|m| m.key_id == member_key_id)
+        {
+            report.skipped = Some("not_a_member");
+            return Ok(report);
+        }
+        let minted_before = backend
+            .community_dek_epochs(community_key_id, minter_key_id)
+            .await?;
+        let Some(newest) = minted_before.iter().map(|(e, _)| *e).max() else {
+            report.skipped = Some("not_a_minter");
+            return Ok(report);
+        };
+        let current = backend
+            .community_dek_current_epoch(community_key_id, minter_key_id)
+            .await?;
+        let held_before: std::collections::HashSet<String> = backend
+            .community_dek_member_grant_recipients(community_key_id, minter_key_id, current)
+            .await?
+            .into_iter()
+            .collect();
+        let ensured = ensure_epoch_dek(backend, community_key_id, minter_key_id, current).await?;
+        report.epoch = Some(ensured.epoch);
+        report.minted = !minted_before.iter().any(|(e, _)| *e == ensured.epoch);
+        if report.minted {
+            report.rotated_from = Some(newest);
+        }
+        let newcomer: std::collections::HashSet<String> = backend
+            .list_identity_occurrences_active(member_key_id)
+            .await
+            .map_err(map_dir_err)?
+            .into_iter()
+            .map(|o| o.occurrence_key_id)
+            .collect();
+        for r in backend
+            .community_dek_member_grant_recipients(community_key_id, minter_key_id, ensured.epoch)
+            .await?
+        {
+            if ensured.epoch == current && held_before.contains(&r) {
+                continue;
+            }
+            if newcomer.contains(&r) {
+                report.newcomer_granted.push(r.clone());
+            }
+            report.granted.push(r);
+        }
+        report.excluded = ensured.report.excluded;
+        report.emit = ensured.changed;
+        Ok(report)
+    }
+
+    /// v61.4.0 — what [`Engine::seat_community_member`](crate::Engine::seat_community_member)
+    /// did: the seat, and the epoch-axis rows it emitted (`None` when none
+    /// were owed).
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    pub struct SeatOutcome {
+        /// The seat.
+        pub seat: SeatReport,
+        /// The emission, when rows were owed.
+        pub emission: Option<crate::federation::key_grant::KeyGrantEmission>,
+    }
+
     /// Encrypt `plaintext` under the community's CURRENT-epoch shared DEK,
     /// store the ciphertext envelope, bind it to `(community, minter,
     /// epoch)`, and (on first emission in the epoch) wrap the DEK to every

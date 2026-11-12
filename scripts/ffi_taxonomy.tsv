@@ -434,6 +434,9 @@ Engine	rekey_self_occurrence_add_json	deontic
 Engine	rekey_family_member_add_json	deontic	
 Engine	rekey_community_member_device_add_json	deontic	
 Engine	rewrap_own_epochs_to_member_devices_json	deontic	
+# v61.4.0 (CC C559) — the seat door is DEONTIC: it wraps the epoch DEK to a
+# newcomer (or rotates and mints) and emits the rows; a wrong stub grants a key.
+Engine	seat_community_member_json	deontic	
 Engine	list_identity_occurrences_for_json	ontological	
 Engine	list_live_occurrences	ontological	
 Engine	list_llm_calls	empirical	
