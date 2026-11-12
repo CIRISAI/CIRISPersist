@@ -315,6 +315,41 @@ For persist:
 
 §5.4 (incremental evaluation) and §6.3 (divergence reports) are organised on this frame.
 
+### 4.3 A worked example of the merge law: ranked choice (CC 4.5.13, rc19)
+
+Eric: "make sure we support ranked choice voting natively". CC 4.5.13 defines ranked choice once, for any choice
+among options, and its definition **is** the merge law [T, read at rc19]:
+
+- **SUMMARY**: a count per ranking. It is a commutative monoid that merges by adding, kept up to date per ballot:
+  `Summary = BTreeMap<RankingId, u64>`, `merge(a, b)` adds per key, and `empty` is the empty map. At most
+  `k + k(k−1) + k(k−1)(k−2)` cells for 3 ranks. CC: "The tally is a sum, so it is the same in whatever order the
+  ballots arrived, and two tallies of separate parts add to the tally of the whole."
+- **One ballot per person, `pick=agree`**: "a person whose ballots disagree has none". This is the one
+  non-monotone step, and it sits **before** the sum. Each person's ballots fold to `Agree(ranking) | None`, and
+  the summary adds the resolved value. Because counts are integers (an abelian group, not just a monoid), a
+  person's second ballot updates the summary in O(1): subtract their old resolved value, add the new one. The
+  standing set "at the count" (`moderator_election`: "member, one voice a person, the set at the count") is an
+  invalidation edge on `Roster(group)`: a member's removal subtracts their contribution.
+- **FINISH**: instant runoff over the summary alone, in whole numbers, in fewer rounds than there are options. A
+  tie for weakest goes against the option later in the declared order.
+
+So ranked choice is native in the kernel's sense: one `MergeLedger` instance (§4.1 #1), keyed by stable ranking
+id (never by option index), with a pure finish. The law test is the same as `holon/tests/laws.rs`: forward and
+shuffled folds of the resolved ballots give equal summaries by struct equality.
+
+**Today:**
+
+- Persist has **no** ranked door. `ballot:moderator` is "registered and not gated", and `governance_policy.rs:555-563`
+  reads `moderator_election` as "a `ranked` row persist has no door for" [T].
+- cewp-kernel's `irv` (`processor.rs:20-78`) differs from CC 4.5.13 in three places [T]:
+  - it keeps the **last-inserted** ballot per signer (`seen.insert`), which is order-dependent, where CC says
+    disagreeing ballots count as none;
+  - it breaks a tie for weakest by **lexicographic id** (`losers.sort()`), where CC says against the later option in
+    the declared order;
+  - it refolds the ballots every round, where CC finishes from the summary.
+
+  §7's convergence fixes all three.
+
 What does **not** transfer: the f64 tiers, conditioning, rent decay as physics, and MPS truncation. Every kernel
 verdict is integer arithmetic over signed inputs (FINAL_REFACTOR §5.3). `RentLedger`'s tolerance law
 (`merge.rs` [T]) is the warning: a fold that needs a tolerance is not order-free, and the kernel does not have
@@ -700,6 +735,13 @@ to the row, and the quotas are sized from the canonical.
 | a **stranger** (no registered key) | **first-held + 1 h** | per origin 1 MB (~90 rows); a pool of 8 MB across all strangers | one sync round for a parent in flight (typically the key record itself). Strangers can't be told apart, so their pool is shared and small |
 | **global** | | a park inbox of 128 MB (~20 days of peak intake; ~7% of the canonical file) | an operator setting that decides storage, never a verdict (FINAL_REFACTOR §5.1 tier 3) |
 
+**CC accepted this table as the W8 placement cell.** Lapses and quotas are **storage, never a verdict**. They
+decide whether this node keeps a copy, never what a row means. Named property **P-QUOTA (quota independence):
+two nodes with different quotas and lapses reach the same verdict on every row they both hold.** A row one node
+dropped at lapse is simply not held there; it never becomes "refused" there. Harnesses 3 and 4 (§6.2) check
+P-QUOTA by running each fixture under two quota profiles (the table above, and every quota at 1 row with every
+lapse at its floor) and comparing digests over the intersection of the rows held.
+
 **On lapse:** drop the local copy, count it as `persist_park_lapsed_total{origin_class, token}`, and keep nothing
 but the counter. Dropping is a storage act, not a verdict. The row stays re-offerable, and a re-offer is a new
 arrival with a new first-held instant. **On quota:** the oldest parked row of that origin lapses first. It is
@@ -745,9 +787,11 @@ There are six harnesses. They are named here and not built.
 3. **Permutation run.** For each fixture's row set (up to 6 rows: every order; above that, 200 seeded orders),
    offer the rows to a fresh store in each order and compare the kernel's output `digest`. This is the kernel's
    P5/D6/G11. A failure is a witness pair. The harness asserts that each shuffle is a permutation and not the
-   identity (Holon's "plant is vacuous" check, §4.1 #5).
+   identity (Holon's "plant is vacuous" check, §4.1 #5). It also runs each fixture under two quota and lapse
+   profiles and compares digests over the rows both hold (**P-QUOTA**, §5.9a).
 4. **Commuting square.** For generated `(S, r)`: `cached_answer(S) ⊕ invalidate(touches(r))` against
-   `fresh_answer(S ∪ {r})`. This is the certificate the answer cache must hold (§5.4).
+   `fresh_answer(S ∪ {r})`. This is the certificate the answer cache must hold (§5.4). Under P-QUOTA, a lapse is a
+   removal from `S`, and the square must close for removals as for arrivals.
 5. **Planted mutations.** `KernelMutation` (§4.1 #8). The must-convict set has to move a digest or fail a vector:
    `DropOnRefuse`, `StampAtDoor`, `LastProcessedWarmStart` (a cache that remembers its last update), and
    `MissingInvalidationEdge` (drop a `Slot` key from `reads`). The must-not-move set has to leave every digest
@@ -996,13 +1040,14 @@ The kernel is held to a cost class per rule cell, not per family. Counts are fro
 | fold `over` a counted set (standing, person) | 17 [T] | per-row roster refold (the 61.3.0 cost) | O(1) per arrival after one stratum-0 fold per batch |
 | reaction with `unless` | 10 of 58 reacts [T] | sweep scans | non-monotone: an invalidation edge on the `unless` event |
 | clocks, expiries | 19 clocks, 20 expiries [T] | seven periodic sweeps (§2.2 #35) | O(log w) on a wake heap; no scans |
+| **ranked choice** (CC 4.5.13; `moderator_election`, any declared choice, the secret poll's tally) | one summary per choice | no door today (§4.3) | **O(1) per ballot** (resolve `pick=agree`, then add or subtract one cell); **finish O(k · cells) per round, fewer than k rounds**, so at most ~k² · L(k, 3): about 25,600 cell visits at k = 8. Whole numbers only. Cost class `Join` per ballot plus a bounded `Finish` |
 
 **Holding the implementation to it.** Every compiled rule cell carries its `CostClass`. CC will publish
 per-transition classes through `tools/kernel_cost.py`, and the build refuses a table whose class differs from the
 kernel's own classification. Each class has a bench, so the budget is enforced per class:
 
 ```rust
-pub enum CostClass { Probe, NonMonotoneProbe, Linear { over: SlotId }, Join, OrderStat, Wake }
+pub enum CostClass { Probe, NonMonotoneProbe, Linear { over: SlotId }, Join, OrderStat, Wake, Finish { rounds_lt: u32 } }
 impl Kernel { pub fn cost_class(&self, cell: CellRef) -> CostClass; }
 ```
 
@@ -1407,6 +1452,109 @@ with use (production holds none of these yet, §13.2a point 4):
 | 2 | I2 group KEK for self/family, rotating on removal **and** device revocation | CC ruling (CC 4.4.3.4.1) + store | removes A2: about 115 KB → 60 B per sealed write in a 5 × 3 family |
 | 3 | I3 history grant | CC + store | A3 from O(H) × D rows to D rows |
 | 4 | I4 sign-once wrap set | CC re-admission (W19) + kernel | A4 ~80% fewer bytes per minter per removal |
+
+### 13.8 The secret ranked poll: a cell layout for CC 6.1.9 (persist's proposal)
+
+**What CC fixes** (rc19, read [T]):
+
+- CC 4.5.13: "A node keeps a tally of how many ballots carry each ranking, and finishes the count from that tally
+  alone… A secret poll (CC 6.1.9) carries one cell for each ranking, and its composite is that same tally."
+- CC 6.1.9: a member's community cell is a one-hot "over the poll's options plus *none*", split into two
+  additive shares over a prime field with a one-hot validity proof (Prio3 histogram). It is sealed under the
+  community's epoch key and sent as `census:member:share:v1` to two tally members drawn by
+  `H(group_exporter_secret ‖ period)`. The result is `ballot:tally:{poll_id}:v1`, which every member recomputes.
+  Every eligible member emits its cell every period "at the fixed size, whether or not a poll is open".
+
+What persist shapes is the **layout**: how a ranking becomes a cell, how cells stay secret, how tallies merge,
+and what it costs.
+
+**1. The domain: one cell per ranking, plus none.** For k options and r ranks (r = 3 unless the poll declares
+otherwise), a ballot is a sequence of 1..r distinct options. The cell count is
+
+```
+L(k, r) = 1 (none) + Σ_{j=1..min(r,k)} k! / (k−j)!        r = 3:  1 + k + k(k−1) + k(k−1)(k−2)
+```
+
+A one-hot over this domain makes an invalid ballot (a repeated option, more than r ranks, two rankings at once)
+**unrepresentable**: the validity proof ("every entry 0 or 1, the entries summing to 1") already admits exactly
+one ranking or none. No extra ballot check is needed.
+
+Why not r one-hots of k + 1 cells, one per rank position (27 cells at k = 8, not 401)? Because they lose the joint
+ranking. Instant runoff transfers a ballot to its *next standing* choice, which needs the whole ranking. CC's one
+cell per ranking is the smallest summary from which the count finishes.
+
+**2. Addressing: by stable id, never by position** (Holon's "join by stable id, never by array index", §4.1).
+
+- **Options are named, not numbered.** The poll record (sealed, signed, carrying `poll_id`) lists its options as
+  `option_id = H("ciris/poll-option/v1" ‖ poll_id ‖ canonical option body)`, plus the **declared order** used
+  only for the tie-break (CC 4.5.13: "goes against the option later in the choice's declared order").
+- **A cell's id is its ranking:** `cell_id = H("ciris/poll-cell/v1" ‖ poll_id ‖ j ‖ option_id_1 ‖ … ‖
+  option_id_j)`, and `none` is `H("ciris/poll-cell/v1" ‖ poll_id ‖ 0)`.
+- **The vector position is derived, never stored.** The Prio3 vector needs positions. They come from a canonical
+  enumeration fixed by the poll record: rankings ordered by length, then lexicographically by option id **as
+  sorted by id** (not by declared order). The position of a ranking is its rank in that enumeration, computed by
+  the factorial-base formula. Positions exist only inside a share vector. Every row that leaves the tally
+  members (partials, composite, tally) carries counts keyed by `cell_id`, or a dense vector together with the
+  enumeration's digest `H(sorted option ids ‖ r)`, so a reader re-derives the mapping and never trusts an index.
+- **A changed option set is a different poll.** Positions are a function of the option set, so amending the
+  options mints a new `poll_id`; nothing is re-indexed in place.
+
+**3. Secrecy until the tally.** Unchanged from CC 6.1.9, applied to the ranking domain:
+
+- The member's node encodes its ranking as the one-hot of length L(k, r), splits it into two additive shares
+  over the field, and seals each share, with its share of the validity proof, under the community epoch key, in a
+  `census:member:share:v1` addressed to one tally member (`for_key_id`).
+- Neither tally member sees a vector. Each sums the shares it accepts into a **partial** keyed by `cell_id`,
+  deletes the shares, and publishes `census:member:partial:v1`. `ballot:tally:{poll_id}:v1` is
+  `partial_a + partial_b` element-wise, and every member recomputes it.
+- **Fixed size.** The field a poll fills must be the same size in every period and every community, whether or
+  not a poll is open. So the community record declares `poll_k_max` (and r), and the poll field is always
+  L(k_max, r) cells. A smaller poll uses the k_max enumeration with its k options (sorted by id) in
+  the first k slots and k_max − k **phantom** slots that no ballot may rank. The rankings that touch a phantom
+  slot are valid one-hot space that stays zero.
+  Without a declared k_max, the field size would reveal k.
+
+**4. A composite is the merge of per-cell counts.** Tallies are maps `cell_id → u64` that merge by adding per key
+(§4.3). The partials, the composite and the tally of the whole are the same monoid: `tally(A ∪ B) = tally(A) +
+tally(B)`, whatever the order. The finish (instant runoff) reads only the merged tally, in whole numbers, in fewer
+rounds than there are options.
+
+**5. Byte cost per member per period** (r = 3). The share field is assumed to be Field128 (16 B), the helper's
+measurement share is a 32 B seed, and the proof share is about 2·⌈√L⌉ field elements. **Those are [B]**: the
+Prio3 parameters are whatever CC's registered `aggregation_algorithm_id` names, and the numbers move with it.
+
+| k | cells L | leader share | helper share | proof share (≈) | tally / composite (dense, 16 B/cell) | two share rows: leader (share + proof) + helper (seed + proof) + 2 × 4,500 B signatures |
+|---:|---:|---:|---:|---:|---:|---:|
+| 3 | 16 | 256 B | 32 B | 128 B | 256 B | ~9.5 KB |
+| 4 | 41 | 656 B | 32 B | 224 B | 656 B | ~10.1 KB |
+| 5 | 86 | 1,376 B | 32 B | 320 B | 1,376 B | ~11.0 KB |
+| 6 | 157 | 2,512 B | 32 B | 416 B | 2,512 B | ~12.4 KB |
+| 7 | 260 | 4,160 B | 32 B | 544 B | 4,160 B | ~14.3 KB |
+| 8 | 401 | 6,416 B | 32 B | 672 B | 6,416 B | ~16.8 KB |
+
+[cells T by the formula; the byte columns are arithmetic on the assumptions above.] **What the table says:**
+
+- The two hybrid signatures are most of the cost at every k up to 8: 81% at k = 5, still 54% at k = 8 (§13's
+  finding again). Sealing overhead is not counted.
+- Because every member pays the k_max size every period, `poll_k_max` is a cost the community chooses. k_max = 8
+  costs each member ~16.8 KB per period for a field that is padding when no poll is open, against ~9.5 KB at k_max = 3.
+- A sparse tally (only nonzero cells, 32 B id + 8 B count each) is smaller than dense once fewer than ~40% of the
+  cells are used. That is likely at k = 8 with few voters, so the published tally should be sparse; the shares
+  cannot be, because their size must not depend on the ballot.
+
+**6. Open for CC.**
+
+- **The k-floor against small cells.** CC 6.1.9 withholds a cell under k = 10 owners. A ranking histogram at
+  k = 8 has 401 cells, and most will be small, but instant runoff cannot finish from a tally with cells
+  withheld. Persist sees two options. (a) The floor applies to the poll's `source_count` only, and the full
+  ranking histogram is published, which is secrecy against tally members but not against small-cell inference.
+  (b) The two tally members also compute the runoff jointly and publish only the per-round standing totals
+  (each a sum over cells, so more of them clear the floor) and the result. That costs every member the ability to
+  recompute the rounds from cells. CC should rule.
+- **One ballot per person (`pick=agree`).** Census counts owners, not nodes, and one accepted cell per owner per
+  period. A poll open over several periods needs a rule for which period's cell counts. Persist proposes **the
+  closing period's composite only**, with members re-emitting their ballot each period while the poll is open.
+  That keeps one cell per owner without linking per-period tokens.
 
 ---
 
