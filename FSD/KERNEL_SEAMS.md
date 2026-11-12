@@ -43,7 +43,13 @@ The interface I propose (§5) is a pure `no_std + alloc` crate with no dependenc
 calls it once per question. Every answer carries the row ids it read and the **dependency keys** it read, which
 are its read set. Persist indexes those keys, and every row declares its write set from its own bytes alone. A new
 row therefore invalidates only the answers whose read set meets its write set. That is the incremental-evaluation
-contract, and it is also what removes the 61.3.0 per-row refold cost (§6.5).
+contract, and it is also what removes the 61.3.0 per-row refold cost.
+
+Performance is required, not hoped for. Eric's requirement is that the kernel "approach the theoretical limit for
+performance for RUST/WASM and provably result in persist performing better post refactor". §11 sets out the
+floor (crypto plus one write), the bound per rule cost class, and three gates that prove "better": an asymptotic
+table, a differential gate on digest and time, and a WASM ratio gate. It also separates the store-side batching
+that the kernel must not take credit for.
 
 ---
 
@@ -175,7 +181,7 @@ three plus the new ones found here:
 | id | class | anchor | what goes wrong | computed form |
 |---|---|---|---|---|
 | B1 | a, k | owner binding: `admission.rs:13091` [T]; C557 | a new owner's binding that arrives ahead of the old owner's withdrawal is lost; two nodes read different owners (`formal/owner_binding` O6) | hold both. `owner_of` = the unique live cosigned binding, else none. This is the model's `fold/unowned` reading, which gives up O4. CC rules O4 against O7 (§10 W1) |
-| B2 | a, f | `withdraws` stamp: `attestation_admit.rs:1163-1181`, `precedence.rs:258-280` [T] | entitlement depends on whether the target was held at the `withdraws`'s arrival | entitlement is a fold over (target, `withdraws`, the signer's standing at the `withdraws`'s signed instant); the stamp column is deleted |
+| B2 | a, f | `withdraws` stamp: `attestation_admit.rs:1163-1181`, `precedence.rs:258-280` [T] | entitlement depends on whether the target was held at the `withdraws`'s arrival | entitlement is a fold over (target, `withdraws`, the signer's standing at the `withdraws`'s signed instant); the stamp column is deleted. The release lead confirmed this independently (`attestation_admit.rs:1170-1181`, TESTED by them): the same rows in a different arrival order give a different retraction verdict, on the retraction path Edge reads. It is C557's class |
 | B3 | a | delegation cycle `admission.rs:18517` [T] | the edge that closes a cycle depends on order | the cycle is a view; its closing edge is chosen by `max(asserted_at), max(id)` and is inert. Same on every node |
 | B4 | a, i | gates 5, 11, 12, 14, 15 in §2.2 [T] | a row that arrives before its key record, consent, standing or subject is dropped; the peer may never re-offer it | **no gate drops.** The row is held with verdict `Inert { reason, retry: WhenAny(keys) }`. When a key in `retry` changes, its verdict is recomputed for free through the read-set index (§5.4). This is `formal/owner_binding`'s `again` reading applied to every door |
 | B5 | c, a, k | W at receipt: `self_roster.rs:556-575`, `key_grant.rs:1197-1210`, `admission.rs:13032`, `admission.rs:5301` [T] | "a signer stands at its signed instant; past W it must also stand **at receipt**." Standing at receipt is the held set at receipt, so an eviction that arrives after the row admits it on one node and refuses it on another, for good | judge standing at the row's signed instant over **all** rows held, ordering the eviction by its own signed instant. Use W only as `first_held − asserted_at ≤ W`, which is a function of the row and its first-held instant. Needs CC's ruling on #1049 (§10 W4) |
@@ -190,7 +196,7 @@ three plus the new ones found here:
 | B14 | f | `hard_case` emissions, 20 call sites [T] | a node writes its own fold result as a signed row; peers replicate this node's opinion | a notice (FINAL_REFACTOR §5.6). Rows remain only for CC-listed signed acts |
 | B15 | g | `withdraws_depth` per row `attestation_admit.rs:1438-1441` [T] | the operator's depth is frozen into the row and later folds read it | the depth comes from governance policy (one number for all) or the column goes |
 | B16 | c | the 4 folds that read `received_at` today, named in persist's own doc (`attestation_admit.rs:76-82`, pinned by `store/parity.rs:3444` `PLAN_INSTANTS`) [T] | folds judged at receipt | judged at `fold_at` (signed instant); `received_at` only in row-local bounds |
-| B17 | a, c | trust threshold at the door `replication/admission.rs:133` [T] | the reader's trust at receipt decides what is held | hold; a `by=reader` view filters. **The cost:** more rows held from low-trust keys, so quotas and placement carry the load (§11 R1) |
+| B17 | a, c | trust threshold at the door `replication/admission.rs:133` [T] | the reader's trust at receipt decides what is held | hold; a `by=reader` view filters. **The cost:** more rows held from low-trust keys, so quotas and placement carry the load (§12 R1) |
 | B18 | k | 8 guard clauses `no X@admitted[…] else refuse` in 5 families (`census:composite:{class}`, `census:member:share`, `census:share:{class}`, `membership:{stage}`, `retirement:{state}`) [T, regex over `transitions.json` guard cells] | uniqueness by refusal keeps whichever arrived first, which is C557's shape again inside the CC tables | each needs a `tie_break` (CC#203's column) so the duplicate is held and inert by `min(asserted_at), min(id)` (§10 W2) |
 | B19 | j | migrations that delete or rewrite held rows: 22 sqlite migrations carry `UPDATE` or `DELETE` [T, grep]; e.g. V196 deletes `federation_attestations` rows; V192 resets emission flags so wraps re-emit [T] | the held set changed with no row saying so | a schema change may add columns and indexes. A held-set change is a signed row (`purged`) or a rule-version change the kernel recomputes from (§5.8) |
 | B20 | l | cewp-kernel `door` commits only on `Ok` (`processor.rs:1078-1084`); `step` returns `Refusal::FamilyMismatch` when an object id was first claimed under another family, and `fold` takes object families in `asserted_at, id` order (`processor.rs:80-87`, `:955-972`) [T] | the reference kernel drops as well, and a signer-chosen backdated instant claims an object id | the converged kernel never drops (§7) |
@@ -229,6 +235,50 @@ named three of them, and this table adds the four the code shows.
 | **Unserved is not zero** | `holon-closure` `LedgerRow::read` returns `None` for an unserved channel [T] | a transition whose cell is `gap` or `Prose` is `Verdict::Unserved { cell }`, never "refused" and never "admitted". The CC worklist (§10) is the list of unserved cells |
 | Refusal names the gate that would lift it | `FENCES.md` law: "refuses, naming the gate whose passing would lift the refusal"; an allowlist entry needs an owner and an exit [T] | `Inert { missing, retry }`. Every bespoke gate that survives the move needs an owner and an exit (a CC cell id), or it is suppression |
 | Derive the zeros first | `FAST_AND_SLOW.md` §2 "Negation": test whether a stake is a theorem's constant before running it [T] | before a differential, mark families whose verdict is constant (no lifecycle, any-key, unenforced): FINAL_REFACTOR counts 86 + 37 of them [B]. They need one vector each, not a corpus |
+
+### 4.1 CC's short list, checked
+
+CC sent a short list of Holon mechanisms, and I verified each cite before relying on it. Holon's discipline in one
+line: anything that could depend on order is a fold over a commutative monoid of exact, integer-backed values.
+That is proved three ways: by law tests, by planted mutations that must fire, and by an exact digest.
+
+Two notes on where things live. `INTERFACE.md` is empty (0 bytes [T]); the interface is in the crate headers.
+`FENCES.md` lists refused capabilities; the dependency fences are in `engine/ci-gates.sh` and the
+`engine/Cargo.toml` comments.
+
+| # | mechanism | cite (checked) | kernel form |
+|---|---|---|---|
+| 1 | **One merge law as a trait** | `MergeLedger { empty, merge }` and `fold` (`holon/src/merge.rs:15-18`, `:62-64`) [T]. One generic law test compares a forward fold with a reversed one, then checks identity (`holon/tests/laws.rs:11-20`) [T]. In Lean a run is a `Multiset`, so "two schedules of the same work are the same multiset" (`lean/CIRISHolon/MergeLaw.lean:14-16`), and `shardedFold_invariant` is at `:62` [T]. "This replaces ACID wholesale" (`DATA_OBJECT.md:168-174`) [T] | the kernel's input is a multiset of rows. Every accumulation (count, roster, holder set, latest-wins pick) is a `MergeLedger` instance. **This is the census's test:** a rule that cannot be written as one is an order-dependent door. Every B-row in §3 fails it, and that is the reason it is a breaker |
+| 2 | **Order-independent bytes** | `mesh::canonicalize` (`holon/src/mesh.rs:111`) [T]. The test at `holon/tests/mesh.rs:440-466` asserts that the forward and reversed folds are **not** struct-equal, that they are value-equal, and that canonicalised they are equal. Its message says to retire the test once the ledger grows a canonical form [T] | kernel outputs are canonicalised before they are compared or hashed. Sets are sorted by `RowId`; maps are `BTreeMap`. A test pins every place where canonicalisation is still load-bearing |
+| 3 | **Integers only; refuse on overflow** | `holon-scene/src/lib.rs:19-20`: "Integers only. No float appears in this crate, so a native build and a wasm build agree bit for bit by construction" [T]. `holon/src/ledger.rs:11-17`: the ring "REFUSES (panics) on overflow rather than wrapping" [T] | scores, weights and thresholds are exact: integer fixed-point or a rational `(num, den)` in `u64`/`i128`, using checked arithmetic. Overflow is a **verdict** (`Unserved { cell }` with an overflow reason), never a panic and never a wrap, because a kernel must not abort a node. This is also CC's open COSE float gap (§10 W16). Persist carries floats into verdicts today. `Attestation.weight` is `Option<f64>` (`types.rs:1645`) [T], and the weighted-rubric arm of `consensus::evaluate` sums `f64` weights (`consensus.rs:38`, `:418`, `:436`) [T]. An `f64` sum is order-dependent past exactness, which is Holon's `RentLedger` warning (§4). CC#203 drops `weighted:{rubric}` (FINAL_REFACTOR §5.8), and that removes this arm |
+| 4 | **An exact digest as the certificate** | `Digest([u64; 4])`, merged by lane-wise `wrapping_add` (`holon-tables/src/digest.rs:39-64`) [T]. `digest_commutes` (`MergeLaw.lean:77`) and `digest_convicts` (`:88`) [T] | `Answer` carries a `Digest`: each output element is hashed with its stable id into four lanes, and the lanes are summed. The sum is order-free by construction. Two nodes compare one digest of their views; the differential compares digests per fixture |
+| 5 | **The permutation is a test input** | `p2_a_scrambled_fold_order_changes_nothing` runs two scrambles and asserts that each **is a permutation** and **is not the identity** ("P2 plant is vacuous", `holon/tests/mesh_clifford_plants.rs:519-543`) [T] | every kernel vector runs under N shuffles of its row multiset, and the harness asserts that each shuffle differs from the identity (§6.2) |
+| 6 | **Rights and unknowns as types** | `Transported { value, cert: None }` unless a `CertWitness` is supplied (`holon/src/transport.rs:15-48`) [T]. Unserved is `Option`, never 0 (`holon-closure/src/lib.rs:28-34`) [T] | a `Standing` value can be constructed only with its granting chain (`Standing { roles, chain: SmallVec<RowId> }`, private constructor). A row that is not held is `Unknown`, never `false`. `Answer<T>` has no path into a stored row |
+| 7 | **Four-valued verdicts and named refusals** | `Verdict { Pass, Fail, Branch(char), Void }`; Void is sticky ("a later passing leg cannot lift it"); `admits()` is true only for Pass and Branch (`holon-campaign/src/gate.rs:20-57`, `:127-140`) [T]. `route()` returns `Err(String)` naming why a circuit leaves a tier (`holon-qasm/src/lib.rs:281-330`) [T] | the kernel's `Verdict` maps one to one: `Live` = Pass; `Inert` = Fail, carrying its reason token **and the row that would cure it**, which is the queue item; `Branch` = a policy outcome chosen from a pre-committed set (enacted, cancelled, or lapsed under two_path); `Unserved` = Void. Nothing to evaluate is Void, never admitted, and a Void verdict on a row stays Void under that rule version |
+| 8 | **Mutations built in; a fenced build** | `enum Mutation` with a must-not-move control (`ReverseRegionOrder`) and must-move or must-convict defects (`holon-tables/src/mutation.rs:25-`; the doctrine is at `holon-tables/src/lib.rs:66-89`) [T]. A dependency **allow-list** gate ("fails on ANY new name") at `engine/ci-gates.sh:18-33`, and a WASM gate that **fails** when `node` is missing rather than skipping (`:852-894`) [T]. The allow-list gate covers `ciris-sim-core` [T]; I did not check where the referee is declared as a dev-dependency [B] | the kernel ships `enum KernelMutation` (e.g. `DropOnRefuse`, `LastProcessedWarmStart`, `StampAtDoor` must convict; `ReverseInput`, `ShardFolds` must not move). It ships an allow-listed dependency set (empty, or a single vendored sha256), a `no_std` build gate, and a WASM run gate that fails without its runner |
+
+**The lesson from `holon-tables/src/lib.rs:30-48` [T].** "The obvious design is for a worker to start from
+whatever it solved last. That design is WRONG": the answer becomes a function of how the work was scheduled.
+Two rules follow for the kernel. **Join by stable id, never by array index.** **Never carry state from "what I
+processed last".** That is the general form of C557 and of B2: a door that consults "what I happened to hold
+when this arrived" is a worker warm-starting from its last solve. An incremental or warm path must be a
+canonical function of the set, with first-held instants as explicit inputs.
+
+### 4.2 The frame: a view is admitted when its square commutes
+
+`Closed v T := ∃ h, v ∘ T = h ∘ v` (`lean/CIRISHolon/Object.lean:59`) [T]. A failure has a normal form,
+`nonfactoring_iff_not_closed` (`:91`) [T], and `holon-lattice/src/probe.rs:103` exhibits one as a `Witness`
+struct ("an exhibited pair of micro-states agreeing under the chart and disagreeing after the motion") [T].
+
+For persist:
+
+- `T` is "a row arrives", and `v` is the kernel's view.
+- Persist's index or answer cache is admissible **exactly when** updating it on arrival gives the same view as
+  refolding the set. That is `h`.
+- A divergence report **is** a witness pair: two row sets, or two orders of one set, with the same index state
+  and different verdicts after one arrival.
+
+§5.4 (incremental evaluation) and §6.3 (divergence reports) are organised on this frame.
 
 What does **not** transfer: the f64 tiers, conditioning, rent decay as physics, and MPS truncation. Every kernel
 verdict is integer arithmetic over signed inputs (FINAL_REFACTOR §5.3). `RentLedger`'s tolerance law
@@ -299,7 +349,11 @@ pub struct Answer<T> {
     pub reads: KeySet,               // the dependency keys it read: the light cone
     pub rule: RuleRef,               // RuleVersion + cell ids (transition / guard / fold / reaction)
     pub valid_until: Option<Micros>, // the next clock edge (window close, expiry); None = only rows change it
+    pub digest: Digest,              // [u64; 4], lane-wise wrapping_add of H(stable id ‖ canonical value) per element (§4.1 #4)
 }
+
+/// Every number a verdict reads is exact. No f32/f64 type exists in the crate (a lint and a grep gate).
+pub struct Ratio { pub num: u64, pub den: u64 }   // thresholds, weights; compared by cross-multiplying in u128
 
 pub enum Verdict {
     /// The transition this row makes, and the object state after it.
@@ -310,6 +364,8 @@ pub enum Verdict {
     Unserved { cell: CellRef },
 }
 pub enum Retry { Never, WhenAny(KeySet), At(Micros) }
+// Holon's four values (§4.1 #7): Live = Pass, Inert = Fail (with the curing row), a policy Branch rides in
+// Live.to (enacted | cancelled | lapsed), Unserved = Void. Overflow in any count is Unserved, never a wrap.
 pub struct Missing { pub roles: SmallVec<Role>, pub voices: Option<(u32, u32)>, pub rows: SmallVec<Need> }
 ```
 
@@ -369,6 +425,18 @@ The cache is a **projection**: rebuildable, dropped wholesale when `rule_version
 of a verdict. It is admitted only under the commuting square: the differential in §6.2 includes
 `cached(S, r) == fresh(S ∪ {r})`. A failure is a witness pair, and that family falls back to "no cache".
 
+**The admissibility condition, stated as the square.** Let `v(S)` be the kernel's answers over held set `S`, let
+`T_r(S) = S ∪ {r}`, and let `h_r` be persist's update: invalidate `touches(r) ∩ reads` and recompute only those.
+The cache is admissible iff `v ∘ T_r = h_r ∘ v` for every `S` and `r`. Monotone joins (`one`, `pick=max`, union,
+sum) close the square with `h_r` = merge one element, at O(1) or O(log n). Non-monotone reads (`no`, `not`,
+`unless`, latest-wins, anything a withdrawal undoes) close it only when their invalidation edge is present: the
+`DepKey` of the row whose arrival flips them must be in the answer's `reads`. That is why the `Slot` key exists.
+A missing edge is exactly a witness pair: two held sets with the same cache state, split by one arrival.
+
+**No history dependence in `h`.** Persist's update may not read "what the cache held last" except through the
+keys the square names (§4.1, the warm-start lesson). A cache built in any order of the same rows must have the
+same `digest`.
+
 **Stratification makes the cones finite.** At load, the kernel builds the graph "family F's guard or fold reads
 family G" from the guard cells (`one X@…`, `set(ref:*) X@…`) and the fold `reads=` clauses. Standing and roster
 are stratum 0. A cycle is a load error naming the cells involved. CC's tables already assert that no row's
@@ -382,7 +450,7 @@ pub fn step_batch(&self, src: &dyn HeldSource, rows: &[RowView], ctx: &Ctx) -> V
 ```
 
 Within one call the kernel memoizes each `DepKey`'s fold. A batch of 50 key grants into one room reads
-`Roster(room)` once, not 50 times. This is the fix §6.5 measures.
+`Roster(room)` once, not 50 times. This is the fix §11 measures, and the store-side half of it already landed in 61.4.0 (§11.4).
 
 ### 5.6 Effects and their acknowledgement
 
@@ -503,7 +571,7 @@ not appear as a gate diff.
 
 ### 6.2 Testing storage against the kernel
 
-There are four harnesses. They are named here and not built.
+There are five harnesses. They are named here and not built.
 
 1. **Vectors.** CC's `mesh_story_trace.json`, `governance_policy_vectors.json`, `namespace_match_vectors.json`,
    and one vector file per `formal/` model's checked traces (each model already enumerates its runs, e.g. 47,296
@@ -514,10 +582,15 @@ There are four harnesses. They are named here and not built.
    `store/backend_suite.rs`, on every backend. It changes no behaviour, so it can ship in 61.x behind a feature
    flag.
 3. **Permutation run.** For each fixture's row set (up to 6 rows: every order; above that, 200 seeded orders),
-   offer the rows to a fresh store in each order and compare kernel views by struct equality. This is the
-   kernel's P5/D6/G11. A failure is a witness pair.
+   offer the rows to a fresh store in each order and compare the kernel's output `digest`. This is the kernel's
+   P5/D6/G11. A failure is a witness pair. The harness asserts that each shuffle is a permutation and not the
+   identity (Holon's "plant is vacuous" check, §4.1 #5).
 4. **Commuting square.** For generated `(S, r)`: `cached_answer(S) ⊕ invalidate(touches(r))` against
    `fresh_answer(S ∪ {r})`. This is the certificate the answer cache must hold (§5.4).
+5. **Planted mutations.** `KernelMutation` (§4.1 #8). The must-convict set has to move a digest or fail a vector:
+   `DropOnRefuse`, `StampAtDoor`, `LastProcessedWarmStart` (a cache that remembers its last update), and
+   `MissingInvalidationEdge` (drop a `Slot` key from `reads`). The must-not-move set has to leave every digest
+   equal: `ReverseInput`, `ShardFolds`, `ColdCache`. Only the two halves together are evidence.
 
 The SQL `lifecycle_predicate` (FINAL_REFACTOR §6.2) joins harness 2: the predicate and the kernel's `view` run
 over the same rows, and any difference is reported.
@@ -535,7 +608,12 @@ DIVERGENCE kd-0042   class=ORDER(a)   family=delegates_to/owner_binding   rule=r
   verdict   DOOR WRONG   → fix lands with its CC cell id; token `federation_owner_conflict` retired
 ```
 
-Every report has the shape (set, two orders or two sets, door outcome, kernel outcome, reads, the CC cell).
+In the frame of §4.2: `S₁ = {r1}` then `r3` arrives, against `S₂ = {r1, r2}` then `r3` arrives. The door's
+state agrees on "r1 is the live owner" in both, and one arrival splits them for good. That is a witness pair
+against the door's `h`. The kernel closes the square because `owner_of` is a fold, not a stored answer.
+
+Every report has the shape (set, two orders or two sets, door outcome, kernel outcome, reads, the CC cell, and the
+two digests).
 It is triaged into one of three outcomes, as FINAL_REFACTOR §6.3 does: **door wrong**, **kernel wrong**, or
 **different question** (listed with its reason).
 
@@ -552,21 +630,14 @@ policies" [T]). The kernel takes the same approach:
 - **loaded**: `Kernel::load(&TableBytes)` parses the vendored JSON at start. Used by the browser and CEWP's sim.
   It is the same evaluator.
 
-A gate asserts that baked and loaded produce identical `RuleVersion` and identical vector results.
+A gate asserts that baked and loaded produce identical `RuleVersion` and identical vector results. Holon's fences
+are copied (§4.1 #8): a dependency allow-list that fails on any new name; `no_std` builds for
+`wasm32-unknown-unknown` and `wasm32-wasip1`; and the vectors **run** on the WASM artifact, with a gate that
+fails rather than skips when the runner is missing.
 
 ### 6.5 Cost per row
 
-| measurement | number | status |
-|---|---|---|
-| key-grant emission in a 50-member room, 61.3.0, roster re-folded per row | ~99 ms per row | [B]: reported in the brief; I did not find it in `CHANGELOG.md` |
-| cewp-kernel `step` | refolds **all** held rows per call (`processor.rs:960` `let f = fold(held, …)`) and `preview` folds twice (`:1177`, `:1197`) [T] | O(n) per row, O(n²) per batch [T by reading] |
-| an unanalyzed Postgres page | 12,319 buffers, against 13 on the seek index (61.3.0 CHANGELOG line 410) [T] | an index matter: persist keeps it |
-
-Target: the cost of a row is `|touches(r)|` index writes, plus the folds of the partitions it invalidated,
-plus nothing else. For the 50-member key grant that is one `Roster(room)` fold per batch (§5.5), then 50 draft
-constructions. The ~99 ms per row should fall to the KEM wrap's cost [B, not measured]. Budgets go in CI with
-the benches (FINAL_REFACTOR §11), and a perf claim needs a moved ratio (Holon's benchmark contract,
-`DATA_OBJECT.md` [T]).
+Cost is now its own section (§11): the floor, the bound per rule class, and the three gates.
 
 ---
 
@@ -670,14 +741,172 @@ numbers come from `transitions.json` and `family_model.json` `_meta` and cells a
 | W13 | **the ruled column** | roles 146 / policy 146 `code-v61`; signer_rule 122, subject_rule 164, cosign_rule 169, lifecycle 181 `code-v61`; undo 30 `gap`; roles 2 `gap` [T] | as FINAL_REFACTOR §5.5: each `code-v61` cell is step 1 (state today). The differential gives step 2 for free |
 | W14 | **reader trust set** | 32 folds `by=reader` [T] | specify the input: reader key and accepted roots, or the reader's own trust rows |
 | W15 | **CEWP tables** | rc17, no guards, no reactions [T] | one tag for both kernels (§7) |
+| W16 | **exact numbers (COSE float gap)** | `weight: Option<f64>` (`types.rs:1645`) and f64 rubric sums (`consensus.rs:418`) [T] | type every score, weight and threshold as an integer fixed-point or a rational on the wire, so the kernel never sees a float (§4.1 #3) |
+| W17 | **cost classes** | none published | per-transition and per-fold `CostClass` via `tools/kernel_cost.py`; the build refuses a mismatch (§11.2) |
+| W18 | **the census-family guards still refuse** | `census:*` folds already carry `pick=once(…)` tie-breaks [T, fold cells], but their guards still say `no … else refuse` (B18) [T] | make the guard defer to the fold's `once` tie-break, so the table stops stating the rule twice |
 
 ---
 
-## 11. Risks and open questions
+## 11. Performance: the floor, the bound, the proof
+
+Eric's requirement, verbatim: "we need that kernel to approach the theoretical limit for performance for
+RUST/WASM and provably result in persist performing better post refactor". This section says what the limit is,
+what bound the kernel is held to, and the three checks that make "better" a gate rather than a claim.
+
+### 11.1 The floor, and how far above it persist runs today
+
+**The floor per admitted row** is what no decision layer can remove:
+
+- one hybrid signature (sign on emit, verify on ingest), where ML-DSA-65 dominates;
+- canonicalisation and hashing;
+- one durable write, amortised by batching commits.
+
+**Measured.** The instrument is `src/federation/kg_burst_measure.rs` on branch w614 (`912e404c`, 367 lines) [T, I
+read the file]. Every test in it is `#[ignore]`. It prints `KGBURST` lines with `plan`, `sign` and `put` split per
+emission, plus `wrap150` and `grant_put150` (`:305-330`) [T]. The per-operation numbers below are the release
+lead's run of it (TESTED by them; the KGBURST output is not committed, so I could not re-read the raw lines).
+
+| operation (v61.3.0, before the 61.4.0 fix) | sqlite | postgres | source |
+|---|---:|---:|---|
+| hybrid wrap, X25519 + ML-KEM-768 | 0.2 ms | | lead's kg_burst run |
+| stamp + canonicalise + hybrid sign | 1.3 ms | | lead's kg_burst run |
+| member-grant insert | 0.3 ms | 0.26 ms | lead's kg_burst run |
+| **floor, emit side** (wrap + sign + insert) | **~1.8-2 ms** | | sum of the three rows |
+| per-row admission check + insert, 50 members | 79 ms | 274 ms | lead's kg_burst run |
+| per-row emit, 1-member room | 13.6 ms | | lead's kg_burst run |
+| per-row emit, 50-member room | ~99 ms | | lead's kg_burst run |
+| 150-row emission (50 members x 3 devices), whole burst | 17.8 s (119 ms/row) | 36.9 s (246 ms/row) | 61.4.0 CHANGELOG, "medians of 3, `kg_burst`" (w614 `bfad9816`) [T] |
+
+**Two corrections to the brief.**
+
+1. **The two sources disagree.** The CHANGELOG's whole-burst medians give 119 ms per row on sqlite and 246 ms
+   per row on pg. The per-row figures give ~99 ms on sqlite and an admission share of 274 ms on pg, which is
+   more than the pg whole-burst per-row cost. The runs differ (median of 3 against one run, and burst against
+   per-row), so neither number is wrong, but the KGBURST lines should be committed beside the instrument so one
+   recorded run backs every figure. I use the ranges.
+2. **The build profile.** The brief says "deps at opt-level 3, crate at opt-level 0". I found no
+   `[profile.dev.package]` or `opt-level` override in `Cargo.toml` or `.cargo/config.toml` on either worktree
+   [T, grep]. So the override, if there was one, came from the environment [B]. If the dependencies were in fact
+   at opt-level 0, then the crypto "floor" is inflated as well. Either way, persist's own decision code ran
+   unoptimised, so the 13.6 ms overstates what release would show. A release-profile run is needed before any
+   ratio is quoted outside this document.
+
+**Decomposing the 1-member 13.6 ms** as far as the code allows. 13.6 − (0.2 + 1.3 + 0.3) ≈ 11.8 ms is not
+crypto or the write. What the code shows runs per row in that remainder:
+
+| component | evidence | share |
+|---|---|---|
+| the attestation door's gates: about 57 calls in `plan_put_attestation` (`attestation_admit.rs:694-1404`) [T], several doing directory reads | read [T] | unmeasured |
+| each directory read crosses `block_on` + `spawn_blocking` + a connection lock on sqlite; `benches/storage_floor.rs` exists to split exactly this tax from the raw write (module doc) [T] | the bench exists [T]; no baseline is recorded in-repo [T] | unmeasured |
+| the key-grant planner and admission: `recipient_may_hold_key` (`key_grant.rs:826`), `check_key_grant_row_admission` (`:1157`) → `check_sealer` (`:998`) → `is_active_member_at`, and the AV-45 write-scope gate. Each folds the roster and lists every member's occurrences per row (61.4.0 CHANGELOG) [T] | read [T] | in a 1-member room the fold is small; this is what grows to ~99 ms at 50 |
+| envelope JSON: gates read `serde_json::Value` paths (e.g. `envelope_dimension`, `admission.rs:2074`) [T], and `compute_persist_row_hash` re-serialises | read [T] | unmeasured |
+
+**The bench that would close this.** `benches/attestation_door.rs` (it does not exist). It would run
+`plan_put_attestation` over a 1-member and a 50-member room in release, with a `tracing` span per gate tier
+(AV-76 tiers 0-5 are already marked in the source), reporting per-tier µs and the count of directory reads per
+row. The other benches have no recorded per-row baselines for this path. `sign.rs` measures Ed25519 only, at
+about 100 µs in software (module doc) [T], not ML-DSA-65. `ingest_pipeline.rs` cites 768 trace rows in about
+9 ms in release (module doc) [T], but that is the trace path, not the attestation door. `occurrence_registry.rs`
+cites 150-215 µs upserts (module doc) [T]. `storage_floor.rs` and `scores_read.rs` record no numbers in source [T].
+`sign.rs` should gain an ML-DSA-65 sign and verify case so the floor is measured by a bench, not inferred.
+
+**What the floor means for the target.** The kernel's job is to make decision cost per row a small, bounded
+fraction of the floor. Proposed budget: **decision cost ≤ 10% of the floor per row in release** (≤ 0.2 ms
+against ~2 ms), held per cost class in §11.2. Today the 1-member gap is about 6x the floor and the 50-member gap
+about 50x [T on the arithmetic of the lead's numbers; the profile caveat above applies].
+
+### 11.2 The bound, per rule cost class
+
+The kernel is held to a cost class per rule cell, not per family. Counts are from CC tip `7b86bee`.
+
+| class | members (CC's counts; mine where they differ) | today's typical cost in persist | kernel bound (incremental) |
+|---|---|---|---|
+| guard `one X@admitted[…]` | CC 25; my regex over guard strings counts 30 occurrences of `one` [T] | a directory query per row | O(log n): one `Slot` index probe |
+| guard `no X@admitted[…]`, negated role tests | `no` 8 [T]; `not` 9 [T] | a query at the door, then **drop** | O(log n) to evaluate. **Non-monotone**: needs a `Slot` invalidation edge, because the arrival of an `X` flips it |
+| guard `each`, `set`, `all` | `each` 11, `set` 2, `all` 1 [T] | a loop of queries | O(k) in the named set; maintained per element |
+| fold `pick` max or rank (latest-wins, the precedence ladder) | CC: max 13, rank 8. My count is max 15, rank 8 (the regex classed a combined rank-then-max pick as max) [T] | `ON CONFLICT … WHERE excluded.asserted_at >` (B10) or a read-time fold | O(1) amortised per arrival (a join); **non-monotone under withdraw**, so keep the per-object candidate set ordered: O(log c) |
+| fold `pick=chain(prev_head_digest)`, `once`, `pair`, `union`, `agree`, `set` | chain 4, union 3, agree 2, once 4, pair 2, set 1, min 1 [T] | held-head replace (B12); refusal | chain: O(1) per link, a fork is a view; union: O(1); once: the tie-break join |
+| fold `combine` | median 5, sum 2, min 2, max 1, all 1, policy 1 [T] | various | sum/min/max/all: O(1) or O(log n). **median: an order-statistic tree, O(log n) per arrival and per withdrawal**. `policy`: the two_path count |
+| fold `cut` | 11 [T] | read-time filter | O(1) per element, at the partition boundary |
+| fold `over` a counted set (standing, person) | 17 [T] | per-row roster refold (the 61.3.0 cost) | O(1) per arrival after one stratum-0 fold per batch |
+| reaction with `unless` | 10 of 58 reacts [T] | sweep scans | non-monotone: an invalidation edge on the `unless` event |
+| clocks, expiries | 19 clocks, 20 expiries [T] | seven periodic sweeps (§2.2 #35) | O(log w) on a wake heap; no scans |
+
+**Holding the implementation to it.** Every compiled rule cell carries its `CostClass`. CC will publish
+per-transition classes through `tools/kernel_cost.py`, and the build refuses a table whose class differs from the
+kernel's own classification. Each class has a bench, so the budget is enforced per class:
+
+```rust
+pub enum CostClass { Probe, NonMonotoneProbe, Linear { over: SlotId }, Join, OrderStat, Wake }
+impl Kernel { pub fn cost_class(&self, cell: CellRef) -> CostClass; }
+```
+
+**Not in the bound:** a `Linear` guard over an unbounded set. CC's tables bound every `each` by a named set (a
+roster or ranks), and the kernel refuses to load an `each` whose set has no declared bound.
+
+### 11.3 "Provably better": three checks
+
+**(a) Asymptotic, per decision site, from the census.** n = held rows in the partition, m = room members, D = the
+devices per member, d = the delegation depth ceiling, R = rows per emission.
+
+| site (§2.2 #) | today | kernel | status |
+|---|---|---|---|
+| key-grant emission (planner + sealer + write scope) | O(R·m·D) per emission at 61.3.0 (61.4.0 CHANGELOG: "re-folded the roster and listed every member's occurrences" per row) [T] | O(m·D + R) | 61.4.0 store-side already gives O(m·D + R) for one emission (§11.4) [T, commit message] |
+| self-roster / key-grant / owner-binding W (20-22) | two roster folds per row (`is_roster_key_at` at the signed instant and at now) [T] | O(1) per row after one `Keys(identity)` fold | |
+| owner binding (6) | list the node's `delegates_to` granters per row (`live_owner_binding_granters`) [T] | O(1) join on `Keys(node)` | |
+| delegation cycle (7) | BFS of ≤ d hops per edge door [T] | the same walk, but only when a `Refs` or `Keys` edge in the cone changes | |
+| `withdraws` authority (9) | a delegation walk at the door plus a fold at read [T] | one fold on `Refs(target)`, O(c) composers | |
+| cohort standing, consent, no-moderator, subject known (11, 12, 14, 15) | 1-3 directory queries per row, each paying the async hop [B on the count] | O(log n) probes, memoised per batch | |
+| cosign execute (19) | a sweep over open receipts, each re-offered through the door [T] | the pending view updated on `Slot(quorum key)` | |
+| community epoch (23) | `resolve_community_members` O(m) per mint [T] | shares the `Roster` fold | |
+| sweeps (35) | a periodic scan of each table [T] | O(log w) wake | |
+| LWW upserts (29) | O(log n) | O(log c) ordered candidates | a constant-factor change, not a class change |
+| trust root, consensus (17, 18) | already pure | the same | no change; the cache comes free |
+
+**(b) Differential CI gate: digests equal, time lower.** The same fixtures (the 119 invariant files, the backend
+suite and kg_burst) run through today's doors and through the kernel in shadow mode (§6.2 #2):
+
+- **digest gate:** per fixture, the kernel's output digest equals the door-path digest, or the fixture names a
+  recorded, ruled divergence (§6.3);
+- **time gate:** per fixture class, kernel time is lower than or equal to door time, in release, interleaved A/B
+  over several rounds, as a ratio. Holon's rule applies: "a performance claim without a moved benchmark ratio does
+  not merge" (`DATA_OBJECT.md`, the benchmark contract) [T]. A family's cut-over (FINAL_REFACTOR §5.5 step 3)
+  cannot merge unless its fixtures move the ratio or hold it within noise.
+
+**(c) WASM ratio gate.** The same kernel benches run on the `wasm32` artifact under a pinned runner. The native
+ratio is recorded per class, and the gate **fails** if the runner is missing (Holon `ci-gates.sh:852-894`
+[T]). The target ratio is near 1x-2x. Holon measured the ordinary WASM cost at 2.1x and **7.9x** when one routine
+fell to soft `libm::sqrt` (`engine/PORTABILITY.md:185-192`) [T]. The kernel avoids that class of penalty by
+construction: integer-only decision code (§4.1 #3), no float type in the crate, no `HashMap` with a random state
+(BTree or a fixed hasher), and no allocation on the hot path (an arena per batch, reset between calls).
+
+### 11.4 What the kernel cannot buy, and what it must not take credit for
+
+Storage and crypto are the floor. The kernel moves neither. Some gains come from the **store side** and are
+credited there:
+
+| gain | layer | status |
+|---|---|---|
+| one fold per emission (`EmissionFold`, `AudienceSnapshot`, `with_roster_read_memo`); one held-check walk; batched member-grant inserts | store-side, 61.4.0 (w614 `bfad9816`, "the 150-row burst is linear in rows") [T, commit and CHANGELOG] | **after-fix numbers: PLACEHOLDER**, to be filled from a committed KGBURST run |
+| batched inserts in one transaction; prepared statements; fewer pg round-trips (pg's 274 ms against sqlite's 79 ms admission at 50 members is mostly round-trips [B]) | store-side | not done |
+| the async-wrapper tax per read (`storage_floor.rs`'s question) | store-side | unmeasured |
+| no per-row refold anywhere (not only key grants), per-class bounds, wake instead of sweeps, digest-checked caches | **kernel** | this document |
+
+The rule: a before/after ratio is attributed to the kernel only on fixtures where the store path is unchanged
+between the two arms. 61.4.0 is the store-side down-payment on exactly the kernel's incremental-evaluation
+problem, so the kernel's baseline is **61.4.0, not 61.3.0**.
+
+---
+
+## 12. Risks and open questions
 
 - **R1. Held-set growth.** Admit-both holds rows that are refused today (low trust, no standing, duplicates).
-  Quotas, placement's `Park`, and `removable` (§3.1) carry that load. It has not been measured [B]. Phase 0
-  should count, in shadow mode, how many rows the door refuses per day on a real node.
+  Quotas, placement's `Park`, and `removable` (§3.1) carry that load. It has not been measured. **The measurement
+  that sizes it:** in Phase 0, shadow mode counts every refusal the doors make today, by token, family and origin
+  (local or replicated), per day on a real node. Those are exactly the rows admit-both would hold. Persist already
+  has the hook point: every refusal leaves the plan as an `Err` before the executor. The count, multiplied by the
+  median row size (kg_burst prints `row_bytes_median`, `kg_burst_measure.rs:305-330` [T]), is the held-set growth
+  per day. Placement and quota budgets are sized from it before any family cuts over.
 - **R2. Read-set precision.** A too-coarse `DepKey` (for example, the whole family) invalidates too much, and the
   answer is still correct, only slow. A too-fine key misses an invalidation, and the answer is wrong. The
   commuting-square harness (§6.2.4) is what catches the second case.
@@ -706,4 +935,7 @@ numbers come from `transitions.json` and `family_model.json` `_meta` and cells a
 | 8 refusing `no` guards | regex over guard strings for a leading `no ` or ` no ` |
 | fold, count, placement, freshness coverage | `family_model.json` `_meta.coverage` and a Counter over row cells |
 | reactions | `reactions.json` `_meta` and a Counter over `effects[].effect` |
+| guard words (`one` 30, `each` 11, `not` 9, `no` 8, `set` 2, `all` 1) | `re.findall(r'\b(one\|no\|each\|set\|all\|not)\b(?= \|\()', guard)` over every guard string. Nested `one` clauses inside `each(...)` count, so 30 exceeds CC's 25 |
+| fold classes (`over` 17, `cut` 11, pick max 15 / rank 8 / chain 4 / once 4 …, combine median 5 / sum 2 / min 2 / max 1) | regexes `pick=([^;]*)`, `combine=(\w+)`, `\bcut=`, `\bover=` over `family_model.json` fold cells. A pick naming both `rank(` and `max(` was classed max, so max is 15 against CC's 13 |
+| reactions with `unless` (10) | `sum(1 for r in reactions if r.get('unless'))` |
 | persist vendors no `transitions.json`, `reactions.json` or `family_model.json` | `find . -name …` (target excluded): no hits [T] |
