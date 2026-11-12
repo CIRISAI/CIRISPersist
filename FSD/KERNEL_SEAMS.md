@@ -39,6 +39,9 @@ Three of the breakers are in the rule text, not in persist: C557, the 8 `no …@
 clauses, and the W window that judges standing at receipt. The kernel cannot fix those. CC has to rule them
 (§10).
 
+§13 is the cost ledger: bytes and time per family, the acts that multiply rows, and the multi-row items that would
+replace them.
+
 Eric widened the scope: copying and placement ("how edge knows when to copy what where") are the same rules,
 so they are kernel outputs too. `route(row, party)` answers hold / offer / serve / relay / park / discard from the
 same tables (§5.9). Persist keeps storage and quotas; Edge keeps transport and the actual send.
@@ -829,6 +832,7 @@ numbers come from `transitions.json` and `family_model.json` `_meta` and cells a
 | W16 | **exact numbers (COSE float gap)** | `weight: Option<f64>` (`types.rs:1645`) and f64 rubric sums (`consensus.rs:418`) [T] | type every score, weight and threshold as an integer fixed-point or a rational on the wire, so the kernel never sees a float (§4.1 #3) |
 | W17 | **cost classes** | none published | per-transition and per-fold `CostClass` via `tools/kernel_cost.py`; the build refuses a mismatch (§11.2) |
 | W18 | **the census-family guards still refuse** | `census:*` folds already carry `pick=once(…)` tie-breaks [T, fold cells], but their guards still say `no … else refuse` (B18) [T] | make the guard defer to the fold's `once` tie-break, so the table stops stating the rule twice |
+| W19 | **multi-row items** | the key-grant set carrier was retired at rc7 (`key_grant.rs:17-18`) [T]; custody is one row per blob per day [T] | rule on I1-I4 (§13.5): a set claim for custody, a group KEK for self/family that rotates on member removal and device revocation, a history grant on join, and a re-admitted, per-leaf-addressable wrap set |
 
 ---
 
@@ -1014,6 +1018,171 @@ problem, so the kernel's baseline is **61.4.0, not 61.3.0**.
 
 ---
 
+## 13. The cost ledger
+
+Eric, verbatim: "The purpose being, we can finally optimize what needs to be copied when, what costs the most, what
+multi-row items we should be able to support to drastically improve performance either fold or transport, etc."
+This section is the ledger: what costs bytes and time, which acts multiply rows, and which multi-row items would
+replace N signed rows with one.
+
+### 13.1 Data, and what it is not
+
+No production store was available; Server has been asked for a read-only copy of a real node. Until it arrives,
+every number here is **test-shaped**, taken from stores that other sessions' test runs left on this machine. I
+copied each one into my scratch directory first (`sqlite3 -readonly src ".backup dst"` for the seeded store; `cp`
+of `.db` + `-wal` for the mesh stores) and ran SELECTs on the copies only.
+
+| label | source | shape |
+|---|---|---|
+| **S** | `/tmp/ciris-native-mesh/seeded/home/data/ciris_engine.db` (Nov 8, 163 MB) | a seeded mesh: 11,269 attestations from 2,202 signers, admitted over 23.0 minutes |
+| **M** | `/tmp/ciris-community-home-764742/mesh-764742-{2,24}/mesh.db` (Nov 12) | community-home runs: 24 and 25 attestations, including a removal |
+| **K** | `kg_burst` (§11.1): the release lead's run, plus the 61.4.0 CHANGELOG | key_grant:epoch, 50 members × 3 devices |
+
+None of S or M holds a single `key_grant` row, and S holds 21 blobs [T, `count(*)`]. So the key-plane rows are
+priced from K and from the code, not from a store. "Rows per day" cannot be read from a 23-minute seed, so it is
+given as the seed's rate, and production rates wait for Server's copy.
+
+### 13.2 Per family: bytes (store S)
+
+Bytes per row = `length(envelope) + length(scrub_signature_classical) + length(scrub_signature_pqc) +
+length(additional_scrubs) +` the id and hash columns (+60 for fixed columns). The family is `attestation_type` plus
+the first two segments of `dimension`.
+
+| family (S) | rows | total bytes | mean B/row | envelope | row signature | other |
+|---|---:|---:|---:|---:|---:|---:|
+| `scores key:record` | 2,202 | 34.4 MB | 15,615 | 23.8 MB | 9.9 MB | 0.6 MB |
+| `scores session:claim` | 4,700 | 25.0 MB | 5,322 | 2.5 MB | 21.2 MB | 1.4 MB |
+| `scores identity:occurrence` | 1,137 | 15.5 MB | 13,636 | 10.1 MB | 5.1 MB | 0.3 MB |
+| `delegates_to trust:accepts` | 1,683 | 8.8 MB | 5,230 | 0.7 MB | 7.6 MB | 0.5 MB |
+| `delegates_to ownership:responsible_party` | 1,013 | 5.4 MB | 5,379 | 0.6 MB | 4.6 MB | 0.3 MB |
+| `scores consent:community_trust` | 387 | 2.1 MB | 5,330 | 0.2 MB | 1.7 MB | 0.1 MB |
+| `scores custody:ack` | 41 | 0.22 MB | 5,331 | 0.02 MB | 0.18 MB | 0.01 MB |
+| `scores chat:message` | 21 | 0.22 MB | 10,303 | 0.02 MB | 0.09 MB | 0.10 MB (additional scrubs) |
+| `scores consent:replication` | 34 | 0.19 MB | 5,597 | 0.03 MB | 0.15 MB | 0.01 MB |
+| `supersedes chat:message` | 21 | 0.12 MB | 5,812 | 0.02 MB | 0.09 MB | 0.01 MB |
+
+[T: SQL in the appendix, on copy S.] Those are the ten families holding the most bytes in S.
+
+**What the split says.**
+
+- **The row signature is about 4,500 B on every row.** That is 88 B Ed25519 plus 4,412 B ML-DSA-65, both
+  base64 text [T, `avg(length(...))` on `session:claim`]. A 3,309 B ML-DSA-65 signature stored as base64 costs
+  about 1.1 KB more per row than a BLOB would. Over S's 11,269 rows that is about 12 MB of the 96.8 MB
+  attestation table [T, `dbstat`]. Storing it as a BLOB is a **store-side** saving (§11.4), not the kernel's.
+- **Signatures inside envelopes double the cost.** A `key:record` row carries the key record, and that record
+  carries its own `scrub_signature_pqc` (4,412 B), an ML-DSA public key (2,604 B) and a `registration_envelope`
+  (2,788 B), all inside the row that has its own 4,500 B signature [T, `json_each` on one row].
+  `identity:occurrence` likewise nests a 4,561 B signature [T]. Over S, 2,208 nested `signature_pqc` members
+  [T, string count] add about 9.7 MB on top of the 50.7 MB of row signatures. **Signatures are about 68% of
+  attestation bytes in S** (60.4 of 88.8 MB). CC's 59% for `key_grant:epoch` (7,641 B) is the same story.
+- **The same signed fact is stored two or three times.** The 2,202 key records are rows in `federation_keys`
+  (27.1 MB) **and** `key:record` attestations (34.4 MB). Occurrences are in `federation_identity_occurrences`
+  (9.9 MB), `federation_identity_occurrence_history` (9.3 MB) **and** `identity:occurrence` attestations
+  (15.5 MB) [T, `dbstat`]. FINAL_REFACTOR's "one row" removes that, with the typed tables becoming indexes over the
+  row. It is a storage saving and the largest single one visible in S.
+
+### 13.3 Per family: time to admit (store S, an upper bound)
+
+S records no per-row admit time. The best proxy available is the gap between consecutive `admitted_at` values in
+a serial seed. That gap includes the seeder's own signing and transport, so it is an **upper bound** on admission,
+not a measurement of it (gaps over 5 s excluded).
+
+| family (S) | rows | mean gap | total |
+|---|---:|---:|---:|
+| `scores key:record` | 2,200 | 116.6 ms | 256.5 s |
+| `scores session:claim` | 4,700 | 28.4 ms | 133.3 s |
+| `delegates_to trust:accepts` | 1,683 | 37.6 ms | 63.3 s |
+| `scores identity:occurrence` | 1,137 | 37.8 ms | 42.9 s |
+| `delegates_to ownership:responsible_party` | 1,012 | 28.4 ms | 28.7 s |
+| `scores consent:community_trust` | 387 | 28.6 ms | 11.1 s |
+| `scores consent:replication` | 34 | 260.4 ms | 8.9 s |
+| `scores custody:ack` | 40 | 120.1 ms | 4.8 s |
+| `scores membership:acceptance` / `widening`, `chat:welcome` / `key_package` | 2-3 each | 1.1-3.2 s | 2-6 s each |
+
+[T: window-function SQL over `julianday(admitted_at)` on copy S.] **The measurement that replaces this** is the
+shadow-mode door timer (§11.1's `benches/attestation_door.rs`, run in production as a histogram per family). Its
+key-grant figures are K's: 79 ms (sqlite) and 274 ms (pg) admission per row at 50 members, before 61.4.0 (§11.1).
+
+### 13.4 Amplification: how many rows one act makes this node sign or store
+
+| # | causing act | rows per act | bytes per act | CC's hypothesis | verdict |
+|---|---|---|---|---|---|
+| A1 | **custody re-ack**: a device holding B blobs | B signed rows **per day**, for ever (`HOLDING_CLAIM_REACK_AFTER_SECS` = 24 h, `holding_claim.rs:634`) [T] | B × 5.3 KB per day (custody:ack mean 5,331 B in S [T]); B = 10,000 gives ~53 MB/day per device, replicated to the cohort | (d) "one row per holder per blob?" | **Confirmed, and worse.** One row per holder per blob, `evidence_refs` "exactly one entry" (`custody_ack.rs` doc) [T], **re-signed daily**. The pass is capped at 256 claims (`HOLDING_CLAIM_REACK_MAX_PER_PASS`, `:662`), which the doc sizes as keeping "about 12,000 claims live" [T]. **A device holding more blobs than that cannot keep all its claims live**: a hard ceiling, not just a cost |
+| A2 | **sealed write at `self`/`family`** | one `key_grant:content` row per recipient occurrence: Σ members' live devices (CC 4.4.3.4.1; "fresh per write, O(members) wraps", `community_dek.rs` doc table) [T] | 5 members × 3 devices = 15 rows × ~7.6 KB ≈ **115 KB for 200 B of content** (about 575×) | (a) ~100 KB | **Confirmed** [T on the row count; the row size is B, taken from K's 7,641 B epoch row, because no store holds a content row] |
+| A3 | **family join** (a newcomer with D devices) | O(H) × D, where H = the family blobs in the group's history: `rekey_for_newcomers` unwraps each blob's DEK and wraps it once per newcomer device (`at_rest_cascade.rs:1534-1573`) [T]; CC 3.3.4 item 3 makes each wrap a `key_grant:content` row [T] | H = 1,000, D = 3: 3,000 rows ≈ 23 MB, and ≥ 3,000 × (0.2 + 1.3 + 0.3) ms ≈ **5.4 s of floor** | (b) O(history) × devices | **Confirmed** [T on the walk; B on the H and D values] |
+| A4 | **removal, or the seat, at the community epoch** | members × devices **per minter** (epochs are `(community, minter, epoch)`, `store/sqlite.rs:9654-9670`) [T] | K: 150 rows, 1.15 MB per minter at 50 × 3 (lead's run; 150 rows [T] in the 61.4.0 CHANGELOG). With M active minters: M × 1.15 MB, e.g. 11.5 MB for M = 10 | (c) minters × devices | **Confirmed** |
+| A5 | **one key registration / one occurrence** | 1 typed row + 1 attestation (+ the occurrence history row) | key: 12.3 KB in `federation_keys` + 15.6 KB as `key:record`; occurrence: ~8.7 + 8.2 + 13.6 KB [T, S `dbstat` ÷ rows] | not in CC's list | **added**: a 2-3× storage copy of every signed fact in its family |
+| A6 | **the 15 `hard_case` kinds** | one row per node per event | 1,723 B for 2 rows in M [T] | (e) if they stay signed | **Mostly moot after W6**: they become notices, except the CC 3.4.13 safeguarding escalation and the tombstone. Small in M, but per node and replicated, so it would scale with N nodes × events had it stayed |
+
+Ranking by what they cost a live node: **A1** (unbounded in held blobs, daily, with a ceiling), **A2** (every sealed
+write), **A3** (every join, in history), **A4** (every removal, in minters), **A5** (every key and occurrence, in
+storage).
+
+### 13.5 Multi-row items for the top five
+
+The common shape: **one signature over a root, and leaves that each carry an inclusion proof.** A leaf is checkable
+on its own once the root's signature is held, so a recipient can be sent the header plus its own leaf and nothing
+else.
+
+| # | replaces | item | bytes | admit cost | kernel fold |
+|---|---|---|---|---|---|
+| **I1** (A1) | B per-blob custody rows per device per day | **set claim**: one signed row per device per scope per day, `{ root = Merkle(sorted blob digests), count, bytes, prev_root }` with the digest list (32 B per blob) or a daily **delta** (added/removed) chained by `prev_root` | 10,000 blobs: 4.5 KB signature + 320 KB list (or a delta of a few KB) against ~53 MB | one sign, one verify; the leaves become index entries, not rows | **ONE item.** `touches` = `{Content(d)}` for each listed digest; `pick=chain(prev_root)` (CC already has `chain` picks [T]). "Who holds X" is a probe of persist's index. It also removes A1's 12,000 ceiling |
+| **I2** (A2) | R `key_grant:content` rows per write | **group key-wrapping key (KEK)**, as the community epoch already does ("one shared per `(community, epoch)`… O(1) per emission", `community_dek.rs` doc table [T]): each member device holds the group KEK of the epoch through one grant per device per epoch; a write wraps its DEK once to the KEK, **inside the content row**, and signs no `key_grant` row at all | 15 rows / 115 KB per write → ~60 B per write, plus 15 rows once per epoch | no extra sign per write | **ONE item** (the content row). Read set `{Roster(group), Keys(member devices)}` for the epoch grants |
+| **I3** (A3) | O(H) × D rows per join | **history grant**: the newcomer device gets one wrap of a **history key** that wraps the group's past epoch KEKs (or the epoch chain), and not one wrap per blob | 3,000 rows / 23 MB → D rows (~23 KB) | D signs | **ONE item per device**: a draft of one row, read set `{Roster(group)}`. The O(H) walk leaves the hot path |
+| **I4** (A4) | members × devices rows per minter per removal | **sign-once wrap set**: header (DEK id, epoch, minter, group) + per-device wrap leaves + one root signature; each leaf ships to its recipient with its path (log₂ 150 ≈ 8 × 32 B) | 150 rows / 1.15 MB → 4.5 KB + 150 × ~1.5 KB ≈ 230 KB (~80% fewer; CC estimated ~60%) [B: the leaf size assumes 1,088 B of ML-KEM-768 ciphertext + 32 B X25519 + AEAD of the DEK, base64] | one sign per removal per minter instead of 150 | **ONE item with per-leaf verdicts** (`Answer<Vec<LeafVerdict>>`), read set `{Roster(group), Keys(recipients)}`. **Constraint:** CC rc7 retired the key-grant *set* carrier (`KeyGrantRefusalReason::SetRetired`, `key_grant.rs:17-18`, `:305`) [T]. A wrap set returns only if CC re-admits it in this per-leaf-addressable form. W19 asks |
+| **I5** (A5) | 2-3 stored copies per key or occurrence | **one row, typed tables as indexes** (FINAL_REFACTOR §4) | ~50% of key and occurrence bytes in S | unchanged | no item needed; a storage change |
+
+**Why self/family do not already use a KEK, and what forward secrecy would then cost.** Self/family chose a fresh
+DEK per write, so forward secrecy on removal is free: "the per-write fresh DEK means future writes simply exclude
+them" (`at_rest_cascade.rs` `rekey_for_newcomers` doc) [T]. The price is A2 on every write and A3 on every join.
+With a KEK, removal costs one rotation: a new epoch KEK wrapped to the remaining devices (members' devices minus
+one member's, about 12-15 rows for a 5 × 3 family) **once per removal**, instead of 15 rows on every write.
+**Device revocation must rotate too.** `formal/key_plane` found exactly this gap at the epoch tier: a revoked device
+of a member who stays kept the epoch key until the next rotation (K8, C558) [T]. So the rule is rotate on member
+removal **or** device revocation (K6 already names "a rotation falling due"). For a family that writes more often
+than it loses members or devices (the normal case), the KEK wins by the write/removal ratio.
+
+**Can the kernel fold each as ONE item?** Yes, for all four items, under one rule. An item is folded as one held
+row when its leaves share **one signer, one signed instant and one family**, and each leaf is checkable against the
+signed root. `touches(item)` is the union of its leaves' keys, and the verdict is per leaf. Persist explodes leaves
+into **index entries** (for "who holds X", "which wraps name this device"), never into rows. A leaf that needs its
+own signer, or its own instant, is a row, not a leaf.
+
+### 13.6 Multi-row items against the breakers
+
+A leaf that is admissible only once its header is held is B4 (missing parent) again. The rules that keep items
+order-free:
+
+1. **Never drop a leaf or a header.** A leaf whose root is not held is held `Inert { missing: header(root id),
+   retry: WhenAny(Refs(root id)) }` (§5.3), so the header's arrival re-evaluates exactly those leaves through the
+   read-set index. A header whose leaves are missing is a held item whose view says what is missing.
+2. **Completeness is a view, not a gate.** With inclusion proofs, a leaf needs only `{header, itself}`, never the
+   whole set, so no item is all-or-nothing, and a recipient that was sent only its own leaf is complete *for it*.
+   An item that needs every leaf (a set claim's count against its list) reports `incomplete { have, of }`, and
+   nothing waits on it.
+3. **Two headers, one item id** (a fork, or a resend with a different root): both are held, the item's view is
+   `forked`, and its leaves are inert, as with peer records (B11). Never first-header-wins.
+4. **A chained item** (set-claim deltas): a delta before its predecessor is held and inert on `Refs(prev_root)`,
+   and the head is `pick=chain`, as for group heads (B12).
+5. **Transport ships items, routing ships leaves.** `route(item leaf, Peer)` (§5.9) decides per leaf; Edge batches
+   the header with the leaves it sends. Persist's settle (`settle_if_held`) settles at the leaf: a re-sent leaf
+   whose root is held is idempotent success.
+
+### 13.7 What to optimise first
+
+| order | change | layer | expected effect (test-shaped) |
+|---|---|---|---|
+| 1 | I1 set claim | CC row + kernel item | removes A1's daily B-row cost and its 12,000-claim ceiling |
+| 2 | I2 group KEK for self/family, rotating on removal **and** device revocation | CC ruling (CC 4.4.3.4.1) + store | removes A2: about 115 KB → 60 B per sealed write in a 5 × 3 family |
+| 3 | I3 history grant | CC + store | A3 from O(H) × D rows to D rows |
+| 4 | signatures as BLOB, not base64 text | store | ~1.1 KB per row (≈12% of S's attestation table) |
+| 5 | I5 one row | store (FINAL_REFACTOR §4) | ~50% of key and occurrence bytes |
+| 6 | I4 sign-once wrap set | CC re-admission (W19) + kernel | A4 ~80% fewer bytes per minter per removal |
+
+Items 4 and 5 are store-side and are credited there (§11.4). Items 1-3 and 6 need CC rows first.
+
+---
+
 ## Appendix: how the counts were taken
 
 | count | command or read |
@@ -1030,4 +1199,8 @@ problem, so the kernel's baseline is **61.4.0, not 61.3.0**.
 | guard words (`one` 30, `each` 11, `not` 9, `no` 8, `set` 2, `all` 1) | `re.findall(r'\b(one\|no\|each\|set\|all\|not)\b(?= \|\()', guard)` over every guard string. Nested `one` clauses inside `each(...)` count, so 30 exceeds CC's 25 |
 | fold classes (`over` 17, `cut` 11, pick max 15 / rank 8 / chain 4 / once 4 …, combine median 5 / sum 2 / min 2 / max 1) | regexes `pick=([^;]*)`, `combine=(\w+)`, `\bcut=`, `\bover=` over `family_model.json` fold cells. A pick naming both `rank(` and `max(` was classed max, so max is 15 against CC's 13 |
 | reactions with `unless` (10) | `sum(1 for r in reactions if r.get('unless'))` |
+| §13 bytes per family (store S) | on the copy: `select attestation_type, dimension-prefix, count(*), sum(length(attestation_envelope) + length(scrub_signature_classical) + length(scrub_signature_pqc) + length(additional_scrubs) + id/hash column lengths + 60) … group by family order by total desc` |
+| §13 table sizes | `select name, sum(pgsize) from dbstat group by name` |
+| §13 nested signatures | `(sum(length(env)) − sum(length(replace(env,'signature_pqc',''))))/13` over all rows: 2,208 |
+| §13 admit-time proxy | `julianday(substr(admitted_at,1,23))·86 400 000 − lag(...) over (order by admitted_at)`, grouped by family, gaps < 5 s |
 | persist vendors no `transitions.json`, `reactions.json` or `family_model.json` | `find . -name …` (target excluded): no hits [T] |
