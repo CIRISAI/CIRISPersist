@@ -491,6 +491,9 @@ mod key_id_fingerprint_invariants;
 // consumers can drive them against their own backends.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod key_grant_invariants;
+// MEASUREMENT ONLY (kg-burst-measure) — the seat-door burst cost.
+#[cfg(test)]
+mod kg_burst_measure;
 // v55.0.0 (CIRISPersist#989) — I742–I745: the key-grant SET retired, one
 // `scores` row per recipient (the upgraded node included).
 #[cfg(test)]
