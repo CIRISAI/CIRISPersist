@@ -582,8 +582,11 @@ pub async fn verify_takedown_authority(
 /// the cohort target of a `community` or `affiliations` row
 /// ([`envelope_cohort_target`](super::admission::envelope_cohort_target)).
 ///
-/// v61.4.0 (CIRISPersist#1260; CC 4.5.3, CC 4.4.3.3.1) — **a placement binds
-/// the content into the room it places it in.** A room's message or file
+/// v61.4.0 (CIRISPersist#1260; CC 4.5.3, CC 4.4.3.3.1; CC 4.5.5 as ruled at
+/// CIRISConstitution 7b86bee, "content is a community's where a live row
+/// places it at that community's scope, a `supersedes` that widens it
+/// included") — **a placement binds the content into the room it places it
+/// in.** A room's message or file
 /// reaches its room as a `supersedes` widening of the author's `self` row, and
 /// only the widening replicates: the `self` row binds no community, and a
 /// member's node holds the widening alone. So the binding rows are read with

@@ -22,6 +22,10 @@
 //!   at the room's scope, is found and lifts the withholding. Once the
 //!   author withdraws a placement (the `withdraws` delivered to B), its
 //!   content binds into no room on either node and the founder is refused.
+//! - **I1750** (two nodes; sqlite and postgres) — the two-person room: the
+//!   founder takes the other member's placed message down on the founder's
+//!   node and the notice applies on the author's; the member cannot take the
+//!   founder's message down.
 //! - **I1747** (sqlite and postgres) — the read.
 //!   `attestations_binding_content_with_placements` returns the `scores`
 //!   rows `attestations_binding_content` returns, plus the room placement;
@@ -423,6 +427,84 @@ pub(crate) mod bodies {
         }
     }
 
+    /// **I1750** — the two-person room (CC 4.5.5): a room of a founder and
+    /// one other member. The founder's node receives the member's placement
+    /// and takes the member's message down there; the notice applies on the
+    /// author's node too. The member, who is no moderator, cannot take down
+    /// the founder's message (they are its author's peer, not its subject).
+    pub(crate) async fn i1750_a_founder_takes_down_in_a_room_of_two(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+        node_a: &str,
+        node_b: &str,
+        s: &str,
+    ) {
+        for d in [a, b] {
+            for n in [node_a, node_b] {
+                if d.lookup_public_key(n).await.unwrap().is_none() {
+                    ts::register_hybrid_key_as(
+                        d,
+                        n,
+                        n,
+                        crate::federation::types::identity_type::NODE,
+                    )
+                    .await;
+                }
+            }
+        }
+        let tag = format!("i1750-{s}");
+        let mut room = String::new();
+        let mut keys = Vec::new();
+        for d in [a, b] {
+            (room, keys) = make_group(
+                d,
+                &tag,
+                consensus_protocol::MAJORITY,
+                &["f", "member"],
+                1,
+                None,
+                None,
+            )
+            .await;
+        }
+        let (founder, member) = (&keys[0], &keys[1]);
+        occurs_through(&[a, b], member, node_a).await;
+        occurs_through(&[a, b], founder, node_b).await;
+
+        let sha = sha_hex(&format!("{tag}-msg"));
+        let (_, placed) = write_and_place(
+            a,
+            edge_room_row(member, &room, &sha, false),
+            room_audience(&room),
+        )
+        .await;
+        deliver(b, &placed).await;
+        let n = notice(&who(founder), &sha, BASIS);
+        td::takedown_tombstone(b, &n, NODE)
+            .await
+            .expect("I1750: the founder takes the other member's message down");
+        td::takedown_tombstone(a, &n, NODE)
+            .await
+            .expect("I1750: the notice applies on the author's node");
+        for d in [a, b] {
+            assert!(purge_withheld(d, &sha_bytes(&sha)).await.unwrap().is_some());
+        }
+
+        // The other way round: the founder's message, the member's notice.
+        let sha_f = sha_hex(&format!("{tag}-founder"));
+        let (_, placed_f) = write_and_place(
+            b,
+            edge_room_row(founder, &room, &sha_f, false),
+            room_audience(&room),
+        )
+        .await;
+        deliver(a, &placed_f).await;
+        let e = td::takedown_tombstone(a, &notice(&who(member), &sha_f, BASIS), NODE)
+            .await
+            .expect_err("I1750: a plain member holds no takedown over a peer's message");
+        assert_eq!(e.kind(), token::UNAUTHORISED, "I1750: {e}");
+    }
+
     /// **I1747** — the read, and the bytes-plane read beside it unchanged.
     pub(crate) async fn i1747_the_binding_read_with_placements(
         d: &dyn FederationDirectory,
@@ -547,6 +629,26 @@ mod run {
             return;
         };
         super::bodies::i1746_a_room_moderator_takes_down_placed_content(&a, &b, &na, &nb, &s).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i1750_sqlite() {
+        let s = suffix();
+        let (na, nb) = nodes(&s);
+        let (a, b) = (sqlite(&na).await, sqlite(&nb).await);
+        super::bodies::i1750_a_founder_takes_down_in_a_room_of_two(&a, &b, &na, &nb, &s).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i1750_postgres() {
+        let s = suffix();
+        let (na, nb) = nodes(&s);
+        let (Some(a), Some(b)) = (postgres(&na).await, postgres(&nb).await) else {
+            return;
+        };
+        super::bodies::i1750_a_founder_takes_down_in_a_room_of_two(&a, &b, &na, &nb, &s).await;
     }
 
     #[cfg(feature = "sqlite")]
