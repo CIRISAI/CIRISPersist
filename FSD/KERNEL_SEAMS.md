@@ -39,6 +39,10 @@ Three of the breakers are in the rule text, not in persist: C557, the 8 `no …@
 clauses, and the W window that judges standing at receipt. The kernel cannot fix those. CC has to rule them
 (§10).
 
+Eric widened the scope: copying and placement ("how edge knows when to copy what where") are the same rules,
+so they are kernel outputs too. `route(row, party)` answers hold / offer / serve / relay / park / discard from the
+same tables (§5.9). Persist keeps storage and quotas; Edge keeps transport and the actual send.
+
 The interface I propose (§5) is a pure `no_std + alloc` crate with no dependencies, built from CC's tables. Persist
 calls it once per question. Every answer carries the row ids it read and the **dependency keys** it read, which
 are its read set. Persist indexes those keys, and every row declares its write set from its own bytes alone. A new
@@ -60,7 +64,7 @@ CC's definition, as confirmed by Eric:
 | | |
 |---|---|
 | **in** | the unsorted set of signed, well-formed rows held; for each, the instant this node first held it; the reader's trust set; the node's own keys |
-| **out** | views (what is true now, and why); the queue (transitions whose `from` matches the view and whose roles the standing meets); effects (stop serving, destroy bytes, wrap a key, raise a report); drafts (rows the node itself must sign) |
+| **out** | views (what is true now, and why); the queue (transitions whose `from` matches the view and whose roles the standing meets); effects (stop serving, destroy bytes, wrap a key, raise a report); drafts (rows the node itself must sign); **routes**: for a row and a party (this node, a peer, a stranger), hold / offer / serve / relay / park / discard (§5.9, Eric's widening) |
 | **replaces** | the store's decisions (`admission.rs` and the other gates) |
 | **does not replace** | storage, sync, signature checking, indexes |
 | **rules from** | `transitions.json`, `reactions.json`, `family_model.json`, `governance_policy.json`, `seat_duties.tsv`, `duty_holders.tsv` |
@@ -83,6 +87,19 @@ is needed, and the gap between doing and signing is covered because every effect
 
 `at`, the evaluation instant, is the fourth input every call takes. It is the "now" against which windows that
 open at a first-held instant are read. It is never compared to a signed instant inside a gate.
+
+**Standing is a function of rows *and* first-held instants (W4 / C565, ruled by Eric).** Standing is judged at
+the row's **signed** instant. That signed instant is trusted only when `first_held − asserted_at ≤ W`, and that
+test is row-local: it reads one row and this node's first-held instant for it. **The node's clock decides only
+what the node does**: when a window it opened closes, when an effect falls due, when to wake. It never decides
+what a row means.
+
+So standing is **not** a pure function of the rows alone. It is a function of the rows plus their first-held
+instants, which are already a kernel input. The ruling leaves a residue, which CC's model pins and this document
+records: a row first held within W on one node and past W on another **counts at the first and is inert at the
+second**. Its `Inert` verdict names the cure: a current member's vouch for the past (CC 3.3.4, "A node does not
+rebuild a group's past from old signatures… Events inside a vouched past are held on that vouch", `part_3`
+around line 1568 [T]). That is a convergence of answers by a row that can be signed, not by a clock.
 
 ---
 
@@ -180,11 +197,11 @@ three plus the new ones found here:
 
 | id | class | anchor | what goes wrong | computed form |
 |---|---|---|---|---|
-| B1 | a, k | owner binding: `admission.rs:13091` [T]; C557 | a new owner's binding that arrives ahead of the old owner's withdrawal is lost; two nodes read different owners (`formal/owner_binding` O6) | hold both. `owner_of` = the unique live cosigned binding, else none. This is the model's `fold/unowned` reading, which gives up O4. CC rules O4 against O7 (§10 W1) |
+| B1 | a, k | owner binding: `admission.rs:13091` [T]; C557 | a new owner's binding that arrives ahead of the old owner's withdrawal is lost; two nodes read different owners (`formal/owner_binding` O6) | **RULED (C557, Eric): the fold decides.** Hold every binding. Only bindings **this node's own key cosigned** count. If exactly one counts, it is the owner; any other count (zero, or two or more) is **unowned**; a binding the node did not cosign (a stranger's) is held and `Inert`. This is the model's `fold/unowned` reading, and it gives up O4. **Deltas from today:** `check_single_node_owner_admission`'s `NodeAlreadyOwned` refusal (`admission.rs:13129-13133`) [T] goes; `owner_of`'s `AmbiguousNodeOwner` error for two owners (`admission.rs:12702`) [T] becomes the verdict `unowned`, not an `Err`; and today a node's cosignature is demanded only after a reclaim (`check_post_reclaim_rebinding_admission`, `admission.rs:13140`) [T], whereas the ruling makes it the condition for **every** counted binding |
 | B2 | a, f | `withdraws` stamp: `attestation_admit.rs:1163-1181`, `precedence.rs:258-280` [T] | entitlement depends on whether the target was held at the `withdraws`'s arrival | entitlement is a fold over (target, `withdraws`, the signer's standing at the `withdraws`'s signed instant); the stamp column is deleted. The release lead confirmed this independently (`attestation_admit.rs:1170-1181`, TESTED by them): the same rows in a different arrival order give a different retraction verdict, on the retraction path Edge reads. It is C557's class |
 | B3 | a | delegation cycle `admission.rs:18517` [T] | the edge that closes a cycle depends on order | the cycle is a view; its closing edge is chosen by `max(asserted_at), max(id)` and is inert. Same on every node |
 | B4 | a, i | gates 5, 11, 12, 14, 15 in §2.2 [T] | a row that arrives before its key record, consent, standing or subject is dropped; the peer may never re-offer it | **no gate drops.** The row is held with verdict `Inert { reason, retry: WhenAny(keys) }`. When a key in `retry` changes, its verdict is recomputed for free through the read-set index (§5.4). This is `formal/owner_binding`'s `again` reading applied to every door |
-| B5 | c, a, k | W at receipt: `self_roster.rs:556-575`, `key_grant.rs:1197-1210`, `admission.rs:13032`, `admission.rs:5301` [T] | "a signer stands at its signed instant; past W it must also stand **at receipt**." Standing at receipt is the held set at receipt, so an eviction that arrives after the row admits it on one node and refuses it on another, for good | judge standing at the row's signed instant over **all** rows held, ordering the eviction by its own signed instant. Use W only as `first_held − asserted_at ≤ W`, which is a function of the row and its first-held instant. Needs CC's ruling on #1049 (§10 W4) |
+| B5 | c, a, k | W at receipt: `self_roster.rs:556-575`, `key_grant.rs:1197-1210`, `admission.rs:13032`, `admission.rs:5301` [T] | "a signer stands at its signed instant; past W it must also stand **at receipt**." Standing at receipt is the held set at receipt, so an eviction that arrives after the row admits it on one node and refuses it on another, for good | **RULED (W4 / C565, Eric):** judge standing at the row's **signed** instant over all rows held, ordering the eviction by its own signed instant. Trust that instant only when `first_held − asserted_at ≤ W` (row-local). The four `now` reads go (`self_roster.rs:567`, `key_grant.rs:1197`, `admission.rs:13032`, `:5301`). **Residue (pinned by CC's model, accepted):** a row first held within W on one node and past W on another counts on the first and is `Inert { reason: asserted_at_stale, missing: vouch }` on the second. The cure is a current member's vouched past (CC 3.3.4), which is a row, so the two nodes converge once it is held (§1) |
 | B6 | a, c, e | cosign hold: `cosign.rs:853`, `:1199`, V214 partial UNIQUE [T, doc] | expiry deletes held rows on a sweep; one open proposal per proposer refuses the second | pending, assembled and lapsed are views over held `cosign:*` rows; the reaction `drop_held` (`reactions.json` [T]) becomes the view `lapsed` plus an optional storage reap (§3.1) |
 | B7 | e, c | community DEK epoch: `store/sqlite.rs:9654-9684`, `community_dek.rs:557-575` [T] | a mutable counter; it rotates when a signed `removed_at` exceeds a **local** `minted_at`; bumping twice for one removal gives two epochs [B] | epoch identity = `H(community, minter, the departure rows since the previous epoch)`. Rotation is due when the held departure set grows (`formal/key_plane` K6: "the epoch changes only after a departure or a rotation falling due" [T]). The minted DEK is still persist's secret |
 | B8 | c | takedown `content_binding` `takedown_tombstone.rs:602-611` [T] | the subject set is read against `Utc::now()` | read at the notice's first-held instant |
@@ -193,7 +210,7 @@ three plus the new ones found here:
 | B11 | h | peer record TOFU `directory_admit.rs:155-176` [T] | the first pubkey for a key id wins | hold both; the view reads `conflict` and serves neither (the same law as O8, "a reader that holds two reads none") |
 | B12 | h, a | group head supersede `group_supersede_admit.rs:77-100` [T] | a successor that arrives early is refused; of two forks, the first wins | a fold over the `prev_head_digest` chain; a fork is a view; the head is `pick` over the unforked tip |
 | B13 | c, e | accord `created_at` `accord_admit.rs:93-95` [T] | a local instant enters the record | the serve cursor stays persist's and no verdict reads it [B: confirm no fold reads `created_at`] |
-| B14 | f | `hard_case` emissions, 20 call sites [T] | a node writes its own fold result as a signed row; peers replicate this node's opinion | a notice (FINAL_REFACTOR §5.6). Rows remain only for CC-listed signed acts |
+| B14 | f | `hard_case` emissions, 20 call sites [T] | a node writes its own fold result as a signed row; peers replicate this node's opinion | **DERIVED (W6):** what every node can read from rows plus its clock is a **notice**, not a row. A signed row remains only where someone outside the node must be told or held to it: key grants, `consent:state:expired`, `consent:decay:*`, the safeguarding escalation of CC 3.4.13, and the takedown/purge tombstone. CC will type all fifteen `hard_case` kinds |
 | B15 | g | `withdraws_depth` per row `attestation_admit.rs:1438-1441` [T] | the operator's depth is frozen into the row and later folds read it | the depth comes from governance policy (one number for all) or the column goes |
 | B16 | c | the 4 folds that read `received_at` today, named in persist's own doc (`attestation_admit.rs:76-82`, pinned by `store/parity.rs:3444` `PLAN_INSTANTS`) [T] | folds judged at receipt | judged at `fold_at` (signed instant); `received_at` only in row-local bounds |
 | B17 | a, c | trust threshold at the door `replication/admission.rs:133` [T] | the reader's trust at receipt decides what is held | hold; a `by=reader` view filters. **The cost:** more rows held from low-trust keys, so quotas and placement carry the load (§12 R1) |
@@ -538,19 +555,87 @@ pub struct RuleVersion {
 - **On upgrade:** drop the answer cache, recompute, and diff the old views against the new ones. The diff is the
   changelog of behaviour, and any `EffectNoLongerJustified` notices go in it.
 
-### 5.9 Placement: what persist may refuse to hold
+### 5.9 Routing: hold, offer, serve, relay, park, discard (one answer, with the peer as an argument)
 
-Persist keeps one non-kernel refusal: **may I hold this at all**. It covers the quota, "never store what we are
-not party to", and the audience. If placement depends on held rows (am I in this room?), it is order-dependent
-again. So placement is also a kernel answer, with three outcomes:
+**The widening (Eric).** "This is where we analyze how edge knows when to copy what where and make IT part of the
+kernel, because it is the same rules." Placement and replication are kernel outputs, not a second engine. The
+rules that decide whether a row may be held (audience, scope, custody, the reach gate, the set served to a
+stranger) are the rules that decide whether it may be sent. Two engines would be the Live-filter-vs-door class
+again: a filter that re-derives a verdict disagrees with the door that made it.
+
+**Persist already has half of this as one resolver.** `replication_audience.rs` says "every door that asks 'may
+this node hold, receive or be sent this row' answers through here, so the sender's set, the receiver's hold
+decision and edge's serve gate cannot answer differently" (module doc) [T]. Its parts:
+
+| today | anchor | what it answers |
+|---|---|---|
+| `may_receive(dir, recipient, row) -> Verdict { Yes(Reason) \| No(Reason) }`, `Reason ∈ {Origin, RefersTo, Public, Cohort, NotInAudience, Malformed}` | `replication_audience.rs:664-710` [T] | may this peer have this row |
+| `audience_nodes(scope, target) -> Audience { Everyone \| Nodes(set) }`, built from owners' `consent:replication` allow lists and the occurrence's signed `device_class` | `:563-591`, module doc [T] | who the row reaches (the fan-out) |
+| `is_public_group` | `:457` [T] | the commons and public groups reach everyone |
+| `would_hold` (local or family author always; refuse non-party; under disk pressure refuse proxy content) and `HoldBreadth { OnDemand, ForCohort }` from serve standing | `replication/hold.rs:264-290`, `:540` [T] | may this node keep it, and how widely it holds for others |
+| `policy_for(EnvelopeKind)`, `REPLICATION_POLICY_HASH`; "Edge exports its serve/advertise half; CIRISServer pins both" | `replication_policy.rs:431`, module doc [T] | the per-kind admission policy, pinned across the triple |
+| `settle_if_held` | `replication_policy.rs:651` [T] | a held re-offer is idempotent success (transport, stays persist's) |
+| `cosign::may_receive` | `cosign.rs:1254` [T] | the cosign rows' audience (current members) |
+
+All of these read held rows (owners' grants, occurrences, rosters, charters), so they are folds, and they move into
+the kernel as one answer:
 
 ```rust
-pub enum Placement { Hold, Park { until: KeySet }, Discard }   // Discard only for Retry::Never reasons
+/// Who is asking about the row. Only a key id crosses: the kernel derives the party's principals,
+/// node class and memberships from held rows (occurrences, consent:replication grants, rosters).
+pub enum Party<'a> { Me, Peer(KeyId<'a>), Stranger }
+
+#[non_exhaustive]                  // until Edge's census of copy decisions lands (hook below)
+pub enum Route {
+    Hold,                          // Me: keep it (party to it, in audience)
+    Offer,                         // Peer: advertise or push; the peer is in the row's audience
+    Serve,                         // Peer/Stranger: hand it over if asked, never push (public / served set)
+    Relay { custody: CustodyRef }, // Peer: carry it for others as a custodian (HoldBreadth::ForCohort, sealed bytes)
+    Park { until: KeySet },        // not yet decidable: the deciding row is missing (the `again` reading)
+    Discard { reason: Token },     // never: Retry::Never reasons only (NotInAudience after a terminal fold, Malformed)
+}
+
+impl Kernel {
+    pub fn route(&self, src: &dyn HeldSource, row: &RowView, party: Party, ctx: &Ctx) -> Answer<Route>;
+    /// The fan-out: every party `route` would answer Offer or Relay for. Same fold, enumerated.
+    pub fn audience(&self, src: &dyn HeldSource, row: &RowView, ctx: &Ctx) -> Answer<Audience>;
+}
 ```
 
-`Park` is a bounded inbox (persist's quota) re-offered when a key in `until` changes. CC's `placement` column
-is a gap for 156 of 184 families [T, `_meta.coverage.placement`], so today almost every family takes the
-default (§10 W8).
+**One rule, three readings.** `route(row, Me)` is the receiver's hold decision. `route(row, Peer(p))` is the
+sender's offer and serve gate. `audience(row)` is the fan-out. They are the same fold, so they cannot disagree,
+and the digest (§4.1 #4) proves it per fixture. `Answer.reads` gives Edge its invalidation for free: when a
+`consent:replication` grant, a roster or an occurrence changes, exactly the rows whose audience read it
+re-route. That replaces audience recomputation on every advertise.
+
+**Order-independence carries over.** `Park` is the `again` reading for routing: a row whose audience depends on a
+membership not yet held is parked, not discarded. Today `would_hold` refuses non-party content outright
+(`replication/hold.rs:528-531`, the `would_hold` doc) [T]. That is correct only when non-party is terminal, so the kernel answers `Discard`
+only when the fold says so and `Park` while a deciding row could still arrive.
+
+**What each layer still owns.**
+
+| | owns | why it is not the kernel's |
+|---|---|---|
+| **kernel** | the answer `Route` per (row, party), the `Audience`, and their read sets | it is the same rules as the door |
+| **persist** | the held store; first-held stamping; the settle; **quotas** (the per-peer write budget); **disk pressure** (`DiskPressureSnapshot`, `hold.rs:512-520` [T]) as a *deferral* that is retryable and never a `Discard`; the bounded `Park` inbox; serving bytes from storage | operator and resource state, never row state. A pressure refusal must stay retryable or the held set cannot converge |
+| **Edge** | transport and the actual send; peer discovery, liveness and reachability; scheduling, batching, bandwidth and retries; the want-set and pull protocol (`known_hashes`, set difference); which of several eligible peers to ask first | it is about the network, not the rows. Edge never re-derives a `Route`: it asks |
+
+**Hook for Edge's census.** Edge is running its own census of copy decisions. To join the two:
+
+1. Each Edge copy site is listed as a row of `edge_copy_sites` (site, `file:line`, the question it asks, the
+   inputs it reads).
+2. A site whose inputs are rows plus a peer key plus first-held instants maps to one `Route` arm and moves into
+   the kernel, and the site becomes a `route` call.
+3. A site that reads anything else (liveness, RTT, link cost, a local cache of "what I sent last") stays Edge's.
+   If it changes *whether* a row may be sent, rather than *when* or *via whom*, it is a breaker of the §3 kind
+   ("what I processed last", §4.1) and goes to CC as a worklist item.
+4. `Route` is `#[non_exhaustive]` until that census lands. A new arm needs a CC cell (W8) and a vector.
+5. `REPLICATION_POLICY_HASH` becomes the hash of the kernel's routing tables, so the triple pin persist, Edge and
+   Server already share (`replication_policy.rs` module doc [T]) pins the rules themselves.
+
+`CC`'s `placement` column is a gap for 156 of 184 families [T, `_meta.coverage.placement`], so today almost every
+family takes the default (§10 W8).
 
 ---
 
@@ -726,14 +811,14 @@ numbers come from `transitions.json` and `family_model.json` `_meta` and cells a
 
 | # | item | today | ask |
 |---|---|---|---|
-| W1 | **C557 owner binding** | `formal/owner_binding`: no reading holds O4 and O7 together [T] | rule it. The kernel can implement `fold/unowned` (gives up O4) or `again/unowned` (gives up O7, needs Park). Persist recommends `fold/unowned`: it is the only reading without a dropped row |
+| W1 | **C557 owner binding: RULED** | Eric: the fold decides | only bindings the node's own key cosigned count; exactly one is the owner; any other count is unowned; a stranger's binding is inert (B1). Remaining for CC: type it as a fold cell on the owner-binding family, so the kernel reads it from the table |
 | W2 | **uniqueness guards that refuse** | 8 `no X@admitted … else refuse` clauses in 5 families [T] | a `tie_break` cell for each (CC#203), so the duplicate is held and inert |
 | W3 | **guards** | 26 of 459 transitions typed; 433 `generic` [T] | type the 21 non-set-function sites in §2.2 first: 5-7, 9, 11, 12, 14, 15, 19-24, 26-30, 33, 34. Each names a persist anchor to read |
-| W4 | **W at receipt (#1049)** | `freshness`: 174 `generic`, 7 prose, 3 gap [T]; persist judges standing at receipt in 4 places [T] | rule that W is `first_held − asserted_at ≤ W` (row-local) and that standing is judged at the signed instant over all held rows. Otherwise W stays order-dependent by construction |
+| W4 | **W / C565: RULED** | Eric: standing at the signed instant, trusted only when `first_held − asserted_at ≤ W` | remaining for CC: type the freshness cell (174 `generic` today [T]) with that test, and name the vouched past (CC 3.3.4) as the `Inert` cure so the kernel can put it in `missing` (§1, B5) |
 | W5 | **folds and counts** | fold: 76 `cc-table`, 108 `generic`; count: 16 `cc-table`, 164 `generic`, 4 `gap` [T] | type the folds the kernel needs first: `owner_of`, epoch identity (W7), group head chain, cosign pending/assembled/lapsed, peer record conflict |
-| W6 | **emit or notice** | 25 emits, including 15 `hard_case:*` [T, effect counter]; 7 `not_yet_by_origin_door` [T] | mark each emit as a signed act (row) or a node's computation (notice, FINAL_REFACTOR §5.6). Persist expects only `key_grant:*`, `consent:state:expired` and `consent:decay:*` to remain rows |
+| W6 | **emit or notice: DERIVED** | 25 emits, including 15 `hard_case:*` [T]; 7 `not_yet_by_origin_door` [T] | the rule: what every node can read from rows plus its clock is a notice; a signed row remains only where someone outside the node must be told or held to it (key grants, `consent:state:expired`, `consent:decay:*`, the CC 3.4.13 safeguarding escalation, the takedown/purge tombstone). CC will type all fifteen kinds |
 | W7 | **epoch identity** | `formal/key_plane` K6 states when an epoch changes, not what names it [T] | name an epoch by the digest of its departure rows, not a counter |
-| W8 | **placement** | 156 of 184 `gap` [T] | a placement cell so `Hold / Park / Discard` (§5.9) is a table read |
+| W8 | **placement and routing** | `placement` 156 of 184 `gap` [T] | placement, audience, custody and the stranger-served set as typed cells, so `route` (§5.9) is a table read for every family, not code. Edge's census of copy decisions feeds the same cells |
 | W9 | **operator settings in verdicts** | `withdraws_depth` (V157) [T] | a governance-policy number, or delete the dependence |
 | W10 | **effect vocabulary** | `do` acts: `cancel_watch`, `cease_replication`, `deregister_peer`, `drop_held`, `stop_serving`, `destroy_bytes` [T] | mark each `irreversible` or `idempotent`; recast `stop_serving` and `drop_held` as views; add `destroy_key` (crypto-shred), which persist does on a sweep today (`community_dek.rs:1137` [T]) with no reaction naming it |
 | W11 | **acknowledgement row** | `purged` and `sealed` are new event words [T] | bless `purged` (local tier, `refs=[effect id]`) as the acknowledgement of an irreversible effect (§1) |
@@ -919,6 +1004,13 @@ problem, so the kernel's baseline is **61.4.0, not 61.3.0**.
 - **R5. Order.** Following FINAL_REFACTOR §5.5: shadow (no behaviour change) → cut over per family with the
   bespoke gate deleted in the same commit → rule (behaviour change, one named delta per family). Breakers B1-B20
   are all step-4 changes and each ships as its own delta.
+- **R6. Routing on Edge's hot path.** `route` is asked per (row, peer), which is more often than the door is asked
+  per row. The cost rule: compute `audience(row)` once per row and cache it under its read set, so a per-peer
+  `route` is a set-membership test, O(log a). Edge's census (§5.9 hook) has to show which of its copy decisions
+  run per frame, so that those are served from the cached audience and never refold.
+- **R7. The W residue is visible to users.** Under the W ruling, two nodes can show different standing for a
+  late-arriving row until someone signs a vouched past. The `Inert` verdict names that cure, so a client can
+  show "waiting for a member to vouch" rather than a silent difference.
 
 ---
 
