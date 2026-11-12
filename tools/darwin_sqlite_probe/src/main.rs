@@ -87,9 +87,23 @@ fn reader(path: &str, flags: i32, tuning: bool) -> String {
 }
 
 fn scenario(name: &str, writer_tuning: bool, write_first: bool, flags: i32, reader_tuning: bool) {
+    scenario2(name, writer_tuning, write_first, flags, reader_tuning, "", false)
+}
+
+/// `prime` is SQL the writer runs after its pragmas, before any reader opens.
+/// `reopen` first creates the store, writes, closes it (SQLite deletes the
+/// -wal/-shm on a clean last close), then reopens: the node-restart case.
+fn scenario2(name: &str, writer_tuning: bool, write_first: bool, flags: i32, reader_tuning: bool, prime: &str, reopen: bool) {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("persist.db");
     let path = p.to_str().unwrap().to_string();
+    if reopen {
+        let w0 = Connection::open(&path).unwrap();
+        w0.execute_batch(WRITER_PRAGMAS).unwrap();
+        w0.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);").unwrap();
+        drop(w0);
+        println!("   (reopen: after clean close {})", sizes(&p));
+    }
     let w = Connection::open(&path).unwrap();
     let wr = w.execute_batch(WRITER_PRAGMAS);
     let jm: String = w.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap_or_default();
@@ -98,6 +112,10 @@ fn scenario(name: &str, writer_tuning: bool, write_first: bool, flags: i32, read
     }
     if write_first {
         w.execute_batch("CREATE TABLE IF NOT EXISTS t(x)").unwrap();
+    }
+    if !prime.is_empty() {
+        let r = w.query_row(prime, [], |r| r.get::<_, i64>(0));
+        println!("   prime {prime:?} -> {r:?}, {}", sizes(&p));
     }
     println!("== {name}");
     println!("   writer pragmas {:?}, journal_mode={jm}, {}", wr.map(|_| ()), sizes(&p));
@@ -139,4 +157,9 @@ fn main() {
     scenario("F as shipped, flags RO only", true, false, RO, true);
     scenario("G as shipped, flags RO|URI", true, false, RO | URI, true);
     scenario("H as shipped, mmap 0", false, false, f, false);
+    let prime = "SELECT count(*) FROM sqlite_master";
+    scenario2("I as shipped, writer READS first (the fix)", true, false, f, true, prime, false);
+    scenario2("J restart: reopen existing, no prime", true, false, f, true, "", true);
+    scenario2("K restart: reopen existing, writer reads first", true, false, f, true, prime, true);
+    scenario2("L as shipped, prime = PRAGMA schema_version", true, false, f, true, "PRAGMA schema_version", false);
 }

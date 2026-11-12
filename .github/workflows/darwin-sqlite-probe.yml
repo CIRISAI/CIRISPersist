@@ -8,8 +8,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, macos-14, ubuntu-24.04]
-        rusqlite: ["0.41", "0.31"]
+        os: [macos-15, ubuntu-24.04]
+        rusqlite: ["0.41"]
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.os }} rusqlite ${{ matrix.rusqlite }}
     steps:
