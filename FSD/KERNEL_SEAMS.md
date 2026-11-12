@@ -1043,11 +1043,9 @@ replace N signed rows with one.
 ### 13.1 Data, and what it is not
 
 **Eric's standing rule: no production data, only aggregates.** Server correctly refused a store copy. The
-production numbers will come as an **aggregate table** from the bridge session, taken from the 0.5.246
-offline-boot snapshot: per `attestation_type` × dimension family × `cohort_scope` × `tier`, the count, the
-envelope bytes (total and average), the signature lengths, the first and last month, and a per-month count, with
-groups of n < 5 suppressed. §13.2a is its placeholder. Until it arrives, every number here is **test-shaped**,
-taken from stores that other sessions' test runs left on this machine. I
+production numbers are an **aggregate table** and a `dbstat` from the canonical (§13.2a-c), with groups of n < 5
+merged. Every other number in this section is **test-shaped**, taken from stores that other sessions' test runs
+left on this machine. I
 copied each one into my scratch directory first (`sqlite3 -readonly src ".backup dst"` for the seeded store; `cp`
 of `.db` + `-wal` for the mesh stores) and ran SELECTs on the copies only.
 
@@ -1059,7 +1057,7 @@ of `.db` + `-wal` for the mesh stores) and ran SELECTs on the copies only.
 
 None of S or M holds a single `key_grant` row, and S holds 21 blobs [T, `count(*)`]. So the key-plane rows are
 priced from K and from the code, not from a store. "Rows per day" cannot be read from a 23-minute seed, so it is
-given as the seed's rate, and production rates wait for the aggregate table (§13.2a).
+given as the seed's rate. Production monthly rates are in §13.2a.
 
 ### 13.2 Per family: bytes (store S)
 
@@ -1100,22 +1098,124 @@ the first two segments of `dimension`.
   (15.5 MB) [T, `dbstat`]. FINAL_REFACTOR's "one row" removes that, with the typed tables becoming indexes over the
   row. It is a storage saving and the largest single one visible in S.
 
-### 13.2a PLACEHOLDER: production aggregates (0.5.246 offline-boot snapshot)
+### 13.2a Production aggregates (canonical, 0.5.245 pre-roll backup 2026-11-10, aggregates via cirisbridge-a0)
 
-> **NOT YET FILLED.** This takes the bridge session's aggregate table (§13.1): per `attestation_type` ×
-> dimension family × `cohort_scope` × `tier`, the count, the envelope bytes (total, average), the signature
-> lengths, the first and last month, and the per-month counts. Groups with n < 5 are suppressed. No row-level
-> data.
->
-> When it lands, it fills:
->
-> - the ten families by bytes;
-> - rows per month per family, the production replacement for "rows per day";
-> - the signature share of bytes per family;
-> - the custody holding claims per month, which sizes A1 against its ~12,000-claim ceiling;
-> - `key_grant:content` and `key_grant:epoch` volumes, which sizes A2 and A4. No test store holds a single one.
->
-> Every test-shaped figure in §13.2-13.4 that it contradicts gets struck through, not deleted.
+**Source.** The canonical node's 0.5.245 pre-roll backup of 2026-11-10. These are aggregates only, produced by
+`cirisbridge-a0`, with groups of n < 5 merged. I never saw a row. Eric's rule (§13.1) holds. Every figure in this
+subsection and in §13.2b is this source's [T as received from the bridge via the release lead; I did not run the
+queries].
+
+**File:** `ciris_engine.db` 1,735,835,648 B, plus a 64 MiB `-wal`; no separate blob directory.
+`federation_attestations`: n = 42,048, envelope bytes 275,723,212. Every signed row carries `sig_cl` 88 B and
+`sig_pqc` 4,412 B (base64).
+
+Cohort and tier are `federation` unless noted. "Months" are by `asserted_at`, as month numbers in 2026.
+
+| rank | type / family | n | envelope total | envelope avg | months asserted | PQC sig ÷ envelope |
+|---:|---|---:|---:|---:|---|---:|
+| 1 | `scores` / `key` | 8,075 | 87,987,270 | 10,896 | 06–11 | 0.40 of the row (bridge) |
+| 2 | `scores` / `trace` | 3,818 | 83,970,800 | 21,993 | 07–08 | 0.20 |
+| 3 | `scores` / `identity` | 5,563 | 50,395,708 | 9,059 | 08–11 | 0.49 of the row (bridge) |
+| 4 | `supersedes` / `trace` | 1,470 | 40,523,327 | 27,567 | 09–11 | 0.16 |
+| 5 | `scores` / `capacity` | 7,293 | 4,658,347 | 639 | 08–11 | **6.9×** |
+| 6 | `scores` / `consent` | 5,997 | 3,303,719 | 551 | 07–11 | **8.0×** |
+| 7 | `delegates_to` / `trust` | 3,002 | 1,580,955 | 527 | 10–11 | **8.4×** |
+| 8 | `delegates_to` / `ownership` | 1,316 | 849,937 | 646 | 08–11 | **6.8×** |
+| 9 | `supersedes` / `consent` | 606 | 452,416 | 747 | | 5.9× |
+| 10 | `delegates_to` / `self` | 727 | 431,253 | 593 | | 7.4× |
+| | `supersedes` / (none) | 871 | 384,674 | 442 | | |
+| | `scores` / `age_self_declared` | 932 | 360,542 | 387 | | |
+| | `delegates_to` / (none) | 1,122 | 353,663 | 315 | | |
+| | `consent` / `consent` | 732 | 159,362 | 218 | | |
+| | `scores` / `consent` (cohort `self`) | 335 | 100,419 | 300 | | |
+| | `scores` / `objection` | 7 | 62,888 | 8,984 | | |
+| | `holds_bytes` | 91 | 37,219 | 409 | | |
+| | `supersedes` / `capacity` | 35 | 36,945 | 1,056 | | |
+| | `scores` / `hard_case` (cohort `self`, tier `local`, **unsigned**) | 19 | 24,370 | 1,283 | | |
+| | `delegates_to` / `ownership` (cohort `self`) | 24 | 15,343 | | | |
+| | `withdraws` | 9 | 3,704 | | | |
+| | merged (n < 5) | 4 | 30,351 | | | |
+
+The ratio column is mine (4,412 ÷ envelope avg), except where it says "bridge". The bridge's figure counts the
+signature against the whole row.
+
+**Monthly `admitted_at`** (the largest families only):
+
+| month | |
+|---|---|
+| Aug | capacity 3,970 · trace 3,814 · consent 1,240 |
+| Oct | key 6,611 · identity 4,808 · consent 2,497 · trust 2,001 · capacity 1,480 |
+| Nov (to 11-10) | consent 1,994 · key 1,464 · trust 1,001 · identity 755 |
+
+**What production says, against the test-shaped picture.**
+
+1. **Today's production cost is identity, key and trace.** `key`, `trace` and `identity` scores plus `trace`
+   supersedes are 262.9 MB of 275.7 MB of envelope: **95%**.
+2. **On small rows the signature is the row.** Capacity, consent, trust and ownership envelopes average 527–646 B;
+   the 4,412 B PQC signature beside each is 6.8–8.4× its payload. For 17,608 such rows that is about 78 MB of
+   signature carrying about 10.4 MB of payload. This is where I1-style aggregation (one signature over many
+   leaves, §13.5) would pay first in production. These families are per-subject acts by different signers, so the
+   lever is not a wrap set. It is either a signer batching its own rows under one root (a capacity or consent
+   batch), or binary signatures (S4).
+3. **`admitted_at` ≠ `asserted_at`.** Keys were asserted from June but admitted from October, a re-home and
+   backfill (the v59 one-way rehome, `key_plane.rs` "rehome at first open" [T]). So "rows per month" by admission
+   measures migrations as much as traffic. The ledger uses both columns, and they must not be mixed.
+4. **The key plane is not yet a production cost.** The canonical holds **no `key_grant` rows** and almost no
+   custody rows (91 legacy `holds_bytes`). So A1-A4 (§13.4) are **future** costs that grow with rooms and family
+   content; they do not explain today's file. They still rank first for the *kernel*, because they grow with use
+   and they are where an item replaces N signed rows. But the bytes on disk today are the store's to fix (§13.2b).
+5. **A local, unsigned `hard_case` plane exists** (19 rows, 24 KB): W6's notices, already behaving as local state.
+
+### 13.2b The whole-file ledger (canonical, same backup, `dbstat` aggregates via the bridge)
+
+1.74 GB = 423,788 × 4 KB pages.
+
+| rank | what | size | share | per row | note |
+|---:|---|---:|---:|---:|---|
+| 1 | **trace plane**: `trace_events` 347 MB (92k rows) + its 15 indexes ~150 MB + `trace_thought_signatures` 45 MB + `trace_llm_calls` with indexes ~42 MB | **~585 MB** | **34%** | ~3.8 KB per event before indexes | the canonical reports this plane as "trace_plane dark" |
+| 2 | `federation_attestations` (table + b-tree) | 507 MB | 29% | ~12 KB | 276 MB envelopes; the other ~230 MB is mostly the row signature columns (42,048 × 4,500 B ≈ 189 MB) plus ids, hashes and b-tree |
+| 3 | **freelist** | **333 MB** (81,399 pages) | **19%** | n/a | free space never returned: no `auto_vacuum` / `incremental_vacuum` |
+| 4 | `federation_keys` | 104 MB | 6% | ~12 KB per key (8,604) | a second copy of each key record (below) |
+| 5 | `federation_identity_occurrences` + `_history` | 97 MB | 6% | (5.5k + 5.7k rows) | a second and third copy of each occurrence |
+| 6 | `signed_wire_index` + 2 indexes | ~20 MB | 1% | (52k rows) | |
+| 7 | `transport_destinations` | 18 MB | 1% | (18k rows) | |
+| 8 | `cirisgraph_nodes` | 12 MB | 0.7% | | |
+| | everything else | ~60 MB | 3% | | by difference |
+
+**Is the PQC signature stored twice per row?** For the row's **own** signature, no. In test store S, 0 of
+11,269 envelopes carry a top-level `scrub_signature_pqc` or `signature_pqc` [T, query on copy S], and
+`additional_scrubs` averages 12 B [T]. The row signature lives once, in its column. **For key and occurrence
+rows, yes, a different signature is stored twice.** A `key:record:v1` row carries the key record under
+`key_record` (`key_plane.rs:86`) [T], and that record's own registration signature, ML-DSA public key and
+registration envelope are also the columns of `federation_keys`. In S, all 2,202 of 2,202 nested
+`key_record.scrub_signature_pqc` values equal the `federation_keys` row's exactly [T, join on copy S].
+`identity:occurrence:v1` rows carry the signed occurrence under `identity_occurrence` (`key_plane.rs:91`) [T], and
+all 1,137 of 1,137 nested signatures equal `federation_identity_occurrences.signature` [T]. In S the nested copy is
+about 10.5 KB of a 10.9 KB key envelope.
+
+Applied to production [B: extrapolated from S's shape to the canonical's averages]:
+
+- the `key` score envelopes (avg 10,896 B, 88.0 MB) are almost entirely a copy of `federation_keys` (104 MB);
+- the `identity` score envelopes (50.4 MB) are a copy of the occurrence tables (97 MB, which keep history too).
+
+So **each signed key or occurrence fact is held two or three times, about 230-280 MB in all**, plus each
+attestation row's own 4.5 KB signature on top.
+
+### 13.2c The ranking, whole file: store first
+
+Store-side wins come **before** the kernel's and are credited to the store (§11.4).
+
+| order | win | layer | bytes back (canonical) | needs |
+|---|---|---|---:|---|
+| S1 | `VACUUM` once, then `auto_vacuum = INCREMENTAL` with a periodic `incremental_vacuum` | store | **333 MB (19%)** at once | nothing; an operational step |
+| S2 | **trace-plane retention** (a plane the node reports dark; trace envelopes asserted 07–08 and supersedes 09–11) and a review of its 15 indexes | store + a CC/Server ruling on how long a node keeps trace | up to **~585 MB** of tables + **~124 MB** of trace attestation envelopes (+ their signatures) | a retention rule; trace is audit data, so this is a ruling, not a sweep |
+| S3 | **one copy of each signed key/occurrence fact**: the attestation row is the record, and the typed tables become indexes over it (FINAL_REFACTOR "one row") | store | **~130-200 MB** [B] | the rehome already maps typed ↔ row (`key_plane.rs`) |
+| S4 | **binary signatures** (BLOB, not base64): about 1.1 KB per signature | store | ~46 MB on attestations + ~10 MB on keys, more on nested copies [arithmetic: 42,048 × 1.1 KB; 8,604 × 1.1 KB] | a column migration (sqlite + pg) |
+| S5 | **signer batches** for small rows (capacity, consent, trust, ownership: the signature is 7-8× the payload) | CC + kernel item | up to ~70 MB of the ~78 MB of signatures on those 17,608 rows, if batched | a CC row: one signer's same-family rows under one root (§13.5 shape) |
+| K1-K4 | I1 set claim, I2 group KEK, I3 history grant, I4 wrap set (§13.5) | CC + kernel | **0 today** (no key_grant rows, ~no custody) → future cost | rooms and family content |
+
+S1-S4 together return roughly **0.9-1.2 GB of 1.74 GB** [B: S2 depends on the retention ruling]. None of them is
+the kernel's. The kernel's ledger is S5 and K1-K4: the costs that grow with use rather than with history.
 
 ### 13.3 Per family: time to admit (store S, an upper bound)
 
@@ -1150,7 +1250,10 @@ key-grant figures are K's: 79 ms (sqlite) and 274 ms (pg) admission per row at 5
 | A5 | **one key registration / one occurrence** | 1 typed row + 1 attestation (+ the occurrence history row) | key: 12.3 KB in `federation_keys` + 15.6 KB as `key:record`; occurrence: ~8.7 + 8.2 + 13.6 KB [T, S `dbstat` ÷ rows] | not in CC's list | **added**: a 2-3× storage copy of every signed fact in its family |
 | A6 | **the 15 `hard_case` kinds** | one row per node per event | 1,723 B for 2 rows in M [T] | (e) if they stay signed | **Mostly moot after W6**: they become notices, except the CC 3.4.13 safeguarding escalation and the tombstone. Small in M, but per node and replicated, so it would scale with N nodes × events had it stayed |
 
-Ranking by what they cost a live node: **A1** (unbounded in held blobs, daily, with a ceiling), **A2** (every sealed
+**Production check (§13.2a):** the canonical holds no `key_grant` rows and only 91 legacy `holds_bytes` rows, so
+A1-A4 are not yet a production cost. They are what grows as rooms and family content grow.
+
+Ranking by what they would cost a live node: **A1** (unbounded in held blobs, daily, with a ceiling), **A2** (every sealed
 write), **A3** (every join, in history), **A4** (every removal, in minters), **A5** (every key and occurrence, in
 storage).
 
@@ -1206,16 +1309,16 @@ order-free:
 
 ### 13.7 What to optimise first
 
+The whole-file order is §13.2c: the store first (S1 vacuum, S2 trace retention, S3 one copy, S4 binary
+signatures), then S5 signer batches, then the kernel's items. Within the kernel's own ledger, ranked by growth
+with use (production holds none of these yet, §13.2a point 4):
+
 | order | change | layer | expected effect (test-shaped) |
 |---|---|---|---|
 | 1 | I1 set claim | CC row + kernel item | removes A1's daily B-row cost and its 12,000-claim ceiling |
 | 2 | I2 group KEK for self/family, rotating on removal **and** device revocation | CC ruling (CC 4.4.3.4.1) + store | removes A2: about 115 KB → 60 B per sealed write in a 5 × 3 family |
 | 3 | I3 history grant | CC + store | A3 from O(H) × D rows to D rows |
-| 4 | signatures as BLOB, not base64 text | store | ~1.1 KB per row (≈12% of S's attestation table) |
-| 5 | I5 one row | store (FINAL_REFACTOR §4) | ~50% of key and occurrence bytes |
-| 6 | I4 sign-once wrap set | CC re-admission (W19) + kernel | A4 ~80% fewer bytes per minter per removal |
-
-Items 4 and 5 are store-side and are credited there (§11.4). Items 1-3 and 6 need CC rows first.
+| 4 | I4 sign-once wrap set | CC re-admission (W19) + kernel | A4 ~80% fewer bytes per minter per removal |
 
 ---
 
