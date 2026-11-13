@@ -1185,6 +1185,212 @@ pub enum DirectoryOp {
         /// The detection row, as the detector signed it.
         event: crate::derived::EdgeDetectionEvent,
     },
+    /// v61.4.0 (CIRISPersist#1244 round 2, the rooting view) —
+    /// [`FederationDirectory::list_attestations_referencing`]: the referencing rows `trust_root::live_conferrals` walks (Edge `bundle_gate::pipeline_blessing`). Result rides
+    /// `AttestationRows`. APPEND-ONLY (Growth).
+    ListAttestationsReferencing {
+        /// `target_attestation_id`.
+        target_attestation_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, the rooting view) —
+    /// [`FederationDirectory::get_attestation`]: one row by id. Result rides
+    /// `Attestation`. APPEND-ONLY (Growth).
+    GetAttestation {
+        /// `attestation_id`.
+        attestation_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, the rooting view) —
+    /// [`FederationDirectory::list_settled_self_roster_proposals`]: `self_roster::genesis_evicted_since` reads it. Result rides
+    /// `SelfRosterReceipts`. APPEND-ONLY (Growth).
+    ListSettledSelfRosterProposals {
+        /// `identity_key_id`.
+        identity_key_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, the rooting view) —
+    /// [`FederationDirectory::list_identity_occurrences_for`]: the identity's occurrences (`bridge::live_announcing_rows`). Result rides
+    /// `IdentityOccurrences`. APPEND-ONLY (Growth).
+    ListIdentityOccurrencesFor {
+        /// `identity_key_id`.
+        identity_key_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::get_active_halt`]: an active constitutional halt; through `Unsupported` a halt never latched. Result rides
+    /// `ActiveHalt`. APPEND-ONLY (Growth).
+    GetActiveHalt {
+        /// `family_key_id`.
+        family_key_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::lookup_role_withdrawal`]: the trait default answered `Ok(None)`, so a withdrawn role read as live. Result rides
+    /// `RoleWithdrawal`. APPEND-ONLY (Growth).
+    LookupRoleWithdrawal {
+        /// `role`.
+        role: String,
+        /// `key_id`.
+        key_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::lookup_family`]: `trust_root::resolve_family_root` read `Unsupported` as no family. Result rides
+    /// `Family`. APPEND-ONLY (Growth).
+    LookupFamily {
+        /// `family_key_id`.
+        family_key_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::lookup_community`]: the community record. Result rides
+    /// `Community`. APPEND-ONLY (Growth).
+    LookupCommunity {
+        /// `community_key_id`.
+        community_key_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::list_families_for_member`]: `trust_root` read `Unsupported` as no families. Result rides
+    /// `Families`. APPEND-ONLY (Growth).
+    ListFamiliesForMember {
+        /// `member_identity_key_id`.
+        member_identity_key_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::family_roster_signers`]: the family roster's signers. Result rides
+    /// `RosterSigners`. APPEND-ONLY (Growth).
+    FamilyRosterSigners {
+        /// `family_key_id`.
+        family_key_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::community_roster_signers`]: `canonical_community` read `Unsupported` as no founder resignations. Result rides
+    /// `RosterSigners`. APPEND-ONLY (Growth).
+    CommunityRosterSigners {
+        /// `community_key_id`.
+        community_key_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::list_family_membership_revocations_for`]: `canonical_community` skipped them on `Unsupported`. Result rides
+    /// `FamilyMembershipRevocations`. APPEND-ONLY (Growth).
+    ListFamilyMembershipRevocationsFor {
+        /// `family_key_id`.
+        family_key_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::list_family_membership_widenings_for`]: `canonical_community` skipped them on `Unsupported`. Result rides
+    /// `FamilyMembershipWidenings`. APPEND-ONLY (Growth).
+    ListFamilyMembershipWideningsFor {
+        /// `family_key_id`.
+        family_key_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::list_lineage_head_cosigns_for`]: `canonical_community` read `Unsupported` as no cosigns. Result rides
+    /// `LineageHeadCosigns`. APPEND-ONLY (Growth).
+    ListLineageHeadCosignsFor {
+        /// `lineage_key_id`.
+        lineage_key_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::lookup_signed_community`]: the signed community record. Result rides
+    /// `SignedCommunity`. APPEND-ONLY (Growth).
+    LookupSignedCommunity {
+        /// `community_key_id`.
+        community_key_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::lookup_canonical_withdrawal`]: the trait default answered `Ok(None)`, so `is_canonical_effective` read a withdrawn canonical as live. Result rides
+    /// `CanonicalWithdrawal`. APPEND-ONLY (Growth).
+    LookupCanonicalWithdrawal {
+        /// `key_id`.
+        key_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::list_canonical_withdrawals`]: the trait default answered empty. Result rides
+    /// `CanonicalWithdrawals`. APPEND-ONLY (Growth).
+    ListCanonicalWithdrawals {},
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::vote_window_first_held`]: the reverse-quorum deadline fell back to the actor's own instant on `Unsupported`. Result rides
+    /// `OptionalInstant`. APPEND-ONLY (Growth).
+    VoteWindowFirstHeld {
+        /// `action_id`.
+        action_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::list_cosign_aliases`]: `cosign::act_retracted` skipped aliases on `Unsupported`. Result rides
+    /// `CosignAliases`. APPEND-ONLY (Growth).
+    ListCosignAliases {
+        /// `quorum_key`.
+        quorum_key: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::cosign_alias`]: a withdraws naming an alias resolved to nothing on `Unsupported`. Result rides
+    /// `CosignAlias`. APPEND-ONLY (Growth).
+    CosignAlias {
+        /// `attestation_id`.
+        attestation_id: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::get_accord_decision`]: `roster_head::roster_lag` read `Unsupported` as undecided. Result rides
+    /// `AccordDecision`. APPEND-ONLY (Growth).
+    GetAccordDecision {
+        /// `proposal_digest`.
+        proposal_digest: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::list_accord_proposals_by_anchor`]: `roster_head::roster_lag` read `Unsupported` as none. Result rides
+    /// `AccordProposals`. APPEND-ONLY (Growth).
+    ListAccordProposalsByAnchor {
+        /// `action`.
+        action: String,
+        /// `prior_family_digest`.
+        prior_family_digest: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::purge_tombstoned`]: the tombstone admission gate read `Unsupported` as not tombstoned. Result rides
+    /// `OptionalString`. APPEND-ONLY (Growth).
+    PurgeTombstoned {
+        /// `plane`.
+        plane: String,
+        /// `record_ref`.
+        record_ref: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::purge_tombstone_notices`]: the serve-side withheld filter read `Unsupported` as not withheld. Result rides
+    /// `WireHashes`. APPEND-ONLY (Growth).
+    PurgeTombstoneNotices {
+        /// `plane`.
+        plane: String,
+        /// `record_ref`.
+        record_ref: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::list_targeted_by_dimension_prefix`]: `cosign::held_rows_of_act` and `community_dissolved_at` read `Unsupported` as none. Result rides
+    /// `AttestationRows`. APPEND-ONLY (Growth).
+    ListTargetedByDimensionPrefix {
+        /// `cohort_scopes`.
+        cohort_scopes: Vec<String>,
+        /// `cohort_target`.
+        cohort_target: String,
+        /// `dimension_prefix`.
+        dimension_prefix: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::key_grant_held_owner`]: the trait default answered `Ok(None)`, so `check_sealer` skipped the signer-is-author leg. Result rides
+    /// `OptionalString`. APPEND-ONLY (Growth).
+    KeyGrantHeldOwner {
+        /// `axis`.
+        axis: crate::federation::key_grant::KeyGrantAxis,
+    },
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::node_key_id`]: the trait default answered `None`,
+    /// which `replicated_row_in_audience` reads as "no audience check". Result
+    /// rides `OptionalString`. APPEND-ONLY (Growth).
+    NodeKeyId {},
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::withdraws_delegation_depth`]: the host's
+    /// configured depth, not the trait default. Result rides `U64`.
+    /// APPEND-ONLY (Growth).
+    WithdrawsDelegationDepth {},
+    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
+    /// [`FederationDirectory::hardware_attestation_policy`]: the host's
+    /// installed policy, not the default. Result rides
+    /// `HardwareAttestationPolicy`. APPEND-ONLY (Growth).
+    HardwareAttestationPolicy {},
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -1420,6 +1626,48 @@ pub enum DirectoryOpResult {
     ),
     /// v61.4.0 (CIRISPersist#1244) — `blackhole_list`. APPEND-ONLY (Growth).
     BlackholeRecords(Vec<crate::federation::BlackholeRecord>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `get_attestation`. APPEND-ONLY (Growth).
+    Attestation(Option<Attestation>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `list_settled_self_roster_proposals`. APPEND-ONLY (Growth).
+    SelfRosterReceipts(Vec<crate::federation::self_roster::SelfRosterReceipt>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `get_active_halt`. APPEND-ONLY (Growth).
+    ActiveHalt(Option<accord_quorum::ActiveHalt>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `lookup_role_withdrawal`. APPEND-ONLY (Growth).
+    RoleWithdrawal(Option<crate::federation::admission::RoleWithdrawal>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `lookup_family`. APPEND-ONLY (Growth).
+    Family(Option<Family>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `lookup_community`. APPEND-ONLY (Growth).
+    Community(Option<Community>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `list_families_for_member`. APPEND-ONLY (Growth).
+    Families(Vec<Family>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `family_roster_signers`, `community_roster_signers`. APPEND-ONLY (Growth).
+    RosterSigners(types::CommunityRosterSigners),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `list_family_membership_revocations_for`. APPEND-ONLY (Growth).
+    FamilyMembershipRevocations(Vec<FamilyMembershipRevocation>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `list_family_membership_widenings_for`. APPEND-ONLY (Growth).
+    FamilyMembershipWidenings(Vec<types::FamilyMembershipWidening>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `list_lineage_head_cosigns_for`. APPEND-ONLY (Growth).
+    LineageHeadCosigns(Vec<crate::federation::lineage_witness::LineageHeadCosign>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `lookup_signed_community`. APPEND-ONLY (Growth).
+    SignedCommunity(Option<SignedCommunity>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `lookup_canonical_withdrawal`. APPEND-ONLY (Growth).
+    CanonicalWithdrawal(Option<crate::federation::admission::CanonicalWithdrawal>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `list_canonical_withdrawals`. APPEND-ONLY (Growth).
+    CanonicalWithdrawals(Vec<crate::federation::admission::CanonicalWithdrawal>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `vote_window_first_held`. APPEND-ONLY (Growth).
+    OptionalInstant(Option<chrono::DateTime<chrono::Utc>>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `list_cosign_aliases`. APPEND-ONLY (Growth).
+    CosignAliases(Vec<(String, String)>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `cosign_alias`. APPEND-ONLY (Growth).
+    CosignAlias(Option<(String, String)>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `get_accord_decision`. APPEND-ONLY (Growth).
+    AccordDecision(Option<accord_quorum::StoredDecision>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `list_accord_proposals_by_anchor`. APPEND-ONLY (Growth).
+    AccordProposals(Vec<accord_quorum::StoredProposal>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `purge_tombstoned`, `key_grant_held_owner`, `node_key_id`. APPEND-ONLY (Growth).
+    OptionalString(Option<String>),
+    /// v61.4.0 (CIRISPersist#1244 round 2) — `hardware_attestation_policy`. APPEND-ONLY (Growth).
+    HardwareAttestationPolicy(crate::federation::HardwareAttestationPolicy),
 }
 
 /// v61.4.0 (CIRISPersist#1244) — the refusal a blackhole op gets from a
@@ -1433,6 +1681,30 @@ pub const NO_BLACKHOLE_SURFACE: &str =
 /// `None`.
 pub const NO_EDGE_DETECTION_SURFACE: &str =
     "directory capsule: this directory carries no edge-detection surface";
+
+/// v61.4.0 (CIRISPersist#1244 round 2) — what the proxy's
+/// [`FederationDirectory::node_key_id`] answers when it cannot fetch the
+/// host's: a key id no row names, so an audience check refuses rather than
+/// being skipped (`None` means "no audience check").
+pub const NODE_KEY_ID_UNAVAILABLE: &str = "ciris-persist:directory-proxy:node-key-id-unavailable";
+
+/// v61.4.0 (CIRISPersist#1244 round 2) — what the proxy's
+/// [`FederationDirectory::hardware_attestation_policy`] answers when it
+/// cannot fetch the host's: a policy that accepts no evidence, so holder
+/// evidence is refused rather than judged against the default.
+pub fn refuse_all_hardware_attestation_policy() -> crate::federation::HardwareAttestationPolicy {
+    crate::federation::HardwareAttestationPolicy {
+        accepted_hardware_types: std::collections::HashSet::new(),
+        max_nonce_age: std::time::Duration::ZERO,
+        accepted_custody_tiers: std::collections::HashSet::new(),
+        yubico_root_der: std::borrow::Cow::Borrowed(&[]),
+        android_root_ders: Vec::new(),
+    }
+}
+
+/// How long a sync proxy read waits for the host before answering its
+/// fail-closed value.
+const BLOCKING_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
 ///
@@ -1750,6 +2022,197 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             },
         },
+        DirectoryOp::ListAttestationsReferencing {
+            target_attestation_id,
+        } => {
+            match dir
+                .list_attestations_referencing(&target_attestation_id)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::AttestationRows(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::GetAttestation { attestation_id } => {
+            match dir.get_attestation(&attestation_id).await {
+                Ok(v) => DirectoryOpResult::Attestation(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSettledSelfRosterProposals { identity_key_id } => {
+            match dir
+                .list_settled_self_roster_proposals(&identity_key_id)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::SelfRosterReceipts(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListIdentityOccurrencesFor { identity_key_id } => {
+            match dir.list_identity_occurrences_for(&identity_key_id).await {
+                Ok(v) => DirectoryOpResult::IdentityOccurrences(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::GetActiveHalt { family_key_id } => {
+            match dir.get_active_halt(&family_key_id).await {
+                Ok(v) => DirectoryOpResult::ActiveHalt(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::LookupRoleWithdrawal { role, key_id } => {
+            match dir.lookup_role_withdrawal(&role, &key_id).await {
+                Ok(v) => DirectoryOpResult::RoleWithdrawal(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::LookupFamily { family_key_id } => {
+            match dir.lookup_family(&family_key_id).await {
+                Ok(v) => DirectoryOpResult::Family(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::LookupCommunity { community_key_id } => {
+            match dir.lookup_community(&community_key_id).await {
+                Ok(v) => DirectoryOpResult::Community(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListFamiliesForMember {
+            member_identity_key_id,
+        } => match dir.list_families_for_member(&member_identity_key_id).await {
+            Ok(v) => DirectoryOpResult::Families(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::FamilyRosterSigners { family_key_id } => {
+            match dir.family_roster_signers(&family_key_id).await {
+                Ok(v) => DirectoryOpResult::RosterSigners(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::CommunityRosterSigners { community_key_id } => {
+            match dir.community_roster_signers(&community_key_id).await {
+                Ok(v) => DirectoryOpResult::RosterSigners(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListFamilyMembershipRevocationsFor { family_key_id } => {
+            match dir
+                .list_family_membership_revocations_for(&family_key_id)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::FamilyMembershipRevocations(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListFamilyMembershipWideningsFor { family_key_id } => {
+            match dir
+                .list_family_membership_widenings_for(&family_key_id)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::FamilyMembershipWidenings(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListLineageHeadCosignsFor { lineage_key_id } => {
+            match dir.list_lineage_head_cosigns_for(&lineage_key_id).await {
+                Ok(v) => DirectoryOpResult::LineageHeadCosigns(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::LookupSignedCommunity { community_key_id } => {
+            match dir.lookup_signed_community(&community_key_id).await {
+                Ok(v) => DirectoryOpResult::SignedCommunity(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::LookupCanonicalWithdrawal { key_id } => {
+            match dir.lookup_canonical_withdrawal(&key_id).await {
+                Ok(v) => DirectoryOpResult::CanonicalWithdrawal(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListCanonicalWithdrawals {} => match dir.list_canonical_withdrawals().await {
+            Ok(v) => DirectoryOpResult::CanonicalWithdrawals(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::VoteWindowFirstHeld { action_id } => {
+            match dir.vote_window_first_held(&action_id).await {
+                Ok(v) => DirectoryOpResult::OptionalInstant(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListCosignAliases { quorum_key } => {
+            match dir.list_cosign_aliases(&quorum_key).await {
+                Ok(v) => DirectoryOpResult::CosignAliases(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::CosignAlias { attestation_id } => {
+            match dir.cosign_alias(&attestation_id).await {
+                Ok(v) => DirectoryOpResult::CosignAlias(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::GetAccordDecision { proposal_digest } => {
+            match dir.get_accord_decision(&proposal_digest).await {
+                Ok(v) => DirectoryOpResult::AccordDecision(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListAccordProposalsByAnchor {
+            action,
+            prior_family_digest,
+        } => {
+            match dir
+                .list_accord_proposals_by_anchor(&action, &prior_family_digest)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::AccordProposals(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::PurgeTombstoned { plane, record_ref } => {
+            match dir.purge_tombstoned(&plane, &record_ref).await {
+                Ok(v) => DirectoryOpResult::OptionalString(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::PurgeTombstoneNotices { plane, record_ref } => {
+            match dir.purge_tombstone_notices(&plane, &record_ref).await {
+                Ok(v) => DirectoryOpResult::WireHashes(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListTargetedByDimensionPrefix {
+            cohort_scopes,
+            cohort_target,
+            dimension_prefix,
+        } => {
+            let cohort_scopes_refs: Vec<&str> = cohort_scopes.iter().map(String::as_str).collect();
+            match dir
+                .list_targeted_by_dimension_prefix(
+                    &cohort_scopes_refs,
+                    &cohort_target,
+                    &dimension_prefix,
+                )
+                .await
+            {
+                Ok(v) => DirectoryOpResult::AttestationRows(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::KeyGrantHeldOwner { axis } => match dir.key_grant_held_owner(&axis).await {
+            Ok(v) => DirectoryOpResult::OptionalString(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::NodeKeyId {} => DirectoryOpResult::OptionalString(dir.node_key_id()),
+        DirectoryOp::WithdrawsDelegationDepth {} => {
+            DirectoryOpResult::U64(dir.withdraws_delegation_depth() as u64)
+        }
+        DirectoryOp::HardwareAttestationPolicy {} => DirectoryOpResult::HardwareAttestationPolicy(
+            dir.hardware_attestation_policy().as_ref().clone(),
+        ),
         DirectoryOp::PutEdgeDetectionEvent { event } => match dir.edge_detection_surface() {
             None => DirectoryOpResult::Err(NO_EDGE_DETECTION_SURFACE.into()),
             Some(s) => match s.put_edge_detection_event(event).await {
@@ -2695,6 +3158,61 @@ impl OpsDirectory {
 }
 
 impl OpsDirectory {
+    /// The std-channel twin of [`Self::result_trampoline`], for
+    /// [`Self::run_op_blocking`].
+    ///
+    /// # Safety
+    /// Invoked only as the `result_cb` handed to `build_op` in
+    /// [`OpsDirectory::run_op_blocking`]; MUST NOT be called directly.
+    unsafe extern "C" fn blocking_trampoline(ctx: *mut c_void, ptr: *const u8, len: usize) {
+        // SAFETY: `ctx` is the `Box::into_raw`'d `mpsc::Sender<Vec<u8>>` made
+        // in `run_op_blocking` for THIS op; `build_op` fires the callback
+        // exactly once, so the Box is reclaimed exactly once.
+        let tx = unsafe { Box::from_raw(ctx as *mut std::sync::mpsc::Sender<Vec<u8>>) };
+        // SAFETY: `(ptr, len)` name readable bytes valid for this call only;
+        // copied out before returning.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+        let _ = tx.send(bytes);
+    }
+
+    /// v61.4.0 (CIRISPersist#1244 round 2) — [`Self::run_op`] for the trait's
+    /// SYNC methods. The op runs on persist's runtime (the executor capsule);
+    /// this thread waits on a std channel, up to [`BLOCKING_OP_TIMEOUT`]. It
+    /// touches no tokio primitive of the caller's binary, so it is safe from
+    /// any thread, but it parks the calling thread for one host round trip.
+    fn run_op_blocking(&self, op: &DirectoryOp) -> Result<DirectoryOpResult, Error> {
+        let op_bytes = serde_json::to_vec(op).map_err(|e| {
+            Error::Backend(format!("directory ops proxy: op serialize failure: {e}"))
+        })?;
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let ctx: *mut c_void = Box::into_raw(Box::new(tx)) as *mut c_void;
+        // SAFETY: as in `run_op` — a matched data/vtable pair (ABI asserted at
+        // build), readable op bytes for the call, and a Send-able single-fire
+        // ctx/callback pair.
+        let task: *mut TaskOpaque = unsafe {
+            (self.directory.vtable.build_op)(
+                self.directory.data,
+                op_bytes.as_ptr(),
+                op_bytes.len(),
+                Self::blocking_trampoline,
+                ctx,
+            )
+        };
+        // SAFETY: `task` is this directory's `build_op` output, spawned once
+        // on a matched, live executor capsule.
+        unsafe { (self.executor.vtable.spawn)(self.executor.data, task) };
+        let bytes = rx.recv_timeout(BLOCKING_OP_TIMEOUT).map_err(|e| {
+            Error::Backend(format!(
+                "directory ops proxy: sync op did not complete: {e}"
+            ))
+        })?;
+        serde_json::from_slice::<DirectoryOpResult>(&bytes).map_err(|e| {
+            Error::Backend(format!(
+                "directory ops proxy: result deserialize failure: {e}"
+            ))
+        })
+    }
+
     /// Run a blackhole op and expect `Unit`.
     async fn blackhole_unit_op(&self, op: DirectoryOp) -> Result<(), Error> {
         match self.run_op(&op).await? {
@@ -3425,6 +3943,303 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
+    // v61.4.0 (CIRISPersist#1244 round 2) — the three sync config reads, each
+    // fetched from the host on every call (the host may change them at run
+    // time). A failed fetch answers the fail-CLOSED value, never the default.
+    fn node_key_id(&self) -> Option<String> {
+        match self.run_op_blocking(&DirectoryOp::NodeKeyId {}) {
+            Ok(DirectoryOpResult::OptionalString(v)) => v,
+            _ => Some(NODE_KEY_ID_UNAVAILABLE.to_owned()),
+        }
+    }
+
+    fn withdraws_delegation_depth(&self) -> usize {
+        match self.run_op_blocking(&DirectoryOp::WithdrawsDelegationDepth {}) {
+            Ok(DirectoryOpResult::U64(d)) => {
+                crate::federation::topology::effective_delegation_depth(Some(
+                    usize::try_from(d).unwrap_or(0),
+                ))
+            }
+            _ => 0,
+        }
+    }
+
+    fn hardware_attestation_policy(&self) -> Arc<crate::federation::HardwareAttestationPolicy> {
+        match self.run_op_blocking(&DirectoryOp::HardwareAttestationPolicy {}) {
+            Ok(DirectoryOpResult::HardwareAttestationPolicy(p)) => Arc::new(p),
+            _ => Arc::new(refuse_all_hardware_attestation_policy()),
+        }
+    }
+
+    async fn list_settled_self_roster_proposals(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::self_roster::SelfRosterReceipt>, Error> {
+        // v61.4.0 (CIRISPersist#1244 round 2, the rooting view).
+        match self
+            .run_op(&DirectoryOp::ListSettledSelfRosterProposals {
+                identity_key_id: identity_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::SelfRosterReceipts(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+    async fn lookup_role_withdrawal(
+        &self,
+        role: &str,
+        key_id: &str,
+    ) -> Result<Option<crate::federation::admission::RoleWithdrawal>, Error> {
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::LookupRoleWithdrawal {
+                role: role.to_string(),
+                key_id: key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::RoleWithdrawal(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+    async fn family_roster_signers(
+        &self,
+        family_key_id: &str,
+    ) -> Result<types::CommunityRosterSigners, Error> {
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::FamilyRosterSigners {
+                family_key_id: family_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::RosterSigners(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+    async fn community_roster_signers(
+        &self,
+        community_key_id: &str,
+    ) -> Result<types::CommunityRosterSigners, Error> {
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::CommunityRosterSigners {
+                community_key_id: community_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::RosterSigners(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+    async fn list_lineage_head_cosigns_for(
+        &self,
+        lineage_key_id: &str,
+    ) -> Result<Vec<crate::federation::lineage_witness::LineageHeadCosign>, Error> {
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::ListLineageHeadCosignsFor {
+                lineage_key_id: lineage_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::LineageHeadCosigns(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+    async fn lookup_signed_community(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Option<SignedCommunity>, Error> {
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::LookupSignedCommunity {
+                community_key_id: community_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::SignedCommunity(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+    async fn lookup_canonical_withdrawal(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<crate::federation::admission::CanonicalWithdrawal>, Error> {
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::LookupCanonicalWithdrawal {
+                key_id: key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::CanonicalWithdrawal(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+    async fn list_canonical_withdrawals(
+        &self,
+    ) -> Result<Vec<crate::federation::admission::CanonicalWithdrawal>, Error> {
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::ListCanonicalWithdrawals {})
+            .await?
+        {
+            DirectoryOpResult::CanonicalWithdrawals(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+    async fn vote_window_first_held(
+        &self,
+        action_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, Error> {
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::VoteWindowFirstHeld {
+                action_id: action_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::OptionalInstant(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+    async fn list_cosign_aliases(&self, quorum_key: &str) -> Result<Vec<(String, String)>, Error> {
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::ListCosignAliases {
+                quorum_key: quorum_key.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::CosignAliases(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+    async fn cosign_alias(&self, attestation_id: &str) -> Result<Option<(String, String)>, Error> {
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::CosignAlias {
+                attestation_id: attestation_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::CosignAlias(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+    async fn purge_tombstoned(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Option<String>, Error> {
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::PurgeTombstoned {
+                plane: plane.to_string(),
+                record_ref: record_ref.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::OptionalString(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+    async fn purge_tombstone_notices(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Vec<String>, Error> {
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::PurgeTombstoneNotices {
+                plane: plane.to_string(),
+                record_ref: record_ref.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::WireHashes(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+    async fn list_targeted_by_dimension_prefix(
+        &self,
+        cohort_scopes: &[&str],
+        cohort_target: &str,
+        dimension_prefix: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::ListTargetedByDimensionPrefix {
+                cohort_scopes: cohort_scopes.iter().map(|s| s.to_string()).collect(),
+                cohort_target: cohort_target.to_string(),
+                dimension_prefix: dimension_prefix.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::AttestationRows(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+    async fn key_grant_held_owner(
+        &self,
+        axis: &crate::federation::key_grant::KeyGrantAxis,
+    ) -> Result<Option<String>, Error> {
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::KeyGrantHeldOwner { axis: axis.clone() })
+            .await?
+        {
+            DirectoryOpResult::OptionalString(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
     async fn list_all_transport_destinations_unfolded(
         &self,
     ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
@@ -3642,10 +4457,19 @@ impl FederationDirectory for OpsDirectory {
         &self,
         target_attestation_id: &str,
     ) -> Result<Vec<Attestation>, Error> {
-        // v47.2.0 (#853) — as its siblings: not proxied across the capsule.
-        Err(Error::Unsupported {
-            method: "list_attestations_referencing",
-        })
+        // v61.4.0 (CIRISPersist#1244 round 2, the rooting view).
+        match self
+            .run_op(&DirectoryOp::ListAttestationsReferencing {
+                target_attestation_id: target_attestation_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::AttestationRows(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn list_composers_referencing_any(
         &self,
@@ -3737,9 +4561,19 @@ impl FederationDirectory for OpsDirectory {
         &self,
         identity_key_id: &str,
     ) -> Result<Vec<IdentityOccurrence>, Error> {
-        Err(Error::Unsupported {
-            method: "list_identity_occurrences_for",
-        })
+        // v61.4.0 (CIRISPersist#1244 round 2, the rooting view).
+        match self
+            .run_op(&DirectoryOp::ListIdentityOccurrencesFor {
+                identity_key_id: identity_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::IdentityOccurrences(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     // v59.1.2 (CIRISPersist#1162) — routed (was `Unsupported`, #851):
     // `owner_of`'s `self_of_at` reads it, so a capsule consumer's owner walk
@@ -3872,22 +4706,52 @@ impl FederationDirectory for OpsDirectory {
         })
     }
     async fn lookup_family(&self, family_key_id: &str) -> Result<Option<Family>, Error> {
-        Err(Error::Unsupported {
-            method: "lookup_family",
-        })
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::LookupFamily {
+                family_key_id: family_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Family(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn list_families_for_member(
         &self,
         member_identity_key_id: &str,
     ) -> Result<Vec<Family>, Error> {
-        Err(Error::Unsupported {
-            method: "list_families_for_member",
-        })
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::ListFamiliesForMember {
+                member_identity_key_id: member_identity_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Families(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn lookup_community(&self, community_key_id: &str) -> Result<Option<Community>, Error> {
-        Err(Error::Unsupported {
-            method: "lookup_community",
-        })
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::LookupCommunity {
+                community_key_id: community_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Community(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn list_communities_for_member(
         &self,
@@ -4527,9 +5391,19 @@ impl FederationDirectory for OpsDirectory {
         &self,
         family_key_id: &str,
     ) -> Result<Vec<FamilyMembershipRevocation>, Error> {
-        Err(Error::Unsupported {
-            method: "list_family_membership_revocations_for",
-        })
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::ListFamilyMembershipRevocationsFor {
+                family_key_id: family_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::FamilyMembershipRevocations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn list_community_membership_revocations_for(
         &self,
@@ -4551,11 +5425,20 @@ impl FederationDirectory for OpsDirectory {
     async fn list_family_membership_widenings_for(
         &self,
         family_key_id: &str,
-    ) -> Result<Vec<crate::federation::FamilyMembershipWidening>, Error> {
-        let _ = family_key_id;
-        Err(Error::Unsupported {
-            method: "list_family_membership_widenings_for",
-        })
+    ) -> Result<Vec<types::FamilyMembershipWidening>, Error> {
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::ListFamilyMembershipWideningsFor {
+                family_key_id: family_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::FamilyMembershipWidenings(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn list_location_proofs_for(
         &self,
@@ -4625,9 +5508,19 @@ impl FederationDirectory for OpsDirectory {
         })
     }
     async fn get_attestation(&self, attestation_id: &str) -> Result<Option<Attestation>, Error> {
-        Err(Error::Unsupported {
-            method: "get_attestation",
-        })
+        // v61.4.0 (CIRISPersist#1244 round 2, the rooting view).
+        match self
+            .run_op(&DirectoryOp::GetAttestation {
+                attestation_id: attestation_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Attestation(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn enter_mesh(
         &self,
@@ -4674,9 +5567,20 @@ impl FederationDirectory for OpsDirectory {
         action: &str,
         prior_family_digest: &str,
     ) -> Result<Vec<accord_quorum::StoredProposal>, Error> {
-        Err(Error::Unsupported {
-            method: "list_accord_proposals_by_anchor",
-        })
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::ListAccordProposalsByAnchor {
+                action: action.to_string(),
+                prior_family_digest: prior_family_digest.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::AccordProposals(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn put_accord_participation(
         &self,
@@ -4708,9 +5612,19 @@ impl FederationDirectory for OpsDirectory {
         &self,
         proposal_digest: &str,
     ) -> Result<Option<accord_quorum::StoredDecision>, Error> {
-        Err(Error::Unsupported {
-            method: "get_accord_decision",
-        })
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::GetAccordDecision {
+                proposal_digest: proposal_digest.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::AccordDecision(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn set_active_halt(
         &self,
@@ -4725,9 +5639,19 @@ impl FederationDirectory for OpsDirectory {
         &self,
         family_key_id: &str,
     ) -> Result<Option<accord_quorum::ActiveHalt>, Error> {
-        Err(Error::Unsupported {
-            method: "get_active_halt",
-        })
+        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
+        match self
+            .run_op(&DirectoryOp::GetActiveHalt {
+                family_key_id: family_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::ActiveHalt(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn clear_active_halt(
         &self,
@@ -5602,9 +6526,11 @@ mod tests {
         // the two `*Unfolded` transport reads, the five `Blackhole*` ops and
         // `PutEdgeDetectionEvent` APPENDED, nothing existing touched;
         // DIRECTORY_ABI_VERSION stays 13.
+        // v61.4.0 round 2 (CIRISPersist#1244) — GROWTH: the rooting reads and
+        // the fail-open trust reads APPENDED (29 ops); ABI stays 13.
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "e9c41f83a04abb009150a602cc73ba1a38281d79a6834986e6f8672d25191086",
+            "10f494612b504776fad61ddd55b88d70ffcdf6dd6c6ba1387d9e3db5b4ca9f8e",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -5661,9 +6587,11 @@ mod tests {
         // v61.1.0 (CIRISPersist#1190, #1163) — GROWTH:
         // `ServedAttestationPage` and `OwnerBindingPage` APPENDED.
         // v61.4.0 (CIRISPersist#1244) — GROWTH: `BlackholeRecords` APPENDED.
+        // v61.4.0 round 2 (CIRISPersist#1244) — GROWTH: 21 result variants
+        // APPENDED for the rooting and trust reads.
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "87f8e0e77a9ab91750d4738d9e0ba0442c7a13670a8425f8672af8541f17a538",
+            "e3041d8473605d82d0aad59d6f99920013a38968d4ca66a938a67b4053ed553c",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );
@@ -6828,14 +7756,16 @@ mod tests {
         ));
         let proxy = build_ops_directory(directory, executor).expect("abi ok");
 
+        // v61.4.0 — `get_attestation` routes now; `list_communities_for_member`
+        // is still a stub (allowlisted, its callers fail closed).
         let err = rt
-            .block_on(proxy.get_attestation("att-x"))
-            .expect_err("get_attestation has no op → Unsupported");
+            .block_on(proxy.list_communities_for_member("member-x"))
+            .expect_err("list_communities_for_member has no op → Unsupported");
         assert!(
             matches!(
                 err,
                 Error::Unsupported {
-                    method: "get_attestation"
+                    method: "list_communities_for_member"
                 }
             ),
             "got {err:?}"
@@ -7567,6 +8497,829 @@ mod tests {
         unsafe { (directory.vtable.drop)(directory.data) };
     }
 
+    // ── v61.4.0 round 2 (CIRISPersist#1244) — the rooting view and the
+    // fail-open trust reads cross the capsule ───────────────────────────
+
+    type ProxyCall =
+        fn(Arc<dyn FederationDirectory>) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
+
+    fn axis() -> crate::federation::key_grant::KeyGrantAxis {
+        crate::federation::key_grant::KeyGrantAxis::Content {
+            at_rest_sha256: "00".repeat(32),
+            cohort_scope: "self".into(),
+            owner_key_id: "x".into(),
+        }
+    }
+
+    /// **I1762 — every round-2 read reaches the HOST's method.** Over a
+    /// directory double that fails exactly one method, that op's capsule
+    /// answer (vtable) and the proxy's carry the injected failure by name:
+    /// an op that answered empty, or called another method, would not. One
+    /// row per routed read; the sync reads are I1766–I1768.
+    fn exercise_i1762(rt: &Arc<tokio::runtime::Runtime>, inner: Arc<dyn FederationDirectory>) {
+        let table: Vec<(&'static str, DirectoryOp, ProxyCall)> = vec![
+            (
+                "list_attestations_referencing",
+                DirectoryOp::ListAttestationsReferencing {
+                    target_attestation_id: "x".into(),
+                },
+                |p| Box::pin(async move { p.list_attestations_referencing("x").await.map(|_| ()) }),
+            ),
+            (
+                "get_attestation",
+                DirectoryOp::GetAttestation {
+                    attestation_id: "x".into(),
+                },
+                |p| Box::pin(async move { p.get_attestation("x").await.map(|_| ()) }),
+            ),
+            (
+                "list_settled_self_roster_proposals",
+                DirectoryOp::ListSettledSelfRosterProposals {
+                    identity_key_id: "x".into(),
+                },
+                |p| {
+                    Box::pin(
+                        async move { p.list_settled_self_roster_proposals("x").await.map(|_| ()) },
+                    )
+                },
+            ),
+            (
+                "list_identity_occurrences_for",
+                DirectoryOp::ListIdentityOccurrencesFor {
+                    identity_key_id: "x".into(),
+                },
+                |p| Box::pin(async move { p.list_identity_occurrences_for("x").await.map(|_| ()) }),
+            ),
+            (
+                "get_active_halt",
+                DirectoryOp::GetActiveHalt {
+                    family_key_id: "x".into(),
+                },
+                |p| Box::pin(async move { p.get_active_halt("x").await.map(|_| ()) }),
+            ),
+            (
+                "lookup_family",
+                DirectoryOp::LookupFamily {
+                    family_key_id: "x".into(),
+                },
+                |p| Box::pin(async move { p.lookup_family("x").await.map(|_| ()) }),
+            ),
+            (
+                "lookup_community",
+                DirectoryOp::LookupCommunity {
+                    community_key_id: "x".into(),
+                },
+                |p| Box::pin(async move { p.lookup_community("x").await.map(|_| ()) }),
+            ),
+            (
+                "list_families_for_member",
+                DirectoryOp::ListFamiliesForMember {
+                    member_identity_key_id: "x".into(),
+                },
+                |p| Box::pin(async move { p.list_families_for_member("x").await.map(|_| ()) }),
+            ),
+            (
+                "family_roster_signers",
+                DirectoryOp::FamilyRosterSigners {
+                    family_key_id: "x".into(),
+                },
+                |p| Box::pin(async move { p.family_roster_signers("x").await.map(|_| ()) }),
+            ),
+            (
+                "community_roster_signers",
+                DirectoryOp::CommunityRosterSigners {
+                    community_key_id: "x".into(),
+                },
+                |p| Box::pin(async move { p.community_roster_signers("x").await.map(|_| ()) }),
+            ),
+            (
+                "list_family_membership_revocations_for",
+                DirectoryOp::ListFamilyMembershipRevocationsFor {
+                    family_key_id: "x".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.list_family_membership_revocations_for("x")
+                            .await
+                            .map(|_| ())
+                    })
+                },
+            ),
+            (
+                "list_family_membership_widenings_for",
+                DirectoryOp::ListFamilyMembershipWideningsFor {
+                    family_key_id: "x".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.list_family_membership_widenings_for("x")
+                            .await
+                            .map(|_| ())
+                    })
+                },
+            ),
+            (
+                "list_lineage_head_cosigns_for",
+                DirectoryOp::ListLineageHeadCosignsFor {
+                    lineage_key_id: "x".into(),
+                },
+                |p| Box::pin(async move { p.list_lineage_head_cosigns_for("x").await.map(|_| ()) }),
+            ),
+            (
+                "lookup_signed_community",
+                DirectoryOp::LookupSignedCommunity {
+                    community_key_id: "x".into(),
+                },
+                |p| Box::pin(async move { p.lookup_signed_community("x").await.map(|_| ()) }),
+            ),
+            (
+                "vote_window_first_held",
+                DirectoryOp::VoteWindowFirstHeld {
+                    action_id: "x".into(),
+                },
+                |p| Box::pin(async move { p.vote_window_first_held("x").await.map(|_| ()) }),
+            ),
+            (
+                "list_cosign_aliases",
+                DirectoryOp::ListCosignAliases {
+                    quorum_key: "x".into(),
+                },
+                |p| Box::pin(async move { p.list_cosign_aliases("x").await.map(|_| ()) }),
+            ),
+            (
+                "cosign_alias",
+                DirectoryOp::CosignAlias {
+                    attestation_id: "x".into(),
+                },
+                |p| Box::pin(async move { p.cosign_alias("x").await.map(|_| ()) }),
+            ),
+            (
+                "get_accord_decision",
+                DirectoryOp::GetAccordDecision {
+                    proposal_digest: "x".into(),
+                },
+                |p| Box::pin(async move { p.get_accord_decision("x").await.map(|_| ()) }),
+            ),
+            (
+                "list_accord_proposals_by_anchor",
+                DirectoryOp::ListAccordProposalsByAnchor {
+                    action: "x".into(),
+                    prior_family_digest: "y".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.list_accord_proposals_by_anchor("x", "y")
+                            .await
+                            .map(|_| ())
+                    })
+                },
+            ),
+            (
+                "purge_tombstoned",
+                DirectoryOp::PurgeTombstoned {
+                    plane: "x".into(),
+                    record_ref: "y".into(),
+                },
+                |p| Box::pin(async move { p.purge_tombstoned("x", "y").await.map(|_| ()) }),
+            ),
+            (
+                "purge_tombstone_notices",
+                DirectoryOp::PurgeTombstoneNotices {
+                    plane: "x".into(),
+                    record_ref: "y".into(),
+                },
+                |p| Box::pin(async move { p.purge_tombstone_notices("x", "y").await.map(|_| ()) }),
+            ),
+            (
+                "list_targeted_by_dimension_prefix",
+                DirectoryOp::ListTargetedByDimensionPrefix {
+                    cohort_scopes: vec!["community".into()],
+                    cohort_target: "x".into(),
+                    dimension_prefix: "y".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.list_targeted_by_dimension_prefix(&["community"], "x", "y")
+                            .await
+                            .map(|_| ())
+                    })
+                },
+            ),
+            (
+                "key_grant_held_owner",
+                DirectoryOp::KeyGrantHeldOwner { axis: axis() },
+                |p| Box::pin(async move { p.key_grant_held_owner(&axis()).await.map(|_| ()) }),
+            ),
+        ];
+        assert_eq!(table.len(), 23, "I1762: one row per routed async read");
+        // Every row runs, and the red names every op that failed, not only
+        // the first (so one mutated build shows each arm's witness).
+        let mut red = Vec::new();
+        for (method, op, call) in table {
+            let row = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let want = format!("injected backend failure: {method}");
+                let faulty: Arc<dyn FederationDirectory> = Arc::new(
+                    crate::federation::directory_double::FaultInjectingDirectory::new(
+                        inner.clone(),
+                    )
+                    .erroring(method),
+                );
+                let directory = build_persist_directory(faulty.clone());
+                match run_op(rt, &directory, &op) {
+                    DirectoryOpResult::Err(e) => {
+                        assert!(e.contains(&want), "I1762 {method} vtable: {e}")
+                    }
+                    other => {
+                        panic!(
+                            "I1762 {method}: the vtable answered {other:?}, not the host's failure"
+                        )
+                    }
+                }
+                // SAFETY: single-drop, matched vtable.
+                unsafe { (directory.vtable.drop)(directory.data) };
+                let proxy = proxy_1244(rt, faulty);
+                match rt.block_on(call(proxy as Arc<dyn FederationDirectory>)) {
+                    Err(Error::Backend(e)) => {
+                        assert!(e.contains(&want), "I1762 {method} proxy: {e}")
+                    }
+                    other => {
+                        panic!(
+                            "I1762 {method}: the proxy answered {other:?}, not the host's failure"
+                        )
+                    }
+                }
+                // And with no fault, the proxy answers what the direct call does
+                // (never the old `Unsupported`): both Ok, or the same failure.
+                let clean = proxy_1244(rt, inner.clone());
+                match (rt.block_on(call(clean)), rt.block_on(call(inner.clone()))) {
+                    (Ok(()), Ok(())) => {}
+                    (Err(Error::Backend(p)), Err(d)) => {
+                        assert_eq!(p, d.to_string(), "I1762 {method}: the host's own failure")
+                    }
+                    (p, d) => panic!("I1762 {method}: proxy {p:?} vs direct {d:?}"),
+                }
+            }));
+            if row.is_err() {
+                red.push(method);
+            }
+        }
+        assert!(
+            red.is_empty(),
+            "I1762: these ops did not reach the host: {red:?}"
+        );
+    }
+
+    /// **I1763 — an active halt is SEEN through the proxy.** Before #1244
+    /// round 2 the proxy answered `Unsupported`, and `trust_root` read it as
+    /// no halt.
+    fn exercise_i1763(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: Arc<dyn FederationDirectory>,
+        tag: &str,
+    ) {
+        let fam = format!("{tag}-halted-family");
+        rt.block_on(dir.set_active_halt(&fam, "halt-1763"))
+            .expect("set halt");
+        let direct = rt.block_on(dir.get_active_halt(&fam)).expect("direct");
+        assert!(direct.is_some(), "I1763 seed");
+        let directory = build_persist_directory(dir.clone());
+        match run_op(
+            rt,
+            &directory,
+            &DirectoryOp::GetActiveHalt {
+                family_key_id: fam.clone(),
+            },
+        ) {
+            DirectoryOpResult::ActiveHalt(v) => assert_eq!(v, direct, "I1763 vtable"),
+            other => panic!("I1763: {other:?}"),
+        }
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+        let proxy = proxy_1244(rt, dir.clone());
+        let via = rt
+            .block_on(proxy.get_active_halt(&fam))
+            .expect("I1763 routed");
+        assert_eq!(via, direct, "I1763: the proxy sees the active halt");
+        assert_eq!(via.unwrap().active_halt_id, "halt-1763");
+    }
+
+    /// **I1764 — a withdrawn role is SEEN as withdrawn through the proxy.**
+    /// The trait default answered `Ok(None)`, so a withdrawn role read as live.
+    fn exercise_i1764(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: Arc<dyn FederationDirectory>,
+        tag: &str,
+    ) {
+        let key = format!("{tag}-role-key");
+        rt.block_on(dir.record_role_withdrawal("steward", &key, None, "digest-1764"))
+            .expect("record role withdrawal");
+        let direct = rt
+            .block_on(dir.lookup_role_withdrawal("steward", &key))
+            .expect("direct");
+        assert!(direct.is_some(), "I1764 seed");
+        let directory = build_persist_directory(dir.clone());
+        match run_op(
+            rt,
+            &directory,
+            &DirectoryOp::LookupRoleWithdrawal {
+                role: "steward".into(),
+                key_id: key.clone(),
+            },
+        ) {
+            DirectoryOpResult::RoleWithdrawal(v) => assert_eq!(v, direct, "I1764 vtable"),
+            other => panic!("I1764: {other:?}"),
+        }
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+        let proxy = proxy_1244(rt, dir.clone());
+        let via = rt
+            .block_on(proxy.lookup_role_withdrawal("steward", &key))
+            .expect("I1764 routed");
+        assert_eq!(via, direct, "I1764: the proxy sees the role as withdrawn");
+        assert!(rt
+            .block_on(proxy.lookup_role_withdrawal("steward", "never-withdrawn"))
+            .unwrap()
+            .is_none());
+    }
+
+    /// **I1765 — a withdrawn canonical is SEEN through the proxy**, by key and
+    /// in the list. The trait defaults answered `Ok(None)` / empty, so
+    /// `is_canonical_effective` read a withdrawn canonical as live.
+    fn exercise_i1765(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: Arc<dyn FederationDirectory>,
+        tag: &str,
+    ) {
+        let key = format!("{tag}-canonical");
+        rt.block_on(dir.record_canonical_withdrawal(&key, None, "digest-1765"))
+            .expect("record canonical withdrawal");
+        let direct = rt
+            .block_on(dir.lookup_canonical_withdrawal(&key))
+            .expect("direct");
+        assert!(direct.is_some(), "I1765 seed");
+        let directory = build_persist_directory(dir.clone());
+        match run_op(
+            rt,
+            &directory,
+            &DirectoryOp::LookupCanonicalWithdrawal {
+                key_id: key.clone(),
+            },
+        ) {
+            DirectoryOpResult::CanonicalWithdrawal(v) => assert_eq!(v, direct, "I1765 vtable"),
+            other => panic!("I1765: {other:?}"),
+        }
+        let listed = match run_op(rt, &directory, &DirectoryOp::ListCanonicalWithdrawals {}) {
+            DirectoryOpResult::CanonicalWithdrawals(v) => v,
+            other => panic!("I1765: {other:?}"),
+        };
+        assert_eq!(
+            listed,
+            rt.block_on(dir.list_canonical_withdrawals()).unwrap(),
+            "I1765 list"
+        );
+        assert!(
+            listed.contains(direct.as_ref().unwrap()),
+            "I1765 list holds it"
+        );
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+        let proxy = proxy_1244(rt, dir.clone());
+        assert_eq!(
+            rt.block_on(proxy.lookup_canonical_withdrawal(&key))
+                .unwrap(),
+            direct,
+            "I1765 proxy"
+        );
+        assert_eq!(
+            rt.block_on(proxy.list_canonical_withdrawals()).unwrap(),
+            listed,
+            "I1765 proxy list"
+        );
+    }
+
+    /// **I1769 — the rooting view's row reads cross the capsule:**
+    /// `list_attestations_referencing` and `get_attestation` return the stored
+    /// `withdraws` row, equal to the direct reads.
+    /// A stored `withdraws` row naming `target`; returns its id.
+    fn seed_withdraws_1244(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: &dyn FederationDirectory,
+        issuer: &str,
+        target: &str,
+    ) -> String {
+        use crate::federation::tier_ingest::test_support as ts;
+        rt.block_on(ts::register_hybrid_key_as(
+            dir,
+            issuer,
+            issuer,
+            crate::federation::types::identity_type::USER,
+        ));
+        let env =
+            serde_json::json!({"references_attestation_id": target, "withdrawal_reason": "CC 2.3"});
+        let wid = uuid::Uuid::new_v4().to_string();
+        let mut w = ts::bare_attestation(&wid, issuer, issuer, &env);
+        w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
+        w.cohort_scope = "federation".into();
+        ts::seal_row_in_place(issuer, &mut w);
+        rt.block_on(dir.put_attestation(crate::federation::SignedAttestation { attestation: w }))
+            .expect("a withdraws is admitted");
+        wid
+    }
+
+    fn exercise_i1769(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: Arc<dyn FederationDirectory>,
+        tag: &str,
+    ) {
+        let issuer = format!("{tag}-issuer-1769");
+        let target = format!("{tag}-target-1769");
+        let wid = seed_withdraws_1244(rt, dir.as_ref(), &issuer, &target);
+        let refs = rt
+            .block_on(dir.list_attestations_referencing(&target))
+            .expect("direct");
+        assert_eq!(refs.len(), 1, "I1769 seed");
+        let got = rt.block_on(dir.get_attestation(&wid)).expect("direct");
+        assert!(got.is_some(), "I1769 seed");
+        let directory = build_persist_directory(dir.clone());
+        match run_op(
+            rt,
+            &directory,
+            &DirectoryOp::ListAttestationsReferencing {
+                target_attestation_id: target.clone(),
+            },
+        ) {
+            DirectoryOpResult::AttestationRows(v) => {
+                assert_eq!(v, refs, "I1769 vtable referencing")
+            }
+            other => panic!("I1769: {other:?}"),
+        }
+        match run_op(
+            rt,
+            &directory,
+            &DirectoryOp::GetAttestation {
+                attestation_id: wid.clone(),
+            },
+        ) {
+            DirectoryOpResult::Attestation(v) => assert_eq!(v, got, "I1769 vtable get"),
+            other => panic!("I1769: {other:?}"),
+        }
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+        let proxy = proxy_1244(rt, dir.clone());
+        assert_eq!(
+            rt.block_on(proxy.list_attestations_referencing(&target))
+                .unwrap(),
+            refs,
+            "I1769 proxy"
+        );
+        assert_eq!(
+            rt.block_on(proxy.get_attestation(&wid)).unwrap(),
+            got,
+            "I1769 proxy get"
+        );
+    }
+
+    /// **I1770 — an identity's occurrences cross the capsule**
+    /// (`list_identity_occurrences_for`), equal to the direct read.
+    fn exercise_i1770(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: Arc<dyn FederationDirectory>,
+        tag: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support as ts;
+        let id = format!("{tag}-ident-1770");
+        rt.block_on(async {
+            ts::register_identity_key(
+                dir.as_ref(),
+                &id,
+                crate::federation::types::identity_type::USER,
+            )
+            .await;
+            let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                (chrono::Utc::now() - chrono::Duration::seconds(300)).timestamp_millis(),
+            )
+            .unwrap();
+            dir.put_identity_occurrence(
+                ts::signed_content_only_occurrence(&id, &id, &id, at).await,
+            )
+            .await
+            .expect("occurrence");
+        });
+        let direct = rt
+            .block_on(dir.list_identity_occurrences_for(&id))
+            .expect("direct");
+        assert_eq!(direct.len(), 1, "I1770 seed");
+        let directory = build_persist_directory(dir.clone());
+        match run_op(
+            rt,
+            &directory,
+            &DirectoryOp::ListIdentityOccurrencesFor {
+                identity_key_id: id.clone(),
+            },
+        ) {
+            DirectoryOpResult::IdentityOccurrences(v) => assert_eq!(v, direct, "I1770 vtable"),
+            other => panic!("I1770: {other:?}"),
+        }
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+        let proxy = proxy_1244(rt, dir.clone());
+        assert_eq!(
+            rt.block_on(proxy.list_identity_occurrences_for(&id))
+                .unwrap(),
+            direct,
+            "I1770 proxy"
+        );
+    }
+
+    /// **I1771 — settled self-roster proposals cross the capsule.**
+    fn exercise_i1771(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: Arc<dyn FederationDirectory>,
+        tag: &str,
+    ) {
+        let id = format!("{tag}-ident-1771");
+        // The receipt names a stored row (the ledger joins on it).
+        let prop = seed_withdraws_1244(rt, dir.as_ref(), &format!("{tag}-issuer-1771"), "t-1771");
+        rt.block_on(async {
+            dir.note_self_roster_proposal(&prop, &id, chrono::Utc::now())
+                .await
+                .expect("note");
+            dir.settle_self_roster_proposal(
+                &prop,
+                crate::federation::self_roster::WITHDRAWN_OUTCOME,
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("settle");
+        });
+        let direct = rt
+            .block_on(dir.list_settled_self_roster_proposals(&id))
+            .expect("direct");
+        assert_eq!(direct.len(), 1, "I1771 seed");
+        let directory = build_persist_directory(dir.clone());
+        match run_op(
+            rt,
+            &directory,
+            &DirectoryOp::ListSettledSelfRosterProposals {
+                identity_key_id: id.clone(),
+            },
+        ) {
+            DirectoryOpResult::SelfRosterReceipts(v) => assert_eq!(v, direct, "I1771 vtable"),
+            other => panic!("I1771: {other:?}"),
+        }
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+        let proxy = proxy_1244(rt, dir.clone());
+        assert_eq!(
+            rt.block_on(proxy.list_settled_self_roster_proposals(&id))
+                .unwrap(),
+            direct,
+            "I1771 proxy"
+        );
+    }
+
+    /// **I1772 — cosign aliases cross the capsule**, by alias and by quorum
+    /// key; through `Unsupported` a withdraws naming an alias resolved to
+    /// nothing.
+    fn exercise_i1772(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: Arc<dyn FederationDirectory>,
+        tag: &str,
+    ) {
+        let (alias, qk, held) = (
+            format!("{tag}-alias"),
+            format!("{tag}-qk"),
+            format!("{tag}-held"),
+        );
+        rt.block_on(dir.note_cosign_alias(&alias, &qk, &held))
+            .expect("note alias");
+        let one = rt.block_on(dir.cosign_alias(&alias)).expect("direct");
+        let all = rt.block_on(dir.list_cosign_aliases(&qk)).expect("direct");
+        assert!(one.is_some() && all.len() == 1, "I1772 seed");
+        let directory = build_persist_directory(dir.clone());
+        match run_op(
+            rt,
+            &directory,
+            &DirectoryOp::CosignAlias {
+                attestation_id: alias.clone(),
+            },
+        ) {
+            DirectoryOpResult::CosignAlias(v) => assert_eq!(v, one, "I1772 vtable"),
+            other => panic!("I1772: {other:?}"),
+        }
+        match run_op(
+            rt,
+            &directory,
+            &DirectoryOp::ListCosignAliases {
+                quorum_key: qk.clone(),
+            },
+        ) {
+            DirectoryOpResult::CosignAliases(v) => assert_eq!(v, all, "I1772 vtable list"),
+            other => panic!("I1772: {other:?}"),
+        }
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+        let proxy = proxy_1244(rt, dir.clone());
+        assert_eq!(
+            rt.block_on(proxy.cosign_alias(&alias)).unwrap(),
+            one,
+            "I1772 proxy"
+        );
+        assert_eq!(
+            rt.block_on(proxy.list_cosign_aliases(&qk)).unwrap(),
+            all,
+            "I1772 proxy list"
+        );
+    }
+
+    both_backends_1244!(
+        i1762_every_round2_read_reaches_the_host_sqlite,
+        i1762_every_round2_read_reaches_the_host_pg,
+        |rt, b, tag| {
+            let _ = tag;
+            exercise_i1762(&rt, b)
+        }
+    );
+    both_backends_1244!(
+        i1763_an_active_halt_is_seen_through_the_proxy_sqlite,
+        i1763_an_active_halt_is_seen_through_the_proxy_pg,
+        |rt, b, tag| exercise_i1763(&rt, b, &tag)
+    );
+    both_backends_1244!(
+        i1764_a_withdrawn_role_is_seen_through_the_proxy_sqlite,
+        i1764_a_withdrawn_role_is_seen_through_the_proxy_pg,
+        |rt, b, tag| exercise_i1764(&rt, b, &tag)
+    );
+    both_backends_1244!(
+        i1765_a_withdrawn_canonical_is_seen_through_the_proxy_sqlite,
+        i1765_a_withdrawn_canonical_is_seen_through_the_proxy_pg,
+        |rt, b, tag| exercise_i1765(&rt, b, &tag)
+    );
+    both_backends_1244!(
+        i1769_rooting_row_reads_cross_the_capsule_sqlite,
+        i1769_rooting_row_reads_cross_the_capsule_pg,
+        |rt, b, tag| exercise_i1769(&rt, b, &tag)
+    );
+    both_backends_1244!(
+        i1770_occurrences_cross_the_capsule_sqlite,
+        i1770_occurrences_cross_the_capsule_pg,
+        |rt, b, tag| exercise_i1770(&rt, b, &tag)
+    );
+    both_backends_1244!(
+        i1771_settled_self_roster_crosses_the_capsule_sqlite,
+        i1771_settled_self_roster_crosses_the_capsule_pg,
+        |rt, b, tag| exercise_i1771(&rt, b, &tag)
+    );
+    both_backends_1244!(
+        i1772_cosign_aliases_cross_the_capsule_sqlite,
+        i1772_cosign_aliases_cross_the_capsule_pg,
+        |rt, b, tag| exercise_i1772(&rt, b, &tag)
+    );
+
+    /// **I1766 / I1767 / I1768 — the sync config reads answer the HOST's
+    /// setting**, not the trait default: the node key id, a tightened hardware
+    /// policy, and a non-default withdraws depth (sqlite; the setters are the
+    /// concrete backend's).
+    #[test]
+    fn i1766_i1767_i1768_sync_reads_answer_the_hosts_setting_sqlite() {
+        let rt = test_runtime();
+        let b = sqlite_backend_1244(&rt);
+        exercise_sync_reads(
+            &rt,
+            b.clone(),
+            |p| b.set_node_key_id(p),
+            |p| b.set_hardware_attestation_policy(Arc::new(p)),
+            |d| b.set_withdraws_delegation_depth(d),
+        );
+    }
+
+    /// I1766–I1768 — postgres arm.
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[serial_test::serial(postgres)]
+    fn i1766_i1767_i1768_sync_reads_answer_the_hosts_setting_pg() {
+        let rt = test_runtime();
+        let Some(b) = pg_backend_1244(&rt) else {
+            return;
+        };
+        exercise_sync_reads(
+            &rt,
+            b.clone(),
+            |p| b.set_node_key_id(p),
+            |p| b.set_hardware_attestation_policy(Arc::new(p)),
+            |d| b.set_withdraws_delegation_depth(d),
+        );
+    }
+
+    fn exercise_sync_reads(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: Arc<dyn FederationDirectory>,
+        set_node: impl Fn(&str),
+        set_policy: impl Fn(crate::federation::HardwareAttestationPolicy),
+        set_depth: impl Fn(usize),
+    ) {
+        let proxy = proxy_1244(rt, dir.clone());
+        let mut red = Vec::new();
+        let mut check = |id: &'static str, f: &dyn Fn()| {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+                red.push(id);
+            }
+        };
+        set_node("node-1766");
+        set_depth(2);
+        let mut tight = crate::federation::HardwareAttestationPolicy::default();
+        tight.accepted_custody_tiers.clear();
+        tight.max_nonce_age = std::time::Duration::from_secs(60);
+        set_policy(tight.clone());
+        check("I1766", &|| {
+            // I1766 — the node key id.
+            assert_eq!(
+                dir.node_key_id().as_deref(),
+                Some("node-1766"),
+                "I1766 seed"
+            );
+            assert_eq!(
+                proxy.node_key_id(),
+                dir.node_key_id(),
+                "I1766: the proxy answers the host's node key"
+            );
+        });
+        check("I1767", &|| {
+            // I1767 — a tightened policy (no custody tiers, a short nonce age).
+            assert_ne!(
+                tight,
+                crate::federation::HardwareAttestationPolicy::default()
+            );
+            assert_eq!(
+                *proxy.hardware_attestation_policy(),
+                tight,
+                "I1767: the host's policy, not the default"
+            );
+        });
+        check("I1768", &|| {
+            // I1768 — a non-default withdraws depth.
+            assert_eq!(dir.withdraws_delegation_depth(), 2, "I1768 seed");
+            assert_eq!(
+                proxy.withdraws_delegation_depth(),
+                2,
+                "I1768: the host's depth, not the default"
+            );
+        });
+        assert!(
+            red.is_empty(),
+            "sync reads answered something other than the host's setting: {red:?}"
+        );
+    }
+
+    /// **I1773 — a sync read that cannot reach the host answers FAIL-CLOSED**:
+    /// a node key id no row names (an audience check refuses), a policy that
+    /// accepts no evidence, and depth 0 — never the trait's permissive default.
+    #[test]
+    fn i1773_an_unreachable_host_fails_closed() {
+        unsafe extern "C" fn err_build_op(
+            _data: *mut c_void,
+            _op_ptr: *const u8,
+            _op_len: usize,
+            cb: ResultCallback,
+            ctx: *mut c_void,
+        ) -> *mut TaskOpaque {
+            let bytes =
+                serde_json::to_vec(&DirectoryOpResult::Err("host unreachable".into())).unwrap();
+            // SAFETY: the callback contract — fired once with readable bytes.
+            unsafe { cb(ctx, bytes.as_ptr(), bytes.len()) };
+            let fut: BoxedFut = Box::pin(async {});
+            Box::into_raw(Box::new(fut)) as *mut TaskOpaque
+        }
+        unsafe extern "C" fn noop_drop(_: *mut c_void) {}
+        static ERRING: DirectoryVTable = DirectoryVTable {
+            abi_version: DIRECTORY_ABI_VERSION,
+            _reserved: 0,
+            build_op: err_build_op,
+            drop: noop_drop,
+        };
+        let rt = test_runtime();
+        let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
+            rt.clone(),
+        ));
+        let proxy = build_ops_directory_proxy(
+            Directory {
+                data: std::ptr::null_mut(),
+                vtable: &ERRING,
+            },
+            executor,
+        )
+        .expect("abi ok");
+        assert_eq!(
+            proxy.node_key_id().as_deref(),
+            Some(NODE_KEY_ID_UNAVAILABLE),
+            "I1773 node key"
+        );
+        let p = proxy.hardware_attestation_policy();
+        assert_eq!(*p, refuse_all_hardware_attestation_policy(), "I1773 policy");
+        assert!(p.accepted_hardware_types.is_empty() && p.accepted_custody_tiers.is_empty());
+        assert_eq!(proxy.withdraws_delegation_depth(), 0, "I1773 depth");
+    }
+
     /// CIRISPersist#1162 — every field of the query and of its rows crosses
     /// the capsule's JSON as itself, and an unknown field is a refusal: a
     /// newer consumer's narrowing that an older host silently dropped would
@@ -7731,10 +9484,6 @@ mod tests {
             "#1162: Edge confirms no production edge path \
           calls it; left unrouted so the patch grows the wire by one op",
         ),
-        (
-            "list_attestations_referencing",
-            "v47.2.0 (#853): not proxied, as its siblings",
-        ),
         ("attestations_binding_content", PRE_1162),
         (
             "attestations_binding_content_with_placements",
@@ -7746,20 +9495,14 @@ mod tests {
             "v53.1.0 (#979): a capsule host stores no blobs through this \
           surface",
         ),
-        ("list_identity_occurrences_for", PRE_1162),
         ("add_family_member", PRE_1162),
-        ("lookup_family", PRE_1162),
-        ("list_families_for_member", PRE_1162),
-        ("lookup_community", PRE_1162),
         ("list_communities_for_member", PRE_1162),
         ("put_family_membership_revocation", PRE_1162),
         ("put_community_membership_revocation", PRE_1162),
         ("put_community_membership_widening", PRE_1162),
         ("put_family_membership_widening", PRE_1162),
-        ("list_family_membership_revocations_for", PRE_1162),
         ("list_community_membership_revocations_for", PRE_1162),
         ("list_community_membership_widenings_for", PRE_1162),
-        ("list_family_membership_widenings_for", PRE_1162),
         ("list_location_proofs_for", PRE_1162),
         ("withdraw_location_proof", PRE_1162),
         ("communities_containing", PRE_1162),
@@ -7768,19 +9511,15 @@ mod tests {
         ("list_group_versions", PRE_1162),
         ("attach_key_pqc_signature", PRE_1162),
         ("attach_attestation_pqc_signature", PRE_1162),
-        ("get_attestation", PRE_1162),
         ("enter_mesh", PRE_1162),
         ("list_hybrid_pending_keys", PRE_1162),
         ("list_hybrid_pending_attestations", PRE_1162),
         ("put_accord_proposal", PRE_1162),
         ("get_accord_proposal", PRE_1162),
-        ("list_accord_proposals_by_anchor", PRE_1162),
         ("put_accord_participation", PRE_1162),
         ("list_accord_participations", PRE_1162),
         ("put_accord_decision", PRE_1162),
-        ("get_accord_decision", PRE_1162),
         ("set_active_halt", PRE_1162),
-        ("get_active_halt", PRE_1162),
         ("clear_active_halt", PRE_1162),
         // v61 (CIRISPersist#991): the group framed kinds retired; their ops
         // left the capsule at ABI 12 and the records replicate as rows.
@@ -7810,7 +9549,6 @@ mod tests {
         ("list_derived_hex", INHERITED_DEFAULT),
         ("adopt_genesis_reanchor", INHERITED_DEFAULT),
         ("list_attestations_citing_by_dimension", INHERITED_DEFAULT),
-        ("list_targeted_by_dimension_prefix", INHERITED_DEFAULT),
         ("list_consent_peers_for", INHERITED_DEFAULT),
         ("list_live_consent_grants_by", INHERITED_DEFAULT),
         ("list_live_consent_grants_for", INHERITED_DEFAULT),
@@ -7821,12 +9559,9 @@ mod tests {
         ("list_expired_attestation_ids", INHERITED_DEFAULT),
         ("purge_attestation_v31", INHERITED_DEFAULT),
         ("purge_genesis_delegation_row_v31", INHERITED_DEFAULT),
-        ("lookup_signed_community", INHERITED_DEFAULT),
         ("store_lineage_head_cosign", INHERITED_DEFAULT),
-        ("list_lineage_head_cosigns_for", INHERITED_DEFAULT),
         ("note_self_roster_proposal", INHERITED_DEFAULT),
         ("list_open_self_roster_proposals", INHERITED_DEFAULT),
-        ("list_settled_self_roster_proposals", INHERITED_DEFAULT),
         ("settle_self_roster_proposal", INHERITED_DEFAULT),
         // v61.3.0 (CIRISPersist#1252) — the cosign hold's node-local ledgers
         // and the group pointer read: a proxy has no store of its own, so no
@@ -7837,15 +9572,7 @@ mod tests {
         ("list_cosign_signatures", COSIGN_1252),
         ("drop_cosign_rows", COSIGN_1252),
         ("note_cosign_alias", COSIGN_1252),
-        ("cosign_alias", COSIGN_1252),
-        ("list_cosign_aliases", COSIGN_1252),
         ("read_group_plane_object", COSIGN_1252),
-        (
-            "vote_window_first_held",
-            "node-local receipt; a proxy has no store of its own, and the fold reads the action's signed instant",
-        ),
-        ("family_roster_signers", INHERITED_DEFAULT),
-        ("community_roster_signers", INHERITED_DEFAULT),
         ("purge_scan_attestations", INHERITED_DEFAULT),
         ("purge_trace_ids_for_llm_model", INHERITED_DEFAULT),
         ("purge_trace_ids_signed_by", INHERITED_DEFAULT),
@@ -7853,8 +9580,6 @@ mod tests {
         ("purge_put_execution", INHERITED_DEFAULT),
         ("purge_execution", INHERITED_DEFAULT),
         ("purge_tombstones_of", INHERITED_DEFAULT),
-        ("purge_tombstoned", INHERITED_DEFAULT),
-        ("purge_tombstone_notices", INHERITED_DEFAULT),
         ("list_purge_executions_since", INHERITED_DEFAULT),
         ("purge_delete_tombstoned_attestation", INHERITED_DEFAULT),
         ("purge_delete_tombstoned_trace", INHERITED_DEFAULT),
