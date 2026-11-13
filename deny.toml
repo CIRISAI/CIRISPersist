@@ -93,6 +93,10 @@ ignore = [
     "RUSTSEC-2026-0511",  # NXDOMAIN accepted for a proven empty non-terminal
     "RUSTSEC-2026-0512",  # an unrelated signed RRset accepted as the answer
     "RUSTSEC-2026-0514",  # lookup / lookup_ip returned records that failed validation
+    "RUSTSEC-2026-0530",  # parent-side NSEC at a zone cut accepted as nonexistence proof
+    "RUSTSEC-2026-0531",  # child-side NSEC/NSEC3 accepted as proof of no DS record
+    "RUSTSEC-2026-0532",  # parent-side NSEC3 at a zone cut accepted as nonexistence proof
+                           # (all three: the same DNSSEC-validation class and path as above)
     # v61.2.1 — RUSTSEC-2025-0134 (rustls-pemfile) and RUSTSEC-2026-0098 /
     # 0099 / 0104 (rustls-webpki) are CLEARED: cargo deny (all features, every
     # target) reported each ignore matched no crate. The ignores are gone.
