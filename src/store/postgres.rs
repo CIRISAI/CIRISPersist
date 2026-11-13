@@ -9461,6 +9461,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         self
     }
 
+    // v61.4.0 (CIRISPersist#1244) — the directory capsule reaches the
+    // blackhole and edge-detection surfaces through these, so those calls
+    // run inside persist's `.so`.
+    fn blackhole_rules_surface(&self) -> Option<&dyn crate::federation::BlackholeRules> {
+        Some(self)
+    }
+
+    fn edge_detection_surface(&self) -> Option<&dyn crate::derived::EdgeDetectionSink> {
+        Some(self)
+    }
+
     // ── v54.1.0 (CIRISPersist#1046) — the steward purge plane (V187) ──────
 
     async fn purge_scan_attestations(

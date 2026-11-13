@@ -1116,6 +1116,75 @@ pub enum DirectoryOp {
         /// Page size (1..=500).
         limit: i64,
     },
+    /// v61.4.0 (CIRISPersist#1227) —
+    /// [`FederationDirectory::list_keys_by_identity_type`] for ANY role.
+    /// [`Self::ListAccordHolders`] answers only the accord set, so a capsule
+    /// consumer could not list `canonical` conferrals. Result rides
+    /// `KeyRecords`. APPEND-ONLY (Growth).
+    ListKeysByIdentityType {
+        /// The `federation_keys.identity_type` to list.
+        identity_type: String,
+    },
+    /// v61.4.0 —
+    /// [`FederationDirectory::list_all_transport_destinations_unfolded`]:
+    /// every stored live route before the one-live-key fold, so a consumer
+    /// that folds itself runs the read inside persist's `.so`. Result rides
+    /// `TransportDestinations`. APPEND-ONLY (Growth).
+    ListAllTransportDestinationsUnfolded {},
+    /// v61.4.0 —
+    /// [`FederationDirectory::list_transport_destinations_by_destination_unfolded`]:
+    /// every stored live claimant of a destination before the fold. Result
+    /// rides `TransportDestinations`. APPEND-ONLY (Growth).
+    ListTransportDestinationsByDestinationUnfolded {
+        /// The destination hash.
+        destination: String,
+    },
+    /// v61.4.0 (CIRISPersist#1244) —
+    /// [`crate::federation::BlackholeRules::blackhole_list`]. Result rides
+    /// `BlackholeRecords`. APPEND-ONLY (Growth).
+    BlackholeList {},
+    /// v61.4.0 (CIRISPersist#1244) —
+    /// [`crate::federation::BlackholeRules::blackhole_upsert`]. Result rides
+    /// `Unit`. APPEND-ONLY (Growth).
+    BlackholeUpsert {
+        /// The 16-byte Reticulum identity hash.
+        #[serde(with = "crate::federation::serde_bytes_b64")]
+        identity_hash: Vec<u8>,
+        /// Soft expiry; `None` is a permanent rule.
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        /// Operator-readable reason.
+        reason: Option<String>,
+    },
+    /// v61.4.0 (CIRISPersist#1244) —
+    /// [`crate::federation::BlackholeRules::blackhole_remove`]. Result rides
+    /// `Unit`. APPEND-ONLY (Growth).
+    BlackholeRemove {
+        /// The 16-byte Reticulum identity hash.
+        #[serde(with = "crate::federation::serde_bytes_b64")]
+        identity_hash: Vec<u8>,
+    },
+    /// v61.4.0 (CIRISPersist#1244) —
+    /// [`crate::federation::BlackholeRules::blackhole_record_hit`]. Result
+    /// rides `Unit`. APPEND-ONLY (Growth).
+    BlackholeRecordHit {
+        /// The 16-byte Reticulum identity hash.
+        #[serde(with = "crate::federation::serde_bytes_b64")]
+        identity_hash: Vec<u8>,
+    },
+    /// v61.4.0 (CIRISPersist#1244) —
+    /// [`crate::federation::BlackholeRules::blackhole_prune_expired`]. Result
+    /// rides `U64`. APPEND-ONLY (Growth).
+    BlackholePruneExpired {
+        /// Rules whose `until` is before this instant are dropped.
+        now: chrono::DateTime<chrono::Utc>,
+    },
+    /// v61.4.0 (CIRISPersist#1244) —
+    /// [`crate::derived::DerivedSchema::put_edge_detection_event`]. Result
+    /// rides `Unit`. APPEND-ONLY (Growth).
+    PutEdgeDetectionEvent {
+        /// The detection row, as the detector signed it.
+        event: crate::derived::EdgeDetectionEvent,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -1349,7 +1418,21 @@ pub enum DirectoryOpResult {
     OwnerBindingPage(
         crate::federation::types::ServePage<crate::federation::types::OwnerBindingChange>,
     ),
+    /// v61.4.0 (CIRISPersist#1244) — `blackhole_list`. APPEND-ONLY (Growth).
+    BlackholeRecords(Vec<crate::federation::BlackholeRecord>),
 }
+
+/// v61.4.0 (CIRISPersist#1244) — the refusal a blackhole op gets from a
+/// directory whose [`FederationDirectory::blackhole_rules_surface`] is `None`
+/// (a test double, or the memory backend).
+pub const NO_BLACKHOLE_SURFACE: &str =
+    "directory capsule: this directory carries no BlackholeRules surface";
+
+/// v61.4.0 (CIRISPersist#1244) — the refusal `PutEdgeDetectionEvent` gets
+/// from a directory whose [`FederationDirectory::edge_detection_surface`] is
+/// `None`.
+pub const NO_EDGE_DETECTION_SURFACE: &str =
+    "directory capsule: this directory carries no edge-detection surface";
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
 ///
@@ -1601,6 +1684,79 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
+        DirectoryOp::ListKeysByIdentityType { identity_type } => {
+            match dir.list_keys_by_identity_type(&identity_type).await {
+                Ok(v) => DirectoryOpResult::KeyRecords(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListAllTransportDestinationsUnfolded {} => {
+            match dir.list_all_transport_destinations_unfolded().await {
+                Ok(v) => DirectoryOpResult::TransportDestinations(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListTransportDestinationsByDestinationUnfolded { destination } => {
+            match dir
+                .list_transport_destinations_by_destination_unfolded(&destination)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::TransportDestinations(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        // v61.4.0 (CIRISPersist#1244) — the blackhole and edge-detection
+        // surfaces are sibling traits of `FederationDirectory`, reached
+        // through the backend's own accessor so they run inside this `.so`.
+        DirectoryOp::BlackholeList {} => match dir.blackhole_rules_surface() {
+            None => DirectoryOpResult::Err(NO_BLACKHOLE_SURFACE.into()),
+            Some(r) => match r.blackhole_list().await {
+                Ok(v) => DirectoryOpResult::BlackholeRecords(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            },
+        },
+        DirectoryOp::BlackholeUpsert {
+            identity_hash,
+            until,
+            reason,
+        } => match dir.blackhole_rules_surface() {
+            None => DirectoryOpResult::Err(NO_BLACKHOLE_SURFACE.into()),
+            Some(r) => match r
+                .blackhole_upsert(&identity_hash, until, reason.as_deref())
+                .await
+            {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            },
+        },
+        DirectoryOp::BlackholeRemove { identity_hash } => match dir.blackhole_rules_surface() {
+            None => DirectoryOpResult::Err(NO_BLACKHOLE_SURFACE.into()),
+            Some(r) => match r.blackhole_remove(&identity_hash).await {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            },
+        },
+        DirectoryOp::BlackholeRecordHit { identity_hash } => match dir.blackhole_rules_surface() {
+            None => DirectoryOpResult::Err(NO_BLACKHOLE_SURFACE.into()),
+            Some(r) => match r.blackhole_record_hit(&identity_hash).await {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            },
+        },
+        DirectoryOp::BlackholePruneExpired { now } => match dir.blackhole_rules_surface() {
+            None => DirectoryOpResult::Err(NO_BLACKHOLE_SURFACE.into()),
+            Some(r) => match r.blackhole_prune_expired(now).await {
+                Ok(n) => DirectoryOpResult::U64(n),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            },
+        },
+        DirectoryOp::PutEdgeDetectionEvent { event } => match dir.edge_detection_surface() {
+            None => DirectoryOpResult::Err(NO_EDGE_DETECTION_SURFACE.into()),
+            Some(s) => match s.put_edge_detection_event(event).await {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            },
+        },
         DirectoryOp::RecordAnnouncedPeer {
             key_id,
             pubkey_ed25519_base64,
@@ -2411,7 +2567,17 @@ pub fn build_capsule_with_destructor<'py>(
 /// add the op in persist). Methods with a trait DEFAULT body that have no
 /// op are left inherited — their default bodies compose other trait
 /// methods, which themselves route (or surface `Unsupported`).
-struct OpsDirectory {
+///
+/// v61.4.0 (CIRISPersist#1244) — public, and also a
+/// [`crate::federation::BlackholeRules`] and a
+/// [`crate::derived::DerivedSchema`] (its edge-detection admission routed,
+/// the rest `NotImplemented`), so a consumer holding an
+/// `Arc<OpsDirectory>` from [`build_ops_directory_proxy`] reaches all three
+/// surfaces without the raw `outbound_queue_capsule`. Being a concrete
+/// `Sized` type, it also satisfies a consumer's blanket impls bound on
+/// `F: FederationDirectory`. Every call runs inside persist's `.so`: no
+/// code compiled into the consumer locks persist's primitives.
+pub struct OpsDirectory {
     /// The received directory capsule handle (opaque `data` + `&'static`
     /// vtable). `Directory` is already `Send + Sync`.
     directory: Directory,
@@ -2528,6 +2694,159 @@ impl OpsDirectory {
     }
 }
 
+impl OpsDirectory {
+    /// Run a blackhole op and expect `Unit`.
+    async fn blackhole_unit_op(&self, op: DirectoryOp) -> Result<(), Error> {
+        match self.run_op(&op).await? {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+}
+
+/// v61.4.0 (CIRISPersist#1244) — the blackhole surface over the capsule. The
+/// 16-byte length check runs here as well as on the far side, so a short
+/// hash is still [`Error::InvalidArgument`], not a flattened backend error.
+#[async_trait::async_trait]
+impl crate::federation::BlackholeRules for OpsDirectory {
+    async fn blackhole_list(&self) -> Result<Vec<crate::federation::BlackholeRecord>, Error> {
+        match self.run_op(&DirectoryOp::BlackholeList {}).await? {
+            DirectoryOpResult::BlackholeRecords(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn blackhole_upsert(
+        &self,
+        identity_hash: &[u8],
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        reason: Option<&str>,
+    ) -> Result<(), Error> {
+        crate::federation::blackhole::validate_identity_hash_len(identity_hash)?;
+        self.blackhole_unit_op(DirectoryOp::BlackholeUpsert {
+            identity_hash: identity_hash.to_vec(),
+            until,
+            reason: reason.map(str::to_owned),
+        })
+        .await
+    }
+
+    async fn blackhole_remove(&self, identity_hash: &[u8]) -> Result<(), Error> {
+        crate::federation::blackhole::validate_identity_hash_len(identity_hash)?;
+        self.blackhole_unit_op(DirectoryOp::BlackholeRemove {
+            identity_hash: identity_hash.to_vec(),
+        })
+        .await
+    }
+
+    async fn blackhole_record_hit(&self, identity_hash: &[u8]) -> Result<(), Error> {
+        crate::federation::blackhole::validate_identity_hash_len(identity_hash)?;
+        self.blackhole_unit_op(DirectoryOp::BlackholeRecordHit {
+            identity_hash: identity_hash.to_vec(),
+        })
+        .await
+    }
+
+    async fn blackhole_prune_expired(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, Error> {
+        match self
+            .run_op(&DirectoryOp::BlackholePruneExpired { now })
+            .await?
+        {
+            DirectoryOpResult::U64(n) => Ok(n),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+}
+
+/// v61.4.0 (CIRISPersist#1244) — the derived-schema surface over the capsule.
+/// Only the edge-detection admission is routed (the one call a consumer
+/// makes); every other method answers [`crate::derived::Error::NotImplemented`].
+/// A far-side failure arrives as [`crate::derived::Error::Backend`] carrying
+/// the far side's message (a `Conflict` keeps its text, not its variant).
+impl crate::derived::DerivedSchema for OpsDirectory {
+    async fn put_detection_event(
+        &self,
+        _event: crate::derived::DetectionEvent,
+    ) -> Result<(), crate::derived::Error> {
+        Err(crate::derived::Error::NotImplemented(
+            "put_detection_event: not routed through the directory capsule",
+        ))
+    }
+
+    async fn get_detection_events(
+        &self,
+        _filter: crate::derived::EventFilter,
+    ) -> Result<Vec<crate::derived::DetectionEvent>, crate::derived::Error> {
+        Err(crate::derived::Error::NotImplemented(
+            "get_detection_events: not routed through the directory capsule",
+        ))
+    }
+
+    async fn put_edge_detection_event(
+        &self,
+        event: crate::derived::EdgeDetectionEvent,
+    ) -> Result<(), crate::derived::Error> {
+        match self
+            .run_op(&DirectoryOp::PutEdgeDetectionEvent { event })
+            .await
+            .map_err(|e| crate::derived::Error::Backend(e.to_string()))?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(crate::derived::Error::Backend(s)),
+            _ => Err(crate::derived::Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn get_edge_detection_events(
+        &self,
+        _filter: crate::derived::EdgeEventFilter,
+    ) -> Result<Vec<crate::derived::EdgeDetectionEvent>, crate::derived::Error> {
+        Err(crate::derived::Error::NotImplemented(
+            "get_edge_detection_events: not routed through the directory capsule",
+        ))
+    }
+
+    async fn put_calibration_bundle(
+        &self,
+        _bundle: crate::derived::CalibrationBundle,
+    ) -> Result<(), crate::derived::Error> {
+        Err(crate::derived::Error::NotImplemented(
+            "put_calibration_bundle: not routed through the directory capsule",
+        ))
+    }
+
+    async fn get_current_calibration_bundle(
+        &self,
+    ) -> Result<Option<crate::derived::CalibrationBundle>, crate::derived::Error> {
+        Err(crate::derived::Error::NotImplemented(
+            "get_current_calibration_bundle: not routed through the directory capsule",
+        ))
+    }
+
+    async fn get_calibration_bundle_by_version(
+        &self,
+        _version: i32,
+    ) -> Result<Option<crate::derived::CalibrationBundle>, crate::derived::Error> {
+        Err(crate::derived::Error::NotImplemented(
+            "get_calibration_bundle_by_version: not routed through the directory capsule",
+        ))
+    }
+}
+
 /// Build a consumer-side [`FederationDirectory`] proxy over a received
 /// [`Directory`] capsule + an [`AsyncExecutor`] capsule (CIRISPersist#329).
 ///
@@ -2547,6 +2866,23 @@ pub fn build_ops_directory(
     directory: Directory,
     executor: Arc<AsyncExecutor>,
 ) -> Result<Arc<dyn FederationDirectory>, Error> {
+    let proxy: Arc<dyn FederationDirectory> = build_ops_directory_proxy(directory, executor)?;
+    Ok(proxy)
+}
+
+/// v61.4.0 (CIRISPersist#1244) — [`build_ops_directory`], returning the
+/// concrete [`OpsDirectory`] so one capsule serves as a
+/// `FederationDirectory`, a [`crate::federation::BlackholeRules`] and a
+/// [`crate::derived::DerivedSchema`] (`Arc<OpsDirectory>` coerces to each
+/// trait object). Same ABI-version refusal.
+///
+/// # Errors
+/// [`Error::Backend`] if `directory.vtable.abi_version` does not equal
+/// [`DIRECTORY_ABI_VERSION`].
+pub fn build_ops_directory_proxy(
+    directory: Directory,
+    executor: Arc<AsyncExecutor>,
+) -> Result<Arc<OpsDirectory>, Error> {
     if directory.vtable.abi_version != DIRECTORY_ABI_VERSION {
         return Err(Error::Backend(format!(
             "directory ops proxy: directory capsule ABI version mismatch \
@@ -2570,6 +2906,17 @@ pub fn build_ops_directory(
 impl FederationDirectory for OpsDirectory {
     fn as_dyn_directory(&self) -> &dyn crate::federation::FederationDirectory {
         self
+    }
+
+    // v61.4.0 (CIRISPersist#1244) — the proxy is itself both surfaces (each
+    // routed through the capsule), so a directory capsule built over a proxy
+    // forwards them too.
+    fn blackhole_rules_surface(&self) -> Option<&dyn crate::federation::BlackholeRules> {
+        Some(self)
+    }
+
+    fn edge_detection_surface(&self) -> Option<&dyn crate::derived::EdgeDetectionSink> {
+        Some(self)
     }
 
     // ── covered: routed through DirectoryOp ────────────────────────
@@ -2622,14 +2969,18 @@ impl FederationDirectory for OpsDirectory {
         &self,
         identity_type: &str,
     ) -> Result<Vec<KeyRecord>, Error> {
-        // Only the ACCORD_HOLDER set has an op (the constitutional 2-of-3
-        // verification set); any other identity_type is not routable.
-        if identity_type != crate::federation::types::identity_type::ACCORD_HOLDER {
-            return Err(Error::Unsupported {
-                method: "list_keys_by_identity_type(non-accord)",
-            });
-        }
-        match self.run_op(&DirectoryOp::ListAccordHolders {}).await? {
+        // v61.4.0 (CIRISPersist#1227) — every role routes. The accord set
+        // keeps its original op, so a host older than v61.4.0 still answers
+        // the one read it always could; every other role rides
+        // `ListKeysByIdentityType`.
+        let op = if identity_type == crate::federation::types::identity_type::ACCORD_HOLDER {
+            DirectoryOp::ListAccordHolders {}
+        } else {
+            DirectoryOp::ListKeysByIdentityType {
+                identity_type: identity_type.to_string(),
+            }
+        };
+        match self.run_op(&op).await? {
             DirectoryOpResult::KeyRecords(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
@@ -3064,6 +3415,43 @@ impl FederationDirectory for OpsDirectory {
             .run_op(&DirectoryOp::ListTransportDestinationsByDestination {
                 destination: destination.to_string(),
             })
+            .await?
+        {
+            DirectoryOpResult::TransportDestinations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn list_all_transport_destinations_unfolded(
+        &self,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        // v61.4.0 — the pre-fold read, run inside persist's `.so`.
+        match self
+            .run_op(&DirectoryOp::ListAllTransportDestinationsUnfolded {})
+            .await?
+        {
+            DirectoryOpResult::TransportDestinations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn list_transport_destinations_by_destination_unfolded(
+        &self,
+        destination: &str,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        // v61.4.0 — the pre-fold claimant read, run inside persist's `.so`.
+        match self
+            .run_op(
+                &DirectoryOp::ListTransportDestinationsByDestinationUnfolded {
+                    destination: destination.to_string(),
+                },
+            )
             .await?
         {
             DirectoryOpResult::TransportDestinations(v) => Ok(v),
@@ -5210,9 +5598,13 @@ mod tests {
         // v61.1.0 (CIRISPersist#1190, #1163) — GROWTH:
         // `ListAttestationsSinceByPrefixes` and `ListOwnerBindingsSince`
         // APPENDED.
+        // v61.4.0 (CIRISPersist#1227, #1244) — GROWTH: `ListKeysByIdentityType`,
+        // the two `*Unfolded` transport reads, the five `Blackhole*` ops and
+        // `PutEdgeDetectionEvent` APPENDED, nothing existing touched;
+        // DIRECTORY_ABI_VERSION stays 13.
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "e45b6cbcc46f5817301a94f8f289bff42dcb4f64d32729782d9bf835bd26e8a3",
+            "e9c41f83a04abb009150a602cc73ba1a38281d79a6834986e6f8672d25191086",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -5268,9 +5660,10 @@ mod tests {
         // with the member listing (a BREAK, inside ABI 12).
         // v61.1.0 (CIRISPersist#1190, #1163) — GROWTH:
         // `ServedAttestationPage` and `OwnerBindingPage` APPENDED.
+        // v61.4.0 (CIRISPersist#1244) — GROWTH: `BlackholeRecords` APPENDED.
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "4aff512102f2ba2aadd4bbbbccbfac5472302f3c1c7c81a689812e64bd021420",
+            "87f8e0e77a9ab91750d4738d9e0ba0442c7a13670a8425f8672af8541f17a538",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );
@@ -6613,6 +7006,567 @@ mod tests {
         exercise_attestation_query_through_the_proxy_1162(&rt, Arc::new(backend), &suffix);
     }
 
+    // ── v61.4.0 — the ops Edge moves off the raw outbound_queue capsule ──
+    //
+    // Edge's `.so` and persist's each link their own `parking_lot`, so a
+    // store method compiled into Edge that locks persist's writer mutex can
+    // park where persist's unlock never wakes it. Each op below runs the
+    // method inside persist's `.so`. Every witness drives the op through the
+    // C-ABI vtable (`run_op`) AND through the consumer proxy, on sqlite and
+    // postgres, against the direct call.
+
+    /// A migrated sqlite backend, or a postgres one when the DSN is set.
+    fn sqlite_backend_1244(
+        rt: &Arc<tokio::runtime::Runtime>,
+    ) -> Arc<crate::store::sqlite::SqliteBackend> {
+        Arc::new(rt.block_on(async {
+            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .expect("open sqlite");
+            crate::store::backend::Backend::run_migrations(&b)
+                .await
+                .expect("migrate");
+            b
+        }))
+    }
+
+    #[cfg(feature = "postgres")]
+    fn pg_backend_1244(
+        rt: &Arc<tokio::runtime::Runtime>,
+    ) -> Option<Arc<crate::store::postgres::PostgresBackend>> {
+        let Some(dsn) = crate::test_pg::dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return None;
+        };
+        Some(Arc::new(rt.block_on(async {
+            let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+                .await
+                .expect("connect");
+            crate::store::backend::Backend::run_migrations(&b)
+                .await
+                .expect("migrate");
+            b
+        })))
+    }
+
+    fn proxy_1244(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: Arc<dyn FederationDirectory>,
+    ) -> Arc<OpsDirectory> {
+        let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
+            rt.clone(),
+        ));
+        build_ops_directory_proxy(build_persist_directory(dir), executor).expect("abi ok")
+    }
+
+    /// **I1755 (CIRISPersist#1227) — `list_keys_by_identity_type` crosses the
+    /// capsule for a non-accord role.** Two `node` keys come back through the
+    /// vtable and through the proxy, equal to the direct read; the proxy no
+    /// longer answers `Unsupported`.
+    fn exercise_i1755(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: Arc<dyn FederationDirectory>,
+        tag: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type::NODE;
+        let mine = [format!("{tag}-node-a"), format!("{tag}-node-b")];
+        rt.block_on(async {
+            for k in &mine {
+                ts::register_identity_key(dir.as_ref(), k, NODE).await;
+            }
+        });
+        let ids = |v: &[KeyRecord]| -> Vec<String> { v.iter().map(|r| r.key_id.clone()).collect() };
+        let direct = rt
+            .block_on(dir.list_keys_by_identity_type(NODE))
+            .expect("direct");
+        for k in &mine {
+            assert!(ids(&direct).contains(k), "I1755 seed {k}");
+        }
+        let directory = build_persist_directory(dir.clone());
+        match run_op(
+            rt,
+            &directory,
+            &DirectoryOp::ListKeysByIdentityType {
+                identity_type: NODE.into(),
+            },
+        ) {
+            DirectoryOpResult::KeyRecords(v) => assert_eq!(ids(&v), ids(&direct), "I1755 vtable"),
+            other => panic!("I1755: expected KeyRecords, got {other:?}"),
+        }
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+        let proxy = proxy_1244(rt, dir.clone());
+        let via = rt
+            .block_on(proxy.list_keys_by_identity_type(NODE))
+            .expect("I1755: the proxy routes a non-accord role");
+        assert_eq!(ids(&via), ids(&direct), "I1755 proxy");
+    }
+
+    /// Two `node` keys tied to one owner, each with a route on one
+    /// destination: the fold keeps the newer, the unfolded read keeps both.
+    fn seed_tied_routes_1244(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) -> (String, Vec<String>) {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type::{NODE, USER};
+        let dest = format!("{tag}dest");
+        let owner = format!("{tag}-owner");
+        let nodes = vec![format!("{tag}-node-1"), format!("{tag}-node-2")];
+        rt.block_on(async {
+            ts::register_identity_key(dir, &owner, USER).await;
+            for (i, n) in nodes.iter().enumerate() {
+                ts::register_identity_key(dir, n, NODE).await;
+                ts::put_owner_binding(dir, &owner, n).await;
+                let r = self_at_login::TransportDestination {
+                    occurrence_key_id: n.clone(),
+                    transport_kind: "reticulum".into(),
+                    destination: dest.clone(),
+                    asserted_at: "2026-10-22T00:00:00.000Z".parse().unwrap(),
+                    last_seen_at: None,
+                    transport_ed25519_pubkey_base64: None,
+                    transport_x25519_pubkey_base64: None,
+                    binding_provenance: self_at_login::BindingProvenance::Rooted,
+                    epoch: 1 + i as u64,
+                    retired_at: None,
+                };
+                dir.put_transport_destination(&r).await.expect("seed route");
+            }
+        });
+        (dest, nodes)
+    }
+
+    fn route_keys_1244(v: &[self_at_login::TransportDestination], tag: &str) -> Vec<String> {
+        let mut k: Vec<String> = v
+            .iter()
+            .filter(|r| r.occurrence_key_id.starts_with(tag))
+            .map(|r| r.occurrence_key_id.clone())
+            .collect();
+        k.sort();
+        k
+    }
+
+    /// **I1756 — `list_all_transport_destinations_unfolded` crosses the
+    /// capsule unfolded.** Both tied routes come back through the vtable and
+    /// the proxy (the folded read keeps one), equal to the direct read.
+    fn exercise_i1756(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: Arc<dyn FederationDirectory>,
+        tag: &str,
+    ) {
+        let (_, nodes) = seed_tied_routes_1244(rt, dir.as_ref(), tag);
+        let direct = rt
+            .block_on(dir.list_all_transport_destinations_unfolded())
+            .expect("direct");
+        assert_eq!(
+            route_keys_1244(&direct, tag),
+            nodes,
+            "I1756 seed: both routes"
+        );
+        let folded = rt
+            .block_on(dir.list_all_transport_destinations())
+            .expect("folded");
+        assert_eq!(
+            route_keys_1244(&folded, tag),
+            vec![nodes[1].clone()],
+            "I1756 seed: the fold keeps one"
+        );
+        let directory = build_persist_directory(dir.clone());
+        match run_op(
+            rt,
+            &directory,
+            &DirectoryOp::ListAllTransportDestinationsUnfolded {},
+        ) {
+            DirectoryOpResult::TransportDestinations(v) => {
+                assert_eq!(route_keys_1244(&v, tag), nodes, "I1756 vtable")
+            }
+            other => panic!("I1756: expected TransportDestinations, got {other:?}"),
+        }
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+        let proxy = proxy_1244(rt, dir.clone());
+        let via = rt
+            .block_on(proxy.list_all_transport_destinations_unfolded())
+            .expect("I1756: the proxy routes the unfolded read");
+        assert_eq!(route_keys_1244(&via, tag), nodes, "I1756 proxy");
+    }
+
+    /// **I1757 — `list_transport_destinations_by_destination_unfolded`
+    /// crosses the capsule unfolded.** Same shape as I1756, one destination.
+    fn exercise_i1757(
+        rt: &Arc<tokio::runtime::Runtime>,
+        dir: Arc<dyn FederationDirectory>,
+        tag: &str,
+    ) {
+        let (dest, nodes) = seed_tied_routes_1244(rt, dir.as_ref(), tag);
+        let direct = rt
+            .block_on(dir.list_transport_destinations_by_destination_unfolded(&dest))
+            .expect("direct");
+        assert_eq!(
+            route_keys_1244(&direct, tag),
+            nodes,
+            "I1757 seed: both routes"
+        );
+        let directory = build_persist_directory(dir.clone());
+        match run_op(
+            rt,
+            &directory,
+            &DirectoryOp::ListTransportDestinationsByDestinationUnfolded {
+                destination: dest.clone(),
+            },
+        ) {
+            DirectoryOpResult::TransportDestinations(v) => {
+                assert_eq!(route_keys_1244(&v, tag), nodes, "I1757 vtable")
+            }
+            other => panic!("I1757: expected TransportDestinations, got {other:?}"),
+        }
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+        let proxy = proxy_1244(rt, dir.clone());
+        let via = rt
+            .block_on(proxy.list_transport_destinations_by_destination_unfolded(&dest))
+            .expect("I1757: the proxy routes the unfolded claimant read");
+        assert_eq!(route_keys_1244(&via, tag), nodes, "I1757 proxy");
+    }
+
+    /// **I1758 (CIRISPersist#1244) — the five blackhole ops run inside
+    /// persist's `.so`.** Through the vtable: upsert lands a rule, record_hit
+    /// bumps its counter, an expired rule is pruned with its count, remove
+    /// drops a rule; through the proxy (`Arc<OpsDirectory>` as
+    /// `BlackholeRules`), the same, and a short hash is `InvalidArgument`.
+    fn exercise_i1758<B>(rt: &Arc<tokio::runtime::Runtime>, backend: Arc<B>)
+    where
+        B: FederationDirectory + crate::federation::BlackholeRules + 'static,
+    {
+        use crate::federation::BlackholeRules;
+        let fresh = || uuid::Uuid::new_v4().as_bytes().to_vec();
+        let find = |v: &[crate::federation::BlackholeRecord], h: &[u8]| {
+            v.iter().find(|r| r.identity_hash == h).cloned()
+        };
+        let dir: Arc<dyn FederationDirectory> = backend.clone();
+        let directory = build_persist_directory(dir.clone());
+        let list_via_vtable = || match run_op(rt, &directory, &DirectoryOp::BlackholeList {}) {
+            DirectoryOpResult::BlackholeRecords(v) => v,
+            other => panic!("I1758: expected BlackholeRecords, got {other:?}"),
+        };
+        let unit = |op: DirectoryOp| match run_op(rt, &directory, &op) {
+            DirectoryOpResult::Unit => {}
+            other => panic!("I1758: expected Unit for {op:?}, got {other:?}"),
+        };
+
+        // upsert + list
+        let h = fresh();
+        unit(DirectoryOp::BlackholeUpsert {
+            identity_hash: h.clone(),
+            until: None,
+            reason: Some("i1758".into()),
+        });
+        let row = find(&list_via_vtable(), &h).expect("I1758 upsert landed");
+        assert_eq!(row.reason.as_deref(), Some("i1758"));
+        assert_eq!(row.hits, 0);
+        assert_eq!(
+            find(&rt.block_on(backend.blackhole_list()).unwrap(), &h),
+            Some(row),
+            "I1758 list equals the direct read"
+        );
+        // record_hit
+        unit(DirectoryOp::BlackholeRecordHit {
+            identity_hash: h.clone(),
+        });
+        unit(DirectoryOp::BlackholeRecordHit {
+            identity_hash: h.clone(),
+        });
+        assert_eq!(
+            find(&list_via_vtable(), &h).unwrap().hits,
+            2,
+            "I1758 record_hit"
+        );
+        // prune
+        let expired = fresh();
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        unit(DirectoryOp::BlackholeUpsert {
+            identity_hash: expired.clone(),
+            until: Some(past),
+            reason: None,
+        });
+        match run_op(
+            rt,
+            &directory,
+            &DirectoryOp::BlackholePruneExpired {
+                now: chrono::Utc::now(),
+            },
+        ) {
+            DirectoryOpResult::U64(n) => assert!(n >= 1, "I1758 prune counted {n}"),
+            other => panic!("I1758: expected U64, got {other:?}"),
+        }
+        let after = list_via_vtable();
+        assert!(
+            find(&after, &expired).is_none(),
+            "I1758 the expired rule is pruned"
+        );
+        assert!(
+            find(&after, &h).is_some(),
+            "I1758 a permanent rule survives"
+        );
+        // remove
+        unit(DirectoryOp::BlackholeRemove {
+            identity_hash: h.clone(),
+        });
+        assert!(find(&list_via_vtable(), &h).is_none(), "I1758 remove");
+        // a short hash is refused inside the .so too
+        match run_op(
+            rt,
+            &directory,
+            &DirectoryOp::BlackholeRecordHit {
+                identity_hash: vec![1, 2, 3],
+            },
+        ) {
+            DirectoryOpResult::Err(e) => assert!(e.contains("16 bytes"), "I1758: {e}"),
+            other => panic!("I1758: a short hash must refuse, got {other:?}"),
+        }
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+
+        // the consumer's view: the proxy as `Arc<dyn BlackholeRules>`.
+        let rules: Arc<dyn BlackholeRules> = proxy_1244(rt, dir.clone());
+        let p = fresh();
+        rt.block_on(rules.blackhole_upsert(&p, None, Some("proxy")))
+            .expect("I1758 proxy upsert");
+        rt.block_on(rules.blackhole_record_hit(&p))
+            .expect("I1758 proxy record_hit");
+        let r = find(&rt.block_on(rules.blackhole_list()).unwrap(), &p).expect("I1758 proxy list");
+        assert_eq!((r.reason.as_deref(), r.hits), (Some("proxy"), 1));
+        let q = fresh();
+        rt.block_on(rules.blackhole_upsert(&q, Some(past), None))
+            .unwrap();
+        assert!(
+            rt.block_on(rules.blackhole_prune_expired(chrono::Utc::now()))
+                .unwrap()
+                >= 1
+        );
+        rt.block_on(rules.blackhole_remove(&p)).unwrap();
+        let left = rt.block_on(backend.blackhole_list()).unwrap();
+        assert!(
+            find(&left, &p).is_none() && find(&left, &q).is_none(),
+            "I1758 proxy"
+        );
+        assert!(matches!(
+            rt.block_on(rules.blackhole_record_hit(&[0u8; 3])),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    /// **I1759 (CIRISPersist#1244) — `put_edge_detection_event` runs inside
+    /// persist's `.so`.** A row put through the vtable reads back from the
+    /// backend; a re-put is idempotent; the same id with another row hash is
+    /// refused through the capsule; and the proxy, as a `DerivedSchema`,
+    /// admits a second row.
+    fn exercise_i1759<B>(rt: &Arc<tokio::runtime::Runtime>, backend: Arc<B>, tag: &str)
+    where
+        B: FederationDirectory + crate::derived::DerivedSchema + 'static,
+    {
+        use crate::derived::DerivedSchema;
+        let subject = format!("{tag}-edge-sub");
+        rt.block_on(backend.add_peer_record(&subject, "AAAA", "agent", None))
+            .expect("peer");
+        let event = |hash: &str| crate::derived::EdgeDetectionEvent {
+            detection_id: uuid::Uuid::new_v4().to_string(),
+            tenant_id: "i1759".into(),
+            detector_kind: "unconsented_external_probe".into(),
+            subject_key_id: subject.clone(),
+            observed_at: chrono::Utc::now(),
+            evidence: serde_json::json!({"probe_count": 7}),
+            severity: "warn".into(),
+            signature: "edge-sig-base64".into(),
+            signing_key_id: subject.clone(),
+            signature_verified: true,
+            persist_row_hash: hash.into(),
+        };
+        let stored = || -> Vec<String> {
+            let mut v: Vec<String> = rt
+                .block_on(
+                    backend.get_edge_detection_events(crate::derived::EdgeEventFilter {
+                        peer_key_id: Some(subject.clone()),
+                        ..Default::default()
+                    }),
+                )
+                .expect("read")
+                .into_iter()
+                .map(|e| e.detection_id)
+                .collect();
+            v.sort();
+            v
+        };
+        let dir: Arc<dyn FederationDirectory> = backend.clone();
+        let directory = build_persist_directory(dir.clone());
+        let e1 = event("row-hash-A");
+        for _ in 0..2 {
+            match run_op(
+                rt,
+                &directory,
+                &DirectoryOp::PutEdgeDetectionEvent { event: e1.clone() },
+            ) {
+                DirectoryOpResult::Unit => {}
+                other => panic!("I1759: expected Unit, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            stored(),
+            vec![e1.detection_id.clone()],
+            "I1759 vtable put landed"
+        );
+        let mut clash = e1.clone();
+        clash.persist_row_hash = "row-hash-B".into();
+        match run_op(
+            rt,
+            &directory,
+            &DirectoryOp::PutEdgeDetectionEvent { event: clash },
+        ) {
+            DirectoryOpResult::Err(e) => assert!(e.contains("conflict"), "I1759: {e}"),
+            other => panic!("I1759: a differing row hash must refuse, got {other:?}"),
+        }
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+
+        let proxy = proxy_1244(rt, dir);
+        let e2 = event("row-hash-C");
+        rt.block_on(DerivedSchema::put_edge_detection_event(
+            proxy.as_ref(),
+            e2.clone(),
+        ))
+        .expect("I1759 proxy put");
+        let mut want = vec![e1.detection_id, e2.detection_id];
+        want.sort();
+        assert_eq!(stored(), want, "I1759 proxy put landed");
+    }
+
+    macro_rules! both_backends_1244 {
+        ($sqlite:ident, $pg:ident, |$rt:ident, $b:ident, $tag:ident| $body:expr) => {
+            #[test]
+            fn $sqlite() {
+                let $rt = test_runtime();
+                let $b = sqlite_backend_1244(&$rt);
+                let $tag = "sq".to_string();
+                $body
+            }
+            #[cfg(feature = "postgres")]
+            #[test]
+            #[serial_test::serial(postgres)]
+            fn $pg() {
+                let $rt = test_runtime();
+                let Some($b) = pg_backend_1244(&$rt) else {
+                    return;
+                };
+                let $tag = uuid::Uuid::new_v4().simple().to_string();
+                $body
+            }
+        };
+    }
+
+    both_backends_1244!(
+        i1755_keys_by_any_role_cross_the_capsule_sqlite,
+        i1755_keys_by_any_role_cross_the_capsule_pg,
+        |rt, b, tag| exercise_i1755(&rt, b, &tag)
+    );
+    both_backends_1244!(
+        i1756_all_routes_unfolded_cross_the_capsule_sqlite,
+        i1756_all_routes_unfolded_cross_the_capsule_pg,
+        |rt, b, tag| exercise_i1756(&rt, b, &tag)
+    );
+    both_backends_1244!(
+        i1757_claimants_unfolded_cross_the_capsule_sqlite,
+        i1757_claimants_unfolded_cross_the_capsule_pg,
+        |rt, b, tag| exercise_i1757(&rt, b, &tag)
+    );
+    both_backends_1244!(
+        i1758_blackhole_ops_cross_the_capsule_sqlite,
+        i1758_blackhole_ops_cross_the_capsule_pg,
+        |rt, b, tag| {
+            let _ = tag;
+            exercise_i1758(&rt, b)
+        }
+    );
+    both_backends_1244!(
+        i1759_edge_detection_put_crosses_the_capsule_sqlite,
+        i1759_edge_detection_put_crosses_the_capsule_pg,
+        |rt, b, tag| exercise_i1759(&rt, b, &tag)
+    );
+
+    /// **I1760 (CIRISPersist#1244) — a skewed ABI version is refused by the
+    /// concrete-proxy constructor too**, so the new surfaces cannot dispatch
+    /// over a capsule built for another layout.
+    #[test]
+    fn i1760_the_concrete_proxy_refuses_a_skewed_abi() {
+        static SKEWED: DirectoryVTable = DirectoryVTable {
+            abi_version: DIRECTORY_ABI_VERSION + 1,
+            _reserved: 0,
+            build_op: persist_directory_build_op,
+            drop: persist_directory_drop,
+        };
+        let rt = test_runtime();
+        let directory = Directory {
+            data: std::ptr::null_mut(),
+            vtable: &SKEWED,
+        };
+        let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
+            rt.clone(),
+        ));
+        match build_ops_directory_proxy(directory, executor) {
+            Err(Error::Backend(m)) => assert!(m.contains("ABI version mismatch"), "I1760: {m}"),
+            Err(e) => panic!("I1760: wrong refusal {e:?}"),
+            Ok(_) => panic!("I1760: a skewed capsule was accepted"),
+        }
+    }
+
+    /// **I1761 (CIRISPersist#1244) — a directory with no blackhole or
+    /// edge-detection surface refuses those ops by name**, never answering
+    /// an empty list or a silent `Unit`.
+    #[test]
+    fn i1761_a_surfaceless_directory_refuses_by_name() {
+        let rt = test_runtime();
+        let inner: Arc<dyn FederationDirectory> = sqlite_backend_1244(&rt);
+        let double: Arc<dyn FederationDirectory> =
+            Arc::new(crate::federation::directory_double::FaultInjectingDirectory::new(inner));
+        assert!(double.blackhole_rules_surface().is_none());
+        let directory = build_persist_directory(double);
+        for (op, want) in [
+            (DirectoryOp::BlackholeList {}, NO_BLACKHOLE_SURFACE),
+            (
+                DirectoryOp::BlackholePruneExpired {
+                    now: chrono::Utc::now(),
+                },
+                NO_BLACKHOLE_SURFACE,
+            ),
+            (
+                DirectoryOp::PutEdgeDetectionEvent {
+                    event: crate::derived::EdgeDetectionEvent {
+                        detection_id: uuid::Uuid::new_v4().to_string(),
+                        tenant_id: "i1761".into(),
+                        detector_kind: "unconsented_external_probe".into(),
+                        subject_key_id: "nobody".into(),
+                        observed_at: chrono::Utc::now(),
+                        evidence: serde_json::json!({}),
+                        severity: "warn".into(),
+                        signature: "sig".into(),
+                        signing_key_id: "nobody".into(),
+                        signature_verified: false,
+                        persist_row_hash: "h".into(),
+                    },
+                },
+                NO_EDGE_DETECTION_SURFACE,
+            ),
+        ] {
+            match run_op(&rt, &directory, &op) {
+                DirectoryOpResult::Err(e) => assert_eq!(e, want, "I1761 {op:?}"),
+                other => panic!("I1761 {op:?}: {other:?}"),
+            }
+        }
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+    }
+
     /// CIRISPersist#1162 — every field of the query and of its rows crosses
     /// the capsule's JSON as itself, and an unknown field is a refusal: a
     /// newer consumer's narrowing that an older host silently dropped would
@@ -6752,11 +7706,6 @@ mod tests {
                                   capsule at ABI 12; the record replicates as its group-plane \
                                   row through ApplyReplicatedAttestation";
     const PROXY_UNSUPPORTED_ALLOWLIST: &[(&str, &str)] = &[
-        (
-            "list_keys_by_identity_type",
-            "routed for ACCORD_HOLDER only (ListAccordHolders); every \
-          other identity_type has no op",
-        ),
         (
             "attestation_type_census",
             "v53.0.0 (#975): a local report door; no DirectoryOp \
@@ -7105,11 +8054,18 @@ mod proxy_gate {
             "I1322: the op scan found {} variants — the extractor collapsed",
             variants.len()
         );
-        let proxy = block(
-            &src,
-            src.find("impl FederationDirectory for OpsDirectory {")
-                .expect("the consumer proxy"),
-        );
+        // v61.4.0 (CIRISPersist#1244) — the proxy is three impls: the
+        // directory, and the blackhole and derived-schema surfaces the
+        // capsule also carries.
+        let proxy: String = [
+            "impl FederationDirectory for OpsDirectory {",
+            "impl crate::federation::BlackholeRules for OpsDirectory {",
+            "impl crate::derived::DerivedSchema for OpsDirectory {",
+        ]
+        .iter()
+        .map(|head| block(&src, src.find(head).expect("a consumer proxy impl")))
+        .collect::<Vec<_>>()
+        .join("\n");
         let built = |v: &str| {
             proxy
                 .match_indices(&format!("DirectoryOp::{v}"))

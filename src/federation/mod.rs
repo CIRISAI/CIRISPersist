@@ -3555,6 +3555,22 @@ pub trait FederationDirectory: Send + Sync {
     /// through this. Every implementor returns `self`.
     fn as_dyn_directory(&self) -> &dyn FederationDirectory;
 
+    /// v61.4.0 (CIRISPersist#1244) — the backend's [`BlackholeRules`]
+    /// surface, when it has one, so the directory capsule can dispatch the
+    /// blackhole ops inside persist's `.so` from a `&dyn FederationDirectory`.
+    /// `None` by default; the sqlite and postgres backends return `self`.
+    fn blackhole_rules_surface(&self) -> Option<&dyn BlackholeRules> {
+        None
+    }
+
+    /// v61.4.0 (CIRISPersist#1244) — the backend's edge-detection admission
+    /// ([`crate::derived::DerivedSchema::put_edge_detection_event`]), when it
+    /// has one. `None` by default; the sqlite and postgres backends return
+    /// `self`.
+    fn edge_detection_surface(&self) -> Option<&dyn crate::derived::EdgeDetectionSink> {
+        None
+    }
+
     // ── Public keys ────────────────────────────────────────────────
 
     /// Insert a new pubkey row. Idempotent on `key_id` collision with
