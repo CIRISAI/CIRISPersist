@@ -31518,6 +31518,23 @@ impl PyEngine {
     /// (`outbound_queue_ops_capsule`), the ABI-stable C-vtable
     /// serialized-op surface that dispatches the method INSIDE persist's
     /// `.so`. Retained for the migration window (CIRISEdge#245 extends).
+    ///
+    /// # Cross-binary lock hazard (v61.4.0)
+    ///
+    /// Code compiled into another binary must never lock persist's
+    /// primitives. A consumer that takes the concrete `Arc<SqliteBackend>` /
+    /// `Arc<PostgresBackend>` out of this capsule and calls its methods runs
+    /// ITS OWN monomorphized copy of persist's store code, and so its own
+    /// statically linked `parking_lot`. `parking_lot` keeps parked threads in
+    /// a per-binary global table: a waiter parked by the consumer's copy on
+    /// persist's writer `Mutex<Connection>` (or the reader pool, or a
+    /// tokio-postgres client's internal mutex) is never woken by persist's
+    /// unlock, and vice versa. That is a permanent hang, not a slowdown
+    /// (CIRISEdge, 61.4.0). Use the ops capsules instead: `directory_ops_capsule`
+    /// (with [`crate::ffi::directory_capsule::build_ops_directory_proxy`], which
+    /// also serves `BlackholeRules` and `DerivedSchema::put_edge_detection_event`)
+    /// and `outbound_queue_ops_capsule`, whose method bodies run inside
+    /// persist's `.so`.
     #[pyo3(name = "outbound_queue_capsule")]
     fn outbound_queue_capsule_py<'py>(
         &self,

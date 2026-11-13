@@ -654,6 +654,17 @@ impl SqliteBackend {
     /// Shared WRITER handle. Used by sibling modules
     /// (cirisgraph SQLite impl in v0.8.4+) that ride on the same
     /// underlying SQLite file/in-memory connection.
+    ///
+    /// # Cross-binary lock hazard (v61.4.0)
+    ///
+    /// The handle is a `parking_lot::Mutex`. Code compiled into another
+    /// binary (a consumer wheel that links persist as an rlib) must never
+    /// lock it: that binary's `parking_lot` keeps its own global table of
+    /// parked threads, so a waiter it parks is never woken by persist's
+    /// unlock, and vice versa — a permanent hang. Only code inside persist's
+    /// own binary may hold this handle; a cross-binary consumer reaches the
+    /// store through the ops capsules
+    /// ([`crate::ffi::directory_capsule::build_ops_directory_proxy`]).
     pub fn conn_handle(&self) -> std::sync::Arc<parking_lot::Mutex<Connection>> {
         self.conn.clone()
     }
@@ -843,6 +854,17 @@ impl SqliteBackend {
     /// reads fall back to the writer it was given (FSD §4). A view that
     /// should read through the owning backend's pool takes
     /// [`Self::from_handles`].
+    ///
+    /// # Cross-binary lock hazard (v61.4.0)
+    ///
+    /// The handle is a `parking_lot::Mutex`. Code compiled into another
+    /// binary (a consumer wheel that links persist as an rlib) must never
+    /// lock it: that binary's `parking_lot` keeps its own global table of
+    /// parked threads, so a waiter it parks is never woken by persist's
+    /// unlock, and vice versa — a permanent hang. Only code inside persist's
+    /// own binary may hold this handle; a cross-binary consumer reaches the
+    /// store through the ops capsules
+    /// ([`crate::ffi::directory_capsule::build_ops_directory_proxy`]).
     pub fn from_conn_handle(conn: std::sync::Arc<parking_lot::Mutex<Connection>>) -> Self {
         Self::from_handles(conn, crate::store::sqlite_conn_model::ReadPool::empty())
     }
