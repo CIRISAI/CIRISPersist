@@ -5,7 +5,7 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
-## [61.4.0] - UNRELEASED
+## [61.4.0] - 2026-11-13
 
 Room moderation for rooms larger than two: a room moderator can take down a message or a file placed in the room (CIRISPersist#1260), and every room duty door is witnessed asking for an appointment, never for membership (CIRISPersist#1195). Large rooms: a key-grant emission folds the room once (a 150-row emission went from 17.8 s to 0.85 s on sqlite), and a newcomer is seated into the current epoch without waiting for a content write (CC C559).
 
