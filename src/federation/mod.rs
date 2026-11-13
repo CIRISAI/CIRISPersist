@@ -493,12 +493,15 @@ mod key_id_fingerprint_invariants;
 pub mod key_grant_invariants;
 // MEASUREMENT ONLY (kg-burst-measure) — the seat-door burst cost.
 #[cfg(test)]
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 mod kg_burst_measure;
 // v61.4.0 — I1800–I1802: one emission, one fold (the key-grant burst).
 #[cfg(test)]
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 mod key_grant_fold_invariants;
 // v61.4.0 — I1803–I1807: the seat door (CC C559, DERIVED, pending text).
 #[cfg(test)]
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 mod seat_door_invariants;
 // v55.0.0 (CIRISPersist#989) — I742–I745: the key-grant SET retired, one
 // `scores` row per recipient (the upgraded node included).
