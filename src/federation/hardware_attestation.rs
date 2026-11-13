@@ -166,7 +166,9 @@ pub const DEFAULT_MAX_NONCE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 ///   `SoftwareOnly.supports_professional_license() == false`; that
 ///   floor is operationally absorbed here.
 /// - `max_nonce_age`: [`DEFAULT_MAX_NONCE_AGE`] (24h).
-#[derive(Debug, Clone, PartialEq, Eq)]
+// v61.4.0 (CIRISPersist#1244 round 2) — serde, so the directory capsule's
+// proxy answers the host's installed policy instead of the default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HardwareAttestationPolicy {
     /// Hardware variants persist accepts for accord-holder identity.
     /// Default: every variant EXCEPT

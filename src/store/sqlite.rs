@@ -654,6 +654,17 @@ impl SqliteBackend {
     /// Shared WRITER handle. Used by sibling modules
     /// (cirisgraph SQLite impl in v0.8.4+) that ride on the same
     /// underlying SQLite file/in-memory connection.
+    ///
+    /// # Cross-binary lock hazard (v61.4.0)
+    ///
+    /// The handle is a `parking_lot::Mutex`. Code compiled into another
+    /// binary (a consumer wheel that links persist as an rlib) must never
+    /// lock it: that binary's `parking_lot` keeps its own global table of
+    /// parked threads, so a waiter it parks is never woken by persist's
+    /// unlock, and vice versa — a permanent hang. Only code inside persist's
+    /// own binary may hold this handle; a cross-binary consumer reaches the
+    /// store through the ops capsules
+    /// ([`crate::ffi::directory_capsule::build_ops_directory_proxy`]).
     pub fn conn_handle(&self) -> std::sync::Arc<parking_lot::Mutex<Connection>> {
         self.conn.clone()
     }
@@ -843,6 +854,17 @@ impl SqliteBackend {
     /// reads fall back to the writer it was given (FSD §4). A view that
     /// should read through the owning backend's pool takes
     /// [`Self::from_handles`].
+    ///
+    /// # Cross-binary lock hazard (v61.4.0)
+    ///
+    /// The handle is a `parking_lot::Mutex`. Code compiled into another
+    /// binary (a consumer wheel that links persist as an rlib) must never
+    /// lock it: that binary's `parking_lot` keeps its own global table of
+    /// parked threads, so a waiter it parks is never woken by persist's
+    /// unlock, and vice versa — a permanent hang. Only code inside persist's
+    /// own binary may hold this handle; a cross-binary consumer reaches the
+    /// store through the ops capsules
+    /// ([`crate::ffi::directory_capsule::build_ops_directory_proxy`]).
     pub fn from_conn_handle(conn: std::sync::Arc<parking_lot::Mutex<Connection>>) -> Self {
         Self::from_handles(conn, crate::store::sqlite_conn_model::ReadPool::empty())
     }
@@ -3181,6 +3203,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         self
     }
 
+    // v61.4.0 (CIRISPersist#1244) — the directory capsule reaches the
+    // blackhole and edge-detection surfaces through these, so those calls
+    // run inside persist's `.so`.
+    fn blackhole_rules_surface(&self) -> Option<&dyn crate::federation::BlackholeRules> {
+        Some(self)
+    }
+
+    fn edge_detection_surface(&self) -> Option<&dyn crate::derived::EdgeDetectionSink> {
+        Some(self)
+    }
+
     // ── v54.1.0 (CIRISPersist#1046) — the steward purge plane (V187) ──────
 
     async fn purge_scan_attestations(
@@ -5002,6 +5035,59 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             crate::observe::record_read(
                 crate::observe::StoreBackend::Sqlite,
                 crate::observe::Door::AttestationsBindingContent,
+                content_sha256,
+                rows,
+                bytes,
+            )
+        })
+    }
+
+    async fn attestations_binding_content_with_placements(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        // v61.4.0 (CIRISPersist#1260) — `attestations_binding_content` plus the
+        // `supersedes` placements into a room, in one scan. The same LIKE
+        // prefilter, then the shared predicate in Rust.
+        let sha = content_sha256.to_owned();
+        let like = format!("%{sha}%");
+        let (read, bytes) = self.read_measured(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                        weight, asserted_at, expires_at, attestation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                        subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
+                     FROM federation_attestations \
+                     WHERE tier = 'federation' \
+                        AND (attestation_type = 'scores' \
+                             OR (attestation_type = 'supersedes' \
+                                 AND cohort_scope IN ('community', 'affiliations'))) \
+                        AND attestation_envelope LIKE ?1 \
+                     ORDER BY asserted_at DESC",
+            )?;
+            let rows = stmt.query_map([&like], sqlite_row_to_attestation)?;
+            rows.collect::<Result<Vec<_>, _>>()
+        }).await;
+        read.map(|atts| {
+            atts.into_iter()
+                .filter(|a| {
+                    crate::federation::admission::envelope_binds_content(
+                        &a.attestation_envelope,
+                        &sha,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "attestations_binding_content_with_placements: {e}"
+            ))
+        })
+        .inspect(|rows| {
+            crate::observe::record_read(
+                crate::observe::StoreBackend::Sqlite,
+                crate::observe::Door::AttestationsBindingContentWithPlacements,
                 content_sha256,
                 rows,
                 bytes,

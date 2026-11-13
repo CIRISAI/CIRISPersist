@@ -18,6 +18,10 @@
 //! retraction classes: a row naming a member is admitted and one naming an
 //! outsider refused; the named member withdraws a peer's row about them, but
 //! not a `moderation:*` act or a cosigned act naming them.
+//!
+//! v61.4.0 (CIRISPersist#1195; CC 4.5.4) — **I1745** witnesses that a plain
+//! member of a `majority` room holds no duty at the moderation-act, takedown
+//! and takedown-reversal doors, while the founder and its deputy do.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -111,10 +115,171 @@ pub(crate) mod bodies {
             after.persist_row_hash, before.persist_row_hash,
             "I1512: the flagged row is untouched"
         );
-        // (Under quorum:1/1 every member is the room's authority, so a
-        // plain member holds `moderate` zero-hop; the duty gate's refusal of
-        // a non-holder is the existing moderation witnesses'.)
+        // `found_community` seats every signer as a founder, so `member` is
+        // one here. A plain member's refusal is I1745's.
         let _ = member;
+    }
+
+    /// **I1745** (CIRISPersist#1195; CC 4.5.4, CC 4.5.5, CC 4.1) — every room
+    /// duty door asks for an appointment, never for membership. In a
+    /// `majority` room (one founder; the author, a plain member and a deputy
+    /// seated beside it), a plain member may sign for the room
+    /// (`community_authority_set_for`) and still:
+    ///
+    /// - its `moderation:*` act naming the author's placed row is refused
+    ///   `federation_delegated_scope_unauthorized`, and not stored;
+    /// - its takedown of content bound into the room is
+    ///   `takedown_unauthorised`, and nothing is tombstoned;
+    /// - its `reversed` ruling on the founder's takedown is refused, and the
+    ///   bytes stay withheld.
+    ///
+    /// The founder (zero-hop) and the founder's `takedown`/`review` deputy
+    /// pass the same doors. I1522 covers the helpers and the community-scoped
+    /// reconsideration door; this covers the moderation-act, takedown and
+    /// takedown-reversal doors.
+    pub(crate) async fn i1745_every_room_duty_door_asks_for_an_appointment(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::doors_takedown_invariants::bodies::{delegate, notice, Claimant};
+        use crate::federation::room_roster_authority_invariants::bodies::make_group;
+        use crate::federation::takedown_reversal_invariants::bodies::{ruling, sha_bytes, sha_hex};
+        use crate::federation::takedown_tombstone::{self as td, token};
+        const NODE: &str = "c-node-1";
+
+        let tag = format!("i1745-{s}");
+        let (room, keys) = make_group(
+            d,
+            &tag,
+            crate::federation::types::consensus_protocol::MAJORITY,
+            &["f", "author", "plain", "deputy"],
+            1,
+            None,
+            None,
+        )
+        .await;
+        let (founder, author, plain, deputy) = (&keys[0], &keys[1], &keys[2], &keys[3]);
+        let record = d.lookup_community(&room).await.unwrap().unwrap();
+        assert!(
+            crate::federation::admission::community_authority_set_for(d, &record)
+                .await
+                .unwrap()
+                .contains(plain),
+            "I1745: the plain member may still sign for the room"
+        );
+        delegate(d, founder, deputy, &["takedown", "review"]).await;
+
+        // The moderation-act door, in CC's shape (I1512), on the author's
+        // placed row.
+        let prior = self_row(d, author).await;
+        let flagged = place(d, &prior, &room).await;
+        let refused = act(plain, "moderation:rogue_vote:v1", &flagged, &room);
+        let e = put(d, &refused)
+            .await
+            .expect_err("I1745: a plain member's moderation act");
+        assert_eq!(
+            e.kind(),
+            "federation_delegated_scope_unauthorized",
+            "I1745: {e}"
+        );
+        assert!(d
+            .get_attestation(&refused.attestation_id)
+            .await
+            .unwrap()
+            .is_none());
+        put(
+            d,
+            &act(founder, "moderation:rogue_vote:v1", &flagged, &room),
+        )
+        .await
+        .expect("I1745: the founder's moderation act");
+
+        // The takedown door, over content bound into the room by a row the
+        // author signs at the room's scope.
+        let bind = |sha: &str| {
+            let env = serde_json::json!({
+                "dimension": "chat:message:v1",
+                "score": 1.0,
+                "evidence_refs": [sha],
+                "community_key_id": room,
+                "content_type": "text/plain",
+            });
+            let mut r =
+                ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), author, author, &env);
+            r.attestation_type = attestation_type::SCORES.into();
+            r.weight = None;
+            r.cohort_scope = cohort_scope::COMMUNITY.into();
+            r.subject_key_ids = vec![author.clone()];
+            ts::seal_row_in_place(author, &mut r);
+            r
+        };
+        let (sha, sha_deputy) = (sha_hex(&format!("{tag}-a")), sha_hex(&format!("{tag}-b")));
+        for sha in [&sha, &sha_deputy] {
+            put(d, &bind(sha))
+                .await
+                .expect("I1745: the room's content row");
+        }
+        let who = |k: &str| Claimant { id: k.to_owned() };
+        let e = td::takedown_tombstone(d, &notice(&who(plain), &sha, "community_standards"), NODE)
+            .await
+            .expect_err("I1745: a plain member's takedown");
+        assert_eq!(e.kind(), token::UNAUTHORISED, "I1745: {e}");
+        assert_eq!(d.purge_tombstoned("blob", &sha).await.unwrap(), None);
+        let by_deputy = td::takedown_tombstone(
+            d,
+            &notice(&who(deputy), &sha_deputy, "community_standards"),
+            NODE,
+        )
+        .await
+        .expect("I1745: the founder's takedown deputy");
+        assert!(by_deputy.tombstoned);
+        let by_founder =
+            td::takedown_tombstone(d, &notice(&who(founder), &sha, "community_standards"), NODE)
+                .await
+                .expect("I1745: the founder's takedown");
+        let notice_row = by_founder
+            .notice_attestation_id
+            .clone()
+            .expect("a notice row");
+        let withheld = || async {
+            crate::federation::steward_purge::purge_withheld(d, &sha_bytes(&sha))
+                .await
+                .unwrap()
+        };
+        assert!(withheld().await.is_some(), "I1745: the takedown withholds");
+
+        // The takedown-reversal door.
+        let e = put(
+            d,
+            &ruling(
+                plain,
+                &notice_row,
+                "reversed",
+                cohort_scope::COMMUNITY,
+                &room,
+            ),
+        )
+        .await
+        .expect_err("I1745: a plain member's reversal");
+        assert_eq!(
+            e.kind(),
+            "federation_delegated_scope_unauthorized",
+            "I1745: {e}"
+        );
+        assert!(withheld().await.is_some(), "I1745: still withheld");
+        put(
+            d,
+            &ruling(
+                deputy,
+                &notice_row,
+                "reversed",
+                cohort_scope::COMMUNITY,
+                &room,
+            ),
+        )
+        .await
+        .expect("I1745: the review deputy's reversal");
+        assert!(withheld().await.is_none(), "I1745: the reversal lifts it");
     }
 
     /// A `scores` row by `by` at the room's `community` scope naming
@@ -277,6 +442,33 @@ mod runners {
         b.run_migrations().await.unwrap();
         super::bodies::i1516_subject_within_audience_and_retraction_classes(&b, &suffix()).await;
         eprintln!("i1516 postgres: RAN");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i1745_every_room_duty_door_asks_for_an_appointment_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        crate::federation::hard_case::test_support::declare_node(&b, "dt-node").await;
+        super::bodies::i1745_every_room_duty_door_asks_for_an_appointment(&b, &suffix()).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i1745_every_room_duty_door_asks_for_an_appointment_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        crate::federation::hard_case::test_support::declare_node(&b, "dt-node").await;
+        super::bodies::i1745_every_room_duty_door_asks_for_an_appointment(&b, &suffix()).await;
     }
 
     #[cfg(feature = "postgres")]

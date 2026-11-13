@@ -24479,6 +24479,42 @@ impl PyEngine {
         })
     }
 
+    /// v61.4.0 — **the seat door (CC C559, DERIVED, pending text)**: call it
+    /// when this node's roster fold gains `member_key_id` in
+    /// `community_key_id`. Where this node is a minter in the room it wraps
+    /// its current epoch key to the newcomer's live devices now (nothing
+    /// due: no mint), or rotates its own counter at the seat (a removal
+    /// effective after its current epoch was minted: the new epoch is minted
+    /// with no content and wrapped to every current member's live devices),
+    /// and emits the epoch-axis `key_grant` rows. A keyless device is
+    /// excluded; an epoch another node minted is reported, never touched; a
+    /// re-run adds nothing. JSON `{seat: {community_key_id, minter_key_id,
+    /// skipped, epoch, minted, rotated_from, granted, newcomer_granted,
+    /// excluded, minted_elsewhere: [[minter, epoch]], emit}, emission:
+    /// null | {axis, attestation_ids, already_emitted, withheld, deferred,
+    /// sealer_refused, misbuilt}}`; `skipped` is `not_a_member` or
+    /// `not_a_minter` when nothing was done.
+    fn seat_community_member_json(
+        &self,
+        py: Python<'_>,
+        community_key_id: &str,
+        member_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let (comm, member) = (community_key_id.to_owned(), member_key_id.to_owned());
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let r = self
+                    .runtime
+                    .block_on(engine.seat_community_member(&comm, &member))
+                    .map_err(blob_err_to_py)?;
+                serde_json::to_string(&r)
+                    .map_err(|e| PyRuntimeError::new_err(format!("seat encode: {e}")))
+            })
+        })
+    }
+
     /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **the minter
     /// side of the second device, on demand**: re-wrap every retained epoch
     /// THIS node minted to each device of an active member that does not hold
@@ -31482,6 +31518,23 @@ impl PyEngine {
     /// (`outbound_queue_ops_capsule`), the ABI-stable C-vtable
     /// serialized-op surface that dispatches the method INSIDE persist's
     /// `.so`. Retained for the migration window (CIRISEdge#245 extends).
+    ///
+    /// # Cross-binary lock hazard (v61.4.0)
+    ///
+    /// Code compiled into another binary must never lock persist's
+    /// primitives. A consumer that takes the concrete `Arc<SqliteBackend>` /
+    /// `Arc<PostgresBackend>` out of this capsule and calls its methods runs
+    /// ITS OWN monomorphized copy of persist's store code, and so its own
+    /// statically linked `parking_lot`. `parking_lot` keeps parked threads in
+    /// a per-binary global table: a waiter parked by the consumer's copy on
+    /// persist's writer `Mutex<Connection>` (or the reader pool, or a
+    /// tokio-postgres client's internal mutex) is never woken by persist's
+    /// unlock, and vice versa. That is a permanent hang, not a slowdown
+    /// (CIRISEdge, 61.4.0). Use the ops capsules instead: `directory_ops_capsule`
+    /// (with [`crate::ffi::directory_capsule::build_ops_directory_proxy`], which
+    /// also serves `BlackholeRules` and `DerivedSchema::put_edge_detection_event`)
+    /// and `outbound_queue_ops_capsule`, whose method bodies run inside
+    /// persist's `.so`.
     #[pyo3(name = "outbound_queue_capsule")]
     fn outbound_queue_capsule_py<'py>(
         &self,
@@ -35892,13 +35945,33 @@ mod tests {
                     group_key_id: "g".into(),
                     offered_authority_key_id: "a".into(),
                     rule: crate::federation::ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED,
+                    shortfall: None,
                 },
                 "federation_roster_authority_unauthorized: roster_authority_not_established",
+            ),
+            // v61.4.0 (CIRISPersist#1250) — the count rides the Rust error
+            // only: the Python type and message are the arm's, unchanged.
+            (
+                crate::federation::Error::RosterAuthorityUnauthorized {
+                    group_key_id: "g".into(),
+                    offered_authority_key_id: "a".into(),
+                    rule: crate::federation::ROSTER_CONSENSUS_INSUFFICIENT,
+                    shortfall: Some(crate::federation::consensus::ConsensusShortfall {
+                        have: 1,
+                        need: 2,
+                        eligible_signer_key_ids: Some(vec!["a".into(), "b".into()]),
+                    }),
+                },
+                "federation_roster_authority_unauthorized: roster_consensus_insufficient",
             ),
         ] {
             let py_err = federation_err_to_py(e);
             pyo3::Python::attach(|py| {
                 assert_eq!(py_err.value(py).to_string(), want);
+                assert!(
+                    py_err.is_instance_of::<PyValueError>(py),
+                    "the arm's Python type (ValueError) is unchanged"
+                );
             });
         }
     }

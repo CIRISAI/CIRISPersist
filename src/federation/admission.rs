@@ -4681,6 +4681,7 @@ async fn community_quorum_cosigned_at(
         subject: None,
         // Read at every licence walk over rows already held: left per key.
         persons: super::key_person::PersonsAt::each_key(),
+        high_water: None,
     })
     .admits())
 }
@@ -16692,15 +16693,21 @@ pub async fn check_community_membership_steward_binding(
 ///
 /// # The existence check
 ///
-/// A named moderator exists IFF the community has ≥1 **steward-bound authority
-/// root**. This is exact, not an approximation: [`is_named_moderator`] admits
-/// `k` only via a chain rooted at some `root ∈ authority_set(C)` with
-/// [`is_steward_bound(root)`](is_steward_bound) — and that steward-bound root
-/// is itself a **zero-hop** named moderator. So `moderators_of(C, moderate)`
-/// is non-empty IFF such a root exists; we test that directly (the authority
-/// set computed from the in-flight record's roster, per
-/// [`community_authority_set_for`]'s `founder_only`-vs-open rule), avoiding the
-/// per-delegate walk.
+/// The gate admits a community with ≥1 **steward-bound key of its authority
+/// set** (the in-flight record's roster, per [`community_authority_set_for`]'s
+/// `founder_only`-vs-open rule): a room that can sign for itself.
+///
+/// v61.4.0 (CIRISPersist#1195) — **this is no longer the same set as
+/// `moderators_of(C, moderate)`.** Since 61.0.2 the duty roots are the
+/// steward-bound founders alone ([`moderation_duty_roots`]), at every
+/// protocol. Under `founder_only` and `open:self_admit` the two coincide.
+/// Under any other protocol a room whose founders have all left, but whose
+/// steward-bound members remain, passes this gate with no `moderate`-holder.
+/// CC 4.5.4 rule 2 says such a room locks and elects (CC 4.5.13). Neither
+/// the lock nor the election is built (`ballot:moderator*` is registered
+/// with no door), and narrowing this gate to founders without them would fail
+/// the room secure with no way out. So the gate keeps its pre-#1195 reading
+/// until the lock lands.
 ///
 /// # Carve-out + fail-secure
 ///

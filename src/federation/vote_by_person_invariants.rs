@@ -1766,7 +1766,8 @@ mod run {
             reversed: false,
         };
         let state = authorized_roster_state_at(&record, rules, &[], t);
-        roster_event_standing(rules, &state, &event)
+        let hw = crate::federation::authorized_roster_high_water_at(&record, rules, &[], t);
+        roster_event_standing(rules, &state, hw, &event)
             .expect_err("I1530: the door counts one person of two");
         let roster = authorized_roster_at(&record, rules, &[event], t);
         assert!(

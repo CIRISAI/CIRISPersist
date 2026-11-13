@@ -491,6 +491,18 @@ mod key_id_fingerprint_invariants;
 // consumers can drive them against their own backends.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod key_grant_invariants;
+// MEASUREMENT ONLY (kg-burst-measure) — the seat-door burst cost.
+#[cfg(test)]
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+mod kg_burst_measure;
+// v61.4.0 — I1800–I1802: one emission, one fold (the key-grant burst).
+#[cfg(test)]
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+mod key_grant_fold_invariants;
+// v61.4.0 — I1803–I1807: the seat door (CC C559, DERIVED, pending text).
+#[cfg(test)]
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+mod seat_door_invariants;
 // v55.0.0 (CIRISPersist#989) — I742–I745: the key-grant SET retired, one
 // `scores` row per recipient (the upgraded node included).
 #[cfg(test)]
@@ -846,6 +858,10 @@ mod vote_by_person_invariants;
 // purge's tombstone row (CC 4.5.3 step 2, CC 4.5.5).
 #[cfg(test)]
 pub(crate) mod doors_takedown_invariants;
+// v61.4.0 (CIRISPersist#1260; CC 4.5.3) — I1746/I1747: a room moderator
+// takes down content placed in the room by a `supersedes` widening.
+#[cfg(test)]
+mod room_takedown_invariants;
 #[cfg(test)]
 mod steward_purge_invariants;
 pub mod takedown_tombstone;
@@ -1673,15 +1689,22 @@ pub struct RosterEvent {
 /// the event's instant; otherwise the room's `consensus_protocol` through the
 /// ONE evaluator ([`consensus::evaluate`]). Every admitted change must also
 /// leave a founder whenever it leaves members (the last-founder rule).
+///
+/// `high_water` (CIRISPersist#1201): the largest active roster the lineage
+/// reached before `e`, from the same fold that built `state`
+/// ([`authorized_roster_high_water_at`]).
 pub fn roster_event_standing(
     rules: RosterRules<'_>,
     state: &RosterState,
+    high_water: usize,
     e: &RosterEvent,
 ) -> Result<(), (&'static str, String)> {
-    match roster_event_verdict(rules, state, e) {
+    match roster_event_verdict(rules, state, high_water, e) {
         StandingVerdict::Admit => Ok(()),
-        StandingVerdict::ConsensusShort { detail } => Err((ROSTER_CONSENSUS_INSUFFICIENT, detail)),
-        StandingVerdict::Refuse { rule, detail } => Err((rule, detail)),
+        StandingVerdict::ConsensusShort { detail, .. } => {
+            Err((ROSTER_CONSENSUS_INSUFFICIENT, detail))
+        }
+        StandingVerdict::Refuse { rule, detail, .. } => Err((rule, detail)),
     }
 }
 
@@ -1700,6 +1723,9 @@ pub enum StandingVerdict {
     ConsensusShort {
         /// The evaluator's detail.
         detail: String,
+        /// v61.4.0 (CIRISPersist#1250) — the evaluator's count, when the
+        /// protocol is a count of voices.
+        shortfall: Option<consensus::ConsensusShortfall>,
     },
     /// Any other refusal: the rule token and its detail, exactly as
     /// [`roster_event_standing`] returned before the split.
@@ -1708,6 +1734,11 @@ pub enum StandingVerdict {
         rule: &'static str,
         /// A human-readable detail.
         detail: String,
+        /// v61.4.0 (CIRISPersist#1250) — under
+        /// [`ROSTER_CONSENSUS_INSUFFICIENT`] from the count (a signer who is no
+        /// active member, so the hold does not apply), the evaluator's count;
+        /// `None` otherwise.
+        shortfall: Option<consensus::ConsensusShortfall>,
     },
 }
 
@@ -1721,6 +1752,7 @@ pub enum StandingVerdict {
 pub fn roster_event_verdict(
     rules: RosterRules<'_>,
     state: &RosterState,
+    high_water: usize,
     e: &RosterEvent,
 ) -> StandingVerdict {
     // v50.0.0 (CIRISPersist#925 review M2) — a `node`-bearing seat (at this
@@ -1744,6 +1776,7 @@ pub fn roster_event_verdict(
     let standing_without_protocol = e.signers.is_empty()
         || (!e.is_add && e.signers.contains(&e.member.key_id))
         || moderator_may_act;
+    let mut counted: Option<consensus::ConsensusShortfall> = None;
     let admitted = if standing_without_protocol {
         Ok(())
     } else {
@@ -1769,12 +1802,14 @@ pub fn roster_event_verdict(
             },
             subject: Some(e.member.key_id.as_str()),
             persons: rules.persons.at(e.effective_at),
+            high_water: Some(high_water),
         }) {
             consensus::Verdict::Admit => Ok(()),
             consensus::Verdict::Unevaluable { reason } => {
                 Err((ROSTER_CONSENSUS_UNEVALUABLE, reason))
             }
-            consensus::Verdict::Insufficient { detail } => {
+            consensus::Verdict::Insufficient { detail, shortfall } => {
+                counted = shortfall;
                 if e.signers.iter().any(|s| !state.contains_key(s)) {
                     Err((ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED, detail))
                 } else {
@@ -1793,7 +1828,15 @@ pub fn roster_event_verdict(
     let shortfall = match admitted {
         Ok(()) => None,
         Err((_, detail)) if short => Some(detail),
-        Err((rule, detail)) => return StandingVerdict::Refuse { rule, detail },
+        // v61.4.0 (CIRISPersist#1250) — a count the extra signer cannot mend
+        // (a removed member's signature) still states the count.
+        Err((rule, detail)) => {
+            return StandingVerdict::Refuse {
+                rule,
+                detail,
+                shortfall: counted.filter(|_| rule == ROSTER_CONSENSUS_INSUFFICIENT),
+            }
+        }
     };
     // The last-founder rule: a removal — or a role change that demotes — that
     // leaves members but no founder.
@@ -1816,9 +1859,12 @@ pub fn roster_event_verdict(
                 return StandingVerdict::Refuse {
                     rule: ROSTER_CONSENSUS_INSUFFICIENT,
                     detail,
+                    // More signatures do not mend it: no count to show.
+                    shortfall: None,
                 };
             }
             return StandingVerdict::Refuse {
+                shortfall: None,
                 rule: ROSTER_LAST_FOUNDER,
                 detail: format!(
                     "removing or demoting {} would leave {others_after} member(s) and no founder",
@@ -1829,7 +1875,10 @@ pub fn roster_event_verdict(
     }
     match shortfall {
         None => StandingVerdict::Admit,
-        Some(detail) => StandingVerdict::ConsensusShort { detail },
+        Some(detail) => StandingVerdict::ConsensusShort {
+            detail,
+            shortfall: counted,
+        },
     }
 }
 
@@ -1887,7 +1936,7 @@ fn fold_roster(
     rules: RosterRules<'_>,
     events: &[RosterEvent],
     as_of: chrono::DateTime<chrono::Utc>,
-) -> (RosterState, RosterSpans) {
+) -> (RosterState, RosterSpans, usize) {
     let mut ordered: Vec<RosterEvent> = events
         .iter()
         .filter(|e| e.effective_at <= as_of)
@@ -1902,6 +1951,7 @@ fn fold_roster(
         .iter()
         .map(|m| (m.key_id.clone(), None))
         .collect();
+    let mut high_water = active_count(&state);
     for e in ordered {
         if e.reversed {
             continue;
@@ -1910,8 +1960,8 @@ fn fold_roster(
         // already held under the per-key count stays in the fold: an admitted
         // row is not unsaid by a later gate (the #1200 posture). Nothing new
         // arrives that way, since every door refuses it.
-        if roster_event_standing(rules, &state, &e).is_ok()
-            || roster_event_standing(rules.counting_keys(), &state, &e).is_ok()
+        if roster_event_standing(rules, &state, high_water, &e).is_ok()
+            || roster_event_standing(rules.counting_keys(), &state, high_water, &e).is_ok()
         {
             let was_active = matches!(state.get(&e.member.key_id), Some((true, _)));
             if !e.is_add {
@@ -1920,9 +1970,40 @@ fn fold_roster(
                 spans.insert(e.member.key_id.clone(), Some(e.effective_at));
             }
             state.insert(e.member.key_id.clone(), (e.is_add, e.member));
+            high_water = high_water.max(active_count(&state));
         }
     }
-    (state, spans)
+    (state, spans, high_water)
+}
+
+/// The active members of a fold state.
+fn active_count(state: &RosterState) -> usize {
+    state.values().filter(|(active, _)| *active).count()
+}
+
+/// CIRISPersist#1201 (CC 4.4.3.4.2.1) — **the lineage's high-water roster
+/// size at `as_of`**: the largest number of active members the group has held
+/// at once, over the record and every event the authorized fold admits up to
+/// `as_of`. A fold over persisted rows, never a stored flag: the same replay
+/// as [`authorized_roster_state_at`] (one loop, so the two cannot disagree).
+/// The `quorum:M/N` gate reads it as the latch "has this group ever reached
+/// `M`" ([`consensus::quorum_need`]); as a size it also answers a later change
+/// of `M`.
+///
+/// Counted by key, where the gate counts persons: a person seated under two
+/// keys raises the high water early, which only latches `M` sooner (the
+/// stricter direction).
+///
+/// TODO(CIRISPersist#1253): carry the high water on the signed `group:roster`
+/// head, so a node that holds the head and not the whole lineage can read it.
+#[must_use]
+pub fn authorized_roster_high_water_at(
+    record_members: &[types::CommunityMember],
+    rules: RosterRules<'_>,
+    events: &[RosterEvent],
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    fold_roster(record_members, rules, events, as_of).2
 }
 
 /// v49.0.0 (CIRISPersist#908) — the active members of
@@ -2015,11 +2096,13 @@ fn root_authority_intervals(
         .filter(|r| is_f(&state, r))
         .map(|r| (r.clone(), chrono::DateTime::<chrono::Utc>::MIN_UTC))
         .collect();
+    let mut high_water = active_count(&state);
     for e in ordered {
-        if e.reversed || roster_event_standing(rules, &state, &e).is_err() {
+        if e.reversed || roster_event_standing(rules, &state, high_water, &e).is_err() {
             continue;
         }
         state.insert(e.member.key_id.clone(), (e.is_add, e.member.clone()));
+        high_water = high_water.max(active_count(&state));
         let k = &e.member.key_id;
         if !roots.contains(k) {
             continue;
@@ -2542,17 +2625,51 @@ pub async fn authorized_community_roster_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    let reads = match roster_read_memo_get(community) {
+        Some(r) => r,
+        None => {
+            let r =
+                std::sync::Arc::new(Box::pin(read_community_roster(directory, community)).await?);
+            roster_read_memo_put(community, &r);
+            r
+        }
+    };
     // v61 S2 (CIRISPersist#1143; CC rc14 4.4.3.2.8) — seats lapse at the
     // dissolution: from its instant the room seats nobody.
-    if Box::pin(group_plane::community_dissolved_at(
+    if reads.dissolved_at.is_some_and(|at| at <= as_of) {
+        return Ok(Vec::new());
+    }
+    Ok(authorized_roster_at(
+        &community.members,
+        RosterRules::of_community(community, &reads.nodes).with_persons(&reads.persons),
+        &reads.events,
+        as_of,
+    ))
+}
+
+/// v61.4.0 — the directory reads [`authorized_community_roster_at`] folds:
+/// everything it reads, nothing that depends on the instant. The fold itself
+/// ([`authorized_roster_at`]) is pure over these and `as_of`.
+#[derive(Debug)]
+pub(crate) struct CommunityRosterReads {
+    dissolved_at: Option<chrono::DateTime<chrono::Utc>>,
+    nodes: NodeBearingSeats,
+    persons: key_person::KeySelves,
+    events: Vec<RosterEvent>,
+}
+
+async fn read_community_roster<F>(
+    directory: &F,
+    community: &Community,
+) -> Result<CommunityRosterReads, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let dissolved_at = Box::pin(group_plane::community_dissolved_at(
         directory,
         &community.community_key_id,
     ))
-    .await?
-    .is_some_and(|at| at <= as_of)
-    {
-        return Ok(Vec::new());
-    }
+    .await?;
     // Boxed: the replay nests the moderator walk and the reverse-quorum
     // fold; a caller's future must not inline all of it (2 MiB worker stacks).
     let nodes = Box::pin(community_node_bearing_seats(directory, community)).await?;
@@ -2561,7 +2678,90 @@ where
         directory, community, &nodes, &persons,
     ))
     .await?;
-    Ok(authorized_roster_at(
+    Ok(CommunityRosterReads {
+        dissolved_at,
+        nodes,
+        persons,
+        events,
+    })
+}
+
+/// v61.4.0 — **one key-grant emission's roster reads, read once.** While a
+/// memo is in scope ([`with_roster_read_memo`]), [`authorized_community_roster_at`]
+/// reads a STORED record's roster state (keyed by the record's id and row
+/// hash) once and folds every later call from those reads at the call's own
+/// `as_of`: the instant every gate asks at is unchanged, only the directory
+/// reads are shared. Scoped to one task by its caller, the key-grant emitter
+/// ([`key_grant`]'s `emit_planned`), whose own puts (key-grant rows) change
+/// no roster state. A record with no row hash (one in flight, not stored) is
+/// never memoized.
+type RosterReadMemo = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<(String, String), std::sync::Arc<CommunityRosterReads>>,
+    >,
+>;
+
+tokio::task_local! {
+    static ROSTER_READ_MEMO: RosterReadMemo;
+}
+
+/// Run `f` with a fresh roster-read memo in scope (see [`RosterReadMemo`]).
+pub(crate) async fn with_roster_read_memo<T>(f: impl std::future::Future<Output = T>) -> T {
+    ROSTER_READ_MEMO.scope(RosterReadMemo::default(), f).await
+}
+
+fn roster_read_memo_key(community: &Community) -> Option<(String, String)> {
+    (!community.persist_row_hash.is_empty()).then(|| {
+        (
+            community.community_key_id.clone(),
+            community.persist_row_hash.clone(),
+        )
+    })
+}
+
+fn roster_read_memo_get(community: &Community) -> Option<std::sync::Arc<CommunityRosterReads>> {
+    let key = roster_read_memo_key(community)?;
+    ROSTER_READ_MEMO
+        .try_with(|m| {
+            m.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .cloned()
+        })
+        .ok()
+        .flatten()
+}
+
+fn roster_read_memo_put(community: &Community, reads: &std::sync::Arc<CommunityRosterReads>) {
+    let Some(key) = roster_read_memo_key(community) else {
+        return;
+    };
+    let _ = ROSTER_READ_MEMO.try_with(|m| {
+        m.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, reads.clone());
+    });
+}
+
+/// CIRISPersist#1201 (CC 4.4.3.4.2.1) — **the one read of a community's
+/// high-water roster size**: [`authorized_roster_high_water_at`] over the
+/// community's record and roster events, as [`authorized_community_roster_at`]
+/// folds them. `quorum:M/N` binds absolutely once this reaches `M`.
+pub async fn community_roster_high_water_at<F>(
+    directory: &F,
+    community: &Community,
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Result<usize, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let nodes = Box::pin(community_node_bearing_seats(directory, community)).await?;
+    let persons = Box::pin(community_key_selves(directory, community)).await?;
+    let events = Box::pin(community_roster_events(
+        directory, community, &nodes, &persons,
+    ))
+    .await?;
+    Ok(authorized_roster_high_water_at(
         &community.members,
         RosterRules::of_community(community, &nodes).with_persons(&persons),
         &events,
@@ -2605,7 +2805,7 @@ where
     // retry of a held row is not a new removal.
     let held_retry = events.iter().any(is_this_row);
     let events: Vec<RosterEvent> = events.into_iter().filter(|e| !is_this_row(e)).collect();
-    let state = authorized_roster_state_at(record_members, rules, &events, effective_at);
+    let (state, _, high_water) = fold_roster(record_members, rules, &events, effective_at);
     let moderator_roots = match moderation_roots {
         Some(mut roots) if !is_revocation || held_retry => {
             if !is_revocation && incoming.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER) {
@@ -2631,21 +2831,36 @@ where
         moderator_roots,
         reversed: false,
     };
-    let refusal = |rule: &'static str, detail: &str| {
-        tracing::debug!(group_key_id, primary, rule, detail = %detail, "roster change refused");
-        Error::RosterAuthorityUnauthorized {
-            group_key_id: group_key_id.to_owned(),
-            offered_authority_key_id: primary.to_owned(),
-            rule,
-        }
-    };
+    // v61.4.0 (CIRISPersist#1250; CC 5.2) — the eligible signers are roster
+    // information: told only to a primary signer who is (or acts for) an
+    // active member immediately before the event.
+    let primary_identity = directory.active_identity_for_occurrence(primary).await?;
+    let primary_is_member = [primary, primary_identity.as_str()]
+        .iter()
+        .any(|k| matches!(state.get(*k), Some((true, _))));
+    let refusal =
+        |rule: &'static str, detail: &str, shortfall: Option<consensus::ConsensusShortfall>| {
+            let shortfall = shortfall.map(|s| s.for_caller(primary_is_member));
+            tracing::debug!(group_key_id, primary, rule, detail = %detail, "roster change refused");
+            Error::RosterAuthorityUnauthorized {
+                group_key_id: group_key_id.to_owned(),
+                offered_authority_key_id: primary.to_owned(),
+                rule,
+                shortfall,
+            }
+        };
     // v61.3.0 (CIRISPersist#1252) — the verdict, the shortfall split out.
-    let short = match roster_event_verdict(rules, &state, &e) {
+    // v61.4.0 (CIRISPersist#1250) — the refusal carries the count.
+    let short = match roster_event_verdict(rules, &state, high_water, &e) {
         StandingVerdict::Admit => None,
-        StandingVerdict::ConsensusShort { detail } => {
-            Some(refusal(ROSTER_CONSENSUS_INSUFFICIENT, &detail))
+        StandingVerdict::ConsensusShort { detail, shortfall } => {
+            Some(refusal(ROSTER_CONSENSUS_INSUFFICIENT, &detail, shortfall))
         }
-        StandingVerdict::Refuse { rule, detail } => return Err(refusal(rule, &detail)),
+        StandingVerdict::Refuse {
+            rule,
+            detail,
+            shortfall,
+        } => return Err(refusal(rule, &detail, shortfall)),
     };
     // v52.0.0 (CIRISPersist#955) — a GROWTH (a key not active before this
     // instant) needs the member's own acceptance, under every protocol. The
@@ -3339,6 +3554,22 @@ pub trait FederationDirectory: Send + Sync {
     /// object (`steward_bindings_of` and everything above it) are reached
     /// through this. Every implementor returns `self`.
     fn as_dyn_directory(&self) -> &dyn FederationDirectory;
+
+    /// v61.4.0 (CIRISPersist#1244) — the backend's [`BlackholeRules`]
+    /// surface, when it has one, so the directory capsule can dispatch the
+    /// blackhole ops inside persist's `.so` from a `&dyn FederationDirectory`.
+    /// `None` by default; the sqlite and postgres backends return `self`.
+    fn blackhole_rules_surface(&self) -> Option<&dyn BlackholeRules> {
+        None
+    }
+
+    /// v61.4.0 (CIRISPersist#1244) — the backend's edge-detection admission
+    /// ([`crate::derived::DerivedSchema::put_edge_detection_event`]), when it
+    /// has one. `None` by default; the sqlite and postgres backends return
+    /// `self`.
+    fn edge_detection_surface(&self) -> Option<&dyn crate::derived::EdgeDetectionSink> {
+        None
+    }
 
     // ── Public keys ────────────────────────────────────────────────
 
@@ -5129,6 +5360,43 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         content_sha256: &str,
     ) -> Result<Vec<Attestation>, Error>;
+
+    /// v61.4.0 (CIRISPersist#1260; CC 4.5.3, CC 4.5.5, CC 4.4.3.3.1) — the
+    /// rows that bind `content_sha256` **for the duty question**: every row
+    /// [`Self::attestations_binding_content`] returns, and also every
+    /// federation-tier `supersedes` row at `community` or `affiliations` scope
+    /// whose envelope binds the digest (the same
+    /// [`admission::envelope_binds_content`] predicate). One scan, newest
+    /// first.
+    ///
+    /// A room's message or file reaches its room as a `supersedes` widening
+    /// of the author's `self` row (CC 4.4.3.3.1): the widening reuses the
+    /// body, `evidence_refs` included, at the room's scope. The `self` row
+    /// never replicates, so a member's node holds the widening alone. Read
+    /// without it, room content binds to no community and no room moderator
+    /// holds `takedown` or `review` over it.
+    ///
+    /// Only the takedown binding
+    /// ([`takedown_tombstone::content_binding`](super::takedown_tombstone::content_binding))
+    /// reads this. The bytes plane and `subject_of_content` keep
+    /// [`Self::attestations_binding_content`].
+    ///
+    /// # Default impl rationale
+    ///
+    /// `Unsupported`, as the 61.1.0 reads are, so a directory implemented
+    /// outside this crate (a host's wrapper) still compiles on a minor
+    /// release and answers loudly rather than with a binding that silently
+    /// omits the room. sqlite and postgres override it, each with its own
+    /// prefilter and the shared predicate.
+    async fn attestations_binding_content_with_placements(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        let _ = content_sha256;
+        Err(Error::Unsupported {
+            method: "attestations_binding_content_with_placements",
+        })
+    }
 
     /// v53.1.0 (CIRISPersist#979, CC 2.3) — **the sealed manifests a held
     /// chunk belongs to**: every manifest the V176 relation names for
@@ -8191,9 +8459,10 @@ pub trait FederationDirectory: Send + Sync {
                 direction,
                 subject: None,
                 persons,
+                high_water: None,
             }) {
                 consensus::Verdict::Admit => {}
-                consensus::Verdict::Insufficient { detail } => {
+                consensus::Verdict::Insufficient { detail, .. } => {
                     return Err(refuse(format!(
                         "consensus_protocol not met ({direction:?}): {detail}"
                     )))
@@ -11302,6 +11571,17 @@ pub enum Error {
         offered_authority_key_id: String,
         /// Which clause refused; one of the rule tokens above.
         rule: &'static str,
+        /// v61.4.0 (CIRISPersist#1250; CC 4.4.3.4.2) — under
+        /// [`ROSTER_CONSENSUS_INSUFFICIENT`], the door's own count: the voices
+        /// counted (`have`), the voices the protocol needs at this roster
+        /// (`need`) and the keys whose signature would count
+        /// ([`consensus::ConsensusShortfall`]). `None` under every other rule,
+        /// under a protocol whose tally is not a count (a weighted rubric), for
+        /// a short event that would also leave no founder (more signatures do
+        /// not mend it), and for the accord charter quorum a trust root's
+        /// birth is judged by (it counts accord holders, not this record's
+        /// ballot).
+        shortfall: Option<consensus::ConsensusShortfall>,
     },
 
     /// v52.0.0 (CIRISPersist#956) — a write naming a family that a

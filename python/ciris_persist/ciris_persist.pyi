@@ -900,6 +900,9 @@ class Engine:
     def evict_actor_json(self, attesting_key_id: str, now_iso: str) -> str:
         """(derived) deontic — v3.5.0 (CIRISPersist#125) — Federation blob storage: per-actor eviction. Deletes every federation_blobs row this Engine holds that attesting_key_id..."""
 
+    def execute_cosign_due(self) -> int:
+        """(derived) deontic — v61.3.0 (CIRISPersist#1252, CC 3.3.4) — execute every open cosign hold (a merged widening or removal that meets its protocol lands; a lapsed hold e..."""
+
     def execute_self_roster_due(self) -> int:
         """(derived) deontic — v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — execute every open self-roster proposal that lands now; returns how many landed. Run it on a schedule: a..."""
 
@@ -1504,6 +1507,9 @@ class Engine:
 
     def seal_stream_scoped(self, cohort_scope: str, stream_id: str, community_key_id: str | None = None, media_type: str | None = None, aad_b64: str | None = None) -> str:
         """(derived) deontic — #832 (§12.3) — seal a live stream into a chunk_dag at cohort_scope. Refuses unless every chunk ROW is at the DAG's tier (I32); builds the manifest..."""
+
+    def seat_community_member_json(self, community_key_id: str, member_key_id: str) -> str:
+        """(derived) deontic — v61.4.0 — the seat door (CC C559, DERIVED, pending text): call it when this node's roster fold gains member_key_id in community_key_id. Where this..."""
 
     def secrets_decapsulate(self, action_type: str, action_params_json: str, ctx_json: str) -> str:
         """(derived) deontic — Walk action_params_json, replacing every {SECRET:<uuid>:<description>} placeholder with the decrypted plaintext (when the action_type is in the sec... [build-conditional: #[cfg(feature = "secrets")]]"""
@@ -4260,15 +4266,6 @@ class Engine:
         """(derived) pragmatic — v16 (CIRISPersist#431) — pure §19.1 root builder: the WW-scheme Merkle root (lexicographic leaf order, odd-duplication, WW-v1-empty empty sentinel)..."""
 
 
-    # ==============================================================
-    # CONTINGENT  (descriptive)
-    # Varying one of these out of scope by construction — see `report` for why this is empty.
-    # ==============================================================
-
-    def execute_cosign_due(self) -> int:
-        """(derived) contingent — v61.3.0 (CIRISPersist#1252, CC 3.3.4) — execute every open cosign hold (a merged widening or removal that meets its protocol lands; a lapsed hold e..."""
-
-
 class ScoringFactorStream:
 
     # ==============================================================
@@ -4486,6 +4483,15 @@ def transform_algebra_hash() -> str:
 
 
 # ==================================================================
+# NOMOLOGICAL  (descriptive)
+# Varying one of these changes the model every other symbol reasons under.
+# ==================================================================
+
+def attestation_wire_hash(row_json: str) -> str:
+    """(derived) nomological — v61.3.0 (CIRISPersist#1252) — THE ref rule for an attestation-plane row (wire_index::attestation_wire_hash): the lowercase-hex wire-index content h..."""
+
+
+# ==================================================================
 # EMPIRICAL  (descriptive)
 # Varying one of these makes a checkable, re-derivable world-fact wrong.
 # ==================================================================
@@ -4504,14 +4510,5 @@ def dimension_rejection_is_retryable(reason: str) -> bool:
 
 def key_grant_refusal_is_retryable(reason: str) -> bool:
     """(derived) procedural — v60.1.0 (CIRISPersist#1064, CIRISEdge) — may a later re-offer of the row a federation_key_grant_refused refusal named succeed? reason is the refusa..."""
-
-
-# ==================================================================
-# CONTINGENT  (descriptive)
-# Varying one of these out of scope by construction — see `report` for why this is empty.
-# ==================================================================
-
-def attestation_wire_hash(row_json: str) -> str:
-    """(derived) contingent — v61.3.0 (CIRISPersist#1252) — THE ref rule for an attestation-plane row (wire_index::attestation_wire_hash): the lowercase-hex wire-index content h..."""
 
 # --- pyi_surface: END GENERATED REGION ---

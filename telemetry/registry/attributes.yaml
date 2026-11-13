@@ -57,6 +57,9 @@ groups:
           - id: attestations_binding_content
             value: "attestations_binding_content"
             stability: development
+          - id: attestations_binding_content_with_placements
+            value: "attestations_binding_content_with_placements"
+            stability: development
           - id: get_attestation
             value: "get_attestation"
             stability: development

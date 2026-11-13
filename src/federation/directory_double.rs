@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 144 delegations, generated. Every one: fault first, then delegate.
+// 145 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn adopt_genesis_reanchor(
@@ -226,6 +226,17 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .attestations_binding_content(content_sha256)
+            .await
+    }
+    async fn attestations_binding_content_with_placements(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        if let Some(e) = self.faulted("attestations_binding_content_with_placements") {
+            return Err(e);
+        }
+        self.inner
+            .attestations_binding_content_with_placements(content_sha256)
             .await
     }
     async fn clear_active_halt(

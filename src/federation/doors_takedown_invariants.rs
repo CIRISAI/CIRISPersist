@@ -1137,7 +1137,12 @@ pub(crate) mod bodies {
     }
 
     /// A `delegates_to(granter → grantee)` bearing `scope`, really signed.
-    async fn delegate(dir: &dyn FederationDirectory, granter: &str, grantee: &str, scope: &[&str]) {
+    pub(crate) async fn delegate(
+        dir: &dyn FederationDirectory,
+        granter: &str,
+        grantee: &str,
+        scope: &[&str],
+    ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         let mut envelope = serde_json::json!({"references_attestation_id": id, "scope": scope});
         // v60.0.0 (#1048) — a duty edge carries a term (CC 2.4).
@@ -1148,6 +1153,7 @@ pub(crate) mod bodies {
         dir.put_attestation(SignedAttestation { attestation: row })
             .await
             .expect("the delegation");
+        id
     }
 
     // ── I798 ──────────────────────────────────────────────────────────────

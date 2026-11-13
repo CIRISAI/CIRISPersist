@@ -525,6 +525,11 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v60.0.0 (CIRISPersist#1105) — the family-scoped holdings read.
     ("read_key_plane_wire_hashes", ConnClass::Read),
     ("attestations_binding_content", ConnClass::Read),
+    // v61.4.0 (CIRISPersist#1260) — the takedown binding read.
+    (
+        "attestations_binding_content_with_placements",
+        ConnClass::Read,
+    ),
     ("backfill_trace_dedup_shard_keys", ConnClass::Write),
     ("backfill_revocation_subject_digests", ConnClass::Write),
     ("blackhole_list", ConnClass::Read),

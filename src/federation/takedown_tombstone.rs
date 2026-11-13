@@ -582,6 +582,25 @@ pub async fn verify_takedown_authority(
 /// the cohort target of a `community` or `affiliations` row
 /// ([`envelope_cohort_target`](super::admission::envelope_cohort_target)).
 ///
+/// v61.4.0 (CIRISPersist#1260; CC 4.5.3, CC 4.4.3.3.1; CC 4.5.5 as ruled at
+/// CIRISConstitution 7b86bee, "content is a community's where a live row
+/// places it at that community's scope, a `supersedes` that widens it
+/// included") — **a placement binds the content into the room it places it
+/// in.** A room's message or file
+/// reaches its room as a `supersedes` widening of the author's `self` row, and
+/// only the widening replicates: the `self` row binds no community, and a
+/// member's node holds the widening alone. So the binding rows are read with
+/// [`FederationDirectory::attestations_binding_content_with_placements`]: a
+/// live `supersedes` at `community` or `affiliations` scope binding the digest
+/// binds it into that cohort, under the same liveness rule as any other row (a
+/// `withdraws` of the widening takes the content out of the room). Its subjects
+/// are the original's: the widening door refuses one whose `subject_key_ids`
+/// or `attested_key_id` differ from its prior's
+/// ([`crossing::check_widening`](super::crossing::check_widening)). On a node
+/// that does not hold the prior, they are the author's signed claim, as any
+/// binding row's subjects are. The bytes
+/// plane is unchanged: it reads [`FederationDirectory::attestations_binding_content`].
+///
 /// # Errors
 ///
 /// Directory reads.
@@ -593,7 +612,7 @@ pub async fn content_binding(
         return Ok(None);
     }
     let rows = directory
-        .attestations_binding_content(content_sha256)
+        .attestations_binding_content_with_placements(content_sha256)
         .await?;
     if rows.is_empty() {
         return Ok(None);

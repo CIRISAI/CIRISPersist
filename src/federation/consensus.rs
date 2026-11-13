@@ -103,6 +103,15 @@ pub struct Ballot<'a> {
     /// numerator, and any live key of a seated person signs for them. Resolved
     /// by the caller, so the evaluator stays pure.
     pub persons: PersonsAt<'a>,
+    /// CIRISPersist#1201 (CC 4.4.3.4.2.1, "below `M`, a room counts its
+    /// whole roster") — the largest roster this group's lineage has reached
+    /// before the change ([`crate::federation::authorized_roster_high_water_at`]),
+    /// when the caller folded it. Under `quorum:M/N`, while both it and the
+    /// roster are below `M` the gate counts every live member; once the
+    /// lineage has reached `M`, `M` binds for good (the latch: a room never
+    /// shrinks `M` this way). `None` reads absolute `M`, the pre-#1201 rule:
+    /// a caller that has not folded the lineage never relaxes the count.
+    pub high_water: Option<usize>,
 }
 
 /// v61 (CIRISPersist#1123; CC 4.5.13 "never fewer than two voices in a
@@ -128,6 +137,11 @@ pub enum Verdict {
     Insufficient {
         /// A human-readable account of what was needed and what was counted.
         detail: String,
+        /// v61.4.0 (CIRISPersist#1250) — the count the arm reached, when the
+        /// protocol is a count of voices. `None` for a weighted rubric (its
+        /// tally is a weight, not a count) and for a refusal that is not a
+        /// shortfall (a self-signed admission outside `open:self_admit`).
+        shortfall: Option<ConsensusShortfall>,
     },
     /// The protocol cannot be evaluated from signed state: an undeclared
     /// rubric or custom id, a malformed declaration, or a non-canonical string.
@@ -141,6 +155,53 @@ impl Verdict {
     /// True iff [`Verdict::Admit`].
     pub fn admits(&self) -> bool {
         matches!(self, Verdict::Admit)
+    }
+
+    /// v61.4.0 (CIRISPersist#1250) — the shortfall of an
+    /// [`Verdict::Insufficient`] that carries one.
+    pub fn shortfall(&self) -> Option<&ConsensusShortfall> {
+        match self {
+            Verdict::Insufficient { shortfall, .. } => shortfall.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+/// v61.4.0 (CIRISPersist#1250; CC 4.4.3.4.2, CC 4.5.13) — **what a short
+/// ballot counted**, as the evaluator's own arm counted it, so a host can say
+/// "1 of 2 approvals" and who else may sign without evaluating the protocol
+/// itself (CIRISConstitution#198 §5: the host evaluates no quorum).
+///
+/// Counts are of PERSONS (CIRISPersist#1198): two keys of one person are one
+/// voice.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConsensusShortfall {
+    /// Distinct counted voices among the verified signers.
+    pub have: usize,
+    /// The voices the protocol needs at this roster.
+    pub need: usize,
+    /// The keys whose signature would count: one key per eligible person (a
+    /// founder's seat, else the lowest key), sorted. Under `founder_only`
+    /// the eligible founders. Under a removal that the named member may not
+    /// vote on (`unanimous`, `open:self_admit`), that member is left out.
+    /// Includes the persons who already signed; `have` counts them. Any
+    /// live key of a listed person also signs for them.
+    ///
+    /// Roster information (CC 5.2): `None` when the refusal goes to a caller
+    /// who is not an active member of the group ([`Self::for_caller`]). The
+    /// counts go to anyone.
+    pub eligible_signer_key_ids: Option<Vec<String>>,
+}
+
+impl ConsensusShortfall {
+    /// v61.4.0 (CIRISPersist#1250; CC 5.2) — the shortfall as told to a
+    /// caller: the eligible signers withheld unless `caller_is_member`.
+    #[must_use]
+    pub fn for_caller(mut self, caller_is_member: bool) -> Self {
+        if !caller_is_member {
+            self.eligible_signer_key_ids = None;
+        }
+        self
     }
 }
 
@@ -198,7 +259,31 @@ fn is_subject(b: &Ballot<'_>, seat: &Seat) -> bool {
 }
 
 fn insufficient(detail: String) -> Verdict {
-    Verdict::Insufficient { detail }
+    Verdict::Insufficient {
+        detail,
+        shortfall: None,
+    }
+}
+
+/// [`insufficient`] with the arm's count (CIRISPersist#1250).
+fn short<'s>(
+    detail: String,
+    have: usize,
+    need: usize,
+    voices: impl IntoIterator<Item = &'s &'s Seat>,
+) -> Verdict {
+    let mut eligible_signer_key_ids: Vec<String> =
+        voices.into_iter().map(|s| s.key_id.clone()).collect();
+    eligible_signer_key_ids.sort();
+    eligible_signer_key_ids.dedup();
+    Verdict::Insufficient {
+        detail,
+        shortfall: Some(ConsensusShortfall {
+            have,
+            need,
+            eligible_signer_key_ids: Some(eligible_signer_key_ids),
+        }),
+    }
 }
 
 fn unevaluable(reason: impl Into<String>) -> Verdict {
@@ -215,7 +300,7 @@ pub fn evaluate(b: &Ballot<'_>) -> Verdict {
     let got = counted(b, &elig);
     let n = elig.len();
     if b.protocol == cp::OPEN_SELF_ADMIT {
-        return evaluate_open_self_admit(b, &got);
+        return evaluate_open_self_admit(b, &elig, &got);
     }
     // v61 (CIRISPersist#1123; CC 4.4.3.4.2) — a self-signed admission is
     // `open:self_admit`'s alone: under every other protocol a key does not
@@ -230,18 +315,42 @@ pub fn evaluate(b: &Ballot<'_>) -> Verdict {
             b.protocol
         ));
     }
+    // No protocol admits a change that no eligible member signed. The arm
+    // still states its count (CIRISPersist#1250): a host shows "0 of 2".
     if got.is_empty() {
-        return insufficient(format!(
+        let detail = format!(
             "no signer is an eligible member ({n} eligible under {:?})",
             b.protocol
-        ));
+        );
+        return match evaluate_counted(b, &elig, &got) {
+            Verdict::Insufficient {
+                shortfall: Some(s), ..
+            } => Verdict::Insufficient {
+                detail,
+                shortfall: Some(s),
+            },
+            Verdict::Admit => short(detail, 0, 1, &elig),
+            _ => insufficient(detail),
+        };
     }
+    evaluate_counted(b, &elig, &got)
+}
+
+/// [`evaluate`]'s protocol arms, past the two checks every protocol shares.
+fn evaluate_counted<'a>(b: &Ballot<'a>, elig: &[&'a Seat], got: &[&'a Seat]) -> Verdict {
+    let n = elig.len();
     let p = b.protocol;
     if p == cp::FOUNDER_ONLY {
+        let founders: Vec<&&Seat> = elig.iter().filter(|s| s.is_founder()).collect();
         return if got.iter().any(|s| s.is_founder()) {
             Verdict::Admit
         } else {
-            insufficient("founder_only: no signer is an active founder".into())
+            short(
+                "founder_only: no signer is an active founder".into(),
+                0,
+                1,
+                founders,
+            )
         };
     }
     if p == cp::UNANIMOUS {
@@ -251,30 +360,48 @@ pub fn evaluate(b: &Ballot<'_>) -> Verdict {
         // resignation is the exit.
         if b.direction == Direction::Remove && b.subject.is_some() {
             let voices = got.iter().filter(|s| !is_subject(b, s)).count();
-            let others = elig.iter().filter(|s| !is_subject(b, s)).count();
-            return if voices == others && 2 * voices > n {
+            let others: Vec<&&Seat> = elig.iter().filter(|s| !is_subject(b, s)).collect();
+            return if voices == others.len() && 2 * voices > n {
                 Verdict::Admit
             } else {
-                insufficient(format!(
-                    "unanimous removal: {voices} of the {others} other members signed, of \
-                     {n}, and a strict majority of the roster is needed"
-                ))
+                // Every other member, and never fewer than a strict majority.
+                let need = others.len().max(n / 2 + 1);
+                short(
+                    format!(
+                        "unanimous removal: {voices} of the {} other members signed, of \
+                         {n}, and a strict majority of the roster is needed",
+                        others.len()
+                    ),
+                    voices,
+                    need,
+                    others,
+                )
             };
         }
         return if got.len() == n {
             Verdict::Admit
         } else {
-            insufficient(format!("unanimous: {} of {n} signed", got.len()))
+            short(
+                format!("unanimous: {} of {n} signed", got.len()),
+                got.len(),
+                n,
+                elig,
+            )
         };
     }
     if p == cp::MAJORITY {
         return if 2 * got.len() > n {
             Verdict::Admit
         } else {
-            insufficient(format!(
-                "majority: {} of {n} signed, more than half needed",
-                got.len()
-            ))
+            short(
+                format!(
+                    "majority: {} of {n} signed, more than half needed",
+                    got.len()
+                ),
+                got.len(),
+                n / 2 + 1,
+                elig,
+            )
         };
     }
     if p.starts_with(cp::REVERSE_QUORUM_PREFIX) {
@@ -291,10 +418,15 @@ pub fn evaluate(b: &Ballot<'_>) -> Verdict {
                 if got.len() >= need {
                     Verdict::Admit
                 } else {
-                    insufficient(format!(
-                        "reverse_quorum addition: {} of {need} signatures",
-                        got.len()
-                    ))
+                    short(
+                        format!(
+                            "reverse_quorum addition: {} of {need} signatures",
+                            got.len()
+                        ),
+                        got.len(),
+                        need,
+                        elig,
+                    )
                 }
             }
         };
@@ -303,16 +435,33 @@ pub fn evaluate(b: &Ballot<'_>) -> Verdict {
         let Some((m, _n)) = parse_quorum_tail(tail) else {
             return unevaluable(format!("malformed quorum form {p:?}"));
         };
-        // Absolute M (CC 4.4.3.4.2.1); at least one signer regardless.
-        let need = (m as usize).max(1);
+        let need = quorum_need(m as usize, n, b.high_water, b.subkind);
         return if got.len() >= need {
             Verdict::Admit
         } else {
-            insufficient(format!("quorum: {} of {need} signatures", got.len()))
+            let stalled = n < m as usize && need > n;
+            short(
+                if stalled {
+                    // CIRISPersist#1201 — the latch: this lineage reached M
+                    // and has shrunk below it. M still binds, so the room is
+                    // stalled until it grows back.
+                    format!(
+                        "quorum: stalled — this group once reached M = {m} and now has {n} \
+                         eligible member(s); M stays absolute and is not met ({} of {need} \
+                         signatures) (CC 4.4.3.4.2.1)",
+                        got.len()
+                    )
+                } else {
+                    format!("quorum: {} of {need} signatures", got.len())
+                },
+                got.len(),
+                need,
+                elig,
+            )
         };
     }
     if let Some(rubric) = p.strip_prefix(cp::WEIGHTED_PREFIX) {
-        return eval_weighted(b, &elig, &got, rubric);
+        return eval_weighted(b, elig, got, rubric);
     }
     if let Some(id) = p.strip_prefix(cp::CUSTOM_PREFIX) {
         let Some(expr) = b
@@ -324,7 +473,7 @@ pub fn evaluate(b: &Ballot<'_>) -> Verdict {
                 "custom:{id} is not declared in the group record's policy_blob.custom"
             ));
         };
-        return eval_expr(b, &elig, &got, expr, 0);
+        return eval_expr(b, elig, got, expr, 0);
     }
     unevaluable(format!("{p:?} is not a canonical consensus_protocol form"))
 }
@@ -339,7 +488,7 @@ pub fn evaluate(b: &Ballot<'_>) -> Verdict {
 ///   [`OPEN_SELF_ADMIT_REMOVAL_FLOOR`] distinct eligible signers, the member
 ///   the change names not counted: one voice never decides who is in a room;
 /// - a whole-roster change (no single subject) gains no one by itself.
-fn evaluate_open_self_admit(b: &Ballot<'_>, got: &[&Seat]) -> Verdict {
+fn evaluate_open_self_admit(b: &Ballot<'_>, elig: &[&Seat], got: &[&Seat]) -> Verdict {
     if b.subkind != Some(super::public_room::COHORT_SUBKIND_PUBLIC) {
         return unevaluable(format!(
             "{} is admissible only on a public group (CC 4.4.3.2)",
@@ -369,11 +518,16 @@ fn evaluate_open_self_admit(b: &Ballot<'_>, got: &[&Seat]) -> Verdict {
     if voices >= OPEN_SELF_ADMIT_REMOVAL_FLOOR {
         Verdict::Admit
     } else {
-        insufficient(format!(
-            "{}: {voices} distinct voice(s) besides the member named; one vote never \
-             decides who is in a room (at least {OPEN_SELF_ADMIT_REMOVAL_FLOOR})",
-            cp::OPEN_SELF_ADMIT
-        ))
+        short(
+            format!(
+                "{}: {voices} distinct voice(s) besides the member named; one vote never \
+                 decides who is in a room (at least {OPEN_SELF_ADMIT_REMOVAL_FLOOR})",
+                cp::OPEN_SELF_ADMIT
+            ),
+            voices,
+            OPEN_SELF_ADMIT_REMOVAL_FLOOR,
+            elig.iter().filter(|s| !is_subject(b, s)),
+        )
     }
 }
 
@@ -513,7 +667,12 @@ fn eval_expr(b: &Ballot<'_>, elig: &[&Seat], got: &[&Seat], expr: &Value, depth:
             if have >= need {
                 Verdict::Admit
             } else {
-                insufficient(format!("role {name}: {have} of {need} signatures"))
+                short(
+                    format!("role {name}: {have} of {need} signatures"),
+                    have,
+                    need,
+                    elig.iter().filter(|s| s.role.as_deref() == Some(name)),
+                )
             }
         }
         other => unevaluable(format!("unknown custom expression node {other:?}")),
@@ -525,7 +684,37 @@ fn eval_expr(b: &Ballot<'_>, elig: &[&Seat], got: &[&Seat], expr: &Value, depth:
 /// which applies its own #557 floor on top). `None` for forms whose answer is
 /// not a count (`founder_only` — a founder, not a number; `weighted:`;
 /// `custom:`) or that do not parse; such callers read `None` FAIL-SECURE.
+/// CIRISPersist#1201 (CC 4.4.3.4.2.1) — THE `quorum:M/N` count, shared by
+/// [`evaluate`] and [`required_signatures`]. Absolute `M` (at least one),
+/// except while the lineage has never reached `M` (`high_water < M`) and the
+/// roster `n` is below it: then every live member (`n`, at least one). An
+/// `infrastructure` group never relaxes (CC 3.2 T7: founded at `N ≥ M + 1`).
+/// `high_water: None` is absolute `M`.
+#[must_use]
+pub fn quorum_need(m: usize, n: usize, high_water: Option<usize>, subkind: Option<&str>) -> usize {
+    let absolute = m.max(1);
+    match high_water {
+        Some(hw) if hw < m && n < m && subkind != Some("infrastructure") => n.max(1),
+        _ => absolute,
+    }
+}
+
+///
+/// CIRISPersist#1201 — `quorum:M/N` reads absolute `M` here; a caller that
+/// folded the lineage asks [`required_signatures_at`], which agrees with
+/// [`evaluate`] through [`quorum_need`].
 pub fn required_signatures(protocol: &str, roster_size: usize) -> Option<usize> {
+    required_signatures_at(protocol, roster_size, None)
+}
+
+/// [`required_signatures`] with the lineage's high-water roster size
+/// (CIRISPersist#1201, CC 4.4.3.4.2.1): the same count [`evaluate`] asks of a
+/// `quorum:M/N` ballot carrying `high_water`.
+pub fn required_signatures_at(
+    protocol: &str,
+    roster_size: usize,
+    high_water: Option<usize>,
+) -> Option<usize> {
     if protocol == cp::UNANIMOUS {
         return Some(roster_size.max(1));
     }
@@ -537,7 +726,8 @@ pub fn required_signatures(protocol: &str, roster_size: usize) -> Option<usize> 
             .map(|p| p.dismissal_threshold(roster_size));
     }
     if let Some(tail) = protocol.strip_prefix(cp::QUORUM_PREFIX) {
-        return parse_quorum_tail(tail).map(|(m, _)| (m as usize).max(1));
+        return parse_quorum_tail(tail)
+            .map(|(m, _)| quorum_need(m as usize, roster_size, high_water, None));
     }
     None
 }
@@ -568,6 +758,7 @@ mod tests {
             direction: d,
             subject: None,
             persons: PersonsAt::each_key(),
+            high_water: None,
         })
     }
 
@@ -588,7 +779,148 @@ mod tests {
             direction: d,
             subject: Some(subject),
             persons: PersonsAt::each_key(),
+            high_water: None,
         })
+    }
+
+    /// **I1752** (v61.4.0, CIRISPersist#1201; CC 4.4.3.4.2.1) — the latch, pure.
+    /// Below `M` with a lineage that never reached it, every live member; at
+    /// or past `M`, or once the lineage reached it, absolute `M`; `None` (no
+    /// lineage folded) and `infrastructure` never relax. `required_signatures_at`
+    /// and the evaluator agree on every case.
+    #[test]
+    fn i1752_quorum_below_m_and_the_latch() {
+        let cases = [
+            (3, 1, Some(1), None, 1),
+            (3, 2, Some(2), None, 2),
+            (3, 3, Some(3), None, 3),
+            (3, 4, Some(4), None, 3),
+            (3, 2, Some(4), None, 3),
+            (3, 2, None, None, 3),
+            (3, 1, Some(1), Some("infrastructure"), 3),
+        ];
+        for (m, n, hw, sub, want) in cases {
+            assert_eq!(quorum_need(m, n, hw, sub), want, "{m} {n} {hw:?} {sub:?}");
+            if sub.is_none() {
+                assert_eq!(
+                    required_signatures_at(&format!("quorum:{m}/{}", m + 1), n, hw),
+                    Some(want)
+                );
+            }
+            let roster: Vec<Seat> = (0..n)
+                .map(|i| Seat {
+                    key_id: format!("k{i}"),
+                    role: (i == 0).then(|| "founder".to_owned()),
+                    node_bearing: false,
+                })
+                .collect();
+            let all: Vec<&str> = roster.iter().map(|s| s.key_id.as_str()).collect();
+            let v = evaluate(&Ballot {
+                protocol: &format!("quorum:{m}/{}", m + 1),
+                subkind: sub,
+                policy_blob: None,
+                roster: &roster,
+                signers: &signers(&all[..want.min(n)]),
+                direction: Direction::Add,
+                subject: None,
+                persons: PersonsAt::each_key(),
+                high_water: hw,
+            });
+            assert_eq!(
+                v.admits(),
+                want <= n,
+                "evaluate agrees: {m} {n} {hw:?} {sub:?}"
+            );
+        }
+    }
+
+    /// **I1749** (v61.4.0, CIRISPersist#1250) — each count arm states the count
+    /// it refused on: `have` is the voices it counted, `need` what it needs
+    /// at this roster, the eligible keys the voices it would count. A refusal
+    /// that is no count (a self-signed admission) and a weighted rubric carry
+    /// none; an admit carries none.
+    #[test]
+    fn i1749_a_short_verdict_carries_its_count() {
+        use Direction::{Add, Remove};
+        let sf = |v: Verdict| {
+            v.shortfall().cloned().map(|s| {
+                (
+                    s.have,
+                    s.need,
+                    s.eligible_signer_key_ids.unwrap_or_default(),
+                )
+            })
+        };
+        let ks = |v: &[&str]| v.iter().map(|k| (*k).to_owned()).collect::<Vec<_>>();
+        let four = seats(&[
+            ("a", Some("founder")),
+            ("b", None),
+            ("c", None),
+            ("d", None),
+        ]);
+        assert_eq!(
+            sf(eval(cp::MAJORITY, &four, &["b"], None, Add)),
+            Some((1, 3, ks(&["a", "b", "c", "d"])))
+        );
+        assert_eq!(
+            sf(eval(cp::MAJORITY, &four, &[], None, Add)),
+            Some((0, 3, ks(&["a", "b", "c", "d"]))),
+            "no signer at all: the arm still counts"
+        );
+        assert_eq!(
+            sf(eval(cp::UNANIMOUS, &four, &["a", "b"], None, Add)),
+            Some((2, 4, ks(&["a", "b", "c", "d"])))
+        );
+        assert_eq!(
+            sf(eval("quorum:3/4", &four, &["c", "x"], None, Add)),
+            Some((1, 3, ks(&["a", "b", "c", "d"]))),
+            "a non-member's signature is no voice"
+        );
+        assert_eq!(
+            sf(eval(cp::FOUNDER_ONLY, &four, &["b"], None, Add)),
+            Some((0, 1, ks(&["a"])))
+        );
+        assert_eq!(
+            sf(eval("reverse_quorum:2/4:86400", &four, &["a"], None, Add)),
+            Some((1, 3, ks(&["a", "b", "c", "d"])))
+        );
+        // A unanimous removal: every other member, and a strict majority.
+        assert_eq!(
+            sf(eval_about(cp::UNANIMOUS, None, &four, &["a"], "b", Remove)),
+            Some((1, 3, ks(&["a", "c", "d"])))
+        );
+        // open:self_admit's floor of two, the named member no voice.
+        assert_eq!(
+            sf(eval_about(
+                cp::OPEN_SELF_ADMIT,
+                Some("public"),
+                &four,
+                &["a", "c"],
+                "c",
+                Remove
+            )),
+            Some((1, OPEN_SELF_ADMIT_REMOVAL_FLOOR, ks(&["a", "b", "d"])))
+        );
+        // A custom role arm counts its role.
+        let blob =
+            serde_json::json!({"custom": {"elders": {"role": {"name": "founder", "min": 2}}}});
+        assert_eq!(
+            sf(eval("custom:elders", &four, &["a"], Some(&blob), Add)),
+            Some((1, 2, ks(&["a"])))
+        );
+        // No count: a self-signed admission, a weighted rubric, an admit.
+        assert_eq!(
+            sf(eval_about(cp::MAJORITY, None, &four, &["x"], "x", Add)),
+            None
+        );
+        assert_eq!(
+            sf(eval("weighted:uniform_half", &four, &["a"], None, Add)),
+            None
+        );
+        assert_eq!(
+            sf(eval(cp::MAJORITY, &four, &["a", "b", "c"], None, Add)),
+            None
+        );
     }
 
     /// v61 (CIRISPersist#1123) — `open:self_admit`: a new key admits itself;
@@ -624,6 +956,7 @@ mod tests {
                 direction: Add,
                 subject: None,
                 persons: PersonsAt::each_key(),
+                high_water: None,
             })
             .admits()
         };
@@ -793,6 +1126,7 @@ mod tests {
             direction: Direction::Add,
             subject: None,
             persons: PersonsAt::each_key(),
+            high_water: None,
         });
         assert!(
             !v.admits(),
@@ -825,6 +1159,7 @@ mod tests {
             direction: Direction::Add,
             subject: None,
             persons: PersonsAt::each_key(),
+            high_water: None,
         };
         let elig: Vec<&str> = eligible(&b).iter().map(|s| s.key_id.as_str()).collect();
         assert_eq!(

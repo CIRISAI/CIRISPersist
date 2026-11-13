@@ -103,6 +103,7 @@ pub const DOOR_VALUES: &[&str] = &[
     "list_widening_candidates",
     "list_attestations_for_migration",
     "attestations_binding_content",
+    "attestations_binding_content_with_placements",
     "get_attestation",
     "list_attestations_since",
     "list_attestation_log",

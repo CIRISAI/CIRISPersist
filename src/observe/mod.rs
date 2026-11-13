@@ -139,6 +139,9 @@ label_set! {
         ListAttestationsForMigration => "list_attestations_for_migration",
         /// `FederationDirectory::attestations_binding_content`.
         AttestationsBindingContent => "attestations_binding_content",
+        /// v61.4.0 (CIRISPersist#1260) —
+        /// `FederationDirectory::attestations_binding_content_with_placements`.
+        AttestationsBindingContentWithPlacements => "attestations_binding_content_with_placements",
         /// `FederationDirectory::get_attestation`.
         GetAttestation => "get_attestation",
         /// `FederationDirectory::list_attestations_since`.

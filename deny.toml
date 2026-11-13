@@ -82,6 +82,21 @@ ignore = [
     "RUSTSEC-2026-0490",  # v61.3.0 — hickory-proto SVCB/HTTPS text parse panic (lone quote)
                            # All three: TEXT/zone-file parsers, same transitive path and same
                            # fix (0.26.2) as 0491 above; persist parses no DNS text or zone file.
+    # v61.4.0 — five hickory DNSSEC-VALIDATION advisories published after v61.3.0,
+    # the same class and path as RUSTSEC-2026-0118 above: transitive ONLY via
+    # ciris-verify-core v22.2.0 → hickory-resolver 0.25 (reqwest's plain resolver).
+    # persist enables no DNSSEC validation and calls no ciris_verify_core::dns path,
+    # so no validator runs. Fix is hickory 0.26.2 (semver-major, upstream-only);
+    # remove when a TAGGED Verify carries it.
+    "RUSTSEC-2026-0504",  # inverted NSEC3 comparison
+    "RUSTSEC-2026-0505",  # NSEC3 owner names not checked against the zone
+    "RUSTSEC-2026-0511",  # NXDOMAIN accepted for a proven empty non-terminal
+    "RUSTSEC-2026-0512",  # an unrelated signed RRset accepted as the answer
+    "RUSTSEC-2026-0514",  # lookup / lookup_ip returned records that failed validation
+    "RUSTSEC-2026-0530",  # parent-side NSEC at a zone cut accepted as nonexistence proof
+    "RUSTSEC-2026-0531",  # child-side NSEC/NSEC3 accepted as proof of no DS record
+    "RUSTSEC-2026-0532",  # parent-side NSEC3 at a zone cut accepted as nonexistence proof
+                           # (all three: the same DNSSEC-validation class and path as above)
     # v61.2.1 — RUSTSEC-2025-0134 (rustls-pemfile) and RUSTSEC-2026-0098 /
     # 0099 / 0104 (rustls-webpki) are CLEARED: cargo deny (all features, every
     # target) reported each ignore matched no crate. The ignores are gone.

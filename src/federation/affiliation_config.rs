@@ -166,6 +166,7 @@ where
         group_key_id: community.community_key_id.clone(),
         offered_authority_key_id: primary.to_owned(),
         rule: AFFILIATION_COUNTERSIGN_MISSING,
+        shortfall: None,
     })
 }
 

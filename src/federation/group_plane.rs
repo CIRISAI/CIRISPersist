@@ -1522,6 +1522,7 @@ pub(crate) async fn check_cosigned_withdraws(
                 direction,
                 subject,
                 persons,
+                high_water: None,
             });
             if verdict.admits() {
                 Ok(Some(rule))
@@ -1530,6 +1531,13 @@ pub(crate) async fn check_cosigned_withdraws(
                     group_key_id: group.to_owned(),
                     offered_authority_key_id: issuer.to_owned(),
                     rule: super::ROSTER_CONSENSUS_INSUFFICIENT,
+                    // v61.4.0 (CIRISPersist#1250; CC 5.2) — the eligible
+                    // signers go only to an issuer seated in the roster (as
+                    // itself or as one of its person's devices).
+                    shortfall: verdict
+                        .shortfall()
+                        .cloned()
+                        .map(|s| s.for_caller(ids.iter().any(|k| persons.same_person(k, issuer)))),
                 })
             }
         }

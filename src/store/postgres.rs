@@ -9461,6 +9461,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         self
     }
 
+    // v61.4.0 (CIRISPersist#1244) — the directory capsule reaches the
+    // blackhole and edge-detection surfaces through these, so those calls
+    // run inside persist's `.so`.
+    fn blackhole_rules_surface(&self) -> Option<&dyn crate::federation::BlackholeRules> {
+        Some(self)
+    }
+
+    fn edge_detection_surface(&self) -> Option<&dyn crate::derived::EdgeDetectionSink> {
+        Some(self)
+    }
+
     // ── v54.1.0 (CIRISPersist#1046) — the steward purge plane (V187) ──────
 
     async fn purge_scan_attestations(
@@ -11446,6 +11457,67 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         crate::observe::record_read(
             crate::observe::StoreBackend::Postgres,
             crate::observe::Door::AttestationsBindingContent,
+            content_sha256,
+            &rows,
+            bytes,
+        );
+        Ok(rows)
+    }
+
+    async fn attestations_binding_content_with_placements(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        // v61.4.0 (CIRISPersist#1260) — `attestations_binding_content` plus the
+        // `supersedes` placements into a room, in one scan. The same prefilter,
+        // then the shared predicate.
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let like = format!("%{content_sha256}%");
+        let needle =
+            serde_json::Value::Array(vec![serde_json::Value::String(content_sha256.to_owned())]);
+        let rows = client
+            .query(
+                // weight::float8 AS weight — see list_attestations_for.
+                "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
+                    weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
+                 FROM cirislens.federation_attestations \
+                 WHERE tier = 'federation' \
+                     AND (attestation_type = 'scores' \
+                          OR (attestation_type = 'supersedes' \
+                              AND cohort_scope IN ('community', 'affiliations'))) \
+                     AND (attestation_envelope::jsonb -> 'evidence_refs' @> $1 \
+                          OR attestation_envelope::text LIKE $2) \
+                 ORDER BY asserted_at DESC",
+                &[&needle, &like],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "attestations_binding_content_with_placements: {e}"
+                ))
+            })?;
+        let bytes = pg_envelope_bytes(&rows);
+        let atts: Vec<crate::federation::Attestation> = rows
+            .into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<_, _>>()?;
+        let rows: Vec<crate::federation::Attestation> = atts
+            .into_iter()
+            .filter(|a| {
+                crate::federation::admission::envelope_binds_content(
+                    &a.attestation_envelope,
+                    content_sha256,
+                )
+            })
+            .collect();
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Postgres,
+            crate::observe::Door::AttestationsBindingContentWithPlacements,
             content_sha256,
             &rows,
             bytes,

@@ -155,6 +155,26 @@ pub trait DerivedSchema: Send + Sync {
     ) -> impl Future<Output = Result<Option<CalibrationBundle>, Error>> + Send;
 }
 
+/// v61.4.0 (CIRISPersist#1244) — the object-safe slice of [`DerivedSchema`]
+/// the directory capsule dispatches: the edge-detection admission.
+///
+/// [`DerivedSchema`] returns `impl Future` and cannot be a trait object, so
+/// a backend reached as `&dyn FederationDirectory` hands this out through
+/// [`crate::federation::FederationDirectory::edge_detection_surface`]. Every
+/// `DerivedSchema` implementor is one, by the blanket impl below.
+#[async_trait::async_trait]
+pub trait EdgeDetectionSink: Send + Sync {
+    /// [`DerivedSchema::put_edge_detection_event`].
+    async fn put_edge_detection_event(&self, event: EdgeDetectionEvent) -> Result<(), Error>;
+}
+
+#[async_trait::async_trait]
+impl<T: DerivedSchema> EdgeDetectionSink for T {
+    async fn put_edge_detection_event(&self, event: EdgeDetectionEvent) -> Result<(), Error> {
+        <T as DerivedSchema>::put_edge_detection_event(self, event).await
+    }
+}
+
 /// Lens-derived schema errors. Distinct from [`crate::store::Error`]
 /// (which covers trace ingest / lens schema concerns) and from
 /// [`crate::federation::Error`] (which covers the public-key /
