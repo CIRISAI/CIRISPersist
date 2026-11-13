@@ -9320,6 +9320,319 @@ mod tests {
         assert_eq!(proxy.withdraws_delegation_depth(), 0, "I1773 depth");
     }
 
+    // ── I1774 (CIRISPersist#1268) — the trust walk, concrete vs proxy ──
+
+    /// One answer, as the harness compares it: the `Ok` value's debug form,
+    /// any error as `Err` (the proxy flattens error variants), and an
+    /// `Unsupported` named, so reaching one is a red of its own.
+    fn answer_1774<T: std::fmt::Debug>(r: Result<T, Error>) -> String {
+        match r {
+            Ok(v) => format!("{v:?}"),
+            Err(Error::Unsupported { method }) => format!("UNSUPPORTED({method})"),
+            Err(e) if e.to_string().contains("ops_proxy_unsupported") => {
+                format!("UNSUPPORTED({e})")
+            }
+            Err(_) => "Err".to_owned(),
+        }
+    }
+
+    /// The policy in a canonical form (its sets sorted: two equal
+    /// `HashSet`s need not iterate alike).
+    fn policy_1774(p: &crate::federation::HardwareAttestationPolicy) -> String {
+        let mut hw: Vec<String> = p
+            .accepted_hardware_types
+            .iter()
+            .map(|t| format!("{t:?}"))
+            .collect();
+        hw.sort();
+        let mut tiers: Vec<&String> = p.accepted_custody_tiers.iter().collect();
+        tiers.sort();
+        format!(
+            "{hw:?} {:?} {tiers:?} {:?} {:?}",
+            p.max_nonce_age, p.yubico_root_der, p.android_root_ders
+        )
+    }
+
+    /// The trust questions the harness asks of one directory.
+    async fn trust_questions_1774(
+        d: &dyn FederationDirectory,
+        wid: &str,
+    ) -> Vec<(&'static str, String)> {
+        use crate::federation::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID as CANON;
+        use crate::federation::trust_root::{
+            capability_roots_to_trusted_root, trust_root_valid, INFRA_SERVE_SCOPE,
+        };
+        vec![
+            (
+                "trust_root_valid key root",
+                answer_1774(trust_root_valid(d, "eqa-user", "eqa-root").await),
+            ),
+            (
+                "trust_root_valid self root",
+                answer_1774(trust_root_valid(d, "eqa-user", "eqa-user").await),
+            ),
+            (
+                "trust_root_valid family-quorum root",
+                answer_1774(trust_root_valid(d, "eqf-user", "eqf-accord").await),
+            ),
+            (
+                "trust_root_valid community root",
+                answer_1774(trust_root_valid(d, "eqc-consumer", CANON).await),
+            ),
+            (
+                "trust_root_valid unknown root",
+                answer_1774(trust_root_valid(d, "eqf-user", "eq-nobody").await),
+            ),
+            (
+                "capability key root",
+                answer_1774(
+                    capability_roots_to_trusted_root(
+                        d,
+                        "eqa-user",
+                        "eqa-subject",
+                        INFRA_SERVE_SCOPE,
+                    )
+                    .await,
+                ),
+            ),
+            (
+                "capability family root",
+                answer_1774(
+                    capability_roots_to_trusted_root(
+                        d,
+                        "eqf-user",
+                        "eqf-subject",
+                        INFRA_SERVE_SCOPE,
+                    )
+                    .await,
+                ),
+            ),
+            (
+                "get_active_halt",
+                answer_1774(d.get_active_halt("eqf-accord").await),
+            ),
+            (
+                "lookup_role_withdrawal",
+                answer_1774(d.lookup_role_withdrawal("steward", "eqf-subject").await),
+            ),
+            (
+                "lookup_canonical_withdrawal",
+                answer_1774(d.lookup_canonical_withdrawal("eqf-subject").await),
+            ),
+            (
+                "owner_of",
+                answer_1774(crate::federation::admission::owner_of(d, "eqf-subject").await),
+            ),
+            (
+                "list_attestations_referencing",
+                answer_1774(d.list_attestations_referencing("eq-target").await),
+            ),
+            ("get_attestation", answer_1774(d.get_attestation(wid).await)),
+            (
+                "list_settled_self_roster_proposals",
+                answer_1774(d.list_settled_self_roster_proposals("eqf-user").await),
+            ),
+            (
+                "list_identity_occurrences_for",
+                answer_1774(d.list_identity_occurrences_for("eqf-user").await),
+            ),
+            (
+                "list_identity_occurrence_revocations_for",
+                answer_1774(d.list_identity_occurrence_revocations_for("eqf-user").await),
+            ),
+            (
+                "lookup_family",
+                answer_1774(d.lookup_family("eqf-accord").await),
+            ),
+            (
+                "list_families_for_member",
+                answer_1774(d.list_families_for_member("h0-eqf").await),
+            ),
+            (
+                "lookup_community",
+                answer_1774(d.lookup_community(CANON).await),
+            ),
+            (
+                "lookup_signed_community",
+                answer_1774(d.lookup_signed_community(CANON).await),
+            ),
+            (
+                "family_roster_signers",
+                answer_1774(d.family_roster_signers("eqf-accord").await),
+            ),
+            (
+                "community_roster_signers",
+                answer_1774(d.community_roster_signers(CANON).await),
+            ),
+            (
+                "hardware_attestation_policy",
+                policy_1774(&d.hardware_attestation_policy()),
+            ),
+            ("node_key_id", format!("{:?}", d.node_key_id())),
+            (
+                "withdraws_delegation_depth",
+                format!("{:?}", d.withdraws_delegation_depth()),
+            ),
+        ]
+    }
+
+    /// Ask both, and return every difference (and every `Unsupported`).
+    fn diff_1774(
+        rt: &Arc<tokio::runtime::Runtime>,
+        concrete: &Arc<dyn FederationDirectory>,
+        proxy: &Arc<OpsDirectory>,
+        wid: &str,
+        phase: &str,
+    ) -> (Vec<String>, Vec<(&'static str, String)>) {
+        let want = rt.block_on(trust_questions_1774(concrete.as_ref(), wid));
+        let got = rt.block_on(trust_questions_1774(proxy.as_ref(), wid));
+        let mut red = Vec::new();
+        for ((q, w), (_, g)) in want.iter().zip(&got) {
+            if g.starts_with("UNSUPPORTED") || w.starts_with("UNSUPPORTED") {
+                red.push(format!(
+                    "{phase} / {q}: Unsupported reached: {g} (concrete {w})"
+                ));
+            } else if w != g {
+                red.push(format!("{phase} / {q}: concrete {w}\n    proxy    {g}"));
+            }
+        }
+        (red, want)
+    }
+
+    /// **I1774 (CIRISPersist#1268) — the trust walk answers the same through
+    /// the proxy as on the concrete backend.** One store holds a key root
+    /// (`exercise_trust_root`), a family-quorum root
+    /// (`seed_chartered_family_root`, `quorum:2/3`) and the `ciris-canonical` community
+    /// root, plus a `withdraws` row. The same trust questions — the
+    /// `trust_root_valid` and conferral walks over each root, the halt, role
+    /// and canonical-withdrawal reads, and the rooting reads — run on the
+    /// backend and on `build_ops_directory_proxy` over its capsule, in three
+    /// phases: as seeded; with an active halt, a withdrawn role and a
+    /// withdrawn canonical; and with the halt lifted. Any difference, or any
+    /// `Unsupported` reached, is red. It does not list the methods the walks
+    /// reach: it finds them.
+    fn exercise_i1774(rt: &Arc<tokio::runtime::Runtime>, concrete: Arc<dyn FederationDirectory>) {
+        use crate::federation::operational::test_support as ops;
+        rt.block_on(async {
+            ops::exercise_trust_root(concrete.as_ref(), "eqa").await;
+            let holders: Vec<String> = (0..3).map(|i| format!("h{i}-eqf")).collect();
+            for k in holders
+                .iter()
+                .map(String::as_str)
+                .chain(["eqf-user", "eqf-subject"])
+            {
+                ops::register_typed_key(
+                    concrete.as_ref(),
+                    k,
+                    crate::federation::types::identity_type::NODE,
+                )
+                .await
+                .unwrap();
+            }
+            ops::seed_chartered_family_root(concrete.as_ref(), "eqf-accord", &holders, "eqf-user")
+                .await
+                .expect("the family-quorum fixture");
+            crate::federation::canonical_community_invariants::bodies::d_the_one_row_untrust(
+                concrete.as_ref(),
+                "eqc",
+            )
+            .await;
+            // `d` ends un-trusted; pin ciris-canonical again so the community
+            // arm answers VALID.
+            ops::emit_trust_edge(
+                concrete.as_ref(),
+                "eqc-consumer",
+                crate::federation::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID,
+                None,
+            )
+            .await
+            .expect("re-pin ciris-canonical");
+        });
+        let wid = seed_withdraws_1244(rt, concrete.as_ref(), "eq-issuer", "eq-target");
+        let proxy = proxy_1244(rt, concrete.clone());
+
+        let mut red = Vec::new();
+        let (r, seeded) = diff_1774(rt, &concrete, &proxy, &wid, "seeded");
+        red.extend(r);
+        // The fixture is not trivial: all three roots answer VALID.
+        for q in [
+            "trust_root_valid key root",
+            "trust_root_valid family-quorum root",
+            "trust_root_valid community root",
+        ] {
+            let a = &seeded.iter().find(|(n, _)| *n == q).unwrap().1;
+            assert!(
+                a.contains("valid: true"),
+                "I1774 fixture: {q} is not valid: {a}"
+            );
+        }
+
+        rt.block_on(async {
+            concrete
+                .set_active_halt("eqf-accord", "eq-halt")
+                .await
+                .unwrap();
+            concrete
+                .record_role_withdrawal("steward", "eqf-subject", None, "eq-digest")
+                .await
+                .unwrap();
+            concrete
+                .record_canonical_withdrawal("eqf-subject", None, "eq-digest")
+                .await
+                .unwrap();
+        });
+        let (r, halted) = diff_1774(rt, &concrete, &proxy, &wid, "halted+withdrawn");
+        red.extend(r);
+        let fam = &halted
+            .iter()
+            .find(|(n, _)| *n == "trust_root_valid family-quorum root")
+            .unwrap()
+            .1;
+        assert!(
+            fam.contains("halt_latched: Some(true)"),
+            "I1774 fixture: the halt latched: {fam}"
+        );
+
+        rt.block_on(concrete.clear_active_halt("eqf-accord", "eq-halt"))
+            .unwrap();
+        let (r, _) = diff_1774(rt, &concrete, &proxy, &wid, "halt lifted");
+        red.extend(r);
+
+        assert!(
+            red.is_empty(),
+            "I1774: the proxy answers differently:\n{}",
+            red.join("\n")
+        );
+    }
+
+    #[test]
+    fn i1774_the_trust_walk_answers_the_same_through_the_proxy_sqlite() {
+        let rt = test_runtime();
+        exercise_i1774(&rt, sqlite_backend_1244(&rt));
+    }
+
+    /// I1774 — postgres arm, in a database of its own (the community fixture
+    /// uses fixed key ids).
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn i1774_the_trust_walk_answers_the_same_through_the_proxy_pg() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let rt = test_runtime();
+        let b = rt.block_on(async {
+            let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+                .await
+                .expect("connect");
+            crate::store::backend::Backend::run_migrations(&b)
+                .await
+                .expect("migrate");
+            b
+        });
+        exercise_i1774(&rt, Arc::new(b));
+    }
+
     /// CIRISPersist#1162 — every field of the query and of its rows crosses
     /// the capsule's JSON as itself, and an unknown field is a refusal: a
     /// newer consumer's narrowing that an older host silently dropped would
