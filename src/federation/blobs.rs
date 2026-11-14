@@ -3584,21 +3584,69 @@ pub trait BlobStorage: Send + Sync {
     /// repair.** Rebind every `federation_community_blob_epoch` row at
     /// `(community_key_id, epoch)` whose recorded `minter_key_id` is
     /// **stranded** — holds no DEK state and no member grants at that
-    /// community and epoch — onto `minter_key_id`. Returns the number of
-    /// rows rebound.
+    /// community and epoch — AND whose author `minter_key_id` acts for
+    /// (CIRISPersist#1271), onto `minter_key_id`. Returns the number
+    /// of rows rebound.
     ///
     /// Called when a `key_grant` set is admitted: the bytes may arrive
     /// before their key set (`BLOB_REPLICATION.md` §3), and every binding
     /// written before v46 recorded the row's AUTHOR. Nobody re-sends bytes
     /// to fix a key column. A row whose recorded minter DOES hold state is
     /// never touched — the sweep repairs the stranded, it does not
-    /// re-point the bound.
+    /// re-point the bound (a WRONG bound row is healed on read, where AEAD
+    /// decides: [`rebind_blob_epoch_minter_cas`](Self::rebind_blob_epoch_minter_cas)).
+    ///
+    /// #1271 — a stranded row is rebound only onto a minter that IS the
+    /// row's author or acts for it
+    /// ([`rebind_stranded_for_authors`](super::epoch_minter::rebind_stranded_for_authors),
+    /// the one body every backend runs). In a room every member node mints
+    /// its own epoch, so the next set to land at `(community, epoch)` is not
+    /// evidence it sealed any particular row; a row with no recorded author
+    /// is left for the read-side heal.
     fn rebind_stranded_blob_epochs(
         &self,
         community_key_id: &str,
         minter_key_id: &str,
         epoch: u64,
     ) -> impl Future<Output = Result<usize, BlobError>> + Send;
+
+    /// CIRISPersist#1271 (`FSD/EPOCH_MINTER.md` §3) — **the
+    /// stranded rows, with their authors**: every
+    /// `federation_community_blob_epoch` row at `(community_key_id, epoch)`
+    /// whose recorded minter holds no DEK state and no member grant at that
+    /// community and epoch, as `(at_rest_sha256, recorded_minter_key_id,
+    /// author_key_id)`. The author is `federation_blobs.author_key_id`
+    /// (`None` when unrecorded). Ordered by `at_rest_sha256`.
+    ///
+    /// The input of the author-checked repair: the stranded predicate is SQL
+    /// here, the "acts for the author" predicate is the self-collective fold
+    /// in Rust, and the rebind is
+    /// [`rebind_blob_epoch_minter_cas`](Self::rebind_blob_epoch_minter_cas).
+    fn list_stranded_blob_epochs(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<Vec<StrandedBlobEpoch>, BlobError>> + Send;
+
+    /// CIRISPersist#1271 — **re-point one binding, compare-and-set.**
+    /// Set the `federation_community_blob_epoch` row for `at_rest_sha256` to
+    /// `new_minter_key_id` only if it still records `expected_minter_key_id`.
+    /// `true` iff the row was changed. Community and epoch are untouched: the
+    /// bytes name those (the signed pointer carries them); only the minter
+    /// was ever derived.
+    ///
+    /// Not an authority. The two callers each prove the new minter first:
+    /// the stranded repair by the author predicate
+    /// ([`rebind_stranded_for_authors`](super::epoch_minter::rebind_stranded_for_authors)),
+    /// and the read-side heal by AEAD — the bytes OPENED under the new
+    /// minter's DEK at the row's `(community, epoch)`, which no other DEK can
+    /// do. A caller holding neither proof must not call this.
+    fn rebind_blob_epoch_minter_cas(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        expected_minter_key_id: &str,
+        new_minter_key_id: &str,
+    ) -> impl Future<Output = Result<bool, BlobError>> + Send;
 
     /// #848 (§13, §17) — the viewer's OWN wrap on `(community, minter,
     /// epoch)`: `(wrap_algorithm, wrapped_dek)`, or `None`. This is what a
@@ -3973,6 +4021,12 @@ pub struct PutBlobAttestation {
     /// refused.
     pub asserted_at: chrono::DateTime<chrono::Utc>,
 }
+
+/// CIRISPersist#1271 — one stranded `federation_community_blob_epoch` row,
+/// as [`BlobStorage::list_stranded_blob_epochs`] returns it:
+/// `(at_rest_sha256, recorded_minter_key_id, author_key_id)`. The author is
+/// `federation_blobs.author_key_id`, `None` when unrecorded.
+pub type StrandedBlobEpoch = ([u8; 32], String, Option<String>);
 
 /// #833 (`BLOB_ENCRYPTION_AT_REST.md` §11.5, I31) — one
 /// `federation_community_blob_epoch` row: which `(community, epoch)` DEK

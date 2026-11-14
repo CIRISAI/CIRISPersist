@@ -1213,3 +1213,996 @@ mod run {
             as bodies::Pick<crate::store::postgres::PostgresBackend>
     );
 }
+
+/// CIRISPersist#1271 — **the late-seated member, I1776–I1780.**
+///
+/// A three-person room, one node per person, each node its OWN backend. On
+/// Carol's node the first epoch-0 grant to land is BOB's; Alice's bytes are
+/// adopted with no named minter; Alice's epoch-0 grant lands after. v61.4.0
+/// bound Alice's bytes to Bob's node — "the only minter granting me" — and
+/// the read was a permanent `SealDidNotOpen` (Edge `seal_mismatch`): Bob
+/// holds state, so the stranded repair never looked at the row again.
+///
+/// The fixture is the ORDER, not a count: every body below lands the
+/// crossings on Carol's node in the sequence the harness logged.
+#[cfg(test)]
+pub(crate) mod room_1271 {
+    use super::bodies::Pick;
+    use crate::federation::key_grant::SignedKeyGrantRow;
+    use crate::federation::key_grant_invariants::two_node::{
+        introduce, seed_community_everywhere, Node,
+    };
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
+    use crate::federation::types::identity_type::USER;
+    use crate::federation::{
+        AdoptDisposition, BlobBody, BlobError, BlobProvenance, BlobStorage, EncryptionPubkeys,
+        FederationDirectory,
+    };
+    use crate::Engine;
+    use std::sync::Arc;
+
+    /// Three engines, introduced; a room of three PERSONS, each occurring
+    /// through their own node.
+    pub(crate) struct Room<B> {
+        pub alice_engine: Engine,
+        pub bob_engine: Engine,
+        pub carol_engine: Engine,
+        pub ba: Arc<B>,
+        pub bb: Arc<B>,
+        pub bc: Arc<B>,
+        pub node_a: String,
+        pub node_b: String,
+        pub node_c: String,
+        pub alice: String,
+        pub comm: String,
+    }
+
+    pub(crate) async fn room<B>(dsns: &[String; 3], run: &str, pick: Pick<B>) -> Room<B>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        room_with(dsns, run, pick, true).await
+    }
+
+    /// [`room`], with `alice_occurs_on_carol = false` leaving Carol's node
+    /// WITHOUT the record that Alice occurs through node A: Alice is on
+    /// Carol's roster but node A resolves to no human there.
+    pub(crate) async fn room_with<B>(
+        dsns: &[String; 3],
+        run: &str,
+        pick: Pick<B>,
+        alice_occurs_on_carol: bool,
+    ) -> Room<B>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let aliases = [
+            format!("r1271-a-{run}"),
+            format!("r1271-b-{run}"),
+            format!("r1271-c-{run}"),
+        ];
+        let mut engines = Vec::new();
+        for (dsn, alias) in dsns.iter().zip(aliases.iter()) {
+            let e = Engine::with_signer_pre_genesis(ts::local_signer(alias), dsn)
+                .await
+                .unwrap();
+            e.register_self_federation_key(USER, alias, None, serde_json::json!({}), vec![])
+                .await
+                .expect("register the engine's own key");
+            engines.push(e);
+        }
+        let carol_engine = engines.pop().unwrap();
+        let bob_engine = engines.pop().unwrap();
+        let alice_engine = engines.pop().unwrap();
+        let (sa, sb, sc) = (pick(&alice_engine), pick(&bob_engine), pick(&carol_engine));
+        let kem =
+            |id: crate::federation::identity_aggregate::ContentKemIdentity| EncryptionPubkeys {
+                x25519_base64: id.x25519_pubkey_b64,
+                ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
+            };
+        let mut nodes = Vec::new();
+        for ((engine, backend), alias) in [
+            (&alice_engine, &sa),
+            (&bob_engine, &sb),
+            (&carol_engine, &sc),
+        ]
+        .into_iter()
+        .zip(aliases.iter())
+        {
+            nodes.push(Node {
+                backend: backend.as_ref(),
+                signer: ts::local_signer(alias),
+                key: engine.local_derived_key_id().await.unwrap(),
+                kem: kem(backend.load_or_init_content_kem_identity().await.unwrap()),
+            });
+        }
+        let refs: Vec<&Node<'_, B>> = nodes.iter().collect();
+        let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
+        introduce(&refs, &alias_refs).await;
+        let comm = format!("r1271-comm-{run}");
+        let (alice, bob, carol) = (
+            format!("r1271-alice-{run}"),
+            format!("r1271-bob-{run}"),
+            format!("r1271-carol-{run}"),
+        );
+        let seats_alice = if alice_occurs_on_carol {
+            &refs[..]
+        } else {
+            &refs[..2]
+        };
+        seed_community_everywhere(
+            seats_alice,
+            &comm,
+            &[
+                (&alice, Some(refs[0])),
+                (&bob, Some(refs[1])),
+                (&carol, Some(refs[2])),
+            ],
+        )
+        .await;
+        if !alice_occurs_on_carol {
+            seed_community_everywhere(
+                &refs[2..],
+                &comm,
+                &[
+                    (&alice, None),
+                    (&bob, Some(refs[1])),
+                    (&carol, Some(refs[2])),
+                ],
+            )
+            .await;
+        }
+        let (node_a, node_b, node_c) = (
+            nodes[0].key.clone(),
+            nodes[1].key.clone(),
+            nodes[2].key.clone(),
+        );
+        drop(nodes);
+        Room {
+            alice_engine,
+            bob_engine,
+            carol_engine,
+            ba: sa,
+            bb: sb,
+            bc: sc,
+            node_a,
+            node_b,
+            node_c,
+            alice,
+            comm,
+        }
+    }
+
+    /// `engine` (node `minter`) seals `plaintext` into the room through the
+    /// production door; returns the sha, the sealed bytes, and the epoch-axis
+    /// row it emitted to `recipient`.
+    async fn seal<B>(
+        engine: &Engine,
+        backend: &Arc<B>,
+        minter: &str,
+        comm: &str,
+        plaintext: &[u8],
+        recipient: &str,
+    ) -> ([u8; 32], Vec<u8>, SignedKeyGrantRow)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
+        let r = engine
+            .put_blob_scoped(COMMUNITY, Some(comm), plaintext, None, None)
+            .await
+            .expect("scoped put");
+        assert_eq!(r.tier, CryptoTier::CommunityDek);
+        let to = backend
+            .all_attestations_by(minter)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|x| {
+                crate::federation::admission::envelope_dimension(&x.attestation_envelope)
+                    == Some(crate::federation::key_grant::KEY_GRANT_EPOCH_DIMENSION)
+                    && x.attested_key_id == recipient
+            })
+            .max_by_key(|x| x.asserted_at)
+            .expect("an epoch-axis row to the recipient, signed by the minting NODE");
+        let Some(BlobBody::Inline(bytes)) = backend.get_blob(&r.at_rest_sha256).await.unwrap()
+        else {
+            panic!("inline")
+        };
+        (
+            r.at_rest_sha256,
+            bytes,
+            SignedKeyGrantRow { attestation: to },
+        )
+    }
+
+    fn provenance(author: &str, comm: &str, minter: Option<&str>) -> BlobProvenance {
+        BlobProvenance {
+            author_key_id: author.to_owned(),
+            cohort_scope: COMMUNITY.into(),
+            community_key_id: Some(comm.to_owned()),
+            epoch: Some(0),
+            tier: CryptoTier::CommunityDek,
+            minter_key_id: minter.map(str::to_owned),
+        }
+    }
+
+    async fn bound<B: BlobStorage + Sync>(b: &Arc<B>, sha: &[u8; 32]) -> String {
+        b.community_dek_blob_epoch(sha)
+            .await
+            .unwrap()
+            .expect("the binding exists")
+            .1
+    }
+
+    /// The harness ordering on Carol's node, up to (not including) Alice's
+    /// grant: Bob's epoch-0 grant admitted, Alice's bytes adopted unnamed.
+    /// Returns Alice's sha, her bytes, and her not-yet-carried row to Carol.
+    async fn bob_first<B>(r: &Room<B>) -> ([u8; 32], Vec<u8>, SignedKeyGrantRow)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let (sha_a, bytes_a, a_to_c) = seal(
+            &r.alice_engine,
+            &r.ba,
+            &r.node_a,
+            &r.comm,
+            b"alice, before carol",
+            &r.node_c,
+        )
+        .await;
+        let (_sha_b, _bytes_b, b_to_c) = seal(
+            &r.bob_engine,
+            &r.bb,
+            &r.node_b,
+            &r.comm,
+            b"bob's epoch",
+            &r.node_c,
+        )
+        .await;
+        r.carol_engine
+            .apply_replicated_key_grant(b_to_c)
+            .await
+            .expect("Carol admits Bob's epoch-0 row");
+        assert_eq!(
+            r.bc.community_dek_minters_granting(&r.comm, 0, &r.node_c)
+                .await
+                .unwrap(),
+            vec![r.node_b.clone()],
+            "#1271: Bob is the ONLY minter granting Carol when Alice's bytes land"
+        );
+        r.carol_engine
+            .adopt_sealed_blob(
+                &bytes_a,
+                provenance(&r.alice, &r.comm, None),
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("Carol adopts Alice's bytes");
+        (sha_a, bytes_a, a_to_c)
+    }
+
+    /// **I1776 — the harness ordering, end to end.** Bob's grant, Alice's
+    /// bytes unnamed, Alice's grant: the binding names ALICE'S node before
+    /// anything reads it (the derivation and the repair, no heal), and the
+    /// read opens.
+    pub(crate) async fn i1776_the_late_seat_ordering_opens<B>(
+        dsns: &[String; 3],
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let r = room(dsns, run, pick).await;
+        let (sha_a, _bytes, a_to_c) = bob_first(&r).await;
+        r.carol_engine
+            .apply_replicated_key_grant(a_to_c)
+            .await
+            .expect("Carol admits Alice's epoch-0 row");
+        assert_eq!(
+            bound(&r.bc, &sha_a).await,
+            r.node_a,
+            "I1776: the binding names the node that SEALED the bytes before any read"
+        );
+        assert_eq!(
+            r.carol_engine
+                .read_blob_as(&sha_a, &r.node_c, None)
+                .await
+                .expect("I1776: Carol's read OPENS"),
+            b"alice, before carol"
+        );
+    }
+
+    /// **I1777 — (a) one candidate is filtered too.** With Bob the only
+    /// minter granting Carol, an unnamed adopt of Alice's bytes does NOT
+    /// derive Bob: it falls back to the author (stranded, repairable).
+    pub(crate) async fn i1777_one_candidate_is_filtered<B>(
+        dsns: &[String; 3],
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let r = room(dsns, run, pick).await;
+        let (sha_a, _bytes, _a_to_c) = bob_first(&r).await;
+        assert_eq!(
+            crate::federation::epoch_minter::resolve(
+                r.bc.as_ref(),
+                None,
+                &r.comm,
+                0,
+                &r.node_c,
+                &r.alice,
+            )
+            .await
+            .unwrap(),
+            r.alice,
+            "I1777: Bob's node does not act for Alice — the lone candidate is not derived"
+        );
+        assert_eq!(
+            bound(&r.bc, &sha_a).await,
+            r.alice,
+            "I1777: the adopt recorded the STRANDED author fallback, not Bob's node"
+        );
+        // And the lone candidate that DOES act for the author is still derived.
+        let bob_person =
+            r.bc.active_identities_for_occurrence(&r.node_b)
+                .await
+                .unwrap();
+        assert_eq!(bob_person.len(), 1, "fixture: node B occurs for one person");
+        assert_eq!(
+            crate::federation::epoch_minter::resolve(
+                r.bc.as_ref(),
+                None,
+                &r.comm,
+                0,
+                &r.node_c,
+                &bob_person[0],
+            )
+            .await
+            .unwrap(),
+            r.node_b,
+            "I1777: a lone candidate that acts for the author is derived"
+        );
+    }
+
+    /// **I1778 — (b) the repair asks whose row it is.** Alice's bytes are
+    /// stranded on her author key (no grant at all when they land). Bob's
+    /// epoch-0 set is admitted next: it must NOT claim Alice's row. Alice's
+    /// set then rebinds it, and it opens.
+    pub(crate) async fn i1778_the_repair_checks_the_author<B>(
+        dsns: &[String; 3],
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let r = room(dsns, run, pick).await;
+        let (sha_a, bytes_a, a_to_c) = seal(
+            &r.alice_engine,
+            &r.ba,
+            &r.node_a,
+            &r.comm,
+            b"bytes before any key",
+            &r.node_c,
+        )
+        .await;
+        let (_sha_b, _bytes_b, b_to_c) = seal(
+            &r.bob_engine,
+            &r.bb,
+            &r.node_b,
+            &r.comm,
+            b"bob's epoch",
+            &r.node_c,
+        )
+        .await;
+        r.carol_engine
+            .adopt_sealed_blob(
+                &bytes_a,
+                provenance(&r.alice, &r.comm, None),
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("Carol adopts with no grant held");
+        assert_eq!(
+            bound(&r.bc, &sha_a).await,
+            r.alice,
+            "I1778: stranded on the author"
+        );
+        assert_eq!(
+            r.bc.list_stranded_blob_epochs(&r.comm, 0).await.unwrap(),
+            vec![(sha_a, r.alice.clone(), Some(r.alice.clone()))],
+            "I1778: the stranded row is listed with its author"
+        );
+        r.carol_engine
+            .apply_replicated_key_grant(b_to_c)
+            .await
+            .expect("Carol admits Bob's epoch-0 row");
+        assert_eq!(
+            bound(&r.bc, &sha_a).await,
+            r.alice,
+            "I1778: Bob's set does not claim a row Alice authored"
+        );
+        r.carol_engine
+            .apply_replicated_key_grant(a_to_c)
+            .await
+            .expect("Carol admits Alice's epoch-0 row");
+        assert_eq!(
+            bound(&r.bc, &sha_a).await,
+            r.node_a,
+            "I1778: Alice's set rebinds her stranded row"
+        );
+        assert!(
+            r.bc.list_stranded_blob_epochs(&r.comm, 0)
+                .await
+                .unwrap()
+                .is_empty(),
+            "I1778: nothing stranded remains"
+        );
+        assert_eq!(
+            r.carol_engine
+                .read_blob_as(&sha_a, &r.node_c, None)
+                .await
+                .expect("I1778: opens"),
+            b"bytes before any key"
+        );
+    }
+
+    /// **I1779 — (c) a row ALREADY wrong heals on read.** Alice's bytes
+    /// bound to Bob's node (named, as the pre-#1271 derivation wrote it), Bob
+    /// holding state, Alice's grant admitted after: the repair does not
+    /// touch it, and the read opens it under Alice's DEK, re-pointing the
+    /// binding. The negative: bytes that open under no granted minter still
+    /// refuse, and nothing is rebound.
+    pub(crate) async fn i1779_a_wrong_binding_heals_on_read<B>(
+        dsns: &[String; 3],
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let r = room(dsns, run, pick).await;
+        let (sha_a, bytes_a, a_to_c) = seal(
+            &r.alice_engine,
+            &r.ba,
+            &r.node_a,
+            &r.comm,
+            b"bound wrong",
+            &r.node_c,
+        )
+        .await;
+        let (_sha_b, _bytes_b, b_to_c) = seal(
+            &r.bob_engine,
+            &r.bb,
+            &r.node_b,
+            &r.comm,
+            b"bob's epoch",
+            &r.node_c,
+        )
+        .await;
+        r.carol_engine
+            .apply_replicated_key_grant(b_to_c)
+            .await
+            .unwrap();
+        r.carol_engine
+            .adopt_sealed_blob(
+                &bytes_a,
+                provenance(&r.alice, &r.comm, Some(&r.node_b)),
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("the pre-#1271 state: bound to Bob's node");
+        assert_eq!(bound(&r.bc, &sha_a).await, r.node_b);
+        // A second Alice row in the same state, healed through the OTHER
+        // production read door (`read_blob_for_community_viewer`).
+        let (sha_a2, bytes_a2, _) = seal(
+            &r.alice_engine,
+            &r.ba,
+            &r.node_a,
+            &r.comm,
+            b"bound wrong, community door",
+            &r.node_c,
+        )
+        .await;
+        r.carol_engine
+            .adopt_sealed_blob(
+                &bytes_a2,
+                provenance(&r.alice, &r.comm, Some(&r.node_b)),
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .unwrap();
+
+        // NEGATIVE first: Carol holds only Bob's grant. Nothing opens these
+        // bytes, so the refusal stands and the row is untouched.
+        let err = r
+            .carol_engine
+            .read_blob_as(&sha_a, &r.node_c, None)
+            .await
+            .expect_err("I1779: no granted minter opens these bytes");
+        assert!(
+            matches!(err, BlobError::SealDidNotOpen { .. }),
+            "I1779: the refusal is the seal mismatch, unchanged: {err}"
+        );
+        assert_eq!(
+            bound(&r.bc, &sha_a).await,
+            r.node_b,
+            "I1779: a failed heal rebinds nothing"
+        );
+
+        r.carol_engine
+            .apply_replicated_key_grant(a_to_c)
+            .await
+            .unwrap();
+        assert_eq!(
+            bound(&r.bc, &sha_a).await,
+            r.node_b,
+            "I1779: Bob holds state, so the stranded repair leaves the row WRONG"
+        );
+        assert_eq!(
+            r.carol_engine
+                .read_blob_as(&sha_a, &r.node_c, None)
+                .await
+                .expect("I1779: the read HEALS and opens"),
+            b"bound wrong"
+        );
+        assert_eq!(
+            bound(&r.bc, &sha_a).await,
+            r.node_a,
+            "I1779: the binding is re-pointed to the minter AEAD proved"
+        );
+        let healed = r
+            .carol_engine
+            .read_blob_for_community_viewer(&sha_a2, &r.node_c)
+            .await;
+        assert_eq!(
+            healed.expect("I1779: the community door heals too"),
+            b"bound wrong, community door"
+        );
+        assert_eq!(bound(&r.bc, &sha_a2).await, r.node_a, "I1779: re-pointed");
+        // The compare-and-set refuses a stale expectation: the row names
+        // Alice's node now, so "if it still names Bob's" changes nothing.
+        assert!(
+            !r.bc
+                .rebind_blob_epoch_minter_cas(&sha_a, &r.node_b, "r1271-nobody")
+                .await
+                .unwrap(),
+            "I1779: a CAS on a stale minter is refused"
+        );
+        assert_eq!(bound(&r.bc, &sha_a).await, r.node_a);
+        // Healed for good: the next read takes the ordinary path.
+        assert_eq!(
+            r.carol_engine
+                .read_blob_as(&sha_a, &r.node_c, None)
+                .await
+                .unwrap(),
+            b"bound wrong"
+        );
+        // A second NEGATIVE, after the heal: the wrong AAD opens under no
+        // minter at all — refused, and the (now correct) row is untouched.
+        let err = r
+            .carol_engine
+            .read_blob_as(&sha_a, &r.node_c, Some(b"not the row's aad"))
+            .await
+            .expect_err("I1779: wrong associated data opens nothing");
+        assert!(matches!(err, BlobError::SealDidNotOpen { .. }), "{err}");
+        assert_eq!(bound(&r.bc, &sha_a).await, r.node_a);
+    }
+
+    /// **I1780 — (c)'s boundary: an UNGRANTED binding is not healed.** A
+    /// row whose binding names a minter that never granted the viewer —
+    /// here a stranded key no repair can claim (its author is nobody the
+    /// room's nodes act for) — refuses `NotGranted` at authorization, before
+    /// any body, on both read doors, and stays bound as it was: even once a
+    /// minter that DID grant the viewer holds the DEK that would open it. The
+    /// heal is the AEAD arm only, for a viewer the bound minter already
+    /// authorized; reaching past `NotGranted` would re-point a rotated
+    /// signer's rows onto the node's key, which PR #850 ruled must refuse
+    /// (I66).
+    pub(crate) async fn i1780_an_ungranted_binding_is_not_healed<B>(
+        dsns: &[String; 3],
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let r = room(dsns, run, pick).await;
+        let (sha_a, bytes_a, a_to_c) = seal(
+            &r.alice_engine,
+            &r.ba,
+            &r.node_a,
+            &r.comm,
+            b"ghost bound",
+            &r.node_c,
+        )
+        .await;
+        let (_sha_b, _bytes_b, b_to_c) = seal(
+            &r.bob_engine,
+            &r.bb,
+            &r.node_b,
+            &r.comm,
+            b"bob's epoch",
+            &r.node_c,
+        )
+        .await;
+        // The row names `ghost` — a key holding no DEK and no grant — and
+        // its recorded author is a key no node in the room acts for, so no
+        // admitted set can prove a claim to it and the repair leaves it.
+        let ghost = format!("r1271-ghost-{run}");
+        let ghost_author = format!("r1271-ghost-author-{run}");
+        for k in [&ghost, &ghost_author] {
+            ts::register_identity_key(r.bc.as_ref(), k, USER).await;
+        }
+        r.carol_engine
+            .adopt_sealed_blob(
+                &bytes_a,
+                provenance(&ghost_author, &r.comm, Some(&ghost)),
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("bound to a minter that holds nothing");
+        let (sha_a2, bytes_a2, _) = seal(
+            &r.alice_engine,
+            &r.ba,
+            &r.node_a,
+            &r.comm,
+            b"ghost bound, community door",
+            &r.node_c,
+        )
+        .await;
+        r.carol_engine
+            .adopt_sealed_blob(
+                &bytes_a2,
+                provenance(&ghost_author, &r.comm, Some(&ghost)),
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .unwrap();
+        r.carol_engine
+            .apply_replicated_key_grant(b_to_c)
+            .await
+            .unwrap();
+        // NEGATIVE: only Bob grants Carol; his DEK does not open Alice's
+        // bytes. NotGranted, as before, and the row is untouched.
+        let err = r
+            .carol_engine
+            .read_blob_as(&sha_a, &r.node_c, None)
+            .await
+            .expect_err("I1780: nothing that granted Carol opens these bytes");
+        assert!(matches!(err, BlobError::NotGranted { .. }), "I1780: {err}");
+        assert_eq!(bound(&r.bc, &sha_a).await, ghost, "I1780: nothing rebound");
+        // A stranger with no grant at all is refused the same way.
+        let err = r
+            .carol_engine
+            .read_blob_as(&sha_a, "r1271-stranger", None)
+            .await
+            .expect_err("a stranger");
+        assert!(matches!(err, BlobError::NotGranted { .. }), "{err}");
+
+        r.carol_engine
+            .apply_replicated_key_grant(a_to_c)
+            .await
+            .unwrap();
+        assert_eq!(
+            bound(&r.bc, &sha_a).await,
+            ghost,
+            "I1780: the repair cannot prove Alice's node acts for this row's author"
+        );
+        // Alice's node now grants Carol, and its DEK would open both rows.
+        // Neither door reaches past NotGranted, and nothing is re-pointed.
+        let err = r
+            .carol_engine
+            .read_blob_as(&sha_a, &r.node_c, None)
+            .await
+            .expect_err("I1780: an ungranted binding still refuses");
+        assert!(matches!(err, BlobError::NotGranted { .. }), "I1780: {err}");
+        let err = r
+            .carol_engine
+            .read_blob_for_community_viewer(&sha_a2, &r.node_c)
+            .await
+            .expect_err("I1780: and on the community door");
+        assert!(matches!(err, BlobError::NotGranted { .. }), "I1780: {err}");
+        assert_eq!(bound(&r.bc, &sha_a).await, ghost, "I1780: nothing rebound");
+        assert_eq!(bound(&r.bc, &sha_a2).await, ghost, "I1780: nothing rebound");
+        // The bytes ARE Alice's epoch: re-pointed by an authority that can
+        // (here the CAS by hand), they open — so the refusal
+        // above is the boundary, not a broken fixture.
+        assert!(r
+            .bc
+            .rebind_blob_epoch_minter_cas(&sha_a, &ghost, &r.node_a)
+            .await
+            .unwrap());
+        assert_eq!(
+            r.carol_engine
+                .read_blob_as(&sha_a, &r.node_c, None)
+                .await
+                .expect("fixture: Alice's DEK opens the row"),
+            b"ghost bound"
+        );
+    }
+
+    /// **I1781 — (c) tries only the author's minters.** Bytes SEALED under
+    /// Bob's DEK but attributed to Alice, bound to Alice's node. Carol holds
+    /// both grants, so Bob's DEK WOULD open them — but Bob's node does not act
+    /// for Alice, so it is never tried: the refusal is unchanged and nothing
+    /// is rebound. AEAD proves which key sealed the bytes, not whose bytes
+    /// they are.
+    pub(crate) async fn i1781_a_non_author_minter_is_not_tried<B>(
+        dsns: &[String; 3],
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let r = room(dsns, run, pick).await;
+        let (_sha_a, _bytes_a, a_to_c) = seal(
+            &r.alice_engine,
+            &r.ba,
+            &r.node_a,
+            &r.comm,
+            b"alice's epoch",
+            &r.node_c,
+        )
+        .await;
+        let (sha_b, bytes_b, b_to_c) = seal(
+            &r.bob_engine,
+            &r.bb,
+            &r.node_b,
+            &r.comm,
+            b"sealed by bob, claimed for alice",
+            &r.node_c,
+        )
+        .await;
+        for row in [a_to_c, b_to_c] {
+            r.carol_engine
+                .apply_replicated_key_grant(row)
+                .await
+                .unwrap();
+        }
+        r.carol_engine
+            .adopt_sealed_blob(
+                &bytes_b,
+                provenance(&r.alice, &r.comm, Some(&r.node_a)),
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("bound to Alice's node, attributed to Alice");
+        // Fixture check: Bob's DEK, recovered for Carol, DOES open the bytes.
+        let dek = crate::federation::community_dek::orchestrate::recover_epoch_dek_for_viewer(
+            r.bc.as_ref(),
+            &r.comm,
+            &r.node_b,
+            0,
+            &r.node_c,
+        )
+        .await
+        .expect("Carol holds Bob's wrap");
+        let envelope =
+            crate::federation::at_rest_cascade::AtRestEnvelope::from_bytes(&bytes_b).unwrap();
+        assert_eq!(
+            crate::federation::at_rest_cascade::open(&dek, &envelope, None).unwrap(),
+            b"sealed by bob, claimed for alice",
+            "fixture: a non-author minter's DEK would open these bytes"
+        );
+        for _ in 0..2 {
+            let err = r
+                .carol_engine
+                .read_blob_as(&sha_b, &r.node_c, None)
+                .await
+                .expect_err("I1781: a non-author minter's DEK is not tried");
+            assert!(
+                matches!(err, BlobError::SealDidNotOpen { .. }),
+                "I1781: the refusal is unchanged: {err}"
+            );
+        }
+        let err = r
+            .carol_engine
+            .read_blob_for_community_viewer(&sha_b, &r.node_c)
+            .await
+            .expect_err("I1781: nor through the community door");
+        assert!(matches!(err, BlobError::SealDidNotOpen { .. }), "{err}");
+        assert_eq!(
+            bound(&r.bc, &sha_b).await,
+            r.node_a,
+            "I1781: nothing rebound onto a minter that does not act for the author"
+        );
+    }
+
+    /// **I1782 — an unresolved lone candidate is unreachable.** (a) falls
+    /// back to the author for a lone candidate that does not act for the
+    /// author. The v61.4.0 answer would differ only for a candidate this node
+    /// resolves to NO human — and no such candidate can exist: a peer's
+    /// epoch row is admitted only if its signer is an active member
+    /// occurrence of the room (`key_grant::is_active_member_at`, read through
+    /// the same occurrence / owner records `principals_of` folds).
+    ///
+    /// Carol's node holds Alice on the roster but not the record that Alice
+    /// occurs through node A. Node A's grant is REFUSED, retryably, so it is
+    /// no candidate; the unnamed adopt strands on the author. When the
+    /// occurrence lands and the row is re-offered, it is admitted, the
+    /// strict repair rebinds the row (node A now acts for Alice), and the
+    /// read opens — nothing was lost by not guessing.
+    pub(crate) async fn i1782_an_unresolved_lone_candidate_is_unreachable<B>(
+        dsns: &[String; 3],
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let r = room_with(dsns, run, pick, false).await;
+        assert_eq!(
+            crate::federation::self_collective::principals_of(r.bc.as_ref(), &r.node_a)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|p| *p != r.node_a)
+                .count(),
+            0,
+            "fixture: node A resolves to no human on Carol's node"
+        );
+        let (sha_a, bytes_a, a_to_c) = seal(
+            &r.alice_engine,
+            &r.ba,
+            &r.node_a,
+            &r.comm,
+            b"alice, node unresolved on carol",
+            &r.node_c,
+        )
+        .await;
+        let err = r
+            .carol_engine
+            .apply_replicated_key_grant(a_to_c.clone())
+            .await
+            .expect_err("I1782: an unresolved node's epoch row is not admitted");
+        assert!(
+            matches!(
+                &err,
+                crate::federation::Error::KeyGrantRefused { reason, .. }
+                    if *reason == "signer_not_active_member"
+            ),
+            "I1782: refused as signer_not_active_member: {err}"
+        );
+        assert!(
+            r.bc.community_dek_minters_granting(&r.comm, 0, &r.node_c)
+                .await
+                .unwrap()
+                .is_empty(),
+            "I1782: so it is no candidate"
+        );
+        r.carol_engine
+            .adopt_sealed_blob(
+                &bytes_a,
+                provenance(&r.alice, &r.comm, None),
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("Carol adopts Alice's bytes");
+        assert_eq!(bound(&r.bc, &sha_a).await, r.alice, "I1782: stranded");
+        // The occurrence lands (the same record the other nodes hold).
+        let kem_a = r.ba.load_or_init_content_kem_identity().await.unwrap();
+        r.bc.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            identity_key_id: r.alice.clone(),
+            occurrence_key_id: r.node_a.clone(),
+            device_class: crate::federation::types::device_class::LAPTOP.into(),
+            hardware_attestation: None,
+            asserted_at: chrono::Utc::now() - chrono::Duration::minutes(5),
+            valid_until: None,
+            encryption_pubkeys: Some(EncryptionPubkeys {
+                x25519_base64: kem_a.x25519_pubkey_b64,
+                ml_kem_768_base64: kem_a.ml_kem_768_pubkey_b64,
+            }),
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        })
+        .await
+        .unwrap();
+        r.carol_engine
+            .apply_replicated_key_grant(a_to_c)
+            .await
+            .expect("I1782: re-offered after the occurrence, admitted");
+        assert_eq!(
+            bound(&r.bc, &sha_a).await,
+            r.node_a,
+            "I1782: the strict repair rebinds it"
+        );
+        assert_eq!(
+            r.carol_engine
+                .read_blob_as(&sha_a, &r.node_c, None)
+                .await
+                .expect("I1782: the read opens"),
+            b"alice, node unresolved on carol"
+        );
+    }
+}
+
+#[cfg(test)]
+mod run_1271 {
+    fn suffix() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+
+    macro_rules! runners_1271 {
+        ($modname:ident, $dsns:expr, $pick:expr) => {
+            mod $modname {
+                use super::super::room_1271 as bodies;
+                #[tokio::test]
+                async fn i1776() {
+                    let Some(d) = $dsns else { return };
+                    bodies::i1776_the_late_seat_ordering_opens(&d, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i1777() {
+                    let Some(d) = $dsns else { return };
+                    bodies::i1777_one_candidate_is_filtered(&d, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i1778() {
+                    let Some(d) = $dsns else { return };
+                    bodies::i1778_the_repair_checks_the_author(&d, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i1779() {
+                    let Some(d) = $dsns else { return };
+                    bodies::i1779_a_wrong_binding_heals_on_read(&d, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i1782() {
+                    let Some(d) = $dsns else { return };
+                    bodies::i1782_an_unresolved_lone_candidate_is_unreachable(
+                        &d,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i1781() {
+                    let Some(d) = $dsns else { return };
+                    bodies::i1781_a_non_author_minter_is_not_tried(&d, &super::suffix(), $pick)
+                        .await
+                }
+                #[tokio::test]
+                async fn i1780() {
+                    let Some(d) = $dsns else { return };
+                    bodies::i1780_an_ungranted_binding_is_not_healed(&d, &super::suffix(), $pick)
+                        .await
+                }
+            }
+        };
+    }
+    #[cfg(feature = "sqlite")]
+    runners_1271!(
+        sqlite,
+        Some([
+            "sqlite::memory:".to_owned(),
+            "sqlite::memory:".to_owned(),
+            "sqlite::memory:".to_owned(),
+        ]),
+        (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
+            as crate::federation::epoch_minter_invariants::bodies::Pick<
+                crate::store::sqlite::SqliteBackend,
+            >
+    );
+    #[cfg(feature = "postgres")]
+    runners_1271!(
+        postgres,
+        (|| Some([
+            crate::test_pg::empty_dsn()?,
+            crate::test_pg::empty_dsn()?,
+            crate::test_pg::empty_dsn()?,
+        ]))(),
+        (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
+            as crate::federation::epoch_minter_invariants::bodies::Pick<
+                crate::store::postgres::PostgresBackend,
+            >
+    );
+}

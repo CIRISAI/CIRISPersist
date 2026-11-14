@@ -10963,37 +10963,106 @@ impl crate::federation::BlobStorage for SqliteBackend {
     /// `(community, epoch)` is STRANDED — it can never authorize anyone —
     /// and rebinds onto the minter that just proved it holds the epoch. A
     /// row whose minter DOES hold state is left alone.
+    ///
+    /// #1271 — and only onto a minter that acts for the row's
+    /// author: the one body both backends run.
     async fn rebind_stranded_blob_epochs(
         &self,
         community_key_id: &str,
         minter_key_id: &str,
         epoch: u64,
     ) -> Result<usize, crate::federation::BlobError> {
-        let (c, m, e) = (
-            community_key_id.to_owned(),
-            minter_key_id.to_owned(),
-            epoch as i64,
-        );
-        self.write(move |conn| -> Result<usize, rusqlite::Error> {
-            conn.execute(
-                "UPDATE federation_community_blob_epoch \
-                    SET minter_key_id = ?2 \
-                  WHERE community_key_id = ?1 AND epoch = ?3 AND minter_key_id <> ?2 \
-                    AND NOT EXISTS (SELECT 1 FROM federation_community_dek d \
-                                     WHERE d.community_key_id = federation_community_blob_epoch.community_key_id \
-                                       AND d.minter_key_id = federation_community_blob_epoch.minter_key_id \
-                                       AND d.epoch = federation_community_blob_epoch.epoch) \
-                    AND NOT EXISTS (SELECT 1 FROM federation_community_dek_member_grants g \
-                                     WHERE g.community_key_id = federation_community_blob_epoch.community_key_id \
-                                       AND g.minter_key_id = federation_community_blob_epoch.minter_key_id \
-                                       AND g.epoch = federation_community_blob_epoch.epoch)",
-                rusqlite::params![c, m, e],
-            )
-        })
+        crate::federation::epoch_minter::rebind_stranded_for_authors(
+            self,
+            community_key_id,
+            minter_key_id,
+            epoch,
+        )
         .await
-        .map_err(|e| {
-            crate::federation::BlobError::Backend(format!("rebind_stranded_blob_epochs: {e}"))
-        })
+    }
+
+    /// #1271 — the stranded rows at `(community, epoch)` with
+    /// their authors. The v46 stranded predicate, unchanged, as a SELECT.
+    async fn list_stranded_blob_epochs(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+    ) -> Result<Vec<crate::federation::blobs::StrandedBlobEpoch>, crate::federation::BlobError>
+    {
+        type StrandedRow = (Vec<u8>, String, Option<String>);
+        let (c, e) = (community_key_id.to_owned(), epoch as i64);
+        let rows = self
+            .read(move |conn| -> Result<Vec<StrandedRow>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT be.at_rest_sha256, be.minter_key_id, b.author_key_id \
+                           FROM federation_community_blob_epoch be \
+                           LEFT JOIN federation_blobs b ON b.sha256 = be.at_rest_sha256 \
+                          WHERE be.community_key_id = ?1 AND be.epoch = ?2 \
+                            AND NOT EXISTS (SELECT 1 FROM federation_community_dek d \
+                                             WHERE d.community_key_id = be.community_key_id \
+                                               AND d.minter_key_id = be.minter_key_id \
+                                               AND d.epoch = be.epoch) \
+                            AND NOT EXISTS (SELECT 1 FROM federation_community_dek_member_grants g \
+                                             WHERE g.community_key_id = be.community_key_id \
+                                               AND g.minter_key_id = be.minter_key_id \
+                                               AND g.epoch = be.epoch) \
+                          ORDER BY be.at_rest_sha256 ASC",
+                )?;
+                let rows: Result<Vec<_>, rusqlite::Error> = stmt
+                    .query_map(rusqlite::params![c, e], |r| {
+                        Ok((
+                            r.get::<_, Vec<u8>>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    })?
+                    .collect();
+                rows
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("list_stranded_blob_epochs: {e}"))
+            })?;
+        rows.into_iter()
+            .map(|(sha, minter, author)| {
+                let sha: [u8; 32] = sha.as_slice().try_into().map_err(|_| {
+                    crate::federation::BlobError::Backend(format!(
+                        "list_stranded_blob_epochs: at_rest_sha256 is {} bytes, not 32",
+                        sha.len()
+                    ))
+                })?;
+                Ok((sha, minter, author))
+            })
+            .collect()
+    }
+
+    /// #1271 — re-point one binding, compare-and-set on the
+    /// recorded minter. One guarded UPDATE on the writer.
+    async fn rebind_blob_epoch_minter_cas(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        expected_minter_key_id: &str,
+        new_minter_key_id: &str,
+    ) -> Result<bool, crate::federation::BlobError> {
+        let (sha, old, new) = (
+            at_rest_sha256.to_vec(),
+            expected_minter_key_id.to_owned(),
+            new_minter_key_id.to_owned(),
+        );
+        let n = self
+            .write(move |conn| -> Result<usize, rusqlite::Error> {
+                conn.execute(
+                    "UPDATE federation_community_blob_epoch \
+                        SET minter_key_id = ?3 \
+                      WHERE at_rest_sha256 = ?1 AND minter_key_id = ?2",
+                    rusqlite::params![sha, old, new],
+                )
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("rebind_blob_epoch_minter_cas: {e}"))
+            })?;
+        Ok(n == 1)
     }
 
     async fn community_dek_blob_epoch(

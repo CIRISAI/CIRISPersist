@@ -5,6 +5,26 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [61.4.1] - 2026-11-14
+
+A member seated late in a room of three or more could read an earlier message as `seal_mismatch`, permanently (CIRISPersist#1271). This release binds a room message to its author's minter, and heals on read a binding that is already wrong.
+
+### Fixed
+
+- **A late-seated member's node bound an earlier room message to the wrong minter** (CIRISPersist#1271, `FSD/EPOCH_MINTER.md` §2–§3). In a room every member node mints its own epoch. When a blob is adopted with no named minter, `epoch_minter::resolve` derives one from the admitted `key_grant` sets that grant this node a wrap at `(community, epoch)`. With exactly one such set, it took that minter without checking that it acts for the blob's author, so a blob fetched after Bob's grant but before Alice's was bound to Bob, and Alice's later grant never moved it: the #876 repair (`rebind_stranded_blob_epochs`) only rebinds stranded rows, and it rebound them onto whichever minter's set landed next. Three changes:
+  - `resolve` applies the acts-for-author filter (`epoch_minter::acts_for_author`: the candidate is the author, or `principals_of` names the author) to a lone candidate as it already did to several. No survivor falls back to the author, as before, which leaves the row stranded for the repair. A peer minter this node cannot resolve to a person never becomes a candidate: its `key_grant` set is refused at admission (`signer_not_active_member`) until the occurrence lands (I1782).
+  - The stranded repair rebinds a row only onto a minter that acts for that row's author (`federation_blobs.author_key_id`), one row at a time, compare-and-set on the recorded minter. Both backends run one body, `epoch_minter::rebind_stranded_for_authors`.
+  - **Heal on read.** When a `community_dek` read fails AEAD (`SealDidNotOpen`) under the bound minter, `read_for_community_viewer_sealed` tries the viewer's other granted minters at the same `(community, epoch)` that act for the row's author (at most that many; usually one). If exactly one opens the bytes, the binding is moved to it (compare-and-set) and the plaintext returned. Otherwise the read refuses as before and nothing is rebound. A row bound wrongly on a node already in the field heals on its next read, with no re-fetch and no migration. A `NotGranted` refusal is not healed (PR #850's rotated-signer rows still refuse, I66). Chunk-DAG rows are not covered; that and naming the sealer on the signed blob pointer are v62.
+- New `BlobStorage` methods `list_stranded_blob_epochs` and `rebind_blob_epoch_minter_cas` (sqlite and postgres), and the alias `StrandedBlobEpoch`. No migration.
+
+### Adoption notes (CIRISEdge, CIRISServer)
+
+- No call shape changes. `read_for_community_viewer_sealed` gains a `FederationDirectory` bound on its backend; every persist backend meets it and no consumer calls it directly. `BlobStorage` gains two methods with no default body; no consumer implements `BlobStorage`.
+
+### Tested
+
+- I1776–I1782 (`epoch_minter_invariants.rs`, three engines on three separate backends, sqlite and postgres): the late-seat ordering opens; a lone non-author candidate is not chosen; a stranded row is not claimed by a non-author's grant; a wrongly bound row heals on read through both read doors, and a stale compare-and-set is refused; `NotGranted` is not healed; a non-author minter whose DEK opens the bytes is not tried; an unresolved lone candidate is unreachable. Each fix and the compare-and-set guard were reverted by hand and the witnesses went red.
+
 ## [61.4.0] - 2026-11-13
 
 Room moderation for rooms larger than two: a room moderator can take down a message or a file placed in the room (CIRISPersist#1260), and every room duty door is witnessed asking for an appointment, never for membership (CIRISPersist#1195). Large rooms: a key-grant emission folds the room once (a 150-row emission went from 17.8 s to 0.85 s on sqlite), and a newcomer is seated into the current epoch without waiting for a content write (CC C559).
