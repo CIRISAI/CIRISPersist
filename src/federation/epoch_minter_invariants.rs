@@ -1762,13 +1762,17 @@ pub(crate) mod room_1271 {
         assert_eq!(bound(&r.bc, &sha_a).await, r.node_a);
     }
 
-    /// **I1780 — (c) the NotGranted arm.** A row whose binding names a
-    /// minter that never granted the viewer — here a stranded key no repair
-    /// can claim (its author is nobody the room's nodes act for) — refuses
-    /// `NotGranted` at authorization, before any body. When a minter that
-    /// DID grant the viewer opens the bytes, the read heals it; while none
-    /// does, `NotGranted` stands and nothing is rebound.
-    pub(crate) async fn i1780_an_ungranted_binding_heals_on_read<B>(
+    /// **I1780 — (c)'s boundary: an UNGRANTED binding is not healed.** A
+    /// row whose binding names a minter that never granted the viewer —
+    /// here a stranded key no repair can claim (its author is nobody the
+    /// room's nodes act for) — refuses `NotGranted` at authorization, before
+    /// any body, on both read doors, and stays bound as it was: even once a
+    /// minter that DID grant the viewer holds the DEK that would open it. The
+    /// heal is the AEAD arm only, for a viewer the bound minter already
+    /// authorized; reaching past `NotGranted` would re-point a rotated
+    /// signer's rows onto the node's key, which PR #850 ruled must refuse
+    /// (I66).
+    pub(crate) async fn i1780_an_ungranted_binding_is_not_healed<B>(
         dsns: &[String; 3],
         run: &str,
         pick: Pick<B>,
@@ -1859,23 +1863,125 @@ pub(crate) mod room_1271 {
             ghost,
             "I1780: the repair cannot prove Alice's node acts for this row's author"
         );
+        // Alice's node now grants Carol, and its DEK would open both rows.
+        // Neither door reaches past NotGranted, and nothing is re-pointed.
+        let err = r
+            .carol_engine
+            .read_blob_as(&sha_a, &r.node_c, None)
+            .await
+            .expect_err("I1780: an ungranted binding still refuses");
+        assert!(matches!(err, BlobError::NotGranted { .. }), "I1780: {err}");
+        let err = r
+            .carol_engine
+            .read_blob_for_community_viewer(&sha_a2, &r.node_c)
+            .await
+            .expect_err("I1780: and on the community door");
+        assert!(matches!(err, BlobError::NotGranted { .. }), "I1780: {err}");
+        assert_eq!(bound(&r.bc, &sha_a).await, ghost, "I1780: nothing rebound");
+        assert_eq!(bound(&r.bc, &sha_a2).await, ghost, "I1780: nothing rebound");
+        // The bytes ARE Alice's epoch: re-pointed by an authority that can
+        // (here the CAS by hand), they open — so the refusal
+        // above is the boundary, not a broken fixture.
+        assert!(r
+            .bc
+            .rebind_blob_epoch_minter_cas(&sha_a, &ghost, &r.node_a)
+            .await
+            .unwrap());
         assert_eq!(
             r.carol_engine
                 .read_blob_as(&sha_a, &r.node_c, None)
                 .await
-                .expect("I1780: the read heals the ungranted binding and opens"),
+                .expect("fixture: Alice's DEK opens the row"),
             b"ghost bound"
         );
-        assert_eq!(bound(&r.bc, &sha_a).await, r.node_a, "I1780: re-pointed");
-        assert_eq!(bound(&r.bc, &sha_a2).await, ghost);
-        assert_eq!(
+    }
+
+    /// **I1781 — (c) tries only the author's minters.** Bytes SEALED under
+    /// Bob's DEK but attributed to Alice, bound to Alice's node. Carol holds
+    /// both grants, so Bob's DEK WOULD open them — but Bob's node does not act
+    /// for Alice, so it is never tried: the refusal is unchanged and nothing
+    /// is rebound. AEAD proves which key sealed the bytes, not whose bytes
+    /// they are.
+    pub(crate) async fn i1781_a_non_author_minter_is_not_tried<B>(
+        dsns: &[String; 3],
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let r = room(dsns, run, pick).await;
+        let (_sha_a, _bytes_a, a_to_c) = seal(
+            &r.alice_engine,
+            &r.ba,
+            &r.node_a,
+            &r.comm,
+            b"alice's epoch",
+            &r.node_c,
+        )
+        .await;
+        let (sha_b, bytes_b, b_to_c) = seal(
+            &r.bob_engine,
+            &r.bb,
+            &r.node_b,
+            &r.comm,
+            b"sealed by bob, claimed for alice",
+            &r.node_c,
+        )
+        .await;
+        for row in [a_to_c, b_to_c] {
             r.carol_engine
-                .read_blob_for_community_viewer(&sha_a2, &r.node_c)
+                .apply_replicated_key_grant(row)
                 .await
-                .expect("I1780: the community door heals too"),
-            b"ghost bound, community door"
+                .unwrap();
+        }
+        r.carol_engine
+            .adopt_sealed_blob(
+                &bytes_b,
+                provenance(&r.alice, &r.comm, Some(&r.node_a)),
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("bound to Alice's node, attributed to Alice");
+        // Fixture check: Bob's DEK, recovered for Carol, DOES open the bytes.
+        let dek = crate::federation::community_dek::orchestrate::recover_epoch_dek_for_viewer(
+            r.bc.as_ref(),
+            &r.comm,
+            &r.node_b,
+            0,
+            &r.node_c,
+        )
+        .await
+        .expect("Carol holds Bob's wrap");
+        let envelope =
+            crate::federation::at_rest_cascade::AtRestEnvelope::from_bytes(&bytes_b).unwrap();
+        assert_eq!(
+            crate::federation::at_rest_cascade::open(&dek, &envelope, None).unwrap(),
+            b"sealed by bob, claimed for alice",
+            "fixture: a non-author minter's DEK would open these bytes"
         );
-        assert_eq!(bound(&r.bc, &sha_a2).await, r.node_a, "I1780: re-pointed");
+        for _ in 0..2 {
+            let err = r
+                .carol_engine
+                .read_blob_as(&sha_b, &r.node_c, None)
+                .await
+                .expect_err("I1781: a non-author minter's DEK is not tried");
+            assert!(
+                matches!(err, BlobError::SealDidNotOpen { .. }),
+                "I1781: the refusal is unchanged: {err}"
+            );
+        }
+        let err = r
+            .carol_engine
+            .read_blob_for_community_viewer(&sha_b, &r.node_c)
+            .await
+            .expect_err("I1781: nor through the community door");
+        assert!(matches!(err, BlobError::SealDidNotOpen { .. }), "{err}");
+        assert_eq!(
+            bound(&r.bc, &sha_b).await,
+            r.node_a,
+            "I1781: nothing rebound onto a minter that does not act for the author"
+        );
     }
 }
 
@@ -1910,9 +2016,15 @@ mod run_1271 {
                     bodies::i1779_a_wrong_binding_heals_on_read(&d, &super::suffix(), $pick).await
                 }
                 #[tokio::test]
+                async fn i1781() {
+                    let Some(d) = $dsns else { return };
+                    bodies::i1781_a_non_author_minter_is_not_tried(&d, &super::suffix(), $pick)
+                        .await
+                }
+                #[tokio::test]
                 async fn i1780() {
                     let Some(d) = $dsns else { return };
-                    bodies::i1780_an_ungranted_binding_heals_on_read(&d, &super::suffix(), $pick)
+                    bodies::i1780_an_ungranted_binding_is_not_healed(&d, &super::suffix(), $pick)
                         .await
                 }
             }

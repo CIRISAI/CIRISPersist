@@ -1559,14 +1559,6 @@ pub mod orchestrate {
             .community_dek_has_member_grant(&community_key_id, &minter_key_id, epoch, viewer_key_id)
             .await?
         {
-            // #1271 — a wrong binding naming a minter that never
-            // granted this viewer: healed only if the bytes OPEN under a
-            // minter that did.
-            if let Some(plaintext) =
-                heal_unauthorized_read(backend, at_rest_sha256, viewer_key_id, None).await?
-            {
-                return Ok(plaintext);
-            }
             return Err(BlobError::NotGranted {
                 sha256_hex: hex::encode(at_rest_sha256),
                 viewer_key_id: viewer_key_id.to_owned(),
@@ -1652,14 +1644,20 @@ pub mod orchestrate {
     ///
     /// CIRISPersist#1271 — **the read-side heal.** A binding whose
     /// minter was derived wrong (a late-seated member's adopt bound another
-    /// member's epoch) refuses here as [`BlobError::SealDidNotOpen`] — or as
-    /// `NotGranted`, where the wrong minter never granted this viewer — for
-    /// ever, because the stranded repair does not re-point a minter that
-    /// holds state. On either refusal [`heal_binding_by_open`] tries the
-    /// viewer's OTHER granted minters at the row's `(community, epoch)`; the
-    /// one whose DEK OPENS the bytes is, by AEAD, the minter that sealed them.
-    /// The binding is re-pointed (compare-and-set) and the plaintext
-    /// returned. When none opens, the original refusal stands, unchanged.
+    /// member's epoch, and that member granted this viewer too) passes
+    /// authorization and then refuses here as [`BlobError::SealDidNotOpen`]
+    /// for ever: the stranded repair does not re-point a minter that holds
+    /// state. On that refusal [`heal_binding_by_open`] tries the viewer's
+    /// OTHER granted minters at the row's `(community, epoch)` that act for
+    /// the row's author; the one whose
+    /// DEK OPENS the bytes is, by AEAD, the minter that sealed them. The
+    /// binding is re-pointed (compare-and-set) and the plaintext returned.
+    /// When none opens, the refusal stands, unchanged.
+    ///
+    /// `NotGranted` is NOT healed: a binding naming a minter that never
+    /// granted this viewer refuses before any open, as PR #850 ruled for a
+    /// rotated signer's rows (I66) — the AEAD arm heals only a viewer the
+    /// bound minter already authorized.
     pub async fn read_for_community_viewer_sealed<B>(
         backend: &B,
         at_rest_sha256: &[u8; 32],
@@ -1668,16 +1666,14 @@ pub mod orchestrate {
         aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, BlobError>
     where
-        B: BlobStorage + Sync,
+        B: BlobStorage + FederationDirectory + Sync,
     {
-        let opened = match community_dek_for_viewer(backend, at_rest_sha256, viewer_key_id).await {
-            Ok(dek) => open(&dek, envelope, aad).map_err(
-                crate::federation::at_rest_cascade::open_err(at_rest_sha256, map_at_rest_err),
-            ),
-            Err(e) => Err(e),
-        };
-        match opened {
-            Err(e @ (BlobError::SealDidNotOpen { .. } | BlobError::NotGranted { .. })) => {
+        let dek = community_dek_for_viewer(backend, at_rest_sha256, viewer_key_id).await?;
+        match open(&dek, envelope, aad).map_err(crate::federation::at_rest_cascade::open_err(
+            at_rest_sha256,
+            map_at_rest_err,
+        )) {
+            Err(e @ BlobError::SealDidNotOpen { .. }) => {
                 match heal_binding_by_open(backend, at_rest_sha256, viewer_key_id, envelope, aad)
                     .await?
                 {
@@ -1689,61 +1685,28 @@ pub mod orchestrate {
         }
     }
 
-    /// CIRISPersist#1271 — the heal for a door that refused
-    /// `NotGranted` BEFORE touching the body (authorization runs first,
-    /// §11.3): a binding that names a minter which never granted this viewer
-    /// — a stranded author fallback, or another member's epoch — while a
-    /// minter at the same `(community, epoch)` did. Cheap for a stranger: no
-    /// other granted minter, no body read. The body is read only when a
-    /// candidate exists, and [`heal_binding_by_open`] decides by AEAD. A body
-    /// that is absent, external or not an envelope heals nothing (`None`):
-    /// the caller's refusal stands.
-    pub(crate) async fn heal_unauthorized_read<B>(
-        backend: &B,
-        at_rest_sha256: &[u8; 32],
-        viewer_key_id: &str,
-        aad: Option<&[u8]>,
-    ) -> Result<Option<Vec<u8>>, BlobError>
-    where
-        B: BlobStorage + Sync,
-    {
-        let Some(binding) = backend.community_dek_blob_binding(at_rest_sha256).await? else {
-            return Ok(None);
-        };
-        if binding.evicted_at.is_some() {
-            return Ok(None);
-        }
-        if !backend
-            .community_dek_minters_granting(&binding.community_key_id, binding.epoch, viewer_key_id)
-            .await?
-            .iter()
-            .any(|m| *m != binding.minter_key_id)
-        {
-            return Ok(None);
-        }
-        let Some(BlobBody::Inline(bytes)) = backend.get_blob(at_rest_sha256).await? else {
-            return Ok(None);
-        };
-        let Ok(envelope) = AtRestEnvelope::from_bytes(&bytes) else {
-            return Ok(None);
-        };
-        heal_binding_by_open(backend, at_rest_sha256, viewer_key_id, &envelope, aad).await
-    }
-
     /// CIRISPersist#1271 — **heal a wrong epoch binding by AEAD.**
     ///
-    /// The candidates are the minters that granted `viewer_key_id` a wrap at
-    /// the row's `(community, epoch)`
+    /// FILTER FIRST, THEN TRY. The candidates are the minters that granted
+    /// `viewer_key_id` a wrap at the row's `(community, epoch)`
     /// ([`community_dek_minters_granting`](BlobStorage::community_dek_minters_granting)),
-    /// less the minter the row already names. That set includes this node's
-    /// own minted epoch whenever the node wrapped it to the viewer, which its
-    /// cascade does for every member occurrence; an epoch this node minted
-    /// but never wrapped to the viewer is not the viewer's to open by this
-    /// read, so it is not a candidate. Each candidate's DEK is recovered for
-    /// the viewer ([`recover_epoch_dek_for_viewer`]: self-retention, or the
-    /// viewer's own wrap) and the envelope opened under it. The attempts are
-    /// bounded by the candidate count; a candidate whose DEK cannot be
-    /// recovered is skipped, never an error.
+    /// less the minter the row already names, AND only those that act for the
+    /// row's recorded author
+    /// ([`acts_for_author`](crate::federation::epoch_minter::acts_for_author):
+    /// the same predicate the derivation and the stranded repair ask). A row
+    /// with no recorded author has no candidates. The grant set includes this
+    /// node's own minted epoch whenever the node wrapped it to the viewer,
+    /// which its cascade does for every member occurrence. Each candidate's
+    /// DEK is recovered for the viewer ([`recover_epoch_dek_for_viewer`]:
+    /// self-retention, or the viewer's own wrap) and the envelope opened under
+    /// it; a candidate whose DEK cannot be recovered is skipped, never an
+    /// error.
+    ///
+    /// **The trial bound**: at most |minters that act for the author and
+    /// grant the viewer at `(community, epoch)`| opens, usually ONE (the
+    /// author's node, or nodes). Bytes that would open only under a
+    /// NON-author minter's DEK are not tried, not rebound, and the caller's
+    /// refusal stands exactly as before.
     ///
     /// - Exactly ONE candidate opens → AEAD has authenticated that minter's
     ///   DEK as the one that sealed these bytes. The binding is re-pointed by
@@ -1764,7 +1727,7 @@ pub mod orchestrate {
         aad: Option<&[u8]>,
     ) -> Result<Option<Vec<u8>>, BlobError>
     where
-        B: BlobStorage + Sync,
+        B: BlobStorage + FederationDirectory + Sync,
     {
         let Some(binding) = backend.community_dek_blob_binding(at_rest_sha256).await? else {
             return Ok(None);
@@ -1772,11 +1735,26 @@ pub mod orchestrate {
         if binding.evicted_at.is_some() {
             return Ok(None);
         }
-        let candidates = backend
+        let Some(author) = backend
+            .blob_provenance(at_rest_sha256)
+            .await?
+            .and_then(|p| p.author_key_id)
+        else {
+            return Ok(None);
+        };
+        let mut candidates = Vec::new();
+        for c in backend
             .community_dek_minters_granting(&binding.community_key_id, binding.epoch, viewer_key_id)
-            .await?;
+            .await?
+        {
+            if c != binding.minter_key_id
+                && crate::federation::epoch_minter::acts_for_author(backend, &c, &author).await?
+            {
+                candidates.push(c);
+            }
+        }
         let mut opened: Vec<(String, Vec<u8>)> = Vec::new();
-        for candidate in candidates.iter().filter(|c| **c != binding.minter_key_id) {
+        for candidate in &candidates {
             let Ok(dek) = recover_epoch_dek_for_viewer(
                 backend,
                 &binding.community_key_id,

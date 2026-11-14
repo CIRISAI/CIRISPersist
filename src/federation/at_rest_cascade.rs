@@ -3202,35 +3202,7 @@ pub mod orchestrate {
         // 2. AUTHORIZE BY TIER, BEFORE TOUCHING THE BODY. (§11.3) The
         //    decision lives above the dispatch so a new tier cannot skip it.
         //    A refusal names only the sha and the viewer.
-        if let Err(refusal) =
-            authorize_viewer_by_tier(backend, at_rest_sha256, tier, viewer_key_id).await
-        {
-            // CIRISPersist#1271 — a community row whose binding
-            // names a minter that never granted this viewer (a stranded
-            // author fallback, or another member's epoch) is healed only when
-            // the bytes OPEN under a minter at the same (community, epoch)
-            // that did. AEAD is the authorization: that minter granted the
-            // viewer, and its DEK sealed these bytes. Otherwise the refusal
-            // stands as it was. A chunk DAG is not healed here.
-            if tier == CryptoTier::CommunityDek
-                && head.storage_kind != "chunk_dag"
-                && matches!(refusal, BlobError::NotGranted { .. })
-            {
-                if let Some(plaintext) =
-                    crate::federation::community_dek::orchestrate::heal_unauthorized_read(
-                        backend,
-                        at_rest_sha256,
-                        viewer_key_id,
-                        aad,
-                    )
-                    .await?
-                {
-                    refuse_if_withdrawn(backend, at_rest_sha256).await?;
-                    return Ok(plaintext);
-                }
-            }
-            return Err(refusal);
-        }
+        authorize_viewer_by_tier(backend, at_rest_sha256, tier, viewer_key_id).await?;
         // 2½. CC 2.3 AT THE BYTES PLANE (v47.2.0, #853): after authorization
         //    (a stranger is NotGranted and learns nothing), before the body.
         refuse_if_withdrawn(backend, at_rest_sha256).await?;
