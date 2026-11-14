@@ -1262,6 +1262,21 @@ pub(crate) mod room_1271 {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
+        room_with(dsns, run, pick, true).await
+    }
+
+    /// [`room`], with `alice_occurs_on_carol = false` leaving Carol's node
+    /// WITHOUT the record that Alice occurs through node A: Alice is on
+    /// Carol's roster but node A resolves to no human there.
+    pub(crate) async fn room_with<B>(
+        dsns: &[String; 3],
+        run: &str,
+        pick: Pick<B>,
+        alice_occurs_on_carol: bool,
+    ) -> Room<B>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
         let aliases = [
             format!("r1271-a-{run}"),
             format!("r1271-b-{run}"),
@@ -1311,8 +1326,13 @@ pub(crate) mod room_1271 {
             format!("r1271-bob-{run}"),
             format!("r1271-carol-{run}"),
         );
+        let seats_alice = if alice_occurs_on_carol {
+            &refs[..]
+        } else {
+            &refs[..2]
+        };
         seed_community_everywhere(
-            &refs,
+            seats_alice,
             &comm,
             &[
                 (&alice, Some(refs[0])),
@@ -1321,6 +1341,18 @@ pub(crate) mod room_1271 {
             ],
         )
         .await;
+        if !alice_occurs_on_carol {
+            seed_community_everywhere(
+                &refs[2..],
+                &comm,
+                &[
+                    (&alice, None),
+                    (&bob, Some(refs[1])),
+                    (&carol, Some(refs[2])),
+                ],
+            )
+            .await;
+        }
         let (node_a, node_b, node_c) = (
             nodes[0].key.clone(),
             nodes[1].key.clone(),
@@ -1983,6 +2015,113 @@ pub(crate) mod room_1271 {
             "I1781: nothing rebound onto a minter that does not act for the author"
         );
     }
+
+    /// **I1782 — an unresolved lone candidate is unreachable.** (a) falls
+    /// back to the author for a lone candidate that does not act for the
+    /// author. The v61.4.0 answer would differ only for a candidate this node
+    /// resolves to NO human — and no such candidate can exist: a peer's
+    /// epoch row is admitted only if its signer is an active member
+    /// occurrence of the room (`key_grant::is_active_member_at`, read through
+    /// the same occurrence / owner records `principals_of` folds).
+    ///
+    /// Carol's node holds Alice on the roster but not the record that Alice
+    /// occurs through node A. Node A's grant is REFUSED, retryably, so it is
+    /// no candidate; the unnamed adopt strands on the author. When the
+    /// occurrence lands and the row is re-offered, it is admitted, the
+    /// strict repair rebinds the row (node A now acts for Alice), and the
+    /// read opens — nothing was lost by not guessing.
+    pub(crate) async fn i1782_an_unresolved_lone_candidate_is_unreachable<B>(
+        dsns: &[String; 3],
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let r = room_with(dsns, run, pick, false).await;
+        assert_eq!(
+            crate::federation::self_collective::principals_of(r.bc.as_ref(), &r.node_a)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|p| *p != r.node_a)
+                .count(),
+            0,
+            "fixture: node A resolves to no human on Carol's node"
+        );
+        let (sha_a, bytes_a, a_to_c) = seal(
+            &r.alice_engine,
+            &r.ba,
+            &r.node_a,
+            &r.comm,
+            b"alice, node unresolved on carol",
+            &r.node_c,
+        )
+        .await;
+        let err = r
+            .carol_engine
+            .apply_replicated_key_grant(a_to_c.clone())
+            .await
+            .expect_err("I1782: an unresolved node's epoch row is not admitted");
+        assert!(
+            matches!(
+                &err,
+                crate::federation::Error::KeyGrantRefused { reason, .. }
+                    if *reason == "signer_not_active_member"
+            ),
+            "I1782: refused as signer_not_active_member: {err}"
+        );
+        assert!(
+            r.bc.community_dek_minters_granting(&r.comm, 0, &r.node_c)
+                .await
+                .unwrap()
+                .is_empty(),
+            "I1782: so it is no candidate"
+        );
+        r.carol_engine
+            .adopt_sealed_blob(
+                &bytes_a,
+                provenance(&r.alice, &r.comm, None),
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("Carol adopts Alice's bytes");
+        assert_eq!(bound(&r.bc, &sha_a).await, r.alice, "I1782: stranded");
+        // The occurrence lands (the same record the other nodes hold).
+        let kem_a = r.ba.load_or_init_content_kem_identity().await.unwrap();
+        r.bc.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            identity_key_id: r.alice.clone(),
+            occurrence_key_id: r.node_a.clone(),
+            device_class: crate::federation::types::device_class::LAPTOP.into(),
+            hardware_attestation: None,
+            asserted_at: chrono::Utc::now() - chrono::Duration::minutes(5),
+            valid_until: None,
+            encryption_pubkeys: Some(EncryptionPubkeys {
+                x25519_base64: kem_a.x25519_pubkey_b64,
+                ml_kem_768_base64: kem_a.ml_kem_768_pubkey_b64,
+            }),
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        })
+        .await
+        .unwrap();
+        r.carol_engine
+            .apply_replicated_key_grant(a_to_c)
+            .await
+            .expect("I1782: re-offered after the occurrence, admitted");
+        assert_eq!(
+            bound(&r.bc, &sha_a).await,
+            r.node_a,
+            "I1782: the strict repair rebinds it"
+        );
+        assert_eq!(
+            r.carol_engine
+                .read_blob_as(&sha_a, &r.node_c, None)
+                .await
+                .expect("I1782: the read opens"),
+            b"alice, node unresolved on carol"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2014,6 +2153,16 @@ mod run_1271 {
                 async fn i1779() {
                     let Some(d) = $dsns else { return };
                     bodies::i1779_a_wrong_binding_heals_on_read(&d, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i1782() {
+                    let Some(d) = $dsns else { return };
+                    bodies::i1782_an_unresolved_lone_candidate_is_unreachable(
+                        &d,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
                 }
                 #[tokio::test]
                 async fn i1781() {
