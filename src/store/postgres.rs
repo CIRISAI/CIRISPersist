@@ -17565,15 +17565,35 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .collect()
     }
 
-    /// v46.0.0 (#876, FSD/EPOCH_MINTER.md §3) — the sqlite twin of the
+    /// v46.0.0 (#876, FSD/EPOCH_MINTER.md §3) — the postgres twin of the
     /// repair: rebind only the STRANDED rows (recorded minter holds neither
     /// DEK state nor a grant at this community and epoch).
+    ///
+    /// #1271 — and only onto a minter that acts for the row's
+    /// author: the one body both backends run.
     async fn rebind_stranded_blob_epochs(
         &self,
         community_key_id: &str,
         minter_key_id: &str,
         epoch: u64,
     ) -> Result<usize, crate::federation::BlobError> {
+        crate::federation::epoch_minter::rebind_stranded_for_authors(
+            self,
+            community_key_id,
+            minter_key_id,
+            epoch,
+        )
+        .await
+    }
+
+    /// #1271 — the postgres twin: the stranded rows at
+    /// `(community, epoch)` with their authors, the v46 predicate as a SELECT.
+    async fn list_stranded_blob_epochs(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+    ) -> Result<Vec<crate::federation::blobs::StrandedBlobEpoch>, crate::federation::BlobError>
+    {
         let client = self
             .get_client()
             .await
@@ -17581,27 +17601,71 @@ impl crate::federation::BlobStorage for PostgresBackend {
         let e = i64::try_from(epoch).map_err(|_| {
             crate::federation::BlobError::InvalidArgument("epoch exceeds i64".into())
         })?;
-        let n = client
-            .execute(
-                "UPDATE cirislens.federation_community_blob_epoch b \
-                    SET minter_key_id = $2 \
-                  WHERE b.community_key_id = $1 AND b.epoch = $3 AND b.minter_key_id <> $2 \
+        let rows = client
+            .query(
+                "SELECT be.at_rest_sha256, be.minter_key_id, b.author_key_id \
+                   FROM cirislens.federation_community_blob_epoch be \
+                   LEFT JOIN cirislens.federation_blobs b ON b.sha256 = be.at_rest_sha256 \
+                  WHERE be.community_key_id = $1 AND be.epoch = $2 \
                     AND NOT EXISTS (SELECT 1 FROM cirislens.federation_community_dek d \
-                                     WHERE d.community_key_id = b.community_key_id \
-                                       AND d.minter_key_id = b.minter_key_id \
-                                       AND d.epoch = b.epoch) \
+                                     WHERE d.community_key_id = be.community_key_id \
+                                       AND d.minter_key_id = be.minter_key_id \
+                                       AND d.epoch = be.epoch) \
                     AND NOT EXISTS (SELECT 1 FROM cirislens.federation_community_dek_member_grants g \
-                                     WHERE g.community_key_id = b.community_key_id \
-                                       AND g.minter_key_id = b.minter_key_id \
-                                       AND g.epoch = b.epoch)",
-                &[&community_key_id, &minter_key_id, &e],
+                                     WHERE g.community_key_id = be.community_key_id \
+                                       AND g.minter_key_id = be.minter_key_id \
+                                       AND g.epoch = be.epoch) \
+                  ORDER BY be.at_rest_sha256 ASC",
+                &[&community_key_id, &e],
             )
             .await
             .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("rebind_stranded_blob_epochs: {e}"))
+                crate::federation::BlobError::Backend(format!("list_stranded_blob_epochs: {e}"))
             })?;
-        usize::try_from(n)
-            .map_err(|_| crate::federation::BlobError::Backend("rebind count exceeds usize".into()))
+        rows.iter()
+            .map(|r| {
+                let sha: Vec<u8> =
+                    r.safe_get_with("at_rest_sha256", crate::federation::BlobError::Backend)?;
+                let sha: [u8; 32] = sha.as_slice().try_into().map_err(|_| {
+                    crate::federation::BlobError::Backend(format!(
+                        "list_stranded_blob_epochs: at_rest_sha256 is {} bytes, not 32",
+                        sha.len()
+                    ))
+                })?;
+                let minter: String =
+                    r.safe_get_with("minter_key_id", crate::federation::BlobError::Backend)?;
+                let author: Option<String> =
+                    r.safe_get_with("author_key_id", crate::federation::BlobError::Backend)?;
+                Ok((sha, minter, author))
+            })
+            .collect()
+    }
+
+    /// #1271 — the postgres twin: re-point one binding,
+    /// compare-and-set on the recorded minter.
+    async fn rebind_blob_epoch_minter_cas(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        expected_minter_key_id: &str,
+        new_minter_key_id: &str,
+    ) -> Result<bool, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let sha = at_rest_sha256.as_slice();
+        let n = client
+            .execute(
+                "UPDATE cirislens.federation_community_blob_epoch \
+                    SET minter_key_id = $3 \
+                  WHERE at_rest_sha256 = $1 AND minter_key_id = $2",
+                &[&sha, &expected_minter_key_id, &new_minter_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("rebind_blob_epoch_minter_cas: {e}"))
+            })?;
+        Ok(n == 1)
     }
 
     async fn community_dek_blob_epoch(

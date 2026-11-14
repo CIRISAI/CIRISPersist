@@ -661,7 +661,13 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("community_dek_minters_granting", ConnClass::Read),
     // v50.0.0 (#916) — what a member holds: a plain SELECT on the reader path.
     ("community_dek_member_grant_epochs", ConnClass::Read),
-    ("rebind_stranded_blob_epochs", ConnClass::Write),
+    // #1271 — `rebind_stranded_blob_epochs` no longer touches a
+    // connection: it runs the shared author-checked repair
+    // (`epoch_minter::rebind_stranded_for_authors`), which lists the
+    // stranded rows (a plain SELECT on the reader path) and re-points each
+    // with one guarded compare-and-set UPDATE on the writer's.
+    ("list_stranded_blob_epochs", ConnClass::Read),
+    ("rebind_blob_epoch_minter_cas", ConnClass::Write),
     // v46.3.0 (#884) — the content-axis half of `minter_of_blob` is one
     // SELECT on the reader path (the community half delegates to
     // `community_dek_blob_epoch`, itself Read).
