@@ -5,7 +5,7 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
-## [61.4.1] - UNRELEASED
+## [61.4.1] - 2026-11-14
 
 A member seated late in a room of three or more could read an earlier message as `seal_mismatch`, permanently (CIRISPersist#1271). This release binds a room message to its author's minter, and heals on read a binding that is already wrong.
 
