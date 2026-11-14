@@ -1665,6 +1665,26 @@ pub(crate) mod room_1271 {
             .await
             .expect("the pre-#1271 state: bound to Bob's node");
         assert_eq!(bound(&r.bc, &sha_a).await, r.node_b);
+        // A second Alice row in the same state, healed through the OTHER
+        // production read door (`read_blob_for_community_viewer`).
+        let (sha_a2, bytes_a2, _) = seal(
+            &r.alice_engine,
+            &r.ba,
+            &r.node_a,
+            &r.comm,
+            b"bound wrong, community door",
+            &r.node_c,
+        )
+        .await;
+        r.carol_engine
+            .adopt_sealed_blob(
+                &bytes_a2,
+                provenance(&r.alice, &r.comm, Some(&r.node_b)),
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .unwrap();
 
         // NEGATIVE first: Carol holds only Bob's grant. Nothing opens these
         // bytes, so the refusal stands and the row is untouched.
@@ -1704,6 +1724,25 @@ pub(crate) mod room_1271 {
             r.node_a,
             "I1779: the binding is re-pointed to the minter AEAD proved"
         );
+        let healed = r
+            .carol_engine
+            .read_blob_for_community_viewer(&sha_a2, &r.node_c)
+            .await;
+        assert_eq!(
+            healed.expect("I1779: the community door heals too"),
+            b"bound wrong, community door"
+        );
+        assert_eq!(bound(&r.bc, &sha_a2).await, r.node_a, "I1779: re-pointed");
+        // The compare-and-set refuses a stale expectation: the row names
+        // Alice's node now, so "if it still names Bob's" changes nothing.
+        assert!(
+            !r.bc
+                .rebind_blob_epoch_minter_cas(&sha_a, &r.node_b, "r1271-nobody")
+                .await
+                .unwrap(),
+            "I1779: a CAS on a stale minter is refused"
+        );
+        assert_eq!(bound(&r.bc, &sha_a).await, r.node_a);
         // Healed for good: the next read takes the ordinary path.
         assert_eq!(
             r.carol_engine
@@ -1772,6 +1811,24 @@ pub(crate) mod room_1271 {
             )
             .await
             .expect("bound to a minter that holds nothing");
+        let (sha_a2, bytes_a2, _) = seal(
+            &r.alice_engine,
+            &r.ba,
+            &r.node_a,
+            &r.comm,
+            b"ghost bound, community door",
+            &r.node_c,
+        )
+        .await;
+        r.carol_engine
+            .adopt_sealed_blob(
+                &bytes_a2,
+                provenance(&ghost_author, &r.comm, Some(&ghost)),
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .unwrap();
         r.carol_engine
             .apply_replicated_key_grant(b_to_c)
             .await
@@ -1810,6 +1867,15 @@ pub(crate) mod room_1271 {
             b"ghost bound"
         );
         assert_eq!(bound(&r.bc, &sha_a).await, r.node_a, "I1780: re-pointed");
+        assert_eq!(bound(&r.bc, &sha_a2).await, ghost);
+        assert_eq!(
+            r.carol_engine
+                .read_blob_for_community_viewer(&sha_a2, &r.node_c)
+                .await
+                .expect("I1780: the community door heals too"),
+            b"ghost bound, community door"
+        );
+        assert_eq!(bound(&r.bc, &sha_a2).await, r.node_a, "I1780: re-pointed");
     }
 }
 
