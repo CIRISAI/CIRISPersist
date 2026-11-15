@@ -1063,6 +1063,20 @@ required-features = ["encrypted-kv"]
 name = "projection"
 harness = false
 
+# Pre-kernel baseline (CIRISKernel PR #1, ADOPTING.md) — the persist paths
+# the kernel crate replaces, measured before the move so the same benches
+# re-run with `--baseline pre-kernel` after it. See BENCHMARKS-pre-kernel.md.
+# `consensus_eval` is pure compute (no features); `kernel_paths` drives the
+# sqlite store through the `test-anchor` fixture surface (synthetic keys).
+[[bench]]
+name = "consensus_eval"
+harness = false
+
+[[bench]]
+name = "kernel_paths"
+harness = false
+required-features = ["sqlite", "test-anchor"]
+
 # v1.10.0 — keep `target/` from ballooning. The full debuginfo
 # (`debug = 2`, the default) is the dominant cost in dev/test builds,
 # and this crate's dep graph is large (pyo3 + the CIRISVerify stack +
