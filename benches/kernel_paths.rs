@@ -69,10 +69,16 @@ use serde_json::json;
 
 /// Row counts for the store-size sweeps.
 const ROW_SIZES: [usize; 3] = [1_000, 16_000, 64_000];
-/// Row counts for the admission-door sweep under criterion. 64k runs once,
-/// in the peak-RSS mode (one pass is ~a minute; ten samples per order would
-/// not fit the run).
-const ADMISSION_SIZES: [usize; 2] = [1_000, 16_000];
+/// Row counts for the admission-door sweep under criterion. 16k and 64k run
+/// as ONE pass each, in the peak-RSS mode: criterion's floor of ten samples
+/// is eleven passes, and on the shared host one pass was 20-35 s at 16k and
+/// up to 36 s at 4k (reversed, under load), so a criterion run of one order
+/// above 1k did not fit a ten-minute command.
+const ADMISSION_SIZES: [usize; 1] = [1_000];
+/// Row counts for the fold sweep under criterion. 64k runs as ONE pass in
+/// the peak-RSS mode (`folds:64000`): its fixture alone is 64k admissions,
+/// and the guardianship fold at 64k is ~15-20 s per pass on the shared host.
+const FOLD_SIZES: [usize; 2] = [1_000, 16_000];
 /// Edges per delegation chain in the admission workload.
 const CHAIN_LEN: usize = 8;
 /// Fixed seed for the shuffled arrival order.
@@ -600,6 +606,32 @@ async fn version_family(
     prev: Option<&str>,
     name: &str,
 ) -> Result<u32, Error> {
+    let v = prepare_version(d, family_key_id, signers, prev, name).await?;
+    submit_version(d, &v).await
+}
+
+/// A signed, quorum-authorized family version, ready to submit (signing is
+/// done here, outside any timed region).
+#[derive(Clone)]
+struct PreparedVersion {
+    signed: ciris_persist::federation::SignedFamily,
+    env: serde_json::Value,
+    sigs: Vec<ciris_verify_core::threshold::ThresholdSignature>,
+}
+
+async fn submit_version(d: &dyn FederationDirectory, v: &PreparedVersion) -> Result<u32, Error> {
+    let v = v.clone();
+    d.supersede_family_with_quorum(v.signed, v.env, v.sigs)
+        .await
+}
+
+async fn prepare_version(
+    d: &dyn FederationDirectory,
+    family_key_id: &str,
+    signers: &[String],
+    prev: Option<&str>,
+    name: &str,
+) -> Result<PreparedVersion, Error> {
     let held = d
         .lookup_family(family_key_id)
         .await?
@@ -624,8 +656,11 @@ async fn version_family(
         .iter()
         .map(|k| ts::threshold_sign(k, &bytes))
         .collect();
-    d.supersede_family_with_quorum(ts::sign_family(&signers[0], next), env, sigs)
-        .await
+    Ok(PreparedVersion {
+        signed: ts::sign_family(&signers[0], next),
+        env,
+        sigs,
+    })
 }
 
 const LINEAGE_LENGTHS: [usize; 3] = [1, 16, 128];
@@ -635,6 +670,8 @@ struct LineageFixture {
     holders: Vec<String>,
     /// The founding version's row hash (a fork names it as its prior).
     root_hash: String,
+    /// The held head's parent's row hash.
+    parent_hash: String,
 }
 
 const BENCH_FAMILY: &str = "bench-lineage-family";
@@ -657,7 +694,14 @@ async fn lineage_fixture(len: usize) -> LineageFixture {
         .unwrap()
         .unwrap()
         .persist_row_hash;
+    let mut parent_hash = root_hash.clone();
     for v in 0..len {
+        parent_hash = d
+            .lookup_family(BENCH_FAMILY)
+            .await
+            .unwrap()
+            .unwrap()
+            .persist_row_hash;
         version_family(d, BENCH_FAMILY, &holders, None, &format!("lineage v{v}"))
             .await
             .unwrap_or_else(|e| panic!("lineage version {v}: {e}"));
@@ -666,6 +710,7 @@ async fn lineage_fixture(len: usize) -> LineageFixture {
         store,
         holders,
         root_hash,
+        parent_hash,
     }
 }
 
@@ -679,30 +724,31 @@ fn bench_held_head(c: &mut Criterion) {
         // A forked version: a valid, quorum-signed version whose prior is the
         // founding version, not the held head. The door refuses it (persist's
         // `held_head_verdict`; the kernel holds it as a second tip).
-        group.bench_function(BenchmarkId::new("fork_refused", len), |b| {
-            let f = fx();
-            let d: &dyn FederationDirectory = &f.store.backend;
-            let r = rt.block_on(version_family(
-                d,
-                BENCH_FAMILY,
-                &f.holders,
-                Some(&f.root_hash),
-                "fork",
-            ));
-            assert!(r.is_err(), "a fork off the root is refused: {r:?}");
-            b.iter(|| {
-                black_box(
-                    rt.block_on(version_family(
+        // Two forks, each signed up front: off the founding version, and off
+        // the held head's parent (a stale prior one version back).
+        for (case, prior) in [("fork_from_root", 0usize), ("fork_from_parent", 1)] {
+            group.bench_function(BenchmarkId::new(case, len), |b| {
+                let f = fx();
+                let d: &dyn FederationDirectory = &f.store.backend;
+                let prev = if prior == 0 {
+                    f.root_hash.clone()
+                } else {
+                    f.parent_hash.clone()
+                };
+                let v = rt
+                    .block_on(prepare_version(
                         d,
                         BENCH_FAMILY,
                         &f.holders,
-                        Some(&f.root_hash),
-                        "fork",
+                        Some(&prev),
+                        case,
                     ))
-                    .is_err(),
-                )
+                    .expect("prepare fork");
+                let r = rt.block_on(submit_version(d, &v));
+                assert!(r.is_err(), "{case}: the fork is refused: {r:?}");
+                b.iter(|| black_box(rt.block_on(submit_version(d, &v)).is_err()));
             });
-        });
+        }
     }
     group.finish();
 }
@@ -1100,7 +1146,7 @@ fn bench_fold_recompute(c: &mut Criterion) {
     group.sample_size(10);
     group.sampling_mode(SamplingMode::Flat);
     group.warm_up_time(Duration::from_millis(1));
-    for n in ROW_SIZES {
+    for n in FOLD_SIZES {
         let cell: OnceCell<FoldFixture> = OnceCell::new();
         let fx = || cell.get_or_init(|| rt.block_on(fold_fixture(n)));
         group.throughput(Throughput::Elements(n as u64));
