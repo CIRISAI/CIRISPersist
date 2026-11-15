@@ -212,7 +212,7 @@ where
                 local,
                 &sha256,
                 uuid::Uuid::new_v4(),
-                chrono::Utc::now(),
+                crate::host::clock::now(),
                 envelope.len() as u64,
                 &scope,
             )

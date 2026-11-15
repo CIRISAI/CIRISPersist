@@ -155,7 +155,7 @@ impl SweepReport {
 /// — never by [`Engine::from_shared`] (cohabitation views must not
 /// duplicate the sweeper).
 pub struct EvictionSweeper {
-    join_handle: tokio::task::JoinHandle<()>,
+    join_handle: crate::host::TaskHandle,
     shutdown: std::sync::Arc<tokio::sync::Notify>,
 }
 
@@ -163,7 +163,7 @@ impl EvictionSweeper {
     /// Construct from a freshly-spawned join handle + the shutdown
     /// notifier the spawned task awaits.
     pub fn new(
-        join_handle: tokio::task::JoinHandle<()>,
+        join_handle: crate::host::TaskHandle,
         shutdown: std::sync::Arc<tokio::sync::Notify>,
     ) -> Self {
         Self {
@@ -175,7 +175,7 @@ impl EvictionSweeper {
     /// Signal the sweeper to stop. The spawned task drops out of its
     /// loop on the next `sweep_interval` tick or immediately if it's
     /// currently sleeping.
-    pub fn stop(self) -> tokio::task::JoinHandle<()> {
+    pub fn stop(self) -> crate::host::TaskHandle {
         self.shutdown.notify_one();
         self.join_handle
     }

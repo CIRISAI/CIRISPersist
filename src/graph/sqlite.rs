@@ -545,7 +545,7 @@ impl GraphService for SqliteGraphBackend {
                     .map_err(|e| map_sqlite_error(e, "delete_node"))?;
                 Ok(n > 0)
             } else {
-                let now = fmt_datetime(chrono::Utc::now());
+                let now = fmt_datetime(crate::host::clock::now());
                 let n = guard
                     .execute(
                         "UPDATE cirisgraph_nodes SET \

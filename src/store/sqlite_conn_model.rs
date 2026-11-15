@@ -184,7 +184,7 @@ pub fn default_reader_count() -> usize {
 ///
 /// A free list under a `parking_lot::Mutex` plus a `Condvar`; `acquire`
 /// blocks the calling thread until a connection is free, which is why it
-/// is only ever called from inside [`dispatch_blocking`]'s closure. No
+/// is only ever called from inside [`dispatch_blocking`](crate::host::rt::dispatch_blocking)'s closure. No
 /// tokio primitive is involved so it works with no runtime on the thread.
 ///
 /// `size() == 0` is the in-memory / borrowed-handle case (FSD §4): there is
@@ -361,34 +361,10 @@ impl Drop for ReadGuard<'_> {
 
 // ── the dispatcher ────────────────────────────────────────────────────────
 
-/// Run `f` off the async runtime when there is one, inline when there is
-/// not (FSD §3.3).
-///
-/// `Handle::try_current()` is the same thread-local read
-/// `tokio::task::spawn_blocking` performs, but it returns `Err` where
-/// `spawn_blocking` panics with `there is no reactor running`. That is the
-/// whole of CIRISPersist#158's concern, answered: a cohabiting consumer's
-/// statically-linked copy of persist on a foreign worker takes the inline
-/// arm, exactly as v3.14.0 → v43.0.0 always did.
-///
-/// A panic inside `f` is re-raised on the caller (`resume_unwind`) so the
-/// observable behaviour matches the inline arm. A join cancelled by runtime
-/// shutdown has no value to return; it panics naming the cause, and the
-/// caller's task is being torn down regardless.
-pub async fn dispatch_blocking<R, F>(f: F) -> R
-where
-    R: Send + 'static,
-    F: FnOnce() -> R + Send + 'static,
-{
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => match handle.spawn_blocking(f).await {
-            Ok(r) => r,
-            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-            Err(e) => panic!("sqlite blocking task cancelled by runtime shutdown: {e}"),
-        },
-        Err(_) => f(),
-    }
-}
+// v62.0.0 (slice A, P5) — the dispatcher moved to the executor seam,
+// [`crate::host::rt::dispatch_blocking`], with the same two arms (the running
+// runtime's blocking pool, inline with no runtime) plus the single-thread
+// profile's third: inline, always.
 
 // ── the write transaction ─────────────────────────────────────────────────
 

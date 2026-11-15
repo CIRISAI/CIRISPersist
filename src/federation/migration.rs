@@ -1502,7 +1502,7 @@ async fn build_restamped(
                 )
             })?;
             next.scrub_timestamp =
-                super::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+                super::admission::truncate_to_substrate_resolution(crate::host::clock::now());
             // DEFENCE IN DEPTH. `classify` already refuses to re-stamp a
             // co-scrubbed row, so reaching here with one is a routing bug — and
             // the failure mode is silent AUTHORITY LOSS, which is exactly the
@@ -1540,7 +1540,7 @@ pub async fn run_v31_migration(
     signer: &dyn MigrationSigner,
     options: &MigrationOptions,
 ) -> Result<MigrationOutcome, Error> {
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     let self_key_id = signer.signing_key_id().await;
 
     // v31.0.0 (CIRISPersist#650) — **NO IDENTITY, NO MIGRATION.** This was true

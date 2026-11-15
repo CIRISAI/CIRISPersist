@@ -368,7 +368,7 @@ impl IncidentService for SqliteIncidentBackend {
                 )));
             }
 
-            let now_str = fmt_datetime(chrono::Utc::now());
+            let now_str = fmt_datetime(crate::host::clock::now());
             match transition.new_state {
                 IncidentState::Resolved => {
                     tx.execute(

@@ -255,7 +255,7 @@ pub(crate) async fn grant_trust_planned<D>(dir: &D, signed: SignedTrustGrant) ->
 where
     D: ConsentStore + FederationDirectory,
 {
-    let row = plan_grant_trust(dir, signed, Utc::now()).await?;
+    let row = plan_grant_trust(dir, signed, crate::host::clock::now()).await?;
     let key = row.key.clone();
     if dir.store_planned_trust_grant(row).await? {
         Ok(())
@@ -290,7 +290,7 @@ where
             )));
         }
     }
-    dir.store_trust_revocation(&revocation.key, Utc::now())
+    dir.store_trust_revocation(&revocation.key, crate::host::clock::now())
         .await
 }
 

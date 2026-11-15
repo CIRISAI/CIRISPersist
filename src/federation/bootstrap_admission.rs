@@ -62,7 +62,7 @@ pub mod test_support {
         });
         let (och, sc, sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(attester, &envelope);
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let mut sealed_row_ = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: attester.to_owned(),
@@ -155,7 +155,7 @@ pub mod test_support {
                     crate::federation::consent::consent_dimension::STATE_GRANTED_PREFIX
                 ),
                 &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
-                chrono::Utc::now() - chrono::Duration::seconds(60),
+                crate::host::clock::now() - chrono::Duration::seconds(60),
             ),
         })
         .await
@@ -369,7 +369,7 @@ pub mod test_support {
         }
         const DIM: &str = "capacity:core_identity:v1";
         let capacity = || scores_row(&uuid::Uuid::new_v4().to_string(), &attester, &subject, DIM);
-        let t0 = chrono::Utc::now() - chrono::Duration::seconds(120);
+        let t0 = crate::host::clock::now() - chrono::Duration::seconds(120);
 
         // (a) NO CONSENT — P scores S with nothing from S authorizing it.
         // Under RC2 this is ADMITTED; under CC#46 it is the whole point.
@@ -490,7 +490,7 @@ pub mod test_support {
         let envelope = serde_json::json!({ "note": "type-keyed wire shape" });
         let (och, sc, sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(attester, &envelope);
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let mut sealed_row_ = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: attester.to_owned(),
@@ -619,7 +619,7 @@ pub mod test_support {
         for k in [&attester, &subject] {
             crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
         }
-        let t0 = chrono::Utc::now() - chrono::Duration::seconds(120);
+        let t0 = crate::host::clock::now() - chrono::Duration::seconds(120);
 
         let signal = |dimension: &str| {
             scores_row(
@@ -765,7 +765,7 @@ pub mod test_support {
             }
             let (och, sc, sp) =
                 crate::federation::tier_ingest::test_support::sign_envelope(&writer, &envelope);
-            let now = chrono::Utc::now();
+            let now = crate::host::clock::now();
             let mut sealed_row_ = Attestation {
                 attestation_id: uuid::Uuid::new_v4().to_string(),
                 attesting_key_id: writer.clone(),
@@ -1162,7 +1162,7 @@ pub mod test_support {
                     crate::federation::consent::consent_dimension::STATE_GRANTED_PREFIX
                 ),
                 &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
-                chrono::Utc::now() - chrono::Duration::seconds(60),
+                crate::host::clock::now() - chrono::Duration::seconds(60),
             ),
         })
         .await
@@ -1245,7 +1245,7 @@ pub mod test_support {
         });
         // (a2)
         let ns_expiry = crate::federation::admission::truncate_to_substrate_resolution(
-            chrono::Utc::now() + chrono::Duration::days(30),
+            crate::host::clock::now() + chrono::Duration::days(30),
         ) + chrono::Duration::nanoseconds(500);
         let expiring_id = {
             let mut input = local_input("trust:demo:v1");
@@ -1283,7 +1283,7 @@ pub mod test_support {
         );
         crate::federation::admission::check_instant_binding(
             &expiring,
-            chrono::Utc::now(),
+            crate::host::clock::now(),
             crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
         )
         .unwrap_or_else(|e| panic!("({tag}) #598 (a2): the instant binding holds: {e}"));
@@ -1441,7 +1441,7 @@ pub mod test_support {
         let mut diverging = stale_local.clone();
         diverging.tier = attestation_tier::FEDERATION.to_owned();
         diverging.cohort_scope = cohort_scope::FEDERATION.to_owned(); // column says one thing…
-        diverging.promoted_at = Some(chrono::Utc::now()); // …the signed mirror still says `self`
+        diverging.promoted_at = Some(crate::host::clock::now()); // …the signed mirror still says `self`
         let err = peer
             .put_attestation(SignedAttestation {
                 attestation: diverging,
@@ -1522,7 +1522,7 @@ pub mod test_support {
         // P is a MEMBER of both cohorts: a cohort placement is a membership
         // claim the put door proves first (AV-45); with membership proven, what
         // is left to refuse is STANDING — the party the row names.
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         dir.put_community(ts::sign_community(
             &producer,
             crate::federation::types::Community {
@@ -1761,10 +1761,14 @@ pub mod test_support {
             .await
             .expect("b renews");
 
-        let got =
-            distinct_self_reporting_subjects(dir, &subjects, "config:load", chrono::Utc::now())
-                .await
-                .expect("fold");
+        let got = distinct_self_reporting_subjects(
+            dir,
+            &subjects,
+            "config:load",
+            crate::host::clock::now(),
+        )
+        .await
+        .expect("fold");
         assert_eq!(
             got,
             std::collections::BTreeSet::from([a.clone(), b.clone()]),
@@ -1909,7 +1913,7 @@ pub mod test_support {
                 ));
             ts::reseal(r);
         };
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let mine = uuid::Uuid::new_v4().to_string();
         let mut r = scores_row(&mine, &occurrence, &occurrence, "session:claim:v1");
         lease(&mut r, now, 3_600);
@@ -2096,7 +2100,7 @@ pub mod test_support {
         );
 
         // THE POINT: it binds nobody, because it is not in the fold.
-        let set = status_set_for(dir, &holder, &authority, chrono::Utc::now())
+        let set = status_set_for(dir, &holder, &authority, crate::host::clock::now())
             .await
             .expect("fold");
         assert_eq!(
@@ -2538,7 +2542,7 @@ pub mod test_support {
         for k in [&us, &mate, &stranger, &comm] {
             ts::register_hybrid_key_as(dir, k, k, identity_type::USER).await;
         }
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         // A community this node and `mate` both belong to — and `stranger`
         // does not. This is the ONLY difference between the two arms.
         dir.put_community(ts::sign_community(
@@ -3030,7 +3034,7 @@ pub mod test_support {
                     &prior,
                     &crossing::Audience::Biosphere,
                     &[],
-                    chrono::Utc::now(),
+                    crate::host::clock::now(),
                 )
                 .unwrap();
                 // Re-date the claim — exactly what v39.0.0 did by omission —
@@ -3038,12 +3042,12 @@ pub mod test_support {
                 // `check_widening` can object to it.
                 input.attestation_envelope.asserted_at =
                     Some(crate::federation::admission::render_signed_instant(
-                        chrono::Utc::now() + chrono::Duration::seconds(1),
+                        crate::host::clock::now() + chrono::Duration::seconds(1),
                     ));
                 let canonical = attestation_emit::stamp_and_canonicalize(
                     &mut input,
                     &actor,
-                    chrono::Utc::now() + chrono::Duration::seconds(1),
+                    crate::host::clock::now() + chrono::Duration::seconds(1),
                 )
                 .unwrap();
                 let sig = ts::local_signer(&actor)
@@ -3116,12 +3120,15 @@ pub mod test_support {
                 &sup,
                 &crossing::Audience::Federation,
                 &[],
-                chrono::Utc::now(),
+                crate::host::clock::now(),
             )
             .unwrap();
-            let canonical =
-                attestation_emit::stamp_and_canonicalize(&mut input, &stranger, chrono::Utc::now())
-                    .unwrap();
+            let canonical = attestation_emit::stamp_and_canonicalize(
+                &mut input,
+                &stranger,
+                crate::host::clock::now(),
+            )
+            .unwrap();
             let sig = ts::local_signer(&stranger)
                 .sign_hybrid(&canonical)
                 .await
@@ -3155,16 +3162,19 @@ pub mod test_support {
                 &sup,
                 &crossing::Audience::Federation,
                 &[],
-                chrono::Utc::now(),
+                crate::host::clock::now(),
             )
             .unwrap();
             input
                 .attestation_envelope
                 .extra
                 .insert("score".into(), serde_json::json!(0.1));
-            let canonical =
-                attestation_emit::stamp_and_canonicalize(&mut input, &actor, chrono::Utc::now())
-                    .unwrap();
+            let canonical = attestation_emit::stamp_and_canonicalize(
+                &mut input,
+                &actor,
+                crate::host::clock::now(),
+            )
+            .unwrap();
             let sig = ts::local_signer(&actor)
                 .sign_hybrid(&canonical)
                 .await
@@ -3211,8 +3221,9 @@ pub mod test_support {
         chrono::DateTime<chrono::Utc>,
         chrono::DateTime<chrono::Utc>,
     ) {
-        let now =
-            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        let now = crate::federation::admission::truncate_to_substrate_resolution(
+            crate::host::clock::now(),
+        );
         (
             now - chrono::Duration::seconds(300),
             now - chrono::Duration::seconds(120),
@@ -3299,9 +3310,15 @@ pub mod test_support {
         .await
         .unwrap_or_else(|e| panic!("({tag}) B10-a: the subject's own revocation admits: {e}"));
         assert_eq!(
-            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
-                .await
-                .expect("fold reads"),
+            dir.resolve_scoped_consent(
+                &attester,
+                &subject,
+                analyze,
+                None,
+                crate::host::clock::now()
+            )
+            .await
+            .expect("fold reads"),
             ConsentState::Revoked,
             "({tag}) B10-a: after the revoke the fold must read Revoked"
         );
@@ -3377,9 +3394,15 @@ pub mod test_support {
         // (d) …and nothing moved: the fold is still closed and the gate INSIDE
         // persist still refuses.
         assert_eq!(
-            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
-                .await
-                .expect("fold reads"),
+            dir.resolve_scoped_consent(
+                &attester,
+                &subject,
+                analyze,
+                None,
+                crate::host::clock::now()
+            )
+            .await
+            .expect("fold reads"),
             ConsentState::Revoked,
             "({tag}) B10-a: the replay must not flip the fold back to Granted"
         );
@@ -3748,7 +3771,7 @@ pub mod test_support {
                         &subject,
                         analyze,
                         None,
-                        chrono::Utc::now()
+                        crate::host::clock::now()
                     )
                     .await
                     .expect("fold reads"),
@@ -3767,9 +3790,15 @@ pub mod test_support {
                     });
             }
             verdicts.push(
-                dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
-                    .await
-                    .expect("fold reads"),
+                dir.resolve_scoped_consent(
+                    &attester,
+                    &subject,
+                    analyze,
+                    None,
+                    crate::host::clock::now(),
+                )
+                .await
+                .expect("fold reads"),
             );
         }
         assert_eq!(
@@ -3825,8 +3854,9 @@ pub mod test_support {
         let analyze = crate::federation::admission::ANALYZE_CONSENT_SCOPE;
         let granted = format!("{}:v1", consent_dimension::STATE_GRANTED_PREFIX);
         let revoked = format!("{}:v1", consent_dimension::STATE_REVOKED_PREFIX);
-        let now =
-            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        let now = crate::federation::admission::truncate_to_substrate_resolution(
+            crate::host::clock::now(),
+        );
         // The forward mint: 120s ahead of the revocation and INSIDE the 300s
         // skew tolerance, so `check_instant_binding` admits it. This is the
         // race #642 is about — not a rejected row, an admitted one that wins.
@@ -3874,13 +3904,19 @@ pub mod test_support {
         for (entry, got) in [
             (
                 "resolve_scoped_consent",
-                dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
-                    .await
-                    .expect("scoped fold reads"),
+                dir.resolve_scoped_consent(
+                    &attester,
+                    &subject,
+                    analyze,
+                    None,
+                    crate::host::clock::now(),
+                )
+                .await
+                .expect("scoped fold reads"),
             ),
             (
                 "resolve_consent_state",
-                dir.resolve_consent_state(&attester, &subject, chrono::Utc::now())
+                dir.resolve_consent_state(&attester, &subject, crate::host::clock::now())
                     .await
                     .expect("unscoped fold reads"),
             ),
@@ -3931,9 +3967,15 @@ pub mod test_support {
         )
         .await;
         assert_eq!(
-            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
-                .await
-                .expect("fold reads"),
+            dir.resolve_scoped_consent(
+                &attester,
+                &subject,
+                analyze,
+                None,
+                crate::host::clock::now()
+            )
+            .await
+            .expect("fold reads"),
             ConsentState::Granted,
             "({tag}) B12-A': WITHOUT the edge this is the #642 defect itself — the forward-minted \
              grant out-sorts the revocation. If this leg reads Revoked the fixture is not \
@@ -3976,9 +4018,15 @@ pub mod test_support {
             )
             .await;
             assert_eq!(
-                dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
-                    .await
-                    .expect("fold reads"),
+                dir.resolve_scoped_consent(
+                    &attester,
+                    &subject,
+                    analyze,
+                    None,
+                    crate::host::clock::now()
+                )
+                .await
+                .expect("fold reads"),
                 ConsentState::Revoked,
                 "({tag}) B12-B/{leg}: a revocation naming {what} means this node's view is \
                  INCOMPLETE. Degrading to the clock there hands the answer to the grant minted \
@@ -4018,9 +4066,15 @@ pub mod test_support {
         )
         .await;
         assert_eq!(
-            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
-                .await
-                .expect("fold reads"),
+            dir.resolve_scoped_consent(
+                &attester,
+                &subject,
+                analyze,
+                None,
+                crate::host::clock::now()
+            )
+            .await
+            .expect("fold reads"),
             ConsentState::Revoked,
             "({tag}) B12-C: `granted` is the sole fail-OPEN stance and carries no causal \
              authority here — an earlier grant naming the revocation must not delete it"
@@ -4060,9 +4114,15 @@ pub mod test_support {
         )
         .await;
         assert_eq!(
-            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
-                .await
-                .expect("fold reads"),
+            dir.resolve_scoped_consent(
+                &attester,
+                &subject,
+                analyze,
+                None,
+                crate::host::clock::now()
+            )
+            .await
+            .expect("fold reads"),
             ConsentState::Revoked,
             "({tag}) B12-D: eliminating the real revocation leaves {{grant, back-dated revoke}} \
              and the grant is the later of those. The causal plane may only TIGHTEN — consent is \
@@ -4096,9 +4156,15 @@ pub mod test_support {
         )
         .await;
         assert_eq!(
-            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
-                .await
-                .expect("fold reads"),
+            dir.resolve_scoped_consent(
+                &attester,
+                &subject,
+                analyze,
+                None,
+                crate::host::clock::now()
+            )
+            .await
+            .expect("fold reads"),
             ConsentState::Unspecified,
             "({tag}) B12-E: the grant was retracted through the substrate's OWN retraction \
              primitive (`precedence::retired_ids`, entitlement-gated). Before #642 the consent \
@@ -4146,9 +4212,15 @@ pub mod test_support {
         )
         .await;
         assert_eq!(
-            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
-                .await
-                .expect("fold reads"),
+            dir.resolve_scoped_consent(
+                &attester,
+                &subject,
+                analyze,
+                None,
+                crate::host::clock::now()
+            )
+            .await
+            .expect("fold reads"),
             ConsentState::Granted,
             "({tag}) B12-F: a later grant re-opens consent exactly as it did before the causal \
              plane existed — the edge orders history, it does not freeze it"
@@ -4207,18 +4279,30 @@ pub mod test_support {
         )
         .await;
         assert_eq!(
-            dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
-                .await
-                .expect("fold reads"),
+            dir.resolve_scoped_consent(
+                &attester,
+                &subject,
+                analyze,
+                None,
+                crate::host::clock::now()
+            )
+            .await
+            .expect("fold reads"),
             ConsentState::Granted,
             "({tag}) B12-G: the blanket revocation's edge RESOLVES against the subject's own \
              history (the export grant is in it), so it carries no unresolved-view restriction \
              and the later grant wins on the clock as it always did"
         );
         assert_eq!(
-            dir.resolve_scoped_consent(&attester, &subject, "export", None, chrono::Utc::now())
-                .await
-                .expect("fold reads"),
+            dir.resolve_scoped_consent(
+                &attester,
+                &subject,
+                "export",
+                None,
+                crate::host::clock::now()
+            )
+            .await
+            .expect("fold reads"),
             ConsentState::Revoked,
             "({tag}) B12-G: …and on the scope it DID revoke, the blanket revocation still closes \
              the gate — resolving the edge widens nothing"
@@ -4253,9 +4337,9 @@ pub mod test_support {
         let analyze = crate::federation::admission::ANALYZE_CONSENT_SCOPE;
         let granted = format!("{}:v1", consent_dimension::STATE_GRANTED_PREFIX);
         let revoked = format!("{}:v1", consent_dimension::STATE_REVOKED_PREFIX);
-        let base =
-            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now())
-                - chrono::Duration::seconds(60);
+        let base = crate::federation::admission::truncate_to_substrate_resolution(
+            crate::host::clock::now(),
+        ) - chrono::Duration::seconds(60);
 
         // (1) 500ns apart — refused on EVERY backend, so no backend can be the
         // one that reads this pair as a strict order.
@@ -4365,9 +4449,15 @@ pub mod test_support {
                     });
             }
             assert_eq!(
-                dir.resolve_scoped_consent(&attester, &subject, analyze, None, chrono::Utc::now())
-                    .await
-                    .expect("fold reads"),
+                dir.resolve_scoped_consent(
+                    &attester,
+                    &subject,
+                    analyze,
+                    None,
+                    crate::host::clock::now()
+                )
+                .await
+                .expect("fold reads"),
                 ConsentState::Revoked,
                 "({tag}) B10-c/{order}: a grant and a revoke at the SAME instant must resolve \
                  to the RESTRICTIVE stance, in either insertion order and on every backend \

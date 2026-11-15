@@ -23,7 +23,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 
@@ -81,7 +80,7 @@ impl MaintenanceService for PostgresMaintenanceBackend {
             .checkout()
             .await
             .map_err(|e| Error::Backend(format!("vacuum pool: {e}")))?;
-        let started = Instant::now();
+        let started = crate::host::clock::monotonic_now();
         client
             .batch_execute("VACUUM ANALYZE")
             .await
@@ -212,8 +211,8 @@ impl MaintenanceService for PostgresMaintenanceBackend {
     }
 
     async fn maintain(&self) -> Result<MaintenanceReport, Error> {
-        let started_at = Utc::now();
-        let started = Instant::now();
+        let started_at = crate::host::clock::now();
+        let started = crate::host::clock::monotonic_now();
         let vacuum = self.vacuum_substrate().await?;
         let archive = self
             .archive_expired(ArchiveWindow::SubstrateDefault)

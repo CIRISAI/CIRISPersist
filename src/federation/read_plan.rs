@@ -231,7 +231,7 @@ pub(crate) async fn resolve_scores_planned(
         composers,
         &policy,
         trace,
-        chrono::Utc::now(),
+        crate::host::clock::now(),
     ))
 }
 
@@ -258,7 +258,8 @@ pub(crate) async fn list_attestation_log_planned(
     // v25.1.0 (CIRISPersist#570 ask 5) — THE SERVE CONSULT: this is the relay
     // read a peer's rows leave through, so rows authored by a withheld key are
     // dropped here (retained locally, reversible).
-    let items = super::quarantine::filter_withheld_rows(dir, rows, chrono::Utc::now()).await?;
+    let items =
+        super::quarantine::filter_withheld_rows(dir, rows, crate::host::clock::now()).await?;
     crate::observe::record_read(
         backend,
         crate::observe::Door::ListAttestationLog,

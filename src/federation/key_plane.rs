@@ -1146,7 +1146,8 @@ where
     if is_held_revocation(dir, &revocation.revocation).await? {
         return Ok(());
     }
-    let planned = plan_put_revocation(dir, revocation.revocation, chrono::Utc::now()).await?;
+    let planned =
+        plan_put_revocation(dir, revocation.revocation, crate::host::clock::now()).await?;
     dir.store_planned_revocation(planned).await
 }
 
@@ -1816,7 +1817,7 @@ pub(crate) async fn key_record_write_planned<D>(
 where
     D: KeyPlaneStore,
 {
-    match plan_key_record_write(dir, write, chrono::Utc::now()).await? {
+    match plan_key_record_write(dir, write, crate::host::clock::now()).await? {
         KeyRecordPlan::Settled => Ok(KeyRecordWritten::Settled),
         KeyRecordPlan::Write(planned) => {
             dir.store_planned_key_record(*planned).await?;

@@ -723,7 +723,7 @@ impl SqliteBackend {
     /// CIRISPersist#829 — **the read door.** Runs `f` on a reader connection
     /// (or on the writer when the pool is empty — in-memory, or a view over
     /// a borrowed handle), off the async runtime when one is current and
-    /// inline otherwise. See [`crate::store::sqlite_conn_model::dispatch_blocking`].
+    /// inline otherwise. See [`crate::host::rt::dispatch_blocking`].
     ///
     /// Readers are `SQLITE_OPEN_READ_ONLY`: a closure that writes here gets
     /// `SQLITE_READONLY`, loudly. That is the point.
@@ -734,14 +734,14 @@ impl SqliteBackend {
     {
         if self.readers.size() == 0 {
             let conn = self.conn.clone();
-            return crate::store::sqlite_conn_model::dispatch_blocking(move || {
+            return crate::host::rt::dispatch_blocking(move || {
                 let guard = conn.lock();
                 f(&guard)
             })
             .await;
         }
         let readers = self.readers.clone();
-        crate::store::sqlite_conn_model::dispatch_blocking(move || {
+        crate::host::rt::dispatch_blocking(move || {
             let guard = readers.acquire();
             f(&guard)
         })
@@ -776,7 +776,7 @@ impl SqliteBackend {
         F: FnOnce(&mut Connection) -> R + Send + 'static,
     {
         let conn = self.conn.clone();
-        crate::store::sqlite_conn_model::dispatch_blocking(move || {
+        crate::host::rt::dispatch_blocking(move || {
             let mut guard = conn.lock();
             f(&mut guard)
         })
@@ -1290,7 +1290,7 @@ impl Backend for SqliteBackend {
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                     .map(|d| d.with_timezone(&chrono::Utc));
                 let admitted_at = crate::federation::types::monotonic_admission_instant(
-                    chrono::Utc::now(),
+                    crate::host::clock::now(),
                     last_admitted,
                 );
                 let admitted_at_str =
@@ -3524,7 +3524,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     sqlite_tombstone_detection_events(
                         &tx,
                         std::slice::from_ref(&id),
-                        &chrono::Utc::now().to_rfc3339(),
+                        &crate::host::clock::now().to_rfc3339(),
                     )?;
                     let calls = tx
                         .execute("DELETE FROM trace_llm_calls WHERE trace_id = ?1", [&id])?
@@ -3914,7 +3914,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<(), crate::federation::Error> {
         let mut record = crate::federation::CanonicalWithdrawal {
             key_id: key_id.to_owned(),
-            withdrawn_at: chrono::Utc::now(),
+            withdrawn_at: crate::host::clock::now(),
             authority_decision_digest: authority_decision_digest.to_owned(),
             superseded_by: superseded_by.map(str::to_owned),
             persist_row_hash: String::new(),
@@ -4015,7 +4015,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let mut record = crate::federation::admission::RoleWithdrawal {
             role: role.to_owned(),
             key_id: key_id.to_owned(),
-            withdrawn_at: chrono::Utc::now(),
+            withdrawn_at: crate::host::clock::now(),
             authority_decision_digest: authority_decision_digest.to_owned(),
             superseded_by: superseded_by.map(str::to_owned),
             persist_row_hash: String::new(),
@@ -4155,7 +4155,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             self,
             &me,
             Some((owner, device)),
-            chrono::Utc::now(),
+            crate::host::clock::now(),
         )
         .await
         .map(|_| ())
@@ -5550,7 +5550,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<bool, crate::federation::Error> {
         // v51.0.0 (#938) — V159; insert-or-hold, never delete (evidence).
         let c = cosign.clone();
-        let admitted_at = chrono::Utc::now().to_rfc3339();
+        let admitted_at = crate::host::clock::now().to_rfc3339();
         self.write(move |conn| -> Result<bool, rusqlite::Error> {
             let n = conn.execute(
                 "INSERT OR IGNORE INTO federation_lineage_head_cosigns \
@@ -5851,7 +5851,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<(), crate::federation::Error> {
         let fam = family_key_id.to_owned();
         let halt = active_halt_id.to_owned();
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = crate::host::clock::now().to_rfc3339();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             conn.execute(
                 "INSERT INTO accord_active_halt (family_key_id, active_halt_id, set_at) \
@@ -6652,7 +6652,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         owner_hostname: &str,
         stale_after: Option<std::time::Duration>,
     ) -> Result<Option<crate::federation::SharedInstanceLease>, crate::federation::Error> {
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let stale = stale_after.unwrap_or(crate::federation::shared_instance::DEFAULT_STALE_AFTER);
         // Fixed Micros+Z format on every write AND the threshold so the
         // staleness check is a plain TEXT `<` (lexical == chronological
@@ -6704,7 +6704,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         lease: &crate::federation::SharedInstanceLease,
     ) -> Result<Option<crate::federation::SharedInstanceLease>, crate::federation::Error> {
-        let now_s = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let now_s = crate::host::clock::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
         let lease = lease.clone();
         self.write(
             move |conn| -> Result<Option<crate::federation::SharedInstanceLease>, rusqlite::Error> {
@@ -8241,7 +8241,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // `json_each` works but composes awkwardly with the rest of
         // the filter. For the row counts persist sees on the SQLite
         // arm (sovereign-mode agents, single-tenant) this is fine.
-        let now_text = chrono::Utc::now().to_rfc3339();
+        let now_text = crate::host::clock::now().to_rfc3339();
         let mut where_parts: Vec<String> = vec!["trusted_by IS NOT NULL".to_owned()];
         let mut params: Vec<String> = Vec::new();
         if !filter.include_expired {
@@ -8453,7 +8453,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let key_id_owned = key_id.to_owned();
         let reason_owned = reason.to_owned();
         let delegation_owned = acting_under_delegation_id.map(str::to_owned);
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let now_str = now.to_rfc3339();
         // v57.0.0 (CIRISPersist#988 item 2) — the record's attester, read
         // before the transaction; asked for only once the removal's own
@@ -8852,7 +8852,7 @@ async fn sqlite_update_peer_field(
     update: SqlitePeerUpdate,
 ) -> Result<(), crate::federation::Error> {
     let key_id_owned = key_id.to_owned();
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     let now_str = now.to_rfc3339();
     let outcome = backend
         .write(
@@ -9783,7 +9783,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let alg = crate::federation::at_rest_cascade::WRAP_ALGORITHM_CONTENT_MASTER.to_owned();
         // #848 (§15) — `minted_at` is stamped HERE, as RFC 3339, so the
         // rotation compare reads one format on every row this crate writes.
-        let minted_at = chrono::Utc::now().to_rfc3339();
+        let minted_at = crate::host::clock::now().to_rfc3339();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             conn.execute(
                 "INSERT INTO federation_community_dek (\
@@ -11118,7 +11118,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         })?;
         // SQLite has no DEFAULT NOW(); the application supplies the
         // wall-clock (the federation_blobs V053 discipline).
-        let now_iso = chrono::Utc::now().to_rfc3339();
+        let now_iso = crate::host::clock::now().to_rfc3339();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             // First-write-wins on (record_id, symbol_index): a re-put of the
             // same symbol is a no-op (no LRU clock reset on a redundant write).
@@ -11152,7 +11152,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
     ) -> Result<Option<crate::federation::ScopeBlobSymbol>, crate::federation::BlobError> {
         let record_id_vec = record_id.to_vec();
         let symbol_index_i64 = symbol_index as i64;
-        let now_iso = chrono::Utc::now().to_rfc3339();
+        let now_iso = crate::host::clock::now().to_rfc3339();
         let row = self
             .write(
                 move |conn| -> Result<Option<ScopeBlobRow>, rusqlite::Error> {
@@ -11184,7 +11184,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         record_id: [u8; 32],
     ) -> Result<Vec<crate::federation::ScopeBlobSymbol>, crate::federation::BlobError> {
         let record_id_vec = record_id.to_vec();
-        let now_iso = chrono::Utc::now().to_rfc3339();
+        let now_iso = crate::host::clock::now().to_rfc3339();
         let rows = self
             .write(move |conn| -> Result<Vec<ScopeBlobRow>, rusqlite::Error> {
                 conn.execute(
@@ -11370,8 +11370,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // review), through the module's dispatcher, NOT bare `spawn_blocking`:
         // with no tokio runtime current (a cohabiting consumer's statically
         // linked persist, #158) it runs inline instead of panicking.
-        let source =
-            crate::store::sqlite_conn_model::dispatch_blocking(|| content_master_key(true)).await;
+        let source = crate::host::rt::dispatch_blocking(|| content_master_key(true)).await;
         let (kind, key_b64, descriptor) = match source {
             ContentMasterSource::Hardware { descriptor, .. } => ("hardware", None, descriptor),
             ContentMasterSource::SoftwareFallback { reason } => {
@@ -11760,7 +11759,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
     ) -> Result<crate::federation::AbandonFloorReport, crate::federation::BlobError> {
         use crate::federation::types::cohort_scope::CryptoTier;
         let (sid, owner) = (stream_id.to_owned(), owner_key_id.to_owned());
-        let now_iso = chrono::Utc::now().to_rfc3339();
+        let now_iso = crate::host::clock::now().to_rfc3339();
         enum Ab {
             Unknown,
             NotOwned,
@@ -12198,7 +12197,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let sha_vec = sha256.to_vec();
         let sha_hex = hex::encode(sha256);
         let stream = stream_id.to_owned();
-        let now_iso = chrono::Utc::now().to_rfc3339();
+        let now_iso = crate::host::clock::now().to_rfc3339();
         enum Promote {
             Done,
             Already,
@@ -12406,7 +12405,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
 
     async fn seal_stream(&self, stream_id: &str) -> Result<[u8; 32], crate::federation::BlobError> {
         let cap = self.inline_bytes_cap();
-        let now_iso = chrono::Utc::now().to_rfc3339();
+        let now_iso = crate::host::clock::now().to_rfc3339();
         let stream_id_owned = stream_id.to_string();
         // All DB work inside one closure / one txn.
         let manifest_sha = self
@@ -12751,7 +12750,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // every read hit. SQLite has no UPDATE … RETURNING for our row
         // shape; we do SELECT first, then bump in the same transaction
         // so the counter survives a concurrent get_blob.
-        let now_iso = chrono::Utc::now().to_rfc3339();
+        let now_iso = crate::host::clock::now().to_rfc3339();
         type GetBlobRow = (
             String,
             Option<Vec<u8>>,
@@ -12844,7 +12843,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
             ));
         }
         let sha_vec = sha256.to_vec();
-        let now_iso = chrono::Utc::now().to_rfc3339();
+        let now_iso = crate::host::clock::now().to_rfc3339();
         // Outcome of the in-transaction work. The chunk_dag case can't
         // be resolved inside the blocking tx (it needs async get_blob on
         // covering chunks), so it returns the manifest bytes + clamped
@@ -12981,7 +12980,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // access-tracking columns when the row exists (per the
         // architect's plan §"Per-row access tracking"). Both reads are
         // treated as evidence the blob is still hot.
-        let now_iso = chrono::Utc::now().to_rfc3339();
+        let now_iso = crate::host::clock::now().to_rfc3339();
         self.write(move |conn| -> Result<bool, rusqlite::Error> {
             let tx = write_tx(conn)?;
             let count: i64 = tx.query_row(
@@ -13574,7 +13573,7 @@ impl SqliteBackend {
                     let last_accessed_at: chrono::DateTime<chrono::Utc> =
                         chrono::DateTime::parse_from_rfc3339(&last_str)
                             .map(|t| t.with_timezone(&chrono::Utc))
-                            .unwrap_or_else(|_| chrono::Utc::now());
+                            .unwrap_or_else(|_| crate::host::clock::now());
                     out.push(crate::federation::EvictionCandidate {
                         sha256: sha,
                         size_bytes: size_bytes.max(0) as u64,
@@ -13845,7 +13844,7 @@ impl crate::federation::BlackholeRules for SqliteBackend {
         reason: Option<&str>,
     ) -> Result<(), crate::federation::Error> {
         crate::federation::blackhole::validate_identity_hash_len(identity_hash)?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let identity_owned = identity_hash.to_vec();
         let reason_owned = reason.map(str::to_owned);
         let outcome = self
@@ -14013,7 +14012,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         }
         let queue_id = format!(
             "{:x}-{:x}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            crate::host::clock::now().timestamp_nanos_opt().unwrap_or(0),
             std::process::id()
         );
         let qid = queue_id.clone();
@@ -14023,7 +14022,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         let esv = edge_schema_version.to_owned();
         let env_bytes = envelope_bytes.to_vec();
         let hash_vec = body_sha256.to_vec();
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             conn.execute(
                 "INSERT INTO edge_outbound_queue (\
@@ -14064,7 +14063,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         claim_duration_seconds: i64,
         claimed_by: &str,
     ) -> Result<Vec<crate::outbound::OutboundRow>, crate::outbound::Error> {
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let claim_until = now + chrono::Duration::seconds(claim_duration_seconds);
         let claimed_by = claimed_by.to_owned();
         let rows = self
@@ -14120,7 +14119,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
     ) -> Result<(), crate::outbound::Error> {
         let qid = queue_id.clone();
         let transport = transport.to_owned();
-        let now_str = chrono::Utc::now().to_rfc3339();
+        let now_str = crate::host::clock::now().to_rfc3339();
         let n = self
             .write(move |conn| -> rusqlite::Result<usize> {
                 // CASE branch on requires_ack: !requires_ack → delivered;
@@ -14159,7 +14158,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         let error_class = error_class.to_owned();
         let error_detail = error_detail.to_owned();
         let transport = transport.to_owned();
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let next_str = next_attempt_after.to_rfc3339();
         let outcome = self
             .write(
@@ -14243,7 +14242,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         queue_id: &crate::outbound::QueueId,
     ) -> Result<(), crate::outbound::Error> {
         let qid = queue_id.clone();
-        let now_str = chrono::Utc::now().to_rfc3339();
+        let now_str = crate::host::clock::now().to_rfc3339();
         self.write(move |conn| -> rusqlite::Result<()> {
             conn.execute(
                 "UPDATE edge_outbound_queue \
@@ -14282,7 +14281,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
     ) -> Result<(), crate::outbound::Error> {
         let qid = queue_id.clone();
         let ack_bytes = ack_envelope_bytes.to_vec();
-        let now_str = chrono::Utc::now().to_rfc3339();
+        let now_str = crate::host::clock::now().to_rfc3339();
         let n = self
             .write(move |conn| -> rusqlite::Result<usize> {
                 conn.execute(
@@ -14304,7 +14303,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
     }
 
     async fn sweep_ack_timeouts(&self) -> Result<i64, crate::outbound::Error> {
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         self.write(move |conn| -> rusqlite::Result<i64> {
             let tx = write_tx(conn)?;
             // Walk awaiting_ack rows; per-row TTL/timeout checks in Rust
@@ -14385,7 +14384,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
     }
 
     async fn sweep_ttl_expired(&self) -> Result<i64, crate::outbound::Error> {
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         self.write(move |conn| -> rusqlite::Result<i64> {
             let tx = write_tx(conn)?;
             // Pull non-terminal rows; check ttl in Rust.
@@ -14421,7 +14420,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
     }
 
     async fn sweep_expired_claims(&self) -> Result<i64, crate::outbound::Error> {
-        let now_str = chrono::Utc::now().to_rfc3339();
+        let now_str = crate::host::clock::now().to_rfc3339();
         self.write(move |conn| -> rusqlite::Result<i64> {
             let n = conn.execute(
                 "UPDATE edge_outbound_queue \
@@ -14527,7 +14526,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         queue_id: &crate::outbound::QueueId,
     ) -> Result<(), crate::outbound::Error> {
         let qid = queue_id.clone();
-        let now_str = chrono::Utc::now().to_rfc3339();
+        let now_str = crate::host::clock::now().to_rfc3339();
         self.write(move |conn| -> rusqlite::Result<()> {
             conn.execute(
                 "UPDATE edge_outbound_queue \
@@ -14549,7 +14548,7 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         queue_id: &crate::outbound::QueueId,
     ) -> Result<(), crate::outbound::Error> {
         let qid = queue_id.clone();
-        let now_str = chrono::Utc::now().to_rfc3339();
+        let now_str = crate::host::clock::now().to_rfc3339();
         let n = self
             .write(move |conn| -> rusqlite::Result<usize> {
                 conn.execute(
@@ -15004,7 +15003,7 @@ fn sqlite_row_to_purge_tombstone(
 fn parse_rfc3339(s: &str) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|t| t.with_timezone(&chrono::Utc))
-        .unwrap_or_else(|_| chrono::Utc::now())
+        .unwrap_or_else(|_| crate::host::clock::now())
 }
 
 /// v36.0.0 (CIRISPersist#707) — the `federation_keys` SERVE POSITION on this
@@ -15042,7 +15041,7 @@ fn sqlite_next_key_serve_position(
         .optional()?
         .flatten();
     Ok(crate::federation::types::monotonic_admission_instant(
-        chrono::Utc::now(),
+        crate::host::clock::now(),
         last.as_deref().map(parse_rfc3339),
     ))
 }
@@ -15075,7 +15074,7 @@ fn sqlite_next_plane_position(
         .optional()?
         .flatten();
     Ok(crate::federation::types::monotonic_admission_instant(
-        chrono::Utc::now(),
+        crate::host::clock::now(),
         last.as_deref().map(parse_rfc3339),
     ))
 }
@@ -20753,7 +20752,7 @@ impl crate::read::ReadEngine for SqliteBackend {
             )
             .await?;
 
-        let evaluated_at = chrono::Utc::now().timestamp_millis();
+        let evaluated_at = crate::host::clock::now().timestamp_millis();
         let stats = repo::fold_statistics(period, &per_trace, evaluated_at, false);
         let size = repo::estimate_size(&stats);
         cache.store(key, stats.clone(), size);
@@ -22005,7 +22004,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                         calibration_error: None,
                         unsafe_action_rate: 0.0,
                         coherence_decay_series: Vec::new(),
-                        evaluated_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+                        evaluated_at_unix_ms: crate::host::clock::now().timestamp_millis(),
                         cache_hit: false,
                     }
                 }));
@@ -22658,7 +22657,7 @@ impl SqliteBackend {
                 // CIRISPersist#195 — compute-time honesty fields. The
                 // batch caller stamps `evaluated_at` once for the whole
                 // batch; here we set it per-aggregate at compute time.
-                evaluated_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+                evaluated_at_unix_ms: crate::host::clock::now().timestamp_millis(),
                 cache_hit: false,
             })
         }).await?;
@@ -22878,7 +22877,7 @@ impl SqliteBackend {
              GROUP BY agent_id_hash"
         );
 
-        let evaluated_at_unix_ms = chrono::Utc::now().timestamp_millis();
+        let evaluated_at_unix_ms = crate::host::clock::now().timestamp_millis();
         self.read(
             move |conn| -> Result<
                 std::collections::HashMap<String, crate::read::ScoringFactorAggregate>,
@@ -24331,8 +24330,10 @@ impl crate::federation::read_plan::ReadPlanStore for SqliteBackend {
         use crate::federation::Error;
         // `None`: sqlite's head is exact (its one writer assigns the serve
         // position inside the write transaction).
-        let settled_before =
-            crate::federation::read_plan::serve_settled_before(Dialect::Sqlite, chrono::Utc::now());
+        let settled_before = crate::federation::read_plan::serve_settled_before(
+            Dialect::Sqlite,
+            crate::host::clock::now(),
+        );
         let head_stmt = crate::federation::read_plan::serve_stream_head_statement(Dialect::Sqlite);
         let page_stmt = crate::federation::read_plan::serve_stream_statement(
             Dialect::Sqlite,
@@ -24793,7 +24794,7 @@ impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
         use crate::federation::blob_admit::{HeldStream, StreamClaimWrite};
         use crate::federation::BlobError;
         let db = |e: rusqlite::Error| BlobError::Backend(format!("put_blob_chunk tx: {e}"));
-        let now_iso = chrono::Utc::now().to_rfc3339();
+        let now_iso = crate::host::clock::now().to_rfc3339();
         self.write(
             move |conn| -> Result<Vec<(usize, ItemAppended)>, BlobError> {
                 let mut tx = write_tx(conn).map_err(db)?;
@@ -25203,7 +25204,7 @@ impl crate::federation::blob_admit::BlobWriteStore for SqliteBackend {
         let inject_association_fault = false;
         // V053's last_accessed_at sentinel: the real wall clock, so a fresh
         // blob's last_accessed_at matches its first_seen_at.
-        let now_iso = chrono::Utc::now().to_rfc3339();
+        let now_iso = crate::host::clock::now().to_rfc3339();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             let r = &planned.row;
             let sha_vec = r.sha256.to_vec();
@@ -25329,7 +25330,7 @@ impl crate::federation::blob_admit::BlobWriteStore for SqliteBackend {
         &self,
         planned: crate::federation::blob_admit::PlannedDag,
     ) -> Result<(), crate::federation::BlobError> {
-        let now_iso = chrono::Utc::now().to_rfc3339();
+        let now_iso = crate::host::clock::now().to_rfc3339();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             let tx = write_tx(conn)?;
             for row in &planned.rows {
@@ -25370,7 +25371,7 @@ impl crate::federation::blob_admit::BlobWriteStore for SqliteBackend {
         use crate::federation::BlobError;
         let db =
             |e: rusqlite::Error| BlobError::Backend(format!("put_dag_manifest_over_held: {e}"));
-        let now_iso = chrono::Utc::now().to_rfc3339();
+        let now_iso = crate::host::clock::now().to_rfc3339();
         self.write(move |conn| -> Result<(), BlobError> {
             let tx = write_tx(conn).map_err(db)?;
             for (idx, (chunk_sha, size)) in planned.held_chunks.iter().enumerate() {
@@ -25427,7 +25428,7 @@ impl crate::federation::blob_admit::BlobWriteStore for SqliteBackend {
         planned: crate::federation::blob_admit::PlannedSeal,
     ) -> Result<crate::federation::blob_admit::SealWrite, crate::federation::BlobError> {
         use crate::federation::blob_admit::SealWrite;
-        let now_iso = chrono::Utc::now().to_rfc3339();
+        let now_iso = crate::host::clock::now().to_rfc3339();
         self.write(move |conn| -> Result<SealWrite, rusqlite::Error> {
             let p = &planned;
             let tx = write_tx(conn)?;
@@ -26051,7 +26052,7 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for SqliteBac
     ) -> Result<u32, crate::federation::Error> {
         use crate::federation::group_supersede_admit::{held_head_verdict, PlannedHead};
         use crate::federation::Error;
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = crate::host::clock::now().to_rfc3339();
         let cohort_str = planned.cohort_str;
         let auth_json = match &planned.authorization {
             Some(v) => Some(
@@ -27161,7 +27162,7 @@ impl crate::federation::key_plane::KeyPlaneStore for SqliteBackend {
                 .optional()?
                 .flatten();
             let admitted_at = crate::federation::types::monotonic_admission_instant(
-                chrono::Utc::now(),
+                crate::host::clock::now(),
                 last.as_deref().map(parse_rfc3339),
             );
             // v58.0.0 (CIRISPersist#991) — the row first: the projection names it.
@@ -27604,7 +27605,7 @@ impl crate::federation::community_admit::CommunityStore for SqliteBackend {
         let hard_case_attester = crate::federation::attestation_admit::hard_case_attester(self)
             .await
             .map_err(|e| format!("{}: {e}", e.kind()));
-        let hard_case_received_at = chrono::Utc::now();
+        let hard_case_received_at = crate::host::clock::now();
         // v21.0.0 (CIRISPersist#502 E4 followup) — persist the verified
         // authority signature.
         let authority_key_id = revocation.authority_key_id;

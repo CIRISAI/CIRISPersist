@@ -618,7 +618,7 @@ pub async fn content_binding(
         return Ok(None);
     }
     let mut out = ContentBinding::default();
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     for row in rows {
         // v60.0.0 (CIRISPersist#803) — a takedown notice row is ABOUT the
         // content, never a binding of it: its `evidence_refs` may name the

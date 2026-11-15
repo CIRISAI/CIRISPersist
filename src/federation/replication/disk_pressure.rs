@@ -573,7 +573,7 @@ impl DiskPressureMonitor {
         let shutdown_for_loop = shutdown.clone();
         let interval = self.cfg.effective_poll_interval();
         let monitor = self.clone();
-        let join_handle = tokio::spawn(async move {
+        let join_handle = crate::host::rt::spawn(async move {
             // Prime once immediately so the first poll happens without
             // waiting a full interval.
             monitor.poll_once();
@@ -585,7 +585,7 @@ impl DiskPressureMonitor {
                         );
                         return;
                     }
-                    _ = tokio::time::sleep(interval) => {
+                    _ = crate::host::rt::sleep(interval) => {
                         monitor.poll_once();
                     }
                 }
@@ -603,14 +603,14 @@ impl DiskPressureMonitor {
 /// `EngineCell` holds it so cohabitation views don't spawn a second
 /// loop; `close()` calls [`Self::stop`] to shut it down.
 pub struct DiskPressureMonitorHandle {
-    join_handle: tokio::task::JoinHandle<()>,
+    join_handle: crate::host::TaskHandle,
     shutdown: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl DiskPressureMonitorHandle {
     /// Signal the poll loop to stop and return its `JoinHandle`. The
     /// task observes the `Notify` and exits at its next `select!` poll.
-    pub fn stop(self) -> tokio::task::JoinHandle<()> {
+    pub fn stop(self) -> crate::host::TaskHandle {
         self.shutdown.notify_one();
         self.join_handle
     }

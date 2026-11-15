@@ -104,7 +104,7 @@ pub(crate) async fn add_peer_record_planned<D: DirectoryStore>(
     // path writes a caller-supplied `identity_type`: the role gate runs
     // before any write.
     super::admission::check_peer_record_admission(dir, key_id, identity_type).await?;
-    let now = Utc::now();
+    let now = crate::host::clock::now();
     let mut key = KeyRecord {
         key_id: key_id.to_owned(),
         pubkey_ed25519_base64: pubkey_ed25519_base64.to_owned(),

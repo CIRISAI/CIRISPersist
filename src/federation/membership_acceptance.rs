@@ -868,7 +868,7 @@ pub async fn live_invitees_of<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     // v53.1.6 — the GROUP's proposal rows (V150's cohort_target seek: the
     // rows placed on this plane naming this group), not every row every
     // member and every member's occurrence ever authored. A proposal still

@@ -16,7 +16,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::host::clock::Instant;
 
 use super::key::{Bucket, CacheKey};
 
@@ -273,7 +275,7 @@ mod tests {
 
     #[test]
     fn insert_and_get_hits() {
-        let now = Instant::now();
+        let now = crate::host::clock::monotonic_now();
         let mut c = LruCache::new(10, 1_000_000);
         c.insert(key(1), entry(10, now));
         let got = c.get(&key(1), TTL, now);
@@ -283,7 +285,7 @@ mod tests {
 
     #[test]
     fn lru_evicts_least_recently_used_on_entry_bound() {
-        let now = Instant::now();
+        let now = crate::host::clock::monotonic_now();
         let mut c = LruCache::new(2, 1_000_000);
         c.insert(key(1), entry(10, now));
         c.insert(key(2), entry(10, now));
@@ -299,7 +301,7 @@ mod tests {
 
     #[test]
     fn byte_bound_evicts() {
-        let now = Instant::now();
+        let now = crate::host::clock::monotonic_now();
         let mut c = LruCache::new(100, 100); // 100 bytes max
         c.insert(key(1), entry(60, now));
         let out = c.insert(key(2), entry(60, now)); // 120 > 100
@@ -309,7 +311,7 @@ mod tests {
 
     #[test]
     fn ttl_expiry_on_get_is_a_miss_not_a_stale_serve() {
-        let now = Instant::now();
+        let now = crate::host::clock::monotonic_now();
         let mut c = LruCache::new(10, 1_000_000);
         c.insert(key(1), entry(10, now));
         let later = now + Duration::from_secs(31); // past 30s TTL
@@ -321,7 +323,7 @@ mod tests {
 
     #[test]
     fn evict_expired_drains_aged_entries() {
-        let now = Instant::now();
+        let now = crate::host::clock::monotonic_now();
         let mut c = LruCache::new(10, 1_000_000);
         c.insert(key(1), entry(10, now));
         c.insert(key(2), entry(10, now + Duration::from_secs(40)));
@@ -334,7 +336,7 @@ mod tests {
 
     #[test]
     fn replace_updates_resident_bytes() {
-        let now = Instant::now();
+        let now = crate::host::clock::monotonic_now();
         let mut c = LruCache::new(10, 1_000_000);
         c.insert(key(1), entry(100, now));
         assert_eq!(c.bytes_resident(), 100);
@@ -345,7 +347,7 @@ mod tests {
 
     #[test]
     fn remove_is_unconditional() {
-        let now = Instant::now();
+        let now = crate::host::clock::monotonic_now();
         let mut c = LruCache::new(10, 1_000_000);
         c.insert(key(1), entry(10, now));
         assert!(c.remove(&key(1)));

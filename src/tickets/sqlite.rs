@@ -408,7 +408,7 @@ impl TicketService for SqliteTicketBackend {
             .unwrap_or(TicketStatus::Assigned)
             .as_sql_str()
             .to_owned();
-        let now_str = fmt_datetime(chrono::Utc::now());
+        let now_str = fmt_datetime(crate::host::clock::now());
         let ticket_id_owned = ticket_id.to_owned();
         let user_identifier_owned = user_identifier.to_owned();
         let conn = self.conn.clone();
@@ -470,7 +470,7 @@ impl TicketService for SqliteTicketBackend {
             return Err(Error::InvalidArgument("ticket_id required".into()));
         }
         let status_str = new_status.as_sql_str().to_owned();
-        let now_str = fmt_datetime(chrono::Utc::now());
+        let now_str = fmt_datetime(crate::host::clock::now());
         let completed_at_str = completed_at.map(fmt_datetime);
         let ticket_id_owned = ticket_id.to_owned();
         let conn = self.conn.clone();

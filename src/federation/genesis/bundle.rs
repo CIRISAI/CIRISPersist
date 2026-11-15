@@ -655,7 +655,7 @@ where
     // worse than no verifier: it converts a loud producer-side failure into a
     // silent consumer-side one.
     let policy = directory.hardware_attestation_policy();
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     for holder in &bundle.holders {
         if !holder
             .record

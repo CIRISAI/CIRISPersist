@@ -277,7 +277,7 @@ pub(crate) fn purge_clock() -> chrono::DateTime<chrono::Utc> {
     if let Some(at) = test_clock::get() {
         return at;
     }
-    chrono::Utc::now()
+    crate::host::clock::now()
 }
 
 /// The `cfg(test)` clock seam: a thread-local instant [`purge_clock`] returns

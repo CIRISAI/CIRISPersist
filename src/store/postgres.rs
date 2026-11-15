@@ -1263,7 +1263,7 @@ impl crate::federation::read_plan::ReadPlanStore for PostgresBackend {
         // before it has committed, so it is visible to both reads below.
         let settled_before = crate::federation::read_plan::serve_settled_before(
             Dialect::Postgres,
-            chrono::Utc::now(),
+            crate::host::clock::now(),
         );
         let head_stmt =
             crate::federation::read_plan::serve_stream_head_statement(Dialect::Postgres);
@@ -3022,7 +3022,7 @@ impl crate::federation::group_supersede_admit::GroupSupersedeStore for PostgresB
         use crate::federation::group_supersede_admit::{held_head_verdict, PlannedHead};
         use crate::federation::Error;
         let cohort_discriminator = planned.cohort_str;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let mut client = self
             .get_client()
             .await
@@ -4150,7 +4150,7 @@ impl crate::federation::key_plane::KeyPlaneStore for PostgresBackend {
             .map_err(|e| Error::Backend(format!("last admitted_at: {e}")))?
             .safe_get_with(0, Error::Backend)?;
         let admitted_at = crate::federation::types::monotonic_admission_instant(
-            chrono::Utc::now(),
+            crate::host::clock::now(),
             last_admitted,
         );
         // v58.0.0 (CIRISPersist#991) — the row first: the projection names it.
@@ -4705,7 +4705,7 @@ impl crate::federation::community_admit::CommunityStore for PostgresBackend {
         let hard_case_attester = crate::federation::attestation_admit::hard_case_attester(self)
             .await
             .map_err(|e| format!("{}: {e}", e.kind()));
-        let hard_case_received_at = chrono::Utc::now();
+        let hard_case_received_at = crate::host::clock::now();
         let mut client = self
             .get_client()
             .await
@@ -7154,7 +7154,7 @@ impl PostgresBackend {
             "CIRIS_PERSIST_MIGRATION_LOCK_WAIT_SECS",
             DEFAULT_MIGRATION_LOCK_WAIT_SECS,
         );
-        let started = std::time::Instant::now();
+        let started = crate::host::clock::monotonic_now();
         let mut last_progress = started;
         loop {
             let acquired: bool = client
@@ -7180,7 +7180,7 @@ impl PostgresBackend {
                 });
             }
             if last_progress.elapsed() >= MIGRATION_LOCK_PROGRESS_EVERY {
-                last_progress = std::time::Instant::now();
+                last_progress = crate::host::clock::monotonic_now();
                 tracing::info!(
                     lock_id = MIGRATION_LOCK_ID,
                     waited_secs = waited.as_secs(),
@@ -7189,7 +7189,7 @@ impl PostgresBackend {
                      occurrence is migrating this database"
                 );
             }
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            crate::host::rt::sleep(std::time::Duration::from_millis(250)).await;
         }
     }
 
@@ -7215,11 +7215,12 @@ async fn dedicated_connect_to(dsn: &str) -> Result<tokio_postgres::Client, Error
                 sqlstate: extract_sqlstate(&e),
                 detail: format!("dedicated connect: {e}"),
             })?;
-    tokio::spawn(async move {
+    // Detached: the connection task ends when the client drops.
+    drop(crate::host::rt::spawn(async move {
         if let Err(e) = connection.await {
             tracing::warn!(error = %e, "migration-lock connection terminated");
         }
-    });
+    }));
     Ok(client)
 }
 
@@ -7253,11 +7254,12 @@ async fn dedicated_connect_to(dsn: &str) -> Result<tokio_postgres::Client, Error
                 sqlstate: extract_sqlstate(&e),
                 detail: format!("dedicated connect (tls): {e}"),
             })?;
-    tokio::spawn(async move {
+    // Detached: the connection task ends when the client drops.
+    drop(crate::host::rt::spawn(async move {
         if let Err(e) = connection.await {
             tracing::warn!(error = %e, "migration-lock connection terminated");
         }
-    });
+    }));
     Ok(client)
 }
 
@@ -7294,9 +7296,7 @@ pub fn stale_genesis_scratch(datname: &str, now_secs: u64) -> bool {
 /// Drop every stale genesis scratch in the cluster `admin` is connected to.
 /// Best effort: a list or drop failure is logged and never fails the caller.
 async fn reap_stale_genesis_scratches(admin: &tokio_postgres::Client) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let now = u64::try_from(crate::host::clock::now().timestamp()).unwrap_or(0);
     let names: Vec<String> = match admin
         .query(
             "SELECT datname FROM pg_database WHERE starts_with(datname, $1)",
@@ -7380,9 +7380,7 @@ impl crate::federation::genesis::scratch::GenesisScratch for PostgresBackend {
         let fail = |what: &str, e: &dyn std::fmt::Display| {
             crate::federation::Error::Backend(format!("genesis scratch: {what}: {e}"))
         };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        let now = u64::try_from(crate::host::clock::now().timestamp()).unwrap_or(0);
         let name = format!(
             "{GENESIS_SCRATCH_DB_PREFIX}{now}_{}_{}",
             std::process::id(),
@@ -7576,7 +7574,7 @@ impl Backend for PostgresBackend {
             .try_get("m")
             .map_err(|e| Error::Backend(format!("decode max admitted_at: {e}")))?;
         let admitted_at = crate::federation::types::monotonic_admission_instant(
-            chrono::Utc::now(),
+            crate::host::clock::now(),
             last_admitted,
         );
 
@@ -8141,7 +8139,7 @@ impl Backend for PostgresBackend {
         // v58.0.0 (CIRISPersist#1094 item 2) — what V196 will delete, counted
         // before it runs so the boot can say so.
         let v196 = pg_v196_pending(&lock_client).await;
-        let migration_started = std::time::Instant::now();
+        let migration_started = crate::host::clock::monotonic_now();
         // v7.0.0 — V079 (the TimescaleDB continuous-aggregate accelerator)
         // is left IMMUTABLE and unmodified, like V001's hypertable guard:
         // its DDL is guarded by `IF EXISTS pg_extension timescaledb`, so it
@@ -9152,7 +9150,7 @@ impl PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(format!("last serve position: {e}")))?
             .get(0);
         Ok(crate::federation::types::monotonic_admission_instant(
-            chrono::Utc::now(),
+            crate::host::clock::now(),
             last,
         ))
     }
@@ -9190,7 +9188,7 @@ impl PostgresBackend {
             })?
             .get(0);
         Ok(crate::federation::types::monotonic_admission_instant(
-            chrono::Utc::now(),
+            crate::host::clock::now(),
             last,
         ))
     }
@@ -9845,7 +9843,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // The derived detection events take the Art. 17 tombstone, in this
         // transaction (the same function the DSAR door runs).
         let trace_ids = [trace_id.to_owned()];
-        pg_tombstone_detection_events(&tx, &trace_ids, chrono::Utc::now())
+        pg_tombstone_detection_events(&tx, &trace_ids, crate::host::clock::now())
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("purge detections: {e}")))?;
         let calls = tx
@@ -10279,7 +10277,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     ) -> Result<(), crate::federation::Error> {
         let mut record = crate::federation::CanonicalWithdrawal {
             key_id: key_id.to_owned(),
-            withdrawn_at: chrono::Utc::now(),
+            withdrawn_at: crate::host::clock::now(),
             authority_decision_digest: authority_decision_digest.to_owned(),
             superseded_by: superseded_by.map(str::to_owned),
             persist_row_hash: String::new(),
@@ -10400,7 +10398,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let mut record = crate::federation::admission::RoleWithdrawal {
             role: role.to_owned(),
             key_id: key_id.to_owned(),
-            withdrawn_at: chrono::Utc::now(),
+            withdrawn_at: crate::host::clock::now(),
             authority_decision_digest: authority_decision_digest.to_owned(),
             superseded_by: superseded_by.map(str::to_owned),
             persist_row_hash: String::new(),
@@ -10592,7 +10590,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             self,
             &me,
             Some((owner, device)),
-            chrono::Utc::now(),
+            crate::host::clock::now(),
         )
         .await
         .map(|_| ())
@@ -11962,7 +11960,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         cosign: &crate::federation::lineage_witness::LineageHeadCosign,
     ) -> Result<bool, crate::federation::Error> {
         // v51.0.0 (#938) — V159; insert-or-hold, never delete (evidence).
-        let admitted_at = chrono::Utc::now();
+        let admitted_at = crate::host::clock::now();
         let client = self
             .get_client()
             .await
@@ -12277,7 +12275,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                  VALUES ($1, $2, $3) \
                  ON CONFLICT (family_key_id) DO UPDATE SET \
                     active_halt_id = EXCLUDED.active_halt_id, set_at = EXCLUDED.set_at",
-                &[&family_key_id, &active_halt_id, &chrono::Utc::now()],
+                &[&family_key_id, &active_halt_id, &crate::host::clock::now()],
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("set_active_halt: {e}")))?;
@@ -13134,7 +13132,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         owner_hostname: &str,
         stale_after: Option<std::time::Duration>,
     ) -> Result<Option<crate::federation::SharedInstanceLease>, crate::federation::Error> {
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let stale = stale_after.unwrap_or(crate::federation::shared_instance::DEFAULT_STALE_AFTER);
         let threshold = crate::federation::shared_instance::staleness_threshold(now, stale);
         let client = self
@@ -13180,7 +13178,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         lease: &crate::federation::SharedInstanceLease,
     ) -> Result<Option<crate::federation::SharedInstanceLease>, crate::federation::Error> {
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let client = self
             .get_client()
             .await
@@ -14479,7 +14477,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             crate::federation::admission::check_delegation_cycle_admission(
                 &PgTxDelegationGraph(&*tx),
                 &row,
-                chrono::Utc::now(),
+                crate::host::clock::now(),
             )
             .await?;
             #[cfg(test)]
@@ -15017,7 +15015,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // before the transaction; asked for only once the removal's own
         // refusals have had their say (an act: no attester, no removal).
         let attester = crate::federation::attestation_admit::hard_case_attester(self).await;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let removal_event = crate::federation::HardCaseEvent {
             event_id: uuid::Uuid::new_v4().to_string(),
             kind: crate::federation::hard_case::admin_action_kind(
@@ -15122,7 +15120,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         "remove_peer_record peer_metadata fetch: {e}"
                     ))
                 })?;
-            let now = chrono::Utc::now();
+            let now = crate::host::clock::now();
             let new_row = pg_row_to_peer_metadata_for_hash(&row, Some(now), now)?;
             let new_hash = crate::federation::types::compute_persist_row_hash(&new_row)?;
             tx.execute(
@@ -15357,9 +15355,9 @@ async fn pg_update_peer_field(
     // persist_row_hash against the mutated shape.
     let inserted_at: chrono::DateTime<chrono::Utc> =
         row.safe_get_with("inserted_at", crate::federation::Error::Backend)?;
-    let mut mut_row = pg_row_to_peer_metadata_for_hash(&row, None, chrono::Utc::now())?;
+    let mut mut_row = pg_row_to_peer_metadata_for_hash(&row, None, crate::host::clock::now())?;
     mut_row.inserted_at = inserted_at;
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     mut_row.updated_at = now;
 
     match &update {
@@ -16291,7 +16289,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
         let ep = epoch as i64;
         let alg = crate::federation::at_rest_cascade::WRAP_ALGORITHM_CONTENT_MASTER;
         // #848 (§15) — `minted_at` stamped here, by the writer's clock.
-        let minted_at = chrono::Utc::now();
+        let minted_at = crate::host::clock::now();
         client
             .execute(
                 "INSERT INTO cirislens.federation_community_dek (\
@@ -17967,7 +17965,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
         // No row yet: free to take the hardware root, and this is the only
         // moment that choice is free.
         // §11.8 — TPM + filesystem I/O off the async workers (v50, #920 review).
-        let source = tokio::task::spawn_blocking(|| content_master_key(true))
+        let source = crate::host::rt::try_dispatch_blocking(|| content_master_key(true))
             .await
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("content-master derive join: {e}"))
@@ -20045,7 +20043,7 @@ impl crate::federation::BlackholeRules for PostgresBackend {
         reason: Option<&str>,
     ) -> Result<(), crate::federation::Error> {
         crate::federation::blackhole::validate_identity_hash_len(identity_hash)?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         // Compute the would-be `persist_row_hash` for the FRESH-insert
         // arm (added_at = now). The conflict path recomputes against
         // the existing row's added_at; do that inside the SQL via a
@@ -20270,7 +20268,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         // primitive — concurrent workers see disjoint batches
         // (CIRISEdge OQ-06). Subquery picks claim candidates;
         // outer UPDATE marks them sending + writes claim metadata.
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let claim_until = now + chrono::Duration::seconds(claim_duration_seconds);
         let rows = tx
             .query(
@@ -20316,7 +20314,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
             .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         // Branch on requires_ack within the SQL: 'delivered' immediately
         // when no ACK required; 'awaiting_ack' otherwise. CHECK
         // constraints enforce delivered_at correctness on terminal.
@@ -20390,7 +20388,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         let enqueued_at: chrono::DateTime<chrono::Utc> = row.safe_get_with(2, mk_err)?;
         let ttl_seconds: i64 = row.safe_get_with(3, mk_err)?;
 
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let ttl_expired = (now - enqueued_at) > chrono::Duration::seconds(ttl_seconds);
         let attempts_exhausted = attempt_count >= max_attempts;
 
@@ -20458,7 +20456,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
             .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         // Treat as delivered — receiver already accepted the body
         // (replay window expired before our ACK arrived). Idempotent
         // across non-terminal states.
@@ -20516,7 +20514,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
             .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let n = client
             .execute(
                 "UPDATE cirislens.edge_outbound_queue \
@@ -20541,7 +20539,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
             .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         // Walk awaiting_ack rows where the ack_timeout has expired.
         // Treat each as a transport failure (attempt_count++,
         // retry-or-abandon). Reschedule next_attempt_after to now +
@@ -20595,7 +20593,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
             .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let n = client
             .execute(
                 "UPDATE cirislens.edge_outbound_queue \
@@ -20617,7 +20615,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
             .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let n = client
             .execute(
                 "UPDATE cirislens.edge_outbound_queue \
@@ -20760,7 +20758,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
             .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         client
             .execute(
                 "UPDATE cirislens.edge_outbound_queue \
@@ -20783,7 +20781,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
             .checkout()
             .await
             .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let n = client
             .execute(
                 "UPDATE cirislens.edge_outbound_queue \
@@ -24028,7 +24026,7 @@ where
         })?
         .get(0);
     Ok(crate::federation::types::monotonic_admission_instant(
-        chrono::Utc::now(),
+        crate::host::clock::now(),
         last,
     ))
 }
@@ -26525,7 +26523,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             .map(pg_row_to_per_trace)
             .collect::<Result<Vec<_>, _>>()?;
 
-        let evaluated_at = chrono::Utc::now().timestamp_millis();
+        let evaluated_at = crate::host::clock::now().timestamp_millis();
         let stats = repo::fold_statistics(period, &per_trace, evaluated_at, false);
         let size = repo::estimate_size(&stats);
         cache.store(key, stats.clone(), size);
@@ -27766,7 +27764,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                         calibration_error: None,
                         unsafe_action_rate: 0.0,
                         coherence_decay_series: Vec::new(),
-                        evaluated_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+                        evaluated_at_unix_ms: crate::host::clock::now().timestamp_millis(),
                         cache_hit: false,
                     }
                 }));
@@ -28481,7 +28479,7 @@ impl PostgresBackend {
                 crate::read::Error::Backend(format!("aggregate_scoring_factors rollup: {e}"))
             })?;
 
-        let evaluated_at_unix_ms = chrono::Utc::now().timestamp_millis();
+        let evaluated_at_unix_ms = crate::host::clock::now().timestamp_millis();
         let mut out = std::collections::HashMap::with_capacity(rows.len());
         for row in rows {
             let agent_id_hash: String = row.safe_get("agent_id_hash")?;
@@ -28841,7 +28839,7 @@ impl PostgresBackend {
             unsafe_action_rate,
             coherence_decay_series,
             // CIRISPersist#195 — compute-time honesty fields.
-            evaluated_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+            evaluated_at_unix_ms: crate::host::clock::now().timestamp_millis(),
             cache_hit: false,
         })
     }

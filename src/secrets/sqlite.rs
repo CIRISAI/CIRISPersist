@@ -514,20 +514,21 @@ impl SecretsService for SqliteSecretsBackend {
             if let Some(uuid) = audit.secret_uuid {
                 let conn = self.conn.clone();
                 let uuid_str = uuid.to_string();
-                let now = fmt_datetime(Utc::now());
-                let _ = tokio::task::spawn_blocking(move || -> Result<(), SecretsError> {
-                    let guard = conn.lock();
-                    guard
-                        .execute(
-                            "UPDATE cirislens_secrets_secrets \
+                let now = fmt_datetime(crate::host::clock::now());
+                let _ =
+                    crate::host::rt::try_dispatch_blocking(move || -> Result<(), SecretsError> {
+                        let guard = conn.lock();
+                        guard
+                            .execute(
+                                "UPDATE cirislens_secrets_secrets \
                              SET last_accessed = ?1, access_count = access_count + 1 \
                              WHERE secret_uuid = ?2",
-                            params![now, uuid_str],
-                        )
-                        .map_err(|e| map_sqlite_error(e, "retrieve bump access_count"))?;
-                    Ok(())
-                })
-                .await;
+                                params![now, uuid_str],
+                            )
+                            .map_err(|e| map_sqlite_error(e, "retrieve bump access_count"))?;
+                        Ok(())
+                    })
+                    .await;
             }
         }
         let _ = self.secrets_audit(audit, true, None).await;
@@ -590,9 +591,9 @@ impl SecretsService for SqliteSecretsBackend {
                             // Bump access_count.
                             let conn = self.conn.clone();
                             let uuid_str_inner = parsed_uuid.to_string();
-                            let now = fmt_datetime(Utc::now());
-                            let _ =
-                                tokio::task::spawn_blocking(move || -> Result<(), SecretsError> {
+                            let now = fmt_datetime(crate::host::clock::now());
+                            let _ = crate::host::rt::try_dispatch_blocking(
+                                move || -> Result<(), SecretsError> {
                                     let guard = conn.lock();
                                     guard
                                         .execute(
@@ -606,8 +607,9 @@ impl SecretsService for SqliteSecretsBackend {
                                             map_sqlite_error(e, "recall bump access_count")
                                         })?;
                                     Ok(())
-                                })
-                                .await;
+                                },
+                            )
+                            .await;
                             let pt = String::from_utf8(pt).map_err(|e| {
                                 SecretsError::Internal(format!("ciphertext not utf8: {e}"))
                             })?;
@@ -858,7 +860,7 @@ impl SecretsService for SqliteSecretsBackend {
                 config_id: "global".into(),
                 config_value: serde_json::json!({}),
                 version: 0,
-                updated_at: Utc::now(),
+                updated_at: crate::host::clock::now(),
                 updated_by: "default".into(),
             }),
             Some((config_id, config_value_str, version, updated_at_str, updated_by)) => {
@@ -887,7 +889,7 @@ impl SecretsService for SqliteSecretsBackend {
     ) -> Result<FilterUpdateResult, SecretsError> {
         let config_value_str = serde_json::to_string(&updates.new_config)
             .map_err(|e| SecretsError::Internal(format!("config_value serialize: {e}")))?;
-        let now = fmt_datetime(Utc::now());
+        let now = fmt_datetime(crate::host::clock::now());
 
         let conn = self.conn.clone();
         let config_id = updates.config_id.clone();
@@ -1175,7 +1177,7 @@ impl SecretsService for SqliteSecretsBackend {
         new_master_key_ref: MasterKeyRef,
         accessor: String,
     ) -> Result<RotationResult, SecretsError> {
-        let start = std::time::Instant::now();
+        let start = crate::host::clock::monotonic_now();
         // Resolve the new master-key bytes. For Software variant the
         // handle = key_ref already in software_keys.
         let new_key_ref = match &new_master_key_ref {
@@ -1190,7 +1192,7 @@ impl SecretsService for SqliteSecretsBackend {
 
         let conn = self.conn.clone();
         let new_key_ref_for_tx = new_key_ref.clone();
-        let now_for_tx = fmt_datetime(Utc::now());
+        let now_for_tx = fmt_datetime(crate::host::clock::now());
         let (reencrypted, failures) = (move || -> Result<(u64, Vec<String>), SecretsError> {
             // Read every secret up front under a brief lock, then
             // release it. Each row is self-describing (per-row
@@ -1384,7 +1386,7 @@ impl SecretsService for SqliteSecretsBackend {
         // winner's key.
         let conn = self.conn.clone();
         let new_key_ref_for_db = new_key_ref.clone();
-        let now = fmt_datetime(Utc::now());
+        let now = fmt_datetime(crate::host::clock::now());
         // Cache the bytes BEFORE the commit so the row is never
         // visible to a concurrent `active_master_key()` without its
         // bytes. The loser path evicts them on rollback.
@@ -1488,7 +1490,7 @@ impl SecretsService for SqliteSecretsBackend {
         let conn = self.conn.clone();
         let new_key_ref_for_db = new_key_ref.clone();
         let descriptor_for_db = descriptor.clone();
-        let now = fmt_datetime(Utc::now());
+        let now = fmt_datetime(crate::host::clock::now());
         // Record the new key as `hardware`, not yet active —
         // `reencrypt_all` activates it once every secret is
         // re-encrypted (same staging as `rotate_master_key`).

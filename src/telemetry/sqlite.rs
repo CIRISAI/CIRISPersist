@@ -1046,7 +1046,7 @@ fn upsert_typed_summary(
         .map_err(|e| map_sqlite_error(e, "typed upsert read version"))?;
     let expected_version = current_version.unwrap_or(0);
     let row_hash = format!("{node_type}_v1.6.2");
-    let now_str = fmt_datetime(chrono::Utc::now());
+    let now_str = fmt_datetime(crate::host::clock::now());
     let affected = conn
         .execute(
             "INSERT INTO cirisgraph_nodes (\
@@ -1212,7 +1212,7 @@ fn run_rollup(
     let mut summaries_written: i64 = 0;
     let mut edges_created: i64 = 0;
 
-    let now_str = fmt_datetime(chrono::Utc::now());
+    let now_str = fmt_datetime(crate::host::clock::now());
 
     // Truncate timestamps to microsecond precision before serializing
     // into attributes JSON. SQLite stores attributes as TEXT and the

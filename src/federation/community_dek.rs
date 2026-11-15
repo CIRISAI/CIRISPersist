@@ -395,7 +395,7 @@ pub mod orchestrate {
     where
         B: FederationDirectory + Sync + ?Sized,
     {
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let revs = backend
             .list_community_membership_revocations_for(&community.community_key_id)
             .await
@@ -1962,7 +1962,7 @@ pub mod lifecycle_support {
                 occurrence_key_id: occurrence_key_id.to_owned(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
-                asserted_at: chrono::Utc::now(),
+                asserted_at: crate::host::clock::now(),
                 valid_until: None,
                 encryption_pubkeys: Some(crate::federation::EncryptionPubkeys {
                     x25519_base64: B64.encode(x_pub),
@@ -2058,7 +2058,7 @@ pub mod lifecycle_support {
             .iter()
             .map(|(ident, _)| crate::federation::types::CommunityMember {
                 key_id: (*ident).to_owned(),
-                joined_at: chrono::Utc::now(),
+                joined_at: crate::host::clock::now(),
                 role: None,
             })
             .collect();
@@ -2075,7 +2075,7 @@ pub mod lifecycle_support {
                         policy_blob.as_ref(),
                         roster,
                     ),
-                    founded_at: chrono::Utc::now(),
+                    founded_at: crate::host::clock::now(),
                     consensus_protocol:
                         crate::federation::tier_ingest::test_support::fixture_protocol(
                             policy_blob.as_ref(),
@@ -2137,7 +2137,7 @@ pub mod lifecycle_support {
                     occurrence_key_id: (*occurrence_key_id).to_owned(),
                     device_class: crate::federation::types::device_class::LAPTOP.into(),
                     hardware_attestation: None,
-                    asserted_at: chrono::Utc::now(),
+                    asserted_at: crate::host::clock::now(),
                     valid_until: None,
                     encryption_pubkeys,
                     transport_binding: None,
@@ -2173,7 +2173,7 @@ pub mod lifecycle_support {
             .iter()
             .map(|(ident, _)| crate::federation::types::CommunityMember {
                 key_id: (*ident).to_owned(),
-                joined_at: chrono::Utc::now(),
+                joined_at: crate::host::clock::now(),
                 role: None,
             })
             .collect();
@@ -2186,7 +2186,7 @@ pub mod lifecycle_support {
                     community_key_id: community_key_id.to_owned(),
                     community_name: "Shaped Co-op".into(),
                     members: roster,
-                    founded_at: chrono::Utc::now(),
+                    founded_at: crate::host::clock::now(),
                     consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
                         .to_owned(),
                     policy_blob: None,
@@ -2223,7 +2223,7 @@ pub mod lifecycle_support {
             .iter()
             .map(|(ident, _)| crate::federation::types::FamilyMember {
                 key_id: (*ident).to_owned(),
-                joined_at: chrono::Utc::now(),
+                joined_at: crate::host::clock::now(),
                 role: None,
             })
             .collect();
@@ -2236,7 +2236,7 @@ pub mod lifecycle_support {
                     family_key_id: family_key_id.to_owned(),
                     family_name: "Shaped Household".into(),
                     members: roster,
-                    founded_at: chrono::Utc::now(),
+                    founded_at: crate::host::clock::now(),
                     consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
                         .to_owned(),
                     consensus_protocol_entrenched: false,
@@ -2271,7 +2271,7 @@ pub mod lifecycle_support {
         B: BlobStorage + FederationDirectory + Sync,
     {
         use crate::federation::tier_ingest::test_support as ts;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         // v49.0.0 (#908): signed as the room's protocol requires.
         let signed = ts::sign_revocation_by_consensus(
             backend,
@@ -2401,7 +2401,7 @@ pub mod lifecycle_harness {
         };
 
         // (1) A scheduled removal — bob stays active until it takes effect.
-        let scheduled = chrono::Utc::now() + chrono::Duration::days(30);
+        let scheduled = crate::host::clock::now() + chrono::Duration::days(30);
         let first = removal(scheduled);
         backend
             .put_family_membership_revocation(first.clone())
@@ -2430,7 +2430,7 @@ pub mod lifecycle_harness {
         // removal and now needs it immediately gets it: an earlier removal is
         // another event, and the fold honours it now.
         backend
-            .put_family_membership_revocation(removal(chrono::Utc::now()))
+            .put_family_membership_revocation(removal(crate::host::clock::now()))
             .await
             .unwrap_or_else(|e| panic!("{tag}: an earlier removal accelerates: {e}"));
         assert_eq!(
@@ -2703,7 +2703,7 @@ pub mod lifecycle_harness {
                 None,
                 &sweeper.derived_key_id(),
                 &sweeper,
-                chrono::Utc::now(),
+                crate::host::clock::now(),
                 uuid::Uuid::new_v4(),
                 None,
             )
@@ -2725,7 +2725,7 @@ pub mod lifecycle_harness {
             backend,
             &comm,
             &sweeper,
-            chrono::Utc::now(),
+            crate::host::clock::now(),
         )
         .await
         .unwrap_or_else(|e| panic!("{tag}: sweep: {e}"));

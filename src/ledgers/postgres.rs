@@ -92,7 +92,7 @@ impl LedgerService for PostgresBackend {
         validate::non_empty(standard_version, "standard_version")?;
         let ledger_id = derive_ledger_id(owner_key_id, unit, standard_version)
             .map_err(|e| Error::Internal(e.to_string()))?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let client = self
             .checkout()
             .await
@@ -171,7 +171,7 @@ impl LedgerService for PostgresBackend {
         validate::non_empty(ledger_id, "ledger_id")?;
         validate::non_empty(head_hash, "head_hash")?;
         let seq_i = validate::seq_as_i64(seq, "seq")?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let client = self
             .checkout()
             .await
@@ -315,7 +315,7 @@ impl LedgerService for PostgresBackend {
         validate::balance_minor(&checkpoint.balance_minor)?;
         validate::witness_refs(&checkpoint.witness_refs)?;
         let seq_i = validate::seq_as_i64(checkpoint.seq, "seq")?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let client = self
             .checkout()
             .await
@@ -434,7 +434,7 @@ impl LedgerService for PostgresBackend {
         }
         let from_i = validate::seq_as_i64(range.from_seq, "from_seq")?;
         let to_i = validate::seq_as_i64(range.to_seq, "to_seq")?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let client = self
             .checkout()
             .await
@@ -536,7 +536,7 @@ impl LedgerService for PostgresBackend {
         let seq_i = validate::seq_as_i64(evidence.seq(), "seq")?;
         let evidence_json = serde_json::to_value(evidence)
             .map_err(|e| Error::Internal(format!("evidence encode: {e}")))?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let client = self
             .checkout()
             .await

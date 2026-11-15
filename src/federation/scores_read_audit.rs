@@ -339,7 +339,12 @@ pub fn log_scores_read(
     caller_occurrence_key_id: &str,
     filter: &AttestationFilter,
 ) {
-    let record = ScoresReadLogRecord::new(site, caller_occurrence_key_id, filter, Utc::now());
+    let record = ScoresReadLogRecord::new(
+        site,
+        caller_occurrence_key_id,
+        filter,
+        crate::host::clock::now(),
+    );
     tracing::info!(
         target: SCORES_READ_LOG_TARGET,
         site = record.site,

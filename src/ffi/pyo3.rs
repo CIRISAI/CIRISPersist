@@ -446,7 +446,7 @@ type SubscriptionRegistry = Arc<std::sync::Mutex<SubscriptionState>>;
 /// `Arc<Runtime>`, and the last one to die ran tokio's blocking
 /// shutdown right there — usually inside CPython's `Py_DECREF` during
 /// a `gc.collect()`, with the GIL held, taking the whole interpreter
-/// down with it. See [`crate::engine::teardown`] for the full
+/// down with it. See [`crate::ffi::teardown`] for the full
 /// mechanism.
 ///
 /// Behaviour: `Deref<Target = Runtime>` so every existing
@@ -506,7 +506,7 @@ impl SharedRuntime {
             return;
         };
         match Arc::try_unwrap(arc) {
-            Ok(rt) => crate::engine::teardown::retire_runtime(rt, keepalive),
+            Ok(rt) => crate::ffi::teardown::retire_runtime(rt, keepalive),
             Err(_still_shared) => drop(keepalive),
         }
     }
@@ -589,7 +589,7 @@ fn teardown_timeout(seconds: f64) -> std::time::Duration {
 /// FIRST: the runtime must finish winding down before `backend` frees
 /// the connection handle its in-flight `spawn_blocking` tasks are
 /// still using. Reversing these two reinstates the "Bus error"
-/// teardown crash. See [`crate::engine::teardown`].
+/// teardown crash. See [`crate::ffi::teardown`].
 struct EngineCell {
     runtime: SharedRuntime,
     backend: BackendDispatch,
@@ -2792,7 +2792,7 @@ impl PyEngine {
             return Ok(());
         };
         // GIL released for the drop — see `SharedRuntime` / #572.
-        py.detach(move || crate::engine::teardown::retire_payload(Box::new(cell)));
+        py.detach(move || crate::ffi::teardown::retire_payload(Box::new(cell)));
         Ok(())
     }
 
@@ -2847,10 +2847,10 @@ impl PyEngine {
         self.runtime.retire(Box::new(self.backend.clone()));
         let timeout = teardown_timeout(timeout_seconds);
         let outcome = py.detach(move || {
-            crate::engine::teardown::retire_payload(Box::new(cell));
+            crate::ffi::teardown::retire_payload(Box::new(cell));
             if !sole_owner {
                 TeardownOutcome::Deferred
-            } else if crate::engine::teardown::wait_quiesced(timeout) {
+            } else if crate::ffi::teardown::wait_quiesced(timeout) {
                 TeardownOutcome::Drained
             } else {
                 TeardownOutcome::TimedOut
@@ -37324,7 +37324,7 @@ mod tests {
         // The teardown is deferred, not skipped: it really does finish,
         // and it finishes only once the in-flight blocking task is done.
         assert!(
-            crate::engine::teardown::wait_quiesced(WEDGE_HOLD * 4),
+            crate::ffi::teardown::wait_quiesced(WEDGE_HOLD * 4),
             "the retired runtime never finished winding down"
         );
     }
@@ -37734,7 +37734,7 @@ mod tests {
             "backend was freed while the runtime was still winding down \
              — that is the #572 use-after-free"
         );
-        assert!(crate::engine::teardown::wait_quiesced(WEDGE_HOLD * 4));
+        assert!(crate::ffi::teardown::wait_quiesced(WEDGE_HOLD * 4));
         assert!(
             weak.upgrade().is_none(),
             "backend must be released once teardown completes"
@@ -37896,7 +37896,7 @@ mod tests {
         clear_singleton_slot();
 
         Python::attach(|_py| drop(handle));
-        assert!(crate::engine::teardown::wait_quiesced(WEDGE_HOLD * 4));
+        assert!(crate::ffi::teardown::wait_quiesced(WEDGE_HOLD * 4));
     }
 
     /// v24.3.0 (CIRISPersist#572) — a zero/negative/NaN timeout means
@@ -38101,10 +38101,10 @@ fn reset_engine(py: Python<'_>, timeout_seconds: f64) -> &'static str {
         // Release outside the slot lock and off this thread: even with
         // the GIL detached, a blocking drop under the slot lock would
         // stall every concurrent `Engine(...)` constructor.
-        crate::engine::teardown::retire_payload(Box::new(cell));
+        crate::ffi::teardown::retire_payload(Box::new(cell));
         if !sole_owner {
             TeardownOutcome::Deferred.token()
-        } else if crate::engine::teardown::wait_quiesced(timeout) {
+        } else if crate::ffi::teardown::wait_quiesced(timeout) {
             TeardownOutcome::Drained.token()
         } else {
             TeardownOutcome::TimedOut.token()
@@ -38134,7 +38134,7 @@ fn reset_engine(py: Python<'_>, timeout_seconds: f64) -> &'static str {
 fn engine_teardown_wait(py: Python<'_>, timeout_seconds: f64) -> &'static str {
     let timeout = teardown_timeout(timeout_seconds);
     py.detach(move || {
-        if crate::engine::teardown::wait_quiesced(timeout) {
+        if crate::ffi::teardown::wait_quiesced(timeout) {
             TeardownOutcome::Drained.token()
         } else {
             TeardownOutcome::TimedOut.token()
@@ -38173,7 +38173,7 @@ fn set_caller_scope(label: Option<&str>) -> PyResult<Option<String>> {
 /// never finished".
 #[pyfunction]
 fn engine_teardowns_in_flight() -> usize {
-    crate::engine::teardown::in_flight()
+    crate::ffi::teardown::in_flight()
 }
 
 impl EngineCell {

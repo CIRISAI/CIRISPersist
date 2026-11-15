@@ -1316,8 +1316,9 @@ where
         use sha2::{Digest as _, Sha256};
         // v61 (CC 2.6.2) — the signed instant is at the millisecond, so
         // the envelope's `scrub_timestamp` is the instant the bytes name.
-        let now =
-            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        let now = crate::federation::admission::truncate_to_substrate_resolution(
+            crate::host::clock::now(),
+        );
         let key_id = self.signer_key_id.to_owned();
         let mut envelopes = Vec::with_capacity(pre_hashes.len());
         let mut idx = 0usize;

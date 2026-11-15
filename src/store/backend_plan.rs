@@ -235,7 +235,7 @@ pub(crate) async fn delete_traces_for_agent_planned<D: BackendStore>(
         signature_key_id: signature_key_id.to_owned(),
         include_federation_key,
     };
-    let planned = plan_trace_erasure(dir, agent_id_hash, scope, Utc::now()).await?;
+    let planned = plan_trace_erasure(dir, agent_id_hash, scope, crate::host::clock::now()).await?;
     let erased = dir.store_planned_trace_erasure(&planned).await?;
     Ok(DeleteSummary {
         trace_events_deleted: erased.trace_events,
@@ -244,7 +244,7 @@ pub(crate) async fn delete_traces_for_agent_planned<D: BackendStore>(
         federation_attestations_deleted: erased.federation_attestations,
         federation_revocations_deleted: erased.federation_revocations,
         detection_rows_refused: planned.plan.refused,
-        deleted_at: Utc::now(),
+        deleted_at: crate::host::clock::now(),
     })
 }
 
@@ -253,7 +253,7 @@ pub(crate) async fn delete_traces_for_agent_id_hash_planned<D: BackendStore>(
     dir: &D,
     agent_id_hash: &str,
 ) -> Result<ErasureSummary, Error> {
-    let erased_at = Utc::now();
+    let erased_at = crate::host::clock::now();
     let planned =
         plan_trace_erasure(dir, agent_id_hash, TraceErasureScope::Full, erased_at).await?;
     let erased = dir.store_planned_trace_erasure(&planned).await?;
@@ -287,7 +287,7 @@ fn plan_fountain_content<'a>(
                 .collect(),
         ),
         original_content_length,
-        admitted_at: Utc::now(),
+        admitted_at: crate::host::clock::now(),
         aggregation,
     })
 }

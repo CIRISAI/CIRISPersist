@@ -153,7 +153,7 @@ pub async fn build_caller_admission_from_directory(
     directory: &dyn crate::federation::FederationDirectory,
     occurrence_key_id: &KeyId,
 ) -> Result<CallerAdmission, crate::federation::Error> {
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
 
     // Step 1 — occurrence → identity. §4.4 singleton fallback when the
     // occurrence key is not bound as an occurrence of any identity, OR

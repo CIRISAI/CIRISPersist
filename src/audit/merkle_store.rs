@@ -18,13 +18,23 @@
 //! `InMemoryTransparencyStore<AuditLeaf>` so any future drift is
 //! caught at CI time.
 //!
-//! # Sync-over-async
+//! # No sync-over-async (v62.0.0, slice A, P8)
 //!
-//! `TransparencyStore<L>` is a **sync** trait. Both backends below
-//! capture a `tokio::runtime::Handle` and use `runtime.block_on`
-//! around the underlying async/blocking SQL calls — matching the
-//! pattern used elsewhere in `src/ffi/pyo3.rs` for crossing the
-//! sync-PyO3 / async-tokio boundary.
+//! Up to v61 both stores captured a `tokio::runtime::Handle` and wrapped
+//! every SQL call in `runtime.block_on`, so a caller had to hop to a
+//! blocking-pool thread first or panic ("Cannot start a runtime from within
+//! a runtime"). A single-thread host (FSD WASM_NODE §5.1) has neither the
+//! hop nor a second thread, and node code rewrites `block_on` as `.await`
+//! rather than wrapping it. Now:
+//!
+//! - [`SqliteMerkleStore`] is the synchronous `TransparencyStore` its body
+//!   always was (rusqlite is synchronous): no runtime handle. Async callers
+//!   reach it through [`crate::host::rt::dispatch_blocking`], which runs it
+//!   inline on a single-thread host.
+//! - [`PgMerkleStore`] is async end to end: inherent `async fn`s over
+//!   tokio-postgres. The proof and root computations Verify's trait
+//!   provides run over a read-only snapshot of the tenant's leaf hashes
+//!   (`LeafHashSnapshot`), so they are Verify's own code, byte for byte.
 //!
 //! # What this module is NOT
 //!
@@ -48,7 +58,6 @@ use ciris_verify_core::transparency::{
 };
 // #470 arc — `hash_leaf` now delegates to verify's `transparency::hash_leaf`;
 // the RFC-6962-spec-anchor unit test imports sha2 inside its own module.
-use tokio::runtime::Handle;
 
 use super::merkle_leaf::AuditLeaf;
 
@@ -301,11 +310,12 @@ mod pg_impl {
     use super::{
         deserialize_signature, hash_leaf, leaf_hash_from_bytes, log_id_for_tenant,
         require_hybrid_sth, root_hash_from_bytes, serialize_signature,
-        serialize_witness_signatures, AuditLeaf, DateTime, Handle, SignedTreeHead,
-        TransparencyError, TransparencyStore, Utc,
+        serialize_witness_signatures, AuditLeaf, DateTime, SignedTreeHead, TransparencyError,
+        TransparencyStore, Utc,
     };
     use crate::store::postgres::PostgresBackend;
     use ciris_verify_core::transparency::TransparencyLeaf;
+    use ciris_verify_core::transparency::{ConsistencyProof, MerkleProof};
     use deadpool_postgres::Pool;
     use std::sync::Arc;
 
@@ -329,7 +339,6 @@ mod pg_impl {
         /// v61 (CIRISPersist#1166) — how long a checkout waits before the
         /// pool is exhausted (the backend's, when built from one).
         checkout_wait: std::time::Duration,
-        runtime: Handle,
         tenant_id: String,
     }
 
@@ -337,28 +346,18 @@ mod pg_impl {
         /// Construct a tenant-scoped Postgres Merkle store from a
         /// backend Arc. Backward-compatible Phase B shape — clones the
         /// backend's pool internally.
-        ///
-        /// `runtime` is the tokio runtime handle the sync trait
-        /// methods bridge to via `block_on`. Pass
-        /// `tokio::runtime::Handle::current()` if you're already
-        /// inside a tokio context.
-        pub fn new(
-            backend: Arc<PostgresBackend>,
-            runtime: Handle,
-            tenant_id: impl Into<String>,
-        ) -> Self {
-            Self::from_backend(&backend, runtime, tenant_id)
+        pub fn new(backend: Arc<PostgresBackend>, tenant_id: impl Into<String>) -> Self {
+            Self::from_backend(&backend, tenant_id)
         }
 
         /// Construct a tenant-scoped Postgres Merkle store from the
         /// pool directly (Phase C ingest path). Used by
         /// `AuditService::record_entry` on `PostgresBackend` so the
         /// store can be built from `&self` without an `Arc<Self>`.
-        pub fn from_pool(pool: Pool, runtime: Handle, tenant_id: impl Into<String>) -> Self {
+        pub fn from_pool(pool: Pool, tenant_id: impl Into<String>) -> Self {
             Self {
                 pool,
                 checkout_wait: crate::store::postgres::POOL_WAIT_TIMEOUT,
-                runtime,
                 tenant_id: tenant_id.into(),
             }
         }
@@ -367,13 +366,11 @@ mod pg_impl {
         /// pool that waits for a connection as long as `backend` does.
         pub(crate) fn from_backend(
             backend: &PostgresBackend,
-            runtime: Handle,
             tenant_id: impl Into<String>,
         ) -> Self {
             Self {
                 pool: backend.pool().clone(),
                 checkout_wait: backend.checkout_wait(),
-                runtime,
                 tenant_id: tenant_id.into(),
             }
         }
@@ -395,8 +392,69 @@ mod pg_impl {
         TransparencyError::Storage(format!("pg merkle store {op}: {e:?}"))
     }
 
-    impl TransparencyStore<AuditLeaf> for PgMerkleStore {
-        fn append(&self, entry: AuditLeaf) -> Result<u64, TransparencyError> {
+    /// v62.0.0 (P8) — a read-only snapshot of one tenant's leaf hashes, so the
+    /// root and proof computations run as Verify's own `TransparencyStore`
+    /// defaults (which read only `all_leaf_hashes`) without a sync store over
+    /// async SQL. Byte-identical to v61, where `PgMerkleStore` overrode none
+    /// of those defaults.
+    struct LeafHashSnapshot(Vec<[u8; 32]>);
+
+    fn snapshot_is_read_only() -> TransparencyError {
+        TransparencyError::Storage("pg merkle leaf-hash snapshot is read-only".into())
+    }
+
+    impl TransparencyStore<AuditLeaf> for LeafHashSnapshot {
+        fn append(&self, _entry: AuditLeaf) -> Result<u64, TransparencyError> {
+            Err(snapshot_is_read_only())
+        }
+        fn get(&self, _index: u64) -> Result<Option<AuditLeaf>, TransparencyError> {
+            Err(snapshot_is_read_only())
+        }
+        fn leaf_hash(&self, index: u64) -> Result<Option<[u8; 32]>, TransparencyError> {
+            Ok(usize::try_from(index)
+                .ok()
+                .and_then(|i| self.0.get(i).copied()))
+        }
+        fn tree_size(&self) -> Result<u64, TransparencyError> {
+            Ok(u64::try_from(self.0.len()).unwrap_or(u64::MAX))
+        }
+        fn latest_sth(&self) -> Result<Option<SignedTreeHead>, TransparencyError> {
+            Err(snapshot_is_read_only())
+        }
+        fn store_sth(&self, _sth: &SignedTreeHead) -> Result<(), TransparencyError> {
+            Err(snapshot_is_read_only())
+        }
+        fn all_leaf_hashes(&self) -> Result<Vec<[u8; 32]>, TransparencyError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// v62.0.0 (P8) — the tenant's log, async end to end. The same seven
+    /// operations Verify's `TransparencyStore` names, plus the root and the
+    /// two proofs, each one `.await` on tokio-postgres: no `block_on`, no
+    /// runtime handle, and so callable from any task on any runtime flavour.
+    impl PgMerkleStore {
+        /// Current Merkle root (RFC 6962 MTH; `[0; 32]` for an empty tree).
+        pub async fn root(&self) -> Result<[u8; 32], TransparencyError> {
+            LeafHashSnapshot(self.all_leaf_hashes().await?).root()
+        }
+
+        /// Inclusion proof for the leaf at `index`.
+        pub async fn inclusion_proof(&self, index: u64) -> Result<MerkleProof, TransparencyError> {
+            LeafHashSnapshot(self.all_leaf_hashes().await?).inclusion_proof(index)
+        }
+
+        /// RFC 6962 §2.1.2 consistency proof between two tree sizes.
+        pub async fn consistency_proof(
+            &self,
+            from_size: u64,
+            to_size: u64,
+        ) -> Result<ConsistencyProof, TransparencyError> {
+            LeafHashSnapshot(self.all_leaf_hashes().await?).consistency_proof(from_size, to_size)
+        }
+
+        /// Append a leaf; returns its index (the pre-append tree size).
+        pub async fn append(&self, entry: AuditLeaf) -> Result<u64, TransparencyError> {
             let canonical = entry.canonical_bytes()?;
             let leaf_h = hash_leaf(&canonical);
             let leaf_serialized =
@@ -406,7 +464,7 @@ mod pg_impl {
             let pool = self.pool.clone();
             let wait = self.checkout_wait;
 
-            self.runtime.block_on(async move {
+            async move {
                 let mut client = crate::store::postgres::checkout_bounded(&pool, wait, None)
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
@@ -453,16 +511,17 @@ mod pg_impl {
 
                 tx.commit().await.map_err(|e| pg_storage_err("commit", e))?;
                 Ok::<u64, TransparencyError>(u64::try_from(leaf_index).unwrap_or(u64::MAX))
-            })
+            }
+            .await
         }
 
-        fn get(&self, index: u64) -> Result<Option<AuditLeaf>, TransparencyError> {
+        pub async fn get(&self, index: u64) -> Result<Option<AuditLeaf>, TransparencyError> {
             let tenant = self.tenant_id.clone();
             let pool = self.pool.clone();
             let wait = self.checkout_wait;
             let leaf_idx = i64::try_from(index)
                 .map_err(|_| TransparencyError::Storage("index exceeds i64 range".into()))?;
-            self.runtime.block_on(async move {
+            async move {
                 let client = crate::store::postgres::checkout_bounded(&pool, wait, None)
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
@@ -484,16 +543,17 @@ mod pg_impl {
                 let leaf: AuditLeaf = serde_json::from_slice(&blob)
                     .map_err(|e| pg_storage_err("deserialize leaf", e))?;
                 Ok(Some(leaf))
-            })
+            }
+            .await
         }
 
-        fn leaf_hash(&self, index: u64) -> Result<Option<[u8; 32]>, TransparencyError> {
+        pub async fn leaf_hash(&self, index: u64) -> Result<Option<[u8; 32]>, TransparencyError> {
             let tenant = self.tenant_id.clone();
             let pool = self.pool.clone();
             let wait = self.checkout_wait;
             let leaf_idx = i64::try_from(index)
                 .map_err(|_| TransparencyError::Storage("index exceeds i64 range".into()))?;
-            self.runtime.block_on(async move {
+            async move {
                 let client = crate::store::postgres::checkout_bounded(&pool, wait, None)
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
@@ -513,14 +573,15 @@ mod pg_impl {
                     .try_get("leaf_hash")
                     .map_err(|e| pg_storage_err("decode leaf_hash", e))?;
                 Ok(Some(leaf_hash_from_bytes(&raw)?))
-            })
+            }
+            .await
         }
 
-        fn tree_size(&self) -> Result<u64, TransparencyError> {
+        pub async fn tree_size(&self) -> Result<u64, TransparencyError> {
             let tenant = self.tenant_id.clone();
             let pool = self.pool.clone();
             let wait = self.checkout_wait;
-            self.runtime.block_on(async move {
+            async move {
                 let client = crate::store::postgres::checkout_bounded(&pool, wait, None)
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
@@ -537,14 +598,15 @@ mod pg_impl {
                     .try_get("n")
                     .map_err(|e| pg_storage_err("decode tree_size", e))?;
                 Ok(u64::try_from(n).unwrap_or(u64::MAX))
-            })
+            }
+            .await
         }
 
-        fn latest_sth(&self) -> Result<Option<SignedTreeHead>, TransparencyError> {
+        pub async fn latest_sth(&self) -> Result<Option<SignedTreeHead>, TransparencyError> {
             let tenant = self.tenant_id.clone();
             let pool = self.pool.clone();
             let wait = self.checkout_wait;
-            self.runtime.block_on(async move {
+            async move {
                 let client = crate::store::postgres::checkout_bounded(&pool, wait, None)
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
@@ -595,10 +657,11 @@ mod pg_impl {
                 // verifier asks. A head stored before the gate (an earlier
                 // build) keeps its proofs, and the tenant can still append.
                 Ok(Some(sth))
-            })
+            }
+            .await
         }
 
-        fn store_sth(&self, sth: &SignedTreeHead) -> Result<(), TransparencyError> {
+        pub async fn store_sth(&self, sth: &SignedTreeHead) -> Result<(), TransparencyError> {
             // v61.1.0 (CIRISPersist#1233) — a head without its ML-DSA-65 half
             // is refused before anything is written.
             require_hybrid_sth(sth)?;
@@ -612,7 +675,7 @@ mod pg_impl {
             let signature_blob = serialize_signature(&sth.signature)?;
             let witnesses_str = serialize_witness_signatures(&sth.witness_signatures)?;
             let signer_key_id = hex::encode(&sth.signature.classical.public_key);
-            self.runtime.block_on(async move {
+            async move {
                 let client = crate::store::postgres::checkout_bounded(&pool, wait, None)
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
@@ -638,14 +701,15 @@ mod pg_impl {
                     .await
                     .map_err(|e| pg_storage_err("insert sth", e))?;
                 Ok(())
-            })
+            }
+            .await
         }
 
-        fn all_leaf_hashes(&self) -> Result<Vec<[u8; 32]>, TransparencyError> {
+        pub async fn all_leaf_hashes(&self) -> Result<Vec<[u8; 32]>, TransparencyError> {
             let tenant = self.tenant_id.clone();
             let pool = self.pool.clone();
             let wait = self.checkout_wait;
-            self.runtime.block_on(async move {
+            async move {
                 let client = crate::store::postgres::checkout_bounded(&pool, wait, None)
                     .await
                     .map_err(|e| pg_storage_err("pool get", e))?;
@@ -667,7 +731,8 @@ mod pg_impl {
                     out.push(leaf_hash_from_bytes(&raw)?);
                 }
                 Ok(out)
-            })
+            }
+            .await
         }
     }
 }
@@ -684,8 +749,8 @@ mod sqlite_impl {
     use super::{
         deserialize_signature, deserialize_witness_signatures, hash_leaf, leaf_hash_from_bytes,
         log_id_for_tenant, require_hybrid_sth, root_hash_from_bytes, serialize_signature,
-        serialize_witness_signatures, AuditLeaf, DateTime, Handle, SignedTreeHead,
-        TransparencyError, TransparencyStore, Utc,
+        serialize_witness_signatures, AuditLeaf, DateTime, SignedTreeHead, TransparencyError,
+        TransparencyStore, Utc,
     };
     use ciris_verify_core::transparency::TransparencyLeaf;
     use parking_lot::Mutex;
@@ -698,21 +763,20 @@ mod sqlite_impl {
     /// handle with the rest of the SQLite-backed audit + cirisgraph
     /// surfaces so writes coordinate via SQLite's WAL + the
     /// PRAGMA busy_timeout shared across the process.
+    ///
+    /// v62.0.0 (P8) — synchronous, with no runtime handle: every method is the
+    /// rusqlite body it always ran, called directly. An async caller reaches
+    /// it through [`crate::host::rt::dispatch_blocking`] (inline on a
+    /// single-thread host).
     pub struct SqliteMerkleStore {
         conn: Arc<Mutex<Connection>>,
-        runtime: Handle,
         tenant_id: String,
     }
 
     impl SqliteMerkleStore {
-        pub fn new(
-            conn: Arc<Mutex<Connection>>,
-            runtime: Handle,
-            tenant_id: impl Into<String>,
-        ) -> Self {
+        pub fn new(conn: Arc<Mutex<Connection>>, tenant_id: impl Into<String>) -> Self {
             Self {
                 conn,
-                runtime,
                 tenant_id: tenant_id.into(),
             }
         }
@@ -756,41 +820,39 @@ mod sqlite_impl {
             let tenant = self.tenant_id.clone();
             let conn_arc = self.conn.clone();
 
-            self.runtime.block_on(async move {
-                (move || -> Result<u64, TransparencyError> {
-                    let mut guard = conn_arc.lock();
-                    // BEGIN IMMEDIATE serializes writers (RESERVED lock)
-                    // — same pattern as `audit::sqlite`'s record_entry.
-                    let tx = guard
-                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                        .map_err(|e| sq_storage_err("begin tx", e))?;
-                    let n: i64 = tx
-                        .query_row(
-                            "SELECT COUNT(*) FROM merkle_leaves WHERE tenant_id = ?1",
-                            params![tenant],
-                            |row| row.get(0),
-                        )
-                        .map_err(|e| sq_storage_err("count leaves", e))?;
-                    let leaf_index = n;
-                    tx.execute(
-                        "INSERT INTO merkle_leaves \
+            (move || -> Result<u64, TransparencyError> {
+                let mut guard = conn_arc.lock();
+                // BEGIN IMMEDIATE serializes writers (RESERVED lock)
+                // — same pattern as `audit::sqlite`'s record_entry.
+                let tx = guard
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|e| sq_storage_err("begin tx", e))?;
+                let n: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM merkle_leaves WHERE tenant_id = ?1",
+                        params![tenant],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| sq_storage_err("count leaves", e))?;
+                let leaf_index = n;
+                tx.execute(
+                    "INSERT INTO merkle_leaves \
                          (tenant_id, leaf_index, chain_event_id, leaf_hash, \
                           canonical_bytes, leaf_serialized) \
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        params![
-                            tenant,
-                            leaf_index,
-                            chain_event_id,
-                            leaf_h.to_vec(),
-                            canonical,
-                            leaf_serialized,
-                        ],
-                    )
-                    .map_err(|e| sq_storage_err("insert leaf", e))?;
-                    tx.commit().map_err(|e| sq_storage_err("commit", e))?;
-                    Ok(u64::try_from(leaf_index).unwrap_or(u64::MAX))
-                })()
-            })
+                    params![
+                        tenant,
+                        leaf_index,
+                        chain_event_id,
+                        leaf_h.to_vec(),
+                        canonical,
+                        leaf_serialized,
+                    ],
+                )
+                .map_err(|e| sq_storage_err("insert leaf", e))?;
+                tx.commit().map_err(|e| sq_storage_err("commit", e))?;
+                Ok(u64::try_from(leaf_index).unwrap_or(u64::MAX))
+            })()
         }
 
         fn get(&self, index: u64) -> Result<Option<AuditLeaf>, TransparencyError> {
@@ -798,25 +860,23 @@ mod sqlite_impl {
             let conn_arc = self.conn.clone();
             let leaf_idx = i64::try_from(index)
                 .map_err(|_| TransparencyError::Storage("index exceeds i64 range".into()))?;
-            self.runtime.block_on(async move {
-                (move || -> Result<Option<AuditLeaf>, TransparencyError> {
-                    let conn = conn_arc.lock();
-                    let blob: Option<Vec<u8>> = conn
-                        .query_row(
-                            "SELECT leaf_serialized \
+            (move || -> Result<Option<AuditLeaf>, TransparencyError> {
+                let conn = conn_arc.lock();
+                let blob: Option<Vec<u8>> = conn
+                    .query_row(
+                        "SELECT leaf_serialized \
                                  FROM merkle_leaves \
                                  WHERE tenant_id = ?1 AND leaf_index = ?2",
-                            params![tenant, leaf_idx],
-                            |row| row.get(0),
-                        )
-                        .optional()
-                        .map_err(|e| sq_storage_err("select leaf", e))?;
-                    let Some(blob) = blob else { return Ok(None) };
-                    let leaf: AuditLeaf = serde_json::from_slice(&blob)
-                        .map_err(|e| sq_storage_err("deserialize leaf", e))?;
-                    Ok(Some(leaf))
-                })()
-            })
+                        params![tenant, leaf_idx],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| sq_storage_err("select leaf", e))?;
+                let Some(blob) = blob else { return Ok(None) };
+                let leaf: AuditLeaf = serde_json::from_slice(&blob)
+                    .map_err(|e| sq_storage_err("deserialize leaf", e))?;
+                Ok(Some(leaf))
+            })()
         }
 
         fn leaf_hash(&self, index: u64) -> Result<Option<[u8; 32]>, TransparencyError> {
@@ -824,97 +884,90 @@ mod sqlite_impl {
             let conn_arc = self.conn.clone();
             let leaf_idx = i64::try_from(index)
                 .map_err(|_| TransparencyError::Storage("index exceeds i64 range".into()))?;
-            self.runtime.block_on(async move {
-                (move || -> Result<Option<[u8; 32]>, TransparencyError> {
-                    let conn = conn_arc.lock();
-                    let raw: Option<Vec<u8>> = conn
-                        .query_row(
-                            "SELECT leaf_hash \
+            (move || -> Result<Option<[u8; 32]>, TransparencyError> {
+                let conn = conn_arc.lock();
+                let raw: Option<Vec<u8>> = conn
+                    .query_row(
+                        "SELECT leaf_hash \
                                  FROM merkle_leaves \
                                  WHERE tenant_id = ?1 AND leaf_index = ?2",
-                            params![tenant, leaf_idx],
-                            |row| row.get(0),
-                        )
-                        .optional()
-                        .map_err(|e| sq_storage_err("select leaf_hash", e))?;
-                    match raw {
-                        Some(b) => Ok(Some(leaf_hash_from_bytes(&b)?)),
-                        None => Ok(None),
-                    }
-                })()
-            })
+                        params![tenant, leaf_idx],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| sq_storage_err("select leaf_hash", e))?;
+                match raw {
+                    Some(b) => Ok(Some(leaf_hash_from_bytes(&b)?)),
+                    None => Ok(None),
+                }
+            })()
         }
 
         fn tree_size(&self) -> Result<u64, TransparencyError> {
             let tenant = self.tenant_id.clone();
             let conn_arc = self.conn.clone();
-            self.runtime.block_on(async move {
-                (move || -> Result<u64, TransparencyError> {
-                    let conn = conn_arc.lock();
-                    let n: i64 = conn
-                        .query_row(
-                            "SELECT COUNT(*) FROM merkle_leaves WHERE tenant_id = ?1",
-                            params![tenant],
-                            |row| row.get(0),
-                        )
-                        .map_err(|e| sq_storage_err("tree_size", e))?;
-                    Ok(u64::try_from(n).unwrap_or(u64::MAX))
-                })()
-            })
+            (move || -> Result<u64, TransparencyError> {
+                let conn = conn_arc.lock();
+                let n: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM merkle_leaves WHERE tenant_id = ?1",
+                        params![tenant],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| sq_storage_err("tree_size", e))?;
+                Ok(u64::try_from(n).unwrap_or(u64::MAX))
+            })()
         }
 
         fn latest_sth(&self) -> Result<Option<SignedTreeHead>, TransparencyError> {
             let tenant = self.tenant_id.clone();
             let conn_arc = self.conn.clone();
-            self.runtime.block_on(async move {
-                (move || -> Result<Option<SignedTreeHead>, TransparencyError> {
-                    let conn = conn_arc.lock();
-                    let row_opt = conn
-                        .query_row(
-                            "SELECT tree_size, root_hash, signed_at, \
+            (move || -> Result<Option<SignedTreeHead>, TransparencyError> {
+                let conn = conn_arc.lock();
+                let row_opt = conn
+                    .query_row(
+                        "SELECT tree_size, root_hash, signed_at, \
                                         signature_blob, witness_signatures \
                                  FROM merkle_sth_log \
                                  WHERE tenant_id = ?1 \
                                  ORDER BY tree_size DESC \
                                  LIMIT 1",
-                            params![tenant],
-                            |row| {
-                                Ok((
-                                    row.get::<_, i64>(0)?,
-                                    row.get::<_, Vec<u8>>(1)?,
-                                    row.get::<_, String>(2)?,
-                                    row.get::<_, Vec<u8>>(3)?,
-                                    row.get::<_, String>(4)?,
-                                ))
-                            },
-                        )
-                        .optional()
-                        .map_err(|e| sq_storage_err("latest_sth select", e))?;
-                    let Some((tree_size_i, root_bytes, signed_at_str, sig_blob, witness_str)) =
-                        row_opt
-                    else {
-                        return Ok(None);
-                    };
-                    let timestamp = parse_signed_at(&signed_at_str)?;
-                    let signature = deserialize_signature(&sig_blob)?;
-                    let witness_signatures = deserialize_witness_signatures(&witness_str)?;
-                    let sth = SignedTreeHead {
-                        log_id: log_id_for_tenant(&tenant),
-                        tree_size: u64::try_from(tree_size_i).unwrap_or(u64::MAX),
-                        root_hash: root_hash_from_bytes(&root_bytes)?,
-                        timestamp,
-                        signature,
-                        witness_signatures,
-                    };
-                    // v61.1.0 (CIRISPersist#1233, CC 2.6.1.8) — a stored head
-                    // is served AS ITSELF, with no shape gate: `store_sth`
-                    // gates NEW heads, and `verify_audit_sth` is the
-                    // hybrid-Strict check a verifier asks. A head stored before
-                    // the gate (an earlier build) keeps its proofs, and the
-                    // tenant can still append.
-                    Ok(Some(sth))
-                })()
-            })
+                        params![tenant],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, Vec<u8>>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, Vec<u8>>(3)?,
+                                row.get::<_, String>(4)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(|e| sq_storage_err("latest_sth select", e))?;
+                let Some((tree_size_i, root_bytes, signed_at_str, sig_blob, witness_str)) = row_opt
+                else {
+                    return Ok(None);
+                };
+                let timestamp = parse_signed_at(&signed_at_str)?;
+                let signature = deserialize_signature(&sig_blob)?;
+                let witness_signatures = deserialize_witness_signatures(&witness_str)?;
+                let sth = SignedTreeHead {
+                    log_id: log_id_for_tenant(&tenant),
+                    tree_size: u64::try_from(tree_size_i).unwrap_or(u64::MAX),
+                    root_hash: root_hash_from_bytes(&root_bytes)?,
+                    timestamp,
+                    signature,
+                    witness_signatures,
+                };
+                // v61.1.0 (CIRISPersist#1233, CC 2.6.1.8) — a stored head
+                // is served AS ITSELF, with no shape gate: `store_sth`
+                // gates NEW heads, and `verify_audit_sth` is the
+                // hybrid-Strict check a verifier asks. A head stored before
+                // the gate (an earlier build) keeps its proofs, and the
+                // tenant can still append.
+                Ok(Some(sth))
+            })()
         }
 
         fn store_sth(&self, sth: &SignedTreeHead) -> Result<(), TransparencyError> {
@@ -930,56 +983,52 @@ mod sqlite_impl {
             let signature_blob = serialize_signature(&sth.signature)?;
             let witnesses_str = serialize_witness_signatures(&sth.witness_signatures)?;
             let signer_key_id = hex::encode(&sth.signature.classical.public_key);
-            self.runtime.block_on(async move {
-                (move || -> Result<(), TransparencyError> {
-                    let conn = conn_arc.lock();
-                    conn.execute(
-                        "INSERT INTO merkle_sth_log \
+            (move || -> Result<(), TransparencyError> {
+                let conn = conn_arc.lock();
+                conn.execute(
+                    "INSERT INTO merkle_sth_log \
                          (tenant_id, tree_size, root_hash, signed_at, \
                           signer_key_id, signature_blob, witness_signatures) \
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                          ON CONFLICT (tenant_id, tree_size) DO NOTHING",
-                        params![
-                            tenant,
-                            tree_size,
-                            root_hash,
-                            signed_at,
-                            signer_key_id,
-                            signature_blob,
-                            witnesses_str,
-                        ],
-                    )
-                    .map_err(|e| sq_storage_err("insert sth", e))?;
-                    Ok(())
-                })()
-            })
+                    params![
+                        tenant,
+                        tree_size,
+                        root_hash,
+                        signed_at,
+                        signer_key_id,
+                        signature_blob,
+                        witnesses_str,
+                    ],
+                )
+                .map_err(|e| sq_storage_err("insert sth", e))?;
+                Ok(())
+            })()
         }
 
         fn all_leaf_hashes(&self) -> Result<Vec<[u8; 32]>, TransparencyError> {
             let tenant = self.tenant_id.clone();
             let conn_arc = self.conn.clone();
-            self.runtime.block_on(async move {
-                (move || -> Result<Vec<[u8; 32]>, TransparencyError> {
-                    let conn = conn_arc.lock();
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT leaf_hash \
+            (move || -> Result<Vec<[u8; 32]>, TransparencyError> {
+                let conn = conn_arc.lock();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT leaf_hash \
                                  FROM merkle_leaves \
                                  WHERE tenant_id = ?1 \
                                  ORDER BY leaf_index ASC",
-                        )
-                        .map_err(|e| sq_storage_err("prepare all_leaf_hashes", e))?;
-                    let rows = stmt
-                        .query_map(params![tenant], |row| row.get::<_, Vec<u8>>(0))
-                        .map_err(|e| sq_storage_err("query all_leaf_hashes", e))?;
-                    let mut out = Vec::new();
-                    for row in rows {
-                        let raw = row.map_err(|e| sq_storage_err("row all_leaf_hashes", e))?;
-                        out.push(leaf_hash_from_bytes(&raw)?);
-                    }
-                    Ok(out)
-                })()
-            })
+                    )
+                    .map_err(|e| sq_storage_err("prepare all_leaf_hashes", e))?;
+                let rows = stmt
+                    .query_map(params![tenant], |row| row.get::<_, Vec<u8>>(0))
+                    .map_err(|e| sq_storage_err("query all_leaf_hashes", e))?;
+                let mut out = Vec::new();
+                for row in rows {
+                    let raw = row.map_err(|e| sq_storage_err("row all_leaf_hashes", e))?;
+                    out.push(leaf_hash_from_bytes(&raw)?);
+                }
+                Ok(out)
+            })()
         }
     }
 }
@@ -1078,13 +1127,9 @@ mod tests {
         };
         use std::sync::Arc;
 
-        /// Spin up a dedicated multi-thread runtime, build the
-        /// in-memory backend + store inside it, then hand the store
-        /// to `f` on a blocking thread so the store's
-        /// `runtime.block_on` calls don't trip "Cannot start a
-        /// runtime from within a runtime". Production callers
-        /// (PyO3 via py.detach) are sync-context-callers; tests
-        /// reproduce that shape via spawn_blocking.
+        /// Build the in-memory backend + store on a runtime, then hand the
+        /// store to `f` from plain synchronous code: v62 (P8) — the store is
+        /// synchronous and holds no runtime, so no blocking-thread hop.
         fn run_with_store<F, R>(tenant: &str, f: F) -> R
         where
             F: FnOnce(Arc<dyn TransparencyStore<AuditLeaf>>) -> R + Send + 'static,
@@ -1098,27 +1143,13 @@ mod tests {
             rt.block_on(async move {
                 let backend = SqliteBackend::open_in_memory().await.unwrap();
                 backend.run_migrations().await.unwrap();
-                let handle = tokio::runtime::Handle::current();
-                let store = SqliteMerkleStore::new(backend.conn_handle(), handle, tenant_owned);
+                let store = SqliteMerkleStore::new(backend.conn_handle(), tenant_owned);
                 let store_arc: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(store);
                 // Keep `backend` alive for the closure's duration —
                 // the SqliteMerkleStore only holds the conn_handle()
                 // Arc clone, not the SqliteBackend itself.
                 let _backend_keepalive = backend;
-                // v3.14.0 (CIRISPersist#158) — DO NOT inline this
-                // closure. `f` calls `store.append(...)` which
-                // internally invokes `self.runtime.block_on(...)`.
-                // Calling `block_on` from a tokio worker panics with
-                // "Cannot start a runtime from within a runtime".
-                // `spawn_blocking` hops to the blocking-pool thread,
-                // which has no current runtime; `block_on` works
-                // there. This is the test-side mirror of production's
-                // py.detach (PyO3 release-GIL hop). The inline-sync
-                // sweep that closed #158 in the sqlite hot paths
-                // does NOT apply here — `f` MUST run off-worker.
-                tokio::task::spawn_blocking(move || f(store_arc))
-                    .await
-                    .expect("spawn_blocking join")
+                f(store_arc)
             })
         }
 
@@ -1180,38 +1211,18 @@ mod tests {
                 b.run_migrations().await.unwrap();
                 b
             });
-            let handle = rt.handle().clone();
-            let store_a: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(SqliteMerkleStore::new(
-                backend.conn_handle(),
-                handle.clone(),
-                "tenant-A",
-            ));
-            let store_b: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(SqliteMerkleStore::new(
-                backend.conn_handle(),
-                handle,
-                "tenant-B",
-            ));
-            let a = store_a.clone();
-            let b = store_b.clone();
-            // v3.14.0 (CIRISPersist#158) — store.append calls
-            // `self.runtime.block_on(...)`, which panics if invoked
-            // from a tokio worker. spawn_blocking hops to the
-            // blocking pool (no runtime context); the inline-sync
-            // sweep does NOT apply here. Same mirroring of py.detach
-            // as in `run_with_store`.
-            rt.block_on(async move {
-                tokio::task::spawn_blocking(move || {
-                    a.append(make_test_leaf("a-1", 1, 1)).unwrap();
-                    a.append(make_test_leaf("a-2", 2, 2)).unwrap();
-                    b.append(make_test_leaf("b-1", 1, 1)).unwrap();
-                    assert_eq!(a.tree_size().unwrap(), 2);
-                    assert_eq!(b.tree_size().unwrap(), 1);
-                    assert_eq!(b.get(0).unwrap().unwrap().entry.entry_id, "b-1");
-                    assert!(b.get(1).unwrap().is_none());
-                })
-                .await
-                .expect("spawn_blocking join");
-            });
+            let a: Arc<dyn TransparencyStore<AuditLeaf>> =
+                Arc::new(SqliteMerkleStore::new(backend.conn_handle(), "tenant-A"));
+            let b: Arc<dyn TransparencyStore<AuditLeaf>> =
+                Arc::new(SqliteMerkleStore::new(backend.conn_handle(), "tenant-B"));
+            // v62 (P8) — synchronous calls straight from the test thread.
+            a.append(make_test_leaf("a-1", 1, 1)).unwrap();
+            a.append(make_test_leaf("a-2", 2, 2)).unwrap();
+            b.append(make_test_leaf("b-1", 1, 1)).unwrap();
+            assert_eq!(a.tree_size().unwrap(), 2);
+            assert_eq!(b.tree_size().unwrap(), 1);
+            assert_eq!(b.get(0).unwrap().unwrap().entry.entry_id, "b-1");
+            assert!(b.get(1).unwrap().is_none());
             drop(backend);
         }
 
@@ -1339,7 +1350,7 @@ mod tests {
         use crate::audit::merkle_store::PgMerkleStore;
         use crate::store::backend::Backend;
         use crate::store::postgres::PostgresBackend;
-        use ciris_verify_core::transparency::{TransparencyLeaf, TransparencyLog};
+        use ciris_verify_core::transparency::TransparencyLeaf;
         use std::sync::Arc;
 
         fn pg_dsn() -> Option<String> {
@@ -1364,140 +1375,81 @@ mod tests {
                 .unwrap();
         }
 
-        /// Build a dedicated tokio runtime, connect to PG, run
-        /// migrations, build the store, then hand the store to `f`
-        /// on a blocking thread — same shape as the SQLite tests'
-        /// `run_with_store` so the store's `block_on` doesn't fight
-        /// the test's runtime.
-        fn run_with_pg_store<F, R>(tenant: &str, f: F) -> Option<R>
-        where
-            F: FnOnce(Arc<dyn TransparencyStore<AuditLeaf>>, Arc<PostgresBackend>) -> R
-                + Send
-                + 'static,
-            R: Send + 'static,
-        {
-            let dsn = pg_dsn()?;
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let tenant_owned = tenant.to_owned();
-            let result =
-                rt.block_on(async move {
-                    let backend = Arc::new(PostgresBackend::connect(&dsn).await.unwrap());
-                    backend.run_migrations().await.unwrap();
-                    clean_tenant(&backend, &tenant_owned).await;
-                    let handle = tokio::runtime::Handle::current();
-                    let store: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(
-                        PgMerkleStore::new(backend.clone(), handle, tenant_owned.clone()),
-                    );
-                    let backend_for_f = backend.clone();
-                    // v3.14.0 (CIRISPersist#158) — DO NOT inline. `f`
-                    // calls `store.append(...)` which internally
-                    // invokes `self.runtime.block_on(...)`. Calling
-                    // `block_on` from a tokio worker panics with
-                    // "Cannot start a runtime from within a runtime".
-                    // spawn_blocking hops to the blocking pool (no
-                    // current runtime); the inline-sync sweep does
-                    // NOT apply here — same as the sqlite-side
-                    // `run_with_store`.
-                    let r = tokio::task::spawn_blocking(move || f(store, backend_for_f))
-                        .await
-                        .expect("spawn_blocking join");
-                    clean_tenant(&backend, &tenant_owned).await;
-                    r
-                });
-            Some(result)
+        /// Connect, migrate, clean the tenant. v62 (P8) — the store is async,
+        /// so the tests `.await` it directly on their own runtime.
+        async fn pg_backend(dsn: &str, tenants: &[&str]) -> Arc<PostgresBackend> {
+            let backend = Arc::new(PostgresBackend::connect(dsn).await.unwrap());
+            backend.run_migrations().await.unwrap();
+            for t in tenants {
+                clean_tenant(&backend, t).await;
+            }
+            backend
         }
 
-        #[test]
+        #[tokio::test(flavor = "multi_thread")]
         #[serial_test::serial(postgres)]
-        fn pg_empty_and_append_and_get() {
-            let tenant = format!("merkle-empty-{}", uuid::Uuid::new_v4().simple());
-            let Some(()) = run_with_pg_store(&tenant, |store, _backend| {
-                assert_eq!(store.tree_size().unwrap(), 0);
-                assert_eq!(store.append(make_test_leaf("pg-1", 1, 100)).unwrap(), 0);
-                assert_eq!(store.append(make_test_leaf("pg-2", 2, 101)).unwrap(), 1);
-                assert_eq!(store.tree_size().unwrap(), 2);
-                let got = store.get(1).unwrap().unwrap();
-                assert_eq!(got.entry.entry_id, "pg-2");
-                assert_eq!(got.chain_event_id, 101);
-            }) else {
-                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-                return;
-            };
-        }
-
-        #[test]
-        #[serial_test::serial(postgres)]
-        fn pg_leaf_hash_matches_local() {
-            let tenant = format!("merkle-hash-{}", uuid::Uuid::new_v4().simple());
-            let Some(()) = run_with_pg_store(&tenant, |store, _backend| {
-                let leaf = make_test_leaf("pg-h-1", 1, 1);
-                store.append(leaf.clone()).unwrap();
-                let stored = store.leaf_hash(0).unwrap().unwrap();
-                let canonical = <AuditLeaf as TransparencyLeaf>::canonical_bytes(&leaf).unwrap();
-                assert_eq!(stored, hash_leaf(&canonical));
-            }) else {
-                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-                return;
-            };
-        }
-
-        #[test]
-        #[serial_test::serial(postgres)]
-        fn pg_tenants_isolated() {
+        async fn pg_empty_and_append_and_get() {
             let Some(dsn) = pg_dsn() else {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap();
+            let tenant = format!("merkle-empty-{}", uuid::Uuid::new_v4().simple());
+            let backend = pg_backend(&dsn, &[&tenant]).await;
+            let store = PgMerkleStore::new(backend.clone(), tenant.clone());
+            assert_eq!(store.tree_size().await.unwrap(), 0);
+            assert_eq!(
+                store.append(make_test_leaf("pg-1", 1, 100)).await.unwrap(),
+                0
+            );
+            assert_eq!(
+                store.append(make_test_leaf("pg-2", 2, 101)).await.unwrap(),
+                1
+            );
+            assert_eq!(store.tree_size().await.unwrap(), 2);
+            let got = store.get(1).await.unwrap().unwrap();
+            assert_eq!(got.entry.entry_id, "pg-2");
+            assert_eq!(got.chain_event_id, 101);
+            clean_tenant(&backend, &tenant).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[serial_test::serial(postgres)]
+        async fn pg_leaf_hash_matches_local() {
+            let Some(dsn) = pg_dsn() else {
+                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+                return;
+            };
+            let tenant = format!("merkle-hash-{}", uuid::Uuid::new_v4().simple());
+            let backend = pg_backend(&dsn, &[&tenant]).await;
+            let store = PgMerkleStore::new(backend.clone(), tenant.clone());
+            let leaf = make_test_leaf("pg-h-1", 1, 1);
+            store.append(leaf.clone()).await.unwrap();
+            let stored = store.leaf_hash(0).await.unwrap().unwrap();
+            let canonical = <AuditLeaf as TransparencyLeaf>::canonical_bytes(&leaf).unwrap();
+            assert_eq!(stored, hash_leaf(&canonical));
+            clean_tenant(&backend, &tenant).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[serial_test::serial(postgres)]
+        async fn pg_tenants_isolated() {
+            let Some(dsn) = pg_dsn() else {
+                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+                return;
+            };
             let tenant_a = format!("merkle-iso-A-{}", uuid::Uuid::new_v4().simple());
             let tenant_b = format!("merkle-iso-B-{}", uuid::Uuid::new_v4().simple());
-            let (backend, store_a, store_b) = rt.block_on(async {
-                let backend = Arc::new(PostgresBackend::connect(&dsn).await.unwrap());
-                backend.run_migrations().await.unwrap();
-                clean_tenant(&backend, &tenant_a).await;
-                clean_tenant(&backend, &tenant_b).await;
-                let handle = tokio::runtime::Handle::current();
-                let a: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(PgMerkleStore::new(
-                    backend.clone(),
-                    handle.clone(),
-                    tenant_a.clone(),
-                ));
-                let b: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(PgMerkleStore::new(
-                    backend.clone(),
-                    handle,
-                    tenant_b.clone(),
-                ));
-                (backend, a, b)
-            });
-            let a = store_a.clone();
-            let b = store_b.clone();
-            // v3.14.0 (CIRISPersist#158) — store.append calls
-            // `self.runtime.block_on(...)`. spawn_blocking hops to
-            // the blocking pool so block_on works; the inline-sync
-            // sweep does NOT apply here. Same mirror of py.detach
-            // as in the sqlite-side `tenants_do_not_cross_contaminate`.
-            rt.block_on(async move {
-                tokio::task::spawn_blocking(move || {
-                    a.append(make_test_leaf("a-1", 1, 1)).unwrap();
-                    a.append(make_test_leaf("a-2", 2, 2)).unwrap();
-                    b.append(make_test_leaf("b-1", 1, 1)).unwrap();
-                    assert_eq!(a.tree_size().unwrap(), 2);
-                    assert_eq!(b.tree_size().unwrap(), 1);
-                    assert_eq!(b.get(0).unwrap().unwrap().entry.entry_id, "b-1");
-                })
-                .await
-                .expect("spawn_blocking join");
-            });
-            rt.block_on(async {
-                clean_tenant(&backend, &tenant_a).await;
-                clean_tenant(&backend, &tenant_b).await;
-            });
+            let backend = pg_backend(&dsn, &[&tenant_a, &tenant_b]).await;
+            let a = PgMerkleStore::new(backend.clone(), tenant_a.clone());
+            let b = PgMerkleStore::new(backend.clone(), tenant_b.clone());
+            a.append(make_test_leaf("a-1", 1, 1)).await.unwrap();
+            a.append(make_test_leaf("a-2", 2, 2)).await.unwrap();
+            b.append(make_test_leaf("b-1", 1, 1)).await.unwrap();
+            assert_eq!(a.tree_size().await.unwrap(), 2);
+            assert_eq!(b.tree_size().await.unwrap(), 1);
+            assert_eq!(b.get(0).await.unwrap().unwrap().entry.entry_id, "b-1");
+            clean_tenant(&backend, &tenant_a).await;
+            clean_tenant(&backend, &tenant_b).await;
         }
 
         // Mock signers (same as SQLite tests).
@@ -1531,35 +1483,57 @@ mod tests {
             }
         }
 
-        #[test]
-        #[serial_test::serial(postgres)]
-        fn pg_sth_round_trip_with_transparency_log() {
-            use ciris_verify_core::transparency::verify_inclusion;
-            let tenant = format!("merkle-sth-{}", uuid::Uuid::new_v4().simple());
-            let tenant_for_log = tenant.clone();
-            let Some(()) = run_with_pg_store(&tenant, move |store, _backend| {
-                for i in 1..=3i64 {
-                    store
-                        .append(make_test_leaf(&format!("pg-s-{i}"), i, i))
-                        .unwrap();
-                }
-                let log_id = format!("tenant:{tenant_for_log}");
-                let log = TransparencyLog::<AuditLeaf>::for_log(log_id.clone(), store.clone());
-                let signer = HybridSigner::new(StubClassical, StubPqc).unwrap();
-                let sth = log.sign_head(&signer).unwrap();
-                assert_eq!(sth.tree_size, 3);
-                let stored = store.latest_sth().unwrap().unwrap();
-                assert_eq!(stored.log_id, log_id);
-                assert_eq!(stored.tree_size, sth.tree_size);
-                assert_eq!(stored.root_hash, sth.root_hash);
+        /// Sign the store's current head the way Verify's
+        /// `TransparencyLog::sign_head` does (tree size, root, now, sign,
+        /// store) — over the async store.
+        async fn sign_head(store: &PgMerkleStore, log_id: &str) -> SignedTreeHead {
+            let tree_size = store.tree_size().await.unwrap();
+            let root_hash = store.root().await.unwrap();
+            let timestamp = Utc::now();
+            let signing_bytes =
+                SignedTreeHead::signing_bytes(log_id, tree_size, &root_hash, timestamp);
+            let signer = HybridSigner::new(StubClassical, StubPqc).unwrap();
+            let sth = SignedTreeHead {
+                log_id: log_id.to_owned(),
+                tree_size,
+                root_hash,
+                timestamp,
+                signature: signer.sign(&signing_bytes).unwrap(),
+                witness_signatures: Vec::new(),
+            };
+            store.store_sth(&sth).await.unwrap();
+            sth
+        }
 
-                let proof = log.inclusion_proof(1).unwrap();
-                assert!(verify_inclusion(&proof));
-                assert_eq!(proof.root, sth.root_hash);
-            }) else {
+        #[tokio::test(flavor = "multi_thread")]
+        #[serial_test::serial(postgres)]
+        async fn pg_sth_round_trip_with_transparency_log() {
+            use ciris_verify_core::transparency::verify_inclusion;
+            let Some(dsn) = pg_dsn() else {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
+            let tenant = format!("merkle-sth-{}", uuid::Uuid::new_v4().simple());
+            let backend = pg_backend(&dsn, &[&tenant]).await;
+            let store = PgMerkleStore::new(backend.clone(), tenant.clone());
+            for i in 1..=3i64 {
+                store
+                    .append(make_test_leaf(&format!("pg-s-{i}"), i, i))
+                    .await
+                    .unwrap();
+            }
+            let log_id = format!("tenant:{tenant}");
+            let sth = sign_head(&store, &log_id).await;
+            assert_eq!(sth.tree_size, 3);
+            let stored = store.latest_sth().await.unwrap().unwrap();
+            assert_eq!(stored.log_id, log_id);
+            assert_eq!(stored.tree_size, sth.tree_size);
+            assert_eq!(stored.root_hash, sth.root_hash);
+
+            let proof = store.inclusion_proof(1).await.unwrap();
+            assert!(verify_inclusion(&proof));
+            assert_eq!(proof.root, sth.root_hash);
+            clean_tenant(&backend, &tenant).await;
         }
     }
 }

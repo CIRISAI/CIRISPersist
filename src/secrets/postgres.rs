@@ -212,7 +212,7 @@ impl PostgresBackend {
             // *software* key has no such recovery path (its bytes
             // lived only in memory), so that case stays fatal.
             None if key_kind == "hardware" => {
-                let (master, _descriptor) = tokio::task::spawn_blocking(
+                let (master, _descriptor) = crate::host::rt::try_dispatch_blocking(
                     crate::secrets::hardware::derive_hardware_master_key,
                 )
                 .await
@@ -643,7 +643,7 @@ impl SecretsService for PostgresBackend {
                 config_id: "global".into(),
                 config_value: serde_json::json!({}),
                 version: 0,
-                updated_at: Utc::now(),
+                updated_at: crate::host::clock::now(),
                 updated_by: "default".into(),
             }),
             Some(row) => Ok(FilterConfig {
@@ -799,7 +799,7 @@ impl SecretsService for PostgresBackend {
         new_master_key_ref: MasterKeyRef,
         accessor: String,
     ) -> Result<RotationResult, SecretsError> {
-        let start = std::time::Instant::now();
+        let start = crate::host::clock::monotonic_now();
         // Resolve the new master-key bytes. For Software variant the
         // handle = key_ref already in software_keys.
         let new_key_ref = match &new_master_key_ref {
@@ -1109,10 +1109,11 @@ impl SecretsService for PostgresBackend {
         // Derive the hardware-rooted master key — CIRISVerify owns the
         // derivation (HKDF over a hardware-sealed seed). Blocking I/O
         // (TPM + filesystem), so it runs on a blocking thread.
-        let (master, descriptor) =
-            tokio::task::spawn_blocking(crate::secrets::hardware::derive_hardware_master_key)
-                .await
-                .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
+        let (master, descriptor) = crate::host::rt::try_dispatch_blocking(
+            crate::secrets::hardware::derive_hardware_master_key,
+        )
+        .await
+        .map_err(|e| SecretsError::Backend(format!("spawn_blocking join: {e}")))??;
 
         let new_key_ref = Uuid::new_v4().to_string();
         let client = self.checkout().await.map_err(SecretsError::from)?;

@@ -373,11 +373,8 @@ mod tests {
             let backend = open().await;
             let t = tenant("1564s");
             let (genuine, _, _) = b::genuine_head(&log_id_for_tenant(&t), 1).await;
-            let store: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(SqliteMerkleStore::new(
-                backend.conn_handle(),
-                tokio::runtime::Handle::current(),
-                t,
-            ));
+            let store: Arc<dyn TransparencyStore<AuditLeaf>> =
+                Arc::new(SqliteMerkleStore::new(backend.conn_handle(), t));
             tokio::task::spawn_blocking(move || {
                 b::i1564_store_refuses_a_head_without_its_pqc_half(
                     store.as_ref(),
@@ -396,11 +393,8 @@ mod tests {
             let t = tenant("1565s");
             let (genuine, ed_pk, pqc_pk) = b::genuine_head(&log_id_for_tenant(&t), 1).await;
             let conn = backend.conn_handle();
-            let store: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(SqliteMerkleStore::new(
-                conn.clone(),
-                tokio::runtime::Handle::current(),
-                t.clone(),
-            ));
+            let store: Arc<dyn TransparencyStore<AuditLeaf>> =
+                Arc::new(SqliteMerkleStore::new(conn.clone(), t.clone()));
             let inject: Arc<dyn Fn(i64, Vec<u8>) + Send + Sync> = {
                 let t_inject = t.clone();
                 Arc::new(move |size: i64, blob: Vec<u8>| {
@@ -444,6 +438,71 @@ mod tests {
         use crate::store::postgres::PostgresBackend;
         use crate::store::Backend as _;
 
+        /// v62.0.0 (P8) — `PgMerkleStore` is async end to end and no longer
+        /// a `TransparencyStore`. The shared `b::` witnesses take the sync
+        /// trait, so the TEST bridges back: each call blocks a blocking-pool
+        /// thread on the store's own future. Test-only; production awaits.
+        struct PgSync {
+            store: PgMerkleStore,
+            rt: tokio::runtime::Handle,
+        }
+
+        impl TransparencyStore<AuditLeaf> for PgSync {
+            fn append(
+                &self,
+                e: AuditLeaf,
+            ) -> Result<u64, ciris_verify_core::transparency::TransparencyError> {
+                self.rt.block_on(self.store.append(e))
+            }
+            fn get(
+                &self,
+                i: u64,
+            ) -> Result<Option<AuditLeaf>, ciris_verify_core::transparency::TransparencyError>
+            {
+                self.rt.block_on(self.store.get(i))
+            }
+            fn leaf_hash(
+                &self,
+                i: u64,
+            ) -> Result<Option<[u8; 32]>, ciris_verify_core::transparency::TransparencyError>
+            {
+                self.rt.block_on(self.store.leaf_hash(i))
+            }
+            fn tree_size(&self) -> Result<u64, ciris_verify_core::transparency::TransparencyError> {
+                self.rt.block_on(self.store.tree_size())
+            }
+            fn latest_sth(
+                &self,
+            ) -> Result<
+                Option<ciris_verify_core::transparency::SignedTreeHead>,
+                ciris_verify_core::transparency::TransparencyError,
+            > {
+                self.rt.block_on(self.store.latest_sth())
+            }
+            fn store_sth(
+                &self,
+                sth: &ciris_verify_core::transparency::SignedTreeHead,
+            ) -> Result<(), ciris_verify_core::transparency::TransparencyError> {
+                self.rt.block_on(self.store.store_sth(sth))
+            }
+            fn all_leaf_hashes(
+                &self,
+            ) -> Result<Vec<[u8; 32]>, ciris_verify_core::transparency::TransparencyError>
+            {
+                self.rt.block_on(self.store.all_leaf_hashes())
+            }
+        }
+
+        fn pg_sync(
+            backend: &Arc<PostgresBackend>,
+            t: String,
+        ) -> Arc<dyn TransparencyStore<AuditLeaf>> {
+            Arc::new(PgSync {
+                store: PgMerkleStore::new(backend.clone(), t),
+                rt: tokio::runtime::Handle::current(),
+            })
+        }
+
         async fn open() -> Option<Arc<PostgresBackend>> {
             let Some(dsn) = crate::test_pg::dsn() else {
                 eprintln!("1233 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
@@ -459,11 +518,7 @@ mod tests {
             let Some(backend) = open().await else { return };
             let t = tenant("1564p");
             let (genuine, _, _) = b::genuine_head(&log_id_for_tenant(&t), 1).await;
-            let store: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(PgMerkleStore::new(
-                backend.clone(),
-                tokio::runtime::Handle::current(),
-                t,
-            ));
+            let store = pg_sync(&backend, t);
             tokio::task::spawn_blocking(move || {
                 b::i1564_store_refuses_a_head_without_its_pqc_half(
                     store.as_ref(),
@@ -482,11 +537,7 @@ mod tests {
             let Some(backend) = open().await else { return };
             let t = tenant("1565p");
             let (genuine, ed_pk, pqc_pk) = b::genuine_head(&log_id_for_tenant(&t), 1).await;
-            let store: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(PgMerkleStore::new(
-                backend.clone(),
-                tokio::runtime::Handle::current(),
-                t.clone(),
-            ));
+            let store = pg_sync(&backend, t.clone());
             // Called from a blocking thread, so it may block on the runtime.
             let inject: Arc<dyn Fn(i64, Vec<u8>) + Send + Sync> = {
                 let handle = tokio::runtime::Handle::current();

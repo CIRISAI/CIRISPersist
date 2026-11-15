@@ -349,7 +349,11 @@ pub(crate) fn prepare_holding_claim_row(
     row.scrub_signature_pqc = claim.scrub_signature_pqc.clone();
     row.scrub_key_id = claim.scrub_key_id.clone();
     row.scrub_timestamp = claim.scrub_timestamp;
-    super::blobs::check_put_blob_admission(&row, &claim.original_content_hash_hex, Utc::now())?;
+    super::blobs::check_put_blob_admission(
+        &row,
+        &claim.original_content_hash_hex,
+        crate::host::clock::now(),
+    )?;
     parse_custody_ack(&row)
         .map_err(|e| BlobError::InvalidArgument(e.to_string()))?
         .ok_or_else(|| {
@@ -1050,7 +1054,7 @@ where
     }
     // A directory read, not an access to the bytes (Codex r2 on #1065).
     let held_here = backend.blob_head(sha256).await?.is_some();
-    let claims = holder_claims(backend, sha256, Utc::now())
+    let claims = holder_claims(backend, sha256, crate::host::clock::now())
         .await
         .map_err(|e| BlobError::Backend(format!("list_holders: {e}")))?;
     Ok(claims
@@ -1077,7 +1081,7 @@ where
     if backend.blob_head(sha256).await?.is_none() || is_withheld(backend, sha256).await? {
         return Ok(Vec::new());
     }
-    Ok(holder_claims(backend, sha256, Utc::now())
+    Ok(holder_claims(backend, sha256, crate::host::clock::now())
         .await
         .map_err(|e| BlobError::Backend(format!("list_local_holders: {e}")))?
         .into_iter()
@@ -1099,7 +1103,7 @@ where
     B: BlobStorage + FederationDirectory + Sync,
 {
     let mut out = Vec::new();
-    for sha in held_by(backend, holder_key_id, Utc::now(), true)
+    for sha in held_by(backend, holder_key_id, crate::host::clock::now(), true)
         .await
         .map_err(|e| BlobError::Backend(format!("list_held_by: {e}")))?
     {

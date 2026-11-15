@@ -310,7 +310,7 @@ unsafe extern "C" fn persist_drop(data: *mut c_void) {
     // it to a teardown thread instead; when other holders remain this
     // is just an atomic decrement, exactly as before.
     if let Ok(rt) = Arc::try_unwrap(runtime) {
-        crate::engine::teardown::retire_runtime(rt, Box::new(()));
+        crate::ffi::teardown::retire_runtime(rt, Box::new(()));
     }
 }
 

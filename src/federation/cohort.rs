@@ -202,8 +202,9 @@ pub mod test_support {
         for k in [&fam, &comm] {
             ts::register_hybrid_key(directory, k).await;
         }
-        let now =
-            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        let now = crate::federation::admission::truncate_to_substrate_resolution(
+            crate::host::clock::now(),
+        );
         let unsigned = AdmitSpec {
             authority_key_id: String::new(),
             scrub_signature_classical: String::new(),

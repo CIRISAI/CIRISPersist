@@ -226,7 +226,7 @@ fn parse_age_band_fine_token(attestation_type: &str) -> Option<AgeBandFine> {
 /// module docs for the witness-outranks-self resolution + the
 /// presumption-of-sovereignty `Unknown` default.
 pub async fn age_band(directory: &dyn FederationDirectory, k: &str) -> Result<AgeBand, Error> {
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     // `list_attestations_for(k)` is ordered asserted_at DESC, so the first
     // matching witness row is the most recent.
     let mut self_says_minor = false;
@@ -306,7 +306,7 @@ pub async fn age_band_fine(
     directory: &dyn FederationDirectory,
     k: &str,
 ) -> Result<AgeBandFine, Error> {
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     let mut best_self_minor: Option<AgeBandFine> = None;
     // Every row about `k`, newest first, walked in pages: a claim token
     // rides either the `scores` dimension or the legacy type slot

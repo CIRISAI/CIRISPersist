@@ -338,7 +338,7 @@ impl TicketService for PostgresBackend {
             .unwrap_or(TicketStatus::Assigned)
             .as_sql_str()
             .to_owned();
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let client = self
             .checkout()
             .await
@@ -389,7 +389,7 @@ impl TicketService for PostgresBackend {
             return Err(Error::InvalidArgument("ticket_id required".into()));
         }
         let status_str = new_status.as_sql_str().to_owned();
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let client = self
             .checkout()
             .await

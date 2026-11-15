@@ -342,7 +342,7 @@ pub async fn capacity_state(
     k: &str,
     d: &str,
 ) -> Result<CapacityState, Error> {
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     // Every row about `k`, newest first, walked in pages: a claim token
     // rides either the `scores` dimension or the legacy type slot
     // (`row_type::claim_token`), so no one narrowing holds both shapes.
@@ -395,7 +395,7 @@ pub async fn incapacity_facts(
     directory: &dyn FederationDirectory,
     k: &str,
 ) -> Result<IncapacityFacts, Error> {
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     let mut facts = IncapacityFacts {
         incapacitated_domains: HashSet::new(),
         reversible_excluded_domains: HashSet::new(),

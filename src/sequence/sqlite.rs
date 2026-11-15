@@ -82,7 +82,7 @@ impl SequenceService for SqliteSequenceBackend {
         validate_key(identity, stream)?;
         let identity = identity.to_owned();
         let stream = stream.to_owned();
-        let updated_at = fmt_datetime(Utc::now());
+        let updated_at = fmt_datetime(crate::host::clock::now());
         let conn = self.conn.clone();
         (move || -> Result<u64, Error> {
             let guard = conn.lock();

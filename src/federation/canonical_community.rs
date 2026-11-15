@@ -400,7 +400,7 @@ pub async fn accord_quorum_over_community<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    accord_quorum_at(directory, signed, &mut Memo::at(chrono::Utc::now())).await
+    accord_quorum_at(directory, signed, &mut Memo::at(crate::host::clock::now())).await
 }
 
 /// [`accord_quorum_over_community`] with the family roster folded at
@@ -1523,7 +1523,7 @@ pub async fn stored_standing<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    stored_standing_at(directory, community_key_id, chrono::Utc::now()).await
+    stored_standing_at(directory, community_key_id, crate::host::clock::now()).await
 }
 
 /// Re-judge the row stored at `community_key_id` AT `now` (see the module
@@ -2803,7 +2803,7 @@ where
     // the protocol is still refused as the entrenchment violation it is.
     check_founding_margin(&chain[0].community)?;
     // The door's one clock read; everything below judges at it.
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     check_founders_eligible(directory, community, now).await?;
     let mut memo = Memo::at(now);
     let standing = stored_standing_at(directory, &community.community_key_id, now).await?;
@@ -3018,7 +3018,7 @@ where
 {
     let mut chain = chain_of(offered);
     let id = offered.community.community_key_id.as_str();
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     let mut memo = Memo::at(now);
     let standing = stored_standing_at(directory, id, now).await?;
     let (start, replaces) = match (&standing, standing.held()) {
@@ -3142,7 +3142,7 @@ where
     F: FederationDirectory + ?Sized,
 {
     let id = new.community.community_key_id.clone();
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     let standing = stored_standing_at(directory, &id, now).await?;
     match standing.held() {
         Some(held) => {
@@ -3400,7 +3400,7 @@ where
         return Ok(None);
     };
     let trust_root = is_trust_root_grade(&community);
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     let mut rooted_head: Option<Community> = None;
     let mut live_now: Option<bool> = None;
     if trust_root {

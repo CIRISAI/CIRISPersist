@@ -217,7 +217,7 @@ pub(crate) async fn put_touch_claim_planned<D: EvidenceStore>(
     // admission gate, THEN the future-skew guard, THEN the monotonic-max
     // merge.
     super::admission::verify_signed_touch_claim(dir, claim).await?;
-    let received_at = Utc::now();
+    let received_at = crate::host::clock::now();
     super::admission::verify_touch_claim_admission(
         claim,
         received_at,
@@ -281,7 +281,7 @@ pub(crate) async fn put_wholeness_witness_planned<D: EvidenceStore>(
         observed_at_unix_ms,
         claim_namespaces,
         keep: i64::try_from(crate::witness::WITNESS_CORPUS_K).unwrap_or(i64::MAX),
-        admitted_at: Utc::now(),
+        admitted_at: crate::host::clock::now(),
     })
     .await
 }

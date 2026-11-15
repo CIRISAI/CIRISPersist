@@ -1072,9 +1072,13 @@ where
         return Ok(());
     }
     use super::topology::DelegateStanding;
-    let standing =
-        super::topology::live_delegate_standing(directory, subject, authority, chrono::Utc::now())
-            .await?;
+    let standing = super::topology::live_delegate_standing(
+        directory,
+        subject,
+        authority,
+        crate::host::clock::now(),
+    )
+    .await?;
     let rule = match standing {
         DelegateStanding::Live => return Ok(()),
         DelegateStanding::NoEdge => LOCATION_AUTHORITY_RULE_NO_DELEGATION_EDGE,
@@ -1231,8 +1235,9 @@ pub mod test_support {
         key: &str,
         revoked_by: &str,
     ) -> crate::federation::SignedTrustRevocation {
-        let revoked_at =
-            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        let revoked_at = crate::federation::admission::truncate_to_substrate_resolution(
+            crate::host::clock::now(),
+        );
         let bytes = crate::federation::admission::trust_revocation_signing_bytes(
             key,
             revoked_by,
@@ -1335,7 +1340,7 @@ pub mod test_support {
         // future fixture tidy-up.
         let now = {
             use chrono::Timelike as _;
-            let dt = chrono::Utc::now();
+            let dt = crate::host::clock::now();
             dt.with_nanosecond(dt.nanosecond() / 1_000 * 1_000)
                 .unwrap_or(dt)
         };
@@ -1754,7 +1759,7 @@ pub mod test_support {
             scrub_signature_pqc: pqc,
             // The co-signer stamps its own instant; the crossing writes it.
             cosigned_at: Some(crate::federation::admission::render_signed_instant(
-                chrono::Utc::now(),
+                crate::host::clock::now(),
             )),
         })
     }
@@ -1771,7 +1776,7 @@ pub mod test_support {
     ) -> Result<crate::federation::MeshCrossingOutcome, crate::federation::Error> {
         use crate::federation::{attestation_emit, crossing, CrossingBasis, SignedAttestation};
         let ci = describe_for(prior, audience, CrossingBasis::ProducerAuthority);
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let mut input = crossing::build_widening(prior, &ci.recipient_see, strip, now)?;
         let canonical =
             attestation_emit::stamp_and_canonicalize(&mut input, &prior.attesting_key_id, now)?;
@@ -1826,7 +1831,7 @@ pub mod test_support {
             scrub_signature_pqc,
             scrub_key_id: signing_key_id.to_owned(),
             scrub_timestamp: crate::federation::admission::truncate_to_substrate_resolution(
-                chrono::Utc::now(),
+                crate::host::clock::now(),
             ),
         }
     }
@@ -2212,14 +2217,14 @@ pub mod test_support {
                 attested_key_id: producer.to_owned(),
                 attestation_type: attestation_type::SCORES.to_owned(),
                 weight: None,
-                asserted_at: chrono::Utc::now(),
+                asserted_at: crate::host::clock::now(),
                 expires_at: None,
                 attestation_envelope: env,
                 original_content_hash: "ab".repeat(32),
                 scrub_signature_classical: "c2ln".to_owned(),
                 scrub_signature_pqc: None,
                 scrub_key_id: producer.to_owned(),
-                scrub_timestamp: chrono::Utc::now(),
+                scrub_timestamp: crate::host::clock::now(),
                 pqc_completed_at: None,
                 persist_row_hash: String::new(),
                 subject_key_ids: vec![producer.to_owned()],
@@ -2331,8 +2336,8 @@ pub mod test_support {
                 crate::federation::types::CommunityMembershipRevocation {
                     community_key_id: cid.clone(),
                     removed_identity_key_id: author.clone(),
-                    removed_at: chrono::Utc::now(),
-                    effective_at: chrono::Utc::now(),
+                    removed_at: crate::host::clock::now(),
+                    effective_at: crate::host::clock::now(),
                     reason: None,
                     witness_set: vec![],
                     persist_row_hash: String::new(),
@@ -2419,7 +2424,7 @@ pub mod test_support {
             occurrence_key_id: device.clone(),
             device_class: crate::federation::types::device_class::SERVER.into(),
             hardware_attestation: None,
-            asserted_at: chrono::Utc::now(),
+            asserted_at: crate::host::clock::now(),
             valid_until: None,
             encryption_pubkeys: None,
             transport_binding: None,
@@ -2521,8 +2526,8 @@ pub mod test_support {
             crate::federation::types::IdentityOccurrenceRevocation {
                 identity_key_id: bob_observer.clone(),
                 occurrence_key_id: device.clone(),
-                revoked_at: chrono::Utc::now(),
-                effective_at: chrono::Utc::now(),
+                revoked_at: crate::host::clock::now(),
+                effective_at: crate::host::clock::now(),
                 reason: None,
                 witness_set: vec![],
                 persist_row_hash: String::new(),
@@ -2661,7 +2666,7 @@ pub mod test_support {
             occurrence_key_id: agent_ok.clone(),
             device_class: crate::federation::types::device_class::SERVER.into(),
             hardware_attestation: None,
-            asserted_at: chrono::Utc::now(),
+            asserted_at: crate::host::clock::now(),
             valid_until: None,
             encryption_pubkeys: None,
             transport_binding: None,
@@ -3026,7 +3031,7 @@ pub mod test_support {
                 "node,infra:serve",
                 &expired_node,
                 "expired-788",
-                chrono::Utc::now() - chrono::Duration::hours(1),
+                crate::host::clock::now() - chrono::Duration::hours(1),
             ),
         })
         .await
@@ -3466,7 +3471,7 @@ pub mod test_support {
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
         let now = {
             use chrono::Timelike as _;
-            let dt = chrono::Utc::now();
+            let dt = crate::host::clock::now();
             dt.with_nanosecond(dt.nanosecond() / 1_000 * 1_000)
                 .unwrap_or(dt)
         };
@@ -3953,7 +3958,7 @@ pub mod test_support {
         attested: &str,
         envelope: &serde_json::Value,
     ) -> Attestation {
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: attester.to_owned(),
@@ -4205,7 +4210,7 @@ pub mod test_support {
             dir,
             &subject,
             &expired,
-            Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+            Some(crate::host::clock::now() - chrono::Duration::hours(1)),
         )
         .await?;
         let err = dir
@@ -4780,8 +4785,9 @@ pub mod test_support {
         // carries a term, measured from its signed instant: signed now (not at
         // the owner-binding fixture's fixed instant) for 180 days, so the
         // fixture never decays on a calendar date.
-        let now =
-            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        let now = crate::federation::admission::truncate_to_substrate_resolution(
+            crate::host::clock::now(),
+        );
         a.asserted_at = now;
         a.scrub_timestamp = now;
         crate::federation::admission::DelegationTermBounds::until(

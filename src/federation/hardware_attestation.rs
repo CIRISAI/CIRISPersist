@@ -1182,7 +1182,7 @@ pub mod test_support {
     pub fn fresh_accord_holder_evidence() -> serde_json::Value {
         static NONCE: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>> =
             std::sync::Mutex::new(None);
-        let captured = process_nonce_instant(&NONCE, chrono::Utc::now());
+        let captured = process_nonce_instant(&NONCE, crate::host::clock::now());
         serde_json::json!({
             "platform_attestation": {
                 "Android": {

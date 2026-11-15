@@ -336,7 +336,7 @@ impl IncidentService for PostgresBackend {
         // Resolved/Closed: stamp resolved_at + notes (preserved
         // through subsequent transitions; e.g. resolved → closed
         // keeps the original resolved_at).
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         match transition.new_state {
             IncidentState::Resolved => {
                 tx.execute(

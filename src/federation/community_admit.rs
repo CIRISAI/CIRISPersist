@@ -165,7 +165,7 @@ where
     // and the record's head instant.
     let instants = PlanInstants {
         fold_at: super::canonical_community::head_instant(&community),
-        received_at: chrono::Utc::now(),
+        received_at: crate::host::clock::now(),
     };
     let planned = plan_put_community(dir, community, door, instants).await?;
     // v49.0.0 (CIRISPersist#910.5) — the occupied-id route the plan decided:
@@ -324,7 +324,7 @@ where
     // the row's signed instant.
     let instants = PlanInstants {
         fold_at: revocation.community_membership_revocation.effective_at,
-        received_at: chrono::Utc::now(),
+        received_at: crate::host::clock::now(),
     };
     let planned = plan_put_community_membership_revocation(dir, revocation, instants).await?;
     // v61.3.0 (CIRISPersist#1252) — the sole refusal is the shortfall: held
@@ -530,7 +530,7 @@ where
     // the row's signed instant.
     let instants = PlanInstants {
         fold_at: widening.community_membership_widening.effective_at,
-        received_at: chrono::Utc::now(),
+        received_at: crate::host::clock::now(),
     };
     let planned = plan_put_community_membership_widening(dir, widening, instants).await?;
     // v61.3.0 (CIRISPersist#1252) — the sole refusal is the shortfall: held

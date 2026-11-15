@@ -88,8 +88,10 @@ pub mod federation;
 pub mod feedback_mappings;
 pub mod ffi;
 pub mod fountain;
+// v62.0.0 (slice A) — the host seams: clock, executor, lifecycle.
 #[cfg(feature = "cirisgraph")]
 pub mod graph;
+pub mod host;
 #[cfg(feature = "cirisincident")]
 pub mod incident;
 pub mod ingest;
@@ -242,10 +244,11 @@ pub use ingest::{BatchSummary, IngestError, IngestPipeline};
 pub use journal::{Journal, JournalError};
 #[cfg(feature = "sqlite")]
 pub use outbound::EdgeOutboundQueueSqlite;
-pub use queue::{
-    shutdown_signal, spawn_persister, IngestHandle, PersisterHandle, QueueError,
-    DEFAULT_QUEUE_DEPTH,
-};
+// v62.0.0 (P9) — `shutdown_signal` is gone from the node: the host delivers
+// `host::LifecycleEvent::Shutdown`; the native signal adapter is
+// `ffi::native_host::{os_shutdown_signal, deliver_os_signals}`.
+pub use host::{Lifecycle, LifecycleEvent};
+pub use queue::{spawn_persister, IngestHandle, PersisterHandle, QueueError, DEFAULT_QUEUE_DEPTH};
 // v2.7.0 (CIRISPersist#107) — retention primitive types. The three
 // Engine methods (`storage_summary`, `delete_traces_older_than`,
 // `archive_audit_range`) consume these; re-export at the crate root

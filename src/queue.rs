@@ -140,7 +140,7 @@ impl IngestHandle {
             #[cfg(feature = "server")]
             sidecar: None,
         };
-        match tokio::time::timeout(timeout, self.tx.send(job)).await {
+        match crate::host::rt::timeout(timeout, self.tx.send(job)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(QueueError::Closed),
             Err(_) => Err(QueueError::Full),
@@ -162,14 +162,20 @@ impl IngestHandle {
 /// work. The persister processes the rest of the queue, journals
 /// any backend-write failures, and then exits cleanly.
 pub struct PersisterHandle {
-    join: tokio::task::JoinHandle<()>,
+    join: crate::host::TaskHandle,
 }
 
 impl PersisterHandle {
     /// Wait for the persister task to finish processing the queue
     /// and exit. Caller must have dropped the corresponding
     /// [`IngestHandle`]s first; otherwise this hangs forever.
-    pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
+    ///
+    /// v62.0.0 (P9) — the trigger in a long-running deployment is the
+    /// host's [`LifecycleEvent::Shutdown`](crate::host::LifecycleEvent)
+    /// ([`Lifecycle::shutdown`](crate::host::Lifecycle::shutdown)); a native
+    /// host wires its OS signals to it with
+    /// [`deliver_os_signals`](crate::ffi::native_host::deliver_os_signals).
+    pub async fn shutdown(self) -> Result<(), crate::host::TaskError> {
         self.join.await
     }
 
@@ -181,8 +187,8 @@ impl PersisterHandle {
     pub async fn shutdown_with_timeout(
         self,
         timeout: Duration,
-    ) -> Result<(), tokio::task::JoinError> {
-        match tokio::time::timeout(timeout, self.join).await {
+    ) -> Result<(), crate::host::TaskError> {
+        match crate::host::rt::timeout(timeout, self.join).await {
             Ok(r) => r,
             Err(_) => {
                 tracing::warn!(
@@ -192,40 +198,6 @@ impl PersisterHandle {
                 Ok(())
             }
         }
-    }
-}
-
-/// A future that resolves on SIGINT or SIGTERM.
-///
-/// Use as the trigger for [`PersisterHandle::shutdown`] in long-
-/// running deployments. For the Phase 1.0 PyO3 path, the host
-/// process (FastAPI worker) handles signals; the lens shouldn't
-/// call this from inside the wheel. For Phase 1.1 standalone
-/// server, this is the recommended shutdown trigger.
-#[cfg(unix)]
-pub async fn shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-    tokio::select! {
-        _ = term.recv() => tracing::info!("received SIGTERM; beginning graceful shutdown"),
-        _ = int.recv()  => tracing::info!("received SIGINT; beginning graceful shutdown"),
-    }
-}
-
-/// Windows analog of [`shutdown_signal`] (CIRISPersist#200): Ctrl+C
-/// (≈ SIGINT) + Ctrl+Break (the closest console-event analog of SIGTERM).
-/// The wheel path never calls this — the host process handles signals —
-/// but the source tree must compile on `windows-x86_64` for the pyo3
-/// consumers (CIRISEdge#90 → CIRISLensCore → Agent 2.9.6 Windows wheels).
-#[cfg(windows)]
-pub async fn shutdown_signal() {
-    use tokio::signal::windows::{ctrl_break, ctrl_c};
-    let mut cc = ctrl_c().expect("install Ctrl+C handler");
-    let mut cb = ctrl_break().expect("install Ctrl+Break handler");
-    tokio::select! {
-        _ = cc.recv() => tracing::info!("received Ctrl+C; beginning graceful shutdown"),
-        _ = cb.recv() => tracing::info!("received Ctrl+Break; beginning graceful shutdown"),
     }
 }
 
@@ -261,50 +233,44 @@ where
 {
     let (tx, mut rx) = mpsc::channel::<Job>(queue_depth);
 
-    let join = tokio::spawn(async move {
+    let join = crate::host::rt::spawn(async move {
         // Step 0: replay the journal before accepting new traffic.
         // Mission constraint (FSD §3.4 #2; MISSION.md §2 — `store/`):
         // resume from where the previous process left off so no
         // signed evidence is lost across restarts.
-        let backend_clone = backend.clone();
-        let canon_clone = canonicalizer.clone();
-        let scrub_clone = scrubber.clone();
-        let signer_clone_outer = signer.clone();
-        let signer_key_id_outer = signer_key_id.clone();
-
-        let replay_result = journal.replay(|_seq, bytes| {
-            // Synchronous handler — bridge to async via block_on on
-            // the current runtime. We're already inside tokio::spawn
-            // so a Handle is available.
-            let backend = backend_clone.clone();
-            let canon = canon_clone.clone();
-            let scrub = scrub_clone.clone();
-            let signer_clone = signer_clone_outer.clone();
-            let signer_key_id_clone = signer_key_id_outer.clone();
-            let bytes_owned = bytes.to_vec();
-            let rt = tokio::runtime::Handle::current();
-            let outcome = std::thread::scope(|s| {
-                let join = s.spawn(move || {
-                    rt.block_on(async move {
-                        let pipeline = IngestPipeline {
-                            backend: &*backend,
-                            canonicalizer: &*canon,
-                            scrubber: &*scrub,
-                            signer: &*signer_clone,
-                            signer_key_id: &signer_key_id_clone,
-                        };
-                        pipeline.receive_and_persist(&bytes_owned).await
-                    })
-                });
-                join.join().expect("replay task")
-            });
-            match outcome {
-                Ok(_) => Ok(()),
-                Err(e) => Err(format!("{e}")),
+        //
+        // v62.0.0 (P5) — the replay awaits the pipeline in place. Up to v61
+        // a synchronous `Journal::replay` handler bridged back with a scoped
+        // OS thread + `Handle::current().block_on`, which a single-thread
+        // host has neither of. Same order, same halt-on-first-failure, same
+        // purge-after-success.
+        loop {
+            let (seq, bytes) = match journal.first_pending() {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::error!(error = %e, "journal replay halted");
+                    break;
+                }
+            };
+            let pipeline = IngestPipeline {
+                backend: &*backend,
+                canonicalizer: &*canonicalizer,
+                scrubber: &*scrubber,
+                signer: &*signer,
+                signer_key_id: &signer_key_id,
+            };
+            if let Err(e) = pipeline.receive_and_persist(&bytes).await {
+                tracing::error!(
+                    error = %JournalError::Replay(format!("{e}")),
+                    "journal replay halted"
+                );
+                break;
             }
-        });
-        if let Err(e) = replay_result {
-            tracing::error!(error = %e, "journal replay halted");
+            if let Err(e) = journal.purge(seq) {
+                tracing::error!(error = %e, "journal replay halted");
+                break;
+            }
         }
 
         // Main loop.

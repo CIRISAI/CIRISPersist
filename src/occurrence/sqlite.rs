@@ -149,7 +149,7 @@ impl OccurrenceService for SqliteOccurrenceBackend {
         validate_register(occurrence_id, identity, ttl_seconds)?;
         let occurrence_id = occurrence_id.to_owned();
         let identity = identity.to_owned();
-        let now = Utc::now();
+        let now = crate::host::clock::now();
         let now_str = fmt_datetime(now);
         let expires_str = fmt_datetime(now + Duration::seconds(ttl_seconds));
         let metadata_str = encode_optional_json(&metadata)?;
@@ -196,7 +196,7 @@ impl OccurrenceService for SqliteOccurrenceBackend {
             return Err(Error::InvalidArgument("ttl_seconds must be > 0".into()));
         }
         let occurrence_id = occurrence_id.to_owned();
-        let now = Utc::now();
+        let now = crate::host::clock::now();
         let now_str = fmt_datetime(now);
         let expires_str = fmt_datetime(now + Duration::seconds(ttl_seconds));
         let conn = self.conn.clone();
@@ -237,7 +237,7 @@ impl OccurrenceService for SqliteOccurrenceBackend {
             return Err(Error::InvalidArgument("identity required".into()));
         }
         let identity = identity.to_owned();
-        let now_str = fmt_datetime(Utc::now());
+        let now_str = fmt_datetime(crate::host::clock::now());
         let conn = self.conn.clone();
         (move || -> Result<Vec<OccurrenceRecord>, Error> {
             let guard = conn.lock();

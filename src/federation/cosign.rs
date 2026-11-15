@@ -1274,7 +1274,7 @@ where
         dir,
         read.event.kind(),
         read.event.group_key_id(),
-        chrono::Utc::now(),
+        crate::host::clock::now(),
     )
     .await?;
     let members: Vec<String> = active_members_at(

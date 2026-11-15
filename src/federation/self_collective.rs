@@ -62,7 +62,7 @@ where
             // naming `(owner, k)` stops the owner binding from lifting `k`; an
             // occurrence re-established after it (agreed, asserted later) is
             // already in `out` through the active fold.
-            let now = chrono::Utc::now();
+            let now = crate::host::clock::now();
             let revoked = dir
                 .list_identity_occurrence_revocations_for(&owner)
                 .await?

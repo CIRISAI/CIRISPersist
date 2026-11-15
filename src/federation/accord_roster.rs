@@ -171,7 +171,7 @@ where
         .iter()
         .map(|m| (m.key_id.clone(), m.role.clone()))
         .collect();
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     let mut seen = std::collections::BTreeSet::new();
     for c in changes {
         let digest = c

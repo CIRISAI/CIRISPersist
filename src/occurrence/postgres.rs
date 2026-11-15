@@ -10,7 +10,7 @@
 //! values are mutually consistent within one call and the TTL math
 //! is testable.
 
-use chrono::{Duration, Utc};
+use chrono::Duration;
 
 use super::service::OccurrenceService;
 use super::types::OccurrenceRecord;
@@ -86,7 +86,7 @@ impl OccurrenceService for PostgresBackend {
         metadata: Option<serde_json::Value>,
     ) -> Result<(), Error> {
         validate_register(occurrence_id, identity, ttl_seconds)?;
-        let now = Utc::now();
+        let now = crate::host::clock::now();
         let expires_at = now + Duration::seconds(ttl_seconds);
         let client = self
             .checkout()
@@ -131,7 +131,7 @@ impl OccurrenceService for PostgresBackend {
         if ttl_seconds <= 0 {
             return Err(Error::InvalidArgument("ttl_seconds must be > 0".into()));
         }
-        let now = Utc::now();
+        let now = crate::host::clock::now();
         let expires_at = now + Duration::seconds(ttl_seconds);
         let client = self
             .checkout()
@@ -171,7 +171,7 @@ impl OccurrenceService for PostgresBackend {
         if identity.is_empty() {
             return Err(Error::InvalidArgument("identity required".into()));
         }
-        let now = Utc::now();
+        let now = crate::host::clock::now();
         let client = self
             .checkout()
             .await
@@ -366,7 +366,7 @@ mod tests {
         // Force occ_b's expires_at into the past via raw SQL — proves
         // the `expires_at > now` filter without a real sleep.
         let client = backend.checkout().await.unwrap();
-        let past = Utc::now() - Duration::hours(1);
+        let past = chrono::Utc::now() - Duration::hours(1);
         client
             .execute(
                 "UPDATE cirislens.occurrence_registry \

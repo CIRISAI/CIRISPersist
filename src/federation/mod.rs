@@ -1414,7 +1414,7 @@ pub async fn is_node_bearing_key<F>(directory: &F, key_id: &str) -> Result<bool,
 where
     F: FederationDirectory + ?Sized,
 {
-    is_node_bearing_key_at(directory, key_id, chrono::Utc::now()).await
+    is_node_bearing_key_at(directory, key_id, crate::host::clock::now()).await
 }
 
 /// v50.0.0 (CIRISPersist#925, review item 5) — is `key_id` `node`-bearing at
@@ -2305,7 +2305,7 @@ where
     // Reverse quorum: the objection fold counts against the roster with NO
     // reversals applied — the members who could object — supplied here,
     // because the fold's own roster read would re-enter this function.
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     let state0 = authorized_roster_state_at(record_members, rules, &events, now);
     let roster0: Vec<String> = state0
         .iter()
@@ -3140,7 +3140,7 @@ pub fn roster_row_signer_set(
 pub fn reject_future_dated_family_widening(
     effective_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error> {
-    let max_allowed = chrono::Utc::now()
+    let max_allowed = crate::host::clock::now()
         + chrono::Duration::seconds(community_dek::COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS);
     if effective_at > max_allowed {
         return Err(Error::InvalidArgument(format!(
@@ -3789,7 +3789,7 @@ pub trait FederationDirectory: Send + Sync {
             return Ok(Vec::new());
         }
         Ok(
-            holding_claim::holder_claims(self, sha256, chrono::Utc::now())
+            holding_claim::holder_claims(self, sha256, crate::host::clock::now())
                 .await?
                 .into_iter()
                 .filter(|c| c.state == custody_ack::CustodyState::Here)
@@ -5615,7 +5615,7 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         occurrence_key_id: &str,
     ) -> Result<Option<EncryptionPubkeys>, Error> {
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let Some(occ) = self
             .lookup_identity_for_occurrence(occurrence_key_id)
             .await?
@@ -6181,7 +6181,7 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         cosign: lineage_witness::LineageHeadCosign,
     ) -> Result<lineage_witness::LineageCosignOutcome, Error> {
-        lineage_witness::admit_lineage_head_cosign(self, &cosign, chrono::Utc::now()).await
+        lineage_witness::admit_lineage_head_cosign(self, &cosign, crate::host::clock::now()).await
     }
 
     /// v51.0.0 (CIRISPersist#938) — every cosign held for `lineage_key_id`,
@@ -7112,7 +7112,7 @@ pub trait FederationDirectory: Send + Sync {
         let revs = self
             .list_identity_occurrence_revocations_for(identity_key_id)
             .await?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         // v16.0.0 (#421): per-occurrence fold via THE comparator
         // ([`IdentityOccurrenceRevocation::revokes`]) — a re-established
         // occurrence (asserted after its revocation) is ACTIVE again; the old
@@ -7137,7 +7137,7 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         member_identity_key_id: &str,
     ) -> Result<Vec<Family>, Error> {
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let families = self
             .list_families_for_member(member_identity_key_id)
             .await?;
@@ -7158,7 +7158,7 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         member_identity_key_id: &str,
     ) -> Result<Vec<Community>, Error> {
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let communities = self
             .list_communities_for_member(member_identity_key_id)
             .await?;
@@ -7208,7 +7208,7 @@ pub trait FederationDirectory: Send + Sync {
         if family.dissolved_at.is_some() {
             return Ok(Vec::new());
         }
-        authorized_family_roster_at(self, &family, chrono::Utc::now()).await
+        authorized_family_roster_at(self, &family, crate::host::clock::now()).await
     }
 
     /// v38.2.0 (PR #761 review) — occurrence → identity through the ACTIVE
@@ -7413,7 +7413,7 @@ pub trait FederationDirectory: Send + Sync {
         // members plus the widening plane minus the revocation plane, by
         // effective instant. v49.0.0 (#908): only events whose signer has
         // standing count.
-        authorized_community_roster_at(self, &community, chrono::Utc::now()).await
+        authorized_community_roster_at(self, &community, crate::host::clock::now()).await
     }
 
     /// #249 Cut B — incremental **community-roster grow**. The exact mirror
@@ -7837,7 +7837,7 @@ pub trait FederationDirectory: Send + Sync {
         // idempotent no-op) so consumers reconcile via `list_hard_case_events`.
         // change_kind=ADDED; idempotent on the event_id.
         if added {
-            let now = chrono::Utc::now();
+            let now = crate::host::clock::now();
             hard_case::record_observation(
                 self,
                 hard_case::HardCaseEvent {
@@ -7878,7 +7878,7 @@ pub trait FederationDirectory: Send + Sync {
     ) -> Result<(), Error> {
         // v54.0.0 (CIRISPersist#1034) — the held record is this cohort.
         affiliation_config::check_group_cohort(self, cohort, group_key_id).await?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         // v61.1.0 (D7) — the revocation row is the spec's own construction
         // (`RevokeSpec::family_revocation` / `community_revocation`), the one
         // its signers sign over (`RevokeSpec::signing_envelope`).
@@ -8315,7 +8315,7 @@ pub trait FederationDirectory: Send + Sync {
                     .into_iter()
                     .map(|m| consensus::Seat {
                         // A quorum-gated supersede happens now.
-                        node_bearing: nodes.at(&m.key_id, chrono::Utc::now()),
+                        node_bearing: nodes.at(&m.key_id, crate::host::clock::now()),
                         key_id: m.key_id,
                         role: m.role,
                     })
@@ -8516,7 +8516,7 @@ pub trait FederationDirectory: Send + Sync {
                     // v49.0.0 (#910.2) — the prior roster the quorum sees is
                     // the family's authorized fold, not the record's members.
                     "members": members_json(
-                        authorized_family_roster_at(self, &f, chrono::Utc::now())
+                        authorized_family_roster_at(self, &f, crate::host::clock::now())
                             .await?
                             .into_iter()
                             .map(|m| (m.key_id, m.role))
@@ -9125,7 +9125,7 @@ pub trait FederationDirectory: Send + Sync {
                 ))
             })?;
         crossing::check_widening(&prior, &signed.attestation)?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         crossing::check_contextual_integrity(
             self,
             &signed.attestation,
@@ -10066,7 +10066,8 @@ pub trait FederationDirectory: Send + Sync {
             // (the timestamp does not enter the id) so there is exactly
             // one derivation to keep coherent.
             let event_id =
-                crate::witness::equivocation_hard_case(proof, &[], chrono::Utc::now()).event_id;
+                crate::witness::equivocation_hard_case(proof, &[], crate::host::clock::now())
+                    .event_id;
             let hard_case = cases.iter().find(|c| c.event_id == event_id).cloned();
             records.push(crate::witness::WitnessEquivocationRecord {
                 peer_id: proof.peer_id.clone(),

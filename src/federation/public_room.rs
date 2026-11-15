@@ -365,7 +365,7 @@ where
         .filter(|m| m.role.as_deref() == Some(super::admission::MEMBER_ROLE_FOUNDER))
         .map(|m| m.key_id)
         .collect();
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     let mut live: Vec<Attestation> = Vec::new();
     for row in directory
         .list_targeted_by_dimension_prefix(
@@ -447,7 +447,7 @@ where
     // Codex r2 on #1065 — a listing expired at the read instant is not live:
     // dropped BEFORE the maximum, so an older unexpired listing is the room's
     // live one and a room whose every listing expired has none.
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     Ok(rows
         .into_iter()
         .filter(|r| !retired.contains(&r.attestation_id))

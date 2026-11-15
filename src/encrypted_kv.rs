@@ -735,7 +735,7 @@ impl XChaChaKvStore {
         F: FnOnce(&Connection) -> Result<T, KVError> + Send + 'static,
     {
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::host::rt::try_dispatch_blocking(move || {
             let guard = conn.lock();
             f(&guard)
         })

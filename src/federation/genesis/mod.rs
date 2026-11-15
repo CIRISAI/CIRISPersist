@@ -4468,7 +4468,7 @@ pub(crate) fn preflight_replacement_admission(
     // THE WALL-CLOCK GATE, asked exactly as the write door asks it.
     super::admission::check_instant_binding(
         &normalized,
-        chrono::Utc::now(),
+        crate::host::clock::now(),
         super::admission::DEFAULT_MAX_TOUCH_SKEW,
     )?;
     Ok(())

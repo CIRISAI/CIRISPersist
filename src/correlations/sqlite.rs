@@ -307,7 +307,7 @@ impl CorrelationService for SqliteCorrelationBackend {
             return Err(Error::InvalidArgument("correlation_id required".into()));
         }
         let response_data_str = encode_json_opt(response_data.as_ref())?;
-        let now_str = fmt_datetime(chrono::Utc::now());
+        let now_str = fmt_datetime(crate::host::clock::now());
         let status_sql = new_status.as_sql_str().to_owned();
         let correlation_id_owned = correlation_id.to_owned();
         let conn = self.conn.clone();

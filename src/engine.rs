@@ -94,554 +94,6 @@ use crate::store::SqliteBackend;
 use crate::store::Backend;
 use crate::store::Error as StoreError;
 
-/// v24.3.0 (CIRISPersist#572) — bounded, caller-thread-free teardown
-/// of a tokio runtime and everything it was driving.
-///
-/// # The defect this exists to close
-///
-/// `tokio::runtime::Runtime`'s `Drop` **blocks the dropping thread**
-/// until every worker has parked and every `spawn_blocking` task that
-/// has already begun executing has run to completion. There is no
-/// timeout on that wait and no way to cancel a blocking task — the
-/// SQLite backend runs every statement through `spawn_blocking`, so
-/// "already begun" is the normal state during a busy teardown.
-///
-/// That is merely slow in a Rust program. Under PyO3 it is fatal: the
-/// last `Arc<Runtime>` reference is normally released from inside
-/// CPython's `Py_DECREF` — a `gc.collect()`, an interpreter shutdown,
-/// a capsule destructor — and **CPython holds the GIL for the whole
-/// of a deallocation**. A blocking wait there does not stall one
-/// thread, it stalls the interpreter: no other Python thread can be
-/// scheduled, so watchdogs (pytest-timeout's thread-method timer,
-/// `faulthandler`, signal handlers written in Python) never fire. The
-/// process presents as a silent native wedge with no Rust-side error
-/// at all, which is exactly the residual flake reported downstream as
-/// CIRISAgent#956 and filed here as CIRISPersist#572.
-///
-/// # The rule
-///
-/// **Nothing that can block may be dropped on a thread that might
-/// hold the GIL.** Instead the payload is moved to a dedicated OS
-/// thread — which by construction holds no GIL — and dropped there.
-/// The caller's cost is one `thread::spawn`; the wait still happens,
-/// it just happens somewhere it cannot take the interpreter with it.
-///
-/// # Why this is not "leaking the runtime to dodge the wait"
-///
-/// It is a deferred join, not a leak: the runtime is really dropped,
-/// really winds its workers down, and really waits for its in-flight
-/// blocking tasks — and [`teardown::wait_quiesced`] lets a caller (a test
-/// fixture, a shutdown sequence) block on that completion with a
-/// bound, off the GIL. The only true leak is the thread-spawn-failed
-/// fallback in [`teardown::retire_runtime`], which is documented there.
-///
-/// # Ordering
-///
-/// Teardown payloads are dropped in tuple/field declaration order, and
-/// callers are expected to put the runtime FIRST: a backend handle
-/// freed before the runtime has finished winding down is a
-/// use-after-free for any blocking task still touching it (the
-/// historical "Bus error" half of #572's symptom set).
-pub mod teardown {
-    use std::any::Any;
-    use std::sync::{Arc, Condvar, Mutex, OnceLock};
-    use std::time::Duration;
-
-    use tokio::runtime::Runtime;
-
-    thread_local! {
-        /// Set only on the threads [`spawn_drop`] creates. It marks
-        /// "blocking is allowed here" — those threads are the one
-        /// place in the process that provably cannot be holding the
-        /// GIL, so a nested [`retire_runtime`] on such a thread drops
-        /// inline rather than spawning another thread (which would
-        /// break the runtime-before-backend ordering).
-        static ON_TEARDOWN_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-
-    /// `(count of retirements not yet finished, condvar)`.
-    static IN_FLIGHT: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
-
-    fn gauge() -> &'static (Mutex<usize>, Condvar) {
-        IN_FLIGHT.get_or_init(|| (Mutex::new(0), Condvar::new()))
-    }
-
-    /// True when the calling thread is a teardown thread — i.e. when
-    /// blocking here is safe.
-    pub fn on_teardown_thread() -> bool {
-        ON_TEARDOWN_THREAD.with(|c| c.get())
-    }
-
-    /// Number of retirements handed off and not yet finished.
-    pub fn in_flight() -> usize {
-        *gauge().0.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn finish_one() {
-        let (lock, cv) = gauge();
-        let mut n = lock.lock().unwrap_or_else(|e| e.into_inner());
-        *n = n.saturating_sub(1);
-        cv.notify_all();
-    }
-
-    /// Move `payload` onto a dedicated OS thread and drop it there.
-    ///
-    /// Returns `Err(payload)` — handing ownership back, undamaged —
-    /// when the thread could not be spawned, so the caller can pick
-    /// a fallback that suits the payload. Never blocks.
-    fn spawn_drop<T: Send + 'static>(payload: T) -> Result<(), T> {
-        {
-            let (lock, _) = gauge();
-            *lock.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-        }
-        // The payload rides in a shared slot rather than being moved
-        // straight into the closure, because `thread::Builder::spawn`
-        // consumes (and on failure destroys) its closure — and
-        // destroying the closure would perform the very blocking drop
-        // we are trying to move off this thread.
-        let cargo = Arc::new(Mutex::new(Some(payload)));
-        let theirs = Arc::clone(&cargo);
-        let spawned = std::thread::Builder::new()
-            .name("ciris-persist-teardown".to_string())
-            .spawn(move || {
-                ON_TEARDOWN_THREAD.with(|c| c.set(true));
-                drop(theirs.lock().unwrap_or_else(|e| e.into_inner()).take());
-                finish_one();
-            });
-        match spawned {
-            // Deliberately detached: joining it is what
-            // `wait_quiesced` is for, with a bound.
-            Ok(_join) => Ok(()),
-            Err(e) => {
-                finish_one();
-                let payload = cargo
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .take()
-                    .expect("payload is only taken by the spawned thread");
-                tracing::error!(
-                    error = %e,
-                    "ciris-persist v24.3.0 (#572): could not spawn a teardown thread"
-                );
-                Err(payload)
-            }
-        }
-    }
-
-    /// Retire a tokio runtime plus everything that must outlive its
-    /// shutdown, without blocking the calling thread.
-    ///
-    /// `keepalive` is dropped **after** the runtime has fully wound
-    /// down. Pass the backend / pool handles the runtime's in-flight
-    /// blocking tasks are still touching; freeing those first is the
-    /// SIGBUS half of #572.
-    ///
-    /// Safe to call while holding the GIL. Safe to call from a
-    /// `Drop` impl.
-    pub fn retire_runtime(rt: Runtime, keepalive: Box<dyn Any + Send>) {
-        if on_teardown_thread() {
-            // Already off the GIL and already inside an ordered
-            // teardown — do the wait here so the caller's remaining
-            // fields (the backend, above all) drop strictly after it.
-            drop(rt);
-            drop(keepalive);
-            return;
-        }
-        // Tuple fields drop in declaration order: runtime, then the
-        // things it was driving. That ordering is the whole point.
-        if let Err((rt, keepalive)) = spawn_drop((rt, keepalive)) {
-            // No thread to hand this to, and we may be holding the
-            // GIL — blocking is the one thing we must not do. Signal
-            // shutdown without waiting and forget the keepalive:
-            // leaking a pool is survivable, wedging the interpreter
-            // is not. Thread exhaustion is already a hard failure of
-            // the process, so this is loud rather than silent.
-            tracing::error!(
-                "ciris-persist v24.3.0 (#572): backgrounding runtime shutdown \
-                 and leaking its keepalive — teardown thread unavailable"
-            );
-            rt.shutdown_background();
-            std::mem::forget(keepalive);
-        }
-    }
-
-    /// Retire an arbitrary payload whose `Drop` may block (an engine
-    /// cell, a connection pool) on a teardown thread.
-    ///
-    /// Same contract as [`retire_runtime`]: never blocks the caller,
-    /// safe under the GIL. On thread-spawn failure the payload is
-    /// forgotten rather than dropped, for the same reason.
-    pub fn retire_payload(payload: Box<dyn Any + Send>) {
-        if on_teardown_thread() {
-            drop(payload);
-            return;
-        }
-        if let Err(payload) = spawn_drop(payload) {
-            tracing::error!(
-                "ciris-persist v24.3.0 (#572): leaking a teardown payload — \
-                 teardown thread unavailable"
-            );
-            std::mem::forget(payload);
-        }
-    }
-
-    /// Block — with a bound — until every retirement handed off so far
-    /// has finished. Returns `true` if the process quiesced, `false`
-    /// on timeout.
-    ///
-    /// # This must never be called while holding the GIL
-    ///
-    /// It is the one blocking call in this module, and it exists so a
-    /// caller can *choose* to wait somewhere safe. The PyO3 surface
-    /// only ever reaches it from inside `py.detach(...)`. Calling it
-    /// with the GIL held reintroduces exactly the wedge the module
-    /// exists to prevent.
-    ///
-    /// A `false` return is a typed, loggable outcome, not an error:
-    /// the retirement keeps running on its own thread and the caller
-    /// gets its thread back.
-    pub fn wait_quiesced(timeout: Duration) -> bool {
-        debug_assert!(
-            !on_teardown_thread(),
-            "wait_quiesced from a teardown thread would deadlock on itself"
-        );
-        let (lock, cv) = gauge();
-        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let (_guard, res) = cv
-            .wait_timeout_while(guard, timeout, |n| *n > 0)
-            .unwrap_or_else(|e| e.into_inner());
-        !res.timed_out()
-    }
-
-    #[cfg(test)]
-    mod tests {
-
-        /// v30.3.0 (CIRISPersist#607) — **the abuse-surface path, through a real
-        /// Engine, with no test doubles.**
-        ///
-        /// Mirrors CIRISServer's `abuse_surface` reproduction: a stranger
-        /// self-registers carrying `identity_type: "witness"` — which still
-        /// SUCCEEDS, because the claim is self-assertable at registration and #607
-        /// never argued otherwise — and then attempts an `age_assurance:` row about
-        /// a third party. That second step is what must now fail.
-        ///
-        /// Kept as an Engine-level regression rather than trusting the
-        /// backend-level `a_self_asserted_witness_is_refused_607`: the consumer's
-        /// path builds an Engine, and a gate that works on a bare backend while the
-        /// Engine wires it differently is exactly the class this repo keeps hitting
-        /// (a control reachable in tests and absent from every real caller).
-        ///
-        /// The assertion is on the REFUSAL REASON, not merely on `is_err()`. A row
-        /// rejected for the wrong reason — an unregistered key, a bad signature —
-        /// would pass an `is_err()` check while proving nothing about #607.
-        #[cfg(feature = "sqlite")]
-        #[tokio::test]
-        async fn a_self_asserted_witness_is_refused_through_the_engine_607() {
-            let signer = crate::federation::tier_ingest::test_support::local_signer("probe-node");
-            let engine = crate::Engine::with_signer(signer, "sqlite::memory:")
-                .await
-                .expect("engine");
-            let sq = engine.sqlite_backend().expect("sqlite").clone();
-            // The Engine sets this at construction; without it the door refuses for
-            // a DIFFERENT reason (cannot verify), which would make this test pass
-            // while proving nothing.
-            assert!(
-                crate::federation::FederationDirectory::node_key_id(sq.as_ref()).is_some(),
-                "the Engine must give its backend a node identity at construction"
-            );
-
-            // A stranger self-registers AS a witness — the claim is on the record
-            // from the start, exactly as CIRISServer's abuse_surface does it.
-            let (ed, pqc) =
-                crate::federation::tier_ingest::test_support::hybrid_pubkeys("probe-stranger");
-            let rec = crate::federation::KeyRecord {
-                key_id: "probe-stranger".into(),
-                identity_ref: "probe-stranger".into(),
-                identity_type: "witness".into(),
-                pubkey_ed25519_base64: ed,
-                pubkey_ml_dsa_65_base64: pqc,
-                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
-                valid_from: chrono::Utc::now(),
-                valid_until: None,
-                registration_envelope: serde_json::json!({ "id": "probe-stranger" }),
-                original_content_hash: "deadbeef".to_owned(),
-                scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
-                scrub_signature_pqc: None,
-                scrub_key_id: "probe-stranger".into(),
-                scrub_timestamp: chrono::Utc::now(),
-                pqc_completed_at: None,
-                persist_row_hash: String::new(),
-                capability_roles: Vec::new(),
-                // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
-                attestation_evidence: Some(crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence()),
-                consent_role: None,
-                additional_scrubs: Vec::new(),
-            };
-            crate::federation::FederationDirectory::put_public_key(
-                sq.as_ref(),
-                crate::federation::SignedKeyRecord { record: rec },
-            )
-            .await
-            .expect("stranger self-registers as witness");
-            // The claim itself IS still self-assertable — that is not the hole.
-            assert_eq!(
-            crate::federation::FederationDirectory::lookup_public_key(sq.as_ref(), "probe-stranger")
-                .await
-                .unwrap()
-                .map(|k| k.identity_type),
-            Some("witness".to_owned()),
-            "the stranger must actually hold the claim, or this test refuses for the wrong reason"
-        );
-
-            crate::federation::tier_ingest::test_support::register_hybrid_key(
-                sq.as_ref(),
-                "probe-victim",
-            )
-            .await;
-
-            let envelope =
-                serde_json::json!({"id":"probe-1","dimension":"age_assurance:government:adult:v1"});
-            let (och, sc, sp) = crate::federation::tier_ingest::test_support::sign_envelope(
-                "probe-stranger",
-                &envelope,
-            );
-            let now = chrono::Utc::now();
-            let att = crate::federation::tier_ingest::test_support::seal_row(
-                "probe-stranger",
-                crate::federation::Attestation {
-                    attestation_id: uuid::Uuid::new_v4().to_string(),
-                    attesting_key_id: "probe-stranger".into(),
-                    attested_key_id: "probe-victim".into(),
-                    attestation_type: "age_assurance:government:adult:v1".into(),
-                    weight: None,
-                    asserted_at: now,
-                    expires_at: None,
-                    attestation_envelope: envelope,
-                    original_content_hash: och,
-                    scrub_signature_classical: sc,
-                    scrub_signature_pqc: sp,
-                    scrub_key_id: "probe-stranger".into(),
-                    scrub_timestamp: now,
-                    pqc_completed_at: Some(now),
-                    persist_row_hash: String::new(),
-                    subject_key_ids: Vec::new(),
-                    withdraws_admission_rule: None,
-                    cohort_scope: "federation".into(),
-                    tier: "federation".into(),
-                    promoted_at: None,
-                    additional_scrubs: Vec::new(),
-                },
-            );
-            let err = crate::federation::FederationDirectory::put_attestation(
-                sq.as_ref(),
-                crate::federation::SignedAttestation { attestation: att },
-            )
-            .await
-            .expect_err(
-                "a self-asserted witness must NOT be able to assert an age rung about a third \
-             party through the Engine path — that is CIRISPersist#607",
-            );
-            let msg = err.to_string();
-            assert!(
-                msg.contains("infra:attest_assurance"),
-                "refused, but not for the #607 reason — an is_err() check alone would have passed \
-             on an unregistered key or a bad signature. Got: {msg}"
-            );
-        }
-
-        use super::*;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        /// A keepalive that records, at the moment it is dropped,
-        /// whether the runtime had already finished winding down.
-        struct OrderWitness {
-            task_finished: Arc<AtomicBool>,
-            saw_finished: Arc<AtomicBool>,
-        }
-
-        impl Drop for OrderWitness {
-            fn drop(&mut self) {
-                self.saw_finished
-                    .store(self.task_finished.load(Ordering::SeqCst), Ordering::SeqCst);
-            }
-        }
-
-        /// v31.0.0 (CIRISPersist#658) — how long a test's in-flight blocking
-        /// task stays in flight when nothing releases it.
-        ///
-        /// It is NOT a budget and no assertion compares against it as one. Both
-        /// tests below hold a `spawn_blocking` task open on a channel and
-        /// release it explicitly, so in a healthy run the task waits
-        /// microseconds and this value is never reached. It exists so that a
-        /// REGRESSION — a `retire_runtime` that blocks its caller, which would
-        /// otherwise deadlock against the very channel meant to hold the task
-        /// open — self-releases and lands on a named assertion with a
-        /// diagnosis, instead of hanging until nextest SIGKILLs it at
-        /// `terminate-after` (six minutes, no message, no attribution).
-        ///
-        /// Comfortably under that six-minute kill, and three orders of
-        /// magnitude above anything the healthy path does.
-        const HELD_OPEN: Duration = Duration::from_secs(30);
-
-        /// v24.3.0 (CIRISPersist#572) — the ordering contract, with no
-        /// backend and no Python in the picture: `retire_runtime`
-        /// releases the keepalive strictly AFTER the runtime's
-        /// in-flight blocking work is done.
-        ///
-        /// This is what makes the keepalive worth passing. Freeing a
-        /// backend handle while a `spawn_blocking` task is still using
-        /// it is a use-after-free, and it is the half of #572 that
-        /// presented downstream as "Bus error" rather than as a hang.
-        ///
-        /// # Why there is no elapsed-time assertion here
-        ///
-        /// v31.0.0 (CIRISPersist#658) — "the caller is not the one paying for
-        /// the wait" used to be spelled `t0.elapsed() < 150ms` around a call
-        /// whose one job is to SPAWN AN OS THREAD. That measures the
-        /// scheduler: on a contended box a `thread::Builder::spawn` plus a
-        /// mutex acquisition can take longer than 150 ms while the code under
-        /// test is perfectly correct, and the failure it produces names a
-        /// duration rather than a defect.
-        ///
-        /// The property was never a duration. It is an ORDERING: `retire_runtime`
-        /// returns to its caller while the runtime's blocking work is still
-        /// UNFINISHED. So the task is held open on a channel that only this
-        /// test can close, and the assertion reads the work's own completion
-        /// flag. On a correct implementation the task cannot possibly have
-        /// finished, at any machine speed, because nothing has released it —
-        /// the assertion is exact rather than generous.
-        #[test]
-        #[serial_test::serial(runtime_teardown_gauge)]
-        fn keepalive_outlives_the_runtimes_in_flight_work() {
-            let task_finished = Arc::new(AtomicBool::new(false));
-            let saw_finished = Arc::new(AtomicBool::new(false));
-
-            let rt = Runtime::new().expect("tokio runtime");
-            let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
-            // The blocking task is held in flight by a CHANNEL, not by a sleep:
-            // the test decides when it finishes, so "still in flight" is a fact
-            // rather than a race against a timer.
-            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-            let flag = Arc::clone(&task_finished);
-            rt.spawn_blocking(move || {
-                let _ = started_tx.send(());
-                // `recv_timeout`, not `recv`: see `HELD_OPEN`. A blocking
-                // `recv` would turn the regression this test exists to catch
-                // into an unattributable SIGKILL.
-                let _ = release_rx.recv_timeout(HELD_OPEN);
-                flag.store(true, Ordering::SeqCst);
-            });
-            // Deterministic: the task has begun, so tokio's shutdown
-            // is obliged to wait for it.
-            started_rx.recv().expect("blocking task must start");
-
-            let witness = OrderWitness {
-                task_finished: Arc::clone(&task_finished),
-                saw_finished: Arc::clone(&saw_finished),
-            };
-            retire_runtime(rt, Box::new(witness));
-            // The caller is not the one paying for the wait — and nothing has
-            // released the task yet, so on a correct implementation this flag
-            // is false no matter how slow the box is.
-            assert!(
-                !task_finished.load(Ordering::SeqCst),
-                "retire_runtime did not return until the runtime's in-flight blocking task \
-                 had finished. Nothing in this test released that task, so the only way to \
-                 observe it finished is to have waited {HELD_OPEN:?} for its own self-release \
-                 — i.e. retire_runtime blocked its caller on work the caller does not own \
-                 (#572). This is not a slow machine; it is the contract inverted."
-            );
-
-            // Now let the runtime wind down, and only now.
-            release_tx
-                .send(())
-                .expect("the blocking task must still be waiting to be released");
-            assert!(
-                wait_quiesced(Duration::from_secs(10)),
-                "retirement never completed"
-            );
-            assert!(
-                saw_finished.load(Ordering::SeqCst),
-                "the keepalive was dropped before the runtime finished \
-                 its in-flight blocking task (#572 use-after-free)"
-            );
-            assert_eq!(in_flight(), 0);
-        }
-
-        /// v24.3.0 (CIRISPersist#572) — a `false` from `wait_quiesced`
-        /// is a value, not a hang: the bound is honoured and the
-        /// retirement keeps running on its own thread.
-        ///
-        /// # The one place a real-time bound IS the property
-        ///
-        /// v31.0.0 (CIRISPersist#658) — unlike its neighbour, this test cannot
-        /// be rewritten free of wall clocks: `wait_quiesced(d)` takes a
-        /// `Duration` and the whole claim is that it honours it. What it CAN
-        /// do is stop measuring the machine.
-        ///
-        /// The in-flight work is held open for [`HELD_OPEN`] instead of a
-        /// 800 ms sleep, which widens the gap the assertion has to straddle
-        /// from 100 ms-vs-800 ms (8x) to 100 ms-vs-30 s (300x). The two
-        /// readings a breach must tell apart are "waited for the BOUND" and
-        /// "waited for the WORK", and the threshold sits a factor of 30 above
-        /// the first and a factor of 10 below the second. A scheduler does not
-        /// dilate a single condvar timeout by 30x; a `wait_quiesced` that
-        /// ignores its argument misses by 300x.
-        ///
-        /// The LOWER bound is the half that can never flake — slowness only
-        /// makes it more true — and it is what stops a `wait_quiesced` that
-        /// returns `false` instantly from passing this test vacuously.
-        #[test]
-        #[serial_test::serial(runtime_teardown_gauge)]
-        fn wait_quiesced_honours_its_bound() {
-            /// The argument under test.
-            const BOUND: Duration = Duration::from_millis(100);
-            /// 30x the bound, a tenth of the work. See the doc-comment.
-            const CEILING: Duration = Duration::from_secs(3);
-
-            let rt = Runtime::new().expect("tokio runtime");
-            let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
-            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-            rt.spawn_blocking(move || {
-                let _ = started_tx.send(());
-                let _ = release_rx.recv_timeout(HELD_OPEN);
-            });
-            started_rx.recv().expect("blocking task must start");
-            retire_runtime(rt, Box::new(()));
-
-            let t0 = std::time::Instant::now();
-            let quiesced = wait_quiesced(BOUND);
-            let waited = t0.elapsed();
-            // Exact, not timing-dependent: nothing has released the in-flight
-            // task, so the retirement CANNOT have completed.
-            assert!(
-                !quiesced,
-                "wait_quiesced reported the process quiesced, but the retirement's blocking \
-                 task has not been released and so cannot have finished — a `true` here is a \
-                 false quiesce, which is the use-after-free window #572 closed"
-            );
-            assert!(
-                waited >= BOUND,
-                "wait_quiesced({BOUND:?}) returned after only {waited:?} — it reported a \
-                 timeout without waiting for one, so the bound is not a bound"
-            );
-            assert!(
-                waited < CEILING,
-                "wait_quiesced({BOUND:?}) took {waited:?}. The in-flight work is held for \
-                 {HELD_OPEN:?} and the bound is {BOUND:?}, so this is not a slow box: it \
-                 waited for the WORK instead of for the BOUND, which is the blocking-teardown \
-                 wedge #572 exists to prevent."
-            );
-
-            release_tx
-                .send(())
-                .expect("the blocking task must still be waiting to be released");
-            // Still true afterwards: it finishes on its own.
-            assert!(wait_quiesced(Duration::from_secs(10)));
-        }
-    }
-}
-
 /// v1.1.0 (CIRISPersist#43) — public dispatch enum over the
 /// substrate's storage backends.
 ///
@@ -1845,7 +1297,7 @@ impl Engine {
 
         let target_freed = bytes_before.saturating_sub(watermark);
         let decay = EvictionDecay::new(cfg.eviction_decay_half_life_days);
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         // v9.3.0 (#247) — the sweeper retracts its OWN holding claims, which a
         // correctly-registered node emits under its DERIVED federation key_id
         // (`<label>-<fp>`), so the lookup key is the derived id, NOT the
@@ -2095,7 +1547,7 @@ impl Engine {
             .sweep_interval
             .max(crate::federation::MIN_SWEEP_INTERVAL);
         let engine = self.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::host::rt::spawn(async move {
             loop {
                 tokio::select! {
                     _ = shutdown_for_loop.notified() => {
@@ -2104,7 +1556,7 @@ impl Engine {
                         );
                         return;
                     }
-                    _ = tokio::time::sleep(interval) => {}
+                    _ = crate::host::rt::sleep(interval) => {}
                 }
                 match engine.sweep_evictions_once().await {
                     Ok(report) if !report.is_noop() => {
@@ -2202,7 +1654,7 @@ impl Engine {
         let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
         let shutdown_for_loop = shutdown.clone();
         let engine = self.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::host::rt::spawn(async move {
             let mut wait = start_delay;
             loop {
                 tokio::select! {
@@ -2210,10 +1662,13 @@ impl Engine {
                         tracing::info!("ciris-persist v55.0.0 re-ack sweeper: shutdown signal received");
                         return;
                     }
-                    _ = tokio::time::sleep(wait) => {}
+                    _ = crate::host::rt::sleep(wait) => {}
                 }
                 wait = interval;
-                match engine.reack_holding_claims_once(chrono::Utc::now()).await {
+                match engine
+                    .reack_holding_claims_once(crate::host::clock::now())
+                    .await
+                {
                     Ok(report)
                         if report.renewed > 0 || report.failed > 0 || report.converted > 0 =>
                     {
@@ -2359,7 +1814,7 @@ impl Engine {
         // TPM + filesystem I/O off the async workers — through sqlite's
         // dispatcher (`encrypted-kv` implies `sqlite`), so it runs inline
         // rather than panicking when no tokio runtime is current (#158).
-        crate::store::sqlite_conn_model::dispatch_blocking(move || {
+        crate::host::rt::dispatch_blocking(move || {
             XChaChaKvStore::open_mls_state_from_row(
                 path,
                 &row.key_kind,
@@ -2673,7 +2128,7 @@ impl Engine {
         use crate::store::Backend;
         // Gate 1 — verify at the gate; nothing persists on failure.
         verify_storage_budget_wire(wire_json, ed25519_pubkey_base64, ml_dsa_65_pubkey_base64)?;
-        let budget = InstalledStorageBudget::from_wire_json(wire_json, chrono::Utc::now())?;
+        let budget = InstalledStorageBudget::from_wire_json(wire_json, crate::host::clock::now())?;
         // Gates 2+3 — the backend's conditional upsert IS the anti-rollback
         // check (atomic at the row).
         let written = match &self.backend {
@@ -3035,7 +2490,7 @@ impl Engine {
             &signer.derived_key_id(),
             signer,
             &*directory,
-            chrono::Utc::now(),
+            crate::host::clock::now(),
         )
         .await
     }
@@ -3336,7 +2791,7 @@ impl Engine {
             })?;
             match env.get("valid_from") {
                 None => {
-                    let t = truncate_to_substrate_resolution(chrono::Utc::now());
+                    let t = truncate_to_substrate_resolution(crate::host::clock::now());
                     env.insert(
                         "valid_from".into(),
                         serde_json::Value::String(render_signed_instant(t)),
@@ -3405,7 +2860,7 @@ impl Engine {
         // to avoid a cirisaudit-feature dep on this path (mirrors the FFI).
         let now = {
             use chrono::Timelike as _;
-            let dt = chrono::Utc::now();
+            let dt = crate::host::clock::now();
             let micros = dt.nanosecond() / 1000;
             dt.with_nanosecond(micros * 1000).unwrap_or(dt)
         };
@@ -3625,7 +3080,7 @@ impl Engine {
         let original_content_hash = hex::encode(Sha256::digest(&canonical));
         let now = {
             use chrono::Timelike as _;
-            let dt = chrono::Utc::now();
+            let dt = crate::host::clock::now();
             let micros = dt.nanosecond() / 1000;
             dt.with_nanosecond(micros * 1000).unwrap_or(dt)
         };
@@ -4055,7 +3510,7 @@ impl Engine {
         }
         let Some(custody) = self.custody_for(&row, actor).await? else {
             return Ok(MeshCrossingOutcome::AwaitingActor {
-                age_ms: (chrono::Utc::now() - row.asserted_at).num_milliseconds(),
+                age_ms: (crate::host::clock::now() - row.asserted_at).num_milliseconds(),
                 attestation_id: row.attestation_id,
             });
         };
@@ -4126,7 +3581,7 @@ impl Engine {
                 }
                 None => {
                     return Ok(MeshCrossingOutcome::AwaitingActor {
-                        age_ms: (chrono::Utc::now() - prior.asserted_at).num_milliseconds(),
+                        age_ms: (crate::host::clock::now() - prior.asserted_at).num_milliseconds(),
                         attestation_id: prior.attestation_id,
                     })
                 }
@@ -4134,7 +3589,7 @@ impl Engine {
         };
         // ONE instant for both: `widened_at` (the act) and whatever
         // `stamp_and_canonicalize` still needs to fill.
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let mut input = crossing::build_widening(&prior, &ci.recipient_see, strip, now)?;
         let canonical =
             attestation_emit::stamp_and_canonicalize(&mut input, &prior.attesting_key_id, now)?;
@@ -4207,7 +3662,7 @@ impl Engine {
                 // crossing, which writes this instant into the row and must
                 // write the same one on every backend.
                 cosigned_at: Some(crate::federation::admission::render_signed_instant(
-                    chrono::Utc::now(),
+                    crate::host::clock::now(),
                 )),
             })));
         }
@@ -4242,7 +3697,7 @@ impl Engine {
             scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
             scrub_key_id,
             scrub_timestamp: crate::federation::admission::truncate_to_substrate_resolution(
-                chrono::Utc::now(),
+                crate::host::clock::now(),
             ),
         })))
     }
@@ -4483,7 +3938,7 @@ impl Engine {
                 .await?
         };
 
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let mut active: Vec<ConsentActiveGrant> = Vec::new();
         for grant in &grants {
             let policy = match consent_grammar::parse_grant_payload(&grant.attestation_envelope) {
@@ -4749,7 +4204,7 @@ impl Engine {
         crate::federation::attestation_emit::stamp_and_canonicalize(
             input,
             attesting_key_id,
-            chrono::Utc::now(),
+            crate::host::clock::now(),
         )
     }
 
@@ -5885,7 +5340,7 @@ impl Engine {
         scope: &[&str],
     ) -> Result<serde_json::Value, crate::federation::Error> {
         use crate::federation::canonical_community::acceptance_edge_envelope;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -5943,7 +5398,7 @@ impl Engine {
             stream_id,
             chunk_shas,
             tree_size,
-            chrono::Utc::now(),
+            crate::host::clock::now(),
         )
         .await
     }
@@ -6109,7 +5564,7 @@ impl Engine {
             // `custody:ack:v1` `here` at the content's scope, now that the
             // promotion's checks found every chunk held.
             let local = self.announcing_signer().await?;
-            let now = chrono::Utc::now();
+            let now = crate::host::clock::now();
             let emitted = match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(arc) => {
@@ -6462,7 +5917,7 @@ impl Engine {
         sha256: &[u8; 32],
     ) -> Result<(), crate::federation::BlobError> {
         let local = self.announcing_signer().await?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -6940,7 +6395,7 @@ impl Engine {
         // carries them. A failure is logged: the dirty sets still go out.
         {
             use crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices;
-            let now = chrono::Utc::now();
+            let now = crate::host::clock::now();
             let swept = match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(b) => {
@@ -7065,7 +6520,7 @@ impl Engine {
             let self_key_id = self.local_derived_key_id().await.map_err(|e| {
                 crate::federation::Error::Backend(format!("instant form pass: key id: {e}"))
             })?;
-            let now = chrono::Utc::now();
+            let now = crate::host::clock::now();
             match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(b) => {
@@ -7327,7 +6782,7 @@ impl Engine {
                     .to_string(),
             )
         })?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -7537,7 +6992,7 @@ impl Engine {
     ) -> Result<crate::federation::lineage_witness::LineageCosignOutcome, crate::federation::Error>
     {
         use crate::federation::lineage_witness::admit_lineage_head_cosign;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -7565,7 +7020,7 @@ impl Engine {
         crate::federation::Error,
     > {
         use crate::federation::canonical_community::root_witness_view;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -7673,7 +7128,7 @@ impl Engine {
         stream_id: Option<&str>,
     ) -> Result<crate::federation::custody_ack::CustodyView, crate::federation::BlobError> {
         use crate::federation::custody_ack::custody_view;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -7701,7 +7156,7 @@ impl Engine {
     ) -> Result<crate::federation::durability::DurabilityDeficit, crate::federation::BlobError>
     {
         use crate::federation::durability::{durability_deficit, DEFAULT_FEASIBILITY_FLOOR};
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -8211,7 +7666,7 @@ impl Engine {
         crate::federation::BlobError,
     > {
         use crate::federation::at_rest_cascade::orchestrate::rekey_family_member_add;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let r = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -8291,7 +7746,7 @@ impl Engine {
             crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
         })?;
         use crate::federation::at_rest_cascade::orchestrate::rekey_community_member_revoke;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         // #848 (§15) — the revoker's explicit bump is of THIS node's own
         // counter.
         let minter = self.local_derived_key_id().await.map_err(|e| {
@@ -8382,7 +7837,7 @@ impl Engine {
         let minter = self.local_derived_key_id().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("local derived key id: {e}"))
         })?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let seat = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -8442,7 +7897,7 @@ impl Engine {
         })?;
         use crate::federation::at_rest_cascade::orchestrate::rekey_community_member_device_add;
         self.ensure_backend_node_key().await;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let r = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -8513,7 +7968,7 @@ impl Engine {
             .local_derived_key_id()
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("local derived key id: {e}")))?;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let r = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -8553,7 +8008,7 @@ impl Engine {
         crate::federation::BlobError,
     > {
         use crate::federation::at_rest_cascade::orchestrate::rekey_self_occurrence_add;
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let r = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -8652,7 +8107,7 @@ impl Engine {
             IdentityOccurrence, TransportDestination,
         };
 
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let directory = self.federation_directory();
 
         // v44.5.0 (§21.3, I93) — the signer-is-the-identity check used to sit
@@ -8762,8 +8217,9 @@ impl Engine {
         // one bilateral_pair_id. Local-tier, self-cohort. v61
         // (CIRISPersist#1126): each half is a `consent_record` naming the
         // other party, at one instant.
-        let partnered_at =
-            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+        let partnered_at = crate::federation::admission::truncate_to_substrate_resolution(
+            crate::host::clock::now(),
+        );
         let grant_id = directory
             .attestation_upsert_local(LocalAttestationInput {
                 attestation_id: None,
@@ -9116,7 +8572,7 @@ impl Engine {
             }
         }
         let directory = self.federation_directory();
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         for holder in &local_holders {
             let withheld =
                 crate::federation::quarantine::is_withheld(directory.as_ref(), holder, now)
@@ -9249,7 +8705,7 @@ impl Engine {
                 &content.x25519_pubkey_b64,
             )?;
 
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = crate::host::clock::now().timestamp_millis();
         Ok(LocalIdentityAggregate::assemble(
             key_id,
             pqc_key_id,
@@ -11447,10 +10903,11 @@ impl Engine {
         // bumps `since` past the newest yielded row's `ts` by 1 µs
         // each iteration so the inclusive `>=` filter on the existing
         // `EventFilter.since` doesn't re-yield the boundary row.
-        let mut since: chrono::DateTime<chrono::Utc> = chrono::Utc::now();
-        tokio::spawn(async move {
+        let mut since: chrono::DateTime<chrono::Utc> = crate::host::clock::now();
+        // The poll task detaches; it ends when the subscriber drops `rx`.
+        drop(crate::host::rt::spawn(async move {
             loop {
-                tokio::time::sleep(POLL_INTERVAL).await;
+                crate::host::rt::sleep(POLL_INTERVAL).await;
                 // Channel-closed detection: if the receiver is dropped,
                 // `send` errors → exit. Pre-check via `is_closed` so we
                 // skip the DB poll entirely once the subscriber is gone.
@@ -11494,7 +10951,7 @@ impl Engine {
                     }
                 }
             }
-        });
+        }));
 
         tokio_stream::wrappers::ReceiverStream::new(rx)
     }
@@ -23642,6 +23099,151 @@ mod register_self_canonicalizer_parity {
                 .expect("v1"),
             "and the stored form must be distinguishable from the V1 rule on this \
              fixture, or the assertion above is vacuous"
+        );
+    }
+}
+
+/// v30.3.0 (CIRISPersist#607) — moved out of the former `teardown::tests`
+/// module when v62 (P9) moved the teardown adapter to `ffi::teardown`.
+#[cfg(test)]
+mod engine_607_tests {
+
+    /// v30.3.0 (CIRISPersist#607) — **the abuse-surface path, through a real
+    /// Engine, with no test doubles.**
+    ///
+    /// Mirrors CIRISServer's `abuse_surface` reproduction: a stranger
+    /// self-registers carrying `identity_type: "witness"` — which still
+    /// SUCCEEDS, because the claim is self-assertable at registration and #607
+    /// never argued otherwise — and then attempts an `age_assurance:` row about
+    /// a third party. That second step is what must now fail.
+    ///
+    /// Kept as an Engine-level regression rather than trusting the
+    /// backend-level `a_self_asserted_witness_is_refused_607`: the consumer's
+    /// path builds an Engine, and a gate that works on a bare backend while the
+    /// Engine wires it differently is exactly the class this repo keeps hitting
+    /// (a control reachable in tests and absent from every real caller).
+    ///
+    /// The assertion is on the REFUSAL REASON, not merely on `is_err()`. A row
+    /// rejected for the wrong reason — an unregistered key, a bad signature —
+    /// would pass an `is_err()` check while proving nothing about #607.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn a_self_asserted_witness_is_refused_through_the_engine_607() {
+        let signer = crate::federation::tier_ingest::test_support::local_signer("probe-node");
+        let engine = crate::Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        // The Engine sets this at construction; without it the door refuses for
+        // a DIFFERENT reason (cannot verify), which would make this test pass
+        // while proving nothing.
+        assert!(
+            crate::federation::FederationDirectory::node_key_id(sq.as_ref()).is_some(),
+            "the Engine must give its backend a node identity at construction"
+        );
+
+        // A stranger self-registers AS a witness — the claim is on the record
+        // from the start, exactly as CIRISServer's abuse_surface does it.
+        let (ed, pqc) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys("probe-stranger");
+        let rec = crate::federation::KeyRecord {
+            key_id: "probe-stranger".into(),
+            identity_ref: "probe-stranger".into(),
+            identity_type: "witness".into(),
+            pubkey_ed25519_base64: ed,
+            pubkey_ml_dsa_65_base64: pqc,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            valid_from: chrono::Utc::now(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": "probe-stranger" }),
+            original_content_hash: "deadbeef".to_owned(),
+            scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "probe-stranger".into(),
+            scrub_timestamp: chrono::Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+            attestation_evidence: Some(
+                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
+                ),
+            ),
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+        crate::federation::FederationDirectory::put_public_key(
+            sq.as_ref(),
+            crate::federation::SignedKeyRecord { record: rec },
+        )
+        .await
+        .expect("stranger self-registers as witness");
+        // The claim itself IS still self-assertable — that is not the hole.
+        assert_eq!(
+            crate::federation::FederationDirectory::lookup_public_key(
+                sq.as_ref(),
+                "probe-stranger"
+            )
+            .await
+            .unwrap()
+            .map(|k| k.identity_type),
+            Some("witness".to_owned()),
+            "the stranger must actually hold the claim, or this test refuses for the wrong reason"
+        );
+
+        crate::federation::tier_ingest::test_support::register_hybrid_key(
+            sq.as_ref(),
+            "probe-victim",
+        )
+        .await;
+
+        let envelope =
+            serde_json::json!({"id":"probe-1","dimension":"age_assurance:government:adult:v1"});
+        let (och, sc, sp) = crate::federation::tier_ingest::test_support::sign_envelope(
+            "probe-stranger",
+            &envelope,
+        );
+        let now = chrono::Utc::now();
+        let att = crate::federation::tier_ingest::test_support::seal_row(
+            "probe-stranger",
+            crate::federation::Attestation {
+                attestation_id: uuid::Uuid::new_v4().to_string(),
+                attesting_key_id: "probe-stranger".into(),
+                attested_key_id: "probe-victim".into(),
+                attestation_type: "age_assurance:government:adult:v1".into(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: envelope,
+                original_content_hash: och,
+                scrub_signature_classical: sc,
+                scrub_signature_pqc: sp,
+                scrub_key_id: "probe-stranger".into(),
+                scrub_timestamp: now,
+                pqc_completed_at: Some(now),
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: "federation".into(),
+                tier: "federation".into(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            },
+        );
+        let err = crate::federation::FederationDirectory::put_attestation(
+            sq.as_ref(),
+            crate::federation::SignedAttestation { attestation: att },
+        )
+        .await
+        .expect_err(
+            "a self-asserted witness must NOT be able to assert an age rung about a third \
+         party through the Engine path — that is CIRISPersist#607",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("infra:attest_assurance"),
+            "refused, but not for the #607 reason — an is_err() check alone would have passed \
+         on an unregistered key or a bad signature. Got: {msg}"
         );
     }
 }

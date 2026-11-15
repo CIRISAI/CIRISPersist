@@ -479,7 +479,7 @@ impl TaskService for SqliteTaskBackend {
             return Err(Error::InvalidArgument("task_id required".into()));
         }
         let outcome_str = encode_json_opt(outcome.as_ref())?;
-        let now_str = fmt_datetime(chrono::Utc::now());
+        let now_str = fmt_datetime(crate::host::clock::now());
         let status_sql = new_status.as_sql_str().to_owned();
         let task_id_owned = task_id.to_owned();
         let conn = self.conn.clone();

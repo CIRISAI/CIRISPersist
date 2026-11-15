@@ -1526,7 +1526,7 @@ where
     }
     let about_root = with_slice_composers(directory, about_selected, Some(legs_ref), None).await?;
 
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
 
     // 1. Edge: live (non-tombstoned, non-expired) delegates_to(user → root).
     // v23.0.0 (#551 item 2): the row may NAME itself `trust:accepts:v1`; one
@@ -2079,7 +2079,7 @@ where
         with_slice_composers(directory, conferrals, Some(subject_key_id), None).await?;
     let about_refs: Vec<&Attestation> = about_subject.iter().collect();
     let dead = tombstoned_ids(&about_refs);
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
 
     // Candidate roots: distinct granters of a live (non-tombstoned,
     // non-expired — #488 delta 3) scoped delegates_to edge to the subject
@@ -3130,7 +3130,7 @@ pub(crate) async fn transit_eligibility_walk(
     // (D) shared root. Candidates come from the USER's own edges — see
     // `transit_candidate_roots` for why that boundary is the anti-inflation
     // property and not merely an optimization.
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     // v53.1.7 — the user's trust edges and their composers (the candidate
     // predicate's whole input), never the user's history.
     let mut user_edges = Vec::new();
@@ -3791,7 +3791,7 @@ where
     // validity window has closed.
     if subject_row
         .valid_until
-        .is_some_and(|until| until <= chrono::Utc::now())
+        .is_some_and(|until| until <= crate::host::clock::now())
     {
         return Ok(ServeTier::None);
     }
@@ -3903,7 +3903,7 @@ where
         with_slice_composers(directory, conferrals, Some(subject_key_id), None).await?;
     let about_refs: Vec<&Attestation> = about_subject.iter().collect();
     let dead = tombstoned_ids(&about_refs);
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
 
     Ok(about_subject.iter().any(|a| {
         a.attestation_type == attestation_type::DELEGATES_TO

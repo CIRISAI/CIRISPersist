@@ -33,7 +33,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::host::clock::{monotonic_now, Instant};
 
 use super::key::{IdentityKeyId, OccurrenceKeyId};
 
@@ -178,7 +180,7 @@ impl AdmissionCache {
     where
         F: FnOnce() -> Result<CallerAdmission, E>,
     {
-        let now = Instant::now();
+        let now = monotonic_now();
 
         // Fast path: live hit.
         {
@@ -275,7 +277,7 @@ impl AdmissionCache {
     /// Drop every entry whose TTL has fired (§7.5). Opportunistic — TTL
     /// is also enforced lazily on read. Returns the count dropped.
     pub fn sweep_expired(&self) -> u64 {
-        let now = Instant::now();
+        let now = monotonic_now();
         let mut inner = self.inner.lock().expect("admission cache poisoned");
         let expired: Vec<OccurrenceKeyId> = inner
             .map

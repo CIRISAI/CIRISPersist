@@ -129,7 +129,7 @@ impl LedgerService for SqliteLedgerBackend {
         validate::non_empty(standard_version, "standard_version")?;
         let ledger_id = derive_ledger_id(owner_key_id, unit, standard_version)
             .map_err(|e| Error::Internal(e.to_string()))?;
-        let now = fmt_datetime(Utc::now());
+        let now = fmt_datetime(crate::host::clock::now());
         let (owner, unit, sv) = (
             owner_key_id.to_owned(),
             unit.to_owned(),
@@ -215,7 +215,7 @@ impl LedgerService for SqliteLedgerBackend {
         validate::non_empty(ledger_id, "ledger_id")?;
         validate::non_empty(head_hash, "head_hash")?;
         let seq_i = validate::seq_as_i64(seq, "seq")?;
-        let now = fmt_datetime(Utc::now());
+        let now = fmt_datetime(crate::host::clock::now());
         let (lid, hash) = (ledger_id.to_owned(), head_hash.to_owned());
         let anchor = witness_anchor_ref.map(str::to_owned);
         let envelope_ref = source_envelope_ref.map(str::to_owned);
@@ -370,7 +370,7 @@ impl LedgerService for SqliteLedgerBackend {
         let seq_i = validate::seq_as_i64(checkpoint.seq, "seq")?;
         let witness_str = serde_json::to_string(&checkpoint.witness_refs)
             .map_err(|e| Error::Internal(format!("witness_refs encode: {e}")))?;
-        let now = fmt_datetime(Utc::now());
+        let now = fmt_datetime(crate::host::clock::now());
         let cp = checkpoint.clone();
         let conn = self.conn.clone();
         (move || -> Result<bool, Error> {
@@ -504,7 +504,7 @@ impl LedgerService for SqliteLedgerBackend {
         }
         let from_i = validate::seq_as_i64(range.from_seq, "from_seq")?;
         let to_i = validate::seq_as_i64(range.to_seq, "to_seq")?;
-        let now = fmt_datetime(Utc::now());
+        let now = fmt_datetime(crate::host::clock::now());
         let rg = range.clone();
         let conn = self.conn.clone();
         (move || -> Result<bool, Error> {
@@ -614,7 +614,7 @@ impl LedgerService for SqliteLedgerBackend {
         let evidence_str = serde_json::to_string(evidence)
             .map_err(|e| Error::Internal(format!("evidence encode: {e}")))?;
         let (lid, kind) = (evidence.ledger_id().to_owned(), evidence.fork_kind_str());
-        let now = fmt_datetime(Utc::now());
+        let now = fmt_datetime(crate::host::clock::now());
         let eid = evidence_id.clone();
         let conn = self.conn.clone();
         (move || -> Result<String, Error> {

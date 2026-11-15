@@ -997,7 +997,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // bare `spawn_blocking` there is sound. PLUMBING: its only failure is the
     // join (a panicked or cancelled task), the runtime's terms, never a
     // question about the caller's input. SQLite never calls it — it uses
-    // `sqlite_conn_model::dispatch_blocking`, which returns the value (no
+    // `host::rt::dispatch_blocking`, which returns the value (no
     // propagated error) and runs inline with no runtime (#158); a bare
     // `spawn_blocking` reappearing in a sqlite door is a regression of that,
     // which this row would NOT catch — `sqlite_conn_model`'s module header is

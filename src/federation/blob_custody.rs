@@ -139,7 +139,13 @@ pub async fn blob_custody<B>(
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    blob_custody_at(backend, at_rest_sha256, viewer_key_id, chrono::Utc::now()).await
+    blob_custody_at(
+        backend,
+        at_rest_sha256,
+        viewer_key_id,
+        crate::host::clock::now(),
+    )
+    .await
 }
 
 /// [`blob_custody`] with the reader's clock injected (custody reports are live

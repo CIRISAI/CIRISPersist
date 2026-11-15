@@ -1525,7 +1525,7 @@ pub mod orchestrate {
         let chunk_count = listing.chunks.len() as u64;
         let total_size = manifest.total_size;
         let jcs = manifest.to_jcs_bytes();
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
 
         match tier {
             CryptoTier::Plaintext => {
@@ -6224,7 +6224,7 @@ pub mod invariants {
                 occurrence_key_id: occurrence_key_id.to_owned(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
-                asserted_at: chrono::Utc::now(),
+                asserted_at: crate::host::clock::now(),
                 valid_until: None,
                 encryption_pubkeys: Some(crate::federation::EncryptionPubkeys {
                     x25519_base64: B64.encode(x_pub),
@@ -6309,7 +6309,7 @@ pub mod invariants {
         }
         let root_hash = store.root().unwrap();
         let log_id = crate::federation::stream_sth::log_id_for_stream(stream_id);
-        let timestamp = chrono::Utc::now();
+        let timestamp = crate::host::clock::now();
         let signing_bytes = ciris_verify_core::transparency::SignedTreeHead::signing_bytes(
             &log_id, tree_size, &root_hash, timestamp,
         );

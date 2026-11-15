@@ -53,7 +53,6 @@
 
 use std::io::Write;
 use std::sync::Mutex;
-use std::time::Instant;
 
 static WRITE_GUARD: Mutex<()> = Mutex::new(());
 
@@ -95,7 +94,7 @@ impl MigrationTiming {
     where
         F: FnOnce() -> Result<refinery::Report, E>,
     {
-        let started = Instant::now();
+        let started = crate::host::clock::monotonic_now();
         let report = run()?;
         let elapsed = started.elapsed();
         let applied = report.applied_migrations();
@@ -120,9 +119,7 @@ pub fn append(timing: &MigrationTiming) {
     let Some(path) = resolve_log_path() else {
         return;
     };
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
+    let now_ms = u128::try_from(crate::host::clock::now().timestamp_millis()).unwrap_or(0);
     let total_wall_us = timing.elapsed.as_micros();
     // Manual JSON construction — avoids serde_json::Value heap +
     // keeps the diagnostic minimal in the always-compiled path.

@@ -54,7 +54,7 @@ impl SqliteBackend {
         let admitted_at = on_own_runtime(|| block_on(self.next_key_admission_position()))
             .expect("fixture: key admission position")
             .to_rfc3339();
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = crate::host::clock::now().to_rfc3339();
         self.conn_handle()
             .lock()
             .execute(

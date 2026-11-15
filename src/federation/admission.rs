@@ -3307,13 +3307,13 @@ pub async fn check_promotion_admission(
     // promotion is the OTHER way a `consent:state:*` row arrives there — and
     // the local door mints `asserted_at` from this node's own clock, which is
     // exactly the bumped ordering key the replay wants. Pure, so it leads.
-    check_instant_binding(row, chrono::Utc::now(), DEFAULT_MAX_TOUCH_SKEW)?;
+    check_instant_binding(row, crate::host::clock::now(), DEFAULT_MAX_TOUCH_SKEW)?;
 
     // AV-77 — a de-admitted author's rows are refused before any walk runs, so
     // a sanctioned peer also sheds the amplification cost (same posture as
     // `put_attestation`'s tier-4 placement).
     if let Some(me) = self_key_id {
-        check_peer_deadmission(directory, row, me, chrono::Utc::now()).await?;
+        check_peer_deadmission(directory, row, me, crate::host::clock::now()).await?;
     }
 
     // AV-62/74 — reserved-prefix + the dimension-keyed capacity self-emission
@@ -3337,7 +3337,7 @@ pub async fn check_promotion_admission(
     // the promotion chokepoint too: a local-tier licence does not cross with a
     // malformed payload, an unsorted or repeated set, or a processor id.
     super::operational::check_licence_payload(row)?;
-    check_capacity_consent_admission(directory, row, chrono::Utc::now()).await?;
+    check_capacity_consent_admission(directory, row, crate::host::clock::now()).await?;
 
     // v38.7.0 (CIRISPersist#778) — CC 3.4.5's OTHER emitter rule: `config:*`
     // is a self-report. Re-run here under this stack's own inclusion rule —
@@ -3382,8 +3382,13 @@ pub async fn check_promotion_admission(
 
     // CC 3.3.9 / CC 4.4.3.4.3 — a `license`-scoped issuance must resolve to the
     // authority it names (v42.0.0, CIRISPersist#814).
-    check_licensure_delegator_is_authority(directory, row, chrono::Utc::now(), row.asserted_at)
-        .await?;
+    check_licensure_delegator_is_authority(
+        directory,
+        row,
+        crate::host::clock::now(),
+        row.asserted_at,
+    )
+    .await?;
     // v60.0.0 (CIRISPersist#1036 item 4) — the payload's `revision` against
     // the authority's held licences, as at the put door.
     check_partner_record_revision(directory, row).await?;
@@ -3413,7 +3418,7 @@ pub async fn check_promotion_admission(
     // community an edge names is an affiliation, and its `role_term`, are
     // directory state that can have changed since the local write.
     check_delegation_term_admission(directory, row).await?;
-    check_delegation_cycle_admission(directory, row, chrono::Utc::now()).await?;
+    check_delegation_cycle_admission(directory, row, crate::host::clock::now()).await?;
 
     // CC 5.4.6 / CC 3.4.13 Q5 — a minor's owner-binding is never announced
     // (v50.0.0, CIRISPersist#924). Re-run here because "admission MUST refuse
@@ -5060,7 +5065,7 @@ pub async fn emitter_resolves_to_authority(
     if matches!(&authority, LicensureAuthority::Key(k) if k == attester) {
         return Ok(true);
     }
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     let targets: std::collections::HashSet<String> = std::iter::once(attester.to_owned()).collect();
     let lens = DelegationWalkLens {
         as_of: Some(now),
@@ -6562,7 +6567,7 @@ where
         if !same_instant_ms(at, row.asserted_at) {
             return Err(diverges("asserted_at"));
         }
-        super::operational::check_skew_bound(row.asserted_at, chrono::Utc::now())?;
+        super::operational::check_skew_bound(row.asserted_at, crate::host::clock::now())?;
     }
     // (3) Verify the hybrid signature against the signer's PINNED federation key.
     let Some(signer_key) = directory
@@ -6734,7 +6739,7 @@ where
     // must not date its occurrence into the future to out-rank authentic
     // replacements and escape a later revocation (PR #852 review, round
     // five). The same clock-skew tolerance every stamped write gets.
-    super::operational::check_skew_bound(row.asserted_at, chrono::Utc::now())?;
+    super::operational::check_skew_bound(row.asserted_at, crate::host::clock::now())?;
     match (
         env.get("valid_until").filter(|v| !v.is_null()),
         row.valid_until,
@@ -9386,7 +9391,7 @@ async fn scoped_delegation_reach(
     // [`scoped_delegation_reach_at`] instead — never this wrapper.
     let lens = if is_issuance_scope(scope_token) {
         DelegationWalkLens {
-            as_of: Some(chrono::Utc::now()),
+            as_of: Some(crate::host::clock::now()),
             ..DelegationWalkLens::default()
         }
     } else {
@@ -11275,7 +11280,7 @@ async fn run_recovery_ceremony_gate(
         directory,
         row,
         policy.as_ref(),
-        chrono::Utc::now(),
+        crate::host::clock::now(),
     )
     .await?
     {
@@ -12019,7 +12024,7 @@ pub(crate) async fn live_delegation_granter_instants<F: super::FederationDirecto
     // `subject`). Bounds the granter-scoped reads by DISTINCT granters.
     let mut granter_live: std::collections::HashMap<String, bool> =
         std::collections::HashMap::new();
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     // v53.1.6 — the subject's incoming `delegates_to` edges (V178's
     // attested+type seek) and the composers attested to the subject naming
     // them — the rows the retraction fold below can use — not every row
@@ -13029,7 +13034,7 @@ pub async fn check_owner_binding_affiliation_admission(
             ),
         );
     }
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     if super::self_roster::outside_past_freshness_window(row.asserted_at, now)
         && !community_quorum_cosigned_at(directory, &c, row, now).await?
     {
@@ -13069,7 +13074,7 @@ pub async fn affiliation_of_binding(
     directory: &dyn super::FederationDirectory,
     key: &str,
 ) -> Result<Option<String>, Error> {
-    let bindings = owner_bindings_in_force_at(directory, key, chrono::Utc::now()).await?;
+    let bindings = owner_bindings_in_force_at(directory, key, crate::host::clock::now()).await?;
     // More than one binding in force (one steward's, naming two
     // affiliations): the smallest id, so every node names the same one.
     let mut named = Vec::new();
@@ -14549,7 +14554,7 @@ pub async fn check_peer_record_admission(
     // roles, no evidence. The gates read `identity_type`, `capability_roles`
     // and the scrub set, so a probe that matches on those matches on
     // everything they can see.
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     let probe = super::KeyRecord {
         key_id: key_id.to_owned(),
         pubkey_ed25519_base64: String::new(),
@@ -17827,7 +17832,7 @@ pub async fn check_consent_for_key_admission(
     {
         // v60.0.0 (CIRISPersist#1049, CC 2.6.7) — the chain stood at the
         // row's signed instant; that instant stands alone only inside W.
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         if super::self_roster::outside_past_freshness_window(row.asserted_at, now)
             && !holds_grant_delegation(directory, for_key, &row.attesting_key_id, now).await?
         {
@@ -18208,7 +18213,7 @@ pub async fn licence_authority_set(
     authority_id: &str,
 ) -> Result<std::collections::HashSet<String>, Error> {
     let authority = resolve_licensure_authority(directory, authority_id).await?;
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     Ok(match licence_roots_at(directory, &authority, now).await? {
         LicenceRoots::Seats(keys) => keys.into_iter().collect(),
         LicenceRoots::Quorum(c) => Box::pin(crate::federation::authorized_community_roster_at(
@@ -19110,7 +19115,7 @@ pub async fn check_adult_incapacity_binding(
         return reject("valid_until_unparseable");
     };
     // No window may outrun the T2 periodic-review cadence.
-    let ceiling = chrono::Utc::now() + chrono::Duration::days(T2_REVIEW_CADENCE_DAYS);
+    let ceiling = crate::host::clock::now() + chrono::Duration::days(T2_REVIEW_CADENCE_DAYS);
     if valid_until > ceiling {
         return reject("valid_until_exceeds_review_cadence");
     }

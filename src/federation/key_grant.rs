@@ -926,13 +926,15 @@ where
             Err(e) => return Err(e),
         },
         _ if room => match dir.lookup_community(group).await? {
-            Some(c) => {
-                crate::federation::authorized_community_roster_at(dir, &c, chrono::Utc::now())
-                    .await?
-                    .into_iter()
-                    .map(|m| m.key_id)
-                    .collect()
-            }
+            Some(c) => crate::federation::authorized_community_roster_at(
+                dir,
+                &c,
+                crate::host::clock::now(),
+            )
+            .await?
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect(),
             None => Vec::new(),
         },
         _ => Vec::new(),
@@ -1274,7 +1276,8 @@ pub async fn check_key_grant_row_admission(
     // instant, is judged against the emission's one fold (the sealer leg at
     // that instant, the audience folded once); every other row, a peer's
     // included, takes the per-row path below.
-    if let Some(verdict) = judged_by_emission_fold(signer, &parsed, row, chrono::Utc::now()) {
+    if let Some(verdict) = judged_by_emission_fold(signer, &parsed, row, crate::host::clock::now())
+    {
         return verdict;
     }
     check_sealer(
@@ -1291,7 +1294,7 @@ pub async fn check_key_grant_row_admission(
     // signer must ALSO be a sealer at receipt, or the row is
     // `asserted_at_stale`: a withdrawn delegate cannot backdate a grant into
     // its old window.
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     if crate::federation::self_roster::outside_past_freshness_window(row.asserted_at, now)
         && check_sealer(dir, signer, &parsed.axis, now, now)
             .await
@@ -1744,7 +1747,8 @@ where
     };
     // The emission's one instant, at the signed-instant resolution so the
     // rows' `asserted_at` reads back exactly this value.
-    let at = crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
+    let at =
+        crate::federation::admission::truncate_to_substrate_resolution(crate::host::clock::now());
     let mut plan = KeyGrantEmissionPlan {
         axis: axis.clone(),
         rows: Vec::new(),
@@ -2038,7 +2042,7 @@ pub const MISBUILT_AXIS_RETRY: std::time::Duration = std::time::Duration::from_s
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MisbuiltAxisState {
     /// The earliest instant the dirty loop plans it again.
-    pub next_retry: std::time::Instant,
+    pub next_retry: crate::host::clock::Instant,
     /// Passes that planned it and found it mis-built (one log line each).
     pub planned: u64,
     /// Passes that skipped it inside the retry interval.
@@ -2072,7 +2076,7 @@ pub fn misbuilt_axis_state(signer: &str, axis: &KeyGrantAxis) -> Option<Misbuilt
 /// the key's interval has passed or it was never seen, else `false` (count
 /// it skipped).
 fn throttle_tick(key: &str) -> bool {
-    let now = std::time::Instant::now();
+    let now = crate::host::clock::monotonic_now();
     let mut map = misbuilt_axes()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2121,7 +2125,7 @@ where
     let mut report = DirtyEmissionReport::default();
     for axis in axes {
         let key = misbuilt_axis_key(signer, &axis);
-        let now = std::time::Instant::now();
+        let now = crate::host::clock::monotonic_now();
         {
             let mut map = misbuilt_axes()
                 .lock()
@@ -2296,7 +2300,7 @@ where
     // Millisecond-exact: the envelope carries the millisecond rendering and
     // the gate requires the typed instant to carry nothing below it.
     let asserted_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
-        chrono::Utc::now().timestamp_millis(),
+        crate::host::clock::now().timestamp_millis(),
     )
     .unwrap_or_else(chrono::Utc::now);
     // v44.5.0 (#855, §21.2) — `valid_until` is one more bound member, carried

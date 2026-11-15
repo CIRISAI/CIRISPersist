@@ -983,7 +983,7 @@ where
     // v55.0.0 (CC 3.1.3.3 rule 5) — the report's freshness is its own
     // `expires_at`: the signed instant is fixed here (the emit recipe honours
     // a producer-set `asserted_at`) so the window is exactly 72 hours after it.
-    let now = super::admission::truncate_to_substrate_resolution(Utc::now());
+    let now = super::admission::truncate_to_substrate_resolution(crate::host::clock::now());
     input.attestation_envelope.asserted_at = Some(super::admission::render_signed_instant(now));
     input.expires_at = Some(now + chrono::Duration::seconds(CUSTODY_LIVE_SECS));
     Ok(input)

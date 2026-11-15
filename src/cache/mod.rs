@@ -20,7 +20,9 @@ pub mod lru;
 pub mod stats;
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::host::clock::monotonic_now;
 
 pub use admission::{AdmissionCache, AdmissionStats};
 pub use key::{Bucket, CacheKey, IdentityKeyId, KeyId, OccurrenceKeyId};
@@ -200,7 +202,7 @@ impl<T> Cache<T> {
     where
         F: FnOnce() -> Result<(T, usize), E>,
     {
-        let now = Instant::now();
+        let now = monotonic_now();
         let ttl = self.config.ttl;
 
         // Fast path: hit.
@@ -265,7 +267,7 @@ impl<T> Cache<T> {
     /// Returns `Some(Arc<T>)` on a live hit (records a hit), `None` on
     /// absent-or-expired (records a miss).
     pub fn try_get(&self, key: &CacheKey) -> Option<Arc<T>> {
-        let now = Instant::now();
+        let now = monotonic_now();
         let ttl = self.config.ttl;
         let mut inner = self.inner.lock().expect("cache mutex poisoned");
         let got = inner.lru.get(key, ttl, now);
@@ -293,7 +295,7 @@ impl<T> Cache<T> {
     /// caller hands back the same instance a concurrent hit would have
     /// seen.
     pub fn store(&self, key: CacheKey, value: T, byte_size: usize) -> Arc<T> {
-        let now = Instant::now();
+        let now = monotonic_now();
         let value = Arc::new(value);
         let mut inner = self.inner.lock().expect("cache mutex poisoned");
         let out = inner.lru.insert(
@@ -343,7 +345,7 @@ impl<T> Cache<T> {
     /// Drop every entry whose TTL has fired (§7.4). Opportunistic — TTL
     /// is also enforced lazily on read. Returns the count dropped.
     pub fn sweep_expired(&self) -> u64 {
-        let now = Instant::now();
+        let now = monotonic_now();
         let mut inner = self.inner.lock().expect("cache mutex poisoned");
         let drained = inner.lru.evict_expired(self.config.ttl, now);
         let n = drained.len() as u64;

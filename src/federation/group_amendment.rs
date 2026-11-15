@@ -235,7 +235,7 @@ where
     super::roster_head::check_version_covers_fold(
         dir,
         super::roster_head::LineageRecord::Family(f),
-        chrono::Utc::now(),
+        crate::host::clock::now(),
     )
     .await?;
     let snapshot = serde_json::to_value(family)
@@ -717,7 +717,7 @@ where
     super::roster_head::check_version_covers_fold(
         dir,
         super::roster_head::LineageRecord::Family(&new.family),
-        chrono::Utc::now(),
+        crate::host::clock::now(),
     )
     .await?;
     // The snapshot is the SIGNED WRAPPER, not the bare record: the record and
@@ -756,7 +756,7 @@ where
     super::verify_community_admission(dir, &new).await?;
     // v61 S2 (CIRISPersist#1123) — a room stored under founder_only admits
     // one new version, its escape.
-    super::admission::check_founder_only_escape(dir, &new, chrono::Utc::now()).await?;
+    super::admission::check_founder_only_escape(dir, &new, crate::host::clock::now()).await?;
     // v52.0.0 (#955, Q2) — an amendment never adds a member. The one
     // exception is a trust-root founders' amendment (#926 HIGH-3: its founder
     // seats move ONLY through the record): a founder it seats signed that very
@@ -791,7 +791,7 @@ where
     super::admission::check_infrastructure_community_conformance(
         dir.as_dyn_directory(),
         &new.community,
-        chrono::Utc::now(),
+        crate::host::clock::now(),
     )
     .await?;
     // v50.0.0 (CIRISPersist#926) — a trust-root row amends only as a verified

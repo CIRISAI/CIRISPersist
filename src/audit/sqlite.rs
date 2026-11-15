@@ -111,21 +111,20 @@ async fn merkle_hook_sqlite(
     };
 
     let conn = backend.conn_handle();
-    let handle = tokio::runtime::Handle::current();
     let tenant_id = entry.tenant_id.clone();
     let leaf = AuditLeaf::with_chain_event_id(entry.clone(), chain_event_id);
     let log_id = log_id_for_tenant(&tenant_id);
 
     let store: StdArc<dyn TransparencyStore<AuditLeaf>> =
-        StdArc::new(SqliteMerkleStore::new(conn, handle, tenant_id));
+        StdArc::new(SqliteMerkleStore::new(conn, tenant_id));
     let log = TransparencyLog::<AuditLeaf>::for_log(log_id.clone(), store.clone());
 
-    // 1. Append + compute tree_size + merkle_root in a blocking
-    //    thread (sync TransparencyStore trait calls `runtime.block_on`
-    //    inside the SqliteMerkleStore — would panic on a tokio worker).
+    // 1. Append + compute tree_size + merkle_root through the blocking
+    //    dispatcher: the store is synchronous rusqlite (v62, P8), so this
+    //    is the blocking pool natively and inline on a single-thread host.
     let log_for_block = log;
     let leaf_for_block = leaf;
-    let head_jh = tokio::task::spawn_blocking(
+    let head_jh = crate::host::rt::try_dispatch_blocking(
         move || -> Result<(u64, [u8; 32]), ciris_verify_core::transparency::TransparencyError> {
             let _idx = log_for_block.append(leaf_for_block)?;
             let ts = log_for_block.tree_size()?;
@@ -139,7 +138,7 @@ async fn merkle_hook_sqlite(
         .map_err(|e| Error::Merkle(format!("append: {e}")))?;
 
     // 2. Sign STH via LocalSigner::sign_hybrid (async).
-    let timestamp = chrono::Utc::now();
+    let timestamp = crate::host::clock::now();
     let signing_bytes = SignedTreeHead::signing_bytes(&log_id, tree_size, &root_hash, timestamp);
     let signature = signer
         .sign_hybrid(&signing_bytes)
@@ -155,10 +154,10 @@ async fn merkle_hook_sqlite(
         witness_signatures: Vec::new(),
     };
 
-    // 3. Persist the STH (sync trait → spawn_blocking).
+    // 3. Persist the STH (synchronous store → the blocking dispatcher).
     let store_for_store = store;
     let sth_for_store = sth;
-    let store_jh = tokio::task::spawn_blocking(
+    let store_jh = crate::host::rt::try_dispatch_blocking(
         move || -> Result<(), ciris_verify_core::transparency::TransparencyError> {
             store_for_store.store_sth(&sth_for_store)
         },
@@ -227,7 +226,7 @@ async fn project_trust_grant_sqlite(
         // Rust to keep the SQL portable. `now` is captured once so
         // CHECK (`revoked_at IS NULL OR revoked_by IS NOT NULL`) is
         // satisfied transactionally.
-        let now_str = fmt_datetime(chrono::Utc::now());
+        let now_str = fmt_datetime(crate::host::clock::now());
         let is_revocation = expires_at_str
             .as_deref()
             .map(|e| e <= now_str.as_str())
@@ -1118,13 +1117,12 @@ impl AuditService for SqliteAuditBackend {
             return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
         }
         let conn = self.conn_handle();
-        let handle = tokio::runtime::Handle::current();
         let tenant_owned = tenant_id.to_owned();
         let store: Arc<dyn TransparencyStore<AuditLeaf>> =
-            Arc::new(SqliteMerkleStore::new(conn, handle, tenant_owned));
-        let jh: tokio::task::JoinHandle<
+            Arc::new(SqliteMerkleStore::new(conn, tenant_owned));
+        let jh: crate::host::rt::BlockingTask<
             Result<Option<SignedTreeHead>, ciris_verify_core::transparency::TransparencyError>,
-        > = tokio::task::spawn_blocking(move || store.latest_sth());
+        > = crate::host::rt::try_dispatch_blocking(move || store.latest_sth());
         let res = jh
             .await
             .map_err(|e| Error::Merkle(format!("current_sth join: {e}")))?
@@ -1144,8 +1142,8 @@ impl AuditService for SqliteAuditBackend {
         // V045 SQLite migration mirrors the PG UNIQUE constraint.
         let conn = self.conn_handle();
         let tenant_owned = tenant_id.to_owned();
-        let jh: tokio::task::JoinHandle<Result<Option<String>, rusqlite::Error>> =
-            tokio::task::spawn_blocking(move || {
+        let jh: crate::host::rt::BlockingTask<Result<Option<String>, rusqlite::Error>> =
+            crate::host::rt::try_dispatch_blocking(move || {
                 let guard = conn.lock();
                 guard
                     .query_row(
@@ -1180,9 +1178,9 @@ impl AuditService for SqliteAuditBackend {
     ) -> Result<Option<crate::federation::trust_grant::TrustGrantRow>, Error> {
         let conn = self.conn_handle();
         let grant_id_str = grant_id.to_string();
-        let jh: tokio::task::JoinHandle<
+        let jh: crate::host::rt::BlockingTask<
             Result<Option<crate::federation::trust_grant::TrustGrantRow>, Error>,
-        > = tokio::task::spawn_blocking(move || {
+        > = crate::host::rt::try_dispatch_blocking(move || {
             let guard = conn.lock();
             let mut stmt = guard
                 .prepare(
@@ -1223,10 +1221,10 @@ impl AuditService for SqliteAuditBackend {
         let scope = scope.to_owned();
         // Lexical comparison against an UTC-Z RFC3339 string is monotonic
         // — see fmt_datetime + parse_datetime locked above.
-        let now_str = fmt_datetime(chrono::Utc::now());
-        let jh: tokio::task::JoinHandle<
+        let now_str = fmt_datetime(crate::host::clock::now());
+        let jh: crate::host::rt::BlockingTask<
             Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error>,
-        > = tokio::task::spawn_blocking(move || {
+        > = crate::host::rt::try_dispatch_blocking(move || {
             let mut sql = String::from(
                 "SELECT grant_id, grantee_key, granter_key, purpose, scope, \
                         granted_at, expires_at, revoked_at, revoked_by, \
@@ -1284,10 +1282,10 @@ impl AuditService for SqliteAuditBackend {
         filter: crate::federation::trust_grant::TrustGrantFilter,
     ) -> Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error> {
         let conn = self.conn_handle();
-        let now_str = fmt_datetime(chrono::Utc::now());
-        let jh: tokio::task::JoinHandle<
+        let now_str = fmt_datetime(crate::host::clock::now());
+        let jh: crate::host::rt::BlockingTask<
             Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error>,
-        > = tokio::task::spawn_blocking(move || {
+        > = crate::host::rt::try_dispatch_blocking(move || {
             let mut sql = String::from(
                 "SELECT grant_id, grantee_key, granter_key, purpose, scope, \
                         granted_at, expires_at, revoked_at, revoked_by, \
@@ -1355,8 +1353,8 @@ impl AuditService for SqliteAuditBackend {
         }
         let conn = self.conn_handle();
         let tenant = tenant_id.to_owned();
-        let jh: tokio::task::JoinHandle<Result<Option<Vec<u8>>, rusqlite::Error>> =
-            tokio::task::spawn_blocking(move || {
+        let jh: crate::host::rt::BlockingTask<Result<Option<Vec<u8>>, rusqlite::Error>> =
+            crate::host::rt::try_dispatch_blocking(move || {
                 let guard = conn.lock();
                 guard
                     .query_row(
@@ -1388,8 +1386,8 @@ impl AuditService for SqliteAuditBackend {
         let conn = self.conn_handle();
         let tenant = tenant_id.to_owned();
         let tenant_for_lookup = tenant.clone();
-        let leaf_idx_opt: tokio::task::JoinHandle<Result<Option<i64>, rusqlite::Error>> =
-            tokio::task::spawn_blocking(move || {
+        let leaf_idx_opt: crate::host::rt::BlockingTask<Result<Option<i64>, rusqlite::Error>> =
+            crate::host::rt::try_dispatch_blocking(move || {
                 let guard = conn.lock();
                 guard
                     .query_row(
@@ -1413,16 +1411,15 @@ impl AuditService for SqliteAuditBackend {
             u64::try_from(leaf_idx_i).map_err(|_| Error::Backend("leaf_index negative".into()))?;
 
         let conn = self.conn_handle();
-        let handle = tokio::runtime::Handle::current();
         let store: Arc<dyn TransparencyStore<AuditLeaf>> =
-            Arc::new(SqliteMerkleStore::new(conn, handle, tenant.clone()));
+            Arc::new(SqliteMerkleStore::new(conn, tenant.clone()));
         let log_id = super::merkle_store::log_id_for_tenant(&tenant);
-        let jh: tokio::task::JoinHandle<
+        let jh: crate::host::rt::BlockingTask<
             Result<
                 ciris_verify_core::transparency::MerkleProof,
                 ciris_verify_core::transparency::TransparencyError,
             >,
-        > = tokio::task::spawn_blocking(move || {
+        > = crate::host::rt::try_dispatch_blocking(move || {
             let log = TransparencyLog::<AuditLeaf>::for_log(log_id, store);
             log.inclusion_proof(leaf_index)
         });
@@ -1445,17 +1442,16 @@ impl AuditService for SqliteAuditBackend {
             return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
         }
         let conn = self.conn_handle();
-        let handle = tokio::runtime::Handle::current();
         let tenant_owned = tenant_id.to_owned();
         let store: Arc<dyn TransparencyStore<AuditLeaf>> =
-            Arc::new(SqliteMerkleStore::new(conn, handle, tenant_owned.clone()));
+            Arc::new(SqliteMerkleStore::new(conn, tenant_owned.clone()));
         let log_id = super::merkle_store::log_id_for_tenant(&tenant_owned);
-        let jh: tokio::task::JoinHandle<
+        let jh: crate::host::rt::BlockingTask<
             Result<
                 ciris_verify_core::transparency::ConsistencyProof,
                 ciris_verify_core::transparency::TransparencyError,
             >,
-        > = tokio::task::spawn_blocking(move || {
+        > = crate::host::rt::try_dispatch_blocking(move || {
             let log = TransparencyLog::<AuditLeaf>::for_log(log_id, store);
             log.consistency_proof(old_size, new_size)
         });
@@ -1479,8 +1475,8 @@ impl AuditService for SqliteAuditBackend {
         }
         let conn = self.conn_handle();
         let local_pubkey = local_pubkey.to_owned();
-        let jh: tokio::task::JoinHandle<Result<Vec<V020TrustRow>, Error>> =
-            tokio::task::spawn_blocking(move || {
+        let jh: crate::host::rt::BlockingTask<Result<Vec<V020TrustRow>, Error>> =
+            crate::host::rt::try_dispatch_blocking(move || {
                 let guard = conn.lock();
                 let mut stmt = guard
                     .prepare(

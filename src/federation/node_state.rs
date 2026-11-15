@@ -593,7 +593,7 @@ impl NodeStateOptions<'_> {
         NodeStateOptions {
             self_key_id,
             root_key_id: None,
-            now: Utc::now(),
+            now: crate::host::clock::now(),
             sla: std::time::Duration::from_secs(86_400),
         }
     }

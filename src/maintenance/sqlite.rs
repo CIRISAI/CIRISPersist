@@ -26,7 +26,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
@@ -66,7 +65,7 @@ fn fixed_seconds(window: ArchiveWindow, default_days: i64) -> i64 {
 impl MaintenanceService for SqliteMaintenanceBackend {
     async fn vacuum_substrate(&self) -> Result<VacuumReport, Error> {
         let conn = self.conn.clone();
-        let started = Instant::now();
+        let started = crate::host::clock::monotonic_now();
         (move || -> Result<(), Error> {
             let guard = conn.lock();
             // VACUUM rebuilds the file; ANALYZE refreshes the stat1
@@ -195,8 +194,8 @@ impl MaintenanceService for SqliteMaintenanceBackend {
     }
 
     async fn maintain(&self) -> Result<MaintenanceReport, Error> {
-        let started_at = Utc::now();
-        let started = Instant::now();
+        let started_at = crate::host::clock::now();
+        let started = crate::host::clock::monotonic_now();
         let vacuum = self.vacuum_substrate().await?;
         let archive = self
             .archive_expired(ArchiveWindow::SubstrateDefault)
@@ -220,7 +219,7 @@ impl MaintenanceService for SqliteMaintenanceBackend {
         crate::maintenance::validate_sql_identifier(&table_name)?;
         crate::maintenance::validate_sql_identifier(&policy.time_column)?;
         let conn = self.conn.clone();
-        let updated = Utc::now().to_rfc3339();
+        let updated = crate::host::clock::now().to_rfc3339();
         (move || -> Result<(), rusqlite::Error> {
             let g = conn.lock();
             g.execute(

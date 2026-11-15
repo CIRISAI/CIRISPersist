@@ -90,7 +90,7 @@ pub(crate) async fn put_accord_proposal_planned<D: AccordStore>(
     proposal: AccordProposal,
     authority_signature: Option<serde_json::Value>,
 ) -> Result<(), Error> {
-    let received_at = Utc::now();
+    let received_at = crate::host::clock::now();
     let last = dir.last_accord_proposal_created_at().await?;
     let created_at = super::types::monotonic_admission_instant(received_at, last);
     let prep = accord_quorum::prepare_proposal(&proposal, authority_signature, created_at)?;
@@ -119,7 +119,7 @@ pub(crate) async fn put_accord_participation_planned<D: AccordStore>(
                 participation.proposal_digest
             ))
         })?;
-    let received_at = Utc::now();
+    let received_at = crate::host::clock::now();
     let last = dir.last_accord_participation_arrival().await?;
     let arrival = super::types::monotonic_admission_instant(received_at, last);
     let prep = accord_quorum::verify_and_prepare_participation(
@@ -145,7 +145,7 @@ pub(crate) async fn put_accord_decision_planned<D: AccordStore>(
     dir: &D,
     decision: AccordDecision,
 ) -> Result<(), Error> {
-    let received_at = Utc::now();
+    let received_at = crate::host::clock::now();
     let prep = accord_quorum::prepare_decision(&decision, received_at)?;
     let digest = prep.proposal_digest.clone();
     // M2 — immutable: an identical re-PUT is a no-op, a differing one a

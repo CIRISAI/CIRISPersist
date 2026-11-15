@@ -236,7 +236,7 @@ pub async fn hardware_content_master_cached() -> Option<[u8; 32]> {
         return Some(*v);
     }
     // Re-derivation of a master in use: NEVER mint a seed (§11.7).
-    let derived = tokio::task::spawn_blocking(|| match content_master_key(false) {
+    let derived = crate::host::rt::try_dispatch_blocking(|| match content_master_key(false) {
         ContentMasterSource::Hardware { key, .. } => Some(*key),
         ContentMasterSource::SoftwareFallback { .. } => None,
     })
@@ -3491,7 +3491,7 @@ pub mod orchestrate {
         use crate::federation::PutBlobScopedResult;
         use sha2::Digest as _;
 
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         // §11.2 (6) / I23 — the attesting key id has exactly one correct
         // value per signer; derive it, never accept it.
         // §11.2 (6) / I23 / §20.5 — the announcing identity IS the PQC
@@ -4210,7 +4210,7 @@ pub mod blob_invariants {
                 None,
                 &signer.derived_key_id(),
                 &signer,
-                chrono::Utc::now(),
+                crate::host::clock::now(),
                 uuid::Uuid::new_v4(),
             )
             .await
@@ -4270,7 +4270,7 @@ pub mod blob_invariants {
                     None,
                     &signer.derived_key_id(),
                     &signer,
-                    chrono::Utc::now(),
+                    crate::host::clock::now(),
                     uuid::Uuid::new_v4(),
                 )
                 .await;
@@ -4420,7 +4420,13 @@ pub mod blob_invariants {
             .unwrap();
         let sweeper = node_signer(backend, &format!("{tag}-sweeper-{run}")).await;
         backend
-            .community_dek_evict_epoch_objects(&comm, &minter, epoch, &sweeper, chrono::Utc::now())
+            .community_dek_evict_epoch_objects(
+                &comm,
+                &minter,
+                epoch,
+                &sweeper,
+                crate::host::clock::now(),
+            )
             .await
             .unwrap();
         set_key_state(backend, &comm, &minter, epoch, DekKeyState::Destroyed)
@@ -4492,7 +4498,13 @@ pub mod blob_invariants {
             .unwrap();
         let sweeper = node_signer(backend, &format!("{tag}-sweeper-{run}")).await;
         backend
-            .community_dek_evict_epoch_objects(&comm, &minter, epoch, &sweeper, chrono::Utc::now())
+            .community_dek_evict_epoch_objects(
+                &comm,
+                &minter,
+                epoch,
+                &sweeper,
+                crate::host::clock::now(),
+            )
             .await
             .unwrap();
         set_key_state(backend, &comm, &minter, epoch, DekKeyState::Destroyed)
@@ -4572,7 +4584,7 @@ pub mod blob_invariants {
                 None,
                 &signer.derived_key_id(),
                 &signer,
-                chrono::Utc::now(),
+                crate::host::clock::now(),
                 uuid::Uuid::new_v4(),
                 None,
             )
@@ -4596,7 +4608,7 @@ pub mod blob_invariants {
             .community_dek_set_retain_past_epochs(&comm, &minter, Some(0))
             .await
             .unwrap();
-        let report = sweep_rotated_epochs(backend, &comm, &signer, chrono::Utc::now())
+        let report = sweep_rotated_epochs(backend, &comm, &signer, crate::host::clock::now())
             .await
             .unwrap();
         assert_eq!(
@@ -4652,7 +4664,7 @@ pub mod blob_invariants {
                 None,
                 &signer.derived_key_id(),
                 &signer,
-                chrono::Utc::now(),
+                crate::host::clock::now(),
                 uuid::Uuid::new_v4(),
             )
             .await
@@ -4905,7 +4917,7 @@ pub mod blob_invariants {
                 None,
                 &signer.derived_key_id(),
                 &signer,
-                chrono::Utc::now(),
+                crate::host::clock::now(),
                 uuid::Uuid::new_v4(),
                 None,
             )
@@ -4923,7 +4935,7 @@ pub mod blob_invariants {
             &node_derived,
             &signer,
             backend,
-            chrono::Utc::now(),
+            crate::host::clock::now(),
         )
         .await
         .unwrap_or_else(|e| panic!("{tag} I18: retract by hand: {e}"));
@@ -4947,7 +4959,7 @@ pub mod blob_invariants {
                 &minter,
                 sealed.epoch,
                 &signer,
-                chrono::Utc::now(),
+                crate::host::clock::now(),
             )
             .await
             .unwrap_or_else(|e| panic!("{tag} I18(a): evict after a manual retraction: {e}"));
@@ -4981,7 +4993,7 @@ pub mod blob_invariants {
                 None,
                 &signer.derived_key_id(),
                 &signer,
-                chrono::Utc::now(),
+                crate::host::clock::now(),
                 uuid::Uuid::new_v4(),
                 None,
             )
@@ -4991,7 +5003,7 @@ pub mod blob_invariants {
             .community_dek_bump_epoch(&comm, &minter)
             .await
             .unwrap();
-        let far_future = chrono::Utc::now() + chrono::Duration::days(3650);
+        let far_future = crate::host::clock::now() + chrono::Duration::days(3650);
         let res = backend
             .community_dek_evict_epoch_objects(&comm, &minter, sealed2.epoch, &signer, far_future)
             .await;
@@ -5490,7 +5502,7 @@ pub mod blob_invariants {
                 &minter,
                 sealed.epoch,
                 &sweeper,
-                chrono::Utc::now(),
+                crate::host::clock::now(),
             )
             .await
             .unwrap();
@@ -5507,7 +5519,7 @@ pub mod blob_invariants {
                 None,
                 &signer.derived_key_id(),
                 &signer,
-                chrono::Utc::now(),
+                crate::host::clock::now(),
                 uuid::Uuid::new_v4(),
                 None,
             )
@@ -5593,7 +5605,7 @@ pub mod blob_invariants {
         // ── Phase A: evict WITHOUT destroying (the sweep's first half, alone)
         //    so the epoch-grant leg of the authorization is the one that
         //    decides.
-        let t_evict = chrono::Utc::now();
+        let t_evict = crate::host::clock::now();
         let n = backend
             .community_dek_evict_epoch_objects(&comm, &minter, e0, &sweeper, t_evict)
             .await
@@ -5619,7 +5631,13 @@ pub mod blob_invariants {
              forever"
         );
         let again = backend
-            .community_dek_evict_epoch_objects(&comm, &minter, e0, &sweeper, chrono::Utc::now())
+            .community_dek_evict_epoch_objects(
+                &comm,
+                &minter,
+                e0,
+                &sweeper,
+                crate::host::clock::now(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -5673,7 +5691,7 @@ pub mod blob_invariants {
         // ── Phase B: the production sweep — evicts (nothing left) and
         //    DESTROYS e0, erasing every e0 grant (I5). From here the roster
         //    leg is the only one that can authorize a member.
-        let report = sweep_rotated_epochs(backend, &comm, &sweeper, chrono::Utc::now())
+        let report = sweep_rotated_epochs(backend, &comm, &sweeper, crate::host::clock::now())
             .await
             .unwrap();
         assert!(
@@ -6328,7 +6346,7 @@ pub mod blob_invariants {
                 occurrence_key_id: occurrence_key_id.to_owned(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
-                asserted_at: chrono::Utc::now(),
+                asserted_at: crate::host::clock::now(),
                 valid_until: None,
                 encryption_pubkeys: Some(crate::federation::EncryptionPubkeys {
                     x25519_base64: B64.encode(x_pub),

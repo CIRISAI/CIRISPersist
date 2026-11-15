@@ -555,7 +555,7 @@ pub mod test_support {
         .expect("bind the #659 subject into the registration envelope");
         let bytes = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
             .expect("canonicalize envelope");
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let scrub_sigs: Vec<ScrubSig> = scrubbers
             .iter()
             .map(|s| {
@@ -984,7 +984,7 @@ pub mod test_support {
     ) -> Result<(), crate::federation::Error> {
         let (ed_pk, mldsa_pk) =
             crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         // An `accord_holder` registration hits the #513 hardware-attestation
         // gate on every backend: the established mock Android-StrongBox
         // evidence with a FRESH nonce passes shape + freshness (≤24h).
@@ -1070,7 +1070,7 @@ pub mod test_support {
     ) -> crate::federation::types::KeyRecord {
         let (ed_pk, mldsa_pk) =
             crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         crate::federation::types::KeyRecord {
             key_id: key_id.to_owned(),
             pubkey_ed25519_base64: ed_pk,
@@ -1286,7 +1286,7 @@ pub mod test_support {
     ) -> crate::federation::Attestation {
         let (och, sc, sp) =
             crate::federation::tier_ingest::test_support::sign_envelope(signing_key_id, &envelope);
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         crate::federation::tier_ingest::test_support::seal_row(
             signing_key_id,
             crate::federation::Attestation {
@@ -2121,7 +2121,7 @@ pub mod test_support {
             directory,
             root_key_id,
             identity_type::NODE,
-            Some(strongbox_evidence(chrono::Utc::now())),
+            Some(strongbox_evidence(crate::host::clock::now())),
         )
         .await?;
         let la = format!("{root_key_id}-la");
@@ -2230,7 +2230,7 @@ pub mod test_support {
         if let Ok(Some(head)) = crate::federation::canonical_community::attach_head_for(
             directory,
             root,
-            chrono::Utc::now(),
+            crate::host::clock::now(),
         )
         .await
         {
@@ -3520,7 +3520,7 @@ pub mod test_support {
             // that meet it), not by the newcomer admitting itself.
             let member = crate::federation::types::FamilyMember {
                 key_id: extra.clone(),
-                joined_at: chrono::Utc::now(),
+                joined_at: crate::host::clock::now(),
                 role: Some("founder".to_owned()),
             };
             let spec = crate::federation::tier_ingest::test_support::family_widening_admit_spec_by_consensus(
@@ -3884,8 +3884,8 @@ pub mod test_support {
         // unbounded edges are withdrawn first, and the earliest bound is then
         // moved from one side to the other — a fold that always returned "our"
         // side, or "the first" side, fails the second half.
-        let near = chrono::Utc::now() + chrono::Duration::hours(2);
-        let far = chrono::Utc::now() + chrono::Duration::hours(9);
+        let near = crate::host::clock::now() + chrono::Duration::hours(2);
+        let far = crate::host::clock::now() + chrono::Duration::hours(9);
         withdraw_attestation(directory, &peer, &root, &peer_edge).await?;
         withdraw_attestation(directory, &user, &root, &user_edge).await?;
         let peer_far = emit_trust_edge(directory, &peer, &root, Some(far)).await?;
@@ -4066,7 +4066,7 @@ pub mod test_support {
         // (#488 delta 3), so a peer cannot ride a stale grant.
         let stale_root = format!("{tag}-stale-root");
         establish_trust_root_side(directory, &stale_root, &sink, INFRA_SERVE_SCOPE).await?;
-        let past = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let past = crate::host::clock::now() - chrono::Duration::minutes(5);
         emit_trust_edge(directory, &user, &stale_root, Some(past)).await?;
         emit_trust_edge(directory, &peer, &stale_root, None).await?;
         let expired = resolve_transit_eligibility(directory, &user, &peer).await?;
@@ -4370,7 +4370,7 @@ pub mod test_support {
             // protocol; see the twin fixture above.
             let member = crate::federation::types::FamilyMember {
                 key_id: extra.clone(),
-                joined_at: chrono::Utc::now(),
+                joined_at: crate::host::clock::now(),
                 role: Some("founder".to_owned()),
             };
             let spec = crate::federation::tier_ingest::test_support::family_widening_admit_spec_by_consensus(
@@ -4414,7 +4414,7 @@ pub mod test_support {
         dir: &dyn crate::federation::FederationDirectory,
         label: &str,
     ) {
-        let t0 = chrono::Utc::now();
+        let t0 = crate::host::clock::now();
         // v59.0.0 — on the Attestation kind: a framed `Key` advertisement is
         // refused at this door (the sealed-transport floor, I1150).
         // A hash this node has HEARD OF and does not hold. A REAL sha256 —
@@ -4566,7 +4566,7 @@ pub mod test_support {
         let hash = crate::federation::wire_index::content_hash_of_bytes(
             format!("double{label}").as_bytes(),
         );
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
 
         // UN-faulted: every call must reach the inner backend.
         let dbl = FaultInjectingDirectory::new(std::sync::Arc::clone(&inner));
@@ -4764,8 +4764,8 @@ pub mod test_support {
         dir: &dyn crate::federation::FederationDirectory,
         label: &str,
     ) {
-        let old = chrono::Utc::now() - chrono::Duration::hours(4);
-        let fresh = chrono::Utc::now();
+        let old = crate::host::clock::now() - chrono::Duration::hours(4);
+        let fresh = crate::host::clock::now();
         // Per-run canonical hashes: the postgres leg shares a live table with
         // every other run, so each assertion below is about THIS run's two
         // entries, and the insert door requires real 64-hex.
@@ -4811,7 +4811,7 @@ pub mod test_support {
         // Cutoff between the two: the stale entry goes, the live one stays.
         // Persist compares timestamps and never derives this instant — edge
         // owns the wrap period that produced it.
-        let cutoff = chrono::Utc::now() - chrono::Duration::hours(1);
+        let cutoff = crate::host::clock::now() - chrono::Duration::hours(1);
         let report = dir
             .evict_known_wire_hashes(cutoff, u64::MAX)
             .await

@@ -199,7 +199,7 @@ impl OwnerAllowLists {
     /// verbatim, over the rows read once.
     #[must_use]
     pub fn list_for(&self, node: &str) -> Option<BTreeSet<CohortEntry>> {
-        let now = chrono::Utc::now();
+        let now = crate::host::clock::now();
         let mut acc: Option<BTreeSet<CohortEntry>> = None;
         for g in &self.grants {
             if g.attesting_key_id != self.owner

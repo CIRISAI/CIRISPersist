@@ -481,20 +481,14 @@ async fn i1570_every_checkout_family_answers_an_exhausted_pool_inside_the_wait()
         .await;
         // The audit Merkle store holds the bare pool and checks out through
         // `checkout_bounded` on its own runtime.
-        let store = crate::audit::merkle_store::PgMerkleStore::from_backend(
-            &b,
-            tokio::runtime::Handle::current(),
-            "i1570",
-        );
+        // v62.0.0 (P8) — the store is async; the read is awaited in place.
+        let store = crate::audit::merkle_store::PgMerkleStore::from_backend(&b, "i1570");
         let started = std::time::Instant::now();
-        let e = tokio::task::spawn_blocking(move || {
-            use ciris_verify_core::transparency::TransparencyStore;
-            TransparencyStore::<crate::audit::merkle_leaf::AuditLeaf>::tree_size(&store)
-        })
-        .await
-        .expect("I1570 merkle join")
-        .expect_err("I1570 merkle: a store read ran on a held pool")
-        .to_string();
+        let e = store
+            .tree_size()
+            .await
+            .expect_err("I1570 merkle: a store read ran on a held pool")
+            .to_string();
         assert!(
             started.elapsed() < SHORT_WAIT * 2 && e.to_lowercase().contains("exhausted"),
             "I1570 merkle: {e} after {:?}",

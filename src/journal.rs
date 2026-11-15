@@ -121,28 +121,31 @@ impl Journal {
         F: FnMut(u64, &[u8]) -> Result<(), String>,
     {
         let mut replayed = 0usize;
-        loop {
-            let entry: Option<(u64, Vec<u8>)> = {
-                let read = self
-                    .db
-                    .begin_read()
-                    .map_err(|e| JournalError::Backend(e.to_string()))?;
-                let table = read
-                    .open_table(QUEUED_BATCHES)
-                    .map_err(|e| JournalError::Backend(e.to_string()))?;
-                let first = table
-                    .first()
-                    .map_err(|e| JournalError::Backend(e.to_string()))?;
-                first.map(|(k, v)| (k.value(), v.value().to_vec()))
-            };
-            let Some((seq, bytes)) = entry else {
-                break;
-            };
+        while let Some((seq, bytes)) = self.first_pending()? {
             handler(seq, &bytes).map_err(JournalError::Replay)?;
             self.purge(seq)?;
             replayed += 1;
         }
         Ok(replayed)
+    }
+
+    /// v62.0.0 (P5) — the oldest entry still pending replay, without
+    /// removing it. The async replay in [`crate::queue::spawn_persister`]
+    /// reads one, awaits the pipeline on it, then [`Self::purge`]s it: the
+    /// order and halt-on-failure of [`Self::replay`], with no synchronous
+    /// handler to bridge.
+    pub fn first_pending(&self) -> Result<Option<(u64, Vec<u8>)>, JournalError> {
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|e| JournalError::Backend(e.to_string()))?;
+        let table = read
+            .open_table(QUEUED_BATCHES)
+            .map_err(|e| JournalError::Backend(e.to_string()))?;
+        let first = table
+            .first()
+            .map_err(|e| JournalError::Backend(e.to_string()))?;
+        Ok(first.map(|(k, v)| (k.value(), v.value().to_vec())))
     }
 
     /// Remove a single entry by sequence number.

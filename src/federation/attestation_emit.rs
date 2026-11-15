@@ -397,7 +397,7 @@ where
     // [`stamp_and_canonicalize`]); `assemble` then reads the instants back out
     // and `check_row_column_binding` re-checks the typed-column mirror at the
     // door.
-    let canonical = stamp_and_canonicalize(&mut input, &key_id, chrono::Utc::now())?;
+    let canonical = stamp_and_canonicalize(&mut input, &key_id, crate::host::clock::now())?;
     let sig = signer.sign_hybrid(&canonical).await.map_err(|e| {
         Error::Backend(format!(
             "emit_attestation sign_hybrid: {e} — a conformant federation-tier emit requires a \

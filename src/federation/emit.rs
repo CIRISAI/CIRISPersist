@@ -223,7 +223,7 @@ where
         .map_err(|e| EmitError::Signing(format!("payload serialize: {e}")))?;
 
     let entry_id = Uuid::new_v4().to_string();
-    let recorded_at = truncate_to_micros(Utc::now());
+    let recorded_at = truncate_to_micros(crate::host::clock::now());
 
     let mut entry = AuditEntry {
         entry_id,
@@ -321,7 +321,7 @@ where
         grantee_key,
         purpose,
         scope,
-        Some(Utc::now()),
+        Some(crate::host::clock::now()),
         "revocation",
     )
     .await

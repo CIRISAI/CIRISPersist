@@ -17,8 +17,7 @@ use super::{Error, GENESIS_PREV_HASH};
 use crate::store::postgres::PostgresBackend;
 use crate::ClaimResult;
 
-use ciris_verify_core::transparency::{SignedTreeHead, TransparencyLog, TransparencyStore};
-use std::sync::Arc;
+use ciris_verify_core::transparency::SignedTreeHead;
 
 use super::merkle_leaf::AuditLeaf;
 use super::merkle_store::{log_id_for_tenant, PgMerkleStore};
@@ -58,46 +57,28 @@ async fn merkle_hook_pg(
         return Ok(());
     };
 
-    // Bridge from the async caller into the sync TransparencyStore
-    // trait. The TransparencyLog operations (append / merkle_root /
-    // store_sth) all call PgMerkleStore methods which in turn call
-    // `runtime.block_on(pool.get())`. Doing that on the current
-    // tokio worker would panic; spawn_blocking moves the work to
-    // a blocking thread.
-    let handle = tokio::runtime::Handle::current();
+    // v62.0.0 (P8) — the store is async end to end: append, size and root
+    // are three `.await`s on tokio-postgres, in the order Verify's
+    // `TransparencyLog` made them (append, tree_size, merkle_root). No
+    // blocking-thread hop, no `block_on`.
     let tenant_id = entry.tenant_id.clone();
     let leaf = AuditLeaf::with_chain_event_id(entry.clone(), chain_event_id);
     let log_id = log_id_for_tenant(&tenant_id);
+    let store = PgMerkleStore::from_backend(backend, tenant_id.clone());
 
-    let store: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(PgMerkleStore::from_backend(
-        backend,
-        handle,
-        tenant_id.clone(),
-    ));
-    let log = TransparencyLog::<AuditLeaf>::for_log(log_id.clone(), store.clone());
-
-    // 1. Append the leaf + compute tree_size + merkle_root on a
-    //    blocking thread (the TransparencyStore trait is sync; its
-    //    PgMerkleStore impl uses `runtime.block_on(pool.get())`,
-    //    which would panic on a tokio worker — spawn_blocking moves
-    //    the work to a blocking thread).
-    let log_for_block = log;
-    let leaf_for_block = leaf;
-    let head_jh: tokio::task::JoinHandle<
-        Result<(u64, [u8; 32]), ciris_verify_core::transparency::TransparencyError>,
-    > = tokio::task::spawn_blocking(move || {
-        let _idx = log_for_block.append(leaf_for_block)?;
-        let ts = log_for_block.tree_size()?;
-        let root = log_for_block.merkle_root()?;
-        Ok((ts, root))
-    });
-    let (tree_size, root_hash) = head_jh
+    // 1. Append the leaf + compute tree_size + merkle_root.
+    let head = async {
+        let _idx = store.append(leaf).await?;
+        let ts = store.tree_size().await?;
+        let root = store.root().await?;
+        Ok::<_, ciris_verify_core::transparency::TransparencyError>((ts, root))
+    };
+    let (tree_size, root_hash) = head
         .await
-        .map_err(|e| Error::Merkle(format!("append join: {e}")))?
         .map_err(|e| Error::Merkle(format!("append: {e}")))?;
 
     // 2. Sign the STH via LocalSigner::sign_hybrid (async).
-    let timestamp = chrono::Utc::now();
+    let timestamp = crate::host::clock::now();
     let signing_bytes = SignedTreeHead::signing_bytes(&log_id, tree_size, &root_hash, timestamp);
     let signature = signer
         .sign_hybrid(&signing_bytes)
@@ -113,15 +94,10 @@ async fn merkle_hook_pg(
         witness_signatures: Vec::new(),
     };
 
-    // 3. Persist the STH (sync trait again → spawn_blocking).
-    let store_for_store = store;
-    let sth_for_store = sth;
-    let store_jh: tokio::task::JoinHandle<
-        Result<(), ciris_verify_core::transparency::TransparencyError>,
-    > = tokio::task::spawn_blocking(move || store_for_store.store_sth(&sth_for_store));
-    store_jh
+    // 3. Persist the STH.
+    store
+        .store_sth(&sth)
         .await
-        .map_err(|e| Error::Merkle(format!("store_sth join: {e}")))?
         .map_err(|e| Error::Merkle(format!("store_sth: {e}")))?;
 
     Ok(())
@@ -1092,20 +1068,11 @@ impl AuditService for PostgresBackend {
         if tenant_id.is_empty() {
             return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
         }
-        // Build a tenant-scoped PG merkle store on the fly + call its
-        // sync `latest_sth()` via spawn_blocking (the store uses
-        // `runtime.block_on` internally — calling it directly on a
-        // tokio worker would panic).
-        let handle = tokio::runtime::Handle::current();
-        let tenant_owned = tenant_id.to_owned();
-        let store: Arc<dyn TransparencyStore<AuditLeaf>> =
-            Arc::new(PgMerkleStore::from_backend(self, handle, tenant_owned));
-        let jh: tokio::task::JoinHandle<
-            Result<Option<SignedTreeHead>, ciris_verify_core::transparency::TransparencyError>,
-        > = tokio::task::spawn_blocking(move || store.latest_sth());
-        let res = jh
+        // v62.0.0 (P8) — a tenant-scoped async store, awaited in place.
+        let store = PgMerkleStore::from_backend(self, tenant_id.to_owned());
+        let res = store
+            .latest_sth()
             .await
-            .map_err(|e| Error::Merkle(format!("current_sth join: {e}")))?
             .map_err(|e| Error::Merkle(format!("latest_sth: {e}")))?;
         Ok(res)
     }
@@ -1326,28 +1293,10 @@ impl AuditService for PostgresBackend {
             u64::try_from(leaf_idx_i).map_err(|_| Error::Backend("leaf_index negative".into()))?;
         drop(client);
 
-        // Build a tenant-scoped store and delegate inclusion_proof on
-        // a blocking worker (the store is sync-trait + uses block_on
-        // internally). Same shape as `current_sth`.
-        let handle = tokio::runtime::Handle::current();
-        let tenant_owned = tenant_id.to_owned();
-        let store: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(PgMerkleStore::from_backend(
-            self,
-            handle,
-            tenant_owned.clone(),
-        ));
-        let log_id = log_id_for_tenant(&tenant_owned);
-        let jh: tokio::task::JoinHandle<
-            Result<
-                ciris_verify_core::transparency::MerkleProof,
-                ciris_verify_core::transparency::TransparencyError,
-            >,
-        > = tokio::task::spawn_blocking(move || {
-            let log = TransparencyLog::<AuditLeaf>::for_log(log_id, store);
-            log.inclusion_proof(leaf_index)
-        });
-        jh.await
-            .map_err(|e| Error::Merkle(format!("inclusion_proof join: {e}")))?
+        // v62.0.0 (P8) — a tenant-scoped async store, awaited in place.
+        PgMerkleStore::from_backend(self, tenant_id.to_owned())
+            .inclusion_proof(leaf_index)
+            .await
             .map_err(|e| Error::Merkle(format!("inclusion_proof: {e}")))
     }
 
@@ -1360,25 +1309,9 @@ impl AuditService for PostgresBackend {
         if tenant_id.is_empty() {
             return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
         }
-        let handle = tokio::runtime::Handle::current();
-        let tenant_owned = tenant_id.to_owned();
-        let store: Arc<dyn TransparencyStore<AuditLeaf>> = Arc::new(PgMerkleStore::from_backend(
-            self,
-            handle,
-            tenant_owned.clone(),
-        ));
-        let log_id = log_id_for_tenant(&tenant_owned);
-        let jh: tokio::task::JoinHandle<
-            Result<
-                ciris_verify_core::transparency::ConsistencyProof,
-                ciris_verify_core::transparency::TransparencyError,
-            >,
-        > = tokio::task::spawn_blocking(move || {
-            let log = TransparencyLog::<AuditLeaf>::for_log(log_id, store);
-            log.consistency_proof(old_size, new_size)
-        });
-        jh.await
-            .map_err(|e| Error::Merkle(format!("consistency_proof join: {e}")))?
+        PgMerkleStore::from_backend(self, tenant_id.to_owned())
+            .consistency_proof(old_size, new_size)
+            .await
             .map_err(|e| Error::Merkle(format!("consistency_proof: {e}")))
     }
 

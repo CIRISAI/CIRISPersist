@@ -619,7 +619,7 @@ pub(crate) async fn put_delivery_receipt_planned<D: BlobFloorStore>(
         k_i64,
         epoch_i64,
         signature_blob: super::stream_sth::serialize_signature(&receipt.signature)?,
-        received_at: chrono::Utc::now(),
+        received_at: crate::host::clock::now(),
     };
     match dir.store_delivery_receipt(planned).await? {
         // Step 2: the JOIN gate. The signature proved WHO; a root this node

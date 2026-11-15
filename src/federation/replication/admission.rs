@@ -9,7 +9,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::host::clock::{monotonic_now, Instant};
 
 use super::trust_scoring::{TrustScoring, TrustScoringError};
 
@@ -1931,7 +1933,7 @@ impl PeerWriteQuota {
     /// a migration, and a background writer in all three backends — none of
     /// which lives in this module. Filed as the durable half of #575 ask (b).
     pub fn new() -> Self {
-        let now = Instant::now();
+        let now = monotonic_now();
         Self {
             state: std::sync::Mutex::new(QuotaState {
                 buckets: HashMap::new(),
@@ -2042,7 +2044,7 @@ impl PeerWriteQuota {
             peer_key_id,
             WriteAdmissionClass::CohortSync,
             &WriteCost::for_envelope_bytes(envelope_charged_bytes(&row.attestation_envelope)),
-            Instant::now(),
+            monotonic_now(),
         )
         .map_err(Into::into)
     }
@@ -2075,7 +2077,7 @@ impl PeerWriteQuota {
         }
         if st.cohort_affinity.len() < PER_PEER_QUOTA_TRACKED_PEERS_CAP {
             st.cohort_affinity
-                .insert(peer_key_id.to_owned(), (shares, Instant::now()));
+                .insert(peer_key_id.to_owned(), (shares, monotonic_now()));
         }
     }
 
@@ -2094,7 +2096,7 @@ impl PeerWriteQuota {
             &row.attesting_key_id,
             WriteAdmissionClass::LocalAuthorship,
             &WriteCost::for_envelope_bytes(envelope_charged_bytes(&row.attestation_envelope)),
-            Instant::now(),
+            monotonic_now(),
         )
         .map_err(Into::into)
     }
@@ -2113,7 +2115,7 @@ impl PeerWriteQuota {
             &row.attesting_key_id,
             Self::classify(row),
             &WriteCost::for_envelope_bytes(envelope_charged_bytes(&row.attestation_envelope)),
-            Instant::now(),
+            monotonic_now(),
         )
     }
 
@@ -2126,7 +2128,7 @@ impl PeerWriteQuota {
     /// a door around the dimension, and the completeness gate exists to stop
     /// exactly that.
     pub fn check(&self, key_id: &str) -> Result<(), crate::federation::Error> {
-        self.check_at(key_id, Instant::now())
+        self.check_at(key_id, monotonic_now())
     }
 
     /// Clock-injected ordinary-class [`Self::check`]. Private: the windows
@@ -2381,7 +2383,7 @@ impl PeerWriteQuota {
     #[must_use]
     pub fn observe(&self) -> PeerQuotaObservation {
         let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let now = Instant::now();
+        let now = monotonic_now();
         PeerQuotaObservation {
             process_local: true,
             tracked_peers: st.buckets.len(),
@@ -2674,7 +2676,7 @@ pub mod gate_order_test_support {
     {
         let key_id = format!("av76q{tag}");
         let n = super::PER_PEER_ATTESTATION_WRITES_PER_WINDOW;
-        let started = std::time::Instant::now();
+        let started = crate::host::clock::monotonic_now();
         // The cap is `2n`: draining `n` empties a full bucket, and the second
         // `n` is headroom for tokens that accrue while the first `n` are in
         // flight. Reaching it means `2n` consecutive writes were all admitted
@@ -3008,14 +3010,14 @@ mod local_authorship_804 {
         // The door, once: it spends the CohortSync class for the authenticated
         // peer. The rest of the scenario runs on ONE pinned instant through
         // the clock-injected core, because the bucket refills at a per-second
-        // rate from `Instant::now()` — under a loaded lane a scheduling stall
+        // rate from `monotonic_now()` — under a loaded lane a scheduling stall
         // between exhausting the budget and the second peer's check accrued a
         // token and the "shared, spent" assertion below read a refill as a
         // hole (v46.3.0 certify, `default` lane, 1 of 1622). A wall clock is
         // not a cursor; this witness measures the budget, not the scheduler.
         q.check_write_synced(&row("a"), "mate-a")
             .expect("#804: the first sync row of a cohort mate is admitted");
-        let now = Instant::now();
+        let now = monotonic_now();
         let cost = |attester: &str| {
             WriteCost::for_envelope_bytes(envelope_charged_bytes(
                 &row(attester).attestation_envelope,
@@ -3195,7 +3197,7 @@ mod tests {
     #[test]
     fn n_plus_first_write_in_window_is_rate_limited() {
         let quota = PeerWriteQuota::new();
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
         for i in 0..PER_PEER_ATTESTATION_WRITES_PER_WINDOW {
             quota
                 .check_at("peer-a", t0)
@@ -3233,7 +3235,7 @@ mod tests {
     #[test]
     fn quota_is_keyed_per_peer() {
         let quota = PeerWriteQuota::new();
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
         for _ in 0..PER_PEER_ATTESTATION_WRITES_PER_WINDOW {
             quota.check_at("peer-a", t0).expect("peer-a fills its own");
         }
@@ -3248,7 +3250,7 @@ mod tests {
     #[test]
     fn bucket_refills_over_the_window() {
         let quota = PeerWriteQuota::new();
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
         for _ in 0..PER_PEER_ATTESTATION_WRITES_PER_WINDOW {
             quota.check_at("peer-a", t0).expect("initial burst admits");
         }
@@ -3334,7 +3336,7 @@ mod tests {
     #[test]
     fn one_peer_cannot_write_a_million_rows_in_a_day() {
         let quota = PeerWriteQuota::new();
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
         let day = Duration::from_secs(86_400);
         let step = Duration::from_secs(60);
 
@@ -3392,7 +3394,7 @@ mod tests {
     #[test]
     fn a_peer_refused_on_every_write_is_visible_from_outside_609() {
         let quota = PeerWriteQuota::new();
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
         // Drain until the control fires — the flood.
         let mut drained = 0_u64;
         while quota.check_at("flooder", t0).is_ok() {
@@ -3432,7 +3434,7 @@ mod tests {
     #[test]
     fn the_refused_keys_window_saturates_at_its_cap_609() {
         let quota = PeerWriteQuota::new();
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
         while quota.check_at("seed", t0).is_ok() {}
         // A rotating-identity flood: every key distinct, every write refused.
         for i in 0..(REFUSED_KEYS_WINDOW_CAP + 50) {
@@ -3453,7 +3455,7 @@ mod tests {
     #[test]
     fn a_restart_is_worth_one_node_burst_not_a_sybil_multiple() {
         let quota = PeerWriteQuota::new(); // ← the restart
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
         let bound = node_budget()
             .dim(QuotaDimension::Rows)
             .burst
@@ -3494,7 +3496,7 @@ mod tests {
     #[test]
     fn a_rotation_flood_cannot_grow_the_tracked_table_past_the_cap() {
         let quota = PeerWriteQuota::new();
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
         for i in 0..(PER_PEER_QUOTA_TRACKED_PEERS_CAP + 1000) {
             let _ = quota.check_at(&format!("rotating-{i}"), t0);
         }
@@ -3517,7 +3519,7 @@ mod tests {
     /// because the budget they draw on does not multiply with them.
     #[test]
     fn ten_thousand_fresh_identities_buy_one_peer_s_worth() {
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
 
         let one = PeerWriteQuota::new();
         let mut with_one_identity = 0u64;
@@ -3549,7 +3551,7 @@ mod tests {
     #[test]
     fn an_ordinary_flood_cannot_crowd_out_the_reserved_class() {
         let quota = PeerWriteQuota::new();
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
 
         // Spend the node budget down to nothing with ordinary traffic: each
         // flooder gets a bucket on first contact and drains it.
@@ -3578,7 +3580,7 @@ mod tests {
     #[test]
     fn the_reserved_class_is_finite_and_separately_accounted() {
         let quota = PeerWriteQuota::new();
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
 
         let mut reserved_admitted = 0u64;
         loop {
@@ -3621,7 +3623,7 @@ mod tests {
     #[test]
     fn a_refused_write_debits_nothing() {
         let quota = PeerWriteQuota::new();
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
 
         // Give `victim` a bucket, then exhaust the NODE budget elsewhere so
         // the refusal comes from a budget that is not victim's own.
@@ -3744,7 +3746,7 @@ mod tests {
     /// handed the disjunction.
     #[test]
     fn each_budget_refuses_under_its_own_name() {
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
 
         // PeerBurst: a tracked peer spending its own burst.
         let q = PeerWriteQuota::new();
@@ -3824,7 +3826,7 @@ mod tests {
     #[test]
     fn reserved_sustained_horizon_binds() {
         let quota = PeerWriteQuota::new();
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
         let mut at = t0;
         let reason = loop {
             let ended_with = loop {
@@ -3867,7 +3869,7 @@ mod tests {
     #[test]
     fn no_schedule_of_peers_and_clocks_outruns_the_ceilings() {
         let quota = PeerWriteQuota::new();
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
         let peer_spec = peer_budget();
         let node_spec = node_budget();
 
@@ -4117,7 +4119,7 @@ mod tests {
     #[test]
     fn an_honest_newcomer_gets_its_own_budget_during_a_rotation_flood() {
         let quota = PeerWriteQuota::new();
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
         let mut at = t0;
         let mut fleet: Vec<String> = Vec::new();
 
@@ -4210,7 +4212,7 @@ mod tests {
     ) -> PeerQuotaRefusal {
         let cost = witness_cost(dim);
         let quota = PeerWriteQuota::new();
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
         let mut at = t0;
 
         let class = match budget {
@@ -4386,7 +4388,7 @@ mod tests {
     fn no_adversary_schedule_resets_itself_or_degrades_an_incumbent() {
         let quota = PeerWriteQuota::new();
         let peer_spec = peer_budget();
-        let t0 = Instant::now();
+        let t0 = monotonic_now();
         let mut at = t0;
 
         // Deterministic RNG — a property harness whose schedule changes run

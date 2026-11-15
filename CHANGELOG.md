@@ -5,6 +5,24 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [62.0.0] - UNRELEASED
+
+### Changed (v62 slice A: host seams)
+
+Persist's node code reads time, spawns, sleeps, dispatches blocking work and learns of shutdown only through one module, `ciris_persist::host` (FSD WASM_NODE §4.1, §5). A host installs its seams once (`HostSeams::install`) before it builds an Engine or a store; nothing installed is the native default, which behaves as v61 did.
+
+- **The clock seam (P3).** `host::clock::{Clock, SystemClock, FixedClock, Instant, now, monotonic_now}`. The 401 production `Utc::now()` reads in node code are `host::clock::now()`; the 30 `std::time::Instant` and 4 `SystemTime` reads are `host::clock::monotonic_now()` / `host::clock::Instant` / `host::clock::now()`. `SystemClock::now()` is `chrono::Utc::now()`, so a native node stamps the same instants, and the stores' µs truncation is untouched. `debug/mod.rs`'s panic hook (`debug-tools`) keeps its `SystemTime` read on purpose: it must not take a lock while panicking.
+- **The executor seam (P5).** `host::rt::{spawn, sleep, timeout, dispatch_blocking, try_dispatch_blocking, Executor, TokioExecutor, TaskHandle}`. `dispatch_blocking` moved here from `store::sqlite_conn_model` (same two arms, plus the single-thread profile's third: inline, always). The 16 raw `spawn_blocking` calls on the sqlite path (and the postgres ones) go through `try_dispatch_blocking`. The engine loops (eviction sweeper, re-ack sweeper, detection poll), the disk-pressure monitor, the persister and the postgres connection drivers spawn and sleep through the seam. `TokioExecutor::single_thread()` (or `HostSeams::single_thread()`) runs blocking work inline, so a current-thread runtime opens, writes and reads a store without starting a thread.
+- **The Merkle stores without sync-over-async (P8).** `SqliteMerkleStore::new(conn, tenant)` takes no runtime handle and is the synchronous `TransparencyStore` its body always was. `PgMerkleStore` is async end to end: inherent `async fn`s (`append`, `get`, `leaf_hash`, `tree_size`, `latest_sth`, `store_sth`, `all_leaf_hashes`, `root`, `inclusion_proof`, `consistency_proof`); root and proofs run as Verify's own `TransparencyStore` defaults over a read-only snapshot of the leaf hashes, so their bytes are unchanged. No `block_on` or `Handle::current` remains in `audit/merkle_store.rs`.
+- **Lifecycle is an event the host delivers (P9).** `queue::shutdown_signal` (and its crate-root re-export) is removed. The node waits on `host::Lifecycle::shutdown()`; the host calls `Lifecycle::deliver(LifecycleEvent::Shutdown)`. The native signal handling (SIGINT/SIGTERM on unix, Ctrl+C/Ctrl+Break on windows) lives in the adapter `ffi::native_host::{os_shutdown_signal, deliver_os_signals}`, so node code holds no `cfg(unix)` / `cfg(windows)`. `engine::teardown` moved to `ffi::teardown` (the native host's off-GIL teardown thread); in the single-thread profile a retirement drops inline. The persister's journal replay awaits the pipeline in place (`Journal::first_pending`) instead of bridging through a scoped thread and `Handle::current().block_on`.
+
+### Adoption notes (CIRISEdge, CIRISServer)
+
+- Clean-break renames, no aliases: `ciris_persist::shutdown_signal` → `ffi::native_host::os_shutdown_signal` (or wire `deliver_os_signals` to a `Lifecycle`); `engine::teardown::*` → `ffi::teardown::*`; `store::sqlite_conn_model::dispatch_blocking` → `host::rt::dispatch_blocking`.
+- `EvictionSweeper::stop`, `DiskPressureMonitorHandle::stop` and `PersisterHandle` now return / hold a `host::TaskHandle` (awaitable, `Result<(), host::TaskError>`) instead of a tokio `JoinHandle`.
+- `SqliteMerkleStore::new` and `PgMerkleStore::{new, from_pool}` drop their `Handle` argument. `PgMerkleStore` no longer implements `TransparencyStore`; await its inherent methods.
+- `federation::key_grant`'s `next_retry` field is a `host::clock::Instant`.
+
 ## [61.4.1] - 2026-11-14
 
 A member seated late in a room of three or more could read an earlier message as `seal_mismatch`, permanently (CIRISPersist#1271). This release binds a room message to its author's minter, and heals on read a binding that is already wrong.

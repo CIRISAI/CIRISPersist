@@ -412,7 +412,7 @@ pub(crate) async fn attach_attestation_pqc_planned<D>(
 where
     D: AttestationStore,
 {
-    let received_at = chrono::Utc::now();
+    let received_at = crate::host::clock::now();
     // The row as stored, any tier: the same point read the crossing door
     // plans over (`enter_mesh`).
     let held = dir.get_attestation(attestation_id).await?;
@@ -535,7 +535,7 @@ where
     // replay of `V(rows, t)` calls the plan with `fold_at = t`.
     let instants = PlanInstants {
         fold_at: attestation.attestation.asserted_at,
-        received_at: chrono::Utc::now(),
+        received_at: crate::host::clock::now(),
     };
     let outcome = async {
         let outcome = match plan_put_attestation(dir, attestation, &origin, instants).await? {
@@ -1553,7 +1553,7 @@ pub(crate) async fn write_local_attestation_planned<D>(
 where
     D: AttestationStore,
 {
-    let received_at = chrono::Utc::now();
+    let received_at = crate::host::clock::now();
     let id = match plan_write_local_attestation(dir, input, replace, received_at).await? {
         LocalPlan::Held(id) => id,
         LocalPlan::Write(planned) => {
@@ -1896,7 +1896,7 @@ pub(crate) async fn reseal_attestation_planned<D>(
 where
     D: AttestationStore,
 {
-    let received_at = chrono::Utc::now();
+    let received_at = crate::host::clock::now();
     let Some(stored) = dir.get_attestation(&resealed.attestation_id).await? else {
         return Ok(false);
     };
@@ -1997,7 +1997,7 @@ where
         key_id,
         identity_type,
     };
-    dir.rehome_legacy_hard_case_events(&attester, chrono::Utc::now())
+    dir.rehome_legacy_hard_case_events(&attester, crate::host::clock::now())
         .await?;
     Ok(attester)
 }
@@ -2164,7 +2164,7 @@ where
 {
     super::hard_case::check_admin_action_attribution(&event)?;
     let attester = hard_case_attester(dir).await?;
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     let planned = plan_hard_case_row(
         &event,
         &attester,
@@ -2342,7 +2342,7 @@ pub(crate) async fn put_detection_planned<D>(
 where
     D: AttestationStore,
 {
-    let received_at = chrono::Utc::now();
+    let received_at = crate::host::clock::now();
     dir.rehome_legacy_detection_events(received_at).await?;
     let body = crate::derived::detection_row::DetectionProjection::from(event);
     let identity_type = dir

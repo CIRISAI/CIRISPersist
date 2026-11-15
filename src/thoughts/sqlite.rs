@@ -396,7 +396,7 @@ impl ThoughtService for SqliteThoughtBackend {
             return Err(Error::InvalidArgument("thought_id required".into()));
         }
         let final_action_str = encode_json_opt(final_action.as_ref())?;
-        let now_str = fmt_datetime(chrono::Utc::now());
+        let now_str = fmt_datetime(crate::host::clock::now());
         let status_sql = new_status.as_sql_str().to_owned();
         let thought_id_owned = thought_id.to_owned();
         let conn = self.conn.clone();

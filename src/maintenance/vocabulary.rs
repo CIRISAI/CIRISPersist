@@ -526,8 +526,8 @@ where
     Fut: std::future::Future<Output = Result<String, crate::federation::Error>>,
 {
     target.validate()?;
-    let started_at = Utc::now();
-    let t0 = std::time::Instant::now();
+    let started_at = crate::host::clock::now();
+    let t0 = crate::host::clock::monotonic_now();
 
     // ── scan ──────────────────────────────────────────────────────────────
     // v36.0.0 (CIRISPersist#668) — the cursor is the `(position, id)` PAIR,
