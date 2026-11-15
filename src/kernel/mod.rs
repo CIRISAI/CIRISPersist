@@ -26,6 +26,28 @@ pub mod owner;
 pub mod trust;
 pub mod view;
 
+#[cfg(test)]
+pub(crate) mod differential;
+
+/// The differential's hooks where a from-disk gate scans the caller's body
+/// (`store::parity`): a call that compiles to nothing outside a test build,
+/// so the scanned body carries no `#[cfg(test)]` statement.
+pub(crate) mod witness {
+    /// [`super::differential::held_head`], in a test build.
+    #[inline]
+    #[allow(unused_variables)]
+    pub(crate) fn held_head(
+        group: &str,
+        held: &str,
+        offered_prev: &str,
+        birth: bool,
+        persist_ok: bool,
+    ) {
+        #[cfg(test)]
+        super::differential::held_head(group, Some(held), offered_prev, true, birth, persist_ok);
+    }
+}
+
 /// What the kernel answered, and what it read (KERNEL_SEAMS §5.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answer<T> {

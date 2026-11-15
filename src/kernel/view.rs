@@ -393,9 +393,16 @@ pub fn attestation_view(
     id_of: &dyn Fn(&str) -> Option<RowId>,
 ) -> KRow {
     let mut names = Vec::new();
-    if let Some(r) = crate::federation::precedence::references_attestation_id_from_envelope(
-        &a.attestation_envelope,
-    ) {
+    // only a structural composer's pointer names a row (CC 4.5.1.1)
+    let composer = crate::federation::precedence::is_structural_composer(&a.attestation_type);
+    if let Some(r) = composer
+        .then(|| {
+            crate::federation::precedence::references_attestation_id_from_envelope(
+                &a.attestation_envelope,
+            )
+        })
+        .flatten()
+    {
         names.push(id_of(r).unwrap_or_else(|| RowId::of_label(&["unheld", r])));
     }
     KRow::new(

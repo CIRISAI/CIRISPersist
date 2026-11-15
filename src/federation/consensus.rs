@@ -303,6 +303,16 @@ fn unevaluable(reason: impl Into<String>) -> Verdict {
 /// (FSD §2 table). Every arm requires at least one counted signer: no
 /// protocol admits a change that no eligible member signed.
 pub fn evaluate(b: &Ballot<'_>) -> Verdict {
+    let v = evaluate_reference(b);
+    // v62.0.0 (slice C, I1838) — the differential witness: the kernel's
+    // answer over the same ballot, every disagreement a named departure.
+    #[cfg(test)]
+    crate::kernel::differential::consensus(b, &v);
+    v
+}
+
+/// The evaluator as persist wrote it, before the kernel.
+fn evaluate_reference(b: &Ballot<'_>) -> Verdict {
     let elig = eligible(b);
     let got = counted(b, &elig);
     let n = elig.len();
@@ -614,7 +624,7 @@ fn eval_expr(b: &Ballot<'_>, elig: &[&Seat], got: &[&Seat], expr: &Value, depth:
     };
     let (op, arg) = obj.iter().next().expect("one key");
     let sub = |proto: &str| -> Verdict {
-        evaluate(&Ballot {
+        evaluate_reference(&Ballot {
             protocol: proto,
             ..*b
         })

@@ -1419,6 +1419,39 @@ where
     .await
 }
 
+/// v62.0.0 (slice C) — **the edge leg, through the kernel**
+/// ([`crate::kernel::trust`]). Persist's reads decide which of the user's rows
+/// are candidates (toward the root, federation tier, not expired at `now`,
+/// labelled `trust:accepts:v1` or held as acceptance from before the label);
+/// the kernel concludes the rotations, folds the composers (CC 3.5.1) and
+/// walks one hop.
+#[cfg_attr(not(test), allow(dead_code))] // production from the switch (step 3)
+pub(crate) async fn kernel_edge_leg<F>(
+    directory: &F,
+    by_user: &[Attestation],
+    user_key_id: &str,
+    root_ref: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<crate::kernel::Answer<bool>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let shaped = |a: &Attestation| {
+        (a.attestation_type == attestation_type::DELEGATES_TO
+            || a.attestation_type == attestation_type::SUPERSEDES)
+            && a.attested_key_id == root_ref
+            && !is_expired(a, now)
+            && counts_in_capability_walk(a)
+            && job_dimension_admits(&a.attestation_envelope, TRUST_ACCEPTS_DIMENSION)
+    };
+    let denied = direction_denied_ids(directory, by_user.iter().filter(|a| shaped(a))).await?;
+    let rows: Vec<&Attestation> = by_user.iter().collect();
+    let view = crate::kernel::trust::edge_rows(&rows, &|a| {
+        shaped(a) && !denied.contains(&a.attestation_id)
+    });
+    Ok(crate::kernel::trust::edge_leg(&view, user_key_id, root_ref))
+}
+
 /// [`trust_root_valid`]'s walk, run inside its [`crate::observe::fold`].
 async fn trust_root_valid_body<F>(
     directory: &F,
@@ -1564,6 +1597,19 @@ where
         .filter(|a| !edge_denied.contains(&a.attestation_id))
         .collect();
     let edge_exists = !live_edges.is_empty();
+    // v62.0.0 (slice C, I1838) — the differential witness: the kernel's edge
+    // leg over the same slice (the user's rows and their composers).
+    #[cfg(test)]
+    {
+        let edge = kernel_edge_leg(directory, &by_user, user_key_id, root_ref, now).await?;
+        crate::kernel::differential::trust_edge(
+            user_key_id,
+            root_ref,
+            edge_exists,
+            edge.value,
+            by_user.len(),
+        );
+    }
 
     // 2. Charter.
     //

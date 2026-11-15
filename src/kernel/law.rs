@@ -21,11 +21,11 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 /// The seat a group's roster places.
-pub const SCOPE_MEMBER: &str = "member";
+pub const SEAT_MEMBER: &str = "member";
 /// The seat a founder holds beside `member`.
-pub const SCOPE_FOUNDER: &str = "founder";
+pub const SEAT_FOUNDER: &str = "founder";
 /// The single-valued seat over a node's key (CC 3.2, the first binding).
-pub const SCOPE_OWNER: &str = "owner";
+pub const SEAT_OWNER: &str = "owner";
 
 /// The policy cell of each arm of the closed vocabulary, by its arm word.
 /// `quorum` reads its threshold from the counted row (`Declared`: persist
@@ -49,7 +49,7 @@ pub fn seat_law() -> &'static SeatLaw {
         confers: BTreeMap::new(),
         ends: BTreeMap::new(),
         final_scopes: Vec::new(),
-        roster_seats: vec![SCOPE_MEMBER.to_owned(), SCOPE_FOUNDER.to_owned()],
+        roster_seats: vec![SEAT_MEMBER.to_owned(), SEAT_FOUNDER.to_owned()],
         depth: 1,
         policy: ARMS.iter().map(|(w, p)| ((*w).to_owned(), *p)).collect(),
     })
@@ -106,8 +106,8 @@ pub fn window_specs() -> &'static BTreeMap<String, WindowSpec<Micros>> {
             out.insert(
                 family.to_owned(),
                 WindowSpec {
-                    counted: SCOPE_MEMBER.into(),
-                    concluder: SCOPE_MEMBER.into(),
+                    counted: SEAT_MEMBER.into(),
+                    concluder: SEAT_MEMBER.into(),
                     opener_says: Some("yes".into()),
                     at_once,
                     silent: None,

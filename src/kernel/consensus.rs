@@ -25,7 +25,7 @@
 //! right to refuse malformed input"), and the lineage's high-water latch
 //! (CC 4.4.3.4.2.1), which persist folds and passes as the declared `need`.
 
-use super::law::{seat_law, SCOPE_FOUNDER, SCOPE_MEMBER};
+use super::law::{seat_law, SEAT_FOUNDER, SEAT_MEMBER};
 use super::view::{KRow, NoCut, RowId, SeatFields};
 use super::Answer;
 use crate::federation::consensus::{
@@ -84,7 +84,7 @@ fn whole(v: &Value, what: &str, rubric: &str) -> Result<u64, NoCell> {
 pub fn arm_of(b: &Ballot<'_>) -> Result<Arm, NoCell> {
     let p = b.protocol;
     let infra = b.subkind == Some("infrastructure");
-    let counted = if infra { SCOPE_FOUNDER } else { SCOPE_MEMBER };
+    let counted = if infra { SEAT_FOUNDER } else { SEAT_MEMBER };
     let elig = eligible_seats(b);
     let n = elig.len();
     let arm = |word, counted, need| {
@@ -96,7 +96,7 @@ pub fn arm_of(b: &Ballot<'_>) -> Result<Arm, NoCell> {
         })
     };
     if p == cp::FOUNDER_ONLY {
-        return arm("founder_only", SCOPE_FOUNDER, None);
+        return arm("founder_only", SEAT_FOUNDER, None);
     }
     if p == cp::OPEN_SELF_ADMIT {
         if b.subkind != Some(crate::federation::public_room::COHORT_SUBKIND_PUBLIC) {
@@ -232,7 +232,7 @@ pub fn ballot_rows(b: &Ballot<'_>, arm: &Arm) -> Vec<KRow> {
     };
     rows.push(KRow::new(gid, Vec::new(), g_signer).with_seat(SeatFields {
         to: members.clone(),
-        scope: Some(SCOPE_MEMBER.into()),
+        scope: Some(SEAT_MEMBER.into()),
         obj: Some(Obj::Row(gid)),
         conf: Some(Conf::Own),
         cosigners: g_rest,
@@ -244,7 +244,7 @@ pub fn ballot_rows(b: &Ballot<'_>, arm: &Arm) -> Vec<KRow> {
         rows.push(
             KRow::new(fid, vec![gid], f_signer.clone()).with_seat(SeatFields {
                 to: founders.clone(),
-                scope: Some(SCOPE_FOUNDER.into()),
+                scope: Some(SEAT_FOUNDER.into()),
                 obj: Some(Obj::Row(gid)),
                 conf: Some(Conf::Own),
                 cosigners: f_rest.to_vec(),
@@ -280,9 +280,20 @@ pub fn ballot_rows(b: &Ballot<'_>, arm: &Arm) -> Vec<KRow> {
     let sorted: Vec<&str> = voices.iter().map(String::as_str).collect();
     label.extend(sorted.iter().copied());
     let cid = RowId::of_label(&label);
+    // a removal its subject alone signs is the member's own leaving: CC
+    // 3.3.4's `membership:resignation`, a withdrawal by the member of the
+    // offer that seats it, which ends its seat alone (DIFFERENCES.md 5a)
+    if b.direction == Direction::Remove && to.len() == 1 && voices == to && members.contains(&to[0])
+    {
+        rows.push(KRow::new(cid, vec![head], c_signer).with_seat(SeatFields {
+            target: Some(gid),
+            ..SeatFields::of(SeatKind::Withdraw)
+        }));
+        return rows;
+    }
     rows.push(KRow::new(cid, vec![head], c_signer).with_seat(SeatFields {
         to,
-        scope: Some(SCOPE_MEMBER.into()),
+        scope: Some(SEAT_MEMBER.into()),
         obj: Some(Obj::Row(gid)),
         conf: Some(Conf::Group),
         cosigners: c_rest,

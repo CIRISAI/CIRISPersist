@@ -604,6 +604,33 @@ pub(crate) fn check_prev_head_names_held(
     stored_persist_row_hash: &str,
     authorization: Option<&serde_json::Value>,
 ) -> Result<(), Error> {
+    let verdict = prev_head_names_held(
+        kind,
+        group_key_id,
+        offered_prev_head_digest,
+        stored_persist_row_hash,
+        authorization,
+    );
+    // v62.0.0 (slice C, I1838) — the differential witness: the kernel holds
+    // a version that does not name the held head as a tip (CC 2.7.8).
+    crate::kernel::witness::held_head(
+        group_key_id,
+        stored_persist_row_hash,
+        offered_prev_head_digest,
+        offered_prev_head_digest.is_empty() && authorization.is_some(),
+        verdict.is_ok(),
+    );
+    verdict
+}
+
+/// [`check_prev_head_names_held`]'s rule.
+fn prev_head_names_held(
+    kind: &str,
+    group_key_id: &str,
+    offered_prev_head_digest: &str,
+    stored_persist_row_hash: &str,
+    authorization: Option<&serde_json::Value>,
+) -> Result<(), Error> {
     if offered_prev_head_digest == stored_persist_row_hash {
         return Ok(());
     }

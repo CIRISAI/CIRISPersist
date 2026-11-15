@@ -12608,6 +12608,84 @@ pub async fn announced_owner_state<F: super::FederationDirectory + ?Sized>(
     }
 }
 
+/// v62.0.0 (slice C) — **the owner seat, through the kernel**
+/// ([`crate::kernel::owner`]): the selves holding the `owner` seat over
+/// `node`'s key. The reads are [`live_delegation_granter_instants`]'s (the
+/// node's incoming `delegates_to`, their composers, the retractions about
+/// the node); the granter's `user` key fact is the key plane's; each seated
+/// key is named as the self it signed as at its earliest live binding's
+/// `asserted_at` ([`self_of_at`](super::self_roster::self_of_at)), so two
+/// devices of one person are one owner.
+#[cfg_attr(not(test), allow(dead_code))] // production from the switch (step 3)
+pub(crate) async fn kernel_owner_selves<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    node: &str,
+    cosign: crate::kernel::owner::Cosign,
+) -> Result<std::collections::BTreeSet<String>, Error> {
+    let mut edges = Vec::new();
+    let mut pages = AttestationQuery::to(node, FOLD_PAGE)
+        .types(&[attestation_type::DELEGATES_TO])
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        edges.extend(page);
+    }
+    let edge_ids: Vec<String> = edges.iter().map(|e| e.attestation_id.clone()).collect();
+    let mut rows = edges;
+    rows.extend(
+        directory
+            .list_composers_referencing_any(&edge_ids, Some(node), None)
+            .await?,
+    );
+    let mut retractions = Vec::new();
+    let mut pages = AttestationQuery::to(node, FOLD_PAGE)
+        .types(&[attestation_type::WITHDRAWS, attestation_type::RECANTS])
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        retractions.extend(page);
+    }
+    // the key plane: is each granter a `user` key
+    let mut users = std::collections::BTreeSet::new();
+    let granters: std::collections::BTreeSet<&str> = rows
+        .iter()
+        .filter(|r| r.attestation_type == attestation_type::DELEGATES_TO)
+        .map(|r| r.attesting_key_id.as_str())
+        .collect();
+    for g in granters {
+        if directory
+            .lookup_public_key(g)
+            .await?
+            .is_some_and(|k| identity_type::set_contains(&k.identity_type, identity_type::USER))
+        {
+            users.insert(g.to_owned());
+        }
+    }
+    let now = chrono::Utc::now();
+    let view = crate::kernel::owner::owner_rows(
+        node,
+        &rows,
+        &retractions,
+        now,
+        &|k| users.contains(k),
+        cosign,
+    );
+    let held = crate::kernel::owner::owner_holders(&view, node).value;
+    let mut selves = std::collections::BTreeSet::new();
+    for key in held {
+        let at = rows
+            .iter()
+            .filter(|r| {
+                r.attestation_type == attestation_type::DELEGATES_TO
+                    && r.attesting_key_id == key
+                    && r.attested_key_id == node
+            })
+            .map(|r| r.asserted_at)
+            .min()
+            .unwrap_or(now);
+        selves.insert(super::self_roster::self_of_at(directory, &key, at).await?);
+    }
+    Ok(selves)
+}
+
 async fn live_owner_binding_granters<F: super::FederationDirectory + ?Sized>(
     directory: &F,
     node: &str,
@@ -12697,6 +12775,16 @@ pub async fn owner_of<F: super::FederationDirectory + ?Sized>(
     node: &str,
 ) -> Result<Option<String>, Error> {
     let owners = live_owner_binding_granters(directory, node).await?;
+    // v62.0.0 (slice C, I1838) — the differential witness: the kernel's owner
+    // seat over the same held rows, with the node's cosignature required and
+    // (the counterfactual) assumed.
+    #[cfg(test)]
+    {
+        use crate::kernel::owner::Cosign;
+        let kernel = kernel_owner_selves(directory, node, Cosign::Required).await?;
+        let assumed = kernel_owner_selves(directory, node, Cosign::Assumed).await?;
+        crate::kernel::differential::owner_of(node, &owners, &kernel, &assumed);
+    }
     match owners.len() {
         0 => Ok(None),
         1 => Ok(owners.into_iter().next()),
@@ -18551,14 +18639,18 @@ where
     if row.attesting_key_id == row.attested_key_id {
         return Ok(());
     }
-    match delegation_path_hops(
+    let hops = delegation_path_hops(
         directory,
         &row.attested_key_id,
         &row.attesting_key_id,
         received_at,
     )
-    .await?
-    {
+    .await?;
+    // v62.0.0 (slice C, I1838) — the differential witness: the kernel's walk
+    // visits a cycle once and refuses no edge for closing one.
+    #[cfg(test)]
+    crate::kernel::differential::cycle_gate(row, hops);
+    match hops {
         Some(hops) => refuse(hops),
         None => Ok(()),
     }

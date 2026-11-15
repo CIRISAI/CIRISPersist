@@ -57,10 +57,17 @@ pub fn edge_rows(rows: &[&Attestation], edge: &dyn Fn(&Attestation) -> bool) -> 
             r.attestation_type == attestation_type::DELEGATES_TO || rank(&r.attestation_type) > 0
         })
         .map(|r| {
-            let target = crate::federation::precedence::references_attestation_id_from_envelope(
-                &r.attestation_envelope,
-            )
-            .map(|t| {
+            // only a structural composer's pointer names a row (CC 4.5.1.1)
+            let composer =
+                crate::federation::precedence::is_structural_composer(&r.attestation_type);
+            let pointer = composer
+                .then(|| {
+                    crate::federation::precedence::references_attestation_id_from_envelope(
+                        &r.attestation_envelope,
+                    )
+                })
+                .flatten();
+            let target = pointer.map(|t| {
                 id_of
                     .get(t)
                     .copied()

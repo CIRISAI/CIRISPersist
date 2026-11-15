@@ -28,7 +28,7 @@
 //! The genesis-record path of the CC sentence is not presented: no persist
 //! genesis bundle carries an owner binding today (left for the next slice).
 
-use super::law::{seat_law, SCOPE_OWNER};
+use super::law::{seat_law, SEAT_OWNER};
 use super::view::{micros, KRow, NoCut, RowId, SeatFields};
 use super::Answer;
 use crate::federation::types::{attestation_type, Attestation};
@@ -123,7 +123,7 @@ pub fn owner_rows(
                 .at(micros(b.asserted_at))
                 .with_seat(SeatFields {
                     to: vec![b.attesting_key_id.clone()],
-                    scope: Some(SCOPE_OWNER.into()),
+                    scope: Some(SEAT_OWNER.into()),
                     obj: Some(Obj::Key(node.to_owned())),
                     conf: Some(Conf::Own),
                     cosigners,
@@ -134,7 +134,11 @@ pub fn owner_rows(
     // the composers naming a binding, folded one signer's chain at a time
     let composers: Vec<KRow> = rows
         .iter()
-        .filter(|r| rank(&r.attestation_type) > 0)
+        .filter(|r| crate::federation::precedence::is_structural_composer(&r.attestation_type))
+        // CC 3.2: a node cannot outrun its owner — the node's own retraction
+        // of its owner binding is no withdrawal of the seat (a node has no
+        // agency; the ownerless-lock reclaim is the ceremony that ends it)
+        .filter(|r| r.attesting_key_id != node)
         .filter_map(|r| {
             let t = crate::federation::precedence::references_attestation_id_from_envelope(
                 &r.attestation_envelope,
@@ -205,7 +209,7 @@ pub fn owner_holders(rows: &[KRow], node: &str) -> Answer<BTreeSet<String>> {
     let c = layers::conclude(rows.iter(), |p| seat_rule(p, law, &NoCut, &|_| false), None);
     let seats = Seats::new(&c, law, &NoCut, None);
     let obj = Obj::Key(node.to_owned());
-    let value = seats.holders(SCOPE_OWNER, &obj, None);
+    let value = seats.holders(SEAT_OWNER, &obj, None);
     let read: Vec<RowId> = seats
         .recs
         .iter()
@@ -304,7 +308,12 @@ mod tests {
             )
         };
         assert!(holders(&[b.clone(), wd("w", "O")], &[], Cosign::Required).is_empty());
-        assert!(holders(&[b.clone(), wd("w", "N")], &[], Cosign::Required).is_empty());
+        // CC 3.2: a node cannot outrun its owner — its own retraction is no
+        // withdrawal of the seat (the ownerless-lock reclaim is the ceremony)
+        assert_eq!(
+            holders(&[b.clone(), wd("w", "N")], &[], Cosign::Required).len(),
+            1
+        );
         assert_eq!(
             holders(&[b.clone(), wd("w", "T")], &[], Cosign::Required).len(),
             1
