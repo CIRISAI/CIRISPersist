@@ -704,6 +704,10 @@ impl ConsentSweepReport {
     }
 }
 
+/// I1783 — the accord lineage cross-implementation vector (CIRISVerify).
+#[cfg(test)]
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+mod accord_lineage_vector;
 /// v53.0.0 (CC 4.2.6) — I450e–I450h, the accord's roster change.
 #[cfg(test)]
 mod accord_roster_invariants;
