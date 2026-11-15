@@ -151,6 +151,5 @@ ignore = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "warn"
-# v62.0.0 — the kernel crate (CIRISKernel), pinned by rev until it tags
-# (TODO(kernel-v0.1.0) in Cargo.toml).
+# v62.0.0 — the kernel crate (CIRISKernel), pinned at tag kernel-v0.1.0.
 allow-git = ["https://github.com/CIRISAI/CIRISKernel"]
