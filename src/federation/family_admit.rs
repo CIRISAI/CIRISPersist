@@ -71,6 +71,8 @@ pub(crate) async fn put_family_local_planned<D: FamilyStore>(
     mut row: Family,
 ) -> Result<(), Error> {
     super::admission::check_family_consensus_protocol_form(&row.consensus_protocol)?;
+    // v61.4.0 (CC rc19 6453665) — `custom:` is removed.
+    super::admission::check_consensus_protocol_not_custom(&row.consensus_protocol)?;
     // v13.3.0 (CIRISPersist#386) — every member key_id must be a registered
     // key (the dropped family_key_id FK's real invariant).
     super::admission::validate_family_members(dir, &row).await?;

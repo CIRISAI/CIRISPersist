@@ -4443,7 +4443,9 @@ pub(crate) mod test_support {
                 crate::federation::ReplicatedCommunityOutcome::Inserted,
                 "({suffix}) P3: the replicated entry admits the legacy room as data"
             );
-            dir.put_community_membership_revocation(ts::sign_community_membership_revocation(
+            // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one
+            // signature never removes; an overruler cosigns the removal.
+            let mut removal = ts::sign_community_membership_revocation(
                 &human,
                 crate::federation::types::CommunityMembershipRevocation {
                     community_key_id: room.clone(),
@@ -4454,9 +4456,11 @@ pub(crate) mod test_support {
                     witness_set: vec![],
                     persist_row_hash: String::new(),
                 },
-            ))
-            .await
-            .unwrap_or_else(|e| panic!("({suffix}) P3 {leg}: the human's removal lands: {e}"));
+            );
+            ts::cosign_community_membership_revocation(&mut removal, &overrulers[0]);
+            dir.put_community_membership_revocation(removal)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) P3 {leg}: the human's removal lands: {e}"));
             let row_hash = dir
                 .list_community_membership_revocations_for(&room)
                 .await
@@ -4626,7 +4630,7 @@ pub(crate) mod test_support {
                 .is_empty(),
             "({suffix}) I181: nothing stored"
         );
-        dir.put_community_membership_revocation(ts::sign_community_membership_revocation(
+        let removal = ts::sign_community_membership_revocation(
             &bob,
             CommunityMembershipRevocation {
                 community_key_id: community.clone(),
@@ -4637,9 +4641,23 @@ pub(crate) mod test_support {
                 witness_set: vec![],
                 persist_row_hash: String::new(),
             },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("({suffix}) I181: one member's removal lands: {e}"));
+        );
+        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d, "the floor of two
+        // voices stands under every protocol"): one member's signature never
+        // removes, reverse_quorum included; two land it, and the objection
+        // fold still undoes it.
+        dir.put_community_membership_revocation(removal.clone())
+            .await
+            .expect_err("one member's signature never removes another");
+        assert!(
+            active().await.contains(&carol),
+            "({suffix}) I181: carol stays"
+        );
+        let mut removal = removal;
+        ts::cosign_community_membership_revocation(&mut removal, &alice);
+        dir.put_community_membership_revocation(removal)
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I181: two members' removal lands: {e}"));
         assert!(
             !active().await.contains(&carol),
             "({suffix}) I181: carol is out"

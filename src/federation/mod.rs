@@ -2189,6 +2189,49 @@ where
     Ok(out)
 }
 
+/// v61.4.0 (CC 4.5.13 rc19 b9d267c, "a moderator removes an agent alone") —
+/// is `key_id` an AI agent's key: `agent`-typed and not a person's (`user`)?
+/// Fixed at mint, so every replay reads the same answer.
+async fn is_ai_agent_key<F>(directory: &F, key_id: &str) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Ok(directory.lookup_public_key(key_id).await?.is_some_and(|k| {
+        types::identity_type::set_contains(&k.identity_type, types::identity_type::AGENT)
+            && !types::identity_type::set_contains(&k.identity_type, types::identity_type::USER)
+    }))
+}
+
+/// v61.4.0 — the moderation roots among `signers` that held authority (were
+/// active, steward-bound founders) at `at`: a zero-hop moderator signing for
+/// itself. [`moderator_roots_at`] reads only roots that reach ANOTHER signer;
+/// this is the agent-removal standing alone (CC 4.5.13).
+async fn founders_signing_at<F>(
+    directory: &F,
+    roots: &std::collections::BTreeSet<String>,
+    intervals: &RootAuthorityIntervals,
+    signers: &std::collections::BTreeSet<String>,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<std::collections::BTreeSet<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut out = std::collections::BTreeSet::new();
+    for r in roots.iter().filter(|r| signers.contains(*r)) {
+        let in_authority = intervals.get(r).is_some_and(|iv| {
+            iv.iter()
+                .any(|(start, end)| *start <= at && end.is_none_or(|e| at < e))
+        });
+        // A non-steward-bound founder roots no duty (CC 4.5.4).
+        if in_authority
+            && Box::pin(admission::is_steward_bound(directory.as_dyn_directory(), r)).await?
+        {
+            out.insert(r.clone());
+        }
+    }
+    Ok(out)
+}
+
 fn signer_set(e: &types::RosterEventSigner) -> std::collections::BTreeSet<String> {
     e.authority_key_id
         .iter()
@@ -2285,6 +2328,14 @@ where
                 ev.effective_at,
             ))
             .await?;
+            // v61.4.0 (CC 4.5.13 rc19 b9d267c) — the door's agent-removal
+            // standing, read the same way at every replay.
+            if !ev.is_add && is_ai_agent_key(directory, &ev.member.key_id).await? {
+                ev.moderator_roots.extend(
+                    founders_signing_at(directory, roots, &intervals, &ev.signers, ev.effective_at)
+                        .await?,
+                );
+            }
         }
     }
     if reverse_candidates.is_empty() {
@@ -2701,22 +2752,34 @@ where
     // admitted (an admitted row is not unsaid by a later gate), and an exact
     // retry of a held row is not a new removal.
     let held_retry = events.iter().any(is_this_row);
+    // v61.4.0 (CC 4.5.13 rc19 b9d267c, "a moderator removes an agent alone")
+    // — the one removal a moderator's standing reaches: an AI agent's key
+    // (agent-typed, not a person's).
+    let target_is_agent = is_revocation && is_ai_agent_key(directory, &incoming.key_id).await?;
     let events: Vec<RosterEvent> = events.into_iter().filter(|e| !is_this_row(e)).collect();
     let (state, _, high_water) = fold_roster(record_members, rules, &events, effective_at);
     let moderator_roots = match moderation_roots {
-        Some(mut roots) if !is_revocation || held_retry => {
+        Some(mut roots) if !is_revocation || held_retry || target_is_agent => {
             if !is_revocation && incoming.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER) {
                 roots.remove(&incoming.key_id);
             }
-            Box::pin(moderator_roots_at(
+            let intervals = root_authority_intervals(record_members, rules, &events, &roots);
+            let mut out = Box::pin(moderator_roots_at(
                 directory,
                 group_key_id,
                 &roots,
-                &root_authority_intervals(record_members, rules, &events, &roots),
+                &intervals,
                 signers,
                 effective_at,
             ))
-            .await?
+            .await?;
+            if target_is_agent {
+                out.extend(
+                    founders_signing_at(directory, &roots, &intervals, signers, effective_at)
+                        .await?,
+                );
+            }
+            out
         }
         _ => std::collections::BTreeSet::new(),
     };
@@ -2758,6 +2821,65 @@ where
             detail,
             shortfall,
         } => return Err(refusal(rule, &detail, shortfall)),
+    };
+    // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at CIRISConstitution dfde68d,
+    // "The floor of two voices stands under every protocol ... A removal has
+    // no such second voice, so one signature never removes"; CC 4.5.13) — a
+    // NEW removal of another member needs two voices besides the member it
+    // removes, whatever the protocol (`quorum:1/N` and `founder_only`
+    // included). A resignation (the member signs) is the exit and needs no
+    // one; a moderator's removal of an AI agent's key stands alone. Asked
+    // here at the door only: removals the fold already admitted are not unsaid
+    // by this later gate. Short by signatures, so held like any shortfall.
+    let short = match short {
+        None if is_revocation
+            && !held_retry
+            && !e.signers.contains(&e.member.key_id)
+            && !(target_is_agent && !e.moderator_roots.is_empty()) =>
+        {
+            let persons = rules.persons.at(effective_at);
+            let target = persons.seat_person(&e.member.key_id);
+            let active_persons: std::collections::BTreeSet<&str> = state
+                .iter()
+                .filter(|(_, (active, _))| *active)
+                .map(|(k, _)| persons.seat_person(k))
+                .collect();
+            // CC 4.4.3.2.8 — an affiliation's designated official is the
+            // second voice its one-voice countersign rule names.
+            let officials = affiliation_config::designated_official_keys(rules.policy_blob);
+            let official_persons: std::collections::BTreeSet<&str> =
+                officials.iter().map(|k| persons.seat_person(k)).collect();
+            let voices: std::collections::BTreeSet<&str> = e
+                .signers
+                .iter()
+                .filter_map(|k| persons.voice(k))
+                .filter(|p| {
+                    *p != target && (active_persons.contains(p) || official_persons.contains(p))
+                })
+                .collect();
+            (voices.len() < consensus::REMOVAL_VOICE_FLOOR).then(|| {
+                let mut eligible: Vec<String> = state
+                    .iter()
+                    .filter(|(k, (active, _))| *active && persons.seat_person(k) != target)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                eligible.sort();
+                refusal(
+                    ROSTER_CONSENSUS_INSUFFICIENT,
+                    &format!(
+                        "removal floor: {} voice(s) besides the member removed; one \
+                         signature never removes (CC 3.1.3.2, CC 4.5.13)",
+                        voices.len()
+                    ),
+                    Some(consensus::ConsensusShortfall {
+                        have: voices.len(),
+                        need: consensus::REMOVAL_VOICE_FLOOR,
+                        eligible_signer_key_ids: Some(eligible),
+                    }),
+                )
+            })
+        }
+        other => other,
     };
     // v52.0.0 (CIRISPersist#955) — a GROWTH (a key not active before this
     // instant) needs the member's own acceptance, under every protocol. The

@@ -6290,11 +6290,13 @@ mod tests {
             witness_set: vec![],
             persist_row_hash: String::new(),
         };
-        // Honest: signed by e4-fmr-authority — admits.
+        // Honest — admits. v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at
+        // dfde68d): one signature never removes another member, so the
+        // honest revocation is the member's own resignation.
         backend
             .put_family_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
-                    "e4-fmr-authority",
+                    "e4-fmr-member",
                     rev.clone(),
                 ),
             )

@@ -229,6 +229,10 @@ where
         return Ok(OccupiedRoute::Settled(CommunityWrite::Unchanged));
     }
     super::admission::check_family_consensus_protocol_form(&f.consensus_protocol)?;
+    // v61.4.0 (CC rc19 6453665) — never moved onto a removed `custom:`.
+    if held.consensus_protocol != f.consensus_protocol {
+        super::admission::check_consensus_protocol_not_custom(&f.consensus_protocol)?;
+    }
     super::admission::validate_family_members(dir, f).await?;
     // v53.0.0 (CC 3.2 T6, consequence (i)) — a family version carries no
     // signed instant, so it is judged at admission.
@@ -681,6 +685,8 @@ where
     F: FederationDirectory + ?Sized,
 {
     super::admission::check_family_consensus_protocol_form(&new.family.consensus_protocol)?;
+    // v61.4.0 (CC rc19 6453665) — `custom:` is removed.
+    super::admission::check_consensus_protocol_not_custom(&new.family.consensus_protocol)?;
     super::verify_family_admission(dir, &new).await?;
     // v52.0.0 (#956) — a dissolved family admits no change, on either door.
     super::family_dissolution::refuse_if_held_family_dissolved(dir, &new.family.family_key_id)
@@ -746,6 +752,8 @@ where
     F: FederationDirectory + ?Sized,
 {
     super::check_consensus_protocol_form(&new.community.consensus_protocol)?;
+    // v61.4.0 (CC rc19 6453665) — `custom:` is removed.
+    super::admission::check_consensus_protocol_not_custom(&new.community.consensus_protocol)?;
     // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the held record is the
     // cohort this door addresses, the new version declares the same cohort,
     // and an affiliation's config validates against the new roster.

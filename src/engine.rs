@@ -20536,9 +20536,11 @@ mod tests {
                 cohort,
                 group,
                 &mem_b,
+                // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one
+                // signature never removes another member; mem_b resigns.
                 crate::federation::tier_ingest::test_support::sign_revoke_spec(
                     cohort,
-                    &founder,
+                    &mem_b,
                     group,
                     &mem_b,
                     chrono::Utc::now(),
@@ -21237,9 +21239,17 @@ mod tests {
                     for key in &keys {
                         ts::register_hybrid_key_as(d, key, key, identity_type::USER).await;
                     }
-                    d.put_community(community(&room, &keys[..n], founders, cp))
-                        .await
-                        .unwrap_or_else(|e| panic!("{tag}: put_community: {e}"));
+                    // v61.4.0 (CC rc19 6453665) — a `custom:` room is a
+                    // legacy room now, delivered as data.
+                    if cp.starts_with(types::consensus_protocol::CUSTOM_PREFIX) {
+                        d.apply_replicated_community(community(&room, &keys[..n], founders, cp))
+                            .await
+                            .unwrap_or_else(|e| panic!("{tag}: legacy room: {e}"));
+                    } else {
+                        d.put_community(community(&room, &keys[..n], founders, cp))
+                            .await
+                            .unwrap_or_else(|e| panic!("{tag}: put_community: {e}"));
+                    }
                     (room, keys)
                 }
             };

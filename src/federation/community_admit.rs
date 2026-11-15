@@ -278,6 +278,12 @@ where
     let row = &community.community;
     // v4.0 — the consensus_protocol canonical form.
     super::check_consensus_protocol_form(&row.consensus_protocol)?;
+    // v61.4.0 (CC rc19 6453665) — `custom:` is removed: refused on the local
+    // door; a replicated version is refused only when it moves a stored room
+    // onto it (`check_replicated_supersede_does_not_degrade`).
+    if door != CommunityDoor::ReplicatedApply {
+        super::admission::check_consensus_protocol_not_custom(&row.consensus_protocol)?;
+    }
     // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the declared cohort parses,
     // a config rides only on an affiliation, and an affiliation's config
     // validates against its roster.

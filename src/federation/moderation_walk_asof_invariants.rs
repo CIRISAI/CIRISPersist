@@ -436,9 +436,16 @@ pub mod bodies {
             "[{tag}] I1524: hank stays after mo's refused removal"
         );
         tick().await;
+        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one signature
+        // never removes, the founder's included; at two members only the
+        // member's own resignation does.
         dir.put_community_membership_revocation(revoke(&alice))
             .await
-            .unwrap_or_else(|e| panic!("[{tag}] I1524: the protocol removes: {e}"));
+            .expect_err("I1524: the founder alone removes nobody either");
+        tick().await;
+        dir.put_community_membership_revocation(revoke(&hank))
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] I1524: hank resigns: {e}"));
         assert!(
             !held(dir.active_community_members(&here).await.unwrap()),
             "[{tag}] I1524: hank is gone after the protocol's removal"

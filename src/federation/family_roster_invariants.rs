@@ -347,9 +347,11 @@ pub mod bodies {
             at("2026-04-01T00:00:00Z"),
             at("2026-05-01T00:00:00Z"),
         );
-        revoke_by(a, &[alice], revocation(&fam, carol, t2))
+        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one signature
+        // never removes another member; carol resigns.
+        revoke_by(a, &[carol], revocation(&fam, carol, t2))
             .await
-            .unwrap_or_else(|e| panic!("{tag} I177: the founder removes carol: {e}"));
+            .unwrap_or_else(|e| panic!("{tag} I177: carol resigns: {e}"));
         assert!(!admitted(a, carol, &fam).await, "{tag} I177: removed");
         widen_by(a, &[alice], widening(&fam, carol, t3, None))
             .await
@@ -358,7 +360,7 @@ pub mod bodies {
             admitted(a, carol, &fam).await,
             "{tag} I177 (#910.1): the re-added member is active again"
         );
-        revoke_by(a, &[alice], revocation(&fam, carol, t4))
+        revoke_by(a, &[carol], revocation(&fam, carol, t4))
             .await
             .unwrap_or_else(|e| panic!("{tag} I177: a re-added member can be removed again: {e}"));
         assert!(!admitted(a, carol, &fam).await, "{tag} I177: removed again");
@@ -373,7 +375,7 @@ pub mod bodies {
             "{tag} I177 (#910.1): two removals of one member are two rows"
         );
         // The exact retry of a stored removal is still the #861 no-op.
-        revoke_by(a, &[alice], revocation(&fam, carol, t4))
+        revoke_by(a, &[carol], revocation(&fam, carol, t4))
             .await
             .unwrap_or_else(|e| panic!("{tag} I177: the #861 retry is Ok: {e}"));
         assert_eq!(

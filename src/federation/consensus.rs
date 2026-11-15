@@ -121,6 +121,13 @@ pub struct Ballot<'a> {
 /// not among them, sign a removal.
 pub const OPEN_SELF_ADMIT_REMOVAL_FLOOR: usize = 2;
 
+/// v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at CIRISConstitution dfde68d, CC
+/// 4.5.13) — the voices a removal of another member needs under EVERY
+/// protocol, the member removed not among them. The roster door asks it
+/// (`check_roster_authority_over`); a resignation and a moderator's removal of
+/// an AI agent's key are outside it.
+pub const REMOVAL_VOICE_FLOOR: usize = 2;
+
 /// v61 S2 (CC 4.5.13, the release lead's ruling) — under `open:self_admit`
 /// each counted voice of a removal signs within this many seconds of the
 /// removal's asserted instant (72 hours). A roster cosignature carries no

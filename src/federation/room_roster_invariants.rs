@@ -105,8 +105,10 @@ pub mod bodies {
         )
         .await
         .unwrap_or_else(|e| panic!("{tag}: seal before: {e}"));
+        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one signature never
+        // removes another member; the removed member resigns.
         b.put_community_membership_revocation(ts::sign_community_membership_revocation(
-            &alice,
+            &bob,
             revocation(&room, &bob, at("2026-02-01T00:00:00Z")),
         ))
         .await
@@ -473,11 +475,13 @@ pub mod bodies {
             let carol = format!("{tg}-carol");
             ts::register_hybrid_key_as(*d, &carol, &carol, identity_type::USER).await;
             let w1 = ts::sign_community_membership_widening(&alice, widening(&room, &carol, t1));
+            // v61.4.0 (CIRISPersist#1201): carol resigns (one signature
+            // never removes another member).
             let r2 =
-                ts::sign_community_membership_revocation(&alice, revocation(&room, &carol, t2));
+                ts::sign_community_membership_revocation(&carol, revocation(&room, &carol, t2));
             let w3 = ts::sign_community_membership_widening(&alice, widening(&room, &carol, t3));
             let r4 =
-                ts::sign_community_membership_revocation(&alice, revocation(&room, &carol, t4));
+                ts::sign_community_membership_revocation(&carol, revocation(&room, &carol, t4));
             let events: Vec<(&str, usize)> = match i {
                 0 => vec![("w", 1), ("r", 2), ("w", 3), ("r", 4)],
                 1 => vec![("r", 4), ("w", 3), ("r", 2), ("w", 1)],
@@ -708,8 +712,10 @@ pub mod bodies {
         let t1 = at("2026-03-01T00:00:00Z");
         let t2 = at("2026-03-02T00:00:00Z");
         let t3 = at("2026-03-03T00:00:00Z");
+        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one signature never
+        // removes another member; the removed member resigns.
         d.put_community_membership_revocation(ts::sign_community_membership_revocation(
-            &alice,
+            &bob,
             revocation(&room, &bob, t1),
         ))
         .await
@@ -721,7 +727,7 @@ pub mod bodies {
         .await
         .unwrap();
         d.put_community_membership_revocation(ts::sign_community_membership_revocation(
-            &alice,
+            &bob,
             revocation(&room, &bob, t3),
         ))
         .await

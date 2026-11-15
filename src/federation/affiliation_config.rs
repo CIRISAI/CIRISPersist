@@ -664,6 +664,23 @@ pub fn declared_cohort(c: &Community) -> Result<Cohort, Error> {
     }
 }
 
+/// v61.4.0 (CIRISPersist#1201; CC 4.4.3.2.8) — the designated officials'
+/// keys a group's `policy_blob` names: the outside voice an affiliation's
+/// countersign rule counts. Empty when none are named or the member does not
+/// parse (the record door refuses a malformed config).
+#[must_use]
+pub fn designated_official_keys(policy_blob: Option<&serde_json::Value>) -> BTreeSet<String> {
+    policy_blob
+        .and_then(serde_json::Value::as_object)
+        .and_then(|o| o.get(POLICY_AFFILIATION_CONFIG_FIELD))
+        .and_then(|v| serde_json::from_value::<AffiliationConfig>(v.clone()).ok())
+        .and_then(|c| c.designated_officials)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|o| o.key_id)
+        .collect()
+}
+
 /// The record's typed config, if it carries one (no validation).
 ///
 /// # Errors

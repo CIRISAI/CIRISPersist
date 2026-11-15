@@ -490,21 +490,25 @@ pub(crate) mod family_events {
             );
         }
         let at = Utc::now() - Duration::minutes(5);
+        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one signature
+        // never removes another member, founder_only included; Q cosigns.
+        let mut removal = ts::sign_family_membership_revocation(
+            &p,
+            FamilyMembershipRevocation {
+                family_key_id: fam.clone(),
+                removed_identity_key_id: r.clone(),
+                removed_at: at,
+                effective_at: at,
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        );
+        ts::cosign_family_membership_revocation(&mut removal, &q);
         p_node
-            .put_family_membership_revocation(ts::sign_family_membership_revocation(
-                &p,
-                FamilyMembershipRevocation {
-                    family_key_id: fam.clone(),
-                    removed_identity_key_id: r.clone(),
-                    removed_at: at,
-                    effective_at: at,
-                    reason: None,
-                    witness_set: vec![],
-                    persist_row_hash: String::new(),
-                },
-            ))
+            .put_family_membership_revocation(removal)
             .await
-            .expect("I1521: P removes R");
+            .expect("I1521: P and Q remove R");
         let removal = plane_row(p_node, &fam, MEMBERSHIP_REMOVAL_DIMENSION).await;
         assert_eq!(
             carry(r_node, &removal).await,

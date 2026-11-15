@@ -165,7 +165,17 @@ pub(crate) mod bodies {
         .await
         .unwrap();
         seat(d, &pair, &f, &m, at).await;
-        remove(d, &pair, &[&f], &m, at + Duration::minutes(5))
+        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d) — one seat's
+        // signature never removes, founder_only included: both seats do.
+        let e = remove(d, &pair, &[&f], &m, at + Duration::minutes(4))
+            .await
+            .expect_err("I1513: one of two seats never removes");
+        assert_eq!(
+            rule(&e),
+            crate::federation::ROSTER_CONSENSUS_INSUFFICIENT,
+            "{e}"
+        );
+        remove(d, &pair, &[&f, &g], &m, at + Duration::minutes(5))
             .await
             .expect("I1513: a body of two seats");
     }

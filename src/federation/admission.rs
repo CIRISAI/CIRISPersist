@@ -8592,6 +8592,34 @@ pub fn check_consensus_protocol_form(consensus_protocol: &str) -> Result<(), Err
     }
 }
 
+/// v61.4.0 (CC 3.3.4, 4.4.3.4.2.1 at CIRISConstitution 6453665, which
+/// removes `custom:`) — the refusal token for a group declaring a
+/// `custom:{id}` protocol. `Error::ConsensusProtocolMalformed` carries the
+/// protocol; this token leads its Display through
+/// [`check_consensus_protocol_not_custom`].
+pub const CONSENSUS_PROTOCOL_CUSTOM_REMOVED: &str = "consensus_protocol_custom_removed";
+
+/// v61.4.0 (CC rc19 6453665: `custom:` is removed) — **refuse a declaration of
+/// `custom:{id}`** at every door that accepts a `consensus_protocol`: a new
+/// community or family, a supersede, and a replicated version that moves a
+/// stored group onto it. A group already stored under `custom:` keeps folding
+/// as data (inert, never rewritten); its next version names another protocol.
+/// `weighted:` stays declarable.
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] led by [`CONSENSUS_PROTOCOL_CUSTOM_REMOVED`]
+/// (Python `ValueError`).
+pub fn check_consensus_protocol_not_custom(consensus_protocol: &str) -> Result<(), Error> {
+    if consensus_protocol.starts_with(crate::federation::types::consensus_protocol::CUSTOM_PREFIX) {
+        return Err(Error::InvalidArgument(format!(
+            "{CONSENSUS_PROTOCOL_CUSTOM_REMOVED}: {consensus_protocol:?} — `custom:` protocols \
+             are removed (CC 3.3.4, CC 4.4.3.4.2.1); declare a canonical protocol"
+        )));
+    }
+    Ok(())
+}
+
 /// v61 (CIRISPersist#1123; CC 4.4.3.2) — a FAMILY's `consensus_protocol`:
 /// [`check_consensus_protocol_form`], and never `open:self_admit`, which is a
 /// `public` group's protocol and a family is never public. Refused as
@@ -16528,6 +16556,10 @@ pub async fn check_replicated_supersede_does_not_degrade(
         // room already stored under it still syncs its versions as data.
         if stored.consensus_protocol != super::types::consensus_protocol::FOUNDER_ONLY {
             check_founder_only_above_family(offered)?;
+        }
+        // v61.4.0 (CC rc19 6453665) — nor onto a removed `custom:` protocol.
+        if stored.consensus_protocol != offered.consensus_protocol {
+            check_consensus_protocol_not_custom(&offered.consensus_protocol)?;
         }
         return Ok(());
     }

@@ -108,9 +108,12 @@ pub mod bodies {
         // v61, as the field holds one), which a peer still delivers: the
         // replicated door admits it as data, and every fold reads it as
         // before. An affiliation keeps `founder_only` on the local door.
-        let legacy = protocol == consensus_protocol::FOUNDER_ONLY
+        // v61.4.0 (CC rc19 6453665) — so is a `custom:` room: removed at
+        // declaration, still folded as data.
+        let legacy = (protocol == consensus_protocol::FOUNDER_ONLY
             && crate::federation::affiliation_config::declared_cohort(&community.community)
-                .is_ok_and(|c| c != crate::federation::cohort::Cohort::Affiliations);
+                .is_ok_and(|c| c != crate::federation::cohort::Cohort::Affiliations))
+            || protocol.starts_with(consensus_protocol::CUSTOM_PREFIX);
         if legacy {
             let outcome = d
                 .apply_replicated_community(community)
@@ -251,9 +254,11 @@ pub mod bodies {
             admitted(d, &carol, &room).await,
             "{tag} I170: a widened member is admitted (#907)"
         );
+        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one signature never
+        // removes another member; the removed member resigns.
         revoke(
             d,
-            &alice,
+            &carol,
             revocation(&room, &carol, at("2026-03-02T00:00:00Z")),
         )
         .await
@@ -1164,14 +1169,12 @@ pub mod bodies {
 
     /// The store-half setup: a room, bob removed by alice.
     pub async fn i173_setup(d: &dyn FederationDirectory, tag: &str) -> (String, String) {
-        let (room, alice, bob) = make_room(d, tag, "quorum:1/1").await;
-        revoke(
-            d,
-            &alice,
-            revocation(&room, &bob, at("2026-03-01T00:00:00Z")),
-        )
-        .await
-        .unwrap();
+        let (room, _alice, bob) = make_room(d, tag, "quorum:1/1").await;
+        // v61.4.0 (CIRISPersist#1201; CC 3.1.3.2 at dfde68d): one signature never
+        // removes another member; the removed member resigns.
+        revoke(d, &bob, revocation(&room, &bob, at("2026-03-01T00:00:00Z")))
+            .await
+            .unwrap();
         (room, bob)
     }
 }

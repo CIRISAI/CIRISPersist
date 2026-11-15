@@ -1509,6 +1509,223 @@ pub(crate) mod bodies {
         );
     }
 
+    /// **I1753** (CIRISPersist#1201; CC 3.1.3.2 at CIRISConstitution dfde68d,
+    /// "the floor of two voices stands under every protocol ... one signature
+    /// never removes"; CC 4.5.13 rc19 b9d267c, a moderator removes an AI
+    /// agent alone). At a node that is not the primary's (refused, not held):
+    ///
+    /// - `quorum:1/3`: one member removing another is
+    ///   `roster_consensus_insufficient` with `have 1, need 2`; the removed
+    ///   member resigns alone; two members other than the target remove;
+    /// - a `founder_only` family of two founders: one founder never removes
+    ///   the other (`have 1, need 2`);
+    /// - a room's founder (its moderator, zero-hop) removes an AI agent's key
+    ///   alone, and never a person.
+    ///
+    /// Mutation: drop the door's floor → each one-signature removal lands: red.
+    pub(crate) async fn i1753_one_signature_never_removes<D: Node>(d: &D, tag: &str) {
+        use crate::federation::membership_acceptance_invariants::bodies::found_family;
+        use crate::federation::types::{identity_type, FamilyMembershipRevocation};
+        let count = |e: &Error| match e {
+            Error::RosterAuthorityUnauthorized {
+                rule, shortfall, ..
+            } => (*rule, shortfall.as_ref().map(|s| (s.have, s.need))),
+            other => panic!("I1753: a standing refusal, got {other:?}"),
+        };
+        let removal = |cid: &str, signers: &[&str], target: &str, t: DateTime<Utc>| {
+            let mut r = ts::sign_community_membership_revocation(
+                signers[0],
+                CommunityMembershipRevocation {
+                    community_key_id: cid.to_owned(),
+                    removed_identity_key_id: target.to_owned(),
+                    removed_at: t,
+                    effective_at: t,
+                    reason: None,
+                    witness_set: Vec::new(),
+                    persist_row_hash: String::new(),
+                },
+            );
+            for c in &signers[1..] {
+                ts::cosign_community_membership_revocation(&mut r, c);
+            }
+            r
+        };
+        let t0 = ms(Utc::now() - Duration::hours(2));
+        let at_i = |i: i64| t0 + Duration::minutes(i);
+
+        // quorum:1/3, three founders.
+        let r = room(d, tag, "i1753q", "quorum:1/3", 3).await;
+        d.set_node(&format!("i1753-elsewhere-{tag}"));
+        let (a, b, c) = (&r.founders[0], &r.founders[1], &r.founders[2]);
+        let e = d
+            .put_community_membership_revocation(removal(&r.cid, &[a], c, at_i(1)))
+            .await
+            .expect_err("I1753: one signature never removes");
+        assert_eq!(
+            count(&e),
+            (ROSTER_CONSENSUS_INSUFFICIENT, Some((1, 2))),
+            "{e:?}"
+        );
+        // The target's own signature is no second voice for removing them.
+        assert!(active(d, &r.cid, c).await);
+        d.put_community_membership_revocation(removal(&r.cid, &[a, b], c, at_i(2)))
+            .await
+            .expect("I1753: two voices besides the target remove");
+        assert!(!active(d, &r.cid, c).await);
+        d.put_community_membership_revocation(removal(&r.cid, &[b], b, at_i(3)))
+            .await
+            .expect("I1753: a resignation needs no one");
+        assert!(!active(d, &r.cid, b).await);
+
+        // founder_only, a family of two.
+        let (ff, fg, fam) = (
+            format!("i1753-ff-{tag}"),
+            format!("i1753-fg-{tag}"),
+            format!("i1753-fam-{tag}"),
+        );
+        reg(d, &[&ff, &fg]).await;
+        found_family(d, &fam, "founder_only", &[&ff, &fg], &[])
+            .await
+            .expect("I1753: the family");
+        let e = d
+            .put_family_membership_revocation(ts::sign_family_membership_revocation(
+                &ff,
+                FamilyMembershipRevocation {
+                    family_key_id: fam.clone(),
+                    removed_identity_key_id: fg.clone(),
+                    removed_at: at_i(4),
+                    effective_at: at_i(4),
+                    reason: None,
+                    witness_set: Vec::new(),
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .expect_err("I1753: founder_only, one founder never removes the other");
+        assert_eq!(
+            count(&e),
+            (ROSTER_CONSENSUS_INSUFFICIENT, Some((1, 2))),
+            "{e:?}"
+        );
+
+        // The moderator and the agent.
+        let rm = room(d, tag, "i1753m", "majority", 1).await;
+        d.set_node(&format!("i1753-elsewhere-{tag}"));
+        let f = rm.founders[0].clone();
+        let person = format!("i1753-person-{tag}");
+        let agent = format!("i1753-agent-{tag}");
+        reg(d, &[&person]).await;
+        ts::register_hybrid_key_as(d, &agent, &agent, identity_type::AGENT).await;
+        // The agent is steward-bound: an occurrence of the person (CC 3.2).
+        d.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            identity_key_id: person.clone(),
+            occurrence_key_id: agent.clone(),
+            device_class: crate::federation::types::device_class::LAPTOP.into(),
+            hardware_attestation: None,
+            asserted_at: at_i(0),
+            valid_until: None,
+            encryption_pubkeys: None,
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        })
+        .await
+        .expect("I1753: the agent occurs for the person");
+        for (i, k) in [(5, &person), (6, &agent)] {
+            let w = widening_by(&rm, &f, k, at_i(i));
+            // At two members a majority is both.
+            let w = if i == 6 { cosigned(&w, &[&person]) } else { w };
+            consent(d, &w).await;
+            d.put_community_membership_widening(w)
+                .await
+                .unwrap_or_else(|e| panic!("I1753: seat {k}: {e}"));
+        }
+        let e = d
+            .put_community_membership_revocation(removal(&rm.cid, &[&f], &person, at_i(7)))
+            .await
+            .expect_err("I1753: a moderator never removes a person alone");
+        assert_eq!(count(&e).0, ROSTER_CONSENSUS_INSUFFICIENT, "{e:?}");
+        assert!(active(d, &rm.cid, &person).await);
+        d.put_community_membership_revocation(removal(&rm.cid, &[&f], &agent, at_i(8)))
+            .await
+            .expect("I1753: the moderator removes an AI agent's key alone");
+        assert!(!active(d, &rm.cid, &agent).await);
+    }
+
+    /// **I1754** (CC 3.3.4, 4.4.3.4.2.1 at CIRISConstitution 6453665:
+    /// `custom:` is removed) — a community or family declaring `custom:{id}`
+    /// is refused `consensus_protocol_custom_removed` at put; a room stored
+    /// under `custom:` (a peer's legacy version, applied as data) keeps
+    /// folding; `weighted:` stays declarable. Mutation: the check returns Ok
+    /// → the custom room founds: red.
+    pub(crate) async fn i1754_custom_protocols_are_removed<D: Node>(d: &D, tag: &str) {
+        use crate::federation::admission::CONSENSUS_PROTOCOL_CUSTOM_REMOVED;
+        use crate::federation::membership_acceptance_invariants::bodies::found_family;
+        let (f, g) = (format!("i1754-f-{tag}"), format!("i1754-g-{tag}"));
+        reg(d, &[&f, &g]).await;
+        let e = found_community(
+            d,
+            &format!("i1754-c-{tag}"),
+            "custom:council",
+            &[&f, &g],
+            &[],
+        )
+        .await
+        .expect_err("I1754: a custom: room");
+        assert!(
+            e.to_string().contains(CONSENSUS_PROTOCOL_CUSTOM_REMOVED),
+            "{e}"
+        );
+        let e = found_family(
+            d,
+            &format!("i1754-fam-{tag}"),
+            "custom:council",
+            &[&f, &g],
+            &[],
+        )
+        .await
+        .expect_err("I1754: a custom: family");
+        assert!(
+            e.to_string().contains(CONSENSUS_PROTOCOL_CUSTOM_REMOVED),
+            "{e}"
+        );
+        found_community(
+            d,
+            &format!("i1754-w-{tag}"),
+            "weighted:uniform_half",
+            &[&f, &g],
+            &[],
+        )
+        .await
+        .expect("I1754: weighted: stays declarable");
+        // A peer's legacy custom room still applies as data and folds.
+        let legacy = format!("i1754-legacy-{tag}");
+        let community = ts::sign_community(
+            &f,
+            crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                community_key_id: legacy.clone(),
+                community_name: "legacy".into(),
+                members: [&f, &g]
+                    .iter()
+                    .map(|k| crate::federation::types::CommunityMember {
+                        key_id: (*k).clone(),
+                        joined_at: Utc::now() - Duration::days(1),
+                        role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
+                    })
+                    .collect(),
+                founded_at: Utc::now() - Duration::days(1),
+                consensus_protocol: "custom:council".into(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        d.apply_replicated_community(community)
+            .await
+            .expect("I1754: a stored legacy custom room is data");
+        assert!(active(d, &legacy, &g).await, "I1754: the legacy room folds");
+    }
+
     pub(crate) async fn i1744_freshness_w_on_cosign_rows<D: Node>(d: &D, tag: &str) {
         let r = room(d, tag, "i1744", "majority", 4).await;
         let gone = r.founders[3].clone();
@@ -1791,6 +2008,8 @@ mod tests {
     on_every_backend!(i1744, bodies::i1744_freshness_w_on_cosign_rows);
     on_every_backend!(i1748, bodies::i1748_a_short_refusal_carries_the_count);
     on_every_backend!(i1751, bodies::i1751_below_m_counts_the_roster_and_m_latches);
+    on_every_backend!(i1753, bodies::i1753_one_signature_never_removes);
+    on_every_backend!(i1754, bodies::i1754_custom_protocols_are_removed);
 
     mod i1739 {
         use super::*;
