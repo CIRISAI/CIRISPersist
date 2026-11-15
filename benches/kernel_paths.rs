@@ -10,7 +10,7 @@
 //! | `delegation_walk` | `admission::reachable_under_scope`, `check_delegation_cycle_admission` | `trust::reaches` (a cycle visited once), the seat walk's depth |
 //! | `held_head` | `group_supersede_admit::held_head_verdict` (via the supersede door) | `seat::Seats::tips`, `line::settle` |
 //! | `accord_recovery` | `accord_recovery::{recovery_commitment_in_force, verify_accord_recovery}` | `seat::seat_rule` over the lineage |
-//! | `admission_door` | `put_attestation` (`plan_put_attestation` + gates) | `layers::kept`, `layers::conclude` |
+//! | `admission_door` | `put_attestation_authored` (the `put_attestation` gauntlet, no AV-76 quota) | `layers::kept`, `layers::conclude` |
 //! | `fold_recompute` | `deletion_window::run_deletion_window_watch`, `admission::steward_bindings_of` | the folds read from the held set |
 //!
 //! Every store is a file-backed sqlite database in a temp directory, built
@@ -214,10 +214,34 @@ fn moderate_edge(id: &str, granter: &str, grantee: &str) -> Attestation {
     row
 }
 
+/// Fixture rows enter through the AUTHORED door: the same admission gauntlet
+/// as `put_attestation`, charged to the node's own ceiling only. The wire
+/// door meters every attester at 600 rows/min (and every never-seen attester
+/// together at the same), which a synthetic store of thousands of rows
+/// exceeds by design (AV-76, `PeerQuotaRefusal::UntrackedTailBurst`).
 async fn put(d: &dyn FederationDirectory, row: Attestation, what: &str) {
-    d.put_attestation(SignedAttestation { attestation: row })
+    d.put_attestation_authored(SignedAttestation { attestation: row })
         .await
         .unwrap_or_else(|e| panic!("fixture row refused ({what}): {e}"));
+}
+
+/// Rows per backend handle before a fixture or the admission loop moves to a
+/// fresh handle: under the node ingest ceiling's 6 000-row burst
+/// (`NODE_INGEST_BUDGET_MULTIPLE` × `PER_PEER_ATTESTATION_WRITES_PER_WINDOW`),
+/// which is per backend instance.
+const QUOTA_ROTATE: usize = 5_000;
+
+/// [`put`] every row, rotating to a fresh handle on the same file every
+/// [`QUOTA_ROTATE`] rows (see [`QUOTA_ROTATE`]).
+async fn put_many(store: &Store, rows: Vec<Attestation>, what: &str) {
+    let mut handle: Option<SqliteBackend> = None;
+    for (i, row) in rows.into_iter().enumerate() {
+        if i > 0 && i % QUOTA_ROTATE == 0 {
+            handle = Some(store.reopen().await);
+        }
+        let d: &dyn FederationDirectory = handle.as_ref().unwrap_or(&store.backend);
+        put(d, row, &format!("{what} {i}")).await;
+    }
 }
 
 /// Reset the process's peak RSS to its current RSS (Linux ≥ 4.0).
@@ -267,6 +291,13 @@ async fn owner_fixture(n: usize) -> OwnerFixture {
     for o in &owners {
         ts::register_identity_key(d, o, identity_type::USER).await;
     }
+    // The door resolves every attested key: each node is registered.
+    for i in 0..n {
+        ts::register_identity_key(d, &format!("own-node-{i:06}"), identity_type::NODE).await;
+    }
+    for probe in ["own-withdrawn", "own-unbound"] {
+        ts::register_identity_key(d, probe, identity_type::NODE).await;
+    }
     let rows = par_map(n, |i| {
         owner_binding_row(
             &format!("own-binding-{i:06}"),
@@ -274,9 +305,7 @@ async fn owner_fixture(n: usize) -> OwnerFixture {
             &format!("own-node-{i:06}"),
         )
     });
-    for (i, row) in rows.into_iter().enumerate() {
-        put(d, row, &format!("owner binding {i}")).await;
-    }
+    put_many(&store, rows, "owner binding").await;
 
     // The cosigned binding: the owner's seal plus the node's co-scrub.
     let node = "own-cosigned";
@@ -372,6 +401,9 @@ async fn trust_fixture(extra: usize) -> TrustFixture {
         .await
         .expect("establish_trust_root");
     for k in 0..extra {
+        ops::register_typed_key(d, &format!("tr-other-root-{k:04}"), identity_type::NODE)
+            .await
+            .expect("register other root");
         ops::emit_trust_edge(d, "tr-user", &format!("tr-other-root-{k:04}"), None)
             .await
             .expect("extra trust edge");
@@ -910,15 +942,39 @@ async fn admission_store(w: &AdmissionWorkload) -> Store {
 }
 
 /// Put every row through the door; the elapsed time of the puts only.
+///
+/// The authored door (`put_attestation_authored`): every gate and the hybrid
+/// verify of `put_attestation`, without the AV-76 per-peer quota, which caps
+/// the wire door at 600 rows/min per attester and 6 000 rows/min per node
+/// and would make the figure the quota's, not the door's.
+///
+/// Even the authored door spends the NODE ingest ceiling (6 000 rows, then
+/// 100 rows/s). The ceiling lives in the backend instance, so every
+/// [`QUOTA_ROTATE`] rows the loop moves to a fresh handle on the same file;
+/// the opens are not timed. The figure is the gauntlet's cost, not the
+/// ceiling's.
 async fn admit_all(store: &Store, rows: Vec<Attestation>) -> Duration {
-    let d: &dyn FederationDirectory = &store.backend;
-    let t0 = Instant::now();
-    for row in rows {
-        d.put_attestation(SignedAttestation { attestation: row })
-            .await
-            .expect("admitted");
+    let mut total = Duration::ZERO;
+    let mut handle: Option<SqliteBackend> = None;
+    let mut rows = rows.into_iter();
+    for i in 0.. {
+        let chunk: Vec<Attestation> = rows.by_ref().take(QUOTA_ROTATE).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        if i > 0 {
+            handle = Some(store.reopen().await);
+        }
+        let d: &dyn FederationDirectory = handle.as_ref().unwrap_or(&store.backend);
+        let t0 = Instant::now();
+        for row in chunk {
+            d.put_attestation_authored(SignedAttestation { attestation: row })
+                .await
+                .expect("admitted");
+        }
+        total += t0.elapsed();
     }
-    t0.elapsed()
+    total
 }
 
 fn bench_admission_door(c: &mut Criterion) {
@@ -991,7 +1047,7 @@ async fn fold_fixture(n: usize) -> FoldFixture {
             sealed(
                 &id,
                 &producers[i % STEWARD_POOL],
-                &format!("fold-subject-{i:06}"),
+                &agents[i % agents.len()],
                 attestation_type::DELEGATES_TO,
                 json!({
                     "references_attestation_id": id,
@@ -1017,9 +1073,7 @@ async fn fold_fixture(n: usize) -> FoldFixture {
             )
         }
     });
-    for (i, row) in rows.into_iter().enumerate() {
-        put(d, row, &format!("fold row {i}")).await;
-    }
+    put_many(&store, rows, "fold row").await;
     FoldFixture { store, agents }
 }
 
@@ -1144,7 +1198,136 @@ criterion_group!(
     bench_fold_recompute
 );
 
+/// `KERNEL_PATHS_SMOKE=1`: build every fixture at its smallest size and
+/// ask each path once, reporting every failure instead of stopping at the
+/// first (a fixture check, not a measurement).
+fn smoke() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let rt = runtime();
+    let checks: Vec<(&str, Box<dyn Fn()>)> = vec![
+        (
+            "owner_of",
+            Box::new(|| {
+                let f = rt.block_on(owner_fixture(64));
+                for (node, owned) in [
+                    (f.bound_node.as_str(), true),
+                    ("own-cosigned", true),
+                    ("own-withdrawn", false),
+                    ("own-unbound", false),
+                ] {
+                    let got = rt
+                        .block_on(owner_of(&f.store.backend, node))
+                        .expect("owner_of");
+                    assert_eq!(got.is_some(), owned, "{node}: {got:?}");
+                }
+            }),
+        ),
+        (
+            "trust_root_valid",
+            Box::new(|| {
+                let f = rt.block_on(trust_fixture(2));
+                let v = rt
+                    .block_on(trust_root_valid(&f.store.backend, "tr-user", "tr-root"))
+                    .expect("walk");
+                assert!(v.valid, "{v:?}");
+            }),
+        ),
+        (
+            "delegation_walk",
+            Box::new(|| {
+                let s = rt.block_on(walk_fixture());
+                let hit = rt
+                    .block_on(reachable_under_scope(
+                        &s.backend,
+                        &walk_key(4, 0),
+                        &walk_key(4, 4),
+                        DELEGATION_SCOPE_MODERATE,
+                        64,
+                    ))
+                    .expect("walk");
+                assert!(hit, "depth 4 reach");
+                let closing = moderate_edge("smoke-close", &walk_key(4, 4), &walk_key(4, 0));
+                let r = rt.block_on(check_delegation_cycle_admission(
+                    &s.backend,
+                    &closing,
+                    chrono::Utc::now(),
+                ));
+                assert!(r.is_err(), "cycle refused: {r:?}");
+            }),
+        ),
+        (
+            "held_head",
+            Box::new(|| {
+                let f = rt.block_on(lineage_fixture(2));
+                let r = rt.block_on(version_family(
+                    &f.store.backend,
+                    BENCH_FAMILY,
+                    &f.holders,
+                    Some(&f.root_hash),
+                    "fork",
+                ));
+                assert!(r.is_err(), "fork refused: {r:?}");
+                println!("    fork refusal: {}", r.unwrap_err());
+            }),
+        ),
+        (
+            "accord_recovery",
+            Box::new(|| {
+                let f = rt.block_on(accord_fixture(2));
+                let c = rt
+                    .block_on(recovery_commitment_in_force(
+                        &f.store.backend,
+                        accord_family_key_id(),
+                        &f.holder,
+                    ))
+                    .expect("read");
+                assert!(c.is_some(), "commitment in force");
+                let v = rt
+                    .block_on(verify_accord_recovery(&f.store.backend, &f.signed))
+                    .expect("verify");
+                assert_eq!(v.as_deref(), Some(f.new_holder.as_str()));
+            }),
+        ),
+        (
+            "admission_door",
+            Box::new(|| {
+                let w = admission_workload(64);
+                for order in Order::ALL {
+                    let store = rt.block_on(admission_store(&w));
+                    rt.block_on(admit_all(&store, ordered(&w.rows, order)));
+                }
+            }),
+        ),
+        (
+            "fold_recompute",
+            Box::new(|| {
+                let f = rt.block_on(fold_fixture(64));
+                let cold = rt.block_on(f.store.reopen());
+                let scanned = rt.block_on(deletion_fold(&cold));
+                let bound = rt.block_on(guardianship_fold(&cold, &f.agents));
+                assert!(scanned >= 64, "scanned {scanned}");
+                assert_eq!(bound, f.agents.len(), "one steward per agent");
+            }),
+        ),
+    ];
+    let mut failed = 0;
+    for (name, check) in &checks {
+        match catch_unwind(AssertUnwindSafe(check)) {
+            Ok(()) => println!("smoke {name}: ok"),
+            Err(_) => {
+                failed += 1;
+                println!("smoke {name}: FAILED");
+            }
+        }
+    }
+    assert_eq!(failed, 0, "{failed} fixture check(s) failed");
+}
+
 fn main() {
+    if std::env::var_os("KERNEL_PATHS_SMOKE").is_some() {
+        smoke();
+        return;
+    }
     if let Ok(spec) = std::env::var("KERNEL_PATHS_PEAK_RSS") {
         peak_rss(&spec);
         return;
