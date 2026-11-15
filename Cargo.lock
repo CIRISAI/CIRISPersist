@@ -833,6 +833,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "ciris-kernel"
+version = "0.1.0"
+source = "git+https://github.com/CIRISAI/CIRISKernel?rev=d1df21486b8aabd5644b3d1f5dd777e2d4c11fb1#d1df21486b8aabd5644b3d1f5dd777e2d4c11fb1"
+
+[[package]]
 name = "ciris-keyring"
 version = "22.2.0"
 source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v22.2.0#7146fa4c310fae5451557a32ec4af68b2a9050bc"
@@ -882,6 +887,7 @@ dependencies = [
  "candle-transformers",
  "chrono",
  "ciris-crypto",
+ "ciris-kernel",
  "ciris-keyring",
  "ciris-verify-core",
  "criterion",

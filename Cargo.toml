@@ -579,6 +579,13 @@ getrandom = "0.2"
 # `src/secrets/crypto.rs` facade lands as a single import-site change.
 ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.2.0", version = "22", features = ["pqc-ml-dsa"] }
 ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.2.0", version = "22" }
+# v62.0.0 (slice C, the kernel adapter) — persist's decisions answer through
+# `ciris-kernel`: no_std, zero dependencies, its rules the Constitution's
+# (CC 2.7). `src/kernel/` is the adapter (persist's verified rows as the
+# kernel's `Row` / `SeatRow` views). TODO(kernel-v0.1.0): pinned by REV until
+# CIRISKernel tags v0.1.0; the release gate refuses an untagged git pin, so
+# the release lead flips this to `tag = "v0.1.0"` before the cut.
+ciris-kernel = { git = "https://github.com/CIRISAI/CIRISKernel", rev = "d1df21486b8aabd5644b3d1f5dd777e2d4c11fb1", version = "0.1" }
 # v0.3.6 (CIRISPersist#14) — direct ciris-crypto dep for HybridVerifier
 # in `Engine.verify_hybrid`. Same git source / tag as ciris-keyring +
 # ciris-verify-core so versions are workspace-coherent. Features

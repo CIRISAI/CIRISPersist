@@ -94,6 +94,8 @@ pub mod graph;
 pub mod incident;
 pub mod ingest;
 pub mod journal;
+/// v62.0.0 — the kernel adapter: persist's decisions answer through `ciris-kernel`.
+pub mod kernel;
 pub mod ledgers;
 #[cfg(feature = "cirislens_legacy_migration")]
 pub mod legacy_migration;

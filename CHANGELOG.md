@@ -5,6 +5,12 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [62.0.0] - UNRELEASED
+
+### Changed — slice C, the kernel adapter
+
+- Persist's decisions begin to answer through `ciris-kernel` (CIRISKernel, `crates/ciris-kernel`, pinned by git rev until it tags v0.1.0): a `no_std`, zero-dependency crate of pure functions whose rules the Constitution states and has modelled (CC 2.7). New module `ciris_persist::kernel`: the row view (`KRow`: id = `persist_row_hash`, names, signer = `attesting_key_id`), the tables (`SeatLaw`, `WindowSpec`) loaded from the vendored policy, and the adapters for the consensus count, the owner seat, the trust edge leg and a group's head.
+
 ## [61.4.1] - 2026-11-14
 
 A member seated late in a room of three or more could read an earlier message as `seal_mismatch`, permanently (CIRISPersist#1271). This release binds a room message to its author's minter, and heals on read a binding that is already wrong.

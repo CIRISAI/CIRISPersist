@@ -220,6 +220,13 @@ impl ConsensusShortfall {
 /// lowest key. The set is a denominator of persons, and a person's role is
 /// the highest of their seats.
 fn eligible<'a>(b: &Ballot<'a>) -> Vec<&'a Seat> {
+    eligible_seats(b)
+}
+
+/// v62.0.0 (slice C) — [`eligible`], for the kernel adapter
+/// ([`crate::kernel::consensus`]): one representative seat per eligible
+/// person, the seats the kernel counts as persons (KERNEL.md 7b).
+pub(crate) fn eligible_seats<'a>(b: &Ballot<'a>) -> Vec<&'a Seat> {
     let founders_only = b.subkind == Some("infrastructure");
     let mut one_per_person: BTreeMap<&str, &'a Seat> = BTreeMap::new();
     for seat in b
@@ -531,7 +538,7 @@ fn evaluate_open_self_admit(b: &Ballot<'_>, elig: &[&Seat], got: &[&Seat]) -> Ve
     }
 }
 
-fn parse_quorum_tail(tail: &str) -> Option<(u32, u32)> {
+pub(crate) fn parse_quorum_tail(tail: &str) -> Option<(u32, u32)> {
     let (m, n) = tail.split_once('/')?;
     let (m, n) = (m.parse::<u32>().ok()?, n.parse::<u32>().ok()?);
     (n > 0 && m <= n).then_some((m, n))
