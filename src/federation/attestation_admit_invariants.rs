@@ -135,14 +135,16 @@ pub(crate) mod bodies {
             .expect("(2) c → e, expiring at t0 + 1h");
         let closing = edge(&k("e"), &k("c"), t0);
         let id = closing.attestation.attestation_id.clone();
+        // v62.0.0 (slice C) — the cycle gate refuses nothing (CC 4.4.3.34:
+        // "Cycles are visited once"; the kernel's walk visits a cycle once), so the closing edge plans an insert at either
+        // receipt instant; the walk's own reading at receipt is
+        // `delegation_cycle_invariants`' (`delegation_path_hops`).
         let live = plan_put_attestation(d, closing.clone(), &WriteOrigin::Wire, at(t0, t0)).await;
-        match &live {
-            Err(Error::DelegationCycle { hops, .. }) => assert_eq!(*hops, 1, "(2) hops"),
-            other => panic!(
-                "(2) received at t0, c → e is live, so e → c closes a cycle; got {}",
-                verdict(other)
-            ),
-        }
+        assert!(
+            matches!(live, Ok(AttestationPlan::Insert(_))),
+            "(2) received at t0, e → c is admitted though c → e is live (v62); got {}",
+            verdict(&live)
+        );
         let expired =
             plan_put_attestation(d, closing, &WriteOrigin::Wire, at(t0, t0 + hour * 2)).await;
         assert!(

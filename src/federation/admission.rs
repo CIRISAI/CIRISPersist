@@ -9895,6 +9895,9 @@ pub async fn check_delegation_term_admission(
 /// but before its term opens was counted, though the lens (which reads both
 /// at one instant, `DelegationWalkLens::admits_edge`) refuses it at every
 /// instant: when its term opens it has already expired.
+// v62.0.0 (slice C): the cycle gate's former lens, the differential's
+// reference only (the gate refuses nothing; CC 4.4.3.34).
+#[cfg(test)]
 fn delegation_edge_live_at_or_after(
     edge: &super::Attestation,
     now: chrono::DateTime<chrono::Utc>,
@@ -12616,7 +12619,6 @@ pub async fn announced_owner_state<F: super::FederationDirectory + ?Sized>(
 /// key is named as the self it signed as at its earliest live binding's
 /// `asserted_at` ([`self_of_at`](super::self_roster::self_of_at)), so two
 /// devices of one person are one owner.
-#[cfg_attr(not(test), allow(dead_code))] // production from the switch (step 3)
 pub(crate) async fn kernel_owner_selves<F: super::FederationDirectory + ?Sized>(
     directory: &F,
     node: &str,
@@ -12686,6 +12688,11 @@ pub(crate) async fn kernel_owner_selves<F: super::FederationDirectory + ?Sized>(
     Ok(selves)
 }
 
+/// The owner fold as persist wrote it before the kernel. v62.0.0: the
+/// differential's reference for [`owner_of`], and still the single-owner
+/// admission gate's incumbent read ([`check_single_node_owner_admission`]),
+/// which refuses a second owner at the door — a breaker the kernel slice
+/// that deletes the door gates moves (KERNEL_SEAMS §2.2).
 async fn live_owner_binding_granters<F: super::FederationDirectory + ?Sized>(
     directory: &F,
     node: &str,
@@ -12763,6 +12770,16 @@ pub async fn admission_identity_for_writer<F: super::FederationDirectory + ?Size
 /// owner-binding edges), and the reader consumers MUST use to resolve "the owner
 /// of a node" for the `self` cohort boundary.
 ///
+/// v62.0.0 (slice C) — answered through the kernel: the holders of the
+/// `owner` seat over the node's key ([`kernel_owner_selves`],
+/// [`crate::kernel::owner`]). CC 3.2, *The first binding (MUST)*: "an
+/// owner-binding counts toward ownership only when the node's own key
+/// cosigned it, or the node's genesis record carries it" (C557, ruled). A
+/// binding whose verified signatures do not include the node's key names no
+/// owner; the crossing door's node co-scrub
+/// ([`TierPromotionCustody::NodeCoScrub`](super::TierPromotionCustody::NodeCoScrub))
+/// or an `additional_scrubs` entry by the node is the cosignature.
+///
 /// Returns [`Error::AmbiguousNodeOwner`] when the node carries **more than one**
 /// distinct live owner — a pre-gate anomaly the single-owner admission gate
 /// [`check_single_node_owner_admission`] prevents going forward. Consumers
@@ -12774,16 +12791,17 @@ pub async fn owner_of<F: super::FederationDirectory + ?Sized>(
     directory: &F,
     node: &str,
 ) -> Result<Option<String>, Error> {
-    let owners = live_owner_binding_granters(directory, node).await?;
-    // v62.0.0 (slice C, I1838) — the differential witness: the kernel's owner
-    // seat over the same held rows, with the node's cosignature required and
-    // (the counterfactual) assumed.
+    let owners =
+        kernel_owner_selves(directory, node, crate::kernel::owner::Cosign::Required).await?;
+    // v62.0.0 (slice C, I1838) — the differential witness: persist's own fold
+    // over the same held rows, against the kernel's seat with the node's
+    // cosignature required and (the counterfactual) assumed.
     #[cfg(test)]
     {
-        use crate::kernel::owner::Cosign;
-        let kernel = kernel_owner_selves(directory, node, Cosign::Required).await?;
-        let assumed = kernel_owner_selves(directory, node, Cosign::Assumed).await?;
-        crate::kernel::differential::owner_of(node, &owners, &kernel, &assumed);
+        let reference = live_owner_binding_granters(directory, node).await?;
+        let assumed =
+            kernel_owner_selves(directory, node, crate::kernel::owner::Cosign::Assumed).await?;
+        crate::kernel::differential::owner_of(node, &reference, &owners, &assumed);
     }
     match owners.len() {
         0 => Ok(None),
@@ -18528,6 +18546,15 @@ pub fn grant_chain_instant(row: &super::Attestation) -> chrono::DateTime<chrono:
 /// v54.0.0 (CIRISPersist#1031, CC 4.1.1) — **the cycle-closing `delegates_to`
 /// is refused at admission.**
 ///
+/// **v62.0.0 (slice C) — no longer refused.** The decision answers through the
+/// kernel, whose trust walk visits a cycle once (`ciris_kernel::trust::reaches`,
+/// KERNEL.md 5; CIRISKernel `ADOPTING.md`: "no edge is refused for closing a
+/// cycle"). Every row this gate examines is now admitted and held; the walks'
+/// visited guard reads a cycle once. What follows is the v54 reading, kept as
+/// the differential's reference (test builds). CC 4.1.1's anti-pattern row
+/// ("reject the cycle-closing emission") still reads the v54 way; the kernel's
+/// reading is the one persist adopts (the CC session is told).
+///
 /// CC 4.1.1's anti-pattern table, row "Cycles (A → B → A)": *"Substrate MUST
 /// detect cycles on the `delegates_to` graph and reject the cycle-closing
 /// emission."* Until this gate every walk was visited-guarded
@@ -18625,13 +18652,6 @@ where
     if is_trust_plane_edge(row) {
         return Ok(());
     }
-    let refuse = |hops| {
-        Err(Error::DelegationCycle {
-            attesting_key_id: row.attesting_key_id.clone(),
-            attested_key_id: row.attested_key_id.clone(),
-            hops,
-        })
-    };
     // A self-edge is not the anti-pattern: it is the root charter, the
     // constitutional `delegates_to(root → root)` self-declaration (CC 3.2 —
     // `trust_root`), and every walk's visited guard already treats it as a
@@ -18639,21 +18659,27 @@ where
     if row.attesting_key_id == row.attested_key_id {
         return Ok(());
     }
-    let hops = delegation_path_hops(
-        directory,
-        &row.attested_key_id,
-        &row.attesting_key_id,
-        received_at,
-    )
-    .await?;
-    // v62.0.0 (slice C, I1838) — the differential witness: the kernel's walk
-    // visits a cycle once and refuses no edge for closing one.
+    // v62.0.0 (slice C) — the kernel's walk visits a cycle once
+    // (`ciris_kernel::trust::reaches`: "a cycle is visited once, since
+    // arriving again at a key with no more budget than before reaches
+    // nothing new"; KERNEL.md 5; CC 4.4.3.34: "Cycles are visited
+    // once"), so no edge is refused for
+    // closing one: the closing edge is held, and every walk reads it once.
+    // The differential witness still computes persist's former reading.
     #[cfg(test)]
-    crate::kernel::differential::cycle_gate(row, hops);
-    match hops {
-        Some(hops) => refuse(hops),
-        None => Ok(()),
+    {
+        let hops = delegation_path_hops(
+            directory,
+            &row.attested_key_id,
+            &row.attesting_key_id,
+            received_at,
+        )
+        .await?;
+        crate::kernel::differential::cycle_gate(row, hops);
     }
+    #[cfg(not(test))]
+    let _ = (directory, received_at);
+    Ok(())
 }
 
 /// v54.0.0 (Codex on PR #1050) — does [`check_delegation_cycle_admission`]
@@ -18721,6 +18747,9 @@ fn is_trust_plane_edge(row: &super::Attestation) -> bool {
 /// when there is none. Unscoped, unattenuated: it asks whether the graph
 /// CONNECTS the two keys, not whether a duty flows. Edge liveness is the
 /// reading [`check_delegation_cycle_admission`] documents.
+// v62.0.0 (slice C): the differential's reference and the cycle witnesses'
+// reading of the graph (test builds only).
+#[cfg(test)]
 pub(crate) async fn delegation_path_hops<G>(
     directory: &G,
     from: &str,

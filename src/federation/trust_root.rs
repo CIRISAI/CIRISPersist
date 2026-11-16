@@ -1425,7 +1425,6 @@ where
 /// labelled `trust:accepts:v1` or held as acceptance from before the label);
 /// the kernel concludes the rotations, folds the composers (CC 3.5.1) and
 /// walks one hop.
-#[cfg_attr(not(test), allow(dead_code))] // production from the switch (step 3)
 pub(crate) async fn kernel_edge_leg<F>(
     directory: &F,
     by_user: &[Attestation],
@@ -1564,49 +1563,49 @@ where
     // 1. Edge: live (non-tombstoned, non-expired) delegates_to(user → root).
     // v23.0.0 (#551 item 2): the row may NAME itself `trust:accepts:v1`; one
     // claiming a different job is refused here (see `job_dimension_admits`).
-    let user_refs: Vec<&Attestation> = by_user.iter().collect();
-    let user_dead = tombstoned_ids(&user_refs);
-    // v24.1.0 (CIRISPersist#561) — collected rather than `.any()`-ed, so the
-    // SAME predicate that decides `edge_exists` also supplies the edge leg's
-    // expiry bound. One predicate, one pass; a second filter written to compute
-    // the TTL is a second answer free to disagree with the first.
-    //
-    // v53.0.0 (CC 3.2 T2) — an acceptance edge rotates the way a grant does:
-    // the user's own `supersedes` on it is the live edge and the edge it
-    // replaced is not. The SAME [`live_conferrals`] the capability walk reads
-    // grants through, so "is this edge live" has one answer on both reads.
-    let shaped_edges: Vec<&Attestation> = by_user
+    // v62.0.0 (slice C) — answered through the kernel ([`kernel_edge_leg`]):
+    // persist's reads pick the candidates (toward the root, federation tier,
+    // not expired, labelled `trust:accepts:v1` or held as acceptance before
+    // the label, CC 3.2 T4a); the kernel concludes rotations (CC 3.2 T2),
+    // folds the composers by the CC 3.5.1 default and walks one hop. The
+    // edges it read are the leg's live edges, so the SAME answer that decides
+    // `edge_exists` supplies the edge leg's expiry bound (#561).
+    let edge = kernel_edge_leg(directory, &by_user, user_key_id, root_ref, now).await?;
+    let read: std::collections::BTreeSet<crate::kernel::view::RowId> =
+        edge.rows.iter().copied().collect();
+    let live_edges: Vec<&Attestation> = by_user
         .iter()
-        .filter(|a| {
-            (a.attestation_type == attestation_type::DELEGATES_TO
-                || a.attestation_type == attestation_type::SUPERSEDES)
-                && a.attested_key_id == root_ref
-                && !user_dead.contains(&a.attestation_id)
-                && !is_expired(a, now)
-                && counts_in_capability_walk(a)
-                && job_dimension_admits(&a.attestation_envelope, TRUST_ACCEPTS_DIMENSION)
-        })
+        .filter(|a| read.contains(&crate::kernel::view::RowId::of_hash(&a.persist_row_hash)))
         .collect();
-    let live_edges = live_conferrals(directory, shaped_edges).await?;
-    // #973 (CC 3.2 T4a) — "a new row with no `trust:{job}` label gives no
-    // acceptance": an unlabelled edge counts only where its direction reading
-    // stands (held when the rule arrived, or a pinned-bundle row).
-    let edge_denied = direction_denied_ids(directory, live_edges.iter().copied()).await?;
-    let live_edges: Vec<&Attestation> = live_edges
-        .into_iter()
-        .filter(|a| !edge_denied.contains(&a.attestation_id))
-        .collect();
-    let edge_exists = !live_edges.is_empty();
-    // v62.0.0 (slice C, I1838) — the differential witness: the kernel's edge
-    // leg over the same slice (the user's rows and their composers).
+    let edge_exists = edge.value;
+    // v62.0.0 (slice C, I1838) — the differential witness: persist's own
+    // edge fold over the same slice, against the kernel's.
     #[cfg(test)]
     {
-        let edge = kernel_edge_leg(directory, &by_user, user_key_id, root_ref, now).await?;
+        let user_refs: Vec<&Attestation> = by_user.iter().collect();
+        let user_dead = tombstoned_ids(&user_refs);
+        let shaped_edges: Vec<&Attestation> = by_user
+            .iter()
+            .filter(|a| {
+                (a.attestation_type == attestation_type::DELEGATES_TO
+                    || a.attestation_type == attestation_type::SUPERSEDES)
+                    && a.attested_key_id == root_ref
+                    && !user_dead.contains(&a.attestation_id)
+                    && !is_expired(a, now)
+                    && counts_in_capability_walk(a)
+                    && job_dimension_admits(&a.attestation_envelope, TRUST_ACCEPTS_DIMENSION)
+            })
+            .collect();
+        let reference = live_conferrals(directory, shaped_edges).await?;
+        let denied = direction_denied_ids(directory, reference.iter().copied()).await?;
+        let reference = reference
+            .iter()
+            .any(|a| !denied.contains(&a.attestation_id));
         crate::kernel::differential::trust_edge(
             user_key_id,
             root_ref,
+            reference,
             edge_exists,
-            edge.value,
             by_user.len(),
         );
     }

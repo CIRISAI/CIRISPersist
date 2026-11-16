@@ -816,6 +816,9 @@ mod scores_form_family_1174_invariants;
 // held without its window, on every backend.
 #[cfg(test)]
 mod withdraws_order_roster_receipt_invariants;
+// v62.0.0 (slice C) — I1840–I1843: the doors the kernel adapter switched.
+#[cfg(test)]
+mod kernel_adapter_invariants;
 // v61.1.0 (CIRISPersist#1188) — I1621/I1622: the pure survivors of the
 // v61.0.0 mutation run (the consensus_protocol vocabulary, the supersede's
 // held-head verdict). I1620 and I1623–I1626 sit beside their helpers.

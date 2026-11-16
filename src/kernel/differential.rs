@@ -230,7 +230,10 @@ pub fn held_head(
 ) {
     use super::head::{head_reading, HeadReading};
     let reading = head_reading(group, held, offered_prev, "");
-    let kernel_ok = reading == HeadReading::Extends;
+    // the kernel HOLDS a version that extends the head and one that names
+    // another (a tip, or a row waiting for the head it names); it holds
+    // nothing in place of an unheld group
+    let kernel_ok = reading != HeadReading::NothingHeld;
     let class = if !proof_ok || birth {
         // a proof naming another prior is a contradiction inside one row,
         // refused for its shape before the kernel; an accord birth over a
@@ -240,6 +243,7 @@ pub fn held_head(
     } else if persist_ok == kernel_ok {
         Class::Agree
     } else if !persist_ok && reading == HeadReading::Tip {
+        // CC 2.7.8: "Two versions of one head wait as tips"
         Class::ForkAsTip
     } else {
         Class::Unexplained

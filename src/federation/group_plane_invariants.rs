@@ -1323,10 +1323,13 @@ pub(crate) mod bodies {
         );
     }
 
-    /// I1492 — a retraction moves the roster in a direction, and the
-    /// group's protocol reads it: under `reverse_quorum` one member may
-    /// retract a widening (a removal: protective), never a removal (an
-    /// addition: m of n).
+    /// I1492 — was "a retraction has a direction": under `reverse_quorum` one
+    /// member could retract a widening (protective) but not a removal.
+    /// v62.0.0 (slice C): `reverse_quorum` is no membership protocol. CC 3.2:
+    /// "Not a membership rule: reverse quorum. … It admits no one and confers
+    /// no consent on anyone's behalf." A family under it admits no
+    /// membership change at all: two of its three members widening it is
+    /// refused `roster_consensus_unevaluable`, and the roster is unchanged.
     pub(crate) async fn i1492_a_retraction_has_a_direction<D>(d: &D, tag: &str)
     where
         D: FederationDirectory + GroupPlaneStore + AttestationStore,
@@ -1335,35 +1338,58 @@ pub(crate) mod bodies {
         for n in ["ann", "ben", "cat", "dan"] {
             user(dd, &format!("{n}-{tag}")).await;
         }
-        let (fam, [ann, _ben, _cat, dan]) =
-            family_with_history_under(d, tag, "reverse_quorum:2/3:86400").await;
-        let removal = one(
-            d,
-            &fam,
-            gp::MEMBERSHIP_REMOVAL_DIMENSION,
-            GroupPlaneTable::FamilyRevocations,
-        )
-        .await;
-        let e = put_row(dd, withdraws_of(&ann, &[], &removal))
-            .await
-            .expect_err("one member does not put a removed member back");
-        assert!(
-            matches!(e, Error::RosterAuthorityUnauthorized { .. }),
-            "{tag}: {e}"
+        let fam = format!("fam-{tag}");
+        let [ann, ben, cat, dan] = ["ann", "ben", "cat", "dan"].map(|n| format!("{n}-{tag}"));
+        let founded = at("2026-01-01T00:00:00Z");
+        d.put_family(ts::sign_family(
+            &ann,
+            Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                family_key_id: fam.clone(),
+                family_name: "household".into(),
+                members: [&ann, &ben, &cat]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| FamilyMember {
+                        key_id: (*k).clone(),
+                        joined_at: founded,
+                        role: (i == 0).then(|| "founder".to_owned()),
+                    })
+                    .collect(),
+                founded_at: founded,
+                consensus_protocol: "reverse_quorum:2/3:86400".to_owned(),
+                consensus_protocol_entrenched: false,
+                dissolved_at: None,
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .expect("the family record is held");
+        let mut w = ts::sign_family_membership_widening(
+            &ann,
+            FamilyMembershipWidening {
+                family_key_id: fam.clone(),
+                member_key_id: dan.clone(),
+                joined_at: at("2026-02-01T00:00:00Z"),
+                effective_at: at("2026-02-01T00:00:00Z"),
+                role: None,
+                persist_row_hash: String::new(),
+            },
         );
-        let widening = one(
-            d,
-            &fam,
-            gp::MEMBERSHIP_WIDENING_DIMENSION,
-            GroupPlaneTable::FamilyWidenings,
-        )
-        .await;
-        put_row(dd, withdraws_of(&ann, &[], &widening))
+        ts::cosign_family_membership_widening(&mut w, &ben);
+        let e = d
+            .put_family_membership_widening_consented(w)
             .await
-            .expect("one member may retract a widening: protective");
+            .expect_err("CC 3.2: reverse_quorum admits no one");
+        assert!(
+            matches!(&e, Error::RosterAuthorityUnauthorized { rule, .. }
+                if *rule == "roster_consensus_unevaluable"),
+            "{tag}: {e:?}"
+        );
         assert!(
             !sorted_active(dd, &fam).await.contains(&dan),
-            "{tag}: the retracted widening seats nobody"
+            "{tag}: the refused widening seats nobody"
         );
     }
 

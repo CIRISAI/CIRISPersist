@@ -185,16 +185,15 @@ async fn i602_the_cycle_recheck_completes_on_one_connection() {
     .await
     .expect("I602 a → c admits");
     assert!(dc::has_fed_edge(d, &a, &c).await, "I602 a → c is stored");
-    // The re-check still runs under the lock: the closing edge is refused.
-    match within_bound(
+    // v62.0.0 (slice C) — the closing edge is admitted (CC 4.4.3.34: "Cycles are visited once"; the kernel's walk
+    // visits a cycle once, so no edge is refused for closing one), and the put
+    // still completes on one connection under the lock it takes.
+    within_bound(
         "I602 the cycle-closing put",
         ts::put_delegates_to(d, &c, &a, None),
     )
     .await
-    {
-        Err(Error::DelegationCycle { .. }) => {}
-        other => panic!("I602 c → a closes a cycle and must be refused: {other:?}"),
-    }
+    .expect("I602 c → a is admitted (v62: no edge refused for closing a cycle)");
     // A crossing of a gated edge takes the same lock and re-check.
     let (x, y) = (format!("i602-x-{tag}"), format!("i602-y-{tag}"));
     dc::agent(d, &x).await;

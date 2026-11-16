@@ -62,6 +62,10 @@ fn rank(k: &str) -> u8 {
     }
 }
 
+/// The `withdraws_admission_rule` of an admitted ownerless-lock reclaim
+/// (`federation::ownership_reclaim`, CC 3.2).
+const RECLAIM_RULE: u8 = 5;
+
 /// Whether the node's cosignature is read from the row or assumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cosign {
@@ -85,8 +89,26 @@ pub fn owner_rows(
     is_user: &dyn Fn(&str) -> bool,
     cosign: Cosign,
 ) -> Vec<KRow> {
+    // CC 3.2, the ownerless-lock reclaim: a third-party `withdraws` the door
+    // admitted only on a verified m-of-n reclaim quorum (rule 5) ends the
+    // binding. The kernel has no cell for that count; the quorum is
+    // signature verification, persist's, so a reclaimed binding is not
+    // presented (KERNEL_SEAMS §8; reported to the CC session).
+    let reclaimed: std::collections::BTreeSet<&str> = rows
+        .iter()
+        .filter(|r| {
+            r.attestation_type == attestation_type::WITHDRAWS
+                && r.withdraws_admission_rule == Some(RECLAIM_RULE)
+        })
+        .filter_map(|r| {
+            crate::federation::precedence::references_attestation_id_from_envelope(
+                &r.attestation_envelope,
+            )
+        })
+        .collect();
     let bindings: Vec<&Attestation> = rows
         .iter()
+        .filter(|r| !reclaimed.contains(r.attestation_id.as_str()))
         .filter(|r| {
             r.attestation_type == attestation_type::DELEGATES_TO
                 && r.attested_key_id == node

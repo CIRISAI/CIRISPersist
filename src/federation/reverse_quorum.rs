@@ -4443,98 +4443,33 @@ pub(crate) mod test_support {
                 crate::federation::ReplicatedCommunityOutcome::Inserted,
                 "({suffix}) P3: the replicated entry admits the legacy room as data"
             );
-            dir.put_community_membership_revocation(ts::sign_community_membership_revocation(
-                &human,
-                crate::federation::types::CommunityMembershipRevocation {
-                    community_key_id: room.clone(),
-                    removed_identity_key_id: x.clone(),
-                    removed_at: t,
-                    effective_at: t,
-                    reason: None,
-                    witness_set: vec![],
-                    persist_row_hash: String::new(),
-                },
-            ))
-            .await
-            .unwrap_or_else(|e| panic!("({suffix}) P3 {leg}: the human's removal lands: {e}"));
-            let row_hash = dir
-                .list_community_membership_revocations_for(&room)
-                .await
-                .expect("revocations")
-                .into_iter()
-                .find(|r| r.removed_identity_key_id == x)
-                .expect("stored")
-                .persist_row_hash;
-            let action = ActionRef {
-                actor_key_id: &human,
-                action_id: &row_hash,
-                asserted_at: t,
-            };
-            let o = signed_row(
-                &uuid::Uuid::new_v4().to_string(),
-                &objector,
-                &human,
-                objection_envelope(Cohort::Community, &room, &row_hash, "not so"),
-                t + Duration::seconds(10),
-                &[],
-            );
-            // This node first held the objection at `t`: the window has run.
-            // The receipt is the executor's, written with the row (V213).
-            hold_objection_at(store, &o, t).await;
-            // Stored at the substrate's microsecond resolution.
-            let held = dir
-                .vote_window_first_held(&row_hash)
-                .await
-                .expect("window")
-                .expect("the objection opened this node's window");
-            assert!(
-                (held - t).num_microseconds().is_some_and(|d| d.abs() <= 1),
-                "({suffix}) P3 {leg}: the window opened at t, got {held}"
-            );
-            // The door re-offered the held row: its gates still run, and it
-            // reports the objection recorded.
-            assert!(
-                matches!(
-                    record_objection_against(dir, &o, action)
-                        .await
-                        .expect("objection"),
-                    ObjectionOutcome::Admitted
-                ),
-                "({suffix}) P3 {leg}: the objection is recorded"
-            );
-            let ballot = |author: &String, upholds: bool, at: DateTime<Utc>| {
-                signed_row(
-                    &uuid::Uuid::new_v4().to_string(),
-                    author,
+            // v62.0.0 (slice C) — `reverse_quorum` is no membership protocol.
+            // CC 3.2: "Not a membership rule: reverse quorum. … It admits no
+            // one and confers no consent on anyone's behalf." The human's
+            // removal of x — the roster change whose reversal this witness
+            // weighed the node-bearing founder's ruling on — is refused, so
+            // the roster plane never reaches the escalation fold and no
+            // founder's ruling (node-bearing or not) moves the roster.
+            let e = dir
+                .put_community_membership_revocation(ts::sign_community_membership_revocation(
                     &human,
-                    ballot_envelope(
-                        Cohort::Community,
-                        &room,
-                        &row_hash,
-                        &o.attestation_id,
-                        upholds,
-                        "ruling",
-                    ),
-                    at,
-                    &[],
-                )
-            };
-            let mut ballots = vec![ballot(&second, true, t + Duration::seconds(20))];
-            for m in &overrulers {
-                ballots.push(ballot(m, false, t + Duration::seconds(30)));
-            }
-            for b in &ballots {
-                assert!(
-                    matches!(
-                        record_objection_ballot_against(dir, b, action)
-                            .await
-                            .expect("ballot"),
-                        ObjectionOutcome::Admitted
-                    ),
-                    "({suffix}) P3 {leg}: ballot by {} recorded",
-                    b.attesting_key_id
-                );
-            }
+                    crate::federation::types::CommunityMembershipRevocation {
+                        community_key_id: room.clone(),
+                        removed_identity_key_id: x.clone(),
+                        removed_at: t,
+                        effective_at: t,
+                        reason: None,
+                        witness_set: vec![],
+                        persist_row_hash: String::new(),
+                    },
+                ))
+                .await
+                .expect_err("CC 3.2: reverse_quorum admits no removal");
+            assert!(
+                matches!(&e, Error::RosterAuthorityUnauthorized { rule, .. }
+                    if *rule == "roster_consensus_unevaluable"),
+                "({suffix}) P3 {leg}: {e:?}"
+            );
             let active: Vec<String> = dir
                 .active_community_members(&room)
                 .await
@@ -4542,28 +4477,22 @@ pub(crate) mod test_support {
                 .into_iter()
                 .map(|m| m.key_id)
                 .collect();
-            if bound {
-                assert!(
-                    !active.contains(&x),
-                    "({suffix}) P3: a node-bearing founder's uphold is no duty-holder ruling — \
-                     the respondents dismiss the objection and the removal stands"
-                );
-            } else {
-                assert!(
-                    active.contains(&x),
-                    "({suffix}) P3 control: a seated duty-holder's uphold keeps the objection — \
-                     the removal is reversed"
-                );
-            }
+            assert!(active.contains(&x), "({suffix}) P3 {leg}: x stays seated");
+            let _ = (&objector, &overrulers, &second, store);
         }
     }
 
     /// v49.0.0 — **I181: a reverse-quorum roster removal is protective and
-    /// undoable** (FSD §2 `reverse_quorum` row). One member's signature lands
-    /// a removal; `m` distinct in-window objections against the revocation's
-    /// `persist_row_hash` reverse it and the member counts again. An addition
-    /// is a capability grant: one signature is refused, the #574 dismissal
-    /// threshold (here 3 of 5) admits it.
+    /// undoable** (FSD §2 `reverse_quorum` row): one member's removal landed,
+    /// `m` objections reversed it, and an addition took 3 of 5.
+    ///
+    /// v62.0.0 (slice C) — `reverse_quorum` is no membership protocol. CC 3.2:
+    /// "Not a membership rule: reverse quorum. … It admits no one and confers
+    /// no consent on anyone's behalf." Every roster change of a room under it
+    /// is refused `roster_consensus_unevaluable` — a stranger's removal, one
+    /// member's removal, and an addition by three of five — and nothing is
+    /// stored. The objection fold itself (for non-roster actions) is
+    /// unchanged and witnessed by `exercise_reverse_quorum_action_ref`.
     pub(crate) async fn exercise_reverse_quorum_roster_removal(
         dir: &dyn FederationDirectory,
         suffix: &str,
@@ -4595,30 +4524,30 @@ pub(crate) mod test_support {
                 .collect::<Vec<_>>()
         };
         let at = Utc::now() - Duration::hours(1);
-        // A stranger's removal is refused — the protective direction is cheap
-        // for MEMBERS, never for anyone at all (no eligible signer admits
-        // nothing, even under reverse_quorum).
+        let unevaluable = |e: &Error| {
+            matches!(e, Error::RosterAuthorityUnauthorized { rule, .. }
+                if *rule == "roster_consensus_unevaluable")
+        };
         let stranger = format!("rqr-stranger-{suffix}");
         register_user_key(dir, &stranger).await;
-        let e = dir
-            .put_community_membership_revocation(ts::sign_community_membership_revocation(
-                &stranger,
-                CommunityMembershipRevocation {
-                    community_key_id: community.clone(),
-                    removed_identity_key_id: carol.clone(),
-                    removed_at: at,
-                    effective_at: at,
-                    reason: None,
-                    witness_set: vec![],
-                    persist_row_hash: String::new(),
-                },
-            ))
-            .await
-            .expect_err("a stranger cannot remove a member of a reverse_quorum room");
-        assert!(
-            matches!(&e, Error::RosterAuthorityUnauthorized { rule, .. } if *rule == crate::federation::ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED),
-            "({suffix}) I181: {e}"
-        );
+        for signer in [&stranger, &bob] {
+            let e = dir
+                .put_community_membership_revocation(ts::sign_community_membership_revocation(
+                    signer,
+                    CommunityMembershipRevocation {
+                        community_key_id: community.clone(),
+                        removed_identity_key_id: carol.clone(),
+                        removed_at: at,
+                        effective_at: at,
+                        reason: None,
+                        witness_set: vec![],
+                        persist_row_hash: String::new(),
+                    },
+                ))
+                .await
+                .expect_err("CC 3.2: reverse_quorum admits no removal");
+            assert!(unevaluable(&e), "({suffix}) I181 removal by {signer}: {e}");
+        }
         assert!(
             dir.list_community_membership_revocations_for(&community)
                 .await
@@ -4626,84 +4555,30 @@ pub(crate) mod test_support {
                 .is_empty(),
             "({suffix}) I181: nothing stored"
         );
-        dir.put_community_membership_revocation(ts::sign_community_membership_revocation(
-            &bob,
-            CommunityMembershipRevocation {
-                community_key_id: community.clone(),
-                removed_identity_key_id: carol.clone(),
-                removed_at: at,
-                effective_at: at,
-                reason: None,
-                witness_set: vec![],
-                persist_row_hash: String::new(),
-            },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("({suffix}) I181: one member's removal lands: {e}"));
-        assert!(
-            !active().await.contains(&carol),
-            "({suffix}) I181: carol is out"
-        );
-        let row_hash = dir
-            .list_community_membership_revocations_for(&community)
-            .await
-            .expect("revocations")
-            .into_iter()
-            .find(|r| r.removed_identity_key_id == carol)
-            .expect("stored")
-            .persist_row_hash;
-        let action = ActionRef {
-            actor_key_id: &bob,
-            action_id: &row_hash,
-            asserted_at: at,
-        };
-        for (i, objector) in [&dave, &erin].into_iter().enumerate() {
-            let o = signed_row(
-                &uuid::Uuid::new_v4().to_string(),
-                objector,
-                &bob,
-                objection_envelope(Cohort::Community, &community, &row_hash, "she did nothing"),
-                Utc::now(),
-                &[],
-            );
-            record_objection_against(dir, &o, action)
-                .await
-                .unwrap_or_else(|e| panic!("({suffix}) I181: objection {i}: {e}"));
-            if i == 0 {
-                assert!(
-                    !active().await.contains(&carol),
-                    "({suffix}) I181: one objection does not reverse (m = 2)"
-                );
-            }
-        }
         assert!(
             active().await.contains(&carol),
-            "({suffix}) I181: two objections reverse the removal — carol counts again"
+            "({suffix}) I181: carol stays"
         );
-        let widen = |signers: &[&str]| {
-            let mut s = ts::sign_community_membership_widening(
-                signers[0],
-                CommunityMembershipWidening {
-                    community_key_id: community.clone(),
-                    member_key_id: frank.clone(),
-                    joined_at: Utc::now(),
-                    effective_at: Utc::now(),
-                    role: None,
-                    persist_row_hash: String::new(),
-                },
-            );
-            for c in &signers[1..] {
-                ts::cosign_community_membership_widening(&mut s, c);
-            }
-            s
-        };
-        dir.put_community_membership_widening_consented(widen(&[&bob]))
+        let mut w = ts::sign_community_membership_widening(
+            &bob,
+            CommunityMembershipWidening {
+                community_key_id: community.clone(),
+                member_key_id: frank.clone(),
+                joined_at: Utc::now(),
+                effective_at: Utc::now(),
+                role: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        for c in [&dave, &erin] {
+            ts::cosign_community_membership_widening(&mut w, c);
+        }
+        let e = dir
+            .put_community_membership_widening_consented(w)
             .await
-            .expect_err("an addition is never 1-of-N");
-        dir.put_community_membership_widening_consented(widen(&[&bob, &dave, &erin]))
-            .await
-            .unwrap_or_else(|e| panic!("({suffix}) I181: three of five admit an addition: {e}"));
-        assert!(active().await.contains(&frank), "({suffix}) I181");
+            .expect_err("CC 3.2: reverse_quorum admits no one");
+        assert!(unevaluable(&e), "({suffix}) I181 addition: {e}");
+        assert!(!active().await.contains(&frank), "({suffix}) I181");
     }
 
     /// v49.0.0 — the [`ActionRef`] witness: the fold reverses an action that
@@ -5279,41 +5154,43 @@ pub(crate) mod test_support {
         //    invisible. Protection returning by itself is the fail-SAFE
         //    direction, and it is the same read-time re-derivation the charter
         //    plane does (a quorum that stops reaching stops counting).
-        for i in 0..4 {
-            let newcomer = format!("rq-newcomer{i}-{suffix}");
+        //    v62.0.0 (slice C) — the commons can no longer grow: CC 3.2, "Not
+        //    a membership rule: reverse quorum. … It admits no one." Its roster
+        //    is the one the dismissal was counted against, so the dismissal
+        //    stands (the read-time re-derivation is unchanged; nothing moves
+        //    the roster under it).
+        {
+            let newcomer = format!("rq-newcomer0-{suffix}");
             register_user_key(dir, &newcomer).await;
-            // v31.0.0 (CIRISPersist#654) — the roster grow carries an authority
-            // signature over the GROWN envelope.
             let member = CommunityMember {
                 key_id: newcomer.clone(),
                 joined_at: Utc::now(),
                 role: Some("member".to_owned()),
             };
-            // v49.0.0 (#908) — the commons' own protocol signs its growth (an
-            // addition under reverse_quorum needs the dismissal threshold); a
-            // newcomer has no standing to admit itself.
             let spec =
                 crate::federation::tier_ingest::test_support::widening_admit_spec_by_consensus(
                     dir, &community, &member,
                 )
                 .await;
-            dir.add_community_member_consented(&community, member, &spec)
+            let e = dir
+                .add_community_member_consented(&community, member, &spec)
                 .await
-                .expect("grow the commons");
+                .expect_err("CC 3.2: reverse_quorum admits no one");
+            assert!(
+                matches!(&e, Error::RosterAuthorityUnauthorized { rule, .. }
+                    if *rule == "roster_consensus_unevaluable"),
+                "({suffix}) {e:?}"
+            );
         }
         let f_grown = fold(&action).await;
-        assert_eq!(f_grown.roster_size, 9, "({suffix})");
+        assert_eq!(f_grown.roster_size, 5, "({suffix}) the roster did not move");
         assert!(
-            f_grown.dismissed_objection_ids.is_empty(),
-            "({suffix}) a 3-signature dismissal does not survive a roster of 9: {f_grown:?}"
-        );
-        assert!(
-            f_grown.counted_objection_ids.contains(&o1_id),
-            "({suffix}) the objection it had lifted is LIVE again"
+            !f_grown.counted_objection_ids.contains(&o1_id),
+            "({suffix}) the 3-of-5 dismissal still lifts alice's objection: {f_grown:?}"
         );
         assert_eq!(
-            f_grown.distinct_objectors, 3,
-            "({suffix}) alice is counted once more, beside dave and erin"
+            f_grown.distinct_objectors, 2,
+            "({suffix}) dave and erin, alice dismissed"
         );
 
         // ── (8) A cohort that never adopted the protocol is NOT GOVERNED —
@@ -5342,9 +5219,10 @@ pub(crate) mod test_support {
         assert_eq!(plain_fold.standing, ReverseQuorumStanding::NotGoverned);
 
         // ── (9) SELF-RETRACTION IS FREE. erin raised the brake alone; she may
-        //    lower her own alone, on a roster of NINE where dismissing anyone
-        //    else's would take five. It takes nothing from alice or dave —
-        //    their objections are untouched — which is why one signature is the
+        //    lower her own alone, on a roster of five where dismissing anyone
+        //    else's would take three (v62: the roster no longer grows). It
+        //    takes nothing from dave — his objection is untouched — which is
+        //    why one signature is the
         //    right price and why a captured key gains nothing by it.
         let (_erin_key, erin_objection_id) = late_objections
             .last()
@@ -5376,8 +5254,7 @@ pub(crate) mod test_support {
         assert_eq!(
             (retracted.quorum.counted, retracted.quorum.required),
             (1, 1),
-            "({suffix}) one, on a roster of nine — and dismissing anyone ELSE's \
-             here still costs five"
+            "({suffix}) one, on a roster of five — dismissing anyone ELSE's costs three"
         );
         let f_retracted = fold(&action).await;
         assert!(
@@ -5387,9 +5264,9 @@ pub(crate) mod test_support {
             "({suffix}) erin's objection is lifted"
         );
         assert_eq!(
-            f_retracted.distinct_objectors, 2,
-            "({suffix}) alice and dave are UNTOUCHED — a self-retraction is not \
-             an undo of anybody else's protection: {f_retracted:?}"
+            f_retracted.distinct_objectors, 1,
+            "({suffix}) dave is UNTOUCHED — a self-retraction is not an undo of \
+             anybody else's protection: {f_retracted:?}"
         );
     }
 

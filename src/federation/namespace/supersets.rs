@@ -1813,7 +1813,9 @@ mod tests {
         // hybrid-required verify doors.
         // CIRISPersist#1252 (v61.3.0): +11, CLM-cosign-collection-held at the
         // cosign hold's doors.
-        const EXPECTED: usize = 379;
+        // v62.0.0 (slice C): -1, CLM-anti-pattern-delegation withdrawn (the
+        // cycle gate refuses nothing; CC 4.4.3.34 "Cycles are visited once").
+        const EXPECTED: usize = 378;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

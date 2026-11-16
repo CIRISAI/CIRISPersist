@@ -49522,8 +49522,8 @@ mod tests {
                         attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         asserted_at, attestation_envelope, original_content_hash, \
                         scrub_signature_classical, scrub_key_id, scrub_timestamp, \
-                        persist_row_hash, admitted_at\
-                     ) VALUES ($1, $2, $3, 'delegates_to', $4, $5, $6, 'c2ln', $2, $4, '0', $4)",
+                        persist_row_hash, admitted_at, additional_scrubs\
+                     ) VALUES ($1, $2, $3, 'delegates_to', $4, $5, $6, 'c2ln', $2, $4, '0', $4, $7)",
                     &[
                         &anomaly.attestation_id,
                         &owner2,
@@ -49532,6 +49532,8 @@ mod tests {
                         // v31.0.0 (#644) — TEXT since V122.
                         &serde_json::to_string(&anomaly.attestation_envelope).unwrap(),
                         &hash_bytes,
+                        // v62.0.0 — the node's co-scrub (CC 3.2, the first binding)
+                        &serde_json::to_string(&anomaly.additional_scrubs).unwrap(),
                     ],
                 )
                 .await

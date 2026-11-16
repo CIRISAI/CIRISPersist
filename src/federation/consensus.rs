@@ -37,8 +37,10 @@ pub const RUBRIC_UNIFORM_HALF: &str = "uniform_half";
 /// A rubric's per-seat weight function.
 type WeightFn = Box<dyn Fn(&Seat) -> f64>;
 
-/// How deep a declared `custom:` expression may nest before it is refused.
-pub const MAX_CUSTOM_DEPTH: usize = 8;
+/// How deep a declared `custom:` expression may nest before it is refused
+/// (the differential's reference only, v62.0.0).
+#[cfg(test)]
+const MAX_CUSTOM_DEPTH: usize = 8;
 
 /// Which way a membership change moves the roster. Only `reverse_quorum`
 /// reads it (the accord-ops invariant: *1-of-N to protect, m-of-n to undo,
@@ -299,19 +301,78 @@ fn unevaluable(reason: impl Into<String>) -> Verdict {
     }
 }
 
-/// **The evaluator.** Pure and total over the `consensus_protocol` vocabulary
-/// (FSD §2 table). Every arm requires at least one counted signer: no
-/// protocol admits a change that no eligible member signed.
+/// **The evaluator.** v62.0.0 (slice C) — the count is the kernel's: the
+/// ballot is presented as rows ([`crate::kernel::consensus`]) and admitted iff
+/// the counted row concludes under `ciris_kernel::seat::seat_rule`, over the
+/// head it names. Persist keeps the protocol string's shape (a malformed
+/// form is [`Verdict::Unevaluable`]) and the account of a short ballot
+/// ([`Verdict::Insufficient`] with its [`ConsensusShortfall`], counted by the
+/// arm that refused).
+///
+/// The CC-cited departures (CIRISKernel `DIFFERENCES.md`):
+///
+/// - `reverse_quorum:*` is no membership protocol — CC 3.2: "Not a
+///   membership rule: reverse quorum. … It admits no one and confers no
+///   consent on anyone's behalf." [`Verdict::Unevaluable`];
+/// - `custom:*` is no protocol — CC 4.4.3.6's protocol table has six arms
+///   and no `custom:`. [`Verdict::Unevaluable`];
+/// - a `weighted:` rubric reads whole numbers only — CC 3.3.4: "Each weight
+///   and the threshold is a whole number carried on the group's signed
+///   record." A fractional weight or `threshold_fraction` is
+///   [`Verdict::Unevaluable`].
 pub fn evaluate(b: &Ballot<'_>) -> Verdict {
-    let v = evaluate_reference(b);
-    // v62.0.0 (slice C, I1838) — the differential witness: the kernel's
-    // answer over the same ballot, every disagreement a named departure.
+    use crate::kernel::consensus::{admits, NoCell};
+    let v = match admits(b) {
+        Ok(a) if a.value => Verdict::Admit,
+        Ok(_) => explain_refusal(b),
+        Err(NoCell::ReverseQuorum) => unevaluable(format!(
+            "{:?}: reverse_quorum is not a membership rule; it admits no one (CC 3.2)",
+            b.protocol
+        )),
+        Err(NoCell::Custom) => unevaluable(format!(
+            "{:?}: custom: is not a consensus_protocol; CC 4.4.3.6 names six arms",
+            b.protocol
+        )),
+        Err(NoCell::NotWhole(reason) | NoCell::Malformed(reason)) => unevaluable(reason),
+    };
+    // v62.0.0 (slice C, I1838) — the differential witness: persist's own
+    // evaluator over the same ballot, every disagreement a named departure.
     #[cfg(test)]
-    crate::kernel::differential::consensus(b, &v);
+    crate::kernel::differential::consensus(b, &evaluate_reference(b));
     v
 }
 
-/// The evaluator as persist wrote it, before the kernel.
+/// A ballot the kernel refused, as the arm that counts it accounts for it:
+/// what was needed, what was counted, who else may sign
+/// (CIRISPersist#1250). The kernel decided; this only explains.
+fn explain_refusal(b: &Ballot<'_>) -> Verdict {
+    match evaluate_reference(b) {
+        v @ (Verdict::Insufficient { .. } | Verdict::Unevaluable { .. }) => v,
+        Verdict::Admit => {
+            // The arm's own count would admit what the kernel refuses: a key
+            // the change names is no voice of its count (CC 2.7.5), or a
+            // removal's member is not among the counted. Report the count
+            // without the change's subject.
+            let elig = eligible(b);
+            let got = counted(b, &elig);
+            let have = got.iter().filter(|s| !is_subject(b, s)).count();
+            short(
+                format!(
+                    "{:?}: not met over the head it names — {have} counted voice(s), a key \
+                     the change names is no voice of its own count (CC 2.7.5)",
+                    b.protocol
+                ),
+                have,
+                have + 1,
+                elig.iter().filter(|s| !is_subject(b, s)),
+            )
+        }
+    }
+}
+
+/// The evaluator as persist wrote it before the kernel. Production reads it
+/// only to explain a refusal ([`explain_refusal`]); the `reverse_quorum:` and
+/// `custom:` arms are the differential's reference (test builds only).
 fn evaluate_reference(b: &Ballot<'_>) -> Verdict {
     let elig = eligible(b);
     let got = counted(b, &elig);
@@ -421,6 +482,7 @@ fn evaluate_counted<'a>(b: &Ballot<'a>, elig: &[&'a Seat], got: &[&'a Seat]) -> 
             )
         };
     }
+    #[cfg(test)]
     if p.starts_with(cp::REVERSE_QUORUM_PREFIX) {
         let Some(policy) = super::reverse_quorum::ReverseQuorumPolicy::parse(p) else {
             return unevaluable(format!("malformed reverse_quorum form {p:?}"));
@@ -480,6 +542,7 @@ fn evaluate_counted<'a>(b: &Ballot<'a>, elig: &[&'a Seat], got: &[&'a Seat]) -> 
     if let Some(rubric) = p.strip_prefix(cp::WEIGHTED_PREFIX) {
         return eval_weighted(b, elig, got, rubric);
     }
+    #[cfg(test)]
     if let Some(id) = p.strip_prefix(cp::CUSTOM_PREFIX) {
         let Some(expr) = b
             .policy_blob
@@ -612,7 +675,9 @@ fn eval_weighted(b: &Ballot<'_>, elig: &[&Seat], got: &[&Seat], rubric: &str) ->
     }
 }
 
-/// A declared `custom:` expression (FSD §2 table).
+/// A declared `custom:` expression (FSD §2 table). v62.0.0: the
+/// differential's reference only (CC 4.4.3.6 has no `custom:` arm).
+#[cfg(test)]
 fn eval_expr(b: &Ballot<'_>, elig: &[&Seat], got: &[&Seat], expr: &Value, depth: usize) -> Verdict {
     if depth > MAX_CUSTOM_DEPTH {
         return unevaluable(format!(
@@ -897,10 +962,12 @@ mod tests {
             sf(eval(cp::FOUNDER_ONLY, &four, &["b"], None, Add)),
             Some((0, 1, ks(&["a"])))
         );
-        assert_eq!(
-            sf(eval("reverse_quorum:2/4:86400", &four, &["a"], None, Add)),
-            Some((1, 3, ks(&["a", "b", "c", "d"])))
-        );
+        // v62.0.0 (slice C) — CC 3.2: "Not a membership rule: reverse quorum.
+        // … It admits no one." No count: the protocol is refused.
+        assert!(matches!(
+            eval("reverse_quorum:2/4:86400", &four, &["a"], None, Add),
+            Verdict::Unevaluable { .. }
+        ));
         // A unanimous removal: every other member, and a strict majority.
         assert_eq!(
             sf(eval_about(cp::UNANIMOUS, None, &four, &["a"], "b", Remove)),
@@ -918,13 +985,14 @@ mod tests {
             )),
             Some((1, OPEN_SELF_ADMIT_REMOVAL_FLOOR, ks(&["a", "b", "d"])))
         );
-        // A custom role arm counts its role.
+        // v62.0.0 (slice C) — CC 4.4.3.6's protocol table has six arms and no
+        // `custom:`: a declared custom arm is refused, never counted.
         let blob =
             serde_json::json!({"custom": {"elders": {"role": {"name": "founder", "min": 2}}}});
-        assert_eq!(
-            sf(eval("custom:elders", &four, &["a"], Some(&blob), Add)),
-            Some((1, 2, ks(&["a"])))
-        );
+        assert!(matches!(
+            eval("custom:elders", &four, &["a"], Some(&blob), Add),
+            Verdict::Unevaluable { .. }
+        ));
         // No count: a self-signed admission, a weighted rubric, an admit.
         assert_eq!(
             sf(eval_about(cp::MAJORITY, None, &four, &["x"], "x", Add)),
@@ -1087,7 +1155,13 @@ mod tests {
     }
 
     #[test]
-    fn custom_composes_the_primitives() {
+    /// v62.0.0 (slice C, the kernel's departure 5e) — was
+    /// `custom_composes_the_primitives`. CC 4.4.3.6's protocol table has six
+    /// arms (`founder_only`, `open:self_admit`, `unanimous`, `majority`,
+    /// `quorum:M/N`, `weighted:{rubric}`) and no `custom:`: every `custom:`
+    /// ballot is unevaluable, the declared expression and its signers
+    /// notwithstanding.
+    fn custom_is_no_consensus_protocol() {
         use Direction::Add;
         let r = seats(&[
             ("a", Some("founder")),
@@ -1097,8 +1171,12 @@ mod tests {
         ]);
         let blob = serde_json::json!({"custom": {"council": {"all_of": [
             {"founder": {}}, {"role": {"name": "elder", "min": 1}}]}}});
-        assert!(eval("custom:council", &r, &["a", "b"], Some(&blob), Add).admits());
-        assert!(!eval("custom:council", &r, &["a", "d"], Some(&blob), Add).admits());
+        for signed in [&["a", "b"][..], &["a", "d"][..]] {
+            assert!(matches!(
+                eval("custom:council", &r, signed, Some(&blob), Add),
+                Verdict::Unevaluable { .. }
+            ));
+        }
         assert!(matches!(
             eval("custom:nope", &r, &["a"], Some(&blob), Add),
             Verdict::Unevaluable { .. }
@@ -1111,7 +1189,12 @@ mod tests {
     }
 
     #[test]
-    fn reverse_quorum_protects_cheaply_and_grants_expensively() {
+    /// v62.0.0 (slice C, the kernel's departure 5d) — was
+    /// `reverse_quorum_protects_cheaply_and_grants_expensively`. CC 3.2: "Not
+    /// a membership rule: reverse quorum. … It admits no one and confers no
+    /// consent on anyone's behalf." Neither a removal by one nor an addition
+    /// by a majority is counted under it.
+    fn reverse_quorum_is_not_a_membership_rule() {
         let r = seats(&[
             ("a", None),
             ("b", None),
@@ -1120,10 +1203,15 @@ mod tests {
             ("e", None),
         ]);
         let p = "reverse_quorum:2/5:86400";
-        assert!(eval(p, &r, &["a"], None, Direction::Remove).admits());
-        // Addition: m=2 floored at a strict majority of 5 = 3.
-        assert!(!eval(p, &r, &["a", "b"], None, Direction::Add).admits());
-        assert!(eval(p, &r, &["a", "b", "c"], None, Direction::Add).admits());
+        for (signed, d) in [
+            (&["a"][..], Direction::Remove),
+            (&["a", "b", "c"][..], Direction::Add),
+        ] {
+            assert!(matches!(
+                eval(p, &r, signed, None, d),
+                Verdict::Unevaluable { .. }
+            ));
+        }
     }
 
     #[test]
