@@ -538,6 +538,11 @@ pub async fn admit_replicated_accord_evidence_over_roster(
 /// second list**. The candidate set is derived from the same union
 /// `claims_role` tests, so the gate and the projection cannot disagree about
 /// what a record claims.
+///
+/// v62.0.0 (CC rc20 4.2.1 / 8.11.27, CIRISPersist#1274) — `canonical` here is
+/// the NAME of the conferral a tombstone withdraws (the V095 table), never a
+/// read of `identity_type` as standing: it is considered for every key, and
+/// the standing itself is read from the conferral (`admission::is_canonical`).
 fn withdrawal_ops_for(record: &super::KeyRecord) -> Vec<(String, String)> {
     // Considered for EVERY key regardless of what it claims today: a tombstone
     // exists to block a future re-add, and the key that will be re-offered

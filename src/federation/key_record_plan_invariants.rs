@@ -133,8 +133,13 @@ pub(crate) mod bodies {
         let mut other = rec.clone();
         other.identity_ref = format!("elsewhere-{tag}");
         match b.put_public_key(signed(other)).await {
-            Err(Error::Conflict(m)) => assert!(m.contains("different content"), "I1183: {m}"),
-            o => panic!("I1183: a differing re-offer is Conflict, got {o:?}"),
+            // v62.0.0 (#1274) — typed: the same key with another record is
+            // told apart from a pubkey swap.
+            Err(Error::KeyRecordConflict {
+                reason: crate::federation::register::KeyRecordConflictReason::SameKeyDifferentRecord,
+                ..
+            }) => {}
+            o => panic!("I1183: a differing re-offer is a same-key conflict, got {o:?}"),
         }
         assert_eq!(
             held(d, &k).await.persist_row_hash,
@@ -400,9 +405,13 @@ pub(crate) mod bodies {
             b.apply_replicated_key_record(signed(own(&f, "node,user")))
                 .await
                 .unwrap(),
-            O::Inserted,
-            "I1186: a fused key minted elsewhere is admitted as data"
+            O::Refused {
+                reason: crate::federation::register::KeyRefusalReason::NodeIdentityFused
+            },
+            "I1186: a fused key minted elsewhere is refused, typed (v62: CC rc20 \
+             3.4.7.1 / 2.4.1.1 — the set is malformed wherever it arrives)"
         );
+        assert!(absent(d, &f).await, "I1186: the fused key is not stored");
     }
 
     /// The v2 ceremony's preconditions (the I1189 / I1191 setup): the holder
@@ -818,7 +827,6 @@ pub(crate) mod bodies {
                 b,
                 KeyRecordWrite::Put {
                     record: pop_record(&k),
-                    door: crate::federation::register::KeyDoor::LocalMint,
                 },
             )
             .await

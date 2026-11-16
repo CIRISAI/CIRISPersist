@@ -362,6 +362,10 @@ pub(crate) mod occurrence_consent_invariants;
 /// v52.0.0 (CIRISPersist#930) — the occurrence history witnesses, every backend.
 #[cfg(test)]
 pub(crate) mod occurrence_history_invariants;
+/// v62.0.0 slice E1 (CIRISPersist#1274) — the CC rc20 rules on today's wire,
+/// I1870 onward, every backend.
+#[cfg(test)]
+pub(crate) mod rc20_rules_invariants;
 /// v50.0.0 (CIRISPersist#925/#927/#928) — the CC rc5 adopts, every backend.
 #[cfg(test)]
 pub mod rc5_adopts_invariants;
@@ -3708,9 +3712,11 @@ pub trait FederationDirectory: Send + Sync {
             // body has no plan (it cannot: `&Self` is unsized here). Every
             // real backend overrides with an apply that runs the plan and
             // dispatches its `Rebind` arm to `store_rebound_key_record`.
-            Err(Error::Conflict(_)) => Ok(register::ReplicatedKeyOutcome::Refused {
-                reason: register::KeyRefusalReason::StoreConflict,
-            }),
+            Err(Error::Conflict(_) | Error::KeyRecordConflict { .. }) => {
+                Ok(register::ReplicatedKeyOutcome::Refused {
+                    reason: register::KeyRefusalReason::StoreConflict,
+                })
+            }
             Err(e) => Err(e),
         }
     }
@@ -8840,7 +8846,9 @@ pub trait FederationDirectory: Send + Sync {
     /// resolution. A target whose roster is not held here refuses
     /// [`ScopeRefusalReason::MembershipUnresolved`](crate::scope::ScopeRefusalReason::MembershipUnresolved)
     /// (retryable, #797); one that excludes the writer refuses the
-    /// plane's membership reason (terminal). On refusal a §9.3
+    /// plane's membership reason: the roster held here does not name the
+    /// writer; re-check when the roster changes (a revoked member is the only
+    /// final case; v62.0.0, #1274). On refusal a §9.3
     /// `persist_refused_write_scope_total` event is emitted.
     ///
     /// Provided method (not per-backend SQL): composes the existing
@@ -8890,8 +8898,10 @@ pub trait FederationDirectory: Send + Sync {
             // v47.0.0 (CIRISPersist#797) — a roster this directory does NOT
             // HOLD is a different fact from a roster that excludes the
             // writer. The first is transient (the row arrived ahead of its
-            // roster, CIRISEdge#522 — refused rows re-offer); the second is
-            // terminal. Both still refuse; the first now says so. Detected
+            // roster, CIRISEdge#522 — refused rows re-offer); the second says
+            // the roster held here does not name the writer, to re-check when
+            // the roster changes (v62: not terminal; only a revoked member is
+            // final). Both still refuse; the first now says so. Detected
             // STRUCTURALLY — `lookup_*` returned `None` — never by reading an
             // error's variant: `InvalidArgument` is not a statement that the
             // roster is absent.
@@ -11021,6 +11031,33 @@ pub enum Error {
         message: String,
     },
 
+    /// v62.0.0 (CC rc20 2.4 / 2.6.1.9 / 2.7.4, CIRISPersist#1274) — a
+    /// `licensure:{A}` row signed by an active member of the authority
+    /// community `A`, whose `consensus_protocol` admits only a quorum act,
+    /// naming no delegation, and short of that quorum. CC 2.4: "a row short of
+    /// its protocol by signatures alone is not refused; it waits". Until v62
+    /// such a row was admitted as testimony; it is no longer testimony. On
+    /// today's wire it **waits** as a typed RETRYABLE refusal: nothing is
+    /// stored, and the same act re-offered carrying the quorum's scrub set
+    /// (base scrub + `additional_scrubs`) is admitted as the authority's act.
+    /// Collecting the signatures (a hold for attestation rows) is deferred to
+    /// the kernel slice. Stable `kind()` token
+    /// `federation_licensure_short_of_authority_quorum`; Python `ValueError`.
+    #[error(
+        "licensure_short_of_authority_quorum: {attesting_key_id:?} signed a licensure row \
+         for {authority_id:?}, whose consensus_protocol admits only a quorum act, carrying \
+         {signers} verified member signature(s): short of the quorum, the row waits \
+         (retryable: re-offer it with the quorum's scrubs; CC 2.4)"
+    )]
+    LicensureShortOfAuthorityQuorum {
+        /// The row's emitter.
+        attesting_key_id: String,
+        /// The authority community.
+        authority_id: String,
+        /// The verified roster signatures the row carries.
+        signers: usize,
+    },
+
     /// v54.1.0 (CIRISPersist#1042 follow-up C, CIRISEdge#858;
     /// CIRISPersist#1047) — an `accord_proposal` whose proposer-minted nonce
     /// already names a DIFFERENT proposal in its family. **Refused, terminal
@@ -11135,6 +11172,26 @@ pub enum Error {
     /// fires only when the caller is overwriting.
     #[error("conflicts with existing row: {0}")]
     Conflict(String),
+
+    /// v62.0.0 (CIRISPersist#1274) — a key-record store step found a stored
+    /// row for `key_id` it may not replace, for the TYPED `reason`. Before
+    /// v62 each case was an untyped [`Self::Conflict`] with only a message to
+    /// tell them apart; in particular a re-registration of the SAME key (same
+    /// pubkeys, a different record) and a pubkey swap read alike. Treated as a
+    /// conflict everywhere `Conflict` is ([`Self::is_duplicate_key`], the
+    /// replication plane's `StoreConflict`), same Python type (ValueError).
+    /// Stable `kind()` token per reason:
+    /// `federation_key_record_conflict_{reason}` (see
+    /// [`register::KeyRecordConflictReason::as_str`]).
+    #[error("key {key_id:?}: the stored record is not replaced ({reason}): {detail}")]
+    KeyRecordConflict {
+        /// The key whose stored row stands.
+        key_id: String,
+        /// Why the store step refused.
+        reason: register::KeyRecordConflictReason,
+        /// A human-readable account (the pre-v62 message).
+        detail: String,
+    },
 
     /// v25.1.0 (CIRISPersist#570 ask 3) — a
     /// [`hard_case::kind::ADMIN_ACTION`] record did not carry the authority
@@ -12881,6 +12938,24 @@ pub enum Error {
         identity_type: String,
     },
 
+    /// v62.0.0 (CC rc20 3.4.7.1 / 2.4.1.1, CIRISPersist#1274) — a key record
+    /// whose `identity_type` set holds `user` or `accord_holder` together with
+    /// `node` or `agent` (and is not already the `node`+`agent`/`user` case of
+    /// [`Self::NodeIdentityNotExclusive`]) was refused at a key-record door:
+    /// "a key is a person's or a machine's, never both" (CC 3.4.7.1). Refused on
+    /// every door, the replicated insert included. Nothing is stored. Stable
+    /// `kind()` token `federation_identity_set_mixes_person_and_machine`.
+    #[error(
+        "key {key_id:?} identity_type {identity_type:?} mixes a person's role with a \
+         machine's (CC 3.4.7.1: user or accord_holder never with node or agent)"
+    )]
+    IdentitySetMixesPersonAndMachine {
+        /// The refused record's `key_id`.
+        key_id: String,
+        /// The refused `identity_type` set as submitted.
+        identity_type: String,
+    },
+
     /// v50.0.0 (CIRISPersist#925 review H3) — a rewrite of a stored key record
     /// would add or remove `node` from its `identity_type`. `node` is fixed at
     /// mint; the key re-mints. Nothing is stored. Stable `kind()` token
@@ -13359,6 +13434,25 @@ pub mod malformed_row {
     /// signed envelope member written as an explicit JSON `null`. An optional
     /// member that is not carried is absent.
     pub const ENVELOPE_MEMBER_NULL: &str = "envelope_member_null";
+    /// v62.0.0 (CC rc20 3.3.6.2, CIRISPersist#1274) — `transit_xwing_pubkey`
+    /// or `onion_hop_xwing_pubkey` does not decode to exactly 1216 bytes (the
+    /// X-Wing public key `pk_M ‖ pk_X`, 1184 + 32). "A key of the wrong length
+    /// is refused as malformed, under the same rule as the transit key."
+    pub const XWING_PUBKEY_WRONG_LENGTH: &str = "xwing_pubkey_wrong_length";
+    /// v62.0.0 (CC rc20 3.3.6.2) — bytes 0..1184 of `transit_xwing_pubkey`
+    /// equal another key carried on the same signed row.
+    pub const TRANSIT_XWING_ML_KEM_768_REUSE: &str = "transit_xwing_ml_kem_768_reuse";
+    /// v62.0.0 (CC rc20 3.3.6.2) — bytes 1184..1216 of `transit_xwing_pubkey`
+    /// equal another key carried on the same signed row.
+    pub const TRANSIT_XWING_X25519_REUSE: &str = "transit_xwing_x25519_reuse";
+    /// v62.0.0 (CC rc20 3.3.6.2) — bytes 0..1184 of `onion_hop_xwing_pubkey`
+    /// equal another key on the same row: "The token is
+    /// `onion_hop_ml_kem_768_reuse` for the first half".
+    pub const ONION_HOP_ML_KEM_768_REUSE: &str = "onion_hop_ml_kem_768_reuse";
+    /// v62.0.0 (CC rc20 3.3.6.2) — bytes 1184..1216 of `onion_hop_xwing_pubkey`
+    /// equal another key on the same row: "`onion_hop_x25519_reuse` for the
+    /// second".
+    pub const ONION_HOP_X25519_REUSE: &str = "onion_hop_x25519_reuse";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -13383,6 +13477,11 @@ pub mod malformed_row {
         SUBJECT_KEY_ID_MALFORMED,
         // Appended, never inserted: adopters key on the position.
         ENVELOPE_MEMBER_NULL,
+        XWING_PUBKEY_WRONG_LENGTH,
+        TRANSIT_XWING_ML_KEM_768_REUSE,
+        TRANSIT_XWING_X25519_REUSE,
+        ONION_HOP_ML_KEM_768_REUSE,
+        ONION_HOP_X25519_REUSE,
     ];
 }
 
@@ -13442,6 +13541,9 @@ impl Error {
             Error::LicensureDelegatorNotAuthority { .. } => {
                 "federation_licensure_delegator_not_authority"
             }
+            Error::LicensureShortOfAuthorityQuorum { .. } => {
+                "federation_licensure_short_of_authority_quorum"
+            }
             Error::AccordProposalNonceReused { .. } => "federation_accord_proposal_nonce_reused",
             Error::RateLimited { .. } => "federation_rate_limited",
             Error::ConsentGateRefused(_) => "federation_consent_gate_refused",
@@ -13449,6 +13551,7 @@ impl Error {
             Error::MediaSourceInvalid { .. } => "federation_media_source_invalid",
             Error::LocalAttestationIdOccupied { .. } => "federation_local_attestation_id_occupied",
             Error::Conflict(_) => "federation_conflict",
+            Error::KeyRecordConflict { reason, .. } => reason.kind(),
             Error::AdminActionUnattributed { .. } => "federation_admin_action_unattributed",
             Error::HardCaseAttesterUnavailable { .. } => hard_case::refusal::ATTESTER_UNAVAILABLE,
             Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",
@@ -13553,6 +13656,9 @@ impl Error {
                 roster_head::LINEAGE_VERSION_DISAGREES_WITH_FOLD
             }
             Error::NodeIdentityNotExclusive { .. } => "federation_node_identity_not_exclusive",
+            Error::IdentitySetMixesPersonAndMachine { .. } => {
+                "federation_identity_set_mixes_person_and_machine"
+            }
             Error::NodeIdentityImmutable { .. } => "federation_node_identity_immutable",
             Error::UserTargetStewardBindingForbidden { .. } => {
                 "federation_user_target_steward_binding_forbidden"
@@ -13628,7 +13734,7 @@ impl Error {
     /// driver-rendering change of the other.
     #[must_use]
     pub fn is_duplicate_key(&self) -> bool {
-        if matches!(self, Error::Conflict(_)) {
+        if matches!(self, Error::Conflict(_) | Error::KeyRecordConflict { .. }) {
             return true;
         }
         let Error::Backend(msg) = self else {

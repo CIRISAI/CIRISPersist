@@ -118,8 +118,15 @@ pub(crate) mod bodies {
             )
             .await;
         assert!(
-            matches!(changed_role, Err(Error::Conflict(_))),
-            "I1146: a changed role is Conflict: {changed_role:?}"
+            matches!(
+                changed_role,
+                Err(Error::KeyRecordConflict {
+                    reason:
+                        crate::federation::register::KeyRecordConflictReason::SameKeyDifferentRecord,
+                    ..
+                })
+            ),
+            "I1146: a changed role is a same-key conflict (v62: typed): {changed_role:?}"
         );
 
         // A changed expiry is a real change.
@@ -133,7 +140,14 @@ pub(crate) mod bodies {
             )
             .await;
         assert!(
-            matches!(changed_expiry, Err(Error::Conflict(_))),
+            matches!(
+                changed_expiry,
+                Err(Error::KeyRecordConflict {
+                    reason:
+                        crate::federation::register::KeyRecordConflictReason::SameKeyDifferentRecord,
+                    ..
+                })
+            ),
             "I1146: a changed expiry is Conflict: {changed_expiry:?}"
         );
         drop(restarted);
@@ -150,7 +164,13 @@ pub(crate) mod bodies {
             )
             .await;
         assert!(
-            matches!(changed_pqc, Err(Error::Conflict(_))),
+            matches!(
+                changed_pqc,
+                Err(Error::KeyRecordConflict {
+                    reason: crate::federation::register::KeyRecordConflictReason::PubkeyChange,
+                    ..
+                })
+            ),
             "I1146: a changed PQC key is Conflict: {changed_pqc:?}"
         );
 
@@ -164,7 +184,14 @@ pub(crate) mod bodies {
             .put_public_key(SignedKeyRecord { record: fresh })
             .await;
         assert!(
-            matches!(put, Err(Error::Conflict(_))),
+            matches!(
+                put,
+                Err(Error::KeyRecordConflict {
+                    reason:
+                        crate::federation::register::KeyRecordConflictReason::SameKeyDifferentRecord,
+                    ..
+                })
+            ),
             "I1146: the replicated put of a fresh envelope is still Conflict: {put:?}"
         );
         let unchanged = swapped

@@ -215,6 +215,17 @@ pub mod identity_type {
     /// op: an accord holder scrub-signs the node with the `canonical` role.
     /// The admission gate is
     /// [`super::super::admission::check_canonical_role_admission`].
+    ///
+    /// **v62.0.0 (CC rc20 3.4.7.1 / 4.2.1 / 8.11.27, CIRISPersist#1274) — not
+    /// an identity type.** "A conferral is not a label. A canonical key's
+    /// `identity_type` is {`node`}; its canonical standing is the accord's
+    /// counted conferral." This token survives as the EARLIER FORM's name for
+    /// that conferral (CC 8.11.27: the envelope `"canonical,node"` "names that
+    /// conferral and is no identity type"). Standing is read from the conferral
+    /// itself ([`super::super::admission::is_canonical`]); a `canonical` left
+    /// in a stored `identity_type` whose co-scrub does not verify is inert. A
+    /// new canonical is signed as {`node`} with `roles: ["infra:serve"]` and the
+    /// accord's co-scrub (the ceremony re-signs; persist reads both forms).
     pub const CANONICAL: &str = "canonical";
     /// v17.0.0 (CIRISPersist#440, CC 3.4.9) — the **CIRISRegistry
     /// co-steward** of the co-stewarded `licensure:{authority_id}`
@@ -280,10 +291,14 @@ pub mod identity_type {
     /// costs nothing. [`STEWARD`], [`PARTNER`] and [`WISE_AUTHORITY`] ARE
     /// present: each is read as authority (steward-binding, partner licensure,
     /// WA adjudication) somewhere in the write path.
-    pub const AUTHORITY_CONFERRING_IDENTITY_TYPES: [&str; 11] = [
+    ///
+    /// v62.0.0 (CC rc20 3.4.7.1, CIRISPersist#1274) — [`SUBSTRATE_PERSIST`]
+    /// left this set: "`substrate_persist` is a key type that confers no
+    /// authority. A store asserts it under its own key, and no ceremony or
+    /// co-scrub confers it." It is in [`SELF_REPORT_IDENTITY_TYPES`] instead.
+    pub const AUTHORITY_CONFERRING_IDENTITY_TYPES: [&str; 10] = [
         ACCORD_HOLDER,
         CANONICAL,
-        SUBSTRATE_PERSIST,
         WITNESS,
         TRUSTED_PUBLISHER,
         LENSCORE_DETECTOR,
@@ -300,6 +315,29 @@ pub mod identity_type {
         REGISTRY,
         VERIFY,
     ];
+
+    /// v62.0.0 (CC rc20 3.4.7.1 / 3.1.3, CIRISPersist#1274) — the key types
+    /// that **confer no authority** yet still name who may file a family: the
+    /// substrate's self-report. CC 3.1.3: "`system:*` is one family, reserved to
+    /// the substrate component"; CC 3.4.7.1: "`substrate_persist` is a key type
+    /// that confers no authority. A store asserts it under its own key … Nothing
+    /// is admitted on its strength, and the records a store signs mark and
+    /// never cause." A reserved-prefix rule may key on a member of this set
+    /// (the self-report families of
+    /// [`SUBSTRATE_SELF_REPORT_PREFIXES`](crate::federation::admission::SUBSTRATE_SELF_REPORT_PREFIXES)),
+    /// and the row must describe its own signer
+    /// ([`check_substrate_self_report_attester`](crate::federation::admission::check_substrate_self_report_attester)).
+    /// Disjoint from [`AUTHORITY_CONFERRING_IDENTITY_TYPES`]; no
+    /// [`ConferralMode`] names a member.
+    ///
+    /// Until v62 one reader admitted on this type's strength:
+    /// [`is_authorized_infrastructure_community`](crate::federation::admission::is_authorized_infrastructure_community)
+    /// granted the infrastructure carve-out to a community whose own key
+    /// claimed `substrate_persist`, which any key could self-claim (v61.4.1
+    /// never gated it at registration). v62.0.0 replaced that reader with a
+    /// conformant record rooted in this node's trust set (I1871, I1881–I1885);
+    /// no reader admits on this type any more.
+    pub const SELF_REPORT_IDENTITY_TYPES: [&str; 1] = [SUBSTRATE_PERSIST];
 
     /// v22.0.0 (CIRISPersist#543 finding 3) — HOW each member of
     /// [`AUTHORITY_CONFERRING_IDENTITY_TYPES`] is conferred. Naming the
@@ -393,19 +431,12 @@ pub mod identity_type {
             // root the asking node itself trusts.
             TRUSTED_PUBLISHER | LENSCORE_DETECTOR => ConferralMode::DelegatedFromTrustRoot,
 
-            // SELF-DESCRIPTIVE. `substrate_persist` is a node's identity FOR
-            // ITSELF — the families it unlocks (`system:`, `audit_chain:`,
-            // `corpus_health:`, `identity_continuity:`, `federation_directory:`)
-            // are the node's own operational telemetry about its own substrate,
-            // and nothing consumes them as authority over a third party. A
-            // Sybil calling itself "the substrate" gains standing over nobody:
-            // its `system:` rows describe its own node, which it is free to
-            // describe. Requiring an accord co-scrub here would also be
-            // unsatisfiable by construction — a node registers this identity at
-            // its OWN bootstrap, before any accord family exists to co-scrub it.
-            // (If a `system:*` row ever becomes an input to a decision ABOUT
-            // ANOTHER PARTY, this must move to AccordCoScrubbed.)
-            SUBSTRATE_PERSIST => ConferralMode::DerivedFromVerifiedState,
+            // v62.0.0 (CC rc20 3.4.7.1) — `substrate_persist` declares NO
+            // mode: it "is a key type that confers no authority", so it is not
+            // a member of the set this table is exhaustive over. Until v61.4.1
+            // it was `DerivedFromVerifiedState` (self-descriptive, never gated
+            // at registration); its families are the store's self-report, see
+            // `SELF_REPORT_IDENTITY_TYPES`.
 
             // Conferred by graph edges persist already verifies at each USE:
             // steward-binding, licensure quorum, WA adjudication, and the

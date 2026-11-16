@@ -33108,7 +33108,9 @@ fn seal_did_not_open_message(kind: &str, sha256_hex: &str) -> String {
 
 /// v47.0.0 (CIRISPersist#797) — `"<kind>: <reason-kind>"` for an AV-45
 /// refusal, so a host can tell `scope_membership_unresolved` (retryable) from
-/// `scope_no_community_membership` (terminal). The leading `kind` token is
+/// `scope_no_community_membership` (the roster held here does not name the
+/// writer; re-check when the roster changes; v62.0.0 #1274: only a revoked
+/// member is final). The leading `kind` token is
 /// unchanged, so a `startswith` check keeps working.
 fn write_scope_refused_message(kind: &str, reason: &crate::scope::ScopeRefusalReason) -> String {
     format!("{kind}: {}", reason.kind())
@@ -33446,8 +33448,17 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
             PyValueError::new_err(format!("{kind}: {reason}"))
         }
         crate::federation::Error::AccordProposalNonceReused { .. } => PyValueError::new_err(kind),
+        // v62.0.0 (#1274) — a licensure row short of its authority's quorum
+        // waits (retryable); it was admitted (no error) before, so the new
+        // arm takes the licensure family's type.
+        crate::federation::Error::LicensureShortOfAuthorityQuorum { .. } => {
+            PyValueError::new_err(kind)
+        }
         // Conflict → ValueError too; lens-side maps to 409.
         crate::federation::Error::Conflict(_) => PyValueError::new_err(kind),
+        // v62.0.0 (#1274) — the typed key-record conflicts were `Conflict`
+        // until v62; they keep its Python type.
+        crate::federation::Error::KeyRecordConflict { .. } => PyValueError::new_err(kind),
         // v2.4.0 (CIRISPersist#102 Ask 3) — admission-gate rejections
         // are caller-fault malformed-content; ValueError (4xx).
         crate::federation::Error::AccordDimensionRequiresAccordHolder { .. }
@@ -33595,7 +33606,10 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v47.0.0 (CIRISPersist#797) — the REASON rides the message as
         // `"<kind>: <reason-kind>"` (the `rate_limited_message` shape), so a
         // host can tell `scope_membership_unresolved` (retryable: the roster
-        // has not arrived) from `scope_no_community_membership` (terminal).
+        // has not arrived) from `scope_no_community_membership` (the roster
+        // held here does not name the writer; re-check when the roster
+        // changes. v62.0.0, #1274: not terminal; a revoked member is the only
+        // final case).
         // Before this the host saw only `federation_write_scope_refused` and
         // the distinction stopped at the Rust boundary. Exception TYPE and the
         // leading `kind` token are unchanged: `except ValueError` and
@@ -33742,6 +33756,9 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::LineageVersionDisagreesWithFold { .. }
         | crate::federation::Error::CommunityConsensusProtocolViolation { .. }
         | crate::federation::Error::NodeIdentityNotExclusive { .. }
+        // v62.0.0 (CC rc20 3.4.7.1) — the wider identity set rule: the same
+        // submitter-fault class as the node exclusion it extends.
+        | crate::federation::Error::IdentitySetMixesPersonAndMachine { .. }
         | crate::federation::Error::NodeIdentityImmutable { .. } => PyValueError::new_err(kind),
         // v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — a refused
         // user-target steward-binding (target is a self-sovereign adult / its

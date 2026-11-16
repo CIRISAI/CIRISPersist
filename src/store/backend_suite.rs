@@ -4026,10 +4026,32 @@ mod tests {
         );
         assert_eq!(err.kind(), "federation_community_no_moderator");
 
-        // (3) infrastructure community with a non-steward-bound founder →
-        //     EXEMPT (trust + serve needs no moderator) → ADMIT.
+        // (3) v62.0.0 (CC rc20 3.4.7.1 / 3.2, #1274) — a SELF-DECLARED
+        //     infrastructure community (its key self-claims substrate_persist,
+        //     its founder is no person, it roots nowhere) is NOT exempt: the
+        //     exemption is the authorized-infrastructure predicate's (a
+        //     conformant record rooted in this node's trust set), never a key
+        //     type. Until v62 this leg asserted the exemption.
         let c_infra = seed(&b, "dt-infra", "dt-iprim", identity_type::PRIMITIVE, true).await;
-        check_no_moderator_federate_admission(&b, &c_infra)
+        assert!(matches!(
+            check_no_moderator_federate_admission(&b, &c_infra).await,
+            Err(crate::federation::Error::CommunityHasNoModerator { .. })
+        ));
+        //     A conformant, rooted infrastructure room is authorized.
+        let rooted =
+            crate::federation::canonical_community_invariants::bodies::rooted_infrastructure_room(
+                &b as &dyn crate::federation::FederationDirectory,
+                "dt-rooted",
+                &[],
+                "dt-rooted",
+            )
+            .await;
+        assert!(
+            crate::federation::admission::is_authorized_infrastructure_community(&b, &rooted)
+                .await
+                .unwrap()
+        );
+        check_no_moderator_federate_admission(&b, &rooted)
             .await
             .expect("authorized infrastructure community is exempt from the moderator gate");
 

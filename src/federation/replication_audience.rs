@@ -490,16 +490,12 @@ where
             if super::public_room::is_public_community(&c) {
                 return Ok(true);
             }
-            // v53.0.0 — a KEYLESS trust-root community (`ciris-canonical`) has
-            // no key record to carry `substrate_persist`; its authority is
-            // its chain from an accord birth. ROOTED by the one rooting
-            // function ⇒ public. A squat at the id, or a stalled row, is not.
-            if matches!(
-                super::canonical_community::stored_standing(dir, group).await?,
-                super::canonical_community::StoredStanding::Rooted(_)
-            ) {
-                return Ok(true);
-            }
+            // v62.0.0 (CC rc20 3.2, #1274) — a rooted trust-root community
+            // (`ciris-canonical` included) is public ONLY through the one
+            // infrastructure predicate above, which roots it in THIS node's
+            // trust set. The separate `stored_standing(..) == Rooted` leg that
+            // stood here (v53.0.0) is folded into it: on a re-rooted node an
+            // accord-rooted community is not a Commons audience.
         }
         Ok(None) | Err(Error::Unsupported { .. }) => {}
         Err(e) => return Err(e),

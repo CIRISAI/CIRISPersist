@@ -16566,7 +16566,7 @@
     "decimal_id": "3.4.7.1",
     "claim_id": "CLM-identity-set",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/types.rs#identity_type::set_contains",
+    "path#symbol": "src/federation/register.rs#check_node_identity_exclusive",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc8-1091"
    },

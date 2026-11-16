@@ -263,7 +263,8 @@ pub mod bodies {
                     .await
                 ),
                 "scope_no_community_membership",
-                "I147/{scope}: a KNOWN room the writer is not in is terminal"
+                "I147/{scope}: a KNOWN room the writer is not in: the roster held here does not \
+                 name the writer (re-check when the roster changes)"
             );
             let ours = format!("i147-ours-{scope}-{s}");
             seed_room_for(b, scope, &ours, &[&writer]).await;

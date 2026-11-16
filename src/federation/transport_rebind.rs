@@ -107,6 +107,74 @@ fn pinned_row(occurrence_key_id: &str, kind: &str) -> Option<&'static SignedTran
     })
 }
 
+/// v62.0.0 (#1274) — is `key_id` a seated serve node of the pinned bundle
+/// this build reads?
+#[must_use]
+pub fn is_seated_serve_node(key_id: &str) -> bool {
+    super::genesis::canonical_genesis_bundle()
+        .serve_nodes
+        .iter()
+        .any(|n| n.record.key_id == key_id)
+}
+
+/// v62.0.0 (CC rc20 3.3.6.2, CIRISPersist#1274) — **the re-bind this node holds
+/// for a seat**: the carried row of the admitted `transport:canonical_rebind`
+/// about `seat_key_id` whose carried row is latest by `(epoch, asserted_at)`
+/// (the transport door's own order), or `None` when it holds none. Every row
+/// read was admitted by [`check_rebind_admission`] at `put_attestation` (a
+/// held row is an admitted one); a row whose carried destination is about
+/// another key is skipped.
+///
+/// [`transit_xwing_pubkey_for`](super::self_at_login::transit_xwing_pubkey_for)
+/// asks this for THE RULE: a seated serve node's X-Wing transit key is live
+/// only when this returns exactly its live row.
+///
+/// # Errors
+///
+/// A backend read error.
+pub async fn rebind_held_for<D>(
+    dir: &D,
+    seat_key_id: &str,
+) -> Result<Option<SignedTransportDestination>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let mut best: Option<SignedTransportDestination> = None;
+    let mut pages = super::attestation_query::AttestationQuery::to(
+        seat_key_id,
+        super::attestation_query::FOLD_PAGE,
+    )
+    .types(&[attestation_type::SCORES])
+    .dimension(REBIND_DIMENSION)
+    .pages();
+    while let Some(page) = pages.next(dir.as_dyn_directory()).await? {
+        for row in &page {
+            if row.attested_key_id != seat_key_id {
+                continue;
+            }
+            let Some(c) = carried_row(row) else {
+                continue;
+            };
+            if c.transport_destination.occurrence_key_id != seat_key_id {
+                continue;
+            }
+            let later = best.as_ref().is_none_or(|b| {
+                (
+                    c.transport_destination.epoch,
+                    c.transport_destination.asserted_at,
+                ) > (
+                    b.transport_destination.epoch,
+                    b.transport_destination.asserted_at,
+                )
+            });
+            if later {
+                best = Some(c);
+            }
+        }
+    }
+    Ok(best)
+}
+
 fn pair_of(row: &SignedTransportDestination) -> Result<Option<TransitKexPair>, Error> {
     if row.transport_destination.retired_at.is_some() {
         return Ok(None);

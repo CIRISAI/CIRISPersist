@@ -126,7 +126,10 @@ pub enum ScopeRefusalReason {
     /// difference is for the caller — this one is RETRYABLE (the roster may
     /// simply not have replicated; CIRISEdge#522 refused rows re-offer),
     /// while [`Self::NoFamilyMembership`] / [`Self::NoCommunityMembership`]
-    /// are terminal. Produced only where the roster is structurally absent
+    /// say "the roster held here does not name the writer; re-check when the
+    /// roster changes" (v62.0.0, #1274: not terminal; a later roster version
+    /// may name the writer, and only a writer the roster has REVOKED is a
+    /// final no). Produced only where the roster is structurally absent
     /// (`lookup_*` → `None`), never from an error.
     #[error(
         "the claimed cohort's roster is not held here yet; membership is unresolved (retryable)"

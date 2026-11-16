@@ -2031,8 +2031,10 @@ pub mod lifecycle_support {
     }
 
     /// As [`seed_community`], with control over the community key's
-    /// identity type (SUBSTRATE_PERSIST makes an `infrastructure`-labeled
-    /// community AUTHORIZED per SecReview F2) and its policy blob.
+    /// identity type and its policy blob. v62.0.0: `SUBSTRATE_PERSIST` with an
+    /// `infrastructure` policy asks for an AUTHORIZED infrastructure community,
+    /// which is stood up as a rooted trust-root room (the key type itself
+    /// confers nothing).
     pub async fn seed_community_with<B>(
         backend: &B,
         community_key_id: &str,
@@ -2044,6 +2046,35 @@ pub mod lifecycle_support {
     {
         use crate::federation::tier_ingest::test_support as ts;
 
+        // v62.0.0 (CC rc20 3.4.7.1 / 3.2, #1274) — an AUTHORIZED
+        // infrastructure community is a conformant record rooted in this
+        // node's trust set; a self-claimed `substrate_persist` key no longer
+        // makes one. An infrastructure-labelled fixture is therefore stood up
+        // as a rooted trust-root room with `members` seated.
+        // (Unit-test builds only: the rooted fixture is test code; a
+        // `test-anchor` simulation build keeps the v61 shape and gets the
+        // stricter non-infrastructure path.)
+        #[cfg(test)]
+        if policy_blob
+            .as_ref()
+            .and_then(|b| b.get("cohort_subkind"))
+            .and_then(|v| v.as_str())
+            == Some("infrastructure")
+            && community_identity_type == crate::federation::types::identity_type::SUBSTRATE_PERSIST
+        {
+            for (ident, occ) in members {
+                seed_member(backend, ident, occ).await;
+            }
+            let idents: Vec<&str> = members.iter().map(|(i, _)| *i).collect();
+            crate::federation::canonical_community_invariants::bodies::rooted_infrastructure_room(
+                backend as &dyn FederationDirectory,
+                community_key_id,
+                &idents,
+                community_key_id,
+            )
+            .await;
+            return;
+        }
         ts::register_hybrid_key_as(
             backend,
             community_key_id,

@@ -2961,7 +2961,10 @@ impl Engine {
                 Ok(other) => Err(crate::federation::Error::Backend(format!(
                     "rebind_key_record: store step returned {other:?}"
                 ))),
-                Err(crate::federation::Error::Conflict(_)) => Ok(RebindOutcome::Refused {
+                Err(
+                    crate::federation::Error::Conflict(_)
+                    | crate::federation::Error::KeyRecordConflict { .. },
+                ) => Ok(RebindOutcome::Refused {
                     reason: KeyRefusalReason::StoreConflict,
                 }),
                 Err(e) => Err(e),
@@ -2979,7 +2982,10 @@ impl Engine {
                     Ok(other) => Err(crate::federation::Error::Backend(format!(
                         "rebind_key_record: invalid-replace store step returned {other:?}"
                     ))),
-                    Err(crate::federation::Error::Conflict(_)) => Ok(RebindOutcome::Refused {
+                    Err(
+                        crate::federation::Error::Conflict(_)
+                        | crate::federation::Error::KeyRecordConflict { .. },
+                    ) => Ok(RebindOutcome::Refused {
                         reason: KeyRefusalReason::StoreConflict,
                     }),
                     Err(e) => Err(e),
@@ -9980,11 +9986,12 @@ impl Engine {
         crate::federation::accord_threshold_now(directory.as_ref()).await
     }
 
-    /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
-    /// founding bootstrap servers**: all `federation_keys` rows whose
-    /// `identity_type` set contains `canonical`, stable-sorted by `key_id`.
-    /// Every returned row is (by the admission gate) anchor-scrub-conferred —
-    /// none is self-claimed. Dispatches to the backend's inherent enumerator.
+    /// v13.0.0 (CIRISPersist#372) — enumerate the **canonical / founding
+    /// bootstrap servers**, stable-sorted by `key_id`. v62.0.0 (CC rc20 4.2.1,
+    /// #1274): a server is canonical by the accord's verified co-scrub
+    /// conferral, never by a `canonical` label in `identity_type`
+    /// ([`is_canonical`](crate::federation::is_canonical)). Dispatches to the
+    /// backend's inherent enumerator.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn list_canonical_servers(
         &self,

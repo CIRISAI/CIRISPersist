@@ -1953,12 +1953,49 @@ pub(crate) mod bodies {
             .expect_err("closed vocabulary");
         assert_eq!(e.kind(), "schema_unknown_run_kind", "I670: {e}");
         // (d) a signed mock run on the canonical: `trace_run_kind_mock`.
-        ts::register_hybrid_key(dir, NODE).await;
-        d.set_node(NODE);
-        d.set_identity_type(NODE, "node,canonical").await;
+        let g = confer_canonical(dir).await;
+        d.set_node(&g);
         let mock = signed_run_kind_trace("trace-i670-mock", AGENT, "mock", "mock");
         let e = ingest_full(d, &batch(&mock)).await.expect_err("a mock run");
         assert_eq!(e.kind(), sp::TRACE_RUN_KIND_MOCK, "I670: {e}");
+    }
+
+    /// v62.0.0 (CC rc20 4.2.1 / 3.4.7.1, CIRISPersist#1274) — make a node
+    /// CANONICAL the way the standing is now read: by the accord's verified
+    /// co-scrub conferral, never by a `canonical` label (the
+    /// `set_identity_type` seam these witnesses used is now inert, as CC 3.4.7.1
+    /// requires: "A conferral is not a label"). The canonical is the baked
+    /// lineage id (the pre-floor bar) in the forward form: {node} with
+    /// `roles: ["infra:serve"]`, co-scrubbed 2-of-3 by the genesis holders
+    /// under test keys. Returns its key id, which the caller seats as the node.
+    pub(crate) async fn confer_canonical(dir: &dyn FederationDirectory) -> String {
+        use crate::federation::operational::test_support as ops;
+        let accord = ops::register_genesis_accord_roster(dir)
+            .await
+            .expect("genesis accord roster");
+        let g = crate::federation::genesis::canonical_genesis_bundle().serve_nodes[0]
+            .record
+            .key_id
+            .clone();
+        if dir.lookup_public_key(&g).await.unwrap().is_none() {
+            dir.put_public_key(crate::federation::SignedKeyRecord {
+                record: ops::signed_canonical_record_with_roles(
+                    &g,
+                    "node",
+                    ops::PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                    None,
+                    vec!["infra:serve".to_owned()],
+                    serde_json::json!({ "key_id": g }),
+                    &[&accord[0], &accord[1]],
+                ),
+            })
+            .await
+            .expect("the canonical conferral is admitted");
+        }
+        assert!(crate::federation::is_canonical_effective(dir, &g)
+            .await
+            .unwrap());
+        g
     }
 
     // ── I669 ──────────────────────────────────────────────────────────────
@@ -2101,9 +2138,8 @@ pub(crate) mod bodies {
             "I1030: the steward-purge read sees the profile's run_kind"
         );
         // Mock, signed in the profile, on the canonical: `trace_run_kind_mock`.
-        ts::register_hybrid_key(dir, NODE).await;
-        d.set_node(NODE);
-        d.set_identity_type(NODE, "node,canonical").await;
+        let g = confer_canonical(dir).await;
+        d.set_node(&g);
         let (mock, _) = sign_v28(
             v28_trace_json("trace-i1030-mock", AGENT, Some("mock"), Some("2.8.0")),
             AGENT,
@@ -2801,10 +2837,17 @@ pub(crate) mod bodies {
         ingest(canonical, &early)
             .await
             .expect("a node without `canonical` keeps it");
+        // v62.0.0 — the canonical standing is the conferral (CC 3.4.7.1); a
+        // `canonical` label on NODE would be inert.
         canonical.set_identity_type(NODE, "node,canonical").await;
-        assert!(crate::federation::is_canonical_effective(dir, NODE)
-            .await
-            .unwrap());
+        assert!(
+            !crate::federation::is_canonical_effective(dir, NODE)
+                .await
+                .unwrap(),
+            "I659(b): a label alone confers nothing"
+        );
+        let g = confer_canonical(dir).await;
+        canonical.set_node(&g);
         let mock = batch(&trace_json(
             "trace-i659-ingest",
             AGENT,

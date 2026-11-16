@@ -30,9 +30,19 @@
 //! Regenerate: `ACCORD_LINEAGE_VECTOR_OUT=<path> cargo nextest run --features
 //! sqlite -E 'test(accord_lineage_vector)'`, then copy `<path>` over the
 //! checked-in file.
+//!
+//! **v2** (v62.0.0, CIRISPersist#1274; I1877): `accord_lineage_v2.json` extends
+//! v1 with **v4**, a charter version whose charter re-lists the commitment
+//! v3's recovery spent, plus the charter rows (as stored) and the commitments
+//! in force at the head (CC rc20 4.2.6). v1 stays pinned. Regenerate with
+//! `ACCORD_LINEAGE_VECTOR_V2_OUT=<path>`.
 
 /// The checked-in vector.
 const VECTOR: &str = include_str!("../../tests/vectors/accord_lineage/accord_lineage_v1.json");
+/// v62.0.0 (CIRISPersist#1274) — the checked-in v2 vector: v1's versions plus
+/// a charter version re-listing a spent commitment, the charter rows, and the
+/// commitments in force. v1 stays pinned beside it.
+const VECTOR_V2: &str = include_str!("../../tests/vectors/accord_lineage/accord_lineage_v2.json");
 
 /// The bytes `compute_persist_row_hash` hashes for `row`: the serde value
 /// without `persist_row_hash` / `consent_role`, every instant truncated to
@@ -194,6 +204,22 @@ pub(crate) mod bodies {
         id: &str,
         asserted_at: &str,
     ) -> crate::federation::Attestation {
+        charter_row_with(
+            test_accord_recovery_commitments(roster),
+            signers,
+            id,
+            asserted_at,
+        )
+    }
+
+    /// [`charter_row`] with its `recovery_commitments` given (v2's v4 charter
+    /// re-lists a spent commitment).
+    fn charter_row_with(
+        commitments: serde_json::Value,
+        signers: &[&str],
+        id: &str,
+        asserted_at: &str,
+    ) -> crate::federation::Attestation {
         let env = json!({
             "references_attestation_id": id,
             "dimension": TRUST_CHARTER_DIMENSION,
@@ -203,7 +229,7 @@ pub(crate) mod bodies {
                 "vec-successor-b".to_owned(),
             ])
             .unwrap(),
-            "recovery_commitments": test_accord_recovery_commitments(roster),
+            "recovery_commitments": commitments,
         });
         // `ops::co_signed_trust_attestation`, at a FIXED instant: the row's
         // instants are sealed into its envelope, so every scrub follows them.
@@ -474,6 +500,305 @@ pub(crate) mod bodies {
         })
     }
 
+    /// v4's charter id and instant (v2 vector).
+    const CHARTER_V4_ID: &str = "vec-accord-charter-v4";
+    const CHARTER_V4_AT: &str = "2026-07-01T00:00:00Z";
+    const DECISION4_CLOSES: &str = "2026-08-01T00:00:00Z";
+
+    /// **Build the v2 vector** (CIRISPersist#1274, asked by CIRISVerify for
+    /// `accord_live_quorum::recovery_commitment_in_force_with_charters`): the
+    /// v1 vector's three versions, then **v4**, a charter version naming a new
+    /// charter that RE-LISTS the commitment v3's recovery spent (as
+    /// `vec-holder-a2`'s entry). Beside the versions it carries the charter
+    /// rows the lineage adopts, as stored (each identified by its own
+    /// `persist_row_hash`), and what persist reads from them: the commitment
+    /// in force for every seat at the head and the spent commitments. CC rc20
+    /// 4.2.6: "A spent commitment never returns: a row that names it again is
+    /// read as naming none for that holder."
+    pub(crate) async fn generate_v2(d: &dyn FederationDirectory) -> serde_json::Value {
+        let mut v = generate(d).await;
+        let accord = accord_family_key_id();
+        let spent =
+            recovery_commitment(&test_committed_key(&format!("{}-recovery", HOLDERS[0]))).unwrap();
+        let a2_next =
+            recovery_commitment(&test_committed_key(&format!("{RECOVERED}-recovery"))).unwrap();
+        // v4 — a charter version: it names a new charter that RE-LISTS the
+        // spent commitment as vec-holder-a2's entry. It also retires ADDED
+        // through the accord's roster door (the accord's charter-adopting
+        // version is a roster version; the charter commits the roster it
+        // leaves: a2, b, c).
+        let roster4 = [RECOVERED, HOLDERS[1], HOLDERS[2]];
+        let mut entries = test_accord_recovery_commitments(&roster4[1..]);
+        entries[RECOVERED] = json!(spent);
+        let signers4 = [RECOVERED, HOLDERS[1], HOLDERS[2]];
+        let c4 = put_charter(
+            d,
+            charter_row_with(entries, &signers4, CHARTER_V4_ID, CHARTER_V4_AT),
+        )
+        .await;
+        let s3 = held(d).await;
+        let change4 = SeatChange {
+            remove: vec![ADDED.to_owned()],
+            add: vec![],
+        };
+        let decision4 = decide(
+            d,
+            &change4,
+            at(DECISION4_CLOSES),
+            true,
+            "vec-accord-lineage-v4",
+        )
+        .await;
+        let v4 = version_shaped(d, &change4, &decision4, &c4, &signers4, RECOVERED, |_| {}).await;
+        let proof4 = v4.supersede_proof.clone().unwrap();
+        let offered4 = v4.family.clone();
+        apply(d, v4)
+            .await
+            .unwrap_or_else(|e| panic!("v4: the charter version is admitted: {e}"));
+        let s4 = held(d).await;
+        assert_eq!(s4.prev_head_digest, s3.persist_row_hash, "v4 links v3");
+        assert_eq!(s4.charter_digest, c4, "v4 names the new charter");
+        let env4 = proof4.change_envelope.clone();
+        let sb4 = ciris_verify_core::accord_genesis::accord_family_signing_bytes(&env4).unwrap();
+        let mut r4 = record_block(&offered4, &s4);
+        r4["kind"] = json!("charter_version");
+        r4["admitted_by"] = json!(
+            "accord_roster::verify_accord_roster_change via group_amendment::supersede_family_signed"
+        );
+        r4["charter_digest"] = json!(c4);
+        r4["change_envelope"] = env4;
+        r4["signing_bytes_fn"] =
+            json!("ciris_verify_core::accord_genesis::accord_family_signing_bytes");
+        r4["signing_bytes"] = bytes_json(&sb4);
+        r4["quorum_signatures"] = serde_json::to_value(&proof4.quorum_signatures).unwrap();
+        r4["decision"] = json!({
+            "digest": decision4,
+            "window_until": at(DECISION4_CLOSES).to_rfc3339(),
+            "nonce": "vec-accord-lineage-v4",
+            "seat_change_digest":
+                crate::federation::accord_roster::seat_change_digest(accord, &change4).unwrap(),
+        });
+        // The charter rows, as stored.
+        let mut charters = Vec::new();
+        for id in [
+            "vec-accord-charter-v1",
+            "vec-accord-charter-v2",
+            CHARTER_V4_ID,
+        ] {
+            let row = d
+                .get_attestation(id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} is held"));
+            charters.push(serde_json::to_value(&row).unwrap());
+        }
+        // What persist reads at the head.
+        let mut in_force = serde_json::Map::new();
+        for m in &s4.members {
+            let c = crate::federation::accord_recovery::recovery_commitment_in_force(
+                d, accord, &m.key_id,
+            )
+            .await
+            .unwrap();
+            in_force.insert(m.key_id.clone(), json!(c));
+        }
+        assert_eq!(
+            in_force[RECOVERED],
+            json!(a2_next),
+            "v2: the re-listed spent commitment names none; v3's next stands"
+        );
+        v["vector"] = json!("ciris.accord_lineage.v2");
+        v["produced_by"] =
+            json!("CIRISPersist (src/federation/accord_lineage_vector.rs, from v62.0.0)");
+        v["versions"].as_array_mut().unwrap().push(r4);
+        v["keys"] = holder_keys(&[
+            HOLDERS[0],
+            HOLDERS[1],
+            HOLDERS[2],
+            ADDED,
+            RECOVERED,
+            RECOVERY_KEY,
+        ]);
+        v["charters"] = json!(charters);
+        v["charters_note"] = json!(
+            "each charter row is the stored Attestation; it is named by its own persist_row_hash \
+             (recompute it), which is the charter_digest a version adopts; recovery_commitments \
+             is attestation_envelope.recovery_commitments"
+        );
+        v["expected"] = json!({
+            "rule": "CC 4.2.6 (rc20): the commitment in force for a holder is the one named by the latest row of the lineage (by prev_head_digest links) that names one for that holder: a recovery version (next_recovery_commitment for new_holder_key_id) or a charter version (the genesis version, or one whose charter_digest differs from its predecessor's: every recovery_commitments entry); a recovery spends the commitment then in force for old_holder_key_id; a spent commitment named again names none",
+            "in_force_at_head": in_force,
+            "spent": [spent],
+        });
+        v
+    }
+
+    /// The statement + offered version + signed family a recovery of the
+    /// head's seat `old` onto `new` would carry, built by hand so a refusal
+    /// the drafter would catch earlier reaches the verifier.
+    fn recovery_by_hand(
+        held: &Family,
+        old: &str,
+        new: &str,
+        recovery_key: &str,
+        next_commitment: &str,
+    ) -> crate::federation::types::SignedFamily {
+        use crate::federation::accord_recovery::{
+            recovery_version, AccordRecoveryDraft, RECOVERY_STATEMENT_KIND,
+        };
+        let mut next = held.clone();
+        next.persist_row_hash = String::new();
+        next.prev_head_digest = held.persist_row_hash.clone();
+        for m in &mut next.members {
+            if m.key_id == old {
+                m.key_id = new.to_owned();
+            }
+        }
+        let statement = json!({
+            "kind": RECOVERY_STATEMENT_KIND,
+            "family_key_id": held.family_key_id,
+            "prior_persist_row_hash": held.persist_row_hash,
+            "next_persist_row_hash": crate::federation::types::compute_persist_row_hash(&next).unwrap(),
+            "old_holder_key_id": old,
+            "new_holder_key_id": new,
+            "recovery_key_id": recovery_key,
+            "next_recovery_commitment": next_commitment,
+        });
+        let statement_bytes =
+            crate::verify::canonical::ceg_produce_canonicalize(&statement).unwrap();
+        let record_bytes =
+            crate::verify::canonical::ceg_produce_canonicalize(&next.signing_envelope()).unwrap();
+        let rsig = ts::threshold_sign(recovery_key, &statement_bytes);
+        let draft = AccordRecoveryDraft {
+            next,
+            statement,
+            statement_bytes,
+            record_bytes,
+        };
+        recovery_version(
+            &held.persist_row_hash,
+            &draft,
+            (
+                rsig.ed25519_signature_base64.clone(),
+                rsig.mldsa65_signature_base64.clone().unwrap(),
+            ),
+            ("c2ln".to_owned(), "c2ln".to_owned()),
+        )
+    }
+
+    async fn refused_with(
+        d: &dyn FederationDirectory,
+        sf: &crate::federation::types::SignedFamily,
+        token: &str,
+        what: &str,
+    ) {
+        match crate::federation::accord_recovery::verify_accord_recovery(d, sf).await {
+            Err(crate::federation::Error::CharterInvalid { detail })
+                if detail.starts_with(token) => {}
+            other => panic!("I1886 {what}: expected {token}, got {other:?}"),
+        }
+    }
+
+    /// **I1886** (CC rc20 4.2.6) — the recovery sentences at the door, over
+    /// the v2 vector's state (v4 head: a2, b, c; a2's commitment in force is
+    /// the one v3 named, its key `vec-holder-a2-recovery`; v4's charter
+    /// re-lists the commitment v3 spent).
+    ///
+    /// - "A recovery that names as the new signing key either the holder's
+    ///   current signing key or the recovery key itself concludes nothing":
+    ///   `accord_recovery_reuses_signing_key`, `accord_recovery_key_as_signing_key`;
+    /// - "never becomes a seat's signing key, under any id; the test is the
+    ///   public key material, not the id": a new key carrying the recovery
+    ///   key's material under another id is `accord_recovery_key_as_signing_key`;
+    /// - "A spent commitment never returns": a next commitment equal to a spent
+    ///   one is `accord_recovery_next_commitment_not_fresh`; the spent
+    ///   commitment v4 re-lists is not in force (a recovery under its key is
+    ///   `accord_recovery_key_mismatch`);
+    /// - the control: a well-formed recovery verifies.
+    pub(crate) async fn i1886_recovery_refusals(d: &dyn FederationDirectory) -> Family {
+        let accord = accord_family_key_id();
+        let _ = generate_v2(d).await;
+        let held = held(d).await;
+        let rk = format!("{RECOVERED}-recovery");
+        ts::register_hybrid_key_as(d, &rk, &rk, identity_type::NODE).await;
+        let fresh_next =
+            recovery_commitment(&test_committed_key("vec-holder-a3-recovery")).unwrap();
+        let spent = recovery_commitment(&test_committed_key(RECOVERY_KEY)).unwrap();
+        assert_eq!(
+            crate::federation::accord_recovery::recovery_commitment_in_force(d, accord, RECOVERED)
+                .await
+                .unwrap(),
+            Some(recovery_commitment(&test_committed_key(&rk)).unwrap()),
+            "I1886: a2's commitment in force is v3's, not the spent one v4 re-lists"
+        );
+        // 2a — the holder's current key.
+        refused_with(
+            d,
+            &recovery_by_hand(&held, RECOVERED, RECOVERED, &rk, &fresh_next),
+            crate::federation::accord_recovery::ACCORD_RECOVERY_REUSES_SIGNING_KEY,
+            "the current key",
+        )
+        .await;
+        // 2b — the recovery key itself, by id.
+        refused_with(
+            d,
+            &recovery_by_hand(&held, RECOVERED, &rk, &rk, &fresh_next),
+            crate::federation::accord_recovery::ACCORD_RECOVERY_KEY_AS_SIGNING_KEY,
+            "the recovery key by id",
+        )
+        .await;
+        // A fresh holder key for the remaining legs.
+        let fresh = "vec-holder-a3";
+        ops::register_accord_holder_as(d, &ops::Identity::new(fresh), identity_type::ACCORD_HOLDER)
+            .await
+            .unwrap();
+        // A spent commitment as the next one.
+        refused_with(
+            d,
+            &recovery_by_hand(&held, RECOVERED, fresh, &rk, &spent),
+            "accord_recovery_next_commitment_not_fresh",
+            "a spent commitment as the next one",
+        )
+        .await;
+        // The spent commitment v4 re-lists is not in force: its key does not
+        // recover a2.
+        refused_with(
+            d,
+            &recovery_by_hand(&held, RECOVERED, fresh, RECOVERY_KEY, &fresh_next),
+            "accord_recovery_key_mismatch",
+            "the re-listed spent commitment's key",
+        )
+        .await;
+        // The control.
+        assert_eq!(
+            crate::federation::accord_recovery::verify_accord_recovery(
+                d,
+                &recovery_by_hand(&held, RECOVERED, fresh, &rk, &fresh_next),
+            )
+            .await
+            .unwrap(),
+            Some(fresh.to_owned()),
+            "I1886: a well-formed recovery verifies"
+        );
+        held
+    }
+
+    /// I1886 (part 2) — after the runner seeded `twin`, an `accord_holder`
+    /// record carrying the RECOVERY key's public key material under another
+    /// id: refused by material.
+    pub(crate) async fn i1886_by_material(d: &dyn FederationDirectory, held: &Family, twin: &str) {
+        let rk = format!("{RECOVERED}-recovery");
+        let fresh_next =
+            recovery_commitment(&test_committed_key("vec-holder-a3-recovery")).unwrap();
+        refused_with(
+            d,
+            &recovery_by_hand(held, RECOVERED, twin, &rk, &fresh_next),
+            crate::federation::accord_recovery::ACCORD_RECOVERY_KEY_AS_SIGNING_KEY,
+            "the recovery key's material under another id",
+        )
+        .await;
+    }
+
     /// The vector, pretty-printed, newline-terminated: the checked-in form.
     pub(crate) fn render(v: &serde_json::Value) -> String {
         let mut s = serde_json::to_string_pretty(v).unwrap();
@@ -596,6 +921,112 @@ mod pin {
     }
 }
 
+/// **I1877** — the checked-in v2 vector is persist's own, and its commitments
+/// in force follow from its own rows by the CC 4.2.6 walk (re-derived here
+/// from the vector alone, as CIRISVerify reads it).
+#[cfg(test)]
+mod pin_v2 {
+    use super::VECTOR_V2;
+    use crate::federation::types::{compute_persist_row_hash, Attestation, Family};
+
+    #[test]
+    fn i1877_the_v2_vector_walks_to_its_commitments() {
+        let v: serde_json::Value = serde_json::from_str(VECTOR_V2).unwrap();
+        let v1: serde_json::Value = serde_json::from_str(super::VECTOR).unwrap();
+        let versions = v["versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 4, "I1877: four versions");
+        assert_eq!(
+            &versions[..3],
+            v1["versions"].as_array().unwrap().as_slice(),
+            "I1877: v2 extends v1 (its three versions are v1's, byte for byte)"
+        );
+        // Charter rows by their own recomputed persist_row_hash.
+        let mut charters = std::collections::BTreeMap::new();
+        for c in v["charters"].as_array().unwrap() {
+            let row: Attestation = serde_json::from_value(c.clone()).unwrap();
+            let h = compute_persist_row_hash(&row).unwrap();
+            assert_eq!(h, row.persist_row_hash, "I1877: a charter recomputes");
+            charters.insert(h, row);
+        }
+        // The walk, from the vector alone.
+        let mut named: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        let mut spent: std::collections::BTreeSet<String> = Default::default();
+        let in_force = |named: &std::collections::BTreeMap<String, Vec<String>>,
+                        spent: &std::collections::BTreeSet<String>,
+                        k: &str| {
+            named
+                .get(k)
+                .and_then(|cs| cs.iter().rev().find(|c| !spent.contains(*c)).cloned())
+        };
+        let mut prev_hash = String::new();
+        let mut prev_charter = String::new();
+        for (i, r) in versions.iter().enumerate() {
+            let f: Family = serde_json::from_value(r["stored_family"].clone()).unwrap();
+            assert_eq!(f.prev_head_digest, prev_hash, "I1877 v{}: the link", i + 1);
+            if let Some(st) = r.get("change_envelope").filter(|e| {
+                e["kind"] == crate::federation::accord_recovery::RECOVERY_STATEMENT_KIND
+            }) {
+                let old = st["old_holder_key_id"].as_str().unwrap();
+                if let Some(c) = in_force(&named, &spent, old) {
+                    spent.insert(c);
+                }
+                named
+                    .entry(st["new_holder_key_id"].as_str().unwrap().to_owned())
+                    .or_default()
+                    .push(st["next_recovery_commitment"].as_str().unwrap().to_owned());
+            }
+            if (i == 0 || f.charter_digest != prev_charter) && !f.charter_digest.is_empty() {
+                let row = charters
+                    .get(&f.charter_digest)
+                    .unwrap_or_else(|| panic!("I1877 v{}: the adopted charter is listed", i + 1));
+                for (k, c) in row.attestation_envelope["recovery_commitments"]
+                    .as_object()
+                    .unwrap()
+                {
+                    named
+                        .entry(k.clone())
+                        .or_default()
+                        .push(c.as_str().unwrap().to_owned());
+                }
+            }
+            prev_hash = compute_persist_row_hash(&f).unwrap();
+            prev_charter = f.charter_digest.clone();
+        }
+        let expected = v["expected"]["in_force_at_head"].as_object().unwrap();
+        let head: Family = serde_json::from_value(versions[3]["stored_family"].clone()).unwrap();
+        assert_eq!(expected.len(), head.members.len());
+        for m in &head.members {
+            assert_eq!(
+                expected[&m.key_id],
+                serde_json::json!(in_force(&named, &spent, &m.key_id)),
+                "I1877: {}'s commitment in force",
+                m.key_id
+            );
+        }
+        let want_spent: Vec<String> = v["expected"]["spent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            spent.into_iter().collect::<Vec<_>>(),
+            want_spent,
+            "I1877: spent"
+        );
+        // The case the vector exists for: v4 re-lists the spent commitment as
+        // vec-holder-a2's entry, and it names none.
+        let relisted = charters[versions[3]["charter_digest"].as_str().unwrap()]
+            .attestation_envelope["recovery_commitments"]["vec-holder-a2"]
+            .clone();
+        assert_eq!(relisted, v["expected"]["spent"][0], "I1877: v4 re-lists it");
+        assert_ne!(
+            expected["vec-holder-a2"], relisted,
+            "I1877: and it names none"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "sqlite"))]
 mod run_sqlite {
     /// I1783 (generator) — the doors still produce the checked-in vector.
@@ -615,6 +1046,26 @@ mod run_sqlite {
             rendered,
             super::VECTOR,
             "I1783: the doors produce the checked-in vector (regenerate: module doc)"
+        );
+    }
+
+    /// I1877 (generator) — the doors produce the checked-in v2 vector.
+    #[tokio::test]
+    async fn i1877_the_doors_produce_the_v2_vector() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let v = super::bodies::generate_v2(&b).await;
+        let rendered = super::bodies::render(&v);
+        if let Ok(out) = std::env::var("ACCORD_LINEAGE_VECTOR_V2_OUT") {
+            std::fs::write(&out, &rendered).unwrap();
+        }
+        assert_eq!(
+            rendered,
+            super::VECTOR_V2,
+            "I1877: the doors produce the checked-in v2 vector (regenerate: module doc)"
         );
     }
 }
@@ -638,5 +1089,76 @@ mod run_postgres {
             super::VECTOR,
             "I1783: postgres produces the checked-in vector"
         );
+    }
+
+    /// I1877 (generator) on postgres — the same v2 vector.
+    #[tokio::test]
+    async fn i1877_the_doors_produce_the_v2_vector_pg() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let v = super::bodies::generate_v2(&b).await;
+        assert_eq!(
+            super::bodies::render(&v),
+            super::VECTOR_V2,
+            "I1877: postgres produces the checked-in v2 vector"
+        );
+    }
+}
+
+/// I1886 on both backends.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod run_1886 {
+    fn twin_record(twin: &str) -> crate::federation::SignedKeyRecord {
+        use crate::federation::tier_ingest::test_support as ts;
+        let rk = "vec-holder-a2-recovery";
+        let mut r = ts::replicated_key_record(twin, "accord_holder", twin, twin, "n1");
+        let (ed, mldsa) = ts::hybrid_pubkeys(rk);
+        r.pubkey_ed25519_base64 = ed;
+        r.pubkey_ml_dsa_65_base64 = mldsa;
+        r.attestation_evidence = Some(
+            crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(),
+        );
+        crate::federation::SignedKeyRecord { record: r }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i1886_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let held = super::bodies::i1886_recovery_refusals(&b).await;
+        let twin = "vec-twin-of-a2-recovery";
+        b.seed_genesis_accord_holders(&[twin_record(twin)])
+            .await
+            .expect("seed the twin");
+        super::bodies::i1886_by_material(&b, &held, twin).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i1886_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let held = super::bodies::i1886_recovery_refusals(&b).await;
+        let twin = "vec-twin-of-a2-recovery";
+        b.seed_genesis_accord_holders(&[twin_record(twin)])
+            .await
+            .expect("seed the twin");
+        super::bodies::i1886_by_material(&b, &held, twin).await;
     }
 }

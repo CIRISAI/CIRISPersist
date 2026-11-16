@@ -746,16 +746,202 @@ pub fn transit_kex_pair_from_envelope(
     Ok(Some(TransitKexPair { x25519, ml_kem_768 }))
 }
 
-/// v56.0.0 (CIRISPersist#1077) — do two signed envelopes carry the same transit
-/// KEX member (both absent, or byte-equal JSON)? The three backends'
-/// `put_signed_transport_destination` call this before answering `Unchanged`:
-/// the pair is envelope-only, so an equal typed projection at an equal
-/// `(epoch, asserted_at)` no longer means equal content. A same-clock re-sign
-/// that changes the pair is a fork and is `Refused`, never kept silently as
-/// the old pair.
+/// v56.0.0 (CIRISPersist#1077); v62.0.0 (CC rc20 3.3.6.2, #1274) — do two
+/// signed envelopes carry the same ENVELOPE-ONLY key members (each absent, or
+/// byte-equal JSON): `transit_kex_pubkeys`, `transit_xwing_pubkey` and
+/// `onion_hop_xwing_pubkey`? The backends' `put_signed_transport_destination`
+/// ask this before answering `Unchanged`: the keys are envelope-only, so an
+/// equal typed projection at an equal `(epoch, asserted_at)` does not mean
+/// equal content. A same-clock re-sign that changes any of them is a fork and
+/// is `Refused`, never kept silently as the old key. (Was
+/// `same_transit_kex_member`, which compared the pair alone.)
 #[must_use]
-pub fn same_transit_kex_member(a: &serde_json::Value, b: &serde_json::Value) -> bool {
-    a.get(TRANSIT_KEX_PUBKEYS_MEMBER) == b.get(TRANSIT_KEX_PUBKEYS_MEMBER)
+pub fn same_envelope_key_members(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    ENVELOPE_KEY_MEMBERS.iter().all(|m| a.get(m) == b.get(m))
+}
+
+/// v62.0.0 — every envelope-only key member of a transport destination.
+pub const ENVELOPE_KEY_MEMBERS: [&str; 3] = [
+    TRANSIT_KEX_PUBKEYS_MEMBER,
+    TRANSIT_XWING_PUBKEY_MEMBER,
+    ONION_HOP_XWING_PUBKEY_MEMBER,
+];
+
+// ─── X-Wing transport keys (CC rc20 3.3.6.2 / 5.3.3.10 / 5.4.6) ─────────
+
+/// v62.0.0 (CC rc20 3.3.6.2, CIRISPersist#1274) — the relay's **X-Wing transit
+/// public key**, beside the earlier-form [`TRANSIT_KEX_PUBKEYS_MEMBER`] pair:
+/// "exactly 1216 bytes, the X-Wing public key `pk_M ‖ pk_X`, the ML-KEM-768
+/// encapsulation key of 1184 bytes then the X25519 key of 32 bytes." On
+/// today's JSON wire it is the standard base64 of those bytes. Envelope-only,
+/// like the pair. Read it with [`SignedTransportDestination::transit_xwing_pubkey`];
+/// resolve a peer's with [`transit_xwing_pubkey_for`], which applies the
+/// seated-serve-node rule.
+pub const TRANSIT_XWING_PUBKEY_MEMBER: &str = "transit_xwing_pubkey";
+/// v62.0.0 (CC rc20 3.3.6.2 "The onion hop key", CC 5.4.6) — the node's static
+/// **X-Wing onion hop public key**, 1216 bytes, standard base64 on the JSON
+/// wire. It replaces the earlier form's two-member `onion_hop_pubkeys` (CC
+/// 8.11.20), which persist never read, admitted or served (CIRISPersist#1181
+/// was open; CIRISEdge's hop tier ran on the transit-pair stand-in), so there
+/// is no stored old form to keep reading. Envelope-only: "It lives in the
+/// signed envelope only, never in a typed column".
+pub const ONION_HOP_XWING_PUBKEY_MEMBER: &str = "onion_hop_xwing_pubkey";
+/// The X-Wing public key's exact raw length (`pk_M ‖ pk_X`).
+pub const XWING_PUBKEY_LEN: usize = 1216;
+/// Bytes `0..1184` of an X-Wing public key: the ML-KEM-768 encapsulation key.
+pub const XWING_ML_KEM_768_LEN: usize = 1184;
+/// Bytes `1184..1216` of an X-Wing public key: the X25519 key.
+pub const XWING_X25519_LEN: usize = 32;
+
+/// v62.0.0 — a decoded X-Wing public key; the length is in the type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XWingPublicKey(Box<[u8; XWING_PUBKEY_LEN]>);
+
+impl XWingPublicKey {
+    /// From exactly 1216 raw bytes; `None` for any other length.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Box::<[u8; XWING_PUBKEY_LEN]>::try_from(bytes.to_vec().into_boxed_slice())
+            .ok()
+            .map(Self)
+    }
+    /// The whole key, `pk_M ‖ pk_X`.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; XWING_PUBKEY_LEN] {
+        &self.0
+    }
+    /// `pk_M`, bytes `0..1184`.
+    #[must_use]
+    pub fn ml_kem_768(&self) -> &[u8] {
+        &self.0[..XWING_ML_KEM_768_LEN]
+    }
+    /// `pk_X`, bytes `1184..1216`.
+    #[must_use]
+    pub fn x25519(&self) -> &[u8] {
+        &self.0[XWING_ML_KEM_768_LEN..]
+    }
+}
+
+/// v62.0.0 — THE one reading of an X-Wing member (`member` is
+/// [`TRANSIT_XWING_PUBKEY_MEMBER`] or [`ONION_HOP_XWING_PUBKEY_MEMBER`]) from a
+/// signed transport-destination envelope; admission and the accessors both
+/// call it.
+///
+/// - absent ⇒ `Ok(None)`;
+/// - not a string (an explicit `null` included), or not standard base64 ⇒
+///   [`malformed_row::ENVELOPE_MEMBER_INVALID`](crate::federation::malformed_row::ENVELOPE_MEMBER_INVALID);
+/// - anything but exactly 1216 bytes ⇒
+///   [`malformed_row::XWING_PUBKEY_WRONG_LENGTH`](crate::federation::malformed_row::XWING_PUBKEY_WRONG_LENGTH).
+///
+/// # Errors
+///
+/// [`crate::federation::Error::MalformedRow`] on plane `transport_destination`.
+pub fn xwing_pubkey_from_envelope(
+    envelope: &serde_json::Value,
+    member: &'static str,
+) -> Result<Option<XWingPublicKey>, crate::federation::Error> {
+    use crate::federation::{malformed_row, Error};
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    const PLANE: &str = "transport_destination";
+    let Some(v) = envelope.get(member) else {
+        return Ok(None);
+    };
+    let s = v.as_str().ok_or_else(|| {
+        Error::malformed_row(
+            PLANE,
+            malformed_row::ENVELOPE_MEMBER_INVALID,
+            format!("`{member}` must be a standard-base64 string (CC 3.3.6.2), got {v}"),
+        )
+    })?;
+    let raw = B64.decode(s).map_err(|e| {
+        Error::malformed_row(
+            PLANE,
+            malformed_row::ENVELOPE_MEMBER_INVALID,
+            format!("`{member}` is not standard base64: {e}"),
+        )
+    })?;
+    XWingPublicKey::from_bytes(&raw).map(Some).ok_or_else(|| {
+        Error::malformed_row(
+            PLANE,
+            malformed_row::XWING_PUBKEY_WRONG_LENGTH,
+            format!(
+                "`{member}` must decode to exactly {XWING_PUBKEY_LEN} bytes (pk_M 1184 ‖ pk_X 32, \
+                 CC 3.3.6.2), got {}",
+                raw.len()
+            ),
+        )
+    })
+}
+
+/// v62.0.0 — which X-Wing key a reuse check is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XWingKeyRole {
+    /// [`TRANSIT_XWING_PUBKEY_MEMBER`].
+    Transit,
+    /// [`ONION_HOP_XWING_PUBKEY_MEMBER`].
+    OnionHop,
+}
+
+/// v62.0.0 (CC rc20 3.3.6.2) — why an X-Wing key fails the per-half reuse
+/// rule. "The reuse refusals read the key's halves, bytes 0..1184 and bytes
+/// 1184..1216."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XWingReuseRefusal {
+    /// The transit key's ML-KEM-768 half is another key on the row.
+    TransitMlKem768Reuse,
+    /// The transit key's X25519 half is another key on the row.
+    TransitX25519Reuse,
+    /// The hop key's ML-KEM-768 half is another key on the row.
+    OnionHopMlKem768Reuse,
+    /// The hop key's X25519 half is another key on the row.
+    OnionHopX25519Reuse,
+}
+
+impl XWingReuseRefusal {
+    /// The stable token (the [`crate::federation::malformed_row`] reason).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        use crate::federation::malformed_row as mr;
+        match self {
+            Self::TransitMlKem768Reuse => mr::TRANSIT_XWING_ML_KEM_768_REUSE,
+            Self::TransitX25519Reuse => mr::TRANSIT_XWING_X25519_REUSE,
+            Self::OnionHopMlKem768Reuse => mr::ONION_HOP_ML_KEM_768_REUSE,
+            Self::OnionHopX25519Reuse => mr::ONION_HOP_X25519_REUSE,
+        }
+    }
+}
+
+/// v62.0.0 (CC rc20 3.3.6.2) — **the per-half reuse rule, pure.** Each half of
+/// `key` (`0..1184`, `1184..1216`) must not be byte-equal to any of `others`
+/// (raw keys, and halves of other X-Wing keys, as the caller gathers them).
+/// The ML-KEM half is checked first.
+///
+/// # Errors
+///
+/// The first [`XWingReuseRefusal`] found.
+pub fn check_xwing_halves<'a>(
+    role: XWingKeyRole,
+    key: &XWingPublicKey,
+    others: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<(), XWingReuseRefusal> {
+    let (m, x) = match role {
+        XWingKeyRole::Transit => (
+            XWingReuseRefusal::TransitMlKem768Reuse,
+            XWingReuseRefusal::TransitX25519Reuse,
+        ),
+        XWingKeyRole::OnionHop => (
+            XWingReuseRefusal::OnionHopMlKem768Reuse,
+            XWingReuseRefusal::OnionHopX25519Reuse,
+        ),
+    };
+    let others: Vec<&[u8]> = others.into_iter().collect();
+    if others.iter().any(|k| *k == key.ml_kem_768()) {
+        return Err(m);
+    }
+    if others.iter().any(|k| *k == key.x25519()) {
+        return Err(x);
+    }
+    Ok(())
 }
 
 impl SignedTransportDestination {
@@ -780,6 +966,33 @@ impl SignedTransportDestination {
     /// `transit_kex_wrong_length`, `envelope_member_invalid`).
     pub fn transit_kex_pair(&self) -> Result<Option<TransitKexPair>, crate::federation::Error> {
         transit_kex_pair_from_envelope(&self.signed_envelope)
+    }
+
+    /// v62.0.0 (CC rc20 3.3.6.2, #1274) — this row's `transit_xwing_pubkey`,
+    /// as signed (one row's envelope, nothing more).
+    ///
+    /// **Consumer rule:** this raw read does NOT say the key is LIVE. A seated
+    /// serve node's X-Wing transit key is live only when an admitted
+    /// `transport:canonical_rebind` carries exactly this row; resolve a peer's
+    /// key with [`transit_xwing_pubkey_for`], never with this.
+    ///
+    /// # Errors
+    ///
+    /// As [`xwing_pubkey_from_envelope`].
+    pub fn transit_xwing_pubkey(&self) -> Result<Option<XWingPublicKey>, crate::federation::Error> {
+        xwing_pubkey_from_envelope(&self.signed_envelope, TRANSIT_XWING_PUBKEY_MEMBER)
+    }
+
+    /// v62.0.0 (CC rc20 3.3.6.2, CC 5.4.6) — this row's
+    /// `onion_hop_xwing_pubkey`, as signed.
+    ///
+    /// # Errors
+    ///
+    /// As [`xwing_pubkey_from_envelope`].
+    pub fn onion_hop_xwing_pubkey(
+        &self,
+    ) -> Result<Option<XWingPublicKey>, crate::federation::Error> {
+        xwing_pubkey_from_envelope(&self.signed_envelope, ONION_HOP_XWING_PUBKEY_MEMBER)
     }
 
     /// v56.0.0 (CIRISPersist#1077) — the binding's trust provenance, read from
@@ -841,8 +1054,6 @@ pub async fn transit_kex_pair_for<D: crate::federation::FederationDirectory + ?S
     dir: &D,
     occurrence_key_id: &str,
 ) -> Result<Option<TransitKexPair>, crate::federation::Error> {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-
     let bindings = dir
         .list_signed_transport_destinations_for(occurrence_key_id)
         .await?;
@@ -865,9 +1076,26 @@ pub async fn transit_kex_pair_for<D: crate::federation::FederationDirectory + ?S
         return Ok(None);
     };
 
+    let others = other_keys_of(dir, occurrence_key_id, &live).await?;
+    if check_transit_kex_pair(&pair, &others).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(pair))
+}
+
+/// v62.0.0 (#1274) — every key on the node's current occurrence that a
+/// transport key must be separated from at use (the four
+/// [`TransitKexOtherKeys`] groups), shared by [`transit_kex_pair_for`] and
+/// [`transit_xwing_pubkey_for`] so the cross-row rule exists once.
+async fn other_keys_of<D: crate::federation::FederationDirectory + ?Sized>(
+    dir: &D,
+    occurrence_key_id: &str,
+    live: &[&SignedTransportDestination],
+) -> Result<TransitKexOtherKeys, crate::federation::Error> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     let dec = |b64: Option<&str>| b64.and_then(|s| B64.decode(s).ok());
     let mut others = TransitKexOtherKeys::default();
-    for b in &live {
+    for b in live {
         let td = &b.transport_destination;
         others
             .transport_identity
@@ -915,10 +1143,85 @@ pub async fn transit_kex_pair_for<D: crate::federation::FederationDirectory + ?S
                 .extend(dec(k.pubkey_ml_dsa_65_base64.as_deref()));
         }
     }
-    if check_transit_kex_pair(&pair, &others).is_err() {
+    Ok(others)
+}
+
+/// v62.0.0 (CC rc20 3.3.6.2 "A seat's transit key", CIRISPersist#1274) — **the
+/// per-peer X-Wing transit key resolver**: the `transit_xwing_pubkey` a dialler
+/// may seal a link to `occurrence_key_id` with, or `None`.
+///
+/// 1. Read it only from live (unretired) [`BindingProvenance::Rooted`]
+///    bindings; none, or two live bindings carrying different keys ⇒ `None`.
+/// 2. **THE RULE.** For a seated serve node of the pinned bundle, the key is
+///    live ONLY when an admitted `transport:canonical_rebind` carries exactly
+///    the live row ([`rebind_held_for`](super::transport_rebind::rebind_held_for)).
+///    CC 3.3.6.2: "A seated serve node's new transit key moves by
+///    `transport:canonical_rebind`, counted by the accord's holders, before
+///    the handshake changes." A seat publishing the key ALONE (a re-assertion
+///    of its pinned earlier-form pair, which the transport door admits) is
+///    held and served, but its X-Wing key is not live: otherwise a seat would
+///    choose its own forward transit key, which #1106 exists to prevent.
+/// 3. The cross-row rule at use: a half equal to any key on the node's current
+///    occurrence (as [`transit_kex_pair_for`] gathers them), or to a half of
+///    the live row's earlier-form pair ⇒ `None`.
+///
+/// # Errors
+///
+/// A backend read error; a stored binding whose key does not parse.
+pub async fn transit_xwing_pubkey_for<D: crate::federation::FederationDirectory + ?Sized>(
+    dir: &D,
+    occurrence_key_id: &str,
+) -> Result<Option<XWingPublicKey>, crate::federation::Error> {
+    let bindings = dir
+        .list_signed_transport_destinations_for(occurrence_key_id)
+        .await?;
+    let live: Vec<&SignedTransportDestination> = bindings
+        .iter()
+        .filter(|b| b.transport_destination.retired_at.is_none())
+        .collect();
+    let mut found: Option<(XWingPublicKey, &SignedTransportDestination)> = None;
+    for b in &live {
+        if b.binding_provenance() != BindingProvenance::Rooted {
+            continue;
+        }
+        let Some(k) = b.transit_xwing_pubkey()? else {
+            continue;
+        };
+        match &found {
+            None => found = Some((k, b)),
+            Some((q, _)) if *q == k => {}
+            Some(_) => return Ok(None),
+        }
+    }
+    let Some((key, row)) = found else {
+        return Ok(None);
+    };
+    if super::transport_rebind::is_seated_serve_node(occurrence_key_id)
+        && super::transport_rebind::rebind_held_for(dir, occurrence_key_id)
+            .await?
+            .as_ref()
+            != Some(row)
+    {
         return Ok(None);
     }
-    Ok(Some(pair))
+    let others = other_keys_of(dir, occurrence_key_id, &live).await?;
+    let mut pair_halves: Vec<Vec<u8>> = Vec::new();
+    for b in &live {
+        if let Some(p) = b.transit_kex_pair()? {
+            pair_halves.push(p.x25519.to_vec());
+            pair_halves.push(p.ml_kem_768.to_vec());
+        }
+    }
+    if check_xwing_halves(
+        XWingKeyRole::Transit,
+        &key,
+        others.all().chain(pair_halves.iter().map(Vec::as_slice)),
+    )
+    .is_err()
+    {
+        return Ok(None);
+    }
+    Ok(Some(key))
 }
 
 /// v17.0.0 (CIRISPersist#443) — outcome of a
@@ -2715,6 +3018,327 @@ pub(crate) mod test_support {
             .unwrap()
             .expect("I1022: retired pair ignored");
         assert_eq!(got.x25519, [0x08; TRANSIT_KEX_X25519_LEN]);
+    }
+
+    /// v62.0.0 slice E1 (CIRISPersist#1274; CC rc20 3.3.6.2) — **the X-Wing
+    /// matrix**, run on sqlite and postgres (`rc20_rules_invariants`). Every
+    /// envelope is REALLY signed by a registered key that may act for the
+    /// route, so each refusal is the X-Wing rule's.
+    ///
+    /// - **I1872** both members admit, are stored verbatim and read back by the
+    ///   typed accessors as 1216 bytes split 1184 / 32; a wrong length (1215,
+    ///   1217, 0) refuses `xwing_pubkey_wrong_length`; `null` and non-base64
+    ///   refuse `envelope_member_invalid`; a same-clock re-sign that changes
+    ///   only an X-Wing member is `Refused` (a fork), never kept as the old key.
+    /// - **I1873** the per-half reuse refusals, bytes 0..1184 and 1184..1216,
+    ///   against every other key on the row: the earlier-form pair's halves,
+    ///   the link x25519, the transport ed25519, the signer's pinned Ed25519,
+    ///   `encryption_pubkeys`, and the other X-Wing key (named under the hop
+    ///   key's token). The stored row never moves.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) async fn run_xwing_matrix(dir: &dyn FederationDirectory, suffix: &str) {
+        use crate::federation::malformed_row as mr;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
+        use ciris_verify_core::self_at_login::HybridSigningIdentity;
+        use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
+        use TransportDestinationApplyOutcome as Outcome;
+
+        let relay_id = format!("xwing-relay-{suffix}");
+        let relay = Box::new(HybridSigningIdentity::new(
+            &relay_id,
+            Ed25519Signer::random().unwrap(),
+            MlDsa65Signer::new().unwrap(),
+        ));
+        let member = relay.directory_member().unwrap();
+        let signer_ed = B64.decode(&member.ed25519_public_key_base64).unwrap();
+        dir.put_public_key(SignedKeyRecord {
+            record: fixture_key(
+                &relay_id,
+                member.ed25519_public_key_base64.clone(),
+                member.mldsa65_public_key_base64.clone(),
+            ),
+        })
+        .await
+        .expect("register relay key");
+        let xw = |m: &[u8], x: &[u8]| -> serde_json::Value {
+            let mut k = m.to_vec();
+            k.extend_from_slice(x);
+            serde_json::Value::String(B64.encode(k))
+        };
+        let sign = |row: TransportDestination, extra: Vec<(&'static str, serde_json::Value)>| {
+            let mut env = envelope_with_transit_kex(&row, None);
+            for (k, v) in extra {
+                env.as_object_mut().unwrap().insert(k.into(), v);
+            }
+            let relay = relay.as_ref();
+            let relay_id = relay_id.clone();
+            async move {
+                let (env, sig) = produce_signed_identity_occurrence(relay, env)
+                    .await
+                    .expect("sign route envelope");
+                SignedTransportDestination {
+                    transport_destination: row,
+                    attesting_key_id: relay_id,
+                    signed_envelope: env,
+                    signature: sig,
+                }
+            }
+        };
+        let kind = "reticulum";
+        let t_m = vec![0xA1u8; XWING_ML_KEM_768_LEN];
+        let t_x = [0xA2u8; XWING_X25519_LEN];
+        let h_m = vec![0xB1u8; XWING_ML_KEM_768_LEN];
+        let h_x = [0xB2u8; XWING_X25519_LEN];
+
+        // I1872 — both members admit and read back.
+        let r1 = route(&relay_id, kind, "d1", 1, "2026-11-01T01:00:00Z");
+        let s1 = sign(
+            r1,
+            vec![
+                (TRANSIT_KEX_PUBKEYS_MEMBER, transit_kex_member(0x11, 0x22)),
+                (TRANSIT_XWING_PUBKEY_MEMBER, xw(&t_m, &t_x)),
+                (ONION_HOP_XWING_PUBKEY_MEMBER, xw(&h_m, &h_x)),
+            ],
+        )
+        .await;
+        assert_eq!(
+            dir.put_signed_transport_destination(&s1).await.unwrap(),
+            Outcome::Inserted,
+            "I1872: a row carrying both X-Wing keys admits"
+        );
+        let held = dir
+            .list_signed_transport_destinations_for(&relay_id)
+            .await
+            .unwrap();
+        assert_eq!(held[0], s1, "I1872: stored verbatim");
+        let t = held[0]
+            .transit_xwing_pubkey()
+            .unwrap()
+            .expect("I1872: transit key");
+        assert_eq!(
+            t.ml_kem_768(),
+            t_m.as_slice(),
+            "I1872: pk_M is bytes 0..1184"
+        );
+        assert_eq!(t.x25519(), &t_x[..], "I1872: pk_X is bytes 1184..1216");
+        let h = held[0]
+            .onion_hop_xwing_pubkey()
+            .unwrap()
+            .expect("I1872: hop key");
+        assert_eq!(h.ml_kem_768(), h_m.as_slice());
+        assert_eq!(h.x25519(), &h_x[..]);
+        assert_eq!(
+            held[0].transit_kex_pair().unwrap().unwrap().x25519,
+            [0x11; 32],
+            "I1872: the earlier-form pair still reads beside the X-Wing key"
+        );
+
+        // I1872 — malformed members refuse by name; the stored row stands.
+        let mut n = 10u64;
+        for member_name in [TRANSIT_XWING_PUBKEY_MEMBER, ONION_HOP_XWING_PUBKEY_MEMBER] {
+            for (what, v, reason) in [
+                (
+                    "1215 bytes",
+                    serde_json::Value::String(B64.encode(vec![7u8; 1215])),
+                    mr::XWING_PUBKEY_WRONG_LENGTH,
+                ),
+                (
+                    "1217 bytes",
+                    serde_json::Value::String(B64.encode(vec![7u8; 1217])),
+                    mr::XWING_PUBKEY_WRONG_LENGTH,
+                ),
+                (
+                    "empty",
+                    serde_json::Value::String(String::new()),
+                    mr::XWING_PUBKEY_WRONG_LENGTH,
+                ),
+                ("null", serde_json::Value::Null, mr::ENVELOPE_MEMBER_INVALID),
+                (
+                    "not base64",
+                    serde_json::Value::String("@@@".into()),
+                    mr::ENVELOPE_MEMBER_INVALID,
+                ),
+                (
+                    "an object",
+                    serde_json::json!({ "x25519_base64": "AA==" }),
+                    mr::ENVELOPE_MEMBER_INVALID,
+                ),
+            ] {
+                n += 1;
+                let r = route(&relay_id, kind, "bad", n, "2026-11-01T02:00:00Z");
+                let s = sign(r, vec![(member_name, v)]).await;
+                let e = dir
+                    .put_signed_transport_destination(&s)
+                    .await
+                    .expect_err(what);
+                expect_route_malformed(&e, reason, &format!("I1872 {member_name} {what}"));
+            }
+        }
+
+        // I1873 — per-half reuse against every other key on the row.
+        let pair_m = vec![0x22u8; XWING_ML_KEM_768_LEN];
+        let link = [0x55u8; 32];
+        let ted = [0x56u8; 32];
+        let enc_x = [0x57u8; 32];
+        /// `(what, member, key, extra members, refusal reason)`.
+        type ReuseCase<'a> = (
+            &'a str,
+            &'static str,
+            serde_json::Value,
+            Vec<(&'static str, serde_json::Value)>,
+            &'a str,
+        );
+        let cases: Vec<ReuseCase> = vec![
+            (
+                "transit pk_M = the earlier pair's ML-KEM",
+                TRANSIT_XWING_PUBKEY_MEMBER,
+                xw(&pair_m, &t_x),
+                vec![],
+                mr::TRANSIT_XWING_ML_KEM_768_REUSE,
+            ),
+            (
+                "transit pk_X = the earlier pair's x25519",
+                TRANSIT_XWING_PUBKEY_MEMBER,
+                xw(&t_m, &[0x11u8; 32]),
+                vec![],
+                mr::TRANSIT_XWING_X25519_REUSE,
+            ),
+            (
+                "transit pk_X = the link x25519",
+                TRANSIT_XWING_PUBKEY_MEMBER,
+                xw(&t_m, &link),
+                vec![],
+                mr::TRANSIT_XWING_X25519_REUSE,
+            ),
+            (
+                "transit pk_X = the transport ed25519",
+                TRANSIT_XWING_PUBKEY_MEMBER,
+                xw(&t_m, &ted),
+                vec![],
+                mr::TRANSIT_XWING_X25519_REUSE,
+            ),
+            (
+                "transit pk_X = the signer's ed25519",
+                TRANSIT_XWING_PUBKEY_MEMBER,
+                xw(&t_m, &signer_ed),
+                vec![],
+                mr::TRANSIT_XWING_X25519_REUSE,
+            ),
+            (
+                "hop pk_M = the transit pk_M",
+                ONION_HOP_XWING_PUBKEY_MEMBER,
+                xw(&t_m, &h_x),
+                vec![(TRANSIT_XWING_PUBKEY_MEMBER, xw(&t_m, &t_x))],
+                mr::ONION_HOP_ML_KEM_768_REUSE,
+            ),
+            (
+                "hop pk_X = the transit pk_X",
+                ONION_HOP_XWING_PUBKEY_MEMBER,
+                xw(&h_m, &t_x),
+                vec![(TRANSIT_XWING_PUBKEY_MEMBER, xw(&t_m, &t_x))],
+                mr::ONION_HOP_X25519_REUSE,
+            ),
+            (
+                "hop pk_M = the earlier pair's ML-KEM",
+                ONION_HOP_XWING_PUBKEY_MEMBER,
+                xw(&pair_m, &h_x),
+                vec![],
+                mr::ONION_HOP_ML_KEM_768_REUSE,
+            ),
+            (
+                "hop pk_X = encryption_pubkeys.x25519",
+                ONION_HOP_XWING_PUBKEY_MEMBER,
+                xw(&h_m, &enc_x),
+                vec![(
+                    "encryption_pubkeys",
+                    serde_json::json!({ "x25519_base64": B64.encode(enc_x), "ml_kem_768_base64": B64.encode(vec![0x58u8; 1184]) }),
+                )],
+                mr::ONION_HOP_X25519_REUSE,
+            ),
+            (
+                "hop pk_X = the link x25519",
+                ONION_HOP_XWING_PUBKEY_MEMBER,
+                xw(&h_m, &link),
+                vec![],
+                mr::ONION_HOP_X25519_REUSE,
+            ),
+        ];
+        for (what, member_name, key, mut extra, reason) in cases {
+            n += 1;
+            let mut r = route(&relay_id, kind, "reuse", n, "2026-11-01T03:00:00Z");
+            r.transport_x25519_pubkey_base64 = Some(B64.encode(link));
+            r.transport_ed25519_pubkey_base64 = Some(B64.encode(ted));
+            extra.push((TRANSIT_KEX_PUBKEYS_MEMBER, transit_kex_member(0x11, 0x22)));
+            extra.push((member_name, key));
+            let s = sign(r, extra).await;
+            let e = dir
+                .put_signed_transport_destination(&s)
+                .await
+                .expect_err(what);
+            expect_route_malformed(&e, reason, &format!("I1873 {what}"));
+        }
+        assert_eq!(
+            dir.list_signed_transport_destinations_for(&relay_id)
+                .await
+                .unwrap()[0],
+            s1,
+            "I1872/I1873: refusals leave the stored row untouched"
+        );
+        // The control: distinct halves on a row carrying every other key admit.
+        n += 1;
+        let mut r = route(&relay_id, kind, "ok", n, "2026-11-01T04:00:00Z");
+        r.transport_x25519_pubkey_base64 = Some(B64.encode(link));
+        r.transport_ed25519_pubkey_base64 = Some(B64.encode(ted));
+        let ok = sign(
+            r.clone(),
+            vec![
+                (TRANSIT_KEX_PUBKEYS_MEMBER, transit_kex_member(0x11, 0x22)),
+                (TRANSIT_XWING_PUBKEY_MEMBER, xw(&t_m, &t_x)),
+                (ONION_HOP_XWING_PUBKEY_MEMBER, xw(&h_m, &h_x)),
+            ],
+        )
+        .await;
+        assert_eq!(
+            dir.put_signed_transport_destination(&ok).await.unwrap(),
+            Outcome::Superseded,
+            "I1873 control: separated keys admit"
+        );
+        // I1872 — a same-clock re-sign that changes only an X-Wing key is a fork.
+        let fork = sign(
+            r,
+            vec![
+                (TRANSIT_KEX_PUBKEYS_MEMBER, transit_kex_member(0x11, 0x22)),
+                (TRANSIT_XWING_PUBKEY_MEMBER, xw(&t_m, &[0xA3u8; 32])),
+                (ONION_HOP_XWING_PUBKEY_MEMBER, xw(&h_m, &h_x)),
+            ],
+        )
+        .await;
+        assert!(
+            matches!(
+                dir.put_signed_transport_destination(&fork).await.unwrap(),
+                Outcome::Refused { .. }
+            ),
+            "I1872: a same-clock re-sign changing only the X-Wing key is refused"
+        );
+        assert_eq!(
+            dir.put_signed_transport_destination(&ok).await.unwrap(),
+            Outcome::Unchanged,
+            "I1872: the exact replay is Unchanged"
+        );
+        // The resolver: a node that is not a seated serve node needs no
+        // re-bind; its Rooted binding's key resolves.
+        assert!(!crate::federation::transport_rebind::is_seated_serve_node(
+            &relay_id
+        ));
+        assert_eq!(
+            transit_xwing_pubkey_for(dir, &relay_id)
+                .await
+                .unwrap()
+                .map(|k| k.as_bytes().to_vec()),
+            Some([t_m.as_slice(), &t_x[..]].concat()),
+            "I1872: a non-seat's Rooted X-Wing transit key resolves"
+        );
     }
 }
 

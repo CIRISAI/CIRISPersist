@@ -322,7 +322,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.3.6	CLM-identity	CIRISPersist	src/federation/admission.rs#verify_signed_identity_occurrence	ciris-persist@61.4.1
 3.3.6.1	CLM-encryption_pubkeys	CIRISPersist	src/federation/admission.rs#check_encryption_pubkeys	ciris-persist@61.4.1
 3.4.7	CLM-enforcement	CIRISPersist	src/federation/admission.rs#DimensionAdmissionPolicy::check	ciris-persist@61.4.1
-3.4.7.1	CLM-identity-set	CIRISPersist	src/federation/types.rs#identity_type::set_contains	ciris-persist@61.4.1
+3.4.7.1	CLM-identity-set	CIRISPersist	src/federation/register.rs#check_node_identity_exclusive	ciris-persist@61.4.1
 3.5.1	CLM-concurrent-write	CIRISPersist	src/federation/precedence.rs#precedence_winner	ciris-persist@61.4.1
 4.4.3.2.1	CLM-community-three	CIRISPersist	src/federation/community_dek.rs#encrypt_and_cascade_community	ciris-persist@61.4.1
 4.4.3.4	CLM-family-policy	CIRISPersist	src/federation/at_rest_cascade.rs#resolve_recipients	ciris-persist@61.4.1

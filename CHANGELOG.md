@@ -7,6 +7,64 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
 ## [62.0.0] - UNRELEASED
 
+### Changed (v62 slice E1: CC rc20 rules on today's wire, CIRISPersist#1274)
+
+These rules come from CC 1.0-rc20 (branch `rc20`, `140fed4a`; not yet tagged). Persist adopts them on today's JSON wire and Verify pin. The edition-2 encodings are slice E2.
+
+- **The identity set rule on every door (CC 3.4.7.1, CC 2.4.1.1).** Two pairs may not share a key: `node` with `agent`, and `user` or `accord_holder` with `node` or `agent`. `node`+`agent` and `node`+`user` keep `federation_node_identity_not_exclusive`. `user`+`agent`, `accord_holder`+`node` and `accord_holder`+`agent` are refused with the new `Error::IdentitySetMixesPersonAndMachine` (`federation_identity_set_mixes_person_and_machine`, Python `ValueError`). The replicated insert now refuses a mixed set too. The review-M5 carve-out is gone, along with the `register::KeyDoor` marker it needed. The insert refusal is typed (`KeyRefusalReason::NodeIdentityFused` or the new `IdentitySetMixed`, token `identity_set_mixed`), so the replication cursor advances past it. `CLM-identity-set` now cites `register.rs#check_node_identity_exclusive`.
+- **`canonical` is a ceremony conferral, not an identity type (CC 3.4.7.1, CC 4.2.1, CC 8.11.27).** Canonical standing is now read from the accord's counted co-scrub, never from `identity_type`. `is_canonical`, `is_canonical_effective`, `list_canonical_servers` (both backends) and `verify_canonical_seeded` hold a key canonical only when its stored record presents the conferral and its stored scrub set verifies as the accord's co-scrub. The co-scrub is checked over the stored `registration_envelope` with the same roster, bar and floor the admission gate uses (`admission::{presents_canonical_conferral, holds_canonical_conferral, canonical_conferral_coscrub, canonical_servers_among, is_canonical_over_roster}`). It can be presented in two forms:
+  - the earlier form, the `canonical` name in `identity_type` or `roles` (CC 8.11.27: the name "names that conferral and is no identity type");
+  - the forward form: `identity_type` {`node`}, `roles` with `infra:serve`, and a co-scrub set.
+
+  A `canonical` left in a stored `identity_type` without a verifying co-scrub is inert. The door still refuses a record that names the conferral but cannot back it (`names_canonical_conferral`, unchanged token). The forward form is read, not gated: an unverified one is an ordinary node record.
+
+  **How a v61 canonical keeps resolving:** its stored record carries the earlier-form envelope (`"canonical,node"`, `infra:serve`) and the accord's 2-of-3 co-scrub over that envelope. That presents the conferral, and the co-scrub verifies against the genesis roster at the baked lineage's bar. No migration, re-sign or re-seed is needed. The baked genesis bundle is unchanged (it re-signs at the ceremony).
+- **`substrate_persist` confers no authority (CC 3.4.7.1).** It left `AUTHORITY_CONFERRING_IDENTITY_TYPES` (now 10 members) and declares no `ConferralMode`. It moved to the new `identity_type::SELF_REPORT_IDENTITY_TYPES`, whose self-report families (`system:` …) stay reserved to it (CC 3.1.3) and must describe their signer (#1174). The #607 ratchet's grandfathered list is now empty.
+- **Security fix to the infrastructure carve-out (CC 3.2, 4.4.3.4, 6.1.8 N1, 5.4.6).** Until now a community labelled `infrastructure` got the carve-out when its own key claimed `substrate_persist`, a type any key could self-claim (v61.4.1 never gated it). The carve-out covers the node-member steward-binding exemption, the moderator exemption, the DEK skip, the at-rest plaintext tier and the Commons replication audience. `admission::is_authorized_infrastructure_community` is now one predicate, and it never reads a key type. It requires:
+  - (i) a conformant infrastructure record (`is_conformant_infrastructure_record`): `cohort_subkind: infrastructure`, a `quorum:M/N` protocol, and at least one founder, every founder a person's key (`user` or `accord_holder`, never `node` or `agent`), judged on the record held for the id;
+  - (ii) rooted in this node's own trust set (`infrastructure_rooted_here`): the stored trust-root chain verifies to a root this node's live trust edges name, or to the shipped default when the node holds none.
+
+  The separate `is_trust_root_grade && is_rooted` leg is folded in. The exemption covers node members only: an agent member of any community needs its live steward binding. A serve seat's announced owner was already enforced at the growth gate (`serve_seat_owner_unannounced`, v61, CC 5.4.6).
+- **X-Wing transport keys (CC 3.3.6.2, 5.3.3.10, 5.4.6).** Two envelope-only members on a signed transport destination, each the standard base64 of exactly 1216 bytes (ML-KEM-768 `pk_M` 1184, then X25519 `pk_X` 32):
+  - `transit_xwing_pubkey`, beside the earlier-form `transit_kex_pubkeys`;
+  - `onion_hop_xwing_pubkey`, which replaces the earlier form's `onion_hop_pubkeys`. Persist never read, admitted or served that member (#1181), so there is no stored old form to keep reading.
+
+  New pieces:
+  - typed accessors `SignedTransportDestination::{transit_xwing_pubkey, onion_hop_xwing_pubkey}` and the `XWingPublicKey` type;
+  - `xwing_pubkey_from_envelope` and `check_xwing_halves`;
+  - in-row admission. A wrong length is refused `xwing_pubkey_wrong_length`. Each half (bytes 0..1184 and 1184..1216) may not equal the link x25519, the transport ed25519, the signer's pinned keys, the earlier pair's halves, `encryption_pubkeys`, or the other X-Wing key. The tokens are `transit_xwing_ml_kem_768_reuse`, `transit_xwing_x25519_reuse`, `onion_hop_ml_kem_768_reuse` and `onion_hop_x25519_reuse` (appended to `malformed_row::ALL`);
+  - a same-clock re-sign that changes any of the three key members is a fork (`same_transit_kex_member` became `same_envelope_key_members`).
+
+  **THE RULE:** a seated serve node's `transit_xwing_pubkey` is live only when an admitted `transport:canonical_rebind` carries exactly its live row. Resolve a peer's key with `transit_xwing_pubkey_for` and read the carried row with `transport_rebind::rebind_held_for`. A seat publishing the key alone (a v1 re-assertion) is still admitted and served, but its key is not live.
+- **Accord recovery (CC 4.2.6).**
+  - The commitment in force is the one named by the latest row of the accord's lineage that names one for that holder. The lineage is walked by `prev_head_digest` links, never by instant, and either a recovery version or a charter version can name the commitment. A spent commitment named again names none. A broken link refuses `accord_recovery_lineage_incomplete`.
+  - The next commitment must differ from the spent one and from every commitment already spent (`accord_recovery_next_commitment_not_fresh`).
+  - A recovery key is spent by id or by the commitment its material reproduces. It never becomes a seat's signing key under any id: the test is the public key material (`accord_recovery_key_as_signing_key`).
+  - A recovery naming the holder's current key as the new one refuses `accord_recovery_reuses_signing_key`. It was `accord_recovery_seat_taken` before.
+  - Persist keeps one stricter precondition: the head's charter must be a live row here.
+- **Licensure short of quorum waits (CC 2.4, 2.6.1.9).** A `licensure:{A}` row has three features: an active member of a quorum authority community signed it, it names no delegation, and it is short of the quorum. Such a row is no longer admitted as testimony. It is refused with the typed, retryable `Error::LicensureShortOfAuthorityQuorum` (`federation_licensure_short_of_authority_quorum`, Python `ValueError`). The same act re-offered with the quorum's scrub set is admitted as the authority's act. A `founder_only` authority is unchanged.
+- **Typed key-record conflicts.** The register store path's `Error::Conflict`s are now `Error::KeyRecordConflict { key_id, reason, detail }`. The reasons are `pubkey_change`, `same_key_different_record`, `anchor_scrubbed`, `claim_differs`, `not_replaceable_here` and `stored_record_verifies` (`register::KeyRecordConflictReason`). Each has its own `kind()` (`federation_key_record_conflict_{reason}`). Python `ValueError` is unchanged. A re-register of the same key with a different record (`same_key_different_record`) is now told apart from a pubkey swap. Every place that treated `Conflict` as a conflict treats this variant the same way (`is_duplicate_key`, the replication `StoreConflict`).
+- **Docs:** `scope_no_community_membership` is no longer called terminal. It means the roster held here does not name the writer: re-check when the roster changes. A revoked member is the only final case. Behaviour is unchanged.
+- **The accord lineage vector v2** (`tests/vectors/accord_lineage/accord_lineage_v2.json`, I1877; v1 stays pinned). It adds a v4 charter version whose charter re-lists the commitment v3's recovery spent. It also carries the charter rows as stored, the commitments in force at the head and the spent set.
+- The cosign fold token: CC rc20's `cosign:{state}` fold keys on `event_row_id`. On today's wire the act is named by the quorum key, and CC 8.11.18 keeps that name. Every `quorum_key` in persist is an earlier-form wire member or a V214 column, and persist holds no fold text that spells the token, so nothing is renamed (doc only, `cosign.rs`).
+
+### Adoption notes (CIRISServer, CIRISEdge) for slice E1
+
+- **Server: sign the canonical as {`node`} at the ceremony.** The forward-form canonical record is `identity_type` `node` with `roles` `["infra:serve"]` and the accord's co-scrub. Persist reads a v61 `canonical,node` record as the same conferral. Do not rely on `canonical` in `identity_type` for standing: read `is_canonical` / `list_canonical_servers`.
+- **Edge: do not treat a seat-published X-Wing key as live.** Resolve a peer's `transit_xwing_pubkey` with `transit_xwing_pubkey_for`. For a seated serve node it answers only for the row an admitted `transport:canonical_rebind` carries (`rebind_held_for`). Read `onion_hop_xwing_pubkey`, not `onion_hop_pubkeys`.
+- Key-record conflicts now carry `federation_key_record_conflict_*` kinds where they carried `federation_conflict`. A host that matched the kind string should match the prefix or the typed reason.
+- A licensure row short of its authority's quorum now raises `federation_licensure_short_of_authority_quorum`. Park it and re-offer it with the quorum's scrubs.
+- An infrastructure community is authorized only as a conformant record rooted in this node's trust set. A community that relied on a self-claimed `substrate_persist` key gets the strict path: steward bindings, the DEK cascade, and no Commons audience.
+- A `user`+`agent` or `accord_holder`+`node`/`agent` key is refused everywhere, the replicated insert included. Server's aggregate counts none such [#1274].
+
+### Deferred to E2 (edition-2)
+
+- Licensure: collecting the signatures (a `cosign:pending` hold for attestation rows). Under the kernel model a counted row that waits is held and concluded by the fold, so this belongs to the kernel slice. Reading the roster at the head the row names needs the edition-2 `refs.head`.
+- The forward canonical supersede (rotation of a forward-form canonical) and re-baking the genesis bundle as {`node`}: both happen at the ceremony.
+- The `event_row_id` fold token (the edition-2 row id is a different digest, CC 2.6.1.3).
+- `transit_xwing_pubkey` / `onion_hop_xwing_pubkey` as CBOR byte strings in signed bytes, and the edition-2 quorum act that moves a seat's key without a re-bind.
+- An empty trust set on a known node reads as the shipped default. Un-trusting the default to an empty set is not modelled until the edition-2 subscription row.
+
 ### Changed (v62 slice A: host seams)
 
 Persist's node code reads time, spawns, sleeps, dispatches blocking work and learns of shutdown only through one module, `ciris_persist::host` (FSD WASM_NODE §4.1, §5). A host installs its seams once (`HostSeams::install`) before it builds an Engine or a store; nothing installed is the native default, which behaves as v61 did.

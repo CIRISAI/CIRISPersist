@@ -91,7 +91,7 @@ pub(crate) fn held_destination_verdict(
         .as_deref()
         .and_then(|e| serde_json::from_str::<serde_json::Value>(e).ok())
         .is_some_and(|stored| {
-            super::self_at_login::same_transit_kex_member(&stored, &signed.signed_envelope)
+            super::self_at_login::same_envelope_key_members(&stored, &signed.signed_envelope)
         });
     if ex == d && held.signed && same_pair {
         return DestinationVerdict::Answer(Outcome::Unchanged);

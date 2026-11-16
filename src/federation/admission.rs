@@ -5303,6 +5303,37 @@ pub async fn check_licensure_delegator_is_authority(
             message,
         });
     }
+    // v62.0.0 (CC rc20 2.4 / 2.6.1.9, CIRISPersist#1274) — a row an active
+    // member of a QUORUM authority signs, naming no delegation, short of that
+    // quorum, is no longer testimony: it waits (a typed retryable refusal).
+    // CC 2.4: "A `licensure:{authority_id}` row that is the authority
+    // community's act under that protocol is counted"; "a row short of its
+    // protocol by signatures alone is not refused; it waits". The roster is
+    // read at the signed instant; reading it at the head the row names needs
+    // the edition-2 `refs.head` (E2).
+    if at_signed == LicensureIssuance::Testimony {
+        if let LicenceRoots::Quorum(c) = licence_roots_at(directory, &authority, fold_at).await? {
+            let roster = Box::pin(crate::federation::authorized_community_roster_at(
+                directory, &c, fold_at,
+            ))
+            .await?;
+            if roster.iter().any(|m| m.key_id == row.attesting_key_id) {
+                let keys: Vec<String> = roster.iter().map(|m| m.key_id.clone()).collect();
+                let signers = super::reverse_quorum::count_distinct_roster_scrubs(
+                    directory,
+                    &row.attestation_envelope,
+                    &row.scrubs(),
+                    &keys,
+                )
+                .await;
+                return Err(Error::LicensureShortOfAuthorityQuorum {
+                    attesting_key_id: row.attesting_key_id.clone(),
+                    authority_id: authority_id.to_owned(),
+                    signers: signers.len(),
+                });
+            }
+        }
+    }
     if at_signed.is_the_authoritys()
         && super::self_roster::outside_past_freshness_window(row.asserted_at, received_at)
         && !licensure_issuance_at(directory, &authority, row, received_at)
@@ -6884,6 +6915,74 @@ where
     Ok(())
 }
 
+/// v62.0.0 (CC rc20 3.3.6.2, CIRISPersist#1274) — the in-row rule for the two
+/// X-Wing keys of a signed transport destination. Each key decodes to exactly
+/// 1216 bytes ([`xwing_pubkey_from_envelope`](crate::federation::self_at_login::xwing_pubkey_from_envelope)),
+/// and each half must differ from every other key the row carries: the
+/// Reticulum link x25519, the transport ed25519, the signer's pinned Ed25519
+/// and ML-DSA-65, the earlier-form transit pair's two halves, the halves of
+/// `encryption_pubkeys` when the row carries them, and the other X-Wing key's
+/// halves. The transit key is checked against everything but the hop key; the
+/// hop key against everything, the transit key included, so a collision
+/// between the two is refused under the hop key's token, as CC 3.3.6.2 names
+/// it ("A half equal to either half of `transit_xwing_pubkey` …").
+fn check_xwing_keys_in_row(
+    env: &serde_json::Value,
+    row: &crate::federation::self_at_login::TransportDestination,
+    transit_pair: Option<&crate::federation::self_at_login::TransitKexPair>,
+    signer: &super::KeyRecord,
+) -> Result<(), Error> {
+    use crate::federation::self_at_login::{
+        check_xwing_halves, xwing_pubkey_from_envelope, XWingKeyRole,
+        ONION_HOP_XWING_PUBKEY_MEMBER, TRANSIT_XWING_PUBKEY_MEMBER,
+    };
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let transit = xwing_pubkey_from_envelope(env, TRANSIT_XWING_PUBKEY_MEMBER)?;
+    let hop = xwing_pubkey_from_envelope(env, ONION_HOP_XWING_PUBKEY_MEMBER)?;
+    if transit.is_none() && hop.is_none() {
+        return Ok(());
+    }
+    let dec = |s: Option<&str>| s.and_then(|s| B64.decode(s).ok());
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    keys.extend(dec(row.transport_x25519_pubkey_base64.as_deref()));
+    keys.extend(dec(row.transport_ed25519_pubkey_base64.as_deref()));
+    keys.extend(dec(Some(&signer.pubkey_ed25519_base64)));
+    keys.extend(dec(signer.pubkey_ml_dsa_65_base64.as_deref()));
+    if let Some(p) = transit_pair {
+        keys.push(p.x25519.to_vec());
+        keys.push(p.ml_kem_768.to_vec());
+    }
+    if let Some(enc) = env.get("encryption_pubkeys") {
+        for m in ["x25519_base64", "ml_kem_768_base64"] {
+            keys.extend(dec(enc.get(m).and_then(|v| v.as_str())));
+        }
+    }
+    let refuse = |r: crate::federation::self_at_login::XWingReuseRefusal, member: &str| {
+        Error::malformed_row(
+            "transport_destination",
+            r.as_str(),
+            format!(
+                "signed transport_destination: a half of `{member}` is another key on the same \
+                 row; the X-Wing key must be key-separated (CC 3.3.6.2)"
+            ),
+        )
+    };
+    if let Some(t) = &transit {
+        check_xwing_halves(XWingKeyRole::Transit, t, keys.iter().map(Vec::as_slice))
+            .map_err(|r| refuse(r, TRANSIT_XWING_PUBKEY_MEMBER))?;
+    }
+    if let Some(h) = &hop {
+        let mut with_transit: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        if let Some(t) = &transit {
+            with_transit.push(t.ml_kem_768());
+            with_transit.push(t.x25519());
+        }
+        check_xwing_halves(XWingKeyRole::OnionHop, h, with_transit)
+            .map_err(|r| refuse(r, ONION_HOP_XWING_PUBKEY_MEMBER))?;
+    }
+    Ok(())
+}
+
 /// v17.0.0 (CIRISPersist#443) — the SIGNED transport-destination admission
 /// gate: the route-plane mirror of
 /// [`verify_signed_identity_occurrence_revocation`], closing the
@@ -7084,6 +7183,14 @@ pub async fn verify_signed_transport_destination(
             "transport_destination",
         ));
     };
+    // v62.0.0 (CC rc20 3.3.6.2, CIRISPersist#1274) — the two X-Wing keys,
+    // envelope-only, each exactly 1216 bytes, with the per-half reuse rule
+    // against every other key on the row. CC 3.3.6.2: "The reuse refusals read
+    // the key's halves, bytes 0..1184 and bytes 1184..1216. A half equal to
+    // either half of `transit_xwing_pubkey`, to either half of
+    // `encryption_pubkeys` on the same row, to the transport x25519 or
+    // ed25519, or to the signer's pinned keys is refused."
+    check_xwing_keys_in_row(env, row, transit_pair.as_ref(), &signer_key)?;
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
         Error::malformed_row(
             "transport_destination",
@@ -13255,10 +13362,14 @@ pub async fn check_canonical_role_admission_over_roster(
     row: &super::KeyRecord,
     roster_key_ids: &[String],
 ) -> Result<(), Error> {
-    // (1) Fast path: no `canonical` role on EITHER surface → nothing to gate.
-    // #441: evaluated over identity_type ∪ roles — `roles=["canonical"]` is
-    // the same claim as `identity_type="canonical"` and hits the same gate.
-    if !row.claims_role(identity_type::CANONICAL) {
+    // (1) Fast path: the record NAMES no canonical conferral → nothing to
+    // gate. #441: evaluated over identity_type ∪ roles. v62.0.0 (CC rc20
+    // 8.11.27, #1274): this is the earlier form's NAME for the conferral, and
+    // a record that names one must carry it ([`names_canonical_conferral`]).
+    // The forward form ({node} + `infra:serve` + a co-scrub) is not refused
+    // here: its standing is read from the verified co-scrub at every reader
+    // ([`is_canonical`]), so an unverified one is simply not canonical.
+    if !names_canonical_conferral(row) {
         return Ok(());
     }
 
@@ -13321,26 +13432,13 @@ pub async fn check_canonical_role_admission_over_roster(
     //   are explicitly declared software keys; the floor would make every
     //   test-anchor mint impossible. Prod builds compile the override to
     //   const-false.
-    let legacy = is_baked_genesis_canonical(row)
-        || crate::federation::genesis::test_anchor_override_active();
-    let verify_result = if legacy {
-        verify_accord_family_coscrub(directory, row, roster_key_ids).await
-    } else {
-        verify_accord_family_coscrub_with(
-            directory,
-            row,
-            roster_key_ids,
-            CANONICAL_MIN_COSCRUBBERS,
-            true,
-            YUBICO_ATTESTATION_ROOT_1_DER,
-        )
+    canonical_conferral_coscrub(directory, row, roster_key_ids)
         .await
-    };
-    verify_result.map_err(|reason| Error::CanonicalRoleNotAccordConferred {
-        key_id: row.key_id.clone(),
-        scrub_key_id: row.scrub_key_id.clone(),
-        reason,
-    })
+        .map_err(|reason| Error::CanonicalRoleNotAccordConferred {
+            key_id: row.key_id.clone(),
+            scrub_key_id: row.scrub_key_id.clone(),
+            reason,
+        })
 }
 
 /// v21.4.0 (CIRISPersist#513 / CIRISVerify#219) — the STRICT canonical
@@ -13364,7 +13462,7 @@ pub async fn check_canonical_role_admission_over_roster_with_custody_root(
     roster_key_ids: &[String],
     custody_root: &[u8],
 ) -> Result<(), Error> {
-    if !row.claims_role(identity_type::CANONICAL) {
+    if !names_canonical_conferral(row) {
         return Ok(());
     }
     // v31.1.0 (CIRISPersist#662) — materialize before consulting, like the
@@ -13417,7 +13515,7 @@ pub(crate) async fn check_canonical_role_admission_over_roster_legacy(
     row: &super::KeyRecord,
     roster_key_ids: &[String],
 ) -> Result<(), Error> {
-    if !row.claims_role(identity_type::CANONICAL) {
+    if !names_canonical_conferral(row) {
         return Ok(());
     }
     // v31.1.0 (CIRISPersist#662) — materialize before consulting, like the
@@ -15236,20 +15334,170 @@ pub async fn is_infra_attest_effective(
 }
 
 /// **CIRISPersist#372 — is `key_id` a canonical / founding bootstrap server?**
-/// True iff `key_id` resolves to a `federation_keys` row whose `identity_type`
-/// **set** contains [`super::types::identity_type::CANONICAL`]. Because
-/// [`check_canonical_role_admission`] gates every write path, a stored row can
-/// carry `canonical` only if it earned it via anchor-scrub — so this simple
-/// set-membership read is sufficient (the admission gate is the enforcement
-/// point). `false` for an unknown `key_id` or a non-canonical row.
+///
+/// v62.0.0 (CC rc20 4.2.1 / 3.4.7.1 / 8.11.27, CIRISPersist#1274) — **the
+/// canonical standing is the accord's ceremony conferral, read from it, never
+/// from `identity_type`.** CC 3.4.7.1: "A conferral is not a label. A canonical
+/// key's `identity_type` is {`node`}; its canonical standing is the accord's
+/// counted conferral of CC 4.2.1, never a member of the set." CC 4.2.1: "That
+/// co-scrub is the key's canonical standing."
+///
+/// True iff `key_id` resolves to a stored record that PRESENTS the conferral
+/// ([`presents_canonical_conferral`]) AND whose stored scrub set VERIFIES as
+/// the accord's counted co-scrub over its stored `registration_envelope`
+/// ([`canonical_conferral_coscrub`], the same core, roster and floor the
+/// admission gate runs). A `canonical` left in a stored `identity_type` is
+/// therefore INERT: it confers nothing unless the co-scrub it names verifies.
+///
+/// **How a v61 store's canonical keeps resolving.** The v61 canonical's stored
+/// record carries the earlier-form envelope `"identity_type": "canonical,node"`
+/// with `roles` including `infra:serve` (CC 8.11.27: "the accord's co-scrub
+/// over that envelope is the conferral … Its `canonical` member names that
+/// conferral"), and its stored scrub set (base `scrub_key_id` plus
+/// `additional_scrubs`) is the accord's 2-of-3 co-scrub over that envelope. It
+/// presents the conferral by its earlier-form name and the co-scrub verifies
+/// against the genesis roster at the baked lineage's bar, so it is canonical
+/// with no migration, re-sign or re-seed. A record of the forward form
+/// ({`node`}, `infra:serve`, the same co-scrub) resolves the same way.
+///
+/// Not tombstone-aware (see [`is_canonical_effective`]). `false` for an unknown
+/// `key_id` or a record without a verifying conferral.
 pub async fn is_canonical(
     directory: &dyn super::FederationDirectory,
     key_id: &str,
 ) -> Result<bool, Error> {
-    Ok(directory
-        .lookup_public_key(key_id)
-        .await?
-        .is_some_and(|r| identity_type::set_contains(&r.identity_type, identity_type::CANONICAL)))
+    is_canonical_over_roster(directory, key_id, &accord_holder_roster_key_ids()).await
+}
+
+/// [`is_canonical`] over an explicit accord roster.
+pub async fn is_canonical_over_roster(
+    directory: &dyn super::FederationDirectory,
+    key_id: &str,
+    roster_key_ids: &[String],
+) -> Result<bool, Error> {
+    let Some(record) = directory.lookup_public_key(key_id).await? else {
+        return Ok(false);
+    };
+    holds_canonical_conferral(directory, &record, roster_key_ids).await
+}
+
+/// v62.0.0 (#1274) — the canonical servers among the candidate `key_ids`
+/// (each backend's `list_canonical_servers` SQL), in the order given: each
+/// stored record kept only when it holds the conferral over the effective
+/// accord roster. The one filter both backends share.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn canonical_servers_among(
+    directory: &dyn super::FederationDirectory,
+    key_ids: Vec<String>,
+) -> Result<Vec<super::KeyRecord>, Error> {
+    let roster = accord_holder_roster_key_ids();
+    let mut out = Vec::new();
+    for id in key_ids {
+        let Some(record) = directory.lookup_public_key(&id).await? else {
+            continue;
+        };
+        if holds_canonical_conferral(directory, &record, &roster).await? {
+            out.push(record);
+        }
+    }
+    Ok(out)
+}
+
+/// v62.0.0 (#1274) — does `record` hold the canonical conferral: it presents
+/// one ([`presents_canonical_conferral`]) and its stored scrub set verifies as
+/// the accord's counted co-scrub ([`canonical_conferral_coscrub`])?
+pub async fn holds_canonical_conferral(
+    directory: &dyn super::FederationDirectory,
+    record: &super::KeyRecord,
+    roster_key_ids: &[String],
+) -> Result<bool, Error> {
+    if !presents_canonical_conferral(record) {
+        return Ok(false);
+    }
+    Ok(
+        canonical_conferral_coscrub(directory, record, roster_key_ids)
+            .await
+            .is_ok(),
+    )
+}
+
+/// v62.0.0 (CC rc20 4.2.1 / 8.11.27, CIRISPersist#1274) — **does this record
+/// PRESENT the canonical conferral?** Structural and sync; whether the
+/// conferral HOLDS is [`canonical_conferral_coscrub`]'s question.
+///
+/// - **The earlier form** (CC 8.11.27): the record names `canonical` in its
+///   `identity_type` set or its `roles` (#441, [`claims_role`](super::KeyRecord::claims_role)).
+///   "Its `canonical` member names that conferral and is no identity type."
+/// - **The forward form** (CC 4.2.1): `identity_type` is exactly {`node`},
+///   `roles` carries `infra:serve`, and the record carries a co-scrub set
+///   (`additional_scrubs` non-empty) — "an accord co-scrub by a strict majority
+///   of the standing accord roster over the key record of a key whose
+///   `identity_type` is {`node`}, bearing `roles: ["infra:serve"]`". One anchor
+///   scrub alone (root binding, recognition) is not a conferral.
+///
+/// A record that NAMES the conferral (the earlier form,
+/// [`names_canonical_conferral`]) is refused at every key-record door unless
+/// it verifies. The forward form is read, not gated: an unverified forward
+/// co-scrub is admitted as an ordinary node record and is never canonical.
+#[must_use]
+pub fn presents_canonical_conferral(record: &super::KeyRecord) -> bool {
+    if names_canonical_conferral(record) {
+        return true;
+    }
+    identity_type::parse_set(&record.identity_type) == [identity_type::NODE]
+        && record
+            .capability_roles
+            .iter()
+            .any(|r| r == super::types::delegation_scope::INFRA_SERVE)
+        && !record.additional_scrubs.is_empty()
+}
+
+/// v62.0.0 (CC rc20 8.11.27, #1274) — does `record` NAME the canonical
+/// conferral in the earlier form: `canonical` in its `identity_type` set or its
+/// `roles` (#441)? "Its `canonical` member names that conferral and is no
+/// identity type." The door gates exactly these (a record that names a
+/// conferral must carry it); the name confers nothing by itself (readers
+/// verify the co-scrub, [`holds_canonical_conferral`]).
+#[must_use]
+pub fn names_canonical_conferral(record: &super::KeyRecord) -> bool {
+    record.claims_role(identity_type::CANONICAL)
+}
+
+/// v62.0.0 (#1274) — **the canonical conferral's co-scrub**, verified: the
+/// record's stored scrub set meets the accord's count over its stored
+/// `registration_envelope` — at the pre-floor bar for the compiled-in genesis
+/// canonical lineage and an armed test anchor, else with the #513 custody
+/// floor. The ONE core the admission gate and every reader
+/// ([`is_canonical`], `list_canonical_servers`, `verify_canonical_seeded`)
+/// share, so what admits is what reads. Withdrawal is not consulted here (the
+/// gate and [`is_canonical_effective`] add it).
+///
+/// # Errors
+///
+/// The quorum core's reason.
+pub async fn canonical_conferral_coscrub(
+    directory: &dyn super::FederationDirectory,
+    row: &super::KeyRecord,
+    roster_key_ids: &[String],
+) -> Result<(), String> {
+    let legacy = is_baked_genesis_canonical(row)
+        || crate::federation::genesis::test_anchor_override_active();
+    if legacy {
+        verify_accord_family_coscrub(directory, row, roster_key_ids).await
+    } else {
+        verify_accord_family_coscrub_with(
+            directory,
+            row,
+            roster_key_ids,
+            CANONICAL_MIN_COSCRUBBERS,
+            true,
+            YUBICO_ATTESTATION_ROOT_1_DER,
+        )
+        .await
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -15970,29 +16218,67 @@ pub async fn steward_binding_chain(
     Ok(Vec::new())
 }
 
-/// v9.0.0 SecReview F2 (CC 3.2 / CC 4.4.3.2.1) — is `community` an
-/// **authorized** infrastructure community whose carve-outs (steward-binding
-/// exemption + Commons-plaintext opt-out) may be honored?
+/// **The infrastructure carve-out's ONE predicate.** v62.0.0 (CC rc20 3.2 /
+/// 4.4.3.4 / 6.1.8 N1 / 5.4.6, CIRISPersist#1274): a community is an
+/// AUTHORIZED infrastructure community iff
 ///
-/// A `cohort_subkind: infrastructure` label is honored ONLY IF the
-/// community's OWN key ([`Community::community_key_id`]) resolves in
-/// `federation_keys` to a record whose `identity_type` set contains
-/// [`identity_type::SUBSTRATE_PERSIST`] — the §5.3/§7.2 reserved
-/// governance/substrate authority that already owns the `system:` /
-/// `audit_chain:` / `corpus_health:` reserved prefixes
-/// ([`default_reserved_prefix_rules`]). CC 3.2 reserves the infrastructure
-/// carve-out for genuine governance / trust roots (`ciris-canonical`);
-/// without this check ANY caller could self-label a community
-/// `infrastructure` to (a) skip the steward-binding gate and (b) force its
-/// content to Commons-plaintext (no DEK).
+/// - **(i) its record is a CONFORMANT infrastructure record**
+///   ([`is_conformant_infrastructure_record`]): `cohort_subkind:
+///   infrastructure`; a `quorum:M/N` `consensus_protocol` (never
+///   `founder_only`, `unanimous` or a bare `majority`); at least one founder,
+///   and every founder a PERSON — a key whose `identity_type` includes `user`
+///   or `accord_holder` and never `node` or `agent` ("Infrastructure does not
+///   vote", CC 3.2); and
+/// - **(ii) it is ROOTED IN THIS NODE'S OWN TRUST SET**
+///   ([`infrastructure_rooted_here`]): its stored trust-root-grade chain
+///   verifies to a root this node trusts.
 ///
-/// **Fail-secure:** a community labeled `infrastructure` whose key does
-/// NOT resolve to `substrate_persist` (or does not resolve at all) returns
-/// `false` — the label is NOT honored, so the caller falls through to the
-/// STRICTER non-infra path (steward-binding REQUIRED + DEK cascade applies).
-/// An unauthorized infra label can only ever get the stricter treatment,
-/// never the weaker one.
+/// **Never a key type.** Until v62 the label was honoured when the
+/// community's own key claimed `substrate_persist`, which any key could
+/// self-claim (CC rc20 3.4.7.1: `substrate_persist` "confers no authority …
+/// Nothing is admitted on its strength"), so the carve-out was self-grantable:
+/// a self-labelled community skipped the steward binding of its node members
+/// and was forced to Commons plaintext. A separate `is_trust_root_grade &&
+/// is_rooted` leg in the steward-binding gate is folded in here, so every
+/// treatment reads one predicate: the node-member steward-binding exemption
+/// ([`check_community_membership_steward_binding`]), the moderator exemption
+/// ([`check_no_moderator_federate_admission`]), the DEK skip
+/// (`community_dek`), the at-rest cascade (`at_rest_cascade`) and the Commons
+/// replication audience (`replication_audience`).
+///
+/// **Fail-secure:** anything else returns `false`, and the caller takes the
+/// STRICTER non-infrastructure path (steward binding required, DEK cascade).
 pub async fn is_authorized_infrastructure_community<F>(
+    directory: &F,
+    community: &super::Community,
+) -> Result<bool, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    // (i) is judged on the record this node HOLDS for the id when it holds one
+    // (a door may hand in a probe carrying only the members it adds), else on
+    // the record in hand; (ii) reads the stored chain either way.
+    let held = directory
+        .lookup_community(&community.community_key_id)
+        .await?;
+    let record = held.as_ref().unwrap_or(community);
+    if !is_conformant_infrastructure_record(directory, record).await? {
+        return Ok(false);
+    }
+    infrastructure_rooted_here(directory, &community.community_key_id).await
+}
+
+/// v62.0.0 (CC rc20 3.2 / 4.4.3.4, CIRISPersist#1274) — (i) of
+/// [`is_authorized_infrastructure_community`]: is `community` a conformant
+/// infrastructure record? `cohort_subkind: infrastructure`; a well-formed
+/// `quorum:M/N` protocol; at least one founder; every founder a person's key
+/// (`user` or `accord_holder`, never `node` or `agent`). A founder whose key
+/// this node does not hold is not shown to be a person: not conformant.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn is_conformant_infrastructure_record<F>(
     directory: &F,
     community: &super::Community,
 ) -> Result<bool, Error>
@@ -16004,22 +16290,82 @@ where
         .as_ref()
         .and_then(|b| b.get("cohort_subkind"))
         .and_then(|v| v.as_str())
-        == Some("infrastructure");
-    if !labeled_infra {
+        == Some(COHORT_SUBKIND_INFRASTRUCTURE);
+    if !labeled_infra || !is_quorum_protocol(&community.consensus_protocol) {
         return Ok(false);
     }
-    // Honor the carve-out ONLY if the community's own key is the reserved
-    // governance/substrate authority.
-    match directory
-        .lookup_public_key(&community.community_key_id)
-        .await?
-    {
-        Some(rec) => Ok(identity_type::set_contains(
-            &rec.identity_type,
-            identity_type::SUBSTRATE_PERSIST,
-        )),
-        None => Ok(false),
+    let founders: Vec<&str> = community
+        .members
+        .iter()
+        .filter(|m| m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER))
+        .map(|m| m.key_id.as_str())
+        .collect();
+    if founders.is_empty() {
+        return Ok(false);
     }
+    for f in founders {
+        let Some(rec) = directory.lookup_public_key(f).await? else {
+            return Ok(false);
+        };
+        let set = identity_type::parse_set(&rec.identity_type);
+        let person =
+            set.contains(&identity_type::USER) || set.contains(&identity_type::ACCORD_HOLDER);
+        let machine = set.contains(&identity_type::NODE) || set.contains(&identity_type::AGENT);
+        if !person || machine {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `quorum:M/N` with `0 < M <= N` (the one protocol kind an infrastructure
+/// community may declare; CC 3.2 conformance, #927).
+fn is_quorum_protocol(protocol: &str) -> bool {
+    let Some(rest) = protocol.strip_prefix("quorum:") else {
+        return false;
+    };
+    let Some((m, n)) = rest.split_once('/') else {
+        return false;
+    };
+    matches!((m.parse::<u32>(), n.parse::<u32>()), (Ok(m), Ok(n)) if m > 0 && m <= n)
+}
+
+/// v62.0.0 (CC rc20 4.4.3.34 / 3.2, CIRISPersist#1274) — (ii) of
+/// [`is_authorized_infrastructure_community`]: does the community stored at
+/// `community_key_id` root in THIS node's own trust set? Its stored
+/// trust-root-grade chain must verify
+/// ([`rooted_community_family`](super::canonical_community::rooted_community_family))
+/// to a root this node trusts: the roots its own live trust edges name
+/// ([`trusted_roots_of`](super::trust_root::trusted_roots_of)) when this node
+/// knows its key and holds any, else the shipped default (the accord family:
+/// CC 4.2.1 "The CIRIS root is the shipped default, not a privileged one").
+/// On a re-rooted node whose edges name another root, an accord-rooted
+/// community is NOT authorized here (fail-secure).
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn infrastructure_rooted_here<F>(
+    directory: &F,
+    community_key_id: &str,
+) -> Result<bool, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    let Some(root) =
+        super::canonical_community::rooted_community_family(directory, community_key_id).await?
+    else {
+        return Ok(false);
+    };
+    let Some(node) = directory.node_key_id() else {
+        return Ok(root == super::canonical_community::accord_family_key_id());
+    };
+    let trusted =
+        super::trust_root::trusted_roots_of(directory, &node, crate::host::clock::now()).await?;
+    if trusted.is_empty() {
+        return Ok(root == super::canonical_community::accord_family_key_id());
+    }
+    Ok(trusted.contains(&root))
 }
 
 /// v50.0.0 (CIRISPersist#925/#927) — the `cohort_subkind` CC 3.2 codifies
@@ -16618,22 +16964,14 @@ pub async fn check_community_membership_steward_binding(
     community: &super::Community,
 ) -> Result<(), Error> {
     // Infrastructure carve-out: trust + serve needs no steward (CC 3.2) —
-    // honored ONLY for an AUTHORIZED infrastructure community (its own key
-    // is the `substrate_persist` governance authority). A self-labeled
-    // infra community whose key is NOT substrate_persist falls through to
-    // the strict steward-binding path below (SecReview F2, fail-secure).
-    if is_authorized_infrastructure_community(directory, community).await? {
-        return Ok(());
-    }
-    // v50.0.0 (CIRISPersist#926, review HIGH-2) — a trust-root community the
-    // accord's quorum founded is an authorized infrastructure community too:
-    // a serve node joins it through the roster plane without a steward. Judged
-    // from the STORED row (rooted), never the probe's label.
-    if super::canonical_community::is_trust_root_grade(community)
-        && super::canonical_community::is_rooted(directory, &community.community_key_id).await?
-    {
-        return Ok(());
-    }
+    // honored ONLY for an AUTHORIZED infrastructure community (a conformant
+    // record rooted in this node's trust set); anything else takes the strict
+    // steward-binding path below (SecReview F2, fail-secure).
+    // v62.0.0 (CC rc20 3.2, CIRISPersist#1274) — ONE predicate (the v50
+    // trust-root leg is folded into it), and it exempts NODE members only: an
+    // agent member of any community, infrastructure included, needs its live
+    // steward binding ("Authority MUST root in an accountable human").
+    let infra = is_authorized_infrastructure_community(directory, community).await?;
     for member in &community.members {
         // Resolve the member's identity_type set. An unresolved member has
         // no node/agent standing this gate can prove — out of scope (and
@@ -16650,6 +16988,12 @@ pub async fn check_community_membership_steward_binding(
         } else {
             continue;
         };
+        // The carve-out: a NODE member of an authorized infrastructure
+        // community trusts and serves without a steward (CC 3.2 "Trust ≠
+        // membership"). Never an agent.
+        if infra && member_role == identity_type::NODE {
+            continue;
+        }
         if !is_steward_bound(directory, &member.key_id).await? {
             return Err(Error::UnstewardedCommunityMember {
                 community_key_id: community.community_key_id.clone(),
@@ -20600,10 +20944,23 @@ mod tests {
             .iter()
             .copied()
             .collect();
+        // v62.0.0 (CC rc20 3.4.7.1) — a self-report type confers no
+        // authority, yet CC 3.1.3 reserves the substrate's own families to it.
+        // It is the one other kind of type a reserved-prefix rule may name.
+        let self_report: BTreeSet<&str> = identity_type::SELF_REPORT_IDENTITY_TYPES
+            .iter()
+            .copied()
+            .collect();
+        assert!(
+            closed.is_disjoint(&self_report),
+            "a self-report type confers no authority (CC 3.4.7.1)"
+        );
         let mut required: BTreeSet<String> = BTreeSet::new();
         for rule in default_reserved_prefix_rules() {
             for t in rule.required_identity_types {
-                required.insert(t);
+                if !self_report.contains(t.as_str()) {
+                    required.insert(t);
+                }
             }
         }
         assert!(
@@ -21679,13 +22036,13 @@ mod tests {
         //
         // Shrink this list; never extend it. A list that grows is a suppression
         // file, and this one is load-bearing on an exploitable surface.
-        const GRANDFATHERED_607: &[(&str, &str)] = &[
-            ("substrate_persist", "system:"),
-            ("substrate_persist", "audit_chain:"),
-            ("substrate_persist", "corpus_health:"),
-            ("substrate_persist", "identity_continuity:"),
-            ("substrate_persist", "federation_directory:"),
-        ];
+        //
+        // v62.0.0 (CC rc20 3.4.7.1) — the list is EMPTY. Its five pairs were
+        // all `substrate_persist`, which "is a key type that confers no
+        // authority": it left the authority set for `SELF_REPORT_IDENTITY_TYPES`,
+        // so it no longer claims a mode this gate examines, and its families
+        // are the store's self-report about itself (#1174's attester rule).
+        const GRANDFATHERED_607: &[(&str, &str)] = &[];
         let rules = default_reserved_prefix_rules();
         let mut violations: Vec<String> = Vec::new();
         let mut still_open = 0usize;
@@ -25805,7 +26162,14 @@ mod canonical_gate_tests {
         // #441 closures). Backend-specific: the HW policy lives on the SQL
         // backends.
         for (kid, ident, roles) in [
-            ("sp-ah-set-sq", "agent,accord_holder".to_owned(), Vec::new()),
+            // v62.0.0 (CC rc20 3.4.7.1) — the set shape cohabits with a role
+            // the identity set rule allows: `agent,accord_holder` is now
+            // refused earlier, as a person's role with a machine's.
+            (
+                "sp-ah-set-sq",
+                "accord_holder,steward".to_owned(),
+                Vec::new(),
+            ),
             (
                 "sp-ah-roles-sq",
                 identity_type::NODE.to_owned(),
