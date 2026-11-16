@@ -61,16 +61,6 @@ impl PostgresBackend {
         &self.test_hooks
     }
 
-    /// v60.1.0 (CIRISPersist#1070 item 3) — does the bytes-plane tombstone
-    /// table exist, so a byte write's in-transaction tombstone read can run?
-    /// `false` only between a test-only `run_migrations_through` below V187
-    /// and the next full migration (the `pre_purge_schema` flag).
-    fn bytes_tombstone_plane(&self) -> bool {
-        !self
-            .pre_purge_schema
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
     /// v61 (CIRISPersist#991) — test-only: one integer a SQL statement
     /// selects, read straight off the database (the from-disk count a rehome
     /// witness checks, independent of the executor it witnesses).
@@ -1736,7 +1726,10 @@ impl crate::federation::directory_admit::DirectoryStore for PostgresBackend {
 #[async_trait::async_trait]
 impl crate::federation::blob_admit::BlobFloorStore for PostgresBackend {
     fn tombstone_plane_present(&self) -> bool {
-        self.bytes_tombstone_plane()
+        // v62.0.0 (slice E2b) — every store is the edition-2 baseline, which
+        // carries the bytes-plane tombstone table: there is no schema without
+        // it to answer for.
+        true
     }
 
     #[cfg(test)]
@@ -5572,16 +5565,12 @@ pub struct PostgresBackend {
     /// (`from_shared*`) resolves lazily at its first DEK-plane door when
     /// this is still false (CIRISPersist#850 review).
     minter_sentinel_resolved: std::sync::atomic::AtomicBool,
+    /// v62.0.0 (slice E2b) — what this backend's open found of an earlier
+    /// store and did about it ([`crate::store::edition_upgrade`]).
+    edition_upgrade_report: std::sync::Mutex<Option<crate::store::edition_upgrade::UpgradeReport>>,
     /// v58.0.0 (CIRISPersist#991) — set once [`Self::rehome_legacy_key_plane`]
     /// has run on this backend.
     key_plane_rehomed: std::sync::atomic::AtomicBool,
-    /// v54.1.0 (CIRISPersist#1046) — `true` only between a test-only
-    /// `run_migrations_through(v)` with `v` below V187 and the next full
-    /// `run_migrations`: the schema predates the purge plane, so it holds no
-    /// tombstone and the admission gates' read answers `Unsupported` (which
-    /// they pass) instead of "no such table". Never set on a production path;
-    /// the default is the plane PRESENT, so a gate fails closed.
-    pre_purge_schema: std::sync::atomic::AtomicBool,
     /// v3.4.0 (CIRISPersist#123) — trust-weighted admission gate.
     /// `None` = no trust gate is installed (bootstrap-permissive — the
     /// historical pre-#123 behavior). Set via
@@ -6056,30 +6045,6 @@ impl PostgresBackend {
         migration_guard::forget_for_tests(&self.dsn);
     }
 
-    /// #840 (I44) — normalise a V070 history row written by v43.0.0–v44.1.0.
-    ///
-    /// Postgres twin of the sqlite repair. Runs on the caller's client, so
-    /// the main boot path executes it INSIDE the migration advisory lock and
-    /// two booting workers cannot race it. Narrow by construction: version
-    /// 70, that name, and the one literal checksum those releases wrote —
-    /// any other divergence still aborts the boot. See
-    /// `FSD/MIGRATION_IMMUTABILITY.md` §3.
-    async fn repair_v070_checksum(
-        client: &tokio_postgres::Client,
-    ) -> Result<u64, tokio_postgres::Error> {
-        use crate::store::migration_immutability as mi;
-        let present: bool = client
-            .query_one(mi::POSTGRES_HISTORY_TABLE_PROBE, &[])
-            .await?
-            .get(0);
-        if !present {
-            return Ok(0);
-        }
-        client
-            .execute(mi::repair_statement(mi::Dialect::Postgres).as_str(), &[])
-            .await
-    }
-
     /// #848 (`BLOB_REPLICATION.md` §16, I66) — resolve the V145 minter
     /// sentinel to this node's own key. Postgres twin of the sqlite repair;
     /// see it for the reasoning. One transaction; a surviving sentinel aborts
@@ -6196,30 +6161,6 @@ impl PostgresBackend {
                 tracing::warn!(error = %e, "postgres: planner statistics at open failed; open proceeds")
             }
         }
-    }
-
-    /// Test-only: apply migrations up to and including `version` (see the
-    /// sqlite twin). No advisory lock — a test database has one writer.
-    #[cfg(any(test, feature = "test-anchor"))]
-    pub async fn run_migrations_through(&self, version: u32) -> Result<(), Error> {
-        self.pre_purge_schema
-            .store(version < 187, std::sync::atomic::Ordering::Release);
-        let mut client = self.dedicated_connect().await?;
-        Self::repair_v070_checksum(&client)
-            .await
-            .map_err(|e| Error::Migration {
-                sqlstate: None,
-                detail: format!("postgres V070 checksum repair (#840): {e}"),
-            })?;
-        crate::store::migration_runner::run_postgres(
-            &mut client,
-            &crate::store::migration_runner::postgres_migrations(),
-            Some(i32::try_from(version).unwrap_or(i32::MAX)),
-            &crate::host::clock::now,
-        )
-        .await
-        .map(|_| ())
-        .map_err(|e| runner_error(&format!("postgres migrations through V{version}"), e))
     }
 
     /// #226 (V094) — assign `shard_key` to legacy `trace_events` rows that
@@ -6388,10 +6329,10 @@ impl PostgresBackend {
                 crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
             ),
             minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
+            edition_upgrade_report: std::sync::Mutex::new(None),
             checkout_wait: wait,
             persist_timer: super::postgres_runtime_connect::capture_persist_timer(),
             key_plane_rehomed: std::sync::atomic::AtomicBool::new(false),
-            pre_purge_schema: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
             self_key_id: std::sync::RwLock::new(None),
             peer_write_quota: crate::federation::replication::admission::PeerWriteQuota::new(),
@@ -6451,10 +6392,10 @@ impl PostgresBackend {
                 crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
             ),
             minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
+            edition_upgrade_report: std::sync::Mutex::new(None),
             checkout_wait: POOL_WAIT_TIMEOUT,
             persist_timer: super::postgres_runtime_connect::capture_persist_timer(),
             key_plane_rehomed: std::sync::atomic::AtomicBool::new(false),
-            pre_purge_schema: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
             self_key_id: std::sync::RwLock::new(None),
             peer_write_quota: crate::federation::replication::admission::PeerWriteQuota::new(),
@@ -6601,6 +6542,38 @@ impl PostgresBackend {
     #[cfg(test)]
     pub(crate) fn forget_node_key_id(&self) {
         *self.node_key_id.write().expect("node_key_id lock") = None;
+    }
+
+    /// v62.0.0 (slice E2b) — [`crate::store::edition_upgrade::delete_earlier_store`]
+    /// on this database. `DryRun` finds, guards and counts on a connection of
+    /// its own and changes nothing. `Delete` is this backend's migration
+    /// phase (the upgrade runs inside its advisory lock, then the baseline);
+    /// a process that already migrated this database reports what it finds.
+    pub async fn edition_upgrade(
+        &self,
+        mode: crate::store::edition_upgrade::UpgradeMode,
+    ) -> Result<crate::store::edition_upgrade::UpgradeReport, Error> {
+        use crate::store::edition_upgrade as eu;
+        if mode == eu::UpgradeMode::Delete {
+            self.run_migrations().await?;
+            if let Some(r) = self.last_edition_upgrade() {
+                return Ok(r);
+            }
+        }
+        let mut client = self.dedicated_connect().await?;
+        let (report, _) =
+            eu::postgres::upgrade_locked(&mut client, eu::UpgradeMode::DryRun).await?;
+        Ok(eu::UpgradeReport { mode, ..report })
+    }
+
+    /// v62.0.0 (slice E2b) — what this backend's open found of an earlier
+    /// (edition-1) store and did about it; `None` when the open did not look
+    /// (an in-memory store, a view over another backend's handles).
+    pub fn last_edition_upgrade(&self) -> Option<crate::store::edition_upgrade::UpgradeReport> {
+        self.edition_upgrade_report
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// #848 — has [`Self::repair_minter_sentinel`] completed on this backend?
@@ -8029,8 +8002,6 @@ impl Backend for PostgresBackend {
     }
 
     async fn run_migrations(&self) -> Result<(), Error> {
-        self.pre_purge_schema
-            .store(false, std::sync::atomic::Ordering::Release);
         // v24.1.0 (CIRISPersist#559) — THE DDL RUNS ONCE PER PROCESS, PER
         // DATABASE. `Engine(...)` re-enters this on every construction, and
         // even a steady-state boot took the global advisory lock and re-ran
@@ -8113,46 +8084,33 @@ impl Backend for PostgresBackend {
             "ciris-persist: migration phase begin (advisory lock acquired)"
         );
 
-        // Run refinery on the same lock-holding connection. refinery
-        // wraps each migration in its own transaction; the advisory
-        // lock is at session scope, so it persists across all of
-        // them. If a single migration fails, refinery rolls back its
-        // transaction; we drop the connection below; lock releases.
+        // v62.0.0 (slice E2b) — THE EDITION UPGRADE, inside the advisory
+        // lock and before the runner: an edition-1 store is found, guarded
+        // (a live legal hold or a store persist did not create refuses, and
+        // nothing is deleted), counted and deleted; the runner then builds
+        // the fresh edition-2 store, and the deletion is recorded in it.
+        let upgrade = crate::store::edition_upgrade::postgres::upgrade_locked(
+            &mut lock_client,
+            crate::store::edition_upgrade::UpgradeMode::Delete,
+        )
+        .await;
+        let (report, earlier) = match upgrade {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = lock_client
+                    .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_ID])
+                    .await;
+                return Err(e);
+            }
+        };
+
+        // The runner on the same lock-holding connection: each migration and
+        // its history row in one transaction; the advisory lock is at session
+        // scope, so it persists across all of them.
         //
-        // v3.12.x (CIRISPersist#156) — wrap the `run_async` call in
-        // the migration-timing diagnostic. The diagnostic silently
-        // no-ops without `CIRIS_PERSIST_MIGRATION_TIMING_LOG` set;
-        // when set, it appends one JSON-Lines entry per migration
-        // apply documenting total_wall_us + applied_count +
-        // applied_versions. See `crate::store::migration_timing`.
-        // #840 (I44) — BEFORE refinery reads the history table, and inside
-        // the advisory lock this connection holds: a node that applied V070
-        // under v43.0.0–v44.1.0 carries a checksum the shipped file no
-        // longer produces, and refinery would abort the boot here.
-        if let Err(e) = Self::repair_v070_checksum(&lock_client).await {
-            let _ = lock_client
-                .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_ID])
-                .await;
-            return Err(Error::Migration {
-                sqlstate: None,
-                detail: format!("postgres V070 checksum repair (#840): {e}"),
-            });
-        }
-        // v58.0.0 (CIRISPersist#1094 item 2) — what V196 will delete, counted
-        // before it runs so the boot can say so.
-        let v196 = pg_v196_pending(&lock_client).await;
+        // v3.12.x (CIRISPersist#156) — the migration-timing diagnostic
+        // silently no-ops without `CIRIS_PERSIST_MIGRATION_TIMING_LOG` set.
         let migration_started = crate::host::clock::monotonic_now();
-        // v7.0.0 — V079 (the TimescaleDB continuous-aggregate accelerator)
-        // is left IMMUTABLE and unmodified, like V001's hypertable guard:
-        // its DDL is guarded by `IF EXISTS pg_extension timescaledb`, so it
-        // no-ops on plain PostgreSQL (the CEWP device-mesh deployment), and
-        // V081 supersedes it with the plain, backend-agnostic rollup table
-        // (tearing down any CAGG a timescale image left behind). Because the
-        // shipped migration is unchanged, its checksum still matches what
-        // `schema_history` recorded — so refinery's divergence + missing
-        // detection both stay at their strict defaults (no integrity
-        // weakening). Runtime is 100% TimescaleDB-free; the only residue is
-        // dormant guarded DDL in the two immutable shipped migrations.
         // v62.0.0 (P6) — persist's runner, refinery's decisions and rows;
         // the instant is the caller's (the Clock seam wires it).
         let report_result = crate::store::migration_runner::run_postgres(
@@ -8163,7 +8121,7 @@ impl Backend for PostgresBackend {
         )
         .await;
         let elapsed = migration_started.elapsed();
-        let migration_result = match report_result {
+        let mut migration_result = match report_result {
             Ok(report) => {
                 let applied = report.versions();
                 let applied_versions = applied
@@ -8183,6 +8141,13 @@ impl Backend for PostgresBackend {
             }
             Err(e) => Err(runner_error("migrations", e)),
         };
+        // The local-tier record of the deletion, in the fresh store.
+        if let (Ok(()), Some(earlier), Some(at)) =
+            (&migration_result, earlier.as_ref(), report.deleted_at)
+        {
+            migration_result =
+                crate::store::edition_upgrade::postgres::record(&lock_client, earlier, at).await;
+        }
 
         // Best-effort explicit unlock — graceful path. The drop below
         // is the actual guarantee (session ends → lock releases),
@@ -8195,18 +8160,10 @@ impl Backend for PostgresBackend {
         drop(lock_client);
 
         migration_result?;
-        #[cfg(feature = "sqlite")]
-        crate::store::sqlite::log_v196(v196);
-        #[cfg(not(feature = "sqlite"))]
-        if let Some((rows, silo, headers)) = v196.filter(|(a, b, c)| a + b + c > 0) {
-            tracing::warn!(
-                hard_case_rows = rows,
-                legacy_silo_rows = silo,
-                art17_erasure_headers = headers,
-                "V196 deleted v57-shaped trace_erasure hard cases that named their subject and \
-                 the art17_erasure purge headers citing them (CIRISPersist#1094)"
-            );
-        }
+        *self
+            .edition_upgrade_report
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report);
 
         // v24.1.0 (CIRISPersist#559) — marked ONLY here, on the success path,
         // and BEFORE the backfill because the backfill is not part of what the
@@ -9639,14 +9596,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         plane: &str,
         record_ref: &str,
     ) -> Result<Option<String>, crate::federation::Error> {
-        if self
-            .pre_purge_schema
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Err(crate::federation::Error::Unsupported {
-                method: "purge_tombstoned",
-            });
-        }
         let client = self
             .get_client()
             .await
@@ -9667,17 +9616,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         plane: &str,
         record_ref: &str,
     ) -> Result<Vec<String>, crate::federation::Error> {
-        // v60.1.0 (#1070 × #1113) — below V187 there is no tombstone table:
-        // the plane is absent (`Unsupported`), exactly as `purge_tombstoned`
-        // answers, so the withheld read it now serves withholds nothing there.
-        if self
-            .pre_purge_schema
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Err(crate::federation::Error::Unsupported {
-                method: "purge_tombstone_notices",
-            });
-        }
         let client = self
             .get_client()
             .await
@@ -23287,55 +23225,6 @@ fn pg_error_detail(e: &tokio_postgres::Error) -> String {
     out
 }
 
-/// v58.0.0 (CIRISPersist#1094 item 2) — what V196 will delete on this store,
-/// `(hard_case rows, pre-v57 silo rows, art17_erasure headers)`, counted with
-/// V196's own predicates; `None` once V196 is applied or before the tables
-/// exist.
-async fn pg_v196_pending(client: &tokio_postgres::Client) -> Option<(i64, i64, i64)> {
-    let applied: i32 = client
-        .query_one(
-            "SELECT COALESCE(MAX(version), 0) FROM ciris_persist_schema_history",
-            &[],
-        )
-        .await
-        .ok()?
-        .try_get(0)
-        .ok()?;
-    if applied >= 196 {
-        return None;
-    }
-    let count = |sql: &'static str| async move {
-        client
-            .query_one(sql, &[])
-            .await
-            .ok()
-            .and_then(|r| r.try_get::<_, i64>(0).ok())
-            .unwrap_or(0)
-    };
-    let rows = count(
-        "SELECT COUNT(*) FROM cirislens.federation_attestations \
-          WHERE dimension = 'hard_case:trace_erasure:v1' \
-            AND (COALESCE(attestation_envelope::jsonb #> '{hard_case,target_key_id}', 'null') <> 'null' \
-              OR COALESCE(attestation_envelope::jsonb #> '{hard_case,subject_key_id}', 'null') <> 'null' \
-              OR COALESCE(attestation_envelope::jsonb #> '{hard_case,detail,agent_id_hash}', 'null') <> 'null' \
-              OR COALESCE(attestation_envelope::jsonb #> '{hard_case,detail,signing_key_id}', 'null') <> 'null')",
-    )
-    .await;
-    let silo = count(
-        "SELECT COUNT(*) FROM cirislens.hard_case_events \
-          WHERE attestation_id IS NULL AND kind = 'trace_erasure' \
-            AND (target_key_id IS NOT NULL OR subject_key_id IS NOT NULL \
-              OR COALESCE(detail -> 'agent_id_hash', 'null') <> 'null' \
-              OR COALESCE(detail -> 'signing_key_id', 'null') <> 'null')",
-    )
-    .await;
-    let headers = count(
-        "SELECT COUNT(*) FROM cirislens.purge_executions WHERE legal_basis = 'art17_erasure'",
-    )
-    .await;
-    Some((rows, silo, headers))
-}
-
 /// v58.0.0 (CIRISPersist#1094 item 2) — store the producers' planned
 /// `withdraws` rows inside the erasure's transaction, through the local-row
 /// statement every local writer uses (row, subject projection, V157 depth).
@@ -30194,55 +30083,6 @@ mod tests {
         .await;
     }
 
-    /// v52.0.0 (CIRISPersist#784) — **I221 on postgres: V163 backfills a
-    /// legacy revocation's subject digest in SQL**, from the key it named, and
-    /// the column is then NOT NULL.
-    #[tokio::test]
-    async fn i221_v163_backfills_the_legacy_revocation_subject_postgres_784() {
-        let Some(dsn) = crate::test_pg::empty_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
-        backend
-            .run_migrations_through(162)
-            .await
-            .expect("through V162");
-        let (pk, _) =
-            crate::federation::tier_ingest::test_support::hybrid_pubkeys("k784-legacy-pg");
-        let client = backend.get_client().await.unwrap();
-        client
-            .batch_execute(&format!(
-                "INSERT INTO cirislens.federation_keys (key_id, pubkey_ed25519_base64, algorithm, \
-                   identity_type, identity_ref, valid_from, registration_envelope, original_content_hash, \
-                   scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at) \
-                 VALUES ('k1','{pk}','hybrid','node','ref1','2026-01-01T00:00:00Z','{{}}','\\x00','sig', \
-                   'k1','2026-01-01T00:00:01Z','h','2026-01-01T00:00:01Z'); \
-                 INSERT INTO cirislens.federation_revocations (revocation_id, revoked_key_id, \
-                   revoking_key_id, revoked_at, effective_at, revocation_envelope, original_content_hash, \
-                   scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at) \
-                 VALUES ('r1','k1','k1','2026-01-05T00:00:00Z','2026-01-05T00:00:00Z','{{}}','\\x00', \
-                   'sig','k1','2026-01-05T00:00:01Z','h','2026-01-05T00:00:01Z');"
-            ))
-            .await
-            .expect("seed the V162 shape");
-        drop(client);
-        backend.run_migrations().await.expect("V163 runs");
-        let digest = crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(&pk)
-            .unwrap()
-            .to_hex();
-        use crate::federation::FederationDirectory as _;
-        let found = backend.revocations_for_subject(&digest).await.unwrap();
-        assert_eq!(
-            found
-                .iter()
-                .map(|r| r.revocation_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["r1"],
-            "I221: the SQL backfill digests the RAW key bytes exactly as Rust does"
-        );
-    }
-
     /// v31.0.0 (CIRISPersist#659) — the closed-set region gate, the
     /// anti-rollback floor and its new ceiling, on postgres.
     #[tokio::test]
@@ -30989,257 +30829,6 @@ mod tests {
         backend.set_perceptual_hash_matcher(Some(matcher.clone()));
         let tag = format!("pg{}", uuid_like());
         exercise_i21b_a_refused_plaintext_is_never_sealed(&backend, &tag, &matcher).await;
-    }
-
-    /// §11.10 I16 — V139 classifies PRE-EXISTING rows from their own
-    /// evidence, on postgres. Needs an EMPTY database (the template is
-    /// already migrated), so this is the one test on `empty_dsn()`.
-    #[tokio::test]
-    async fn blob_invariant_i16_v139_classifies_legacy_rows_postgres() {
-        use crate::federation::types::cohort_scope::CryptoTier;
-        use crate::federation::BlobStorage;
-        let Some(dsn) = crate::test_pg::empty_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
-        backend
-            .run_migrations_through(138)
-            .await
-            .expect("through V138");
-        let a = [1u8; 32];
-        let b = [2u8; 32];
-        let c = [3u8; 32];
-        let orphan = [4u8; 32];
-        {
-            let client = backend.get_client().await.expect("client");
-            for (sha, body) in [
-                (&a, "self-sealed"),
-                (&b, "community-sealed"),
-                (&c, "commons"),
-            ] {
-                client
-                    .execute(
-                        "INSERT INTO cirislens.federation_blobs (sha256, storage_kind, bytes_inline, size_bytes) \
-                         VALUES ($1, 'inline', $2, $3)",
-                        &[&sha.to_vec(), &body.as_bytes().to_vec(), &(body.len() as i64)],
-                    )
-                    .await
-                    .unwrap();
-            }
-            client
-                .execute(
-                    "INSERT INTO cirislens.federation_blob_key_grants \
-                        (at_rest_sha256, recipient_key_id, wrap_algorithm, wrapped_dek, cohort_scope) \
-                     VALUES ($1, 'persist:self', 'aes256_gcm_content_master', 'AAAA', 'self')",
-                    &[&a.to_vec()],
-                )
-                .await
-                .unwrap();
-            for sha in [&b, &orphan] {
-                client
-                    .execute(
-                        "INSERT INTO cirislens.federation_community_blob_epoch \
-                            (at_rest_sha256, community_key_id, epoch) VALUES ($1, 'comm-legacy', 0)",
-                        &[&sha.to_vec()],
-                    )
-                    .await
-                    .unwrap();
-            }
-        }
-        backend
-            .run_migrations()
-            .await
-            .expect("the rest of the migrations");
-
-        assert_eq!(
-            backend.blob_crypto_tier(&a).await.unwrap(),
-            Some(CryptoTier::InvisibleEncrypted),
-            "I16: a legacy self-sealed row (it has an at-rest grant) is NOT commons"
-        );
-        assert_eq!(
-            backend.blob_cohort_scope(&a).await.unwrap().as_deref(),
-            Some("self")
-        );
-        assert_eq!(
-            backend.blob_crypto_tier(&b).await.unwrap(),
-            Some(CryptoTier::CommunityDek),
-            "I16: a legacy community-sealed row (it has an epoch binding) is NOT commons"
-        );
-        assert_eq!(
-            backend.blob_crypto_tier(&c).await.unwrap(),
-            Some(CryptoTier::Plaintext)
-        );
-        assert!(
-            backend
-                .community_dek_blob_epoch(&orphan)
-                .await
-                .unwrap()
-                .is_none(),
-            "I16: a binding whose blob is gone is removed"
-        );
-        let r = crate::federation::at_rest_cascade::orchestrate::read_any_for_viewer(
-            &backend, &a, "stranger", None,
-        )
-        .await;
-        assert!(
-            matches!(r, Err(crate::federation::BlobError::NotGranted { .. })),
-            "I16: after upgrade a stranger read the legacy ciphertext row as commons: {r:?}"
-        );
-    }
-
-    /// §11.10 I41 (the backfill) — V143 gives every PRE-EXISTING stream a
-    /// row from its first chunk, on postgres (see the sqlite twin for the
-    /// shape). Needs an EMPTY database like I16: seeds through V142, then
-    /// migrates, then an attributed append adopts the unclaimed stream.
-    #[tokio::test]
-    async fn blob_invariant_i41_v143_backfills_legacy_streams_postgres() {
-        use crate::federation::chunk_dag_cascade::orchestrate::put_blob_chunk_scoped;
-        use crate::federation::types::cohort_scope::FEDERATION;
-        use crate::federation::{BlobError, BlobStorage, StreamHead};
-        let Some(dsn) = crate::test_pg::empty_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
-        backend
-            .run_migrations_through(142)
-            .await
-            .expect("through V142");
-        let a = [0x41u8; 32];
-        let b = [0x42u8; 32];
-        {
-            let client = backend.get_client().await.expect("client");
-            for (sha, cohort, tier) in [
-                (&a, "community", "community_dek"),
-                (&b, "federation", "plaintext"),
-            ] {
-                client
-                    .execute(
-                        "INSERT INTO cirislens.federation_blobs \
-                            (sha256, storage_kind, bytes_inline, size_bytes, cohort_scope, crypto_tier) \
-                         VALUES ($1, 'inline', $2, 1, $3, $4)",
-                        &[&sha.to_vec(), &b"x".to_vec(), &cohort, &tier],
-                    )
-                    .await
-                    .unwrap();
-            }
-            client
-                .execute(
-                    "INSERT INTO cirislens.federation_community_blob_epoch \
-                        (at_rest_sha256, community_key_id, epoch) VALUES ($1, 'comm-legacy', 0)",
-                    &[&a.to_vec()],
-                )
-                .await
-                .unwrap();
-            for (stream, seq, sha) in [
-                ("legacy-comm", 5i64, &a),
-                ("legacy-comm", 6, &b),
-                ("legacy-commons", 0, &b),
-            ] {
-                client
-                    .execute(
-                        "INSERT INTO cirislens.federation_stream_chunks \
-                            (stream_id, seq, chunk_sha, epoch, size_bytes, plaintext_size_bytes) \
-                         VALUES ($1, $2, $3, 0, 1, 1)",
-                        &[&stream, &seq, &sha.to_vec()],
-                    )
-                    .await
-                    .unwrap();
-            }
-            assert!(
-                client
-                    .query("SELECT 1 FROM cirislens.federation_streams", &[])
-                    .await
-                    .is_err(),
-                "precondition: no federation_streams before V143"
-            );
-        }
-        backend
-            .run_migrations()
-            .await
-            .expect("the rest of the migrations");
-
-        assert_eq!(
-            backend.stream_chunks("legacy-comm").await.unwrap().stream,
-            Some(StreamHead {
-                cohort_scope: "community".into(),
-                community_key_id: Some("comm-legacy".into()),
-                owner_key_id: None,
-            }),
-            "I41: a legacy community stream is backfilled from its FIRST chunk's row and binding"
-        );
-        assert_eq!(
-            backend
-                .stream_chunks("legacy-commons")
-                .await
-                .unwrap()
-                .stream,
-            Some(StreamHead {
-                cohort_scope: "federation".into(),
-                community_key_id: None,
-                owner_key_id: None,
-            }),
-            "I41: a legacy commons stream is backfilled unclaimed"
-        );
-
-        let writer_a = crate::signing::LocalSignerHardwareAdapter::new(
-            crate::federation::at_rest_cascade::blob_invariants::node_signer(
-                &backend,
-                "legacy-writer-a",
-            )
-            .await,
-        );
-        let writer_b = crate::signing::LocalSignerHardwareAdapter::new(
-            crate::federation::at_rest_cascade::blob_invariants::node_signer(
-                &backend,
-                "legacy-writer-b",
-            )
-            .await,
-        );
-        put_blob_chunk_scoped(
-            &backend,
-            &writer_a,
-            FEDERATION,
-            None,
-            "legacy-commons",
-            1,
-            b"more",
-            0,
-            None,
-        )
-        .await
-        .expect("I41: an attributed append adopts a legacy (unclaimed) stream");
-        assert_eq!(
-            backend
-                .stream_chunks("legacy-commons")
-                .await
-                .unwrap()
-                .stream
-                .and_then(|h| h.owner_key_id),
-            Some(
-                crate::signing::federation_key_id_of(&writer_a)
-                    .await
-                    .unwrap()
-            ),
-            "I41: adopted by the first attributed writer"
-        );
-        let res = put_blob_chunk_scoped(
-            &backend,
-            &writer_b,
-            FEDERATION,
-            None,
-            "legacy-commons",
-            2,
-            b"else",
-            0,
-            None,
-        )
-        .await;
-        assert!(
-            matches!(res, Err(BlobError::InvalidArgument(_))),
-            "I41: an adopted legacy stream is owned: {res:?}"
-        );
     }
 
     /// §11.10 I24 — see `at_rest_cascade::blob_invariants`.
@@ -50851,59 +50440,6 @@ mod tests {
         .map(|_| ());
         crate::federation::admission::ungated_doors_test_support::assert_role_launder_refused(
             "postgres", a, b,
-        );
-    }
-
-    /// **I44 (#840) — a node that recorded the BRICKED V070 checksum boots,
-    /// on postgres.** Sqlite twin:
-    /// [`crate::store::sqlite`]`::i44_a_node_that_recorded_the_bricked_v070_checksum_boots`.
-    ///
-    /// Needs an EMPTY database of its own: it runs migrations twice and
-    /// rewrites a history row between them, which no shared template can
-    /// serve.
-    #[tokio::test]
-    async fn i44_a_node_that_recorded_the_bricked_v070_checksum_boots_postgres() {
-        use crate::store::migration_immutability as mi;
-        let Some(dsn) = crate::test_pg::empty_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
-        backend.run_migrations().await.expect("migrations run");
-
-        // Become population B: the history row v43.0.0–v44.1.0 wrote.
-        let client = backend.dedicated_connect().await.expect("client");
-        let touched = client
-            .execute(
-                "UPDATE ciris_persist_schema_history SET checksum = $1 WHERE version = 70",
-                &[&mi::V070_BRICKED_CHECKSUM_POSTGRES],
-            )
-            .await
-            .expect("fixture update");
-        assert_eq!(touched, 1, "the fixture must have moved exactly one row");
-
-        // A RESTART: the migration phase is per process, and both the break
-        // and the repair live inside it.
-        backend.forget_migration_guard_for_tests();
-
-        // The next boot. This is the whole invariant.
-        backend
-            .run_migrations()
-            .await
-            .expect("a node carrying the bricked V070 checksum must boot");
-
-        let after: String = client
-            .query_one(
-                "SELECT checksum FROM ciris_persist_schema_history WHERE version = 70",
-                &[],
-            )
-            .await
-            .expect("read back")
-            .get(0);
-        assert_eq!(
-            after,
-            mi::V070_CANONICAL_CHECKSUM_POSTGRES,
-            "the repair must rewrite the row to the shipped file's checksum"
         );
     }
 

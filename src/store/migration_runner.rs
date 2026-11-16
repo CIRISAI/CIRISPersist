@@ -77,6 +77,11 @@ pub(crate) enum MigrationError {
     Missing { version: i32, name: String },
     /// Two files carry one version.
     Repeated { version: i32, name: String },
+    /// v62.0.0 (slice E2b, I1951) — the store carries edition-1 history (a
+    /// row below the edition-2 baseline, V300). The baseline never runs over
+    /// it: an edition-1 store is deleted by
+    /// [`crate::store::edition_upgrade`], never migrated.
+    EditionOneHistory { head: i32 },
     /// A history row this runner cannot read (its checksum is not a `u64`).
     History(String),
     /// The instant `now` returned has no RFC 3339 form (a year outside
@@ -111,6 +116,13 @@ impl std::fmt::Display for MigrationError {
                     "migration V{version}__{name} is repeated, migration versions must be unique"
                 )
             }
+            Self::EditionOneHistory { head } => write!(
+                f,
+                "the store carries edition-1 migration history (head V{head}); the edition-2 \
+                 baseline (V{}) never runs over it — an edition-1 store is deleted at open \
+                 (store::edition_upgrade)",
+                crate::store::edition_baseline::EDITION_TWO_BASELINE
+            ),
             Self::History(d) => write!(f, "error reading the schema history: {d}"),
             Self::Instant(d) => write!(f, "the applied_on instant has no RFC 3339 form: {d}"),
             Self::Apply {
@@ -263,6 +275,15 @@ pub(crate) fn plan<'m>(
     migrations: &'m [Migration],
     target: Option<i32>,
 ) -> Result<Vec<&'m Migration>, MigrationError> {
+    // v62.0.0 (I1951) — edition 2 never continues an edition-1 history.
+    if applied
+        .iter()
+        .any(|a| a.version < crate::store::edition_baseline::EDITION_TWO_BASELINE)
+    {
+        return Err(MigrationError::EditionOneHistory {
+            head: applied.iter().map(|a| a.version).max().unwrap_or(0),
+        });
+    }
     for app in applied {
         match migrations.iter().find(|m| m.version == app.version) {
             None => {
@@ -522,9 +543,10 @@ mod tests {
         assert!(!lists.is_empty());
         for (dialect, ours, mut theirs) in lists {
             theirs.sort();
-            assert!(
-                ours.len() > 190,
-                "I1818 {dialect}: the embed found the files"
+            assert_eq!(
+                ours.first().map(|m| m.version),
+                Some(crate::store::edition_baseline::EDITION_TWO_BASELINE),
+                "I1818 {dialect}: the embed found the edition-2 baseline first"
             );
             assert_eq!(ours.len(), theirs.len(), "I1818 {dialect}: the same files");
             for (o, t) in ours.iter().zip(&theirs) {
@@ -577,11 +599,17 @@ mod tests {
             name: n.into(),
             checksum: checksum(n, v, ""),
         };
-        let files = vec![m(1, "a"), m(2, "b"), m(3, "c"), m(5, "e")];
+        let files = vec![m(300, "a"), m(301, "b"), m(302, "c"), m(304, "e")];
         let vs = |p: Vec<&Migration>| p.iter().map(|m| m.version).collect::<Vec<_>>();
-        assert_eq!(vs(plan(&[], &files, None).unwrap()), [1, 2, 3, 5]);
-        assert_eq!(vs(plan(&[a(1, "a")], &files, None).unwrap()), [2, 3, 5]);
-        assert_eq!(vs(plan(&[a(1, "a")], &files, Some(3)).unwrap()), [2, 3]);
+        assert_eq!(vs(plan(&[], &files, None).unwrap()), [300, 301, 302, 304]);
+        assert_eq!(
+            vs(plan(&[a(300, "a")], &files, None).unwrap()),
+            [301, 302, 304]
+        );
+        assert_eq!(
+            vs(plan(&[a(300, "a")], &files, Some(302)).unwrap()),
+            [301, 302]
+        );
         assert!(plan(
             &files
                 .iter()
@@ -594,33 +622,70 @@ mod tests {
         .is_empty());
         // divergent: same version, another name or checksum
         assert!(matches!(
-            plan(&[a(1, "x")], &files, None),
+            plan(&[a(300, "x")], &files, None),
             Err(MigrationError::Divergent { .. })
         ));
-        let mut edited = a(2, "b");
+        let mut edited = a(301, "b");
         edited.checksum ^= 1;
         assert!(matches!(
-            plan(&[a(1, "a"), edited], &files, None),
+            plan(&[a(300, "a"), edited], &files, None),
             Err(MigrationError::Divergent { .. })
         ));
         // missing: applied with no file; a file under the head never applied
         assert!(matches!(
-            plan(&[a(4, "d")], &files, None),
-            Err(MigrationError::Missing { version: 4, .. })
+            plan(&[a(303, "d")], &files, None),
+            Err(MigrationError::Missing { version: 303, .. })
         ));
         assert!(matches!(
-            plan(&[a(1, "a"), a(3, "c")], &files, None),
-            Err(MigrationError::Missing { version: 2, .. })
+            plan(&[a(300, "a"), a(302, "c")], &files, None),
+            Err(MigrationError::Missing { version: 301, .. })
         ));
         assert_eq!(
             MigrationError::Divergent {
-                applied: (1, "x".into(), 0),
-                file: (1, "a".into(), 0)
+                applied: (300, "x".into(), 0),
+                file: (300, "a".into(), 0)
             }
             .to_string(),
-            "applied migration V1__x is different than filesystem one V1__a"
+            "applied migration V300__x is different than filesystem one V300__a"
         );
+        // I1951 — any history row below the baseline refuses, before any
+        // other decision: an edition-1 store is deleted, never continued.
+        for applied in [
+            vec![a(1, "trace_events")],
+            vec![a(216, "attestation_dimension_asserted_seek")],
+            vec![a(299, "x"), a(300, "a")],
+        ] {
+            let head = applied.iter().map(|x| x.version).max().unwrap();
+            assert_eq!(
+                plan(&applied, &files, None).map(|p| p.len()),
+                Err(MigrationError::EditionOneHistory { head }),
+                "I1951: {applied:?}"
+            );
+        }
     }
+}
+
+/// The edition-1 history every edition-1 store carries, as frozen in
+/// `tests/fixtures/edition1_schema/{dialect}.history`: `(version, name,
+/// checksum)`.
+#[cfg(test)]
+pub(crate) fn edition_one_history(dialect: &str) -> Vec<(i32, String, String)> {
+    let text = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("tests/fixtures/edition1_schema/{dialect}.history")),
+    )
+    .expect("edition-1 history fixture");
+    text.lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (
+                f[0].parse().expect("version"),
+                f[1].to_owned(),
+                f[2].to_owned(),
+            )
+        })
+        .collect()
 }
 
 /// A clock for the witnesses: distinct instants, each with a subsecond.
@@ -750,83 +815,60 @@ mod sqlite_witnesses {
         );
     }
 
-    /// **I1820 (sqlite) — a store refinery migrated at v61.4.1 is continued,
-    /// never re-applied.** refinery migrates through V215 (v61.4.1's set);
-    /// persist's runner applies exactly the files above it, leaves every
-    /// earlier row byte-identical (its `applied_on` included), applies
-    /// nothing on a second run, and refinery then reads the store and finds
-    /// nothing to do (it parses persist's `applied_on`). The continued
-    /// store's schema is a fresh one's.
+    /// **I1951 (sqlite) — the baseline never runs over edition-1 history.**
+    /// A store carrying edition 1's history rows (V001..V216, as every
+    /// edition-1 store recorded them) refuses with `EditionOneHistory`
+    /// naming V216, and nothing is applied or written.
     #[test]
-    fn i1820_a_refinery_store_is_continued_without_reapply_sqlite() {
+    fn i1951_edition_one_history_refuses_sqlite() {
         let mut c = conn();
-        refinery_sqlite::migrations::runner()
-            .set_target(refinery::Target::Version(215))
-            .run(&mut c)
+        c.execute_batch(&history_table_ddl("refinery_schema_history"))
             .unwrap();
-        let before = history(&c);
-        assert_eq!(before.last().unwrap().0, 215, "I1820: v61.4.1's head");
-        let migs = sqlite_migrations();
+        let rows = super::edition_one_history("sqlite");
+        assert!(rows.len() > 190, "I1951: the fixture is edition 1's");
+        for (v, n, sum) in &rows {
+            c.execute(
+                "INSERT INTO refinery_schema_history VALUES (?1, ?2, '2026-01-01T00:00:00Z', ?3)",
+                rusqlite::params![v, n, sum],
+            )
+            .unwrap();
+        }
+        let (before, objects) = (history(&c), schema(&c));
         let (now, _) = test_clock();
-        let report = run_sqlite(&mut c, &migs, None, &now).unwrap();
-        let above: Vec<i32> = migs
-            .iter()
-            .map(|m| m.version)
-            .filter(|v| *v > 215)
-            .collect();
-        assert!(!above.is_empty());
-        assert_eq!(report.versions(), above, "I1820: only the files above V215");
-        let after = history(&c);
+        let err = run_sqlite(&mut c, &sqlite_migrations(), None, &now).unwrap_err();
         assert_eq!(
-            &after[..before.len()],
-            &before[..],
-            "I1820: the earlier rows unchanged"
+            err,
+            MigrationError::EditionOneHistory { head: 216 },
+            "I1951"
         );
-        assert!(run_sqlite(&mut c, &migs, None, &now)
-            .unwrap()
-            .applied
-            .is_empty());
-        let back = refinery_sqlite::migrations::runner().run(&mut c).unwrap();
-        assert!(
-            back.applied_migrations().is_empty(),
-            "I1820: refinery reads it back"
-        );
-        let mut fresh = conn();
-        run_sqlite(&mut fresh, &migs, None, &now).unwrap();
-        assert_eq!(
-            schema(&c),
-            schema(&fresh),
-            "I1820: the continued schema is a fresh one's"
-        );
+        assert_eq!(history(&c), before, "I1951: no row written");
+        assert_eq!(schema(&c), objects, "I1951: nothing applied");
     }
 
-    /// **I1821 (sqlite) — an edited checksum, an edited name, a missing row
-    /// and a row with no file each refuse, as refinery does, and apply
-    /// nothing.** A row whose checksum is not a `u64` refuses too (refinery
-    /// panicked).
+    /// **I1821 (sqlite) — an edited checksum, an edited name and a row with
+    /// no file each refuse, as refinery does, and apply nothing.** A row
+    /// whose checksum is not a `u64` refuses too (refinery panicked).
     #[test]
     fn i1821_divergence_and_missing_refuse_sqlite() {
         let migs = sqlite_migrations();
         let (now, _) = test_clock();
-        let (v_mid, v_low) = (migs[100].version, migs[50].version);
+        let v = migs[0].version;
         for (tag, tamper) in [
-            ("edited checksum", format!("UPDATE refinery_schema_history SET checksum = '1' WHERE version = {v_mid}")),
-            ("edited name", format!("UPDATE refinery_schema_history SET name = 'renamed' WHERE version = {v_mid}")),
-            ("missing row", format!("DELETE FROM refinery_schema_history WHERE version = {v_low}")),
+            ("edited checksum", format!("UPDATE refinery_schema_history SET checksum = '1' WHERE version = {v}")),
+            ("edited name", format!("UPDATE refinery_schema_history SET name = 'renamed' WHERE version = {v}")),
             ("row with no file", "INSERT INTO refinery_schema_history VALUES (9999, 'ghost', '2026-01-01T00:00:00Z', '1')".to_owned()),
-            ("checksum not a u64", format!("UPDATE refinery_schema_history SET checksum = 'x' WHERE version = {v_mid}")),
+            ("checksum not a u64", format!("UPDATE refinery_schema_history SET checksum = 'x' WHERE version = {v}")),
         ] {
             let mut c = conn();
-            run_sqlite(&mut c, &migs, Some(migs[150].version), &now).unwrap();
+            run_sqlite(&mut c, &migs, None, &now).unwrap();
             c.execute_batch(&tamper).unwrap();
             let (rows, objects) = (history(&c), schema(&c));
             let err = run_sqlite(&mut c, &migs, None, &now).unwrap_err();
             eprintln!("I1821 {tag}: {err}");
             let ok = match tag {
                 "edited checksum" | "edited name" => {
-                    matches!(&err, MigrationError::Divergent { applied, .. } if applied.0 == v_mid)
+                    matches!(&err, MigrationError::Divergent { applied, .. } if applied.0 == v)
                 }
-                "missing row" => matches!(&err, MigrationError::Missing { version, .. } if *version == v_low),
                 "row with no file" => matches!(&err, MigrationError::Missing { version: 9999, .. }),
                 _ => matches!(&err, MigrationError::History(_)),
             };
@@ -880,73 +922,45 @@ mod postgres_witnesses {
         .collect()
     }
 
-    /// **I1822 (postgres) — refinery's rows, continued, and the refusals.**
-    /// refinery migrates one empty database through V215 (v61.4.1's set):
-    /// persist's runner applies exactly the files above it, leaves every
-    /// earlier row byte-identical, applies nothing on a second run, and
-    /// refinery reads it back with nothing to do. A second empty database
-    /// migrated by persist's runner alone carries the same rows (version,
-    /// name, checksum), the same column types, and the injected instants. An
-    /// edited checksum then refuses as divergent and a deleted row as
-    /// missing, with refinery's text, writing nothing.
+    /// **I1822 (postgres) — refinery's rows, and the refusals.** refinery
+    /// and persist's runner each migrate an empty database: the same rows
+    /// (version, name, checksum), the same column types, the injected
+    /// instants. An edited checksum then refuses as divergent and a row with
+    /// no file as missing, with refinery's text, writing nothing. **I1951
+    /// (postgres):** a database carrying edition 1's history refuses with
+    /// `EditionOneHistory`, applying nothing.
     #[tokio::test]
-    async fn i1822_refinerys_rows_continued_and_refused_postgres() {
-        let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
+    async fn i1822_refinerys_rows_and_refusals_postgres() {
+        let (Some(a), Some(b), Some(e1)) = (
+            crate::test_pg::empty_dsn(),
+            crate::test_pg::empty_dsn(),
+            crate::test_pg::empty_dsn(),
+        ) else {
             eprintln!("skipping: no test postgres");
             return;
         };
         let migs = postgres_migrations();
-        let (now, _) = test_clock();
         let mut ca = crate::store::postgres::dedicated_connect_to(&a)
             .await
             .unwrap();
-        let mut r =
-            refinery_postgres::migrations::runner().set_target(refinery::Target::Version(215));
+        let mut r = refinery_postgres::migrations::runner();
         r.set_migration_table_name(POSTGRES_HISTORY_TABLE);
         r.run_async(&mut ca).await.unwrap();
-        let before = history(&ca).await;
-        assert_eq!(before.last().unwrap().0, 215, "I1822: v61.4.1's head");
-        let report = run_postgres(&mut ca, &migs, None, &now).await.unwrap();
-        let above: Vec<i32> = migs
-            .iter()
-            .map(|m| m.version)
-            .filter(|v| *v > 215)
-            .collect();
-        assert!(!above.is_empty());
-        assert_eq!(report.versions(), above, "I1822: only the files above V215");
-        let after = history(&ca).await;
-        assert_eq!(
-            &after[..before.len()],
-            &before[..],
-            "I1822: the earlier rows unchanged"
-        );
-        assert!(run_postgres(&mut ca, &migs, None, &now)
-            .await
-            .unwrap()
-            .applied
-            .is_empty());
-        let mut back = refinery_postgres::migrations::runner();
-        back.set_migration_table_name(POSTGRES_HISTORY_TABLE);
-        assert!(back
-            .run_async(&mut ca)
-            .await
-            .unwrap()
-            .applied_migrations()
-            .is_empty());
+        let theirs = history(&ca).await;
 
         let mut cb = crate::store::postgres::dedicated_connect_to(&b)
             .await
             .unwrap();
         let (now_b, at_b) = test_clock();
         run_postgres(&mut cb, &migs, None, &now_b).await.unwrap();
-        let fresh = history(&cb).await;
+        let ours = history(&cb).await;
         let key = |r: &Row| (r.0, r.1.clone(), r.3.clone());
         assert_eq!(
-            fresh.iter().map(key).collect::<Vec<_>>(),
-            after.iter().map(key).collect::<Vec<_>>(),
+            ours.iter().map(key).collect::<Vec<_>>(),
+            theirs.iter().map(key).collect::<Vec<_>>(),
             "I1822: refinery's version, name and checksum on every row"
         );
-        for (i, r) in fresh.iter().enumerate() {
+        for (i, r) in ours.iter().enumerate() {
             assert_eq!(
                 r.2,
                 format_applied_on(at_b(i)).unwrap(),
@@ -959,12 +973,16 @@ mod postgres_witnesses {
             column_types(&ca).await,
             "I1822: column types"
         );
+        assert!(run_postgres(&mut cb, &migs, None, &now_b)
+            .await
+            .unwrap()
+            .applied
+            .is_empty());
 
-        let (v_mid, v_low) = (migs[100].version, migs[50].version);
-        // One tamper per database: a divergence is decided before a gap.
+        let v = migs[0].version;
         for (tag, tamper, c) in [
-            ("edited checksum", format!("UPDATE ciris_persist_schema_history SET checksum = '1' WHERE version = {v_mid}"), &mut cb),
-            ("missing row", format!("DELETE FROM ciris_persist_schema_history WHERE version = {v_low}"), &mut ca),
+            ("edited checksum", format!("UPDATE ciris_persist_schema_history SET checksum = '1' WHERE version = {v}"), &mut cb),
+            ("row with no file", "INSERT INTO ciris_persist_schema_history VALUES (9999, 'ghost', '2026-01-01T00:00:00Z', '1')".to_owned(), &mut ca),
         ] {
             c.batch_execute(&tamper).await.unwrap();
             let rows = history(c).await;
@@ -974,12 +992,50 @@ mod postgres_witnesses {
             let theirs = theirs.run_async(c).await.unwrap_err();
             eprintln!("I1822 {tag}: ours {err}; refinery {theirs}");
             let ok = match tag {
-                "edited checksum" => matches!(&err, MigrationError::Divergent { applied, .. } if applied.0 == v_mid),
-                _ => matches!(&err, MigrationError::Missing { version, .. } if *version == v_low),
+                "edited checksum" => matches!(&err, MigrationError::Divergent { applied, .. } if applied.0 == v),
+                _ => matches!(&err, MigrationError::Missing { version: 9999, .. }),
             };
             assert!(ok, "I1822 {tag}: {err:?}");
             assert_eq!(err.to_string(), theirs.to_string(), "I1822 {tag}: refinery's text");
             assert_eq!(history(c).await, rows, "I1822 {tag}: no row written");
         }
+
+        let mut c1 = crate::store::postgres::dedicated_connect_to(&e1)
+            .await
+            .unwrap();
+        c1.batch_execute(&history_table_ddl(POSTGRES_HISTORY_TABLE))
+            .await
+            .unwrap();
+        for (ver, n, sum) in super::edition_one_history("postgres") {
+            c1.execute(
+                "INSERT INTO ciris_persist_schema_history VALUES ($1, $2, '2026-01-01T00:00:00Z', $3)",
+                &[&ver, &n, &sum],
+            )
+            .await
+            .unwrap();
+        }
+        let before = history(&c1).await;
+        let err = run_postgres(&mut c1, &migs, None, &now_b)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            MigrationError::EditionOneHistory { head: 216 },
+            "I1951 (postgres)"
+        );
+        assert_eq!(
+            history(&c1).await,
+            before,
+            "I1951 (postgres): no row written"
+        );
+        let n: i64 = c1
+            .query_one(
+                "SELECT count(*) FROM pg_namespace WHERE nspname = 'cirislens'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(n, 0, "I1951 (postgres): nothing applied");
     }
 }

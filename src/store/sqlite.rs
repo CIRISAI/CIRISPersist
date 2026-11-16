@@ -139,17 +139,13 @@ pub struct SqliteBackend {
     /// (`from_shared*`) resolves lazily at its first DEK-plane door when
     /// this is still false (CIRISPersist#850 review).
     minter_sentinel_resolved: std::sync::atomic::AtomicBool,
+    /// v62.0.0 (slice E2b) — what this backend's open found of an earlier
+    /// store and did about it ([`crate::store::edition_upgrade`]).
+    edition_upgrade_report: std::sync::Mutex<Option<crate::store::edition_upgrade::UpgradeReport>>,
     /// v58.0.0 (CIRISPersist#991) — set once [`Self::rehome_legacy_key_plane`]
     /// has run on this backend: the lazy rehome of the key-plane projections
     /// written before V198.
     key_plane_rehomed: std::sync::atomic::AtomicBool,
-    /// v54.1.0 (CIRISPersist#1046) — `true` only between a test-only
-    /// `run_migrations_through(v)` with `v` below V187 and the next full
-    /// `run_migrations`: the schema predates the purge plane, so it holds no
-    /// tombstone and the admission gates' read answers `Unsupported` (which
-    /// they pass) instead of "no such table". Never set on a production path;
-    /// the default is the plane PRESENT, so a gate fails closed.
-    pre_purge_schema: std::sync::atomic::AtomicBool,
     /// v3.4.0 (CIRISPersist#123) — trust-weighted admission gate.
     /// `None` = no gate (bootstrap-permissive). See
     /// [`SqliteBackend::set_admission_gate`].
@@ -200,97 +196,6 @@ pub struct SqliteBackend {
     test_hooks: crate::store::test_hooks::TestHooks,
 }
 
-/// #845 (I55d/I55f) — where a test asks the portable-default rewrite to fail,
-/// so the paths that follow a failure can be witnessed. Production passes
-/// `None`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RepairFault {
-    /// Fail between `writable_schema = ON` and `= OFF` with a real error.
-    AfterWritableSchemaOn,
-    /// Do not issue `writable_schema = ON`, so the read-back reports 0 —
-    /// the shape a connection that refuses schema writes presents.
-    SkipWritableSchemaOn,
-}
-
-/// #845 — what the rewrite did. A refusal is a fact about the CONNECTION
-/// (it will not accept schema writes), told apart from every other failure
-/// by reading `PRAGMA writable_schema` back after setting it — never by
-/// matching an error message. Only a refusal may be downgraded; an I/O
-/// error, a failed commit or a non-`ok` `integrity_check` propagates on
-/// every library (Codex, #849).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RewriteOutcome {
-    /// The rewrite committed; this many tables changed.
-    Rewritten(usize),
-    /// The connection refuses schema writes; nothing was changed.
-    Refused,
-}
-
-/// The nine steps of SQLite's documented "simpler procedure" for changing
-/// a column default (lang_altertable.html, "Making Other Kinds Of Table
-/// Schema Changes"), in its order: transaction, read schema_version,
-/// writable_schema ON, UPDATE sqlite_schema, schema_version = X+1,
-/// writable_schema OFF, integrity_check, commit. One transaction, so a
-/// refusal or failure at any step leaves the shipped text exactly as it
-/// was. Both literals are BOUND (`SQLITE_DQS=0` parses a double-quoted
-/// string as an identifier), and the post-condition counts the exact
-/// obsolete expression, never the substring. Free fn handed the writer's
-/// connection from inside `repair_portable_defaults_with`
-/// (`ConnClass::HelperWrite`).
-fn rewrite_portable_defaults_in_tx(
-    conn: &mut Connection,
-    obsolete: &str,
-    portable: &str,
-    fault: Option<RepairFault>,
-) -> Result<RewriteOutcome, rusqlite::Error> {
-    use crate::store::migration_immutability as mi;
-    let tx = write_tx(conn)?;
-    let version: i64 = tx.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
-    if fault != Some(RepairFault::SkipWritableSchemaOn) {
-        tx.execute_batch("PRAGMA writable_schema = ON")?;
-    }
-    // The refusal probe: a connection that will not accept schema writes
-    // (defensive mode with the toggle unhonoured, or a build that locks it)
-    // leaves the pragma reading 0 after ON. That is the ONE outcome the
-    // caller may downgrade.
-    let writable: i64 = tx.query_row("PRAGMA writable_schema", [], |r| r.get(0))?;
-    if writable == 0 {
-        tx.rollback()?;
-        return Ok(RewriteOutcome::Refused);
-    }
-    if fault == Some(RepairFault::AfterWritableSchemaOn) {
-        // I55d — a real error between `ON` and `OFF`. The transaction rolls
-        // back; the connection flag does not.
-        return Err(rusqlite::Error::ToSqlConversionFailure(
-            "injected fault after writable_schema = ON".into(),
-        ));
-    }
-    let rewritten = tx.execute(
-        mi::SQLITE_PORTABLE_DEFAULT_REWRITE,
-        rusqlite::params![obsolete, portable],
-    )?;
-    tx.execute_batch(&format!("PRAGMA schema_version = {}", version + 1))?;
-    tx.execute_batch("PRAGMA writable_schema = OFF")?;
-    let integrity: String = tx.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-    if integrity != "ok" {
-        return Err(rusqlite::Error::ToSqlConversionFailure(
-            format!("portable-default repair: integrity_check answered {integrity:?}").into(),
-        ));
-    }
-    let after: i64 = tx.query_row(mi::SQLITE_OBSOLETE_DEFAULT_COUNT, [obsolete], |r| r.get(0))?;
-    if after != 0 {
-        return Err(rusqlite::Error::ToSqlConversionFailure(
-            format!(
-                "portable-default repair: {after} CREATE TABLE statement(s) still carry the \
-                 obsolete default after rewriting {rewritten}"
-            )
-            .into(),
-        ));
-    }
-    tx.commit()?;
-    Ok(RewriteOutcome::Rewritten(rewritten))
-}
-
 /// #848 — parse an instant this backend stores as TEXT: RFC 3339 (what every
 /// writer in this crate stamps) or the bare `YYYY-MM-DD HH:MM:SS[.SSS]` a
 /// column DEFAULT produced (V145's `minted_at` backfill copies `created_at`,
@@ -313,16 +218,6 @@ impl SqliteBackend {
     #[cfg(test)]
     pub(crate) fn test_hooks(&self) -> &crate::store::test_hooks::TestHooks {
         &self.test_hooks
-    }
-
-    /// v60.1.0 (CIRISPersist#1070 item 3) — does the bytes-plane tombstone
-    /// table exist, so a byte write's in-transaction tombstone read can run?
-    /// `false` only between a test-only `run_migrations_through` below V187
-    /// and the next full migration (the `pre_purge_schema` flag).
-    fn bytes_tombstone_plane(&self) -> bool {
-        !self
-            .pre_purge_schema
-            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// v61 (CIRISPersist#991) — test-only: one integer a SQL statement
@@ -375,152 +270,6 @@ impl SqliteBackend {
                 .await?;
         }
         Ok(())
-    }
-
-    /// #840 (I44) — normalise a V070 history row written by v43.0.0–v44.1.0.
-    ///
-    /// Those releases shipped V070 with one word changed inside a comment,
-    /// so a database created under them recorded a checksum that the
-    /// (reverted) shipped file no longer produces. Left alone, refinery
-    /// aborts the boot with `DivergentVersion` before anything binds.
-    ///
-    /// Narrow by construction: version 70, that name, and the one literal
-    /// checksum those releases wrote. Any other divergence is a real one and
-    /// still aborts. No-op on a fresh database and on every node that never
-    /// ran a broken release. See `FSD/MIGRATION_IMMUTABILITY.md` §3.
-    pub(crate) async fn repair_v070_checksum(&self) -> Result<usize, Error> {
-        use crate::store::migration_immutability as mi;
-        self.write(|conn| -> Result<usize, rusqlite::Error> {
-            let present: bool = conn
-                .query_row(mi::SQLITE_HISTORY_TABLE_PROBE, [], |_| Ok(true))
-                .optional()?
-                .unwrap_or(false);
-            if !present {
-                return Ok(0);
-            }
-            conn.execute(&mi::repair_statement(mi::Dialect::Sqlite), [])
-        })
-        .await
-        .map_err(|e| Error::Migration {
-            sqlstate: None,
-            detail: format!("sqlite V070 checksum repair (#840): {e}"),
-        })
-    }
-
-    /// #845 (`FSD/MIGRATION_IMMUTABILITY.md` §6, I55) — rewrite every live
-    /// `CREATE TABLE` default naming the `subsec` modifier to the portable
-    /// `strftime('%Y-%m-%d %H:%M:%f', 'now')`, which yields byte-identical
-    /// text on every SQLite this crate has linked.
-    ///
-    /// Thirty-seven `NOT NULL` timestamp columns across twenty-one SHIPPED
-    /// migrations carry the modifier; SQLite < 3.42 (Debian bookworm 3.40.1,
-    /// Ubuntu 22.04 3.37) evaluates it to NULL and every insert relying on
-    /// the default fails `NOT NULL` — the first encrypted-at-rest write dies
-    /// at `federation_content_master.created_at` (CIRISEdge#600). The files
-    /// are immutable (#840) and `ALTER TABLE` cannot change a default, so the
-    /// schema TEXT is corrected here, by SQLite's documented procedure for
-    /// changes `ALTER` cannot express: `writable_schema`, rewrite
-    /// `sqlite_master.sql`, bump `schema_version` so every connection
-    /// reloads, `integrity_check`.
-    ///
-    /// Idempotent and cheap: a no-op when no `subsec` remains (every boot but
-    /// the first). A repair that leaves any `subsec` behind, or whose
-    /// `integrity_check` is not `ok`, aborts the boot rather than leaving a
-    /// schema half-repaired. Returns the number of tables rewritten.
-    pub(crate) async fn repair_portable_defaults(&self) -> Result<usize, Error> {
-        self.repair_portable_defaults_with(
-            crate::store::migration_immutability::SQLITE_PORTABLE_DEFAULT,
-            None,
-        )
-        .await
-    }
-
-    /// The body of [`Self::repair_portable_defaults`] with the replacement
-    /// expression as a parameter, so a test can drive the FAILURE path with
-    /// an invalid one (I55d) and prove the cleanup. Production passes
-    /// [`SQLITE_PORTABLE_DEFAULT`](crate::store::migration_immutability::SQLITE_PORTABLE_DEFAULT).
-    pub(crate) async fn repair_portable_defaults_with(
-        &self,
-        portable: &'static str,
-        fault: Option<RepairFault>,
-    ) -> Result<usize, Error> {
-        use crate::store::migration_immutability as mi;
-        use rusqlite::config::DbConfig;
-        self.write(move |conn| -> Result<usize, rusqlite::Error> {
-            let before: i64 = conn.query_row(
-                mi::SQLITE_OBSOLETE_DEFAULT_COUNT,
-                [mi::SQLITE_SUBSEC_DEFAULT],
-                |r| r.get(0),
-            )?;
-            if before == 0 {
-                return Ok(0);
-            }
-            // Is the repair REQUIRED on this library, or a normalisation? On
-            // SQLite >= 3.42 the modifier evaluates and a refusal below is
-            // survivable; below 3.42 it is NULL and a refusal means this node
-            // cannot write at all — say so once, loudly, rather than let every
-            // insert fail NOT NULL one at a time.
-            let required: bool =
-                conn.query_row(mi::SQLITE_SUBSEC_IS_NULL_PROBE, [], |r| r.get(0))?;
-            // Apple builds its system SQLite with DEFENSIVE on, and macOS /
-            // iOS link the system library. Defensive mode refuses
-            // `writable_schema = ON` and makes `schema_version = N` a silent
-            // no-op (both documented), so it is turned off for the rewrite and
-            // put back whatever happens in between.
-            let was_defensive = conn
-                .db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE)
-                .unwrap_or(false);
-            if was_defensive {
-                conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, false)?;
-            }
-            let outcome =
-                rewrite_portable_defaults_in_tx(conn, mi::SQLITE_SUBSEC_DEFAULT, portable, fault);
-            // Unconditional cleanup. A rolled-back transaction does NOT reset
-            // the connection-level writable_schema flag; without this, a
-            // failed attempt on a >= 3.42 library (downgraded to a warning
-            // below) would leave the live writer editable for the rest of
-            // the process (Codex, #849).
-            let _ = conn.execute_batch("PRAGMA writable_schema = OFF");
-            if was_defensive {
-                // Best effort: a failure to re-arm defensive mode is not a
-                // reason to fail the boot.
-                let _ = conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true);
-            }
-            match outcome {
-                Ok(RewriteOutcome::Rewritten(n)) => Ok(n),
-                // The ONE downgradeable outcome: this connection refuses
-                // schema writes. Survivable where the modifier evaluates;
-                // fatal where it is NULL, because the node could not write.
-                Ok(RewriteOutcome::Refused) if !required => {
-                    tracing::warn!(
-                        remaining = before,
-                        "portable-default repair refused by this SQLite connection; the modifier \
-                         evaluates here (>= 3.42) so writes proceed — schema text left as shipped \
-                         (#845)"
-                    );
-                    Ok(0)
-                }
-                Ok(RewriteOutcome::Refused) => Err(rusqlite::Error::ToSqlConversionFailure(
-                    format!(
-                        "this SQLite ({}) evaluates the subsec modifier to NULL and the connection \
-                         refuses schema writes (writable_schema stays 0). Every insert relying on a \
-                         defaulted timestamp column would fail NOT NULL. Upgrade libsqlite3 to \
-                         >= 3.42 or allow writable_schema (#845)",
-                        rusqlite::version()
-                    )
-                    .into(),
-                )),
-                // Every other failure — I/O, a failed commit, a non-ok
-                // integrity_check — propagates on every library: the schema
-                // may be half-known and the boot must not proceed on it.
-                Err(e) => Err(e),
-            }
-        })
-        .await
-        .map_err(|e| Error::Migration {
-            sqlstate: None,
-            detail: format!("sqlite portable-default repair (#845): {e}"),
-        })
     }
 
     /// #848 (`BLOB_REPLICATION.md` §16, I66) — **resolve the V145 minter
@@ -633,34 +382,6 @@ impl SqliteBackend {
                 tracing::warn!(error = %e, "sqlite: planner statistics at open failed; open proceeds")
             }
         }
-    }
-
-    /// Test-only: apply migrations up to and including `version`, so a test
-    /// can seed rows in the PRE-migration shape and then run the rest.
-    #[cfg(any(test, feature = "test-anchor"))]
-    pub async fn run_migrations_through(&self, version: u32) -> Result<(), Error> {
-        self.pre_purge_schema
-            .store(version < 187, std::sync::atomic::Ordering::Release);
-        self.repair_v070_checksum().await?;
-        self.write(
-            move |conn| -> Result<(), crate::store::migration_runner::MigrationError> {
-                crate::store::migration_runner::run_sqlite(
-                    conn,
-                    &crate::store::migration_runner::sqlite_migrations(),
-                    Some(i32::try_from(version).unwrap_or(i32::MAX)),
-                    &crate::host::clock::now,
-                )
-                .map(|_| ())
-            },
-        )
-        .await
-        .map_err(|e| Error::Migration {
-            sqlstate: None,
-            detail: format!("sqlite migrations through V{version}: {e}"),
-        })?;
-        // #845 — the same repair the full run applies, so a test seeding rows
-        // through a defaulted column behaves as production does.
-        self.repair_portable_defaults().await.map(|_| ())
     }
 
     /// Shared WRITER handle. Used by sibling modules
@@ -905,8 +626,8 @@ impl SqliteBackend {
                 crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
             ),
             minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
+            edition_upgrade_report: std::sync::Mutex::new(None),
             key_plane_rehomed: std::sync::atomic::AtomicBool::new(false),
-            pre_purge_schema: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
             self_key_id: std::sync::RwLock::new(None),
             peer_write_quota: crate::federation::replication::admission::PeerWriteQuota::new(),
@@ -1047,6 +768,16 @@ impl SqliteBackend {
         *self.node_key_id.write().expect("node_key_id lock") = None;
     }
 
+    /// v62.0.0 (slice E2b) — what this backend's open found of an earlier
+    /// (edition-1) store and did about it; `None` when the open did not look
+    /// (an in-memory store, a view over another backend's handles).
+    pub fn last_edition_upgrade(&self) -> Option<crate::store::edition_upgrade::UpgradeReport> {
+        self.edition_upgrade_report
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// #848 — has [`Self::repair_minter_sentinel`] completed on this backend?
     pub fn minter_sentinel_resolved(&self) -> bool {
         self.minter_sentinel_resolved
@@ -1111,10 +842,29 @@ impl SqliteBackend {
         // instead of running on a default nobody asked for.
         let tuning = crate::store::sqlite_conn_model::tuning_from_env()
             .map_err(|e| Error::Backend(format!("sqlite open: {e}")))?;
-        let writer = Self::open_writer(&path, crate::store::HostStoreProfile::Native)?;
         let in_memory = path == ":memory:"
             || path.is_empty()
             || (path.starts_with("file:") && path.contains("mode=memory"));
+        // v62.0.0 (slice E2b) — BEFORE the first connection opens: an
+        // edition-1 store at `path` is guarded, counted, deleted and replaced
+        // by a fresh edition-2 store carrying the record of its deletion
+        // (`store::edition_upgrade`). A live legal hold, or a database
+        // persist did not create, refuses the open and deletes nothing.
+        let upgrade = if in_memory || path.starts_with("file:") {
+            None
+        } else {
+            let p = path.clone();
+            Some(
+                crate::host::rt::dispatch_blocking(move || {
+                    crate::store::edition_upgrade::sqlite::upgrade(
+                        &p,
+                        crate::store::edition_upgrade::UpgradeMode::Delete,
+                    )
+                })
+                .await?,
+            )
+        };
+        let writer = Self::open_writer(&path, crate::store::HostStoreProfile::Native)?;
         if !in_memory {
             crate::store::sqlite_conn_model::apply_tuning(&writer, &tuning)
                 .map_err(|e| Error::Backend(format!("sqlite open tuning: {e}")))?;
@@ -1129,7 +879,12 @@ impl SqliteBackend {
             crate::store::sqlite_conn_model::ReadPool::open(&path, readers, &tuning)
                 .map_err(|e| Error::Backend(format!("sqlite open readers: {e}")))?
         };
-        Ok(Self::from_handles(Arc::new(Mutex::new(writer)), pool))
+        let backend = Self::from_handles(Arc::new(Mutex::new(writer)), pool);
+        *backend
+            .edition_upgrade_report
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = upgrade;
+        Ok(backend)
     }
 
     /// v62.0.0 (WASM_NODE FSD §6.2, P7) — open with the profile the HOST
@@ -1145,6 +900,11 @@ impl SqliteBackend {
             crate::store::HostStoreProfile::Native => Self::open(path).await,
             crate::store::HostStoreProfile::SingleProcess => {
                 let writer = Self::open_writer(&path.into(), host)?;
+                // v62.0.0 (slice E2b) — this host cannot delete files: an
+                // edition-1 (or foreign) store refuses the open, deleting
+                // nothing. Read on the writer, after its pragma block (no
+                // second connection, nothing prepared before EXCLUSIVE).
+                crate::store::edition_upgrade::sqlite::refuse_on_single_process(&writer)?;
                 Ok(Self::from_handles(
                     Arc::new(Mutex::new(writer)),
                     crate::store::sqlite_conn_model::ReadPool::empty(),
@@ -1702,66 +1462,41 @@ impl Backend for SqliteBackend {
     }
 
     async fn run_migrations(&self) -> Result<(), Error> {
-        self.pre_purge_schema
-            .store(false, std::sync::atomic::Ordering::Release);
-        // #840 (I44) — BEFORE refinery reads the history table: a node that
-        // applied V070 under v43.0.0–v44.1.0 carries a checksum the shipped
-        // file no longer produces, and refinery would abort the boot here.
-        self.repair_v070_checksum().await?;
-        // refinery's `runner().run(&mut Connection)` is sync; we wrap
-        // it in spawn_blocking. SQLite has no advisory-lock equivalent
-        // to postgres's `pg_advisory_lock`, but the Phase 1 sovereign-
-        // mode use case is single-process / single-writer (one ingest
-        // per Pi-class node), so the multi-worker boot race v0.1.5
-        // closed for postgres doesn't surface here. If multi-process
-        // SQLite ever lands (unusual; SQLite's WAL handles
-        // concurrent readers but writers serialize on the database
-        // file lock anyway), refinery's idempotent IF NOT EXISTS
-        // semantics on its schema_history table cover the race.
+        // v62.0.0 (slice E2b) — an EDITION-1 store never reaches here through
+        // an open: `open*` deletes it first (`store::edition_upgrade`). A
+        // connection handed in some other way that carries edition-1 history
+        // is refused by the runner (`MigrationError::EditionOneHistory`).
         //
-        // v3.12.x (CIRISPersist#156) — wrap the `run()` call in the
-        // migration-timing diagnostic (silently no-ops without the
-        // env var; quantifies the v3.11.0 → v3.12.x boot-time delta
-        // for cohabitation race triage). See
+        // SQLite has no advisory-lock equivalent to postgres's
+        // `pg_advisory_lock`; the node is single-writer, and the runner's
+        // `CREATE TABLE IF NOT EXISTS` history table covers a second opener.
+        //
+        // v3.12.x (CIRISPersist#156) — the migration-timing diagnostic
+        // (silently no-ops without the env var). See
         // `crate::store::migration_timing` for the format.
-        let v196 = self
-            .write(
-                move |conn| -> Result<
-                    Option<(i64, i64, i64)>,
-                    crate::store::migration_runner::MigrationError,
-                > {
-                    // v58.0.0 (CIRISPersist#1094 item 2) — what V196 will delete,
-                    // counted before it runs so the boot can say so.
-                    let v196 = sqlite_v196_pending(conn);
-                    let timing = crate::store::migration_timing::MigrationTiming::from_run(
-                        "sqlite",
-                        || {
-                            // v62.0.0 (P6) — persist's runner; the instant is
-                            // the caller's (the Clock seam wires it).
-                            crate::store::migration_runner::run_sqlite(
-                                conn,
-                                &crate::store::migration_runner::sqlite_migrations(),
-                                None,
-                                &crate::host::clock::now,
-                            )
-                            .map(|r| r.versions())
-                        },
-                    )?;
-                    crate::store::migration_timing::append(&timing);
-                    Ok(v196)
-                },
-            )
-            .await
-            .map_err(|e| Error::Migration {
-                sqlstate: None,
-                detail: format!("sqlite migrations: {e}"),
-            })?;
-        log_v196(v196);
-
-        // #845 (I55) — AFTER the shipped migrations, BEFORE any write: the
-        // live schema's `subsec` defaults are rewritten to the portable form,
-        // or SQLite < 3.42 refuses every insert that relies on them.
-        self.repair_portable_defaults().await?;
+        self.write(
+            move |conn| -> Result<(), crate::store::migration_runner::MigrationError> {
+                let timing =
+                    crate::store::migration_timing::MigrationTiming::from_run("sqlite", || {
+                        // v62.0.0 (P6) — persist's runner; the instant is
+                        // the caller's (the Clock seam wires it).
+                        crate::store::migration_runner::run_sqlite(
+                            conn,
+                            &crate::store::migration_runner::sqlite_migrations(),
+                            None,
+                            &crate::host::clock::now,
+                        )
+                        .map(|r| r.versions())
+                    })?;
+                crate::store::migration_timing::append(&timing);
+                Ok(())
+            },
+        )
+        .await
+        .map_err(|e| Error::Migration {
+            sqlstate: None,
+            detail: format!("sqlite migrations: {e}"),
+        })?;
 
         // #226 (V094) — backfill shard_key for legacy rows, before the
         // engine serves any write. See `backfill_trace_dedup_shard_keys`.
@@ -3419,14 +3154,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         plane: &str,
         record_ref: &str,
     ) -> Result<Option<String>, crate::federation::Error> {
-        if self
-            .pre_purge_schema
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Err(crate::federation::Error::Unsupported {
-                method: "purge_tombstoned",
-            });
-        }
         let (plane, record_ref) = (plane.to_owned(), record_ref.to_owned());
         self.read(move |conn| -> Result<Option<String>, rusqlite::Error> {
             conn.query_row(
@@ -3444,17 +3171,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         plane: &str,
         record_ref: &str,
     ) -> Result<Vec<String>, crate::federation::Error> {
-        // v60.1.0 (#1070 × #1113) — below V187 there is no tombstone table:
-        // the plane is absent (`Unsupported`), exactly as `purge_tombstoned`
-        // answers, so the withheld read it now serves withholds nothing there.
-        if self
-            .pre_purge_schema
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Err(crate::federation::Error::Unsupported {
-                method: "purge_tombstone_notices",
-            });
-        }
         let (plane, record_ref) = (plane.to_owned(), record_ref.to_owned());
         self.read(move |conn| -> Result<Vec<String>, rusqlite::Error> {
             let mut stmt = conn.prepare(
@@ -18783,57 +18499,6 @@ fn sqlite_ledger_projection_rebuild(
     Ok(crate::federation::silo_projection::ProjectionRebuild { live, rebuilt })
 }
 
-/// v58.0.0 (CIRISPersist#1094 item 2) — what V196 will delete on this store,
-/// `(hard_case rows, pre-v57 silo rows, art17_erasure headers)`, counted with
-/// V196's own predicates; `None` once V196 is applied or on a store too new
-/// to have the tables (nothing to count).
-fn sqlite_v196_pending(conn: &rusqlite::Connection) -> Option<(i64, i64, i64)> {
-    let applied: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM refinery_schema_history",
-            [],
-            |r| r.get(0),
-        )
-        .ok()?;
-    if applied >= 196 {
-        return None;
-    }
-    let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap_or(0);
-    let rows = count(
-        "SELECT COUNT(*) FROM federation_attestations \
-          WHERE dimension = 'hard_case:trace_erasure:v1' \
-            AND (json_extract(attestation_envelope, '$.hard_case.target_key_id') IS NOT NULL \
-              OR json_extract(attestation_envelope, '$.hard_case.subject_key_id') IS NOT NULL \
-              OR json_extract(attestation_envelope, '$.hard_case.detail.agent_id_hash') IS NOT NULL \
-              OR json_extract(attestation_envelope, '$.hard_case.detail.signing_key_id') IS NOT NULL)",
-    );
-    let silo = count(
-        "SELECT COUNT(*) FROM hard_case_events \
-          WHERE attestation_id IS NULL AND kind = 'trace_erasure' \
-            AND (target_key_id IS NOT NULL OR subject_key_id IS NOT NULL \
-              OR json_extract(detail, '$.agent_id_hash') IS NOT NULL \
-              OR json_extract(detail, '$.signing_key_id') IS NOT NULL)",
-    );
-    let headers =
-        count("SELECT COUNT(*) FROM purge_executions WHERE legal_basis = 'art17_erasure'");
-    Some((rows, silo, headers))
-}
-
-/// v58.0.0 (CIRISPersist#1094 item 2) — the counted line V196 owes the
-/// operator (both SQL backends): the one place a hard_case row is deleted.
-pub(crate) fn log_v196(counts: Option<(i64, i64, i64)>) {
-    if let Some((rows, silo, headers)) = counts.filter(|(a, b, c)| a + b + c > 0) {
-        tracing::warn!(
-            hard_case_rows = rows,
-            legacy_silo_rows = silo,
-            art17_erasure_headers = headers,
-            "V196 deleted v57-shaped trace_erasure hard cases that named their subject and \
-             the art17_erasure purge headers citing them (CC 4.5.3: a hard case recording \
-             an erasure MUST NOT name the subject; CIRISPersist#1094)"
-        );
-    }
-}
-
 /// v58.0.0 (CIRISPersist#1094 item 2) — store the producers' planned
 /// `withdraws` rows inside the erasure's transaction, through the local-row
 /// statement every local writer uses (row, subject projection, V157 depth).
@@ -24950,7 +24615,10 @@ impl crate::federation::directory_admit::DirectoryStore for SqliteBackend {
 #[async_trait::async_trait]
 impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
     fn tombstone_plane_present(&self) -> bool {
-        self.bytes_tombstone_plane()
+        // v62.0.0 (slice E2b) — every store is the edition-2 baseline, which
+        // carries the bytes-plane tombstone table: there is no schema without
+        // it to answer for.
+        true
     }
 
     #[cfg(test)]
@@ -27980,402 +27648,6 @@ pub(crate) mod chunk_floor_cost {
 mod accord_tests {
     use super::*;
 
-    /// **I55 (#845) — after migrations, no live schema default depends on
-    /// the `subsec` modifier, and an insert that relies on a defaulted
-    /// timestamp column succeeds and stores the 23-character form.**
-    ///
-    /// On SQLite < 3.42 the `subsec` modifier makes `datetime()` NULL and every such
-    /// insert fails `NOT NULL` (Debian bookworm, CIRISEdge#600). This host
-    /// runs a newer SQLite, so the behavioural half is proved by the
-    /// bookworm witness (`scripts/sqlite_portability_witness.sh`); what this
-    /// test proves is that the REPAIR ran — the schema text no longer names
-    /// the modifier — and that the format it writes is unchanged.
-    #[tokio::test]
-    async fn i55_no_live_schema_default_depends_on_subsec_after_migrations() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        let remaining: i64 = backend
-            .write(|conn| {
-                conn.query_row(
-                    crate::store::migration_immutability::SQLITE_OBSOLETE_DEFAULT_COUNT,
-                    [crate::store::migration_immutability::SQLITE_SUBSEC_DEFAULT],
-                    |r| r.get(0),
-                )
-                .unwrap()
-            })
-            .await;
-        assert_eq!(
-            remaining, 0,
-            "{remaining} live CREATE TABLE statement(s) still carry the obsolete default — \
-             on SQLite < 3.42 every insert relying on them fails NOT NULL (#845)"
-        );
-        // The repair is idempotent: a second pass rewrites nothing.
-        let rewritten = backend.repair_portable_defaults().await.unwrap();
-        assert_eq!(rewritten, 0, "a second repair pass must be a no-op");
-        // An insert that relies on the default still works and stores the
-        // same 23-character form the modifier produced.
-        let (len, text): (i64, String) = backend
-            .write(|conn| {
-                conn.execute(
-                    "INSERT INTO federation_content_master (id, key_kind, master_key_b64, descriptor) \
-                     VALUES (0, 'software', 'AAAA', '{}') ON CONFLICT (id) DO NOTHING",
-                    [],
-                )
-                .unwrap();
-                conn.query_row(
-                    "SELECT length(created_at), created_at FROM federation_content_master WHERE id = 0",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .unwrap()
-            })
-            .await;
-        assert_eq!(
-            len, 23,
-            "created_at must keep the YYYY-MM-DD HH:MM:SS.SSS form, got {text:?}"
-        );
-    }
-
-    /// **I55b (#845) — the repair succeeds on a DEFENSIVE connection.**
-    ///
-    /// Apple builds its system SQLite with `SQLITE_DBCONFIG_DEFENSIVE` on,
-    /// and macOS / iOS link the system library. Defensive mode refuses
-    /// `writable_schema` edits ("table sqlite_master may not be modified").
-    /// A repair that aborted the boot on that refusal would brick every
-    /// Apple node to fix Debian's — so the repair disables defensive mode
-    /// for the rewrite and restores it after.
-    #[tokio::test]
-    async fn i55b_the_repair_succeeds_on_a_defensive_connection() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend
-            .write(|conn| {
-                conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
-                    .unwrap()
-            })
-            .await;
-        backend
-            .run_migrations()
-            .await
-            .expect("migrations + repair must succeed with defensive mode on");
-        let (remaining, defensive): (i64, bool) = backend
-            .write(|conn| {
-                let n = conn
-                    .query_row(
-                        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND sql LIKE '%subsec%'",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .unwrap();
-                let d = conn
-                    .db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE)
-                    .unwrap();
-                (n, d)
-            })
-            .await;
-        assert_eq!(
-            remaining, 0,
-            "the rewrite must have happened under defensive mode"
-        );
-        assert!(
-            defensive,
-            "defensive mode must be RESTORED after the repair"
-        );
-    }
-
-    /// **I55c (#845, Codex) — the repair succeeds with double-quoted
-    /// strings disabled.** SQLite built with `SQLITE_DQS=0`, or a connection
-    /// with `SQLITE_DBCONFIG_DQS_DML` off, parses `"…"` as an identifier; a
-    /// rewrite that spelled its literals in double quotes failed with
-    /// `no such column` — on a pre-3.42 library, an aborted boot. The
-    /// literals are bound parameters.
-    // `unsafe_code` is denied crate-wide; this test-only call is the C-level
-    // twin of `set_db_config`, which rusqlite gates behind `modern_sqlite`.
-    #[allow(unsafe_code)]
-    #[tokio::test]
-    async fn i55c_the_repair_succeeds_with_double_quoted_strings_disabled() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend
-            .write(|conn| {
-                // rusqlite gates the DQS verbs behind `modern_sqlite`, which
-                // this crate does not enable on system-linked builds; the
-                // C-level call is the same one `set_db_config` makes.
-                // SQLITE_DBCONFIG_DQS_DML = 1013, SQLITE_DBCONFIG_DQS_DDL = 1014.
-                for op in [1013i32, 1014i32] {
-                    let mut applied: std::os::raw::c_int = -1;
-                    let rc = unsafe {
-                        rusqlite::ffi::sqlite3_db_config(
-                            conn.handle(),
-                            op,
-                            0 as std::os::raw::c_int,
-                            &mut applied as *mut std::os::raw::c_int,
-                        )
-                    };
-                    assert_eq!(rc, 0, "sqlite3_db_config({op}) failed");
-                    assert_eq!(applied, 0, "double-quoted strings must be OFF for op {op}");
-                }
-            })
-            .await;
-        backend
-            .run_migrations()
-            .await
-            .expect("migrations + repair must succeed with DQS disabled");
-        let remaining: i64 = backend
-            .write(|conn| {
-                conn.query_row(
-                    crate::store::migration_immutability::SQLITE_OBSOLETE_DEFAULT_COUNT,
-                    [crate::store::migration_immutability::SQLITE_SUBSEC_DEFAULT],
-                    |r| r.get(0),
-                )
-                .unwrap()
-            })
-            .await;
-        assert_eq!(remaining, 0, "the rewrite must have happened with DQS off");
-    }
-
-    /// **I55d (#845, Codex) — a FAILED rewrite leaves `writable_schema` OFF
-    /// and the shipped text untouched.** Rolling the transaction back does
-    /// not reset the connection-level flag; without unconditional cleanup a
-    /// failed attempt on SQLite >= 3.42 (where the failure is downgraded to a
-    /// warning) left the live writer with `writable_schema` ON for the rest
-    /// of the process.
-    #[tokio::test]
-    async fn i55d_a_failed_rewrite_leaves_writable_schema_off_and_the_text_untouched() {
-        use crate::store::migration_immutability as mi;
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations_through(143).await.unwrap();
-        // Undo the repair run_migrations_through applied, so there is text
-        // to fail on: put the obsolete expression back on one table.
-        backend
-            .write(|conn| {
-                let v: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0)).unwrap();
-                conn.execute_batch("PRAGMA writable_schema = ON").unwrap();
-                conn.execute(
-                    "UPDATE sqlite_master SET sql = replace(sql, ?1, ?2) WHERE name = 'federation_content_master'",
-                    rusqlite::params![mi::SQLITE_PORTABLE_DEFAULT, mi::SQLITE_SUBSEC_DEFAULT],
-                )
-                .unwrap();
-                conn.execute_batch(&format!("PRAGMA schema_version = {}", v + 1)).unwrap();
-                conn.execute_batch("PRAGMA writable_schema = OFF").unwrap();
-            })
-            .await;
-        // A replacement that is not a valid expression: integrity_check
-        // reports the malformed schema, the transaction rolls back.
-        // (a) The failure Codex named: between ON and OFF. The flag must be
-        //     off afterwards even though the transaction rolled back.
-        let outcome = backend
-            .repair_portable_defaults_with(
-                mi::SQLITE_PORTABLE_DEFAULT,
-                Some(RepairFault::AfterWritableSchemaOn),
-            )
-            .await;
-        let writable_after_fault: i64 = backend
-            .write(|conn| {
-                conn.query_row("PRAGMA writable_schema", [], |r| r.get(0))
-                    .unwrap()
-            })
-            .await;
-        assert_eq!(
-            writable_after_fault, 0,
-            "writable_schema must be OFF after a failure between ON and OFF"
-        );
-        assert!(
-            outcome.is_err(),
-            "a real error between ON and OFF must PROPAGATE on every library: {outcome:?}"
-        );
-        // (b) A failure at integrity_check: the text must be untouched.
-        let outcome = backend
-            .repair_portable_defaults_with("NOT A VALID EXPRESSION ((", None)
-            .await;
-        let (writable, obsolete_left): (i64, i64) = backend
-            .write(|conn| {
-                let w = conn
-                    .query_row("PRAGMA writable_schema", [], |r| r.get(0))
-                    .unwrap();
-                let n = conn
-                    .query_row(
-                        mi::SQLITE_OBSOLETE_DEFAULT_COUNT,
-                        [mi::SQLITE_SUBSEC_DEFAULT],
-                        |r| r.get(0),
-                    )
-                    .unwrap();
-                (w, n)
-            })
-            .await;
-        assert_eq!(
-            writable, 0,
-            "writable_schema must be OFF after a failed rewrite"
-        );
-        assert_eq!(
-            obsolete_left, 1,
-            "the shipped text must be untouched after a failed rewrite"
-        );
-        // The connection is still usable and a real repair then succeeds.
-        assert!(
-            outcome.is_err(),
-            "a non-ok integrity_check must PROPAGATE, whatever the library: {outcome:?}"
-        );
-        let n = backend.repair_portable_defaults().await.unwrap();
-        assert_eq!(n, 1, "the real repair must rewrite the one restored table");
-    }
-
-    /// **I55f (#845, Codex P1) — a REFUSAL is the one downgradeable outcome,
-    /// and it is detected by reading `writable_schema` back, not by matching
-    /// an error.** With the ON skipped, the read-back reports 0 — the shape a
-    /// connection that refuses schema writes presents. On this host the
-    /// modifier evaluates, so the outcome is a warning and `Ok(0)`, the flag
-    /// reads 0, the text is untouched, and a real repair then succeeds.
-    #[tokio::test]
-    async fn i55f_a_refusal_is_the_one_downgradeable_outcome() {
-        use crate::store::migration_immutability as mi;
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations_through(143).await.unwrap();
-        backend
-            .write(|conn| {
-                let v: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0)).unwrap();
-                conn.execute_batch("PRAGMA writable_schema = ON").unwrap();
-                conn.execute(
-                    "UPDATE sqlite_master SET sql = replace(sql, ?1, ?2) WHERE name = 'federation_content_master'",
-                    rusqlite::params![mi::SQLITE_PORTABLE_DEFAULT, mi::SQLITE_SUBSEC_DEFAULT],
-                )
-                .unwrap();
-                conn.execute_batch(&format!("PRAGMA schema_version = {}", v + 1)).unwrap();
-                conn.execute_batch("PRAGMA writable_schema = OFF").unwrap();
-            })
-            .await;
-        let outcome = backend
-            .repair_portable_defaults_with(
-                mi::SQLITE_PORTABLE_DEFAULT,
-                Some(RepairFault::SkipWritableSchemaOn),
-            )
-            .await;
-        assert_eq!(
-            outcome.unwrap(),
-            0,
-            "a refusal on a >= 3.42 library is a warning, not a failure"
-        );
-        let (writable, obsolete_left): (i64, i64) = backend
-            .write(|conn| {
-                let w = conn
-                    .query_row("PRAGMA writable_schema", [], |r| r.get(0))
-                    .unwrap();
-                let n = conn
-                    .query_row(
-                        mi::SQLITE_OBSOLETE_DEFAULT_COUNT,
-                        [mi::SQLITE_SUBSEC_DEFAULT],
-                        |r| r.get(0),
-                    )
-                    .unwrap();
-                (w, n)
-            })
-            .await;
-        assert_eq!(writable, 0);
-        assert_eq!(
-            obsolete_left, 1,
-            "a refused rewrite must leave the text untouched"
-        );
-        assert_eq!(backend.repair_portable_defaults().await.unwrap(), 1);
-    }
-
-    /// **I55e (#845, Codex) — a foreign table whose DDL merely contains the
-    /// substring `subsec` does not make the repair fail.** The count and the
-    /// post-condition match the exact obsolete expression, never the
-    /// substring; a consumer's `subsec_note` column must not abort every
-    /// boot on a pre-3.42 host.
-    #[tokio::test]
-    async fn i55e_a_foreign_table_naming_subsec_does_not_fail_the_repair() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend
-            .write(|conn| {
-                conn.execute_batch(
-                    "CREATE TABLE consumer_probe (id INTEGER PRIMARY KEY, subsec_note TEXT)",
-                )
-                .unwrap()
-            })
-            .await;
-        backend
-            .run_migrations()
-            .await
-            .expect("a foreign table naming the substring must not fail the repair");
-        let (obsolete_left, foreign_intact): (i64, i64) = backend
-            .write(|conn| {
-                let n = conn
-                    .query_row(
-                        crate::store::migration_immutability::SQLITE_OBSOLETE_DEFAULT_COUNT,
-                        [crate::store::migration_immutability::SQLITE_SUBSEC_DEFAULT],
-                        |r| r.get(0),
-                    )
-                    .unwrap();
-                let f = conn
-                    .query_row(
-                        "SELECT count(*) FROM sqlite_master WHERE name = 'consumer_probe' AND sql LIKE '%subsec_note%'",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .unwrap();
-                (n, f)
-            })
-            .await;
-        assert_eq!(obsolete_left, 0);
-        assert_eq!(
-            foreign_intact, 1,
-            "the foreign table's own text must be untouched"
-        );
-    }
-
-    /// **I44 (#840) — a node that recorded the BRICKED V070 checksum boots.**
-    ///
-    /// `4847ede5` edited a comment inside V070, which changed its refinery
-    /// checksum. Reverting the file un-bricks every node that applied V070
-    /// before that edit — and would brick the nodes that applied it from
-    /// v43.0.0–v44.1.0, which recorded the post-edit value. This drives that
-    /// second population: apply, become it, and boot again.
-    ///
-    /// Without the repair, the second `run_migrations` is
-    /// `DivergentVersion` and the node never starts.
-    #[tokio::test]
-    async fn i44_a_node_that_recorded_the_bricked_v070_checksum_boots() {
-        use crate::store::migration_immutability as mi;
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-
-        // Become population B: the history row v43.0.0–v44.1.0 wrote.
-        let bricked = mi::V070_BRICKED_CHECKSUM_SQLITE;
-        let touched = backend
-            .write(move |conn| {
-                conn.execute(
-                    "UPDATE refinery_schema_history SET checksum = ?1 WHERE version = 70",
-                    rusqlite::params![bricked],
-                )
-                .unwrap()
-            })
-            .await;
-        assert_eq!(touched, 1, "the fixture must have moved exactly one row");
-
-        // The next boot. This is the whole invariant.
-        backend
-            .run_migrations()
-            .await
-            .expect("a node carrying the bricked V070 checksum must boot");
-
-        // And it is NORMALISED, not merely tolerated — the next boot after
-        // this one must not depend on the repair running again.
-        let after: String = backend
-            .write(|conn| {
-                conn.query_row(
-                    "SELECT checksum FROM refinery_schema_history WHERE version = 70",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap()
-            })
-            .await;
-        assert_eq!(
-            after,
-            mi::V070_CANONICAL_CHECKSUM_SQLITE,
-            "the repair must rewrite the row to the shipped file's checksum"
-        );
-    }
-
     /// #840 — the repair is not a general escape hatch: a row that diverged
     /// for ANY other reason still aborts the boot. A repair that matched on
     /// version alone would swallow a real schema divergence.
@@ -28662,63 +27934,6 @@ mod accord_tests {
             .await;
     }
 
-    /// v52.0.0 (CIRISPersist#784) — **I221: V163's subject digest is filled at
-    /// open for a revocation written before it existed**, from the key it
-    /// named; and a legacy row whose key's stored pubkey cannot be digested
-    /// REFUSES the open rather than serving a revocation no reader can find.
-    #[tokio::test]
-    async fn i221_open_backfills_the_legacy_revocation_subject_784() {
-        let (pk, _) = crate::federation::tier_ingest::test_support::hybrid_pubkeys("k784-legacy");
-        let seed = |pubkey: &str| {
-            format!(
-                "INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, identity_type, \
-                   identity_ref, valid_from, registration_envelope, original_content_hash, \
-                   scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at) \
-                 VALUES ('k1','{pubkey}','hybrid','node','ref1','2026-01-01T00:00:00+00:00','{{}}',X'00','sig', \
-                   'k1','2026-01-01T00:00:01+00:00','h','2026-01-01T00:00:01+00:00'); \
-                 INSERT INTO federation_revocations (revocation_id, revoked_key_id, revoking_key_id, \
-                   revoked_at, effective_at, revocation_envelope, original_content_hash, \
-                   scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at) \
-                 VALUES ('r1','k1','k1','2026-01-05T00:00:00+00:00','2026-01-05T00:00:00+00:00','{{}}',X'00', \
-                   'sig','k1','2026-01-05T00:00:01+00:00','h','2026-01-05T00:00:01+00:00');"
-            )
-        };
-        // The good row.
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations_through(162).await.unwrap();
-        backend.conn.lock().execute_batch(&seed(&pk)).unwrap();
-        backend
-            .run_migrations()
-            .await
-            .expect("the backfill fills the legacy row");
-        let digest = crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(&pk)
-            .unwrap()
-            .to_hex();
-        use crate::federation::FederationDirectory as _;
-        let found = backend.revocations_for_subject(&digest).await.unwrap();
-        assert_eq!(
-            found
-                .iter()
-                .map(|r| r.revocation_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["r1"],
-            "I221: the legacy revocation is found by its subject digest"
-        );
-        assert_eq!(found[0].revoked_key_id.as_deref(), Some("k1"));
-        // The row whose key cannot be digested.
-        let bad = SqliteBackend::open_in_memory().await.unwrap();
-        bad.run_migrations_through(162).await.unwrap();
-        bad.conn
-            .lock()
-            .execute_batch(&seed("pk-not-a-key"))
-            .unwrap();
-        let e = bad
-            .run_migrations()
-            .await
-            .expect_err("an undigestable legacy subject refuses the open");
-        assert!(format!("{e}").contains("V163"), "I221: {e}");
-    }
-
     /// v31.0.0 (CIRISPersist#659) — the closed-set region gate, the
     /// anti-rollback floor and its new ceiling, on sqlite.
     #[tokio::test]
@@ -28802,86 +28017,6 @@ mod tests {
         .await;
     }
 
-    /// **I827b** — V189's backfill on proposals that already share a pair
-    /// (admitted before #1047): the EARLIEST keeps the claim, every legacy row
-    /// stays, and a new proposal under the pair is refused naming it.
-    #[tokio::test]
-    async fn i827b_the_claim_backfill_keeps_every_legacy_row_sqlite() {
-        use crate::federation::FederationDirectory as _;
-        use crate::store::Backend as _;
-        let b = SqliteBackend::open_in_memory().await.unwrap();
-        b.run_migrations().await.unwrap();
-        let fixtures = crate::federation::accord_quorum::test_fixtures::proposal;
-        let older = fixtures("fam-i827b", "nonce-i827b");
-        let mut newer = older.clone();
-        newer.window_until = "2030-01-01T00:00:00Z".to_owned();
-        b.put_accord_proposal(older.clone(), None).await.unwrap();
-        // Reproduce the pre-#1047 state: a second row under the pair, written
-        // around the door, and no claim table content.
-        let (od, nd) = (older.digest(), newer.digest());
-        b.write(move |conn| -> Result<(), rusqlite::Error> {
-            conn.execute(
-                "INSERT INTO accord_proposal (proposal_digest, family_key_id, action, nonce, \
-                    window_until, prior_family_digest, payload_sha256, proposal_json, \
-                    authority_signature, persist_row_hash, created_at) \
-                 SELECT ?2, family_key_id, action, nonce, window_until, prior_family_digest, \
-                    payload_sha256, proposal_json, authority_signature, persist_row_hash, \
-                    '2999-01-01T00:00:00+00:00' \
-                 FROM accord_proposal WHERE proposal_digest = ?1",
-                rusqlite::params![od, nd],
-            )?;
-            conn.execute("DELETE FROM accord_proposal_nonce_claim", [])?;
-            // V189's backfill, as shipped.
-            let v189 =
-                include_str!("../../migrations/sqlite/lens/V189__accord_proposal_nonce_claim.sql");
-            let backfill = &v189[v189
-                .find("INSERT INTO accord_proposal_nonce_claim")
-                .unwrap()..];
-            conn.execute_batch(backfill)
-        })
-        .await
-        .unwrap();
-        let owner: String = b
-            .read(|conn| {
-                conn.query_row(
-                    "SELECT proposal_digest FROM accord_proposal_nonce_claim \
-                     WHERE family_key_id = 'fam-i827b' AND nonce = 'nonce-i827b'",
-                    [],
-                    |r| r.get(0),
-                )
-            })
-            .await
-            .unwrap();
-        assert_eq!(owner, older.digest(), "I827b: the earliest keeps the claim");
-        assert!(b
-            .get_accord_proposal(&older.digest())
-            .await
-            .unwrap()
-            .is_some());
-        assert!(
-            b.get_accord_proposal(&newer.digest())
-                .await
-                .unwrap()
-                .is_some(),
-            "I827b: no legacy row is deleted"
-        );
-        // Codex round 4 — an exact replay of the legacy non-owner (held
-        // evidence) is idempotent, not refused.
-        b.put_accord_proposal(newer.clone(), None)
-            .await
-            .expect("I827b: a held legacy proposal's replay is idempotent");
-        b.put_accord_proposal(older.clone(), None)
-            .await
-            .expect("I827b: the claim owner's replay too");
-        let mut third = older.clone();
-        third.window_until = "2029-01-01T00:00:00Z".to_owned();
-        let e = b.put_accord_proposal(third, None).await.unwrap_err();
-        assert!(
-            matches!(&e, crate::federation::Error::AccordProposalNonceReused { existing_proposal_digest, .. }
-                if *existing_proposal_digest == older.digest()),
-            "I827b: {e:?}"
-        );
-    }
     use crate::schema::{LlmCallStatus, ReasoningEventType, TraceLevel};
     use chrono::{TimeZone, Utc};
 
@@ -34048,236 +33183,6 @@ mod tests {
         backend.run_migrations().await.unwrap();
         crate::federation::at_rest_cascade::blob_invariants::exercise_i15_infra_row_reads_back_as_plaintext(&backend, "sqlite")
             .await;
-    }
-
-    /// §11.10 I16 — V139 classifies PRE-EXISTING rows from their own
-    /// evidence. Seeds the pre-V139 shape through V138, then migrates.
-    #[tokio::test]
-    async fn blob_invariant_i16_v139_classifies_legacy_rows_sqlite() {
-        use crate::federation::types::cohort_scope::CryptoTier;
-        use crate::federation::BlobStorage;
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations_through(138).await.unwrap();
-        let a = [1u8; 32];
-        let b = [2u8; 32];
-        let c = [3u8; 32];
-        let orphan = [4u8; 32];
-        {
-            let conn = backend.conn.lock();
-            for (sha, body) in [
-                (&a, "self-sealed"),
-                (&b, "community-sealed"),
-                (&c, "commons"),
-            ] {
-                conn.execute(
-                    "INSERT INTO federation_blobs (sha256, storage_kind, bytes_inline, size_bytes) \
-                     VALUES (?1, 'inline', ?2, ?3)",
-                    rusqlite::params![sha.to_vec(), body.as_bytes().to_vec(), body.len() as i64],
-                )
-                .unwrap();
-            }
-            conn.execute(
-                "INSERT INTO federation_blob_key_grants \
-                    (at_rest_sha256, recipient_key_id, wrap_algorithm, wrapped_dek, cohort_scope) \
-                 VALUES (?1, 'persist:self', 'aes256_gcm_content_master', 'AAAA', 'self')",
-                rusqlite::params![a.to_vec()],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO federation_community_blob_epoch (at_rest_sha256, community_key_id, epoch) \
-                 VALUES (?1, 'comm-legacy', 0)",
-                rusqlite::params![b.to_vec()],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO federation_community_blob_epoch (at_rest_sha256, community_key_id, epoch) \
-                 VALUES (?1, 'comm-legacy', 0)",
-                rusqlite::params![orphan.to_vec()],
-            )
-            .unwrap();
-        }
-        backend.run_migrations().await.unwrap();
-
-        assert_eq!(
-            backend.blob_crypto_tier(&a).await.unwrap(),
-            Some(CryptoTier::InvisibleEncrypted),
-            "I16: a legacy self-sealed row (it has an at-rest grant) is NOT commons"
-        );
-        assert_eq!(
-            backend.blob_cohort_scope(&a).await.unwrap().as_deref(),
-            Some("self")
-        );
-        assert_eq!(
-            backend.blob_crypto_tier(&b).await.unwrap(),
-            Some(CryptoTier::CommunityDek),
-            "I16: a legacy community-sealed row (it has an epoch binding) is NOT commons"
-        );
-        assert_eq!(
-            backend.blob_crypto_tier(&c).await.unwrap(),
-            Some(CryptoTier::Plaintext)
-        );
-        assert!(
-            backend
-                .community_dek_blob_epoch(&orphan)
-                .await
-                .unwrap()
-                .is_none(),
-            "I16: a binding whose blob is gone is removed"
-        );
-        let r = crate::federation::at_rest_cascade::orchestrate::read_any_for_viewer(
-            &backend, &a, "stranger", None,
-        )
-        .await;
-        assert!(
-            matches!(r, Err(crate::federation::BlobError::NotGranted { .. })),
-            "I16: after upgrade a stranger read the legacy ciphertext row as commons: {r:?}"
-        );
-    }
-
-    /// §11.10 I41 (the backfill) — **V143 gives every PRE-EXISTING stream a
-    /// row from its first chunk**: cohort from that chunk's blob row,
-    /// community from its epoch binding, owner NULL (unclaimed — no writer
-    /// column ever existed). Seeds the pre-V143 shape through V142, then
-    /// migrates. The lowest `seq` is what the backfill reads, so the seeded
-    /// community stream starts at seq 5 and carries a commons row after it
-    /// (a legacy mixed stream: the FIRST chunk decides). Then an attributed
-    /// append adopts the unclaimed commons stream, and a second writer is
-    /// refused.
-    #[tokio::test]
-    async fn blob_invariant_i41_v143_backfills_legacy_streams_sqlite() {
-        use crate::federation::chunk_dag_cascade::orchestrate::put_blob_chunk_scoped;
-        use crate::federation::types::cohort_scope::FEDERATION;
-        use crate::federation::{BlobError, BlobStorage, StreamHead};
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations_through(142).await.unwrap();
-        let a = [0x41u8; 32];
-        let b = [0x42u8; 32];
-        {
-            let conn = backend.conn.lock();
-            for (sha, cohort, tier) in [
-                (&a, "community", "community_dek"),
-                (&b, "federation", "plaintext"),
-            ] {
-                conn.execute(
-                    "INSERT INTO federation_blobs \
-                        (sha256, storage_kind, bytes_inline, size_bytes, cohort_scope, crypto_tier) \
-                     VALUES (?1, 'inline', ?2, 1, ?3, ?4)",
-                    rusqlite::params![sha.to_vec(), b"x".to_vec(), cohort, tier],
-                )
-                .unwrap();
-            }
-            conn.execute(
-                "INSERT INTO federation_community_blob_epoch (at_rest_sha256, community_key_id, epoch) \
-                 VALUES (?1, 'comm-legacy', 0)",
-                rusqlite::params![a.to_vec()],
-            )
-            .unwrap();
-            for (stream, seq, sha) in [
-                ("legacy-comm", 5i64, &a),
-                ("legacy-comm", 6, &b),
-                ("legacy-commons", 0, &b),
-            ] {
-                conn.execute(
-                    "INSERT INTO federation_stream_chunks \
-                        (stream_id, seq, chunk_sha, epoch, size_bytes, plaintext_size_bytes) \
-                     VALUES (?1, ?2, ?3, 0, 1, 1)",
-                    rusqlite::params![stream, seq, sha.to_vec()],
-                )
-                .unwrap();
-            }
-            assert!(
-                conn.prepare("SELECT 1 FROM federation_streams").is_err(),
-                "precondition: no federation_streams before V143"
-            );
-        }
-        backend.run_migrations().await.unwrap();
-
-        assert_eq!(
-            backend.stream_chunks("legacy-comm").await.unwrap().stream,
-            Some(StreamHead {
-                cohort_scope: "community".into(),
-                community_key_id: Some("comm-legacy".into()),
-                owner_key_id: None,
-            }),
-            "I41: a legacy community stream is backfilled from its FIRST chunk's row and binding"
-        );
-        assert_eq!(
-            backend
-                .stream_chunks("legacy-commons")
-                .await
-                .unwrap()
-                .stream,
-            Some(StreamHead {
-                cohort_scope: "federation".into(),
-                community_key_id: None,
-                owner_key_id: None,
-            }),
-            "I41: a legacy commons stream is backfilled unclaimed"
-        );
-        assert_eq!(
-            backend.stream_chunks("never-seen").await.unwrap().stream,
-            None
-        );
-
-        // An attributed append adopts the unclaimed commons stream; a second
-        // writer is then refused; the commons door is then refused.
-        let writer_a = crate::signing::LocalSignerHardwareAdapter::new(
-            crate::federation::at_rest_cascade::blob_invariants::node_signer(
-                &backend,
-                "legacy-writer-a",
-            )
-            .await,
-        );
-        let writer_b = crate::signing::LocalSignerHardwareAdapter::new(
-            crate::federation::at_rest_cascade::blob_invariants::node_signer(
-                &backend,
-                "legacy-writer-b",
-            )
-            .await,
-        );
-        put_blob_chunk_scoped(
-            &backend,
-            &writer_a,
-            FEDERATION,
-            None,
-            "legacy-commons",
-            1,
-            b"more",
-            0,
-            None,
-        )
-        .await
-        .expect("I41: an attributed append adopts a legacy (unclaimed) stream");
-        assert_eq!(
-            backend
-                .stream_chunks("legacy-commons")
-                .await
-                .unwrap()
-                .stream
-                .and_then(|h| h.owner_key_id),
-            Some(
-                crate::signing::federation_key_id_of(&writer_a)
-                    .await
-                    .unwrap()
-            ),
-            "I41: adopted by the first attributed writer"
-        );
-        let res = put_blob_chunk_scoped(
-            &backend,
-            &writer_b,
-            FEDERATION,
-            None,
-            "legacy-commons",
-            2,
-            b"else",
-            0,
-            None,
-        )
-        .await;
-        assert!(
-            matches!(res, Err(BlobError::InvalidArgument(_))),
-            "I41: an adopted legacy stream is owned: {res:?}"
-        );
     }
 
     /// §11.10 I17 — see `at_rest_cascade::blob_invariants`.
@@ -43875,26 +42780,6 @@ mod tests {
         );
     }
 
-    /// I546b (sqlite) — the fault, pinned separately: migrated through V180
-    /// only, the same statement SCANS `federation_attestations` (V107's
-    /// `composer_ref` carries the extraction behind the attester it never
-    /// pins) — what CIRISEdge measured at 96% of a round.
-    #[tokio::test]
-    async fn i546b_without_v181_the_referencing_read_scans() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations_through(180).await.unwrap();
-        let plan = sqlite_plan(
-            &backend,
-            &sqlite_attestations_referencing_sql(),
-            i546_referencing_binds(),
-        )
-        .await;
-        assert!(
-            plan.iter().any(|l| l == "SCAN federation_attestations"),
-            "through V180 the referencing read scans the table: {plan:?}"
-        );
-    }
-
     /// I546c (sqlite) — the for-type read (v56.0.0: the typed query
     /// `to(K).types([delegates_to])`) seeks V178's
     /// `(attested_key_id, attestation_type, …)` on both equalities, never the
@@ -44750,36 +43635,6 @@ mod tests {
             !p1c.iter()
                 .any(|l| l.contains("USE TEMP B-TREE FOR GROUP BY")),
             "{p1c:?}"
-        );
-    }
-
-    /// I532b — what V179 buys over V042's `trace_events_an_trace_summary`:
-    /// without it phase 1 still streams a trace-ordered index (no GROUP BY
-    /// sort — the `+cohort_scope` pin is what defeats the cohort seek), but
-    /// that index does not carry the scope columns, so every event's heap
-    /// row — payload-sized — is read to evaluate the predicate.
-    #[tokio::test]
-    async fn i532b_without_v178_phase1_reads_the_heap_per_event() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations_through(178).await.unwrap();
-        seed_i531_corpus(&backend, 50).await;
-        let unauth = crate::scope::CallerScope::Unauthenticated;
-        let plan = sqlite_trace_summary_plan(&TraceFilter::default(), None, 500, &unauth).unwrap();
-        let p1 = sqlite_plan(&backend, &plan.phase1, plan.phase1_binds.clone()).await;
-        eprintln!("I532b phase-1 plan without V179: {p1:?}");
-        assert!(
-            !p1.iter()
-                .any(|l| l.contains("USE TEMP B-TREE FOR GROUP BY")),
-            "{p1:?}"
-        );
-        assert!(
-            p1.iter()
-                .any(|l| l.contains("USING INDEX trace_events_an_trace_summary")),
-            "{p1:?}"
-        );
-        assert!(
-            !p1.iter().any(|l| l.contains("COVERING INDEX")),
-            "the V042 index is not covering for the scope predicate: {p1:?}"
         );
     }
 
@@ -50999,940 +49854,6 @@ mod tests {
         assert!(matches!(err, BlobError::InvalidArgument(_)), "got {err:?}");
     }
 
-    /// v41.2.0 (CIRISPersist#810, CIRISAgent#1077) — the V136 rebuild of
-    /// `cirislens_tasks` must admit `rejected` WITHOUT destroying the
-    /// agent's reasoning record.
-    ///
-    /// `migrations_run_clean_in_memory` drives the same chain and cannot
-    /// see this: it runs every migration against EMPTY tables, so the
-    /// implicit `DELETE FROM` inside V136's `DROP TABLE` deletes nothing
-    /// and the `ON DELETE CASCADE` on `cirislens_thoughts.source_task_id`
-    /// (V035) never fires. The hazard only exists on an UPGRADE of a
-    /// database that has rows — which is every deployment.
-    ///
-    /// Two details here are load-bearing, and this witness is worthless
-    /// without either:
-    ///
-    /// 1. `PRAGMA foreign_keys = ON`. `Connection::open_in_memory()`
-    ///    defaults it OFF; `SqliteBackend` sets it at every connection
-    ///    open. With it off, `DROP TABLE` fires no cascade at all and the
-    ///    unstaged migration passes.
-    /// 2. Rows in `cirislens_thoughts` BEFORE the target-135 boundary, and
-    ///    a `source_task_id` that actually points at a task being rebuilt.
-    ///    An orphan thought would survive a cascade it was never subject
-    ///    to.
-    ///
-    /// Both mutations were run, not assumed. Removing the
-    /// `cirislens_thoughts` staging from
-    /// `migrations/sqlite/lens/V136__tasks_status_rejected.sql` turns this
-    /// red two different ways depending on the fixture, and the pair is the
-    /// point:
-    ///
-    /// * with the deferral report present, V136 fails to APPLY — COMMIT is
-    ///   refused because the report's `thought_id` no longer resolves;
-    /// * with it absent — the shape of most databases — V136 APPLIES
-    ///   CLEANLY, reports success, and leaves `cirislens_thoughts` at 0 of
-    ///   2 rows. That is the production failure mode, and the count below
-    ///   is the only thing in the suite that sees it.
-    ///
-    /// Removing the pragma above (while leaving the migration broken) makes
-    /// every survival assertion pass: the cascade never fires, so there is
-    /// nothing to detect. Only the trailing orphan check notices, which is
-    /// why it is here.
-    /// v50.0.0 (CIRISPersist#928 review H2, V157) — every `withdraws` stored
-    /// BEFORE V157 was admitted under the 16-hop walk, so the migration
-    /// records 16 for it; a non-`withdraws` row gets nothing.
-    #[test]
-    fn withdraws_admission_depth_is_backfilled() {
-        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        crate::store::migration_runner::run_sqlite(
-            &mut conn,
-            &crate::store::migration_runner::sqlite_migrations(),
-            Some(156),
-            &crate::host::clock::now,
-        )
-        .expect("migrate to V156");
-        conn.execute_batch(
-            "INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, identity_type, \
-                identity_ref, valid_from, registration_envelope, original_content_hash, \
-                scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at) \
-             VALUES ('k1','pk1','hybrid','user','r','2026-01-01T00:00:00+00:00','{}',X'00','sig','k1', \
-                '2026-01-01T00:00:01+00:00','h','2026-01-01T00:00:02+00:00'); \
-             INSERT INTO federation_attestations (attestation_id, attesting_key_id, attested_key_id, \
-                attestation_type, asserted_at, attestation_envelope, original_content_hash, \
-                scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, tier, admitted_at) \
-             VALUES ('w1','k1','k1','withdraws','2026-01-03T00:00:00+00:00','{}',X'00','sig','k1', \
-                '2026-01-03T00:00:01+00:00','h','federation','2026-01-03T00:00:02+00:00'), \
-                    ('a1','k1','k1','vouch','2026-01-03T00:00:00+00:00','{}',X'00','sig','k1', \
-                '2026-01-03T00:00:01+00:00','h','federation','2026-01-03T00:00:03+00:00');",
-        )
-        .expect("seed the pre-V157 rows");
-        crate::store::migration_runner::run_sqlite(
-            &mut conn,
-            &crate::store::migration_runner::sqlite_migrations(),
-            None,
-            &crate::host::clock::now,
-        )
-        .expect("migrate through V157");
-        let depth = |id: &str| -> Option<i64> {
-            conn.query_row(
-                "SELECT depth FROM federation_withdraws_admission_depths WHERE attestation_id = ?1",
-                [id],
-                |r| r.get(0),
-            )
-            .optional()
-            .unwrap()
-        };
-        assert_eq!(
-            depth("w1"),
-            Some(16),
-            "a pre-V157 withdraws is recorded at 16"
-        );
-        assert_eq!(depth("a1"), None, "a non-withdraws row gets nothing");
-    }
-
-    #[test]
-    fn v136_rebuild_preserves_thoughts_and_admits_rejected_810() {
-        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        // Production parity — and the whole hazard. See (1) above.
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-
-        // Pass 1: everything up to and including V135 (the pre-V136 HEAD).
-        crate::store::migration_runner::run_sqlite(
-            &mut conn,
-            &crate::store::migration_runner::sqlite_migrations(),
-            Some(135),
-            &crate::host::clock::now,
-        )
-        .expect("migrate to V135");
-
-        const T0: &str = "2026-09-05T00:00:00+00:00";
-
-        // A parent task carrying a correlation_id (so V036's partial unique
-        // expression index has something to index), and a child task, so the
-        // self-FK is exercised across the swap.
-        conn.execute(
-            "INSERT INTO cirislens_tasks (task_id, channel_id, description, status, \
-                priority, created_at, updated_at, parent_task_id, context_json, \
-                outcome_json, retry_count, signed_by, signature, signed_at, \
-                updated_info_available, updated_info_content, agent_occurrence_id, \
-                images_json) \
-             VALUES ('t-parent', 'chan-1', 'the parent', 'active', 3, ?1, ?1, NULL, \
-                '{\"correlation_id\":\"corr-1\"}', '{\"note\":\"o\"}', 2, 'signer-a', \
-                'sig-a', ?1, 1, 'more info', 'occ-a', '[\"img\"]')",
-            rusqlite::params![T0],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO cirislens_tasks (task_id, channel_id, description, status, \
-                created_at, updated_at, parent_task_id, agent_occurrence_id) \
-             VALUES ('t-child', 'chan-1', 'the child', 'pending', ?1, ?1, 't-parent', \
-                'occ-a')",
-            rusqlite::params![T0],
-        )
-        .unwrap();
-
-        // Two thoughts under the parent task. These are what the cascade
-        // would take.
-        for (tid, parent) in [("th-1", None), ("th-2", Some("th-1"))] {
-            conn.execute(
-                "INSERT INTO cirislens_thoughts (thought_id, source_task_id, channel_id, \
-                    thought_type, status, created_at, updated_at, round_number, content, \
-                    thought_depth, parent_thought_id, agent_occurrence_id) \
-                 VALUES (?1, 't-parent', 'chan-1', 'standard', 'completed', ?2, ?2, 1, \
-                    'reasoning', 0, ?3, 'occ-a')",
-                rusqlite::params![tid, T0, parent],
-            )
-            .unwrap();
-        }
-
-        // A deferral report pointing at BOTH — the NO ACTION referrer whose
-        // violation V136 leaves to COMMIT rather than staging.
-        conn.execute(
-            "INSERT INTO cirislens_deferral_reports (message_id, task_id, thought_id, \
-                package, created_at) \
-             VALUES ('msg-1', 't-parent', 'th-1', 'pkg', ?1)",
-            rusqlite::params![T0],
-        )
-        .unwrap();
-
-        // Before V136 the CHECK refuses the agent's `rejected` — the
-        // CIRISAgent#1077 wedge, reproduced at the schema layer.
-        let refused = conn.execute(
-            "UPDATE cirislens_tasks SET status = 'rejected' WHERE task_id = 't-parent'",
-            [],
-        );
-        assert!(
-            refused.is_err(),
-            "V024's CHECK must still refuse 'rejected' at V135 — otherwise this \
-             witness proves nothing about V136"
-        );
-
-        // Pass 2: V136.
-        crate::store::migration_runner::run_sqlite(
-            &mut conn,
-            &crate::store::migration_runner::sqlite_migrations(),
-            None,
-            &crate::host::clock::now,
-        )
-        .expect("migrate to HEAD (V136)");
-
-        // THE POINT: the reasoning record survived the cascade.
-        let thoughts: i64 = conn
-            .query_row("SELECT COUNT(*) FROM cirislens_thoughts", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            thoughts, 2,
-            "V136 CASCADE-WIPED cirislens_thoughts. Emptying cirislens_tasks — by \
-             DELETE, or by the implicit DELETE FROM inside DROP TABLE — fires the \
-             ON DELETE CASCADE on source_task_id; PRAGMA defer_foreign_keys defers \
-             violation CHECKING, not cascade ACTIONS. The staged copy must be \
-             restored before COMMIT."
-        );
-        let (src, parent_th): (String, Option<String>) = conn
-            .query_row(
-                "SELECT source_task_id, parent_thought_id FROM cirislens_thoughts \
-                 WHERE thought_id = 'th-2'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(src, "t-parent");
-        assert_eq!(parent_th.as_deref(), Some("th-1"));
-
-        // The deferral report survived too.
-        let reports: i64 = conn
-            .query_row("SELECT COUNT(*) FROM cirislens_deferral_reports", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(reports, 1, "the NO ACTION referrer must be untouched");
-
-        // Every task column round-tripped through the rebuild.
-        let row: (
-            String,
-            String,
-            i64,
-            String,
-            i64,
-            String,
-            String,
-            String,
-            i64,
-            String,
-            String,
-        ) = conn
-            .query_row(
-                "SELECT channel_id, description, priority, outcome_json, retry_count, \
-                    signed_by, signature, signed_at, updated_info_available, \
-                    updated_info_content, images_json \
-                 FROM cirislens_tasks WHERE task_id = 't-parent'",
-                [],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                        r.get(6)?,
-                        r.get(7)?,
-                        r.get(8)?,
-                        r.get(9)?,
-                        r.get(10)?,
-                    ))
-                },
-            )
-            .expect("the parent task survives the rebuild");
-        assert_eq!(
-            row,
-            (
-                "chan-1".into(),
-                "the parent".into(),
-                3,
-                "{\"note\":\"o\"}".into(),
-                2,
-                "signer-a".into(),
-                "sig-a".into(),
-                T0.into(),
-                1,
-                "more info".into(),
-                "[\"img\"]".into(),
-            )
-        );
-        let child_parent: String = conn
-            .query_row(
-                "SELECT parent_task_id FROM cirislens_tasks WHERE task_id = 't-child'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(child_parent, "t-parent", "the self-FK column survives");
-
-        // All four indexes came back — V024's three and V036's partial unique.
-        let idx: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
-                    AND tbl_name = 'cirislens_tasks' AND name IN \
-                    ('tasks_status_occurrence', 'tasks_channel', 'tasks_parent', \
-                     'tasks_correlation_id_unique')",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(idx, 4, "all four indexes must survive the rebuild");
-
-        // V036's unique index still BITES (a rebuild that recreated it as a
-        // plain index would still count 4 above).
-        let dup = conn.execute(
-            "INSERT INTO cirislens_tasks (task_id, channel_id, description, status, \
-                created_at, updated_at, context_json, agent_occurrence_id) \
-             VALUES ('t-dup', 'chan-1', 'dup', 'pending', ?1, ?1, \
-                '{\"correlation_id\":\"corr-1\"}', 'occ-a')",
-            rusqlite::params![T0],
-        );
-        assert!(
-            dup.is_err(),
-            "tasks_correlation_id_unique must still be UNIQUE after the rebuild"
-        );
-
-        // And the reason for the whole migration.
-        conn.execute(
-            "UPDATE cirislens_tasks SET status = 'rejected' WHERE task_id = 't-parent'",
-            [],
-        )
-        .expect("V136 must admit the agent's `rejected`");
-        let st: String = conn
-            .query_row(
-                "SELECT status FROM cirislens_tasks WHERE task_id = 't-parent'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(st, "rejected");
-
-        // The set is still CLOSED — a widened CHECK, not a dropped one.
-        let typo = conn.execute(
-            "UPDATE cirislens_tasks SET status = 'rejcted' WHERE task_id = 't-child'",
-            [],
-        );
-        assert!(
-            typo.is_err(),
-            "V136 widens the CHECK; it must not remove it. A typo is still a refusal."
-        );
-
-        // The FK still binds after the swap: an orphan thought is refused.
-        let orphan = conn.execute(
-            "INSERT INTO cirislens_thoughts (thought_id, source_task_id, status, \
-                created_at, updated_at, content) \
-             VALUES ('th-orphan', 'no-such-task', 'pending', ?1, ?1, 'x')",
-            rusqlite::params![T0],
-        );
-        assert!(
-            orphan.is_err(),
-            "cirislens_thoughts.source_task_id must still resolve to the rebuilt table"
-        );
-    }
-
-    /// The fourteen tables V141 rebuilds, each with the ROW FILTER that
-    /// isolates its seeded pre-V141 row and the instant that row's
-    /// `admitted_at` must be backfilled to — the source column the header of
-    /// `migrations/sqlite/lens/V141__admitted_at_not_null.sql` names per
-    /// table. Spelled as literals, not derived from the migration text, so
-    /// the witness cannot agree with a wrong backfill by construction.
-    const V141_TABLES: [(&str, &str, &str); 14] = [
-        // federation_keys backfills from scrub_timestamp (V126).
-        (
-            "federation_keys",
-            "key_id = 'k1'",
-            "2026-01-01T00:00:01+00:00",
-        ),
-        // federation_attestations backfills from COALESCE(promoted_at, asserted_at);
-        // the seeded row has promoted_at set, so promoted_at must win.
-        (
-            "federation_attestations",
-            "1 = 1",
-            "2026-01-04T00:00:00+00:00",
-        ),
-        // federation_revocations backfills from scrub_timestamp (V123).
-        (
-            "federation_revocations",
-            "1 = 1",
-            "2026-01-05T00:00:01+00:00",
-        ),
-        (
-            "federation_identity_occurrences",
-            "1 = 1",
-            "2026-01-09T00:00:00+00:00",
-        ),
-        (
-            "federation_identity_occurrence_revocations",
-            "1 = 1",
-            "2026-01-10T00:00:00+00:00",
-        ),
-        (
-            "federation_family_membership_revocations",
-            "1 = 1",
-            "2026-01-11T00:00:00+00:00",
-        ),
-        (
-            "federation_community_membership_revocations",
-            "1 = 1",
-            "2026-01-12T00:00:00+00:00",
-        ),
-        (
-            "federation_location_proofs",
-            "1 = 1",
-            "2026-01-13T00:00:00+00:00",
-        ),
-        (
-            "federation_communities",
-            "1 = 1",
-            "2026-01-14T00:00:00+00:00",
-        ),
-        ("federation_families", "1 = 1", "2026-01-15T00:00:00+00:00"),
-        (
-            "federation_organizations",
-            "1 = 1",
-            "2026-01-16T00:00:00+00:00",
-        ),
-        (
-            "federation_org_memberships",
-            "1 = 1",
-            "2026-01-17T00:00:00+00:00",
-        ),
-        (
-            "federation_partner_records",
-            "1 = 1",
-            "2026-01-18T00:00:00+00:00",
-        ),
-        (
-            "transport_destinations",
-            "1 = 1",
-            "2026-01-19T00:00:00+00:00",
-        ),
-    ];
-
-    /// The eight tables V141 stages WITHOUT rebuilding, because they
-    /// reference a table being dropped (directly, or through a cascade the
-    /// drop would fire). Each seeded with one row; each must still hold it.
-    const V141_STAGED_REFERRERS: [&str; 8] = [
-        "attestation_subjects",
-        "identity_canonical_binding",
-        "federation_revocation_quorum_state",
-        "goals",
-        "federation_peer_metadata",
-        "edge_outbound_queue",
-        "edge_detection_events",
-        "federation_trust_grants",
-    ];
-
-    /// One `PRAGMA table_xinfo` row: `(cid, name, type, notnull, dflt, pk, hidden)`.
-    type V141Column = (i64, String, String, i64, Option<String>, i64, i64);
-
-    /// Everything `sqlite_master`, `table_xinfo` and `foreign_key_list` say
-    /// about one table, whitespace-normalised so a re-created index compares
-    /// equal to the original regardless of how the DDL was wrapped.
-    #[derive(Debug, PartialEq, Eq, Clone)]
-    struct V141Shape {
-        /// `"index NAME"` / `"trigger NAME"` -> normalised CREATE text.
-        objects: std::collections::BTreeMap<String, String>,
-        /// Columns in cid order.
-        columns: Vec<V141Column>,
-        /// `(to_table, from_col, to_col, on_update, on_delete)` in id order.
-        fks: Vec<(String, String, String, String, String)>,
-    }
-
-    fn v141_shape(conn: &rusqlite::Connection, table: &str) -> V141Shape {
-        let mut objects = std::collections::BTreeMap::new();
-        let mut st = conn
-            .prepare(
-                "SELECT type, name, sql FROM sqlite_master \
-                 WHERE type IN ('index', 'trigger') AND tbl_name = ?1 AND sql IS NOT NULL",
-            )
-            .unwrap();
-        for row in st
-            .query_map([table], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })
-            .unwrap()
-        {
-            let (ty, name, sql) = row.unwrap();
-            let norm = sql.split_whitespace().collect::<Vec<_>>().join(" ");
-            objects.insert(format!("{ty} {name}"), norm);
-        }
-        let mut st = conn
-            .prepare(&format!("PRAGMA table_xinfo({table})"))
-            .unwrap();
-        let columns = st
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                    r.get::<_, i64>(5)?,
-                    r.get::<_, i64>(6)?,
-                ))
-            })
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        let mut st = conn
-            .prepare(&format!("PRAGMA foreign_key_list({table})"))
-            .unwrap();
-        let fks = st
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                ))
-            })
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        V141Shape {
-            objects,
-            columns,
-            fks,
-        }
-    }
-
-    /// CIRISPersist#828 — V141 rebuilds fourteen tables so that
-    /// `admitted_at` is `NOT NULL` on sqlite as it has been on postgres since
-    /// V130, and the rebuild must be a rebuild of NOTHING ELSE.
-    ///
-    /// A table rebuild is the one moment a constraint, index, trigger or
-    /// foreign key is silently lost by transcription; and on this schema a
-    /// naive `DROP TABLE federation_keys` is an implicit `DELETE FROM` that
-    /// CASCADE-wipes `federation_peer_metadata` and
-    /// `identity_canonical_binding`, SET-NULLs the binding's attestation
-    /// column, and is REFUSED by `goals` (RESTRICT) — see the migration
-    /// header, and V136's for the measurements. `migrations_run_clean_in_memory`
-    /// cannot see any of that: it runs against empty tables, where a drop
-    /// fires nothing and a lost index costs nothing.
-    ///
-    /// So this witness seeds the V140 shape — one row with a NULL
-    /// `admitted_at` in each of the fourteen, one row in each of the eight
-    /// referrers the migration stages without rebuilding, a self-referencing
-    /// key pair and a key that already carries an `admitted_at` — snapshots
-    /// every index, trigger, column and foreign key, runs V141, and asserts:
-    ///
-    /// 1. the snapshot is IDENTICAL afterwards except for exactly fourteen
-    ///    `notnull` flags (a dropped index, a renamed trigger, a reordered
-    ///    column, a lost FK action all red here);
-    /// 2. every NULL was backfilled from the source the header names, and a
-    ///    value already present was NOT overwritten;
-    /// 3. every referrer still holds its row and the SET NULL did not fire;
-    /// 4. the database is FK-consistent and passes `integrity_check`;
-    /// 5. `NOT NULL` is live on all fourteen, and both re-created trigger
-    ///    families still fire.
-    ///
-    /// Vacuity is pinned first: the seed must land NULLs, or the backfill
-    /// leg proves nothing.
-    ///
-    /// The "after" snapshot stops AT V141 (`run_migrations_through(141)`),
-    /// not at HEAD. Running the whole chain made this witness assert
-    /// "V140's shape == today's shape" for all fourteen tables, so any
-    /// later migration that legitimately ADDS a column or an index to one
-    /// of them went red here naming V141 — V150's `cohort_target` did
-    /// (#893). The claim is about V141's transcription; the final schema is
-    /// `migrations_run_clean_in_memory`'s and the per-feature shape tests'.
-    #[tokio::test]
-    async fn v141_rebuild_backfills_admitted_at_and_preserves_every_index_trigger_and_referrer_828()
-    {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations_through(140).await.unwrap();
-
-        let before: Vec<(String, V141Shape)> = {
-            let conn = backend.conn.lock();
-            conn.execute_batch(V141_SEED).expect("seed the V140 shape");
-            // Vacuity: every one of the fourteen holds exactly one NULL.
-            for (table, filter, _) in V141_TABLES {
-                let nulls: i64 = conn
-                    .query_row(
-                        &format!(
-                            "SELECT COUNT(*) FROM {table} WHERE admitted_at IS NULL AND {filter}"
-                        ),
-                        [],
-                        |r| r.get(0),
-                    )
-                    .unwrap();
-                assert_eq!(
-                    nulls, 1,
-                    "{table}: the pre-V141 seed must land a NULL admitted_at, or the \
-                     backfill leg of this witness is vacuous"
-                );
-            }
-            V141_TABLES
-                .iter()
-                .map(|(t, _, _)| ((*t).to_owned(), v141_shape(&conn, t)))
-                .collect()
-        };
-
-        backend
-            .run_migrations_through(141)
-            .await
-            .expect("V141 applies to a populated V140 database");
-
-        let conn = backend.conn.lock();
-
-        // 1. Shape parity: identical except the fourteen notnull flips.
-        for (table, was) in &before {
-            let now = v141_shape(&conn, table);
-            assert_eq!(
-                was.objects, now.objects,
-                "{table}: the set of indexes/triggers (or their DDL) changed across V141 — a \
-                 rebuild that drops or reshapes an index or a trigger is a silent regression"
-            );
-            assert_eq!(
-                was.fks, now.fks,
-                "{table}: foreign keys (or their ON DELETE/UPDATE actions) changed across V141"
-            );
-            let mut expected = was.columns.clone();
-            let flipped = expected
-                .iter_mut()
-                .filter(|c| c.1 == "admitted_at")
-                .map(|c| c.3 = 1)
-                .count();
-            assert_eq!(
-                flipped, 1,
-                "{table}: seeded shape has one admitted_at column"
-            );
-            assert_eq!(
-                expected, now.columns,
-                "{table}: columns differ across V141 beyond admitted_at's NOT NULL — order, \
-                 type, default, pk or generated-ness moved"
-            );
-            assert!(
-                !now.objects.is_empty(),
-                "{table}: no index or trigger at all — the snapshot leg is vacuous"
-            );
-        }
-
-        // 2. Backfill from the named source; a present value is preserved.
-        for (table, filter, want) in V141_TABLES {
-            let got: String = conn
-                .query_row(
-                    &format!("SELECT admitted_at FROM {table} WHERE {filter}"),
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(
-                got, want,
-                "{table}: admitted_at backfilled from the wrong source"
-            );
-            let nulls: i64 = conn
-                .query_row(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE admitted_at IS NULL"),
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(nulls, 0, "{table}: a NULL admitted_at survived V141");
-        }
-        let k2: String = conn
-            .query_row(
-                "SELECT admitted_at FROM federation_keys WHERE key_id = 'k2'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            k2, "2026-02-02T00:00:00+00:00",
-            "a row that already carried admitted_at must keep it — the backfill is WHERE IS NULL"
-        );
-
-        // 3. Referrers survived the drop; no cascade, no SET NULL fired.
-        for table in V141_STAGED_REFERRERS {
-            let n: i64 = conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(
-                n, 1,
-                "{table}: lost its row across V141 — the DROP TABLE of a parent fired an FK \
-                 action the migration did not stage for"
-            );
-        }
-        let bound: Option<String> = conn
-            .query_row(
-                "SELECT binding_attestation_id FROM identity_canonical_binding",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            bound.as_deref(),
-            Some("a1"),
-            "identity_canonical_binding.binding_attestation_id was SET NULL by the \
-             federation_attestations drop"
-        );
-
-        // 4. Consistent and intact; no stage table left behind.
-        let fk_violations: i64 = conn
-            .prepare("PRAGMA foreign_key_check")
-            .unwrap()
-            .query_map([], |_| Ok(()))
-            .unwrap()
-            .count() as i64;
-        assert_eq!(
-            fk_violations, 0,
-            "foreign_key_check reports violations after V141"
-        );
-        let integrity: String = conn
-            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(integrity, "ok");
-        let leftovers: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '\\_v141%' ESCAPE '\\'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(leftovers, 0, "V141 left a stage table behind");
-
-        // 5. NOT NULL is live on all fourteen …
-        for (table, _, _) in V141_TABLES {
-            let err = conn
-                .execute(&format!("UPDATE {table} SET admitted_at = NULL"), [])
-                .expect_err(&format!(
-                    "{table}: a NULL admitted_at must be refused after V141"
-                ))
-                .to_string();
-            assert!(
-                err.contains("NOT NULL constraint failed"),
-                "{table}: refused for the wrong reason: {err}"
-            );
-        }
-        // … and both re-created trigger families still fire.
-        let err = conn
-            .execute(
-                "INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, \
-                    identity_type, identity_ref, valid_from, registration_envelope, \
-                    original_content_hash, scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash, admitted_at) \
-                 VALUES ('k3', 'p', 'hybrid', 'accord_holder', 'r', '2026', '{}', X'00', 's', \
-                    'k1', '2026', 'h', '2026')",
-                [],
-            )
-            .expect_err("the accord_holder trigger must have been re-created")
-            .to_string();
-        assert!(
-            err.contains("federation_keys_accord_holder_requires_attestation"),
-            "wrong refusal: {err}"
-        );
-        let err = conn
-            .execute(
-                "INSERT INTO federation_attestations (attestation_id, attesting_key_id, \
-                    attested_key_id, attestation_type, asserted_at, attestation_envelope, \
-                    original_content_hash, scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash, tier, admitted_at) \
-                 VALUES ('a2', 'k1', 'k2', 'vouch', '2026', '{}', X'00', '', 'k1', '2026', \
-                    'h', 'federation', '2026')",
-                [],
-            )
-            .expect_err("the federation-tier-signed trigger must have been re-created")
-            .to_string();
-        assert!(
-            err.contains("tier=federation requires a non-empty scrub_signature_classical"),
-            "wrong refusal: {err}"
-        );
-
-        // 6. The self-FK is still DEFERRABLE INITIALLY DEFERRED (V004): a
-        //    child key may be written BEFORE the key that scrubbed it, inside
-        //    one transaction, and the pair commits. `PRAGMA foreign_key_list`
-        //    does not report deferrability, so the shape snapshot above is
-        //    blind to it — a mutation that dropped the clause survived every
-        //    other leg. An immediate FK refuses the first INSERT.
-        conn.execute_batch(
-            "BEGIN;
-             INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, \
-                identity_type, identity_ref, valid_from, registration_envelope, \
-                original_content_hash, scrub_signature_classical, scrub_key_id, \
-                scrub_timestamp, persist_row_hash, admitted_at) \
-             VALUES ('k9', 'p', 'hybrid', 'node', 'r', '2026', '{}', X'00', 's', 'k10', \
-                '2026', 'h', '2026');
-             INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, \
-                identity_type, identity_ref, valid_from, registration_envelope, \
-                original_content_hash, scrub_signature_classical, scrub_key_id, \
-                scrub_timestamp, persist_row_hash, admitted_at) \
-             VALUES ('k10', 'p', 'hybrid', 'node', 'r', '2026', '{}', X'00', 's', 'k10', \
-                '2026', 'h', '2026');
-             COMMIT;",
-        )
-        .expect(
-            "federation_keys.scrub_key_id must stay DEFERRABLE INITIALLY DEFERRED across \
-             V141 — the bootstrap order (child before its scrubbing key) was refused",
-        );
-    }
-
-    /// The V140-shape seed for the V141 witness: two keys (k2 scrubbed by k1,
-    /// so the self-FK is exercised across the swap; k1 NULL, k2 already
-    /// stamped), one NULL-`admitted_at` row in each of the other thirteen, and
-    /// one row in each of the eight staged referrers. Distinct legacy
-    /// instants per table so a backfill from the WRONG column is visible.
-    const V141_SEED: &str = "
-INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, identity_type, identity_ref, valid_from, registration_envelope, original_content_hash, scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at)
-VALUES ('k1','pk1','hybrid','node','ref1','2026-01-01T00:00:00+00:00','{}',X'00','sig','k1','2026-01-01T00:00:01+00:00','h', NULL);
-INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, identity_type, identity_ref, valid_from, registration_envelope, original_content_hash, scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at)
-VALUES ('k2','pk2','hybrid','node','ref2','2026-01-01T00:00:00+00:00','{}',X'00','sig','k1','2026-01-01T00:00:02+00:00','h','2026-02-02T00:00:00+00:00');
-INSERT INTO federation_attestations (attestation_id, attesting_key_id, attested_key_id, attestation_type, asserted_at, attestation_envelope, original_content_hash, scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, tier, promoted_at, admitted_at)
-VALUES ('a1','k1','k2','vouch','2026-01-03T00:00:00+00:00','{\"dimension\":\"coherence\"}',X'00','sig','k1','2026-01-03T00:00:01+00:00','h','federation','2026-01-04T00:00:00+00:00',NULL);
-INSERT INTO attestation_subjects (subject_key_id, dimension, asserted_at, attestation_id, tier, cohort_scope) VALUES ('k2','coherence','2026-01-03T00:00:00+00:00','a1','federation','federation');
-INSERT INTO identity_canonical_binding (canonical_hash, federation_key_id, bound_at, binding_attestation_id) VALUES ('ch1','k1','2026-01-03T00:00:00+00:00','a1');
-INSERT INTO federation_revocations (revocation_id, revoked_key_id, revoking_key_id, revoked_at, effective_at, revocation_envelope, original_content_hash, scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at)
-VALUES ('r1','k2','k1','2026-01-05T00:00:00+00:00','2026-01-05T00:00:00+00:00','{}',X'00','sig','k1','2026-01-05T00:00:01+00:00','h',NULL);
-INSERT INTO federation_revocation_quorum_state (revocation_id, us_observed_at) VALUES ('r1','2026-01-05T00:00:00+00:00');
-INSERT INTO goals (goal_id, declared_by_key_id, declared_at, goal_text, goal_text_canonical, scope_kind, meta_dimension, meta_rationale, persist_row_hash) VALUES ('g1','k1','2026-01-06T00:00:00+00:00','t','t','federation','coherence','r','h');
-INSERT INTO federation_peer_metadata (key_id, persist_row_hash) VALUES ('k1','h');
-INSERT INTO edge_outbound_queue (queue_id, sender_key_id, destination_key_id, message_type, edge_schema_version, envelope_bytes, body_sha256, body_size_bytes, status, next_attempt_after, max_attempts, ttl_seconds, requires_ack)
-VALUES ('q1','k1','k2','m','1',X'00',X'0000000000000000000000000000000000000000000000000000000000000000',1,'pending','2026-01-07T00:00:00+00:00',3,60,0);
-INSERT INTO edge_detection_events (detection_id, tenant_id, detector_kind, subject_key_id, observed_at, evidence, severity, signature, signing_key_id, persist_row_hash) VALUES ('d1','t','kind','k2','2026-01-08T00:00:00+00:00','{}','low','sig','k1','h');
-INSERT INTO federation_trust_grants (grant_id, grantee_key, granter_key, purpose, scope, chain_event_id, chain_event_hash, tenant_id) VALUES ('tg1','k2','k1','technical','s',1,X'00','t');
-INSERT INTO federation_identity_occurrences (identity_key_id, occurrence_key_id, device_class, asserted_at, persist_row_hash, admitted_at) VALUES ('k1','k2','server','2026-01-09T00:00:00+00:00','h',NULL);
-INSERT INTO federation_identity_occurrence_revocations (identity_key_id, occurrence_key_id, revoked_at, effective_at, persist_row_hash, admitted_at) VALUES ('k1','k2','2026-01-10T00:00:00+00:00','2026-01-10T00:00:00+00:00','h',NULL);
-INSERT INTO federation_family_membership_revocations (family_key_id, removed_identity_key_id, removed_at, effective_at, persist_row_hash, admitted_at) VALUES ('k1','k2','2026-01-11T00:00:00+00:00','2026-01-11T00:00:00+00:00','h',NULL);
-INSERT INTO federation_community_membership_revocations (community_key_id, removed_identity_key_id, removed_at, effective_at, persist_row_hash, admitted_at) VALUES ('k1','k2','2026-01-12T00:00:00+00:00','2026-01-12T00:00:00+00:00','h',NULL);
-INSERT INTO federation_location_proofs (subject_key_id, cell_id, cell_resolution, asserted_at, persist_row_hash, admitted_at) VALUES ('k1','cell',5,'2026-01-13T00:00:00+00:00','h',NULL);
-INSERT INTO federation_communities (community_key_id, community_name, members, founded_at, consensus_protocol, persist_row_hash, admitted_at) VALUES ('c1','c','[]','2026-01-14T00:00:00+00:00','quorum:2/3','h',NULL);
-INSERT INTO federation_families (family_key_id, family_name, founded_at, consensus_protocol, persist_row_hash, admitted_at) VALUES ('f1','f','2026-01-15T00:00:00+00:00','majority','h',NULL);
-INSERT INTO federation_organizations (attestation_id, org_id, name, org_type, status, asserted_at, attesting_key_id, signed_envelope, ed25519_signature_base64, persist_row_hash, admitted_at) VALUES ('o1','org','n','t','active','2026-01-16T00:00:00+00:00','k1','{}','s','h',NULL);
-INSERT INTO federation_org_memberships (attestation_id, user_id, org_id, role, status, asserted_at, attesting_key_id, signed_envelope, ed25519_signature_base64, persist_row_hash, admitted_at) VALUES ('m1','u','org','r','active','2026-01-17T00:00:00+00:00','k1','{}','s','h',NULL);
-INSERT INTO federation_partner_records (attestation_id, license_id, partner_id, org_id, license_type, max_autonomy_tier, requires_supervisor, deployment_limit, offline_grace_hours, status, revision, issued_at, expires_at, asserted_at, signed_envelope, persist_row_hash, admitted_at) VALUES ('p1','l','p','org','t','t',0,1,1,'active',1,'2026-01-18T00:00:00+00:00','2027-01-18T00:00:00+00:00','2026-01-18T00:00:00+00:00','{}','h',NULL);
-INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destination, asserted_at, admitted_at) VALUES ('k2','https','d','2026-01-19T00:00:00+00:00',NULL);
-";
-
-    /// v4.1 (CIRISPersist#142, Cut B) — the V061 SQLite 12-step table
-    /// rebuild MUST preserve existing federation_blobs rows (incl. the
-    /// V053 access-tracking columns), keep every index, and admit
-    /// chunk_dag afterward. Drives the embedded migration chain in two
-    /// passes (target V060, insert a row, then run to HEAD = V061).
-    #[test]
-    fn v061_rebuild_preserves_existing_blob_rows() {
-        // A single in-memory connection held across both runner passes
-        // (the embedded runner's Target lets us stop at V060, insert a
-        // row, then run the rest — V061 — on the same connection).
-        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-
-        // Pass 1: migrate up to and including V060.
-        crate::store::migration_runner::run_sqlite(
-            &mut conn,
-            &crate::store::migration_runner::sqlite_migrations(),
-            Some(60),
-            &crate::host::clock::now,
-        )
-        .expect("migrate to V060");
-
-        // Insert an inline blob row directly (pre-V061 schema) with
-        // non-default access-tracking values to prove they survive.
-        {
-            let sha = vec![0x11u8; 32];
-            conn.execute(
-                "INSERT INTO federation_blobs (\
-                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, \
-                    media_type, last_accessed_at, access_count\
-                 ) VALUES (?1, 'inline', ?2, NULL, 5, 'text/plain', \
-                    '2026-01-02T03:04:05+00:00', 7)",
-                rusqlite::params![sha, b"hello".to_vec()],
-            )
-            .unwrap();
-        }
-
-        // Pass 2: run the rest of the chain (V061 rebuild).
-        crate::store::migration_runner::run_sqlite(
-            &mut conn,
-            &crate::store::migration_runner::sqlite_migrations(),
-            None,
-            &crate::host::clock::now,
-        )
-        .expect("migrate to HEAD (V061)");
-
-        // Verify the row survived with every column intact.
-        let (kind, inline, size, mt, last_acc, acc_count): (
-            String,
-            Vec<u8>,
-            i64,
-            String,
-            String,
-            i64,
-        ) = conn
-            .query_row(
-                "SELECT storage_kind, bytes_inline, size_bytes, media_type, \
-                    last_accessed_at, access_count FROM federation_blobs \
-                 WHERE sha256 = ?1",
-                rusqlite::params![vec![0x11u8; 32]],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
-                },
-            )
-            .expect("blob row survives V061 rebuild");
-        assert_eq!(kind, "inline");
-        assert_eq!(inline, b"hello".to_vec());
-        assert_eq!(size, 5);
-        assert_eq!(mt, "text/plain");
-        assert_eq!(last_acc, "2026-01-02T03:04:05+00:00");
-        assert_eq!(acc_count, 7);
-
-        // All three indexes survived the rebuild.
-        let idx_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
-                    AND tbl_name='federation_blobs' AND name IN \
-                    ('federation_blobs_size_bytes','federation_blobs_first_seen_at',\
-                     'federation_blobs_eviction_score')",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(idx_count, 3, "all three indexes must survive the rebuild");
-
-        // chunk_dag is now an accepted storage_kind (the CHECK admits it).
-        let dag_sha = vec![0x22u8; 32];
-        conn.execute(
-            "INSERT INTO federation_blobs (\
-                sha256, storage_kind, bytes_inline, external_ref, size_bytes, \
-                media_type, last_accessed_at, access_count\
-             ) VALUES (?1, 'chunk_dag', ?2, NULL, 3, NULL, \
-                '2026-01-01T00:00:00+00:00', 0)",
-            rusqlite::params![dag_sha, b"{}".to_vec()],
-        )
-        .expect("chunk_dag row accepted post-V061");
-
-        // And the cross-column CHECK still rejects a malformed chunk_dag
-        // row (external_ref set when it must be NULL).
-        let bad = conn.execute(
-            "INSERT INTO federation_blobs (\
-                sha256, storage_kind, bytes_inline, external_ref, size_bytes, \
-                media_type, last_accessed_at, access_count\
-             ) VALUES (?1, 'chunk_dag', NULL, 's3://x', 3, NULL, \
-                '2026-01-01T00:00:00+00:00', 0)",
-            rusqlite::params![vec![0x33u8; 32]],
-        );
-        assert!(
-            bad.is_err(),
-            "chunk_dag with external_ref must violate CHECK"
-        );
-    }
-
     /// Admission ordering test — trust rejection beats inline-size
     /// rejection.
     #[tokio::test]
@@ -53827,16 +51748,6 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
     }
 
     impl SqliteBackend {
-        /// v50.0.0 (CIRISPersist#924) — simulate a row STORED BEFORE v50 on a
-        /// shape v50's door now refuses: rewrite a stored row's envelope
-        /// `dimension` directly (the door would refuse the shape, so the seam
-        /// reaches the connection, as `downgrade_to_v30` does).
-        /// v52.0.0 (CIRISPersist#930, I275) — run a migration's SQL against
-        /// the live connection, so a witness can replay its backfill.
-        pub(crate) fn execute_batch_for_test(&self, sql: &str) {
-            self.conn.lock().execute_batch(sql).expect("execute_batch");
-        }
-
         pub(crate) fn rewrite_dimension_for_test(&self, attestation_id: &str, dimension: &str) {
             let conn = self.conn.lock();
             let envelope: String = conn
@@ -54025,86 +51936,6 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
             &backend, "sqlite",
         )
         .await;
-    }
-
-    /// #443 — the V105 collapse rule, against the REAL migration SQL applied
-    /// to a hand-built pre-V105 table: per (occ, kind) keep the newest
-    /// asserted_at, tie-break the lexicographically greatest destination;
-    /// survivors land at epoch 0, live (retired_at NULL), unsigned.
-    #[tokio::test]
-    async fn v105_migration_collapses_duplicate_routes_sqlite() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        // The exact post-V101 (pre-V105) table shape.
-        conn.execute_batch(
-            "CREATE TABLE transport_destinations (
-                occurrence_key_id               TEXT NOT NULL,
-                transport_kind                  TEXT NOT NULL,
-                destination                     TEXT NOT NULL,
-                asserted_at                     TEXT NOT NULL,
-                last_seen_at                    TEXT,
-                transport_ed25519_pubkey_base64 TEXT,
-                transport_x25519_pubkey_base64  TEXT,
-                binding_provenance              TEXT NOT NULL DEFAULT 'rooted',
-                PRIMARY KEY (occurrence_key_id, transport_kind, destination)
-            );
-            CREATE INDEX transport_destinations_by_occurrence
-                ON transport_destinations (occurrence_key_id);
-            INSERT INTO transport_destinations
-                (occurrence_key_id, transport_kind, destination, asserted_at)
-            VALUES
-                ('occ',  'reticulum', 'd1', '2026-06-10T00:00:00+00:00'),
-                ('occ',  'reticulum', 'd2', '2026-06-12T00:00:00+00:00'),
-                ('occ',  'reticulum', 'd3', '2026-06-12T00:00:00+00:00'),
-                ('occ',  'websocket', 'w1', '2026-06-01T00:00:00+00:00'),
-                ('occ2', 'reticulum', 'x1', '2026-06-05T00:00:00+00:00');",
-        )
-        .unwrap();
-        conn.execute_batch(include_str!(
-            "../../migrations/sqlite/lens/V105__transport_route_table.sql"
-        ))
-        .unwrap();
-        // (occ, reticulum): d2/d3 share the newest asserted_at → the
-        // lexicographically greatest destination (d3) wins deterministically.
-        let dest: String = conn
-            .query_row(
-                "SELECT destination FROM transport_destinations \
-                 WHERE occurrence_key_id = 'occ' AND transport_kind = 'reticulum'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(dest, "d3");
-        // One row per (occ, kind) — 3 survivors of 5.
-        let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM transport_destinations", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(n, 3);
-        // Grandfathered rows: epoch 0, live, unsigned.
-        let (epoch, retired, attesting): (i64, Option<String>, Option<String>) = conn
-            .query_row(
-                "SELECT epoch, retired_at, attesting_key_id FROM transport_destinations \
-                 WHERE occurrence_key_id = 'occ2'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(epoch, 0);
-        assert!(retired.is_none());
-        assert!(attesting.is_none());
-        // The new PK really is (occ, kind): a second destination for the same
-        // kind conflicts instead of inserting.
-        let err = conn.execute(
-            "INSERT INTO transport_destinations \
-                (occurrence_key_id, transport_kind, destination, asserted_at) \
-             VALUES ('occ2', 'reticulum', 'x2', '2026-06-06T00:00:00+00:00')",
-            [],
-        );
-        assert!(
-            err.is_err(),
-            "duplicate (occ, kind) must violate the new PK"
-        );
     }
 
     /// v31.0.0 (CIRISPersist#651) — **THE SUPERSEDE PEER-ACCEPTANCE WITNESS.**
