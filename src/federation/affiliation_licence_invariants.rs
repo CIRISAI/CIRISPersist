@@ -538,28 +538,43 @@ pub mod bodies {
                 now - Duration::minutes(mins),
             ))
         };
-        // One member's signature: testimony, admitted, outside the fold.
+        // v62.0.0 (CC rc20 2.4 / 2.6.1.9, CIRISPersist#1274) — one member's
+        // signature is SHORT of the quorum: no longer testimony, it waits (a
+        // typed retryable refusal; nothing is stored). Until v62 this leg
+        // asserted the row was admitted as testimony. CC 2.4: "a row short of
+        // its protocol by signatures alone is not refused; it waits".
         // Kills: a lone member standing for a quorum protocol.
-        let lone = must_put(d, &lic("revoked", 30), "I1214 one member").await;
+        let short = |row: &Attestation| {
+            let row = row.clone();
+            async move {
+                match d
+                    .put_attestation(crate::federation::SignedAttestation { attestation: row })
+                    .await
+                {
+                    Err(Error::LicensureShortOfAuthorityQuorum { signers, .. }) => signers,
+                    other => panic!("[{tag}] I1880: short of the quorum must wait, got {other:?}"),
+                }
+            }
+        };
+        let lone = lic("revoked", 30);
+        assert_eq!(
+            short(&lone).await,
+            1,
+            "[{tag}] I1880: one member's signature"
+        );
         assert!(
-            !crate::federation::admission::row_was_issued_under_authority(d, &lone, &aff)
+            d.get_attestation(&lone.attestation_id)
                 .await
-                .unwrap(),
-            "[{tag}] I1214: one member of a majority affiliation is not its authority"
+                .unwrap()
+                .is_none(),
+            "[{tag}] I1880: nothing stored"
         );
         // A stranger's cosignature counts for nothing. Kills: counting
         // scrubs outside the roster.
-        let with_stranger = must_put(
-            d,
-            &cosigned(lic("suspended", 25), &[&stranger]),
-            "I1214 cosigned by a non-member",
-        )
-        .await;
-        assert!(
-            !crate::federation::admission::row_was_issued_under_authority(d, &with_stranger, &aff)
-                .await
-                .unwrap(),
-            "[{tag}] I1214: a non-member's cosignature does not make a quorum"
+        assert_eq!(
+            short(&cosigned(lic("suspended", 25), &[&stranger])).await,
+            1,
+            "[{tag}] I1880: a non-member's cosignature does not make a quorum"
         );
         // Two of three cosign: the affiliation's licence. Kills: dropping the
         // cosigned-row arm (item 1).
@@ -596,6 +611,36 @@ pub mod bodies {
                 .await
                 .unwrap(),
             "[{tag}] I1214: no single member resolves to a quorum authority"
+        );
+        // I1880 — a `founder_only` authority is unchanged: a non-founder
+        // member's row naming no delegation is still testimony, admitted.
+        let (fo, fk) = affiliation(
+            d,
+            &format!("{tag}-fo"),
+            consensus_protocol::FOUNDER_ONLY,
+            &["a", "b", "c"],
+            1,
+            None,
+        )
+        .await;
+        let testimony = must_put(
+            d,
+            &classed(licence(
+                &fk[1],
+                &holder,
+                &fo,
+                "issued",
+                None,
+                now - Duration::minutes(10),
+            )),
+            "I1880 founder_only testimony",
+        )
+        .await;
+        assert!(
+            !crate::federation::admission::row_was_issued_under_authority(d, &testimony, &fo)
+                .await
+                .unwrap(),
+            "[{tag}] I1880: under founder_only a non-founder's row stays testimony"
         );
     }
 

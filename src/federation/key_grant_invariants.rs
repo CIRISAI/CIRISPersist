@@ -3781,7 +3781,10 @@ mod tests {
                 crate::federation::types::identity_type::NODE,
             )
             .await;
-            exercise_i77_owned_node_minter_admitted_by_principal(&a, &b, "sqlite").await;
+            Box::pin(exercise_i77_owned_node_minter_admitted_by_principal(
+                &a, &b, "sqlite",
+            ))
+            .await;
         }
 
         #[tokio::test]
@@ -5277,7 +5280,10 @@ mod tests {
                 crate::federation::types::identity_type::NODE,
             )
             .await;
-            exercise_i77_owned_node_minter_admitted_by_principal(&a, &b, "postgres").await;
+            Box::pin(exercise_i77_owned_node_minter_admitted_by_principal(
+                &a, &b, "postgres",
+            ))
+            .await;
         }
 
         #[tokio::test]

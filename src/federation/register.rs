@@ -233,6 +233,12 @@ pub enum KeyRefusalReason {
     /// [`Self::UnverifiableSignature`] (the signer IS known and the record
     /// does not verify against it), which before v54.1.0 also covered this case.
     AttesterKeyUnknown,
+    /// v62.0.0 (CC rc20 3.4.7.1 / 2.4.1.1, CIRISPersist#1274) — the record's
+    /// `identity_type` set holds `user` or `accord_holder` with `node` or
+    /// `agent` (outside the `node` case [`Self::NodeIdentityFused`] names):
+    /// malformed wherever it arrives, the replicated `Insert` included. Typed,
+    /// so the cursor advances; nothing is stored.
+    IdentitySetMixed,
 }
 
 impl KeyRefusalReason {
@@ -266,6 +272,7 @@ impl KeyRefusalReason {
             Self::NodeIdentityFused => "node_identity_fused",
             Self::NodeIdentityChanged => "node_identity_changed",
             Self::AttesterKeyUnknown => "attester_key_unknown",
+            Self::IdentitySetMixed => "identity_set_mixed",
         }
     }
 
@@ -287,12 +294,100 @@ impl KeyRefusalReason {
         Self::NodeIdentityFused,
         Self::NodeIdentityChanged,
         Self::AttesterKeyUnknown,
+        Self::IdentitySetMixed,
     ];
 }
 
 impl std::fmt::Display for KeyRefusalReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// v62.0.0 (CIRISPersist#1274) — why a key-record store step refused to
+/// replace the stored row ([`Error::KeyRecordConflict`]). Each was an untyped
+/// `Error::Conflict` until v62. APPEND-ONLY tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyRecordConflictReason {
+    /// The offered record carries other pubkeys than the stored row: a
+    /// different identity under the same `key_id`.
+    PubkeyChange,
+    /// The offered record carries the stored row's pubkeys but differs from
+    /// it: the same key registered again with another record. Not a swap.
+    SameKeyDifferentRecord,
+    /// The stored row is anchor-scrubbed; the holder's rebind door does not
+    /// replace it.
+    AnchorScrubbed,
+    /// A field of the claim (`identity_type`, `identity_ref`, `valid_from`,
+    /// `valid_until`, `roles`, `attestation_evidence`) differs from the stored
+    /// claim; the field is named in the detail.
+    ClaimDiffers,
+    /// The offered record's signer or role is not one this door replaces
+    /// (`invalid_replace_admissible`).
+    NotReplaceableHere,
+    /// The stored record verifies; only a record that fails
+    /// `verify_key_registration` is replaced.
+    StoredRecordVerifies,
+}
+
+impl KeyRecordConflictReason {
+    /// The reason token (APPEND-ONLY).
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::PubkeyChange => "pubkey_change",
+            Self::SameKeyDifferentRecord => "same_key_different_record",
+            Self::AnchorScrubbed => "anchor_scrubbed",
+            Self::ClaimDiffers => "claim_differs",
+            Self::NotReplaceableHere => "not_replaceable_here",
+            Self::StoredRecordVerifies => "stored_record_verifies",
+        }
+    }
+
+    /// The stable `kind()` token of [`Error::KeyRecordConflict`] with this
+    /// reason.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::PubkeyChange => "federation_key_record_conflict_pubkey_change",
+            Self::SameKeyDifferentRecord => {
+                "federation_key_record_conflict_same_key_different_record"
+            }
+            Self::AnchorScrubbed => "federation_key_record_conflict_anchor_scrubbed",
+            Self::ClaimDiffers => "federation_key_record_conflict_claim_differs",
+            Self::NotReplaceableHere => "federation_key_record_conflict_not_replaceable_here",
+            Self::StoredRecordVerifies => "federation_key_record_conflict_stored_record_verifies",
+        }
+    }
+
+    /// Every variant, in declaration order.
+    pub const ALL: &'static [Self] = &[
+        Self::PubkeyChange,
+        Self::SameKeyDifferentRecord,
+        Self::AnchorScrubbed,
+        Self::ClaimDiffers,
+        Self::NotReplaceableHere,
+        Self::StoredRecordVerifies,
+    ];
+}
+
+impl std::fmt::Display for KeyRecordConflictReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// v62.0.0 (#1274) — the typed key-record conflict.
+pub(crate) fn key_record_conflict(
+    key_id: &str,
+    reason: KeyRecordConflictReason,
+    detail: impl Into<String>,
+) -> Error {
+    Error::KeyRecordConflict {
+        key_id: key_id.to_owned(),
+        reason,
+        detail: detail.into(),
     }
 }
 
@@ -797,22 +892,25 @@ pub(crate) async fn prepare_rebind<D: FederationDirectory + ?Sized>(
     if existing.pubkey_ed25519_base64 != incoming.pubkey_ed25519_base64
         || existing.pubkey_ml_dsa_65_base64 != incoming.pubkey_ml_dsa_65_base64
     {
-        return Err(Error::Conflict(format!(
-            "store_rebound_key_record {}: pubkey change refused (different identity)",
-            incoming.key_id
-        )));
+        return Err(key_record_conflict(
+            &incoming.key_id,
+            KeyRecordConflictReason::PubkeyChange,
+            "store_rebound_key_record: pubkey change refused (different identity)",
+        ));
     }
     if existing.scrub_key_id != existing.key_id {
-        return Err(Error::Conflict(format!(
-            "store_rebound_key_record {}: row is anchor-scrubbed; rebind refused",
-            incoming.key_id
-        )));
+        return Err(key_record_conflict(
+            &incoming.key_id,
+            KeyRecordConflictReason::AnchorScrubbed,
+            "store_rebound_key_record: row is anchor-scrubbed; rebind refused",
+        ));
     }
     if let Err(what) = rebind_claim_unchanged(&existing, &incoming) {
-        return Err(Error::Conflict(format!(
-            "store_rebound_key_record {}: {what} differs from the stored claim",
-            incoming.key_id
-        )));
+        return Err(key_record_conflict(
+            &incoming.key_id,
+            KeyRecordConflictReason::ClaimDiffers,
+            format!("store_rebound_key_record: {what} differs from the stored claim"),
+        ));
     }
     let existing_hash = existing.persist_row_hash.clone();
     let mut new = existing;
@@ -876,29 +974,33 @@ pub(crate) async fn prepare_invalid_replace<D: FederationDirectory + ?Sized>(
     if existing.pubkey_ed25519_base64 != incoming.pubkey_ed25519_base64
         || existing.pubkey_ml_dsa_65_base64 != incoming.pubkey_ml_dsa_65_base64
     {
-        return Err(Error::Conflict(format!(
-            "store_invalid_replaced_key_record {}: pubkey change refused (different identity)",
-            incoming.key_id
-        )));
+        return Err(key_record_conflict(
+            &incoming.key_id,
+            KeyRecordConflictReason::PubkeyChange,
+            "store_invalid_replaced_key_record: pubkey change refused (different identity)",
+        ));
     }
     if let Err(what) = rebind_claim_unchanged(&existing, &incoming) {
-        return Err(Error::Conflict(format!(
-            "store_invalid_replaced_key_record {}: {what} differs from the stored claim",
-            incoming.key_id
-        )));
+        return Err(key_record_conflict(
+            &incoming.key_id,
+            KeyRecordConflictReason::ClaimDiffers,
+            format!("store_invalid_replaced_key_record: {what} differs from the stored claim"),
+        ));
     }
     if let Err(what) = invalid_replace_admissible(&existing, &incoming) {
-        return Err(Error::Conflict(format!(
-            "store_invalid_replaced_key_record {}: {what} is not replaced through this door",
-            incoming.key_id
-        )));
+        return Err(key_record_conflict(
+            &incoming.key_id,
+            KeyRecordConflictReason::NotReplaceableHere,
+            format!("store_invalid_replaced_key_record: {what} is not replaced through this door"),
+        ));
     }
     if !stored_record_fails_verification(directory, &existing).await? {
-        return Err(Error::Conflict(format!(
-            "store_invalid_replaced_key_record {}: the stored record verifies; only a record \
+        return Err(key_record_conflict(
+            &incoming.key_id,
+            KeyRecordConflictReason::StoredRecordVerifies,
+            "store_invalid_replaced_key_record: the stored record verifies; only a record \
              that fails verify_key_registration is replaced",
-            incoming.key_id
-        )));
+        ));
     }
     let existing_hash = existing.persist_row_hash.clone();
     let mut new = existing;
@@ -1181,12 +1283,14 @@ pub(crate) enum SupersedePrecheck {
 /// reaches either admitting arm.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) fn supersede_precheck(existing: &KeyRecord, record: &KeyRecord) -> SupersedePrecheck {
-    use super::types::identity_type;
-
     // (1) Canonical-scoped — a non-canonical anchor→anchor re-scrub stays the
     // fail-closed hijack refuse (check_canonical_role_admission fast-paths a
-    // non-canonical row to Ok, so this guard is load-bearing).
-    if !identity_type::set_contains(&record.identity_type, identity_type::CANONICAL) {
+    // record presenting no conferral to Ok, so this guard is load-bearing).
+    // v62.0.0 (CC rc20 8.11.27, #1274): scoped by the conferral the record
+    // NAMES — the same predicate the gate fast-paths on, so the two cannot
+    // disagree (a forward-form supersede is not admitted on today's wire: the
+    // gate would not verify it; it rotates at the edition-2 ceremony).
+    if !super::admission::names_canonical_conferral(record) {
         return SupersedePrecheck::Refuse;
     }
 
@@ -1298,40 +1402,51 @@ pub fn validate_registration_pubkey(record: &KeyRecord) -> Result<(), Error> {
     Ok(())
 }
 
-/// v50.0.0 (CIRISPersist#925 review M5) — which door a key record is being
-/// stored through. Clause A ([`check_node_identity_exclusive`]) gates
-/// [`Self::LocalMint`] only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyDoor {
-    /// `put_public_key`: a key minted (registered) on this node.
-    LocalMint,
-    /// The replicated `Insert` arm of `apply_replicated_key_record`: a key
-    /// minted elsewhere, admitted as gated data.
-    ReplicatedInsert,
-}
-
-/// v50.0.0 (CIRISPersist#925 ask 5, CC 3.4.7.3 Clause A) — **`node` is
-/// exclusive.** A key record whose `identity_type` set contains `node` MUST NOT
-/// also contain `agent` or `user`: a key is substrate or actor, never both
-/// (the axis-fusion defect — one key answering both "which node" and "which
-/// agent"). Other co-locations on the substrate side (`canonical`, `steward`,
-/// `substrate_persist`, `witness`, …) stay conformant.
+/// v50.0.0 (CIRISPersist#925 ask 5, CC 3.4.7.3 Clause A); v62.0.0 (CC rc20
+/// 3.4.7.1 / 2.4.1.1, CIRISPersist#1274) — **the identity set rule.**
 ///
-/// Every LOCAL door that writes `identity_type` runs it right after
-/// [`validate_registration_pubkey`]: `put_public_key` (every local mint — NOT
-/// the replicated `Insert`, which admits a key minted elsewhere as gated data,
-/// review M5, [`KeyDoor`]), `adopt_scrub_upgrade` (the replicated `Upgrade` arm,
-/// which CAN change `identity_type`), `supersede_canonical_record` (the
+/// CC 3.4.7.1: "Two pairs MUST NOT cohabit: `node` with `agent`, and `user` or
+/// `accord_holder` with `node` or `agent`. A key is substrate or actor, and a
+/// person's or a machine's, never both." CC 2.4.1.1: "A set that holds `user`
+/// or `accord_holder` together with `node` or `agent` is malformed and
+/// refused."
+///
+/// Two refusals, one rule:
+/// - a set holding `node` with `agent` or `user` keeps its v50 token
+///   [`Error::NodeIdentityNotExclusive`] (`federation_node_identity_not_exclusive`);
+/// - every other person-with-machine pair (`user`+`agent`,
+///   `accord_holder`+`node`, `accord_holder`+`agent`) is
+///   [`Error::IdentitySetMixesPersonAndMachine`]
+///   (`federation_identity_set_mixes_person_and_machine`), new in v62.
+///
+/// Other co-locations (`canonical`, `steward`, `substrate_persist`, `witness`,
+/// …) stay conformant: "Cohabitation is general; those exclusions are its only
+/// exceptions."
+///
+/// It runs on EVERY door that writes `identity_type`, right after
+/// [`validate_registration_pubkey`]: `put_public_key` (a local mint) AND the
+/// replicated `Insert` (v62 removed the review-M5 carve-out and its `KeyDoor`
+/// marker, since the set is malformed wherever it arrives), `adopt_scrub_upgrade`
+/// (the replicated `Upgrade` arm), `supersede_canonical_record` (the
 /// replicated `Supersede` arm), `adopt_genesis_reanchor`,
-/// `seed_genesis_accord_holders`, and the rebind door. A pre-gate fused key is
-/// therefore refused any rewrite of its record — it re-mints — while Clause B
-/// still gates it wherever it already sits. Clause B ([`check_node_agency_admission`](super::admission::check_node_agency_admission))
-/// is unchanged: it still gates fused keys that pre-date this door.
+/// `seed_genesis_accord_holders`, and the rebind door. A key stored before the
+/// rule is refused any rewrite of its record (it re-mints), while Clause B
+/// ([`check_node_agency_admission`](super::admission::check_node_agency_admission))
+/// still gates it wherever it already sits.
 pub fn check_node_identity_exclusive(record: &KeyRecord) -> Result<(), Error> {
     use crate::federation::types::identity_type as it;
     let set = it::parse_set(&record.identity_type);
-    if set.contains(&it::NODE) && (set.contains(&it::AGENT) || set.contains(&it::USER)) {
+    let has = |t: &str| set.contains(&t);
+    if has(it::NODE) && (has(it::AGENT) || has(it::USER)) {
         return Err(Error::NodeIdentityNotExclusive {
+            key_id: record.key_id.clone(),
+            identity_type: record.identity_type.clone(),
+        });
+    }
+    let person = has(it::USER) || has(it::ACCORD_HOLDER);
+    let machine = has(it::NODE) || has(it::AGENT);
+    if person && machine {
+        return Err(Error::IdentitySetMixesPersonAndMachine {
             key_id: record.key_id.clone(),
             identity_type: record.identity_type.clone(),
         });
@@ -1370,9 +1485,17 @@ pub fn check_node_identity_unchanged(
 /// proof-of-possession gate MUST NOT pre-empt them (it would reject a
 /// co-scrubbed canonical for lacking a self-PoP). E2 guards only the
 /// ungated peer-key insert path — "the paths that don't verify at all".
+///
+/// v62.0.0 (CC rc20 8.11.27, #1274) — the canonical leg asks whether the
+/// record NAMES the conferral in the earlier form
+/// ([`names_canonical_conferral`](super::admission::names_canonical_conferral)),
+/// which `check_canonical_role_admission` then verifies at the same door. A
+/// forward-form record ({`node`} + `infra:serve` + a co-scrub) is not gated
+/// there, so it keeps this E2 PoP gate: its base scrub verifies here, and its
+/// co-scrub is verified by every reader of the standing.
 pub fn record_is_role_gated(record: &KeyRecord) -> bool {
     use crate::federation::types::identity_type as it;
-    record.claims_role(it::CANONICAL)
+    super::admission::names_canonical_conferral(record)
         || record.claims_role(it::ACCORD_HOLDER)
         || record.claims_role("infra:attest")
         || it::CO_STEWARD_ROLES.iter().any(|r| record.claims_role(r))

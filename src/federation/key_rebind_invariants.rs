@@ -245,21 +245,31 @@ pub(crate) mod bodies {
             "I100: no second history row"
         );
         // The store step itself, called PAST the plan, re-asserts what it can:
-        // a swapped pubkey and a changed claim are `Conflict`, the row untouched.
+        // a swapped pubkey and a changed claim are typed key-record conflicts
+        // (v62.0.0, #1274: each was an untyped `Conflict`), the row untouched.
         let mut swapped = bound_record(&k, USER, "r2");
         // (The fixture seeds from the FIRST 32 bytes of a key id; a suffix on
         // a long id changes nothing, so the other identity is a prefix.)
         swapped.pubkey_ed25519_base64 = ts::hybrid_pubkeys(&format!("other-{k}")).0;
         let r = d.store_rebound_key_record(signed(swapped)).await;
         assert!(
-            matches!(r, Err(Error::Conflict(_))),
+            matches!(
+                r,
+                Err(Error::KeyRecordConflict {
+                    reason: crate::federation::register::KeyRecordConflictReason::PubkeyChange,
+                    ..
+                })
+            ),
             "I100: the store step refuses a pubkey swap on its own: {r:?}"
         );
         assert!(
             matches!(
                 d.store_rebound_key_record(signed(bound_record(&k, NODE, "r3")))
                     .await,
-                Err(Error::Conflict(_))
+                Err(Error::KeyRecordConflict {
+                    reason: crate::federation::register::KeyRecordConflictReason::ClaimDiffers,
+                    ..
+                })
             ),
             "I100: the store step refuses a changed claim on its own"
         );

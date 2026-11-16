@@ -1165,10 +1165,9 @@ where
 pub(crate) enum KeyRecordWrite<'a> {
     /// `put_public_key` (a local mint) and the replicated `Insert` arm.
     Put {
-        /// The record as offered.
+        /// The record as offered. v62.0.0: both insert doors run the same
+        /// gates (CC rc20 3.4.7.1), so the write names no door.
         record: KeyRecord,
-        /// Which of the two insert doors (CC 3.4.7.3 Clause A gates minting).
-        door: super::register::KeyDoor,
     },
     /// The genesis seed of one baked accord-holder record (CIRISPersist#347):
     /// every insert invariant but the fresh-nonce hardware gate; a held
@@ -1443,15 +1442,15 @@ fn admit_consent_role(row: &mut KeyRecord) -> Result<(), Error> {
 async fn plan_key_put(
     dir: &dyn super::FederationDirectory,
     mut row: KeyRecord,
-    door: super::register::KeyDoor,
     received_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<KeyRecordPlan, Error> {
     super::canonical_at_rest::canonicalize_in_place(&mut row.registration_envelope)?;
     super::admission::lift_envelope_attested_roles(&mut row);
     super::register::validate_registration_pubkey(&row)?;
-    if door == super::register::KeyDoor::LocalMint {
-        super::register::check_node_identity_exclusive(&row)?;
-    }
+    // v62.0.0 (CC rc20 3.4.7.1, #1274) — the identity set rule on BOTH doors:
+    // "a set that holds `user` or `accord_holder` together with `node` or
+    // `agent` is malformed and refused" (CC 2.4.1.1), wherever it arrives.
+    super::register::check_node_identity_exclusive(&row)?;
     dir.hardware_attestation_policy()
         .admit_key_record(&row, received_at)?;
     admit_consent_role(&mut row)?;
@@ -1463,10 +1462,21 @@ async fn plan_key_put(
     check_key_record_columns(&row, "")?;
     match dir.lookup_public_key(&row.key_id).await? {
         Some(held) if held.persist_row_hash == row.persist_row_hash => Ok(KeyRecordPlan::Settled),
-        Some(_) => Err(Error::Conflict(format!(
-            "key_id {} already exists with different content",
-            row.key_id
-        ))),
+        // v62.0.0 (#1274) — typed: a different record over the SAME pubkeys
+        // (the key re-registered) is told apart from a pubkey swap.
+        Some(held) => {
+            let swap = held.pubkey_ed25519_base64 != row.pubkey_ed25519_base64
+                || held.pubkey_ml_dsa_65_base64 != row.pubkey_ml_dsa_65_base64;
+            Err(super::register::key_record_conflict(
+                &row.key_id,
+                if swap {
+                    super::register::KeyRecordConflictReason::PubkeyChange
+                } else {
+                    super::register::KeyRecordConflictReason::SameKeyDifferentRecord
+                },
+                "already exists with different content",
+            ))
+        }
         None => Ok(KeyRecordPlan::Write(Box::new(PlannedKeyRecord::Insert {
             record: row,
             on_held: OnHeld::Conflict,
@@ -1760,9 +1770,8 @@ pub(crate) async fn plan_key_record_write(
 ) -> Result<KeyRecordPlan, Error> {
     // Each arm propagates, so the parity scan follows it (#934).
     Ok(match write {
-        KeyRecordWrite::Put { record, door } => {
-            plan_key_put(dir, record, door, received_at).await?
-        }
+        // v62.0.0 (#1274) — both insert doors plan alike.
+        KeyRecordWrite::Put { record } => plan_key_put(dir, record, received_at).await?,
         KeyRecordWrite::SeedGenesis { record } => plan_key_seed(record)?,
         KeyRecordWrite::ScrubUpgrade { record } => {
             plan_key_scrub_upgrade(dir, record, received_at).await?
@@ -1873,10 +1882,13 @@ where
             Error::NodeIdentityNotExclusive { .. } => Ok(O::Refused {
                 reason: KeyRefusalReason::NodeIdentityFused,
             }),
+            Error::IdentitySetMixesPersonAndMachine { .. } => Ok(O::Refused {
+                reason: KeyRefusalReason::IdentitySetMixed,
+            }),
             Error::NodeIdentityImmutable { .. } => Ok(O::Refused {
                 reason: KeyRefusalReason::NodeIdentityChanged,
             }),
-            Error::Conflict(_) => Ok(RACED),
+            Error::Conflict(_) | Error::KeyRecordConflict { .. } => Ok(RACED),
             e => Err(e),
         }
     };
@@ -1896,14 +1908,13 @@ where
                     });
                 }
             }
-            let write = KeyRecordWrite::Put {
-                record,
-                door: super::register::KeyDoor::ReplicatedInsert,
-            };
+            let write = KeyRecordWrite::Put { record };
+            // v62.0.0 (CC rc20 3.4.7.1) — the identity set rule now gates
+            // this door too; its refusal is TYPED like the other arms', so
+            // the replication cursor advances past a malformed set.
             return match key_record_write_planned(dir, write).await {
                 Ok(_) => Ok(O::Inserted),
-                Err(Error::Conflict(_)) => Ok(RACED),
-                Err(e) => Err(e),
+                Err(e) => typed(e),
             };
         }
         P::RehydrateScrubs => (

@@ -45,6 +45,18 @@
 //! or kept different randomised ML-DSA bytes, name it alike (CC 2.6.1.8,
 //! built so v62 changes the encoding and not the mechanism).
 //!
+//! **The name, at CC rc20 (v62.0.0, CIRISPersist#1274).** CC rc20's
+//! `cosign:{state}` fold keys on `event_row_id,attesting_key_id` (CC 8.x,
+//! citing CC 3.1.3): the edition-2 name of the act, the event's row id of
+//! CC 2.6.1.3. On today's earlier-form wire the act is named by the quorum
+//! key, and CC 8.11.18 keeps that name: "A `cosign:{state}` row … of the
+//! earlier form names its event by the event's **quorum key**". So every
+//! `quorum_key` here stays: the signature row's member [`field::QUORUM_KEY`]
+//! is an earlier-form wire member, and `quorum_key` is a V214 column on both
+//! backends. Persist holds no fold text that spells the token. The rename
+//! arrives with the edition-2 row id, which is a different digest (CC
+//! 2.6.1.3), not a re-spelling of this one.
+//!
 //! A cosignature is over the event's own signing bytes, the same bytes the
 //! primary signed. A vote signed over its own row (the `objection:assent`
 //! family) is never read as one.

@@ -3234,44 +3234,36 @@ impl SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(e.to_string()))
     }
 
-    /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
-    /// founding bootstrap servers**: `federation_keys` rows whose
-    /// `identity_type` **set** contains
-    /// [`crate::federation::types::identity_type::CANONICAL`], stable-sorted by
-    /// `key_id`. Every such row is (by the admission gate
-    /// [`crate::federation::admission::check_canonical_role_admission`])
-    /// necessarily anchor-scrub-conferred — the role cannot be self-claimed.
-    /// Inherent on the backend (dispatched by `Engine::list_canonical_servers`)
-    /// to avoid `FederationDirectory`/capsule bloat, mirroring
-    /// the key-record doors. The SQL `LIKE` is a coarse prefilter; the
-    /// exact set-membership check is applied in Rust via `set_contains`.
+    /// v13.0.0 (CIRISPersist#372) — enumerate the **canonical / founding
+    /// bootstrap servers**, stable-sorted by `key_id`.
+    ///
+    /// v62.0.0 (CC rc20 4.2.1 / 3.4.7.1, CIRISPersist#1274) — a server is
+    /// canonical by the accord's conferral, never by `identity_type`: the SQL
+    /// reads the node-bearing candidates (the earlier-form `canonical,node` and
+    /// the forward-form {`node`} alike), and each is kept only when its stored
+    /// record holds the conferral
+    /// ([`holds_canonical_conferral`](crate::federation::admission::holds_canonical_conferral):
+    /// it presents one and its stored co-scrub verifies). A `canonical` label
+    /// alone is inert. Inherent on the backend (dispatched by
+    /// `Engine::list_canonical_servers`); the same rule on both backends.
     pub async fn list_canonical_servers(
         &self,
     ) -> Result<Vec<crate::federation::KeyRecord>, crate::federation::Error> {
-        self.read(move |conn| -> Result<Vec<crate::federation::KeyRecord>, rusqlite::Error> {
+        let ids: Vec<String> = self
+            .read(move |conn| -> Result<Vec<String>, rusqlite::Error> {
                 let mut stmt = conn.prepare(
-                    "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
-                        identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
-                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                        attestation_evidence \
-                     FROM federation_keys WHERE identity_type LIKE '%canonical%' \
+                    "SELECT key_id FROM federation_keys \
+                     WHERE identity_type LIKE '%canonical%' OR identity_type LIKE '%node%' \
                      ORDER BY key_id",
                 )?;
-                let rows = stmt.query_map([], sqlite_row_to_key_record)?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
                 rows.collect()
-            }).await
-        .map_err(|e| crate::federation::Error::Backend(format!("list_canonical_servers: {e}")))
-        .map(|rows: Vec<crate::federation::KeyRecord>| {
-            rows.into_iter()
-                .filter(|r| {
-                    crate::federation::types::identity_type::set_contains(
-                        &r.identity_type,
-                        crate::federation::types::identity_type::CANONICAL,
-                    )
-                })
-                .collect()
-        })
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_canonical_servers: {e}"))
+            })?;
+        crate::federation::admission::canonical_servers_among(self, ids).await
     }
 }
 
@@ -3880,7 +3872,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             self,
             crate::federation::key_plane::KeyRecordWrite::Put {
                 record: record.record,
-                door: crate::federation::register::KeyDoor::LocalMint,
             },
         )
         .await?;
@@ -23528,13 +23519,11 @@ impl crate::derived::DerivedSchema for SqliteBackend {
 
 // ─── Tests ─────────────────────────────────────────────────────────
 
-/// v50.0.0 (CIRISPersist#925 review M5) — the key-record store step, with the
-/// door it was reached through: `put_public_key` is the local mint
-/// ([`KeyDoor::LocalMint`](crate::federation::register::KeyDoor::LocalMint));
-/// the replicated `Insert` arm stores a key minted elsewhere
-/// ([`KeyDoor::ReplicatedInsert`](crate::federation::register::KeyDoor::ReplicatedInsert)).
-/// Every gate is the same on both except CC 3.4.7.3 Clause A, which gates
-/// minting only.
+/// v50.0.0 (CIRISPersist#925 review M5) — the key-record store step.
+/// v62.0.0 (CC rc20 3.4.7.1, CIRISPersist#1274): `put_public_key` (a local
+/// mint) and the replicated `Insert` arm (a key minted elsewhere) run the same
+/// gates, the identity set rule included; the door marker that once told them
+/// apart is gone.
 impl SqliteBackend {
     /// v58.0.0 (CIRISPersist#991, CC 3.1.3) — **the lazy rehome**, once per
     /// backend, at the first key-plane write: every projection row written
@@ -32519,7 +32508,13 @@ mod tests {
             .put_public_key(SignedKeyRecord { record: key2 })
             .await
             .unwrap_err();
-        assert!(matches!(err, crate::federation::Error::Conflict(_)));
+        // v62.0.0 (#1274) — typed; both keys share pubkeys, so it is the same
+        // key with another record, not a swap.
+        assert!(matches!(
+            err,
+            crate::federation::Error::KeyRecordConflict { .. }
+        ));
+        assert!(err.is_duplicate_key());
     }
 
     #[tokio::test]
@@ -33889,15 +33884,18 @@ mod tests {
         backend.run_migrations().await.unwrap();
         // #848 — the fixture node IS the minter of every epoch it mints.
         backend.set_node_key_id("comm-node");
-        let mut comm_key = fed_key("comm", "comm", "comm");
-        if comm_authorized {
-            comm_key.identity_type =
-                crate::federation::types::identity_type::SUBSTRATE_PERSIST.into();
+        // v62.0.0 (CC rc20 3.4.7.1 / 3.2, #1274) — an authorized
+        // infrastructure community is a conformant record rooted in this
+        // node's trust set; the community key's type confers nothing. The
+        // authorized fixture is stood up as a rooted trust-root room below.
+        if !comm_authorized {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key("comm", "comm", "comm"),
+                })
+                .await
+                .unwrap();
         }
-        backend
-            .put_public_key(SignedKeyRecord { record: comm_key })
-            .await
-            .unwrap();
         let mut member_idents = Vec::new();
         for (ident, occ, keyed) in members {
             for k in [*ident, *occ] {
@@ -33918,6 +33916,16 @@ mod tests {
                 .await
                 .unwrap();
             member_idents.push(*ident);
+        }
+        if comm_authorized {
+            crate::federation::canonical_community_invariants::bodies::rooted_infrastructure_room(
+                &backend as &dyn crate::federation::FederationDirectory,
+                "comm",
+                &member_idents,
+                "comm",
+            )
+            .await;
+            return backend;
         }
         crate::federation::tier_ingest::test_support::register_fixture_infrastructure_founder(
             &backend,
@@ -48088,13 +48096,26 @@ mod tests {
         cohort_subkind: Option<&str>,
         comm_authorized: bool,
     ) -> Result<(), crate::federation::Error> {
-        let mut comm_key = fed_key(community_id, community_id, community_id);
-        if comm_authorized {
-            comm_key.identity_type =
-                crate::federation::types::identity_type::SUBSTRATE_PERSIST.into();
+        // v62.0.0 (CC rc20 3.4.7.1 / 3.2, #1274) — an authorized
+        // infrastructure community is a conformant record rooted in this
+        // node's trust set ("A node or agent key MUST be steward-bound before
+        // it is admitted to any community that is not `infrastructure`"); the
+        // community key's type confers nothing. The authorized fixture is a
+        // rooted trust-root room with `members` seated.
+        if comm_authorized && cohort_subkind == Some("infrastructure") {
+            crate::federation::canonical_community_invariants::bodies::rooted_infrastructure_room(
+                backend as &dyn crate::federation::FederationDirectory,
+                community_id,
+                &members,
+                community_id,
+            )
+            .await;
+            return Ok(());
         }
         backend
-            .put_public_key(SignedKeyRecord { record: comm_key })
+            .put_public_key(SignedKeyRecord {
+                record: fed_key(community_id, community_id, community_id),
+            })
             .await
             .unwrap();
         crate::federation::tier_ingest::test_support::register_fixture_infrastructure_founder(

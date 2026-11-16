@@ -1167,35 +1167,26 @@ mod engine_bodies {
         infra_room_of(l, run, tag, &l.alice).await
     }
 
-    /// [`infra_room`] founded by `founder` (its only member).
+    /// [`infra_room`] with `founder` seated (v62: as a member of a rooted
+    /// infrastructure room, whose founders are the trust root's stewards).
     async fn infra_room_of<B>(l: &Ladder<B>, run: &str, tag: &str, founder: &str) -> String
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
-        use crate::federation::tier_ingest::test_support as ts;
-        use crate::federation::types::{identity_type, Community, CommunityMember};
+        // v62.0.0 (CC rc20 3.4.7.1 / 3.2, #1274) — the carve-out needs a
+        // conformant infrastructure record rooted in this node's trust set;
+        // a self-claimed `substrate_persist` room key no longer opens it.
+        // `founder` reads the room as a member (human founders are the
+        // accord-conferred stewards the trust root seats).
         let room = format!("em-infra-{tag}-{run}");
         let ba = l.ba.as_ref();
-        ts::register_hybrid_key_as(ba, &room, &room, identity_type::SUBSTRATE_PERSIST).await;
-        let joined = chrono::Utc::now() - chrono::Duration::days(3);
-        let c = Community {
-            prev_head_digest: String::new(),
-            charter_digest: String::new(),
-            community_key_id: room.clone(),
-            community_name: "infra".into(),
-            members: vec![CommunityMember {
-                key_id: founder.to_owned(),
-                joined_at: joined,
-                role: Some("founder".into()),
-            }],
-            founded_at: joined,
-            consensus_protocol: "quorum:1/1".into(),
-            policy_blob: Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
-            persist_row_hash: String::new(),
-        };
-        ba.put_community(ts::sign_community(founder, c))
-            .await
-            .unwrap_or_else(|e| panic!("the infrastructure room {room}: {e}"));
+        crate::federation::canonical_community_invariants::bodies::rooted_infrastructure_room(
+            ba as &dyn FederationDirectory,
+            &room,
+            &[founder],
+            &format!("{tag}-{run}"),
+        )
+        .await;
         room
     }
 
@@ -1506,17 +1497,49 @@ mod engine_bodies {
             Some(room_a.as_str()),
             "I605 precondition: the row's columns name room A only"
         );
-        // Both rooms lose their infrastructure standing: each founder
-        // supersedes its record without the label.
-        for (room, founder) in [(&room_a, &l.alice), (&room_b, &bob)] {
-            let held = ba.lookup_community(room).await.unwrap().expect("held");
-            let mut next = held.clone();
-            next.policy_blob = None;
-            next.prev_head_digest = held.persist_row_hash.clone();
-            next.persist_row_hash = String::new();
-            ba.supersede_community(ts::sign_community(founder, next), None)
+        // Both rooms lose their infrastructure standing ON NODE A.
+        // v62.0.0 (CC rc20 3.2 / 4.4.3.34, #1274): an infrastructure room is a
+        // trust-root record that cannot drop its grade, and its carve-out
+        // holds only while it roots in THIS node's trust set. Until v62 each
+        // founder superseded its record without the label; now node A
+        // re-roots: its own trust edge names another root, so neither
+        // accord-rooted room is authorized here any more.
+        {
+            use crate::federation::envelope::EnvelopeCore;
+            use crate::federation::EmitAttestationInput;
+            let other_root = format!("em-other-root-{run}");
+            ts::register_hybrid_key_as(
+                ba,
+                &other_root,
+                &other_root,
+                crate::federation::types::identity_type::USER,
+            )
+            .await;
+            let core = EnvelopeCore::from_value(serde_json::json!({
+                "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
+            }))
+            .unwrap();
+            let mut input = EmitAttestationInput::with_envelope(
+                crate::federation::types::attestation_type::DELEGATES_TO,
+                core,
+                crate::federation::types::cohort_scope::FEDERATION,
+            );
+            input.attested_key_id = Some(other_root);
+            e.emit_attestation_self(input)
                 .await
-                .unwrap_or_else(|e| panic!("I605 {founder} supersedes {room}: {e}"));
+                .expect("I605: node A's trust edge to another root");
+            for room in [&room_a, &room_b] {
+                let held = ba.lookup_community(room).await.unwrap().expect("held");
+                assert!(
+                    !crate::federation::admission::is_authorized_infrastructure_community(
+                        ba as &dyn FederationDirectory,
+                        &held
+                    )
+                    .await
+                    .unwrap(),
+                    "I605: re-rooted, node A no longer authorizes {room}"
+                );
+            }
         }
         // The premise: the two rooms now reach DIFFERENT nodes.
         for (room, has, lacks) in [

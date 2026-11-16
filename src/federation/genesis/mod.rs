@@ -1172,7 +1172,6 @@ pub async fn verify_canonical_seeded<D>(dir: &D) -> Result<(), GenesisFault>
 where
     D: super::FederationDirectory + ?Sized,
 {
-    use crate::federation::types::identity_type;
     const LEG: GenesisLeg = GenesisLeg::Canonical;
     for sr in &canonical_genesis_bundle().serve_nodes {
         let r = &sr.record;
@@ -1192,11 +1191,22 @@ where
                 ),
             ));
         }
-        if !identity_type::set_contains(&row.identity_type, identity_type::CANONICAL) {
+        // v62.0.0 (CC rc20 4.2.1 / 3.4.7.1, #1274) — the standing is the
+        // accord's conferral, read from the stored scrub set, never the
+        // `canonical` label in `identity_type` (inert on its own).
+        let conferred = crate::federation::admission::holds_canonical_conferral(
+            dir.as_dyn_directory(),
+            &row,
+            &crate::federation::admission::accord_holder_roster_key_ids(),
+        )
+        .await
+        .map_err(|e| GenesisFault::unreadable(LEG, format!("conferral {}: {e}", r.key_id)))?;
+        if !conferred {
             return Err(GenesisFault::divergent(
                 LEG,
                 format!(
-                    "seeded canonical server {} lost its `canonical` role (identity_type={:?})",
+                    "seeded canonical server {} lost its canonical conferral (the accord's \
+                     co-scrub over its record does not verify; identity_type={:?})",
                     r.key_id, row.identity_type
                 ),
             ));

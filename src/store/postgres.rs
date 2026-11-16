@@ -48,13 +48,11 @@ use super::types::{TraceEventRow, TraceLlmCallRow};
 use super::Error;
 use crate::schema::ReasoningEventType;
 
-/// v50.0.0 (CIRISPersist#925 review M5) — the key-record store step, with the
-/// door it was reached through: `put_public_key` is the local mint
-/// ([`KeyDoor::LocalMint`](crate::federation::register::KeyDoor::LocalMint));
-/// the replicated `Insert` arm stores a key minted elsewhere
-/// ([`KeyDoor::ReplicatedInsert`](crate::federation::register::KeyDoor::ReplicatedInsert)).
-/// Every gate is the same on both except CC 3.4.7.3 Clause A, which gates
-/// minting only.
+/// v50.0.0 (CIRISPersist#925 review M5) — the key-record store step.
+/// v62.0.0 (CC rc20 3.4.7.1, CIRISPersist#1274): `put_public_key` (a local
+/// mint) and the replicated `Insert` arm (a key minted elsewhere) run the same
+/// gates, the identity set rule included; the door marker that once told them
+/// apart is gone.
 impl PostgresBackend {
     /// v50.0.0 (PR #921 review) — the test-only hook table (see
     /// [`crate::store::test_hooks`]).
@@ -9371,17 +9369,18 @@ impl PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))
     }
 
-    /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
-    /// founding bootstrap servers**: `federation_keys` rows whose
-    /// `identity_type` **set** contains
-    /// [`crate::federation::types::identity_type::CANONICAL`], stable-sorted by
-    /// `key_id`. Every such row is (by the admission gate
-    /// [`crate::federation::admission::check_canonical_role_admission`])
-    /// necessarily anchor-scrub-conferred — the role cannot be self-claimed.
-    /// Inherent on the backend (dispatched by `Engine::list_canonical_servers`)
-    /// to avoid `FederationDirectory`/capsule bloat, mirroring
-    /// the key-record doors. The SQL `LIKE` is a coarse prefilter; the
-    /// exact set-membership check is applied in Rust via `set_contains`.
+    /// v13.0.0 (CIRISPersist#372) — enumerate the **canonical / founding
+    /// bootstrap servers**, stable-sorted by `key_id`.
+    ///
+    /// v62.0.0 (CC rc20 4.2.1 / 3.4.7.1, CIRISPersist#1274) — a server is
+    /// canonical by the accord's conferral, never by `identity_type`: the SQL
+    /// reads the node-bearing candidates (the earlier-form `canonical,node` and
+    /// the forward-form {`node`} alike), and each is kept only when its stored
+    /// record holds the conferral
+    /// ([`holds_canonical_conferral`](crate::federation::admission::holds_canonical_conferral):
+    /// it presents one and its stored co-scrub verifies). A `canonical` label
+    /// alone is inert. Inherent on the backend (dispatched by
+    /// `Engine::list_canonical_servers`); the same rule on both backends.
     pub async fn list_canonical_servers(
         &self,
     ) -> Result<Vec<crate::federation::KeyRecord>, crate::federation::Error> {
@@ -9391,12 +9390,8 @@ impl PostgresBackend {
             .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
-                "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
-                    identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
-                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence \
-                 FROM cirislens.federation_keys WHERE identity_type LIKE '%canonical%' \
+                "SELECT key_id FROM cirislens.federation_keys \
+                 WHERE identity_type LIKE '%canonical%' OR identity_type LIKE '%node%' \
                  ORDER BY key_id",
                 &[],
             )
@@ -9404,19 +9399,15 @@ impl PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_canonical_servers: {e}"))
             })?;
-        let recs: Vec<crate::federation::KeyRecord> = rows
-            .into_iter()
-            .map(pg_row_to_key_record)
-            .collect::<Result<_, _>>()?;
-        Ok(recs
-            .into_iter()
-            .filter(|r| {
-                crate::federation::types::identity_type::set_contains(
-                    &r.identity_type,
-                    crate::federation::types::identity_type::CANONICAL,
-                )
-            })
-            .collect())
+        drop(client);
+        let ids: Vec<String> = rows
+            .iter()
+            .map(|r| r.safe_get::<String, _>("key_id"))
+            .collect::<Result<_, _>>()
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_canonical_servers: {e}"))
+            })?;
+        crate::federation::admission::canonical_servers_among(self, ids).await
     }
 }
 
@@ -10161,7 +10152,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             self,
             crate::federation::key_plane::KeyRecordWrite::Put {
                 record: record.record,
-                door: crate::federation::register::KeyDoor::LocalMint,
             },
         )
         .await?;
@@ -36519,14 +36509,6 @@ mod tests {
             if kid == &alice || kid == &bob {
                 record.identity_type = crate::federation::types::identity_type::USER.into();
             }
-            // SecReview F2: the infra opt-out is honored only when the
-            // community's OWN key is the `substrate_persist` governance
-            // authority — stamp the infra community's key so the opt-out arm
-            // below exercises the AUTHORIZED carve-out.
-            if kid == &infra {
-                record.identity_type =
-                    crate::federation::types::identity_type::SUBSTRATE_PERSIST.into();
-            }
             backend
                 .put_public_key(crate::federation::SignedKeyRecord { record })
                 .await
@@ -36652,14 +36634,16 @@ mod tests {
                 && e.detail.get("cohort_scope").and_then(|v| v.as_str()) == Some(COMMUNITY)));
 
         // ── infrastructure community opts OUT (no DEK; cascade refuses).
-        backend
-            .put_community(community(
-                &infra,
-                vec![&alice],
-                Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
-            ))
-            .await
-            .unwrap();
+        // v62.0.0 (CC rc20 3.4.7.1 / 3.2, #1274) — AUTHORIZED means a
+        // conformant record rooted in this node's trust set, never a key type:
+        // the infra community is a rooted trust-root room with alice seated.
+        crate::federation::canonical_community_invariants::bodies::rooted_infrastructure_room(
+            &backend as &dyn crate::federation::FederationDirectory,
+            &infra,
+            &[&alice],
+            &infra,
+        )
+        .await;
         assert!(matches!(
             encrypt_and_cascade_community(&backend, &infra, b"root", None, None)
                 .await

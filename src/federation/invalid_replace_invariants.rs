@@ -221,7 +221,14 @@ pub(crate) mod bodies {
             .store_invalid_replaced_key_record(signed(valid(&kv, "b")))
             .await;
         assert!(
-            matches!(r, Err(Error::Conflict(_))),
+            matches!(
+                r,
+                Err(crate::federation::Error::KeyRecordConflict {
+                    reason:
+                        crate::federation::register::KeyRecordConflictReason::StoredRecordVerifies,
+                    ..
+                })
+            ),
             "I617: the store step refuses to replace a row that verifies: {r:?}"
         );
         assert_eq!(
@@ -319,7 +326,14 @@ pub(crate) mod bodies {
             .store_invalid_replaced_key_record(signed(by_stranger))
             .await;
         assert!(
-            matches!(r, Err(Error::Conflict(_))),
+            matches!(
+                r,
+                Err(crate::federation::Error::KeyRecordConflict {
+                    reason:
+                        crate::federation::register::KeyRecordConflictReason::NotReplaceableHere,
+                    ..
+                })
+            ),
             "I620: the store step refuses the stranger's signature: {r:?}"
         );
         let now = d.lookup_public_key(&k).await.unwrap().unwrap();
@@ -511,7 +525,14 @@ mod run {
         );
         let r = d.store_invalid_replaced_key_record(signed(incoming)).await;
         assert!(
-            matches!(r, Err(crate::federation::Error::Conflict(_))),
+            matches!(
+                r,
+                Err(crate::federation::Error::KeyRecordConflict {
+                    reason:
+                        crate::federation::register::KeyRecordConflictReason::NotReplaceableHere,
+                    ..
+                })
+            ),
             "I621: the store step refuses a role-gated row: {r:?}"
         );
         assert_eq!(

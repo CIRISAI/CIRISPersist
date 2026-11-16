@@ -58,9 +58,11 @@ pub mod bodies {
         }
     }
 
-    /// An AUTHORIZED infrastructure room id (its key is `substrate_persist`),
-    /// so the steward-binding carve-out applies and only the #925/#927 gates
-    /// can refuse a node member.
+    /// The infrastructure room's own key, registered as `substrate_persist`
+    /// (the v61 fixture shape). v62.0.0 (CC rc20 3.4.7.1, #1274): this no
+    /// longer AUTHORIZES the room — the carve-out is a conformant record
+    /// rooted in this node's trust set — so a witness needing an unstewarded
+    /// node member steward-binds it.
     async fn authorized_room_key(d: &dyn FederationDirectory, room: &str) {
         ts::register_hybrid_key_as(d, room, room, it::SUBSTRATE_PERSIST).await;
     }
@@ -325,6 +327,27 @@ pub mod bodies {
         // an occurrence of is — and the occurrence signed that binding itself.
         ts::register_hybrid_key_as(d, &relay_occ, &relay_occ, it::PRIMITIVE).await;
         occurrence_of(d, &relay_identity, &relay_occ).await;
+        // v62.0.0 (CC rc20 3.2, #1274) — `authorized_room_key` no longer makes
+        // the room an authorized infrastructure community (a self-claimed
+        // `substrate_persist` key confers nothing; CC 3.4.7.1), so the room's
+        // node members are steward-bound by the human, as CC 3.2 requires of
+        // a node in any community that is not an authorized infrastructure
+        // one. The #925 gates under test are unchanged.
+        for node in [&install, &late] {
+            d.put_attestation(SignedAttestation {
+                attestation: signed_row(
+                    &human,
+                    node,
+                    attestation_type::DELEGATES_TO,
+                    serde_json::json!({
+                        "id": uuid::Uuid::new_v4().to_string(),
+                        "scope": ["infra:serve"],
+                    }),
+                ),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: steward-bind {node}: {e}"));
+        }
 
         // (1) the record door — the key's own set holds `node`.
         let room = format!("root-{tag}");
@@ -960,14 +983,19 @@ pub mod bodies {
         );
     }
 
-    /// **#925 review M5 — the replicated `Insert` admits a fused key minted
-    /// elsewhere** (gated data: Clause B and the steward gates apply wherever
-    /// it acts), while a local mint of the same shape is refused. Every
-    /// outcome of the replicated door is TYPED (`Ok`), so the caller's
-    /// replication cursor records it and advances — a refusal is never an
-    /// `Err` that would be re-polled: a pubkey swap over the admitted key is
-    /// `Refused { pubkey_swap }`.
-    pub async fn clause_a_replicated_insert_admits_a_fused_key(
+    /// **#925 review M5, reversed by CC rc20 — the replicated `Insert` REFUSES
+    /// a fused key minted elsewhere**, as the local mint does.
+    ///
+    /// Until v61 this witness was `clause_a_replicated_insert_admits_a_fused_key`:
+    /// the replicated insert admitted a fused set as gated data. CC rc20 3.4.7.1
+    /// ("Two pairs MUST NOT cohabit: `node` with `agent`, and `user` or
+    /// `accord_holder` with `node` or `agent`") and CC 2.4.1.1 ("A set that holds
+    /// `user` or `accord_holder` together with `node` or `agent` is malformed and
+    /// refused") make the set malformed wherever it arrives, so the carve-out
+    /// goes (v62.0.0, CIRISPersist#1274). The refusal is still TYPED (`Ok`), so
+    /// the caller's replication cursor records it and advances: it is never an
+    /// `Err` that would be re-polled. Nothing is stored.
+    pub async fn clause_a_replicated_insert_refuses_a_fused_key(
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
@@ -982,29 +1010,14 @@ pub mod bodies {
             .unwrap_or_else(|e| panic!("{tag}: M5 — the replicated insert is typed: {e}"));
         assert_eq!(
             out,
-            ReplicatedKeyOutcome::Inserted,
-            "{tag}: admitted as data"
-        );
-        assert_eq!(
-            d.lookup_public_key(&remote)
-                .await
-                .unwrap()
-                .unwrap()
-                .identity_type,
-            fused
-        );
-        let mut swapped = ts::replicated_key_record(&remote, &fused, &remote, &remote, "n2");
-        let (other_ed, _) = ts::hybrid_pubkeys(&format!("other-{tag}"));
-        swapped.pubkey_ed25519_base64 = other_ed;
-        let out = d
-            .apply_replicated_key_record(SignedKeyRecord { record: swapped })
-            .await
-            .unwrap_or_else(|e| panic!("{tag}: a refusal is typed, never an Err: {e}"));
-        assert_eq!(
-            out,
             ReplicatedKeyOutcome::Refused {
-                reason: KeyRefusalReason::PubkeySwap
-            }
+                reason: KeyRefusalReason::NodeIdentityFused
+            },
+            "{tag}: CC 3.4.7.1 — refused at the replicated insert, typed"
+        );
+        assert!(
+            d.lookup_public_key(&remote).await.unwrap().is_none(),
+            "{tag}: nothing is stored"
         );
         let local = format!("local-fused-{tag}");
         let err = d
@@ -2287,7 +2300,7 @@ mod runners {
                 case!(infrastructure_founder_count_is_fixed_by_the_record);
                 case!(replicated_supersede_never_degrades_a_conformant_room);
                 case!(local_withdraws_records_its_depth);
-                case!(clause_a_replicated_insert_admits_a_fused_key);
+                case!(clause_a_replicated_insert_refuses_a_fused_key);
                 // PR #921 review (Codex).
                 case!(f3_b_concurrent_applies_report_one_change);
                 case!(f4_a_zero_depth_reports_the_cut);

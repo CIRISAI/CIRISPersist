@@ -107,6 +107,62 @@ pub(crate) mod bodies {
         holders
     }
 
+    /// v62.0.0 (CC rc20 3.2 / 4.4.3.4, CIRISPersist#1274) — **a conformant,
+    /// ROOTED infrastructure room** for fixtures that need the infrastructure
+    /// carve-out (plaintext at rest, the Commons audience, node members
+    /// without a steward). Until v62 a fixture got the carve-out by
+    /// self-registering the room's key as `substrate_persist`; CC rc20 3.4.7.1
+    /// ("`substrate_persist` is a key type that confers no authority … Nothing
+    /// is admitted on its strength") closed that, and the carve-out now needs a
+    /// conformant record rooted in this node's trust set. So this stands up the
+    /// trust root (the genesis holders under test keys, the accord family,
+    /// three accord-conferred human stewards as founders: "Infrastructure does
+    /// not vote") and puts `room` as a trust-root-grade `quorum:2/3` record,
+    /// co-scrubbed 2-of-3 by the accord, with `members` seated as `member`.
+    /// `tag` keeps the founders' ids distinct per room (their FIRST bytes
+    /// differ: the test signer seeds from the first 32 bytes of a key id).
+    /// Returns the stored record.
+    pub(crate) async fn rooted_infrastructure_room(
+        d: &dyn FederationDirectory,
+        room: &str,
+        members: &[&str],
+        tag: &str,
+    ) -> Community {
+        let holders = ops::register_genesis_accord_roster(d)
+            .await
+            .expect("genesis accord roster");
+        // A second room in one directory finds the family already seeded.
+        let _ = crate::federation::genesis::seed_accord_family(d).await;
+        let founders: Vec<String> = ["us", "eu", "ap"]
+            .iter()
+            .map(|p| format!("{p}-{tag}"))
+            .collect();
+        for f in &founders {
+            put_conferred(d, &holders, f, "user,steward").await;
+        }
+        let refs: Vec<&str> = founders.iter().map(String::as_str).collect();
+        let mut row = canonical_row(&refs);
+        row.community_key_id = room.to_owned();
+        row.community_name = format!("infrastructure {tag}");
+        let joined = row.founded_at;
+        row.members.retain(|m| m.role.as_deref() == Some("founder"));
+        for m in members {
+            row.members.push(CommunityMember {
+                key_id: (*m).to_owned(),
+                joined_at: joined,
+                role: Some("member".to_owned()),
+            });
+        }
+        d.put_community(signed(row, &["A1", "B1"]))
+            .await
+            .unwrap_or_else(|e| panic!("the rooted infrastructure room {room}: {e}"));
+        assert!(
+            cc::is_rooted(d, room).await.unwrap(),
+            "fixture: {room} is rooted"
+        );
+        d.lookup_community(room).await.unwrap().expect("held")
+    }
+
     /// The CC 3.2 worked example as a record.
     pub(crate) fn canonical_row(founders: &[&str]) -> Community {
         let joined = at("2026-09-20T00:00:00Z");
