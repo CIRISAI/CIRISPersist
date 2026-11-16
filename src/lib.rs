@@ -95,6 +95,9 @@ pub mod host;
 #[cfg(feature = "cirisincident")]
 pub mod incident;
 pub mod ingest;
+// v62.0.0 (slice D, P2) — the persister's redb journal and the queue are
+// the lens server's file-backed ingest path, never the Engine's: `queue`.
+#[cfg(feature = "queue")]
 pub mod journal;
 pub mod ledgers;
 #[cfg(feature = "cirislens_legacy_migration")]
@@ -110,6 +113,7 @@ pub mod occurrence;
 pub mod outbound;
 pub mod pipeline;
 pub mod prelude;
+#[cfg(feature = "queue")]
 pub mod queue;
 pub mod read;
 #[cfg(feature = "registry_key_escrows")]
@@ -241,6 +245,7 @@ pub use federation::FederationDirectorySqlite;
 #[cfg(feature = "_pyffi")]
 pub use ffi::pyo3::{current_runtime_handle, current_rust_engine};
 pub use ingest::{BatchSummary, IngestError, IngestPipeline};
+#[cfg(feature = "queue")]
 pub use journal::{Journal, JournalError};
 #[cfg(feature = "sqlite")]
 pub use outbound::EdgeOutboundQueueSqlite;
@@ -248,6 +253,7 @@ pub use outbound::EdgeOutboundQueueSqlite;
 // `host::LifecycleEvent::Shutdown`; the native signal adapter is
 // `ffi::native_host::{os_shutdown_signal, deliver_os_signals}`.
 pub use host::{Lifecycle, LifecycleEvent};
+#[cfg(feature = "queue")]
 pub use queue::{spawn_persister, IngestHandle, PersisterHandle, QueueError, DEFAULT_QUEUE_DEPTH};
 // v2.7.0 (CIRISPersist#107) — retention primitive types. The three
 // Engine methods (`storage_summary`, `delete_traces_older_than`,

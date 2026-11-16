@@ -723,10 +723,6 @@ impl HardwareAttestationPolicy {
         attested_ed25519: Option<&[u8]>,
         a: &AndroidGenerationCustody,
     ) -> Result<HardwareType, Error> {
-        use ciris_verify_core::device_attestation::{
-            verify_android_key_attestation_with_challenge_policy, AndroidChallengePolicy,
-            AndroidSecurityLevel,
-        };
         let refuse = |detail: String| Error::AccordHolderRequiresAttestationEvidence {
             key_id: key_id.to_owned(),
             detail,
@@ -749,12 +745,43 @@ impl HardwareAttestationPolicy {
             .map_err(|e| refuse(format!("android attestation chain is not hex: {e}")))?;
         let chain: Vec<&[u8]> = chain.iter().map(Vec::as_slice).collect();
 
+        let hw = self.walk_android_chain(&leaf, &chain, key, &refuse)?;
+        if !self.accepted_hardware_types.contains(&hw) {
+            let mut accepted: Vec<String> = self
+                .accepted_hardware_types
+                .iter()
+                .map(|t| format!("{t:?}"))
+                .collect();
+            accepted.sort();
+            return Err(Error::HardwareTypeNotAccepted {
+                got: format!("{hw:?}"),
+                accepted,
+            });
+        }
+        Ok(hw)
+    }
+
+    /// v62.0.0 (slice D) — the Android chain walk itself: CIRISVerify's
+    /// `device_attestation`, which is Verify's `host` tier (X.509 + the
+    /// KeyDescription parser), so a NATIVE host's (persist feature `host`).
+    #[cfg(feature = "host")]
+    fn walk_android_chain(
+        &self,
+        leaf: &[u8],
+        chain: &[&[u8]],
+        key: &[u8],
+        refuse: &dyn Fn(String) -> Error,
+    ) -> Result<HardwareType, Error> {
+        use ciris_verify_core::device_attestation::{
+            verify_android_key_attestation_with_challenge_policy, AndroidChallengePolicy,
+            AndroidSecurityLevel,
+        };
         let mut verdict = None;
         let mut last = None;
         for root in &self.android_root_ders {
             match verify_android_key_attestation_with_challenge_policy(
-                &leaf,
-                &chain,
+                leaf,
+                chain,
                 root,
                 key,
                 AndroidChallengePolicy::GenerationOnly,
@@ -775,24 +802,30 @@ impl HardwareAttestationPolicy {
             ),
         })?;
 
-        let hw = match verdict.keymint_security_level {
+        Ok(match verdict.keymint_security_level {
             AndroidSecurityLevel::StrongBox => HardwareType::AndroidStrongbox,
             AndroidSecurityLevel::TrustedEnvironment => HardwareType::AndroidKeystore,
             AndroidSecurityLevel::Software => HardwareType::SoftwareOnly,
-        };
-        if !self.accepted_hardware_types.contains(&hw) {
-            let mut accepted: Vec<String> = self
-                .accepted_hardware_types
-                .iter()
-                .map(|t| format!("{t:?}"))
-                .collect();
-            accepted.sort();
-            return Err(Error::HardwareTypeNotAccepted {
-                got: format!("{hw:?}"),
-                accepted,
-            });
-        }
-        Ok(hw)
+        })
+    }
+
+    /// A node build carries no Android chain walker (Verify's `host` tier):
+    /// the evidence is refused by name, fail closed, never admitted unwalked.
+    #[cfg(not(feature = "host"))]
+    #[allow(clippy::unused_self)]
+    fn walk_android_chain(
+        &self,
+        _leaf: &[u8],
+        _chain: &[&[u8]],
+        _key: &[u8],
+        refuse: &dyn Fn(String) -> Error,
+    ) -> Result<HardwareType, Error> {
+        Err(refuse(
+            "android_chain_walk_unavailable: this build has no Android key-attestation \
+             walker (CIRISVerify's device_attestation is its host tier; persist feature \
+             `host`) — refusing rather than admitting the chain unwalked"
+                .into(),
+        ))
     }
 
     /// v23.1.0 (CIRISPersist#554) — the admissibility decision for

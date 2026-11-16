@@ -1200,6 +1200,39 @@ jobs:
   # Per-ABI matrix Android builds (#99). Each runner builds
   # both the plain .so and the PyO3 Chaquopy abi3 .so for one ABI.
   # Downstream android-package job collects artifacts into tarballs.
+  # v62.0.0 (slice D, readiness P12; CIRISServer FSD/WASM_NODE.md §4.1) — the
+  # NODE build: persist's node feature set (`sqlite,host-abi`) for
+  # wasm32-unknown-unknown. scripts/wasm_node_gate.sh fails on a host-only or
+  # JS-shaped crate/feature in the node graph, on a probe module that does not
+  # link, and on any import outside `ciris:node/*`; `--with-cfg-gate` adds the
+  # from-disk target-cfg gate (I1796 / I1852). The C parts (ring's AEAD, the
+  # SQLite amalgamation) build with the runner's clang (wasm32 backend), else
+  # zig cc.
+  wasm-node-gate:
+    name: wasm node gate (wasm32-unknown-unknown, ciris:node imports only)
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: wasm32-node
+      - name: C compiler for wasm32 (zig when clang lacks the backend)
+        run: |
+          if ! clang --print-targets 2>/dev/null | grep -q wasm32; then
+            python3 -m pip install --user ziglang==0.13.0
+            mkdir -p "$HOME/.local/bin"
+            printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' > "$HOME/.local/bin/zig"
+            chmod +x "$HOME/.local/bin/zig"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+      - name: wasm node gate
+        run: scripts/wasm_node_gate.sh --with-cfg-gate
+
   android-ndk:
     name: android ${{ matrix.abi }}
     needs: tree

@@ -22,7 +22,7 @@
 //! # Canonical signing bytes (§10.5.4 — V3 lock)
 //!
 //! Domain-separated + length-prefixed, matching the
-//! [`SignedTreeHead::signing_bytes`] discipline (u32 **little-endian**
+//! [`SignedTreeHead::signing_bytes`](ciris_verify_core::transparency::SignedTreeHead::signing_bytes) discipline (u32 **little-endian**
 //! length prefix; multi-byte integers little-endian). The byte layout
 //! is the cross-impl interop surface — producer, substrate, and
 //! consumer MUST agree byte-for-byte, so it lives in the single
@@ -45,8 +45,6 @@
 //! same discipline C1b's `verify_stream_sth_signature` uses. No rolled
 //! crypto.
 
-use ciris_verify_core::transparency::SignedTreeHead;
-
 /// Domain-separation tag for the receipt signing bytes (§10.5.4).
 const RECEIPT_SIGNING_DOMAIN: &[u8] = b"ciris-delivery-receipt/v1";
 
@@ -56,7 +54,7 @@ const RECEIPT_SIGNING_DOMAIN: &[u8] = b"ciris-delivery-receipt/v1";
 /// `put_delivery_receipt` takes the receipt as a JSON string).
 /// `chunk_root` serializes as a 32-element byte array; `signature`
 /// reuses the `ciris_crypto::HybridSignature` serde shape shared with
-/// [`SignedTreeHead`].
+/// [`SignedTreeHead`](ciris_verify_core::transparency::SignedTreeHead).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeliveryReceipt {
     /// The stream this receipt is for (`log_id`-equivalent `stream:<id>`
@@ -135,7 +133,7 @@ pub fn try_receipt_signing_bytes(
 
 /// Build the canonical signing bytes for a receipt (§10.5.4 — the sole
 /// place this cross-impl encoding lives). Matches
-/// [`SignedTreeHead::signing_bytes`]: a `u32` little-endian length
+/// [`SignedTreeHead::signing_bytes`](ciris_verify_core::transparency::SignedTreeHead::signing_bytes): a `u32` little-endian length
 /// prefix on each variable field, little-endian multi-byte integers.
 ///
 /// A field longer than `u32::MAX` bytes has no canonical bytes (CC
@@ -177,11 +175,23 @@ pub fn receipt_signing_bytes_of(receipt: &DeliveryReceipt) -> Vec<u8> {
     )
 }
 
-/// Extract the base64 (ed25519, ml_dsa_65) signature parts from a
-/// [`SignedTreeHead`]-style `HybridSignature` for the directory verify
-/// path — mirrors `crate::federation::stream_sth::signature_b64_parts`.
-/// Re-exported here so the receipt path shares the exact extraction.
-pub use crate::federation::stream_sth::signature_b64_parts as hybrid_signature_b64_parts;
+/// The base64 halves of a receipt's bound-hybrid signature (the receipt
+/// keeps the `HybridSignature` shape; it is not a transparency head).
+pub use crate::federation::stream_sth::hybrid_signature_b64_parts;
+
+/// v62.0.0 — decode a stored receipt `signature_blob` (the `HybridSignature`
+/// JSON bytes).
+///
+/// # Errors
+/// [`BlobError::Backend`](crate::federation::BlobError::Backend) on a blob that
+/// is not one.
+pub fn deserialize_receipt_signature(
+    bytes: &[u8],
+) -> Result<ciris_crypto::HybridSignature, crate::federation::BlobError> {
+    serde_json::from_slice(bytes).map_err(|e| {
+        crate::federation::BlobError::Backend(format!("receipt signature deserialize: {e}"))
+    })
+}
 
 /// Verify a receipt's subscriber signature against the pinned
 /// `federation_keys` key (Strict). Necessary, NOT sufficient — the
@@ -194,18 +204,7 @@ pub async fn verify_receipt_signature<F>(
 where
     F: crate::federation::FederationDirectory,
 {
-    // Reuse the STH signature-extraction shape by wrapping the receipt
-    // sig in the same HybridSignature → (ed25519_b64, ml_dsa_b64) split.
-    let sth_like = SignedTreeHead {
-        log_id: String::new(),
-        tree_size: 0,
-        root_hash: [0u8; 32],
-        timestamp: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
-            .expect("epoch is a valid timestamp"),
-        signature: receipt.signature.clone(),
-        witness_signatures: Vec::new(),
-    };
-    let (ed25519_sig_b64, ml_dsa_65_sig_b64) = hybrid_signature_b64_parts(&sth_like);
+    let (ed25519_sig_b64, ml_dsa_65_sig_b64) = hybrid_signature_b64_parts(&receipt.signature);
     // #1132: an over-long field is refused here, never signed over a
     // clamped prefix.
     let signing_bytes = try_receipt_signing_bytes(

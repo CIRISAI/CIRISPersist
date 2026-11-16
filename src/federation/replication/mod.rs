@@ -60,10 +60,12 @@ pub use cache_mode::{
     parse_human_bytes, ByteParseError, CacheMode, CACHE_DEFAULT_CACHE_BYTES, GIB, MIB,
     PROXY_DEFAULT_CACHE_BYTES, PROXY_DEFAULT_TTL_SECONDS,
 };
+#[cfg(feature = "host")]
+pub use disk_pressure::StatvfsFreeBytes;
 pub use disk_pressure::{
     classify_free_bytes, DiskPressureConfig, DiskPressureMonitor, DiskPressureMonitorHandle,
     DiskPressureSnapshot, FamilyPredicate, FreeBytesSource, PressureAction, PressureTier,
-    StatvfsFreeBytes, StubFreeBytes, TrustTier, MIN_POLL_INTERVAL,
+    StubFreeBytes, TrustTier, MIN_POLL_INTERVAL,
 };
 pub use eviction::{
     EvictionCandidate, EvictionDecay, EvictionSweeper, SweepReport, DEFAULT_SWEEP_BATCH,

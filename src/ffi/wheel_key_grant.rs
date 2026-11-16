@@ -41,11 +41,12 @@
 //! - `src/ffi/pyo3.rs`: two thin `#[pymethods]` on `PyEngine`
 //!   delegating to `wrap_dek_for_recipient_v2_json` / `unwrap_dek_v2_json`.
 
+use crate::federation::key_grant::KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use ciris_crypto::key_grant::{
     key_grant_algorithm_v2_accepts, unwrap_dek_v2, wrap_dek_for_recipient_v2, KeyGrantWrapV2,
-    KEY_GRANT_ALGORITHM_V2, KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED,
+    KEY_GRANT_ALGORITHM_V2,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -138,7 +139,7 @@ pub fn unwrap_dek_v2_json(
         .get("algorithm")
         .and_then(|v| v.as_str())
         .ok_or_else(|| PyValueError::new_err("wrap_json: missing algorithm"))?;
-    if !key_grant_algorithm_v2_accepts(algorithm, false) {
+    if !key_grant_algorithm_v2_accepts(algorithm) {
         return Err(if algorithm == KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED {
             PyValueError::new_err(format!(
                 "wrap_json: algorithm `{algorithm}` is the CC 1.0-rc2 hyphenated \

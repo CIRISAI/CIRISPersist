@@ -17,6 +17,43 @@ publish = false
 [features]
 default = []
 
+# v62.0.0 (slice D, FSD WASM_NODE §4.1, readiness P2) — the NODE / HOST split.
+#
+# `default` and the backend features (`sqlite` alone) are the NODE: they pull
+# no tokio `rt-multi-thread` / `signal`, no mio / socket2, no reqwest, no
+# hickory, no fs4, no redb and no wasm-bindgen / JS backend, so the same
+# feature set builds for `wasm32-unknown-unknown` (scripts/wasm_node_gate.sh).
+# Everything that needs an OS lives behind `host`:
+#
+# - tokio `rt-multi-thread` + `signal` (the native signal adapter
+#   `ffi::native_host`, the PyO3 runtime);
+# - fs4 (`StatvfsFreeBytes`, the disk-pressure `FreeBytesSource` a native
+#   host installs; a node host supplies its own source);
+# - Verify's `host` tier (`device_attestation`: the Android generation-custody
+#   chain walk) and the keyring's file-backed / platform signers (`fs`,
+#   `keyring-storage`, `tpm-plugin`).
+#
+# `postgres`, `server`, `queue`, `secrets-client` and the PyO3 shapes imply
+# `host`. A native consumer that builds on `sqlite` alone and wants v61's
+# native surface adds `host` (CHANGELOG 62.0.0, adoption notes).
+host = [
+    "dep:fs4",
+    "tokio/rt-multi-thread",
+    "tokio/signal",
+    "ciris-verify-core/host",
+    "ciris-keyring/default",
+]
+# The persister (`queue::spawn_persister`) and its redb journal: the lens
+# server's ingest path, file-backed, never the Engine's. Off the node.
+queue = ["host", "dep:redb"]
+# v62.0.0 (P4/P12) — the `ciris:node` host ABI. A NODE build (the top-level
+# module crate) turns this on to give persist the ABI-backed seams
+# (`host::abi::{AbiClock, AbiFreeBytes}`). It does NOT enable
+# `ciris-host-abi/getrandom-backend`: the getrandom custom backend is defined
+# once, by the top-level node crate, never by persist. See
+# docs/WASM_NODE_BUILD.md for the rustflags.
+host-abi = ["dep:ciris-host-abi"]
+
 # v17.1.0 (CIRISPersist#449, CIRISVerify#202) — compile-time-fenced TEST-ONLY
 # genesis relaxation for the local mesh harness (CIRISServer#258). Forwards to
 # verify-core's fence so persist and verify share ONE definition of "test
@@ -28,8 +65,8 @@ default = []
 test-anchor = ["ciris-verify-core/test-anchor"]
 
 # Phase 1 features.
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:postgres-types", "dep:siphasher"]
-server   = ["dep:axum", "dep:tower", "dep:http-body-util"]
+postgres = ["host", "dep:tokio-postgres", "dep:deadpool-postgres", "dep:postgres-types", "dep:siphasher"]
+server   = ["host", "queue", "dep:axum", "dep:tower", "dep:http-body-util"]
 # pyo3 implies postgres — the lens FastAPI integration shape (FSD §3.5)
 # needs the Postgres backend to be available. This is the published-wheel
 # shape (both backends) — UNCHANGED by #328.
@@ -50,7 +87,7 @@ pyo3-sqlite = ["_pyffi", "sqlite"]
 # BOTH public pyo3 shapes via `feature = "_pyffi"`. Not meant to be enabled
 # directly (it would give a PyEngine with no backend). Enabling `dep:pyo3`
 # lives here so both `pyo3` and `pyo3-sqlite` inherit it.
-_pyffi   = ["dep:pyo3"]
+_pyffi   = ["dep:pyo3", "host", "queue", "dep:getrandom", "dep:libc"]
 # v1.13.0 (CIRISPersist#92) — `extension-module` is its OWN feature,
 # enabled by maturin (see `pyproject.toml [tool.maturin] features`),
 # NOT folded into `pyo3`.
@@ -168,7 +205,7 @@ secrets-server = ["secrets", "server"]
 # HTTP-over-network path) pull this in. reqwest is configured with
 # `rustls-tls` (not native-tls) to match the rest of the federation
 # transport-layer security posture.
-secrets-client = ["secrets", "dep:reqwest", "dep:url"]
+secrets-client = ["secrets", "host", "dep:reqwest", "dep:url"]
 
 # v9.2.0 (CIRISPersist#243 part 3) — `EncryptedKVStore`: an app-layer
 # XChaCha20-Poly1305 AEAD key/value store over the bundled rusqlite, for
@@ -236,7 +273,7 @@ telemetry      = ["cirisgraph"]  # no `postgres` or `sqlite` requirement — pai
 #   maturin build --profile panic-debug \
 #     --features "pyo3 extension-module debug-tools" \
 #     --skip-auditwheel --strip false --include-debuginfo
-debug-tools    = ["dep:backtrace"]
+debug-tools    = ["dep:backtrace", "dep:libc"]
 
 # v0.8.3 (CIRISPersist#37) — incident records. Absorbs the agent's
 # IncidentManagementService: correlation-keyed deduplication on
@@ -543,7 +580,7 @@ tls = ["postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native
 # 0.2 to match the copy already in the graph. Nothing crosses a type boundary —
 # it fills a `[u8; 32]` — so this cannot split a dependency the way a shared
 # `rand_core` RNG type would.
-getrandom = "0.2"
+getrandom = { version = "0.2", optional = true }
 # v0.1.9 — bumped from v1.6.4 to v1.8.0. v1.7 brought
 # `HardwareSigner::storage_descriptor()` (closes the prediction
 # shim in src/ffi/pyo3.rs); v1.8 brought the generic BuildManifest
@@ -574,14 +611,21 @@ getrandom = "0.2"
 # ciris-crypto invariant (FSD §7.5a) means persist takes ZERO direct
 # deps on AES-GCM/PBKDF2/HKDF/HMAC primitive crates ever — the
 # `src/secrets/crypto.rs` facade lands as a single import-site change.
-ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.2.0", version = "22", features = ["pqc-ml-dsa"] }
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.2.0", version = "22" }
+# v62.0.0 (slice D, P1) — CIRISVerify v23.1.3, all four crates on one tag.
+# The NODE profile: verify-core `std` + `pqc` (the pure verifiers, plus the
+# std-tier accord custody verifiers persist's admission calls), keyring slim
+# (no `fs`: in-memory software signers from caller seeds). `host` (above)
+# turns on verify-core `host` and the keyring's file-backed defaults.
+ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.1.3", version = "23", default-features = false, features = ["software", "pqc-ml-dsa"] }
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.1.3", version = "23", default-features = false, features = ["std", "pqc"] }
+# The `ciris:node` host ABI (`host-abi` feature). No `getrandom-backend` here.
+ciris-host-abi    = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.1.3", version = "23", optional = true }
 # v0.3.6 (CIRISPersist#14) — direct ciris-crypto dep for HybridVerifier
 # in `Engine.verify_hybrid`. Same git source / tag as ciris-keyring +
 # ciris-verify-core so versions are workspace-coherent. Features
 # `ed25519` + `pqc-ml-dsa` light up the concrete Ed25519Verifier +
 # MlDsa65Verifier impls used by HybridVerifier::verify.
-ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.2.0", version = "22", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant", "kdf"] }
+ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.1.3", version = "23", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant", "kdf"] }
 async-trait   = "0.1"
 # v0.1.14 — filesystem advisory locks for the cohabitation
 # bootstrap (docs/COHABITATION.md). POSIX flock cross-process,
@@ -589,8 +633,8 @@ async-trait   = "0.1"
 # `get_platform_signer()` calls when multiple workers/processes
 # coexist on one host. fs4 is the maintained fork of fs2; pinned
 # to 0.x because the API is stable but pre-1.0.
-fs4           = "0.13"
-libc          = "0.2"
+fs4           = { version = "0.13", optional = true }
+libc          = { version = "0.2", optional = true }
 # v3.12.x (CIRISPersist#156) — opt-in raw-IP unwinder for the
 # `debug-tools` diagnostic panic hook. Captures backtraces WITHOUT
 # invoking the symbol resolver at panic time (the resolver aborts
@@ -629,7 +673,10 @@ sha2          = "0.10"
 # are wrapped in `Zeroizing` so freed key bytes don't linger in the
 # heap (swap / core-dump exposure).
 zeroize       = "1"
-chrono        = { version = "0.4", features = ["serde"] }
+# v62.0.0 (slice D, P4) — no `default`: chrono's default carries `wasmbind`
+# (js-sys `Date` on wasm32-unknown-unknown). Persist reads time through the
+# host clock seam; `clock` keeps `Utc::now()` for the native SystemClock.
+chrono        = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
 thiserror     = "2"
 tracing       = "0.1"
 base64        = "0.22"
@@ -645,7 +692,11 @@ h3o           = "0.7"
 # .detection_events.detection_id. v4 generation lives at the
 # caller (lens-core); persist just stores. tokio-postgres's
 # with-uuid-1 feature gives us ToSql/FromSql for UUID columns.
-uuid          = { version = "1", features = ["serde", "v4", "v5"] }
+# v62.0.0 (slice D, P4) — `rng-getrandom`: on wasm32-unknown-unknown uuid's
+# v4 draws through getrandom (no `js`), which the node crate's custom backend
+# answers from `ciris:node/random.fill`. On native targets it is the OS RNG,
+# as before (uuid's default there is getrandom too).
+uuid          = { version = "1", features = ["serde", "v4", "v5", "rng-getrandom"] }
 # v2.5.0 (CIRISPersist#102 Ask 4) — JSON Schema validator for the
 # envelope-schema admission hook. Per-axis schemas (FSD-002 §4.9.1)
 # are JSON Schema documents; persist validates `scores` attestation
@@ -762,14 +813,18 @@ ndarray              = { version = "0.16", optional = true }
 # template behind `store::test_backend::test_backend()`.
 #
 # v61.2.0 (CIRISPersist#1241, RUSTSEC-2026-0459) — 0.31 → 0.41 in lockstep
-# with CIRISVerify v22.2.0 (still one `links = "sqlite3"` per graph).
-rusqlite = { version = "0.41", features = ["backup", "chrono", "serde_json", "functions"], optional = true }
+# with CIRISVerify v22.2.0 / v23.1.3 (still one `links = "sqlite3"` per graph).
+# v62.0.0 (slice D, P4) — no `chrono` feature: persist binds no chrono type
+# through rusqlite (instants cross as RFC 3339 text it formats itself), and on
+# wasm32-unknown-unknown rusqlite's `chrono` feature turns on chrono's
+# `wasmbind` (wasm-bindgen + js-sys), which a node module may not import.
+rusqlite = { version = "0.41", features = ["backup", "serde_json", "functions"], optional = true }
 
 # Phase 1 robustness — local journal for outage tolerance (FSD §3.4)
-redb = "4"
+redb = { version = "4", optional = true }
 
 # Async runtime — phase 1+
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "time"] }
+tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
 
 # v53.2.0 (CIRISPersist#1027, CIRISServer#746 §5 "metrics facade in
 # libraries") — `observe::emit_metrics` writes the read-telemetry counters
@@ -866,19 +921,23 @@ tokio-stream = "0.1"
 # `HardwareKeyUnavailable` and the caller keeps the software master
 # key). Placed AFTER every platform-independent dep — see the v0.9.0
 # bug note on the rusqlite target table above.
-[target.'cfg(target_os = "linux")'.dependencies]
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.2.0", version = "22", features = ["pqc-ml-dsa"] }
-
+#
+# v62.0.0 (slice D) — the Linux table is gone: it named the base set, which
+# the `host` feature now turns on (`ciris-keyring/default`), and a target
+# table that matched would force the keyring's file-backed defaults on a
+# build that asked for none. The iOS / Android tables stay: they are host
+# targets only (no node module is built for them), and they never match
+# `wasm32-unknown-unknown` (I1852 vets them by name).
 [target.'cfg(target_os = "ios")'.dependencies]
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.2.0", version = "22", features = ["pqc-ml-dsa", "ios"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.1.3", version = "23", default-features = false, features = ["software", "pqc-ml-dsa", "ios"] }
 # v12.3.0 (CIRISPersist#355) — vendored openssl removed here too (dead leaf;
 # see the base-deps note). No iOS openssl in any configuration now.
 
 [target.'cfg(target_os = "android")'.dependencies]
 # v3.5.2 (#132) — rusqlite `bundled` for Android. See comment block
 # before the iOS entry (~line 628) for the rationale.
-rusqlite = { version = "0.41", features = ["backup", "bundled", "chrono", "serde_json", "functions"], optional = true }
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.2.0", version = "22", features = ["pqc-ml-dsa", "android"] }
+rusqlite = { version = "0.41", features = ["backup", "bundled", "serde_json", "functions"], optional = true }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.1.3", version = "23", default-features = false, features = ["software", "pqc-ml-dsa", "android"] }
 # v12.3.0 (CIRISPersist#355) — vendored openssl removed here too (dead leaf;
 # see the base-deps note). No Android openssl in any configuration now,
 # retiring the flakiest part of the mobile wheel matrix.
@@ -902,9 +961,12 @@ required-features = ["test-anchor"]
 # own root (structurally inert against the pinned real Yubico root). Same
 # git tag as the [workspace] pins — one graph version, feature-unified in
 # test builds, absent from `--edges normal`.
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22.2.0", version = "22", features = [
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.1.3", version = "23", default-features = false, features = [
     "test-support",
 ] }
+# v62.0.0 (slice D) — the lib's tokio is the node's (`rt, sync, macros, time`);
+# the test modules' `flavor = "multi_thread"` runtimes are a test build's.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # Mission category §4: canonicalization parity. Used to validate our
 # Python-compatible canonicalizer against the JCS reference. NOT a
 # runtime dep (see CRATE_RECOMMENDATIONS §6).
@@ -996,7 +1058,8 @@ harness = false
 [[bench]]
 name = "queue"
 harness = false
-required-features = ["sqlite"]
+# v62.0.0 (slice D): the persister rides `queue`.
+required-features = ["sqlite", "queue"]
 
 # v1.10.x bench-coverage cut — benches for the v1.7.x–v1.10.1 surface
 # that shipped with zero coverage. SQLite in-memory backed where a DB

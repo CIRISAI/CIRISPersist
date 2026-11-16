@@ -354,11 +354,12 @@ pub(crate) mod test_fixtures {
         }
     }
 
-    /// A `fire` proposal over `family` with `nonce` (far-future window).
+    /// A `roster_change` proposal over `family` with `nonce` (far-future window).
+    /// v62.0.0: CIRISVerify 23 retired the `fire` action; `roster_change` is the one.
     pub fn proposal(family: &str, nonce: &str) -> AccordProposal {
         AccordProposal {
             family_key_id: family.to_owned(),
-            action: AccordAction::Fire,
+            action: AccordAction::RosterChange,
             nonce: nonce.to_owned(),
             window_until: "2031-01-01T00:00:00Z".to_owned(),
             prior_family_digest: "prior-family-digest-abc".to_owned(),
@@ -473,7 +474,7 @@ pub(crate) mod test_fixtures {
         // Anchor index returns exactly this proposal (digest match below
         // guards against cross-run rows sharing the fixed anchor).
         assert!(backend
-            .list_accord_proposals_by_anchor("fire", &anchor)
+            .list_accord_proposals_by_anchor("roster_change", &anchor)
             .await
             .unwrap()
             .iter()

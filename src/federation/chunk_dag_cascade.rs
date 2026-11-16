@@ -6245,7 +6245,7 @@ pub mod invariants {
     async fn register_hybrid_producer<B>(
         backend: &B,
         key_id: &str,
-    ) -> Box<ciris_crypto::HybridSigner<ciris_crypto::Ed25519Signer, ciris_crypto::MlDsa65Signer>>
+    ) -> Box<ciris_crypto::composite::CompositeSigningKey>
     where
         B: FederationDirectory + Sync,
     {
@@ -6261,7 +6261,9 @@ pub mod invariants {
             use ciris_crypto::PqcSigner as _;
             B64.encode(mldsa.public_key().unwrap())
         };
-        let signer = Box::new(ciris_crypto::HybridSigner::new(ed, mldsa).unwrap());
+        let signer = Box::new(crate::federation::sth_form::test_support::composite(
+            [0x52; 32], [0x51; 32],
+        ));
         let record = crate::federation::KeyRecord {
             key_id: key_id.into(),
             pubkey_ed25519_base64: ed_pub_b64,
@@ -6292,10 +6294,7 @@ pub mod invariants {
     }
 
     fn sign_stream_sth(
-        signer: &ciris_crypto::HybridSigner<
-            ciris_crypto::Ed25519Signer,
-            ciris_crypto::MlDsa65Signer,
-        >,
+        signer: &ciris_crypto::composite::CompositeSigningKey,
         stream_id: &str,
         chunk_hashes: &[[u8; 32]],
         tree_size: u64,
@@ -6313,6 +6312,7 @@ pub mod invariants {
         let signing_bytes = ciris_verify_core::transparency::SignedTreeHead::signing_bytes(
             &log_id, tree_size, &root_hash, timestamp,
         );
+        // v62.0.0: the earlier (bound-hybrid) form, as the stored bytes.
         let signature = signer.sign(&signing_bytes).unwrap();
         ciris_verify_core::transparency::SignedTreeHead {
             log_id,

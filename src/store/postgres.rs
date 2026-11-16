@@ -13508,8 +13508,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     async fn put_wholeness_witness(
         &self,
         witness: &ciris_verify_core::substrate::WholenessWitness,
-        sig_ed25519_b64: &str,
-        sig_ml_dsa_65_b64: Option<&str>,
+        signature: &crate::verify::sig19::Sig19,
         pqc_key_id: &str,
         ed25519_pubkey_b64: &str,
         ml_dsa_65_pubkey_b64: Option<&str>,
@@ -13518,8 +13517,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         crate::federation::evidence_admit::put_wholeness_witness_planned(
             self,
             witness,
-            sig_ed25519_b64,
-            sig_ml_dsa_65_b64,
+            signature,
             pqc_key_id,
             ed25519_pubkey_b64,
             ml_dsa_65_pubkey_b64,
@@ -19367,7 +19365,8 @@ impl crate::federation::BlobStorage for PostgresBackend {
             let received_at: chrono::DateTime<chrono::Utc> =
                 row.safe_get_with("received_at", crate::federation::BlobError::Backend)?;
             let chunk_root = crate::federation::stream_sth::root_hash_from_bytes(&root_vec)?;
-            let signature = crate::federation::stream_sth::deserialize_signature(&signature_blob)?;
+            let signature =
+                crate::federation::stream_receipt::deserialize_receipt_signature(&signature_blob)?;
             let receipt = crate::federation::stream_receipt::DeliveryReceipt {
                 stream_id: stream_id.to_string(),
                 subscriber_key_id,
@@ -45973,7 +45972,7 @@ mod tests {
     async fn pg_register_hybrid_producer(
         backend: &PostgresBackend,
         key_id: &str,
-    ) -> ciris_crypto::HybridSigner<ciris_crypto::Ed25519Signer, ciris_crypto::MlDsa65Signer> {
+    ) -> ciris_crypto::composite::CompositeSigningKey {
         use crate::federation::FederationDirectory as _;
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
@@ -46023,14 +46022,11 @@ mod tests {
             .put_public_key(crate::federation::SignedKeyRecord { record })
             .await
             .unwrap();
-        ciris_crypto::HybridSigner::new(ed, mldsa).unwrap()
+        crate::federation::sth_form::test_support::composite([0x42; 32], [0x41; 32])
     }
 
     fn pg_sign_stream_sth(
-        signer: &ciris_crypto::HybridSigner<
-            ciris_crypto::Ed25519Signer,
-            ciris_crypto::MlDsa65Signer,
-        >,
+        signer: &ciris_crypto::composite::CompositeSigningKey,
         stream_id: &str,
         chunk_hashes: &[[u8; 32]],
         tree_size: u64,
@@ -46217,9 +46213,13 @@ mod tests {
         let unreg = format!("unregistered-witness-{salt}");
         let stranger = pg_witness_signer();
         let mut sth = base.clone();
-        let cosig = sth
-            .cosign(&unreg, &stranger, WitnessConsistencyProof::genesis())
-            .expect("cosign");
+        let cosig = crate::federation::sth_form::test_support::cosign(
+            &sth,
+            &unreg,
+            &stranger,
+            WitnessConsistencyProof::genesis(),
+        )
+        .expect("cosign");
         sth.witness_signatures.push(cosig);
         let err = backend
             .put_stream_sth(sth, &producer)
@@ -46238,9 +46238,13 @@ mod tests {
         let wit = format!("registered-witness-{salt}");
         let witness = pg_register_witness(&backend, &wit).await;
         let other = pg_sign_stream_sth(&signer, &stream, &hashes, 1);
-        let cosig = other
-            .cosign(&wit, &witness, WitnessConsistencyProof::genesis())
-            .expect("cosign");
+        let cosig = crate::federation::sth_form::test_support::cosign(
+            &other,
+            &wit,
+            &witness,
+            WitnessConsistencyProof::genesis(),
+        )
+        .expect("cosign");
         let mut sth = base.clone();
         sth.witness_signatures.push(cosig);
         backend
@@ -46250,9 +46254,13 @@ mod tests {
 
         // (3) The genuine cosignature is admitted and round-trips.
         let mut sth = base.clone();
-        let cosig = sth
-            .cosign(&wit, &witness, WitnessConsistencyProof::genesis())
-            .expect("cosign");
+        let cosig = crate::federation::sth_form::test_support::cosign(
+            &sth,
+            &wit,
+            &witness,
+            WitnessConsistencyProof::genesis(),
+        )
+        .expect("cosign");
         sth.witness_signatures.push(cosig);
         backend
             .put_stream_sth(sth, &producer)
@@ -46265,11 +46273,8 @@ mod tests {
 
     /// v31.0.0 (CIRISPersist#657) — a witness keypair distinct from
     /// [`pg_register_hybrid_producer`]'s, NOT registered.
-    fn pg_witness_signer(
-    ) -> ciris_crypto::HybridSigner<ciris_crypto::Ed25519Signer, ciris_crypto::MlDsa65Signer> {
-        let ed = ciris_crypto::Ed25519Signer::from_seed(&[0x51; 32]).unwrap();
-        let mldsa = ciris_crypto::MlDsa65Signer::from_seed(&[0x52; 32]).unwrap();
-        ciris_crypto::HybridSigner::new(ed, mldsa).unwrap()
+    fn pg_witness_signer() -> ciris_crypto::composite::CompositeSigningKey {
+        crate::federation::sth_form::test_support::composite([0x52; 32], [0x51; 32])
     }
 
     /// v31.0.0 (CIRISPersist#657) — [`pg_witness_signer`]'s keypair, REGISTERED
@@ -46277,7 +46282,7 @@ mod tests {
     async fn pg_register_witness(
         backend: &PostgresBackend,
         key_id: &str,
-    ) -> ciris_crypto::HybridSigner<ciris_crypto::Ed25519Signer, ciris_crypto::MlDsa65Signer> {
+    ) -> ciris_crypto::composite::CompositeSigningKey {
         use crate::federation::FederationDirectory as _;
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
@@ -46322,7 +46327,7 @@ mod tests {
             .put_public_key(crate::federation::SignedKeyRecord { record })
             .await
             .unwrap();
-        ciris_crypto::HybridSigner::new(ed, mldsa).unwrap()
+        crate::federation::sth_form::test_support::composite([0x52; 32], [0x51; 32])
     }
 
     #[test]
@@ -46373,8 +46378,11 @@ mod tests {
 
         // (b) bad/forged producer signature (root matches).
         let mut bad_sig = pg_sign_stream_sth(&signer, &stream, &hashes, 2);
-        for b in &mut bad_sig.signature.classical.signature {
-            *b ^= 0xFF;
+        {
+            // v62.0.0: tamper the composite's Ed25519 half.
+            for b in &mut bad_sig.signature[3309..] {
+                *b ^= 0xFF;
+            }
         }
         let err = backend.put_stream_sth(bad_sig, &key_id).await.unwrap_err();
         assert!(matches!(err, BlobError::InvalidArgument(_)));

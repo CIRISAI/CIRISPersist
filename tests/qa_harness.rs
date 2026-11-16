@@ -17,7 +17,9 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+#[cfg(feature = "queue")]
+use std::time::Duration;
+use std::time::Instant;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -469,7 +471,7 @@ async fn av24_sign_verify_round_trip_all_rows() {
 /// producer mid-stream. PersisterHandle.shutdown() drains the queue
 /// without losing rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(feature = "sqlite")]
+#[cfg(all(feature = "sqlite", feature = "queue"))]
 async fn av19_graceful_shutdown_under_load() {
     use ciris_persist::{spawn_persister, Journal, DEFAULT_QUEUE_DEPTH};
     let dir = tempfile::tempdir().unwrap();

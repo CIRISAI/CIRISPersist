@@ -5038,17 +5038,17 @@ impl PyEngine {
     fn build_storage_budget_v1_py(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
-            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-            let preimage =
-                crate::fountain::storage_contention::storage_budget_preimage(payload_json)
-                    .map_err(storage_contention_err_to_py)?;
-            let (ed_sig, pqc_sig) =
-                bound_hybrid_sign_qshape(self.local_signer.as_ref(), &self.runtime, py, &preimage)?;
-            crate::fountain::storage_contention::assemble_storage_budget_wire(
-                payload_json,
-                B64.encode(ed_sig),
-                B64.encode(pqc_sig),
-            )
+            // v62.0.0 — the composite (`signature_composite_base64`), the
+            // only form a v62 node writes or reads.
+            let signer = require_qshape_signer(self.local_signer.as_ref())?;
+            let payload = payload_json.to_owned();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    crate::fountain::storage_contention::sign_storage_budget_wire(&signer, &payload)
+                        .await
+                })
+            })
             .map_err(storage_contention_err_to_py)
         })
     }
@@ -5060,16 +5060,17 @@ impl PyEngine {
     fn build_corpus_want_v1_py(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
-            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-            let preimage = crate::fountain::storage_contention::corpus_want_preimage(payload_json)
-                .map_err(storage_contention_err_to_py)?;
-            let (ed_sig, pqc_sig) =
-                bound_hybrid_sign_qshape(self.local_signer.as_ref(), &self.runtime, py, &preimage)?;
-            crate::fountain::storage_contention::assemble_corpus_want_wire(
-                payload_json,
-                B64.encode(ed_sig),
-                B64.encode(pqc_sig),
-            )
+            // v62.0.0 — the composite (`signature_composite_base64`), the
+            // only form a v62 node writes or reads.
+            let signer = require_qshape_signer(self.local_signer.as_ref())?;
+            let payload = payload_json.to_owned();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    crate::fountain::storage_contention::sign_corpus_want_wire(&signer, &payload)
+                        .await
+                })
+            })
             .map_err(storage_contention_err_to_py)
         })
     }
@@ -5099,7 +5100,11 @@ impl PyEngine {
                 // the #370 install-path error) — grouped with the raising
                 // arm for exhaustiveness.
                 Err(
-                    e @ (E::MalformedJson(_) | E::MalformedBase64(_) | E::RevisionRollback { .. }),
+                    e @ (E::MalformedJson(_)
+                    | E::MalformedBase64(_)
+                    | E::RevisionRollback { .. }
+                    | E::Signer(_)
+                    | E::EarlierForm),
                 ) => Err(storage_contention_err_to_py(e)),
             }
         })
@@ -5127,7 +5132,11 @@ impl PyEngine {
                 // the #370 install-path error) — grouped with the raising
                 // arm for exhaustiveness.
                 Err(
-                    e @ (E::MalformedJson(_) | E::MalformedBase64(_) | E::RevisionRollback { .. }),
+                    e @ (E::MalformedJson(_)
+                    | E::MalformedBase64(_)
+                    | E::RevisionRollback { .. }
+                    | E::Signer(_)
+                    | E::EarlierForm),
                 ) => Err(storage_contention_err_to_py(e)),
             }
         })
@@ -10118,10 +10127,14 @@ impl PyEngine {
     ) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
+            // v62.0.0 — the composite only; an earlier-form head (the v22
+            // HybridSignature object) is refused by name.
+            let value: serde_json::Value = serde_json::from_str(sth_json).map_err(|e| {
+                PyValueError::new_err(format!("put_stream_sth: sth_json parse: {e}"))
+            })?;
             let sth: ciris_verify_core::transparency::SignedTreeHead =
-                serde_json::from_str(sth_json).map_err(|e| {
-                    PyValueError::new_err(format!("put_stream_sth: sth_json parse: {e}"))
-                })?;
+                crate::federation::sth_form::sth_from_json(value)
+                    .map_err(|e| PyValueError::new_err(format!("put_stream_sth: sth_json: {e}")))?;
             let runtime = self.runtime.clone();
             let producer_key_id = producer_key_id.to_string();
             py.detach(move || match &self.backend {
@@ -10700,7 +10713,8 @@ impl PyEngine {
             let leaf_bytes_b64_json = leaf_bytes_b64_json.to_owned();
             py.detach(move || {
                 let leaves = decode_b64_leaves(&leaf_bytes_b64_json)?;
-                let root = ciris_verify_core::substrate::compute_merkle_root(&leaves);
+                let root = ciris_verify_core::substrate::compute_merkle_root(&leaves)
+                    .map_err(|e| PyValueError::new_err(format!("wholeness_witness_root: {e}")))?;
                 Ok(crate::witness::encode_root_hex(&root))
             })
         })
@@ -10727,20 +10741,41 @@ impl PyEngine {
     /// `hard_case:witness_equivocation` is emitted (idempotent on its
     /// deterministic event_id). Returns JSON
     /// `{"admitted": true, "verdict": <"consistent"|"divergent"|{"equivocation": [...]}>}`.
-    #[pyo3(signature = (witness_json, sig_ed25519_b64, sig_mldsa65_b64,
-                        ed25519_pubkey_b64, mldsa65_pubkey_b64, leaves_b64_json=None))]
+    ///
+    /// v62.0.0 (CIRISVerify 23) — **one `signature` argument**: the base64
+    /// CC 2.6.1.7 composite (3373 bytes). The earlier bound-hybrid pair (a
+    /// JSON object) is refused, `ValueError("sig19_earlier_form…")`. The
+    /// pubkeys are keyword arguments. The pre-v62 call shape (two signature
+    /// halves as positional arguments) raises `TypeError` naming the change.
+    #[pyo3(signature = (witness_json, signature, *legacy_positional,
+                        ed25519_pubkey_b64=None, mldsa65_pubkey_b64=None, leaves_b64_json=None))]
     #[allow(clippy::too_many_arguments)]
     fn put_wholeness_witness_json(
         &self,
         py: Python<'_>,
         witness_json: &str,
-        sig_ed25519_b64: &str,
-        sig_mldsa65_b64: &str,
-        ed25519_pubkey_b64: &str,
-        mldsa65_pubkey_b64: &str,
+        signature: &str,
+        legacy_positional: &Bound<'_, pyo3::types::PyTuple>,
+        ed25519_pubkey_b64: Option<&str>,
+        mldsa65_pubkey_b64: Option<&str>,
         leaves_b64_json: Option<&str>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
+        if !legacy_positional.is_empty() {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                PUT_WHOLENESS_WITNESS_LEGACY_SHAPE,
+            ));
+        }
+        let (Some(ed25519_pubkey_b64), Some(mldsa65_pubkey_b64)) =
+            (ed25519_pubkey_b64, mldsa65_pubkey_b64)
+        else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "put_wholeness_witness_json: ed25519_pubkey_b64 and mldsa65_pubkey_b64 are \
+                 required keyword arguments",
+            ));
+        };
+        let sig19 = crate::verify::sig19::Sig19::from_wire(signature)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let wire: crate::witness::WitnessWire = serde_json::from_str(witness_json)
@@ -10750,8 +10785,6 @@ impl PyEngine {
                 .map_err(|e| PyValueError::new_err(e.kind()))?;
             let disclosed: Option<Vec<Vec<u8>>> =
                 leaves_b64_json.map(decode_b64_leaves).transpose()?;
-            let sig_ed = sig_ed25519_b64.to_owned();
-            let sig_pqc = sig_mldsa65_b64.to_owned();
             let ed_pub = ed25519_pubkey_b64.to_owned();
             let pqc_pub = mldsa65_pubkey_b64.to_owned();
             py.detach(move || {
@@ -10765,8 +10798,7 @@ impl PyEngine {
                             backend
                                 .put_wholeness_witness(
                                     &witness,
-                                    &sig_ed,
-                                    Some(&sig_pqc),
+                                    &sig19,
                                     &wire.pqc_key_id,
                                     &ed_pub,
                                     Some(&pqc_pub),
@@ -10791,8 +10823,7 @@ impl PyEngine {
                             backend
                                 .put_wholeness_witness(
                                     &witness,
-                                    &sig_ed,
-                                    Some(&sig_pqc),
+                                    &sig19,
                                     &wire.pqc_key_id,
                                     &ed_pub,
                                     Some(&pqc_pub),
@@ -32617,6 +32648,7 @@ fn local_signer_err_to_py(e: crate::signing::LocalSignerError) -> PyErr {
         }
         // v19.2.0 (#493) — deployment-shape property, not caller-fixable.
         LocalSignerError::SelfEncRequiresSoftwareSeed => PyRuntimeError::new_err(format!("{e}")),
+        LocalSignerError::CompositeUnavailable => PyRuntimeError::new_err(format!("{e}")),
     }
 }
 
@@ -32628,31 +32660,29 @@ fn storage_contention_err_to_py(
     PyErr::new::<LensQueryError, _>(format!("{e} (kind={})", e.kind()))
 }
 
-/// #356 — bound-hybrid sign a §Q CC 6.1.3 preimage with the engine's local
-/// signer: Ed25519 over `preimage`, ML-DSA-65 over `preimage ‖ ed25519_sig`.
-/// Returns `(ed25519_sig, ml_dsa_65_sig)`. Raises if no local signer / PQC key.
-fn bound_hybrid_sign_qshape(
+/// v62.0.0 — the TypeError a pre-62 `put_wholeness_witness_json` call shape
+/// gets (two signature halves as positional arguments).
+const PUT_WHOLENESS_WITNESS_LEGACY_SHAPE: &str = concat!(
+    "put_wholeness_witness_json(witness_json, signature, *, ed25519_pubkey_b64, ",
+    "mldsa65_pubkey_b64, leaves_b64_json=None): since ciris-persist 62.0.0 the ",
+    "signature is ONE argument, the base64 CC 2.6.1.7 composite (an earlier-form ",
+    "bound-hybrid pair is refused: sig19_earlier_form), and the pubkeys are ",
+    "keywords; the pre-62 positional shape (sig_ed25519_b64, sig_mldsa65_b64, ",
+    "ed25519_pubkey_b64, mldsa65_pubkey_b64) is gone"
+);
+
+/// #356 — the engine's local signer for a §Q build, or the configuration
+/// refusal. v62.0.0: the signature itself is `storage_contention::sign_*_wire`
+/// (form by ceremony state).
+fn require_qshape_signer(
     local_signer: Option<&std::sync::Arc<crate::signing::LocalSigner>>,
-    runtime: &tokio::runtime::Runtime,
-    py: Python<'_>,
-    preimage: &[u8],
-) -> PyResult<(Vec<u8>, Vec<u8>)> {
-    let signer = local_signer.ok_or_else(|| {
+) -> PyResult<std::sync::Arc<crate::signing::LocalSigner>> {
+    local_signer.cloned().ok_or_else(|| {
         PyValueError::new_err(
             "no local signing key configured (pass local_key_id + local_key_path \
              to the Engine constructor)",
         )
-    })?;
-    let ed_sig = signer
-        .sign_ed25519(preimage)
-        .map_err(local_signer_err_to_py)?;
-    let mut bound = preimage.to_vec();
-    bound.extend_from_slice(&ed_sig);
-    let signer_c = signer.clone();
-    let pqc_sig = py
-        .detach(|| runtime.block_on(async move { signer_c.sign_ml_dsa_65(&bound).await }))
-        .map_err(local_signer_err_to_py)?;
-    Ok((ed_sig.to_vec(), pqc_sig))
+    })
 }
 
 /// v0.4.0 — outbound::Error → PyErr at the FFI boundary. Same

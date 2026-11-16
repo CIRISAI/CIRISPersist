@@ -158,16 +158,15 @@ async fn build_and_verify_trace_pin(corpus_kind: &str, node_id: &str) -> String 
             "pinned_class":["{corpus_kind}"]}}"#
     );
 
-    // Bound-hybrid sign: Ed25519 over the preimage, ML-DSA-65 over
-    // (preimage || ed_sig) — the same shape the engine's signer emits.
+    // v62.0.0: the CC 2.6.1.7 composite under the same two keys (Ed25519
+    // seed 0x11, ML-DSA-65 seed 0x22).
+    let _ = (&ed_sk, &mldsa);
     let preimage = storage_budget_preimage(&payload).expect("valid pin payload");
-    let ed_sig = ed_sk.sign(&preimage).to_bytes();
-    let mut bound = preimage.clone();
-    bound.extend_from_slice(&ed_sig);
-    let pqc_sig = mldsa.sign(&bound).await.unwrap();
-    let wire =
-        assemble_storage_budget_wire(&payload, BASE64.encode(ed_sig), BASE64.encode(&pqc_sig))
-            .expect("assemble signed budget");
+    let sig = ciris_crypto::composite::CompositeSigningKey::from_seeds(&[0x22; 32], &[0x11; 32])
+        .sign(&preimage)
+        .unwrap();
+    let wire = assemble_storage_budget_wire(&payload, BASE64.encode(&sig))
+        .expect("assemble signed budget");
 
     // The pin is genuinely valid (PQC-mandatory bound-hybrid verifies).
     verify_storage_budget_wire(&wire, &ed_pk_b64, &mldsa_pk_b64)

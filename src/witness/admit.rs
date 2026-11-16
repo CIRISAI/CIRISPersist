@@ -15,8 +15,10 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use ciris_verify_core::substrate::{
-    self, compute_merkle_root, verify_witness, BoundHybridSig, HolonomicError, WholenessWitness,
+    self, compute_merkle_root, verify_witness, HolonomicError, WholenessWitness,
 };
+
+use crate::verify::sig19::Sig19;
 
 use super::types::{encode_root_hex, StoredWitness, WitnessLeaf, WITNESS_VERSION_V1};
 
@@ -91,9 +93,8 @@ impl WitnessAdmitError {
 /// shape, preserving the §19.0 classical-only → `hybrid_required` class.
 fn map_substrate_error(err: HolonomicError) -> WitnessAdmitError {
     match err {
-        HolonomicError::PqcHalfMissingOrInvalid => WitnessAdmitError::HybridRequired,
-        HolonomicError::ClassicalSignatureInvalid => {
-            WitnessAdmitError::HybridVerify("classical signature invalid".to_owned())
+        HolonomicError::SignatureInvalid => {
+            WitnessAdmitError::HybridVerify("composite signature invalid".to_owned())
         }
         HolonomicError::MalformedKeyOrSignature => {
             WitnessAdmitError::HybridVerify("malformed key or signature".to_owned())
@@ -105,18 +106,8 @@ fn map_substrate_error(err: HolonomicError) -> WitnessAdmitError {
             reason: "ww_root_mismatch",
         } => WitnessAdmitError::RootMismatch,
         HolonomicError::Invariant { reason } => WitnessAdmitError::HybridVerify(reason.to_owned()),
-        // v38.7.0 — verify v14.0.0 made `HolonomicError` `#[non_exhaustive]`,
-        // so this match must carry a wildcard even though every variant it
-        // knows is handled above.
-        //
-        // The arm is deliberately the CONSERVATIVE class, not a new one: a
-        // variant this build has never seen is a verification failure whose
-        // meaning we cannot claim to know, and `HybridVerify` is the arm that
-        // refuses. Mapping an unknown verify error to anything narrower —
-        // or, worse, treating it as admissible — would let a future verify
-        // release widen what persist admits without persist ever deciding
-        // to. The `{err:?}` keeps the unmapped variant legible in the
-        // refusal instead of collapsing it to a generic string.
+        // v38.7.0 — `HolonomicError` is `#[non_exhaustive]`: an unseen
+        // variant is the CONSERVATIVE refusal class, never admissible.
         other => WitnessAdmitError::HybridVerify(format!(
             "unmapped verify HolonomicError variant (refusing conservatively): {other:?}"
         )),
@@ -168,7 +159,13 @@ pub fn build_local_witness(
     leaves: &[WitnessLeaf],
 ) -> WholenessWitness {
     let filtered = filter_witness_leaves(leaves);
-    let merkle_root = compute_merkle_root(&filtered);
+    // v62.0.0 — Verify 23 refuses a repeated leaf (CC 6.1.1); the WW-2
+    // survivors are deduplicated first (a set, CC 2.6.1.2), so a producer
+    // never signs over a list Verify would refuse.
+    let mut filtered = filtered;
+    filtered.sort_unstable();
+    filtered.dedup();
+    let merkle_root = compute_merkle_root(&filtered).expect("deduplicated leaves have a root");
     let claim_namespaces = surviving_namespaces(leaves);
     WholenessWitness {
         peer_id: peer_id.to_owned(),
@@ -181,33 +178,21 @@ pub fn build_local_witness(
     }
 }
 
-/// Decode a base64 field into bytes, mapping the error to the gate shape.
-fn b64(field: &str, label: &'static str) -> Result<Vec<u8>, WitnessAdmitError> {
-    BASE64
-        .decode(field)
-        .map_err(|e| WitnessAdmitError::MalformedSignature(format!("{label}: {e}")))
-}
-
 /// Run the §19.1 verify-before-persist gate for a candidate witness, and
 /// on `Ok` return the [`StoredWitness`] the backend may insert.
 ///
-/// `ed25519_pubkey_b64` / `ml_dsa_65_pubkey_b64` are the producer's
-/// verifying keys (b64). A `None` PQC pubkey, or an empty
-/// `signature_ml_dsa_65`, is the §19.0 hard-cut rejection
-/// ([`WitnessAdmitError::HybridRequired`]) — deterministic, before any
-/// signature math.
+/// `signature` is the producer's CC 2.6.1.7 composite (v62.0.0), verified by
+/// Verify's `verify_witness` under the composite key of the pinned pair. A
+/// missing ML-DSA-65 pubkey is the §19.0 hard cut
+/// ([`WitnessAdmitError::HybridRequired`]), before any signature math.
 ///
 /// `disclosed_leaves`, when `Some`, are re-hashed and the resulting root
-/// must equal the witness's `merkle_root` (catches a signer who signs a
-/// root inconsistent with its disclosure). Pass `None` when the verifier
-/// has only the signed root.
+/// must equal the witness's `merkle_root`.
 ///
-/// On `Err` NOTHING is written (verify-before-mutation, AV-9). On `Ok`
-/// the witness has passed the hybrid gate AND the WW-2 namespace guard.
+/// On `Err` NOTHING is written (verify-before-mutation, AV-9).
 pub fn admit_witness(
     witness: &WholenessWitness,
-    sig_ed25519_b64: &str,
-    sig_ml_dsa_65_b64: Option<&str>,
+    signature: &Sig19,
     pqc_key_id: &str,
     ed25519_pubkey_b64: &str,
     ml_dsa_65_pubkey_b64: Option<&str>,
@@ -221,47 +206,34 @@ pub fn admit_witness(
         });
     }
 
-    // (1) §19.0 PQC-mandatory hard cut: a witness carrying no ML-DSA-65
-    //     SIGNATURE half is classical-only ⇒ REJECT outright, BEFORE any
-    //     pubkey pairing or signature math (mirrors the #225 fountain
-    //     gate, where the absence of the PQC sig is the trigger).
-    let pqc_sig_b64 = match sig_ml_dsa_65_b64 {
-        Some(s) if !s.is_empty() => s,
-        _ => return Err(WitnessAdmitError::HybridRequired),
-    };
+    // (1) §19.0 PQC-mandatory: the ML-DSA-65 key must be pinned, before
+    //     any signature math. (An earlier-form, bound-hybrid signature never
+    //     reaches here: `Sig19` is the composite, and the wire parsers refuse
+    //     the earlier pair by name, `sig19_earlier_form`.)
     let pqc_pubkey_b64 = match ml_dsa_65_pubkey_b64 {
         Some(s) if !s.is_empty() => s,
         _ => return Err(WitnessAdmitError::HybridRequired),
     };
-
-    // Decode the keys + sig halves.
     let ed_pubkey = BASE64
         .decode(ed25519_pubkey_b64)
         .map_err(|e| WitnessAdmitError::MalformedKey(format!("ed25519 pubkey: {e}")))?;
     let pqc_pubkey = BASE64
         .decode(pqc_pubkey_b64)
         .map_err(|e| WitnessAdmitError::MalformedKey(format!("ml_dsa_65 pubkey: {e}")))?;
-    let ed_sig = b64(sig_ed25519_b64, "ed25519 sig")?;
-    let pqc_sig = b64(pqc_sig_b64, "ml_dsa_65 sig")?;
 
-    // (2) The §19.1 gate: hybrid PQC verify over the canonical preimage +
-    //     the WW-2 namespace guard + (when disclosed) the leaf/root
-    //     recompute. verify_witness owns all three — persist does not
-    //     re-roll them.
+    // (2) The §19.1 gate: the composite over the canonical preimage + the
+    //     WW-2 namespace guard + (when disclosed) the leaf/root recompute.
+    //     verify_witness owns all three — persist does not re-roll them.
     let preimage = witness.canonical_preimage();
-    let sig = BoundHybridSig {
-        ed25519: &ed_sig,
-        mldsa65: Some(&pqc_sig),
-    };
     verify_witness(
         witness,
         &preimage,
-        &sig,
-        &ed_pubkey,
-        &pqc_pubkey,
+        &signature.0,
+        &crate::verify::sig19::composite_pubkey(&ed_pubkey, &pqc_pubkey),
         disclosed_leaves,
     )
     .map_err(map_substrate_error)?;
+    let (sig_stored, pqc_sig_stored) = (BASE64.encode(&signature.0), String::new());
 
     // Admitted. Build the corpus row (no in-band `verified` flag, F-5).
     Ok(StoredWitness {
@@ -272,10 +244,22 @@ pub fn admit_witness(
         leaf_count: witness.leaf_count,
         observed_at_unix_ms: witness.observed_at_unix_ms,
         witness_version: witness.witness_version,
-        signature: sig_ed25519_b64.to_owned(),
-        signature_ml_dsa_65: pqc_sig_b64.to_owned(),
+        signature: sig_stored,
+        signature_ml_dsa_65: pqc_sig_stored,
         pqc_key_id: pqc_key_id.to_owned(),
     })
+}
+
+/// v62.0.0 — sign a witness with the node's signer: the composite, over the
+/// §19.1 canonical preimage [`admit_witness`] checks.
+///
+/// # Errors
+/// The signer's error.
+pub async fn sign_wholeness_witness(
+    signer: &crate::signing::LocalSigner,
+    witness: &WholenessWitness,
+) -> Result<Sig19, crate::signing::LocalSignerError> {
+    crate::verify::sig19::sign_sig19(signer, &witness.canonical_preimage()).await
 }
 
 /// Re-export so callers do not have to reach into verify-core for the
@@ -320,12 +304,12 @@ mod tests {
         // Namespaces exclude self/anonymous.
         assert_eq!(w.claim_namespaces, vec!["scores:medical", "scores:safety"]);
         // The root equals a recompute over exactly the survivors.
-        let expected = compute_merkle_root(&[b"keep-1".to_vec(), b"keep-2".to_vec()]);
+        let expected = compute_merkle_root(&[b"keep-1".to_vec(), b"keep-2".to_vec()]).unwrap();
         assert_eq!(w.merkle_root, expected);
     }
 
     #[test]
-    fn classical_only_is_hard_cut_rejected() {
+    fn the_earlier_form_and_a_missing_pqc_key_are_refused() {
         let w = build_local_witness(
             "p",
             1,
@@ -337,11 +321,18 @@ mod tests {
                 leaf_bytes: b"x".to_vec(),
             }],
         );
-        // Empty PQC sig → hard cut, no signature math.
-        let err = admit_witness(&w, "AA==", Some(""), "k", "AA==", Some("AA=="), None).unwrap_err();
-        assert_eq!(err.kind(), "witness_admit_hybrid_required");
-        // Absent PQC pubkey → hard cut.
-        let err = admit_witness(&w, "AA==", Some("AA=="), "k", "AA==", None, None).unwrap_err();
+        // An earlier-form (bound-hybrid) pair is refused at the wire, by name.
+        assert_eq!(
+            Sig19::from_wire(r#"{"ed25519":"AA==","ml_dsa_65":"AA=="}"#),
+            Err(crate::verify::sig19::Sig19Error::EarlierForm)
+        );
+        assert_eq!(
+            Sig19::from_wire_fields("AA==", "", ""),
+            Err(crate::verify::sig19::Sig19Error::EarlierForm)
+        );
+        // Absent PQC pubkey → hard cut, before any signature math.
+        let sig = Sig19(vec![0u8; 3373]);
+        let err = admit_witness(&w, &sig, "k", "AA==", None, None).unwrap_err();
         assert_eq!(err.kind(), "witness_admit_hybrid_required");
     }
 }

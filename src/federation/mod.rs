@@ -471,6 +471,7 @@ pub mod goal_projection;
 pub(crate) mod group_amendment;
 // v61 (CIRISPersist#991 planes 2 and 3; CC 3.1.3, 3.1.3.2) — the group
 // records and the membership planes as rows.
+pub mod group_membership_change;
 pub mod group_plane;
 pub mod hardware_attestation;
 pub mod identity_aggregate;
@@ -933,6 +934,13 @@ pub mod stream_seal;
 // v4.1 (CIRISPersist#142 Cut C4) — delivery-receipt canonical bytes +
 // subscriber-signature verify. Backend-agnostic; the JOIN-against-STH
 // gate + storage live in the backends.
+pub mod sth_form;
+// v62.0.0 (slice D) — I1850/I1851: CIRISVerify 23's vectors, pinned as files.
+#[cfg(test)]
+mod verify_v23_vectors;
+// v62.0.0 (slice D) — I1853–I1855, I1857: the composite cut, by form.
+#[cfg(test)]
+mod sth_form_invariants;
 pub mod stream_receipt;
 pub mod stream_sth;
 // v62.0.0 (P13) — every item inside is test-gated; so is the module.
@@ -1064,13 +1072,15 @@ pub use register::{
     check_revocation_bound, resolve_key_statement_standing, KeyStatementFold, KeyStatementStanding,
     RevocationBoundRefusal,
 };
+#[cfg(feature = "host")]
+pub use replication::StatvfsFreeBytes;
 pub use replication::{
     aggregate_trust_score, classify_free_bytes, parse_human_bytes, withdraws_attestation_envelope,
     AdmissionGate, ByteParseError, CacheMode, DiskPressureConfig, DiskPressureMonitor,
     DiskPressureMonitorHandle, DiskPressureSnapshot, EvictionCandidate, EvictionDecay,
     EvictionSweeper, FamilyPredicate, FreeBytesSource, MemoryTrustScoring, PressureAction,
-    PressureTier, ReplicationConfig, StatvfsFreeBytes, StubFreeBytes, SweepReport, TrustScoring,
-    TrustScoringError, TrustTier, DEFAULT_SWEEP_BATCH, MIN_POLL_INTERVAL, MIN_SWEEP_INTERVAL,
+    PressureTier, ReplicationConfig, StubFreeBytes, SweepReport, TrustScoring, TrustScoringError,
+    TrustTier, DEFAULT_SWEEP_BATCH, MIN_POLL_INTERVAL, MIN_SWEEP_INTERVAL,
 };
 // v24.3.0 (CIRISPersist#575) — re-exported at `federation::` because
 // `Error::RateLimited` carries it: a public error variant must not force every
@@ -8395,8 +8405,12 @@ pub trait FederationDirectory: Send + Sync {
         let prior_entrenched = prior_envelope.get("consensus_protocol_entrenched")
             == Some(&serde_json::Value::Bool(true));
         let new_roster = if prior_entrenched {
-            ag::validate_membership_change_structure(&prior_envelope, change_envelope, &directory)
-                .map_err(|e| refuse(e.to_string()))?;
+            group_membership_change::validate_membership_change_structure(
+                &prior_envelope,
+                change_envelope,
+                &directory,
+            )
+            .map_err(|e| refuse(e.to_string()))?;
             ag::roster_from_envelope(change_envelope, &directory)
                 .map_err(|e| refuse(e.to_string()))?
         } else {
@@ -8617,7 +8631,7 @@ pub trait FederationDirectory: Send + Sync {
         // then binds the envelope to the ONE version it authorizes
         // ([`canonical_community::bind_next_version`]: every recorded role, the
         // next content hash, the link's instant) before the founders sign.
-        Ok(ciris_verify_core::accord_genesis::build_membership_change(
+        Ok(group_membership_change::build_membership_change(
             &prior_envelope,
             new_member_key_ids,
             role,
@@ -9928,8 +9942,7 @@ pub trait FederationDirectory: Send + Sync {
     async fn put_wholeness_witness(
         &self,
         witness: &ciris_verify_core::substrate::WholenessWitness,
-        sig_ed25519_b64: &str,
-        sig_ml_dsa_65_b64: Option<&str>,
+        signature: &crate::verify::sig19::Sig19,
         pqc_key_id: &str,
         ed25519_pubkey_b64: &str,
         ml_dsa_65_pubkey_b64: Option<&str>,
@@ -9937,8 +9950,7 @@ pub trait FederationDirectory: Send + Sync {
     ) -> Result<(), Error> {
         let _ = (
             witness,
-            sig_ed25519_b64,
-            sig_ml_dsa_65_b64,
+            signature,
             pqc_key_id,
             ed25519_pubkey_b64,
             ml_dsa_65_pubkey_b64,

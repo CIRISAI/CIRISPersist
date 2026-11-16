@@ -110,59 +110,35 @@ pub const AUDIT_STH_SIGNATURE_INVALID: &str = "audit_sth_signature_invalid";
 /// one is refused where it would be stored (`store_sth`, both backends), and
 /// [`verify_audit_sth`] refuses one wherever a verifier checks it.
 ///
-/// It is NOT asked where a stored head is served (`latest_sth`, and so
-/// `AuditService::current_sth`): a stored head is served as itself (CC
-/// 2.6.1.8: an earlier form verifies as itself for rows anchored before the
-/// cutover), so a tenant whose head was stored by an earlier build keeps its
-/// proofs and can still append. The only head this node's store would refuse
-/// today is one written after the gate, which `store_sth` makes impossible by
-/// construction.
+/// v62.0.0 (slice D, CC rc20 "nothing carries"): the head's signature is the
+/// CC 2.6.1.7 composite, and a stored head in the EARLIER (bound-hybrid) form
+/// (a pre-v62 row) is refused by name where it would be served
+/// (`deserialize_signature`, `sth_signature_earlier_form`), never served.
+/// `TODO(archive-ruling)`: the pre-v62 store is to be kept as an archive.
 ///
-/// `HybridSignature` makes the half structurally REQUIRED (its `pqc` field
-/// has no serde default, so a blob with the half removed does not decode),
-/// but not NON-EMPTY: an empty or wrong-length `pqc.signature` /
-/// `pqc.public_key`, another PQC algorithm, or `mode: ClassicalOnly` all
-/// decode. This is the shape check that refuses those. It is shape only, not
-/// crypto: [`verify_audit_sth`] is the crypto check against a pinned signer.
+/// This is the shape check (a 3373-byte composite, nothing else); it is shape
+/// only, not crypto: [`verify_audit_sth`] is the crypto check against a
+/// pinned signer.
 ///
 /// # Errors
 ///
 /// [`TransparencyError::Storage`] led by [`AUDIT_STH_NOT_HYBRID`].
 pub fn require_hybrid_sth(sth: &SignedTreeHead) -> Result<(), TransparencyError> {
-    use ciris_crypto::{PqcAlgorithm, SignatureMode};
-    let sig = &sth.signature;
-    let ml_dsa = PqcAlgorithm::MlDsa65;
-    let missing = if sig.mode != SignatureMode::HybridRequired {
-        Some(format!("signature mode {:?}, not HybridRequired", sig.mode))
-    } else if sig.pqc.algorithm != ml_dsa {
-        Some(format!(
-            "PQC algorithm {:?}, not ML-DSA-65",
-            sig.pqc.algorithm
-        ))
-    } else if sig.pqc.signature.len() != ml_dsa.signature_size() {
-        Some(format!(
-            "ML-DSA-65 signature is {} bytes, not {}",
-            sig.pqc.signature.len(),
-            ml_dsa.signature_size()
-        ))
-    } else if sig.pqc.public_key.len() != ml_dsa.public_key_size() {
-        Some(format!(
-            "ML-DSA-65 public key is {} bytes, not {}",
-            sig.pqc.public_key.len(),
-            ml_dsa.public_key_size()
-        ))
-    } else {
-        None
-    };
-    match missing {
-        None => Ok(()),
-        Some(why) => Err(TransparencyError::Storage(format!(
-            "{AUDIT_STH_NOT_HYBRID}: the signed tree head of {} at tree_size {} has no \
-             ML-DSA-65 half ({why}); the audit gate is the hybrid-signed head \
-             (CC 5.3.1; CIRISPersist#1233)",
-            sth.log_id, sth.tree_size
-        ))),
-    }
+    // v62.0.0 (slice D, CC rc20 "nothing carries") — the composite only. A
+    // composite (CC 2.6.1.7) carries its ML-DSA-65 half by construction
+    // (3373 bytes, `mldsaSig || ed25519Sig`). The earlier bound-hybrid form
+    // is a pre-edition-2 head: refused by name (`sth_signature_earlier_form`),
+    // as are bytes in no form.
+    crate::federation::sth_form::classify(&sth.signature)
+        .map(|_| ())
+        .map_err(|e| {
+            TransparencyError::Storage(format!(
+                "{AUDIT_STH_NOT_HYBRID}: the signed tree head of {} at tree_size {} is not a \
+                 CC 2.6.1.7 composite ({e}); the audit gate is the composite-signed head \
+                 (CC 5.3.1; CIRISPersist#1233)",
+                sth.log_id, sth.tree_size
+            ))
+        })
 }
 
 /// v61.1.0 (CIRISPersist#1233, CC 5.3.1) — **verify an audit signed tree
@@ -188,41 +164,37 @@ pub fn verify_audit_sth(
     signer_ml_dsa_65_pubkey_b64: &str,
 ) -> Result<(), TransparencyError> {
     require_hybrid_sth(sth)?;
-    let (ed25519_sig_b64, ml_dsa_65_sig_b64) =
-        crate::federation::stream_sth::hybrid_signature_b64_parts(&sth.signature);
-    crate::verify::hybrid::verify_hybrid(
-        &sth.signing_bytes_of(),
-        &ed25519_sig_b64,
-        ml_dsa_65_sig_b64.as_deref(),
-        signer_ed25519_pubkey_b64,
-        Some(signer_ml_dsa_65_pubkey_b64),
-        crate::verify::hybrid::HybridPolicy::Strict,
-        None,
-    )
-    .map(|_outcome| ())
-    .map_err(|e| {
+    // v62.0.0 (slice D) — the composite under the PINNED composite key
+    // (`mldsaPK || ed25519PK`), never keys the head names.
+    let pinned = crate::federation::sth_form::PinnedKeys {
+        ed25519_base64: signer_ed25519_pubkey_b64.to_owned(),
+        ml_dsa_65_base64: Some(signer_ml_dsa_65_pubkey_b64.to_owned()),
+    };
+    crate::federation::sth_form::verify_sth_signature(sth, &sth.signature, &pinned).map_err(|e| {
         TransparencyError::Signing(format!(
-            "{AUDIT_STH_SIGNATURE_INVALID}: {} ({e}) for the signed tree head of {} at \
-             tree_size {}",
-            e.kind(),
-            sth.log_id,
-            sth.tree_size
+            "{AUDIT_STH_SIGNATURE_INVALID}: {e} for the signed tree head of {} at \
+                 tree_size {}",
+            sth.log_id, sth.tree_size
         ))
     })
 }
 
-/// JSON-serialize the `HybridSignature` for the `signature_blob`
-/// column. Storage is JSON-as-bytes (vs JSONB) so PG and SQLite share
-/// the exact same encoding.
-fn serialize_signature(sig: &ciris_crypto::HybridSignature) -> Result<Vec<u8>, TransparencyError> {
-    serde_json::to_vec(sig)
-        .map_err(|e| TransparencyError::Storage(format!("sth signature serialize: {e}")))
+/// The head's signature bytes for the `signature_blob` column (v62.0.0): the
+/// 3373-byte composite. PG and SQLite share the encoding.
+fn serialize_signature(sig: &[u8]) -> Result<Vec<u8>, TransparencyError> {
+    crate::federation::sth_form::classify(sig)
+        .map_err(|e| TransparencyError::Storage(format!("sth signature serialize: {e}")))?;
+    Ok(sig.to_vec())
 }
 
-/// Inverse of [`serialize_signature`].
-fn deserialize_signature(bytes: &[u8]) -> Result<ciris_crypto::HybridSignature, TransparencyError> {
-    serde_json::from_slice(bytes)
-        .map_err(|e| TransparencyError::Storage(format!("sth signature deserialize: {e}")))
+/// Inverse of [`serialize_signature`]. A pre-v62 row (the earlier,
+/// bound-hybrid form) is refused by name (`sth_signature_earlier_form`),
+/// never served. `TODO(archive-ruling)`: the pre-v62 store is to be kept as
+/// an archive and never read (operator ruling open).
+fn deserialize_signature(bytes: &[u8]) -> Result<Vec<u8>, TransparencyError> {
+    crate::federation::sth_form::classify(bytes)
+        .map_err(|e| TransparencyError::Storage(format!("sth signature deserialize: {e}")))?;
+    Ok(bytes.to_vec())
 }
 
 /// JSON-serialize witness signatures (PG JSONB / SQLite TEXT column).
@@ -276,7 +248,7 @@ fn serialize_witness_signatures(
 // every leg, because every leg carries both backends.
 #[cfg(feature = "sqlite")]
 fn deserialize_witness_signatures(raw: &str) -> Result<Vec<WitnessSignature>, TransparencyError> {
-    serde_json::from_str(raw)
+    crate::federation::sth_form::witnesses_from_json(raw)
         .map_err(|e| TransparencyError::Storage(format!("witness sigs deserialize: {e}")))
 }
 
@@ -651,11 +623,9 @@ mod pg_impl {
                     signature,
                     witness_signatures,
                 };
-                // v61.1.0 (CIRISPersist#1233, CC 2.6.1.8) — a stored head is
-                // served AS ITSELF, with no shape gate: `store_sth` gates NEW
-                // heads, and `verify_audit_sth` is the hybrid-Strict check a
-                // verifier asks. A head stored before the gate (an earlier
-                // build) keeps its proofs, and the tenant can still append.
+                // v62.0.0 — a stored head reaches here only as a composite:
+                // `deserialize_signature` refused an earlier-form row by name.
+                // `verify_audit_sth` is the check a verifier asks.
                 Ok(Some(sth))
             }
             .await
@@ -674,7 +644,7 @@ mod pg_impl {
             let timestamp = sth.timestamp;
             let signature_blob = serialize_signature(&sth.signature)?;
             let witnesses_str = serialize_witness_signatures(&sth.witness_signatures)?;
-            let signer_key_id = hex::encode(&sth.signature.classical.public_key);
+            let signer_key_id = crate::federation::sth_form::signer_column(&sth.signature);
             async move {
                 let client = crate::store::postgres::checkout_bounded(&pool, wait, None)
                     .await
@@ -960,12 +930,9 @@ mod sqlite_impl {
                     signature,
                     witness_signatures,
                 };
-                // v61.1.0 (CIRISPersist#1233, CC 2.6.1.8) — a stored head
-                // is served AS ITSELF, with no shape gate: `store_sth`
-                // gates NEW heads, and `verify_audit_sth` is the
-                // hybrid-Strict check a verifier asks. A head stored before
-                // the gate (an earlier build) keeps its proofs, and the
-                // tenant can still append.
+                // v62.0.0 — a stored head reaches here only as a composite:
+                // `deserialize_signature` refused an earlier-form row by
+                // name. `verify_audit_sth` is the check a verifier asks.
                 Ok(Some(sth))
             })()
         }
@@ -982,7 +949,7 @@ mod sqlite_impl {
             let signed_at = fmt_signed_at(sth.timestamp);
             let signature_blob = serialize_signature(&sth.signature)?;
             let witnesses_str = serialize_witness_signatures(&sth.witness_signatures)?;
-            let signer_key_id = hex::encode(&sth.signature.classical.public_key);
+            let signer_key_id = crate::federation::sth_form::signer_column(&sth.signature);
             (move || -> Result<(), TransparencyError> {
                 let conn = conn_arc.lock();
                 conn.execute(
@@ -1226,36 +1193,9 @@ mod tests {
             drop(backend);
         }
 
-        // Mock signers for STH testing — ciris-crypto's mocks aren't
-        // exported; same trick Verify's own transparency tests use.
-        use ciris_crypto::{
-            ClassicalAlgorithm, ClassicalSigner, CryptoError, HybridSigner, PqcAlgorithm, PqcSigner,
-        };
-
-        struct StubClassical;
-        impl ClassicalSigner for StubClassical {
-            fn algorithm(&self) -> ClassicalAlgorithm {
-                ClassicalAlgorithm::Ed25519
-            }
-            fn public_key(&self) -> Result<Vec<u8>, CryptoError> {
-                Ok(vec![0xAA; 32])
-            }
-            fn sign(&self, _data: &[u8]) -> Result<Vec<u8>, CryptoError> {
-                Ok(vec![0xBB; 64])
-            }
-        }
-
-        struct StubPqc;
-        impl PqcSigner for StubPqc {
-            fn algorithm(&self) -> PqcAlgorithm {
-                PqcAlgorithm::MlDsa65
-            }
-            fn public_key(&self) -> Result<Vec<u8>, CryptoError> {
-                Ok(vec![0xCC; 1952])
-            }
-            fn sign(&self, _data: &[u8]) -> Result<Vec<u8>, CryptoError> {
-                Ok(vec![0xDD; 3309])
-            }
+        /// A composite (CC 2.6.1.7) test key from fixed seeds.
+        fn composite_test_signer() -> ciris_crypto::composite::CompositeSigningKey {
+            ciris_crypto::composite::CompositeSigningKey::from_seeds(&[0x51; 32], &[0x52; 32])
         }
 
         #[test]
@@ -1267,7 +1207,9 @@ mod tests {
                         .unwrap();
                 }
                 let log = TransparencyLog::<AuditLeaf>::for_log("tenant:t-sth", store.clone());
-                let signer = HybridSigner::new(StubClassical, StubPqc).unwrap();
+                // v62.0.0: Verify's own log signs the composite (CC 2.6.1.7);
+                // the store keeps it as given.
+                let signer = composite_test_signer();
                 let sth = log.sign_head(&signer).unwrap();
                 assert_eq!(sth.tree_size, 3);
                 assert!(sth.witness_signatures.is_empty());
@@ -1280,12 +1222,8 @@ mod tests {
                 assert_eq!(stored.tree_size, sth.tree_size);
                 assert_eq!(stored.root_hash, sth.root_hash);
                 assert_eq!(
-                    stored.signature.classical.signature, sth.signature.classical.signature,
-                    "classical signature bytes round-trip via JSON"
-                );
-                assert_eq!(
-                    stored.signature.pqc.signature, sth.signature.pqc.signature,
-                    "PQC signature bytes round-trip via JSON"
+                    stored.signature, sth.signature,
+                    "the composite signature bytes round-trip unchanged"
                 );
             });
         }
@@ -1315,7 +1253,7 @@ mod tests {
             run_with_store("t-idem", |store| {
                 store.append(make_test_leaf("e1", 1, 1)).unwrap();
                 let log = TransparencyLog::<AuditLeaf>::for_log("tenant:t-idem", store.clone());
-                let signer = HybridSigner::new(StubClassical, StubPqc).unwrap();
+                let signer = composite_test_signer();
                 let first = log.sign_head(&signer).unwrap();
                 // Second sign_head at the same tree_size: ON CONFLICT
                 // DO NOTHING swallows the duplicate.
@@ -1333,7 +1271,7 @@ mod tests {
             run_with_store("t-witness", |store| {
                 store.append(make_test_leaf("e1", 1, 1)).unwrap();
                 let log = TransparencyLog::<AuditLeaf>::for_log("tenant:t-witness", store.clone());
-                let signer = HybridSigner::new(StubClassical, StubPqc).unwrap();
+                let signer = composite_test_signer();
                 let _ = log.sign_head(&signer).unwrap();
                 let stored = store.latest_sth().unwrap().unwrap();
                 let empty: Vec<WitnessSignature> = Vec::new();
@@ -1452,47 +1390,18 @@ mod tests {
             clean_tenant(&backend, &tenant_b).await;
         }
 
-        // Mock signers (same as SQLite tests).
-        use ciris_crypto::{
-            ClassicalAlgorithm, ClassicalSigner, CryptoError, HybridSigner, PqcAlgorithm, PqcSigner,
-        };
-
-        struct StubClassical;
-        impl ClassicalSigner for StubClassical {
-            fn algorithm(&self) -> ClassicalAlgorithm {
-                ClassicalAlgorithm::Ed25519
-            }
-            fn public_key(&self) -> Result<Vec<u8>, CryptoError> {
-                Ok(vec![0xAA; 32])
-            }
-            fn sign(&self, _data: &[u8]) -> Result<Vec<u8>, CryptoError> {
-                Ok(vec![0xBB; 64])
-            }
-        }
-
-        struct StubPqc;
-        impl PqcSigner for StubPqc {
-            fn algorithm(&self) -> PqcAlgorithm {
-                PqcAlgorithm::MlDsa65
-            }
-            fn public_key(&self) -> Result<Vec<u8>, CryptoError> {
-                Ok(vec![0xCC; 1952])
-            }
-            fn sign(&self, _data: &[u8]) -> Result<Vec<u8>, CryptoError> {
-                Ok(vec![0xDD; 3309])
-            }
-        }
-
         /// Sign the store's current head the way Verify's
         /// `TransparencyLog::sign_head` does (tree size, root, now, sign,
-        /// store) — over the async store.
+        /// store) — over the async store, with a composite test key (v62.0.0:
+        /// the only form a head takes).
         async fn sign_head(store: &PgMerkleStore, log_id: &str) -> SignedTreeHead {
             let tree_size = store.tree_size().await.unwrap();
             let root_hash = store.root().await.unwrap();
             let timestamp = Utc::now();
             let signing_bytes =
                 SignedTreeHead::signing_bytes(log_id, tree_size, &root_hash, timestamp);
-            let signer = HybridSigner::new(StubClassical, StubPqc).unwrap();
+            let signer =
+                ciris_crypto::composite::CompositeSigningKey::from_seeds(&[0x51; 32], &[0x52; 32]);
             let sth = SignedTreeHead {
                 log_id: log_id.to_owned(),
                 tree_size,
@@ -1504,6 +1413,8 @@ mod tests {
             store.store_sth(&sth).await.unwrap();
             sth
         }
+
+        // Mock signers (same as SQLite tests).
 
         #[tokio::test(flavor = "multi_thread")]
         #[serial_test::serial(postgres)]

@@ -336,13 +336,20 @@ pub trait FreeBytesSource: Send + Sync {
     fn free_bytes(&self, path: &Path) -> std::io::Result<u64>;
 }
 
+/// v62.0.0 (slice D, P2): a NATIVE host's source, behind `host` (fs4). A
+/// node host passes its own source (`storage.free-bytes`, e.g.
+/// `host::abi::AbiFreeBytes` under `host-abi`) to
+/// [`DiskPressureMonitor::with_source`].
+///
 /// Production [`FreeBytesSource`] — `statvfs`-backed via the in-tree
 /// `fs4` crate. `fs4::available_space` returns `f_bavail × f_frsize`
 /// (Unix) / `GetDiskFreeSpaceEx` (Windows), exactly the free-bytes
 /// semantic issue #149 specifies.
+#[cfg(feature = "host")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StatvfsFreeBytes;
 
+#[cfg(feature = "host")]
 impl FreeBytesSource for StatvfsFreeBytes {
     fn free_bytes(&self, path: &Path) -> std::io::Result<u64> {
         fs4::available_space(path)
@@ -433,7 +440,8 @@ pub struct DiskPressureMonitor {
 }
 
 impl DiskPressureMonitor {
-    /// Construct with the production statvfs source.
+    /// Construct with the production statvfs source (a native host).
+    #[cfg(feature = "host")]
     pub fn new(cfg: DiskPressureConfig) -> Self {
         Self::with_source(cfg, Arc::new(StatvfsFreeBytes))
     }
@@ -755,6 +763,7 @@ mod tests {
         assert!(rx.borrow().refuses_proxy_writes);
     }
 
+    #[cfg(feature = "host")]
     #[tokio::test]
     async fn statvfs_read_failure_keeps_prior_tier() {
         // Path does not exist → fs4 errors; monitor must NOT downgrade

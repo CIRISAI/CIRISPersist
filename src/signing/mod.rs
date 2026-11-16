@@ -155,6 +155,18 @@ pub enum LocalSignerError {
     /// enc keys from its own keystore identity instead.
     #[error("self-enc derivation requires a software (plaintext-seed) identity; this signer is hardware-custodied")]
     SelfEncRequiresSoftwareSeed,
+    /// v62.0.0 (slice D, CIRISVerify 23 composite cut) — a CC 2.6.1.7
+    /// composite ML-DSA-65-Ed25519 signature was asked for, and this signer's
+    /// ML-DSA half cannot produce it: that half signs under the FIPS 204
+    /// context `COMPSIG-MLDSA65-Ed25519-SHA512`, and the `PqcSigner` answered
+    /// `PqcSigner::sign_with_context` with the keyring's NotSupported default.
+    /// Persist never loads an ML-DSA seed to work around it (key custody
+    /// stays in the keyring).
+    #[error(
+        "composite_signing_unavailable: the ML-DSA-65 half of a CC 2.6.1.7 composite signs under \
+         a FIPS 204 context, and this signer's PqcSigner has no context-sign"
+    )]
+    CompositeUnavailable,
 }
 
 /// v7.1.0 (CIRISPersist#224) — the classical (Ed25519) half of a
@@ -232,6 +244,30 @@ impl ClassicalSigner {
     }
 }
 
+/// The ML-DSA-65 half of a seed-file identity: the keyring's file-backed
+/// signer, which needs the keyring's `fs` tier (persist's `host` feature). A
+/// node build has no file-backed keyring: its keys live in the host's seal,
+/// so a seed-file PQC config is refused there rather than read by persist.
+#[cfg(feature = "host")]
+fn load_mldsa_seed_file(
+    path: &std::path::Path,
+    alias: &str,
+) -> Result<MlDsa65SoftwareSigner, ciris_keyring::KeyringError> {
+    MlDsa65SoftwareSigner::from_seed_file(path, alias)
+}
+
+#[cfg(not(feature = "host"))]
+fn load_mldsa_seed_file(
+    _path: &std::path::Path,
+    _alias: &str,
+) -> Result<MlDsa65SoftwareSigner, ciris_keyring::KeyringError> {
+    Err(ciris_keyring::KeyringError::NotSupported {
+        operation: "a seed-file ML-DSA-65 identity needs the keyring's file tier (persist feature \
+                    `host`); a node's keys are in the host seal"
+            .into(),
+    })
+}
+
 /// Local identity signer — Rust-public surface for federation
 /// peers (CIRISLensCore, CIRISEdge, registry, partner sites)
 /// that need to sign as the deployment's local identity.
@@ -305,12 +341,11 @@ impl LocalSigner {
         let (pqc_key_id_out, pqc_signer) = match (&cfg.pqc_key_id, &cfg.pqc_key_path) {
             (Some(id), Some(path)) => {
                 let path_str = path.to_string_lossy().into_owned();
-                let signer = MlDsa65SoftwareSigner::from_seed_file(path, id).map_err(|e| {
-                    LocalSignerError::PqcSeedLoad {
+                let signer =
+                    load_mldsa_seed_file(path, id).map_err(|e| LocalSignerError::PqcSeedLoad {
                         path: path_str.clone(),
                         detail: format!("{e}"),
-                    }
-                })?;
+                    })?;
                 tracing::info!(
                     local_pqc_key_id = id.as_str(),
                     seed_path = path_str.as_str(),
@@ -489,6 +524,50 @@ impl LocalSigner {
             },
             mode: SignatureMode::HybridRequired,
         })
+    }
+
+    /// v62.0.0 (slice D) — the CC 2.6.1.7 composite ML-DSA-65-Ed25519
+    /// signature over `message` (3373 bytes, `mldsaSig || ed25519Sig`): what
+    /// CIRISVerify 23's forward transparency heads, witness cosignatures and
+    /// §19 substrate objects carry.
+    ///
+    /// Composed from Verify's public pieces, no seed read: `M' =
+    /// composite::message_representative(message)`; the ML-DSA half by the
+    /// keyring's FIPS 204 context-sign (`PqcSigner::sign_with_context(LABEL,
+    /// M')`); the Ed25519 half over `M'` by the classical signer (a hardware
+    /// key signs in its hardware); `composite::assemble_composite` checks both
+    /// halves under the composite key before returning the bytes.
+    ///
+    /// # Errors
+    /// [`LocalSignerError::PqcNotConfigured`] without a PQC half;
+    /// [`LocalSignerError::CompositeUnavailable`] when the PQC signer has no
+    /// context-sign (the keyring's default); [`LocalSignerError::PqcSign`] /
+    /// [`LocalSignerError::ClassicalSign`] when a half fails.
+    pub async fn sign_composite(&self, message: &[u8]) -> Result<Vec<u8>, LocalSignerError> {
+        use ciris_crypto::composite::{
+            assemble_composite, message_representative, CompositePublicKey, LABEL,
+        };
+        let pqc = self
+            .pqc_signer
+            .as_ref()
+            .ok_or(LocalSignerError::PqcNotConfigured)?;
+        let representative = message_representative(message);
+        let mldsa_sig = match pqc.sign_with_context(LABEL, &representative).await {
+            Ok(sig) => sig,
+            Err(ciris_keyring::KeyringError::NotSupported { .. }) => {
+                return Err(LocalSignerError::CompositeUnavailable)
+            }
+            Err(e) => return Err(LocalSignerError::PqcSign(format!("{e}"))),
+        };
+        let ed_sig = self.classical.sign(&representative).await?;
+        let mldsa_pk = pqc
+            .public_key()
+            .await
+            .map_err(|e| LocalSignerError::PqcSign(format!("{e}")))?;
+        let public = CompositePublicKey::from_halves(&mldsa_pk, &self.classical.public_key_bytes())
+            .map_err(|e| LocalSignerError::PqcSign(format!("composite public key: {e}")))?;
+        assemble_composite(&public, message, &mldsa_sig, &ed_sig)
+            .map_err(|e| LocalSignerError::PqcSign(format!("composite assemble: {e}")))
     }
 
     /// v19.2.0 (CIRISPersist#493) — THIS node's content-tier

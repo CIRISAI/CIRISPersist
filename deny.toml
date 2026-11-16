@@ -57,46 +57,11 @@ ignore = [
     "RUSTSEC-2024-0388",  # derivative unmaintained (via ciris-keyring TPM derive stack)
     "RUSTSEC-2024-0384",  # instant unmaintained (Phase 2.3 Reticulum may obsolete)
 
-    # v0.1.9 — new advisories surfaced after the v1.6.4 → v1.8.0
-    # ciris-keyring/ciris-verify-core bump. All transitive via
-    # ciris-verify-core's verification stack (DNS, HTTP, rustls,
-    # mobile attestation). Upstream's own deny.toml ignores the
-    # rustls-webpki ones with the same rationale; we inherit.
-    # None of these advisories touch persist's ingest hot path.
-    "RUSTSEC-2026-0119",  # hickory-proto DNS encoding O(n²) — DoS during DNS encoding;
-                           # persist talks to Postgres, no DNS encode path
-    "RUSTSEC-2026-0118",  # hickory-proto NSEC3 closest-encloser proof loop on cross-zone
-                           # responses — a DNSSEC-VALIDATION vuln. Transitive via
-                           # ciris-verify-core → hickory-resolver (reqwest's plain resolver);
-                           # persist does NOT enable DNSSEC/NSEC3 validation, so the vulnerable
-                           # path is unreachable. No patched version exists (patched=[]).
-    "RUSTSEC-2026-0491",  # v61.3.0 — hickory-proto 0.25.2 sizes decode Vecs from the DNS
-                           # header's record counts (memory amplification on a spoofed
-                           # response). Transitive ONLY via ciris-verify-core v22.2.0 →
-                           # hickory-resolver 0.25 (its dns.rs / DoH fallback). persist calls
-                           # no ciris_verify_core::dns / http_client / mobile_http path, so it
-                           # never decodes a DNS message. Fix is hickory 0.26.2 (semver-major,
-                           # upstream-only); remove when a TAGGED Verify carries it.
-    "RUSTSEC-2026-0487",  # v61.3.0 — hickory-proto zone-file lexer panic on a ≥4096-char token
-    "RUSTSEC-2026-0489",  # v61.3.0 — hickory-proto SVCB/HTTPS text parse panic (malformed alpn)
-    "RUSTSEC-2026-0490",  # v61.3.0 — hickory-proto SVCB/HTTPS text parse panic (lone quote)
-                           # All three: TEXT/zone-file parsers, same transitive path and same
-                           # fix (0.26.2) as 0491 above; persist parses no DNS text or zone file.
-    # v61.4.0 — five hickory DNSSEC-VALIDATION advisories published after v61.3.0,
-    # the same class and path as RUSTSEC-2026-0118 above: transitive ONLY via
-    # ciris-verify-core v22.2.0 → hickory-resolver 0.25 (reqwest's plain resolver).
-    # persist enables no DNSSEC validation and calls no ciris_verify_core::dns path,
-    # so no validator runs. Fix is hickory 0.26.2 (semver-major, upstream-only);
-    # remove when a TAGGED Verify carries it.
-    "RUSTSEC-2026-0504",  # inverted NSEC3 comparison
-    "RUSTSEC-2026-0505",  # NSEC3 owner names not checked against the zone
-    "RUSTSEC-2026-0511",  # NXDOMAIN accepted for a proven empty non-terminal
-    "RUSTSEC-2026-0512",  # an unrelated signed RRset accepted as the answer
-    "RUSTSEC-2026-0514",  # lookup / lookup_ip returned records that failed validation
-    "RUSTSEC-2026-0530",  # parent-side NSEC at a zone cut accepted as nonexistence proof
-    "RUSTSEC-2026-0531",  # child-side NSEC/NSEC3 accepted as proof of no DS record
-    "RUSTSEC-2026-0532",  # parent-side NSEC3 at a zone cut accepted as nonexistence proof
-                           # (all three: the same DNSSEC-validation class and path as above)
+    # v62.0.0 (slice D) — the fourteen hickory-proto ignores (RUSTSEC-2026-0118,
+    # 0119, 0487, 0489, 0490, 0491, 0504, 0505, 0511, 0512, 0514, 0530, 0531,
+    # 0532) are CLEARED: CIRISVerify v23.1.0 drops hickory-resolver from
+    # verify-core, and `cargo deny` (all features, every target) reported each
+    # ignore matched no crate. The ignores are gone.
     # v61.2.1 — RUSTSEC-2025-0134 (rustls-pemfile) and RUSTSEC-2026-0098 /
     # 0099 / 0104 (rustls-webpki) are CLEARED: cargo deny (all features, every
     # target) reported each ignore matched no crate. The ignores are gone.

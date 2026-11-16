@@ -86,7 +86,7 @@ async fn signed_verify_inputs_v3(
         .iter()
         .map(|id| (id.clone(), 1_000_000u64))
         .collect();
-    let mass_root = ciris_persist::fountain::aggregation::mass_commitment(&masses);
+    let mass_root = ciris_persist::fountain::aggregation::mass_commitment(&masses).unwrap();
     let meta = ciris_verify_core::substrate::AggregationMetaV1 {
         version,
         content_id: "content-root-agg".to_owned(),
@@ -101,10 +101,13 @@ async fn signed_verify_inputs_v3(
         noise_floor_descriptor: "mean+stddev".to_owned(),
     };
     let preimage = meta.signing_preimage();
-    let ed_sig = ed_sk.sign(&preimage).to_bytes();
-    let mut bound = preimage.clone();
-    bound.extend_from_slice(&ed_sig);
-    let pqc_sig = mldsa.sign(&bound).await.unwrap();
+    // v62.0.0: the aggregator signs the CC 2.6.1.7 composite under the same
+    // two keys the composite manifest envelope carries (Ed25519 seed 0x33,
+    // ML-DSA-65 seed 0x44).
+    let _ = (&ed_sk, &mldsa);
+    let composite =
+        ciris_crypto::composite::CompositeSigningKey::from_seeds(&[0x44; 32], &[0x33; 32]);
+    let sig = composite.sign(&preimage).unwrap();
 
     // tamper: claim a different tier than what was signed → preimage diverges.
     let signed_tier = if tamper { 99 } else { meta.tier };
@@ -125,11 +128,22 @@ async fn signed_verify_inputs_v3(
         },
         member_commitment_hex: commitment_hex.clone(),
         noise_floor_descriptor: meta.noise_floor_descriptor.clone(),
-        sig_ed25519_b64: BASE64.encode(ed_sig),
+        // `drop_pqc` now offers the EARLIER (CC 8.11.12) bound-hybrid pair in
+        // place of the composite: a pre-edition-2 tier, refused by name.
+        sig_ed25519_b64: if drop_pqc {
+            BASE64.encode([0u8; 64])
+        } else {
+            String::new()
+        },
         sig_ml_dsa_65_b64: if drop_pqc {
+            BASE64.encode([0u8; 3309])
+        } else {
+            String::new()
+        },
+        sig_composite_b64: if drop_pqc {
             String::new()
         } else {
-            BASE64.encode(&pqc_sig)
+            BASE64.encode(&sig)
         },
     };
     (inputs, commitment_hex)
@@ -484,10 +498,11 @@ async fn run_aggregation_assertions<B: Backend>(backend: &B, suffix: &str) {
         "(b4) flag-day fail-closed token"
     );
 
-    // ── (b2) §19.7.1 store-path gate: a valid composite manifest but a
-    //         PQC-MISSING aggregation_meta → REJECTED at admission
-    //         (aggregation_meta_hybrid_required), ZERO rows. The PQC-mandatory
-    //         §10.1.5.1.1 gate — never store-then-quarantine.
+    // ── (b2) §19.7.1 store-path gate: a valid composite manifest but an
+    //         aggregation_meta carrying the EARLIER bound-hybrid pair (a
+    //         pre-edition-2 tier) → REJECTED at admission by name
+    //         (aggregation_meta_earlier_form), ZERO rows. v62.0.0, CC rc20:
+    //         a v62 node reads only composites; never store-then-quarantine.
     let pqcmiss_cid = format!("agg-pqcmiss-{suffix}");
     let (m_ok, s_ok) = build_manifest_and_symbols(
         &pqcmiss_cid,
@@ -511,11 +526,11 @@ async fn run_aggregation_assertions<B: Backend>(backend: &B, suffix: &str) {
     let err = backend
         .put_aggregated_tier(&m_ok, &s_ok, &agg_nopqc, 2_500)
         .await
-        .expect_err("(b2) PQC-missing aggregation_meta MUST be rejected (store-path gate)");
+        .expect_err("(b2) an earlier-form aggregation_meta MUST be rejected (store-path gate)");
     assert_eq!(
         err.kind(),
-        "aggregation_meta_hybrid_required",
-        "(b2) PQC-mandatory store-path token"
+        "aggregation_meta_earlier_form",
+        "(b2) the earlier-form token"
     );
     assert!(
         backend
@@ -536,7 +551,7 @@ async fn run_aggregation_assertions<B: Backend>(backend: &B, suffix: &str) {
 
     // ── (b3) §19.7.1 store-path gate: TAMPERED meta — the signed preimage
     //         claims a different tier than the verification inputs assert, so
-    //         the bound-hybrid signature does not match → REJECTED, ZERO rows.
+    //         the composite signature does not match → REJECTED, ZERO rows.
     let tamper_cid = format!("agg-tamper-{suffix}");
     let (m_t, s_t) = build_manifest_and_symbols(
         &tamper_cid,
@@ -1013,7 +1028,10 @@ async fn i1152_member_commitment_unique<B: Backend>(backend: &B, suffix: &str) {
     };
     malformed(member_commitment(&padded_ids).expect_err("I1152: the builder refuses padding"));
     let root = member_commitment(&ids).expect("I1152: a distinct list builds");
-    assert_eq!(root, ciris_verify_core::substrate::member_commitment(&ids));
+    assert_eq!(
+        root,
+        ciris_verify_core::substrate::member_commitment(&ids).unwrap()
+    );
 
     // The fold over the distinct list.
     let fold_cid = format!("i1152-fold-{suffix}");

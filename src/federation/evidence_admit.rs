@@ -247,8 +247,7 @@ pub(crate) async fn put_touch_claim_planned<D: EvidenceStore>(
 pub(crate) async fn put_wholeness_witness_planned<D: EvidenceStore>(
     dir: &D,
     witness: &ciris_verify_core::substrate::WholenessWitness,
-    sig_ed25519_b64: &str,
-    sig_ml_dsa_65_b64: Option<&str>,
+    signature: &crate::verify::sig19::Sig19,
     pqc_key_id: &str,
     ed25519_pubkey_b64: &str,
     ml_dsa_65_pubkey_b64: Option<&str>,
@@ -256,8 +255,7 @@ pub(crate) async fn put_wholeness_witness_planned<D: EvidenceStore>(
 ) -> Result<(), Error> {
     let stored = crate::witness::admit_witness(
         witness,
-        sig_ed25519_b64,
-        sig_ml_dsa_65_b64,
+        signature,
         pqc_key_id,
         ed25519_pubkey_b64,
         ml_dsa_65_pubkey_b64,

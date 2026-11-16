@@ -113,9 +113,9 @@ pub fn member_commitment(
     source_member_ids: &[String],
 ) -> Result<[u8; 32], crate::federation::Error> {
     check_distinct_sources(source_member_ids.iter().map(String::as_str))?;
-    Ok(ciris_verify_core::substrate::member_commitment(
-        source_member_ids,
-    ))
+    ciris_verify_core::substrate::member_commitment(source_member_ids).map_err(|e| {
+        crate::federation::Error::InvalidArgument(format!("aggregate member commitment: {e}"))
+    })
 }
 
 /// §19.7.1.2 (CIRISVerify#167 / CIRISPersist#357) — the CC 6.1.2 noise-floor
@@ -129,6 +129,8 @@ pub fn member_commitment(
 /// (no *signed* `n_eff`), so a v1 tier is rejected — this is the intended
 /// §19.7.1.2 posture (a dominated aggregator cannot bypass the floor by
 /// declaring the pre-#167 schema). Pinned here; twins with CIRISConstitution#6.
+/// v62.0.0: CIRISVerify 23 fixes the floor inside `passes_dominance_gate`
+/// (`2·n_eff ≥ source_count`, integer); this constant names the same half.
 pub const MIN_DOMINANCE_RATIO: f64 = 0.5;
 
 /// §19.7.1.3 (CIRISVerify#191 / CIRISPersist#435, CC 6.1.2.1.2 R9) — the
@@ -248,11 +250,18 @@ pub struct AggregationMetaVerifyInputsV1 {
     pub member_commitment_hex: String,
     /// What survives below the floor (codec-specific, canonical).
     pub noise_floor_descriptor: String,
-    /// Ed25519 signature over the §19.7.1 preimage — base64.
+    /// The EARLIER form's (CC 8.11.12) Ed25519 half. v62.0.0: present only to
+    /// refuse a pre-edition-2 tier by name (`aggregation_meta_earlier_form`);
+    /// a v62 tier leaves it empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sig_ed25519_b64: String,
-    /// ML-DSA-65 signature over `preimage ‖ ed25519_sig` — base64. The
-    /// PQC-mandatory half: empty/absent ⇒ rejected at the gate.
+    /// The EARLIER form's ML-DSA-65 half (refused by name, as above).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sig_ml_dsa_65_b64: String,
+    /// v62.0.0 (CIRISVerify 23) — the CC 2.6.1.7 composite over the §19.7.1
+    /// preimage, base64 (3373 bytes). Required.
+    #[serde(default)]
+    pub sig_composite_b64: String,
 }
 
 impl AggregationMetaVerifyInputsV1 {
@@ -300,6 +309,11 @@ pub enum AggregationMetaError {
     /// signed preimage). §10.1.5.1.1: rejected BEFORE persistence.
     #[error("aggregation_meta §19.7.1 bound-hybrid verify failed (PQC-mandatory)")]
     HybridRequired,
+    /// v62.0.0 — the tier carries the EARLIER (bound-hybrid) signature
+    /// pair, a pre-edition-2 object: a v62 node reads only CC 2.6.1.7
+    /// composites (CC rc20, nothing carries).
+    #[error("aggregation_meta_earlier_form: a bound-hybrid tier signature (pre-edition-2)")]
+    EarlierForm,
     /// The composite manifest envelope did not carry the aggregator's
     /// `pubkey_ed25519` / `pubkey_ml_dsa_65` needed to verify the meta.
     #[error("aggregation_meta verify: composite manifest envelope missing aggregator {0}")]
@@ -344,6 +358,7 @@ impl AggregationMetaError {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::HybridRequired => "aggregation_meta_hybrid_required",
+            Self::EarlierForm => "aggregation_meta_earlier_form",
             Self::MissingAggregatorPubkey(_) => "aggregation_meta_missing_pubkey",
             Self::MalformedInput(_) => "aggregation_meta_invalid",
             Self::MemberCommitmentMismatch => "aggregation_meta_member_commitment",
@@ -496,47 +511,51 @@ impl AggregationMetaV1 {
         let mldsa_pub = BASE64
             .decode(mldsa_pub_b64)
             .map_err(|_| AggregationMetaError::MalformedInput("pubkey_ml_dsa_65 base64"))?;
-        let sig_ed = BASE64
-            .decode(&self.verification.sig_ed25519_b64)
-            .map_err(|_| AggregationMetaError::MalformedInput("sig_ed25519 base64"))?;
-        // An empty PQC sig is the hard-cut classical-only signal — reject
-        // before even decoding (mirrors the #225 fountain hard cut).
-        if self.verification.sig_ml_dsa_65_b64.is_empty() {
+        let verify_meta = self.verification.to_verify_meta()?;
+        let v = &self.verification;
+        // v62.0.0 — by FORM: the composite (CC 2.6.1.7) through Verify's
+        // `verify_aggregation_meta`; the earlier bound-hybrid pair (CC
+        // 8.11.12) over the same §19.7.1 preimage.
+        // v62.0.0 — the composite only (CC 2.6.1.7); the earlier pair is
+        // refused by name before any signature math.
+        let sig = crate::verify::sig19::Sig19::from_wire_fields(
+            &v.sig_ed25519_b64,
+            &v.sig_ml_dsa_65_b64,
+            &v.sig_composite_b64,
+        )
+        .map_err(|e| match e {
+            crate::verify::sig19::Sig19Error::EarlierForm => AggregationMetaError::EarlierForm,
+            _ => AggregationMetaError::MalformedInput("sig_composite"),
+        })?;
+        let verified = matches!(
+            verify_aggregation_meta(
+                &verify_meta,
+                &sig.0,
+                &crate::verify::sig19::composite_pubkey(&ed_pub, &mldsa_pub),
+            ),
+            AggregationMetaVerification::Verified
+        );
+        if !verified {
             return Err(AggregationMetaError::HybridRequired);
         }
-        let sig_mldsa = BASE64
-            .decode(&self.verification.sig_ml_dsa_65_b64)
-            .map_err(|_| AggregationMetaError::MalformedInput("sig_ml_dsa_65 base64"))?;
-
-        let verify_meta = self.verification.to_verify_meta()?;
-        match verify_aggregation_meta(&verify_meta, &sig_ed, &sig_mldsa, &ed_pub, &mldsa_pub) {
-            AggregationMetaVerification::HybridVerified => {
-                // §19.7.1.2 (CIRISVerify#167 / CIRISPersist#357) — dominance
-                // gate. Only now that the bound-hybrid signature authenticated
-                // `n_eff` is the effective-source-count trustworthy; reject a
-                // dominated fold (and, fail-closed, any version-1 tier that
-                // carries no signed n_eff). §10.1.5.1.1: BEFORE persistence.
-                if !passes_dominance_gate(&verify_meta, MIN_DOMINANCE_RATIO) {
-                    return Err(AggregationMetaError::Dominated);
-                }
-                // §19.7.1.3 (CIRISVerify#191 / CIRISPersist#435) — multiplicity
-                // gate, the content-similarity sibling BOTH must pass: the
-                // authenticated `max_source_multiplicity` must respect the
-                // corpus-pinned floor. Rejects the 900-near-duplicates-under-
-                // distinct-ids fold the mass gate honestly admits (equal masses
-                // ⇒ truthful n_eff = 1000, yet the composite blur IS the data
-                // subject). Fail-closed for a pre-v3 tier (no signed
-                // multiplicity surface — the CIRISVerify#191 flag-day cut).
-                if !passes_multiplicity_gate(
-                    &verify_meta,
-                    multiplicity_n_min_for(&verify_meta.corpus_kind),
-                ) {
-                    return Err(AggregationMetaError::Multiplicity);
-                }
-                Ok(())
-            }
-            AggregationMetaVerification::Failed => Err(AggregationMetaError::HybridRequired),
+        // §19.7.1.2 (CIRISVerify#167 / CIRISPersist#357) — dominance
+        // gate. Only now that the signature authenticated `n_eff` is
+        // the effective-source-count trustworthy; reject a dominated
+        // fold (CIRISVerify 23: `2·n_eff ≥ source_count`, version-3
+        // tiers only — fail closed below v3). §10.1.5.1.1: BEFORE
+        // persistence.
+        if !passes_dominance_gate(&verify_meta) {
+            return Err(AggregationMetaError::Dominated);
         }
+        // §19.7.1.3 (CIRISVerify#191 / CIRISPersist#435) — multiplicity
+        // gate, the content-similarity sibling BOTH must pass.
+        if !passes_multiplicity_gate(
+            &verify_meta,
+            multiplicity_n_min_for(&verify_meta.corpus_kind),
+        ) {
+            return Err(AggregationMetaError::Multiplicity);
+        }
+        Ok(())
     }
 }
 
@@ -720,7 +739,9 @@ pub async fn descend_aggregated_sources_on_backend<B: crate::store::Backend>(
             .map_err(crate::store::Error::AggregationMetaRejected)?,
         noise_floor_descriptor: String::new(),
     };
-    if !verify_member_commitment(&verify_meta, &member_ids) {
+    if !verify_member_commitment(&verify_meta, &member_ids).map_err(|_| {
+        crate::store::Error::AggregationMetaRejected(AggregationMetaError::MemberCommitmentMismatch)
+    })? {
         return Err(crate::store::Error::AggregationMetaRejected(
             AggregationMetaError::MemberCommitmentMismatch,
         ));
@@ -856,7 +877,7 @@ mod tests {
         // 900 · 2 = 1800 > 1000 → the R9 false-erasure is REJECTED.
         assert!(!passes_multiplicity_gate(&meta(3, 900), n_min));
         // ...even though the mass gate honestly admits it (n_eff == N).
-        assert!(passes_dominance_gate(&meta(3, 900), MIN_DOMINANCE_RATIO));
+        assert!(passes_dominance_gate(&meta(3, 900)));
         // A genuinely-diverse fold passes: 500 · 2 = 1000 ≤ 1000.
         assert!(passes_multiplicity_gate(&meta(3, 500), n_min));
         // Flag-day: a v2 tier (no signed multiplicity) fails CLOSED.
@@ -881,6 +902,7 @@ mod tests {
             noise_floor_descriptor: String::new(),
             sig_ed25519_b64: String::new(),
             sig_ml_dsa_65_b64: String::new(),
+            sig_composite_b64: String::new(),
         };
         assert_eq!(
             inputs("").to_verify_meta().unwrap().mass_commitment,

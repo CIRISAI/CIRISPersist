@@ -28,6 +28,8 @@ pub mod executor_capsule;
 
 // v62.0.0 (slice A, P9) — the native host's adapters: OS signals → lifecycle
 // events, and the off-GIL teardown thread (moved from `engine::teardown`).
+// v62.0.0 (slice D) — OS signals: a native host's adapter (`host`).
+#[cfg(feature = "host")]
 pub mod native_host;
 pub mod teardown;
 

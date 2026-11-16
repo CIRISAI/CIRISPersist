@@ -759,6 +759,18 @@ impl XChaChaKvStore {
     }
 }
 
+/// v62.0.0 (slice D, P11) — do `a` and `b` name one database file? Compared
+/// canonically where both resolve (an existing file, a native host); by the
+/// literal path otherwise (a file not created yet, or a host with no
+/// filesystem, where the name IS the identity).
+#[must_use]
+pub fn same_database_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
+}
+
 /// Coerce a stored nonce blob to the fixed 24-byte array, rejecting a
 /// wrong length (corrupt row) as an auth failure.
 fn to_nonce(b: &[u8]) -> Result<[u8; NONCE_LEN], KVError> {
@@ -989,7 +1001,9 @@ fn software_mls_state_key(master_key_b64: Option<&str>) -> Result<Zeroizing<Vec<
         )));
     }
     let key = Zeroizing::new(
-        ciris_verify_core::derive_symmetric_key(
+        // v62.0.0: persist's byte-identical copy (Verify 23 moved its own to
+        // the `host` tier; I1859 pins them equal).
+        crate::verify::named_key::derive_symmetric_key(
             &SoftwareRootAsSeed(raw),
             SOFTWARE_ROOT_KEY_ID,
             MLS_STATE_CONTEXT,
@@ -1379,7 +1393,8 @@ mod tests {
                 "test one-seed".into()
             }
         }
-        ciris_verify_core::derive_symmetric_key(&OneSeed(root.to_vec()), "seed", context).unwrap()
+        crate::verify::named_key::derive_symmetric_key(&OneSeed(root.to_vec()), "seed", context)
+            .unwrap()
     }
 
     fn no_hardware_consulted(_: bool) -> HardwareRootResult {

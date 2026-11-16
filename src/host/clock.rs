@@ -12,7 +12,7 @@
 //! - [`Clock`] — the trait a host implements: [`Clock::now`] is the wall
 //!   instant, as persist's existing instant type (`DateTime<Utc>`), and
 //!   [`Clock::monotonic`] is an opaque, never-decreasing reading.
-//! - [`SystemClock`] — the native default. `now()` IS `chrono::Utc::now()`,
+//! - [`SystemClock`] — the native default. `now()` reads the OS wall clock `chrono::Utc::now()` reads,
 //!   so a native node stamps the same instants it always did: the signed
 //!   instants, and the µs truncation every store applies when it writes one,
 //!   are untouched (the truncation lives in the stores' formatters, which
@@ -66,7 +66,7 @@ pub trait Clock: Send + Sync + 'static {
 
 /// The native default: the operating system's clocks.
 ///
-/// `now()` is `chrono::Utc::now()` and `monotonic()` is a
+/// `now()` is the OS wall clock (`chrono::Utc::now()`'s reading) and `monotonic()` is a
 /// `std::time::Instant` measured from a process-wide origin, so every
 /// reading on a native node is the reading v61 made.
 #[derive(Debug, Default, Clone, Copy)]
@@ -85,7 +85,13 @@ fn process_origin() -> std::time::Instant {
 
 impl Clock for SystemClock {
     fn now(&self) -> DateTime<Utc> {
-        Utc::now()
+        // v62.0.0 (slice D) — the OS wall clock through `std::time`, which is
+        // what `chrono::Utc::now()` reads on every native target (same
+        // instant, same nanoseconds). Not `Utc::now()` itself: with chrono's
+        // `wasmbind` on (rusqlite and verify-core turn it on for wasm32), that
+        // call links a JS `Date` import into a node module even when the node
+        // installs its own clock. A node never reads this clock.
+        DateTime::<Utc>::from(std::time::SystemTime::now())
     }
 
     fn monotonic(&self) -> Duration {
@@ -175,8 +181,14 @@ pub fn current() -> Arc<dyn Clock> {
 }
 
 /// **The wall-clock read.** Every production stamp in persist's node code
-/// is this call: the installed clock's [`Clock::now`], or
-/// `chrono::Utc::now()` when no clock is installed.
+/// is this call: the installed clock's [`Clock::now`], or [`SystemClock`]'s
+/// reading (the OS wall clock `chrono::Utc::now()` reads) when no clock is
+/// installed.
+///
+/// v62.0.0 (slice D): the fallback is `SystemClock`, not `Utc::now()` itself:
+/// on wasm32 with chrono's `wasmbind` on, `Utc::now()` links a JS `Date`
+/// import into the node module (measured: `js_sys::Date::new_0` /
+/// `get_time`, called only from here), and the import gate refuses it.
 #[must_use]
 #[inline]
 pub fn now() -> DateTime<Utc> {
@@ -185,7 +197,7 @@ pub fn now() -> DateTime<Utc> {
             return c.now();
         }
     }
-    Utc::now()
+    SystemClock.now()
 }
 
 /// **The monotonic read**: the installed clock's [`Clock::monotonic`] as an

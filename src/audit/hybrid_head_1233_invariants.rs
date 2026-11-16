@@ -1,31 +1,30 @@
 //! v61.1.0 (CIRISPersist#1233, CC 5.3.1 / CC 5.3.2.4.3.1) — **I1564–I1566:
-//! the audit gate is the hybrid-signed head.**
+//! the audit gate is the composite-signed head.**
 //!
 //! An `AuditEntry` is a leaf and its Ed25519 is an inner signature; what
 //! authenticates it across a node boundary is inclusion under a signed tree
 //! head, so the head must carry its ML-DSA-65 half (CC's reading on
 //! CIRISPersist#1233, item 2).
 //!
-//! `HybridSignature` makes the half structurally required — a blob with the
-//! `pqc` member REMOVED does not decode — but an EMPTY or wrong-shaped half,
-//! another PQC algorithm, or `mode: ClassicalOnly` all decode. These
-//! witnesses offer each of those and expect a refusal:
+//! v62.0.0 (slice D, CIRISVerify 23, CC rc20 "nothing carries"): the head's
+//! signature is the CC 2.6.1.7 composite, which carries its ML-DSA-65 half by
+//! construction; a v62 node reads ONLY composites. These witnesses offer the
+//! heads that are not one and expect a refusal:
 //!
-//! - **I1564** `store_sth` refuses every head without its ML-DSA-65 half and
-//!   writes nothing; a genuine hybrid head stores (the control).
-//! - **I1565** a STORED head without its half, written around the store gate
-//!   (the row an earlier build left), is SERVED as itself by `latest_sth` and
-//!   by `AuditService::current_sth` above it (CC 2.6.1.8: an earlier form
-//!   verifies as itself for rows anchored before the cutover), and REFUSED by
-//!   `verify_audit_sth` with `audit_sth_not_hybrid`. The serve does not fall
-//!   back to the older genuine head either. A stored blob that does not
-//!   decode at all (the `pqc` member removed) is malformed, and `latest_sth`
-//!   refuses it: refusal, not absence.
+//! - **I1564** `store_sth` refuses every head that is not a composite (the
+//!   earlier, bound-hybrid form of v61; a composite one byte short; the
+//!   ML-DSA-65 half alone; no bytes) and writes nothing; a genuine composite
+//!   head stores and round-trips (the control).
+//! - **I1565** a STORED earlier-form head (the row a v61 node left) is
+//!   REFUSED by name on read (`sth_signature_earlier_form`), by
+//!   `latest_sth` and by `AuditService::current_sth` above it: never served,
+//!   and not skipped in favour of the genuine head below it
+//!   (`TODO(archive-ruling)`: the pre-v62 store's fate is an open operator
+//!   ruling). A stored blob in no form is refused too: refusal, not absence.
 //! - **I1566** `verify_audit_sth` verifies a genuine head against its pinned
-//!   signer, and refuses the same head with its half emptied, with
-//!   `mode: ClassicalOnly`, with a corrupted (right-length) ML-DSA-65
-//!   signature, and against a different pinned signer (the gate asks about
-//!   the signer the verifier pinned, not the key the head names).
+//!   signer, and refuses every non-composite head as not composite, a
+//!   corrupted composite, and the genuine head against a different pinned
+//!   signer (the gate asks about the signer the verifier pinned).
 //!
 //! I1564 and I1565 run on sqlite and postgres; I1566 is backend-free.
 //! `audit_chain_proof`'s own leg is `ffi::pyo3`'s I1567.
@@ -38,16 +37,15 @@ pub(crate) mod bodies {
     };
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
-    use ciris_crypto::{PqcAlgorithm, SignatureMode};
     use ciris_verify_core::transparency::{SignedTreeHead, TransparencyStore};
 
     /// The pinned signer every genuine head here is signed by.
     pub(crate) const SIGNER: &str = "i1566-audit-sth-signer";
 
-    /// A genuine audit head for `log_id` at `tree_size`, hybrid-signed by
-    /// [`SIGNER`] through `LocalSigner::sign_hybrid` (the production signer
-    /// the Merkle hook uses), with the signer's (Ed25519, ML-DSA-65) pubkeys
-    /// as base64 — the pins a verifier holds.
+    /// A genuine audit head for `log_id` at `tree_size`, composite-signed by
+    /// [`SIGNER`] through `sth_form::sign_sth` (the production signer the
+    /// Merkle hook uses), with the signer's (Ed25519, ML-DSA-65) pubkeys as
+    /// base64 — the pins a verifier holds.
     pub(crate) async fn genuine_head(
         log_id: &str,
         tree_size: u64,
@@ -56,7 +54,9 @@ pub(crate) mod bodies {
         let timestamp = crate::audit::verify::truncate_to_micros(chrono::Utc::now());
         let root_hash = [0x5Au8; 32];
         let bytes = SignedTreeHead::signing_bytes(log_id, tree_size, &root_hash, timestamp);
-        let signature = signer.sign_hybrid(&bytes).await.expect("sign_hybrid");
+        let signature = crate::federation::sth_form::sign_sth(&signer, &bytes)
+            .await
+            .expect("sign_sth (composite)");
         let ed_pk = B64.encode(signer.ed25519_public_key_bytes());
         let pqc_pk = signer
             .pqc_public_key_b64()
@@ -74,54 +74,51 @@ pub(crate) mod bodies {
         (sth, ed_pk, pqc_pk)
     }
 
-    /// Every way a head can decode yet lack its ML-DSA-65 half.
+    /// A v61 (earlier-form, bound-hybrid) signature over `h`'s bytes, from
+    /// fixed test seeds: the bytes a pre-v62 `signature_blob` holds.
+    pub(crate) fn earlier_form_signature(h: &SignedTreeHead) -> Vec<u8> {
+        crate::federation::sth_form::test_support::earlier_bytes(
+            [0x62; 32],
+            [0x61; 32],
+            &h.signing_bytes_of(),
+        )
+    }
+
+    /// Every head that is not a CC 2.6.1.7 composite.
     pub(crate) fn without_the_pqc_half(h: &SignedTreeHead) -> Vec<(&'static str, SignedTreeHead)> {
-        let mut out = Vec::new();
-        let mut v = h.clone();
-        v.signature.pqc.signature = Vec::new();
-        out.push(("ML-DSA-65 signature emptied", v));
-        let mut v = h.clone();
-        v.signature.pqc.public_key = Vec::new();
-        out.push(("ML-DSA-65 public key emptied", v));
-        let mut v = h.clone();
-        v.signature.pqc.signature = Vec::new();
-        v.signature.pqc.public_key = Vec::new();
-        out.push(("both ML-DSA-65 fields emptied", v));
-        let mut v = h.clone();
-        v.signature.pqc.signature.pop();
-        out.push(("ML-DSA-65 signature one byte short", v));
-        let mut v = h.clone();
-        v.signature.mode = SignatureMode::ClassicalOnly;
-        out.push(("mode ClassicalOnly", v));
-        let mut v = h.clone();
-        v.signature.pqc.algorithm = PqcAlgorithm::MlDsa44;
-        out.push(("PQC algorithm ML-DSA-44", v));
-        out
+        let with = |sig: Vec<u8>| {
+            let mut v = h.clone();
+            v.signature = sig;
+            v
+        };
+        let mut short = h.signature.clone();
+        short.pop();
+        vec![
+            (
+                "the earlier (v61 bound-hybrid) form",
+                with(earlier_form_signature(h)),
+            ),
+            ("a composite one byte short", with(short)),
+            (
+                "the ML-DSA-65 half alone",
+                with(h.signature[..3309].to_vec()),
+            ),
+            ("no signature bytes", with(Vec::new())),
+            (
+                "a JSON object that is no signature",
+                with(b"{\"pqc\":null}".to_vec()),
+            ),
+        ]
     }
 
-    /// The JSON `signature_blob` of `h` with the `pqc` member REMOVED — the
-    /// shape `HybridSignature` cannot represent, reachable only as stored
-    /// bytes.
+    /// A stored blob in no form (a composite truncated) — malformed.
     pub(crate) fn blob_with_the_pqc_half_removed(h: &SignedTreeHead) -> Vec<u8> {
-        let mut v = serde_json::to_value(&h.signature).expect("signature serializes");
-        let removed = v
-            .as_object_mut()
-            .expect("HybridSignature serializes as an object")
-            .remove("pqc");
-        assert!(removed.is_some(), "the blob carried a pqc member to remove");
-        assert!(
-            serde_json::from_value::<ciris_crypto::HybridSignature>(v.clone()).is_err(),
-            "HybridSignature cannot represent a missing PQC half"
-        );
-        serde_json::to_vec(&v).expect("blob")
+        h.signature[..h.signature.len() - 1].to_vec()
     }
 
-    /// The JSON `signature_blob` of `h` with the ML-DSA-65 half EMPTIED.
+    /// The row a v61 node left: an earlier-form (bound-hybrid) blob.
     pub(crate) fn blob_with_the_pqc_half_emptied(h: &SignedTreeHead) -> Vec<u8> {
-        let mut sig = h.signature.clone();
-        sig.pqc.signature = Vec::new();
-        sig.pqc.public_key = Vec::new();
-        serde_json::to_vec(&sig).expect("blob")
+        earlier_form_signature(h)
     }
 
     /// Insert a `merkle_sth_log` row on sqlite, bypassing `store_sth` (the
@@ -183,7 +180,7 @@ pub(crate) mod bodies {
             };
             assert!(
                 err.to_string().contains(AUDIT_STH_NOT_HYBRID),
-                "I1564 {who}: {what} is refused as not hybrid: {err}"
+                "I1564 {who}: {what} is refused as not composite: {err}"
             );
             assert!(
                 store.latest_sth().expect("latest_sth").is_none(),
@@ -192,15 +189,15 @@ pub(crate) mod bodies {
         }
         store
             .store_sth(genuine)
-            .unwrap_or_else(|e| panic!("I1564 {who}: the genuine hybrid head stores: {e}"));
+            .unwrap_or_else(|e| panic!("I1564 {who}: the genuine composite head stores: {e}"));
         let served = store
             .latest_sth()
             .expect("I1564: the genuine head is served")
             .expect("I1564: a head is present");
         assert_eq!(served.tree_size, genuine.tree_size, "I1564 {who}");
         assert_eq!(
-            served.signature.pqc.signature, genuine.signature.pqc.signature,
-            "I1564 {who}: the ML-DSA-65 half round-trips"
+            served.signature, genuine.signature,
+            "I1564 {who}: the composite round-trips"
         );
     }
 
@@ -235,52 +232,38 @@ pub(crate) mod bodies {
         });
 
         inject(2, blob_with_the_pqc_half_emptied(genuine));
-        let served = store
-            .latest_sth()
-            .unwrap_or_else(|e| {
-                panic!("I1565 {who}: a stored head with its pqc half EMPTIED is served: {e}")
-            })
-            .expect("I1565: a head is present");
-        assert_served_as_itself(&served, who);
-        let Err(err) = verify_audit_sth(&served, ed_pk, pqc_pk) else {
-            panic!("I1565 {who}: verify_audit_sth must refuse the served head without its half");
+        let Err(err) = store.latest_sth() else {
+            panic!("I1565 {who}: a stored earlier-form head must be refused, never served");
         };
-        assert!(
-            err.to_string().contains(AUDIT_STH_NOT_HYBRID),
-            "I1565 {who}: verify refuses the emptied half as not hybrid: {err}"
-        );
+        assert_refused_as_earlier(&err.to_string(), who);
     }
 
-    /// The head `latest_sth` serves after I1565's injection is the injected
-    /// row itself: tree size 2, its ML-DSA-65 half empty.
-    fn assert_served_as_itself(served: &SignedTreeHead, who: &str) {
-        assert_eq!(
-            served.tree_size, 2,
-            "I1565 {who}: the newest stored head is served, not the genuine one below it"
-        );
+    /// The refusal names the earlier form.
+    fn assert_refused_as_earlier(err: &str, who: &str) {
         assert!(
-            served.signature.pqc.signature.is_empty() && served.signature.pqc.public_key.is_empty(),
-            "I1565 {who}: the stored head is served as itself, its half still empty"
+            err.contains(crate::federation::sth_form::STH_SIGNATURE_EARLIER_FORM),
+            "I1565 {who}: the stored earlier-form head is refused by name: {err}"
         );
     }
 
     /// I1565, the service leg — `AuditService::current_sth` (what
-    /// `trust_grant_inclusion_proof` and `audit_chain_proof` serve) serves
-    /// the same stored head as itself.
+    /// `trust_grant_inclusion_proof` and `audit_chain_proof` serve) refuses
+    /// the same stored earlier-form head by name.
     pub(crate) fn assert_current_sth_serves_the_stored_head(
         got: Result<Option<SignedTreeHead>, crate::audit::Error>,
         who: &str,
     ) {
         match got {
-            Ok(Some(served)) => assert_served_as_itself(&served, who),
-            other => panic!("I1565 {who}: current_sth must serve the stored head: {other:?}"),
+            Err(e) => assert_refused_as_earlier(&e.to_string(), who),
+            other => {
+                panic!("I1565 {who}: current_sth must refuse the earlier-form head: {other:?}")
+            }
         }
     }
 
-    /// I1565, the malformed leg — a stored blob with the `pqc` member REMOVED
-    /// does not decode, and `latest_sth` refuses it (malformed is a refusal,
-    /// not absence; and not the older head below it). Injected at tree size
-    /// 3, after the served leg.
+    /// I1565, the malformed leg — a stored blob in no form (a truncated
+    /// composite) is refused by `latest_sth` (malformed is a refusal, not
+    /// absence; and not the older head below it). Injected at tree size 3.
     pub(crate) fn i1565_a_stored_head_that_does_not_decode_is_refused(
         store: &dyn TransparencyStore<AuditLeaf>,
         inject: &dyn Fn(i64, Vec<u8>),
@@ -292,8 +275,11 @@ pub(crate) mod bodies {
             panic!("I1565 {who}: a stored head with its pqc half REMOVED is refused");
         };
         assert!(
-            err.to_string().contains("sth signature deserialize"),
-            "I1565 {who}: the removed half fails to decode: {err}"
+            err.to_string().contains("sth signature deserialize")
+                && err
+                    .to_string()
+                    .contains(crate::federation::sth_form::STH_SIGNATURE_UNRECOGNIZED),
+            "I1565 {who}: the malformed blob is refused: {err}"
         );
     }
 
@@ -309,14 +295,14 @@ pub(crate) mod bodies {
             };
             assert!(
                 err.to_string().contains(AUDIT_STH_NOT_HYBRID),
-                "I1566: {what} is refused as not hybrid, before crypto: {err}"
+                "I1566: {what} is refused as not composite, before crypto: {err}"
             );
         }
 
         let mut forged = genuine.clone();
-        forged.signature.pqc.signature[0] ^= 0xFF;
+        forged.signature[0] ^= 0xFF;
         let err = verify_audit_sth(&forged, &ed_pk, &pqc_pk)
-            .expect_err("I1566: a corrupted ML-DSA-65 half must not verify");
+            .expect_err("I1566: a corrupted composite must not verify");
         assert!(
             err.to_string().contains(AUDIT_STH_SIGNATURE_INVALID),
             "I1566: the corrupted half fails the crypto: {err}"

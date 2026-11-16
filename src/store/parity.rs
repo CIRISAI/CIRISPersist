@@ -955,6 +955,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // construction (one fn in `renditions.rs`).
     ("decode_sha256_hex", Class::Gate),
     ("dedicated_connect", Class::Delegates),
+    // v62.0.0 (slice D) — decodes a stored delivery receipt's signature
+    // bytes (the substrate's own row), split from the STH decoder when heads
+    // became composites.
+    ("deserialize_receipt_signature", Class::Plumbing),
     ("deserialize_signature", Class::Plumbing),
     ("deserialize_witness_signatures", Class::Plumbing),
     ("entry_as_stored", Class::Plumbing),
@@ -1358,6 +1362,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("sqlite_upsert_wire_index", Class::Delegates),
     ("to_string", Class::Plumbing),
     ("to_value", Class::Plumbing),
+    // v62.0.0 (slice D) — `serde_json::to_vec` of a receipt's signature for
+    // its column: fails only on the substrate's own encoder.
+    ("to_vec", Class::Plumbing),
     ("transaction", Class::Plumbing),
     ("transpose", Class::Plumbing),
     ("try_from", Class::Plumbing),
