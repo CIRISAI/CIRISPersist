@@ -1362,7 +1362,6 @@ type SmokeCheck<'a> = (&'a str, Box<dyn Fn() + 'a>);
 /// `KERNEL_PATHS_SMOKE=1`: build every fixture at its smallest size and
 /// ask each path once, reporting every failure instead of stopping at the
 /// first (a fixture check, not a measurement).
-
 fn smoke() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     let rt = runtime();
