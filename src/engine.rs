@@ -4447,6 +4447,8 @@ impl Engine {
         delegation_purpose: Option<&str>,
         term: crate::federation::admission::DelegationTermBounds,
     ) -> Result<String, crate::federation::Error> {
+        let owner_binding = delegation_purpose
+            .is_some_and(|p| p == crate::federation::types::owner_binding::PURPOSE);
         let mut envelope = match delegation_purpose {
             // The owner-binding sub-relation (CC 3.2): single-valued ownership,
             // gated by check_single_node_owner_admission. `sub_delegation` is
@@ -4469,7 +4471,60 @@ impl Engine {
         // its later `withdraws` by `attested_key_id`, so a `delegates_to`
         // MUST name the delegate there (not the self-attestation default).
         input.attested_key_id = Some(delegate_key_id.to_owned());
+        // v62.0.0 (slice C, CC 3.2 *The first binding (MUST)*): "an
+        // owner-binding counts toward ownership only when the node's own key
+        // cosigned it". Binding THIS node, the engine co-scrubs the row with
+        // its own key over the same bytes before it is stored.
+        if owner_binding
+            && self.local_derived_key_id().await.ok().as_deref() == Some(delegate_key_id)
+        {
+            return self.emit_attestation_node_cosigned(signer, input).await;
+        }
         self.emit_attestation(signer, input).await
+    }
+
+    /// v62.0.0 (slice C) — [`Self::emit_attestation`] with this node's
+    /// co-scrub ([`ScrubSig`](crate::federation::types::ScrubSig)) appended to
+    /// `additional_scrubs`: the actor signs the canonical bytes, this engine's
+    /// composed signer signs the SAME bytes, and the row is stored through the
+    /// authored door, which verifies every scrub. The node's cosignature on an
+    /// owner binding of itself (CC 3.2, the first binding).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn emit_attestation_node_cosigned(
+        &self,
+        signer: &crate::signing::LocalSigner,
+        mut input: crate::federation::EmitAttestationInput,
+    ) -> Result<String, crate::federation::Error> {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let key_id = signer.derived_key_id();
+        let canonical = Self::emit_canonicalize(&mut input, &key_id)?;
+        let sig = signer.sign_hybrid(&canonical).await.map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "emit_attestation sign_hybrid: {e} — a conformant federation-tier emit requires a \
+                 hybrid (Ed25519 + ML-DSA-65) signer (CC 5.3.2.4.3.1)"
+            ))
+        })?;
+        let node = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("node co-scrub derive key_id: {e}"))
+        })?;
+        let co = self.sign_hybrid(&canonical).await.map_err(|e| {
+            crate::federation::Error::Backend(format!("node co-scrub sign_hybrid: {e}"))
+        })?;
+        let (mut row, emitted) =
+            crate::federation::attestation_emit::assemble(key_id, &canonical, sig, input)?;
+        row.additional_scrubs
+            .push(crate::federation::types::ScrubSig {
+                scrub_key_id: node,
+                scrub_signature_classical: B64.encode(&co.classical.signature),
+                scrub_signature_pqc: Some(B64.encode(&co.pqc.signature)),
+                cosigned_at: Some(crate::federation::admission::render_signed_instant(
+                    chrono::Utc::now(),
+                )),
+            });
+        self.federation_directory()
+            .put_attestation_authored(crate::federation::SignedAttestation { attestation: row })
+            .await?;
+        Ok(emitted.attestation_id)
     }
 
     /// v9.3.0 (CIRISPersist#249, CC 4.4.3.4.3 steward-binding) — bind a node /
@@ -19739,7 +19794,13 @@ mod tests {
         let o2_signer = crate::federation::tier_ingest::test_support::local_signer("ob-owner2");
         let o1 = o1_signer.derived_key_id();
         let o2 = o2_signer.derived_key_id();
-        let engine = Engine::with_signer(o1_signer.clone(), "sqlite::memory:")
+        // v62.0.0 (slice C, CC 3.2 *The first binding (MUST)*): "an
+        // owner-binding counts toward ownership only when the node's own key
+        // cosigned it". The engine IS the node, so the binding it stores for
+        // itself carries its co-scrub (`grant_delegation`).
+        let node_signer = crate::federation::tier_ingest::test_support::local_signer("ob-node");
+        let node_id = node_signer.derived_key_id();
+        let engine = Engine::with_signer(node_signer, "sqlite::memory:")
             .await
             .expect("engine");
         let sq = engine.sqlite_backend().expect("sqlite").clone();
@@ -19751,7 +19812,7 @@ mod tests {
         sq.put_public_key(user_test_key_derived_for(&o2, "ob-owner2"))
             .await
             .expect("seed owner2");
-        let mut node = sweeper_test_key("ob-node");
+        let mut node = sweeper_test_key_derived_for(&node_id, "ob-node");
         node.record.identity_type = crate::federation::types::identity_type::NODE.into();
         sq.put_public_key(node).await.expect("seed node");
         let infra = vec![
@@ -19763,7 +19824,7 @@ mod tests {
         let att_id = engine
             .steward_bind(
                 &o1_signer,
-                "ob-node",
+                &node_id,
                 infra.clone(),
                 Some(owner_binding::PURPOSE),
             )
@@ -19781,7 +19842,7 @@ mod tests {
             "owner-binding carries the producer-side purpose marker",
         );
         assert_eq!(
-            engine.owner_of("ob-node").await.unwrap(),
+            engine.owner_of(&node_id).await.unwrap(),
             Some(o1.clone()),
             "owner_of resolves the single owner",
         );
@@ -19790,7 +19851,7 @@ mod tests {
         let err = engine
             .steward_bind(
                 &o2_signer,
-                "ob-node",
+                &node_id,
                 infra.clone(),
                 Some(owner_binding::PURPOSE),
             )
@@ -19803,14 +19864,14 @@ mod tests {
                 ref incumbent_owner,
                 ref attempted_owner,
             } => {
-                assert_eq!(node_key_id, "ob-node");
+                assert_eq!(node_key_id, &node_id);
                 assert_eq!(incumbent_owner, &o1);
                 assert_eq!(attempted_owner, &o2);
             }
             other => panic!("expected NodeAlreadyOwned, got {other:?}"),
         }
         assert_eq!(
-            engine.owner_of("ob-node").await.unwrap(),
+            engine.owner_of(&node_id).await.unwrap(),
             Some(o1.clone()),
             "the rejected second owner left the owner unchanged",
         );
@@ -19819,23 +19880,23 @@ mod tests {
         engine
             .steward_bind(
                 &o1_signer,
-                "ob-node",
+                &node_id,
                 infra.clone(),
                 Some(owner_binding::PURPOSE),
             )
             .await
             .expect("same-owner refresh is idempotent");
-        assert_eq!(engine.owner_of("ob-node").await.unwrap(), Some(o1.clone()));
+        assert_eq!(engine.owner_of(&node_id).await.unwrap(), Some(o1.clone()));
 
         // A general (non-ownership) delegation from a DIFFERENT user is
         // admitted (it never claims ownership) but does NOT count toward
         // owner_of — the purpose filter keeps ownership single-valued.
         engine
-            .steward_bind(&o2_signer, "ob-node", infra.clone(), None)
+            .steward_bind(&o2_signer, &node_id, infra.clone(), None)
             .await
             .expect("a plain steward-binding is not an owner-binding");
         assert_eq!(
-            engine.owner_of("ob-node").await.unwrap(),
+            engine.owner_of(&node_id).await.unwrap(),
             Some(o1.clone()),
             "owner_of ignores the general delegation (purpose-filtered ≤1)",
         );
@@ -19845,6 +19906,23 @@ mod tests {
         node2.record.identity_type = crate::federation::types::identity_type::NODE.into();
         sq.put_public_key(node2).await.expect("seed node2");
         assert_eq!(engine.owner_of("ob-node2").await.unwrap(), None);
+        // v62.0.0 — a binding of a node that never cosigned it names no owner
+        // (CC 3.2, the first binding): this engine is not ob-node2, so the
+        // binding it stores carries no ob-node2 co-scrub.
+        engine
+            .steward_bind(
+                &o1_signer,
+                "ob-node2",
+                infra.clone(),
+                Some(owner_binding::PURPOSE),
+            )
+            .await
+            .expect("an uncosigned owner-binding is held");
+        assert_eq!(
+            engine.owner_of("ob-node2").await.unwrap(),
+            None,
+            "CC 3.2: an owner-binding the node never cosigned names no owner",
+        );
     }
 
     /// #378 PG twin of [`owner_binding_single_owner_end_to_end_sqlite`] — the
@@ -19871,7 +19949,11 @@ mod tests {
         let o2_signer = crate::federation::tier_ingest::test_support::local_signer(&o2_label);
         let o1 = o1_signer.derived_key_id();
         let o2 = o2_signer.derived_key_id();
-        let engine = Engine::with_signer(o1_signer.clone(), &dsn)
+        // v62.0.0 (slice C, CC 3.2 *The first binding (MUST)*): the engine IS
+        // the node, so the binding it stores for itself carries its co-scrub.
+        let node_signer = crate::federation::tier_ingest::test_support::local_signer(&node_label);
+        let node_id = node_signer.derived_key_id();
+        let engine = Engine::with_signer(node_signer, &dsn)
             .await
             .expect("pg engine");
         let pg = engine.postgres_backend().expect("pg backend");
@@ -19881,7 +19963,7 @@ mod tests {
         pg.put_public_key(user_test_key_derived_for(&o2, &o2_label))
             .await
             .expect("seed owner2");
-        let mut node = sweeper_test_key(&node_label);
+        let mut node = sweeper_test_key_derived_for(&node_id, &node_label);
         node.record.identity_type = crate::federation::types::identity_type::NODE.into();
         pg.put_public_key(node).await.expect("seed node");
         let infra = vec![
@@ -19893,7 +19975,7 @@ mod tests {
         let att_id = engine
             .steward_bind(
                 &o1_signer,
-                &node_label,
+                &node_id,
                 infra.clone(),
                 Some(owner_binding::PURPOSE),
             )
@@ -19908,51 +19990,39 @@ mod tests {
             row.attestation_envelope["delegation_purpose"],
             owner_binding::PURPOSE
         );
-        assert_eq!(
-            engine.owner_of(&node_label).await.unwrap(),
-            Some(o1.clone())
-        );
+        assert_eq!(engine.owner_of(&node_id).await.unwrap(), Some(o1.clone()));
 
         // Second distinct owner rejected; owner unchanged.
         let err = engine
             .steward_bind(
                 &o2_signer,
-                &node_label,
+                &node_id,
                 infra.clone(),
                 Some(owner_binding::PURPOSE),
             )
             .await
             .expect_err("a second distinct owner is rejected");
         assert_eq!(err.kind(), "federation_node_already_owned");
-        assert_eq!(
-            engine.owner_of(&node_label).await.unwrap(),
-            Some(o1.clone())
-        );
+        assert_eq!(engine.owner_of(&node_id).await.unwrap(), Some(o1.clone()));
 
         // Same-owner refresh idempotent.
         engine
             .steward_bind(
                 &o1_signer,
-                &node_label,
+                &node_id,
                 infra.clone(),
                 Some(owner_binding::PURPOSE),
             )
             .await
             .expect("same-owner refresh is idempotent");
-        assert_eq!(
-            engine.owner_of(&node_label).await.unwrap(),
-            Some(o1.clone())
-        );
+        assert_eq!(engine.owner_of(&node_id).await.unwrap(), Some(o1.clone()));
 
         // A general delegation from a different user does not count.
         engine
-            .steward_bind(&o2_signer, &node_label, infra.clone(), None)
+            .steward_bind(&o2_signer, &node_id, infra.clone(), None)
             .await
             .expect("a plain steward-binding is not an owner-binding");
-        assert_eq!(
-            engine.owner_of(&node_label).await.unwrap(),
-            Some(o1.clone())
-        );
+        assert_eq!(engine.owner_of(&node_id).await.unwrap(), Some(o1.clone()));
 
         // Unbound node → None.
         let mut node2 = sweeper_test_key(&node2_label);
@@ -21036,12 +21106,14 @@ mod tests {
         );
         assert_eq!(live_len(room).await, 3);
 
-        // A protocol-only rewrite (no member moves) is judged as an ADDITION,
-        // never as a protective removal: under reverse_quorum one signature
-        // must not rewrite the room's rules (the mutant that classes an
-        // unchanged roster as Remove dies here).
-        let rqp = "reverse_quorum:2/5:86400";
-        let (room, ks) = setup("rqp", 5, 0, 0, rqp).await;
+        // v62.0.0 (slice C) — `reverse_quorum` is no membership protocol. CC
+        // 3.2: "Not a membership rule: reverse quorum. … It admits no one and
+        // confers no consent on anyone's behalf." A room under it refuses
+        // every supersede that moves its roster or its rules — a
+        // protocol-only rewrite, a removal on one signature (was: protective,
+        // admitted), a mixed change on three of four — as unevaluable.
+        let rq = "reverse_quorum:2/5:86400";
+        let (room, ks) = setup("rqp", 5, 0, 0, rq).await;
         let msg = refused(
             attempt(
                 room.clone(),
@@ -21053,48 +21125,30 @@ mod tests {
             .await,
             "reverse_quorum: a protocol-only rewrite on one signature",
         );
-        assert!(msg.contains("Add"), "judged as an addition: {msg}");
+        assert!(msg.contains("cannot be evaluated"), "{msg}");
         assert_eq!(
             d.lookup_community(&room)
                 .await
                 .unwrap()
                 .unwrap()
                 .consensus_protocol,
-            rqp,
+            rq,
             "the room keeps its rules"
         );
-
-        // Direction (reverse_quorum:2/5): a pure removal is protective and
-        // lands on one signature; a MIXED change is judged both ways, so the
-        // addition half needs the forward threshold (max(2, strict majority
-        // of 4) = 3).
-        let rq = "reverse_quorum:2/5:86400";
         let (room, ks) = setup("rq", 5, 1, 0, rq).await;
-        attempt(room.clone(), ks[..4].to_vec(), 0, rq, vec![ks[0].clone()])
-            .await
-            .expect("reverse_quorum: a removal lands on one signature");
-        assert_eq!(live_len(room.clone()).await, 4);
+        let msg = refused(
+            attempt(room.clone(), ks[..4].to_vec(), 0, rq, vec![ks[0].clone()]).await,
+            "reverse_quorum: a removal on one signature",
+        );
+        assert!(msg.contains("cannot be evaluated"), "{msg}");
+        assert_eq!(live_len(room.clone()).await, 5);
         let mixed = vec![ks[0].clone(), ks[1].clone(), ks[2].clone(), ks[5].clone()];
         let msg = refused(
-            attempt(room.clone(), mixed.clone(), 0, rq, vec![ks[0].clone()]).await,
-            "reverse_quorum: mixed change on one signature",
-        );
-        assert!(msg.contains("Add"), "the addition half refused: {msg}");
-        assert_eq!(live_len(room.clone()).await, 4);
-        refused_add(
             attempt(room.clone(), mixed, 0, rq, ks[..3].to_vec()).await,
-            "reverse_quorum: a mixed change on 3 of 4 still adds",
+            "reverse_quorum: a mixed change on 3 of 5",
         );
-        let live: std::collections::BTreeSet<String> = d
-            .lookup_community(&room)
-            .await
-            .unwrap()
-            .unwrap()
-            .members
-            .into_iter()
-            .map(|m| m.key_id)
-            .collect();
-        assert!(!live.contains(&ks[5]) && live.contains(&ks[3]));
+        assert!(msg.contains("cannot be evaluated"), "{msg}");
+        assert_eq!(live_len(room).await, 5);
 
         // An undeclared custom protocol cannot be evaluated: refused, whoever signs.
         let (room, ks) = setup("cu", 2, 1, 1, "custom:council").await;

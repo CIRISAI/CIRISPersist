@@ -28984,11 +28984,16 @@ mod tests {
                         attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         asserted_at, attestation_envelope, original_content_hash, \
                         scrub_signature_classical, scrub_key_id, scrub_timestamp, \
-                        persist_row_hash, admitted_at\
+                        persist_row_hash, admitted_at, additional_scrubs\
                      ) VALUES (?1, 'apply-amb-owner2', 'apply-amb-node', 'delegates_to', \
                         '2026-05-01T00:00:00+00:00', ?2, x'00', 'c2ln', 'apply-amb-owner2', \
-                        '2026-05-01T00:00:00+00:00', '0', '2026-05-01T00:00:00+00:00')",
-                    rusqlite::params![anomaly.attestation_id, env_text],
+                        '2026-05-01T00:00:00+00:00', '0', '2026-05-01T00:00:00+00:00', ?3)",
+                    rusqlite::params![
+                        anomaly.attestation_id,
+                        env_text,
+                        // v62.0.0 — the node's co-scrub (CC 3.2, the first binding)
+                        serde_json::to_string(&anomaly.additional_scrubs).unwrap()
+                    ],
                 )?;
                 Ok(())
             })()
@@ -29098,11 +29103,16 @@ mod tests {
                     attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     asserted_at, attestation_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_key_id, scrub_timestamp, \
-                    persist_row_hash, admitted_at\
+                    persist_row_hash, admitted_at, additional_scrubs\
                  ) VALUES (?1, 'cfg-amb-owner2', 'cfg-amb-node', 'delegates_to', \
                     '2026-05-01T00:00:00+00:00', ?2, x'00', 'c2ln', 'cfg-amb-owner2', \
-                    '2026-05-01T00:00:00+00:00', '0', '2026-05-01T00:00:00+00:00')",
-                rusqlite::params![anomaly.attestation_id, env_text],
+                    '2026-05-01T00:00:00+00:00', '0', '2026-05-01T00:00:00+00:00', ?3)",
+                rusqlite::params![
+                    anomaly.attestation_id,
+                    env_text,
+                    // v62.0.0 — the node's co-scrub (CC 3.2, the first binding)
+                    serde_json::to_string(&anomaly.additional_scrubs).unwrap()
+                ],
             )
             .unwrap();
         }
@@ -48140,8 +48150,9 @@ mod tests {
             })
             .await
             .unwrap();
-        // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing edge is
-        // refused at the door, so a two-key cycle can no longer be stored.
+        // v54.0.0 (CIRISPersist#1031, CC 4.1.1) refused the cycle-closing edge
+        // at the door. v62.0.0 (slice C): CC 4.4.3.34, "Cycles are visited
+        // once" — the kernel's walk visits a cycle once, so the closing edge is held and the two-key cycle is stored.
         let closing = backend
             .put_attestation(SignedAttestation {
                 attestation: topo_attestation(
@@ -48157,11 +48168,8 @@ mod tests {
             })
             .await;
         assert!(
-            matches!(
-                closing,
-                Err(crate::federation::Error::DelegationCycle { .. })
-            ),
-            "the cycle-closing edge is refused: {closing:?}"
+            closing.is_ok(),
+            "the cycle-closing edge is admitted (v62): {closing:?}"
         );
         // The walk's visited guard still meets a cycle: a self-edge (the root
         // charter shape, admitted) re-enters cyc-b.
@@ -48183,14 +48191,16 @@ mod tests {
         let graph = crate::federation::build_delegation_graph(&backend, "cyc-a", Some(8))
             .await
             .unwrap();
-        // Both edges discovered; the cycle does NOT cause a second
-        // visit (visited set keeps each granter from being expanded twice).
-        assert_eq!(graph.edges.len(), 2);
-        // Each granter expanded exactly once.
+        // Every edge discovered (v62: the closing cyc-b → cyc-a is held beside
+        // cyc-b's self-edge); the cycle does NOT cause a second visit
+        // (visited set keeps each granter from being expanded twice).
+        assert_eq!(graph.edges.len(), 3);
+        // Each granter expanded exactly once: cyc-b's two edges come from
+        // its one expansion.
         let from_a: usize = graph.edges.iter().filter(|e| e.from_key == "cyc-a").count();
         let from_b: usize = graph.edges.iter().filter(|e| e.from_key == "cyc-b").count();
         assert_eq!(from_a, 1);
-        assert_eq!(from_b, 1);
+        assert_eq!(from_b, 2);
     }
 
     /// #104 — delegates_to_graph annotates an edge with `withdrawn_by`

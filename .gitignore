@@ -22,3 +22,6 @@ mutants.out.old/
 
 # scripts/release.sh stage state (one marker per completed stage)
 /.release/
+
+# v62 slice C — a local clone of CIRISKernel for reading (never built from)
+/.kernel-src/

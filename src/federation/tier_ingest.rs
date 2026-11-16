@@ -1159,7 +1159,28 @@ pub mod test_support {
     /// has two subjects. Put the distinguishing part FIRST, and assert the
     /// pubkeys differ (CIRISPersist#659 hit exactly this, on postgres only,
     /// where the tag carries a uuid).
+    /// v62.0.0 (slice C) — the derived federation key id of every
+    /// [`local_signer`] this process built, mapped to the alias it was seeded
+    /// from: a fixture that co-signs AS an engine's node (its derived key id,
+    /// not the alias) signs with the keys that node registered.
+    fn signer_aliases() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+        static ALIASES: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, String>>,
+        > = std::sync::OnceLock::new();
+        ALIASES.get_or_init(Default::default)
+    }
+
     pub(crate) fn seed_for(key_id: &str) -> [u8; 32] {
+        // The guard is dropped before the recursion (an `if let` scrutinee's
+        // temporaries live through its block).
+        let alias = signer_aliases()
+            .lock()
+            .expect("alias map")
+            .get(key_id)
+            .cloned();
+        if let Some(alias) = alias {
+            return seed_for(&alias);
+        }
         let mut seed = [0x11u8; 32];
         for (i, b) in key_id.bytes().take(32).enumerate() {
             seed[i] = b;
@@ -1416,12 +1437,20 @@ pub mod test_support {
         // registered via `hybrid_pubkeys` verifies the emitted sig); if it
         // ever diverged, the ingest gate would reject the emitted withdraws
         // and the eviction/takedown tests would fail loudly.
-        std::sync::Arc::new(crate::signing::LocalSigner::from_parts(
+        let signer = crate::signing::LocalSigner::from_parts(
             ed,
             key_id.to_owned(),
             Some(pqc),
             Some(key_id.to_owned()),
-        ))
+        );
+        let derived = signer.derived_key_id();
+        if derived != key_id {
+            signer_aliases()
+                .lock()
+                .expect("alias map")
+                .insert(derived, key_id.to_owned());
+        }
+        std::sync::Arc::new(signer)
     }
 
     /// Hybrid-sign `envelope` (through the CEG produce canonicalizer)
@@ -1688,6 +1717,32 @@ pub mod test_support {
         row.original_content_hash = och;
         row.scrub_signature_classical = sc;
         row.scrub_signature_pqc = sp;
+        // v62.0.0 (slice C, CC 3.2 *The first binding (MUST)*) — "an
+        // owner-binding counts toward ownership only when the node's own key
+        // cosigned it": a fixture owner binding is written as a conformant
+        // writer writes it, co-scrubbed by the node it binds. A witness of
+        // the uncosigned shape strips `additional_scrubs` AFTER the seal (the
+        // co-scrubs ride outside the preimage, so the base scrub stays valid).
+        // A re-seal re-signs the node's co-scrub over the new preimage.
+        if row.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO
+            && crate::federation::admission::is_owner_binding_envelope(&row.attestation_envelope)
+            && row.attested_key_id != row.attesting_key_id
+        {
+            let node = row.attested_key_id.clone();
+            let (_, csc, csp) = sign_envelope(&node, &row.attestation_envelope);
+            row.additional_scrubs.retain(|c| c.scrub_key_id != node);
+            row.additional_scrubs
+                .push(crate::federation::types::ScrubSig {
+                    scrub_key_id: node,
+                    scrub_signature_classical: csc,
+                    scrub_signature_pqc: csp,
+                    // Stamped as the engine's own co-scrub is (CC 2.6.7: the
+                    // co-signer stamps the moment it signed).
+                    cosigned_at: Some(crate::federation::admission::render_signed_instant(
+                        row.asserted_at,
+                    )),
+                });
+        }
     }
 
     /// v31.0.0 (CIRISPersist#643) — [`seal_row_in_place`] under the row's OWN
@@ -4815,6 +4870,9 @@ pub mod test_support {
         a.scrub_signature_classical = classical;
         a.scrub_signature_pqc = pqc;
         a.persist_row_hash = String::new();
+        // v62.0.0 — not an owner binding: no node co-scrub (the owner-binding
+        // fixture this starts from carries one).
+        a.additional_scrubs.clear();
         seal_row(granter, a)
     }
 

@@ -1,6 +1,15 @@
 //! v54.0.0 (CIRISPersist#1031, CC 4.1.1) — **the cycle-closing `delegates_to`
 //! is refused at admission.**
 //!
+//! **v62.0.0 (slice C): no longer.** The decision answers through the kernel,
+//! whose trust walk visits a cycle once (`ciris_kernel::trust::reaches`;
+//! KERNEL.md 5; CC 4.4.3.34: "Cycles are visited once"; CIRISKernel `ADOPTING.md`: "no edge is refused
+//! for closing a cycle"). Each witness below is kept, its refusal turned into
+//! an admission: the closing edge is HELD, and the walk's reading of the
+//! graph it closes (retractions, expiry, terms, the trust plane, the ceiling)
+//! is still asserted through `delegation_path_hops`, the same lens the v54
+//! gate read. I597's two writers are both admitted.
+//!
 //! CC 4.1.1's anti-pattern table, row "Cycles (A → B → A)": *"Substrate MUST
 //! detect cycles on the `delegates_to` graph and reject the cycle-closing
 //! emission."* The walks were visited-guarded, so a cycle was tolerated at
@@ -73,39 +82,48 @@ pub mod bodies {
         ts::register_hybrid_key_as(d, k, k, identity_type::AGENT).await;
     }
 
-    /// Unwrap a `DelegationCycle`, or panic naming what came back instead —
-    /// a neighbouring refusal is not this gate.
-    fn expect_cycle(r: Result<String, Error>, from: &str, to: &str, hops: usize, what: &str) {
-        match r {
-            Err(Error::DelegationCycle {
-                attesting_key_id,
-                attested_key_id,
-                hops: got,
-            }) => {
-                assert_eq!(
-                    (attesting_key_id.as_str(), attested_key_id.as_str(), got),
-                    (from, to, hops),
-                    "{what}: the refusal names the edge and the path it closes"
-                );
-            }
-            Err(e) => panic!(
-                "{what}: expected federation_delegation_cycle, got {} ({e})",
+    /// v62.0.0 (slice C) — the cycle-closing edge is ADMITTED: the kernel's
+    /// walk visits a cycle once (`ciris_kernel::trust::reaches`; KERNEL.md 5;
+    /// CC 4.4.3.34: "Cycles are visited once"), so no edge is refused for closing one. Was
+    /// `expect_cycle`, which asserted the v54 refusal (CC 4.1.1's anti-pattern
+    /// row). The walk's own reading of the graph is unchanged and still
+    /// witnessed: the path the edge closes is the one the v54 gate reported,
+    /// `hops` long, read by the same [`delegation_path_hops`] lens.
+    ///
+    /// [`delegation_path_hops`]: crate::federation::admission::delegation_path_hops
+    async fn expect_cycle(
+        d: &dyn FederationDirectory,
+        r: Result<String, Error>,
+        from: &str,
+        to: &str,
+        hops: usize,
+        what: &str,
+    ) {
+        let id = r.unwrap_or_else(|e| {
+            panic!(
+                "{what}: v62 — no edge is refused for closing a cycle (the kernel's walk visits \
+                 it once); got {} ({e})",
                 e.kind()
-            ),
-            Ok(id) => panic!("{what}: the cycle-closing edge {id} was ADMITTED"),
-        }
+            )
+        });
+        let seen =
+            crate::federation::admission::delegation_path_hops(d, to, from, chrono::Utc::now())
+                .await
+                .expect("the walk reads");
+        assert_eq!(
+            seen,
+            Some(hops),
+            "{what}: the closing edge {id} is held, and the walk still reads the path it closes"
+        );
     }
 
-    /// No `delegates_to` from `from` to `to` is stored.
+    /// v62.0.0 (slice C) — was `assert_no_edge` (a refused edge is not
+    /// stored): the closing edge is held.
     async fn assert_no_edge(d: &dyn FederationDirectory, from: &str, to: &str, what: &str) {
-        use crate::federation::attestation_query::test_support::AllAttestations as _;
-        let stored = d.all_attestations_by(from).await.unwrap();
         assert!(
-            !stored
-                .iter()
-                .any(|r| r.attestation_type == attestation_type::DELEGATES_TO
-                    && r.attested_key_id == to),
-            "{what}: a refused edge must not be stored"
+            has_fed_edge(d, from, to).await,
+            "{what}: v62 — the cycle-closing edge is held (the kernel refuses no edge for \
+             closing a cycle)"
         );
     }
 
@@ -229,28 +247,22 @@ pub mod bodies {
             ts::put_delegates_to(first, &a, &b, None),
             rival_while_paused(&pause, ts::put_delegates_to(second, &b, &a, None)),
         );
-        let ab = has_fed_edge(first, &a, &b).await;
-        let ba = has_fed_edge(first, &b, &a).await;
-        assert!(
-            !(ab && ba),
-            "I597 (i): BOTH a → b and b → a were stored — the race admitted the cycle \
-             (b finished while a was held: {b_ran_free}; a: {ra:?}; b: {rb:?})"
-        );
-        assert!(
-            ra.is_ok(),
-            "I597 (i): the first writer holds the lock and admits: {ra:?}"
-        );
+        // v62.0.0 (slice C) — the kernel refuses no edge for closing a cycle:
+        // both writers are admitted, in whichever order they land.
+        let _ = b_ran_free;
+        assert!(ra.is_ok(), "I597 (i): the first writer admits: {ra:?}");
         expect_cycle(
+            first,
             rb,
             &b,
             &a,
             1,
             "I597 (i): the second writer, serialized behind the first",
-        );
-        assert!(ab && !ba, "I597 (i): exactly the first edge is stored");
+        )
+        .await;
         assert!(
-            !b_ran_free,
-            "I597 (i): the second writer must wait for the first"
+            has_fed_edge(first, &a, &b).await && has_fed_edge(first, &b, &a).await,
+            "I597 (i): both edges are held"
         );
     }
 
@@ -270,23 +282,23 @@ pub mod bodies {
             first.enter_mesh(&staged_id, &ci, &custody),
             rival_while_paused(&pause, ts::put_delegates_to(second, &x, &y, None)),
         );
-        let yx = has_fed_edge(first, &y, &x).await;
-        let xy = has_fed_edge(first, &x, &y).await;
-        assert!(
-            !(yx && xy),
-            "I597 (ii): the crossing y → x AND the put x → y both landed — the race \
-             admitted the cycle (put finished while the crossing was held: {p_ran_free}; \
-             crossing: {rc:?}; put: {rp:?})"
-        );
+        // v62.0.0 (slice C) — the kernel refuses no edge for closing a cycle:
+        // the crossing and the put both land.
+        let _ = p_ran_free;
         assert!(rc.is_ok(), "I597 (ii): the held crossing admits: {rc:?}");
         expect_cycle(
+            first,
             rp,
             &x,
             &y,
             1,
             "I597 (ii): the put, serialized behind the crossing",
+        )
+        .await;
+        assert!(
+            has_fed_edge(first, &y, &x).await && has_fed_edge(first, &x, &y).await,
+            "I597 (ii): both edges are held"
         );
-        assert!(!p_ran_free, "I597 (ii): the put must wait for the crossing");
     }
 
     /// A retraction by `granter` against `grantee` (naming `target` when
@@ -328,12 +340,14 @@ pub mod bodies {
             .expect("I608 (a) b → a");
         future_retraction(d, &b, &a, None, ahead).await;
         expect_cycle(
+            d,
             ts::put_delegates_to(d, &a, &b, None).await,
             &a,
             &b,
             1,
             "I608 (a): b's retraction of b → a is not in force yet, so a → b closes a live cycle",
-        );
+        )
+        .await;
         assert_no_edge(d, &a, &b, "I608 (a)").await;
         // Gate (b): e → f with f a subject; f withdraws it by name, ahead.
         let (e, f) = (k("e"), k("f"));
@@ -342,13 +356,15 @@ pub mod bodies {
             .expect("I608 (b) e → f, f a subject");
         future_retraction(d, &f, &f, Some(&ef), ahead).await;
         expect_cycle(
+            d,
             ts::put_delegates_to(d, &f, &e, None).await,
             &f,
             &e,
             1,
             "I608 (b): f's retraction naming e → f is not in force yet, so f → e closes a live \
              cycle",
-        );
+        )
+        .await;
         assert_no_edge(d, &f, &e, "I608 (b)").await;
     }
 
@@ -408,12 +424,14 @@ pub mod bodies {
         .await
         .expect("I609 control edge");
         expect_cycle(
+            d,
             ts::put_delegates_to(d, &p2, &o2, None).await,
             &p2,
             &o2,
             1,
             "I609 control: o2 → p2 is live from its term's opening until its expiry",
-        );
+        )
+        .await;
     }
 
     /// I590 — see the module doc.
@@ -435,12 +453,14 @@ pub mod bodies {
             .await
             .expect("(1) b → c");
         expect_cycle(
+            d,
             ts::put_delegates_to(d, &c, &a, None).await,
             &c,
             &a,
             2,
             "(1) c → a",
-        );
+        )
+        .await;
         assert_no_edge(d, &c, &a, "(1)").await;
         // Over-refusal control: an edge that closes nothing admits beside it.
         ts::put_delegates_to(d, &a, &c, None)
@@ -473,12 +493,14 @@ pub mod bodies {
             .await
             .expect("(4) e → f, f a subject");
         expect_cycle(
+            d,
             ts::put_delegates_to(d, &f, &dk, None).await,
             &f,
             &dk,
             2,
             "(4) before",
-        );
+        )
+        .await;
         ts::put_retraction(d, &f, &f, &ef, attestation_type::WITHDRAWS)
             .await
             .expect("(4) f withdraws e → f by name (rule 2: a subject)");
@@ -545,12 +567,14 @@ pub mod bodies {
         .await
         .expect("(8) a term that opens later");
         expect_cycle(
+            d,
             ts::put_delegates_to(d, &pk, &o, None).await,
             &pk,
             &o,
             1,
             "(8) o → p opens in an hour; p → o closes a cycle that goes live then",
-        );
+        )
+        .await;
 
         // (9) acceptance edges are the subscription plane. Kills: the search
         // following acceptance edges (m1: 9a, 9b and 9d refuse); exempting
@@ -608,12 +632,14 @@ pub mod bodies {
             .expect("(9b) the root's grant to a subscriber closes no cycle");
         // (9c) a CAPABILITY edge closing the same pair is still a cycle.
         expect_cycle(
+            d,
             put_edge(d, &n1, &r1, |_| {}).await,
             &n1,
             &r1,
             1,
             "(9c) a capability delegates_to(node → root) beside the root's grant",
-        );
+        )
+        .await;
         // (9d) a chain that reaches the root only THROUGH an acceptance edge:
         // x3 accepts r3, y3 delegates to x3, and r3 → y3 closes nothing.
         let (r3, x3, y3) = (k("r3"), k("x3"), k("y3"));
@@ -659,12 +685,14 @@ pub mod bodies {
             .expect("(10b) f5 → h5 reaches f5 again only through the charter: not a cycle");
         // (10c) a capability edge closing the same pair is still refused.
         expect_cycle(
+            d,
             ts::put_delegates_to(d, &h4, &f4, None).await,
             &h4,
             &f4,
             1,
             "(10c) a capability delegates_to(h4 → f4) beside f4 → h4",
-        );
+        )
+        .await;
 
         // (6) the ceiling: a 17-hop chain.
         let chain: Vec<String> = (0..=17).map(|i| k(&format!("k{i}"))).collect();
@@ -677,12 +705,14 @@ pub mod bodies {
                 .expect("(6) chain hop");
         }
         expect_cycle(
+            d,
             ts::put_delegates_to(d, &chain[16], &chain[0], None).await,
             &chain[16],
             &chain[0],
             16,
             "(6) a 16-hop path is within the ceiling",
-        );
+        )
+        .await;
         ts::put_delegates_to(d, &chain[17], &chain[0], None)
             .await
             .expect("(6) a 17-hop path is past the ceiling every walk clamps to");
@@ -717,17 +747,15 @@ pub mod bodies {
             .expect("(7) the local door stages producer-authority rows");
         let staged = d.get_attestation(&staged_id).await.unwrap().unwrap();
         let ci = ts::describe_own(&staged, crate::federation::CrossingBasis::ProducerAuthority);
-        match d
-            .enter_mesh(&staged_id, &ci, &ts::actor_reseal(&staged))
+        // v62.0.0 (slice C) — the crossing of a cycle-closing local edge lands:
+        // the kernel's walk visits the cycle once and refuses no edge for it.
+        d.enter_mesh(&staged_id, &ci, &ts::actor_reseal(&staged))
             .await
-        {
-            Err(Error::DelegationCycle { hops: 1, .. }) => {}
-            other => panic!("(7) crossing a cycle-closing local edge must be refused: {other:?}"),
-        }
+            .expect("(7) the cycle-closing crossing is admitted (v62)");
         assert_eq!(
             d.get_attestation(&staged_id).await.unwrap().unwrap().tier,
-            attestation_tier::LOCAL,
-            "(7) a refused crossing leaves the row local"
+            attestation_tier::FEDERATION,
+            "(7) the crossed row is federation-tier"
         );
     }
 }

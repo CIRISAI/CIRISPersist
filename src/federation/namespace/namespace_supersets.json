@@ -15693,7 +15693,8 @@
     "claim_id": "CLM-anti-pattern-delegation",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#check_delegation_cycle_admission",
-    "tsv_target": "evidence/cc_impl.tsv",
+    "tsv_target": "n/a",
+    "tsv_excluded": "v62.0.0 (slice C, the kernel adapter): persist no longer rejects the cycle-closing delegates_to; the decision answers through ciris-kernel, whose trust walk visits a cycle once (KERNEL.md 5, CC 4.4.3.34). CC 4.1.1's anti-pattern row still says reject; the claim returns when the CC session rules the row.",
     "manifest_round": "cc-repin-15-1052"
    },
    {

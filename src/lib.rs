@@ -99,6 +99,8 @@ pub mod ingest;
 // the lens server's file-backed ingest path, never the Engine's: `queue`.
 #[cfg(feature = "queue")]
 pub mod journal;
+/// v62.0.0 — the kernel adapter: persist's decisions answer through `ciris-kernel`.
+pub mod kernel;
 pub mod ledgers;
 #[cfg(feature = "cirislens_legacy_migration")]
 pub mod legacy_migration;

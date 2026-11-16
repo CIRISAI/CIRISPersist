@@ -2026,8 +2026,11 @@ pub(crate) mod test_support {
         );
 
         // ══ RED 8 — step 4 without K's co-signature is refused.
-        let uncosigned =
+        let mut uncosigned =
             ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &claimant, &node);
+        // v62.0.0 — the fixture sealer co-scrubs an owner binding by its node
+        // (CC 3.2, the first binding); this witness is the uncosigned shape.
+        uncosigned.additional_scrubs.clear();
         match store(dir, &uncosigned).await {
             Err(Error::OwnershipReclaimRefused {
                 reason: ReclaimRefusal::FreshBindingNotCosignedByNode,

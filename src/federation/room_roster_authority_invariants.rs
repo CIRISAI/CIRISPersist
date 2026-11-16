@@ -666,18 +666,26 @@ pub mod bodies {
         )
         .await
         .expect_err("no founder");
+        // v62.0.0 (slice C) — CC 4.4.3.6's protocol table has six arms and no
+        // `custom:`: a `custom:` group admits no change, with or without its
+        // founder (was: insufficient without, admitted with).
         assert_eq!(
             rule_of(&e),
-            crate::federation::ROSTER_CONSENSUS_INSUFFICIENT,
+            crate::federation::ROSTER_CONSENSUS_UNEVALUABLE,
             "{tag} I182 custom: {e}"
         );
-        widen_by(
+        let e = widen_by(
             d,
             &[&k[0], &k[1]],
             widening(&r, &y, at("2026-03-02T00:00:00Z"), None),
         )
         .await
-        .unwrap_or_else(|e| panic!("{tag} I182 custom: founder + 2: {e}"));
+        .expect_err("CC 4.4.3.6: custom: is no consensus_protocol");
+        assert_eq!(
+            rule_of(&e),
+            crate::federation::ROSTER_CONSENSUS_UNEVALUABLE,
+            "{tag} I182 custom, founder + 2: {e}"
+        );
     }
 
     fn unverified_signer(e: &Error) -> &str {
