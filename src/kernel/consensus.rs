@@ -370,7 +370,8 @@ pub fn admits_by_rows(b: &Ballot<'_>) -> Result<Answer<bool>, NoCell> {
     let arm = arm_of(b)?;
     let rows = ballot_rows(b, &arm);
     let law = seat_law();
-    let c = layers::conclude(rows.iter(), |p| seat_rule(p, law, &NoCut, &|_| true), None);
+    let kept = layers::kept(&rows, |_| true);
+    let c = layers::conclude(kept, |p| seat_rule(p, law, &NoCut, &|_| true), None);
     let counted = rows.last().expect("the counted row is last").id;
     Ok(Answer {
         value: c.concluded_id(&counted),
@@ -448,6 +449,8 @@ fn count_over<'a>(
                 .map_or(0, |(_, x)| *x)
         },
     )
+    // `None` is a ranked count, which no consensus_protocol arm names
+    .unwrap_or(false)
 }
 
 #[cfg(test)]

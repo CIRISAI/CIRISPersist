@@ -18,6 +18,8 @@
 //!   it.
 //! - **I1845** — a member's leaving in the counted row's past is not counted
 //!   (a `unanimous` widening after a removal needs only those remaining).
+//! - **I1846** — a reference cycle (two rows naming each other's peer-chosen
+//!   id) never hangs the trust walk and gives no edge.
 //! - **I1843** — a fork of a held head (two versions naming one head): persist
 //!   refuses it; the kernel holds it as a tip (CC 2.7.8). Witnessed, not
 //!   switched.
@@ -306,6 +308,50 @@ pub(crate) mod bodies {
             "I1845: {active:?}"
         );
     }
+
+    /// **I1846** — a reference cycle on today's wire: two `supersedes` rows of
+    /// the user's, toward the root, each naming the other's attestation id (a
+    /// peer-chosen string). Whatever the door admits, `trust_root_valid`
+    /// returns within a bound, and the pair gives no edge (the kernel's door,
+    /// `layers::kept`, never keeps a row whose names are not held first).
+    pub(crate) async fn i1846_a_reference_cycle_never_hangs_the_trust_walk(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::trust_root::{trust_root_valid, TRUST_ACCEPTS_DIMENSION};
+        let (user, root) = (format!("i1846-user-{s}"), format!("i1846-root-{s}"));
+        for k in [&user, &root] {
+            ts::register_hybrid_key_as(d, k, k, identity_type::USER).await;
+        }
+        let (a, b) = (format!("i1846-a-{s}"), format!("i1846-b-{s}"));
+        for (id, names) in [(&a, &b), (&b, &a)] {
+            let mut row = ts::bare_attestation(
+                id,
+                &user,
+                &root,
+                &serde_json::json!({
+                    "id": id,
+                    "references_attestation_id": names,
+                    "dimension": TRUST_ACCEPTS_DIMENSION,
+                }),
+            );
+            row.attestation_type = attestation_type::SUPERSEDES.to_owned();
+            ts::seal_row_in_place(&user, &mut row);
+            // the door may refuse a rotation of a grant it does not hold;
+            // either way the walk below must return
+            let _ = d
+                .put_attestation(SignedAttestation { attestation: row })
+                .await;
+        }
+        let v = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            trust_root_valid(d, &user, &root),
+        )
+        .await
+        .expect("I1846: the trust walk returns within a bound over a reference cycle")
+        .expect("I1846: the verdict");
+        assert!(!v.edge_exists, "I1846: a reference cycle gives no edge");
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -364,6 +410,10 @@ mod runners {
     on_sqlite_and_postgres!(
         i1845,
         crate::federation::kernel_adapter_invariants::bodies::i1845_a_leaving_in_the_rows_past_is_not_counted
+    );
+    on_sqlite_and_postgres!(
+        i1846,
+        crate::federation::kernel_adapter_invariants::bodies::i1846_a_reference_cycle_never_hangs_the_trust_walk
     );
     on_sqlite_and_postgres!(
         i1842,

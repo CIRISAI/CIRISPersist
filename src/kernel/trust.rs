@@ -98,8 +98,13 @@ fn kind(r: &KRow) -> &str {
 /// user's one-hop walk reaches the root over them.
 #[must_use]
 pub fn edge_leg(rows: &[KRow], user: &str, root: &str) -> Answer<bool> {
+    // the door first (`layers::kept`): a row is read only once every row it
+    // names is held. On today's wire a reference is a peer-chosen
+    // attestation id, so two rows may name each other; such a pair is never
+    // kept, concludes nothing, and never reaches the graph (I1846)
+    let kept = layers::kept(rows, |_| true);
     let c = layers::conclude(
-        rows.iter(),
+        kept,
         |p| {
             let r = p.row();
             if kind(r) != attestation_type::SUPERSEDES {
@@ -150,5 +155,53 @@ pub fn edge_leg(rows: &[KRow], user: &str, root: &str) -> Answer<bool> {
         value: reaches(&edges, &user.to_owned(), &(), 1, &root.to_owned()),
         rows: live,
         rule: "trust::reaches/1",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: u8, kind: &str, signer: &str, names: Option<u8>, edge_to: Option<&str>) -> KRow {
+        let rid = RowId([id; 32]);
+        let mut k = KRow::new(
+            rid,
+            names.map(|n| RowId([n; 32])).into_iter().collect(),
+            signer,
+        );
+        k.seat.target = names.map(|n| RowId([n; 32]));
+        k.seat.policy = Some(kind.to_owned());
+        k.seat.obj = edge_to.map(|d| Obj::Key(d.to_owned()));
+        k
+    }
+
+    /// I1846 — two rows whose references name each other (on today's wire a
+    /// reference is a peer-chosen id, so the pair is constructible) are never
+    /// kept: the leg returns within a bound, and the pair concludes nothing.
+    #[test]
+    fn i1846_a_name_cycle_waits_and_never_hangs_the_leg() {
+        let rows = vec![
+            row(1, attestation_type::SUPERSEDES, "u", Some(2), Some("root")),
+            row(2, attestation_type::SUPERSEDES, "u", Some(1), Some("root")),
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(edge_leg(&rows, "u", "root"));
+        });
+        let a = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("I1846: the edge leg returns within a bound over a name cycle");
+        assert!(!a.value, "I1846: a cycle concludes nothing");
+        assert!(a.rows.is_empty(), "I1846: no edge of the cycle is live");
+        // beside it, an ordinary edge is still read
+        let rows = vec![
+            row(1, attestation_type::SUPERSEDES, "u", Some(2), Some("root")),
+            row(2, attestation_type::SUPERSEDES, "u", Some(1), Some("root")),
+            row(3, attestation_type::DELEGATES_TO, "u", None, Some("root")),
+        ];
+        assert!(
+            edge_leg(&rows, "u", "root").value,
+            "I1846: the live edge stands"
+        );
     }
 }

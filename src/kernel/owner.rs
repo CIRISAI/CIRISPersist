@@ -228,12 +228,15 @@ pub fn owner_rows(
 #[must_use]
 pub fn owner_holders(rows: &[KRow], node: &str) -> Answer<BTreeSet<String>> {
     let law = seat_law();
-    let c = layers::conclude(rows.iter(), |p| seat_rule(p, law, &NoCut, &|_| false), None);
+    // the door first (`layers::kept`): a row is read only once every row it
+    // names is held, so no name cycle ever reaches the graph (I1846)
+    let kept = layers::kept(rows, |_| true);
+    let c = layers::conclude(kept, |p| seat_rule(p, law, &NoCut, &|_| false), None);
     let seats = Seats::new(&c, law, &NoCut, None);
     let obj = Obj::Key(node.to_owned());
     let value = seats.holders(SEAT_OWNER, &obj, None);
     let read: Vec<RowId> = seats
-        .recs
+        .recs()
         .iter()
         .filter(|r| r.obj == obj)
         .map(|r| r.offer)

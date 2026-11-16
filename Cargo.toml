@@ -585,7 +585,7 @@ ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v22
 # kernel's `Row` / `SeatRow` views). TODO(kernel-v0.1.1): pinned by REV to
 # CIRISKernel PR #3's head (seat::group_count, members_in_scopes,
 # trust::Index) until kernel-v0.1.1 tags; the release re-pins to the tag.
-ciris-kernel = { git = "https://github.com/CIRISAI/CIRISKernel", rev = "eaf5577c04873224ec6494852b507e3eb5a808b8", version = "0.1" }
+ciris-kernel = { git = "https://github.com/CIRISAI/CIRISKernel", rev = "07ced1f2d2f6f672aa240b122657fa20b76d910c", version = "0.1" }
 # v0.3.6 (CIRISPersist#14) — direct ciris-crypto dep for HybridVerifier
 # in `Engine.verify_hybrid`. Same git source / tag as ciris-keyring +
 # ciris-verify-core so versions are workspace-coherent. Features
