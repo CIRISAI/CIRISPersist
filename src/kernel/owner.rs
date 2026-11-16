@@ -366,10 +366,38 @@ mod tests {
             serde_json::json!({}),
         );
         assert!(holders(std::slice::from_ref(&b), &[about], Cosign::Required).is_empty());
+        // the granter's `recants` about the node ends its bindings too
+        let recants = row(
+            "g",
+            attestation_type::RECANTS,
+            "O",
+            "N",
+            serde_json::json!({}),
+        );
+        assert!(
+            holders(std::slice::from_ref(&b), &[recants], Cosign::Required).is_empty(),
+            "a granter's recants about the node withdraws its bindings"
+        );
+        // a row about the node that is no retraction withdraws nothing
+        let scores = row("g", "scores", "O", "N", serde_json::json!({}));
+        assert_eq!(
+            holders(std::slice::from_ref(&b), &[scores], Cosign::Required).len(),
+            1,
+            "only a withdraws / recants is a granter's retraction"
+        );
         // an expired binding is not presented
-        let mut late = b;
+        let mut late = b.clone();
         late.expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
         assert!(holders(&[late], &[], Cosign::Required).is_empty());
+        // a binding expiring at the reading instant has lapsed (`exp > now`)
+        let now = chrono::Utc::now();
+        let mut at_now = b;
+        at_now.expires_at = Some(now);
+        let view = owner_rows("N", &[at_now], &[], now, &|_| true, Cosign::Required);
+        assert!(
+            owner_holders(&view, "N").value.is_empty(),
+            "a binding is live only strictly before its expiry"
+        );
     }
 
     /// CANARY for the adapter's own-withdrawal filter in [`owner_rows`]
