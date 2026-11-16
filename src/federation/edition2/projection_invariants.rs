@@ -451,7 +451,7 @@ pub(crate) async fn body(d: &dyn FederationDirectory, raw: &Raw<'_>) {
     let key_row = raw
         .rows("federation_keys", &format!("key_id = {}", sq(&ik)))
         .await;
-    let rev = revocation(&k, &k, 11_000, Some(11_000));
+    let rev = revocation(&k, &k, 11_500, Some(11_000));
     put_statement(d, &rev, None, INGEST_TIER).await.unwrap();
     let revs = d.revocations_for(&ik).await.unwrap();
     assert_eq!(revs.len(), 1, "I2004: revocations_for sees it");
@@ -461,6 +461,11 @@ pub(crate) async fn body(d: &dyn FederationDirectory, raw: &Raw<'_>) {
         "I2004: effective_at = revoked_after"
     );
     assert_eq!(revs[0].revoked_after, Some(at(11_000)));
+    assert_eq!(
+        revs[0].revoked_at,
+        at(11_500),
+        "I2004: revoked_at is the revocation's own instant"
+    );
     assert_eq!(revs[0].revoking_key_id, ik);
     let digest = crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(
         &d.lookup_public_key(&ik)
