@@ -83,10 +83,6 @@ use crate::schema::ReasoningEventType;
 // CIRISPersist#1238 — every write transaction begins IMMEDIATE.
 use crate::store::sqlite_conn_model::write_tx;
 
-mod embedded {
-    refinery::embed_migrations!("migrations/sqlite/lens");
-}
-
 /// v62.0.0 (WASM_NODE FSD §6.2, P7) — the `SingleProcess` writer's pragma
 /// block. Order is load-bearing: `locking_mode = EXCLUSIVE` is the first
 /// statement on the connection. The rest is the native block's set.
@@ -646,12 +642,17 @@ impl SqliteBackend {
         self.pre_purge_schema
             .store(version < 187, std::sync::atomic::Ordering::Release);
         self.repair_v070_checksum().await?;
-        self.write(move |conn| -> Result<(), refinery::Error> {
-            embedded::migrations::runner()
-                .set_target(refinery::Target::Version(version as _))
-                .run(&mut *conn)
+        self.write(
+            move |conn| -> Result<(), crate::store::migration_runner::MigrationError> {
+                crate::store::migration_runner::run_sqlite(
+                    conn,
+                    &crate::store::migration_runner::sqlite_migrations(),
+                    Some(i32::try_from(version).unwrap_or(i32::MAX)),
+                    &chrono::Utc::now,
+                )
                 .map(|_| ())
-        })
+            },
+        )
         .await
         .map_err(|e| Error::Migration {
             sqlstate: None,
@@ -1725,13 +1726,26 @@ impl Backend for SqliteBackend {
         // `crate::store::migration_timing` for the format.
         let v196 = self
             .write(
-                move |conn| -> Result<Option<(i64, i64, i64)>, refinery::Error> {
+                move |conn| -> Result<
+                    Option<(i64, i64, i64)>,
+                    crate::store::migration_runner::MigrationError,
+                > {
                     // v58.0.0 (CIRISPersist#1094 item 2) — what V196 will delete,
                     // counted before it runs so the boot can say so.
                     let v196 = sqlite_v196_pending(conn);
                     let timing = crate::store::migration_timing::MigrationTiming::from_run(
                         "sqlite",
-                        || embedded::migrations::runner().run(&mut *conn),
+                        || {
+                            // v62.0.0 (P6) — persist's runner; the instant is
+                            // the caller's (the Clock seam wires it).
+                            crate::store::migration_runner::run_sqlite(
+                                conn,
+                                &crate::store::migration_runner::sqlite_migrations(),
+                                None,
+                                &chrono::Utc::now,
+                            )
+                            .map(|r| r.versions())
+                        },
                     )?;
                     crate::store::migration_timing::append(&timing);
                     Ok(v196)
@@ -51009,10 +51023,13 @@ mod tests {
     fn withdraws_admission_depth_is_backfilled() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        embedded::migrations::runner()
-            .set_target(refinery::Target::Version(156))
-            .run(&mut conn)
-            .expect("migrate to V156");
+        crate::store::migration_runner::run_sqlite(
+            &mut conn,
+            &crate::store::migration_runner::sqlite_migrations(),
+            Some(156),
+            &chrono::Utc::now,
+        )
+        .expect("migrate to V156");
         conn.execute_batch(
             "INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, identity_type, \
                 identity_ref, valid_from, registration_envelope, original_content_hash, \
@@ -51028,9 +51045,13 @@ mod tests {
                 '2026-01-03T00:00:01+00:00','h','federation','2026-01-03T00:00:03+00:00');",
         )
         .expect("seed the pre-V157 rows");
-        embedded::migrations::runner()
-            .run(&mut conn)
-            .expect("migrate through V157");
+        crate::store::migration_runner::run_sqlite(
+            &mut conn,
+            &crate::store::migration_runner::sqlite_migrations(),
+            None,
+            &chrono::Utc::now,
+        )
+        .expect("migrate through V157");
         let depth = |id: &str| -> Option<i64> {
             conn.query_row(
                 "SELECT depth FROM federation_withdraws_admission_depths WHERE attestation_id = ?1",
@@ -51055,10 +51076,13 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
         // Pass 1: everything up to and including V135 (the pre-V136 HEAD).
-        embedded::migrations::runner()
-            .set_target(refinery::Target::Version(135))
-            .run(&mut conn)
-            .expect("migrate to V135");
+        crate::store::migration_runner::run_sqlite(
+            &mut conn,
+            &crate::store::migration_runner::sqlite_migrations(),
+            Some(135),
+            &chrono::Utc::now,
+        )
+        .expect("migrate to V135");
 
         const T0: &str = "2026-09-05T00:00:00+00:00";
 
@@ -51123,9 +51147,13 @@ mod tests {
         );
 
         // Pass 2: V136.
-        embedded::migrations::runner()
-            .run(&mut conn)
-            .expect("migrate to HEAD (V136)");
+        crate::store::migration_runner::run_sqlite(
+            &mut conn,
+            &crate::store::migration_runner::sqlite_migrations(),
+            None,
+            &chrono::Utc::now,
+        )
+        .expect("migrate to HEAD (V136)");
 
         // THE POINT: the reasoning record survived the cascade.
         let thoughts: i64 = conn
@@ -51776,10 +51804,13 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
 
         // Pass 1: migrate up to and including V060.
-        embedded::migrations::runner()
-            .set_target(refinery::Target::Version(60))
-            .run(&mut conn)
-            .expect("migrate to V060");
+        crate::store::migration_runner::run_sqlite(
+            &mut conn,
+            &crate::store::migration_runner::sqlite_migrations(),
+            Some(60),
+            &chrono::Utc::now,
+        )
+        .expect("migrate to V060");
 
         // Insert an inline blob row directly (pre-V061 schema) with
         // non-default access-tracking values to prove they survive.
@@ -51797,9 +51828,13 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
         }
 
         // Pass 2: run the rest of the chain (V061 rebuild).
-        embedded::migrations::runner()
-            .run(&mut conn)
-            .expect("migrate to HEAD (V061)");
+        crate::store::migration_runner::run_sqlite(
+            &mut conn,
+            &crate::store::migration_runner::sqlite_migrations(),
+            None,
+            &chrono::Utc::now,
+        )
+        .expect("migrate to HEAD (V061)");
 
         // Verify the row survived with every column intact.
         let (kind, inline, size, mt, last_acc, acc_count): (

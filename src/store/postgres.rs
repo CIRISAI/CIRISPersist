@@ -48,10 +48,6 @@ use super::types::{TraceEventRow, TraceLlmCallRow};
 use super::Error;
 use crate::schema::ReasoningEventType;
 
-mod embedded {
-    refinery::embed_migrations!("migrations/postgres/lens");
-}
-
 /// v50.0.0 (CIRISPersist#925 review M5) — the key-record store step, with the
 /// door it was reached through: `put_public_key` is the local mint
 /// ([`KeyDoor::LocalMint`](crate::federation::register::KeyDoor::LocalMint));
@@ -4974,8 +4970,8 @@ mod attestation_id_is_text_622 {
 #[cfg(test)]
 pub(crate) fn embedded_migration_fingerprint() -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for m in embedded::migrations::runner().get_migrations() {
-        for b in format!("{}:{}:{}", m.version(), m.name(), m.checksum()).bytes() {
+    for m in crate::store::migration_runner::postgres_migrations() {
+        for b in format!("{}:{}:{}", m.version, m.name, m.checksum).bytes() {
             h ^= b as u64;
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }
@@ -4989,11 +4985,10 @@ pub(crate) fn embedded_migration_fingerprint() -> u64 {
 /// hardcoded number that drifts each release.
 ///
 /// Returns the same count refinery walks at runtime —
-/// `embedded::migrations::runner().get_migrations().len()` — and is
-/// stable as long as the `embed_migrations!` macro stays sourced
-/// from the same directory.
+/// `migration_runner::postgres_migrations().len()` — and is stable as long
+/// as build.rs embeds the same directory.
 pub fn embedded_lens_migration_count() -> usize {
-    embedded::migrations::runner().get_migrations().len()
+    crate::store::migration_runner::postgres_migrations().len()
 }
 
 /// Postgres advisory-lock namespace for the migration phase.
@@ -6218,17 +6213,15 @@ impl PostgresBackend {
                 sqlstate: None,
                 detail: format!("postgres V070 checksum repair (#840): {e}"),
             })?;
-        let mut runner =
-            embedded::migrations::runner().set_target(refinery::Target::Version(version as _));
-        runner
-            .set_migration_table_name("ciris_persist_schema_history")
-            .run_async(&mut client)
-            .await
-            .map(|_| ())
-            .map_err(|e| Error::Migration {
-                sqlstate: None,
-                detail: format!("postgres migrations through V{version}: {e}"),
-            })
+        crate::store::migration_runner::run_postgres(
+            &mut client,
+            &crate::store::migration_runner::postgres_migrations(),
+            Some(i32::try_from(version).unwrap_or(i32::MAX)),
+            &chrono::Utc::now,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| runner_error(&format!("postgres migrations through V{version}"), e))
     }
 
     /// #226 (V094) — assign `shard_key` to legacy `trace_events` rows that
@@ -7207,7 +7200,7 @@ impl PostgresBackend {
 /// [`PostgresBackend::dedicated_connect`]); also the genesis scratch's admin
 /// connection (CIRISPersist#1002).
 #[cfg(not(feature = "tls"))]
-async fn dedicated_connect_to(dsn: &str) -> Result<tokio_postgres::Client, Error> {
+pub(crate) async fn dedicated_connect_to(dsn: &str) -> Result<tokio_postgres::Client, Error> {
     let (client, connection) =
         tokio_postgres::connect(dsn, NoTls)
             .await
@@ -7224,7 +7217,7 @@ async fn dedicated_connect_to(dsn: &str) -> Result<tokio_postgres::Client, Error
 }
 
 #[cfg(feature = "tls")]
-async fn dedicated_connect_to(dsn: &str) -> Result<tokio_postgres::Client, Error> {
+pub(crate) async fn dedicated_connect_to(dsn: &str) -> Result<tokio_postgres::Client, Error> {
     use rustls::ClientConfig;
     use tokio_postgres_rustls::MakeRustlsConnect;
     ensure_rustls_provider();
@@ -7480,6 +7473,17 @@ fn extract_sqlstate(err: &(dyn std::error::Error + 'static)) -> Option<String> {
 /// Format a migration-phase error with the SQLSTATE prepended
 /// (when available) so the Display string is greppable in lens
 /// logs without separate field-extraction.
+/// v62.0.0 (P6) — a [`crate::store::migration_runner::MigrationError`] as
+/// [`Error::Migration`], in [`migration_error`]'s `stage: [code] detail` form.
+fn runner_error(stage: &str, err: crate::store::migration_runner::MigrationError) -> Error {
+    let sqlstate = err.sqlstate().map(str::to_owned);
+    let detail = match &sqlstate {
+        Some(code) => format!("{stage}: [{code}] {err}"),
+        None => format!("{stage}: {err}"),
+    };
+    Error::Migration { sqlstate, detail }
+}
+
 fn migration_error<E>(stage: &str, err: E) -> Error
 where
     E: std::error::Error + 'static,
@@ -8153,17 +8157,22 @@ impl Backend for PostgresBackend {
         // detection both stay at their strict defaults (no integrity
         // weakening). Runtime is 100% TimescaleDB-free; the only residue is
         // dormant guarded DDL in the two immutable shipped migrations.
-        let report_result = embedded::migrations::runner()
-            .set_migration_table_name("ciris_persist_schema_history")
-            .run_async(&mut lock_client)
-            .await;
+        // v62.0.0 (P6) — persist's runner, refinery's decisions and rows;
+        // the instant is the caller's (the Clock seam wires it).
+        let report_result = crate::store::migration_runner::run_postgres(
+            &mut lock_client,
+            &crate::store::migration_runner::postgres_migrations(),
+            None,
+            &chrono::Utc::now,
+        )
+        .await;
         let elapsed = migration_started.elapsed();
         let migration_result = match report_result {
             Ok(report) => {
-                let applied = report.applied_migrations();
+                let applied = report.versions();
                 let applied_versions = applied
                     .iter()
-                    .map(|m| m.version().to_string())
+                    .map(i32::to_string)
                     .collect::<Vec<_>>()
                     .join(",");
                 crate::store::migration_timing::append(
@@ -8176,7 +8185,7 @@ impl Backend for PostgresBackend {
                 );
                 Ok(())
             }
-            Err(e) => Err(migration_error("migrations", e)),
+            Err(e) => Err(runner_error("migrations", e)),
         };
 
         // Best-effort explicit unlock — graceful path. The drop below

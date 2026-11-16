@@ -77,31 +77,32 @@ fn resolve_log_path() -> Option<std::path::PathBuf> {
 pub struct MigrationTiming {
     /// `"postgres"` or `"sqlite"`.
     pub backend: &'static str,
-    /// Wall time inside `refinery::Runner::run(...)` (not the wider
+    /// Wall time inside the migration runner's run (not the wider
     /// `run_migrations` wrapper).
     pub elapsed: std::time::Duration,
-    /// Number of migrations refinery applied this call.
+    /// Number of migrations the runner applied this call.
     pub applied_count: usize,
-    /// Comma-joined refinery version numbers (e.g. `"58,59"`).
+    /// Comma-joined migration version numbers (e.g. `"58,59"`).
     pub applied_versions: String,
 }
 
 impl MigrationTiming {
-    /// Convenience: time a block returning a refinery `Report` and
-    /// build a `MigrationTiming` from it. Doesn't write — caller
-    /// passes the result to [`append`] when the env var path
-    /// resolves.
+    /// Convenience: time a block returning the versions it applied, in
+    /// order, and build a `MigrationTiming` from it. Doesn't write — caller
+    /// passes the result to [`append`] when the env var path resolves.
+    ///
+    /// v62.0.0 (P6) — the block returns the applied versions, not a
+    /// `refinery::Report`: persist applies its own migrations.
     pub fn from_run<F, E>(backend: &'static str, run: F) -> Result<Self, E>
     where
-        F: FnOnce() -> Result<refinery::Report, E>,
+        F: FnOnce() -> Result<Vec<i32>, E>,
     {
         let started = Instant::now();
-        let report = run()?;
+        let applied = run()?;
         let elapsed = started.elapsed();
-        let applied = report.applied_migrations();
         let applied_versions = applied
             .iter()
-            .map(|m| m.version().to_string())
+            .map(i32::to_string)
             .collect::<Vec<_>>()
             .join(",");
         Ok(MigrationTiming {

@@ -27,8 +27,8 @@ pub mod decompose;
 pub(crate) mod fountain_read;
 // v3.12.x (CIRISPersist#156) — always-compiled migration-timing
 // diagnostic. Sibling to the `debug-tools`-gated panic hook in
-// `crate::debug`. Gated on `postgres` OR `sqlite` since the type
-// references `refinery::Report`.
+// `crate::debug`. Gated on `postgres` OR `sqlite`, the two backends that
+// migrate.
 /// v31.2.0 (CIRISPersist#670) — **the schema-parity gate.** The sibling of
 /// [`parity`], for the half a Rust scan cannot see: it replays
 /// `migrations/{postgres,sqlite}/lens/V*.sql` and compares the table, column,
@@ -38,6 +38,10 @@ pub(crate) mod fountain_read;
 pub(crate) mod crypto_cardinality;
 /// #840 (I43/I44) — the migration-immutability gate and V070's repair.
 mod migration_immutability;
+/// v62.0.0 (WASM_UEFI_READINESS P6) — persist applies its own migrations:
+/// refinery's decisions, rows and checksums, with the instant the caller's.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) mod migration_runner;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub mod migration_timing;
 /// v31.2.0 (CIRISPersist#670) — **the backend-parity gate.**

@@ -218,13 +218,16 @@ fn checksums_on_disk() -> Vec<(String, i32, String, String)> {
         for path in entries {
             let stem = path.file_stem().unwrap().to_string_lossy().to_string();
             let sql = std::fs::read_to_string(&path).unwrap();
-            let m = refinery::Migration::unapplied(&stem, &sql)
-                .unwrap_or_else(|e| panic!("refinery could not parse {stem}: {e}"));
+            let (v, name) = stem
+                .strip_prefix('V')
+                .and_then(|r| r.split_once("__"))
+                .unwrap_or_else(|| panic!("{stem}: not V{{n}}__{{name}}"));
+            let version: i32 = v.parse().unwrap();
             out.push((
                 dialect.to_string(),
-                m.version() as i32,
-                m.name().to_string(),
-                m.checksum().to_string(),
+                version,
+                name.to_string(),
+                crate::store::migration_runner::checksum(name, version, &sql).to_string(),
             ));
         }
     }
@@ -397,24 +400,24 @@ mod tests {
             let broken = shipped.replace(from, to);
             assert_ne!(shipped, broken, "the substitution changed nothing");
 
-            let m_canon = refinery::Migration::unapplied(stem, &shipped).unwrap();
-            let m_brick = refinery::Migration::unapplied(stem, &broken).unwrap();
+            let name = stem.split_once("__").unwrap().1;
+            let canon_sum = crate::store::migration_runner::checksum(name, 70, &shipped);
+            let brick_sum = crate::store::migration_runner::checksum(name, 70, &broken);
 
             assert_eq!(
-                m_canon.checksum().to_string(),
+                canon_sum.to_string(),
                 canonical,
                 "{}: pinned CANONICAL checksum is not the shipped file's",
                 dialect.as_str()
             );
             assert_eq!(
-                m_brick.checksum().to_string(),
+                brick_sum.to_string(),
                 bricked,
                 "{}: pinned BRICKED checksum is not that of the v43.0.0–v44.1.0 text",
                 dialect.as_str()
             );
             assert_ne!(canonical, bricked, "the two variants must differ");
-            assert_eq!(m_canon.version() as i32, V070_VERSION);
-            assert_eq!(m_canon.name(), V070_NAME);
+            assert_eq!(stem, format!("V{V070_VERSION:03}__{V070_NAME}"));
         }
     }
 
