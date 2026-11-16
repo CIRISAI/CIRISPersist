@@ -16756,7 +16756,8 @@ fn sqlite_project_rendition_row(
 /// v53.1.5 — the `federation_attestations` column list in
 /// [`sqlite_row_to_attestation`]'s order, for the reads that build their
 /// statement.
-const SQLITE_ATTESTATION_COLUMNS: &str = "attestation_id, attesting_key_id, attested_key_id, \
+pub(crate) const SQLITE_ATTESTATION_COLUMNS: &str =
+    "attestation_id, attesting_key_id, attested_key_id, \
     attestation_type, weight, asserted_at, expires_at, attestation_envelope, \
     original_content_hash, scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
     scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, \
@@ -16853,21 +16854,20 @@ pub(crate) fn sqlite_list_attestations_sql(
     // every qualifying row (with statistics: a skip-scan of V004's
     // attester index, the sort unchanged). A pinned key keeps its own
     // index.
-    let keyed = !filter.attesting_key_ids.is_empty()
-        || filter.attesting_key_id.is_some()
-        || !filter.attested_key_ids.is_empty()
-        || filter.attested_key_id.is_some()
-        || matches!(
-            filter.attester_filter,
-            Some(crate::read::AttesterSet::Explicit(_))
-        )
-        || filter.dimension_exact.is_some()
-        || !filter.dimension_prefixes.is_empty();
-    let from = if keyed {
-        "federation_attestations"
-    } else {
-        "federation_attestations INDEXED BY federation_attestations_asserted_seek"
+    let keyed = sqlite_attestation_keyed(filter);
+    // v62.0.0 (FSD §6.4, P10) — one key and an exact dimension: V216's
+    // `(key, dimension, asserted_at DESC, attestation_id DESC)` walks the
+    // slice in page order and stops at the LIMIT. The attester form wins
+    // when both axes hold one key (the subject is then a residual filter).
+    let order_pin = sqlite_attestation_order_pin(filter);
+    let from = match (keyed, order_pin) {
+        (false, _) => "federation_attestations INDEXED BY federation_attestations_asserted_seek",
+        (true, Some(pin)) => pin,
+        (true, None) => "federation_attestations",
     };
+    // Every other keyed shape sorts: phase one sorts `(asserted_at,
+    // attestation_id, rowid)` and keeps the page, phase two fetches it.
+    let two_phase = sqlite_list_attestations_two_phase(filter);
     let mut parts: Vec<String> = Vec::new();
     let mut binds: Vec<SqlValue> = Vec::new();
     // v30.9.0 (CIRISPersist#627) — singular ∪ set, pushed down as `IN (…)`, never looped.
@@ -17054,17 +17054,82 @@ pub(crate) fn sqlite_list_attestations_sql(
     };
     binds.push(SqlValue::Integer(limit));
     let p_limit = binds.len();
-    let sql = format!(
-            "SELECT attestation_id, attesting_key_id, attested_key_id, \
-                    attestation_type, weight, asserted_at, expires_at, \
-                    attestation_envelope, original_content_hash, \
-                    scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
-             FROM {from} {where_sql} \
+    let sql = if two_phase {
+        // v62.0.0 (FSD §6.4, P10; the #575 class) — phase one: the sort
+        // holds keys, never 11 KB rows. It evaluates the whole predicate
+        // and returns the page's rowids in page order; the door then reads
+        // each row by rowid ([`SQLITE_ATTESTATION_BY_ROWID_SQL`]) in that
+        // order, in the same snapshot. `attestation_id` is unique, so the
+        // order is total and ties resolve as the one-statement read did.
+        format!(
+            "SELECT rowid FROM {from} {where_sql} \
              ORDER BY asserted_at DESC, attestation_id DESC LIMIT ?{p_limit}"
-        );
+        )
+    } else {
+        format!(
+            "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM {from} {where_sql} \
+             ORDER BY asserted_at DESC, attestation_id DESC LIMIT ?{p_limit}"
+        )
+    };
     Ok((sql, binds))
 }
+
+/// v62.0.0 (FSD §6.4, P10) — the V216 index that serves `filter`'s page
+/// order, as a `FROM` clause: exactly one attester (else exactly one
+/// subject and no attester) together with an exact dimension.
+fn sqlite_attestation_order_pin(filter: &crate::read::AttestationFilter) -> Option<&'static str> {
+    filter.dimension_exact.as_ref()?;
+    let attesting = crate::ceg::list::federation::merge_key_predicate(
+        filter.attesting_key_id.as_ref(),
+        &filter.attesting_key_ids,
+    );
+    let attested = crate::ceg::list::federation::merge_key_predicate(
+        filter.attested_key_id.as_ref(),
+        &filter.attested_key_ids,
+    );
+    match (attesting.len(), attested.len()) {
+        (1, _) => Some(
+            "federation_attestations \
+             INDEXED BY federation_attestations_attester_dimension_asserted",
+        ),
+        (0, 1) => Some(
+            "federation_attestations \
+             INDEXED BY federation_attestations_attested_dimension_asserted",
+        ),
+        _ => None,
+    }
+}
+
+/// v62.0.0 (FSD §6.4, P10) — whether [`sqlite_list_attestations_sql`]
+/// returns phase one of the two-phase read (rowids in page order) rather
+/// than the rows: a keyed shape whose page order no index serves.
+pub(crate) fn sqlite_list_attestations_two_phase(filter: &crate::read::AttestationFilter) -> bool {
+    sqlite_attestation_keyed(filter) && sqlite_attestation_order_pin(filter).is_none()
+}
+
+/// A key or a dimension is pinned, so the read seeks that index rather
+/// than walking V212's keyset order.
+fn sqlite_attestation_keyed(filter: &crate::read::AttestationFilter) -> bool {
+    !filter.attesting_key_ids.is_empty()
+        || filter.attesting_key_id.is_some()
+        || !filter.attested_key_ids.is_empty()
+        || filter.attested_key_id.is_some()
+        || matches!(
+            filter.attester_filter,
+            Some(crate::read::AttesterSet::Explicit(_))
+        )
+        || filter.dimension_exact.is_some()
+        || !filter.dimension_prefixes.is_empty()
+}
+
+/// v62.0.0 (FSD §6.4, P10) — phase two of the two-phase attestation read:
+/// one row by rowid, in [`sqlite_row_to_attestation`]'s column order.
+const SQLITE_ATTESTATION_BY_ROWID_SQL: &str = "SELECT attestation_id, attesting_key_id, \
+    attested_key_id, attestation_type, weight, asserted_at, expires_at, attestation_envelope, \
+    original_content_hash, scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, \
+    withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
+    FROM federation_attestations WHERE rowid = ?1";
 
 /// v61 — `list_scores`' statement and binds: the read-plan executor's
 /// `read_scores_page` issues exactly this, and the plan witnesses EXPLAIN
@@ -17179,6 +17244,45 @@ fn sqlite_dimension_prefix_clause(prefix: &str, binds: &mut Vec<SqlValue>) -> St
             format!("substr(dimension, 1, {}) = ?{a}", prefix.chars().count())
         }
     }
+}
+
+/// v62.0.0 (FSD §6.4, P10) — run the two-phase attestation read: phase
+/// one (`sql`, from [`sqlite_list_attestations_sql`]) yields the page's
+/// rowids in page order; each row is then read by rowid, in that order.
+/// One deferred transaction, so both phases read one snapshot.
+fn sqlite_read_attestations_two_phase(
+    conn: &Connection,
+    sql: &str,
+    binds: &[SqlValue],
+) -> Result<Vec<crate::federation::Attestation>, crate::read::Error> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(sqlite_read_err("list_attestations begin"))?;
+    let rowids: Vec<i64> = {
+        let mut stmt = tx
+            .prepare(sql)
+            .map_err(sqlite_read_err("list_attestations prepare"))?;
+        let rowids = stmt
+            .query_map(params_from_iter(binds.iter()), |r| r.get::<_, i64>(0))
+            .map_err(sqlite_read_err("list_attestations query"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_read_err("list_attestations row"))?;
+        rowids
+    };
+    let mut stmt = tx
+        .prepare_cached(SQLITE_ATTESTATION_BY_ROWID_SQL)
+        .map_err(sqlite_read_err("list_attestations prepare"))?;
+    let mut items = Vec::with_capacity(rowids.len());
+    for rowid in rowids {
+        items.push(
+            stmt.query_row([rowid], sqlite_row_to_attestation)
+                .map_err(sqlite_read_err("list_attestations row"))?,
+        );
+    }
+    // A read: the deferred transaction ends at drop (rolled back).
+    drop(stmt);
+    drop(tx);
+    Ok(items)
 }
 
 fn sqlite_row_to_attestation(
@@ -21227,18 +21331,24 @@ impl crate::read::ReadEngine for SqliteBackend {
             )));
         }
         let (sql, binds) = sqlite_list_attestations_sql(&filter, cursor.as_ref(), limit, &scope)?;
+        let two_phase = sqlite_list_attestations_two_phase(&filter);
         let limit_usize = limit as usize;
         let (read, bytes) = self
             .read_measured(
                 move |conn| -> Result<crate::read::AttestationListPage, crate::read::Error> {
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(sqlite_read_err("list_attestations prepare"))?;
-                    let items: Vec<crate::federation::Attestation> = stmt
-                        .query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)
-                        .map_err(sqlite_read_err("list_attestations query"))?
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(sqlite_read_err("list_attestations row"))?;
+                    let items = if two_phase {
+                        sqlite_read_attestations_two_phase(conn, &sql, &binds)?
+                    } else {
+                        let mut stmt = conn
+                            .prepare(&sql)
+                            .map_err(sqlite_read_err("list_attestations prepare"))?;
+                        let items = stmt
+                            .query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)
+                            .map_err(sqlite_read_err("list_attestations query"))?
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(sqlite_read_err("list_attestations row"))?;
+                        items
+                    };
                     let next_cursor = if items.len() == limit_usize {
                         let last = &items[items.len() - 1];
                         Some(crate::read::AttestationCursor::from_trailing(
@@ -43922,6 +44032,365 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── v62.0.0 (FSD §6.4, P10) — the attestation page in its order ─────
+    //
+    // The corpus: `n` rows from two attesters (`a` writes three in four)
+    // over two subjects and three dimensions, twelve rows to an instant (so
+    // `attestation_id` breaks ties inside one (key, dimension) slice), ids
+    // permuted against insertion order (rowid order is neither time order
+    // nor id order), every row visible to an unauthenticated reader.
+
+    const P10_ATT_A: &str = "p10-att-a";
+    const P10_ATT_B: &str = "p10-att-b";
+
+    async fn p10_seed(backend: &SqliteBackend, n: i64, pad: i64) {
+        backend
+            .write(move |conn| -> rusqlite::Result<()> {
+                for k in [P10_ATT_A, P10_ATT_B] {
+                    conn.execute(
+                        "INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, \
+                           identity_type, identity_ref, valid_from, registration_envelope, \
+                           original_content_hash, scrub_signature_classical, scrub_key_id, \
+                           scrub_timestamp, persist_row_hash, admitted_at) \
+                         VALUES (?1, 'cA==', 'hybrid', 'agent', ?1, '2026-01-01T00:00:00+00:00', \
+                           '{}', x'', 's', ?1, '2026-01-01T00:00:00+00:00', '0', \
+                           '2026-01-01T00:00:00+00:00')",
+                        [k],
+                    )?;
+                }
+                conn.execute(
+                    "WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n + 1 < ?1), \
+                     r AS (SELECT n, \
+                            CASE WHEN n % 4 = 3 THEN 'p10-att-b' ELSE 'p10-att-a' END AS k, \
+                            strftime('%Y-%m-%dT%H:%M:%S+00:00', '2026-06-01T00:00:00', \
+                                     '-' || (n / 12) || ' minutes') AS ts \
+                           FROM seq) \
+                     INSERT INTO federation_attestations (attestation_id, attesting_key_id, \
+                       attested_key_id, attestation_type, weight, asserted_at, expires_at, \
+                       attestation_envelope, original_content_hash, scrub_signature_classical, \
+                       scrub_signature_pqc, scrub_key_id, scrub_timestamp, pqc_completed_at, \
+                       persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, \
+                       tier, promoted_at, admitted_at) \
+                     SELECT printf('p10-%07d', (n * 7919) % ?1), k, 'p10-subj-' || (n % 2), \
+                       'scores', 1.0, ts, NULL, \
+                       json_object('dimension', CASE n % 3 WHEN 0 THEN 'p10:x:v1' \
+                                                 WHEN 1 THEN 'p10:y:v1' ELSE 'p10:z:v1' END, \
+                                   'pad', substr(hex(zeroblob(?2)), 1, ?2)), \
+                       x'', 's', NULL, k, ts, NULL, 'p10-h-' || n, '[]', NULL, 'federation', \
+                       'federation', NULL, ts \
+                     FROM r",
+                    rusqlite::params![n, pad],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Every corpus row as `(attestation_id, attester, subject, dimension,
+    /// asserted_at)`, read without the door.
+    async fn p10_all_rows(
+        backend: &SqliteBackend,
+    ) -> Vec<(String, String, String, String, String)> {
+        backend
+            .read(|conn| {
+                let mut st = conn
+                    .prepare(
+                        "SELECT attestation_id, attesting_key_id, attested_key_id, dimension, \
+                         asserted_at FROM federation_attestations",
+                    )
+                    .unwrap();
+                st.query_map([], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+            })
+            .await
+    }
+
+    type P10Row = (String, String, String, String, String);
+
+    /// The read shapes: the two V216-pinned ones first, then every keyed
+    /// shape the two-phase read serves, then the unkeyed V212 walk.
+    #[allow(clippy::type_complexity)]
+    fn p10_shapes() -> Vec<(
+        &'static str,
+        crate::read::AttestationFilter,
+        fn(&P10Row) -> bool,
+    )> {
+        let f = crate::read::AttestationFilter::default;
+        vec![
+            (
+                "attester + exact dimension",
+                crate::read::AttestationFilter {
+                    attesting_key_id: Some(P10_ATT_A.into()),
+                    dimension_exact: Some("p10:x:v1".into()),
+                    ..f()
+                },
+                |r| r.1 == P10_ATT_A && r.3 == "p10:x:v1",
+            ),
+            (
+                "subject + exact dimension",
+                crate::read::AttestationFilter {
+                    attested_key_id: Some("p10-subj-1".into()),
+                    dimension_exact: Some("p10:y:v1".into()),
+                    ..f()
+                },
+                |r| r.2 == "p10-subj-1" && r.3 == "p10:y:v1",
+            ),
+            (
+                "attester + dimension prefix",
+                crate::read::AttestationFilter {
+                    attesting_key_id: Some(P10_ATT_A.into()),
+                    dimension_prefixes: vec!["p10:".into()],
+                    ..f()
+                },
+                |r| r.1 == P10_ATT_A && r.3.starts_with("p10:"),
+            ),
+            (
+                "two attesters + exact dimension",
+                crate::read::AttestationFilter {
+                    attesting_key_ids: vec![P10_ATT_A.into(), P10_ATT_B.into()],
+                    dimension_exact: Some("p10:z:v1".into()),
+                    ..f()
+                },
+                |r| r.3 == "p10:z:v1",
+            ),
+            (
+                "attester only",
+                crate::read::AttestationFilter {
+                    attesting_key_id: Some(P10_ATT_B.into()),
+                    ..f()
+                },
+                |r| r.1 == P10_ATT_B,
+            ),
+            (
+                "exact dimension only",
+                crate::read::AttestationFilter {
+                    dimension_exact: Some("p10:x:v1".into()),
+                    ..f()
+                },
+                |r| r.3 == "p10:x:v1",
+            ),
+            ("no key", f(), |_| true),
+        ]
+    }
+
+    /// The ids `keep` selects, in page order: `asserted_at DESC,
+    /// attestation_id DESC` over the stored text, as SQLite compares it.
+    fn p10_oracle(rows: &[P10Row], keep: fn(&P10Row) -> bool) -> Vec<String> {
+        let mut v: Vec<&P10Row> = rows.iter().filter(|r| keep(r)).collect();
+        v.sort_by(|x, y| (&y.4, &y.0).cmp(&(&x.4, &x.0)));
+        v.into_iter().map(|r| r.0.clone()).collect()
+    }
+
+    /// Every page of `filter` through the door, `page` rows at a time.
+    async fn p10_walk(
+        backend: &SqliteBackend,
+        filter: &crate::read::AttestationFilter,
+        page: i64,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cursor = None;
+        loop {
+            let p = backend
+                .list_attestations(
+                    filter.clone(),
+                    cursor,
+                    page,
+                    crate::scope::CallerScope::Unauthenticated,
+                )
+                .await
+                .unwrap();
+            out.extend(p.items.into_iter().map(|a| a.attestation_id));
+            match p.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => return out,
+            }
+        }
+    }
+
+    /// **I1810 (sqlite) — one key and an exact dimension read in page
+    /// order, no sort.** The attester and the subject shape each seek V216
+    /// on both equalities, page one and at a cursor, on a fresh store and
+    /// after ANALYZE of a seeded one: never a TEMP B-TREE, never V004's
+    /// history walk, never V137 / V180 (which carry no `asserted_at`).
+    #[tokio::test]
+    async fn i1810_one_key_exact_dimension_reads_in_page_order_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let cursor =
+            crate::read::AttestationCursor::from_trailing(chrono::Utc::now(), "p10-0000001".into());
+        let shapes = p10_shapes();
+        for stats in ["fresh", "seeded and analyzed"] {
+            if stats == "seeded and analyzed" {
+                p10_seed(&backend, 6_000, 0).await;
+                backend
+                    .write(|conn| conn.execute_batch("ANALYZE"))
+                    .await
+                    .unwrap();
+            }
+            for ((tag, filter, _), (index, cols)) in shapes.iter().take(2).zip([
+                (
+                    "federation_attestations_attester_dimension_asserted",
+                    "(attesting_key_id=? AND dimension=?",
+                ),
+                (
+                    "federation_attestations_attested_dimension_asserted",
+                    "(attested_key_id=? AND dimension=?",
+                ),
+            ]) {
+                assert!(
+                    !sqlite_list_attestations_two_phase(filter),
+                    "I1810 {tag}: one statement"
+                );
+                for c in [None, Some(&cursor)] {
+                    let (sql, binds) = sqlite_list_attestations_sql(
+                        filter,
+                        c,
+                        1000,
+                        &crate::scope::CallerScope::Unauthenticated,
+                    )
+                    .unwrap();
+                    let plan = sqlite_plan(&backend, &sql, binds).await;
+                    let what = format!("I1810 [{stats}] {tag} cursor={}", c.is_some());
+                    eprintln!("{what} plan: {plan:?}");
+                    let want = format!("SEARCH federation_attestations USING INDEX {index} {cols}");
+                    assert!(
+                        plan.iter().any(|l| l.starts_with(&want)),
+                        "{what}: seeks `{want}`: {plan:?}"
+                    );
+                    assert!(
+                        !plan.iter().any(|l| l.contains("TEMP B-TREE")),
+                        "{what}: no sort: {plan:?}"
+                    );
+                    v61_storm_no_history_walk(&plan, &what);
+                }
+            }
+        }
+    }
+
+    /// **I1811 (sqlite) — the same rows in the same order, ties included.**
+    /// Every read shape, walked to its end through the door's cursor at a
+    /// page of 7 (pages split tie groups) and read as one 1000-row page,
+    /// equals the ids an independent oracle selects and orders from the
+    /// whole table.
+    #[tokio::test]
+    async fn i1811_the_page_is_the_oracles_rows_in_its_order_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        p10_seed(&backend, 2_400, 0).await;
+        let rows = p10_all_rows(&backend).await;
+        assert_eq!(rows.len(), 2_400);
+        for (tag, filter, keep) in p10_shapes() {
+            let want = p10_oracle(&rows, keep);
+            assert!(
+                want.len() > 100,
+                "I1811 {tag}: a real slice ({})",
+                want.len()
+            );
+            let walked = p10_walk(&backend, &filter, 7).await;
+            assert_eq!(walked, want, "I1811 {tag}: walked at 7 a page");
+            let one = backend
+                .list_attestations(
+                    filter.clone(),
+                    None,
+                    1000,
+                    crate::scope::CallerScope::Unauthenticated,
+                )
+                .await
+                .unwrap();
+            let one: Vec<String> = one.items.into_iter().map(|a| a.attestation_id).collect();
+            assert_eq!(
+                one,
+                want[..want.len().min(1000)],
+                "I1811 {tag}: one 1000-row page"
+            );
+        }
+    }
+
+    /// The v61.4.1 one-statement read of a two-phase shape: phase one's
+    /// predicate and order, selecting the rows themselves (the oracle
+    /// I1812 measures against).
+    fn p10_v61_4_1_statement(phase_one: &str) -> String {
+        let s = phase_one.replacen(
+            "SELECT rowid FROM",
+            &format!("SELECT {SQLITE_ATTESTATION_COLUMNS} FROM"),
+            1,
+        );
+        assert_ne!(s, phase_one, "phase one selects rowids");
+        s
+    }
+
+    /// **I1812 (sqlite) — the two-phase read's sort holds keys, not rows.**
+    /// A shape no index orders (one attester, a dimension prefix) over rows
+    /// carrying 11 KB envelopes, temp store in MEMORY so a sorter is heap:
+    /// the v61.4.1 statement's sqlite heap high-water holds the candidates'
+    /// envelopes; the door's holds keys and the page.
+    #[tokio::test]
+    async fn i1812_the_two_phase_sort_holds_keys_not_rows_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        p10_seed(&backend, 800, 11 * 1024).await;
+        backend
+            .write(|conn| conn.execute_batch("PRAGMA temp_store = MEMORY"))
+            .await
+            .unwrap();
+        let (_, filter, keep) = p10_shapes().swap_remove(2);
+        assert!(sqlite_list_attestations_two_phase(&filter));
+        let rows = p10_all_rows(&backend).await;
+        let candidates = rows.iter().filter(|r| keep(r)).count() as i64;
+        let payload = candidates * 11 * 1024;
+        const PAGE: i64 = 1000;
+        let unauth = crate::scope::CallerScope::Unauthenticated;
+        let (sql, binds) = sqlite_list_attestations_sql(&filter, None, PAGE, &unauth).unwrap();
+        let old_sql = p10_v61_4_1_statement(&sql);
+        let mut old = i64::MAX;
+        let mut new = i64::MAX;
+        for _ in 0..3 {
+            old = old.min(
+                sqlite_heap_high_water_during(|| async {
+                    let (old_sql, binds) = (old_sql.clone(), binds.clone());
+                    let n = backend
+                        .read(move |conn| {
+                            let mut st = conn.prepare(&old_sql).unwrap();
+                            st.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)
+                                .unwrap()
+                                .count()
+                        })
+                        .await;
+                    assert_eq!(n as i64, candidates.min(PAGE));
+                })
+                .await,
+            );
+            new = new.min(
+                sqlite_heap_high_water_during(|| async {
+                    let page = backend
+                        .list_attestations(filter.clone(), None, PAGE, unauth.clone())
+                        .await
+                        .unwrap();
+                    assert_eq!(page.items.len() as i64, candidates.min(PAGE));
+                })
+                .await,
+            );
+        }
+        eprintln!(
+            "I1812 candidates={candidates} payload={payload} bytes; sqlite heap high-water: \
+             v61.4.1 statement {old} bytes; two-phase read {new} bytes"
+        );
+        assert!(
+            old * 2 > payload,
+            "I1812: the measurement sees the v61.4.1 sorter hold the envelopes: {old}"
+        );
+        assert!(
+            new * 10 < payload,
+            "I1812: the two-phase read's sqlite heap stays under 10% of the candidates' \
+             envelopes: {new}"
+        );
     }
 
     /// The lifecycle subquery of a Live plan seeks `reference_live`.

@@ -907,6 +907,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("sqlite_refuse_tombstoned_at_write", ConnClass::HelperRead),
     ("sqlite_next_key_serve_position", ConnClass::HelperRead),
     ("sqlite_next_plane_position", ConnClass::HelperRead),
+    // v62.0.0 (FSD §6.4, P10) — the two-phase attestation page read.
+    ("sqlite_read_attestations_two_phase", ConnClass::HelperRead),
     (
         "sqlite_project_attestation_subjects",
         ConnClass::HelperWrite,

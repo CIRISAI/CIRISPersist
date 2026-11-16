@@ -22604,13 +22604,21 @@ const PG_ATTESTATION_COLUMNS: &str = "attestation_id::text, attesting_key_id, at
 /// v61 — `list_attestations_by_dimension_citing`'s statement (`$1` the
 /// attester, `$2` the dimension, `$3` the cited blob), spelled once so the
 /// plan witness reads the statement the door runs.
+///
+/// v62.0.0 — the order is `asserted_at + interval '0'`: the same values in
+/// the same order, which no index yields. V216's `(attesting_key_id,
+/// dimension, asserted_at DESC, …)` does yield `asserted_at DESC` under the
+/// first two equalities, and with stale statistics postgres took it to skip
+/// the sort, walking the device's whole custody slice (the sort-avoidance
+/// heuristic sqlite's twin pins against with INDEXED BY). The cited rows are
+/// few, so the sort is of a handful.
 pub(crate) fn pg_by_dimension_citing_sql() -> String {
     format!(
         "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
          WHERE attesting_key_id = $1 AND dimension COLLATE \"C\" = $2 \
            AND (attestation_envelope::jsonb->'evidence_refs'->>0) = $3 \
            AND tier = 'federation' \
-         ORDER BY asserted_at DESC"
+         ORDER BY (asserted_at + interval '0') DESC"
     )
 }
 
@@ -22760,7 +22768,12 @@ pub(crate) fn pg_list_attestations_sql(
             filter.attesting_key_id.as_ref(),
             &filter.attesting_key_ids,
         );
-        if !keys.is_empty() {
+        // v62.0.0 (FSD §6.4, P10) — one key binds as equality, so the
+        // planner sees one (key, dimension) slice and V216's page order.
+        if let [one] = keys.as_slice() {
+            params.push(Box::new(one.clone()));
+            where_parts.push(format!("attesting_key_id = ${}", params.len()));
+        } else if !keys.is_empty() {
             params.push(Box::new(keys));
             where_parts.push(format!("attesting_key_id = ANY(${})", params.len()));
         }
@@ -22771,7 +22784,10 @@ pub(crate) fn pg_list_attestations_sql(
             filter.attested_key_id.as_ref(),
             &filter.attested_key_ids,
         );
-        if !keys.is_empty() {
+        if let [one] = keys.as_slice() {
+            params.push(Box::new(one.clone()));
+            where_parts.push(format!("attested_key_id = ${}", params.len()));
+        } else if !keys.is_empty() {
             params.push(Box::new(keys));
             where_parts.push(format!("attested_key_id = ANY(${})", params.len()));
         }

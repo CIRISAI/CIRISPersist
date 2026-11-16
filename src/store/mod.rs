@@ -8,6 +8,10 @@
 //! Phase 1; later phases fill in surfaces, never restructure the
 //! contract.
 
+/// v62.0.0 (FSD §6.4, P10): I1813–I1814. The attestation page in its order,
+/// postgres (the sqlite twins sit in `sqlite.rs`'s tests).
+#[cfg(all(test, feature = "postgres"))]
+mod attestation_page_order_pg_invariants;
 pub mod backend;
 /// v61 (CIRISPersist#934, S4a) — the `Backend` trait's gated doors (the two
 /// trace erasures, the two fountain writes), decided once, with the

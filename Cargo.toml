@@ -1028,6 +1028,14 @@ name = "scores_read"
 harness = false
 required-features = ["sqlite"]
 
+# v62.0.0 (WASM_NODE FSD §6.4, P10) — the 1000-row attestation page at
+# 1k / 16k / 100k rows: the door (V216 seek; the two-phase read) against
+# the v61.4.1 statement shape (sort every match, then LIMIT).
+[[bench]]
+name = "attestation_read"
+harness = false
+required-features = ["sqlite"]
+
 # Secrets crypto facade (AES-256-GCM) single-call latency. No DB.
 [[bench]]
 name = "secrets_crypto"

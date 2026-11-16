@@ -5,6 +5,22 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [62.0.0] - UNRELEASED
+
+v62 runs persist as one single-threaded module on native, browser (wasm32 in a Dedicated Worker over OPFS sahpool) and UEFI. This section is slice B: the storage profile and the native wins (WASM_UEFI_READINESS P6, P7, P10, P13).
+
+### Changed
+
+- **The attestation page reads in its order (FSD §6.4, P10; the CIRISServer#575 class).** `list_attestations` with one attester (or one subject) and an exact dimension sought V137 / V180, which carry no `asserted_at`, and sorted every match before its LIMIT: on the browser node at 100k rows, about 60k rows of 11 KB in a `TEMP B-TREE`, 513 ms, to keep 1000. Unanalyzed, it walked the attester's whole history instead. New migration **V216** (both dialects) adds `(attesting_key_id, dimension, asserted_at DESC, attestation_id DESC)` and `(attested_key_id, dimension, asserted_at DESC, attestation_id DESC)` (`COLLATE "C"` on the postgres dimension, V137's reason). SQLite pins them with `INDEXED BY` (the V212 precedent). Postgres binds a single key as `=`, not `= ANY($1)`, so the planner can use the index's order. Every other keyed shape (a dimension prefix, a key set, a key alone, a dimension alone) still sorts, but on SQLite it now reads in **two phases**: phase one evaluates the whole predicate and sorts `(asserted_at, attestation_id, rowid)` keys; phase two reads the page's rows by rowid, in that order, in the same snapshot. The rows and their order are unchanged, ties included (`attestation_id` is unique, so the order is total).
+
+### Added
+
+- `benches/attestation_read.rs`: the 1000-row page at 1k / 16k / 100k rows, the door against the v61.4.1 statement shape; run by the bench workflow.
+
+### Tested
+
+- I1810 (sqlite) / I1813 (postgres): one key with an exact dimension seeks V216 on both equalities, on page one and at a cursor, with no sort node. On sqlite this holds fresh and after ANALYZE. On postgres it holds on an analyzed corpus with the FSD's proportions (a 10k-row slice behind 200k newer rows), and a control with V216 dropped shows the sort comes back. I1811 / I1814: every read shape, walked to its end at 7 rows a page and read as one 1000-row page, equals an independent oracle's rows in order, ties included, on both backends. I1812 (sqlite): over 11 KB envelopes, the v61.4.1 statement's sqlite heap high-water holds the candidates' envelopes; the two-phase read's stays under 10% of them.
+
 ## [61.4.1] - 2026-11-14
 
 A member seated late in a room of three or more could read an earlier message as `seal_mismatch`, permanently (CIRISPersist#1271). This release binds a room message to its author's minter, and heals on read a binding that is already wrong.
