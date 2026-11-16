@@ -437,7 +437,7 @@ async fn i1567_audit_chain_proof_serves_a_stored_head_as_itself_sqlite() {
     let log_id = crate::audit::merkle_store::log_id_for_tenant(&tenant);
     let (genuine, ed_pk, pqc_pk) = hb::genuine_head(&log_id, 1).await;
     let conn = backend.conn_handle();
-    let genuine_blob = serde_json::to_vec(&genuine.signature).unwrap();
+    let genuine_blob = genuine.signature.clone();
     let emptied_blob = hb::blob_with_the_pqc_half_emptied(&genuine);
     let removed_blob = hb::blob_with_the_pqc_half_removed(&genuine);
     let dispatch = BackendDispatch::Sqlite(backend);
@@ -479,7 +479,7 @@ async fn i1567_audit_chain_proof_serves_a_stored_head_as_itself_postgres() {
         .expect("I1567: the genesis entry records");
     let log_id = crate::audit::merkle_store::log_id_for_tenant(&tenant);
     let (genuine, ed_pk, pqc_pk) = hb::genuine_head(&log_id, 1).await;
-    let genuine_blob = serde_json::to_vec(&genuine.signature).unwrap();
+    let genuine_blob = genuine.signature.clone();
     let emptied_blob = hb::blob_with_the_pqc_half_emptied(&genuine);
     let removed_blob = hb::blob_with_the_pqc_half_removed(&genuine);
     let dispatch = BackendDispatch::Postgres(backend.clone());

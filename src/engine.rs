@@ -1743,6 +1743,70 @@ impl Engine {
         }
     }
 
+    /// v62.0.0 (slice D, readiness P11) — **open an encrypted key/value store
+    /// in its own database file, keyed by a root the CALLER supplies.**
+    ///
+    /// The node shape of [`open_mls_state`](Self::open_mls_state): on a WASM
+    /// node the key root comes from the host's seal (`ciris:node/seal`
+    /// `unwrap`, or a WebAuthn PRF output), never from a file persist reads
+    /// or an environment variable. `passphrase` is that root; persist
+    /// derives the store's keys from it (HKDF-SHA3-256, as
+    /// [`XChaChaKvStore::open`](crate::encrypted_kv::XChaChaKvStore::open))
+    /// and keeps no copy. A wrong root is
+    /// [`KVError::WrongPassphrase`](crate::encrypted_kv::KVError::WrongPassphrase).
+    ///
+    /// `path` must name a database OTHER than this Engine's: on the browser
+    /// host (OPFS `opfs-sahpool`) two connections to one database do not
+    /// coordinate locks, and the Engine's writer holds it exclusively, so the
+    /// store is its own file (its own sahpool slot). The Engine's own file is
+    /// refused ([`KVError::InvalidArgument`](crate::encrypted_kv::KVError::InvalidArgument),
+    /// `encrypted_kv_shares_the_engine_database`) before anything opens. The
+    /// open runs through the host's blocking dispatch (inline on a
+    /// single-thread node). Native behaviour of every existing opener is
+    /// unchanged.
+    #[cfg(feature = "encrypted-kv")]
+    pub async fn open_encrypted_kv(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        passphrase: zeroize::Zeroizing<Vec<u8>>,
+    ) -> Result<crate::encrypted_kv::XChaChaKvStore, crate::encrypted_kv::KVError> {
+        use crate::encrypted_kv::{KVError, XChaChaKvStore};
+        let path = path.as_ref().to_path_buf();
+        if let Some(own) = self.sqlite_main_database_file().await {
+            if crate::encrypted_kv::same_database_file(&own, &path) {
+                return Err(KVError::InvalidArgument(format!(
+                    "encrypted_kv_shares_the_engine_database: {} is this Engine's own \
+                     database; an encrypted key/value store is its own file",
+                    path.display()
+                )));
+            }
+        }
+        crate::host::rt::dispatch_blocking(move || XChaChaKvStore::open(&path, &passphrase)).await
+    }
+
+    /// The main database file of a sqlite-backed Engine (`PRAGMA
+    /// database_list`), or `None` for an in-memory database or another
+    /// backend.
+    #[cfg(feature = "encrypted-kv")]
+    async fn sqlite_main_database_file(&self) -> Option<std::path::PathBuf> {
+        match &self.backend {
+            BackendDispatch::Sqlite(b) => b
+                .read(|conn| {
+                    conn.query_row(
+                        "SELECT file FROM pragma_database_list WHERE name = 'main'",
+                        [],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .ok()
+                })
+                .await
+                .filter(|f| !f.is_empty())
+                .map(std::path::PathBuf::from),
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(_) => None,
+        }
+    }
+
     /// v50.0.0 (CIRISPersist#920, `FSD/SECOND_DEVICE.md` §2) — **open the
     /// durable MLS-state store at `path`, keyed from the root the content
     /// master resolves to on this host**, and report which.

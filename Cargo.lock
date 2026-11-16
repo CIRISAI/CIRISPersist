@@ -760,10 +760,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
  "serde",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -4740,7 +4738,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags 2.13.0",
- "chrono",
  "fallible-iterator 0.3.0",
  "fallible-streaming-iterator",
  "hashlink",
@@ -6185,7 +6182,17 @@ dependencies = [
  "js-sys",
  "serde_core",
  "sha1_smol",
+ "uuid-rng-internal",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "uuid-rng-internal"
+version = "1.29.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4af36ce0aa6ec3337634e98de25504b6ce3cf9478468c21748a6a6cea37d7276"
+dependencies = [
+ "getrandom 0.4.3",
 ]
 
 [[package]]

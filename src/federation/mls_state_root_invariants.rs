@@ -325,3 +325,87 @@ mod postgres {
         a_v49_store_under_a_software_row_opens_as_legacy_hardware(&e).await;
     }
 }
+
+/// v62.0.0 (slice D, readiness P11) — **I1858: an encrypted key/value store
+/// is its own database file, keyed by the root its caller supplies.**
+///
+/// `Engine::open_encrypted_kv(path, root)` opens the store with the caller's
+/// root (on a node, unwrapped from the host's seal) and never reads one from
+/// disk or the environment; the Engine's own database file is refused before
+/// anything opens (on the browser host two connections to one database do
+/// not coordinate locks); a wrong root is `WrongPassphrase`.
+mod i1858 {
+    use super::*;
+
+    fn root(b: u8) -> zeroize::Zeroizing<Vec<u8>> {
+        zeroize::Zeroizing::new(vec![b; 32])
+    }
+
+    #[tokio::test]
+    async fn i1858_encrypted_kv_is_its_own_file_with_the_callers_root_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine_db = dir.path().join("engine.db");
+        let engine = Engine::with_signer(
+            signer(),
+            &format!("sqlite:///{}", engine_db.to_str().unwrap()),
+        )
+        .await
+        .expect("file-backed sqlite engine");
+
+        // The Engine's own file is refused, before anything opens.
+        let Err(err) = engine.open_encrypted_kv(&engine_db, root(7)).await else {
+            panic!("I1858: the Engine's own database is refused");
+        };
+        assert!(
+            err.to_string()
+                .contains("encrypted_kv_shares_the_engine_database"),
+            "I1858: {err}"
+        );
+        // ... including a spelling that resolves to it.
+        let same = dir.path().join(".").join("engine.db");
+        assert!(engine.open_encrypted_kv(&same, root(7)).await.is_err());
+
+        // Its own file opens under the caller's root and round-trips.
+        let kv_db = dir.path().join("kv.db");
+        let kv = engine
+            .open_encrypted_kv(&kv_db, root(7))
+            .await
+            .expect("I1858: a separate file opens");
+        kv.put("transit", b"seed", b"wrapped-bytes").await.unwrap();
+        drop(kv);
+        let kv = engine.open_encrypted_kv(&kv_db, root(7)).await.unwrap();
+        assert_eq!(
+            kv.get("transit", b"seed").await.unwrap().as_deref(),
+            Some(&b"wrapped-bytes"[..])
+        );
+        drop(kv);
+
+        // Another root is refused by the verifier, not silently re-keyed.
+        let Err(err) = engine.open_encrypted_kv(&kv_db, root(8)).await else {
+            panic!("I1858: a wrong root must not open");
+        };
+        assert!(matches!(err, KVError::WrongPassphrase), "I1858: {err}");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1858_encrypted_kv_opens_beside_a_postgres_engine() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("I1858: no postgres DSN; skipped");
+            return;
+        };
+        let engine = Engine::with_signer(signer(), &dsn)
+            .await
+            .expect("pg engine");
+        let dir = tempfile::tempdir().unwrap();
+        let kv = engine
+            .open_encrypted_kv(dir.path().join("kv.db"), root(9))
+            .await
+            .expect("I1858: a postgres Engine has no sqlite file to collide with");
+        kv.put("ns", b"k", b"v").await.unwrap();
+        assert_eq!(
+            kv.get("ns", b"k").await.unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
+    }
+}

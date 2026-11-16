@@ -1,0 +1,31 @@
+# v62.0.0 (slice D, P12) — the wasm node PROBE: the smallest top-level node
+# module that links ciris-persist's node feature set (`sqlite`, `host-abi`)
+# for wasm32-unknown-unknown, so CI can read the module's import section
+# (scripts/wasm_node_gate.sh). It is the "node crate" of FSD WASM_NODE §4.1:
+# the one place that enables `ciris-host-abi/getrandom-backend` and defines
+# sqlite-wasm-rs's five link-time host hooks over the `ciris:node` imports.
+# Not a workspace member, not published; its Cargo.lock is copied from
+# persist's at build time so the graph is persist's.
+[package]
+name = "ciris-persist-wasm-node-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+ciris-persist = { path = "../..", default-features = false, features = ["sqlite", "host-abi"] }
+ciris-host-abi = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.1.3", version = "23", features = ["getrandom-backend"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true
+
+[workspace]

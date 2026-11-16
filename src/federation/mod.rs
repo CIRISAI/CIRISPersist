@@ -903,6 +903,12 @@ pub mod stream_seal;
 // subscriber-signature verify. Backend-agnostic; the JOIN-against-STH
 // gate + storage live in the backends.
 pub mod sth_form;
+// v62.0.0 (slice D) — I1850/I1851: CIRISVerify 23's vectors, pinned as files.
+#[cfg(test)]
+mod verify_v23_vectors;
+// v62.0.0 (slice D) — I1853–I1855, I1857: the composite cut, by form.
+#[cfg(test)]
+mod sth_form_invariants;
 pub mod stream_receipt;
 pub mod stream_sth;
 pub mod substrate_machine;

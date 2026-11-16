@@ -13,6 +13,9 @@
 //! reads the installed seams. Nothing installed is the native default
 //! ([`HostSeams::native`]), byte-for-byte the behaviour of v61.
 
+// v62.0.0 (slice D) — the seams over the `ciris:node` ABI (a node build).
+#[cfg(feature = "host-abi")]
+pub mod abi;
 pub mod clock;
 pub mod lifecycle;
 pub mod rt;

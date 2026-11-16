@@ -759,6 +759,18 @@ impl XChaChaKvStore {
     }
 }
 
+/// v62.0.0 (slice D, P11) — do `a` and `b` name one database file? Compared
+/// canonically where both resolve (an existing file, a native host); by the
+/// literal path otherwise (a file not created yet, or a host with no
+/// filesystem, where the name IS the identity).
+#[must_use]
+pub fn same_database_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
+}
+
 /// Coerce a stored nonce blob to the fixed 24-byte array, rejecting a
 /// wrong length (corrupt row) as an auth failure.
 fn to_nonce(b: &[u8]) -> Result<[u8; NONCE_LEN], KVError> {
