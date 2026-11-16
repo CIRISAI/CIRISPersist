@@ -922,6 +922,9 @@ fn bench_accord_recovery(c: &mut Criterion) {
 
 // ─── 6. the admission door ──────────────────────────────────────────────────
 
+/// The arrival order. `InOrder` names the order, so the variant keeps the
+/// enum's name (the bench ids read `in_order`).
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug)]
 enum Order {
     InOrder,
@@ -1251,10 +1254,13 @@ criterion_group!(
 /// `KERNEL_PATHS_SMOKE=1`: build every fixture at its smallest size and
 /// ask each path once, reporting every failure instead of stopping at the
 /// first (a fixture check, not a measurement).
+/// One named fixture check of [`smoke`].
+type SmokeCheck<'a> = (&'a str, Box<dyn Fn() + 'a>);
+
 fn smoke() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     let rt = runtime();
-    let checks: Vec<(&str, Box<dyn Fn()>)> = vec![
+    let checks: Vec<SmokeCheck<'_>> = vec![
         (
             "owner_of",
             Box::new(|| {
