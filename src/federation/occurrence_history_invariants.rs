@@ -213,36 +213,6 @@ pub(crate) mod bodies {
         );
     }
 
-    /// I275 — the V161 backfill copies the current rows. `wipe` empties the
-    /// history, `replay` re-runs the migration file against the live store.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub(crate) async fn i275_the_backfill_restores_the_history<W, R>(
-        d: &dyn FederationDirectory,
-        tag: &str,
-        wipe: W,
-        replay: R,
-    ) where
-        W: std::future::Future<Output = ()>,
-        R: std::future::Future<Output = ()>,
-    {
-        let (node, install) = keys(d, tag).await;
-        bound_at(d, &node, &install, ago(300)).await;
-        assert!(
-            bearing(d, &install, ago(200)).await,
-            "{tag} I275: bearing before"
-        );
-        wipe.await;
-        assert!(
-            !bearing(d, &install, ago(200)).await,
-            "{tag} I275: with the history emptied the fold sees nothing (it reads history)"
-        );
-        replay.await;
-        assert!(
-            bearing(d, &install, ago(200)).await,
-            "{tag} I275: the backfill restored the history from the current row"
-        );
-    }
-
     pub(crate) async fn i276_the_next_edge_is_historical(d: &dyn FederationDirectory, tag: &str) {
         let (node, install) = keys(d, tag).await;
         let t0 = ago(300);
@@ -330,64 +300,6 @@ mod runners {
         };
     }
 
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn i275_the_backfill_restores_the_history_sqlite() {
-        use crate::store::Backend as _;
-        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
-            .await
-            .unwrap();
-        b.run_migrations().await.unwrap();
-        super::bodies::i275_the_backfill_restores_the_history(
-            &b as &dyn crate::federation::FederationDirectory,
-            &suffix(),
-            async {
-                b.execute_batch_for_test("DELETE FROM federation_identity_occurrence_history")
-            },
-            async {
-                b.execute_batch_for_test(include_str!(
-                    "../../migrations/sqlite/lens/V161__identity_occurrence_history.sql"
-                ))
-            },
-        )
-        .await
-    }
-
-    #[cfg(feature = "postgres")]
-    #[tokio::test]
-    async fn i275_the_backfill_restores_the_history_postgres() {
-        use crate::store::Backend as _;
-        let Some(dsn) = crate::test_pg::empty_dsn() else {
-            return;
-        };
-        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
-            .await
-            .unwrap();
-        b.run_migrations().await.unwrap();
-        super::bodies::i275_the_backfill_restores_the_history(
-            &b as &dyn crate::federation::FederationDirectory,
-            &suffix(),
-            async {
-                b.get_client()
-                    .await
-                    .unwrap()
-                    .batch_execute("DELETE FROM cirislens.federation_identity_occurrence_history")
-                    .await
-                    .unwrap()
-            },
-            async {
-                b.get_client()
-                    .await
-                    .unwrap()
-                    .batch_execute(include_str!(
-                        "../../migrations/postgres/lens/V161__identity_occurrence_history.sql"
-                    ))
-                    .await
-                    .unwrap()
-            },
-        )
-        .await
-    }
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
         use crate::store::Backend as _;

@@ -964,7 +964,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("entry_as_stored", Class::Plumbing),
     ("envelope_dimension", Class::Plumbing),
     ("execute", Class::Plumbing),
-    ("filter", Class::Plumbing),
     ("filter_withheld_rows", Class::Gate),
     ("fountain_manifest_row", Class::Delegates),
     ("from_bytes", Class::Plumbing),
@@ -1285,8 +1284,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // #845 (I55) — the portable-default repair. PLUMBING for the same
     // reason as its #840 neighbour: no caller input reaches it; it rewrites
     // schema text by this crate's own two literals and refuses nothing.
-    ("repair_portable_defaults", Class::Plumbing),
-    ("repair_v070_checksum", Class::Plumbing),
     ("resolve", Class::Plumbing),
     ("revocation_fold_target", Class::Plumbing),
     ("root_hash_from_bytes", Class::Plumbing),

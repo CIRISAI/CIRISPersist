@@ -105,14 +105,6 @@ const ALLOWED: &[Allowed] = &[
                  it never upgrades.",
     },
     Allowed {
-        file: "src/store/sqlite.rs",
-        item:
-            "v141_rebuild_backfills_admitted_at_and_preserves_every_index_trigger_and_referrer_828",
-        form: Form::BeginLiteral,
-        reason: "TEST: the V004 deferred-FK witness, on a private connection to a scratch \
-                 database no other connection writes.",
-    },
-    Allowed {
         file: "src/store/sqlite_conn_model.rs",
         item: "WRITE_VERBS",
         form: Form::BeginLiteral,

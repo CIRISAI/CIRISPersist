@@ -6,6 +6,18 @@ applied the old bytes from booting. This document states the invariant, the
 narrow repair persist carries for the one shipped migration whose bytes did
 change (V070), and the gate that keeps the class from recurring.
 
+> **v62.0.0 (slice E2b) — edition 2.** Edition 1 (V001..V216) is retired: a
+> v62 node deletes an edition-1 store rather than continuing it
+> (`store::edition_upgrade`, CC rc20 "nothing carries"). The schema is one
+> baseline per dialect, `V300__edition2_baseline.sql`, and the invariant below
+> now applies to it: **from v62 the baseline's bytes, and those of every
+> migration appended after it (V301+), are the contract**
+> (`evidence/migration_checksums.tsv`, I43). The V070 repair (§3) and the
+> #845 portable-default rewrite (§6) are gone with the store they repaired;
+> the baseline carries the portable defaults, and the gate that no shipped
+> migration names `subsec` stays (I56–I58). The sections below are the
+> edition-1 record.
+
 ## 1. What refinery actually checksums
 
 `refinery` 0.9 computes a migration's checksum as

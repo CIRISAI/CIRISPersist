@@ -36,6 +36,14 @@ pub(crate) mod fountain_read;
 #[cfg(test)]
 /// CIRISPersist#789 — the crypto-cardinality declaration gate.
 pub(crate) mod crypto_cardinality;
+/// v62.0.0 (slice E2b) — the edition-2 baseline: its version, its additions,
+/// and the I1950 catalog witness.
+pub(crate) mod edition_baseline;
+/// v62.0.0 (slice E2b) — the upgrade deletes the earlier (edition-1) store.
+pub mod edition_upgrade;
+/// v62.0.0 (slice E2b): I1953–I1959. The upgrade witnesses, both dialects.
+#[cfg(test)]
+mod edition_upgrade_invariants;
 /// #840 (I43/I44) — the migration-immutability gate and V070's repair.
 mod migration_immutability;
 /// v62.0.0 (WASM_UEFI_READINESS P6) — persist applies its own migrations:
@@ -284,6 +292,13 @@ pub enum Error {
         /// How long this process waited before giving up.
         waited_secs: u64,
     },
+
+    /// v62.0.0 (slice E2b) — the open found an earlier (edition-1) store it
+    /// will not delete: one under a live legal hold, or a store persist did
+    /// not create. Nothing was deleted; see
+    /// [`crate::store::edition_upgrade`].
+    #[error("{0}")]
+    EarlierStore(crate::store::edition_upgrade::EarlierStoreRefusal),
 }
 
 // Bridge schema errors into the store layer.
@@ -334,6 +349,7 @@ impl Error {
             }
             Error::Migration { .. } => "store_migration",
             Error::MigrationLockTimeout { .. } => "store_migration_lock_timeout",
+            Error::EarlierStore(r) => r.kind(),
             Error::FountainAdmit(e) => e.kind(),
             Error::FountainIntegrity(_) => "fountain_integrity",
             Error::AggregationMetaRejected(e) => e.kind(),

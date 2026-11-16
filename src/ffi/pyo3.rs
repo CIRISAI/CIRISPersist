@@ -32480,6 +32480,10 @@ fn fountain_store_err_to_py(e: crate::store::Error) -> PyErr {
         | Error::Backend(_)
         | Error::Migration { .. }
         | Error::MigrationLockTimeout { .. } => PyRuntimeError::new_err(format!("{e}")),
+        // v62.0.0 (slice E2b) — the open refused to delete an earlier store
+        // (a live legal hold, or a store persist did not create): an operator
+        // action, never a retry. The token leads the message.
+        Error::EarlierStore(ref r) => PyRuntimeError::new_err(format!("{}: {e}", r.kind())),
         Error::PoolExhausted { .. } => PoolExhausted::new_err(format!("{e}")),
         // v57.0.0 (CIRISPersist#988 item 2) — the erasure doors' typed
         // attester refusal (no fountain door raises it).

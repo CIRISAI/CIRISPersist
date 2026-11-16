@@ -1,172 +1,33 @@
-//! **The migration-immutability gate** (v44.1.1, CIRISPersist#840).
+//! **The migration-immutability gate** (v44.1.1, CIRISPersist#840), pointed
+//! at edition 2 (v62.0.0, slice E2b).
 //!
-//! `refinery` checksums a migration's *entire file text* —
-//! `SipHasher13(name, version, sql)` — and aborts on any divergence between
-//! the applied row and the file. A one-word edit inside a SQL comment
-//! (`4847ede5`, the `ENCRYPTED_AT_REST.md` → `BLOB_ENCRYPTION_AT_REST.md`
-//! rename) therefore bricked every node that had applied V070 before it, on
-//! every release from v43.0.0 through v44.1.0.
+//! The runner checksums a migration's *entire file text* —
+//! `SipHasher13(name, version, sql)`, refinery's — and refuses a divergence
+//! between the applied row and the file. A one-word edit inside a SQL comment
+//! bricked every node that had applied edition 1's V070 (#840). The rule
+//! stands for edition 2: **from v62 on, the shipped baseline
+//! (`V300__edition2_baseline.sql`, each dialect) and every migration appended
+//! after it are immutable as BYTES**; a correction is always a new migration.
 //!
-//! This module is the gate that makes the class unrepeatable, plus the
-//! narrow repair for the nodes the break already reached. See
-//! `FSD/MIGRATION_IMMUTABILITY.md` (I43, I44).
+//! Edition 1 (V001..V216) is retired with its repairs: a v62 node deletes an
+//! edition-1 store rather than continuing it ([`crate::store::edition_upgrade`]),
+//! so the V070 checksum repair and the #845 portable-default rewrite have
+//! nothing left to repair. #845's property stays as a gate: no shipped
+//! migration names the `subsec` modifier (SQLite < 3.42 evaluates it to NULL).
 //!
-//! The constants and the repair statement are pure and carry NO backend
-//! `cfg`: they are just text. The witnesses do carry one, because computing
-//! a checksum means calling `refinery`, which only a backend feature links —
-//! certify's five `axis-*-none` legs build this crate with no backend at
-//! all, and an ungated caller of backend plumbing reds exactly there.
+//! The constants are pure text with NO backend `cfg`; the checksum witnesses
+//! carry one, because computing a checksum calls the runner, which only a
+//! backend feature links — certify's five `axis-*-none` legs build this crate
+//! with no backend at all.
 
-// Which of these items is live depends on the backend feature set: the
-// sqlite constants are dead under `--features postgres` and vice versa, and
-// BOTH are live in the from-disk witnesses, which must compile with NO
-// backend at all (certify's five `axis-*-none` legs). A backend `cfg` on a
-// pure constant is the mistake that costs a certification run, so the items
-// stay unconditional and carry the allow instead.
-
-/// The one version #840 broke.
-pub(crate) const V070_VERSION: i32 = 70;
-/// V070's refinery *name* — the file stem with the `V070__` prefix stripped.
-pub(crate) const V070_NAME: &str = "ceg_018_at_rest_blob_key_grants";
-
-/// What `4847ede5` changed, as the substitution itself. The repair's two
-/// pinned checksums are proved against this by
-/// [`tests::the_pinned_checksums_are_the_two_variants_of_v070`]: applying it
-/// to the shipped file reproduces the bricked text byte for byte.
-#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-pub(crate) const V070_BREAKING_EDIT: (&str, &str) = (
-    "-- ENCRYPTED_AT_REST.md §4.3.",
-    "-- BLOB_ENCRYPTION_AT_REST.md §4.3.",
-);
-
-/// The checksum every node recorded that applied V070 from a release at or
-/// before v42.1.0 — the bytes the tree ships again as of v44.1.1.
-#[allow(dead_code)]
-pub(crate) const V070_CANONICAL_CHECKSUM_SQLITE: &str = "7163486563775091993";
-/// The checksum a node recorded that applied V070 from v43.0.0–v44.1.0.
-#[allow(dead_code)]
-pub(crate) const V070_BRICKED_CHECKSUM_SQLITE: &str = "13308137435046530964";
-/// Postgres twin of [`V070_CANONICAL_CHECKSUM_SQLITE`]. The dialects ship
-/// different text, so they check differently.
-#[allow(dead_code)]
-pub(crate) const V070_CANONICAL_CHECKSUM_POSTGRES: &str = "15706685101112936341";
-/// Postgres twin of [`V070_BRICKED_CHECKSUM_SQLITE`].
-#[allow(dead_code)]
-pub(crate) const V070_BRICKED_CHECKSUM_POSTGRES: &str = "10440797932346982783";
-
-/// Which dialect's constants a repair should use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) enum Dialect {
-    Sqlite,
-    Postgres,
-}
-
-impl Dialect {
-    #[allow(dead_code)]
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Dialect::Sqlite => "sqlite",
-            Dialect::Postgres => "postgres",
-        }
-    }
-
-    /// The schema-history table this backend runs refinery against.
-    pub(crate) fn history_table(self) -> &'static str {
-        match self {
-            // sqlite takes refinery's default.
-            Dialect::Sqlite => "refinery_schema_history",
-            Dialect::Postgres => "ciris_persist_schema_history",
-        }
-    }
-
-    fn canonical_checksum(self) -> &'static str {
-        match self {
-            Dialect::Sqlite => V070_CANONICAL_CHECKSUM_SQLITE,
-            Dialect::Postgres => V070_CANONICAL_CHECKSUM_POSTGRES,
-        }
-    }
-
-    fn bricked_checksum(self) -> &'static str {
-        match self {
-            Dialect::Sqlite => V070_BRICKED_CHECKSUM_SQLITE,
-            Dialect::Postgres => V070_BRICKED_CHECKSUM_POSTGRES,
-        }
-    }
-}
-
-/// #840 (I44) — the repair, as one conditional UPDATE.
-///
-/// Narrow on purpose: version 70, that exact name, and the ONE literal
-/// checksum the broken releases wrote. A row that diverged for any other
-/// reason is left alone and still aborts the boot, which is the correct
-/// outcome — this is not a general checksum-repair facility.
-///
-/// `$1`-style placeholders differ per dialect, so the statement is built
-/// with its literals inline; every one of them is a compile-time constant
-/// of this module, never caller data.
-#[allow(dead_code)]
-pub(crate) fn repair_statement(dialect: Dialect) -> String {
-    format!(
-        "UPDATE {table} SET checksum = '{canonical}' \
-         WHERE version = {version} AND name = '{name}' AND checksum = '{bricked}'",
-        table = dialect.history_table(),
-        canonical = dialect.canonical_checksum(),
-        version = V070_VERSION,
-        name = V070_NAME,
-        bricked = dialect.bricked_checksum(),
-    )
-}
-
-/// #845 (`FSD/MIGRATION_IMMUTABILITY.md` §6) — the default expression twenty-one
-/// shipped sqlite migrations wrote, which SQLite < 3.42 evaluates to NULL.
-#[allow(dead_code)] // live under `sqlite`; dead under `postgres` alone — same posture as the V070 constants
-pub(crate) const SQLITE_SUBSEC_DEFAULT: &str = "datetime('now', 'subsec')";
-/// #845 — the portable replacement: byte-identical output
-/// (`YYYY-MM-DD HH:MM:SS.SSS`) on every SQLite this crate has linked.
-#[allow(dead_code)] // live under `sqlite`; dead under `postgres` alone — same posture as the V070 constants
-/// #845 — does THIS library evaluate the modifier? `true` means NULL, i.e.
-/// the repair is required rather than a normalisation.
-pub(crate) const SQLITE_SUBSEC_IS_NULL_PROBE: &str = "SELECT datetime('now', 'subsec') IS NULL";
-#[allow(dead_code)] // live under `sqlite`; dead under `postgres` alone — same posture as the V070 constants
-pub(crate) const SQLITE_PORTABLE_DEFAULT: &str = "strftime('%Y-%m-%d %H:%M:%f', 'now')";
-/// #845 — how many times the shipped sqlite migrations (V001–V144) name the
-/// modifier. Pinned so the from-disk gate can tell "a new file added one"
-/// from "the shipped set".
-#[cfg(test)] // pure pin, no backend needed — the five no-backend axes compile tests too
-pub(crate) const SQLITE_SUBSEC_OCCURRENCES_SHIPPED: usize = 44;
-/// #845 — the last migration version that may contain `subsec`.
+/// #845 — the default expression edition 1's sqlite migrations wrote, which
+/// SQLite < 3.42 evaluates to NULL. No shipped migration may name it.
 #[cfg(test)]
-pub(crate) const SUBSEC_ALLOWED_THROUGH: i32 = 144;
-
-/// #845 — how many live `CREATE TABLE` statements carry the exact obsolete
-/// default. Bind [`SQLITE_SUBSEC_DEFAULT`] as `?1`. The exact expression,
-/// never the substring: a consumer table with a `subsec_note` column must not
-/// count (Codex, #849).
-#[allow(dead_code)]
-pub(crate) const SQLITE_OBSOLETE_DEFAULT_COUNT: &str =
-    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND instr(sql, ?1) > 0";
-
-/// #845 — the live-schema rewrite, `type = 'table'` rows only. Bind
-/// [`SQLITE_SUBSEC_DEFAULT`] as `?1` and [`SQLITE_PORTABLE_DEFAULT`] as `?2`
-/// — bound, never spelled in double quotes, which `SQLITE_DQS=0` parses as
-/// identifiers (Codex, #849). Run under `PRAGMA writable_schema = ON`, then
-/// bump `schema_version` and `integrity_check` (the documented procedure for a
-/// change `ALTER TABLE` cannot express).
-#[allow(dead_code)]
-pub(crate) const SQLITE_PORTABLE_DEFAULT_REWRITE: &str =
-    "UPDATE sqlite_master SET sql = replace(sql, ?1, ?2) WHERE type = 'table' AND instr(sql, ?1) > 0";
-
-/// #840 (I44) — is the schema-history table present? A fresh database has
-/// none, and the repair must be a silent no-op there rather than an error.
-#[allow(dead_code)]
-pub(crate) const SQLITE_HISTORY_TABLE_PROBE: &str =
-    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'refinery_schema_history'";
-
-/// Postgres twin of [`SQLITE_HISTORY_TABLE_PROBE`].
-#[allow(dead_code)]
-pub(crate) const POSTGRES_HISTORY_TABLE_PROBE: &str =
-    "SELECT to_regclass('ciris_persist_schema_history') IS NOT NULL";
+pub(crate) const SQLITE_SUBSEC_DEFAULT: &str = "datetime('now', 'subsec')";
+/// #845 — the portable form: byte-identical output (`YYYY-MM-DD HH:MM:SS.SSS`)
+/// on every SQLite this crate has linked. The edition-2 baseline carries it.
+#[cfg(test)]
+pub(crate) const SQLITE_PORTABLE_DEFAULT: &str = "strftime('%Y-%m-%d %H:%M:%f', 'now')";
 
 /// Parse `evidence/migration_checksums.tsv` into `(dialect, version) -> (name, checksum)`.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -196,15 +57,13 @@ fn read_manifest(text: &str) -> std::collections::BTreeMap<(String, i32), (Strin
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-#[allow(dead_code)]
 fn manifest_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("evidence/migration_checksums.tsv")
 }
 
-/// Every migration file in the tree, as `(dialect, version, name, checksum)`,
-/// computed with refinery's own hasher.
-#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-fn checksums_on_disk() -> Vec<(String, i32, String, String)> {
+/// Every migration file name in the tree, as `(dialect, version, stem)`.
+#[cfg(test)]
+fn files_on_disk() -> Vec<(String, i32, std::path::PathBuf)> {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
     let mut out = Vec::new();
     for dialect in ["sqlite", "postgres"] {
@@ -217,21 +76,31 @@ fn checksums_on_disk() -> Vec<(String, i32, String, String)> {
         entries.sort();
         for path in entries {
             let stem = path.file_stem().unwrap().to_string_lossy().to_string();
-            let sql = std::fs::read_to_string(&path).unwrap();
-            let (v, name) = stem
+            let version: i32 = stem
                 .strip_prefix('V')
                 .and_then(|r| r.split_once("__"))
+                .and_then(|(v, _)| v.parse().ok())
                 .unwrap_or_else(|| panic!("{stem}: not V{{n}}__{{name}}"));
-            let version: i32 = v.parse().unwrap();
-            out.push((
-                dialect.to_string(),
-                version,
-                name.to_string(),
-                crate::store::migration_runner::checksum(name, version, &sql).to_string(),
-            ));
+            out.push((dialect.to_string(), version, path));
         }
     }
     out
+}
+
+/// Every migration file in the tree, as `(dialect, version, name, checksum)`,
+/// computed with the runner's (refinery's) hasher.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+fn checksums_on_disk() -> Vec<(String, i32, String, String)> {
+    files_on_disk()
+        .into_iter()
+        .map(|(dialect, version, path)| {
+            let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+            let name = stem.split_once("__").unwrap().1.to_owned();
+            let sql = std::fs::read_to_string(&path).unwrap();
+            let sum = crate::store::migration_runner::checksum(&name, version, &sql).to_string();
+            (dialect, version, name, sum)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -239,17 +108,17 @@ mod tests {
     use super::*;
 
     /// **Appends** rows for migrations not yet in
-    /// `evidence/migration_checksums.tsv`. Run it when you ADD a migration:
+    /// `evidence/migration_checksums.tsv`. Run it when you ADD a migration
+    /// (V301 and after):
     ///
     /// ```text
     /// cargo test --features sqlite emit_migration_checksum_manifest -- --ignored
     /// ```
     ///
-    /// It is append-only, and that is the point. A regenerating emitter would
+    /// Append-only, and that is the point: a regenerating emitter would
     /// silently re-bless an edit to a SHIPPED migration — the exact thing
-    /// #840 was — the first time someone ran it to clear a red. So an
-    /// existing row whose checksum no longer matches the file is a hard
-    /// refusal here too: revert the edit, or write a new migration.
+    /// #840 was. An existing row whose checksum no longer matches the file is
+    /// a hard refusal: revert the edit, or write a new migration.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[test]
     #[ignore = "writes evidence/migration_checksums.tsv; run deliberately"]
@@ -265,7 +134,8 @@ mod tests {
                 Some((pinned_name, pinned_checksum)) => {
                     if pinned_name != &name || pinned_checksum != &checksum {
                         edited.push(format!(
-                            "{dialect} V{version:03} {name}: pinned {pinned_checksum}, on disk                              {checksum}"
+                            "{dialect} V{version:03} {name}: pinned {pinned_checksum}, on disk \
+                             {checksum}"
                         ));
                     }
                 }
@@ -297,12 +167,8 @@ mod tests {
         eprintln!("appended {} row(s) to {path:?}", added.len());
     }
 
-    /// **I43 — a migration file that has shipped in a release is immutable.**
-    ///
-    /// The manifest is the record of what the fleet applied. Editing a
-    /// shipped migration changes its checksum and bricks every node that
-    /// already ran it (#840), so the fix for a bad migration is always a NEW
-    /// migration.
+    /// **I43 — a shipped migration is immutable; from v62 that is the
+    /// edition-2 baseline and everything after it.**
     ///
     /// If this fails for a file you just ADDED, add its row. If it fails for
     /// a file you EDITED, revert the edit — the row is not the thing to
@@ -313,13 +179,16 @@ mod tests {
         let manifest = read_manifest(&std::fs::read_to_string(manifest_path()).unwrap());
         let disk = checksums_on_disk();
 
-        // A from-disk gate that simply finds nothing must not pass: assert
-        // the count both ways before comparing any value.
-        assert!(
-            disk.len() > 140,
-            "only {} migration files found — the scan is broken, not the tree",
-            disk.len()
-        );
+        // A from-disk gate that simply finds nothing must not pass: the
+        // baseline is on disk for both dialects, and every file is pinned.
+        let baseline = crate::store::edition_baseline::EDITION_TWO_BASELINE;
+        for dialect in ["sqlite", "postgres"] {
+            assert!(
+                disk.iter()
+                    .any(|(d, v, _, _)| d == dialect && *v == baseline),
+                "{dialect}: the V{baseline} baseline is not on disk — the scan is broken"
+            );
+        }
         assert_eq!(
             manifest.len(),
             disk.len(),
@@ -362,116 +231,61 @@ mod tests {
         );
     }
 
-    /// #840 — the two pinned V070 checksums are what they claim to be:
-    /// the shipped file's, and the shipped file's with `4847ede5`'s one-word
-    /// comment edit applied. Recomputed from the file, so the repair cannot
-    /// carry a stale literal, and the numbers are spelled out rather than
-    /// derived from the same call the repair uses.
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    /// **I1952 (from disk) — edition 2 begins at the baseline.** Each
+    /// dialect's first migration is `V300__edition2_baseline`, and no file is
+    /// numbered below it: edition 1's files are retired, and an edition-2
+    /// version can never be read as an edition-1 one.
     #[test]
-    fn the_pinned_checksums_are_the_two_variants_of_v070() {
-        for (dialect, canonical, bricked) in [
-            (
-                Dialect::Sqlite,
-                V070_CANONICAL_CHECKSUM_SQLITE,
-                V070_BRICKED_CHECKSUM_SQLITE,
-            ),
-            (
-                Dialect::Postgres,
-                V070_CANONICAL_CHECKSUM_POSTGRES,
-                V070_BRICKED_CHECKSUM_POSTGRES,
-            ),
-        ] {
-            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("migrations")
-                .join(dialect.as_str())
-                .join("lens/V070__ceg_018_at_rest_blob_key_grants.sql");
-            let shipped = std::fs::read_to_string(&path).unwrap();
-            let stem = "V070__ceg_018_at_rest_blob_key_grants";
-
-            let (from, to) = V070_BREAKING_EDIT;
+    fn edition_two_begins_at_the_baseline() {
+        let baseline = crate::store::edition_baseline::EDITION_TWO_BASELINE;
+        let files = files_on_disk();
+        for dialect in ["sqlite", "postgres"] {
+            let mine: Vec<_> = files.iter().filter(|(d, _, _)| d == dialect).collect();
+            assert!(!mine.is_empty(), "{dialect}: no migrations on disk");
+            let (_, v, path) = mine[0];
+            assert_eq!(
+                (*v, path.file_name().unwrap().to_string_lossy().to_string()),
+                (baseline, format!("V{baseline}__edition2_baseline.sql")),
+                "{dialect}: edition 2's first migration is the baseline"
+            );
+            let below: Vec<_> = mine.iter().filter(|(_, v, _)| *v < baseline).collect();
             assert!(
-                shipped.contains(from),
-                "{}: the shipped V070 no longer contains {from:?} — the repair's premise is \
-                 gone; #840's edit cannot be reproduced and the pinned bricked checksum is \
-                 unprovable",
-                dialect.as_str()
+                below.is_empty(),
+                "{dialect}: {} migration(s) below the V{baseline} baseline",
+                below.len()
             );
-            let broken = shipped.replace(from, to);
-            assert_ne!(shipped, broken, "the substitution changed nothing");
-
-            let name = stem.split_once("__").unwrap().1;
-            let canon_sum = crate::store::migration_runner::checksum(name, 70, &shipped);
-            let brick_sum = crate::store::migration_runner::checksum(name, 70, &broken);
-
-            assert_eq!(
-                canon_sum.to_string(),
-                canonical,
-                "{}: pinned CANONICAL checksum is not the shipped file's",
-                dialect.as_str()
-            );
-            assert_eq!(
-                brick_sum.to_string(),
-                bricked,
-                "{}: pinned BRICKED checksum is not that of the v43.0.0–v44.1.0 text",
-                dialect.as_str()
-            );
-            assert_ne!(canonical, bricked, "the two variants must differ");
-            assert_eq!(stem, format!("V{V070_VERSION:03}__{V070_NAME}"));
         }
     }
 
-    /// **I56 (#845) — no migration after V144 names `subsec`, and the shipped
-    /// set's count is pinned.** A new file that reintroduces the modifier
-    /// reds here before it reaches a bookworm host.
+    /// **I56 (#845) — no shipped migration names `subsec`.** A file that
+    /// reintroduces the modifier reds here before it reaches a bookworm host.
     #[test]
-    fn no_migration_after_v144_uses_subsec() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
-        let mut shipped = 0usize;
+    fn no_migration_uses_subsec() {
         let mut offenders = Vec::new();
-        for dialect in ["sqlite", "postgres"] {
-            let dir = root.join(dialect).join("lens");
-            for e in std::fs::read_dir(&dir).unwrap() {
-                let path = e.unwrap().path();
-                if path.extension().is_none_or(|x| x != "sql") {
-                    continue;
-                }
-                let stem = path.file_stem().unwrap().to_string_lossy().to_string();
-                let version: i32 = stem
-                    .trim_start_matches('V')
-                    .split("__")
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or_else(|| panic!("unparseable migration name {stem}"));
-                let n = std::fs::read_to_string(&path)
-                    .unwrap()
-                    .matches("subsec")
-                    .count();
-                if version <= SUBSEC_ALLOWED_THROUGH {
-                    shipped += n;
-                } else if n > 0 {
-                    offenders.push(format!("{dialect}/{stem}: {n}"));
-                }
+        let mut scanned = 0usize;
+        for (dialect, _, path) in files_on_disk() {
+            scanned += 1;
+            let n = std::fs::read_to_string(&path)
+                .unwrap()
+                .matches("subsec")
+                .count();
+            if n > 0 {
+                offenders.push(format!("{dialect}/{}: {n}", path.display()));
             }
         }
+        assert!(scanned >= 2, "the scan found {scanned} file(s)");
         assert!(
             offenders.is_empty(),
-            "`subsec` reintroduced after V{SUBSEC_ALLOWED_THROUGH} — SQLite < 3.42 (Debian bookworm) \
-             evaluates it to NULL (#845). Use {SQLITE_PORTABLE_DEFAULT:?}. Offenders:\n  {}",
+            "`subsec` in a shipped migration — SQLite < 3.42 (Debian bookworm) evaluates it to \
+             NULL (#845). Use {SQLITE_PORTABLE_DEFAULT:?}. Offenders:\n  {}",
             offenders.join("\n  ")
-        );
-        assert_eq!(
-            shipped, SQLITE_SUBSEC_OCCURRENCES_SHIPPED,
-            "the shipped set's `subsec` count moved — a shipped migration was edited (#840) or \
-             the pin is stale"
         );
     }
 
-    /// **I57 (#845) — the bookworm witness script and the Rust repair carry
-    /// the same two literals**, so what CI proves on 3.40.1 is what the
-    /// crate does.
+    /// **I57 (#845) — the bookworm witness checks for the modifier by its
+    /// exact spelling**, so what CI proves on 3.40.1 is this gate's property.
     #[test]
-    fn the_bookworm_witness_carries_the_repair_literals() {
+    fn the_bookworm_witness_carries_the_literal() {
         let script = std::fs::read_to_string(
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("scripts/sqlite_portability_witness.sh"),
@@ -479,21 +293,18 @@ mod tests {
         .expect("scripts/sqlite_portability_witness.sh");
         assert!(
             script.contains(SQLITE_SUBSEC_DEFAULT),
-            "the witness must name the shipped default {SQLITE_SUBSEC_DEFAULT:?}"
+            "the witness must name the default it refuses, {SQLITE_SUBSEC_DEFAULT:?}"
         );
         assert!(
-            script.contains(SQLITE_PORTABLE_DEFAULT),
-            "the witness must apply the crate's replacement {SQLITE_PORTABLE_DEFAULT:?}"
+            script.contains("V300__"),
+            "the witness must apply the edition-2 baseline"
         );
     }
 
     /// **I58 (#845) — the `subsec` modifier appears in no source file but
-    /// this one.** Nine runtime statements evaluated it directly (the
-    /// community-DEK epoch rotation, maintenance locks, incidents,
-    /// telemetry); on SQLite < 3.42 those wrote NULL into `rotated_at` and
-    /// friends, or failed `NOT NULL`, and the schema repair cannot reach a
-    /// statement. Doc comments are held to it too, so nobody copies the
-    /// old spelling out of one.
+    /// this one.** Runtime statements that evaluated it wrote NULL on SQLite
+    /// < 3.42. Doc comments are held to it too, so nobody copies the old
+    /// spelling out of one.
     #[test]
     fn the_subsec_modifier_appears_in_no_source_but_this_file() {
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -509,6 +320,7 @@ mod tests {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
         walk(&root, &mut files);
+        assert!(files.len() > 100, "the scan found {} files", files.len());
         let me = root.join("store/migration_immutability.rs");
         let mut offenders = Vec::new();
         for f in files {
@@ -532,30 +344,5 @@ mod tests {
              {SQLITE_PORTABLE_DEFAULT:?}. Found at:\n  {}",
             offenders.join("\n  ")
         );
-    }
-
-    /// The repair names one version, one name and one checksum, and writes
-    /// one. A statement that matched on version alone would rewrite a
-    /// genuinely divergent row and hide a real break.
-    #[test]
-    fn the_repair_is_narrow() {
-        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
-            let sql = repair_statement(dialect);
-            assert!(sql.starts_with(&format!(
-                "UPDATE {} SET checksum = ",
-                dialect.history_table()
-            )));
-            assert!(sql.contains("WHERE version = 70 AND name = 'ceg_018_at_rest_blob_key_grants'"));
-            assert!(
-                sql.contains(&format!("checksum = '{}'", dialect.bricked_checksum())),
-                "the repair must match ONLY the bricked checksum"
-            );
-            assert!(sql.contains(&format!(
-                "SET checksum = '{}'",
-                dialect.canonical_checksum()
-            )));
-            // No data from anywhere but this module's constants.
-            assert!(!sql.contains('$') && !sql.contains('?'));
-        }
     }
 }

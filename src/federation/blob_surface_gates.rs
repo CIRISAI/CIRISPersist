@@ -1332,8 +1332,8 @@ mod tests {
             .expect("the stub");
         assert!(!has_keep(line), "I767: the stub names keep: {line}");
         for m in [
-            "migrations/sqlite/lens/V193__stream_epoch_dek_supplied_and_rooms.sql",
-            "migrations/postgres/lens/V193__stream_epoch_dek_supplied_and_rooms.sql",
+            "migrations/sqlite/lens/V300__edition2_baseline.sql",
+            "migrations/postgres/lens/V300__edition2_baseline.sql",
         ] {
             let ddl: String = src(m)
                 .lines()

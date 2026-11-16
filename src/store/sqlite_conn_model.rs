@@ -858,19 +858,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("release_shared_instance_lease", ConnClass::Write),
     ("remove_peer_record", ConnClass::Write),
     ("remove_transport_destination", ConnClass::Write),
-    // #845 (I55) — the portable-default repair: a writable_schema rewrite
-    // of sqlite_master, run after the migrations.
-    ("repair_portable_defaults_with", ConnClass::Write),
-    // #840 (I44) — the V070 checksum repair: a conditional UPDATE on the
-    // schema-history table, run before refinery validates it.
-    ("repair_v070_checksum", ConnClass::Write),
     ("replay_abandoned", ConnClass::Write),
     ("revocations_for_subject", ConnClass::Read),
-    // #845 (I55) — the nine documented steps, in one transaction: a free fn
-    // handed the writer's connection from inside `repair_portable_defaults_with`.
-    ("rewrite_portable_defaults_in_tx", ConnClass::HelperWrite),
     ("run_migrations", ConnClass::Write),
-    ("run_migrations_through", ConnClass::Write),
     ("sample_public_keys", ConnClass::Read),
     ("scoring_ingest_watermark_ms", ConnClass::Read),
     ("seal_stream", ConnClass::Write),
@@ -1002,7 +992,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("sqlite_render_table", ConnClass::HelperRead),
     ("sqlite_erase_cited_rows", ConnClass::HelperWrite),
     ("sqlite_store_erasure_withdraws", ConnClass::HelperWrite),
-    ("sqlite_v196_pending", ConnClass::HelperRead),
     ("sqlite_put_erasure_execution", ConnClass::HelperWrite),
     ("sqlite_record_erasure", ConnClass::HelperWrite),
     ("sqlite_detection_tombstone_instant", ConnClass::HelperRead),

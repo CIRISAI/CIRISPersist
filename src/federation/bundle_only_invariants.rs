@@ -223,49 +223,11 @@ pub(crate) mod bodies {
             "I368: and carries no charter members"
         );
     }
-
-    /// The rows I369 judges before and after they are held: an unlabelled
-    /// self-directed charter and an unlabelled acceptance edge.
-    pub(crate) struct Held {
-        pub root: String,
-        pub user: String,
-        pub ids: Vec<String>,
-    }
-
-    pub(crate) async fn i369_put_unlabelled(d: &dyn FederationDirectory) -> Held {
-        let s = suffix();
-        let (root, user) = (format!("i369-root-{s}"), format!("i369-user-{s}"));
-        let charter = key_root(d, &root, None).await;
-        let e = edge(d, &user, &root, None).await;
-        Held {
-            root,
-            user,
-            ids: vec![charter, e],
-        }
-    }
-
-    pub(crate) async fn i369_assert(d: &dyn FederationDirectory, h: &Held, held: bool) {
-        let v = trust_root_valid(d, &h.user, &h.root).await.unwrap();
-        assert_eq!(
-            (v.root_self_declares, v.edge_exists, v.valid),
-            (held, held, held),
-            "I369: held={held}: {v:?}"
-        );
-        let roots = trusted_roots_of(d, &h.user, chrono::Utc::now())
-            .await
-            .unwrap();
-        assert_eq!(roots.contains(&h.root), held, "I369: held={held}");
-        let mut got = d.trust_direction_held_among(&h.ids).await.unwrap();
-        got.sort();
-        let mut want = if held { h.ids.clone() } else { Vec::new() };
-        want.sort();
-        assert_eq!(got, want, "I369: the directory's own answer");
-    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod run {
-    use super::bodies;
+    #[cfg(feature = "sqlite")]
     use crate::federation::FederationDirectory;
 
     macro_rules! runners {
@@ -319,89 +281,6 @@ mod run {
         b.run_migrations().await.unwrap();
         Some(b)
     });
-
-    /// The real upgrade: the rows are stored on a V166 schema (before the
-    /// rule), V167 runs, and they keep their reading; rows put after it do not.
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn i369_held_rows_keep_their_reading_through_the_upgrade_sqlite() {
-        use crate::store::Backend as _;
-        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
-            .await
-            .unwrap();
-        b.run_migrations_through(166).await.unwrap();
-        // v53.0.0 — this build reads V174's lineage-head columns on every
-        // family/community lookup, so the pre-V167 write needs them; they are
-        // added for the write and dropped before the upgrade, which then adds
-        // them as a node upgrading from v52 would. The rows under test are
-        // attestations, untouched by either step.
-        b.write(|conn| conn.execute_batch(V174_TEMP_ADD_SQLITE))
-            .await
-            .unwrap();
-        let h = bodies::i369_put_unlabelled(&b as &dyn FederationDirectory).await;
-        b.write(|conn| conn.execute_batch(V174_TEMP_DROP_SQLITE))
-            .await
-            .unwrap();
-        b.run_migrations().await.unwrap();
-        bodies::i369_assert(&b, &h, true).await;
-        let late = bodies::i369_put_unlabelled(&b as &dyn FederationDirectory).await;
-        bodies::i369_assert(&b, &late, false).await;
-    }
-
-    #[cfg(feature = "sqlite")]
-    const V174_TEMP_ADD_SQLITE: &str = "\
-        ALTER TABLE federation_families ADD COLUMN prev_head_digest TEXT NOT NULL DEFAULT '';\
-        ALTER TABLE federation_families ADD COLUMN charter_digest TEXT NOT NULL DEFAULT '';\
-        ALTER TABLE federation_communities ADD COLUMN prev_head_digest TEXT NOT NULL DEFAULT '';\
-        ALTER TABLE federation_communities ADD COLUMN charter_digest TEXT NOT NULL DEFAULT '';";
-    #[cfg(feature = "sqlite")]
-    const V174_TEMP_DROP_SQLITE: &str = "\
-        ALTER TABLE federation_families DROP COLUMN prev_head_digest;\
-        ALTER TABLE federation_families DROP COLUMN charter_digest;\
-        ALTER TABLE federation_communities DROP COLUMN prev_head_digest;\
-        ALTER TABLE federation_communities DROP COLUMN charter_digest;";
-
-    #[cfg(feature = "postgres")]
-    #[tokio::test]
-    async fn i369_held_rows_keep_their_reading_through_the_upgrade_postgres() {
-        use crate::store::Backend as _;
-        let Some(dsn) = crate::test_pg::empty_dsn() else {
-            return;
-        };
-        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
-            .await
-            .unwrap();
-        b.run_migrations_through(166).await.unwrap();
-        // v53.0.0 — see the sqlite leg: V174's columns for the write only.
-        let pg = |sql: &'static str| {
-            let b = &b;
-            async move {
-                b.get_client()
-                    .await
-                    .unwrap()
-                    .batch_execute(sql)
-                    .await
-                    .unwrap()
-            }
-        };
-        pg("ALTER TABLE cirislens.federation_families \
-                ADD COLUMN prev_head_digest TEXT NOT NULL DEFAULT '', \
-                ADD COLUMN charter_digest TEXT NOT NULL DEFAULT ''; \
-            ALTER TABLE cirislens.federation_communities \
-                ADD COLUMN prev_head_digest TEXT NOT NULL DEFAULT '', \
-                ADD COLUMN charter_digest TEXT NOT NULL DEFAULT '';")
-        .await;
-        let h = bodies::i369_put_unlabelled(&b as &dyn FederationDirectory).await;
-        pg("ALTER TABLE cirislens.federation_families \
-                DROP COLUMN prev_head_digest, DROP COLUMN charter_digest; \
-            ALTER TABLE cirislens.federation_communities \
-                DROP COLUMN prev_head_digest, DROP COLUMN charter_digest;")
-        .await;
-        b.run_migrations().await.unwrap();
-        bodies::i369_assert(&b, &h, true).await;
-        let late = bodies::i369_put_unlabelled(&b as &dyn FederationDirectory).await;
-        bodies::i369_assert(&b, &late, false).await;
-    }
 
     /// **I370** — the shipped bundle on a fresh node. Its `genesis-charter`
     /// (A1 → humanity-accord) carries no job label and this node never held

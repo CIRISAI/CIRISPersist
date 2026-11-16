@@ -7,6 +7,71 @@ enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
 ## [62.0.0] - UNRELEASED
 
+### BREAKING — upgrading to v62 DELETES the node's earlier (v61) store (slice E2b: the clean install)
+
+CC 1.0-rc20, "nothing carries, clean mesh": a v62 node reads nothing from an earlier store. Eric's ruling on that store: "No just delete it, we can not store old data indefinitely and no holds exist." A node's storage layout is its own (CC 2.7.9), so edition 2 starts from a fresh schema baseline, and **the first v62 open of a v61 store deletes that store** and creates an empty edition-2 one. There is no archive and no held copy. Server, Edge and Agent each lose the node's v61 rows on upgrade: keys, attestations, communities, blobs, traces, ledgers, secrets, everything persist held.
+
+- **The schema baseline.** Edition 1's 197 SQLite and 205 PostgreSQL migrations (V001..V216) are replaced by ONE file per dialect, `migrations/{sqlite,postgres}/lens/V300__edition2_baseline.sql`. Its first part is edition 1's schema as V216 left it, object for object. SQLite gets every `sqlite_schema` row's DDL text byte for byte, with #845's portable defaults already in place. PostgreSQL gets `pg_dump --schema-only` of a V216 store with no owner and no session settings, plus V005's role guard, V081's seeded row, and `cirislens_pseudonyms` unqualified in the current schema. The rest of the file is the edition-2 additions: `store_edition_deletions` (below), slice E2a's `ceg_statements` / `ceg_row_names`, and three columns on `federation_keys` for the projection of a verified edition-2 key:record. Those are `edition` (SMALLINT, 1 or 2, default 1), `record_row_id` and `kid` (32 bytes each), plus a CHECK that an edition-2 row carries both ids. They are appended with ALTER, so edition 1's DDL text is unchanged, and every FK to `federation_keys` (the attestation signer FKs included) stays valid.
+- **Numbering.** Edition 2 starts at **V300**, so an edition-2 version can never be read as an edition-1 one: an edition-1 history holds 1..=216 only. Future migrations append as V301, V302, and so on. `store::edition_baseline::{EDITION_TWO_BASELINE, EDITION_ONE_HEAD, EDITION_TWO_ADDITIONS}`.
+- **The runner never continues edition 1.** `migration_runner::plan` refuses any history row below V300 with `MigrationError::EditionOneHistory { head }` before any other decision (I1951). It is a backstop: an open deletes an edition-1 store before the runner sees it.
+- **The upgrade, `store::edition_upgrade::delete_earlier_store(target, mode)`.** This is the one entry point, and every open reaches it. `SqliteBackend::open*` calls it for a file path before the first connection opens. `PostgresBackend::run_migrations` calls it inside the migration advisory lock, before the runner. So `Engine::with_signer*`, the PyO3 `Engine(...)`, and a consumer opening a backend directly all upgrade the same way. The steps:
+  1. **Find** the store (`StoreFinding`). It is one of four things:
+     - `Absent`;
+     - `EditionTwo`;
+     - `EditionOne`: history 1..=216 that begins with persist's own V001 (`trace_events`, its shipped checksum, pinned per dialect);
+     - `Foreign`: anything persist cannot prove it created. This is refused and never touched.
+  2. **Guard** (CC 4.5.3; C312 "law wins"). The open refuses with `Error::EarlierStore(EarlierStoreRefusal::LegalHold)` (`store_earlier_store_legal_hold`) and deletes nothing if the store holds a live legal hold on any of four planes (`LEGAL_HOLD_PLANES`):
+     - a `hard_case_events` row of kind `legal_hold…`;
+     - an attestation subject of dimension `hard_case:legal_hold…`;
+     - a community whose `policy_blob` declares the CC 4.4.3.2.8 `legal_hold` limb;
+     - a takedown under counter-notice (`counter_noticed`).
+
+     It is not expected to fire. A guard read that fails refuses the open too.
+  3. **Count** every plane's rows. Counts only, never content.
+  4. **Delete.**
+     - SQLite deletes the file and its `-wal` / `-shm` / `-journal`, with no connection open.
+     - PostgreSQL drops the five schemas persist owns, `cirislens_pseudonyms`, and the history table in the connection's current schema, all in ONE transaction. That transaction ROLLS BACK and refuses (`Foreign`) if a fingerprint of every object outside that footprint changed, which is how a cascade into a host's view or constraint is caught. Before that, a persist schema is refused when it is not owned by the connection's role, or holds a relation edition 1 never created (`EDITION_ONE_PG_RELATIONS`: the 137 tables of every edition-1 version), a loose sequence, a function or a type. A database with persist's schema names and no persist history is refused as foreign.
+  5. **Create** the fresh edition-2 store and write the **local-tier record** `store_edition_deletions`: `tier = 'local'`, the host-clock instant, edition 1's head and history length, `plane_counts` (JSON), and `rows_deleted`. Node-local: no door replicates it.
+
+  `UpgradeMode::DryRun` runs steps 1–3, reports a hold as a finding rather than an error, and changes nothing. A `SingleProcess` host (browser, UEFI) cannot delete files, so an edition-1 store there refuses the open (`store_earlier_store_single_process_host`). No such node ran v61. `SqliteBackend::last_edition_upgrade()` / `PostgresBackend::last_edition_upgrade()` return what the open found and did. `PostgresBackend::edition_upgrade(mode)` runs the flow on that database.
+- **Removed with edition 1:**
+  - the 402 migration files;
+  - their rows in `evidence/migration_checksums.tsv`, which now pins only the V300 baselines (the immutability rule stands: from v62 the baseline's bytes are its contract);
+  - the V070 checksum repair (#840) and its frozen checksums;
+  - the #845 portable-default rewrite (`repair_portable_defaults*`): the baseline carries the portable form, and the "no `subsec` in any migration" gate stays;
+  - the V196 pending count;
+  - the test seam `run_migrations_through`, and the `pre_purge_schema` flag it set (the tombstone plane is always present);
+  - the edition-1 upgrade witnesses that stepped the runner to a version, seeded an old shape, and ran the rest: about 50 tests, among them I44, I55*, I66, I221, I275, I288, I369, I532b, I546b, I592, I744/I745's replay, I769, I1144, I1148, I1173, I1181, I1409, I1489, I1497, I1542, I969, I827b, the V061/V105/V136/V141/V157 rebuilds, and `tests/trace_crypto_cardinality_migration.rs`.
+
+  The open-time data rehomes (key plane, group plane, shard keys, minter sentinel) stay. On an edition-2 store they find nothing.
+
+### Adoption notes (CIRISServer, CIRISEdge, CIRISAgent) for slice E2b
+
+- **Upgrading deletes the node's v61 store.** This holds for every consumer and every backend. The first v62 `Engine` open (or `SqliteBackend::open` / `PostgresBackend::run_migrations`) of a v61 store deletes it and starts empty. Plan the fleet's re-admission and re-sync accordingly: nothing carries, by ruling. If you want to know what will go before the upgrade, run the dry run: `ciris_persist::store::edition_upgrade::delete_earlier_store(target_of_dsn(dsn).unwrap(), UpgradeMode::DryRun)` reports the per-plane counts and the hold guard's answer, and deletes nothing. The deletion's counts are logged at WARN before the delete and recorded in the new store's `store_edition_deletions`.
+- **A refusal is an operator action, never a retry.** `Error::EarlierStore(...)` (Python: `RuntimeError` whose message leads with the token) has three tokens. `store_earlier_store_legal_hold`: resolve the hold with counsel, then open again. `store_foreign_store`: the DSN or path does not point at persist's own store, so point it there. `store_earlier_store_single_process_host`.
+- **PostgreSQL.** Persist drops only its own footprint: `cirislens`, `cirislens_derived`, `cirislens_secrets`, `cirisnode`, `cirisgraph`, plus `cirislens_pseudonyms` and `ciris_persist_schema_history` in the current schema. Anything a host keeps beside it is untouched, and the drop rolls back if it would not be. A host table INSIDE a persist schema, or a host view over a persist table, refuses the upgrade: move it first. The `cirislens_reader` role stays (it is cluster-global).
+- **Server: stores at V216 from v62-int builds are edition 1 too** and are deleted the same way.
+- **The edition-2 additions are in the baseline.** V300 creates `ceg_statements`, `ceg_row_names` (slice E2a's writer; the baseline's DDL is the source of truth, with E2a's columns, order and index names) and `store_edition_deletions`, and it adds `federation_keys.{edition, record_row_id, kid}`. There is no V301 yet.
+
+### Tested (slice E2b)
+
+- I1950: the baseline builds edition 1's schema. On top of edition 1 it adds exactly the declared tables and `federation_keys` columns (the witness applies the ALTER constants and checks them against the file's text), and the two attestation signer FKs are present. Both catalogs are compared with the frozen edition-1 catalog, `tests/fixtures/edition1_schema/{sqlite,postgres}.catalog`, read from a real V001..V216 open at `6a9e88eb` (repairs included). Before the files were removed (commit `76d8dbaa`), `e2b_i1950_pre_{sqlite,postgres}` compared a live V001..V216 store with the baseline directly: both green.
+- I1951: the runner refuses edition-1 history (unit test, SQLite and PostgreSQL).
+- I1952: from disk, each dialect begins at `V300__edition2_baseline` and has nothing below it.
+- I1953–I1959: SQLite and PostgreSQL witnesses for the fresh open (baseline only), the deletion (counts, record, nothing carries, a second open deletes nothing), the hold guard (each plane), the dry run, the foreign store and schema (host objects untouched, cascade rolled back, foreign table refused, schema without history refused), the single-process refusal, and the history classification.
+- `scripts/sqlite_portability_witness.sh` now applies the baseline on bookworm's SQLite 3.40.1.
+- Mutations, each red on its witness and reverted:
+  - the hold guard disabled reds I1955 (SQLite and PostgreSQL);
+  - the foreign-relation check disabled reds I1957(c);
+  - the dry run deleting reds I1956 (SQLite and PostgreSQL);
+  - the cascade-fingerprint rollback disabled reds I1957(b).
+- Gates:
+  - `cargo nextest run --lib --features postgres,server,pyo3,sqlite` (4 partitions, 4,930 tests) is green after re-pointing #840's divergence witnesses at V300 and dropping the V141 row from the #1238 allow-list;
+  - the pyo3 lane (`--features postgres,pyo3,server`, `-D warnings`; 2,893 tests) is green;
+  - the five `axis-*-none` checks pass under `-D warnings`;
+  - all-features clippy passes (pre-commit);
+  - `cargo deny`, `wasm_node_gate.sh`, `pyi_surface.py`, the AST gates and the evidence and mutants-scope gates pass.
+
 ### Changed (v62 slice E1: CC rc20 rules on today's wire, CIRISPersist#1274)
 
 These rules come from CC 1.0-rc20 (branch `rc20`, `140fed4a`; not yet tagged). Persist adopts them on today's JSON wire and Verify pin. The edition-2 encodings are slice E2.

@@ -514,36 +514,6 @@ mod sqlite {
         bodies::i288_the_counter_is_the_truth(&fresh().await, "sqlite").await;
     }
 
-    /// **I288 (backfill)** — V165 over a store that already holds chunk rows
-    /// sets every counter to the GROUP BY.
-    #[tokio::test]
-    async fn i288_v165_backfill_equals_the_group_by_sqlite() {
-        let b = SqliteBackend::open_in_memory().await.unwrap();
-        b.run_migrations_through(164).await.unwrap();
-        b.write(|c| {
-            for (stream, seq, epoch) in [
-                ("bf-a", 0i64, 0i64),
-                ("bf-a", 1, 0),
-                ("bf-a", 2, 3),
-                ("bf-b", 0, 0),
-            ] {
-                c.execute(
-                    "INSERT INTO federation_stream_chunks \
-                        (stream_id, seq, chunk_sha, epoch, size_bytes, plaintext_size_bytes) \
-                     VALUES (?1, ?2, ?3, ?4, 1, 1)",
-                    rusqlite::params![stream, seq, vec![seq as u8; 32], epoch],
-                )
-                .unwrap();
-            }
-        })
-        .await;
-        b.run_migrations().await.unwrap();
-        for s in ["bf-a", "bf-b"] {
-            assert_eq!(b.counters(s).await, b.truth(s).await, "I288 backfill: {s}");
-        }
-        assert_eq!(b.counters("bf-a").await, vec![(0, 2), (3, 1)]);
-    }
-
     #[tokio::test]
     async fn i289_a_batch_is_n_singles_sqlite() {
         bodies::i289_a_batch_is_n_singles(&fresh().await, &fresh().await, "sqlite").await;

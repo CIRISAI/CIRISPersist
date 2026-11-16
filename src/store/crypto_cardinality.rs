@@ -285,7 +285,14 @@ mod tests {
                 if let Some(rest) = t.strip_prefix("CREATE TABLE IF NOT EXISTS ") {
                     current = rest.split_whitespace().next().unwrap_or("").to_owned();
                 } else if let Some(rest) = t.strip_prefix("CREATE TABLE ") {
-                    current = rest.split_whitespace().next().unwrap_or("").to_owned();
+                    // SQLite keeps a renamed table's name quoted in its stored
+                    // DDL, which the edition-2 baseline carries verbatim.
+                    current = rest
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_matches('"')
+                        .to_owned();
                     // CIRISPersist#828 — `CREATE TABLE x AS SELECT …` DECLARES no
                     // column: it copies columns whose own declarations this
                     // gate already read. V141 stages twenty-two tables that

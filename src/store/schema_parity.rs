@@ -27,7 +27,7 @@
 //! | the two trees declare the same tables | none — 103 of 103 match |
 //! | the two trees declare the same columns | none — zero divergences |
 //! | every type pair is a sanctioned dialect encoding | [`DIALECT_ENCODINGS`] + [`PG_NARROWED_ID_COLUMNS`] |
-//! | nullability agrees | [`NULLABILITY_DIVERGENCES`] (1, `cirisnode`; the 14 `admitted_at` entries closed by V141 / #828) |
+//! | nullability agrees | [`NULLABILITY_DIVERGENCES`] (1, `federation_revocations`; the `cirisnode` entry closed in v62 when key columns compare as NOT NULL) |
 //! | a column one dialect omits from its INSERT has a DEFAULT there | [`WRITE_COLUMN_DIVERGENCES`] (5) |
 //!
 //! # Why `UUID` is not just another encoding
@@ -202,30 +202,18 @@ pub(crate) struct NullabilityDivergence {
 /// backends. The replayer could not read V080's `DROP NOT NULL`, so it believed
 /// postgres still strict and the declarations were written to match the
 /// replayer's fiction, not the databases. Same blindness as #828, opposite sign.
-pub(crate) const NULLABILITY_DIVERGENCES: &[NullabilityDivergence] = &[
-    NullabilityDivergence {
-        table: "cirisnode.scheduled_takedown_actions",
-        column: "notice_contribution_id",
-        postgres_not_null: false,
-        reason: "The one divergence pointing the other way: sqlite is STRICTER, refusing a NULL \
-                 postgres accepts. A cirisnode table persist stores for but does not admit \
-                 through a federation door, so no persist caller can observe the difference; it \
-                 would become observable the moment a door writes this table, which is why it is \
-                 pinned and not merely tolerated.",
-    },
-    NullabilityDivergence {
-        table: "cirislens.federation_revocations",
-        column: "revoked_key_sha256_ed25519_raw",
-        postgres_not_null: true,
-        reason: "v52.0.0 (CIRISPersist#784, V163) — postgres computes the subject digest for \
+pub(crate) const NULLABILITY_DIVERGENCES: &[NullabilityDivergence] = &[NullabilityDivergence {
+    table: "cirislens.federation_revocations",
+    column: "revoked_key_sha256_ed25519_raw",
+    postgres_not_null: true,
+    reason: "v52.0.0 (CIRISPersist#784, V163) — postgres computes the subject digest for \
                  existing rows in SQL and then declares NOT NULL; sqlite has no SHA-256, so its \
                  migration cannot, and the column stays NULLable there. \
                  `SqliteBackend::backfill_revocation_subject_digests` fills every legacy row at \
                  open, before any read, and REFUSES the open if one stays NULL; every insert \
                  stamps it. So no sqlite reader can observe a NULL, which is why it is pinned \
                  here rather than tolerated.",
-    },
-];
+}];
 
 /// A table whose INSERT column set differs between `sqlite.rs` and
 /// `postgres.rs`.
@@ -518,7 +506,21 @@ mod tests {
             return None;
         }
         let upper = part.to_ascii_uppercase();
-        let not_null = upper.contains("NOT NULL");
+        // `NOT NULL` as the column's own constraint, never inside a CHECK's
+        // parentheses (`CHECK (edition <> 2 OR kid IS NOT NULL)`).
+        let mut depth = 0i32;
+        let flat: String = upper
+            .chars()
+            .filter(|c| {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => return depth == 0,
+                }
+                false
+            })
+            .collect();
+        let not_null = flat.contains("NOT NULL");
         let default = upper.find("DEFAULT ").map(|p| {
             let rest = &part[p + "DEFAULT ".len()..];
             // Up to the next modifier keyword at depth 0.
@@ -587,14 +589,25 @@ mod tests {
             let Some(close) = rest.rfind(')') else { return };
             let entry = tables.entry(name).or_default();
             for part in split_top(&rest[open + 1..close]) {
-                if let Some((c, col)) = parse_column(&part) {
+                if let Some((c, mut col)) = parse_column(&part) {
+                    // v62.0.0 (slice E2b) — a key column is NOT NULL on
+                    // postgres whether the DDL says so or not, and pg_dump
+                    // (the edition-2 baseline's form) says so; every write
+                    // binds a value on sqlite. Compare keys as NOT NULL.
+                    if part.to_ascii_uppercase().contains("PRIMARY KEY") {
+                        col.not_null = true;
+                    }
                     entry.insert(c, col);
+                } else {
+                    mark_primary_key(entry, &part);
                 }
             }
             return;
         }
         if let Some(rest) = after(st, "ALTER TABLE ") {
             let rest = after(rest, "IF EXISTS ").unwrap_or(rest);
+            // pg_dump's form: `ALTER TABLE ONLY schema.table …`.
+            let rest = after(rest, "ONLY ").unwrap_or(rest);
             let Some(sp) = rest.find(' ') else { return };
             let name = norm_name(&rest[..sp]);
             for act in split_top(&rest[sp..]) {
@@ -609,7 +622,32 @@ mod tests {
         }
     }
 
+    /// `[CONSTRAINT name] PRIMARY KEY (a, b)`: mark each column NOT NULL.
+    fn mark_primary_key(cols: &mut BTreeMap<String, Col>, part: &str) {
+        let upper = part.to_ascii_uppercase();
+        let Some(at) = upper.find("PRIMARY KEY") else {
+            return;
+        };
+        let Some(open) = part[at..].find('(') else {
+            return;
+        };
+        let Some(close) = part[at + open..].find(')') else {
+            return;
+        };
+        for c in part[at + open + 1..at + open + close].split(',') {
+            if let Some(col) = cols.get_mut(&norm_name(c.trim())) {
+                col.not_null = true;
+            }
+        }
+    }
+
     fn apply_alter(tables: &mut Tables, table: &str, act: &str) {
+        if let Some(rest) = after(act, "ADD CONSTRAINT ") {
+            if let Some(t) = tables.get_mut(table) {
+                mark_primary_key(t, rest);
+            }
+            return;
+        }
         if let Some(rest) = after(act, "ADD COLUMN ") {
             let rest = after(rest, "IF NOT EXISTS ").unwrap_or(rest);
             if let Some((c, col)) = parse_column(rest) {
