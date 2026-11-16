@@ -104,6 +104,12 @@ The ruling (CC rc20 `0c9e17c`, "nothing carries, clean mesh"): the edition start
   - the sqlite write uses `write_tx` (BEGIN IMMEDIATE, #1238);
   - test checkouts use the bounded checkout (#1166).
   - I661 now pins the forward digest preimage.
+- Gates:
+  - the lib lane (`--features postgres,server,pyo3,sqlite`, postgres via `pg_test_db.sh`, four partitions): 1248 + 1248 + 1250 + 1249 passed on the first run. The 8 reds were the gate tables above, plus I509 (the charter-gap refusal, narrowed to the head charter). All 8 were fixed and re-run green (45/45 over the affected filter);
+  - the pyo3 lane (`--lib --features postgres,pyo3,server`): 2935 passed;
+  - the five no-backend axes (`--all-targets`, `RUSTFLAGS=-D warnings`) are clean, and so is all-features clippy `-D warnings`;
+  - `pyi_surface.py check` and `cargo deny check` (advisories, bans, licenses, sources) are ok;
+  - `scripts/wasm_node_gate.sh`: green, with 3 `ciris:node/*` imports.
 
 ### Changed (v62 slice E1: CC rc20 rules on today's wire, CIRISPersist#1274)
 
