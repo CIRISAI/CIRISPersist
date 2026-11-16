@@ -5,6 +5,7 @@
 //! each test in its own process, so an installed clock or executor never
 //! leaks into another test; each witness still uninstalls on the way out.
 
+#[cfg(feature = "sqlite")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +14,7 @@ use chrono::{DateTime, TimeZone, Utc};
 
 use super::clock::{self, FixedClock};
 use super::rt::{self, TaskError, TokioExecutor};
+#[cfg(feature = "sqlite")]
 use super::{HostSeams, Lifecycle, LifecycleEvent};
 
 /// An instant every store keeps exactly: whole milliseconds, so the
@@ -24,6 +26,7 @@ fn fixed_instant() -> DateTime<Utc> {
 
 /// Threads this process runs now, where the OS says (`/proc`); `None`
 /// elsewhere. The portable count is the runtime's `on_thread_start`.
+#[cfg(feature = "sqlite")]
 fn os_threads() -> Option<usize> {
     let s = std::fs::read_to_string("/proc/self/status").ok()?;
     s.lines()
@@ -33,6 +36,7 @@ fn os_threads() -> Option<usize> {
 
 /// A current-thread runtime that counts every thread it starts (blocking
 /// pool threads included: tokio calls `on_thread_start` for each).
+#[cfg(feature = "sqlite")]
 fn counting_current_thread() -> (tokio::runtime::Runtime, Arc<AtomicUsize>) {
     let started = Arc::new(AtomicUsize::new(0));
     let counter = started.clone();

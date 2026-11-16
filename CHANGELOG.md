@@ -23,6 +23,11 @@ Persist's node code reads time, spawns, sleeps, dispatches blocking work and lea
 - `SqliteMerkleStore::new` and `PgMerkleStore::{new, from_pool}` drop their `Handle` argument. `PgMerkleStore` no longer implements `TransparencyStore`; await its inherent methods.
 - `federation::key_grant`'s `next_retry` field is a `host::clock::Instant`.
 
+### Tested
+
+- I1790–I1799 (`host/seams_invariants.rs`, `audit/host_seams_invariants.rs`, `store/host_seams_gate.rs`; sqlite and postgres): a fixed clock makes the Engine stamp exactly its instant (`register_self_federation_key`'s signed `valid_from` and `scrub_timestamp`, both backends) and the audit head carry it (I1790, I1794, I1795); the clock reads only the installed clock (I1791); the single-thread profile opens, migrates, writes and reads a file-backed sqlite store on a current-thread runtime without starting a thread, against a native control leg that must start one (I1792); dispatch runs inline or on the pool as the profile says, and a panic is a `TaskError` in both arms (I1793); the sqlite Merkle hook runs on one thread and `PgMerkleStore` on a current-thread runtime, where v61's `block_on` panicked (I1794, I1795); from disk, node code reaches time, spawn, timers, blocking dispatch, `block_on`, signals and target `cfg` only through `src/host/`, with each vetted survivor named and a stale entry red (I1796); shutdown is the host's event and a persister drains on it (I1797); single-thread teardown drops inline (I1798); the journal replay awaits in place on one thread (I1799).
+- Mutations, each red then restored: `clock::now` ignoring the installed clock (I1790 ×2, I1791, I1794, I1795); blocking never inline (I1792, I1793, I1794, I1798); a `Handle::current().block_on` back in `SqliteMerkleStore::append` (I1794), in `PgMerkleStore::append` (I1795) and in the journal replay (I1799); `Lifecycle::shutdown` not waiting (I1797); teardown not inline (I1798); `register_self`'s stamp read from `chrono::Utc::now()` (I1790 ×2, I1796); a raw `tokio::spawn` back in the disk-pressure loop (I1796).
+
 ## [61.4.1] - 2026-11-14
 
 A member seated late in a room of three or more could read an earlier message as `seal_mismatch`, permanently (CIRISPersist#1271). This release binds a room message to its author's minter, and heals on read a binding that is already wrong.
