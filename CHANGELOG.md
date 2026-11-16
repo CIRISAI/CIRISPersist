@@ -21,7 +21,7 @@ v62 runs persist as one single-threaded module on native, browser (wasm32 in a D
 
 ### Added
 
-- `benches/attestation_read.rs`: the 1000-row page at 1k / 16k / 100k rows, the door against the v61.4.1 statement shape; run by the bench workflow.
+- `benches/attestation_read.rs`: the 1000-row page at 1k / 16k / 100k rows, run by the bench workflow. Two stores are seeded alike: v62's, and v61.4.1's (V216 dropped). The door, the door's own statements raw, and the v61.4.1 statements generated from the builder (lifecycle and scope predicates included) run with one decode, and each arm's EXPLAIN QUERY PLAN is printed. I1813 also reports postgres's page-1000 timings and plans for every keyed shape, v62 against the v61.4.1 spelling.
 
 ### Tested
 

@@ -247,6 +247,84 @@ mod witnesses {
         out
     }
 
+    /// Report only: the min of three `EXPLAIN (ANALYZE, FORMAT JSON)`
+    /// execution times of `sql`, in ms, and its top plan nodes.
+    async fn timed(
+        client: &deadpool_postgres::Object,
+        sql: &str,
+        params: &Params<'_>,
+    ) -> (f64, Vec<String>) {
+        let mut best = f64::MAX;
+        let mut nodes = Vec::new();
+        for _ in 0..3 {
+            let row = client
+                .query_one(
+                    &format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"),
+                    &params[..],
+                )
+                .await
+                .unwrap();
+            let v: serde_json::Value = row.get(0);
+            best = best.min(v[0]["Execution Time"].as_f64().unwrap());
+            nodes.clear();
+            fn walk(n: &serde_json::Value, out: &mut Vec<String>, depth: usize) {
+                if depth > 5 {
+                    return;
+                }
+                out.push(format!(
+                    "{}{}",
+                    n["Node Type"].as_str().unwrap_or("?"),
+                    n["Index Name"]
+                        .as_str()
+                        .map(|i| format!("({i})"))
+                        .unwrap_or_default()
+                ));
+                for c in n["Plans"].as_array().into_iter().flatten().take(1) {
+                    walk(c, out, depth + 1);
+                }
+            }
+            walk(&v[0]["Plan"], &mut nodes, 0);
+        }
+        (best, nodes)
+    }
+
+    /// The v61.4.1 spelling of a statement: a single key bound `= ANY`.
+    fn v61_4_1_spelling(sql: &str) -> String {
+        sql.replacen(
+            "attesting_key_id = $1 ",
+            "attesting_key_id = ANY(ARRAY[$1::text]) ",
+            1,
+        )
+        .replacen(
+            "attested_key_id = $1 ",
+            "attested_key_id = ANY(ARRAY[$1::text]) ",
+            1,
+        )
+    }
+
+    /// Report only (the FSD §6.4 numbers on postgres): every keyed shape's
+    /// 1000-row page, the door's statement with V216 against the v61.4.1
+    /// spelling without it.
+    async fn report_pages(client: &deadpool_postgres::Object, leg: &str) {
+        for (tag, filter, _) in shapes().iter().take(4) {
+            let (sql, params) = pg_list_attestations_sql(
+                filter,
+                None,
+                1000,
+                &crate::scope::CallerScope::Unauthenticated,
+            )
+            .unwrap();
+            let sql = if leg == "v61.4.1" {
+                v61_4_1_spelling(&sql)
+            } else {
+                sql
+            };
+            let refs: Params<'_> = params.iter().map(|p| p.as_ref() as _).collect();
+            let (ms, nodes) = timed(client, &sql, &refs).await;
+            eprintln!("I1813 REPORT [{leg}] {tag}, page 1000: {ms:.2} ms, plan {nodes:?}");
+        }
+    }
+
     /// **I1813 (postgres) — one key and an exact dimension read in page order,
     /// no sort.** The adverse corpus (the FSD's proportions): 40,000 corpus rows,
     /// so one (key, dimension) slice holds 10,000, behind 200,000 newer rows of a
@@ -310,6 +388,7 @@ mod witnesses {
                 );
             }
         }
+        report_pages(&client, "v62 (V216)").await;
         // The control: without V216 the same statements sort (measured: V004's
         // attester history walked with an Incremental Sort, or V180 and a Sort).
         client
@@ -337,6 +416,7 @@ mod witnesses {
                 "I1813 control {tag}: without V216 the read sorts: {nodes:?}"
             );
         }
+        report_pages(&client, "v61.4.1").await;
     }
 
     /// **I1814 (postgres) — the same rows in the same order, ties included.**
