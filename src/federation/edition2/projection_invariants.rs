@@ -69,13 +69,6 @@ fn at(ms: i64) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).unwrap()
 }
 
-fn reason(e: &Error) -> String {
-    match e {
-        Error::MalformedRow { reason, .. } => (*reason).to_owned(),
-        other => format!("{}: {other}", other.kind()),
-    }
-}
-
 /// An authored score row of `k` at `at_ms` (Verify's vector family).
 fn score_row(k: &ciris_crypto::composite::CompositeSigningKey, at_ms: u64) -> Vec<u8> {
     let payload = map(vec![
@@ -289,6 +282,19 @@ pub(crate) async fn body(d: &dyn FederationDirectory, raw: &Raw<'_>) {
             "I2000: the ML-DSA-65 half, 1952 bytes"
         );
     }
+    assert_eq!(
+        first.pqc_completed_at,
+        Some(at(1_000)),
+        "I2000: the composite is complete at signing"
+    );
+    assert!(
+        !d.list_hybrid_pending_keys(1_000)
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.id == ik),
+        "I2000: the PQC sweep never offers a projection"
+    );
     let ev = first.attestation_evidence.clone().expect("I2000: evidence");
     assert_eq!(ev["chain"], serde_json::json!([]), "I2000: evidence shape");
     let row_before = raw
@@ -759,44 +765,67 @@ async fn cross_form(
         self_roster, tier_ingest,
     };
     let token = malformed_row::EARLIER_FORM_SIGNER_IS_EDITION2;
-    let check = |site: &str, r: Result<(), Error>| {
-        let got = r.err().map(|e| reason(&e));
+    // Each site refuses under its own plane, so a site whose guard is gone
+    // is seen even where a later site would refuse by the same reason.
+    let check = |site: &str, plane: &str, r: Result<(), Error>| {
+        let got = r.err().map(|e| match e {
+            Error::MalformedRow { plane, reason, .. } => format!("{plane}:{reason}"),
+            other => format!("{}: {other}", other.kind()),
+        });
         if refused {
-            assert_eq!(got.as_deref(), Some(token), "I2003 at {site}");
+            assert_eq!(
+                got.as_deref(),
+                Some(format!("{plane}:{token}").as_str()),
+                "I2003 at {site}"
+            );
         } else {
-            assert_ne!(got.as_deref(), Some(token), "I2003 control at {site}");
+            assert!(
+                !got.as_deref().is_some_and(|g| g.ends_with(token)),
+                "I2003 control at {site}: {got:?}"
+            );
         }
     };
     let b = |r: Result<bool, Error>| r.map(|_| ());
     check(
         "tier_ingest::verify_row_hybrid_signature",
+        "attestation",
         tier_ingest::verify_row_hybrid_signature(d, row).await,
     );
     check(
         "register::verify_key_registration",
+        "key_registration",
         register::verify_key_registration(d, record)
             .await
             .map(|_| ()),
     );
     check(
         "register::verify_proof_of_possession",
+        "key_record",
         register::verify_proof_of_possession(record),
     );
     check(
         "key_plane::verify_plane_row",
+        "key_plane",
         b(key_plane::verify_plane_row(d, row).await),
     );
     check(
         "group_plane::verify_plane_row",
+        "group_plane",
         b(group_plane::verify_plane_row(d, row).await),
     );
     check(
         "self_roster::verify_proposal_row",
+        "self_roster",
         b(self_roster::verify_proposal_row(d, row).await),
     );
-    check("cosign::verify_row", b(cosign::verify_row(d, row).await));
+    check(
+        "cosign::verify_row",
+        "cosign",
+        b(cosign::verify_row(d, row).await),
+    );
     check(
         "occurrence_revocation_carrier::verify_carrier_row",
+        "occurrence_revocation_carrier",
         b(occurrence_revocation_carrier::verify_carrier_row(d, row).await),
     );
     // A subject-side withdrawal transiting the local tier.
@@ -806,6 +835,7 @@ async fn cross_form(
     transit.subject_key_ids = vec![row.attesting_key_id.clone()];
     check(
         "admission::verify_consent_record_transit_ingest",
+        "consent_record",
         admission::verify_consent_record_transit_ingest(d, &transit).await,
     );
     let input: crate::federation::types::LocalAttestationInput =
@@ -818,6 +848,7 @@ async fn cross_form(
         .unwrap();
     check(
         "admission::verify_caller_signed_local_row",
+        "local_attestation",
         admission::verify_caller_signed_local_row(
             d,
             admission::LocalTierDisposition::Durable,

@@ -1711,7 +1711,7 @@ pub fn verify_record_signed_by(
     // proof-of-possession door reads no directory. (`verify_key_registration`,
     // this file's other way into `verify_registration_signature`, refuses an
     // edition-2 key or signer through the directory first.)
-    super::edition2::projection::refuse_edition2_projection("key_registration", record)?;
+    super::edition2::projection::refuse_edition2_projection("key_record", record)?;
     let Some(ml_dsa_65_pubkey_b64) = ml_dsa_65_pubkey_b64 else {
         return Err(Error::SignatureInvalid(format!(
             "key:record:v1 {}: the signer {} carries no ML-DSA-65 key (hybrid-pending); a plane \

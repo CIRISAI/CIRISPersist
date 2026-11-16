@@ -73,7 +73,10 @@ pub struct KeyProjection {
     pub scrub_signature_classical: String,
     /// The record's signer (its `iss`).
     pub scrub_key_id: String,
-    /// The record's `asserted_at`.
+    /// The record's `asserted_at`. Also the row's `pqc_completed_at`: the
+    /// composite carries its ML-DSA-65 half, so nothing is pending, and the
+    /// earlier store's PQC sweep (`list_hybrid_pending_keys`) never offers
+    /// a projection.
     pub scrub_timestamp: DateTime<Utc>,
     /// The record row's id, hex.
     pub persist_row_hash: String,

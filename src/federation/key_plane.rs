@@ -804,7 +804,7 @@ where
     F: super::FederationDirectory + ?Sized,
 {
     // v62.0.0 (slice J0; CC 2.6.1.12) — the cross-form refusal.
-    super::edition2::projection::refuse_edition2_row_signer(directory, "key_record", row).await?;
+    super::edition2::projection::refuse_edition2_row_signer(directory, "key_plane", row).await?;
     match KeyPlaneFamily::of_row(row) {
         None => Ok(false),
         Some(KeyPlaneFamily::KeyRecord) => {

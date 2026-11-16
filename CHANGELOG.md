@@ -19,7 +19,8 @@ Slices E2b (the V300 baseline) and E2a (the edition-2 door) are merged. The sign
   - `registration_envelope` = the record mapped as a row is (`attestation_of`: the payload projection plus `ceg_statement`), with its `original_content_hash`;
   - `scrub_signature_classical` = the composite (base64), `scrub_key_id` = the record's `iss`, `persist_row_hash` = the record's row id;
   - `attestation_evidence` = `{hardware_class, pq_custody, chain}` from the payload, chain as hex DER, leaf first (always an object);
-  - `edition = 2`, `record_row_id`, `kid`.
+  - `edition = 2`, `record_row_id`, `kid`;
+  - `pqc_completed_at` = `scrub_timestamp`: the composite carries its ML-DSA-65 half, so the earlier store's PQC sweep (`list_hybrid_pending_keys`) never offers a projection.
 
   The record projected is the one with the greatest end. An unchanged projection writes nothing, so re-putting is byte-identical; a change sets `mutated_at`. A key id held by an earlier-form row is refused `Conflict`, never overwritten. New `FederationDirectory::upsert_edition2_key_projection`, implemented on sqlite (`write_tx`) and postgres; a directory with no edition-2 store refuses.
 - **The revocation read model.** The same projection writes each `key:revocation` that `HeldKeys` honours (`HeldKeys::honoured_revocations`: by the key itself, or by a revoker `RevokerStanding` admits) into `federation_revocations`, once (`ON CONFLICT DO NOTHING`): `revoked_key_id` = the identity-ref, `revoked_key_sha256_ed25519_raw` from the Ed25519 half, `effective_at` = `revoked_after` (or `asserted_at` when it states none), `revoked_after` kept. `revocations_for` / `revocations_for_subject` and every reader over them see it. A revoker other than the key itself has its own key row projected first (the FK target). `project_key` honours the key alone (`SelfOnly`, what the gates read); `project_key_with` takes a standing.

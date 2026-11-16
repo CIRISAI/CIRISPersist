@@ -14975,9 +14975,9 @@ fn sqlite_upsert_edition2_key(
                 algorithm, identity_type, identity_ref, valid_from, valid_until, \
                 registration_envelope, original_content_hash, scrub_signature_classical, \
                 scrub_key_id, scrub_timestamp, persist_row_hash, attestation_evidence, \
-                consent_role, edition, record_row_id, kid, admitted_at) \
+                consent_role, edition, record_row_id, kid, admitted_at, pqc_completed_at) \
              VALUES (?1, ?2, ?3, 'hybrid', ?4, ?1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
-                'unregistered', 2, ?14, ?15, ?16)",
+                'unregistered', 2, ?14, ?15, ?16, ?11)",
             params,
         )
         .map_err(be)?;
@@ -14988,14 +14988,15 @@ fn sqlite_upsert_edition2_key(
                 valid_until = ?6, registration_envelope = ?7, original_content_hash = ?8, \
                 scrub_signature_classical = ?9, scrub_key_id = ?10, scrub_timestamp = ?11, \
                 persist_row_hash = ?12, attestation_evidence = ?13, record_row_id = ?14, \
-                kid = ?15, mutated_at = ?16 \
+                kid = ?15, mutated_at = ?16, pqc_completed_at = ?11 \
              WHERE key_id = ?1 AND edition = 2 AND ( \
                 pubkey_ed25519_base64 IS NOT ?2 OR pubkey_ml_dsa_65_base64 IS NOT ?3 OR \
                 identity_type IS NOT ?4 OR valid_from IS NOT ?5 OR valid_until IS NOT ?6 OR \
                 registration_envelope IS NOT ?7 OR original_content_hash IS NOT ?8 OR \
                 scrub_signature_classical IS NOT ?9 OR scrub_key_id IS NOT ?10 OR \
                 scrub_timestamp IS NOT ?11 OR persist_row_hash IS NOT ?12 OR \
-                attestation_evidence IS NOT ?13 OR record_row_id IS NOT ?14 OR kid IS NOT ?15)",
+                attestation_evidence IS NOT ?13 OR record_row_id IS NOT ?14 OR kid IS NOT ?15 OR \
+                pqc_completed_at IS NOT ?11)",
             params,
         )
         .map_err(be)?;
