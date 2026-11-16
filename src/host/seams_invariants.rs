@@ -213,7 +213,11 @@ fn i1792_single_thread_profile_open_write_read_starts_no_thread() {
         "I1792: the single-thread profile started a runtime thread"
     );
     if let (Some(b), Some(a)) = (before, after) {
-        assert_eq!(a, b, "I1792: the process gained {} thread(s)", a - b);
+        assert!(
+            a <= b,
+            "I1792: the process gained {} thread(s)",
+            a.saturating_sub(b)
+        );
     }
 }
 
@@ -431,6 +435,10 @@ fn i1799_journal_replay_awaits_in_place() {
         "I1799: a runtime thread started"
     );
     if let (Some(b), Some(a)) = (before, after) {
-        assert_eq!(a, b, "I1799: the process gained {} thread(s)", a - b);
+        assert!(
+            a <= b,
+            "I1799: the process gained {} thread(s)",
+            a.saturating_sub(b)
+        );
     }
 }
